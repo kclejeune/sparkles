@@ -31,11 +31,14 @@ adds to this file and does not override it.
   workspace's Clippy and Rust tests. `scripts/ci.sh` runs every check, and the
   conformance suites run with `mise run test:w3c`, `test:shacl` and `test:shex`.
   [Merging and pushing](#merging-and-pushing) says which of these a lane and a batch run.
-- When the local machine is busy, build and test on another build host or on an
-  ephemeral Namespace instance created with `nsc create --bare --duration …` and always
-  destroyed afterwards. The benchmark host, which `SPARKLES_BENCH_HOST` names, runs no
-  builds or gates, and a benchmark on any host starts only once other heavy work has left
-  it, so the engine under test runs alone.
+- Prefer available local implementation and build hosts. Use Boat sandboxes for overflow,
+  isolation or additional parallel capacity, after checking the worker's tools, memory,
+  disk and competing work. Reuse a warm worker for ordinary fix and test iterations.
+  Namespace remains a fallback for a measured resource need or a workflow without a
+  qualified Boat replacement. See [remote executors](docs/DEVELOPMENT.md#remote-executors).
+- The benchmark host, which `SPARKLES_BENCH_HOST` names, runs no builds or gates. Keep
+  other designated benchmark workers available for comparisons, and start a benchmark
+  only after other heavy work has left its host, so the engine under test runs alone.
 
 ## Long-running and remote work
 
@@ -50,6 +53,11 @@ adds to this file and does not override it.
   so that an out-of-memory kill ends that command and not the session or terminal around it.
 - Never run two `mise run bench:nsc` screens of the same commit at once, since they share
   the commit's source directory.
+- Record remote worker and conversation IDs, source identity and resource deadlines in
+  the lane's notes. Reconcile an uncertain launch before retrying it. Retain results and
+  release owned jobs and Boxington leases before stopping or deleting a worker. Keep
+  development environments and snapshot seeds separate from CI, and exclude credentials
+  and live leases from reusable seeds.
 - Runs that call paid model APIs need the maintainer's approval and a spending cap first.
   Inject their keys through the secret tool the environment provides, and never print or
   write a key.
@@ -122,6 +130,13 @@ configuration. Its brief is therefore self-contained and written to a file in it
 worktree, such as `.artifacts/lanes/<name>/brief.md`. The agent reports results to its
 parent, writes long results to a file, and starts no agents of its own unless the brief
 assigns that.
+
+For a remote agent, record sandbox, conversation and prompt IDs with its source,
+environment version, branch, resource deadline and snapshot identity when applicable.
+Attach the self-contained brief, and confirm subscription authentication before its
+first model turn. Paid API runs still require approval and a spending cap. Independent
+review uses a separate conversation and checkout. Keep native command logs and exit
+results separately from conversation events.
 
 ### Models
 
@@ -224,7 +239,9 @@ full gates of their own.
 
 Finished lanes merge into local `main` as they land, and several lanes may share one
 batch. One gate runs on the batch, with a Namespace screen
-(`mise run bench:nsc origin/main HEAD`). `scripts/gate/gate.sh <rev>` runs it on the
+(`mise run bench:nsc origin/main HEAD`). This provider-specific screen remains the
+required fallback until a replacement is qualified; the Boat placement policy does not
+change its acceptance criteria. `scripts/gate/gate.sh <rev>` runs the gate on the
 configured gate hosts and selects its checks from the batch's diff against `origin/main`.
 It runs the `scripts/ci.sh` tasks, conformance suites and spill matrices that the changed
 files call for, with Clippy and the Rust tests for the packages they can affect, as the

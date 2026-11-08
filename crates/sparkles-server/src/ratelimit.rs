@@ -1548,7 +1548,13 @@ pub fn hold() -> Held {
 /// Store GETs keep working after the handler returned).
 struct PermitBody {
     inner: Body,
-    _permits: Arc<Permits>,
+    _permits: Arc<parking_lot::Mutex<Option<Arc<Permits>>>>,
+}
+
+impl Drop for PermitBody {
+    fn drop(&mut self) {
+        drop(self._permits.lock().take());
+    }
 }
 
 impl HttpBody for PermitBody {
@@ -1976,10 +1982,17 @@ where
         rate_headers(resp.headers_mut(), p, remaining, reset);
     }
     if held {
+        let lease = Arc::new(parking_lot::Mutex::new(Some(permits)));
+        if let Some(abort) = resp.extensions().get::<crate::http::StreamAbort>() {
+            let lease = lease.clone();
+            abort.bind_admission(move || {
+                drop(lease.lock().take());
+            });
+        }
         resp = resp.map(|b| {
             Body::new(PermitBody {
                 inner: b,
-                _permits: permits,
+                _permits: lease,
             })
         });
     }

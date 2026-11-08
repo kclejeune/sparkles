@@ -11,6 +11,7 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 pub(super) struct Request {
+    pub timeouts: stream::Timeouts,
     pub query: String,
     pub options: QueryOptions,
     pub params: Params,
@@ -30,6 +31,7 @@ pub(super) struct Request {
 /// How an opened execution is answered: everything of [`Request`] except what opening
 /// it needed.
 pub(super) struct Serve {
+    pub timeouts: stream::Timeouts,
     pub params: Params,
     pub uri: Uri,
     pub guard: CancelOnDrop,
@@ -54,6 +56,7 @@ pub(super) struct Serve {
 
 pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
     let Request {
+        timeouts,
         query,
         options,
         params,
@@ -92,6 +95,7 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
         seq,
         resolved,
         Serve {
+            timeouts,
             params,
             uri,
             guard,
@@ -120,6 +124,7 @@ pub(super) async fn serve(
     serve: Serve,
 ) -> ApiResult {
     let Serve {
+        timeouts,
         params,
         uri,
         guard,
@@ -187,6 +192,7 @@ pub(super) async fn serve(
         limit,
         control,
         early,
+        timeouts,
         move |writer| {
             let metadata = Some(results::NativeJsonMetadata {
                 commit: seq,
@@ -323,6 +329,7 @@ pub(super) async fn serve(
             return Ok(response);
         }
     };
+    let abort = serialized.abort_handle();
     let body = match serialized {
         stream::Serialized::Whole { body, .. } => {
             // A cursor that stopped at `send` has not run the whole query, so only a
@@ -339,7 +346,7 @@ pub(super) async fn serve(
             }
             Body::from(body)
         }
-        stream::Serialized::Streamed(body) => {
+        stream::Serialized::Streamed(body) | stream::Serialized::Timed { body, .. } => {
             // a body too large to buffer is not quick, as for an eager answer
             if let Some((key, _)) = quick {
                 QUICK.record(key, f64::INFINITY);
@@ -368,6 +375,9 @@ pub(super) async fn serve(
         _ => with_inferences(response, &ds, with_extra && derived.is_none(), seq),
     };
     response.extensions_mut().insert(deferred);
+    if let Some(abort) = abort {
+        response.extensions_mut().insert(abort);
+    }
     Ok(response)
 }
 

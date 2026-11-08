@@ -174,13 +174,23 @@ log "selection: $(tr '\n' ';' < "$out/selection.txt")"
 
 if [ "$part" != conformance ]; then
   step ci scripts/ci.sh "${force[@]}" --jobs "$jobs" "${ci_args[@]}"
-  # scripts/ci.sh keeps its summary and task logs in .artifacts/ci, and older revisions in
-  # target/ci. Copy them before the cleanup below removes the worktree.
-  if [ -d .artifacts/ci ]; then
-    cp -a .artifacts/ci "$out/ci-receipts" 2> /dev/null
-  else
-    cp -a target/ci "$out/ci-receipts" 2> /dev/null
-  fi
+  # New CI revisions retain actual JUnit under their original lease. Copy only that
+  # retained evidence here, after ci.sh has returned; never recover it from a target.
+  # shellcheck disable=SC2329 # step invokes the function passed as its command.
+  retain_ci_receipts() {
+    mkdir "$out/ci-receipts" || return
+    if [ -d .artifacts/ci ]; then
+      cp -a .artifacts/ci/. "$out/ci-receipts/" || return
+    else
+      cp -a target/ci/. "$out/ci-receipts/" || return
+    fi
+    if [ -f scripts/ci-retain-junit.py ]; then
+      python3 scripts/ci-retain-junit.py verify --directory "$out/ci-receipts/junit"
+    else
+      echo 'legacy source does not provide JUnit retention' > "$out/ci-receipts/junit-unsupported.txt"
+    fi
+  }
+  step ci-receipts retain_ci_receipts
 fi
 if [ "$part" != ci ]; then
   for t in w3c shacl shex; do

@@ -22,6 +22,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
+mod lifetime;
+pub(crate) use lifetime::{Abort, Timeouts};
+
 /// Bodies up to this size are returned whole.
 pub const STREAM_AFTER: usize = 1 << 20;
 /// An explicitly streamed body commits the response once it holds this many bytes, or
@@ -36,9 +39,25 @@ const CONTROL_SHIFT: u32 = 14;
 type Chunk = io::Result<Bytes>;
 
 /// A serialized response body.
-pub enum Serialized {
-    Whole { body: Vec<u8>, serialize_ms: f64 },
+pub(super) enum Serialized {
+    Whole {
+        body: Vec<u8>,
+        serialize_ms: f64,
+    },
     Streamed(axum::body::Body),
+    Timed {
+        body: axum::body::Body,
+        abort: Abort,
+    },
+}
+
+impl Serialized {
+    pub(crate) fn abort_handle(&self) -> Option<Abort> {
+        match self {
+            Self::Timed { abort, .. } => Some(abort.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// How a streamed body ended, reported on the serializing thread.
@@ -69,6 +88,7 @@ impl StreamEnd {
 enum Outcome {
     Whole(Vec<u8>),
     Stream(mpsc::Receiver<Chunk>),
+    Timed(lifetime::Receiver),
     Failed(Error),
 }
 
@@ -83,8 +103,13 @@ pub struct SwitchWriter {
     /// Whether a flush before the switch switches to streaming, so that the bytes of a
     /// cursor's first batch reach the client before the next batch is computed.
     commit_on_flush: bool,
+    timeouts: Option<Timeouts>,
+    timed: Option<lifetime::Producer>,
+    held: Option<crate::ratelimit::Held>,
     #[cfg(test)]
     producer_gate: Option<Arc<super::algo::probe::Gate>>,
+    #[cfg(test)]
+    queued_producer_gate: Option<Arc<super::algo::probe::Gate>>,
 }
 
 /// Controls for a native cursor's producer, including time spent waiting for a
@@ -176,13 +201,30 @@ impl SwitchWriter {
     fn switch(&mut self) -> io::Result<()> {
         let (tx, rx) = mpsc::channel(4);
         let signal = self.signal.take().expect("signal before the switch");
-        signal.send(Outcome::Stream(rx)).map_err(|_| gone())?;
+        if let Some(timeouts) = self.timeouts {
+            let cancel = self
+                .control
+                .as_ref()
+                .map_or_else(|| Arc::new(AtomicBool::new(false)), |c| c.cancel.clone());
+            let pause = self.control.as_ref().map(|c| c.wait_ns.clone());
+            let (producer, receiver) =
+                lifetime::Producer::new(rx, timeouts, cancel, self.held.take(), pause);
+            self.timed = Some(producer);
+            signal.send(Outcome::Timed(receiver)).map_err(|_| gone())?;
+        } else {
+            signal.send(Outcome::Stream(rx)).map_err(|_| gone())?;
+        }
         self.tx = Some(tx);
         #[cfg(test)]
         if let Some(gate) = self.producer_gate.take() {
             gate.wait();
         }
-        self.send_chunk()
+        self.send_chunk()?;
+        #[cfg(test)]
+        if let Some(gate) = self.queued_producer_gate.take() {
+            gate.wait();
+        }
+        Ok(())
     }
 
     /// A capped synchronous trial reached its byte threshold and will be retried
@@ -199,41 +241,63 @@ impl SwitchWriter {
             return Ok(());
         }
         let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK));
-        let Some(control) = &self.control else {
+        if self.control.is_none() && self.timed.is_none() {
             return tx.blocking_send(Ok(Bytes::from(chunk))).map_err(|_| gone());
-        };
+        }
         let mut item = Ok(Bytes::from(chunk));
-        // Each chunk starts its own stall clock, so a reader that takes a chunk now and
-        // then never stalls, however slowly it reads.
         let stalled = Instant::now();
         loop {
-            control.check()?;
-            match tx.try_send(item) {
+            if let Some(control) = &self.control {
+                control.check()?;
+            }
+            if let Some(producer) = &self.timed {
+                producer.check()?;
+            }
+            let sent = match &self.timed {
+                Some(producer) => producer.try_send(tx, item)?,
+                None => tx.try_send(item),
+            };
+            match sent {
                 Ok(()) => return Ok(()),
                 Err(mpsc::error::TrySendError::Closed(_)) => return Err(gone()),
                 Err(mpsc::error::TrySendError::Full(returned)) => {
                     item = returned;
                     let began = Instant::now();
-                    // Capacity wakes the producer immediately; the finite timeout
-                    // also checks controls when the reader never polls again.
                     let capacity = tokio::runtime::Handle::current().block_on(async {
                         tokio::time::timeout(Duration::from_millis(10), tx.reserve()).await
                     });
-                    let ns = began.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                    let _ = control
-                        .wait_ns
-                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                            Some(n.saturating_add(ns))
-                        });
+                    if let Some(control) = &self.control {
+                        let ns = began.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                        let _ =
+                            control
+                                .wait_ns
+                                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                                    Some(n.saturating_add(ns))
+                                });
+                    }
                     match capacity {
                         Ok(Ok(permit)) => {
-                            control.check()?;
-                            permit.send(item);
+                            if let Some(control) = &self.control {
+                                control.check()?;
+                            }
+                            if let Some(producer) = &self.timed {
+                                producer.permit_send(permit, item)?;
+                            } else {
+                                permit.send(item);
+                            }
                             return Ok(());
                         }
                         Ok(Err(_)) => return Err(gone()),
                         Err(_) => {
-                            if control.stall.is_some_and(|s| stalled.elapsed() >= s) {
+                            // The configured body timer supersedes the old request-
+                            // coupled stall bound, including while this thread works.
+                            if self.timed.is_none()
+                                && self
+                                    .control
+                                    .as_ref()
+                                    .and_then(|c| c.stall)
+                                    .is_some_and(|s| stalled.elapsed() >= s)
+                            {
                                 return Err(io::Error::new(
                                     io::ErrorKind::TimedOut,
                                     "the client read nothing for longer than the query timeout",
@@ -260,6 +324,9 @@ impl Write for SwitchWriter {
             } else {
                 control.check_cancel()?;
             }
+        }
+        if let Some(producer) = &self.timed {
+            producer.check()?;
         }
         if self.signal.is_none() && self.tx.is_none() {
             // A quick result is tried synchronously, but its row count says nothing
@@ -314,19 +381,30 @@ impl Write for SwitchWriter {
 /// `on_stream_end` runs on that thread when a *streamed* body ends (whole bodies are
 /// reported by the caller). An error before the switch is returned as the response
 /// error.
-pub async fn serialize<F, D>(
+pub(super) async fn serialize_timed<F, D>(
     limit: Option<u64>,
+    timeouts: Timeouts,
     write: F,
-    on_stream_end: D,
+    on_end: D,
 ) -> ApiResult<Serialized>
 where
     F: FnOnce(&mut LimitedWriter<SwitchWriter>) -> sparkles::Result<()> + Send + 'static,
     D: FnOnce(StreamEnd) + Send + 'static,
 {
-    serialize_with(STREAM_AFTER, limit, write, on_stream_end).await
+    serialize_inner_timed(
+        STREAM_AFTER,
+        false,
+        limit,
+        None,
+        Some(timeouts),
+        write,
+        on_end,
+    )
+    .await
 }
 
-pub async fn serialize_with<F, D>(
+#[cfg(test)]
+pub(super) async fn serialize_with<F, D>(
     threshold: usize,
     limit: Option<u64>,
     write: F,
@@ -348,6 +426,7 @@ pub(super) async fn serialize_controlled<F, D>(
     limit: Option<u64>,
     control: StreamControl,
     early: bool,
+    timeouts: Timeouts,
     write: F,
     on_end: D,
 ) -> ApiResult<Serialized>
@@ -360,14 +439,49 @@ where
     } else {
         STREAM_AFTER
     };
-    serialize_inner(threshold, early, limit, Some(control), write, on_end).await
+    serialize_inner_timed(
+        threshold,
+        early,
+        limit,
+        Some(control),
+        Some(timeouts),
+        write,
+        on_end,
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn serialize_inner<F, D>(
     threshold: usize,
     commit_on_flush: bool,
     limit: Option<u64>,
     control: Option<StreamControl>,
+    write: F,
+    on_end: D,
+) -> ApiResult<Serialized>
+where
+    F: FnOnce(&mut LimitedWriter<SwitchWriter>) -> sparkles::Result<()> + Send + 'static,
+    D: FnOnce(StreamEnd) + Send + 'static,
+{
+    serialize_inner_timed(
+        threshold,
+        commit_on_flush,
+        limit,
+        control,
+        None,
+        write,
+        on_end,
+    )
+    .await
+}
+
+async fn serialize_inner_timed<F, D>(
+    threshold: usize,
+    commit_on_flush: bool,
+    limit: Option<u64>,
+    control: Option<StreamControl>,
+    timeouts: Option<Timeouts>,
     write: F,
     on_stream_end: D,
 ) -> ApiResult<Serialized>
@@ -384,7 +498,7 @@ where
     #[cfg(test)]
     let probe = super::algo::probe::current();
     #[cfg(test)]
-    let threshold = if probe.producer.is_some() {
+    let threshold = if probe.producer.is_some() || probe.queued_producer.is_some() {
         1
     } else {
         threshold
@@ -394,6 +508,18 @@ where
         crate::cpus::place_request();
         #[cfg(test)]
         let _completion = probe.producer.clone().map(super::algo::probe::Completion);
+        #[cfg(test)]
+        let _queued_completion = probe
+            .queued_producer
+            .clone()
+            .map(super::algo::probe::Completion);
+        #[cfg(test)]
+        let _completion_only = probe.completion.clone().map(super::algo::probe::Completion);
+        #[cfg(test)]
+        let _after_write_completion = probe
+            .after_write
+            .clone()
+            .map(super::algo::probe::Completion);
         // A local binding drops the permit before the test completion observer,
         // including unwinding. Ordinary builds keep the original capture/drop path.
         #[cfg(test)]
@@ -411,12 +537,17 @@ where
             deferred: false,
             control: control.clone(),
             commit_on_flush,
+            timeouts,
+            timed: None,
+            held: Some(held),
             #[cfg(test)]
             producer_gate: probe.producer,
+            #[cfg(test)]
+            queued_producer_gate: probe.queued_producer,
         };
         // disconnects are noticed through the channel, not a cancellation flag
         let mut w = LimitedWriter::new(sw, limit, None::<Arc<AtomicBool>>);
-        let result = if control.is_some() {
+        let result = if control.is_some() || timeouts.is_some() {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write(&mut w))).unwrap_or_else(
                 |_| {
                     Err(Error::Io(io::Error::other(
@@ -427,9 +558,21 @@ where
         } else {
             write(&mut w)
         };
-        let result = result.map_err(|e| w.classify(e));
+        #[cfg(test)]
+        if let Some(gate) = &probe.after_write {
+            gate.wait();
+        }
+        let result = result
+            .map_err(|e| w.classify(e))
+            .map_err(|e| match &control {
+                Some(c) => c.classify(e),
+                None => e,
+            });
         let mut bytes = w.written();
         let mut sw = w.into_inner();
+        if let (Some(producer), Err(error)) = (&sw.timed, &result) {
+            producer.record_error(error);
+        }
         let result = match result {
             Ok(()) => sw.send_chunk().map_err(Error::from),
             Err(e) => {
@@ -455,6 +598,22 @@ where
             None => e,
         });
         let serialize_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if let Some(mut producer) = sw.timed.take() {
+            drop(sw.tx.take());
+            let result = producer.finish(result);
+            let serialize_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let disconnected = producer.disconnected();
+            producer.release_permit();
+            on_stream_end(StreamEnd {
+                bytes,
+                serialize_ms,
+                error: result.err(),
+                disconnected,
+            });
+            drop(span);
+            producer.publish();
+            return;
+        }
         match (sw.tx.take(), result) {
             (None, Ok(())) => {
                 let body = std::mem::take(&mut sw.buf);
@@ -469,7 +628,7 @@ where
                 drop(span);
                 // Completion may wake the handler immediately. Release the
                 // producer's share before publishing the buffered result.
-                drop(held);
+                drop(sw.held.take());
                 if let Some(s) = sw.signal.take() {
                     let _ = s.send(Outcome::Whole(body));
                 }
@@ -483,14 +642,14 @@ where
                         disconnected: false,
                     });
                     drop(span);
-                    drop(held);
+                    drop(sw.held.take());
                     if let Some(s) = sw.signal.take() {
                         let _ = s.send(Outcome::Failed(e));
                     }
                     return;
                 }
                 drop(span);
-                drop(held);
+                drop(sw.held.take());
                 if let Some(s) = sw.signal.take() {
                     let _ = s.send(Outcome::Failed(e));
                 }
@@ -521,7 +680,7 @@ where
                 }
                 // Closing the sender publishes EOF. The next request must not
                 // observe the completed producer's concurrency permit.
-                drop(held);
+                drop(sw.held.take());
                 drop(tx);
             }
         }
@@ -538,6 +697,13 @@ where
                 done: false,
             },
         ))),
+        Ok(Outcome::Timed(receiver)) => {
+            let abort = receiver.abort_handle();
+            Ok(Serialized::Timed {
+                body: axum::body::Body::from_stream(receiver),
+                abort,
+            })
+        }
         Ok(Outcome::Failed(e)) => Err(ApiError::from(e)),
         Err(_) => Err(err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -549,8 +715,35 @@ where
 /// Try a quick result on the current thread, buffering at most [`STREAM_AFTER`]
 /// bytes. A larger result retries its repeatable serializer on the blocking pool,
 /// where it can apply channel backpressure. Real errors retain their usual behavior.
-pub async fn serialize_quick<F, D>(
+#[cfg(test)]
+pub(super) async fn serialize_quick<F, D>(
     limit: Option<u64>,
+    write: F,
+    on_stream_end: D,
+) -> ApiResult<Serialized>
+where
+    F: Fn(&mut LimitedWriter<SwitchWriter>) -> sparkles::Result<()> + Send + 'static,
+    D: FnOnce(StreamEnd) + Send + 'static,
+{
+    serialize_quick_inner(limit, None, write, on_stream_end).await
+}
+
+pub(super) async fn serialize_quick_timed<F, D>(
+    limit: Option<u64>,
+    timeouts: Timeouts,
+    write: F,
+    on_end: D,
+) -> ApiResult<Serialized>
+where
+    F: Fn(&mut LimitedWriter<SwitchWriter>) -> sparkles::Result<()> + Send + 'static,
+    D: FnOnce(StreamEnd) + Send + 'static,
+{
+    serialize_quick_inner(limit, Some(timeouts), write, on_end).await
+}
+
+async fn serialize_quick_inner<F, D>(
+    limit: Option<u64>,
+    timeouts: Option<Timeouts>,
     write: F,
     on_stream_end: D,
 ) -> ApiResult<Serialized>
@@ -563,10 +756,18 @@ where
         Ok(body)
     } else {
         let trial_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let body = serialize(limit, write, move |mut end| {
-            end.serialize_ms += trial_ms;
-            on_stream_end(end);
-        })
+        let body = serialize_inner_timed(
+            STREAM_AFTER,
+            false,
+            limit,
+            None,
+            timeouts,
+            write,
+            move |mut end| {
+                end.serialize_ms += trial_ms;
+                on_stream_end(end);
+            },
+        )
         .await?;
         Ok(match body {
             Serialized::Whole { body, serialize_ms } => Serialized::Whole {
@@ -596,8 +797,13 @@ where
         deferred: false,
         control: None,
         commit_on_flush: false,
+        timeouts: None,
+        timed: None,
+        held: None,
         #[cfg(test)]
         producer_gate: None,
+        #[cfg(test)]
+        queued_producer_gate: None,
     };
     let mut w = LimitedWriter::new(sw, limit, None::<Arc<AtomicBool>>);
     let result = write(&mut w).map_err(|e| w.classify(e));
@@ -771,7 +977,12 @@ mod tests {
                 deferred: false,
                 control: None,
                 commit_on_flush: false,
+                timeouts: None,
+                timed: None,
+                held: None,
                 producer_gate: None,
+                #[cfg(test)]
+                queued_producer_gate: None,
             };
             w.write_all(&vec![b'x'; size])?;
             w.send_chunk()
@@ -1006,5 +1217,223 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert!(matches!(seen[0].error, Some(Error::BudgetExceeded(_))));
+    }
+}
+
+#[cfg(test)]
+mod timed_tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    fn timeouts() -> Timeouts {
+        Timeouts {
+            idle: Duration::from_millis(30),
+            transfer: None,
+        }
+    }
+    async fn timed<F>(
+        timeouts: Timeouts,
+        limit: Option<u64>,
+        write: F,
+    ) -> (axum::body::Body, Abort, oneshot::Receiver<StreamEnd>)
+    where
+        F: FnOnce(&mut LimitedWriter<SwitchWriter>) -> sparkles::Result<()> + Send + 'static,
+    {
+        let (send, end) = oneshot::channel();
+        let result =
+            serialize_inner_timed(1, false, limit, None, Some(timeouts), write, move |e| {
+                let _ = send.send(e);
+            })
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "timed fixture failed before streaming: {} {}",
+                    error.0, error.1
+                )
+            });
+        match result {
+            Serialized::Timed { body, abort } => (body, abort, end),
+            _ => panic!("fixture must actually switch to streaming"),
+        }
+    }
+    async fn ended(end: oneshot::Receiver<StreamEnd>) -> StreamEnd {
+        tokio::time::timeout(Duration::from_secs(5), end)
+            .await
+            .expect("producer and its owned timer must stop")
+            .unwrap()
+    }
+    // Dropping a test future must unblock its real producer before runtime shutdown.
+    struct Release(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn normal_eof_follows_timer_join_and_real_producer_report() {
+        let (body, _, end) = timed(timeouts(), None, |w| {
+            w.write_all(b"hello")?;
+            Ok(())
+        })
+        .await;
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let report = ended(end).await;
+        assert_eq!(bytes, b"hello"[..]);
+        assert!(report.error.is_none());
+        assert!(!report.disconnected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_unread_tail_expires_and_late_binding_observes_abort() {
+        let (body, abort, end) = timed(timeouts(), None, |w| {
+            w.write_all(b"tail")?;
+            Ok(())
+        })
+        .await;
+        let report = ended(end).await;
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = called.clone();
+        abort.bind_observation(move || {
+            observed.store(true, Ordering::Relaxed);
+        });
+        let failed = axum::body::to_bytes(body, usize::MAX).await.is_err();
+        assert!(matches!(report.error, Some(Error::Timeout)));
+        assert!(!report.disconnected);
+        assert!(failed);
+        assert!(called.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn independent_timer_expires_while_real_producer_is_busy() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let release = Release(Some(release));
+        let (body, abort, mut end) = timed(timeouts(), None, move |w| {
+            w.write_all(b"queued")?;
+            wait.recv().unwrap();
+            w.write_all(b"after work")?;
+            Ok(())
+        })
+        .await;
+        let (signal, aborted) = oneshot::channel();
+        abort.bind_admission(move || {
+            let _ = signal.send(());
+        });
+        let independent = tokio::time::timeout(Duration::from_secs(2), aborted)
+            .await
+            .is_ok();
+        let producer_still_owned =
+            matches!(end.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+        drop(release);
+        let report = ended(end).await;
+        let failed = axum::body::to_bytes(body, usize::MAX).await.is_err();
+        assert!(independent);
+        assert!(
+            producer_still_owned,
+            "logical abort must not manufacture producer completion"
+        );
+        assert!(matches!(report.error, Some(Error::Timeout)));
+        assert!(failed);
+    }
+
+    async fn empty_while_busy(transfer: Option<Duration>) -> (bool, StreamEnd, bool) {
+        let (release, wait) = std::sync::mpsc::channel();
+        let release = Release(Some(release));
+        let (body, abort, end) = timed(
+            Timeouts {
+                transfer,
+                ..timeouts()
+            },
+            None,
+            move |w| {
+                w.write_all(b"ok")?;
+                wait.recv().unwrap();
+                w.write_all(b"done")?;
+                Ok(())
+            },
+        )
+        .await;
+        let aborted = Arc::new(AtomicBool::new(false));
+        let marker = aborted.clone();
+        abort.bind_observation(move || marker.store(true, Ordering::Relaxed));
+        let mut body = body.into_data_stream();
+        let first = body.next().await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let expired = aborted.load(Ordering::Relaxed);
+        drop(release);
+        let mut failed = false;
+        let mut bytes = first.to_vec();
+        while let Some(chunk) = body.next().await {
+            match chunk {
+                Ok(chunk) => bytes.extend_from_slice(&chunk),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        let end = ended(end).await;
+        if !failed {
+            assert_eq!(bytes, b"okdone");
+        }
+        (expired, end, failed)
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_computing_queue_does_not_use_idle_as_compute_timeout() {
+        let (expired, report, failed) = empty_while_busy(None).await;
+        assert!(!expired && !failed);
+        assert!(report.error.is_none());
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn absolute_transfer_limit_expires_with_empty_computing_queue() {
+        let (expired, report, failed) = empty_while_busy(Some(Duration::from_millis(50))).await;
+        assert!(expired && failed);
+        assert!(matches!(report.error, Some(Error::Timeout)));
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn budget_error_precedes_idle_and_is_never_rewritten() {
+        let (body, _, end) = timed(timeouts(), Some(20), |w| {
+            w.write_all(b"prefix")?;
+            w.write_all(&[b'x'; 100])?;
+            Ok(())
+        })
+        .await;
+        let report = ended(end).await;
+        let failed = axum::body::to_bytes(body, usize::MAX).await.is_err();
+        assert!(matches!(report.error, Some(Error::BudgetExceeded(_))));
+        assert!(failed);
+        assert!(!report.disconnected);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_unwind_is_failed_transfer_and_owned_timer_joins() {
+        let (body, _, end) = timed(timeouts(), None, |w| {
+            w.write_all(b"prefix")?;
+            panic!("injected writer unwind");
+        })
+        .await;
+        let failed = axum::body::to_bytes(body, usize::MAX).await.is_err();
+        let report = ended(end).await;
+        assert!(failed);
+        assert!(
+            report
+                .error
+                .unwrap()
+                .to_string()
+                .contains("producer stopped unexpectedly")
+        );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_body_cancels_and_joins_producer_timer() {
+        let (body, _, end) = timed(timeouts(), None, |w| {
+            w.write_all(&[b'x'; 1 << 20])?;
+            Ok(())
+        })
+        .await;
+        drop(body);
+        let report = ended(end).await;
+        assert!(report.error.is_some());
+        assert!(report.disconnected);
     }
 }

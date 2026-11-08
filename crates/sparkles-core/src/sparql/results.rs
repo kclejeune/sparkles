@@ -10,7 +10,7 @@ use serde::{Serialize, Serializer};
 use serde_json::{Value as J, json};
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Arc;
@@ -148,6 +148,9 @@ impl<W: Write> LimitedWriter<W> {
     /// [`Error::BudgetExceeded`] (result bytes); by cancellation -> [`Error::Cancelled`];
     /// otherwise unchanged.
     pub fn classify(&self, e: Error) -> Error {
+        if !matches!(&e, Error::Io(_)) {
+            return e;
+        }
         if let Some(requested) = self.exceeded {
             Error::BudgetExceeded(Budget {
                 kind: BudgetKind::ResultBytes,
@@ -571,6 +574,7 @@ fn solutions_to(
     send: Option<usize>,
     sent: &Cell<u64>,
 ) -> Result<()> {
+    r.ctx.check_memory_failure()?;
     let f = match fmt {
         SolutionsFormat::Json => QueryResultsFormat::Json,
         SolutionsFormat::Xml => QueryResultsFormat::Xml,
@@ -610,17 +614,17 @@ fn solutions_to(
             prefetch_answer(r, n);
         }
         for i in 0..n {
-            let terms: Vec<(usize, Term)> = r
-                .table
-                .cols
-                .iter()
-                .enumerate()
-                .filter_map(|(c, col)| r.term(col[i]).map(|t| (c, t)))
-                .collect();
-            s.serialize(terms.iter().map(|(c, t)| (vars[*c].as_ref(), t.as_ref())))
-                .map_err(io)?;
+            let row = output::ScratchRow::decode(r, i)?;
+            s.serialize(
+                row.terms
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(c, term)| term.as_ref().map(|t| (vars[c].as_ref(), t.as_ref()))),
+            )
+            .map_err(io)?;
             sent.set(sent.get() + 1);
         }
+        r.ctx.check_memory_failure()?;
         s.finish().map_err(io)?;
         return Ok(());
     }
@@ -930,7 +934,8 @@ pub struct NativeJsonMetadata<'a> {
 }
 
 /// Write the rich native result without building an intermediate JSON document.
-/// SELECT decodes one cell at a time; graph results and plan metadata are borrowed.
+/// SELECT admits and decodes one complete row before writing its cells.
+/// Graph results and plan metadata are borrowed.
 /// The query's underlying result tables/graphs are already materialized.
 pub fn write_native_json(
     r: &QueryResult,
@@ -963,8 +968,12 @@ fn native_json_to(
     metadata: Option<NativeJsonMetadata<'_>>,
     sent: &Cell<u64>,
 ) -> Result<()> {
+    r.ctx.check_memory_failure()?;
     let n = send.map_or(r.len(), |s| s.min(r.len()));
-    serde_json::to_writer(
+    // Serde's error type cannot carry the engine's typed refusal. Keep the exact
+    // first decode error at this one boundary instead of converting it into I/O.
+    let failure = RefCell::new(None);
+    let result = serde_json::to_writer(
         w,
         &NativeJson {
             r,
@@ -972,9 +981,13 @@ fn native_json_to(
             metadata,
             started: Instant::now(),
             sent,
+            failure: &failure,
         },
-    )
-    .map_err(|e| Error::Io(e.into()))
+    );
+    if let Some(error) = failure.into_inner() {
+        return Err(error);
+    }
+    result.map_err(|e| Error::Io(e.into()))
 }
 
 /// Consume native SELECT rows without collecting them. Metadata is written only
@@ -1237,6 +1250,7 @@ struct NativeJson<'a> {
     metadata: Option<NativeJsonMetadata<'a>>,
     started: Instant,
     sent: &'a Cell<u64>,
+    failure: &'a RefCell<Option<Error>>,
 }
 
 impl Serialize for NativeJson<'_> {
@@ -1253,6 +1267,7 @@ impl Serialize for NativeJson<'_> {
                         r,
                         n: self.n,
                         sent: self.sent,
+                        failure: self.failure,
                     },
                 )?;
             }
@@ -1274,6 +1289,9 @@ impl Serialize for NativeJson<'_> {
                     map.serialize_entry("quads", &rows)?;
                 }
             }
+        }
+        if let Err(error) = r.ctx.check_memory_failure() {
+            return Err(native_refusal::<S::Error>(self.failure, error));
         }
         let mut timing = r.timing.clone();
         if self.metadata.is_some() {
@@ -1335,6 +1353,7 @@ struct NativeRows<'a> {
     r: &'a QueryResult,
     n: usize,
     sent: &'a Cell<u64>,
+    failure: &'a RefCell<Option<Error>>,
 }
 
 impl Serialize for NativeRows<'_> {
@@ -1347,7 +1366,9 @@ impl Serialize for NativeRows<'_> {
             prefetch_answer(self.r, ahead);
         }
         for i in 0..self.n {
-            seq.serialize_element(&NativeRow { r: self.r, i })?;
+            let row = output::ScratchRow::decode(self.r, i)
+                .map_err(|error| native_refusal::<S::Error>(self.failure, error))?;
+            seq.serialize_element(&NativeRow { terms: &row.terms })?;
             self.sent.set(self.sent.get() + 1);
         }
         seq.end()
@@ -1355,20 +1376,29 @@ impl Serialize for NativeRows<'_> {
 }
 
 struct NativeRow<'a> {
-    r: &'a QueryResult,
-    i: usize,
+    terms: &'a [Option<Term>],
 }
 
 impl Serialize for NativeRow<'_> {
     fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        let mut seq = s.serialize_seq(Some(self.r.table.width()))?;
-        for col in &self.r.table.cols {
-            let term = self.r.term(col[self.i]);
+        let mut seq = s.serialize_seq(Some(self.terms.len()))?;
+        for term in self.terms {
             seq.serialize_element(&term.as_ref().map(|t| NativeTerm(t.as_ref())))?;
         }
         seq.end()
     }
 }
+
+fn native_refusal<E: serde::ser::Error>(failure: &RefCell<Option<Error>>, error: Error) -> E {
+    // No payload or account is dropped while this short local borrow is held.
+    let mut first = failure.borrow_mut();
+    if first.is_none() {
+        *first = Some(error);
+    }
+    E::custom("query output refused")
+}
+
+mod output;
 
 struct NativeQuad<'a>(&'a oxrdf::Quad);
 impl Serialize for NativeQuad<'_> {
@@ -1841,3 +1871,6 @@ mod buffered_tests {
         assert_eq!(sent.get(), 1);
     }
 }
+
+#[cfg(test)]
+mod output_boundary_tests;

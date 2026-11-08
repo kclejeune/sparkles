@@ -321,10 +321,46 @@ chosen packages that have a library. The chosen packages are part of the task ca
 so a narrowed pass never stands in for a full one. The batch gate uses the same
 selection for the packages of a batch, as [Batch gate](#batch-gate) describes.
 
-A lane runs these checks on an ephemeral Namespace instance by default, created with
-`nsc create --bare --duration …` and destroyed when the run ends, or through
-`mise run test:partitioned` over `nsc:16x32` shares. The shared build hosts stay free for
-batch gates and benchmark comparisons.
+Run these checks on available local implementation and build hosts first. Use
+Boat for overflow, isolation or additional parallel capacity, after checking the actual
+worker's tools and resources. Keep designated benchmark workers free of builds and gates
+unless the host policy explicitly permits an idle fallback. The
+[remote executor guidance](#remote-executors) applies to both implementation and validation.
+
+### Remote executors
+
+Prefer available local resources before renting another worker. A 16 GiB Boat worker is
+the normal starting point for overflow builds and tests. Check aggregate memory, swap,
+disk and competing work before admitting a heavy job, and cap it where systemd is
+available. Boxington schedules builds but does not isolate other memory consumers.
+Start with one heavy job per worker, and use measurements to justify more concurrency or
+a larger machine. Namespace remains available for demonstrated resource needs and
+workflows without a qualified Boat replacement.
+
+Keep ordinary implementation and test iterations on a warm worker within its assigned
+lifetime. Record its explicit sandbox ID, environment version, source and branch,
+resource deadline and snapshot identity when applicable.
+
+Use named controllers or native units for long commands, and retain command logs and
+exit results alongside the source and configuration used. Observe an uncertain launch by
+its existing IDs before submitting another one. Copy selected source and result files,
+and forward private application ports when needed. Before stopping, snapshotting or
+deleting a worker, retain evidence, close its owned processes and release Boxington
+leases. A resumed worker needs fresh source, tool and resource checks before work
+continues. Update its recorded deadline and cleanup guard when extending its lifetime.
+Reuse workers and prepared snapshots to reduce setup work and sandbox starts, within
+the account's shared daily and rate limits.
+
+Development environments and CI runners have separate setup and authentication. Inject
+development credentials into owned development sandboxes, and keep Actions OIDC authentication
+for CI. Reusable dev and CI seeds are separate and contain no credentials or live leases.
+Verify snapshot and credential behavior before treating a seed as reusable. Tool setup
+alone does not qualify a compiler workload or snapshot lifecycle.
+
+The existing `bench:nsc` screen and `test:partitioned` Namespace selector remain
+provider-specific fallbacks. Neither command accepts a Boat selector. Use the documented
+supported transport, or a separately qualified Boat execution path; changing placement
+does not waive tests, benchmark comparability or performance acceptance criteria.
 
 ### Known flaky tests
 
@@ -349,6 +385,10 @@ has less than `TEST_PARTITION_MIN_FREE_GB` (default 40) GiB free. `--transport h
 each ssh host's share as a named terminal of the maintainer's terminal service, and the
 default starts it detached over plain ssh. Either way the share survives a dropped
 connection.
+
+The runner has no Boat selector. A Boat worker needs a separately qualified execution
+path before it can replace a share; the Namespace selector remains available as a
+fallback rather than the default placement policy.
 
 The test binaries hold the absolute paths of the checkout that built them, from
 `CARGO_MANIFEST_DIR`, `CARGO_BIN_EXE_*` and `CARGO_TARGET_TMPDIR`. Each share therefore
@@ -820,6 +860,24 @@ turns. Its memory cap is the smaller of 24 GiB and the host's RAM less 2 GiB, wi
 swap. A passing run removes its worktree, and a failing one keeps the sources and drops the
 build directories.
 
+The CI half retains its task logs and summary in `ci-receipts` under the gate output
+before cleanup. While its original managed-target lease is held, the normal Rust `test`
+task also copies the actual nextest XML into
+`ci-receipts/junit/test/<profile>/junit.xml`, together with the target's adjacent MBX
+metadata when present. The versioned `junit/manifest.json` records the capture source,
+selection, profile, original task exit and hashes of the copied bytes. Failed tests keep
+their actual report. A report unchanged since the task started has unproven generation;
+its presence does not show that the cached task executed again. This retains the primary
+normal test report, rather than every intermediate report from the feature matrix.
+
+`ci.exit` keeps the original CI result. The separate `ci-receipts.exit` fails if a
+selected Rust task has no retained report or evidence cannot be copied and verified.
+Not-selected tasks, tasks that never started and selections with no Rust packages are
+recorded separately. No replacement XML is generated for a missing report. A successful
+cached task whose report has been collected can therefore have a passing task result and
+failed evidence retention. The gate does not rerun that task automatically. Compiler
+cache directories are not a store for validation evidence.
+
 `scripts/ci.sh` runs on the primary host, which is `GATE_PRIMARY` or the first gate host.
 When the batch needs a conformance step, the steps run on a second gate host for the same
 commit, the first one that is free: its heavy lock is free, it runs no gate unit and it has
@@ -859,14 +917,18 @@ status and fetch look for its out directory on each gate host and use the newest
 `~/.local/bin/wally-gate.sh` on the laptop is a wrapper that runs this script from the main
 checkout, so older invocations keep working.
 
-atlas and forge are identical machines, and one of them is the benchmark host, which runs
-nothing else while it measures. `SPARKLES_BENCH_HOST` names it and defaults to forge. The
-driver drops that host from `GATE_HOSTS`, which defaults to wally, atlas and forge, and
-refuses it even when `--host` names it. The default helper is the first gate host other than
-the primary. The settings may also be lines such as `SPARKLES_BENCH_HOST=atlas` in
-`~/.config/sparkles/gate.env`, and the environment takes precedence over that file. To swap
-the roles, run `scripts/gate/setup-host.sh forge` once, set `SPARKLES_BENCH_HOST=atlas` in
-that file, and let the gates already queued on atlas finish before benchmarking there.
+Atlas and Forge are identical machines reserved for benchmark work. Forge is the
+canonical benchmark host and runs no gates, builds or tests. Atlas can take a gate only
+as an explicitly permitted quiet migration fallback, with no benchmark using or reserved
+on it. Prefer local build hosts and Boat overflow for other work.
+
+`SPARKLES_BENCH_HOST` names the canonical benchmark host and defaults to forge. The
+driver drops that host from `GATE_HOSTS`, whose built-in defaults are wally, atlas and
+forge, and refuses it even when `--host` names it. The default helper is the first gate
+host other than the primary. Settings may also be lines in
+`~/.config/sparkles/gate.env`, and the environment takes precedence over that file.
+The driver's configurable host list does not override the placement policy. Keep Forge
+excluded and check Atlas reservations before admitting a gate.
 
 The driver installs `scripts/gate/remote/gate-start.sh` and `gate-inner.sh` on each host
 under `~/gate/bin/v-<hash>/`, named by the hash of their contents. A new version therefore

@@ -301,19 +301,28 @@ pub(super) async fn changes(
     };
     let ds_name = ds.name.clone();
     let st_weak = Arc::downgrade(&st);
-    let body = stream::serialize(st.limits.max_export_bytes, write, move |end| {
-        if let Some(st) = st_weak.upgrade() {
-            st.metrics
-                .add_response_bytes(Some(&ds_name), Op::Other, end.bytes);
-        }
-        stream_end_log("changes", &end);
-    })
+    let body = stream::serialize_timed(
+        st.limits.max_export_bytes,
+        stream_timeouts(&st),
+        write,
+        move |end| {
+            if let Some(st) = st_weak.upgrade() {
+                st.metrics
+                    .add_response_bytes(Some(&ds_name), Op::Other, end.bytes);
+            }
+            stream_end_log("changes", &end);
+        },
+    )
     .await?;
+    let abort = body.abort_handle();
     let body = match body {
         stream::Serialized::Whole { body, .. } => axum::body::Body::from(body),
-        stream::Serialized::Streamed(b) => b,
+        stream::Serialized::Streamed(b) | stream::Serialized::Timed { body: b, .. } => b,
     };
     let mut resp = ([(header::CONTENT_TYPE, fmt.content_type())], body).into_response();
+    if let Some(abort) = abort {
+        resp.extensions_mut().insert(abort);
+    }
     let h = resp.headers_mut();
     h.insert(SPARKLES_CHANGES_NEXT, next.into());
     h.insert(history::SPARKLES_HEAD, head.into());

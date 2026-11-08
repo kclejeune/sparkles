@@ -298,7 +298,7 @@ existing limits.
 | `max_rows_produced` and shared `work` | Sum of rows produced by physical operators, kept on the existing shared request counter |
 | `max_memory_bytes` | Estimated query-owned capacity and retained data that are live at the same time, including outstanding batches |
 | Result-byte budget | Serialized uncompressed bytes actually written, independent of row and batch counts |
-| Timeout | One query deadline that counts the query's own time. Time blocked on the reader is added to a per-query pause and does not count, and one wait longer than the request's timeout ends the stream. |
+| Timeout | The query deadline counts the query's own time and leaves out consumer waits. Finite HTTP bodies separately enforce a ready-output idle limit and, when configured, an absolute transfer deadline. |
 | Cancellation | Checked during production, decoding, serialization and interruptible transport waits |
 
 Counters use checked or saturating arithmetic and fail on overflow. Counts are updated
@@ -316,11 +316,10 @@ That rule made a large default export to a slow but steady client fail where eag
 execution, whose deadline ends before the transfer starts, had succeeded. The deadline
 now leaves out the time a cursor waits for its reader over HTTP and in Node, and so does
 every copy of the deadline that a SERVICE call, an algorithm run or a history service
-takes when it starts. The stall bound limits one wait, not the whole transfer, so a
-client that takes a chunk just often enough keeps the stream and its snapshot, memory
-grant and producer thread for as long as it reads, as an eager answer always did. A
-limit on the whole transfer belongs to the `--stream-idle-timeout` follow-up under
-[Roadmap follow-ups](#roadmap-follow-ups-2026-10-12).
+takes when it starts. The request-coupled stall bound originally limited one wait,
+not the whole transfer. Finite HTTP bodies now have independent idle and optional total
+limits, described under [Finite HTTP body limits](#finite-http-body-limits). Idle alone
+cannot bound a transfer that keeps progressing.
 
 Allocated column capacity is charged before it grows, including the overhead of
 zero-column rows. Accounting covers parent and child batches, materialized fallback
@@ -383,9 +382,10 @@ The producer does not retry a cursor that has already advanced after a serializa
 trial. Streaming uses a single-use writer path, and the repeatable quick-result
 serializer remains for eager results. The producer can run ahead by a finite amount of
 queued bytes and one batch in progress. Once those fill, it stops pulling. Channel waits
-observe cancellation, the deadline and the stall bound. A request with a timeout never
-waits longer than that timeout for another write, and one without a timeout waits until
-the client reads or disconnects. When the receiver drops, blocked sends wake up and the producer is released. The
+observe cancellation and the query deadline. Independent HTTP body timers enforce the
+ready-output idle limit and the optional whole-transfer deadline, even when the producer
+is computing or the consumer stops polling. When the receiver drops, blocked sends wake
+up and the producer stops through its actual cleanup path. The
 disconnect guard belongs to the lifetime of the body and the producer, not only to the
 handler future, so returning response headers cannot cancel the running query.
 
@@ -986,9 +986,8 @@ the rest are sketched here.
 * **Earlier first bytes.** Explicit streaming commits the response after the first
   batch or 64 KiB, whichever comes first, instead of after 1 MiB. A later failure aborts
   the transport as §6 specifies. Slow streaming bodies count against the X08 pool through
-  their retained batches. The stall bound is now the request's timeout, and a
-  `--stream-idle-timeout` (default 60 s) would replace it with its own limit on how long a
-  body's reader may take nothing.
+  their retained batches. The independent body idle limit and optional total-transfer
+  deadline are described under [Finite HTTP body limits](#finite-http-body-limits).
 * **Broader automatic selection.** X08 §6.8 lets `auto` stream SELECT plans whose
   estimate exceeds half the memory budget, and retries an eager query that fails its
   budget before output as a cursor with spill. Each widening needs the matched
@@ -1706,3 +1705,42 @@ one query thread, compared 4bd70845 with ec6cd326. Both returned the same answer
 the geometric mean of server time was 1.011 and of client time 0.997. Four queries of 15
 to 26 µs were 7 to 14% slower in server time with spreads of 18 to 80%, and item
 571 rechecks them on a quiet Intel host.
+
+
+### Finite HTTP body limits
+
+Finite streamed query, Graph Store export, diff and changes responses use a separate
+`--stream-idle-timeout`, defaulting to 60 seconds. It runs only while queued uncompressed
+application data or a final end is ready for the downstream consumer. Accepting a
+nonempty chunk resets it, and computation with no output ready disarms it. This observes
+application progress rather than physical socket receipt. The optional
+`--stream-transfer-timeout` starts at streamed publication, includes computation and
+backpressure, and never resets on progress. Both settings require finite positive
+representable seconds. Their `SPARKLES_STREAM_IDLE_TIMEOUT` and
+`SPARKLES_STREAM_TRANSFER_TIMEOUT` environment values yield to command-line flags.
+
+The blocking producer owns and joins its independent async body timer. Logical abort
+discards the receiver and queued data before releasing body-side query admission,
+requests HTTP-owned cancellation, and wakes a later body poll with an error. Actual
+query grants and the producer's admission share remain until work stops. Normal EOF
+requires the consumer's terminal request, timer join, real producer cleanup and report,
+and final quiescent publication. A prior producer or budget failure remains primary if
+a later idle expiry aborts its body. A failed timer cannot yield clean EOF.
+
+After response publication, expiry truncates the transfer and cannot change its status.
+It does not produce a clean native document or final compression trailer. Buffered
+small answers keep their existing early status and fast path, and every streamed body
+keeps the existing bounded chunk queue. One owned timer and final-tail producer join
+add lifecycle work to actual streams; no latency, throughput or RSS benefit is claimed.
+Neither timer preempts kernel I/O or an uncooperative callback. SSE, inbound bodies,
+local stdout and embedded cursor policies are unchanged.
+
+`stream_idle_tests` checks actual grant/admission ownership without polling a held
+response, including a producer that remains gated after logical abort, and checks every
+query mode and SELECT format plus finite Graph Store, diff and changes under plain and
+gzip responses. The private timer controls cover ready/empty/terminal states, deadline
+ties, progress, first failure, callback and producer unwind, runtime shutdown and failed
+timer join. Configuration tests isolate environment/CLI precedence in child processes.
+A capped response's body-side admission uses a take-once shared lease, adding one small
+shared allocation per response under concurrency caps. No measured negligible-cost
+claim follows from these correctness checks.

@@ -30,6 +30,13 @@ testing.
 
 Each kind of claim needs a host that can resolve it.
 
+Use available local resources for builds and validation first, with Boat for overflow
+and isolation, as described under [remote executors](DEVELOPMENT.md#remote-executors).
+Keep benchmark workers free for measurements. The quick screen below still uses its
+Namespace-specific harness; a Boat replacement needs qualification before it supplies
+gate evidence. Keep each A/B comparison on one host with matching tools and configuration,
+and retain the actual host identity with its results.
+
 | Host | Use | Why |
 |---|---|---|
 | Namespace instance, `mise run bench:nsc A B` | Quick A/B screens of changes of about 10% or more, and checks that a change leaves other queries alone | The instances are noisy shared AMD EPYC virtual machines, so they cannot confirm a change of a few percent. |

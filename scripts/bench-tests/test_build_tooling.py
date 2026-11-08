@@ -410,6 +410,7 @@ class ArtifactRetentionContracts(unittest.TestCase):
             (root / "bin").mkdir()
             (root / "target").mkdir()
             script = root / "scripts/ci.sh"
+            (root / "scripts/ci-retain-junit.py").write_bytes((ROOT / "scripts/ci-retain-junit.py").read_bytes())
             script.write_bytes((ROOT / "scripts/ci.sh").read_bytes())
             frontend = root / "bin/mise"
             frontend.write_text('#!/bin/sh\nprintf "retained-ci-output\\n"\n')

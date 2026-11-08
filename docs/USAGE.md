@@ -460,6 +460,8 @@ happens to materialized inferences, and the limits.
 | `--tls-cert FILE`, `--tls-key FILE` | | Serve HTTPS with this PEM certificate chain and key (see [TLS](#tls)). Both are re-read on SIGHUP and when they change. |
 | `--cors-origin ORIGIN` | none | A browser origin, such as `https://yasgui.example`, whose pages may call the API cross-origin without credentials. Repeatable. With `--auth-config`, it is added to `cors.origins`. Without auth, such a page may do everything the server allows. |
 | `--timeout S` | `60` | Default query timeout in seconds. `timeout=` sets it per request. |
+| `--stream-idle-timeout S` | `60` | Stop a finite streamed response when ready application data or its final end remains unread for this many seconds. This is separate from the query timeout. |
+| `--stream-transfer-timeout S` | unset | Optional whole-transfer deadline in seconds, measured from publication of a streamed response. Progress does not reset it. |
 | `--default-execution MODE` | `auto` | How a query runs when its request has no `execution=`. `auto` streams the plain scans of a thousand rows or more and the groupings of 20,000 input rows or more, which measured faster as cursors, and runs the rest eagerly. `eager` runs every query eagerly. See [incremental query execution](#incremental-query-execution). |
 | `--request-cpus MODE` | `auto` | `auto` runs request work on the performance cores of a hybrid processor on Linux while at most one request per performance core is in flight, and leaves one CPU free of query threads for every four efficiency cores. `all` lets every thread run on every CPU. See [Threads on hybrid processors](#threads-on-hybrid-processors). |
 | `--update-timeout S` | `0` | Default SPARQL update timeout in seconds; `0` means none. `timeout=` sets it per request. An update that times out changes nothing. |
@@ -5621,13 +5623,24 @@ because it shows the full row count, and its downloads use the server's default.
 When a client reads a streamed answer slowly, the query pauses once the bounded output
 buffers are full. A disconnect stops the query even while it waits. The query's
 `timeout` counts the time the query itself spends and not the time it waits for the
-client, so a slow reader does not run it out. A client that reads nothing for longer than
-the `timeout` ends the stream, and a request without a timeout has no such limit. The
-limit applies to each wait and not to the whole transfer, so a client that keeps reading,
-however slowly, keeps the query's snapshot and memory until it finishes. An error that
-happens after the first 1 MiB of the response has been sent aborts the response. The
+client, so a slow reader does not run it out. `--stream-idle-timeout` independently
+limits how long ready response data or its final end can remain unread. It defaults to
+60 seconds and pauses while the engine has no output ready. Progress means that the
+next layer accepts a nonempty uncompressed application chunk, which does not prove the
+remote client has received it. A healthy progressing stream has no total time limit by
+default. `--stream-transfer-timeout` optionally bounds the whole transfer from streamed
+publication, including computation and backpressure, without resetting on progress.
+Both settings accept finite positive seconds. `SPARKLES_STREAM_IDLE_TIMEOUT` and
+`SPARKLES_STREAM_TRANSFER_TIMEOUT` set them through the environment; command-line flags
+win.
+
+These body limits cover queries, finite Graph Store exports, diff and changes responses.
+They do not alter SSE or inbound request-body timeouts. An expiry aborts the application
+body and asks its producer to stop. The producer's actual grants and query concurrency
+share remain held until its work stops; the server cannot preempt an uncooperative
+callback or kernel I/O. An error after response publication aborts the transfer. The
 status was already `200`, and in a line format such as TSV or N-Triples the rows before
-the cut are well formed, so only a transfer that finishes successfully is a complete
+the cut can be well formed, so only a transfer that finishes successfully is a complete
 answer.
 `curl --fail` does not catch this case, but curl exits with an error for a transfer that
 ends early. The Rust client, the CLI, the TypeScript client and the UI report a cut-off

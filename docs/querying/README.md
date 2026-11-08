@@ -188,6 +188,14 @@ check them against the W3C suites and Jena's own answers.
 * Rust, Python and Node have snapshot-owning SELECT and graph cursors, and the JVM
   library pulls SELECT results. Result writers use bounded buffers with backpressure and
   stop when the client disconnects.
+* Native SELECT output and standard JSON, XML, CSV and TSV solution responses of at
+  most 65,536 rows check a complete decoded row before writing its cells. Row storage
+  and decoded terms retain query memory credit while they are written. A required
+  memory refusal stops output with its original local or shared-pool budget error and
+  preserves the count of earlier complete rows. Native output holds one decoded row
+  rather than one cell, so a tight budget can refuse the additional live storage.
+  Ownership across public results, native buffers, reasoners and views remains in
+  [roadmap item 675](../ROADMAP.md).
 * Streaming joins run batch by batch with column kernels. ORDER BY with LIMIT keeps only
   its best rows in a bounded heap. A cursor filter over an index scan filters whole blocks
   in parallel, and a range top-k ranks its range a part at a time. FOLD and registered
@@ -238,6 +246,14 @@ check them against the W3C suites and Jena's own answers.
   ([USAGE.md](../USAGE.md#explaining-a-query), [API.md](../API.md#explaining-a-query)). Nodes
   say when they did not run and why, when a `LIMIT` stopped them, how often they reran,
   which filters a scan applied itself, and when a result came from the cache.
+* Finite HTTP response bodies have a separate 60-second idle limit, configured with
+  `serve --stream-idle-timeout`. It runs while application output or its final end is
+  ready but unread, and pauses while the engine has nothing ready. An optional
+  `--stream-transfer-timeout` bounds the whole transfer, even when it keeps progressing.
+  These limits observe uncompressed application chunks rather than remote receipt.
+  Expiry aborts the transfer and requests cancellation. Actual producer owners remain
+  until work stops, and only a successful transfer is a complete answer. The settings
+  also cover finite Graph Store, diff and changes bodies. See [server settings](../USAGE.md).
 * A query that a budget or its timeout stopped keeps its plan in the error body of the
   `application/x-sparkles+json` format.
 * `POST /{ds}/sparql/explain` explains an estimated plan, a read-only run or a plan the

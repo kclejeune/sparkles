@@ -33,6 +33,9 @@ mod fuseki;
 mod streaming;
 pub(crate) use streaming::DeferredReport;
 
+#[cfg(test)]
+mod completion_dispatch_tests;
+
 pub static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
 /// Dataset label of requests that name no existing dataset.
@@ -389,6 +392,9 @@ pub async fn observe(State(st): State<Arc<AppState>>, mut req: Request, next: Ne
         deferred.observe(pending, resp.status().as_u16(), head);
         let body = std::mem::replace(resp.body_mut(), axum::body::Body::empty());
         *resp.body_mut() = deferred.wrap(body);
+        if let Some(abort) = resp.extensions().get::<crate::http::StreamAbort>() {
+            abort.bind_observation(move || deferred.abort_body());
+        }
     } else {
         pending.complete(resp.status().as_u16(), &report);
     }
@@ -401,6 +407,7 @@ pub async fn observe(State(st): State<Arc<AppState>>, mut req: Request, next: Ne
 struct Pending {
     st: Arc<AppState>,
     span: Span,
+    access_dispatch: Option<tracing::Dispatch>,
     op: Op,
     dataset: Option<String>,
     quiet: bool,
@@ -417,9 +424,14 @@ impl Pending {
         if !quiet {
             st.metrics.active[op.index()].fetch_add(1, Ordering::Relaxed);
         }
+        // Completion may run on a producer thread with another default subscriber.
+        let access_dispatch = st
+            .access_log
+            .then(|| tracing::dispatcher::get_default(|dispatch| dispatch.clone()));
         Pending {
             st,
             span,
+            access_dispatch,
             op,
             dataset,
             quiet,
@@ -465,18 +477,21 @@ impl Pending {
             elapsed,
             report,
         );
-        if self.st.access_log {
-            access_event(
-                &self.span,
-                self.quiet,
-                dataset.as_deref(),
-                op,
-                status,
-                outcome,
-                elapsed,
-                report,
-                self.auth.as_ref(),
-            );
+        if let Some(dispatch) = &self.access_dispatch {
+            // The request's span may be disabled while access events are enabled.
+            tracing::dispatcher::with_default(dispatch, || {
+                access_event(
+                    &self.span,
+                    self.quiet,
+                    dataset.as_deref(),
+                    op,
+                    status,
+                    outcome,
+                    elapsed,
+                    report,
+                    self.auth.as_ref(),
+                );
+            });
         }
     }
 }

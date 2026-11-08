@@ -387,6 +387,10 @@ pub struct AppState {
     pub read_only: bool,
     /// honor `validate=false` on writes (skips write-time validation)
     pub allow_unvalidated_writes: bool,
+    /// Maximum downstream response-body idle time, independently of query computation.
+    pub stream_idle_timeout: std::time::Duration,
+    /// Optional absolute deadline from publication of a streamed response.
+    pub stream_transfer_timeout: Option<std::time::Duration>,
     /// response compression
     pub http_compression: crate::compress::HttpCompression,
     pub allow_service: bool,
@@ -759,6 +763,8 @@ impl AppState {
             store_opts,
             default_timeout,
             default_execution: Default::default(),
+            stream_idle_timeout: std::time::Duration::from_secs(60),
+            stream_transfer_timeout: None,
             read_only: false,
             allow_service: true,
             outbound: Default::default(),
@@ -835,6 +841,8 @@ impl AppState {
             store_opts,
             default_timeout,
             default_execution: Default::default(),
+            stream_idle_timeout: std::time::Duration::from_secs(60),
+            stream_transfer_timeout: None,
             read_only: false,
             allow_service: false,
             outbound: Default::default(),

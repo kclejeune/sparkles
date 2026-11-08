@@ -1282,6 +1282,12 @@ enum Cmd {
         /// Compress responses for clients that accept it: auto or off
         #[arg(long, default_value = "auto", value_name = "MODE")]
         http_compression: String,
+        /// Maximum time ready response data or EOF can remain unread, in seconds
+        #[arg(long, env = "SPARKLES_STREAM_IDLE_TIMEOUT", default_value = "60", value_name = "SECONDS", value_parser = parse_stream_timeout)]
+        stream_idle_timeout: Duration,
+        /// Optional absolute streamed-response transfer deadline, in seconds
+        #[arg(long, env = "SPARKLES_STREAM_TRANSFER_TIMEOUT", value_name = "SECONDS", value_parser = parse_stream_timeout)]
+        stream_transfer_timeout: Option<Duration>,
         /// Response compression level: fastest, default (zstd 3, brotli 4, gzip 6), best
         /// or a number for the chosen algorithm
         #[arg(long, default_value = "default", value_name = "LEVEL")]
@@ -2803,6 +2809,8 @@ fn run() -> Result<()> {
             reason_max_inferred,
             reason_max_derived,
             http_compression,
+            stream_idle_timeout,
+            stream_transfer_timeout,
             http_compression_level,
             http_compression_algorithms,
             max_decompressed_mb,
@@ -3064,6 +3072,8 @@ fn run() -> Result<()> {
                 state::GspDirectNaming::layered(&config_direct, &gsp_direct_naming)
                     .map_err(|e| anyhow::anyhow!(e))?;
             st.allow_unvalidated_writes = allow_unvalidated_writes;
+            st.stream_idle_timeout = stream_idle_timeout;
+            st.stream_transfer_timeout = stream_transfer_timeout;
             st.http_compression = compress::HttpCompression::parse(
                 &http_compression,
                 &http_compression_level,
@@ -6314,4 +6324,113 @@ fn entailment_diff_cli(
         _ => bail!("unknown diff format {format}: text, json, turtle, trig or patch"),
     }
     Ok(())
+}
+
+/// Reject nonfinite, rounded-to-zero and unrepresentable server timer durations.
+fn parse_stream_timeout(text: &str) -> std::result::Result<Duration, String> {
+    let seconds: f64 = text
+        .parse()
+        .map_err(|_| "expected positive seconds".to_owned())?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err("expected finite positive seconds".into());
+    }
+    let duration = Duration::try_from_secs_f64(seconds).map_err(|e| e.to_string())?;
+    if duration.is_zero() || std::time::Instant::now().checked_add(duration).is_none() {
+        return Err("stream timeout is not representable".into());
+    }
+    Ok(duration)
+}
+
+#[cfg(test)]
+mod stream_timeout_config_tests {
+    use super::*;
+    #[test]
+    fn stream_timeout_cli_and_env_precedence() {
+        const CHILD: &str = "SPARKLES_ITEM7_CONFIG_TEST_CASE";
+        if let Ok(case) = std::env::var(CHILD) {
+            std::thread::Builder::new()
+                .stack_size(crate::THREAD_STACK)
+                .spawn(move || {
+                    let mut args = vec!["sparkles", "serve"];
+                    if case == "cli" {
+                        args.extend([
+                            "--stream-idle-timeout",
+                            "0.5",
+                            "--stream-transfer-timeout",
+                            "2",
+                        ]);
+                    }
+                    let parsed = Cli::try_parse_from(args);
+                    if case == "invalid" {
+                        assert!(parsed.is_err());
+                        return;
+                    }
+                    let Cmd::Serve {
+                        stream_idle_timeout,
+                        stream_transfer_timeout,
+                        ..
+                    } = parsed.unwrap().cmd
+                    else {
+                        unreachable!()
+                    };
+                    match case.as_str() {
+                        "default" => {
+                            assert_eq!(stream_idle_timeout, Duration::from_secs(60));
+                            assert!(stream_transfer_timeout.is_none());
+                        }
+                        "env" => {
+                            assert_eq!(stream_idle_timeout, Duration::from_secs(3));
+                            assert_eq!(stream_transfer_timeout, Some(Duration::from_secs(4)));
+                        }
+                        "cli" => {
+                            assert_eq!(stream_idle_timeout, Duration::from_millis(500));
+                            assert_eq!(stream_transfer_timeout, Some(Duration::from_secs(2)));
+                        }
+                        _ => unreachable!(),
+                    }
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            return;
+        }
+        for case in ["default", "env", "cli", "invalid"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "stream_timeout_config_tests::stream_timeout_cli_and_env_precedence",
+                    "--nocapture",
+                ])
+                .env(CHILD, case)
+                .env_remove("SPARKLES_STREAM_IDLE_TIMEOUT")
+                .env_remove("SPARKLES_STREAM_TRANSFER_TIMEOUT");
+            if case == "env" {
+                command
+                    .env("SPARKLES_STREAM_IDLE_TIMEOUT", "3")
+                    .env("SPARKLES_STREAM_TRANSFER_TIMEOUT", "4");
+            }
+            if case == "cli" || case == "invalid" {
+                command.env("SPARKLES_STREAM_IDLE_TIMEOUT", "NaN");
+            }
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{case}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn stream_timeout_values_are_checked() {
+        for value in ["0", "-1", "NaN", "inf", "1e999", "1e100", "1e-100", "bad"] {
+            assert!(parse_stream_timeout(value).is_err(), "{value}");
+        }
+        assert_eq!(parse_stream_timeout("60").unwrap(), Duration::from_secs(60));
+        assert_eq!(
+            parse_stream_timeout("0.25").unwrap(),
+            Duration::from_millis(250)
+        );
+    }
 }

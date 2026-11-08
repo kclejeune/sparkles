@@ -42,6 +42,15 @@ an OpenAPI description. The MCP server for agents is described under
   HTTP API, which `sparkles openapi` prints and `docs/openapi.json` checks in
   ([X03](../specs/X03-openapi-and-completions.md), [API.md](../API.md#openapi-description)). A
   test keeps it equal to the server's route table.
+* Finite streamed query, Graph Store, diff and changes responses have an independent
+  idle limit of 60 seconds. `--stream-idle-timeout` configures the time ready application
+  data or a final end may remain unread; it pauses when no output is ready. The optional
+  `--stream-transfer-timeout` bounds the whole streamed transfer, including computation
+  and backpressure. Command-line values override `SPARKLES_STREAM_IDLE_TIMEOUT` and
+  `SPARKLES_STREAM_TRANSFER_TIMEOUT`. Expiry truncates the transfer and requests
+  cancellation, while actual producer ownership remains until work stops. These limits
+  observe application progress rather than physical socket receipt. See
+  [server settings](../USAGE.md).
 * The query result cache has `--result-cache-mb`, `nocache=true`, statistics in
   `/$/stats` and `POST /$/cache/clear/{ds}`.
 

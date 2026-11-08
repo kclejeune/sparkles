@@ -9,6 +9,11 @@ pub(crate) struct Probe {
     pub events: Arc<Mutex<Vec<&'static str>>>,
     pub blocking: Option<Arc<Gate>>,
     pub producer: Option<Arc<Gate>>,
+    pub queued_producer: Option<Arc<Gate>>,
+    /// Observe real producer completion without changing its streaming threshold.
+    pub completion: Option<Arc<Gate>>,
+    /// Pause after the real FnOnce writer returns, before producer finalization.
+    pub after_write: Option<Arc<Gate>>,
     pub cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 
@@ -58,6 +63,9 @@ impl Gate {
     pub fn release(&self) {
         self.state.lock().released = true;
         self.changed.notify_all();
+    }
+    pub fn finished(&self) -> bool {
+        self.state.lock().finished
     }
     pub fn finish(&self) {
         self.state.lock().finished = true;
