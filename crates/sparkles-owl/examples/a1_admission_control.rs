@@ -8,8 +8,14 @@ struct Uninstrumented;
 impl a1_r4::Meter for Uninstrumented {
     const NAME: &'static str = "uninstrumented-mimalloc";
     fn begin() {}
-    fn snapshot() -> serde_json::Value { serde_json::Value::Null }
-    fn end() -> serde_json::Value { serde_json::Value::Null }
+    fn snapshot() -> serde_json::Value {
+        serde_json::Value::Null
+    }
+    fn end() -> serde_json::Value {
+        serde_json::Value::Null
+    }
 }
 
-fn main() { a1_r4::main::<Uninstrumented>(); }
+fn main() {
+    a1_r4::main::<Uninstrumented>();
+}

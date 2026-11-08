@@ -1,7 +1,7 @@
 //! Separate requested-allocation pass. Never use this binary for throughput.
+use serde_json::{Value, json};
 use std::alloc::{GlobalAlloc, Layout};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use serde_json::{Value, json};
 
 mod a1_r4;
 
@@ -21,7 +21,10 @@ fn requested(size: usize) {
     REQUESTED.fetch_add(size as u64, Ordering::Relaxed);
     // For realloc this includes old+requested new storage even if mimalloc can
     // resize in place. This is a requested replacement overlap, not physical RSS.
-    PEAK_REQUEST_OVERLAP.fetch_max(LIVE.load(Ordering::Relaxed) + size as i64, Ordering::Relaxed);
+    PEAK_REQUEST_OVERLAP.fetch_max(
+        LIVE.load(Ordering::Relaxed) + size as i64,
+        Ordering::Relaxed,
+    );
 }
 
 fn held(delta: i64) {
@@ -34,33 +37,52 @@ fn held(delta: i64) {
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let active = ACTIVE.load(Ordering::Relaxed);
-        if active { requested(layout.size()); }
+        if active {
+            requested(layout.size());
+        }
         let p = unsafe { sparkles_alloc::Mimalloc.alloc(layout) };
         if active {
-            if p.is_null() { FAILURES.fetch_add(1, Ordering::Relaxed); } else { held(layout.size() as i64); }
+            if p.is_null() {
+                FAILURES.fetch_add(1, Ordering::Relaxed);
+            } else {
+                held(layout.size() as i64);
+            }
         }
         p
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let active = ACTIVE.load(Ordering::Relaxed);
-        if active { requested(layout.size()); }
+        if active {
+            requested(layout.size());
+        }
         let p = unsafe { sparkles_alloc::Mimalloc.alloc_zeroed(layout) };
         if active {
-            if p.is_null() { FAILURES.fetch_add(1, Ordering::Relaxed); } else { held(layout.size() as i64); }
+            if p.is_null() {
+                FAILURES.fetch_add(1, Ordering::Relaxed);
+            } else {
+                held(layout.size() as i64);
+            }
         }
         p
     }
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
-        if ACTIVE.load(Ordering::Relaxed) { held(-(layout.size() as i64)); }
+        if ACTIVE.load(Ordering::Relaxed) {
+            held(-(layout.size() as i64));
+        }
         unsafe { sparkles_alloc::Mimalloc.dealloc(p, layout) }
     }
     unsafe fn realloc(&self, p: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         let active = ACTIVE.load(Ordering::Relaxed);
-        if active { requested(size); }
+        if active {
+            requested(size);
+        }
         let replacement = unsafe { sparkles_alloc::Mimalloc.realloc(p, layout, size) };
         if active {
-            if replacement.is_null() { FAILURES.fetch_add(1, Ordering::Relaxed); }
-            else { held(size as i64 - layout.size() as i64); }
+            if replacement.is_null() {
+                FAILURES.fetch_add(1, Ordering::Relaxed);
+            } else {
+                held(size as i64 - layout.size() as i64);
+            }
         }
         replacement
     }
@@ -71,9 +93,12 @@ impl a1_r4::Meter for Allocations {
     const NAME: &'static str = "requested-allocation-mimalloc";
     fn begin() {
         assert!(!ACTIVE.load(Ordering::Relaxed));
-        REQUESTS.store(0, Ordering::Relaxed); REQUESTED.store(0, Ordering::Relaxed);
-        LIVE.store(0, Ordering::Relaxed); PEAK_LIVE.store(0, Ordering::Relaxed);
-        PEAK_REQUEST_OVERLAP.store(0, Ordering::Relaxed); FAILURES.store(0, Ordering::Relaxed);
+        REQUESTS.store(0, Ordering::Relaxed);
+        REQUESTED.store(0, Ordering::Relaxed);
+        LIVE.store(0, Ordering::Relaxed);
+        PEAK_LIVE.store(0, Ordering::Relaxed);
+        PEAK_REQUEST_OVERLAP.store(0, Ordering::Relaxed);
+        FAILURES.store(0, Ordering::Relaxed);
         ACTIVE.store(true, Ordering::Relaxed);
     }
     fn snapshot() -> Value {
@@ -88,7 +113,12 @@ impl a1_r4::Meter for Allocations {
         ACTIVE.store(active, Ordering::Relaxed);
         record
     }
-    fn end() -> Value { ACTIVE.store(false, Ordering::Relaxed); Self::snapshot() }
+    fn end() -> Value {
+        ACTIVE.store(false, Ordering::Relaxed);
+        Self::snapshot()
+    }
 }
 
-fn main() { a1_r4::main::<Allocations>(); }
+fn main() {
+    a1_r4::main::<Allocations>();
+}
