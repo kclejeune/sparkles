@@ -353,146 +353,172 @@ pub fn key_merges<'a>(
     bound: &'a (dyn Fn(isize) -> bool + Sync),
 ) -> Result<KeyMerges<'a>, Halt> {
     // The global fixpoint and each conditional world are stable while this routine
-    // reads them. Count actual key membership, not all unrelated named individuals.
-    let mut possible = 0;
+    // reads them. The first pass counts the pairs each key actually merges, so that the
+    // returned storage is admitted for those pairs only, and not for every pair of key
+    // members. The second pass repeats the matching and keeps the pairs. This doubles
+    // the key work in exchange for storage that grows with the merges found.
+    let mut found = 0;
     for key in &ix.keys {
-        key_add(
-            &mut possible,
-            key_pairs(key_member_count(ix, view, key.class, bound)?)?,
-        )?;
+        key_matches(ix, view, key, 0, bound, |_| key_add(&mut found, 1))?;
     }
-    let mut pairs = KeyStorage::new(possible, bound)?;
+    let mut pairs = KeyStorage::new(found, bound)?;
+    let live = pairs._scratch.bytes;
     for key in &ix.keys {
-        let count = key_member_count(ix, view, key.class, bound)?;
-        if count < 2 {
-            continue;
-        }
-        let mut members = KeyStorage::with_live(count, 0, pairs._scratch.bytes, bound)?;
-        for &individual in &ix.nominals {
-            key_poll(bound)?;
-            if key_member(ix, view, individual, key.class) {
-                members.push(individual)?;
-            }
-        }
-        let mut count = 0;
-        key_sources(ix, view, &members.rows, bound, |_| key_add(&mut count, 1))?;
-        let mut sources = KeyStorage::with_live(
-            count,
-            0,
-            key_live(&[pairs._scratch.bytes, members._scratch.bytes])?,
-            bound,
-        )?;
-        key_sources(ix, view, &members.rows, bound, |row| sources.push(row))?;
-        sources.rows.sort_unstable();
-        let (mut object_count, mut data_count, mut data_payload) = (0, 0, 0);
-        key_records(
-            ix,
-            view,
-            key,
-            &sources.rows,
-            bound,
-            |_| key_add(&mut object_count, 1),
-            |_, _, value| {
-                key_add(&mut data_count, 1)?;
-                key_add(&mut data_payload, key_value_copy_bytes(value)?)
-            },
-        )?;
-        let live = key_live(&[
-            pairs._scratch.bytes,
-            members._scratch.bytes,
-            sources._scratch.bytes,
-        ])?;
-        let mut objects = KeyStorage::with_live(object_count, 0, live, bound)?;
-        let mut data = KeyStorage::with_live(
-            data_count,
-            data_payload,
-            key_live(&[live, objects._scratch.bytes])?,
-            bound,
-        )?;
-        key_records(
-            ix,
-            view,
-            key,
-            &sources.rows,
-            bound,
-            |row| objects.push(row),
-            |individual, role, value| data.push((individual, role, value.clone())),
-        )?;
-        for (position, &a) in members.rows.iter().enumerate() {
-            for &b in &members.rows[position + 1..] {
-                key_poll(bound)?;
-                let mut already_merged = false;
-                view.with(a, &mut |st, _| already_merged = st.subs.contains(&b));
-                if already_merged {
-                    continue;
-                }
-                let mut matches = true;
-                for &role in &key.objects {
-                    key_poll(bound)?;
-                    if ix.is_universal(role) {
-                        continue;
-                    }
-                    let mut found = false;
-                    for &(owner, r, target) in &objects.rows {
-                        key_poll(bound)?;
-                        if owner != a || !ix.roles.sub(r, role) {
-                            continue;
-                        }
-                        for &(other, s, shared) in &objects.rows {
-                            key_poll(bound)?;
-                            if other == b && shared == target && ix.roles.sub(s, role) {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if found {
-                            break;
-                        }
-                    }
-                    if !found {
-                        matches = false;
-                        break;
-                    }
-                }
-                if !matches {
-                    continue;
-                }
-                for &role in &key.data {
-                    key_poll(bound)?;
-                    if ix.is_universal(role) {
-                        continue;
-                    }
-                    let mut found = false;
-                    for (owner, r, value) in &data.rows {
-                        key_poll(bound)?;
-                        if *owner != a || !ix.roles.sub(*r, role) {
-                            continue;
-                        }
-                        for (other, s, shared) in &data.rows {
-                            key_poll(bound)?;
-                            if *other == b && shared == value && ix.roles.sub(*s, role) {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if found {
-                            break;
-                        }
-                    }
-                    if !found {
-                        matches = false;
-                        break;
-                    }
-                }
-                if matches {
-                    pairs.push((a, b))?;
-                }
-            }
-        }
+        key_matches(ix, view, key, live, bound, |pair| pairs.push(pair))?;
     }
     pairs.rows.sort_unstable();
     pairs.rows.dedup();
     Ok(KeyMerges { pairs })
+}
+
+/// The rows of `rows`, sorted by owner, that `owner` has.
+fn owned<T>(rows: &[T], owner: Ex, of: impl Fn(&T) -> Ex) -> &[T] {
+    let start = rows.partition_point(|row| of(row) < owner);
+    let len = rows[start..].partition_point(|row| of(row) == owner);
+    &rows[start..start + len]
+}
+
+/// Emits each pair of members of `key` that the key merges. `live` is the storage the
+/// caller already holds, so that each admission here counts it.
+fn key_matches(
+    ix: &Index,
+    view: &dyn View,
+    key: &super::index::Key,
+    live: usize,
+    bound: &(dyn Fn(isize) -> bool + Sync),
+    mut emit: impl FnMut((Ex, Ex)) -> Result<(), Halt>,
+) -> Result<(), Halt> {
+    let count = key_member_count(ix, view, key.class, bound)?;
+    if count < 2 {
+        return Ok(());
+    }
+    let mut members = KeyStorage::with_live(count, 0, live, bound)?;
+    for &individual in &ix.nominals {
+        key_poll(bound)?;
+        if key_member(ix, view, individual, key.class) {
+            members.push(individual)?;
+        }
+    }
+    let mut count = 0;
+    key_sources(ix, view, &members.rows, bound, |_| key_add(&mut count, 1))?;
+    let mut sources =
+        KeyStorage::with_live(count, 0, key_live(&[live, members._scratch.bytes])?, bound)?;
+    key_sources(ix, view, &members.rows, bound, |row| sources.push(row))?;
+    sources.rows.sort_unstable();
+    let (mut object_count, mut data_count, mut data_payload) = (0, 0, 0);
+    key_records(
+        ix,
+        view,
+        key,
+        &sources.rows,
+        bound,
+        |_| key_add(&mut object_count, 1),
+        |_, _, value| {
+            key_add(&mut data_count, 1)?;
+            key_add(&mut data_payload, key_value_copy_bytes(value)?)
+        },
+    )?;
+    let held = key_live(&[live, members._scratch.bytes, sources._scratch.bytes])?;
+    let mut objects = KeyStorage::with_live(object_count, 0, held, bound)?;
+    let mut data = KeyStorage::with_live(
+        data_count,
+        data_payload,
+        key_live(&[held, objects._scratch.bytes])?,
+        bound,
+    )?;
+    key_records(
+        ix,
+        view,
+        key,
+        &sources.rows,
+        bound,
+        |row| objects.push(row),
+        |individual, role, value| data.push((individual, role, value.clone())),
+    )?;
+    // Grouped by owner, a pair reads only the records of its two members. The sorts
+    // are in place and allocate nothing.
+    objects.rows.sort_unstable_by_key(|row| row.0);
+    data.rows.sort_unstable_by_key(|row| row.0);
+    for (position, &a) in members.rows.iter().enumerate() {
+        let (a_objects, a_data) = (
+            owned(&objects.rows, a, |row| row.0),
+            owned(&data.rows, a, |row| row.0),
+        );
+        for &b in &members.rows[position + 1..] {
+            key_poll(bound)?;
+            let mut already_merged = false;
+            view.with(a, &mut |st, _| already_merged = st.subs.contains(&b));
+            if already_merged {
+                continue;
+            }
+            let (b_objects, b_data) = (
+                owned(&objects.rows, b, |row| row.0),
+                owned(&data.rows, b, |row| row.0),
+            );
+            let mut matches = true;
+            for &role in &key.objects {
+                key_poll(bound)?;
+                if ix.is_universal(role) {
+                    continue;
+                }
+                let mut found = false;
+                for &(_, r, target) in a_objects {
+                    key_poll(bound)?;
+                    if !ix.roles.sub(r, role) {
+                        continue;
+                    }
+                    for &(_, s, shared) in b_objects {
+                        key_poll(bound)?;
+                        if shared == target && ix.roles.sub(s, role) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if found {
+                        break;
+                    }
+                }
+                if !found {
+                    matches = false;
+                    break;
+                }
+            }
+            if !matches {
+                continue;
+            }
+            for &role in &key.data {
+                key_poll(bound)?;
+                if ix.is_universal(role) {
+                    continue;
+                }
+                let mut found = false;
+                for (_, r, value) in a_data {
+                    key_poll(bound)?;
+                    if !ix.roles.sub(*r, role) {
+                        continue;
+                    }
+                    for (_, s, shared) in b_data {
+                        key_poll(bound)?;
+                        if shared == value && ix.roles.sub(*s, role) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if found {
+                        break;
+                    }
+                }
+                if !found {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                emit((a, b))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The witnesses: the contexts that are not real, derive an individual and know more
@@ -1536,7 +1562,10 @@ mod numeric_resource_tests {
         assert_two_real_members(ix, &Global(&sat.ctx));
         drop(key_merges(ix, &Global(&sat.ctx), &admitted).unwrap());
         let owners = positive.load(Ordering::Relaxed);
-        assert_eq!(owners, 5, "returned pairs, members, sources, objects, data");
+        assert_eq!(
+            owners, 9,
+            "counting members, sources, objects and data, then returned pairs and the same four"
+        );
         assert_eq!(held.load(Ordering::Relaxed), 0);
         for deny in 1..=owners {
             let grants = AtomicUsize::new(0);
@@ -1614,6 +1643,84 @@ mod numeric_resource_tests {
         assert_two_real_members(ix, &Global(&sat.ctx));
         assert_eq!(key_merges(ix, &Global(&sat.ctx), &bound).unwrap().len(), 1);
         assert_eq!(held.load(Ordering::Relaxed), 0);
+    }
+
+    fn classified_keys(body: &str) -> Saturation {
+        let axioms = owner_axioms(body);
+        let refs: Vec<_> = axioms.iter().map(|a| &a.kind).collect();
+        let mut sat = Saturation::new();
+        let out = sat.classify(&refs, None, &Limits::default()).unwrap();
+        assert!(out.complete && out.consistent && sat.excluded().is_empty());
+        assert!(!sat.index.as_ref().unwrap().keys.is_empty());
+        sat
+    }
+
+    #[test]
+    fn key_pairs_are_admitted_for_found_merges_not_all_member_pairs() {
+        // Many key members without any key value merge nothing, so no storage should
+        // grow with the square of the membership.
+        let n = 1500;
+        let mut body = String::from("ClassAssertion(:K :a) ClassAssertion(:K :b) ");
+        for i in 0..n {
+            body.push_str(&format!("ClassAssertion(:K :i{i}) "));
+        }
+        body.push_str("HasKey(:K () (:d))");
+        let sat = classified_keys(&body);
+        let ix = sat.index.as_ref().unwrap();
+        let largest = AtomicUsize::new(0);
+        let held = AtomicIsize::new(0);
+        let bound = |delta: isize| {
+            held.fetch_add(delta, Ordering::Relaxed);
+            largest.fetch_max(delta.max(0) as usize, Ordering::Relaxed);
+            true
+        };
+        let found = key_merges(ix, &Global(&sat.ctx), &bound).unwrap();
+        assert!(found.is_empty());
+        drop(found);
+        assert_eq!(held.load(Ordering::Relaxed), 0);
+        let largest = largest.load(Ordering::Relaxed);
+        assert!(
+            largest < 64 * (n + 2),
+            "one admission of {largest} bytes for {n} members without key values"
+        );
+    }
+
+    #[test]
+    fn key_matching_reads_only_the_records_of_each_pair() {
+        // Distinct single-valued keys: every pair is compared and none merges. The
+        // work per pair is constant, so doubling the members about quadruples the
+        // polls, where a scan of every record per pair would make them eightfold.
+        let polls = |n: usize| {
+            let mut body = String::from(
+                "ClassAssertion(:K :a) ClassAssertion(:K :b) DataPropertyAssertion(:d :a \"-1\"^^xsd:integer) DataPropertyAssertion(:d :b \"-2\"^^xsd:integer) ",
+            );
+            for i in 0..n {
+                body.push_str(&format!(
+                    "ClassAssertion(:K :i{i}) DataPropertyAssertion(:d :i{i} \"{i}\"^^xsd:integer) "
+                ));
+            }
+            body.push_str("HasKey(:K () (:d))");
+            let sat = classified_keys(&body);
+            let ix = sat.index.as_ref().unwrap();
+            let polls = AtomicUsize::new(0);
+            let bound = |delta: isize| {
+                if delta == 0 {
+                    polls.fetch_add(1, Ordering::Relaxed);
+                }
+                true
+            };
+            assert!(
+                key_merges(ix, &Global(&sat.ctx), &bound)
+                    .unwrap()
+                    .is_empty()
+            );
+            polls.load(Ordering::Relaxed)
+        };
+        let (small, large) = (polls(100), polls(200));
+        assert!(
+            large * 10 < small * 55,
+            "polls grew from {small} to {large} when the members doubled"
+        );
     }
 
     #[test]
@@ -1771,14 +1878,21 @@ mod numeric_resource_tests {
         assert!(matches!(r, Err(Halt::Stopped)));
         assert_eq!(stats.events, 0);
         assert_eq!(held.load(Ordering::Relaxed), 0);
-        // A sufficient grant must do the real key work and release scratch after its
-        // returned merge list dies, even when all equalities are already saturated.
+        // A sufficient grant must do the real key work and release its scratch. When all
+        // equalities are already saturated the returned merge list is empty and holds
+        // nothing.
+        let grants = AtomicUsize::new(0);
         let admitted = |delta: isize| {
             held.fetch_add(delta, Ordering::Relaxed);
+            if delta > 0 {
+                grants.fetch_add(1, Ordering::Relaxed);
+            }
             true
         };
         let merges = key_merges(ix, &view, &admitted).unwrap();
-        assert!(held.load(Ordering::Relaxed) > 0);
+        assert!(grants.load(Ordering::Relaxed) > 0);
+        assert!(merges.is_empty());
+        assert_eq!(held.load(Ordering::Relaxed), 0);
         drop(merges);
         assert_eq!(held.load(Ordering::Relaxed), 0);
     }
