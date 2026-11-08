@@ -161,7 +161,9 @@ and assertions, the datatypes, literals and data ranges of the profile, function
 properties, data property ranges, datatype definitions, keys, negative property
 assertions and the top and bottom properties, with the rules of EL++ (Baader, Brandt and
 Lutz, IJCAI 2005 and OWLED 2008) written from the papers. Item 587 added them, as the
-next three paragraphs describe. A literal or a datatype that the classifier cannot
+next three paragraphs describe. The profile checker validates XML literal namespace
+conformance while retaining noncanonical spellings. Full canonical lexical acceptance
+and canonical value comparison remain in item 663. A literal or a datatype that the classifier cannot
 compare, which is an XML literal, an ill-typed literal, a datatype outside the OWL 2
 datatype map or a number past 128 bits, is an atom that only equals itself, and its
 axiom is reported as used in part. So is a property chain through the top object
