@@ -1323,6 +1323,34 @@ anchored history or a covered commit cannot fall back to legacy absence when a
 reference, flag, generation or coverage file is missing. Complete accepted seals
 are authenticated before recovery can truncate a log or expose recovered data.
 
+The newer file versions are written only after activation, so a store that never
+activates stays readable by older releases. Such a store writes version 1 logs,
+generation `commit.json` format 1 and `managed.json` format 2, and its dataset
+records reader 5, or the managed-graph reader when it has managed graphs.
+Activation first raises the dataset reader of every branch to 8, the
+configuration-history reader. It then upgrades each current log header in place
+and publishes the registry root. From then on the family writes version 2 logs,
+`commit.json` format 2, `managed.json` format 3, `history.json` format 2 and
+`branch.json` format 2. Branches and captures of an activated family record reader 8
+before they write any of these. An older release refuses an activated dataset by its
+reader before it reads anything else. A dataset's recorded reader also bounds the
+versions this build accepts in it. One of these versions in a dataset that records an
+older reader is refused as a newer release's file.
+
+A family root records activation when its dataset reader is at least 8 or when it
+holds an `evidence-history` directory. Activation runs on a migration copy that
+replaces the root only once it is complete, so a live root is never half activated.
+An activated root whose `managed.json` is missing, or names no history root, refuses
+to open with `evidence-unavailable` and is not read as a legacy store. The refusal
+writes nothing.
+
+The prepared native capture is private and has no public caller. Before anything
+calls it, it must charge its copied metadata to the caller's preparation before
+allocating it, or stream that metadata from the retained descriptors. This covers the
+cloned prefix map, its serialized form and whole-file reads of optional metadata such
+as `annotations.bin`. As written, a store with a large annotation history can allocate
+more than a small receiving allowance admits.
+
 Backups retain one coherent family configuration around their data capture,
 including a branch capture racing main configuration. Their immutable source
 descriptors and complete published closure remain valid after later settings
