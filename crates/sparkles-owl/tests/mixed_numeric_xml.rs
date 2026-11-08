@@ -113,7 +113,7 @@ fn mixed_unbound_xml_prefix_reports_the_specific_lexical_diagnostic() {
         assert_eq!(violation.rule, "OWL 2 Structural Specification §5.7");
         assert_eq!(
             violation.message,
-            "the lexical form of \"<p:a/>\"^^<http://www.w3.org/1999/02/22-rdf-syntax-ns#XMLLiteral> is not in the lexical space of <http://www.w3.org/1999/02/22-rdf-syntax-ns#XMLLiteral>"
+            "the lexical form of \"<p:a/>\"^^rdf:XMLLiteral is not in the lexical space of <http://www.w3.org/1999/02/22-rdf-syntax-ns#XMLLiteral>"
         );
     }
 }
