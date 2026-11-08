@@ -832,7 +832,7 @@ pub(super) fn execute_owned(ctx: &Ctx, n: &Node) -> Result<(Materialized<'static
     let (output, info) = execute_owned_inner(ctx, n, contains_algorithm(n))?;
     Ok((output.into_lease_owned(ctx)?, info))
 }
-pub(super) fn execute_materialized<'ctx>(
+pub(crate) fn execute_materialized<'ctx>(
     ctx: &'ctx Ctx,
     n: &Node,
 ) -> Result<(Materialized<'ctx>, PlanInfo)> {
@@ -1595,7 +1595,9 @@ fn run_node<'ctx>(
         }
         Kind::SpatialKnn(spec) => {
             // the template runs once per batch of candidates
-            let (t, c, runs) = spatial_knn(ctx, spec, &n.children[0], &n.vars)?;
+            let (output, c, runs) = spatial_knn(ctx, spec, &n.children[0], &n.vars)?;
+            let (t, credit) = output.into_fast_parts()?;
+            output_fast = Some(credit);
             // one node for the template, its runs added up
             infos.push(
                 runs.into_iter()
@@ -8590,7 +8592,7 @@ use crate::geo::exec::{spatial_pf, spatial_scan};
 #[cfg(feature = "geo")]
 use crate::geo::join::spatial_join;
 #[cfg(feature = "geo")]
-use crate::geo::knn::spatial_knn;
+use crate::geo::knn::spatial_knn_materialized as spatial_knn;
 #[cfg(feature = "geo")]
 use crate::geo::rewrite::spatial_relate;
 
@@ -8626,12 +8628,12 @@ fn spatial_join(
 }
 
 #[cfg(not(feature = "geo"))]
-fn spatial_knn(
-    _: &Ctx,
+fn spatial_knn<'ctx>(
+    _: &'ctx Ctx,
     _: &super::geojoin::SpatialKnnSpec,
     _: &Node,
     _: &[VarId],
-) -> Result<(Table, Counters, Vec<PlanInfo>)> {
+) -> Result<(Materialized<'ctx>, Counters, Vec<PlanInfo>)> {
     Err(crate::geo::not_built())
 }
 

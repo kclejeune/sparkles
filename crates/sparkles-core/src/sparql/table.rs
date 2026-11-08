@@ -251,13 +251,112 @@ pub(super) struct RetainedMaterialized {
 }
 
 /// Private materialization ownership. Payload and context precede admission credit.
-pub(super) struct Materialized<'ctx> {
+pub(crate) struct Materialized<'ctx> {
     pub(super) table: Table,
     _ctx: Option<std::sync::Arc<super::ctx::Ctx>>,
     fast: Option<super::ctx::Charge<'ctx>>,
     pub(super) lease: Option<super::query_memory::QueryMemoryLease>,
 }
 impl<'ctx> Materialized<'ctx> {
+    pub(crate) fn as_table(&self) -> &Table {
+        &self.table
+    }
+
+    /// Only an explicitly raw application facade may detach this legacy table.
+    /// Engine consumers keep this actual owner or make a prepaid receiving copy.
+    pub(crate) fn into_application_table(self) -> Table {
+        self.table
+    }
+
+    /// Copy into an existing prepaid destination while the real source stays
+    /// protected. Capacity growth is admitted before allocation; a failed copy
+    /// restores row lengths and keeps all surviving capacity covered.
+    pub(crate) fn append_copy(
+        &mut self,
+        ctx: &super::ctx::Ctx,
+        source: &Materialized<'_>,
+    ) -> crate::Result<()> {
+        ctx.check()?;
+        if (source.fast.is_some() && source.lease.is_some())
+            || source
+                .lease
+                .as_ref()
+                .is_some_and(|credit| credit.service.is_some())
+            || self.table.vars != source.table.vars
+            || self.table.cols.len() != self.table.vars.len()
+            || source.table.cols.len() != source.table.vars.len()
+            || self
+                .table
+                .cols
+                .iter()
+                .any(|column| column.len() != self.table.len)
+            || source
+                .table
+                .cols
+                .iter()
+                .any(|column| column.len() != source.table.len)
+            || source
+                ._ctx
+                .as_ref()
+                .is_some_and(|owner| !std::ptr::eq(owner.as_ref(), ctx))
+            || source
+                .fast
+                .as_ref()
+                .is_some_and(|credit| !credit.belongs_to(ctx))
+            || source
+                .lease
+                .as_ref()
+                .is_some_and(|credit| !ctx.owns_ledger(&credit.ledger))
+        {
+            return Err(crate::Error::invalid(
+                "incompatible materialized append input",
+            ));
+        }
+        let source_capacity = super::algosvc::table_capacity(&source.table)?;
+        if source
+            .fast
+            .as_ref()
+            .is_some_and(|credit| credit.bytes() < source_capacity)
+            || source
+                .lease
+                .as_ref()
+                .is_some_and(|credit| credit.bytes < source_capacity)
+        {
+            return Err(crate::Error::invalid(
+                "materialized append source exceeds its actual credit",
+            ));
+        }
+        let old_len = self.table.len;
+        let len = old_len
+            .checked_add(source.table.len)
+            .ok_or_else(|| crate::Error::invalid("materialized append rows overflow"))?;
+        ctx.check_output_rows(len)?;
+        self.reserve_rows(ctx, len)?;
+        let copied = (|| {
+            for (destination, source) in self.table.cols.iter_mut().zip(&source.table.cols) {
+                for part in source.chunks(1024) {
+                    ctx.check()?;
+                    destination.extend_from_slice(part);
+                    #[cfg(test)]
+                    crate::algo::memory::probe::at(crate::algo::memory::probe::Point::Work(
+                        "materialized-append-chunk",
+                        part.len(),
+                    ));
+                }
+            }
+            ctx.check()
+        })();
+        if let Err(error) = copied {
+            for column in &mut self.table.cols {
+                column.truncate(old_len);
+            }
+            return Err(error);
+        }
+        self.table.len = len;
+        self.table.sorted.clear();
+        Ok(())
+    }
+
     pub(super) fn has_credit(&self) -> bool {
         self.fast.is_some() || self.lease.is_some()
     }
@@ -287,7 +386,7 @@ impl<'ctx> Materialized<'ctx> {
             || self
                 .lease
                 .as_ref()
-                .is_some_and(|credit| !std::sync::Arc::ptr_eq(&credit.ledger, ctx.memory()))
+                .is_some_and(|credit| !ctx.owns_ledger(&credit.ledger))
         {
             return Err(crate::Error::invalid("foreign materialized slice owner"));
         }
@@ -339,7 +438,7 @@ impl<'ctx> Materialized<'ctx> {
         Ok(table)
     }
 
-    pub(super) fn project(
+    pub(crate) fn project(
         mut self,
         ctx: &'ctx super::ctx::Ctx,
         vars: &[VarId],
@@ -387,9 +486,7 @@ impl<'ctx> Materialized<'ctx> {
             ));
         }
         if let Some(lease) = &self.lease {
-            if !std::sync::Arc::ptr_eq(&lease.ledger, ctx.memory())
-                || lease.service.is_some()
-                || lease.bytes < capacity
+            if !ctx.owns_ledger(&lease.ledger) || lease.service.is_some() || lease.bytes < capacity
             {
                 return Err(crate::Error::invalid(
                     "foreign or active-service final table credit",
@@ -570,7 +667,7 @@ impl<'ctx> Materialized<'ctx> {
         )
     }
 
-    pub(super) fn empty_fast(
+    pub(crate) fn empty_fast(
         ctx: &'ctx super::ctx::Ctx,
         vars: &[VarId],
         sorted: &[VarId],
@@ -826,6 +923,111 @@ mod materialized_credit_tests {
         drop(input);
         assert_eq!(ctx.live_bytes(), 320, "the operator still owns the credit");
         drop(held);
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+
+    #[test]
+    fn paid_append_pays_receiving_copy_overlap_before_allocating_and_keeps_source() {
+        use crate::algo::memory::probe;
+        use std::{cell::Cell, rc::Rc, sync::Arc};
+        let store = Store::in_memory(StoreOptions::default());
+        for short in [false, true] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = 484 - u64::from(short);
+            let ctx = Arc::new(ctx);
+            let source = paid_spare_table(&ctx);
+            let mut destination = Materialized::empty_fast(&ctx, &[0], &[]).unwrap();
+            assert_eq!(ctx.live_bytes(), 476);
+            let observed = Rc::new(Cell::new(0));
+            let seen = observed.clone();
+            let owner = ctx.clone();
+            let hook = probe::install(
+                move |point| {
+                    if let probe::Point::Allocation("eager-column-grow", 1) = point {
+                        assert_eq!(
+                            owner.live_bytes(),
+                            484,
+                            "source320 and complete destination164 coexist"
+                        );
+                        seen.set(seen.get() + 1);
+                    }
+                },
+                None,
+            );
+            let result = destination.append_copy(&ctx, &source);
+            if short {
+                assert!(matches!(result, Err(crate::Error::BudgetExceeded(_))));
+                assert_eq!(destination.table.len, 0);
+                assert_eq!(ctx.live_bytes(), 476);
+                assert_eq!(observed.get(), 0);
+            } else {
+                result.unwrap();
+                assert_eq!(destination.table.cols[0], source.table.cols[0]);
+                assert_eq!(ctx.live_bytes(), 484);
+                assert_eq!(observed.get(), 1);
+            }
+            assert_eq!(source.table.cols[0].capacity(), 8);
+            drop(hook);
+            drop(source);
+            assert_eq!(ctx.live_bytes(), if short { 156 } else { 164 });
+            drop(destination);
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn paid_append_refuses_foreign_lease_without_promoting_and_rolls_back_partial_rows() {
+        use crate::algo::memory::probe;
+        use std::{cell::Cell, rc::Rc, sync::Arc};
+        let store = Store::in_memory(StoreOptions::default());
+        let foreign = Ctx::new(store.snapshot());
+        let source = paid_spare_table(&foreign)
+            .into_lease_owned(&foreign)
+            .unwrap();
+        let ctx = Arc::new(Ctx::new(store.snapshot()));
+        let mut destination = Materialized::empty_fast(&ctx, &[0], &[]).unwrap();
+        let before = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        assert!(destination.append_copy(&ctx, &source).is_err());
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            before
+        );
+        assert_eq!(ctx.live_bytes(), 156);
+        drop(source);
+        let table = Table {
+            vars: vec![0],
+            cols: vec![vec![Id::UNDEF; 2048]],
+            len: 2048,
+            sorted: Vec::new(),
+        };
+        let source = Materialized::clone_fast(&ctx, &table).unwrap();
+        let polls = Rc::new(Cell::new(0usize));
+        let seen = polls.clone();
+        let owner = ctx.clone();
+        let hook = probe::install(
+            move |point| {
+                if let probe::Point::Work("materialized-append-chunk", _) = point {
+                    seen.set(seen.get() + 1);
+                    if seen.get() == 1 {
+                        owner
+                            .cancel
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
+                }
+            },
+            None,
+        );
+        assert!(matches!(
+            destination.append_copy(&ctx, &source),
+            Err(crate::Error::Cancelled)
+        ));
+        assert_eq!(destination.table.len, 0);
+        assert!(destination.table.cols[0].is_empty());
+        assert_eq!(destination.table.cols[0].capacity(), 2048);
+        assert_eq!(source.table.len, 2048);
+        drop(hook);
+        drop(source);
+        drop(destination);
         assert_eq!(ctx.live_bytes(), 0);
     }
 

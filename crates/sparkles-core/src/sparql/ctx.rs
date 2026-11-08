@@ -916,6 +916,12 @@ impl Ctx {
         )
     }
 
+    pub(super) fn owns_ledger(&self, ledger: &Arc<QueryMemoryLedger>) -> bool {
+        self.memory
+            .get()
+            .is_some_and(|own| Arc::ptr_eq(own, ledger))
+    }
+
     /// A distinct reasoning child sharing this query's live total and original
     /// backing. Construct it only when reasoning starts; ordinary execution keeps
     /// its existing lazy fast account. The child retains accounting, not this Ctx.
