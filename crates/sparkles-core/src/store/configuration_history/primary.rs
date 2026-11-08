@@ -37,6 +37,19 @@ fn root_result(
 }
 
 impl Header {
+    /// Fixed original facts can be retained, but a prior operation's successful
+    /// publication lookup must not hide a missing reference on the next read.
+    pub(crate) fn fresh(&self) -> Self {
+        Self {
+            dataset: self.dataset,
+            history: self.history.clone(),
+            cutoff: self.cutoff,
+            origin: self.origin,
+            unreadable_history: self.unreadable_history,
+            last: None,
+        }
+    }
+
     fn new(
         root: &Path,
         dataset: uuid::Uuid,

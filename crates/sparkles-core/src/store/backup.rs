@@ -505,11 +505,73 @@ impl ConfigurationCapture {
         })
     }
 
+    fn check_metadata_basis(
+        &self,
+        expected: crate::evidence::Sha256Digest,
+        preparation: &crate::access::Preparation,
+    ) -> Result<()> {
+        preparation.check()?;
+        // The fixed streaming hash state is paid before lending the remaining
+        // allowance to input/JSON/type decoding. No serialized Meta Vec exists.
+        let _workspace =
+            preparation.reserve(std::mem::size_of::<MetadataDigest<'_>>() as u64 + 1024)?;
+        let allowance = preparation.room();
+        let _loan = preparation.reserve(allowance)?;
+        let options = crate::history::HistoryOptions {
+            cancel: Some(preparation.control().cancel.flag()),
+            deadline: preparation.control().deadline,
+        };
+        let mut budget = super::cold::ColdBudget::new(crate::history::ReadLimit {
+            options: &options,
+            memory: Some(allowance),
+            held: 0,
+        })?;
+        let mut reader = self.primary_reader(CapturedPrimary::Meta).ok_or_else(|| {
+            super::managed_history::unavailable("captured primary index metadata is absent")
+        })?;
+        if reader.extent() > super::managed_history::MAX_BYTES as u64 {
+            return Err(preparation.exhausted());
+        }
+        let extent = reader.extent();
+        let bytes = budget.read_from(&mut reader, extent)?;
+        let raw: super::cold::Loaded<serde_json::Value> = budget.json(&bytes)?;
+        let version = raw
+            .value
+            .get("format_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                Error::Corrupt("captured meta.json: format_version is missing or not a u32".into())
+            })?;
+        crate::formats::INDEX.check("captured-primary/meta.json", version, None)?;
+        let meta: crate::builder::IndexMeta = budget.value(raw.value)?;
+        if meta
+            .features
+            .iter()
+            .any(|feature| !crate::builder::KNOWN_FEATURES.contains(&feature.as_str()))
+        {
+            return Err(Error::Unsupported(
+                "captured index metadata uses an unsupported feature".into(),
+            ));
+        }
+        if metadata_fingerprint_admitted(&meta, preparation)? != expected {
+            return Err(super::managed_history::unavailable(
+                "captured index metadata differs from its actual physical producer",
+            ));
+        }
+        preparation.check()
+    }
+
     fn checked_primary(
         self,
         preparation: &crate::access::Preparation,
     ) -> Result<CheckedPrimaryCapture> {
         preparation.check()?;
+        if self.original.imports.is_some() {
+            return Err(Error::Unsupported(
+                "captured prior origins require authenticated imported physical context".into(),
+            ));
+        }
         let held = preparation.reserve(
             std::mem::size_of::<CheckedPrimaryCapture>() as u64
                 + std::mem::size_of::<super::configuration_history::primary::Header>() as u64
@@ -533,16 +595,8 @@ impl ConfigurationCapture {
         {
             return Err(bad());
         }
-        let basis = if self.data.materialized {
-            CapturedBasis {
-                base: expected_head,
-                physical_owner: self.data.dataset_id,
-                dvocab_len: 0,
-                fold_legacy: false,
-            }
-        } else {
-            self.original.native.ok_or_else(bad)?
-        };
+        let basis = self.original.native.ok_or_else(bad)?;
+        self.check_metadata_basis(basis.metadata, preparation)?;
         // This ephemeral loan admits the input, JSON scratch and decoded origin.
         // No publication callback can run while it holds the remaining allowance.
         let (base_binding, strict_from) = {
@@ -854,17 +908,94 @@ struct CapturedOriginal {
     origin: Option<(u64, crate::history::ConfigurationBinding)>,
     pins: Option<super::managed_history::Bytes>,
     table: Option<super::managed_history::Bytes>,
+    imports: Option<super::configuration_history::OriginalSources>,
     _held: crate::access::Reservation,
 }
 
-/// Scalars selected from the actual Store under its writer, independently of
-/// any captured/decoded generation metadata.
+/// Facts from the actual selected Generation under its writer, or the real
+/// completed materialized Builder output. Never inferred from captured JSON.
 #[derive(Clone, Copy, Debug)]
 struct CapturedBasis {
     base: CommitInfo,
     physical_owner: uuid::Uuid,
     dvocab_len: u64,
     fold_legacy: bool,
+    metadata: crate::evidence::Sha256Digest,
+}
+
+/// Fixed-size streaming semantic fingerprint. It binds every known IndexMeta
+/// field without cloning its strings/maps or materializing its serialized form.
+struct MetadataDigest<'a> {
+    hash: sha2::Sha256,
+    written: usize,
+    preparation: &'a crate::access::Preparation,
+    failure: Option<Error>,
+}
+
+impl Write for MetadataDigest<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        let result = (|| {
+            self.preparation.check()?;
+            let next = self
+                .written
+                .checked_add(bytes.len())
+                .filter(|n| *n <= super::managed_history::MAX_BYTES)
+                .ok_or_else(|| self.preparation.exhausted())?;
+            for chunk in bytes.chunks(64 << 10) {
+                self.preparation.check()?;
+                self.hash.update(chunk);
+            }
+            self.written = next;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.failure.get_or_insert(error);
+            return Err(std::io::Error::other(
+                "actual index metadata fingerprint refused",
+            ));
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn metadata_fingerprint(
+    meta: &crate::builder::IndexMeta,
+    preparation: &crate::access::Preparation,
+) -> Result<crate::evidence::Sha256Digest> {
+    let _workspace =
+        preparation.reserve(std::mem::size_of::<MetadataDigest<'_>>() as u64 + 1024)?;
+    metadata_fingerprint_admitted(meta, preparation)
+}
+
+// Both call sites already hold the fixed workspace, including the decoder that
+// lends all remaining request room to its existing controlled ColdBudget.
+fn metadata_fingerprint_admitted(
+    meta: &crate::builder::IndexMeta,
+    preparation: &crate::access::Preparation,
+) -> Result<crate::evidence::Sha256Digest> {
+    use sha2::Digest;
+    preparation.check()?;
+    let mut writer = MetadataDigest {
+        hash: sha2::Sha256::new(),
+        written: 0,
+        preparation,
+        failure: None,
+    };
+    let result = serde_json::to_writer(&mut writer, meta);
+    if let Some(error) = writer.failure {
+        return Err(error);
+    }
+    result.map_err(|_| {
+        super::managed_history::unavailable("actual index metadata does not encode")
+    })?;
+    preparation.check()?;
+    Ok(crate::evidence::Sha256Digest::from_digest_bytes(
+        writer.hash.finalize().into(),
+    ))
 }
 
 impl CapturedOriginal {
@@ -906,6 +1037,12 @@ impl CapturedOriginal {
             super::managed_history::unavailable("original family branch set is unavailable")
         })?;
         let table = set.original_table(preparation)?;
+        let imports = super::configuration_history::OriginalSources::capture(
+            store,
+            writer,
+            state,
+            preparation,
+        )?;
         let snapshot = store.snapshot();
         let (native, pins) = if let Some(history) = &store.history {
             let history = preparation.lock(history)?;
@@ -933,6 +1070,7 @@ impl CapturedOriginal {
                     physical_owner: store.dataset_id,
                     dvocab_len: snapshot.dvocab_len,
                     fold_legacy: entry.fold_legacy,
+                    metadata: metadata_fingerprint(&snapshot.generation.meta, preparation)?,
                 })
             } else {
                 None
@@ -978,6 +1116,7 @@ impl CapturedOriginal {
             origin,
             pins,
             table,
+            imports,
             _held: held,
         })
     }
@@ -1279,7 +1418,7 @@ impl Store {
             managed,
             managed_state,
             binding,
-            original,
+            mut original,
         ) = {
             let w = self.lock_writer(&control)?;
             check_preparation()?;
@@ -1400,6 +1539,15 @@ impl Store {
             quads: meta.quads,
             ..head
         };
+        if let (Some(original), Some(preparation)) = (original.as_mut(), preparation) {
+            original.native = Some(CapturedBasis {
+                base: commit,
+                physical_owner: self.dataset_id,
+                dvocab_len: 0,
+                fold_legacy: false,
+                metadata: metadata_fingerprint(&meta, preparation)?,
+            });
+        }
         super::write_synced(
             &gdir.join("commit.json"),
             &crate::commit::gen_commit_bytes_with_binding(
@@ -2440,6 +2588,296 @@ mod tests {
         assert!(!value["snapshots"][0]["configuration"].is_null());
         drop(document);
         assert_eq!(preparation.room(), before_credit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_checked_primary_binds_all_actual_index_metadata_fields() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let room = preparation.room();
+        let snapshot = store.snapshot();
+        let path = root.join(&snapshot.generation.name).join("meta.json");
+        let original = std::fs::read(&path).unwrap();
+        let actual = serde_json::to_value(&snapshot.generation.meta).unwrap();
+        for field in [
+            "format_version",
+            "quads",
+            "terms",
+            "next_bnode",
+            "prefixes",
+            "created",
+            "patterns",
+            "features",
+        ] {
+            let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            match field {
+                "format_version" => {
+                    changed[field] = if snapshot.generation.meta.format_version == 3 {
+                        4.into()
+                    } else {
+                        3.into()
+                    }
+                }
+                "quads" | "terms" | "next_bnode" => {
+                    changed[field] = changed[field]
+                        .as_u64()
+                        .unwrap()
+                        .checked_add(1)
+                        .unwrap()
+                        .into()
+                }
+                "prefixes" => {
+                    changed[field]["__meta_basis_witness"] = "urn:different-physical-prefix".into();
+                }
+                "created" => changed[field] = "different-physical-creation".into(),
+                "patterns" => {
+                    changed[field] = serde_json::to_value(crate::patterns::PatternInfo::skipped(
+                        "fingerprint-test-replacement",
+                    ))
+                    .unwrap()
+                }
+                "features" => {
+                    changed[field] = if snapshot.generation.meta.features.is_empty() {
+                        serde_json::json!(["fsst-vocab"])
+                    } else {
+                        serde_json::json!([])
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                changed[field],
+                actual.get(field).cloned().unwrap_or_default()
+            );
+            std::fs::write(&path, serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+            let result = store
+                .configuration_capture("all-meta-fields", &Default::default(), &preparation)
+                .unwrap()
+                .checked_primary(&preparation);
+            std::fs::write(&path, &original).unwrap();
+            let error = result
+                .err()
+                .expect("every complete actual metadata field must be bound");
+            assert!(
+                error
+                    .to_string()
+                    .contains("captured index metadata differs from its actual physical producer"),
+                "{field}: {error}"
+            );
+            assert_eq!(
+                serde_json::to_value(&snapshot.generation.meta).unwrap(),
+                actual
+            );
+            assert_eq!(leases(&store), 0);
+            assert_eq!(preparation.room(), room);
+        }
+        drop(
+            store
+                .configuration_capture("restored-meta", &Default::default(), &preparation)
+                .unwrap()
+                .checked_primary(&preparation)
+                .unwrap(),
+        );
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), room);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_checked_primary_uses_real_materialized_builder_metadata() {
+        let temporary = tempfile::tempdir().unwrap();
+        for persistent in [false, true] {
+            let preparation = capture_preparation();
+            let store = if persistent {
+                history_store(&temporary.path().join("persistent"))
+            } else {
+                let store = Store::in_memory(StoreOptions::default());
+                store
+                    .activate_memory_configuration_history(&preparation)
+                    .unwrap();
+                store
+            };
+            ins(&store, 1);
+            let scratch = temporary.path().join(if persistent {
+                "disk-scratch"
+            } else {
+                "memory-scratch"
+            });
+            let options = MemoryCaptureOptions {
+                tmp_dir: scratch.clone(),
+                ..Default::default()
+            };
+            let room = preparation.room();
+            let captured = store
+                .materialized_configuration_capture("built-meta", &options, &preparation)
+                .unwrap();
+            assert!(captured.data.materialized);
+            assert_ne!(
+                captured.original.native.unwrap().metadata,
+                metadata_fingerprint(&store.snapshot().generation.meta, &preparation).unwrap(),
+                "rebuilt metadata cannot be inferred from the source generation"
+            );
+            drop(captured.checked_primary(&preparation).unwrap());
+            assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+            assert_eq!(preparation.room(), room);
+            let captured = store
+                .materialized_configuration_capture("changed-built-meta", &options, &preparation)
+                .unwrap();
+            let directory = std::fs::read_dir(&scratch)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let path = directory.join(&captured.data.generation).join("meta.json");
+            let bytes = std::fs::read(&path).unwrap();
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["quads"], 1);
+            value["quads"] = 2.into();
+            let changed = serde_json::to_vec_pretty(&value).unwrap();
+            assert_eq!(
+                changed.len(),
+                bytes.len(),
+                "a length mismatch must not substitute for the semantic fingerprint control"
+            );
+            std::fs::write(&path, changed).unwrap();
+            let error = captured.checked_primary(&preparation).err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("captured index metadata differs from its actual physical producer"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+            assert_eq!(preparation.room(), room);
+            if persistent {
+                assert_eq!(leases(&store), 0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_checked_primary_metadata_streaming_limits_controls_and_version_order() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        let mut borrowed = store.snapshot().generation.meta.clone();
+        borrowed
+            .prefixes
+            .insert("large".into(), "x".repeat(1 << 20));
+        let preparation =
+            crate::access::Preparation::new(crate::task::Control::none(), 4096).unwrap();
+        let room = preparation.room();
+        let first = metadata_fingerprint(&borrowed, &preparation).unwrap();
+        borrowed.prefixes.get_mut("large").unwrap().push('y');
+        assert_ne!(
+            metadata_fingerprint(&borrowed, &preparation).unwrap(),
+            first
+        );
+        assert_eq!(
+            preparation.room(),
+            room,
+            "the large borrowed metadata is streamed, not copied into request memory"
+        );
+        let small = crate::access::Preparation::new(crate::task::Control::none(), 512).unwrap();
+        let small_room = small.room();
+        assert!(matches!(
+            metadata_fingerprint(&borrowed, &small),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(small.room(), small_room);
+        let cancelled =
+            crate::access::Preparation::new(crate::task::Control::none(), 4096).unwrap();
+        cancelled.control().cancel.cancel();
+        assert!(matches!(
+            metadata_fingerprint(&borrowed, &cancelled),
+            Err(Error::Cancelled)
+        ));
+        let mut control = crate::task::Control::none();
+        control.deadline = Some(Instant::now() + Duration::from_secs(1));
+        let timed = crate::access::Preparation::new(control, 4096).unwrap();
+        std::thread::sleep(
+            timed
+                .control()
+                .deadline
+                .unwrap()
+                .saturating_duration_since(Instant::now())
+                + Duration::from_millis(1),
+        );
+        assert!(matches!(
+            metadata_fingerprint(&borrowed, &timed),
+            Err(Error::Timeout)
+        ));
+        borrowed.prefixes.insert(
+            "too-large".into(),
+            "z".repeat(super::super::managed_history::MAX_BYTES + 1),
+        );
+        assert!(matches!(
+            metadata_fingerprint(&borrowed, &preparation),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(preparation.room(), room);
+        let capture_preparation = capture_preparation();
+        let capture_room = capture_preparation.room();
+        let path = root
+            .join(&store.snapshot().generation.name)
+            .join("meta.json");
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&path, br#"{"format_version":4294967295,"quads":false}"#).unwrap();
+        let result = store
+            .configuration_capture(
+                "future-meta-first",
+                &Default::default(),
+                &capture_preparation,
+            )
+            .unwrap()
+            .checked_primary(&capture_preparation);
+        std::fs::write(&path, original).unwrap();
+        assert!(
+            matches!(result, Err(Error::Unsupported(_))),
+            "known index version must be checked before the malformed payload"
+        );
+        assert_eq!(leases(&store), 0);
+        assert_eq!(capture_preparation.room(), capture_room);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_checked_primary_refuses_metadata_that_differs_from_its_actual_generation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let room = preparation.room();
+        let snapshot = store.snapshot();
+        let path = root.join(&snapshot.generation.name).join("meta.json");
+        let original = std::fs::read(&path).unwrap();
+        let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        let actual_quads = snapshot.generation.meta.quads;
+        assert_eq!(changed["quads"], actual_quads);
+        changed["quads"] = actual_quads.checked_add(1).unwrap().into();
+        std::fs::write(&path, serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+        assert_eq!(snapshot.generation.meta.quads, actual_quads);
+        let result = store
+            .configuration_capture("actual-meta-basis", &Default::default(), &preparation)
+            .unwrap()
+            .checked_primary(&preparation);
+        std::fs::write(&path, &original).unwrap();
+        let refused = result.is_err();
+        drop(result);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), room);
+        assert!(
+            refused,
+            "captured metadata must match the actual selected Generation, not only a new source-file pin"
+        );
     }
 
     #[test]

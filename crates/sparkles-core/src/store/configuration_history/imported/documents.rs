@@ -227,37 +227,123 @@ impl Documents {
         wanted: ConfigurationIdentity,
         preparation: &Preparation,
     ) -> Result<managed_history::Owned<managed_history::Generation>> {
-        let registry = self.read(crate::managed::FILE, preparation)?;
-        let history = primary::recorded_root_bytes(&registry.value, preparation)?
-            .ok_or_else(|| managed_history::unavailable("original publication root is missing"))?;
-        drop(registry);
-        // The lineage UUID and digest have fixed canonical encodings. Hold the
-        // temporary formatting/storage allowance before either path allocation.
-        let _paths = preparation.reserve(1024)?;
-        let lineage = format!("evidence-history/{}", history.lineage_id);
-        managed_history::resolve_using(
-            self.descriptor.value.family_id,
-            &history,
-            wanted,
-            preparation,
-            || {
-                let bytes = self.read(&format!("{lineage}/coverage.json"), preparation)?;
-                managed_history::coverage_bytes(
-                    &bytes.value,
-                    self.descriptor.value.family_id,
-                    &history,
-                    preparation,
-                )
-            },
-            |identity| {
-                let digest = identity.generation.to_string();
-                let name = digest.strip_prefix("sha256:").expect("canonical digest");
-                let bytes =
-                    self.read(&format!("{lineage}/generations/{name}.json"), preparation)?;
-                managed_history::generation_bytes(&bytes.value, identity, preparation)
-            },
-        )
+        source_publication(&self.directory, &self.descriptor.value, wanted, preparation)
     }
+}
+
+pub(super) fn source_publication(
+    directory: &Opened,
+    descriptor: &Descriptor,
+    wanted: ConfigurationIdentity,
+    preparation: &Preparation,
+) -> Result<managed_history::Owned<managed_history::Generation>> {
+    let registry = read_member(directory, descriptor, crate::managed::FILE, preparation)?;
+    let history = primary::recorded_root_bytes(&registry.value, preparation)?
+        .ok_or_else(|| managed_history::unavailable("original publication root is missing"))?;
+    drop(registry);
+    // The lineage UUID and digest have fixed canonical encodings. Hold the
+    // temporary formatting/storage allowance before either path allocation.
+    let _paths = preparation.reserve(1024)?;
+    let lineage = format!("evidence-history/{}", history.lineage_id);
+    managed_history::resolve_using(
+        descriptor.family_id,
+        &history,
+        wanted,
+        preparation,
+        || {
+            let bytes = read_member(
+                directory,
+                descriptor,
+                &format!("{lineage}/coverage.json"),
+                preparation,
+            )?;
+            managed_history::coverage_bytes(
+                &bytes.value,
+                descriptor.family_id,
+                &history,
+                preparation,
+            )
+        },
+        |identity| {
+            let digest = identity.generation.to_string();
+            let name = digest.strip_prefix("sha256:").expect("canonical digest");
+            let bytes = read_member(
+                directory,
+                descriptor,
+                &format!("{lineage}/generations/{name}.json"),
+                preparation,
+            )?;
+            managed_history::generation_bytes(&bytes.value, identity, preparation)
+        },
+    )
+}
+
+/// A scalar original publisher header. All coverage and branch documents are
+/// still read through the exact declared pins of this retained source owner.
+/// This does not bind those documents to a local RDF base or WAL interval.
+pub(super) fn source_header(
+    directory: &Opened,
+    descriptor: &Descriptor,
+    root_name: &str,
+    preparation: &Preparation,
+) -> Result<primary::Header> {
+    let root = descriptor.roots.get(root_name).ok_or_else(|| {
+        managed_history::unavailable("original primary has no declared logical root")
+    })?;
+    let registry = read_member(directory, descriptor, crate::managed::FILE, preparation)?;
+    let history = primary::recorded_root_bytes(&registry.value, preparation)?
+        .ok_or_else(|| managed_history::unavailable("original primary publication is missing"))?;
+    drop(registry);
+    let _paths = preparation.reserve(
+        (root_name.len() as u64)
+            .saturating_mul(4)
+            .saturating_add(2048),
+    )?;
+    let coverage = read_member(
+        directory,
+        descriptor,
+        &format!("evidence-history/{}/coverage.json", history.lineage_id),
+        preparation,
+    )?;
+    let coverage = managed_history::coverage_bytes(
+        &coverage.value,
+        descriptor.family_id,
+        &history,
+        preparation,
+    )?;
+    let mut origin = None;
+    if root.logical_id != descriptor.family_id {
+        let path = if root_name == "main" {
+            "branch.json".to_owned()
+        } else {
+            format!("branches/{root_name}/branch.json")
+        };
+        let branch = read_member(directory, descriptor, &path, preparation)?;
+        inspect_branch_identity(
+            &branch.value,
+            descriptor.family_id,
+            root.logical_id,
+            root.head,
+            preparation,
+            |branch| {
+                origin = branch
+                    .configuration_origin
+                    .as_ref()
+                    .map(|configuration| (branch.from.seq, configuration.binding));
+                Ok(())
+            },
+        )?;
+    }
+    let header = primary::Header::from_coverage(
+        descriptor.family_id,
+        root.logical_id,
+        origin,
+        Some(history),
+        false,
+        Some(&coverage.value),
+    )?;
+    preparation.check()?;
+    Ok(header)
 }
 
 pub(super) fn verify_staged_native(
@@ -288,7 +374,7 @@ pub(super) fn verify_staged_native(
     source_identities(&directory, &manifest.0.value, preparation)
 }
 
-fn read_member(
+pub(super) fn read_member(
     directory: &Opened,
     descriptor: &Descriptor,
     path: &str,
@@ -315,7 +401,7 @@ fn read_member(
     Ok(bytes)
 }
 
-fn source_identities(
+pub(super) fn source_identities(
     directory: &Opened,
     descriptor: &Descriptor,
     preparation: &Preparation,

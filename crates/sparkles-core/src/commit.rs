@@ -793,6 +793,63 @@ fn write_dataset(root: &Path, ds: &DatasetFile) -> Result<()> {
     )
 }
 
+/// Pure receiving-owned metadata for an unpublished imported destination. The
+/// closed producer separately supplies its genuine old owner and selected data
+/// sequence. These bytes grant no Store/source/replay or current permission.
+/// Reader9 is emitted explicitly; this build still refuses that destination
+/// until the complete physical producer/consumer feature is enabled together.
+pub(crate) fn reidentified_dataset_bytes(
+    bytes: &[u8],
+    old: uuid::Uuid,
+    new: uuid::Uuid,
+    seq: u64,
+    created_ms: i64,
+    preparation: &crate::access::Preparation,
+) -> Result<crate::store::managed_history::Bytes> {
+    use crate::store::{cold::ColdBudget, managed_history};
+    preparation.check()?;
+    if old.is_nil() || new.is_nil() {
+        return Err(Error::invalid(
+            "dataset identity transformation has a nil owner",
+        ));
+    }
+    if bytes.len() > managed_history::MAX_BYTES {
+        return Err(preparation.exhausted());
+    }
+    // Fixed replacement strings and encoder scratch precede all mutation/copy.
+    let _scratch = preparation.reserve(8192)?;
+    let allowance = preparation.room();
+    let mut held = preparation.reserve(allowance)?;
+    let options = crate::history::HistoryOptions {
+        cancel: Some(preparation.control().cancel.flag()),
+        deadline: preparation.control().deadline,
+    };
+    let mut budget = ColdBudget::new(crate::history::ReadLimit {
+        options: &options,
+        memory: Some(allowance),
+        held: 0,
+    })?;
+    let raw: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
+    check_dataset_value(&raw.value)?;
+    // Keep additive original fields. The scalar-only identity helper omits
+    // extensions intentionally, so it is not used to rewrite this document.
+    let mut file: DatasetFile = budget.value(raw.value)?;
+    if file.id != old {
+        return Err(Error::Corrupt(
+            "original dataset belongs to another logical source".into(),
+        ));
+    }
+    file.id = new;
+    file.origin = "restore".to_owned();
+    file.created = rfc3339_ms(created_ms);
+    file.forked_from = Some(ForkedFrom { id: old, seq });
+    file.written_by = Some(crate::formats::SPARKLES_VERSION.to_owned());
+    file.minimum_reader = file.minimum_reader.max(9);
+    held.release_to(budget.used());
+    preparation.check()?;
+    managed_history::encode_pretty(&file, preparation)
+}
+
 /// `forkedFrom` of `<root>/dataset.json`, if the database is a clone.
 pub(crate) fn read_forked_from(root: &Path) -> Result<Option<ForkedFrom>> {
     Ok(read_dataset(root)?.and_then(|f| f.forked_from))
@@ -1067,6 +1124,92 @@ fn parse_gen_commit(path: &Path, b: &[u8]) -> Result<GenCommitFile> {
         .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
     check_gen_binding(path, &file, b)?;
     Ok(file)
+}
+
+/// Pure small-document transformation for a genuine closed import producer.
+/// Preserve every original field, including additive legacy fields and strict
+/// framing, while changing only the logical owner and native-binding tag. This
+/// codec alone supplies no physical source, publication or import authority.
+pub(crate) fn reidentified_generation_bytes(
+    bytes: &[u8],
+    old: uuid::Uuid,
+    new: uuid::Uuid,
+    preparation: &crate::access::Preparation,
+) -> Result<crate::store::managed_history::Bytes> {
+    use crate::store::{cold::ColdBudget, managed_history};
+    preparation.check()?;
+    if old.is_nil() || new.is_nil() {
+        return Err(Error::invalid(
+            "generation identity transformation has a nil owner",
+        ));
+    }
+    if bytes.len() > managed_history::MAX_BYTES {
+        return Err(preparation.exhausted());
+    }
+    let _canonical = preparation.reserve(
+        (bytes.len() as u64)
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(4096))
+            .ok_or_else(|| preparation.exhausted())?,
+    )?;
+    let allowance = preparation.room();
+    let mut held = preparation.reserve(allowance)?;
+    let options = crate::history::HistoryOptions {
+        cancel: Some(preparation.control().cancel.flag()),
+        deadline: preparation.control().deadline,
+    };
+    let mut budget = ColdBudget::new(crate::history::ReadLimit {
+        options: &options,
+        memory: Some(allowance),
+        held: 0,
+    })?;
+    let parsed: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
+    let label = Path::new("original-import/commit.json");
+    check_gen_commit_value(label, &parsed.value)?;
+    let mut file: GenCommitFile = budget.value(parsed.value)?;
+    check_gen_binding(label, &file, bytes)?;
+    if file.dataset_id != old {
+        return Err(Error::Corrupt(
+            "original generation belongs to another physical source".into(),
+        ));
+    }
+    if let Some(binding) = &mut file.configuration_binding {
+        let publisher = binding
+            .configuration()
+            .map_or(old, |identity| identity.dataset_id());
+        binding.validate(publisher)?;
+        if let crate::history::ConfigurationBinding::Known { configuration } = *binding {
+            *binding = crate::history::ConfigurationBinding::ImportedUnbound {
+                source: configuration,
+            };
+        }
+    }
+    file.dataset_id = new;
+    held.release_to(budget.used());
+    preparation.check()?;
+    managed_history::encode_pretty(&file, preparation)
+}
+
+/// Rewrite only an already validated captured catalog header. The producer
+/// streams the unchanged record suffix from its same retained descriptor.
+pub(crate) fn reidentified_catalog_header(
+    header: &[u8; REC],
+    old: uuid::Uuid,
+    new: uuid::Uuid,
+) -> Result<[u8; REC]> {
+    if &header[..8] == MAGIC && header[8..12] != 1u32.to_le_bytes() {
+        return Err(Error::Unsupported(
+            "original catalog header has an unknown format".into(),
+        ));
+    }
+    let (owner, first) = decode_header(header)
+        .ok_or_else(|| Error::Corrupt("original catalog header is invalid".into()))?;
+    if old.is_nil() || new.is_nil() || owner != old {
+        return Err(Error::Corrupt(
+            "original catalog belongs to another source".into(),
+        ));
+    }
+    Ok(encode_header(new, first))
 }
 
 fn check_gen_binding(path: &Path, file: &GenCommitFile, bytes: &[u8]) -> Result<()> {
@@ -2360,5 +2503,252 @@ mod tests {
         let v = read();
         assert_eq!(v["minimumReader"], 5);
         assert_eq!(v["futureMember"], serde_json::json!({"a": 1}));
+    }
+    #[test]
+    fn controlled_generation_commit_reidentification_retains_binding_and_framing() {
+        use crate::{
+            access::Preparation,
+            history::{ConfigurationBinding, ConfigurationIdentity},
+            task::Control,
+        };
+        let old = uuid::Uuid::new_v4();
+        let new = uuid::Uuid::new_v4();
+        let identity = ConfigurationIdentity {
+            dataset_id: uuid::Uuid::new_v4(),
+            lineage_id: uuid::Uuid::new_v4(),
+            generation: crate::evidence::Sha256Digest::from_digest_bytes([7; 32]),
+        };
+        let commit = sample_commit(42);
+        let preparation = Preparation::new(Control::none(), 4 << 20).unwrap();
+        let room = preparation.room();
+        for binding in [
+            ConfigurationBinding::Known {
+                configuration: identity,
+            },
+            ConfigurationBinding::ImportedUnbound { source: identity },
+            ConfigurationBinding::LegacyUnbound,
+        ] {
+            let mut file = gen_commit_file(old, "compaction", &commit);
+            file.format = 2;
+            file.configuration_binding = Some(binding);
+            file.wal_strict_from = Some(crate::store::WAL_REC as u64 * 4);
+            let raw = serde_json::to_vec_pretty(&file).unwrap();
+            let before = raw.clone();
+            let result = reidentified_generation_bytes(&raw, old, new, &preparation).unwrap();
+            let decoded = parse_gen_commit(Path::new("diagnostic"), &result.value).unwrap();
+            assert_eq!(decoded.dataset_id, new);
+            assert_eq!(
+                decoded.wal_strict_from,
+                Some(crate::store::WAL_REC as u64 * 4)
+            );
+            assert_eq!(decoded.origin, "compaction");
+            assert_eq!(
+                decode_gen_commit_file(decoded, Path::new("diagnostic"))
+                    .unwrap()
+                    .commit,
+                commit
+            );
+            let decoded = parse_gen_commit(Path::new("diagnostic"), &result.value).unwrap();
+            let expected = match binding {
+                ConfigurationBinding::Known { configuration } => {
+                    ConfigurationBinding::ImportedUnbound {
+                        source: configuration,
+                    }
+                }
+                other => other,
+            };
+            assert_eq!(decoded.configuration_binding, Some(expected));
+            assert_eq!(raw, before);
+            drop(result);
+            assert_eq!(preparation.room(), room);
+        }
+    }
+
+    #[test]
+    fn controlled_generation_commit_reidentification_preserves_legacy_additions_and_catalog_suffix_contract()
+     {
+        use crate::{access::Preparation, task::Control};
+        let old = uuid::Uuid::new_v4();
+        let new = uuid::Uuid::new_v4();
+        let mut file = gen_commit_file(old, "baseline", &sample_commit(3));
+        file.wal_strict_from = Some(crate::store::WAL_REC as u64 * 32);
+        file.extra
+            .insert("laterRoot".to_owned(), serde_json::json!({"x":[1,2,3]}));
+        file.commit
+            .extra
+            .insert("laterCommit".to_owned(), serde_json::json!("retained"));
+        let raw = serde_json::to_vec(&file).unwrap();
+        let preparation = Preparation::new(Control::none(), 4 << 20).unwrap();
+        let room = preparation.room();
+        let output = reidentified_generation_bytes(&raw, old, new, &preparation).unwrap();
+        let parsed = parse_gen_commit(Path::new("diagnostic"), &output.value).unwrap();
+        assert_eq!(parsed.format, 1);
+        assert_eq!(parsed.configuration_binding, None);
+        assert_eq!(
+            parsed.wal_strict_from,
+            Some(crate::store::WAL_REC as u64 * 32)
+        );
+        assert_eq!(parsed.extra, file.extra);
+        assert_eq!(parsed.commit.extra, file.commit.extra);
+        assert_eq!(parsed.origin, file.origin);
+        let header = encode_header(old, 3);
+        let changed = reidentified_catalog_header(&header, old, new).unwrap();
+        assert_eq!(decode_header(&changed), Some((new, 3)));
+        assert_eq!(decode_header(&header), Some((old, 3)));
+        assert!(reidentified_catalog_header(&header, uuid::Uuid::new_v4(), new).is_err());
+        let mut invalid = header;
+        invalid[63] ^= 1;
+        assert!(reidentified_catalog_header(&invalid, old, new).is_err());
+        drop(output);
+        assert_eq!(preparation.room(), room);
+    }
+
+    #[test]
+    fn controlled_generation_commit_reidentification_refuses_before_delivery_and_keeps_credit() {
+        use crate::{access::Preparation, task::Control};
+        let old = uuid::Uuid::new_v4();
+        let new = uuid::Uuid::new_v4();
+        let raw = gen_commit_bytes_with_binding(
+            old,
+            "create",
+            &sample_commit(0),
+            crate::history::ConfigurationBinding::LegacyUnbound,
+        );
+        let preparation = Preparation::new(Control::none(), 4 << 20).unwrap();
+        let room = preparation.room();
+        assert!(
+            reidentified_generation_bytes(&raw, uuid::Uuid::new_v4(), new, &preparation).is_err()
+        );
+        assert!(reidentified_generation_bytes(&raw, old, uuid::Uuid::nil(), &preparation).is_err());
+        let mut future: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        future["format"] = 99.into();
+        future["commit"] = false.into();
+        assert!(matches!(
+            reidentified_generation_bytes(
+                &serde_json::to_vec(&future).unwrap(),
+                old,
+                new,
+                &preparation
+            ),
+            Err(Error::Unsupported(_))
+        ));
+        let mut noncanonical = raw.clone();
+        noncanonical.push(b'\n');
+        assert!(reidentified_generation_bytes(&noncanonical, old, new, &preparation).is_err());
+        assert_eq!(preparation.room(), room);
+        let control = Control::none();
+        let cancelled = Preparation::new(control.clone(), 4 << 20).unwrap();
+        let available = cancelled.room();
+        control.cancel.cancel();
+        assert!(matches!(
+            reidentified_generation_bytes(&raw, old, new, &cancelled),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(cancelled.room(), available);
+        let small = Preparation::new(Control::none(), 4096).unwrap();
+        let available = small.room();
+        assert!(matches!(
+            reidentified_generation_bytes(&raw, old, new, &small),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(small.room(), available);
+    }
+    #[test]
+    fn controlled_dataset_reidentification_keeps_original_extensions_and_reader_barrier() {
+        use crate::{access::Preparation, task::Control};
+        let old = uuid::Uuid::new_v4();
+        let new = uuid::Uuid::new_v4();
+        let preparation = Preparation::new(Control::none(), 4 << 20).unwrap();
+        let room = preparation.room();
+        let mut original = parse_dataset(&dataset_file_bytes(old, "restore", 1000)).unwrap();
+        original.minimum_reader = 8;
+        original.extra.insert(
+            "futureMetadata".to_owned(),
+            serde_json::json!({"retained":[1,2,3]}),
+        );
+        original.restored_from = Some(RestoredFrom {
+            repository: "old-repository".to_owned(),
+            backup: "old-backup".to_owned(),
+            dataset_id: uuid::Uuid::new_v4(),
+            seq: 7,
+        });
+        let raw = serde_json::to_vec_pretty(&original).unwrap();
+        let before = raw.clone();
+        for destination in [new, old] {
+            let output =
+                reidentified_dataset_bytes(&raw, old, destination, 42, 2000, &preparation).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&output.value).unwrap();
+            assert!(matches!(
+                check_dataset_value_as(&value, 8),
+                Err(Error::Unsupported(_))
+            ));
+            check_dataset_value_as(&value, 9).unwrap();
+            let found: DatasetFile = serde_json::from_slice(&output.value).unwrap();
+            assert_eq!(found.id, destination);
+            assert_eq!(found.minimum_reader, 9);
+            assert_eq!(found.format, 1);
+            assert_eq!(found.origin, "restore");
+            assert_eq!(found.created, rfc3339_ms(2000));
+            assert_eq!(found.forked_from, Some(ForkedFrom { id: old, seq: 42 }));
+            assert_eq!(found.restored_from, original.restored_from);
+            assert_eq!(found.extra, original.extra);
+            assert_eq!(
+                found.written_by.as_deref(),
+                Some(crate::formats::SPARKLES_VERSION)
+            );
+            drop(output);
+            assert_eq!(preparation.room(), room);
+        }
+        assert_eq!(raw, before);
+    }
+
+    #[test]
+    fn controlled_dataset_reidentification_refuses_source_versions_owner_and_receiving_controls() {
+        use crate::{access::Preparation, task::Control};
+        let old = uuid::Uuid::new_v4();
+        let new = uuid::Uuid::new_v4();
+        let raw = dataset_file_bytes(old, "create", 0);
+        let preparation = Preparation::new(Control::none(), 4 << 20).unwrap();
+        let room = preparation.room();
+        assert!(
+            reidentified_dataset_bytes(&raw, uuid::Uuid::new_v4(), new, 0, 0, &preparation)
+                .is_err()
+        );
+        assert!(
+            reidentified_dataset_bytes(&raw, old, uuid::Uuid::nil(), 0, 0, &preparation).is_err()
+        );
+        for future in [
+            serde_json::json!({"format":2,"id":false}),
+            serde_json::json!({"format":1,"minimumReader":u64::MAX,"id":false}),
+        ] {
+            assert!(matches!(
+                reidentified_dataset_bytes(
+                    &serde_json::to_vec(&future).unwrap(),
+                    old,
+                    new,
+                    0,
+                    0,
+                    &preparation
+                ),
+                Err(Error::Unsupported(_))
+            ));
+        }
+        assert_eq!(preparation.room(), room);
+        let control = Control::none();
+        let cancelled = Preparation::new(control.clone(), 4 << 20).unwrap();
+        let room = cancelled.room();
+        control.cancel.cancel();
+        assert!(matches!(
+            reidentified_dataset_bytes(&raw, old, new, 0, 0, &cancelled),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(cancelled.room(), room);
+        let small = Preparation::new(Control::none(), 4096).unwrap();
+        let room = small.room();
+        assert!(matches!(
+            reidentified_dataset_bytes(&raw, old, new, 0, 0, &small),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(small.room(), room);
     }
 }

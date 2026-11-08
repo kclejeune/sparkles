@@ -2195,6 +2195,12 @@ impl Store {
             commit::check_dataset_compatibility(root)?;
             crate::formats::check_dataset_dir(root)?;
         }
+        let configuration_preparation = managed_history::administrative_preparation()?;
+        if ctx.is_none() {
+            // Pin import selection before generation creation, replay, recovery
+            // or catalog changes. Branches share this actual family's receipt.
+            family.select_opening_origin(root, &lock, &configuration_preparation)?;
+        }
         let current_file = root.join("CURRENT");
         if !current_file.exists() {
             if matches!(mode, OpenMode::Existing(_)) {
@@ -2335,7 +2341,6 @@ impl Store {
                     (c, true, crate::history::ConfigurationBinding::LegacyUnbound)
                 }
             };
-        let configuration_preparation = managed_history::administrative_preparation()?;
         let configuration_root = if ctx.is_some() {
             link::dataset_root_of(root)?
         } else {

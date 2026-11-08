@@ -866,3 +866,51 @@ fn copied_primary_validation_keeps_real_pre_metadata_wal_upgrade() {
     assert_eq!(upgraded.snapshot().len(), 1);
     assert!(upgraded.evidence_view(&At::Head, &preparation()).is_err());
 }
+
+#[test]
+fn retained_original_header_reauthenticates_its_target_in_each_operation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("dataset");
+    drop(Store::open(&root, StoreOptions::default()).unwrap());
+    let preparation = preparation();
+    crate::migrate::activate_configuration_history(&root, false, &preparation).unwrap();
+    let store = Store::open(&root, StoreOptions::default()).unwrap();
+    update(&store, "actually-admitted");
+    let seq = store.head_commit().seq;
+    let binding = store.configuration_binding_at(seq, &preparation).unwrap();
+    let identity = match binding {
+        ConfigurationBinding::Known { configuration } => configuration,
+        other => panic!("real publication is not bound: {other:?}"),
+    };
+    let state = store.managed_state_shared();
+    let mut first = primary::Header::from_state(
+        &root,
+        store.owner_dataset_id(),
+        store.dataset_id,
+        None,
+        state.as_deref(),
+        &preparation,
+    )
+    .unwrap();
+    first.generation(&root, &preparation, seq, binding).unwrap();
+    let mut next_operation = first.fresh();
+    let digest = identity.generation.to_string();
+    let target = root
+        .join("evidence-history")
+        .join(identity.lineage_id.to_string())
+        .join("generations")
+        .join(format!("{}.json", digest.strip_prefix("sha256:").unwrap()));
+    let actual_bytes = std::fs::read(&target).unwrap();
+    std::fs::remove_file(&target).unwrap();
+    assert!(
+        next_operation
+            .generation(&root, &preparation, seq, binding)
+            .is_err(),
+        "a previous operation's successful target lookup cannot certify a missing publication"
+    );
+    std::fs::write(&target, &actual_bytes).unwrap();
+    let mut restored_operation = first.fresh();
+    restored_operation
+        .generation(&root, &preparation, seq, binding)
+        .unwrap();
+}

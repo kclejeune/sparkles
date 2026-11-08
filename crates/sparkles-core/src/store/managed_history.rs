@@ -503,6 +503,17 @@ pub(crate) fn decode<T: DeserializeOwned + Serialize>(
     bytes: &[u8],
     preparation: &Preparation,
 ) -> Result<Owned<T>> {
+    decode_with_version(bytes, preparation, version)
+}
+
+/// Keep each document type's version refusal ahead of body decoding. This
+/// factors only the canonical admitted codec; it supplies no publication or
+/// source authority. Existing generation/coverage callers still accept only1.
+pub(crate) fn decode_with_version<T: DeserializeOwned + Serialize>(
+    bytes: &[u8],
+    preparation: &Preparation,
+    validate_version: fn(u32) -> Result<()>,
+) -> Result<Owned<T>> {
     if bytes.len() > MAX_BYTES {
         return Err(preparation.exhausted());
     }
@@ -524,7 +535,7 @@ pub(crate) fn decode<T: DeserializeOwned + Serialize>(
     if let Some(error) = header_reader.failure {
         return Err(error);
     }
-    version(
+    validate_version(
         header
             .map_err(|_| unavailable("configuration format is not a version"))?
             .format,

@@ -11,7 +11,8 @@ mod validation;
 pub(super) use imported::Identities as OriginalIdentities;
 pub(super) use imported::{
     MAX_MEMBERS as SOURCE_MEMBER_LIMIT, SourceFile as SourceFilePin, SourceManifest,
-    encode_native_descriptor, original_branch_table_document, original_history_document,
+    Sources as OriginalSources, encode_first_destination_origin, encode_native_descriptor,
+    opening_origin_selection, original_branch_table_document, original_history_document,
     source_member as source_metadata_member, verify_staged_native_source,
 };
 
@@ -436,3 +437,6 @@ impl Store {
         Ok(binding)
     }
 }
+
+#[cfg(test)]
+pub(super) use imported::{canonical_descriptor_test_value, canonical_origin_test_value};

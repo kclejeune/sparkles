@@ -339,6 +339,25 @@ pub(crate) fn write_initial_table(root: &Path, id: uuid::Uuid, next_ordinal: u64
     write_table(root, &t)
 }
 
+/// Bounded initial table for a closed, unpublished imported destination. No
+/// old branch entries become live members of the new family.
+pub(super) fn initial_import_table_bytes(
+    id: uuid::Uuid,
+    next_ordinal: u32,
+    preparation: &crate::access::Preparation,
+) -> Result<super::managed_history::Bytes> {
+    preparation.check()?;
+    if id.is_nil() || !(1..=u16::MAX as u32 + 1).contains(&next_ordinal) {
+        return Err(Error::invalid(
+            "invalid imported destination blank-node range",
+        ));
+    }
+    let _temporary = preparation.reserve(4096)?;
+    let mut table = TableFile::new(id);
+    table.next_ordinal = next_ordinal;
+    super::managed_history::encode_pretty(&table, preparation)
+}
+
 /// The branch table of a database directory, read without opening it (`None` when the
 /// dataset has no branches).
 pub fn read_branch_table(root: &Path) -> Result<Option<serde_json::Value>> {

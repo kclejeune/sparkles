@@ -54,6 +54,7 @@ pub const FILE: &str = "annotations.bin";
 const MAGIC: &[u8; 8] = b"SPKANNO\0";
 const FORMAT: u32 = 1;
 const HEADER: usize = 32;
+pub(crate) const REIDENTIFY_HEADER_BYTES: usize = HEADER;
 const FLAG_DIGESTS: u32 = 1;
 const REC_MESSAGE: u8 = 1;
 const REC_DIGEST: u8 = 2;
@@ -685,6 +686,28 @@ pub(crate) fn reidentify(root: &Path, old: uuid::Uuid, new: uuid::Uuid) -> Resul
         crate::store::write_atomic(&path, &buf)?;
     }
     Ok(())
+}
+
+/// Pure fixed-header transform for the genuine streaming destination producer.
+/// All records stay on its retained captured descriptor and are copied once.
+pub(crate) fn reidentified_header(
+    header: &[u8; REIDENTIFY_HEADER_BYTES],
+    old: uuid::Uuid,
+    new: uuid::Uuid,
+) -> Result<[u8; REIDENTIFY_HEADER_BYTES]> {
+    if &header[..8] == MAGIC && header[8..12] != FORMAT.to_le_bytes() {
+        return Err(Error::Unsupported(
+            "original annotations have an unknown format".into(),
+        ));
+    }
+    let (owner, flags) = decode_header(header)
+        .ok_or_else(|| Error::Corrupt("original annotation header is invalid".into()))?;
+    if old.is_nil() || new.is_nil() || owner != old {
+        return Err(Error::Corrupt(
+            "original annotations belong to another source".into(),
+        ));
+    }
+    Ok(encode_header(new, flags))
 }
 
 fn encode_header(id: uuid::Uuid, flags: u32) -> [u8; HEADER] {
@@ -1392,5 +1415,20 @@ mod tests {
         let d3 = change_digest(id, &c, Some(&d1), vec![], vec![l("<a> <b> <c> .")]);
         let d4 = change_digest(id, &c, None, vec![], vec![l("<a> <b> <c> .")]);
         assert_ne!(d3, d4);
+    }
+    #[test]
+    fn imported_annotation_header_preserves_flags_and_rejects_foreign_or_malformed_source() {
+        let old = uuid::Uuid::new_v4();
+        let new = uuid::Uuid::new_v4();
+        let header = encode_header(old, FLAG_DIGESTS | 8);
+        let output = reidentified_header(&header, old, new).unwrap();
+        assert_eq!(decode_header(&output), Some((new, FLAG_DIGESTS | 8)));
+        assert_eq!(&output[..16], &header[..16]);
+        assert_eq!(decode_header(&header), Some((old, FLAG_DIGESTS | 8)));
+        assert!(reidentified_header(&header, uuid::Uuid::new_v4(), new).is_err());
+        assert!(reidentified_header(&header, old, uuid::Uuid::nil()).is_err());
+        let mut unknown = header;
+        unknown[8..12].copy_from_slice(&99u32.to_le_bytes());
+        assert!(reidentified_header(&unknown, old, new).is_err());
     }
 }

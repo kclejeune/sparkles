@@ -523,12 +523,12 @@ fn decode_file_controlled(
     checked_file(f, bytes, dataset_id, &|| budget.check())
 }
 
-fn checked_file(
-    f: HistoryFile,
+fn checked_document(
+    f: &HistoryFile,
     bytes: &[u8],
     dataset_id: uuid::Uuid,
     check: &dyn Fn() -> Result<()>,
-) -> Result<HistoryConfig> {
+) -> Result<()> {
     check()?;
     if f.format == 1 && f.snapshots.iter().any(|pin| pin.configuration.is_some()) {
         return Err(Error::Corrupt(
@@ -577,6 +577,16 @@ fn checked_file(
             f.dataset_id
         )));
     }
+    check()
+}
+
+fn checked_file(
+    f: HistoryFile,
+    bytes: &[u8],
+    dataset_id: uuid::Uuid,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<HistoryConfig> {
+    checked_document(&f, bytes, dataset_id, check)?;
     let mut pins = BTreeMap::new();
     for p in f.snapshots {
         check()?;
@@ -1812,10 +1822,20 @@ mod tests {
     #[test]
     fn a_newer_history_file_is_unsupported() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("history.json"), br#"{"format": 2}"#).unwrap();
+        std::fs::write(dir.path().join("history.json"), br#"{"format": 3}"#).unwrap();
         let e = read_file(dir.path(), uuid::Uuid::nil())
             .err()
             .expect("refused");
         assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
+    }
+
+    #[test]
+    fn a_known_history_file_still_requires_its_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("history.json"), br#"{"format": 2}"#).unwrap();
+        let error = read_file(dir.path(), uuid::Uuid::nil())
+            .err()
+            .expect("refused");
+        assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
     }
 }

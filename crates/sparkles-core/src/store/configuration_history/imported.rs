@@ -1,6 +1,9 @@
 //! Closed imported-origin metadata. Decoding establishes syntax and ownership,
 //! never permission to replay a foreign seal. Physical/source proofs are separate.
 
+mod closure;
+mod context;
+mod destination;
 mod documents;
 mod identities;
 
@@ -39,6 +42,7 @@ fn original_document(
 
 mod physical;
 
+pub(in crate::store) use closure::Sources;
 pub(in crate::store) use identities::Identities;
 
 use super::*;
@@ -50,6 +54,78 @@ use uuid::Uuid;
 const FORMAT: u32 = 1;
 pub(in crate::store) const MAX_MEMBERS: usize = 4096;
 const ROOT_FILE: &str = "evidence-history/origin.json";
+
+/// Select only the small origin root. The genuine Family opening binds this
+/// result under its actual process lock; no physical import proof follows.
+pub(in crate::store) fn opening_origin_selection(
+    root: &Path,
+    preparation: &Preparation,
+) -> Result<Option<Sha256Digest>> {
+    preparation.check()?;
+    let _paths = preparation.reserve(
+        (root.as_os_str().len() as u64)
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(4096))
+            .ok_or_else(|| preparation.exhausted())?,
+    )?;
+    let history = root.join("evidence-history");
+    match std::fs::symlink_metadata(&history) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            preparation.check()?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(managed_history::unavailable(
+                "import history is not an ordinary directory",
+            ));
+        }
+    }
+    // Ordinary native/legacy stores need no imported platform reader. If an
+    // origin exists, its bytes and identity below come from anchored handles.
+    match std::fs::symlink_metadata(history.join("origin.json")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(history.join("imports")) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    preparation.check()?;
+                    Ok(None)
+                }
+                Err(error) => Err(error.into()),
+                Ok(_) => Err(managed_history::unavailable(
+                    "prior imports survive without their origin root",
+                )),
+            };
+        }
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let family = documents::Opened::root(root, preparation)?;
+    let encoded = family
+        .child("evidence-history", true, preparation)?
+        .child("origin.json", false, preparation)?
+        .bytes(None, preparation)?;
+    let origin = Origin::decode(&encoded.value, preparation)?;
+    if origin.value.format != FORMAT {
+        // The v2 codec is still private source work. Keep the real opening gate
+        // closed until its producer and every physical consumer are wired and
+        // the required dataset/backup reader boundary is enabled together.
+        return Err(Error::Unsupported(
+            "destination import publication is not enabled by this reader".into(),
+        ));
+    }
+    let identity = family
+        .child("dataset.json", false, preparation)?
+        .bytes(None, preparation)?;
+    if origin.value.dataset_id != documents::dataset_id(&identity.value, preparation)? {
+        return Err(managed_history::unavailable(
+            "opening origin belongs to another family",
+        ));
+    }
+    let digest = Sha256Digest::of_bytes(&encoded.value, preparation.control())?;
+    preparation.check()?;
+    Ok(Some(digest))
+}
 
 /// Physical storage is independent of the family's mutable identity. Main stays
 /// at the root across identity changes; a branch directory has its own UUID.
@@ -82,6 +158,8 @@ struct RangeImport {
 struct Origin {
     format: u32,
     dataset_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    destination: Option<destination::Publication>,
     sources: Vec<Sha256Digest>,
     bases: Vec<BaseImport>,
     ranges: Vec<RangeImport>,
@@ -142,6 +220,14 @@ impl SourceManifest {
         Ok(Self(descriptor))
     }
 
+    pub(in crate::store) fn member_pin(&self, path: &str) -> Option<(u64, Sha256Digest)> {
+        self.0
+            .value
+            .files
+            .get(path)
+            .map(|pin| (pin.bytes, pin.sha256))
+    }
+
     pub(in crate::store) fn member_count(&self) -> usize {
         self.0.value.files.len()
     }
@@ -159,6 +245,61 @@ impl SourceManifest {
     }
 }
 
+/// Syntax-only first-source destination metadata. The closed producer retains
+/// the genuine source capture and its RDF lease separately from these bytes.
+pub(in crate::store) fn encode_first_destination_origin(
+    descriptor: &[u8],
+    source: Sha256Digest,
+    genesis: ConfigurationIdentity,
+    coverage: Sha256Digest,
+    preparation: &Preparation,
+) -> Result<managed_history::Bytes> {
+    let selected = SourceManifest::decode_native(descriptor, preparation)?;
+    if Sha256Digest::of_bytes(descriptor, preparation.control())? != source {
+        return Err(managed_history::unavailable(
+            "destination source descriptor changed",
+        ));
+    }
+    let _structure = preparation.reserve(8192)?;
+    let original =
+        selected.0.value.roots.get("main").ok_or_else(|| {
+            managed_history::unavailable("first destination source has no main root")
+        })?;
+    let location = || Location {
+        branch: None,
+        generation: original.generation.clone(),
+    };
+    let origin = Origin {
+        format: 2,
+        dataset_id: genesis.dataset_id,
+        destination: Some(destination::Publication {
+            genesis,
+            coverage,
+            creation_commit: None,
+        }),
+        sources: vec![source],
+        bases: vec![BaseImport {
+            local: location(),
+            source,
+            original: location(),
+        }],
+        ranges: selected
+            .0
+            .value
+            .intervals
+            .iter()
+            .enumerate()
+            .map(|(index, _)| RangeImport {
+                local: location(),
+                source,
+                interval: index as u32,
+            })
+            .collect(),
+    };
+    origin.validate(preparation)?;
+    managed_history::encode(&origin, preparation)
+}
+
 pub(in crate::store) fn verify_staged_native_source(
     directory: &Path,
     source: Sha256Digest,
@@ -171,6 +312,15 @@ fn version(format: u32) -> Result<()> {
     if format != FORMAT {
         return Err(Error::Unsupported(format!(
             "configuration import format {format}; this reader supports {FORMAT}"
+        )));
+    }
+    Ok(())
+}
+
+fn origin_version(format: u32) -> Result<()> {
+    if !matches!(format, 1 | 2) {
+        return Err(Error::Unsupported(format!(
+            "configuration import origin format {format}; this codec reads1 and2"
         )));
     }
     Ok(())
@@ -284,7 +434,16 @@ impl Location {
 impl Origin {
     fn validate(&self, preparation: &Preparation) -> Result<()> {
         preparation.check()?;
-        version(self.format)?;
+        origin_version(self.format)?;
+        match (self.format, &self.destination) {
+            (1, None) => {}
+            (2, Some(destination)) => destination.validate(self.dataset_id)?,
+            _ => {
+                return Err(managed_history::unavailable(
+                    "import origin is missing its versioned destination publication",
+                ));
+            }
+        }
         if self.dataset_id.is_nil()
             || self.sources.is_empty()
             || !sorted_sources(&self.sources)
@@ -331,7 +490,8 @@ impl Origin {
     }
 
     fn decode(bytes: &[u8], preparation: &Preparation) -> Result<managed_history::Owned<Self>> {
-        let owned: managed_history::Owned<Self> = managed_history::decode(bytes, preparation)?;
+        let owned: managed_history::Owned<Self> =
+            managed_history::decode_with_version(bytes, preparation, origin_version)?;
         owned.value.validate(preparation)?;
         Ok(owned)
     }
@@ -503,6 +663,7 @@ mod tests {
         Origin {
             format: FORMAT,
             dataset_id: Uuid::from_u128(3),
+            destination: None,
             sources: vec![digest(1)],
             bases: Vec::new(),
             ranges: Vec::new(),
@@ -666,4 +827,16 @@ mod tests {
         source.files.get_mut("dataset.json").unwrap().bytes = u64::MAX;
         assert!(source.validate(&preparation).is_err());
     }
+}
+
+#[cfg(test)]
+pub(in crate::store) fn canonical_origin_test_value(value: serde_json::Value) -> Vec<u8> {
+    let origin: Origin = serde_json::from_value(value).unwrap();
+    serde_json::to_vec(&origin).unwrap()
+}
+
+#[cfg(test)]
+pub(in crate::store) fn canonical_descriptor_test_value(value: serde_json::Value) -> Vec<u8> {
+    let descriptor: Descriptor = serde_json::from_value(value).unwrap();
+    serde_json::to_vec(&descriptor).unwrap()
 }

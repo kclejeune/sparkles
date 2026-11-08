@@ -164,6 +164,7 @@ impl Candidate {
         }
         let origin = Origin {
             format: FORMAT,
+            destination: None,
             dataset_id: crate::commit::read_dataset_file(&self.destination)
                 .unwrap()
                 .unwrap(),
