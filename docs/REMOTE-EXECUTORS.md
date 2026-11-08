@@ -104,6 +104,14 @@ consumer pipes fail within that bound, and every terminal outcome retires the ex
 owned local CLI process group. Remote native jobs remain owned by their named units
 and require their separate verified closure.
 
+Teardown of a local CLI process group has a fixed five-second window that an
+interrupt never resets. Ctrl-C during teardown is counted while TERM, KILL, reaping
+and the empty-group check finish, and the pipes close even when closure stays
+unconfirmed. A transfer error stays the reported failure and carries the interrupt
+count. A command that would otherwise have returned is cancelled with
+`KeyboardInterrupt` once teardown ends. An unconfirmed closure after a zero exit is
+refused rather than reported as success.
+
 ## Source, results and cleanup
 
 Query and write commands keep the current worker scripts, A/B order, compiler checks,

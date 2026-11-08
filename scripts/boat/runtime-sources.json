@@ -16,9 +16,9 @@
       "sha256": "e25e6f2070a71461366145e3a4f126e5f46a7bfa97334ed56e074622eec18b08"
     },
     "controller.py": {
-      "bytes": 35439,
+      "bytes": 35706,
       "mode": 420,
-      "sha256": "ec24acb7597ba1f51e9445bd38ea874885c3c699b471bd41a728015fff56f888"
+      "sha256": "30577dd4f282364db180991a1b258dedf99dc19cc373f57b810e7c4283c27d18"
     },
     "controls.py": {
       "bytes": 54649,
@@ -39,6 +39,11 @@
       "bytes": 11030,
       "mode": 420,
       "sha256": "96bfcf154da8ca9a67e4c887f191604f7bf5aee4d6f9954a1f9a657d8de13e77"
+    },
+    "owned_group.py": {
+      "bytes": 5785,
+      "mode": 420,
+      "sha256": "800c5d0235f10eaffa36b98745f7b50f4fcccbef7f5441ff655391c7270c39a5"
     },
     "profile.FALSE.json": {
       "bytes": 1786,

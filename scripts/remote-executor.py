@@ -21,6 +21,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'boat'))
 import job_environment as boat_environment
+import owned_group
 
 SSH = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
        '-o', 'ServerAliveInterval=30']
@@ -420,25 +421,29 @@ def exchange(argv, output, limit=MAX_ARCHIVE, timeout=300, deadline=None, source
     remaining(deadline)
     process = subprocess.Popen(argv, stdin=subprocess.PIPE if source is not None else subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-    finished = False
     failure = None
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
-    selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
-    pipe_source=False;source_fd=None;source_blocking=None;source_eof=False
-    if source is not None:
-        os.set_blocking(process.stdin.fileno(), False)
-        try:
-            source_fd=source.fileno();kind=os.fstat(source_fd).st_mode
-            pipe_source=stat.S_ISFIFO(kind)or stat.S_ISSOCK(kind)
-        except (AttributeError,OSError):pass
-        if pipe_source:
-            source_blocking=os.get_blocking(source_fd);os.set_blocking(source_fd,False)
-            selector.register(source_fd,selectors.EVENT_READ,'source')
-        else:selector.register(process.stdin,selectors.EVENT_WRITE,'stdin')
-    total = errors = sent = 0
-    pending = b''
+    selector = None
+    source_fd=None;pipe_source=False;source_blocking=None
+    def restore_source():
+        if source_fd is not None and pipe_source and source_blocking is not None:
+            os.set_blocking(source_fd,source_blocking)
     try:
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
+        selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
+        source_eof=False
+        if source is not None:
+            os.set_blocking(process.stdin.fileno(), False)
+            try:
+                source_fd=source.fileno();kind=os.fstat(source_fd).st_mode
+                pipe_source=stat.S_ISFIFO(kind)or stat.S_ISSOCK(kind)
+            except (AttributeError,OSError):pass
+            if pipe_source:
+                source_blocking=os.get_blocking(source_fd);os.set_blocking(source_fd,False)
+                selector.register(source_fd,selectors.EVENT_READ,'source')
+            else:selector.register(process.stdin,selectors.EVENT_WRITE,'stdin')
+        total = errors = sent = 0
+        pending = b''
         while selector.get_map():
             left = remaining(deadline)
             for key, _ in selector.select(min(left, 0.2)):
@@ -476,7 +481,6 @@ def exchange(argv, output, limit=MAX_ARCHIVE, timeout=300, deadline=None, source
                         if errors > stderr_limit:fail('transport stderr bound exceeded')
                         if stderr_output is not None:write_output(stderr_output,block,deadline)
         code = process.wait(timeout=remaining(deadline))
-        finished = code == 0
         return code
     except BaseException as error:
         failure = error
@@ -485,41 +489,27 @@ def exchange(argv, output, limit=MAX_ARCHIVE, timeout=300, deadline=None, source
             error.native_exit = code
         raise
     finally:
-        selector.close()
-        if source_fd is not None and pipe_source and source_blocking is not None:
-            os.set_blocking(source_fd,source_blocking)
-        cleanup=[]
-        cleanup_end=time.monotonic()+5
-        # A zero-exit leader is not proof that its invocation is empty.
-        for sig,grace in ((signal.SIGTERM,2),(signal.SIGKILL,3)):
-            try:os.killpg(process.pid,sig)
-            except ProcessLookupError:pass
-            except OSError as problem:cleanup.append(type(problem).__name__)
-            try:process.wait(timeout=max(0.001,min(grace,cleanup_end-time.monotonic())))
-            except subprocess.TimeoutExpired:
-                if sig==signal.SIGKILL:cleanup.append('transport leader closure unconfirmed')
-        while True:
-            # Reap only children in this invocation's group when this process is
-            # their parent/subreaper. Otherwise the system owner must reap them.
-            try:
-                while os.waitpid(-process.pid,os.WNOHANG)[0]>0:pass
-            except ChildProcessError:pass
-            try:os.killpg(process.pid,0)
-            except ProcessLookupError:break
-            except OSError as problem:
-                cleanup.append(type(problem).__name__);break
-            if time.monotonic()>=cleanup_end:
-                cleanup.append('owned invocation closure unconfirmed');break
-            time.sleep(0.01)
+        # Teardown defers and counts SIGINT, closes every stream in its own
+        # finally and never resets its five-second window. The primary
+        # failure stays primary; a cancellation on an otherwise returned
+        # result propagates once closure has finished.
+        prelude=((selector.close,) if selector is not None else ())+(restore_source,)
+        cleanup,interrupted=owned_group.finish(process,(process.stdin,process.stdout,process.stderr),
+                                               prelude,subprocess.TimeoutExpired)
         if cleanup:
-            if failure is not None:failure.cleanup_errors=cleanup
             print('remote-executor: owned transport cleanup unresolved; original outcome retained',file=sys.stderr)
-            if process.returncode==0 and failure is None:
-                problem=ValueError('successful transport leader left unconfirmed invocation closure')
-                problem.native_exit=0;problem.cleanup_errors=cleanup
-                raise problem
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None and not stream.closed:stream.close()
+        if failure is not None:
+            if cleanup:failure.cleanup_errors=cleanup
+            if interrupted:failure.cleanup_interrupted=interrupted
+        elif interrupted:
+            cancelled=KeyboardInterrupt()
+            cancelled.native_exit=process.returncode;cancelled.cleanup_interrupted=interrupted
+            if cleanup:cancelled.cleanup_errors=cleanup
+            raise cancelled
+        elif cleanup and process.returncode==0:
+            problem=ValueError('successful transport leader left unconfirmed invocation closure')
+            problem.native_exit=0;problem.cleanup_errors=cleanup
+            raise problem
 
 
 def collect(argv, output, limit=MAX_ARCHIVE, timeout=300, deadline=None):
@@ -689,3 +679,7 @@ if __name__ == '__main__':
         if native is not None:detail+='; original transport exit '+str(native)
         print('remote-executor: '+detail,file=sys.stderr)
         sys.exit(native if type(native)is int and 0<native<=255 else 97)
+    except KeyboardInterrupt:
+        # Owned transport teardown has finished before cancellation reaches here.
+        print('remote-executor: interrupted',file=sys.stderr)
+        sys.exit(130)

@@ -5,56 +5,63 @@ import sys
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from common import *
 from qualified_worker_admission import make_admission
+import owned_group
 import argparse,fcntl,selectors,signal,subprocess,time,shlex,base64
 
 ROOT=Path(__file__).resolve().parent
 
 def bounded(argv,seconds,input_bytes=None):
-    """Only Root's real adapter calls this. Kill only this new process group."""
-    with subprocess.Popen(argv,stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,start_new_session=True) as child:
+    """Only Root's real adapter calls this. Kill only this new process group.
+
+    Teardown runs through owned_group.finish, which defers SIGINT, closes the pipes
+    and selector unconditionally and never extends its window. A cancellation
+    counted during teardown propagates as KeyboardInterrupt after closure, and a
+    primary exception keeps its type with the count attached.
+    """
+    child=subprocess.Popen(argv,stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,start_new_session=True)
+    select=None;failure=None
+    try:
         select=selectors.DefaultSelector();select.register(child.stdout,selectors.EVENT_READ)
         if input_bytes is not None:
             os.set_blocking(child.stdin.fileno(),False);select.register(child.stdin,selectors.EVENT_WRITE)
         data=bytearray();position=0;end=time.monotonic()+seconds;reason=None
-        try:
-            while select.get_map():
-                if time.monotonic()>=end:reason='timeout';break
-                for key,mask in select.select(min(0.2,max(0,end-time.monotonic()))):
-                    if mask&selectors.EVENT_WRITE:
-                        try:position+=os.write(key.fd,input_bytes[position:position+4096])
-                        except BrokenPipeError:position=len(input_bytes)
-                        if position==len(input_bytes):select.unregister(key.fileobj);child.stdin.close()
+        while select.get_map():
+            if time.monotonic()>=end:reason='timeout';break
+            for key,mask in select.select(min(0.2,max(0,end-time.monotonic()))):
+                if mask&selectors.EVENT_WRITE:
+                    try:position+=os.write(key.fd,input_bytes[position:position+4096])
+                    except BrokenPipeError:position=len(input_bytes)
+                    if position==len(input_bytes):select.unregister(key.fileobj);child.stdin.close()
+                else:
+                    part=os.read(key.fd,16384)
+                    if not part:select.unregister(key.fileobj)
                     else:
-                        part=os.read(key.fd,16384)
-                        if not part:select.unregister(key.fileobj)
-                        else:
-                            data.extend(part)
-                            if len(data)>1024*1024:reason='output_bound';break
-                if reason:break
-            if reason:return {'exit':None,'error':reason,'body':None}
-            try:code=child.wait(timeout=max(0.001,end-time.monotonic()))
+                        data.extend(part)
+                        if len(data)>1024*1024:reason='output_bound';break
+            if reason:break
+        if reason:result={'exit':None,'error':reason,'body':None}
+        else:
+            try:
+                code=child.wait(timeout=max(0.001,end-time.monotonic()))
+                try:body=json.loads(data)
+                except (ValueError,UnicodeError):body=None
+                result={'exit':code,'error':None,'body':body}
             except subprocess.TimeoutExpired:
-                return {'exit':None,'error':'timeout','body':None}
-            try:body=json.loads(data)
-            except (ValueError,UnicodeError):body=None
-            return {'exit':code,'error':None,'body':body}
-        finally:
-            select.close()
-            cleanup_end=time.monotonic()+5
-            for sig,grace in ((signal.SIGTERM,2),(signal.SIGKILL,3)):
-                try:os.killpg(child.pid,sig)
-                except ProcessLookupError:pass
-                try:child.wait(timeout=max(0.001,min(grace,cleanup_end-time.monotonic())))
-                except subprocess.TimeoutExpired:pass
-            while True:
-                try:
-                    while os.waitpid(-child.pid,os.WNOHANG)[0]>0:pass
-                except ChildProcessError:pass
-                try:os.killpg(child.pid,0)
-                except ProcessLookupError:break
-                if time.monotonic()>=cleanup_end:
-                    return {'exit':child.returncode,'error':'owned_invocation_closure_unknown','body':None}
-                time.sleep(0.01)
+                result={'exit':None,'error':'timeout','body':None}
+    except BaseException as error:
+        failure=error;raise
+    finally:
+        prelude=(select.close,) if select is not None else ()
+        problems,interrupted=owned_group.finish(child,(getattr(child,'stdin',None),getattr(child,'stdout',None)),prelude,subprocess.TimeoutExpired)
+        if failure is not None:
+            if problems:failure.cleanup_errors=problems
+            if interrupted:failure.cleanup_interrupted=interrupted
+        elif interrupted:
+            cancelled=KeyboardInterrupt();cancelled.cleanup_interrupted=interrupted
+            if problems:cancelled.cleanup_errors=problems
+            raise cancelled
+    if problems:return {'exit':getattr(child,'returncode',None),'error':'owned_invocation_closure_unknown','body':None}
+    return result
 
 
 def props(text):

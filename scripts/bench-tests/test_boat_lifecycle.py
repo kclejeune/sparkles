@@ -165,4 +165,80 @@ class Finish(unittest.TestCase):
             with patch.object(controller,'RealIO',return_value=io),self.assertRaises(controller.Refusal):
                 controller.finish_operation(f['operation'],seconds=2)
 
+class BoundedFinalizerInterrupt(unittest.TestCase):
+    def test_real_interrupts_finish_owned_closure_before_propagating(self):
+        from finalizer_interrupt import run
+        for leader,phase,count in (('timeout','term_wait',1),('timeout','kill',2),('0','term',1),('17','probe',1)):
+            with self.subTest(leader=leader,phase=phase,count=count):
+                outcome=run('bounded',phase,count,leader)
+                self.assertEqual(outcome['fired'],[phase],outcome)
+                self.assertEqual(outcome['exception'],'KeyboardInterrupt',outcome)
+                self.assertEqual(outcome['cleanup_interrupted'],count,outcome)
+                self.assertFalse(outcome['ready_alive_after_return'],outcome)
+                self.assertTrue(outcome['foreign_alive'],outcome)
+                self.assertTrue(all(outcome['streams_closed']),outcome)
+
+    def injected(self,stage,leader_code=0):
+        """Inject one KeyboardInterrupt at one teardown stage of fake children."""
+        import selectors,signal
+        events=[]
+        class Stream:
+            closed=False
+            def close(self):events.append('stdout_close');self.closed=True
+        class Child:
+            pid=123;stdin=None;stdout=Stream();returncode=leader_code
+            def wait(self,timeout=None):
+                events.append(('wait',timeout is not None and timeout>=1))
+                if stage=='wait' and len([e for e in events if e[0]=='wait'])==2:raise KeyboardInterrupt()
+                return leader_code
+            def poll(self):return leader_code
+        class Select:
+            def register(self,*a):pass
+            def get_map(self):return False
+            def close(self):events.append('selector_close')
+        def kill(pid,sig):
+            events.append(('killpg',pid,int(sig)))
+            if stage=='term' and sig==signal.SIGTERM:raise KeyboardInterrupt()
+            if stage=='kill' and sig==signal.SIGKILL:raise KeyboardInterrupt()
+            if sig==0:
+                if stage=='probe' and events.count(('killpg',123,0))==1:raise KeyboardInterrupt()
+                raise ProcessLookupError()
+        def waitpid(pid,flags):
+            events.append(('waitpid',pid));raise ChildProcessError()
+        with patch.object(controller.subprocess,'Popen',return_value=Child()),patch.object(controller.selectors,'DefaultSelector',return_value=Select()),patch.object(controller.os,'killpg',side_effect=kill),patch.object(controller.os,'waitpid',side_effect=waitpid):
+            with self.assertRaises(KeyboardInterrupt)as raised:controller.bounded(['inert'],1)
+        return events,raised.exception
+
+    def test_injected_interrupt_at_each_stage_still_reaches_kill_and_group_proof(self):
+        import signal
+        for stage in ('term','wait','kill','probe'):
+            for code in (0,17):
+                with self.subTest(stage=stage,code=code):
+                    events,error=self.injected(stage,code)
+                    self.assertIn(('killpg',123,int(signal.SIGTERM)),events)
+                    self.assertIn(('killpg',123,int(signal.SIGKILL)),events)
+                    self.assertIn(('killpg',123,0),events)
+                    self.assertIn(('waitpid',-123),events)
+                    self.assertIn('selector_close',events);self.assertIn('stdout_close',events)
+                    self.assertEqual(error.cleanup_interrupted,1)
+
+    def test_failed_prelude_and_custom_handler_keep_closure_and_redeliver_once(self):
+        import signal,sys,subprocess,owned_group
+        child=subprocess.Popen([sys.executable,'-c','import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);print(1,flush=True);time.sleep(5)'],stdout=subprocess.PIPE,start_new_session=True)
+        self.assertEqual(child.stdout.read(2),b'1\n');seen=[]
+        def failing():
+            signal.raise_signal(signal.SIGINT);raise OSError('restore failed')
+        previous=signal.signal(signal.SIGINT,lambda n,f:seen.append(n))
+        try:
+            problems,interrupted=owned_group.finish(child,(child.stdout,),(failing,),subprocess.TimeoutExpired)
+        finally:signal.signal(signal.SIGINT,previous)
+        self.assertEqual(child.returncode,-signal.SIGKILL);self.assertTrue(child.stdout.closed)
+        self.assertIn('prelude OSError',problems);self.assertEqual(interrupted,0);self.assertEqual(seen,[signal.SIGINT])
+
+    def test_missing_group_and_dead_leader_return_without_interrupt(self):
+        import sys
+        result=controller.bounded([sys.executable,'-c','print("{}")'],2)
+        self.assertEqual(result,{'exit':0,'error':None,'body':{}})
+
+
 if __name__=='__main__':unittest.main()

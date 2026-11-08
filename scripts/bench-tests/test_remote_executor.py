@@ -482,5 +482,53 @@ class JenaStaging(unittest.TestCase):
             self.assertEqual(exit_result.returncode,17)
 
 
+class FinalizerInterrupt(unittest.TestCase):
+    """Real SIGINTs reach the worker only after exchange teardown has started."""
+    def check(self,phase,count,leader):
+        from finalizer_interrupt import run
+        outcome=run('exchange',phase,count,leader)
+        self.assertEqual(outcome['fired'],[phase],outcome)
+        self.assertFalse(outcome['ready_alive_after_return'],outcome)
+        self.assertTrue(outcome['foreign_alive'],outcome)
+        self.assertEqual(outcome['streams_closed'],[True,True,True],outcome)
+        self.assertNotIn('returned',outcome,outcome)
+        return outcome
+
+    def test_first_and_repeated_interrupts_keep_the_timeout_primary(self):
+        for phase,count in (('term_wait',1),('term_wait',3),('kill',1),('probe',2)):
+            with self.subTest(phase=phase,count=count):
+                outcome=self.check(phase,count,'timeout')
+                self.assertEqual(outcome['exception'],'ValueError',outcome)
+                self.assertIn('deadline',outcome['message'])
+                self.assertEqual(outcome['cleanup_interrupted'],count,outcome)
+
+    def test_interrupt_after_leader_exit_is_propagated_after_descendant_closure(self):
+        for leader,phase in (('0','term'),('17','term'),('0','probe'),('17','kill')):
+            with self.subTest(leader=leader,phase=phase):
+                outcome=self.check(phase,1,leader)
+                self.assertEqual(outcome['exception'],'KeyboardInterrupt',outcome)
+                self.assertEqual(outcome['native_exit'],int(leader),outcome)
+                self.assertEqual(outcome['cleanup_interrupted'],1,outcome)
+
+    def test_uncertain_closure_closes_every_stream_and_keeps_numeric_exit(self):
+        real=os.killpg
+        def denied(pid,sig):
+            if sig==0:raise PermissionError()
+            return real(pid,sig)
+        for status in (0,17):
+            created=[];actual=subprocess.Popen
+            def launch(*a,**kw):
+                p=actual(*a,**kw);created.append(p);return p
+            with self.subTest(status=status),patch.object(RX.subprocess,'Popen',side_effect=launch),patch.object(RX.os,'killpg',side_effect=denied):
+                argv=['bash','-c','cat >/dev/null; exit '+str(status)]
+                if status:
+                    self.assertEqual(RX.exchange(argv,io.BytesIO(),source=io.BytesIO(b'x'),deadline=time.monotonic()+2),17)
+                else:
+                    with self.assertRaises(ValueError)as error:
+                        RX.exchange(argv,io.BytesIO(),source=io.BytesIO(b'x'),deadline=time.monotonic()+2)
+                    self.assertEqual(error.exception.native_exit,0);self.assertTrue(error.exception.cleanup_errors)
+                self.assertEqual([s.closed for s in (created[0].stdin,created[0].stdout,created[0].stderr)],[True,True,True])
+
+
 if __name__ == '__main__':
     unittest.main()
