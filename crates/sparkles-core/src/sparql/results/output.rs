@@ -11,6 +11,8 @@ pub(super) struct ScratchRow<'a> {
     // Rust destroys fields in declaration order: free all strings and nested terms
     // before their actual query/parent credit can notify a returning owner.
     pub(super) terms: Vec<Option<Term>>,
+    // The reused reconstruction buffer is freed before the credit that admitted it.
+    key: Vec<u8>,
     credit: OutputCredit<'a>,
     keys: OutputCredit<'a>,
     r: &'a QueryResult,
@@ -25,6 +27,7 @@ impl<'a> ScratchRow<'a> {
         credit.add(Self::slots(r, width)?)?;
         Ok(Self {
             terms: Vec::with_capacity(width),
+            key: Vec::new(),
             credit,
             keys: OutputCredit::new(&r.ctx),
             r,
@@ -47,8 +50,12 @@ impl<'a> ScratchRow<'a> {
         self.credit.reset();
         self.credit.add(Self::slots(r, r.table.width())?)?;
         for col in &r.table.cols {
-            self.terms
-                .push(r.ctx.output_term(col[index], &self.credit, &self.keys)?);
+            self.terms.push(r.ctx.output_term(
+                col[index],
+                &self.credit,
+                &self.keys,
+                &mut self.key,
+            )?);
         }
         r.ctx.check_memory_failure()?;
         Ok(&self.terms)

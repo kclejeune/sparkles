@@ -280,7 +280,12 @@ fn one_cell_fits_but_the_complete_row_refuses_before_publication_and_recovers() 
     let key_credit = crate::sparql::ctx::OutputCredit::new(&r.ctx);
     let cell = r
         .ctx
-        .output_term(r.table.cols[0][0], &cell_credit, &key_credit)
+        .output_term(
+            r.table.cols[0][0],
+            &cell_credit,
+            &key_credit,
+            &mut Vec::new(),
+        )
         .unwrap();
     assert!(matches!(&cell, Some(Term::Literal(v)) if v.value().len() == LONG));
     drop(cell);

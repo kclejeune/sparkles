@@ -1097,10 +1097,20 @@ impl Vocab {
         reserve: impl FnMut(usize) -> std::result::Result<(), E>,
         f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
+        self.get_sorted_checked_in(ids, &mut Vec::new(), reserve, f)
+    }
+
+    fn get_sorted_checked_in<E>(
+        &self,
+        ids: &[u64],
+        key: &mut Vec<u8>,
+        reserve: impl FnMut(usize) -> std::result::Result<(), E>,
+        f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
         if self.fsst.is_some() {
-            self.get_sorted_checked_as::<true, E>(ids, reserve, f)
+            self.get_sorted_checked_as::<true, E>(ids, key, reserve, f)
         } else {
-            self.get_sorted_checked_as::<false, E>(ids, reserve, f)
+            self.get_sorted_checked_as::<false, E>(ids, key, reserve, f)
         }
     }
 
@@ -1109,6 +1119,7 @@ impl Vocab {
     fn get_sorted_checked_as<const F: bool, E>(
         &self,
         ids: &[u64],
+        key: &mut Vec<u8>,
         mut reserve: impl FnMut(usize) -> std::result::Result<(), E>,
         mut f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
@@ -1119,7 +1130,7 @@ impl Vocab {
             // reads them in parallel instead of faulting on one after another
             self.prefetch_sorted(ids);
         }
-        let mut key = Vec::new();
+        key.clear();
         let data = self.data.as_slice();
         let mut i = 0;
         while i < ids.len() && ids[i] < self.len {
@@ -1147,11 +1158,18 @@ impl Vocab {
                     if total > key.capacity() {
                         reserve(total)?;
                         key.reserve_exact(total - key.len());
+                        #[cfg(any(test, feature = "failpoints"))]
+                        crate::algo::observe_projection(
+                            crate::algo::ProjectionEvent::Materialized(
+                                "checked-vocab-scratch-allocated",
+                                key.capacity(),
+                            ),
+                        );
                     }
                     key.truncate(e.shared);
-                    self.push_suffix::<F>(data, e, id, usize::MAX, &mut key, true);
+                    self.push_suffix::<F>(data, e, id, usize::MAX, key, true);
                     if mask >> at & 1 == 1 {
-                        f(id, &key)?;
+                        f(id, key)?;
                     }
                 }
                 i = j;
@@ -1176,11 +1194,18 @@ impl Vocab {
                         let total = total.saturating_add(FSST_ROOM * usize::from(e.coded));
                         reserve(total)?;
                         key.reserve_exact(total - key.len());
+                        #[cfg(any(test, feature = "failpoints"))]
+                        crate::algo::observe_projection(
+                            crate::algo::ProjectionEvent::Materialized(
+                                "checked-vocab-scratch-allocated",
+                                key.capacity(),
+                            ),
+                        );
                     }
                 }
-                self.step::<F>(data, e, id, nd, &mut key, true);
+                self.step::<F>(data, e, id, nd, key, true);
                 if mask >> at & 1 == 1 {
-                    f(id, &key)?;
+                    f(id, key)?;
                 }
                 if let Some(n) = next {
                     e = n;
@@ -1202,6 +1227,24 @@ impl Vocab {
     ) -> std::result::Result<Option<T>, E> {
         let mut out = None;
         self.get_sorted_checked(&[id], reserve, |_, key| {
+            out = Some(f(key));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// The same checked reconstruction with the caller's physically paid buffer.
+    /// The caller reserves every requested growth before it happens and retains
+    /// the buffer's capacity credit until that allocation is actually freed.
+    pub(crate) fn get_with_checked_in<T, E>(
+        &self,
+        id: u64,
+        key: &mut Vec<u8>,
+        reserve: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut f: impl FnMut(&[u8]) -> T,
+    ) -> std::result::Result<Option<T>, E> {
+        let mut out = None;
+        self.get_sorted_checked_in(&[id], key, reserve, |_, key| {
             out = Some(f(key));
             Ok(())
         })?;

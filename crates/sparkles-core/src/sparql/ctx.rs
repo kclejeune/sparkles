@@ -2154,13 +2154,14 @@ impl Ctx {
     /// Decode one private writer cell after admitting its owned payload. Unlike the
     /// public compatibility decoder, this route cannot turn a refusal into UNDEF.
     /// The row's credit outlives every returned term; no owning value escapes it.
-    /// `keys` admits the vocabulary's reconstruction scratch before it is allocated.
-    /// It keeps the largest scratch admitted so far for the rest of the writer call.
+    /// `key` is the writer's reused reconstruction buffer, and `keys` admits its
+    /// growth before it is allocated and holds that credit until the buffer is freed.
     pub(super) fn output_term(
         &self,
         id: Id,
         row: &OutputCredit<'_>,
         keys: &OutputCredit<'_>,
+        key: &mut Vec<u8>,
     ) -> Result<Option<Term>> {
         assert!(
             std::ptr::eq(self, row.charge.ctx) && std::ptr::eq(self, keys.charge.ctx),
@@ -2213,14 +2214,17 @@ impl Ctx {
             }
             // Reconstruction scratch is query-owned even when the vocabulary is mapped.
             // Twice the requested size covers old and new buffers during reallocation.
-            // The writer's high-water credit admits it without a fresh account update
-            // for every cell, which made large answers about a third slower to write.
+            // The writer reuses one buffer for every cell, and its high-water credit
+            // admits growth without an account update per cell. A fresh buffer per
+            // cell reallocated while rebuilding nearly every key and made large
+            // answers about a third slower to write.
             Tag::Vocab => self
                 .snap
                 .generation
                 .vocab
-                .get_with_checked(
+                .get_with_checked_in(
                     id.payload(),
+                    key,
                     |need| keys.reserve((need as u64).saturating_mul(2)),
                     decode,
                 )?
