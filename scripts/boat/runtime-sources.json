@@ -41,9 +41,9 @@
       "sha256": "96bfcf154da8ca9a67e4c887f191604f7bf5aee4d6f9954a1f9a657d8de13e77"
     },
     "owned_group.py": {
-      "bytes": 7904,
+      "bytes": 9292,
       "mode": 420,
-      "sha256": "2ec0455aba14dc74c54c30a5c15625803cef27fd55880799b865e13508ed5fa1"
+      "sha256": "059ccad0431b03aed50ce1e34309e4220c8b0a4cc17cf20f7f71cf6eec6f3bcb"
     },
     "profile.FALSE.json": {
       "bytes": 1786,

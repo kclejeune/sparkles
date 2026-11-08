@@ -17,11 +17,14 @@ def _close_leftover(ready):
         return
     pid = int(ready.read_text())
     try:
-        # The fixture's command line names its unique ready path, so a recycled
-        # pid never matches.
-        if str(ready).encode() not in Path('/proc', str(pid), 'cmdline').read_bytes():
-            return
-        os.kill(pid, signal.SIGKILL)
+        state = Path('/proc', str(pid), 'stat').read_text().split(') ', 1)[1].split()[0]
+        # An exited fixture adopted here is reaped without signalling. A live one
+        # is signalled only when its command line names the unique ready path,
+        # so a recycled pid never matches.
+        if state != 'Z':
+            if str(ready).encode() not in Path('/proc', str(pid), 'cmdline').read_bytes():
+                return
+            os.kill(pid, signal.SIGKILL)
     except (FileNotFoundError, ProcessLookupError):
         return
     try:

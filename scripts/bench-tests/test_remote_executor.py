@@ -508,6 +508,36 @@ class FinalizerInterrupt(unittest.TestCase):
         outcome=self.check('spawn',1,'timeout')
         self.assertEqual(outcome['exception'],'KeyboardInterrupt',outcome);self.assertIsNone(outcome['cleanup_interrupted'],outcome)
 
+    def interrupt_inside(self,body):
+        """Run body with the default handler and return seconds from SIGINT to the raise."""
+        previous=signal.signal(signal.SIGINT,signal.default_int_handler);sent=[]
+        try:
+            try:body(lambda:(sent.append(time.monotonic()),os.kill(os.getpid(),signal.SIGINT)))
+            except KeyboardInterrupt:return time.monotonic()-sent[0]
+            self.fail('no cancellation')
+        finally:signal.signal(signal.SIGINT,previous)
+
+    def test_blocking_sink_source_and_nested_call_still_cancel_promptly(self):
+        import threading
+        argv=['bash','-c','printf x; exec sleep 10']
+        class Sink:
+            def __init__(self,fire):self.fire=fire
+            def write(self,data):self.fire();time.sleep(0.65)
+        class Source:
+            def __init__(self,fire):self.fire=fire
+            def read(self,size):self.fire();time.sleep(0.65);return b''
+        class Nested:
+            def __init__(self,fire):self.fire=fire
+            def read(self,size):
+                threading.Timer(0.04,self.fire).start()
+                RX.boat_environment.controller.bounded([sys.executable,'-c','import time;time.sleep(5)'],0.55);return b''
+        cases={'sink':lambda fire:RX.exchange(argv,Sink(fire),deadline=time.monotonic()+5),
+               'source':lambda fire:RX.exchange(['bash','-c','cat >/dev/null; exec sleep 10'],io.BytesIO(),source=Source(fire),deadline=time.monotonic()+5),
+               'nested':lambda fire:RX.exchange(['bash','-c','cat >/dev/null; exec sleep 10'],io.BytesIO(),source=Nested(fire),deadline=time.monotonic()+5)}
+        for name,body in cases.items():
+            with self.subTest(case=name):
+                self.assertLess(self.interrupt_inside(body),0.45)
+
     def test_custom_handler_runs_after_closure_without_replacing_the_timeout(self):
         from finalizer_interrupt import run
         outcome=run('exchange','term_wait',1,'timeout','custom')

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Small SSH/Boat transport boundary. Boat lifecycle belongs to the admission owner."""
 import argparse
+import contextlib
 from datetime import datetime
 import hashlib
 import json
@@ -389,21 +390,24 @@ def get(host, source, destination):
             temporary.unlink(missing_ok=True)
 
 
-def write_output(stream, block, deadline, check=None):
+def write_output(stream, block, deadline, cancel=None):
     """Bound a live pipe sink as well as the child and producer pipes."""
+    blocking=contextlib.nullcontext() if cancel is None else cancel.interruptible()
     try:
         fd=stream.fileno();kind=os.fstat(fd).st_mode
     except (AttributeError,OSError):
-        stream.write(block);return
+        with blocking:stream.write(block)
+        return
     if not (stat.S_ISFIFO(kind) or stat.S_ISSOCK(kind)):
-        stream.write(block);return
+        with blocking:stream.write(block)
+        return
     previous=os.get_blocking(fd)
     selector=selectors.DefaultSelector()
     try:
         os.set_blocking(fd,False);selector.register(fd,selectors.EVENT_WRITE)
         pending=memoryview(block)
         while pending:
-            if check is not None:check()
+            if cancel is not None:cancel.check()
             left=remaining(deadline)
             if not selector.select(min(left,0.2)):continue
             try:written=os.write(fd,pending)
@@ -463,7 +467,7 @@ def exchange(argv, output, limit=MAX_ARCHIVE, timeout=300, deadline=None, source
                     else:selector.register(process.stdin,selectors.EVENT_WRITE,'stdin')
                 elif key.data == 'stdin':
                     if not pending and not pipe_source:
-                        pending = source.read(65536)
+                        with cancel.interruptible():pending = source.read(65536)
                     if not pending:
                         selector.unregister(key.fileobj); process.stdin.close(); continue
                     if sent + len(pending) > input_limit:
@@ -483,11 +487,11 @@ def exchange(argv, output, limit=MAX_ARCHIVE, timeout=300, deadline=None, source
                     if key.data == 'stdout':
                         total += len(block)
                         if total > limit:fail('archive byte bound exceeded')
-                        write_output(output,block,deadline,cancel.check)
+                        write_output(output,block,deadline,cancel)
                     else:
                         errors += len(block)
                         if errors > stderr_limit:fail('transport stderr bound exceeded')
-                        if stderr_output is not None:write_output(stderr_output,block,deadline,cancel.check)
+                        if stderr_output is not None:write_output(stderr_output,block,deadline,cancel)
         while True:
             cancel.check()
             left = remaining(deadline)

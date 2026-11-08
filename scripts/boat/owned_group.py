@@ -10,7 +10,11 @@ The caller installs a ``Cancellation`` before it starts the child. From then unt
 teardown ends, SIGINT never raises asynchronously. The handler only records the
 signal. While the transfer runs, the caller calls ``check`` at its loop points, which
 hands the signal to the previous handler there, so the default handler raises
-KeyboardInterrupt at a known place. Once teardown starts, every SIGINT is counted and
+KeyboardInterrupt at a known place. Around a blocking call with no loop check, such
+as a write to a regular file or terminal, ``interruptible`` delivers the signal at
+once, which is safe because the call is inside the caller's protected body. A
+nested invocation whose previous handler is an enclosing recorder cancels at its own
+checks when the outermost handler is the default. Once teardown starts, every SIGINT is counted and
 cleanup continues, so repeated cancellation neither skips a stage nor lengthens the
 window. A KeyboardInterrupt raised by a stage itself is counted and that stage is
 attempted again, up to three times. Streams and the selector close in an
@@ -18,6 +22,7 @@ unconditional inner finally, and the previous handler is restored afterwards.
 ``conclude`` then attaches the count to a primary failure or, when there is none,
 cancels the call once closure has finished.
 """
+import contextlib
 import os
 import signal
 import threading
@@ -37,12 +42,27 @@ class Cancellation:
         self.in_teardown = False
         self.previous = None
         self.installed = False
+        self.blocking = False
 
     def record(self, signum, frame):
         if self.in_teardown:
             self.teardown += 1
+        elif self.blocking:
+            # Inside the caller's protected body, around a blocking call that has
+            # no loop check, the signal is delivered at once as before.
+            self.deliver()
         else:
             self.pending += 1
+
+    @contextlib.contextmanager
+    def interruptible(self):
+        """Let SIGINT interrupt one blocking call inside the protected body."""
+        self.check()
+        self.blocking = True
+        try:
+            yield
+        finally:
+            self.blocking = False
 
     def install(self):
         if self.installed or threading.current_thread() is not threading.main_thread():
@@ -57,20 +77,34 @@ class Cancellation:
         signal.signal(signal.SIGINT, self.record)
         return self
 
+    def _root(self):
+        """Return the handler outside any enclosing owned invocation."""
+        handler = self.previous
+        while isinstance(getattr(handler, '__self__', None), Cancellation):
+            handler = handler.__self__.previous
+        return handler
+
     def _default(self):
-        return self.previous is signal.default_int_handler or self.previous is signal.SIG_DFL
+        # An enclosing invocation's recorder counts as the default when the
+        # handler outside it is, so a nested call cancels at its own checks.
+        root = self._root()
+        return root is signal.default_int_handler or root is signal.SIG_DFL
+
+    def deliver(self):
+        if self._default():
+            raise KeyboardInterrupt()
+        if callable(self.previous):
+            self.previous(signal.SIGINT, None)
 
     def check(self):
         """Hand a SIGINT received during the transfer to the previous handler."""
         if not self.pending or self.in_teardown:
             return
         self.pending = 0
-        if self._default():
-            raise KeyboardInterrupt()
-        if callable(self.previous):
-            self.previous(signal.SIGINT, None)
+        self.deliver()
 
     def begin_teardown(self):
+        self.blocking = False
         self.in_teardown = True
         self.teardown += self.pending
         self.pending = 0
