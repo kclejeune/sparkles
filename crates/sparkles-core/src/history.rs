@@ -1836,7 +1836,7 @@ mod tests {
     #[test]
     fn a_newer_history_file_is_unsupported() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("history.json"), br#"{"format": 2}"#).unwrap();
+        std::fs::write(dir.path().join("history.json"), br#"{"format": 3}"#).unwrap();
         let e = read_file(dir.path(), uuid::Uuid::nil())
             .err()
             .expect("refused");

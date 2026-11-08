@@ -1211,7 +1211,7 @@ mod tests {
             e.contains("sparkles dump") && e.contains("Sparkles 0.1.0"),
             "{e}"
         );
-        assert_eq!(WAL.readable(), "0 and 1");
+        assert_eq!(WAL.readable(), "0, 1 and 2");
         assert_eq!(list(&[0, 1, 2]), "0, 1 and 2");
     }
 
