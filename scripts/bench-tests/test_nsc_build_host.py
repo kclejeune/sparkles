@@ -82,7 +82,7 @@ import json,os,pathlib,subprocess,sys,time
 a=sys.argv[1:]
 if a==['--version']:print('mbx 9.9.9');raise SystemExit(0)
 if a[:2]==['sparkles-task','--']:raise SystemExit(subprocess.run(a[2:]).returncode)
-with open(os.environ['FAKE_BUILDS'],'a') as s:s.write(json.dumps({'home':os.environ['HOME'],'cwd':os.getcwd(),'args':a,'jobs':os.environ.get('CARGO_BUILD_JOBS')})+'\\n')
+with open(os.environ['FAKE_BUILDS'],'a') as s:s.write(json.dumps({'home':os.environ['HOME'],'cwd':os.getcwd(),'args':a,'jobs':os.environ.get('CARGO_BUILD_JOBS'),'target_override':os.environ.get('CARGO_TARGET_DIR'),'cache_override':os.environ.get('MBX_CACHE_DIR')})+'\\n')
 pathlib.Path(os.environ['FAKE_HOSTS'],'build-started').touch()
 time.sleep(float(os.environ.get('FAKE_BUILD_DELAY','0')))
 if os.environ.get('FAKE_BUILD_FAIL'):raise SystemExit(17)
@@ -348,6 +348,31 @@ class BuildHost(unittest.TestCase):
             os.killpg(scope, 0)
         self.assertFalse((self.entry() / "build.txt").exists())
 
+    def test_writes_local_build_uses_managed_mbx_source_and_exact_feature_cache(self):
+        (self.cache/'data').mkdir(parents=True)
+        (self.cache/'data/people-100000.nt.zst').write_text('data')
+        (self.repo/'crates/sparkles-core/tests/support').mkdir(parents=True)
+        for index,flags in enumerate(('--features text --locked','--no-default-features')):
+            out=self.root/f'local-writes-{index}'
+            result=subprocess.run(['bash',str(self.repo/'scripts/nsc-writes.sh'),'--out',str(out),
+                                   '--build-host','local','--cargo-args',flags,f'a={self.sha}',f'b={self.sha}'],
+                                  env=self.env,capture_output=True,text=True,timeout=30)
+            self.assertIn('executor acquire failed',result.stderr,result.stderr)
+        builds=self.builds();self.assertEqual(len(builds),2)
+        for build in builds:
+            self.assertIsNone(build['target_override']);self.assertIsNone(build['cache_override'])
+            self.assertNotIn('--target-dir',build['args'])
+            self.assertIn('/writes-v2/src/',build['cwd'])
+        self.assertEqual(builds[0]['args'][4:],['--features','text','--locked'])
+        self.assertEqual(builds[1]['args'][4:],['--no-default-features'])
+        entries=list((self.cache/'writes-v2/bin').iterdir());self.assertEqual(len(entries),2)
+        for entry in entries:
+            record=json.loads((entry/'build.json').read_text())
+            self.assertEqual(record['build_policy'],'mbx-managed-v1')
+            self.assertIn('managed target lease',record['command'])
+        self.assertFalse((self.cache/'writes-v2/target').exists())
+        self.assertEqual(list((self.cache/'writes-v2/src').iterdir()),[])
+
     def test_nsc_writes_builds_on_the_host_and_records_it(self):
         # nsc-writes stops when it tries to create the instance, after staging the binaries.
         (self.cache / "data").mkdir(parents=True)
@@ -367,14 +392,14 @@ class BuildHost(unittest.TestCase):
         [build] = self.builds()
         self.assertEqual(Path(build["home"]), self.hosts / "h2")
         self.assertEqual(build["args"][4:], ["--features", "text"])
-        [entry] = (self.cache / "writes-v1" / "bin").iterdir()
+        [entry] = (self.cache / "writes-v2" / "bin").iterdir()
         record = json.loads((entry / "build.json").read_text())
         self.assertEqual(record["build_host"], "h2")
         self.assertEqual(record["rustc"], "rustc test\n")
         self.assertIn("build host h2", record["command"])
         self.assertIn("built on h2", (out / "manifest.txt").read_text())
         self.assertEqual(self.scratch("h2"), [])
-        self.assertEqual(list((self.cache / "writes-v1" / "src").iterdir()), [])
+        self.assertEqual(list((self.cache / "writes-v2" / "src").iterdir()), [])
         # The verified entry is reused by a later run, which builds nothing.
         result, out = writes("--build-host", "h1", "--cargo-args", "--features text")
         self.assertEqual(len(self.builds()), 1)

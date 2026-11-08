@@ -17,10 +17,10 @@
 #   scripts/nsc-writes.sh off=HEAD:--no-group-commit on=HEAD
 #   scripts/nsc-writes.sh base=main head=HEAD
 #
-# Revisions are built here with `cargo build --release -p sparkles-server` from a
-# `git archive` and cached under $SPARKLES_NSC_CACHE/writes-v1, separately from query
-# builds. Each commit and exact --cargo-args string has its own locked source, target
-# and binary entry. A verified build.json records the artifact's original build, also
+# Revisions are built through scripts/nsc-build.sh with MBX from a committed
+# `git archive` and cached under $SPARKLES_NSC_CACHE/writes-v2, separately from query
+# builds. Each commit and exact --cargo-args string has a locked binary entry and a
+# unique source with a managed target. Build and artifact copy share one target lease. A verified build.json records the artifact's original build, also
 # on cache hits. This identifies source and flags, not a hermetic toolchain or environment.
 # With --build-host naming a build host (see scripts/nsc-build-host.sh), a revision is
 # built there instead, with scripts/nsc-build.sh under the host's Boxington cache, which
@@ -160,8 +160,8 @@ else
   OUT=$(mktemp -d "$ROOT/.artifacts/nsc-writes/$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX")
 fi
 CACHE=$(realpath -m "$CACHE")
-WRITE_CACHE=$CACHE/writes-v1
-mkdir -p "$OUT/stage" "$OUT/logs" "$CACHE/data" "$WRITE_CACHE"/{bin,src,target,locks}
+WRITE_CACHE=$CACHE/writes-v2
+mkdir -p "$OUT/stage" "$OUT/logs" "$CACHE/data" "$WRITE_CACHE"/{bin,src,locks}
 STAGE=$OUT/stage
 MANIFEST=$OUT/manifest.txt
 : > "$MANIFEST"
@@ -172,7 +172,7 @@ secs() { awk "BEGIN {printf \"%.1f\", $2 - $1}"; }
 # ------------------------------------------------------------------------- binaries
 # binary <rev|path> <id>: stages bin-<id>.zst and notes its source and SHA-256
 binary() (
-  local ref=$1 id=$2 bin sha src='' publish='' snapshot='' key entry target args_hash
+  local ref=$1 id=$2 bin sha src='' publish='' snapshot='' key entry args_hash
   # All temporary paths are unique and owned by this invocation. The subshell keeps
   # its lock and cleanup independent of the eventual Namespace instance EXIT trap.
   trap '[ -z "$src" ] || rm -rf -- "$src"; [ -z "$publish" ] || rm -rf -- "$publish"; [ -z "$snapshot" ] || rm -f -- "$snapshot"; bh_cleanup' EXIT
@@ -188,11 +188,10 @@ binary() (
     args_hash=$(printf '%s' "$CARGO_ARGS" | sha256sum | cut -d' ' -f1)
     key=$sha-$args_hash
     entry=$WRITE_CACHE/bin/$key
-    target=$WRITE_CACHE/target/$key
     exec {build_lock}> "$WRITE_CACHE/locks/$key.lock"
     flock "$build_lock"
     # Recheck only after acquiring the lock. Old query builds use neither this
-    # namespace nor these per-key targets and cannot replace a build's output.
+    # namespace and cannot replace a build's output.
     if [ ! -e "$entry" ] && [ ! -L "$entry" ] && { bh_resolve && [ "$BH_HOST" != local ]; }; then
       echo "building $ref ($sha) on $BH_HOST; log: $OUT/logs/build-$id.log"
       src=$(mktemp -d "$WRITE_CACHE/src/$key.XXXXXXXX")
@@ -211,7 +210,7 @@ for line in (received / 'env.txt').read_text().splitlines():
     name, _, value = line.partition('=')
     environment[name] = value
 record = {
-    'schema': 1, 'revision': revision, 'cargo_args': arguments,
+    'schema': 1, 'build_policy': 'mbx-managed-v1', 'revision': revision, 'cargo_args': arguments,
     'cargo_args_sha256': args_hash,
     'binary_sha256': hashlib.sha256((path / 'sparkles').read_bytes()).hexdigest(),
     'built_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -234,55 +233,28 @@ PY
       src=$(mktemp -d "$WRITE_CACHE/src/$key.XXXXXXXX")
       publish=$(mktemp -d "$WRITE_CACHE/bin/.$key.XXXXXXXX")
       git -C "$ROOT" archive "$sha" | tar -x -m -C "$src"
-      mkdir -p "$target/release"
       bh_ui_placeholder "$src"
       (cd "$src" && rustc -vV) > "$publish/rustc.txt"
       (cd "$src" && cargo -V) > "$publish/cargo.txt"
-      # An option selecting another profile or target must not reuse stale output
-      # at our expected path. Explicit paths also make conflicting CLI overrides
-      # fail in Cargo rather than redirecting into a shared target or other source.
-      rm -f -- "$target/release/sparkles"
+      # The fixed native-release helper validates feature/dependency flags, uses
+      # this source's managed target and copies the binary before its lease ends.
       # shellcheck disable=SC2086 # CARGO_ARGS is a list of flags
-      (cd "$src" && CARGO_TARGET_DIR=$target cargo build --release -p sparkles-server \
-        --manifest-path "$src/Cargo.toml" --target-dir "$target" \
-        --message-format=json-render-diagnostics $CARGO_ARGS) \
-        > "$OUT/logs/build-$id.jsonl" 2> "$OUT/logs/build-$id.log" ||
-        die "build of $ref failed, see $OUT/logs/build-$id.log and build-$id.jsonl"
-      [ -f "$target/release/sparkles" ] && [ -x "$target/release/sparkles" ] && [ ! -L "$target/release/sparkles" ] ||
-        die "build of $ref did not produce the expected release/sparkles"
-      cp -- "$target/release/sparkles" "$publish/sparkles"
-      python3 - "$publish" "$sha" "$CARGO_ARGS" "$args_hash" "$OUT/logs/build-$id.jsonl" "$src" "$target" << 'PY'
+      (cd "$src" && bash "$ROOT/scripts/nsc-build.sh" "$publish/sparkles" $CARGO_ARGS) \
+        > "$OUT/logs/build-$id.log" 2>&1 || die "build of $ref failed, see $OUT/logs/build-$id.log"
+      python3 - "$publish" "$sha" "$CARGO_ARGS" "$args_hash" << 'PY'
 import datetime, hashlib, json, os, pathlib, sys
-directory, revision, arguments, args_hash, build_log, source, target = sys.argv[1:]
+directory, revision, arguments, args_hash = sys.argv[1:]
 path = pathlib.Path(directory)
-expected = (pathlib.Path(target) / 'release/sparkles').resolve()
-try:
-    artifacts = []
-    for line in pathlib.Path(build_log).read_text().splitlines():
-        event = json.loads(line)
-        if (event.get('reason') == 'compiler-artifact' and event.get('executable')
-                and pathlib.Path(event['executable']).resolve() == expected):
-            artifacts.append(event)
-    if len(artifacts) != 1:
-        raise ValueError('expected exactly one artifact at the owned executable path')
-    artifact = artifacts[0]
-    if (pathlib.Path(artifact['manifest_path']).resolve()
-            != (pathlib.Path(source) / 'crates/sparkles-server/Cargo.toml').resolve()
-            or artifact['target']['name'] != 'sparkles'
-            or 'bin' not in artifact['target']['kind']):
-        raise ValueError('executable did not come from the archived sparkles-server binary')
-except (OSError, ValueError, KeyError, TypeError) as error:
-    sys.exit(f'nsc-writes: cannot verify Cargo executable provenance: {error}')
 record = {
-    'schema': 1, 'revision': revision, 'cargo_args': arguments,
+    'schema': 1, 'build_policy': 'mbx-managed-v1', 'revision': revision, 'cargo_args': arguments,
     'cargo_args_sha256': args_hash,
     'binary_sha256': hashlib.sha256((path / 'sparkles').read_bytes()).hexdigest(),
     'built_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
     'build_host': 'local (' + os.uname().nodename + ')',
     'rustc': (path / 'rustc.txt').read_text(), 'cargo': (path / 'cargo.txt').read_text(),
     'version_commands': 'rustc -vV and cargo -V in the extracted source directory',
-    'command': 'cargo build --release -p sparkles-server --manifest-path <owned source>/Cargo.toml --target-dir <key target> --message-format=json-render-diagnostics $CARGO_ARGS',
-    'artifact': {'manifest': 'crates/sparkles-server/Cargo.toml', 'name': 'sparkles', 'kind': artifact['target']['kind']},
+    'command': 'scripts/nsc-build.sh (mbx build --release -p sparkles-server $CARGO_ARGS); native artifact copied under the same managed target lease',
+    'artifact': {'manifest': 'crates/sparkles-server/Cargo.toml', 'name': 'sparkles', 'kind': ['bin']},
     'environment': {name: os.environ.get(name) for name in (
         'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTUP_TOOLCHAIN', 'CARGO_BUILD_TARGET',
         'RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER')},
@@ -311,7 +283,7 @@ try:
     if not binary.is_file() or binary.is_symlink() or not receipt.is_file() or receipt.is_symlink():
         raise ValueError('binary or receipt is not a regular file')
     record = json.loads(receipt.read_text())
-    if (record['schema'] != 1 or record['revision'] != revision
+    if (record['schema'] != 1 or record.get('build_policy') != 'mbx-managed-v1' or record['revision'] != revision
             or record['cargo_args'] != arguments or record['cargo_args_sha256'] != args_hash
             or record['binary_sha256'] != hashlib.sha256(binary.read_bytes()).hexdigest()
             or not all(isinstance(record[key], str) and record[key] for key in ('rustc', 'cargo', 'built_at', 'command'))

@@ -1178,7 +1178,7 @@ of a few percent, and [Choosing a host](#choosing-a-host) says where to measure 
 ### Namespace write screens
 
 `scripts/nsc-writes.sh` stages write workloads before creating a capped Namespace
-instance. Its revision builds use `SPARKLES_NSC_CACHE/writes-v1`, separately from the
+instance. Its revision builds use `SPARKLES_NSC_CACHE/writes-v2`, separately from the
 query harness. Each source commit and exact `--cargo-args` string has its own build key,
 target directory and cross-process lock. The lock covers publication, verification and
 compressed staging. Each staged revision binary has a `bin-<id>.build.json` recording its
