@@ -10,6 +10,10 @@
 //! not affect the backup.
 
 use super::Store;
+#[allow(
+    dead_code,
+    reason = "private item 761 import machinery that stays unwired until item 650 consumers agree"
+)]
 mod transport;
 
 use crate::commit::CommitInfo;
@@ -249,6 +253,10 @@ pub(super) struct ConfigurationCapture {
 
 /// The closed primary members needed by the original framing proof. A member
 /// selects an already captured descriptor, never a new filesystem open.
+#[allow(
+    dead_code,
+    reason = "private item 761 import machinery that stays unwired until item 650 consumers agree"
+)]
 #[derive(Clone, Copy)]
 pub(super) enum CapturedPrimary {
     Commit,
@@ -256,6 +264,10 @@ pub(super) enum CapturedPrimary {
     Wal,
 }
 
+#[allow(
+    dead_code,
+    reason = "private item 761 import machinery that stays unwired until item 650 consumers agree"
+)]
 impl CapturedPrimary {
     fn name(self) -> &'static str {
         match self {
@@ -274,6 +286,10 @@ pub(super) struct CapturedReader<'a> {
     position: u64,
 }
 
+#[allow(
+    dead_code,
+    reason = "private item 761 import machinery that stays unwired until item 650 consumers agree"
+)]
 impl ConfigurationCapture {
     pub(super) fn primary_reader(&self, member: CapturedPrimary) -> Option<CapturedReader<'_>> {
         let index = self.data.files.iter().position(|file| {
@@ -292,6 +308,10 @@ impl ConfigurationCapture {
 
 /// A private native primary proof. It retains the genuine captured lease and
 /// the receiving allowance, and grants no imported interval/replay authority.
+#[allow(
+    dead_code,
+    reason = "private item 761 import machinery that stays unwired until item 650 consumers agree"
+)]
 struct CheckedPrimaryCapture {
     capture: ConfigurationCapture,
     base: CommitInfo,
@@ -322,6 +342,10 @@ struct PreparedNativeSource {
     _held: crate::access::Reservation,
 }
 
+#[allow(
+    dead_code,
+    reason = "private item 761 import machinery that stays unwired until item 650 consumers agree"
+)]
 impl CheckedPrimaryCapture {
     fn describe_native(
         self,
@@ -479,11 +503,19 @@ impl CheckedPrimaryCapture {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "private item 761 import machinery that stays unwired until item 650 consumers agree"
+)]
 struct CapturedMembership {
     seqs: Option<Vec<u64>>,
     _held: crate::access::Reservation,
 }
 
+#[allow(
+    dead_code,
+    reason = "private item 761 import machinery that stays unwired until item 650 consumers agree"
+)]
 impl ConfigurationCapture {
     fn annotation_membership(
         &self,
@@ -933,6 +965,10 @@ impl std::io::Seek for CapturedReader<'_> {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "private item 761 import machinery that stays unwired until item 650 consumers agree"
+)]
 struct CapturedOriginal {
     identities: super::configuration_history::OriginalIdentities,
     binding: crate::history::ConfigurationBinding,
@@ -948,6 +984,10 @@ struct CapturedOriginal {
 
 /// Facts from the actual selected Generation under its writer, or the real
 /// completed materialized Builder output. Never inferred from captured JSON.
+#[allow(
+    dead_code,
+    reason = "private item 761 import machinery that stays unwired until item 650 consumers agree"
+)]
 #[derive(Clone, Copy, Debug)]
 struct CapturedBasis {
     base: CommitInfo,
@@ -1408,6 +1448,10 @@ impl Store {
             .map(|(capture, _)| capture)
     }
 
+    #[allow(
+        dead_code,
+        reason = "private item 761 import machinery that stays unwired until item 650 consumers agree"
+    )]
     pub(super) fn materialized_configuration_capture(
         &self,
         label: &str,
@@ -1724,6 +1768,10 @@ impl Store {
             .map(|capture| capture.map(|(data, _)| data))
     }
 
+    #[allow(
+        dead_code,
+        reason = "private item 761 import machinery that stays unwired until item 650 consumers agree"
+    )]
     pub(super) fn configuration_capture(
         &self,
         label: &str,
@@ -2693,9 +2741,7 @@ mod tests {
                 .unwrap()
                 .checked_primary(&preparation);
             std::fs::write(&path, &original).unwrap();
-            let error = result
-                .err()
-                .expect("every complete actual metadata field must be bound");
+            let error = result.expect_err("every complete actual metadata field must be bound");
             assert!(
                 error
                     .to_string()

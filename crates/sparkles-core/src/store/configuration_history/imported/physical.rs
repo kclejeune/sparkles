@@ -231,6 +231,106 @@ pub(super) fn prove_prefix<R: Read + Seek>(
     result
 }
 
+impl<R: Read + Seek> Seek for SpanReader<'_, R> {
+    fn seek(&mut self, request: SeekFrom) -> io::Result<u64> {
+        // stream_position uses Current(0), which must not discard buffered data
+        // or make an already read byte count as a second import observation.
+        if matches!(request, SeekFrom::Current(0)) {
+            return Ok(self.position);
+        }
+        let target = match request {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::Current(offset) => self.position.checked_add_signed(offset),
+            SeekFrom::End(offset) => self.extent.checked_add_signed(offset),
+        }
+        .ok_or_else(invalid)?;
+        // Ordinary lookahead after the last import remains seekable. A read of
+        // an imported span must stay sequential; it cannot reuse an old digest.
+        let lo = target.min(self.position);
+        let hi = target.max(self.position);
+        if target != self.position
+            && self
+                .spans
+                .iter()
+                .any(|span| lo < span.end && hi > span.start)
+        {
+            return Err(invalid());
+        }
+        let actual = self.inner.seek(SeekFrom::Start(target))?;
+        if actual != target {
+            return Err(invalid());
+        }
+        self.position = actual;
+        Ok(actual)
+    }
+}
+
+/// A separate observer checks actual transaction boundaries. Byte read-ahead
+/// may complete hashes before these observations, so the states stay separate.
+pub(super) struct FrameProof<'a> {
+    spans: &'a [Span],
+    index: usize,
+    started: bool,
+}
+
+impl<'a> FrameProof<'a> {
+    pub(super) fn new(spans: &'a [Span], extent: u64) -> io::Result<Self> {
+        validate(spans, extent)?;
+        Ok(Self {
+            spans,
+            index: 0,
+            started: false,
+        })
+    }
+
+    pub(super) fn observe(&mut self, observation: wal::probe::WalCommitObservation) -> Result<()> {
+        let Some(span) = self.spans.get(self.index) else {
+            return Ok(());
+        };
+        let start = observation.start_offset;
+        let end = observation.point.offset;
+        if end <= span.start {
+            return Ok(());
+        }
+        if !self.started {
+            // Only the original parser can emit start=WAL_REC for the first
+            // transaction after its genuine initial header at offset0.
+            if !(start == span.start || (span.start == 0 && start == WAL_REC as u64))
+                || observation.point.seq != span.first_seq
+            {
+                return Err(managed_history::unavailable(
+                    "imported WAL start is not a proven transaction boundary",
+                ));
+            }
+            self.started = true;
+        }
+        if end > span.end {
+            return Err(managed_history::unavailable(
+                "imported WAL end splits a transaction",
+            ));
+        }
+        if end == span.end {
+            if observation.point.seq != span.last_seq {
+                return Err(managed_history::unavailable(
+                    "imported WAL final sequence differs",
+                ));
+            }
+            self.index += 1;
+            self.started = false;
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish(self) -> Result<()> {
+        if self.index != self.spans.len() || self.started {
+            return Err(managed_history::unavailable(
+                "imported WAL interval was not fully framed",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,105 +873,5 @@ mod tests {
             frames.finish().unwrap();
             reader.into_inner().finish().unwrap();
         }
-    }
-}
-
-impl<R: Read + Seek> Seek for SpanReader<'_, R> {
-    fn seek(&mut self, request: SeekFrom) -> io::Result<u64> {
-        // stream_position uses Current(0), which must not discard buffered data
-        // or make an already read byte count as a second import observation.
-        if matches!(request, SeekFrom::Current(0)) {
-            return Ok(self.position);
-        }
-        let target = match request {
-            SeekFrom::Start(offset) => Some(offset),
-            SeekFrom::Current(offset) => self.position.checked_add_signed(offset),
-            SeekFrom::End(offset) => self.extent.checked_add_signed(offset),
-        }
-        .ok_or_else(invalid)?;
-        // Ordinary lookahead after the last import remains seekable. A read of
-        // an imported span must stay sequential; it cannot reuse an old digest.
-        let lo = target.min(self.position);
-        let hi = target.max(self.position);
-        if target != self.position
-            && self
-                .spans
-                .iter()
-                .any(|span| lo < span.end && hi > span.start)
-        {
-            return Err(invalid());
-        }
-        let actual = self.inner.seek(SeekFrom::Start(target))?;
-        if actual != target {
-            return Err(invalid());
-        }
-        self.position = actual;
-        Ok(actual)
-    }
-}
-
-/// A separate observer checks actual transaction boundaries. Byte read-ahead
-/// may complete hashes before these observations, so the states stay separate.
-pub(super) struct FrameProof<'a> {
-    spans: &'a [Span],
-    index: usize,
-    started: bool,
-}
-
-impl<'a> FrameProof<'a> {
-    pub(super) fn new(spans: &'a [Span], extent: u64) -> io::Result<Self> {
-        validate(spans, extent)?;
-        Ok(Self {
-            spans,
-            index: 0,
-            started: false,
-        })
-    }
-
-    pub(super) fn observe(&mut self, observation: wal::probe::WalCommitObservation) -> Result<()> {
-        let Some(span) = self.spans.get(self.index) else {
-            return Ok(());
-        };
-        let start = observation.start_offset;
-        let end = observation.point.offset;
-        if end <= span.start {
-            return Ok(());
-        }
-        if !self.started {
-            // Only the original parser can emit start=WAL_REC for the first
-            // transaction after its genuine initial header at offset0.
-            if !(start == span.start || (span.start == 0 && start == WAL_REC as u64))
-                || observation.point.seq != span.first_seq
-            {
-                return Err(managed_history::unavailable(
-                    "imported WAL start is not a proven transaction boundary",
-                ));
-            }
-            self.started = true;
-        }
-        if end > span.end {
-            return Err(managed_history::unavailable(
-                "imported WAL end splits a transaction",
-            ));
-        }
-        if end == span.end {
-            if observation.point.seq != span.last_seq {
-                return Err(managed_history::unavailable(
-                    "imported WAL final sequence differs",
-                ));
-            }
-            self.index += 1;
-            self.started = false;
-        }
-        Ok(())
-    }
-
-    pub(super) fn finish(self) -> Result<()> {
-        if self.index != self.spans.len() || self.started {
-            return Err(managed_history::unavailable(
-                "imported WAL interval was not fully framed",
-            ));
-        }
-        Ok(())
     }
 }

@@ -2360,6 +2360,7 @@ impl Store {
 
     /// Write a new branch's directory under `branches/.create-<id>/`, then rename it
     /// into place.
+    #[allow(clippy::too_many_arguments)]
     fn write_branch_dir(
         &self,
         root: &Path,

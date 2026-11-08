@@ -4,6 +4,10 @@ use super::*;
 use crate::access::Preparation;
 use crate::history::{ConfigurationBinding, ConfigurationIdentity, HistoryOptions, ReadLimit};
 
+#[allow(
+    dead_code,
+    reason = "private item 761 import machinery that stays unwired until item 650 consumers agree"
+)]
 mod imported;
 pub(super) mod primary;
 mod validation;

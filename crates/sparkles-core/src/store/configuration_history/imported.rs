@@ -648,6 +648,18 @@ pub(in crate::store) fn encode_native_descriptor(
 }
 
 #[cfg(test)]
+pub(in crate::store) fn canonical_origin_test_value(value: serde_json::Value) -> Vec<u8> {
+    let origin: Origin = serde_json::from_value(value).unwrap();
+    serde_json::to_vec(&origin).unwrap()
+}
+
+#[cfg(test)]
+pub(in crate::store) fn canonical_descriptor_test_value(value: serde_json::Value) -> Vec<u8> {
+    let descriptor: Descriptor = serde_json::from_value(value).unwrap();
+    serde_json::to_vec(&descriptor).unwrap()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -827,16 +839,4 @@ mod tests {
         source.files.get_mut("dataset.json").unwrap().bytes = u64::MAX;
         assert!(source.validate(&preparation).is_err());
     }
-}
-
-#[cfg(test)]
-pub(in crate::store) fn canonical_origin_test_value(value: serde_json::Value) -> Vec<u8> {
-    let origin: Origin = serde_json::from_value(value).unwrap();
-    serde_json::to_vec(&origin).unwrap()
-}
-
-#[cfg(test)]
-pub(in crate::store) fn canonical_descriptor_test_value(value: serde_json::Value) -> Vec<u8> {
-    let descriptor: Descriptor = serde_json::from_value(value).unwrap();
-    serde_json::to_vec(&descriptor).unwrap()
 }

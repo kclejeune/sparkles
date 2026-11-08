@@ -1087,7 +1087,6 @@ fn activation_branch(root: &Path, preparation: &Preparation) -> Result<Activatio
     // because compaction moved that reference out of CURRENT.
     drop(cursor);
     drop(physical);
-    drop(budget);
     drop(_decode);
     activation_retained_generations(root, id, preparation)?;
     Ok(ActivationBranch {

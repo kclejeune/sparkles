@@ -517,6 +517,7 @@ impl Installed {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn file_bytes(graphs: &ManagedGraphs) -> Vec<u8> {
     file_bytes_with_history(graphs, None)
 }
