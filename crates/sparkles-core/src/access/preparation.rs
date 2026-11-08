@@ -441,13 +441,19 @@ impl Preparation {
     // selection boundary still decides atomic local/pool admission.
     pub(crate) fn selection_room(&self) -> u64 {
         let local = self.room();
+        self.inner
+            .grant
+            .as_ref()
+            .map_or(local, |grant| local.min(grant.growth_room()))
+    }
+
+    /// The part of [`Preparation::selection_room`] the grant already covers, which
+    /// needs no pool growth. A selection that loses a race for free granules
+    /// retries with this smaller allowance before any read.
+    pub(crate) fn covered_room(&self) -> u64 {
+        let local = self.room();
         self.inner.grant.as_ref().map_or(local, |grant| {
-            let covered = grant.granted().saturating_sub(grant.used());
-            let free = grant
-                .pool()
-                .capacity()
-                .saturating_sub(grant.pool().granted());
-            local.min(covered.saturating_add(free))
+            local.min(grant.granted().saturating_sub(grant.used()))
         })
     }
 
@@ -1733,11 +1739,11 @@ impl PreparedView {
             .validate_instance(store)
     }
 
-    pub(crate) fn original_policy(&self) -> Option<&Arc<GraphAccess>> {
+    pub(crate) fn is_original_policy(&self, policy: &Arc<GraphAccess>) -> bool {
         self.inner
             .selected
             .as_ref()
-            .map(|selected| selected.policy())
+            .is_some_and(|selected| selected.is_original_policy(policy))
     }
 
     /// Bound policy to apply while consuming the physical snapshot.

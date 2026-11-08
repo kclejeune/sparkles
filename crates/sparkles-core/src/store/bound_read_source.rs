@@ -10,7 +10,11 @@ use std::sync::{Arc, Weak};
 // constructor or raw extractor. Payloads precede the actual selection loan.
 pub(crate) struct PreparedRead {
     snapshot: Arc<super::Snapshot>,
-    policy: Arc<GraphAccess>,
+    // The invocation's policy while the view binds it, then only its weak
+    // identity. The weak reference keeps the Arc allocation, so its address
+    // cannot be reused by a replacement policy while this view lives.
+    policy: Option<Arc<GraphAccess>>,
+    identity: Weak<GraphAccess>,
     family: Weak<super::family::Family>,
     dataset: uuid::Uuid,
     logical_branch: uuid::Uuid,
@@ -23,7 +27,18 @@ impl PreparedRead {
     }
 
     pub(crate) fn policy(&self) -> &Arc<GraphAccess> {
-        &self.policy
+        self.policy
+            .as_ref()
+            .expect("the original policy is retained until binding finishes")
+    }
+
+    pub(crate) fn into_identity(mut self) -> Self {
+        self.policy = None;
+        self
+    }
+
+    pub(crate) fn is_original_policy(&self, policy: &Arc<GraphAccess>) -> bool {
+        std::ptr::eq(self.identity.as_ptr(), Arc::as_ptr(policy))
     }
 
     pub(crate) fn validate_instance(&self, store: &super::Store) -> Result<()> {
@@ -94,10 +109,21 @@ impl super::Store {
         inherited: bool,
     ) -> Result<PreparedView> {
         preparation.check()?;
-        let allowance = preparation.selection_room();
-        // The estimate above is not admission. This atomic reservation must
-        // succeed before any cold metadata/decoder/source allocation.
-        let mut held = preparation.reserve(allowance)?;
+        // The estimate below is not admission. This atomic reservation must
+        // succeed before any cold metadata/decoder/source allocation. Another
+        // grant can take the free granules first, so a refused estimate retries
+        // once with the room the grant already covers.
+        let (allowance, mut held) = {
+            let allowance = preparation.selection_room();
+            match preparation.reserve(allowance) {
+                Ok(held) => (allowance, held),
+                Err(Error::BudgetExceeded(_)) => {
+                    let covered = preparation.covered_room();
+                    (covered, preparation.reserve(covered)?)
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let snapshot = if inherited {
             let (snapshot, resolved, _) =
                 self.snapshot_at_prepared(logical, at, preparation, allowance)?;
@@ -132,7 +158,8 @@ impl super::Store {
         held.release_to(retained);
         let selected = PreparedRead {
             snapshot,
-            policy,
+            identity: Arc::downgrade(&policy),
+            policy: Some(policy),
             family: Arc::downgrade(&logical.family),
             dataset: logical.owner_dataset_id(),
             logical_branch: logical.branch_id(),
@@ -207,8 +234,7 @@ impl BoundReadSource {
             Error::NotPermitted("strict source requires this invocation's current policy".into())
         })?;
         if let Source::Prepared(view) = &self.source {
-            let original = view.original_policy().expect("validated Store origin");
-            if !Arc::ptr_eq(policy, original) {
+            if !view.is_original_policy(policy) {
                 return Err(Error::NotPermitted(
                     "strict source cannot replace its original current policy".into(),
                 ));

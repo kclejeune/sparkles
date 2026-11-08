@@ -911,6 +911,9 @@ fn open_pattern_cursor_input(
             // The public strict boundary validated the original invocation Arc.
             // Pass only its retained already-bound policy internally; guards
             // must not be rebound against the masked physical snapshot.
+            // This owner is declared before the policy alias, so on a setup
+            // refusal the alias drops before the last source returns its credit.
+            let _retained = source.clone();
             let bound_policy = source
                 .as_ref()
                 .and_then(|source| source.query_input().1)

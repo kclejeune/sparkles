@@ -384,6 +384,28 @@ impl PoolGrant {
         self.used.load(Ordering::SeqCst)
     }
 
+    /// The bytes this grant could still charge now under the same growth rules as
+    /// [`PoolGrant::charge`]: whole granules of the pool's free capacity, capped by
+    /// half the pool while requests wait. This is a sizing observation only, since
+    /// other grants may take the free granules before a later charge.
+    pub(crate) fn growth_room(&self) -> u64 {
+        let capacity = self.pool.capacity;
+        let cur = self.granted.load(Ordering::SeqCst);
+        let used = self.used.load(Ordering::SeqCst);
+        let share = if self.pool.waiting() > 0 {
+            capacity / 2
+        } else {
+            capacity
+        };
+        let ceiling = share.max(INITIAL_GRANT.min(capacity)).max(cur);
+        let free = capacity.saturating_sub(self.pool.granted());
+        let free = free - free % GRANULE;
+        cur.saturating_add(free)
+            .min(ceiling)
+            .min(capacity.max(cur))
+            .saturating_sub(used)
+    }
+
     /// The most bytes this grant has held at once.
     pub fn peak(&self) -> u64 {
         self.peak.load(Ordering::Relaxed)

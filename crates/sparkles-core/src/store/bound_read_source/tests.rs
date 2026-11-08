@@ -618,3 +618,103 @@ fn local_sibling_source_mask_overlap_and_concurrent_loan_refusal_leave_originals
     ));
     assert_eq!(prep.inner_used(), 256);
 }
+
+#[test]
+fn strict_view_keeps_only_a_weak_identity_of_its_original_guarded_policy() {
+    struct OwningGuard {
+        _payload: Vec<u8>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Drop for OwningGuard {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+    impl crate::access::GuardDecision for OwningGuard {
+        fn exempt(&self, _: &Arc<super::super::Snapshot>) -> Vec<String> {
+            panic!("strict factory must not call legacy uncontrolled provider")
+        }
+        fn exempt_controlled(
+            &self,
+            _: &Arc<super::super::Snapshot>,
+            prep: &Preparation,
+        ) -> Result<crate::access::Exemptions> {
+            crate::access::Exemptions::new(prep)
+        }
+    }
+    let store = super::super::Store::in_memory(Default::default());
+    let dropped = Arc::new(AtomicBool::new(false));
+    // The provider owns more than the whole preparation may admit.
+    let guard = Arc::new(OwningGuard {
+        _payload: vec![0; 64 << 20],
+        dropped: dropped.clone(),
+    });
+    let policy = Arc::new(GraphAccess::graphs(
+        Graphs::All.guarded_by("urn:guarded:*", crate::access::Decider(guard)),
+        Graphs::none(),
+    ));
+    let prep = preparation();
+    let view = store.prepare_read(policy.clone(), &prep).unwrap();
+    assert!(view.is_original_policy(&policy));
+    drop(policy);
+    // The view does not extend the provider's unadmitted lifetime.
+    assert!(dropped.load(Ordering::SeqCst));
+    let replacement = Arc::new(GraphAccess::all());
+    assert!(!view.is_original_policy(&replacement));
+    assert!(matches!(
+        select_source_cursor(view.read_source(), &store, "INVALID", &options(replacement), &Default::default()),
+        Err(Error::NotPermitted(message)) if message.contains("replace")
+    ));
+}
+
+#[test]
+fn strict_setup_refusal_frees_the_bound_policy_before_its_credit() {
+    let store = super::super::Store::in_memory(Default::default());
+    let prep = Preparation::new(Control::none(), 1 << 20).unwrap();
+    let policy = Arc::new(GraphAccess::all());
+    let view = store.prepare_read(policy.clone(), &prep).unwrap();
+    let bound = view.read_source().query_input().1.cloned().unwrap();
+    let counters = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>();
+    let (_, offset) = counters
+        .extend(std::alloc::Layout::new::<GraphAccess>())
+        .unwrap();
+    let address = Arc::as_ptr(&bound) as usize - offset;
+    drop(bound);
+    let source = view.read_source();
+    drop(view);
+    // Leave too little room for the checked context setup after validation.
+    let pressure = prep.reserve(prep.room() - 4096).unwrap();
+    let with_view = prep.inner_used();
+    let watch = crate::sparql::checked_source_tests::AllocationWatch::new(address, &prep);
+    assert!(matches!(
+        select_source_cursor(
+            source,
+            &store,
+            "SELECT * WHERE { ?s ?p ?o }",
+            &options(policy),
+            &Default::default()
+        ),
+        Err(Error::BudgetExceeded(_))
+    ));
+    // The bound policy was freed while the view still held its credit.
+    assert_eq!(watch.observed(), (with_view, 1));
+    assert!(prep.inner_used() < with_view);
+    drop(watch);
+    drop(pressure);
+}
+
+#[test]
+fn selection_sizing_follows_whole_granule_growth() {
+    let store = super::super::Store::in_memory(Default::default());
+    // Two 4 MiB grants leave 2 MiB free, less than one granule.
+    let pool = QueryPool::new(10 << 20);
+    let grant = Arc::new(pool.try_grant(4 << 20).unwrap());
+    let _other = pool.try_grant(4 << 20).unwrap();
+    let prep = Preparation::with_grant(Control::none(), 32 << 20, grant.clone()).unwrap();
+    assert!(prep.selection_room() <= grant.granted() - grant.used());
+    let view = store
+        .prepare_read(Arc::new(GraphAccess::all()), &prep)
+        .unwrap();
+    assert_eq!(grant.granted(), 4 << 20);
+    drop(view);
+}

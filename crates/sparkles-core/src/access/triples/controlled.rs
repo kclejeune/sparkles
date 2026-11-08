@@ -58,7 +58,10 @@ fn finish(
     preparation: &Preparation,
     input: Input<'_>,
 ) -> Result<PreparedView> {
-    PreparedView::new_selected(access, snapshot, held, preparation, input.selected())
+    // Binding is complete, so the strict view drops its strong reference to the
+    // original policy and keeps only the admitted weak identity.
+    let selected = input.selected().map(|selected| selected.into_identity());
+    PreparedView::new_selected(access, snapshot, held, preparation, selected)
 }
 
 fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<PreparedView> {
@@ -73,15 +76,11 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
     // view is charged only for storage this preparation creates or keeps alive alone.
     let mut held = preparation.reserve(PreparedView::header_bytes()?)?;
     if matches!(&input, Input::Selected(_)) {
-        // The strict view additionally retains the invocation's original policy,
-        // not merely the bound copies. Admit its shared backing before cloning it.
-        let read_bytes = retained_graphs_bytes(&original.read, preparation)?;
-        let write_bytes = retained_graphs_bytes(&original.write, preparation)?;
-        let original_bytes = 256u64
-            .checked_add(read_bytes)
-            .and_then(|bytes| bytes.checked_add(write_bytes))
-            .ok_or_else(|| preparation.exhausted())?;
-        held.merge(preparation.reserve(original_bytes)?);
+        // The strict view keeps only a weak identity of the invocation's original
+        // policy, so a replacement policy can be refused without extending the
+        // lifetime of its contents or opaque guard providers. The weak reference
+        // keeps the policy's Arc allocation, whose layout is admitted here.
+        held.merge(preparation.reserve(weak_policy_bytes()?)?);
     }
     // Shared policy definitions are retained too. Inspect their sizes with controls
     // before taking the returned owner's Arc references.
@@ -220,26 +219,18 @@ fn strings_bytes(values: &Vec<String>, preparation: &Preparation) -> Result<u64>
     Ok(bytes)
 }
 
+/// The Arc allocation of a policy that a weak identity keeps after its
+/// contents are dropped.
+fn weak_policy_bytes() -> Result<u64> {
+    let counters = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>();
+    let (layout, _) = counters
+        .extend(std::alloc::Layout::new::<GraphAccess>())
+        .map_err(|_| Error::invalid("policy layout overflows"))?;
+    u64::try_from(layout.pad_to_align().size())
+        .map_err(|_| Error::invalid("policy layout overflows"))
+}
+
 fn graphs_bytes(graphs: &Graphs, preparation: &Preparation) -> Result<u64> {
-    sized_graphs_bytes(graphs, preparation, false)
-}
-
-/// The retained original policy of a strict view keeps the invocation's own
-/// top-level guard providers alive. Binding resolves them before masking, so
-/// the view never calls them again. Their opaque interior belongs to the
-/// caller's policy, and the view admits a fixed handle for each extended
-/// provider lifetime instead of refusing every data-dependent guard.
-fn retained_graphs_bytes(graphs: &Graphs, preparation: &Preparation) -> Result<u64> {
-    sized_graphs_bytes(graphs, preparation, true)
-}
-
-const RETAINED_PROVIDER_BYTES: u64 = 128;
-
-fn sized_graphs_bytes(
-    graphs: &Graphs,
-    preparation: &Preparation,
-    retain_providers: bool,
-) -> Result<u64> {
     let Graphs::Only(rule) = graphs else {
         return Ok(0);
     };
@@ -254,9 +245,7 @@ fn sized_graphs_bytes(
         // Legacy binding leaves guards in triple/protection graph definitions
         // unresolved. Retaining their opaque provider Arc would bypass admission;
         // invoking or clearing it here would change that established policy.
-        if guard.decide.is_some() && retain_providers {
-            bytes = bytes.saturating_add(RETAINED_PROVIDER_BYTES);
-        } else if guard.decide.is_some() {
+        if guard.decide.is_some() {
             return Err(Error::Unsupported(
                 "controlled permission preparation cannot retain unresolved nested guard providers"
                     .into(),
