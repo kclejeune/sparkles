@@ -3329,22 +3329,36 @@ impl Operator {
             ctx.check()?;
             let batch = match &mut self.state {
                 State::Scalar(node) => {
-                    let (table, mut info) = exec::execute(ctx, node)?;
+                    let (mut output, mut info) = exec::execute_owned(ctx, node)?;
                     if ctx.graphs.is_some() {
                         info.redact();
                     }
                     // the scans a count over key runs read itself
                     self.info.children = info.children;
-                    let charge = OwnedCharge::new(ctx, capacity_bytes(&table))?;
-                    debug_assert!(table.len <= 1);
+                    let charge = if output.lease.is_some() {
+                        OwnedCharge::adopt(ctx, &mut output.lease)?
+                    } else {
+                        OwnedCharge::new(ctx, capacity_bytes(&output.table))?
+                    };
+                    debug_assert!(output.table.len <= 1);
                     self.done = true;
-                    Some(Buffer { table, charge })
+                    Some(Buffer {
+                        table: output.table,
+                        charge,
+                    })
                 }
                 State::Counts { node, loaded, at } => {
                     if loaded.is_none() {
-                        let (table, _) = exec::execute(ctx, node)?;
-                        let charge = OwnedCharge::new(ctx, capacity_bytes(&table))?;
-                        *loaded = Some(Buffer { table, charge });
+                        let (mut output, _) = exec::execute_owned(ctx, node)?;
+                        let charge = if output.lease.is_some() {
+                            OwnedCharge::adopt(ctx, &mut output.lease)?
+                        } else {
+                            OwnedCharge::new(ctx, capacity_bytes(&output.table))?
+                        };
+                        *loaded = Some(Buffer {
+                            table: output.table,
+                            charge,
+                        });
                     }
                     let table = &loaded.as_ref().expect("loaded counts").table;
                     let batch = copy_rows(ctx, table, *at, cap)?;

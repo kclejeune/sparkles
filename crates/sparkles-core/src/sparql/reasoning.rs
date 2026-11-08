@@ -856,7 +856,8 @@ fn seed_values(
     sub.attach_owner();
     let mut planner = Planner::new(&sub);
     let node = planner.plan(&gp, &ActiveGraph::Default, Vec::new())?;
-    let (table, _) = exec::execute(&sub, &node)?;
+    let (input, _) = exec::execute_materialized(&sub, &node)?;
+    let table = &input.table;
     let v = sub.var(var.as_str());
     let Some(c) = table.col_of(v) else {
         return Ok(Some(Vec::new()));

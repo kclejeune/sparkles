@@ -822,8 +822,10 @@ const LEFT_EMPTY: &str = "the left side produced no rows";
 
 /// Execute with the result cache: subtrees that are cheap to recompute (leaf scans and
 /// value tables) bypass it; everything else is looked up and stored.
+/// This legacy raw facade returns caller-owned, uncredited storage. Internal
+/// bounded consumers retain execute_materialized's actual owner instead.
 pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
-    let (output, info) = execute_owned(ctx, n)?;
+    let (output, info) = execute_materialized(ctx, n)?;
     Ok((output.table, info))
 }
 pub(super) fn execute_owned(ctx: &Ctx, n: &Node) -> Result<(Materialized<'static>, PlanInfo)> {
@@ -2883,12 +2885,11 @@ fn run_limited<'ctx>(
             } else {
                 1
             };
-            let (mut other, oinfo) = execute_owned(ctx, &n.children[1 - lim])?;
-            let other_owned = other.lease.is_some();
+            let (mut other, oinfo) = execute_materialized(ctx, &n.children[1 - lim])?;
             let other_held = ctx.charge(0)?;
-            if other_owned {
-                other_held.adopt(&mut other.lease)?;
-            } else {
+            let other_kind = other.adopt_input(ctx, &other_held)?;
+            let other_owned = other_kind == InputCredit::Lease;
+            if other_kind == InputCredit::Plain {
                 other_held.add(other.table.mem_bytes())?;
             }
             let other = other.table;
@@ -2924,10 +2925,11 @@ fn run_limited<'ctx>(
                     Some(earlier) => earlier.merge_run(pinfo),
                     None => pinfo,
                 };
-                let part_owned = part.lease.is_some();
                 let part_held = ctx.charge(0)?;
-                if part_owned {
-                    part_held.adopt(&mut part.lease)?;
+                let part_kind = part.adopt_input(ctx, &part_held)?;
+                let part_owned = part_kind == InputCredit::Lease;
+                if part_kind == InputCredit::Plain {
+                    part_held.add(part.table.mem_bytes())?;
                 }
                 let part = part.table;
                 let (l, r) = if lim == 0 {
@@ -3028,7 +3030,7 @@ fn run_limited<'ctx>(
             finish(t, vec![info], true)
         }
         _ => {
-            let (t, info) = execute_owned(ctx, n)?;
+            let (t, info) = execute_materialized(ctx, n)?;
             Ok((t, info, true))
         }
     }
@@ -10154,6 +10156,142 @@ mod paid_eager_producer_tests {
             drop(output);
             assert_eq!(ctx.live_bytes(), 0);
         }
+    }
+
+    #[test]
+    fn review_f1_slice_adopts_one_actual_scan_backing() {
+        let store = scan_fixture();
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.use_cache = false;
+        ctx.mem_limit = 200;
+        let spec = default_subject_scan(&ctx);
+        let (direct, _) = scan_limited(&ctx, &spec, &[0], &[0], Some(1)).unwrap();
+        assert_eq!(ctx.live_bytes(), 168);
+        let expected = direct.table.cols[0][0];
+        drop(direct);
+        assert_eq!(ctx.live_bytes(), 0);
+        let before = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        let mut child = Node::leaf(Kind::Scan(spec), vec![0], 3.0, "review scan".into());
+        child.sorted = vec![0];
+        let mut node = Node::leaf(
+            Kind::Slice {
+                offset: 0,
+                limit: Some(1),
+            },
+            vec![0],
+            1.0,
+            "review slice".into(),
+        );
+        node.children.push(child);
+        let (output, _) = execute_materialized(&ctx, &node).unwrap();
+        assert_eq!(output.table.cols, [vec![expected]]);
+        assert_eq!(
+            ctx.live_bytes(),
+            168,
+            "one physical scan must keep exactly its one prepaid owner"
+        );
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            before
+        );
+        drop(output);
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+
+    #[test]
+    fn review_f2_borrowed_limited_values_stays_fast() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.use_cache = false;
+        ctx.var("value");
+        ctx.mem_limit = 164;
+        let table = Table {
+            vars: vec![0],
+            cols: vec![vec![Id::UNDEF]],
+            len: 1,
+            sorted: Vec::new(),
+        };
+        let node = Node::leaf(Kind::Values(table), vec![0], 1.0, "review values".into());
+        let before = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        let (output, _, complete) = execute_limited(&ctx, &node, 1).unwrap();
+        assert!(complete);
+        assert_eq!(output.table.cols, [vec![Id::UNDEF]]);
+        assert_eq!(ctx.live_bytes(), 164);
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            before,
+            "borrowed limited Values must not initialize the query ledger"
+        );
+        drop(output);
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+
+    #[test]
+    fn review_f2_prepared_values_limit_and_ask_keep_ordinary_eager_execution_fast() {
+        let store = Store::in_memory(StoreOptions::default());
+        for query in [
+            "SELECT ?value WHERE { VALUES ?value { UNDEF } } LIMIT 1",
+            "ASK WHERE { VALUES ?value { UNDEF } }",
+            "SELECT ?value WHERE { VALUES ?value { 1 } FILTER EXISTS { VALUES ?value { 1 } } }",
+        ] {
+            let options = super::super::QueryOptions {
+                no_cache: true,
+                ..Default::default()
+            };
+            let before = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+            let result = super::super::query(store.snapshot(), query, &options).unwrap();
+            assert_eq!(result.len(), 1);
+            if result.kind == super::super::QueryKind::Ask {
+                assert!(result.boolean);
+            }
+            assert_eq!(
+                super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+                before,
+                "{query}"
+            );
+            drop(result);
+        }
+    }
+
+    #[test]
+    fn review_f2_raw_application_facade_does_not_promote_before_returning_unowned_table() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.use_cache = false;
+        ctx.var("value");
+        let table = Table {
+            vars: vec![0],
+            cols: vec![vec![Id::UNDEF]],
+            len: 1,
+            sorted: Vec::new(),
+        };
+        let node = Node::leaf(Kind::Values(table), vec![0], 1.0, "raw facade".into());
+        let before = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        let (table, _) = execute(&ctx, &node).unwrap();
+        assert_eq!(table.cols, [vec![Id::UNDEF]]);
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            before
+        );
+        // This explicitly raw application facade is not the retained engine API.
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+
+    #[test]
+    fn review_f2_update_where_values_consumes_borrowed_backing_without_promotion() {
+        let store = Store::in_memory(StoreOptions::default());
+        let before = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        super::super::update::update(
+            &store,
+            "INSERT { <urn:out> <urn:p> ?value } WHERE { VALUES ?value { 1 } }",
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(store.snapshot().len(), 1);
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            before
+        );
     }
 
     #[test]

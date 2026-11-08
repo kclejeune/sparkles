@@ -258,6 +258,10 @@ pub(super) struct Materialized<'ctx> {
     pub(super) lease: Option<super::query_memory::QueryMemoryLease>,
 }
 impl<'ctx> Materialized<'ctx> {
+    pub(super) fn has_credit(&self) -> bool {
+        self.fast.is_some() || self.lease.is_some()
+    }
+
     /// Slice paid backing in place. The original capacities and their actual
     /// owner stay together; no unadmitted replacement columns overlap the input.
     pub(super) fn slice(

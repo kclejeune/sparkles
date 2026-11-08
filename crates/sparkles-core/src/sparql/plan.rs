@@ -6088,8 +6088,8 @@ pub fn eval_exists(ctx: &Ctx, spec: &ExistsSpec, key: &[Id], schema: &[VarId]) -
     };
     let node = p.plan(&spec.pattern, &graph, Vec::new())?;
     let node = slice(node, 0, Some(1), ctx);
-    let (t, _) = super::exec::execute(ctx, &node)?;
-    Ok(!t.is_empty())
+    let (input, _) = super::exec::execute_materialized(ctx, &node)?;
+    Ok(!input.table.is_empty())
 }
 
 /// Literal helper for tests.
