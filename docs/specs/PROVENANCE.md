@@ -318,7 +318,8 @@ Read the [provenance record](U11-linked-views.md#provenance).
 
 ## OWL 2 ontology API
 
-Read the [provenance record](F21-ontology-api.md#provenance).
+Read the [provenance record](F21-ontology-api.md#provenance), including the OWL 2,
+RDF Concepts 2004, XML and RFC 3986 standards used for XML literal namespace checks.
 
 ## JSON queries, JSON-LD frames and Datalog queries
 
