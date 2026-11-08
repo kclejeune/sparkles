@@ -809,13 +809,65 @@ pub(super) enum Accounting {
     Cursor,
 }
 
-/// The first budget refusal that infallible code met. Scalar evaluation cannot return
-/// a budget error, so it records the refusal here and the next check fails with it,
+/// The first supported resource refusal that infallible code met. Scalar evaluation cannot return
+/// a resource error, so it records the refusal here and the next check fails with it,
 /// which keeps a refused allocation from becoming an unbound value.
 #[derive(Default)]
 struct MemoryFailure {
-    failure: parking_lot::Mutex<Option<Budget>>,
+    failure: parking_lot::Mutex<Option<ResourceRefusal>>,
     failed: AtomicBool,
+}
+
+/// Only the supported resource outcomes become sticky. Arbitrary scalar/service
+/// errors keep their existing semantics; typed ownership errors never become UNDEF.
+#[derive(Clone)]
+enum ResourceRefusal {
+    Budget(Budget),
+    Parent {
+        component: &'static str,
+        code: String,
+        message: String,
+        source: sparkles_budget::ParentRefused,
+    },
+    Cancelled,
+    Timeout,
+}
+
+impl ResourceRefusal {
+    fn from_error(error: &Error) -> Option<Self> {
+        match error {
+            Error::BudgetExceeded(budget) => Some(Self::Budget(*budget)),
+            Error::Cancelled => Some(Self::Cancelled),
+            Error::Timeout => Some(Self::Timeout),
+            Error::Component(component) => component
+                .source
+                .as_ref()
+                .and_then(|source| source.downcast_ref::<sparkles_budget::ParentRefused>())
+                .map(|source| Self::Parent {
+                    component: component.component,
+                    code: component.code.clone(),
+                    message: component.message.clone(),
+                    source: *source,
+                }),
+            _ => None,
+        }
+    }
+
+    fn into_error(self) -> Error {
+        match self {
+            Self::Budget(budget) => Error::BudgetExceeded(budget),
+            Self::Cancelled => Error::Cancelled,
+            Self::Timeout => Error::Timeout,
+            Self::Parent {
+                component,
+                code,
+                message,
+                source,
+            } => Error::Component(Box::new(
+                crate::error::ComponentError::new(component, code, message).with_source(source),
+            )),
+        }
+    }
 }
 
 /// The high-water envelope that transient dictionary decoding reserves in both
@@ -1600,24 +1652,24 @@ impl Ctx {
     #[cold]
     #[inline(never)]
     fn recorded_failure(&self) -> Result<()> {
-        match *self.memory_failure.failure.lock() {
-            Some(budget) => Err(Error::BudgetExceeded(budget)),
+        let failure = self.memory_failure.failure.lock().clone();
+        match failure {
+            Some(failure) => Err(failure.into_error()),
             None => Ok(()),
         }
     }
 
-    /// Record a budget refusal that infallible code met, so that the next check fails
-    /// with it, in both accounting modes.
+    /// Record the first supported resource refusal met by infallible code, so
+    /// the next check preserves its original typed outcome in both modes.
     pub(super) fn fail_memory(&self, error: &Error) {
-        if let Error::BudgetExceeded(budget) = error {
-            self.record_failure(*budget);
+        if self.memory_failure.failed.load(Ordering::Acquire) {
+            return;
         }
-    }
-
-    fn record_failure(&self, budget: Budget) {
-        let failure = &self.memory_failure;
-        failure.failure.lock().get_or_insert(budget);
-        failure.failed.store(true, Ordering::Release);
+        if let Some(refusal) = ResourceRefusal::from_error(error) {
+            let failure = &self.memory_failure;
+            failure.failure.lock().get_or_insert(refusal);
+            failure.failed.store(true, Ordering::Release);
+        }
     }
 
     /// Charge `bytes` more of query-local terms and memos, which stay until the context

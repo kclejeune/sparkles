@@ -221,3 +221,98 @@ fn impossible_container_refuses_without_decoding() {
     assert!(!decoded.get());
     assert_eq!(budget.ctx.live_bytes(), 0);
 }
+
+#[test]
+fn actual_infallible_interning_keeps_typed_parent_refusal_sticky() {
+    use sparkles_budget::{MemoryDomain, ParentRefused};
+    let store = Store::in_memory(StoreOptions::default());
+    let parent = MemoryDomain::unpooled().parent(
+        |bytes| {
+            if bytes == 0 {
+                Ok(())
+            } else {
+                Err(ParentRefused::Overflow)
+            }
+        },
+        |_| {},
+    );
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.set_memory_parent(parent).unwrap();
+    let ctx = Arc::new(ctx);
+    assert!(ctx.intern_key(b"<urn:sticky-refusal>").is_undef());
+    let error = ctx
+        .check()
+        .expect_err("resource refusal must survive actual infallible interning");
+    fn origin(error: Error) {
+        let Error::Component(component) = error else {
+            panic!("lost typed parent: {error:?}")
+        };
+        assert_eq!(
+            (component.component, component.code.as_str()),
+            ("query-memory", "ownership")
+        );
+        assert_eq!(
+            component
+                .source
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<ParentRefused>(),
+            Some(&ParentRefused::Overflow)
+        );
+    }
+    origin(error);
+    ctx.fail_memory(&Error::BudgetExceeded(crate::Budget {
+        kind: BudgetKind::Memory,
+        limit: 1,
+        requested: 2,
+    }));
+    ctx.fail_memory(&Error::Cancelled);
+    origin(ctx.check().unwrap_err());
+    let output = OutputBudget::new(ctx.clone());
+    origin(output.decode(Id::UNDEF).err().unwrap());
+    assert_eq!(ctx.live_bytes(), 0);
+}
+
+#[test]
+fn sticky_resource_outcomes_preserve_first_type_and_ignore_nonresource_errors() {
+    for timeout in [false, true] {
+        let budget = budget(4096);
+        budget
+            .ctx
+            .fail_memory(&Error::Service("ordinary scalar failure".into()));
+        budget
+            .ctx
+            .fail_memory(&Error::Invalid("ordinary invalid value".into()));
+        budget.ctx.check().unwrap();
+        assert!(budget.decode(Id::UNDEF).unwrap().is_none());
+        let first = if timeout {
+            Error::Timeout
+        } else {
+            Error::Cancelled
+        };
+        budget.ctx.fail_memory(&first);
+        budget
+            .ctx
+            .fail_memory(&Error::BudgetExceeded(crate::Budget {
+                kind: BudgetKind::Memory,
+                limit: 1,
+                requested: 2,
+            }));
+        for _ in 0..2 {
+            match budget.ctx.check().unwrap_err() {
+                Error::Timeout if timeout => (),
+                Error::Cancelled if !timeout => (),
+                error => panic!("lost original control: {error:?}"),
+            }
+        }
+    }
+    let budget = budget(4096);
+    let expected = crate::Budget {
+        kind: BudgetKind::Memory,
+        limit: 7,
+        requested: 9,
+    };
+    budget.ctx.fail_memory(&Error::BudgetExceeded(expected));
+    budget.ctx.fail_memory(&Error::Timeout);
+    assert!(matches!(budget.ctx.check(), Err(Error::BudgetExceeded(found)) if found == expected));
+}
