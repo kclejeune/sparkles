@@ -152,6 +152,23 @@ impl PreparedDestination {
                     "captured destination has an unknown output member",
                 ));
             }
+            // Verify the bytes actually written, not a prior read of this
+            // mutable retained FD. Reidentified headers use separate proofs.
+            let copied_pin = manifest.member_pin(path);
+            let metadata = path
+                .strip_prefix(generation)
+                .and_then(|p| p.strip_prefix('/'))
+                == Some("meta.json");
+            if metadata && copied_pin.is_none() {
+                return Err(managed_history::unavailable(
+                    "captured destination metadata has no source pin",
+                ));
+            }
+            if copied_pin.is_some_and(|(length, _)| length != file.len) {
+                return Err(managed_history::unavailable(
+                    "captured destination member extent differs from its selected pin",
+                ));
+            }
             let mut input = CapturedReader {
                 capture,
                 index,
@@ -185,16 +202,22 @@ impl PreparedDestination {
                 preparation.check()?;
                 let want = remaining.min(buffer.len() as u64) as usize;
                 input.read_exact(&mut buffer[..want])?;
-                if wal {
+                if wal || copied_pin.is_some() {
                     hash.update(&buffer[..want]);
                 }
                 output.write_all(&buffer[..want])?;
                 remaining -= want as u64;
             }
+            preparation.check()?;
+            let digest = crate::evidence::Sha256Digest::from_digest_bytes(hash.finalize().into());
+            if copied_pin.is_some_and(|(_, expected)| digest != expected) {
+                return Err(managed_history::unavailable(
+                    "captured destination member differs from its selected pin",
+                ));
+            }
             if wal
                 && (file.len != source.source.primary.wal_extent
-                    || crate::evidence::Sha256Digest::from_digest_bytes(hash.finalize().into())
-                        != source.source.primary.wal_digest)
+                    || digest != source.source.primary.wal_digest)
             {
                 return Err(managed_history::unavailable(
                     "captured WAL changed after its complete primary proof",
