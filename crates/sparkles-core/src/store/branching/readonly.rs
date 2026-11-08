@@ -279,6 +279,7 @@ pub(in crate::store) fn authenticate_retained_generation(
     store: &Store,
     entry: &crate::history::GenEntry,
     limit: &crate::history::ReadLimit<'_>,
+    through: u64,
 ) -> Result<()> {
     let mut budget = ColdBudget::new(*limit)?;
     budget.charge(
@@ -339,26 +340,45 @@ pub(in crate::store) fn authenticate_retained_generation(
     let mut reader = loaded.value;
     let extent = reader.get_ref().metadata()?.len();
     let mut configuration_error = None;
-    wal::probe::prove_prefix_with(
-        &mut reader,
-        extent,
-        entry.base.seq,
-        u64::MAX,
-        entry.fold_legacy,
-        generation.strict_from,
-        terms,
-        annotations.value.as_deref(),
-        &path,
-        &budget,
-        &mut |observation| {
-            if configuration_error.is_none()
-                && let Err(error) = primary.observation(observation, &budget)
-            {
-                configuration_error = Some(error);
-            }
-            Ok(())
-        },
-    )?;
+    let mut observe = |observation| {
+        if configuration_error.is_none()
+            && let Err(error) = primary.observation(observation, &budget)
+        {
+            configuration_error = Some(error);
+        }
+        Ok(())
+    };
+    // A read of one commit needs that commit's prefix, as its replay reads it.
+    // Readers of the whole log pass `u64::MAX` and prove all of it.
+    if through == u64::MAX {
+        wal::probe::prove_prefix_with(
+            &mut reader,
+            extent,
+            entry.base.seq,
+            u64::MAX,
+            entry.fold_legacy,
+            generation.strict_from,
+            terms,
+            annotations.value.as_deref(),
+            &path,
+            &budget,
+            &mut observe,
+        )?;
+    } else {
+        wal::probe::prove_prefix_through(
+            &mut reader,
+            extent,
+            entry.base.seq,
+            through,
+            entry.fold_legacy,
+            generation.strict_from,
+            terms,
+            annotations.value.as_deref(),
+            &path,
+            &budget,
+            &mut observe,
+        )?;
+    }
     if let Some(error) = configuration_error {
         return Err(error);
     }

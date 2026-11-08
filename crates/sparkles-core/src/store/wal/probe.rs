@@ -749,6 +749,73 @@ pub(crate) fn prove_prefix_recording<
     visit: &mut dyn FnMut(WalCommitObservation) -> Result<()>,
     record_used: &mut F,
 ) -> Result<ProvenWal> {
+    prove_prefix_bounded(
+        reader,
+        extent,
+        base,
+        target,
+        fold_legacy,
+        strict_from,
+        dvocab_len,
+        annotated,
+        path,
+        budget,
+        visit,
+        record_used,
+        false,
+    )
+}
+
+/// Prove the log only through commit `target`, as a past-state read of `target`
+/// replays it. Damage to a later commit, durable or not, belongs to the reads of
+/// that commit, so it cannot refuse an earlier one. Observations end at `target`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_prefix_through<R: Read + Seek>(
+    reader: &mut BufReader<R>,
+    extent: u64,
+    base: u64,
+    target: u64,
+    fold_legacy: bool,
+    strict_from: Option<u64>,
+    dvocab_len: u64,
+    annotated: Option<&[u64]>,
+    path: &Path,
+    budget: &ColdBudget<'_>,
+    visit: &mut dyn FnMut(WalCommitObservation) -> Result<()>,
+) -> Result<ProvenWal> {
+    prove_prefix_bounded(
+        reader,
+        extent,
+        base,
+        target,
+        fold_legacy,
+        strict_from,
+        dvocab_len,
+        annotated,
+        path,
+        budget,
+        visit,
+        &mut |_, _| Ok(()),
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_prefix_bounded<R: Read + Seek, F: FnMut(u64, &[u8; WAL_REC]) -> Result<()>>(
+    reader: &mut BufReader<R>,
+    extent: u64,
+    base: u64,
+    target: u64,
+    fold_legacy: bool,
+    strict_from: Option<u64>,
+    dvocab_len: u64,
+    annotated: Option<&[u64]>,
+    path: &Path,
+    budget: &ColdBudget<'_>,
+    visit: &mut dyn FnMut(WalCommitObservation) -> Result<()>,
+    record_used: &mut F,
+    stop_at_target: bool,
+) -> Result<ProvenWal> {
     check_strict_from(path, strict_from)?;
     reader.seek(SeekFrom::Start(0))?;
     let mut head = WalPoint {
@@ -757,6 +824,10 @@ pub(crate) fn prove_prefix_recording<
         folding: fold_legacy,
     };
     let mut selected = (target == base).then_some(head);
+    if stop_at_target && selected.is_some() && !head.folding {
+        budget.check()?;
+        return Ok(ProvenWal { head, selected });
+    }
     let mut framing = Framing::of(strict_from);
     let mut crc = flate2::Crc::new();
     let mut needed = 0;
@@ -846,6 +917,11 @@ pub(crate) fn prove_prefix_recording<
                     },
                 })?;
                 budget.check()?;
+                // Folded legacy commits share one number, so a folding prefix
+                // continues to the first commit that ends the fold.
+                if stop_at_target && selected.is_some() && !head.folding {
+                    return Ok(ProvenWal { head, selected });
+                }
                 crc = flate2::Crc::new();
                 needed = 0;
                 configuration = ConfigurationRecords::default();

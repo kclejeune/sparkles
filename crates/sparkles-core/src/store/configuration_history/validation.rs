@@ -202,6 +202,17 @@ fn inspect_branch(
         } else {
             None
         };
+        // A generation newer than CURRENT is a leftover that open removes or sets
+        // aside, as `settle_newer_generations` does. It never becomes primary, so
+        // its references authenticate nothing and a torn one is not an error.
+        let current = match budget.read_file(&root.join("CURRENT")) {
+            Ok(bytes) => std::str::from_utf8(&bytes)
+                .ok()
+                .map(|name| commit::generation_number(name.trim()))
+                .filter(|number| *number != 0),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
         for entry in std::fs::read_dir(root)? {
             budget.check()?;
             let entry = entry?;
@@ -210,6 +221,9 @@ fn inspect_branch(
             if !name.strip_prefix("gen-").is_some_and(|digits| {
                 !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
             }) {
+                continue;
+            }
+            if current.is_some_and(|current| commit::generation_number(name) > current) {
                 continue;
             }
             if !entry.file_type()?.is_dir() || entry.file_type()?.is_symlink() {

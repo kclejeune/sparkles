@@ -154,7 +154,7 @@ pub(crate) fn descriptor_version(file: &mut File, path: &Path) -> Result<u32> {
             }
             length += count;
         }
-        version_of(&bytes[..length], path)
+        committed_version_of(&bytes[..length], path)
     })();
     let restored = file.seek(SeekFrom::Start(position));
     match result {
@@ -196,6 +196,16 @@ pub(crate) fn version_of(buf: &[u8], path: &Path) -> Result<u32> {
     match buf.first() {
         Some(&WAL_HEADER) => header_version(buf, path),
         _ => Ok(0),
+    }
+}
+
+/// The version of a log for replay, from its first complete record only. A
+/// header record cut short by a crash is a torn tail with no committed record,
+/// as it is to the record-by-record readers, so it reads as an empty log (0).
+pub(crate) fn committed_version_of(buf: &[u8], path: &Path) -> Result<u32> {
+    match buf.get(..WAL_REC) {
+        Some(record) => version_of(record, path),
+        None => Ok(0),
     }
 }
 

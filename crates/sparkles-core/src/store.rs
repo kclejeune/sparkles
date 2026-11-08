@@ -3094,9 +3094,9 @@ impl Store {
         };
         let entry = h.gens[&owner].clone();
         let generation = if memory.is_some() {
-            self.history_generation_limited(&mut h, owner, current, &live, &limit)?
+            self.history_generation_limited(&mut h, owner, current, &live, &limit, seq)?
         } else {
-            self.history_generation(&mut h, owner, current, &live, &entry)?
+            self.history_generation(&mut h, owner, current, &live, &entry, seq)?
         };
         let limit = if memory.is_some() && !Arc::ptr_eq(&generation, &live.generation) {
             limit.holding(generation.retained_bytes_limited(&limit)?)?
@@ -3236,6 +3236,7 @@ impl Store {
         current: u32,
         live: &Snapshot,
         entry: &crate::history::GenEntry,
+        through: u64,
     ) -> Result<Arc<Generation>> {
         if owner == current {
             return Ok(live.generation.clone());
@@ -3246,7 +3247,12 @@ impl Store {
             memory: None,
             held: 0,
         };
-        branching::readonly::authenticate_retained_generation(self, entry, &history_limit)?;
+        branching::readonly::authenticate_retained_generation(
+            self,
+            entry,
+            &history_limit,
+            through,
+        )?;
         if let Some(i) = h.open.iter().position(|(n, _)| *n == owner) {
             let e = h.open.remove(i);
             let g = e.1.clone();
@@ -7870,7 +7876,7 @@ pub(crate) fn wal_end(dir: &Path, base: &CommitInfo, fold_legacy: bool) -> u64 {
         return base.seq;
     };
     let recs = buf.as_chunks::<WAL_REC>().0;
-    let Ok(version) = wal::version_of(&buf, &dir.join("wal.log")) else {
+    let Ok(version) = wal::committed_version_of(&buf, &dir.join("wal.log")) else {
         return base.seq;
     };
     let (mut end, mut txn_start, mut seen_v2) = (base.seq, 0usize, false);
@@ -8060,7 +8066,7 @@ pub(crate) fn replay_wal(
     configuration: &mut dyn FnMut(wal::probe::WalCommitObservation) -> Result<()>,
 ) -> Result<Replay> {
     let cache = from.cache;
-    let wal_version = wal::version_of(buf, from.path)?;
+    let wal_version = wal::committed_version_of(buf, from.path)?;
     let recs = buf.as_chunks::<WAL_REC>().0;
     let dvocab_len = from.generation.dvocab.len();
     let mut out = Replay {

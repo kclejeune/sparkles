@@ -2526,7 +2526,7 @@ impl Store {
             return Err(self.history_gone(&h, seq, head.seq, None, Some(r.commit)));
         };
         let entry = h.gens[&owner].clone();
-        let generation = self.history_generation(&mut h, owner, current, &live, &entry)?;
+        let generation = self.history_generation(&mut h, owner, current, &live, &entry, seq)?;
         if owner == current {
             generation.dvocab.sync()?;
         }
