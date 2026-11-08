@@ -397,13 +397,18 @@ impl PoolGrant {
         } else {
             capacity
         };
-        let ceiling = share.max(INITIAL_GRANT.min(capacity)).max(cur);
+        let ceiling = share.max(INITIAL_GRANT.min(capacity));
         let free = capacity.saturating_sub(self.pool.granted());
-        let free = free - free % GRANULE;
-        cur.saturating_add(free)
-            .min(ceiling)
-            .min(capacity.max(cur))
-            .saturating_sub(used)
+        // The largest target `grow_locked` accepts: a whole granule within both the
+        // ceiling and the free capacity, or the capacity itself, which it uses as
+        // the final clamped granule when that fits.
+        let limit = ceiling.min(cur.saturating_add(free));
+        let best = if capacity <= limit {
+            capacity
+        } else {
+            limit - limit % GRANULE
+        };
+        best.max(cur).saturating_sub(used)
     }
 
     /// The most bytes this grant has held at once.
@@ -668,6 +673,29 @@ mod tests {
         let mut late = pool.enter(8 * MB, None);
         assert!(late.poll().is_none());
         assert!(head.poll().is_some());
+    }
+
+    #[test]
+    fn growth_room_matches_admitted_granule_rounding_while_requests_wait() {
+        let pool = QueryPool::new(68 * MB);
+        let g = pool.try_grant(16 * MB).unwrap();
+        let _other = pool.try_grant(20 * MB).unwrap();
+        let mut waiter = pool.enter(40 * MB, None);
+        assert!(waiter.poll().is_none());
+        // Half the pool is 34 MiB, so the largest admitted target is 32 MiB.
+        let room = g.growth_room();
+        assert_eq!(room, 32 * MB - g.used());
+        g.charge(room).unwrap();
+        assert!(g.charge(1).is_err());
+    }
+
+    #[test]
+    fn growth_room_includes_the_capacity_clamped_final_granule() {
+        let pool = QueryPool::new(10 * MB);
+        let g = pool.try_grant(4 * MB).unwrap();
+        let room = g.growth_room();
+        assert_eq!(room, 10 * MB - g.used());
+        g.charge(room).unwrap();
     }
 
     #[test]
