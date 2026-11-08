@@ -1097,10 +1097,13 @@ impl Vocab {
         reserve: impl FnMut(usize) -> std::result::Result<(), E>,
         f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
-        self.get_sorted_checked_in(ids, &mut Vec::new(), reserve, f)
+        self.get_sorted_checked_in::<false, E>(ids, &mut Vec::new(), reserve, f)
     }
 
-    fn get_sorted_checked_in<E>(
+    /// With `ROOM`, a coded step always has [`FSST_ROOM`] admitted bytes of room past
+    /// the key, so FSST decodes it with its fast loops. A reused buffer keeps that
+    /// room, and a fresh buffer per call would reallocate for it.
+    fn get_sorted_checked_in<const ROOM: bool, E>(
         &self,
         ids: &[u64],
         key: &mut Vec<u8>,
@@ -1108,15 +1111,15 @@ impl Vocab {
         f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
         if self.fsst.is_some() {
-            self.get_sorted_checked_as::<true, E>(ids, key, reserve, f)
+            self.get_sorted_checked_as::<true, ROOM, E>(ids, key, reserve, f)
         } else {
-            self.get_sorted_checked_as::<false, E>(ids, key, reserve, f)
+            self.get_sorted_checked_as::<false, ROOM, E>(ids, key, reserve, f)
         }
     }
 
     /// [`Vocab::get_sorted_checked`] for an FSST-coded vocabulary when `F`.
     #[inline(always)]
-    fn get_sorted_checked_as<const F: bool, E>(
+    fn get_sorted_checked_as<const F: bool, const ROOM: bool, E>(
         &self,
         ids: &[u64],
         key: &mut Vec<u8>,
@@ -1188,7 +1191,8 @@ impl Vocab {
                         (nd - e.shared).min(e.most())
                     };
                     let total = key.len().min(e.shared).saturating_add(add);
-                    if total > key.capacity() {
+                    let room = if ROOM && e.coded { FSST_ROOM } else { 0 };
+                    if total.saturating_add(room) > key.capacity() {
                         // an FSST suffix decodes fastest with room for eight symbols
                         // past the key (`fsst::Table::decode_at`)
                         let total = total.saturating_add(FSST_ROOM * usize::from(e.coded));
@@ -1244,7 +1248,7 @@ impl Vocab {
         mut f: impl FnMut(&[u8]) -> T,
     ) -> std::result::Result<Option<T>, E> {
         let mut out = None;
-        self.get_sorted_checked_in(&[id], key, reserve, |_, key| {
+        self.get_sorted_checked_in::<true, E>(&[id], key, reserve, |_, key| {
             out = Some(f(key));
             Ok(())
         })?;
