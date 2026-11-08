@@ -316,3 +316,126 @@ fn sticky_resource_outcomes_preserve_first_type_and_ignore_nonresource_errors() 
     budget.ctx.fail_memory(&Error::Timeout);
     assert!(matches!(budget.ctx.check(), Err(Error::BudgetExceeded(found)) if found == expected));
 }
+
+#[test]
+fn cancelled_receiving_copy_refuses_even_an_unbound_cell() {
+    let budget = budget(4096);
+    budget
+        .ctx
+        .cancel
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert!(
+        matches!(budget.decode(Id::UNDEF), Err(Error::Cancelled)),
+        "a cancelled receiving budget must refuse before allocating even UNDEF output"
+    );
+    assert_eq!(budget.ctx.live_bytes(), 0);
+}
+
+#[test]
+fn receiving_container_admission_precedes_allocation_and_refusal_retires_partial_state() {
+    use crate::algo::memory::probe;
+    use std::{cell::Cell, rc::Rc};
+    let bytes = (4 * std::mem::size_of::<Option<Term>>()
+        + std::mem::size_of::<RowsBacking>()
+        + 2 * std::mem::size_of::<usize>()) as u64;
+    for reason in ["budget", "cancel", "deadline", "allocation", "ok"] {
+        let mut receiver = budget(bytes - u64::from(reason == "budget"));
+        if reason == "cancel" {
+            receiver
+                .ctx
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        if reason == "deadline" {
+            Arc::get_mut(&mut receiver.ctx).unwrap().deadline = Some(std::time::Instant::now());
+        }
+        let allocations = Rc::new(Cell::new(0));
+        let seen = allocations.clone();
+        let owner = receiver.ctx.clone();
+        let hook = probe::install(
+            move |point| {
+                if let probe::Point::Allocation("owned-output-container", 4) = point {
+                    seen.set(seen.get() + 1);
+                    assert_eq!(
+                        owner.live_bytes(),
+                        bytes,
+                        "entire fixed container and Arc header are prepaid"
+                    );
+                }
+            },
+            (reason == "allocation").then_some("owned-output-container"),
+        );
+        let result = receiver.decode_rows(2, 2, |_, _| Id::UNDEF);
+        match reason {
+            "budget" => assert!(matches!(result, Err(Error::BudgetExceeded(_)))),
+            "cancel" => assert!(matches!(result, Err(Error::Cancelled))),
+            "deadline" => assert!(matches!(result, Err(Error::Timeout))),
+            "allocation" => assert!(matches!(result, Err(Error::Invalid(_)))),
+            _ => {
+                let rows = result.unwrap();
+                assert_eq!((rows.len(), rows.width()), (2, 2));
+                assert_eq!(receiver.ctx.live_bytes(), bytes);
+                drop(rows);
+            }
+        }
+        assert_eq!(
+            allocations.get(),
+            usize::from(matches!(reason, "allocation" | "ok"))
+        );
+        assert_eq!(receiver.ctx.live_bytes(), 0);
+        drop(hook);
+    }
+}
+
+#[test]
+fn receiving_copy_checks_controls_during_unbound_work_and_after_last_cell() {
+    use std::cell::Cell;
+    let receiver = budget(1 << 20);
+    let calls = Cell::new(0usize);
+    let result = receiver.build(2048, 1, |_, _, _| {
+        calls.set(calls.get() + 1);
+        receiver
+            .ctx
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(None)
+    });
+    assert!(matches!(result, Err(Error::Cancelled)));
+    assert_eq!(calls.get(), 1024);
+    assert_eq!(receiver.ctx.live_bytes(), 0);
+    receiver
+        .ctx
+        .cancel
+        .store(false, std::sync::atomic::Ordering::Release);
+    let result = receiver.build(1, 1, |_, _, _| {
+        receiver
+            .ctx
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(None)
+    });
+    assert!(matches!(result, Err(Error::Cancelled)));
+    assert_eq!(receiver.ctx.live_bytes(), 0);
+}
+
+#[test]
+fn late_receiving_refusal_drops_constructed_terms_and_zero_width_needs_no_loop() {
+    let receiver = budget(4096);
+    let result = receiver.build(2, 1, |row, _, credit| {
+        if row == 1 {
+            return Err(Error::Cancelled);
+        }
+        credit.add(64)?;
+        Ok(Some(Term::Literal(oxrdf::Literal::new_simple_literal(
+            "partial",
+        ))))
+    });
+    assert!(matches!(result, Err(Error::Cancelled)));
+    assert_eq!(receiver.ctx.live_bytes(), 0);
+    let rows = receiver
+        .decode_rows(usize::MAX, 0, |_, _| unreachable!())
+        .unwrap();
+    assert_eq!((rows.len(), rows.width()), (usize::MAX, 0));
+    drop(rows);
+    assert_eq!(receiver.ctx.live_bytes(), 0);
+}

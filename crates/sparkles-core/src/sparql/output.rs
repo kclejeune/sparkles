@@ -45,40 +45,61 @@ impl OutputBudget {
         width: usize,
         mut decode: impl FnMut(usize, usize, &Charge<'_>) -> Result<Option<Term>>,
     ) -> Result<OwnedRows> {
-        self.ctx.check_memory_failure()?;
+        self.ctx.check()?;
         let count = rows.checked_mul(width).ok_or_else(|| self.overflow())?;
-        let bytes = count
+        let cells = count
             .checked_mul(std::mem::size_of::<Option<Term>>())
-            .and_then(|n| n.checked_add(std::mem::size_of::<RowsBacking>()))
+            .filter(|bytes| *bytes <= isize::MAX as usize)
+            .ok_or_else(|| self.overflow())?;
+        let bytes = cells
+            .checked_add(std::mem::size_of::<RowsBacking>())
             .and_then(|n| n.checked_add(2 * std::mem::size_of::<usize>()))
             .and_then(|n| u64::try_from(n).ok())
             .ok_or_else(|| self.overflow())?;
         let credit = self.ctx.charge(bytes)?;
-        // Declaration order also protects partial construction on a decoding error.
+        // Partial payload storage drops before its actual admission on every error.
         let mut partial = PartialRows {
-            terms: Vec::with_capacity(count),
+            terms: Vec::new(),
             nesting: 0,
         };
-        // `with_capacity` may provide more than requested. Cover that physical
-        // storage before filling it, without discarding the admitted container.
-        let extra = partial
-            .terms
-            .capacity()
-            .checked_sub(count)
-            .and_then(|n| n.checked_mul(std::mem::size_of::<Option<Term>>()))
-            .and_then(|n| u64::try_from(n).ok())
-            .ok_or_else(|| self.overflow())?;
-        credit.add(extra)?;
-        for r in 0..rows {
-            for c in 0..width {
-                let term = decode(r, c, &credit)?;
-                if let Some(term) = &term {
-                    partial.nesting = partial.nesting.max(term_depth(term));
-                }
-                partial.terms.push(term);
+        #[cfg(test)]
+        {
+            use crate::algo::memory::probe;
+            probe::at(probe::Point::Allocation("owned-output-container", count));
+            if probe::fails("owned-output-container") {
+                return Err(Error::invalid("injected owned output allocation failure"));
             }
         }
-        self.ctx.check_memory_failure()?;
+        self.ctx.check()?;
+        partial
+            .terms
+            .try_reserve_exact(count)
+            .map_err(|_| Error::invalid("owned output allocation failed"))?;
+        if partial.terms.capacity() != count {
+            return Err(Error::invalid(
+                "owned output capacity exceeds prepaid admission",
+            ));
+        }
+        // Zero-width rows call no decoder and need no per-row work. Other copies
+        // poll controls after at most1024 cells, including all-UNDEF inputs.
+        if width != 0 {
+            let mut unchecked = 1024usize;
+            for r in 0..rows {
+                for c in 0..width {
+                    if unchecked == 0 {
+                        self.ctx.check()?;
+                        unchecked = 1024;
+                    }
+                    unchecked -= 1;
+                    let term = decode(r, c, &credit)?;
+                    if let Some(term) = &term {
+                        partial.nesting = partial.nesting.max(term_depth(term));
+                    }
+                    partial.terms.push(term);
+                }
+            }
+        }
+        self.ctx.check()?;
         Ok(OwnedRows {
             inner: Arc::new(RowsBacking {
                 terms: std::mem::take(&mut partial.terms),
