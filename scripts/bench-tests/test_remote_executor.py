@@ -1,11 +1,14 @@
 """Provider contracts using bounded local fixtures, never provider qualification."""
 import hashlib
+import ctypes
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import shlex
+import signal
+import sys
 import subprocess
 import tarfile
 import tempfile
@@ -124,6 +127,8 @@ class LocalTransport(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        libc=ctypes.CDLL(None);previous=ctypes.c_int();self.assertEqual(libc.prctl(37,ctypes.byref(previous),0,0,0),0)
+        self.assertEqual(libc.prctl(36,1,0,0,0),0);self.addCleanup(lambda:libc.prctl(36,previous.value,0,0,0))
         self.calls = []
         def command(host, text):
             self.calls.append((host, text))
@@ -244,6 +249,29 @@ class LocalTransport(unittest.TestCase):
         with payload.open('rb') as data,self.assertRaises(ValueError):
             RX.send('boat:bx_test','ignored',data,time.monotonic()-1)
         self.assertEqual(len(self.calls),calls)
+
+    def test_zero_and_failed_sender_reap_silent_owned_descendants_only(self):
+        for status in (0,17):
+            for public_send in (True,False):
+                ready=self.root/f'ready-{status}-{public_send}';pidfile=self.root/f'pid-{status}-{public_send}'
+                child="import signal,time,pathlib;signal.signal(signal.SIGTERM,signal.SIG_IGN);pathlib.Path("+repr(str(ready))+").write_text('ready');time.sleep(5)"
+                leader="import sys,subprocess,pathlib,time;sys.stdin.buffer.read();p=subprocess.Popen([sys.executable,'-c',"+repr(child)+"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);pathlib.Path("+repr(str(pidfile))+").write_text(str(p.pid));end=time.monotonic()+1\nwhile not pathlib.Path("+repr(str(ready))+").exists():\n if time.monotonic()>end:raise SystemExit(19)\n time.sleep(.005)\nraise SystemExit("+str(status)+")"
+                foreign=subprocess.Popen(['sleep','5'],start_new_session=True)
+                try:
+                    argv=[sys.executable,'-c',leader]
+                    with patch.object(RX,'command',return_value=argv),tempfile.TemporaryFile()as output:
+                        if public_send:code=RX.send('boat:bx_test','fixture',io.BytesIO(b'exact input'),time.monotonic()+2)
+                        else:code=RX.exchange(argv,output,source=io.BytesIO(b'exact input'),deadline=time.monotonic()+2)
+                    self.assertEqual(code,status);self.assertTrue(ready.exists())
+                    child_pid=int(pidfile.read_text());self.assertFalse(Path('/proc',str(child_pid)).exists())
+                    with self.assertRaises(ChildProcessError):os.waitpid(child_pid,os.WNOHANG)
+                    self.assertIsNone(foreign.poll())
+                finally:
+                    foreign.terminate();foreign.wait(timeout=3)
+                    if pidfile.exists():
+                        child_pid=int(pidfile.read_text())
+                        if Path('/proc',str(child_pid)).exists():
+                            os.kill(child_pid,signal.SIGKILL);os.waitpid(child_pid,0)
 
     def test_legacy_ssh_delete_is_delegated_without_changing_arguments(self):
         args=['-a','--delete','wally:gate/out/test/',str(self.root/'dest')+'/']

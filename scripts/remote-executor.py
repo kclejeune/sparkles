@@ -410,6 +410,7 @@ def exchange(argv, output, limit=MAX_ARCHIVE, timeout=300, deadline=None, source
     process = subprocess.Popen(argv, stdin=subprocess.PIPE if source is not None else subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     finished = False
+    failure = None
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
     selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
@@ -448,20 +449,43 @@ def exchange(argv, output, limit=MAX_ARCHIVE, timeout=300, deadline=None, source
         finished = code == 0
         return code
     except BaseException as error:
+        failure = error
         code = process.poll()
         if code is not None and code != 0:
             error.native_exit = code
         raise
     finally:
         selector.close()
-        if not finished:
-            try:os.killpg(process.pid, signal.SIGTERM)
+        cleanup=[]
+        cleanup_end=time.monotonic()+5
+        # A zero-exit leader is not proof that its invocation is empty.
+        for sig,grace in ((signal.SIGTERM,2),(signal.SIGKILL,3)):
+            try:os.killpg(process.pid,sig)
             except ProcessLookupError:pass
-            try:process.wait(timeout=2)
-            except subprocess.TimeoutExpired:pass
-            try:os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:pass
-            process.wait()
+            except OSError as problem:cleanup.append(type(problem).__name__)
+            try:process.wait(timeout=max(0.001,min(grace,cleanup_end-time.monotonic())))
+            except subprocess.TimeoutExpired:
+                if sig==signal.SIGKILL:cleanup.append('transport leader closure unconfirmed')
+        while True:
+            # Reap only children in this invocation's group when this process is
+            # their parent/subreaper. Otherwise the system owner must reap them.
+            try:
+                while os.waitpid(-process.pid,os.WNOHANG)[0]>0:pass
+            except ChildProcessError:pass
+            try:os.killpg(process.pid,0)
+            except ProcessLookupError:break
+            except OSError as problem:
+                cleanup.append(type(problem).__name__);break
+            if time.monotonic()>=cleanup_end:
+                cleanup.append('owned invocation closure unconfirmed');break
+            time.sleep(0.01)
+        if cleanup:
+            if failure is not None:failure.cleanup_errors=cleanup
+            print('remote-executor: owned transport cleanup unresolved; original outcome retained',file=sys.stderr)
+            if process.returncode==0 and failure is None:
+                problem=ValueError('successful transport leader left unconfirmed invocation closure')
+                problem.native_exit=0;problem.cleanup_errors=cleanup
+                raise problem
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None and not stream.closed:stream.close()
 
