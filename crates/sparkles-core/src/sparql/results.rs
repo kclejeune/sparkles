@@ -613,10 +613,11 @@ fn solutions_to(
         if n >= 2 && crate::index::io_hints() {
             prefetch_answer(r, n)?;
         }
+        let mut row = output::ScratchRow::new(r)?;
         for i in 0..n {
-            let row = output::ScratchRow::decode(r, i)?;
+            let terms = row.load(i)?;
             s.serialize(
-                row.terms
+                terms
                     .iter()
                     .enumerate()
                     .filter_map(|(c, term)| term.as_ref().map(|t| (vars[c].as_ref(), t.as_ref()))),
@@ -1852,10 +1853,13 @@ impl Serialize for NativeRows<'_> {
             prefetch_answer(self.r, ahead)
                 .map_err(|error| native_refusal::<S::Error>(self.failure, error))?;
         }
+        let mut row = output::ScratchRow::new(self.r)
+            .map_err(|error| native_refusal::<S::Error>(self.failure, error))?;
         for i in 0..self.n {
-            let row = output::ScratchRow::decode(self.r, i)
+            let terms = row
+                .load(i)
                 .map_err(|error| native_refusal::<S::Error>(self.failure, error))?;
-            seq.serialize_element(&NativeRow { terms: &row.terms })?;
+            seq.serialize_element(&NativeRow { terms })?;
             self.sent.set(self.sent.get() + 1);
         }
         seq.end()

@@ -2,34 +2,71 @@
 //! ownership and large parallel chunks are separate, still-gated migrations.
 use super::QueryResult;
 use crate::error::Result;
-use crate::sparql::ctx::Charge;
+use crate::sparql::ctx::RowCredit;
 use oxrdf::Term;
 
+/// One writer's reused row. Each decode first drops the previous row's terms, so the
+/// credit's high-water mark bounds what the writer holds at any time.
 pub(super) struct ScratchRow<'a> {
     // Rust destroys fields in declaration order: free all strings and nested terms
     // before their actual query/parent credit can notify a returning owner.
     pub(super) terms: Vec<Option<Term>>,
-    _credit: Charge<'a>,
+    // The reused reconstruction buffer is freed before the credit that admitted it.
+    key: Vec<u8>,
+    credit: RowCredit<'a>,
+    keys: RowCredit<'a>,
+    r: &'a QueryResult,
 }
 
 impl<'a> ScratchRow<'a> {
-    pub(super) fn decode(r: &'a QueryResult, index: usize) -> Result<Self> {
+    /// A scratch row for the writer of `r`, admitting the row's term slots.
+    pub(super) fn new(r: &'a QueryResult) -> Result<Self> {
         r.inner.ctx.check_memory_failure()?;
+        let credit = RowCredit::new(&r.inner.ctx);
         let width = r.inner.table.width();
-        let bytes = width
+        credit.add(Self::slots(r, width)?)?;
+        Ok(Self {
+            terms: Vec::with_capacity(width),
+            key: Vec::new(),
+            credit,
+            keys: RowCredit::new(&r.inner.ctx),
+            r,
+        })
+    }
+
+    fn slots(r: &QueryResult, width: usize) -> Result<u64> {
+        width
             .checked_mul(std::mem::size_of::<Option<Term>>())
             .and_then(|n| u64::try_from(n).ok())
-            .ok_or_else(|| r.inner.ctx.memory_exceeded(u64::MAX))?;
-        let credit = r.inner.ctx.charge(bytes)?;
-        let mut row = Self {
-            terms: Vec::with_capacity(width),
-            _credit: credit,
-        };
+            .ok_or_else(|| r.inner.ctx.memory_exceeded(u64::MAX))
+    }
+
+    /// Decode row `index` into this scratch, replacing the previous row.
+    pub(super) fn load(&mut self, index: usize) -> Result<&[Option<Term>]> {
+        let r = self.r;
+        // A refusal recorded while the last row was written stays the writer's error.
+        r.inner.ctx.check_memory_failure()?;
+        self.terms.clear();
+        self.credit.reset();
+        self.credit.add(Self::slots(r, r.inner.table.width())?)?;
         for col in &r.inner.table.cols {
-            row.terms
-                .push(r.inner.ctx.output_term(col[index], &row._credit)?);
+            r.inner.ctx.output_term_into(
+                col[index],
+                &self.credit,
+                &self.keys,
+                &mut self.key,
+                &mut self.terms,
+            )?;
         }
         r.inner.ctx.check_memory_failure()?;
+        Ok(&self.terms)
+    }
+
+    /// Decode one row into its own scratch.
+    #[cfg(test)]
+    pub(super) fn decode(r: &'a QueryResult, index: usize) -> Result<Self> {
+        let mut row = Self::new(r)?;
+        row.load(index)?;
         Ok(row)
     }
 }

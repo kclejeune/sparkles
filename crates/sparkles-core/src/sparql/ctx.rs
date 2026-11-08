@@ -2279,9 +2279,12 @@ impl Ctx {
         }
     }
 
-    /// Decode one private writer cell after admitting its owned payload. Unlike the
+    /// Decode one retained output cell after admitting its owned payload. Unlike the
     /// public compatibility decoder, this route cannot turn a refusal into UNDEF.
-    /// The row's charge outlives every returned term; no owning value escapes it.
+    /// The charge outlives every returned term; no owning value escapes it. Retained
+    /// pages and single terms use this route, so a simple literal takes over its
+    /// reconstructed vocabulary key's allocation. The streaming writer reuses one
+    /// scratch row through [`Ctx::output_term_into`] instead.
     pub(super) fn output_term(&self, id: Id, row: &Charge<'_>) -> Result<Option<Term>> {
         assert!(
             std::ptr::eq(self, row.ctx),
@@ -2339,6 +2342,118 @@ impl Ctx {
         };
         self.check_memory_failure()?;
         Ok(term)
+    }
+
+    /// Decode one streaming writer cell into the writer's reused scratch, for tests.
+    #[cfg(test)]
+    pub(super) fn output_scratch_term(
+        &self,
+        id: Id,
+        row: &RowCredit<'_>,
+        keys: &RowCredit<'_>,
+        key: &mut Vec<u8>,
+    ) -> Result<Option<Term>> {
+        let mut out = Vec::with_capacity(1);
+        self.output_term_into(id, row, keys, key, &mut out)?;
+        Ok(out.pop().flatten())
+    }
+
+    /// Decode one streaming writer cell after admitting its owned payload, pushing it
+    /// onto `out`. Unlike the public compatibility decoder, this route cannot turn a
+    /// refusal into UNDEF. The row's credit outlives every pushed term, and the
+    /// writer drops the row's terms before it decodes the next row. `key` is the
+    /// writer's reused reconstruction buffer, and `keys` admits its growth before it
+    /// is allocated and holds that credit until the buffer is freed. A decoded term
+    /// is built in place in the row rather than returned through the vocabulary's
+    /// callback and its nested results, whose copies of each term cost a large
+    /// answer about a tenth of its writing time.
+    ///
+    /// No term escapes the scratch row, so this route copies each key out of the
+    /// reused buffer instead of moving the key's allocation into the term as
+    /// [`Ctx::output_term`] does. Both physical allocations stay admitted: the
+    /// buffer by `keys` and the copy by `row`.
+    #[inline]
+    pub(super) fn output_term_into(
+        &self,
+        id: Id,
+        row: &RowCredit<'_>,
+        keys: &RowCredit<'_>,
+        key: &mut Vec<u8>,
+        out: &mut Vec<Option<Term>>,
+    ) -> Result<()> {
+        assert!(
+            std::ptr::eq(self, row.charge.ctx) && std::ptr::eq(self, keys.charge.ctx),
+            "output credit belongs to its query"
+        );
+        match id.tag() {
+            Tag::Undef => out.push(None),
+            Tag::Local => {
+                // Keys are append-only. Read the estimate, leave the vocabulary lock,
+                // then admit before taking the lock again to allocate the term.
+                let bytes = self
+                    .local
+                    .read()
+                    .get(id.payload())
+                    .map(|key| output_key_bytes(self, key, 0))
+                    .transpose()?;
+                if let Some(bytes) = bytes {
+                    row.add(bytes)?;
+                }
+                out.push(
+                    bytes.and_then(|_| self.local.read().get(id.payload()).map(copied_output_key)),
+                );
+            }
+            Tag::Delta => {
+                let bytes = self
+                    .snap
+                    .generation
+                    .dvocab
+                    .with(|vocab| {
+                        vocab
+                            .get(id.payload())
+                            .map(|key| output_key_bytes(self, key, 0))
+                    })
+                    .transpose()?;
+                if let Some(bytes) = bytes {
+                    row.add(bytes)?;
+                }
+                out.push(bytes.and_then(|_| {
+                    self.snap
+                        .generation
+                        .dvocab
+                        .with(|vocab| vocab.get(id.payload()).map(copied_output_key))
+                }));
+            }
+            // Reconstruction scratch is query-owned even when the vocabulary is mapped.
+            // Twice the requested size covers old and new buffers during reallocation.
+            // The writer reuses one buffer for every cell, and its high-water credit
+            // admits growth without an account update per cell. A fresh buffer per
+            // cell reallocated while rebuilding nearly every key and made large
+            // answers about a third slower to write.
+            Tag::Vocab => {
+                let found = self.snap.generation.vocab.get_with_checked_in(
+                    id.payload(),
+                    key,
+                    |need| keys.reserve((need as u64).saturating_mul(2)),
+                    |key| -> Result<()> {
+                        row.add(output_key_bytes(self, key, 0)?)?;
+                        out.push(Some(copied_output_key(key)));
+                        Ok(())
+                    },
+                )?;
+                match found {
+                    Some(pushed) => pushed?,
+                    None => out.push(None),
+                }
+            }
+            // Inline numbers/calendar values and blank-node labels have bounded
+            // formatted text. This covers their strings and construction overlap.
+            _ => {
+                row.add(256)?;
+                out.push(self.snap.term(id));
+            }
+        }
+        Ok(())
     }
 
     /// A vocabulary key and its final simple literal share one physical allocation.
@@ -3141,6 +3256,54 @@ impl Charge<'_> {
         Ok(())
     }
 }
+/// Credit of a reused output row. The writer frees each row's terms before it decodes
+/// the next, so live output is at most the largest row so far. The credit keeps that
+/// high-water mark admitted and adds to the query's account only when a row exceeds it,
+/// which leaves one shared account update per growth instead of one per cell.
+pub(super) struct RowCredit<'a> {
+    charge: Charge<'a>,
+    used: std::cell::Cell<u64>,
+}
+impl<'a> RowCredit<'a> {
+    pub(super) fn new(ctx: &'a Ctx) -> Self {
+        Self {
+            charge: Charge {
+                ctx,
+                bytes: std::cell::Cell::new(0),
+                owner: std::cell::Cell::new(None),
+            },
+            used: std::cell::Cell::new(0),
+        }
+    }
+    /// Admit `bytes` more for the current row before they are allocated.
+    pub(super) fn add(&self, bytes: u64) -> Result<()> {
+        let used = self
+            .used
+            .get()
+            .checked_add(bytes)
+            .ok_or_else(|| self.charge.ctx.memory_exceeded(u64::MAX))?;
+        let held = self.charge.bytes.get();
+        if used > held {
+            self.charge.add(used - held)?;
+        }
+        self.used.set(used);
+        Ok(())
+    }
+    /// Hold at least `bytes` in total, for scratch whose size replaces rather than
+    /// adds to what was held before.
+    pub(super) fn reserve(&self, bytes: u64) -> Result<()> {
+        let held = self.charge.bytes.get();
+        if bytes > held {
+            self.charge.add(bytes - held)?;
+        }
+        Ok(())
+    }
+    /// Start a new row. The caller has already dropped every term of the last one.
+    pub(super) fn reset(&self) {
+        self.used.set(0);
+    }
+}
+
 impl Drop for Charge<'_> {
     fn drop(&mut self) {
         self.ctx.release_live(self.owner.get(), self.bytes.get());
