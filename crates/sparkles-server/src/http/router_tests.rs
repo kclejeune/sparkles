@@ -107,13 +107,17 @@ struct Server {
 }
 
 fn server() -> Server {
+    server_with_type(DbType::Mem)
+}
+
+fn server_with_type(kind: DbType) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let opts = StoreOptions {
         result_cache_min_ms: 0.0,
         ..Default::default()
     };
     let state = Arc::new(AppState::new(dir.path(), opts, Duration::from_secs(30)).unwrap());
-    let ds = state.attach("ds", DbType::Mem, None).unwrap();
+    let ds = state.attach("ds", kind, None).unwrap();
     ds.store
         .load(&[Source::from_bytes(
             DATA.as_bytes().to_vec(),
@@ -1465,6 +1469,121 @@ async fn shacl_targets_name_stored_blank_nodes() {
     )
     .await;
     assert_eq!(many["results"].as_array().unwrap().len(), 1, "{many}");
+}
+
+/// A visual draft carries exact stored blank constants without claiming its RDF has
+/// already been written into the snapshot. Ordinary inline shapes remain document-local.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_inline_draft_preserves_stored_blank_constants() {
+    let s = server_with_type(DbType::Persistent);
+    let ds = s.state.datasets().get("ds").cloned().unwrap();
+    ds.store.load(&[Source::from_bytes(
+        b"@prefix ex: <http://example.org/> . _:anon a ex:Person . ex:alice ex:knows _:anon . ex:data { ex:alice ex:knows _:anon . }".to_vec(),
+        oxrdfio::RdfFormat::TriG,
+        None,
+    )]).unwrap();
+    let full = validate_json(&s.app, "", NAME_SHAPES).await;
+    let label = full["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["focusNode"]["type"] == "bnode")
+        .unwrap()["focusNode"]["value"]
+        .as_str()
+        .unwrap();
+    let head = ds.store.snapshot().commit;
+    let constants = format!(
+        "@prefix ex: <http://example.org/> . @prefix sh: <http://www.w3.org/ns/shacl#> . ex:S sh:targetNode ex:alice; sh:property [ sh:path ex:knows; sh:hasValue _:{label}; sh:in (_:{label}) ] ."
+    );
+    let local = validate_json(&s.app, "?target=ex:alice", &constants).await;
+    assert_eq!(local["conforms"], false, "{local}");
+    let stored = validate_json(
+        &s.app,
+        &format!("?target=ex:alice&storedBlankNodes=true&at={head}&graph=default"),
+        &constants,
+    )
+    .await;
+    assert_eq!(stored["conforms"], true, "{stored}");
+    let named = validate_json(
+        &s.app,
+        &format!("?target=ex:alice&storedBlankNodes=true&at={head}&graph=http://example.org/data"),
+        &constants,
+    )
+    .await;
+    assert_eq!(named["conforms"], true, "{named}");
+    let explicit_default = validate_json(
+        &s.app,
+        "?target=ex:alice&storedBlankNodes=false",
+        &constants,
+    )
+    .await;
+    assert_eq!(explicit_default["conforms"], false, "{explicit_default}");
+    let target = format!(
+        "@prefix sh: <http://www.w3.org/ns/shacl#> . <urn:S> sh:targetNode _:{label}; sh:nodeKind sh:IRI ."
+    );
+    let local = validate_json(&s.app, &format!("?target=_:{label}"), &target).await;
+    assert_eq!(local["conforms"], true, "{local}");
+    let stored = validate_json(
+        &s.app,
+        &format!("?target=_:{label}&storedBlankNodes=true&at={head}"),
+        &target,
+    )
+    .await;
+    assert_eq!(stored["conforms"], false, "{stored}");
+    assert_eq!(stored["results"][0]["focusNode"]["value"], label);
+    let unknown = target.replace(label, "visual_unknown");
+    let fresh = validate_json(
+        &s.app,
+        &format!("?target=_:{label}&storedBlankNodes=true"),
+        &unknown,
+    )
+    .await;
+    assert_eq!(fresh["conforms"], true, "{fresh}");
+    // A later data value must not leak into a draft checked at its original head.
+    ds.store.load(&[Source::from_bytes(
+        b"@prefix ex: <http://example.org/> . ex:alice ex:knows _:new . ex:data { ex:alice ex:knows _:new . }".to_vec(),
+        oxrdfio::RdfFormat::TriG,
+        None,
+    )]).unwrap();
+    for graph in ["default", "http://example.org/data"] {
+        let pinned = validate_json(
+            &s.app,
+            &format!("?target=ex:alice&storedBlankNodes=true&at={head}&graph={graph}"),
+            &constants,
+        )
+        .await;
+        assert_eq!(pinned["conforms"], true, "{pinned}");
+        let current = validate_json(
+            &s.app,
+            &format!("?target=ex:alice&storedBlankNodes=true&graph={graph}"),
+            &constants,
+        )
+        .await;
+        assert_eq!(current["conforms"], false, "{current}");
+    }
+}
+
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_inline_draft_refuses_incompatible_identity_options() {
+    let s = server();
+    for query in [
+        "?storedBlankNodes=maybe",
+        "?storedBlankNodes=true&shapes=guard",
+    ] {
+        let r = validate(&s.app, query, NAME_SHAPES, Some("application/json")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    }
+    let r = send(
+        &s.app,
+        Request::post("/ds/shacl?storedBlankNodes=true")
+            .header(header::CONTENT_TYPE, "text/shaclc")
+            .body(Body::from(PERSON_SHAPES_SHACLC))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
 }
 
 /// Every ontology route retains the explicit feature-disabled response.

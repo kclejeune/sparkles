@@ -420,6 +420,26 @@ fn sparql_constraint_and_component() {
 }
 
 #[test]
+fn inline_stored_blank_constants_keep_sparql_shapes_graph_unbound() {
+    let data = store("ex:a ex:p ex:b .");
+    let text = format!(
+        "{PREFIXES}ex:S sh:targetNode ex:a; sh:sparql [ sh:select \"SELECT $this WHERE {{ FILTER(BOUND($shapesGraph)) }}\" ] ."
+    );
+    let document =
+        sparkles_shacl::syntax::read_document(&text, RdfFormat::Turtle.into(), None).unwrap();
+    let draft = Shapes::from_graph_with_stored_blank_nodes(document.graph).unwrap();
+    let report = validate(&data.snapshot(), &draft, &ValidateOptions::default()).unwrap();
+    assert!(report.conforms, "{report}");
+    let ordinary = validate(
+        &data.snapshot(),
+        &shapes(&text),
+        &ValidateOptions::default(),
+    )
+    .unwrap();
+    assert!(ordinary.conforms, "{ordinary}");
+}
+
+#[test]
 fn sparql_prebinding_restrictions() {
     let bad = "ex:S sh:targetNode ex:a ; sh:sparql [ sh:select \"SELECT $this WHERE { $this ?p ?o MINUS { $this ?p 1 } }\" ] .";
     assert!(Shapes::parse(&format!("{PREFIXES}{bad}"), RdfFormat::Turtle, None).is_err());
@@ -639,5 +659,161 @@ fn unique_members_false_still_requires_lists() {
             None
         )
         .is_err()
+    );
+}
+
+// These regression bodies are frozen for the backend consult old-red/repair pair.
+#[test]
+fn authoring_consult_nested_service_is_rejected_while_parsing() {
+    let service = "SERVICE <http://127.0.0.1:1/never-contact> { ?s ?p ?o }";
+    let queries = [
+        format!("SELECT $this WHERE {{ FILTER(EXISTS {{ {service} }}) }}"),
+        format!("SELECT $this WHERE {{ FILTER(NOT EXISTS {{ {service} }}) }}"),
+        format!("SELECT $this WHERE {{ BIND(EXISTS {{ {service} }} AS ?b) }}"),
+        format!(
+            "SELECT $this WHERE {{ OPTIONAL {{ $this ?p ?o FILTER(EXISTS {{ {service} }}) }} }}"
+        ),
+        format!("SELECT $this WHERE {{ }} ORDER BY (EXISTS {{ {service} }})"),
+        format!("SELECT $this (COUNT(EXISTS {{ {service} }}) AS ?n) WHERE {{ }} GROUP BY $this"),
+        format!("SELECT $this WHERE {{ }} GROUP BY $this (EXISTS {{ {service} }} AS ?b)"),
+        format!("SELECT $this WHERE {{ FILTER(IF(true, EXISTS {{ {service} }}, false)) }}"),
+    ];
+    let mut accepted = Vec::new();
+    for query in queries {
+        let ttl =
+            format!("{PREFIXES}ex:S sh:targetNode ex:a; sh:sparql [ sh:select \"{query}\" ] .");
+        match Shapes::parse(&ttl, RdfFormat::Turtle, None) {
+            Ok(_) => accepted.push(query),
+            Err(e) => assert!(
+                format!("{e:#}").contains("SERVICE is not allowed"),
+                "{query}: {e:#}"
+            ),
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "prohibited nested queries accepted: {accepted:?}"
+    );
+}
+
+#[test]
+fn authoring_consult_custom_and_node_expression_service_is_rejected() {
+    let nested = "EXISTS { SERVICE <http://127.0.0.1:1/never-contact> { ?s ?p ?o } }";
+    let documents = [
+        format!(
+            "ex:C a sh:ConstraintComponent; sh:parameter [ sh:path ex:flag ]; sh:validator [ a sh:SPARQLAskValidator; sh:ask \"ASK {{ FILTER({nested}) }}\" ]. ex:S sh:targetNode ex:a; ex:flag true ."
+        ),
+        format!(
+            "ex:C a sh:ConstraintComponent; sh:parameter [ sh:path ex:flag ]; sh:nodeValidator [ a sh:SPARQLSelectValidator; sh:select \"SELECT $this WHERE {{ FILTER({nested}) }}\" ]. ex:S sh:targetNode ex:a; ex:flag true ."
+        ),
+        format!(
+            "ex:S sh:targetWhere [ sh:expression [ sh:select \"SELECT ?result WHERE {{ BIND({nested} AS ?result) }}\" ] ]; sh:class ex:C ."
+        ),
+        format!(
+            "ex:S sh:targetNode ex:a; sh:property [ sh:path ex:p; sh:values [ sh:sparqlExpr \"{nested}\" ]; sh:hasValue true ] ."
+        ),
+    ];
+    let mut accepted = Vec::new();
+    for document in documents {
+        match Shapes::parse(&format!("{PREFIXES}{document}"), RdfFormat::Turtle, None) {
+            Ok(_) => accepted.push(document),
+            Err(e) => assert!(
+                format!("{e:#}").contains("SERVICE is not allowed"),
+                "{document}: {e:#}"
+            ),
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "prohibited embedded queries accepted: {accepted:?}"
+    );
+}
+
+#[test]
+fn authoring_consult_ordinary_exists_remains_supported() {
+    assert_results(
+        "ex:a ex:p ex:b .",
+        "ex:S sh:targetNode ex:a; sh:sparql [ sh:select \"SELECT $this WHERE { FILTER(EXISTS { $this <http://ex.org/p> ?o }) }\" ] .",
+        &["SPARQL a a"],
+    );
+    assert_results(
+        "ex:a ex:p ex:b .",
+        "ex:S sh:targetNode ex:a; sh:sparql [ sh:select \"SELECT $this WHERE { FILTER(NOT EXISTS { $this <http://ex.org/p> ?o }) }\" ] .",
+        &[],
+    );
+}
+
+#[test]
+fn authoring_consult_node_expression_keeps_local_values_syntax() {
+    assert_results(
+        "ex:a a ex:T .",
+        "ex:S sh:targetNode [ sh:select \"SELECT ?this WHERE { VALUES ?this { <http://ex.org/a> } }\" ]; sh:class ex:T .",
+        &[],
+    );
+}
+
+#[test]
+fn authoring_consult_nested_prebinding_restrictions_apply_to_exists() {
+    for body in [
+        "FILTER(EXISTS { VALUES ?x { 1 } })",
+        "FILTER(EXISTS { ?s ?p ?o MINUS { ?s ?p 1 } })",
+        "FILTER(EXISTS { BIND(1 AS $this) })",
+    ] {
+        let ttl = format!(
+            "{PREFIXES}ex:S sh:targetNode ex:a; sh:sparql [ sh:select \"SELECT $this WHERE {{ {body} }}\" ] ."
+        );
+        assert!(
+            Shapes::parse(&ttl, RdfFormat::Turtle, None).is_err(),
+            "nested prebinding form accepted: {body}"
+        );
+    }
+}
+
+#[test]
+fn authoring_consult_inert_blank_targets_preserve_metadata_as_constants() {
+    let nested = "EXISTS { SERVICE <http://127.0.0.1:1/never-contact> { ?s ?p ?o } }";
+    // Keep the exact formerly negative document: invalid expression candidates in
+    // targetNode are plain RDF constants under the existing target contract.
+    let documents = [
+        format!(
+            "ex:S sh:targetNode [ sh:select \"SELECT ?this WHERE {{ FILTER({nested}) }}\" ]; sh:class ex:C ."
+        ),
+        "ex:S sh:targetNode [ ex:metadata 'preserved' ]; sh:class ex:C .".to_string(),
+    ];
+    for document in documents {
+        let report = run("ex:a a ex:C .", &document);
+        assert!(
+            !report.conforms,
+            "a constant target still receives its constraint"
+        );
+        assert_eq!(report.results.len(), 1, "{report}");
+        let result = &report.results[0];
+        assert!(matches!(result.focus_node, Term::BlankNode(_)), "{report}");
+        assert_eq!(result.value.as_ref(), Some(&result.focus_node));
+        assert_eq!(
+            result.source_constraint_component.as_str(),
+            "http://www.w3.org/ns/shacl#ClassConstraintComponent"
+        );
+    }
+}
+
+#[test]
+fn authoring_consult_executable_local_target_expression_selects_data() {
+    let report = run(
+        "ex:a ex:p ex:b . ex:b a ex:C .",
+        "ex:S sh:targetWhere [ sh:expression [ sh:select \"SELECT ?result WHERE { BIND(EXISTS { $this <http://ex.org/p> ?o } AS ?result) }\" ] ]; sh:class ex:C .",
+    );
+    assert!(
+        !report.conforms,
+        "the local expression must actually select ex:a"
+    );
+    assert_eq!(report.results.len(), 1, "{report}");
+    assert_eq!(
+        report.results[0].focus_node,
+        Term::NamedNode(oxrdf::NamedNode::new_unchecked("http://ex.org/a"))
+    );
+    assert_eq!(
+        report.results[0].source_constraint_component.as_str(),
+        "http://www.w3.org/ns/shacl#ClassConstraintComponent"
     );
 }

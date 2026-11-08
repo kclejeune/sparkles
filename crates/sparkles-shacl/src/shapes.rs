@@ -329,6 +329,8 @@ pub struct Shapes {
     /// blank nodes of this shapes graph are store blank nodes (read via
     /// [`Shapes::from_store`]) and may be matched against data nodes
     pub(crate) bnodes_in_store: bool,
+    /// The shapes themselves are a stored graph, independently of constant identity.
+    pub(crate) binds_shapes_graph: bool,
     /// the store graph the shapes were read from (`None` = default graph), for
     /// `$shapesGraph` in SHACL-SPARQL
     pub(crate) source_graph: Option<String>,
@@ -394,6 +396,18 @@ impl Shapes {
     /// Parse the shapes of an RDF graph.
     pub fn from_graph(graph: Graph) -> Result<Shapes> {
         Parser::new(&graph).parse(false)
+    }
+
+    /// Parse an inline RDF draft whose blank-node constants retain stored identities.
+    ///
+    /// Existing store labels resolve in the validation snapshot; unknown labels remain
+    /// local. Unlike `from_store`, this graph is not already in the snapshot, so it does
+    /// not bind `$shapesGraph`. Callers must keep the source dataset and revision when
+    /// carrying labels from a stored graph into a draft.
+    pub fn from_graph_with_stored_blank_nodes(graph: Graph) -> Result<Shapes> {
+        let mut shapes = Self::from_graph(graph)?;
+        shapes.bnodes_in_store = true;
+        Ok(shapes)
     }
 
     /// Parse the shapes of an RDF graph, and the node expression `expr` of it, for
@@ -783,6 +797,7 @@ impl<'g> Parser<'g> {
         expr: Option<&Term>,
     ) -> Result<(Shapes, Option<ExprId>)> {
         self.out.bnodes_in_store = bnodes_in_store;
+        self.out.binds_shapes_graph = bnodes_in_store;
         self.components = crate::sparql::parse_components(&self.g)?;
         self.parse_functions()?;
         // candidate shapes, in a deterministic order
@@ -1309,6 +1324,20 @@ mod graph_read_tests {
     use sparkles_core::index::Perm;
     use sparkles_core::sparql::{QueryOptions, update::update};
     use sparkles_core::store::Store;
+
+    #[test]
+    fn inline_stored_constants_do_not_bind_a_stored_shapes_graph() {
+        let shapes = Shapes::from_graph_with_stored_blank_nodes(Graph::new()).unwrap();
+        assert!(shapes.bnodes_in_store);
+        assert!(!shapes.binds_shapes_graph);
+        let inline = Shapes::from_graph(Graph::new()).unwrap();
+        assert!(!inline.bnodes_in_store);
+        assert!(!inline.binds_shapes_graph);
+        let store = Store::in_memory(Default::default());
+        let stored = Shapes::from_store(&store.snapshot(), None).unwrap();
+        assert!(stored.bnodes_in_store);
+        assert!(stored.binds_shapes_graph);
+    }
 
     #[test]
     fn a_shapes_graph_read_error_is_not_an_empty_schema() {

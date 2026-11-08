@@ -220,6 +220,7 @@ impl Store {
         };
         Ok(Preview {
             dataset_id: self.owner_dataset_id(),
+            branch_id: self.branch_id(),
             head: b.head,
             commit: Some(b.commit),
             kind: b.commit.kind,
@@ -386,6 +387,7 @@ impl WriteTxn<'_> {
         };
         Ok(Preview {
             dataset_id: store.owner_dataset_id(),
+            branch_id: store.branch_id(),
             head,
             commit,
             kind: self.kind,
