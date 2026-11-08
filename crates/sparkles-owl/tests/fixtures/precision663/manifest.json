@@ -1,0 +1,304 @@
+{
+  "schema": "precision663-fixtures/v1",
+  "source_baseline": "6e4bea2693719d4ff50ca5fcdc0bf14f98249ecf",
+  "status": "hand-derived-expectations-oracles-pending",
+  "cases": [
+    {
+      "name": "integer-decimal",
+      "input_sha256": "a193d4c496859df5112d621b57e148a99846a98e7b1e85747ae0f93751ea7246",
+      "expected": {
+        "consistent": true,
+        "entails": [
+          [
+            "A",
+            "B"
+          ]
+        ],
+        "not_entails": [],
+        "unsatisfiable": []
+      },
+      "derivation": "The integer and decimal denote exactly 2^127.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    },
+    {
+      "name": "rational-decimal",
+      "input_sha256": "753b037b064be75314a0524ae0aed415b46ca94ba502e53b78f3de3bc16aafac",
+      "expected": {
+        "consistent": true,
+        "entails": [
+          [
+            "A",
+            "B"
+          ]
+        ],
+        "not_entails": [],
+        "unsatisfiable": []
+      },
+      "derivation": "The reduced rational and decimal denote 2^127.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    },
+    {
+      "name": "negative-leading-zero",
+      "input_sha256": "3b7c6cf040f4afd9f900e199fad1976094813bc1a13b229a20bcf7c102313b2b",
+      "expected": {
+        "consistent": true,
+        "entails": [
+          [
+            "A",
+            "B"
+          ]
+        ],
+        "not_entails": [],
+        "unsatisfiable": []
+      },
+      "derivation": "Both values are -(2^127+1), including a numerator beyond the small magnitude.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    },
+    {
+      "name": "huge-components-small",
+      "input_sha256": "0ac8715d3bf3ce918e7175c386141e018f9b61f83cd7c0cddc98e7a98e27d14b",
+      "expected": {
+        "consistent": true,
+        "entails": [
+          [
+            "A",
+            "B"
+          ]
+        ],
+        "not_entails": [],
+        "unsatisfiable": []
+      },
+      "derivation": "Equal huge components reduce to one.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    },
+    {
+      "name": "functional-distinct",
+      "input_sha256": "cd292bf798245cce6c5430463fece08b912a8c839d3c160482da544e0fb896be",
+      "expected": {
+        "consistent": true,
+        "entails": [],
+        "not_entails": [],
+        "unsatisfiable": [
+          "A"
+        ]
+      },
+      "derivation": "An instance of A would need two distinct values on functional d; A may be empty, so the ontology is consistent.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    },
+    {
+      "name": "functional-equal",
+      "input_sha256": "1c468ab77af4f55e5826ac8b6a2f3a78545a3b8bc2a8b05cfad63c99cbc8f18b",
+      "expected": {
+        "consistent": true,
+        "entails": [],
+        "not_entails": [
+          [
+            "A",
+            "B"
+          ]
+        ],
+        "unsatisfiable": []
+      },
+      "derivation": "Two equal values meet without a clash; no axiom requires A below B.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    },
+    {
+      "name": "abox-functional-distinct",
+      "input_sha256": "f162c1059a981a7c84e3334935201240f4337117a6022c755564a95f9ebafdf9",
+      "expected": {
+        "consistent": false,
+        "entails": [],
+        "not_entails": [],
+        "unsatisfiable": []
+      },
+      "derivation": "The named individual must have both distinct values on functional d.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    },
+    {
+      "name": "negative-equal",
+      "input_sha256": "fdc665435c8da904b2ef66c1d950e12c6376611bb726f6f618bcfefe1c3ff9d3",
+      "expected": {
+        "consistent": false,
+        "entails": [],
+        "not_entails": [],
+        "unsatisfiable": []
+      },
+      "derivation": "A positive and negative assertion name the same ordered property/value pair.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    },
+    {
+      "name": "negative-distinct",
+      "input_sha256": "577d20fc10bc209e770ae4c9e52e4542dcd3cb30a698088f5835d197e38a79ad",
+      "expected": {
+        "consistent": true,
+        "entails": [],
+        "not_entails": [],
+        "unsatisfiable": []
+      },
+      "derivation": "The negative assertion forbids a different exact value.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    },
+    {
+      "name": "different-individuals",
+      "input_sha256": "3dd2bb6f27e53a545ac1edb318c954a396c7dbd16529b34b226b2258d264f1a0",
+      "expected": {
+        "consistent": true,
+        "entails": [],
+        "not_entails": [],
+        "unsatisfiable": []
+      },
+      "derivation": "Functionality applies per subject, not across distinct individuals.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    },
+    {
+      "name": "key-equal",
+      "input_sha256": "fd2d806922cc9fc6b1f7727f2ce217ce1cf3283869ce613e3a98993cc5e2f655",
+      "expected": {
+        "consistent": true,
+        "entails": [
+          [
+            "A",
+            "B"
+          ]
+        ],
+        "not_entails": [],
+        "unsatisfiable": []
+      },
+      "derivation": "Named key members share one exact data value and must be equal.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    },
+    {
+      "name": "key-distinct",
+      "input_sha256": "6ea12238e41526687be74c9910835b2013a373d3e5da080e721e53ac6614b882",
+      "expected": {
+        "consistent": true,
+        "entails": [],
+        "not_entails": [
+          [
+            "A",
+            "B"
+          ]
+        ],
+        "unsatisfiable": []
+      },
+      "derivation": "Different exact values do not establish a shared key value.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    },
+    {
+      "name": "singleton-definition-range",
+      "input_sha256": "cae0faae479aa2e3cbc6d7fa7e805b6e17874ea16c73172fcc435e42c6eacc17",
+      "expected": {
+        "consistent": true,
+        "entails": [
+          [
+            "A",
+            "B"
+          ]
+        ],
+        "not_entails": [],
+        "unsatisfiable": []
+      },
+      "derivation": "The singleton definition and range contain the same canonical value.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    },
+    {
+      "name": "range-distinct",
+      "input_sha256": "0a33f5ba6bb7d2790626c8b33c4ef11560a04bf3c8924c34a754525fd6346ce1",
+      "expected": {
+        "consistent": true,
+        "entails": [],
+        "not_entails": [],
+        "unsatisfiable": [
+          "A"
+        ]
+      },
+      "derivation": "The required value and singleton range are disjoint, forcing only A empty.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    },
+    {
+      "name": "decimal-membership",
+      "input_sha256": "9f9569243d02de0bd9ea2dc8f03ea12352e8eeebd841772d579b3cebf0261f28",
+      "expected": {
+        "consistent": true,
+        "entails": [
+          [
+            "A",
+            "B"
+          ]
+        ],
+        "not_entails": [],
+        "unsatisfiable": []
+      },
+      "derivation": "The reduced denominator has only 2 and 5 factors.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    },
+    {
+      "name": "rational-nondecimal",
+      "input_sha256": "4f3686d67c85410816ba526579f37e1a19dd3564e90c682af77abd08d68fb0e4",
+      "expected": {
+        "consistent": true,
+        "entails": [],
+        "not_entails": [
+          [
+            "A",
+            "B"
+          ]
+        ],
+        "unsatisfiable": []
+      },
+      "derivation": "The reduced denominator retains factor 3 and is outside decimal.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    },
+    {
+      "name": "huge-not-zero",
+      "input_sha256": "cc8c4c9bcc60ba7cb9656398f16c9cee32495e2b01c297470daf2ee00352f98e",
+      "expected": {
+        "consistent": true,
+        "entails": [],
+        "not_entails": [
+          [
+            "A",
+            "B"
+          ]
+        ],
+        "unsatisfiable": []
+      },
+      "derivation": "2^127 and zero are distinct values.",
+      "hermit": null,
+      "konclude": null,
+      "oracle_status": "pending-separately-allocated-run"
+    }
+  ]
+}
