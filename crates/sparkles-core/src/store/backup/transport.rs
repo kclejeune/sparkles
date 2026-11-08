@@ -3053,6 +3053,83 @@ mod tests {
         }
     }
 
+    /// The registry and owner settings descriptors were verified against the
+    /// selected configuration at capture. Describing them must compare with
+    /// that selection, not mint new pins from bytes changed in place since.
+    #[test]
+    fn describe_refuses_registry_and_settings_changed_in_place_after_capture() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let source = store(&root);
+        let settings = crate::evidence::Settings::default();
+        let canonical = settings.canonical(&Control::none()).unwrap();
+        source
+            .enable_managed(
+                crate::managed::OwnerKind::Evidence,
+                crate::managed::OwnerEntry::for_settings(
+                    1,
+                    settings.managed_graphs(),
+                    canonical.bytes(),
+                ),
+                canonical.bytes(),
+            )
+            .unwrap();
+        crate::sparql::update::update(
+            &source,
+            "INSERT DATA { <urn:s> <urn:p> 2 }",
+            &Default::default(),
+        )
+        .unwrap();
+        let preparation = preparation();
+        let members: Vec<String> = {
+            let capture = source
+                .configuration_capture("registry-pin", &Default::default(), &preparation)
+                .unwrap();
+            capture
+                .data
+                .files
+                .iter()
+                .map(|file| file.path.clone())
+                .filter(|path| {
+                    path == crate::managed::FILE
+                        || crate::managed::OwnerKind::ALL
+                            .iter()
+                            .any(|owner| path == owner.settings_file())
+                })
+                .collect()
+        };
+        assert!(members.iter().any(|path| path == crate::managed::FILE));
+        assert!(members.len() > 1, "{members:?}");
+        for member in &members {
+            let capture = source
+                .configuration_capture("registry-pin", &Default::default(), &preparation)
+                .unwrap();
+            let checked = capture.checked_primary(&preparation).unwrap();
+            let path = root.join(member);
+            let original = std::fs::read(&path).unwrap();
+            let mut changed = original.clone();
+            let last = changed.len() - 1;
+            changed[last] = if changed[last] == b' ' { b'\n' } else { b' ' };
+            std::fs::write(&path, &changed).unwrap();
+            let result = checked.describe_native(&preparation).map(|_| ());
+            std::fs::write(&path, &original).unwrap();
+            let error = result.expect_err(member);
+            assert_eq!(error.code(), "evidence-unavailable", "{member}: {error}");
+            assert!(
+                error.to_string().contains("changed before descriptor"),
+                "{member}: {error}"
+            );
+        }
+        let capture = source
+            .configuration_capture("registry-pin", &Default::default(), &preparation)
+            .unwrap();
+        capture
+            .checked_primary(&preparation)
+            .unwrap()
+            .describe_native(&preparation)
+            .unwrap();
+    }
+
     #[test]
     fn genuine_destination_copy_refuses_same_length_meta_mutation_after_source_staging() {
         for kind in ["persistent-main", "memory-child", "persistent-child"] {

@@ -440,6 +440,26 @@ impl CheckedPrimaryCapture {
                     "checked primary member changed before descriptor",
                 ));
             }
+            // The registry and settings descriptors were verified against the
+            // selected configuration at capture. Their pins are that selection.
+            let registry_member = file.path == crate::managed::FILE
+                || crate::managed::OwnerKind::ALL
+                    .iter()
+                    .any(|owner| file.path == owner.settings_file());
+            if registry_member
+                && !self
+                    .capture
+                    .original
+                    .registry
+                    .iter()
+                    .any(|(path, bytes, sha256)| {
+                        *path == file.path && *bytes == pin.bytes && *sha256 == pin.sha256
+                    })
+            {
+                return Err(super::managed_history::unavailable(
+                    "captured registry member changed before descriptor",
+                ));
+            }
             if files.insert(file.path.clone(), pin).is_some() {
                 return Err(super::managed_history::unavailable(
                     "duplicate native source metadata",
@@ -979,6 +999,9 @@ struct CapturedOriginal {
     pins: Option<super::managed_history::Bytes>,
     table: Option<super::managed_history::Bytes>,
     imports: Option<super::configuration_history::OriginalSources>,
+    /// `managed.json` and each owner's settings file as the selected registry
+    /// encodes them, the bytes their captured descriptors were verified against.
+    registry: Vec<(&'static str, u64, crate::evidence::Sha256Digest)>,
     _held: crate::access::Reservation,
 }
 
@@ -1175,6 +1198,31 @@ impl CapturedOriginal {
                 Ok::<_, Error>((seq, origin.binding))
             })
             .transpose()?;
+        let Some(crate::managed::ManagedState::Installed(installed)) = state.as_deref() else {
+            return Err(super::managed_history::unavailable(
+                "original capture has no installed registry",
+            ));
+        };
+        let _registry = preparation.reserve(
+            ((crate::managed::OwnerKind::ALL.len() + 1)
+                * std::mem::size_of::<(&'static str, u64, crate::evidence::Sha256Digest)>())
+                as u64,
+        )?;
+        let mut registry = Vec::with_capacity(crate::managed::OwnerKind::ALL.len() + 1);
+        let (length, digest) = installed.file_pin();
+        registry.push((
+            crate::managed::FILE,
+            length,
+            crate::evidence::Sha256Digest::from_digest_bytes(digest),
+        ));
+        for (owner, bytes) in &installed.settings {
+            preparation.check()?;
+            registry.push((
+                owner.settings_file(),
+                bytes.len() as u64,
+                crate::evidence::Sha256Digest::of_bytes(bytes, preparation.control())?,
+            ));
+        }
         if !store.same_managed_state(state) {
             return Err(Error::Conflict(
                 "configuration changed while selecting original capture metadata".into(),
@@ -1191,6 +1239,7 @@ impl CapturedOriginal {
             pins,
             table,
             imports,
+            registry,
             _held: held,
         })
     }
