@@ -11,6 +11,8 @@ export const XSD = WELL_KNOWN.xsd;
 export const MAX_TRIPLES = 5000;
 export const MAX_BYTES = 2 * 1024 * 1024;
 export const MAX_DEPTH = 64;
+/** The most steps one expanded property path may have, counting each shared operand per use. */
+export const MAX_PATH_NODES = 1000;
 export const MAX_SAMPLES = 100;
 export const MAX_TREE_REFERENCES = 5000;
 export const id = (t: Term) => patchTerm(t);
@@ -201,8 +203,15 @@ export class ShapeGraph {
   readonly triples: Triple[];
   private readonly subjects = new Map<string, Triple[]>();
   private readonly terms = new Map<string, Term>();
-  constructor(triples: readonly Triple[] = []) {
-    if (triples.length > MAX_TRIPLES)
+  /**
+   * A staged graph is an intermediate state of one edit, which may briefly hold both a
+   * replacement structure and the structure it replaces. Only the final graph is bounded.
+   */
+  constructor(
+    triples: readonly Triple[] = [],
+    private readonly staged = false,
+  ) {
+    if (!staged && triples.length > MAX_TRIPLES)
       throw new Error(
         `The shapes graph exceeds ${MAX_TRIPLES} triples. Choose a smaller shapes graph.`,
       );
@@ -213,7 +222,7 @@ export class ShapeGraph {
       unique.set(tripleId(t), t);
     }
     this.triples = [...unique.values()];
-    if (new TextEncoder().encode(JSON.stringify(this.triples)).length > MAX_BYTES)
+    if (!staged && new TextEncoder().encode(JSON.stringify(this.triples)).length > MAX_BYTES)
       throw new Error('The shapes graph exceeds the 2 MiB editor limit.');
     for (const t of this.triples) {
       const key = id(t[0]);
@@ -258,7 +267,18 @@ export class ShapeGraph {
     }
     return out;
   }
-  path(root: Term, seen = new Set<string>(), depth = 0): ShapePath {
+  path(
+    root: Term,
+    seen = new Set<string>(),
+    depth = 0,
+    budget = { left: MAX_PATH_NODES },
+  ): ShapePath {
+    // Shared operands are expanded once per reference, so an acyclic graph of shared
+    // nodes could otherwise describe an exponential tree.
+    if (--budget.left < 0)
+      throw new Error(
+        `The path expands to more than ${MAX_PATH_NODES} steps. Its RDF is preserved.`,
+      );
     if (depth > MAX_DEPTH || seen.has(id(root)))
       throw new Error('The path is cyclic or nested more than 64 levels. Its RDF is preserved.');
     if (root.type === 'uri') return { kind: 'predicate', iri: root.value };
@@ -284,7 +304,7 @@ export class ShapeGraph {
           : [this.one(root, SH + kind)];
     if ((kind === 'sequence' || kind === 'alternativePath') && members.length < 2)
       throw new Error('Sequence and alternative paths need at least two members.');
-    return { kind, children: members.map((m) => this.path(m, next, depth + 1)) };
+    return { kind, children: members.map((m) => this.path(m, next, depth + 1, budget)) };
   }
   /** Generated labels cannot alias an existing blank node, including one only used as an object. */
   fresh(): Term {
@@ -301,13 +321,16 @@ export class ShapeGraph {
     return { type: 'bnode', value: `visual_${n}` };
   }
   add(...triples: Triple[]): ShapeGraph {
-    return new ShapeGraph([...this.triples, ...triples]);
+    return new ShapeGraph([...this.triples, ...triples], this.staged);
   }
   replace(subject: Term, predicate: string, values: Term[]): ShapeGraph {
-    return new ShapeGraph([
-      ...this.triples.filter((t) => !(same(t[0], subject) && t[1].value === predicate)),
-      ...values.map((v) => [subject, iri(predicate), v] as Triple),
-    ]);
+    return new ShapeGraph(
+      [
+        ...this.triples.filter((t) => !(same(t[0], subject) && t[1].value === predicate)),
+        ...values.map((v) => [subject, iri(predicate), v] as Triple),
+      ],
+      this.staged,
+    );
   }
   replaceValue(
     subject: Term,
@@ -339,7 +362,12 @@ export class ShapeGraph {
         todo.push(t[2]);
       }
     }
-    return removed.size ? new ShapeGraph(this.triples.filter((t) => !removed.has(id(t[0])))) : this;
+    return removed.size
+      ? new ShapeGraph(
+          this.triples.filter((t) => !removed.has(id(t[0]))),
+          this.staged,
+        )
+      : this;
   }
   withList(items: Term[]): { graph: ShapeGraph; root: Term } {
     let g: ShapeGraph = this,
@@ -381,16 +409,17 @@ export class ShapeGraph {
   }
   setPath(subject: Term, path: ShapePath): ShapeGraph {
     const old = this.values(subject, SH + 'path');
-    const a = this.withPath(path);
+    const a = new ShapeGraph(this.triples, true).withPath(path);
     let g = a.graph.replace(subject, SH + 'path', [a.root]);
     for (const root of old) g = g.prune(root);
-    return g;
+    return new ShapeGraph(g.triples);
   }
   setList(subject: Term, predicate: string, before: Term | null, items: Term[] | null): ShapeGraph {
-    const a = items ? this.withList(items) : { graph: this, root: null };
+    const staged = new ShapeGraph(this.triples, true);
+    const a = items ? staged.withList(items) : { graph: staged, root: null };
     let g = a.graph.replaceValue(subject, predicate, before, a.root);
     if (before) g = g.prune(before);
-    return g;
+    return new ShapeGraph(g.triples);
   }
   property(subject: Term): boolean {
     return (

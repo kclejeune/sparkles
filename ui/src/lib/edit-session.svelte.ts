@@ -29,6 +29,8 @@ export class EditSession {
   live = $state<'off' | 'on' | 'stopped'>('off');
   /** The last commit by another writer, as a sentence. */
   notice = $state<string | null>(null);
+  /** The commit that `notice` announces, which a slower answer may show to be this session's. */
+  private noticeSeq: number | null = null;
   /** The commits this session made, which live refresh does not announce. */
   readonly own = new Set<number>();
   private pending: Pending = { mode: 'edit', label: '' };
@@ -99,6 +101,11 @@ export class EditSession {
     void op;
     const seq = committedSeq(a);
     if (seq != null) this.own.add(seq);
+    // the change feed announced this commit before its answer arrived
+    if (seq != null && this.noticeSeq === seq) {
+      this.notice = null;
+      this.noticeSeq = null;
+    }
     const p = this.pending;
     if (p.mode === 'undo') this.undo.undid(seq);
     else if (p.mode === 'redo') this.undo.redid(seq);
@@ -151,8 +158,10 @@ export class EditSession {
             after,
             (c) => {
               if (c.seq <= shown()) return;
-              if (!this.own.has(c.seq))
+              if (!this.own.has(c.seq)) {
                 this.notice = `Commit ${c.seq}${c.message ? ` (${c.message})` : ''} by another writer`;
+                this.noticeSeq = c.seq;
+              }
               clearTimeout(timer);
               timer = setTimeout(() => void this.opts.reload(), 300);
             },

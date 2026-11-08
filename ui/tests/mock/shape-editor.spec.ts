@@ -473,3 +473,53 @@ test('clears sample approval when a replacement source answers at the same commi
     page.getByText('These sample nodes conform to the draft.', { exact: true }),
   ).toHaveCount(0);
 });
+
+test('remounts path forms when a clean refresh changes an operand under the same blank node', async ({
+  page,
+  request,
+}) => {
+  const ds = await setup(request);
+  await update(
+    request,
+    ds,
+    `DELETE { GRAPH <${GRAPH}> { ?s <${SH}path> <${P}> } }
+     INSERT { GRAPH <${GRAPH}> { ?s <${SH}path> [ <${SH}inversePath> <urn:shape-editor:a> ] } }
+     WHERE { GRAPH <${GRAPH}> { ?s <${SH}path> <${P}> } }`,
+  );
+  await open(page, ds);
+  await pick(page, 'Name');
+  const operand = page.getByRole('textbox', { name: 'Path predicate at depth 1', exact: true });
+  await expect(operand).toHaveValue(/urn:shape-editor:a/);
+  await update(
+    request,
+    ds,
+    `DELETE { GRAPH <${GRAPH}> { ?r <${SH}inversePath> <urn:shape-editor:a> } }
+     INSERT { GRAPH <${GRAPH}> { ?r <${SH}inversePath> <urn:shape-editor:b> } }
+     WHERE { GRAPH <${GRAPH}> { ?r <${SH}inversePath> <urn:shape-editor:a> } }`,
+  );
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(operand).toHaveValue(/urn:shape-editor:b/);
+});
+
+test('records a commit whose answer arrives after the change feed announced it', async ({
+  page,
+  request,
+}) => {
+  const ds = await setup(request);
+  await open(page, ds);
+  await expect(page.getByText('Following changes', { exact: false })).toBeVisible();
+  await changeCount(page, '2');
+  await page.route(`**/${ds}/patch?**`, async (route) => {
+    if (route.request().url().includes('dryRun=true')) return route.continue();
+    const response = await route.fetch();
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await route.fulfill({ response });
+  });
+  await page.getByRole('button', { name: 'Preview commit', exact: true }).click();
+  await commit(page);
+  await expect(page.getByRole('button', { name: 'Undo commit', exact: true })).toBeEnabled();
+  await expect(page.getByText('0 triples added', { exact: false })).toBeVisible();
+  // The mock's patch stand-in does not reproduce stored-value replacement, so the
+  // committed values are checked by the real-server suite.
+  await expect(page.getByText('by another writer', { exact: false })).toHaveCount(0);
+});

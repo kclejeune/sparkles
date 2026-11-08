@@ -13,6 +13,7 @@ import {
   inputTerm,
   literal,
   MAX_BYTES,
+  MAX_PATH_NODES,
   MAX_TREE_REFERENCES,
   MAX_TRIPLES,
   parseIri,
@@ -242,6 +243,51 @@ describe('structured paths', () => {
     expect(g.path(g.one(s, SH + 'path'))).toEqual(path);
     const changed = g.setPath(s, predicate);
     expect(changed.triples).toEqual([triple(s, SH + 'path', iri(ex + 'p'))]);
+  });
+  it('bounds the expansion of shared acyclic path operands', () => {
+    // Each level is a sequence whose two members are the same node of the level below,
+    // so 18 levels describe 2^19 - 1 steps in 72 triples.
+    let below: Term = p;
+    const triples: Triple[] = [];
+    for (let i = 0; i < 18; i++) {
+      const a = blank(`l${i}a`),
+        b = blank(`l${i}b`);
+      triples.push(
+        triple(a, RDF + 'first', below),
+        triple(a, RDF + 'rest', b),
+        triple(b, RDF + 'first', below),
+        triple(b, RDF + 'rest', iri(RDF + 'nil')),
+      );
+      below = a;
+    }
+    const g = new ShapeGraph(triples);
+    expect(() => g.path(below)).toThrow(`more than ${MAX_PATH_NODES} steps`);
+    expect(g.path(blank('l2a'))).toMatchObject({ kind: 'sequence' });
+  });
+  it('bounds only the final graph when a path or list is replaced at the triple limit', () => {
+    const seq: ShapePath = { kind: 'sequence', children: [predicate, predicate] };
+    const filler = (n: number) =>
+      Array.from({ length: n }, (_, i) => triple(iri(`${ex}f${i}`), ex + 'v', literal('x')));
+    const withPath = new ShapeGraph().setPath(s, seq);
+    const full = new ShapeGraph([
+      ...withPath.triples,
+      ...filler(MAX_TRIPLES - withPath.triples.length),
+    ]);
+    expect(full.triples).toHaveLength(MAX_TRIPLES);
+    const replaced = full.setPath(s, seq);
+    expect(replaced.triples).toHaveLength(MAX_TRIPLES);
+    expect(replaced.path(replaced.one(s, SH + 'path'))).toEqual(seq);
+    const list = new ShapeGraph().withList([literal('a'), literal('b')]);
+    const listed = list.graph.add(triple(s, SH + 'in', list.root));
+    const fullList = new ShapeGraph([
+      ...listed.triples,
+      ...filler(MAX_TRIPLES - listed.triples.length),
+    ]);
+    const relisted = fullList.setList(s, SH + 'in', list.root, [literal('c'), literal('d')]);
+    expect(relisted.triples).toHaveLength(MAX_TRIPLES);
+    expect(() =>
+      fullList.setList(s, SH + 'in', list.root, [literal('c'), literal('d'), literal('e')]),
+    ).toThrow(`exceeds ${MAX_TRIPLES} triples`);
   });
   it('does not remove a shared path or its annotations', () => {
     const a = new ShapeGraph().withPath({ kind: 'inversePath', children: [predicate] });

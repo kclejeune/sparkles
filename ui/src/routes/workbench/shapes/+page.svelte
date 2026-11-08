@@ -33,6 +33,7 @@
   import OntoPreview from '$components/OntoPreview.svelte';
   import ShapeDefinition from '$components/ShapeDefinition.svelte';
   import FollowState from '$components/FollowState.svelte';
+  import PageActions from '$components/PageActions.svelte';
   import Modal from '$components/Modal.svelte';
 
   const q = $derived(page.url.searchParams);
@@ -65,8 +66,17 @@
   let pending = $state(new Set<string>());
   let resetForm = $state(0);
   const reads = new LatestRun();
+  // A refresh closes the preview, which would drop the answer of a commit in flight. The
+  // change feed's refreshes therefore wait until the preview has closed.
+  let deferredReload = false;
   const session = new EditSession({
-    reload: () => load(),
+    reload: () => {
+      if (session.previewOpen) {
+        deferredReload = true;
+        return Promise.resolve();
+      }
+      return load();
+    },
     staleText:
       'Another commit landed. Your shape draft is retained. Discard it to load the new state.',
   });
@@ -152,6 +162,11 @@
       void load();
     });
     return () => reads.abortAll();
+  });
+  $effect(() => {
+    if (session.previewOpen || !deferredReload) return;
+    deferredReload = false;
+    void load();
   });
   $effect(() => {
     const t = target;
@@ -276,10 +291,10 @@
         branchId: b.id,
       };
       stale = false;
-      if (discard) {
-        pending = new Set();
-        resetForm++;
-      }
+      if (discard) pending = new Set();
+      // Field components hold buffers of the structures they edit, which a new revision can
+      // change under the same blank node. Remount them for every accepted source.
+      resetForm++;
       const all = read.shapes();
       selected = all.some((s) => id(s) === selected)
         ? selected
@@ -533,13 +548,15 @@
 
 <svelte:head><title>SHACL shapes · Sparkles</title></svelte:head>
 
-<div class="shape-page">
+<div class="page page-container shape-page">
   <header class="page-head">
-    <div>
+    <div class="title">
       <h1>SHACL shapes</h1>
-      <p>Author a shapes graph, check sample data and preview one commit.</p>
+      <p class="muted">Author a shapes graph, check sample data and preview one commit.</p>
     </div>
-    <FollowState live={session.live} onretry={() => void load()} />
+    <PageActions>
+      <FollowState live={session.live} onretry={() => void load()} />
+    </PageActions>
   </header>
   {#if !name}<p class="faint">Choose a dataset to author shapes.</p>{:else}
     <div class="source-controls">
@@ -860,12 +877,6 @@
 >
 
 <style>
-  .shape-page {
-    display: grid;
-    gap: 14px;
-    min-width: 0;
-  }
-  .page-head,
   .source-controls,
   .editor-actions,
   .sample-options,
@@ -875,14 +886,6 @@
     align-items: center;
     flex-wrap: wrap;
   }
-  .page-head {
-    justify-content: space-between;
-  }
-  h1 {
-    margin: 0 0 5px;
-    font-size: var(--fs-xl);
-  }
-  .page-head p,
   .identity,
   .help {
     margin: 0;
@@ -918,7 +921,7 @@
   }
   .panes {
     display: grid;
-    grid-template-columns: minmax(220px, 30%) minmax(0, 1fr);
+    grid-template-columns: minmax(260px, 2fr) minmax(0, 3fr);
     align-items: start;
     gap: 12px;
     min-width: 0;
