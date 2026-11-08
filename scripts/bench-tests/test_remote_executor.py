@@ -15,6 +15,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+from boat_fixtures import fixture as boat_fixture
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('remote_executor', ROOT / 'scripts/remote-executor.py')
@@ -24,59 +25,48 @@ SPEC.loader.exec_module(RX)
 
 class Admission(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.path = Path(self.tmp.name) / 'receipt.json'
-        self.value = dict(schema=1, worker='bx_test', environment='sparkles', environment_version=8,
-                          expires_at=int(time.time()) + 3600, owner='test-owner',
-                          guard_unit='boat-owned-warm-qual-test.service',
-                          guard_boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
-                          guard_invocation_id='a' * 32,
-                          toolchain_manifest_path='/home/user/.local/state/sparkles-boat/toolchain.json',
-                          toolchain_manifest_sha256='b' * 64,
-                          bootstrap_lock_path='/home/user/.local/state/sparkles-boat/bootstrap.lock',
-                          worker_env_path='/home/user/worker.env', worker_env_sha256='c' * 64)
-        self.path.write_text(json.dumps(self.value))
-        self.env = patch.dict(os.environ, SPARKLES_BOAT_ADMISSION=str(self.path))
-        self.env.start(); self.addCleanup(self.env.stop)
-        self.guard = patch.object(RX.subprocess, 'run', return_value=subprocess.CompletedProcess(
-            [], 0, 'ActiveState=active\nInvocationID=' + 'a' * 32 + '\n', ''))
-        self.guard.start(); self.addCleanup(self.guard.stop)
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.root=Path(self.tmp.name);self.fixtures=boat_fixture(self.root)
+        self.path=self.fixtures['admission'];self.value=self.fixtures['job']
+        self.env=patch.dict(os.environ,SPARKLES_BOAT_ADMISSION=str(self.path),SPARKLES_BOAT_PROFILE=str(self.fixtures['profile_path']))
+        self.env.start();self.addCleanup(self.env.stop)
+        self.clock=patch.object(RX.time,'time',return_value=self.fixtures['now'])
+        self.clock.start();self.addCleanup(self.clock.stop)
+        self.guard=patch.object(RX.boat_environment,'local_guard',return_value=self.fixtures['guard'])
+        self.guard.start();self.addCleanup(self.guard.stop)
 
     def test_exact_warm_identity_and_binary_safe_command(self):
-        result = RX.command('boat:bx_test', "printf '%s' 'a;$(bad)' && cat")
-        self.assertEqual(result[:8], ['boat', '--no-update', 'ssh', 'bx_test', '--', 'bash', '-c', result[7]])
-        decoded = shlex.split(result[-1])
-        self.assertEqual(len(decoded), 1)
-        self.assertIn("printf '%s' 'a;$(bad)' && cat", decoded[0])
-        self.assertIn('worker.env', decoded[0])
-        self.assertFalse(any(action in result for action in ('create', 'resume', 'stop', 'snapshot')))
+        result=RX.command('boat:bx_fixture',"printf '%s' 'a;$(bad)' && cat")
+        self.assertEqual(result[:4],[self.fixtures['release']['boat']['path'],'--no-update','ssh','bx_fixture'])
+        decoded=shlex.split(result[-1]);self.assertEqual(len(decoded),1)
+        self.assertIn("a;$(bad)",decoded[0]);self.assertNotIn('; . ',decoded[0])
+        self.assertFalse(any(action in result for action in ('create','resume','stop','snapshot')))
 
     def test_identity_expiry_unknown_schema_and_guard_replacement_refuse(self):
-        for changed in (dict(worker='bx_other'), dict(schema=2), dict(expires_at=time.time()-1),
-                        dict(guard_boot_id='other'), dict(guard_invocation_id='d'*32)):
-            with self.subTest(changed=changed):
-                self.path.write_text(json.dumps({**self.value, **changed}))
-                with self.assertRaises(ValueError):
-                    RX.admission('boat:bx_test')
+        for changed in (dict(worker='bx_other'),dict(version=2),dict(unexpected='NOT_A_SECRET')):
+            self.path.write_text(json.dumps({**self.value,**changed}))
+            with self.assertRaises(ValueError):RX.admission('boat:bx_fixture')
+        self.path.write_text(json.dumps(self.value))
+        with patch.object(RX.time,'time',return_value=self.fixtures['now']+10800),self.assertRaises(ValueError):
+            RX.admission('boat:bx_fixture')
+        with patch.object(RX.boat_environment,'local_guard',return_value={**self.fixtures['guard'],'InvocationID':'d'*32}),self.assertRaises(ValueError):
+            RX.admission('boat:bx_fixture')
 
     def test_receipt_directory_selects_only_the_exact_worker(self):
-        (self.path.parent/'bx_test.json').write_text(self.path.read_text())
-        with patch.dict(os.environ,SPARKLES_BOAT_ADMISSION=str(self.path.parent)):
-            self.assertEqual(RX.admission('boat:bx_test')['worker'],'bx_test')
+        (self.root/'bx_fixture.json').write_text(self.path.read_text());(self.root/'bx_fixture.json').chmod(0o600)
+        with patch.dict(os.environ,SPARKLES_BOAT_ADMISSION=str(self.root)):
+            self.assertEqual(RX.admission('boat:bx_fixture')['worker'],'bx_fixture')
             with self.assertRaises(OSError):RX.admission('boat:bx_other')
 
     def test_remaining_lifetime_is_a_job_constraint(self):
-        with self.assertRaises(ValueError):
-            RX.admission('boat:bx_test', 7200)
+        with self.assertRaises(ValueError):RX.admission('boat:bx_fixture',10800)
 
     def test_unsafe_selectors_refuse_before_execution(self):
-        for host in ('boat:current', 'boat:bx_test;echo', '-oProxyCommand=bad', 'h x', 'a:12'):
-            with self.subTest(host=host), self.assertRaises(ValueError):
-                RX.boat_id(host)
+        for host in ('boat:current','boat:bx_test;echo','-oProxyCommand=bad','h x','a:12'):
+            with self.subTest(host=host),self.assertRaises(ValueError):RX.boat_id(host)
 
     def test_ssh_remains_explicit_and_needs_no_boat_receipt(self):
-        self.assertEqual(RX.command('wally', 'exit 17'), [*RX.SSH, 'wally', 'exit 17'])
+        self.assertEqual(RX.command('wally','exit 17'),[*RX.SSH,'wally','exit 17'])
 
 
 class Archive(unittest.TestCase):
@@ -148,6 +138,31 @@ class LocalTransport(unittest.TestCase):
         self.assertEqual(source.read_bytes(), result.read_bytes())
         self.assertFalse((self.root / 'bad').exists())
 
+    def test_pipe_producer_roundtrip_stall_and_output_deadlines(self):
+        read,write=os.pipe()
+        with os.fdopen(read,'rb',buffering=0) as source:
+            data=bytes(range(256))*8;os.write(write,data);os.close(write)
+            with tempfile.TemporaryFile() as output:
+                self.assertEqual(RX.exchange(['cat'],output,source=source,timeout=1),0)
+                output.seek(0);self.assertEqual(output.read(),data)
+        read,write=os.pipe()
+        try:
+            with os.fdopen(read,'rb',buffering=0) as source,tempfile.TemporaryFile() as output:
+                with self.assertRaises(ValueError):RX.exchange(['cat'],output,source=source,timeout=0.1)
+                self.assertTrue(os.get_blocking(source.fileno()))
+        finally:os.close(write)
+        read,write=os.pipe()
+        try:
+            with os.fdopen(write,'wb',buffering=0) as output:
+                with self.assertRaises(ValueError):
+                    RX.exchange([sys.executable,'-c','import os;os.write(1,b"x"*100000)'],output,timeout=0.1)
+                self.assertTrue(os.get_blocking(output.fileno()))
+        finally:os.close(read)
+
+    def test_original_wall_deadline_cannot_be_extended_by_suspend(self):
+        deadline=RX.OperationDeadline(time.monotonic()+100,time.time()-1)
+        with self.assertRaises(ValueError):RX.remaining(deadline)
+
     def test_numeric_exit_and_receive_limit(self):
         with tempfile.TemporaryFile() as output:
             self.assertEqual(RX.receive('boat:bx_test', 'exit 17', output), 17)
@@ -163,7 +178,7 @@ class LocalTransport(unittest.TestCase):
         deadline=time.monotonic()+2
         while True:
             try:state=Path('/proc',str(child),'stat').read_text().split(') ',1)[1].split()[0]
-            except FileNotFoundError:break
+            except (FileNotFoundError,ProcessLookupError):break
             if state=='Z':break
             self.assertLess(time.monotonic(),deadline,'owned transfer child survived refusal')
             time.sleep(0.02)
@@ -249,6 +264,50 @@ class LocalTransport(unittest.TestCase):
         with payload.open('rb') as data,self.assertRaises(ValueError):
             RX.send('boat:bx_test','ignored',data,time.monotonic()-1)
         self.assertEqual(len(self.calls),calls)
+
+    def test_sender_uses_original_deadline_after_receipt_changes_and_preparation(self):
+        source=self.root/'blob';source.write_bytes(b'x')
+        self.deadline.stop()
+        with patch.object(RX,'admission',return_value={'expires_at':time.time()+30.06}):
+            deadline=RX.operation_deadline('boat:bx_test')
+        with patch.object(RX,'admission',return_value={'expires_at':time.time()+10000}),patch.object(RX,'command',return_value=['bash','-c','cat >/dev/null; sleep 1']),source.open('rb')as data:
+            with self.assertRaises(ValueError):RX.send('boat:bx_test','ignored',data,deadline)
+        calls=len(self.calls)
+        real_digest=hashlib.file_digest
+        def slow_digest(*a,**kw):time.sleep(0.04);return real_digest(*a,**kw)
+        with patch.object(RX,'operation_deadline',return_value=time.monotonic()+0.02),patch.object(RX.hashlib,'file_digest',side_effect=slow_digest),self.assertRaises(ValueError):
+            RX.put('boat:bx_test',source,'/unused')
+        self.assertEqual(len(self.calls),calls)
+
+    def test_sender_interrupt_cleans_only_owned_session(self):
+        pidfile=self.root/'sender.pid'
+        class Interrupted:
+            def write(self,data):raise KeyboardInterrupt()
+        other=subprocess.Popen(['sleep','3'],start_new_session=True)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                RX.exchange(['bash','-c','echo $$ > '+shlex.quote(str(pidfile))+'; printf x; exec sleep 10'],Interrupted(),source=io.BytesIO(b'data'),deadline=time.monotonic()+1)
+            self.assertIsNone(other.poll())
+            with self.assertRaises(ProcessLookupError):os.kill(int(pidfile.read_text()),0)
+        finally:other.terminate();other.wait(timeout=3)
+
+    def test_sender_preserves_failed_leader_exit_and_download_verification_is_atomic(self):
+        source=self.root/'blob';source.write_bytes(b'data');pidfile=self.root/'descendant.pid'
+        text="(trap '' TERM; exec sleep 10) & echo $! > "+shlex.quote(str(pidfile))+"; exit 17"
+        with patch.object(RX,'command',return_value=['bash','-c',text]),source.open('rb')as data:
+            with self.assertRaises(ValueError)as error:RX.send('boat:bx_test','ignored',data,time.monotonic()+0.05)
+            self.assertEqual(error.exception.native_exit,17)
+        child=int(pidfile.read_text());deadline=time.monotonic()+1
+        while Path('/proc',str(child)).exists():
+            try:state=Path('/proc',str(child),'stat').read_text().split(') ',1)[1].split()[0]
+            except (FileNotFoundError,ProcessLookupError):break
+            if state=='Z':break
+            self.assertLess(time.monotonic(),deadline);time.sleep(0.01)
+        target=self.root/'accepted';target.write_bytes(b'old accepted')
+        def command(host,body):
+            return ['bash','-c',("printf '%s  ignored\\n' "+'0'*64)if body.startswith('sha256sum')else body]
+        with patch.object(RX,'command',side_effect=command),self.assertRaises(ValueError):RX.get('boat:bx_test',str(source),target)
+        self.assertEqual(target.read_bytes(),b'old accepted')
 
     def test_zero_and_failed_sender_reap_silent_owned_descendants_only(self):
         for status in (0,17):

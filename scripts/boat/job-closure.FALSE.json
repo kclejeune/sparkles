@@ -1,0 +1,10 @@
+{
+  "observed_unix": null,
+  "verified_by_Root": false,
+  "receipt_sha256": null,
+  "worker": null,
+  "operation_id": null,
+  "local_guard": {"unit": null, "boot_id": null, "invocation_id": null},
+  "job_release_sha256": null,
+  "all_native_and_leases_closed": false
+}

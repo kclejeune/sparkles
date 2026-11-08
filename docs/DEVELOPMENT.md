@@ -360,7 +360,8 @@ alone does not qualify a compiler workload or snapshot lifecycle.
 The provider-neutral `bench:remote`, `bench:remote-writes` and `bench:jena-remote`
 commands accept an explicit admitted `boat:bx_ID` worker. Build hosts, partitioned test
 shares and gate hosts accept the same selector. The [remote executor commands](REMOTE-EXECUTORS.md)
-describe admission, warm reuse, artifact transport and cleanup. These adapters require
+describe the tracked qualification/environment/finish commands, explicit private
+profile and admission inputs, warm reuse, artifact transport and cleanup. These adapters require
 real workload qualification before they replace the mandatory `bench:nsc` screen.
 Changing placement preserves the tests, benchmark comparability and acceptance criteria.
 

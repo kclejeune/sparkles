@@ -1,0 +1,168 @@
+"""Finite source integration controls; no provider or manager operation runs."""
+from pathlib import Path
+import copy
+import ctypes
+import hashlib
+import json
+import os
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+from boat_fixtures import fixture
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'boat'))
+import controller
+import job_environment as env
+from config_schema import validate_profile
+
+
+class EnvironmentAdmission(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.root=Path(self.tmp.name);self.f=fixture(self.root)
+
+    def load(self):
+        return env.load_job_admission(self.f['admission'],self.f['profile_path'],self.f['profile']['worker'],self.f['now'],lambda unit:self.f['guard'])
+
+    def test_exact_original_qualification_profile_source_job_and_environment(self):
+        p,q,file,cli=self.load()
+        self.assertEqual(q,self.f['qualified']);self.assertEqual(file,env.expected_environment(p,q))
+        self.assertEqual(cli,self.f['release']['boat'])
+        original=self.f['qualified_path'].read_bytes()
+        self.assertEqual(hashlib.sha256(original).hexdigest(),self.f['job']['qualification']['sha256'])
+        self.assertIsNone(json.loads(original)['runtime_env_file'])
+        self.assertEqual(set(env.environment(p)),{'PATH','MBX_REMOTE_TOKEN_FILE'})
+
+    def test_changed_qualification_bytes_or_env_proof_does_not_grant_authority(self):
+        original=self.f['qualified_path'].read_bytes()
+        self.f['qualified_path'].write_bytes(original+b' ')
+        with self.assertRaises(ValueError):self.load()
+        self.f['qualified_path'].write_bytes(original)
+        changed=copy.deepcopy(self.f['job']);changed['runtime_env_file']['sha256']='0'*64
+        self.f['admission'].write_text(json.dumps(changed))
+        with self.assertRaises(ValueError):self.load()
+
+    def test_profile_cache_bindings_are_private_explicit_and_nonsecret(self):
+        p=copy.deepcopy(self.f['profile'])
+        for cache in ({'url':'https://user:secret@cache.invalid','namespace':'fixture/dev','mode':'read-only'},
+                      {'url':'https://cache.invalid','namespace':'fixture/dev','mode':'write'},
+                      {'url':None,'namespace':None,'mode':'read-only'}):
+            p['mbx_remote_config']=cache
+            with self.assertRaises(ValueError):validate_profile(p)
+
+    def test_prepare_preserves_original_bytes_and_checks_again_after_transport(self):
+        original=self.f['qualified_path'].read_bytes();out=self.f['operation']/'prepared.json'
+        expected=env.expected_environment(self.f['profile'],self.f['qualified'])
+        real_context=env.context
+        def context(*args,**kwargs):
+            kwargs['guard_reader']=lambda unit:self.f['guard']
+            return real_context(*args,**kwargs)
+        with patch.object(env,'context',side_effect=context)as check,patch.object(env.time,'time',return_value=self.f['now']),patch.object(controller,'bounded',return_value={'exit':0,'body':expected})as wire:
+            env.prepare(self.f['profile_path'],self.f['operation'],self.f['profile']['worker'],out)
+            self.assertEqual(check.call_count,2);self.assertEqual(wire.call_count,1)
+        self.assertEqual(self.f['qualified_path'].read_bytes(),original)
+        record=json.loads(out.read_bytes());self.assertEqual(record['qualification']['sha256'],hashlib.sha256(original).hexdigest())
+        self.assertEqual(out.stat().st_mode&0o777,0o600)
+
+    def test_remote_environment_creation_and_check_never_open_token_content(self):
+        home=self.root/'worker';state=home/'.local/state/sparkles-boat';state.mkdir(parents=True)
+        token=home/'.config/mbx/remote-token';token.parent.mkdir(parents=True);token.write_bytes(b'INERT ASCII METADATA FIXTURE');token.chmod(0o600)
+        p=copy.deepcopy(self.f['profile']);p['worker_home']=str(home)
+        q=self.f['qualified'];file=env.expected_environment(p,q)
+        payload={'home':str(home),'uid':os.getuid(),'file':file,'body':env.environment_body(p).decode(),'check':False}
+        real_open=os.open;opened=[]
+        def safe_open(path,*args,**kwargs):
+            self.assertNotEqual(Path(path),token,'token content open attempted')
+            opened.append(str(path));return real_open(path,*args,**kwargs)
+        with patch.object(Path,'home',return_value=home),patch.object(sys,'argv',['fixture',json.dumps(payload)]),patch.object(os,'open',side_effect=safe_open),patch('builtins.print'):
+            exec(compile(env.REMOTE,'inert-job-environment','exec'),{'__name__':'inert'})
+        path=Path(file['path']);self.assertEqual(path.read_bytes(),env.environment_body(p));self.assertEqual(path.stat().st_mode&0o777,0o600)
+        before=path.stat().st_ino;payload['check']=True
+        with patch.object(Path,'home',return_value=home),patch.object(sys,'argv',['fixture',json.dumps(payload)]),patch.object(os,'open',side_effect=safe_open),patch('builtins.print'):
+            exec(compile(env.REMOTE,'inert-job-environment-check','exec'),{'__name__':'inert'})
+        self.assertEqual(path.stat().st_ino,before);self.assertNotIn(str(token),opened)
+
+    def test_false_profile_refuses_before_transport(self):
+        false=Path(env.__file__).with_name('profile.FALSE.json')
+        with patch.object(controller,'bounded',side_effect=AssertionError('no child/provider/manager')):
+            with self.assertRaises(ValueError):env.prepare(false,self.f['operation'],'bx_fixture',self.root/'none.json')
+
+
+class ControllerTransportCleanup(unittest.TestCase):
+    def test_owned_local_timeout_stops_descendant_after_leader_exit(self):
+        import signal,time
+        libc=ctypes.CDLL(None);previous=ctypes.c_int();self.assertEqual(libc.prctl(37,ctypes.byref(previous),0,0,0),0);self.assertEqual(libc.prctl(36,1,0,0,0),0)
+        self.addCleanup(lambda:libc.prctl(36,previous.value,0,0,0))
+        with tempfile.TemporaryDirectory()as tmp:
+            pidfile=Path(tmp)/'child.pid';created=[];actual=controller.subprocess.Popen
+            def launch(*a,**kw):
+                p=actual(*a,**kw);created.append(p);return p
+            try:
+                with patch.object(controller.subprocess,'Popen',side_effect=launch):
+                    result=controller.bounded(['bash','-c',"(trap '' TERM; exec sleep 5) & echo $! > "+str(pidfile)+"; exit 0"],0.04)
+                self.assertEqual(result['error'],'timeout');child=int(pidfile.read_text());self.assertFalse(Path('/proc',str(child)).exists());end=time.monotonic()+1
+                while Path('/proc',str(child)).exists():
+                    try:state=Path('/proc',str(child),'stat').read_text().split(') ',1)[1].split()[0]
+                    except (FileNotFoundError,ProcessLookupError):break
+                    if state=='Z':break
+                    self.assertLess(time.monotonic(),end);time.sleep(0.01)
+            finally:
+                if created:
+                    try:os.killpg(created[0].pid,signal.SIGKILL)
+                    except ProcessLookupError:pass
+
+    def test_success_and_failure_retire_silent_descendants(self):
+        import signal,sys
+        libc=ctypes.CDLL(None);previous=ctypes.c_int()
+        self.assertEqual(libc.prctl(37,ctypes.byref(previous),0,0,0),0)
+        self.assertEqual(libc.prctl(36,1,0,0,0),0)
+        self.addCleanup(lambda:libc.prctl(36,previous.value,0,0,0))
+        with tempfile.TemporaryDirectory()as tmp:
+            for code in (0,17):
+                path=Path(tmp)/str(code)
+                script="import os,signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);open("+repr(str(path))+",'w').write(str(os.getpid()));time.sleep(5)"
+                parent="import subprocess,time,sys,pathlib;p=subprocess.Popen([sys.executable,'-c',"+repr(script)+"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);f=pathlib.Path("+repr(str(path))+");end=time.monotonic()+1\nwhile not f.exists() and time.monotonic()<end:time.sleep(.001)\nprint('{}');raise SystemExit("+str(code)+")"
+                result=controller.bounded([sys.executable,'-c',parent],2)
+                self.assertEqual(result,{'exit':code,'error':None,'body':{}})
+                self.assertFalse(Path('/proc',path.read_text()).exists())
+
+
+class Finish(unittest.TestCase):
+    def test_finish_waits_for_original_guard_and_verified_stop_not_submission(self):
+        with tempfile.TemporaryDirectory()as tmp:
+            f=fixture(Path(tmp));r=f['release']
+            worker=f['profile']['worker'];now=f['now']
+            stop='stop_fixture'
+            safe={'id':worker,'access':'owner','environment':f['profile']['future_environment']['name'],
+                  'state':'stopped','type':'large','vcpu':8,'memoryGB':16,'snapshotAvailable':True,'lastSnapshotStatus':'completed',
+                  'snapshotCompletedAt':'2027-01-15T08:01:00Z',
+                  'stoppedAt':'2027-01-15T08:01:00Z','stop':{'id':stop,'status':'completed','error':None,'forced':False,'endedAt':'2027-01-15T08:01:00Z'}}
+            # Keep source fixture clocks consistent; no real provider timestamp is asserted.
+            from datetime import datetime,timezone
+            iso=lambda t:datetime.fromtimestamp(t,timezone.utc).isoformat().replace('+00:00','Z')
+            safe.update(snapshotCompletedAt=iso(now+2),stoppedAt=iso(now+2));safe['stop']['endedAt']=iso(now+2)
+            closed={'worker':worker,'stop_operation':stop,'safe_info':safe,'stopped_confirmed':True,'owned_metadata_closed':True,'guard_may_exit':True}
+            job={'observed_unix':now,'verified_by_Root':True,'receipt_sha256':'c'*64,'worker':worker,
+                 'operation_id':r['guard_unit'],'local_guard':f['qualified']['local_guard'],
+                 'job_release_sha256':'a'*64,'all_native_and_leases_closed':True}
+            class IO:
+                def __init__(self,*a):self.t=0;self.triggered=0;self.records={'root-handoff.json':{'separate_job_release':r['separate_Root_handoff']},'qualified-worker-admission.json':f['qualified'],'root-job-closed.json':job,'guard-loaded.json':{'boot_id':f['qualified']['local_guard']['boot_id'],'loaded':{'InvocationID':'a'*32}},'stop-intent.json':{'requested_wall':now+1}}
+                def wall(self):return now
+                def mono(self):return self.t
+                def read(self,n):return self.records[n]
+                def exists(self,n):return n in self.records
+                def trigger(self):self.triggered+=1
+                def wait(self,n):self.t+=1;self.records['closed.json']=closed
+                def show(self,u):return {'Id':u,'InvocationID':'a'*32,'ActiveState':'inactive','MainPID':'0','ExecMainStatus':'0','ControlGroup':''}
+            io=IO()
+            with patch.object(controller,'RealIO',return_value=io):
+                result=controller.finish_operation(f['operation'],seconds=3)
+            self.assertTrue(result['stopped_confirmed']);self.assertTrue(result['guard_closed']);self.assertEqual(io.triggered,1)
+            io=IO();io.records['guard-loaded.json']['boot_id']='replaced-boot'
+            with patch.object(controller,'RealIO',return_value=io),self.assertRaises(controller.Refusal):
+                controller.finish_operation(f['operation'],seconds=3)
+            io=IO();io.wait=lambda n:setattr(io,'t',io.t+1)
+            with patch.object(controller,'RealIO',return_value=io),self.assertRaises(controller.Refusal):
+                controller.finish_operation(f['operation'],seconds=2)
+
+if __name__=='__main__':unittest.main()

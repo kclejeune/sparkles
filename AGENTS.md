@@ -36,7 +36,8 @@ adds to this file and does not override it.
   disk and competing work. Reuse a warm worker for ordinary fix and test iterations.
   Namespace remains a fallback for a measured resource need or a workflow without a
   qualified Boat replacement. Provider-neutral commands accept an admitted `boat:bx_ID`
-  worker and never create or stop it. See [remote executors](docs/REMOTE-EXECUTORS.md).
+  worker and never create or stop it. The tracked `boat:qualify`, `boat:job-env` and
+  `boat:finish` commands preserve explicit profile/release and verified closure. See [remote executors](docs/REMOTE-EXECUTORS.md).
 - The benchmark host, which `SPARKLES_BENCH_HOST` names, runs no builds or gates. Keep
   other designated benchmark workers available for comparisons, and start a benchmark
   only after other heavy work has left its host, so the engine under test runs alone.

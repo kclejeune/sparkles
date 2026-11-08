@@ -1,0 +1,76 @@
+{
+  "files": {
+    "README.md": {
+      "bytes": 7074,
+      "mode": 420,
+      "sha256": "daa4bb10303eec1a1a9ca3dfe41fcca4dfc26c3009decfb4e187872a3ec531fe"
+    },
+    "common.py": {
+      "bytes": 12704,
+      "mode": 420,
+      "sha256": "951b07b728bd09f2b8560527edfa58153781b85610a4fd05855240f518ccc39f"
+    },
+    "config_schema.py": {
+      "bytes": 3632,
+      "mode": 420,
+      "sha256": "e25e6f2070a71461366145e3a4f126e5f46a7bfa97334ed56e074622eec18b08"
+    },
+    "controller.py": {
+      "bytes": 35439,
+      "mode": 420,
+      "sha256": "ec24acb7597ba1f51e9445bd38ea874885c3c699b471bd41a728015fff56f888"
+    },
+    "controls.py": {
+      "bytes": 54649,
+      "mode": 420,
+      "sha256": "e97a08d9420036ac17fd193be01cd65b38c86beff75e7c0c647a331e66713188"
+    },
+    "job-closure.FALSE.json": {
+      "bytes": 269,
+      "mode": 420,
+      "sha256": "b26f69930360afa4f7fd27f813684c7154efeed8c2507375c904f7d1677f0be8"
+    },
+    "job_environment.py": {
+      "bytes": 8983,
+      "mode": 420,
+      "sha256": "cbbb94b5a7c896bc60ff17fb00456fea8678c322719384a61b3913f9bef5a2a3"
+    },
+    "metadata-probe.py": {
+      "bytes": 11030,
+      "mode": 420,
+      "sha256": "96bfcf154da8ca9a67e4c887f191604f7bf5aee4d6f9954a1f9a657d8de13e77"
+    },
+    "profile.FALSE.json": {
+      "bytes": 1786,
+      "mode": 420,
+      "sha256": "52545934cada5c517218506cdc9f6ac743649d47f9d9f278d3fce4204e5968ae"
+    },
+    "qualified_worker_admission.py": {
+      "bytes": 7834,
+      "mode": 420,
+      "sha256": "4c2cb77666d55448ddd6498ec5b7d68fd51b6e57b55d6d79aeb7a88e6358d428"
+    },
+    "release.FALSE.json": {
+      "bytes": 2781,
+      "mode": 420,
+      "sha256": "6fb62c219ef554409e319fe061bf1bf4deef683f4b14e9b331cf4500c4777385"
+    },
+    "remote-launcher.py": {
+      "bytes": 4360,
+      "mode": 420,
+      "sha256": "ee924799502b46c6563d68842e44de96958fcbb53300d3e8a1aa94caa0d41440"
+    },
+    "startup-observer.py": {
+      "bytes": 8235,
+      "mode": 420,
+      "sha256": "063b5a1ddf2b93e292cfe481e054f65c3d6a0b4c31999d3750ee8eb8f2be8250"
+    },
+    "update_sources.py": {
+      "bytes": 1367,
+      "mode": 420,
+      "sha256": "a1ec33bf519869bc40e3ddada047cba8f15a0d3e55d380a68d87031b5c08edcd"
+    }
+  },
+  "schema": 1,
+  "source_contract": "explicit owned-worker/profile/release; no implicit provider authority"
+}

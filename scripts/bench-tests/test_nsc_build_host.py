@@ -7,6 +7,7 @@ on a real host. A fake systemd-run makes each scope its own process group, which
 systemctl stop kills."""
 
 import json
+import ctypes
 import os
 from pathlib import Path
 import shutil
@@ -14,6 +15,7 @@ import signal
 import subprocess
 import tempfile
 import time
+import threading
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -113,6 +115,7 @@ class BuildHost(unittest.TestCase):
         for name in SCRIPTS:
             (self.repo / "scripts" / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(ROOT / "scripts" / name, self.repo / "scripts" / name)
+        shutil.copytree(ROOT / "scripts/boat", self.repo / "scripts/boat", ignore=shutil.ignore_patterns("__pycache__"))
         (self.repo / "mise.toml").write_text('[tools]\nmr-boxington = "9.9.9"\n')
         git = ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t",
                "-c", "commit.gpgsign=false"]
@@ -145,16 +148,41 @@ class BuildHost(unittest.TestCase):
             self.env.pop(name, None)
         self.runs = 0
         self.holders = []
+        self.fixture_libc=ctypes.CDLL(None);self.fixture_previous=ctypes.c_int()
+        self.assertEqual(self.fixture_libc.prctl(37,ctypes.byref(self.fixture_previous),0,0,0),0)
+        self.assertEqual(self.fixture_libc.prctl(36,1,0,0,0),0)
+        self.reaper_stop=threading.Event()
+        def reap_owned_mock_scopes():
+            while not self.reaper_stop.wait(0.01):
+                for path in (self.hosts/'units').glob('*.scope'):
+                    try:
+                        group=int(path.read_text().split()[0])
+                        while os.waitpid(-group,os.WNOHANG)[0]>0:pass
+                    except (ChildProcessError,FileNotFoundError,ProcessLookupError,ValueError):pass
+        self.fixture_reaper=threading.Thread(target=reap_owned_mock_scopes,daemon=True)
+        self.fixture_reaper.start()
 
     def tearDown(self):
         for holder in self.holders:
-            holder.kill()
-            holder.wait()
+            try:os.killpg(holder.pid,signal.SIGTERM)
+            except ProcessLookupError:pass
+            holder.wait(timeout=3)
+            end=time.monotonic()+3
+            while True:
+                try:
+                    while os.waitpid(-holder.pid,os.WNOHANG)[0]>0:pass
+                except ChildProcessError:pass
+                try:os.killpg(holder.pid,0)
+                except ProcessLookupError:break
+                self.assertLess(time.monotonic(),end,'owned lock fixture did not close')
+                time.sleep(0.01)
+        self.reaper_stop.set();self.fixture_reaper.join(timeout=1)
+        self.fixture_libc.prctl(36,self.fixture_previous.value,0,0,0)
 
     def hold_lock(self, host, seconds=60):
         lanes = self.hosts / host / "lanes"
         lanes.mkdir(exist_ok=True)
-        holder = subprocess.Popen(["flock", str(lanes / ".heavy.lock"), "sleep", str(seconds)])
+        holder = subprocess.Popen(["flock", str(lanes / ".heavy.lock"), "sleep", str(seconds)],start_new_session=True)
         self.holders.append(holder)
         deadline = time.monotonic() + 5
         while subprocess.run(["flock", "-n", str(lanes / ".heavy.lock"), "true"]).returncode == 0:

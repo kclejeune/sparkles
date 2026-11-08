@@ -35,42 +35,45 @@ its separate OIDC authentication. A mode-0600 worker environment file contains o
 literal PATH and `MBX_REMOTE_TOKEN_FILE` assignments. The latter names a file and never
 contains a token. Admission binds the environment file by digest.
 
-## Admission receipt
+## Qualification and job admission
 
-Set `SPARKLES_BOAT_ADMISSION` to the lifecycle owner's bounded JSON receipt, or to a
-directory containing one `bx_ID.json` receipt for each explicitly selected worker. Schema 1
-contains the following fields. Unknown schemas and insufficient remaining lifetimes are
-refused before a job starts.
+The tracked [owned-worker package](../scripts/boat/README.md) supplies the stable
+qualification, environment preparation and verified-stop sequence. Its FALSE examples
+cannot authorize a provider operation. Private independently reviewed profile and
+release files bind the actual worker, environment, source seal, account limits,
+nonsecret cache endpoint/namespace, startup scope and local guard. No live identity is
+selected by maintained defaults.
 
-| Field | Meaning |
-| --- | --- |
-| `schema` | The integer 1. |
-| `worker` | The exact `bx_ID` sandbox identity. |
-| `environment`, `environment_version` | The qualified Sparkles development environment and its integer version. |
-| `expires_at` | The earlier conservative worker and owner deadline as UTC epoch seconds. |
-| `owner` | The identifier of the lifecycle owner. |
-| `guard_unit`, `guard_boot_id`, `guard_invocation_id` | The fully suffixed local systemd service, local boot identity and exact invocation that owns stop reconciliation. A same-name replacement is refused. |
-| `toolchain_manifest_path`, `toolchain_manifest_sha256` | The absolute worker path and observed SHA-256 of its qualified toolchain manifest. |
-| `bootstrap_lock_path` | The absolute worker bootstrap lock path checked for quiescence. |
-| `worker_env_path`, `worker_env_sha256` | The absolute worker path and SHA-256 of its nonsecret environment file. |
+Qualification publishes an immutable `sparkles.boat.qualified-worker-admission`
+version-1 receipt only after an actual explicit job handoff. The shared
+`validate_admission` consumer binds the exact profile, worker/environment, effective UTC
+deadline, local guard boot/invocation, actual manifest/bootstrap lock and source/job
+review hashes. The receipt's `runtime_env_file` remains null.
 
-`python3 scripts/remote-executor.py admit boat:bx_ID --minimum 1800` checks the receipt,
-the local guard invocation, selected current provider metadata and physical worker
-tools. It prints selected nonsecret identities for a run record. The lifecycle owner
-supplies the receipt after qualification. This command cannot turn an unqualified
-worker into a qualified one.
+`boat:job-env` validates that original receipt and prepares a deterministic mode-0600
+worker file containing literal PATH and token FILE path. Its small
+`sparkles.boat.job-admission` version-1 record references the unchanged qualification
+file and its SHA-256, plus actual environment path, SHA-256, byte count, mode and UID.
+It adds no authority or lifetime. Adapters validate the original qualification with the
+shared consumer and check the environment proof before dispatch. They pass known
+values literally and never source arbitrary shell values.
 
-## Warm worker sequence
+Set `SPARKLES_BOAT_PROFILE` to the private reviewed profile and
+`SPARKLES_BOAT_ADMISSION` to the prepared job-admission record. Either setting can also
+name a directory of exact-worker `bx_ID.json` files. Unknown schemas, changed original
+qualification bytes, profile/source drift, a replaced local guard and insufficient
+remaining lifetime are refused.
 
-The stable tracked lifecycle package remains an integration dependency under item 762.
-The current lifecycle contract uses `run --release RELEASE`
-to acquire and qualify one worker. Its handoff supplies the compact receipt and exact
-sandbox ID. Keep the controller's local guard active throughout the following jobs.
-Once the receipt is available, the ordinary commands need no remote shell preparation.
+## Warm worker commands
+
+The [complete sequence](../scripts/boat/README.md#one-warm-worker-sequence) runs
+`boat:qualify` with explicit unit/worker/profile/release, observes qualification, prepares
+`boat:job-env`, runs several ordinary jobs and finishes with actual closure evidence.
+After setting the two validated receipt paths, ordinary jobs need no remote shell
+preparation.
 
 ```sh
-export SPARKLES_BOAT_ADMISSION=/absolute/path/to/admission.json
-worker=boat:bx_ID
+worker="boat:$OWNED_WORKER"
 python3 scripts/remote-executor.py admit "$worker" --minimum 1800
 scripts/build-remote.sh --host "$worker" --out .artifacts/builds/candidate HEAD
 mise run bench:remote --executor "$worker" path/to/baseline path/to/candidate
@@ -79,24 +82,27 @@ mise run bench:jena-remote --executor "$worker" --no-build -- --arm sparkles=spa
 mise run test:partitioned --hosts "$worker" --no-local
 scripts/gate/setup-host.sh "$worker" wally
 scripts/gate/gate.sh --host "$worker" --helper none HEAD
+mise run boat:finish --operation "$OWNED_OPERATION" --job-closure "$PRIVATE_JOB_CLOSURE"
 ```
 
-The Jena example uses prepared bindings and a small comparison workload. Gates require the
-explicit setup command once per worker seed to copy public conformance suites and
-prepare the pytest environment. The admitted tools stay pinned during Boat gate and
-partition jobs. Jobs refuse inadequate lifetime instead of extending a sandbox or
-selecting another provider. `SPARKLES_REMOTE_MIN_LIFETIME` sets the requested minimum
-for screens and builds, which default to 1800 seconds, and gates, which default to
-7200 seconds. Partition shares require `TEST_PARTITION_TIMEOUT` seconds and check again after the
-archive transfer. Boat job caps follow the qualified receipt deadline. The legacy
-`--duration` screen option controls Namespace instance lifetime.
+The Jena example requires prepared bindings. Gates require the explicit setup command
+once per worker seed to copy public suites and prepare pytest. Boat jobs retain pinned
+tools without implicit reinstall. Screens/builds request at least 1800 remaining seconds
+and gates at least 7200 through `SPARKLES_REMOTE_MIN_LIFETIME`. Partitions request
+`TEST_PARTITION_TIMEOUT` and check again after archive transfer. Boat caps follow the
+original qualification deadline. The legacy `--duration` screen option controls
+Namespace instance lifetime.
 
-After collecting results, establish closure of every owned job and Boxington lease.
-Then use the lifecycle controller's `request-stop --operation OPERATION` entrypoint.
-That submits a request. The lifecycle owner must observe its verified terminal closure
-receipt and stopped worker state before reporting release complete. Reconcile an
-unknown acquire, launch or stop by its existing operation and unit identities. Never
-repeat it to obtain a clearer response.
+The operator establishes actual native/cgroup/lease closure before supplying the fresh
+job-closure receipt. `boat:finish` validates that evidence and observes the guard's
+verified normal stop and clean exit. A submitted or unresolved request is a failure to
+establish release. Reconcile its existing worker/operation/unit identities before any
+new action. A new receipt never silently renews an in-flight transfer deadline. The
+raw Boat command stream shares that original deadline with a 30-second reserve. It
+bounds stdin at 64 GiB, stdout at 4 GiB and stderr at 64 MiB. Stalled producer and
+consumer pipes fail within that bound, and every terminal outcome retires the exact
+owned local CLI process group. Remote native jobs remain owned by their named units
+and require their separate verified closure.
 
 ## Source, results and cleanup
 

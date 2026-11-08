@@ -1612,3 +1612,31 @@ SPARKLES_TASK
 [tasks."bench:jena-remote"]
 description = "Jena comparison on an explicit executor; pass --executor nsc or boat:bx_ID and jena.py options after --"
 run = "mbx sparkles-task -- scripts/jena-remote.sh"
+
+[tasks."boat:qualify"]
+description = "Qualify one explicitly owned warm Boat worker under a named bounded local controller; private reviewed profile/release required"
+usage = '''
+flag "--unit <name>" required=#true help="unused local controller unit name"
+flag "--worker <id>" required=#true help="explicit existing owned bx_ID; no default worker"
+flag "--profile <path>" required=#true help="private independently admitted profile"
+flag "--release <path>" required=#true help="private reviewed finite release"
+'''
+run = '''
+systemd-run --user --wait --pipe --unit="$usage_unit" --property=Type=exec \
+  --property=MemoryMax=512M --property=MemorySwapMax=0 --property=RuntimeMaxSec=2700 \
+  --property=TimeoutStopSec=30 --property=KillMode=control-group --property=OOMPolicy=continue \
+  /usr/bin/python3 -I -B "$PWD/scripts/boat/controller.py" run \
+  --owned-worker "$usage_worker" --profile "$usage_profile" --release "$usage_release"
+'''
+
+[tasks."boat:job-env"]
+description = "Prepare deterministic PATH/token-FILE metadata for an actually qualified explicit worker; no lifecycle or source job"
+run = "python3 -I -B scripts/boat/job_environment.py"
+
+[tasks."boat:finish"]
+description = "Validate actual owned job closure, request the guard's normal stop and observe verified stop/guard closure"
+run = "python3 -I -B scripts/boat/controller.py finish"
+
+[tasks."test:boat-controls"]
+description = "Inert maintained Boat lifecycle controls and source-seal validation; no provider, manager, child or network calls"
+run = ["python3 -I -B scripts/boat/update_sources.py --check", "python3 -I -B scripts/boat/controls.py"]
