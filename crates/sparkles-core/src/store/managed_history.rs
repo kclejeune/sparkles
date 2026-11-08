@@ -9,7 +9,7 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -451,6 +451,14 @@ impl Write for Encoder<'_> {
 }
 
 pub(crate) fn encode<T: Serialize>(value: &T, preparation: &Preparation) -> Result<Bytes> {
+    encode_json(value, preparation, false)
+}
+
+pub(crate) fn encode_pretty<T: Serialize>(value: &T, preparation: &Preparation) -> Result<Bytes> {
+    encode_json(value, preparation, true)
+}
+
+fn encode_json<T: Serialize>(value: &T, preparation: &Preparation, pretty: bool) -> Result<Bytes> {
     let mut writer = Encoder {
         bytes: Bytes {
             value: Vec::new(),
@@ -459,7 +467,11 @@ pub(crate) fn encode<T: Serialize>(value: &T, preparation: &Preparation) -> Resu
         preparation,
         failure: None,
     };
-    let result = serde_json::to_writer(&mut writer, value);
+    let result = if pretty {
+        serde_json::to_writer_pretty(&mut writer, value)
+    } else {
+        serde_json::to_writer(&mut writer, value)
+    };
     if let Some(error) = writer.failure {
         return Err(error);
     }
@@ -558,6 +570,58 @@ fn digest_name(digest: Sha256Digest) -> String {
     format!("{}.json", &digest.to_string()[7..])
 }
 
+/// Read one already anchored ordinary metadata FD. The caller owns directory
+/// traversal and content-address authentication; this never reopens a name.
+pub(crate) fn read_opened(
+    mut file: std::fs::File,
+    expected_length: Option<u64>,
+    preparation: &Preparation,
+) -> Result<Bytes> {
+    preparation.check()?;
+    let before = file.metadata()?;
+    if !before.is_file()
+        || before.len() > MAX_BYTES as u64
+        || expected_length.is_some_and(|length| length != before.len())
+    {
+        return Err(unavailable("invalid original configuration metadata FD"));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let length = usize::try_from(before.len()).map_err(|_| preparation.exhausted())?;
+    let held = preparation.reserve(length as u64)?;
+    let mut value = Vec::new();
+    value
+        .try_reserve_exact(length)
+        .map_err(|_| preparation.exhausted())?;
+    if value.capacity() != length {
+        return Err(preparation.exhausted());
+    }
+    while value.len() < length {
+        preparation.check()?;
+        let start = value.len();
+        value.resize((start + (64 << 10)).min(length), 0);
+        file.read_exact(&mut value[start..])?;
+    }
+    let after = file.metadata()?;
+    if before.len() != after.len() || before.modified()? != after.modified()? {
+        return Err(unavailable(
+            "original metadata changed while reading its FD",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
+            return Err(unavailable("original metadata FD identity changed"));
+        }
+    }
+    preparation.check()?;
+    Ok(Bytes { value, _held: held })
+}
+
 pub(crate) fn read_bytes(path: &Path, preparation: &Preparation) -> Result<Bytes> {
     read_bytes_synced(path, preparation, false)
 }
@@ -576,21 +640,7 @@ fn read_bytes_synced(path: &Path, preparation: &Preparation, sync: bool) -> Resu
     if !before.is_file() || before.len() > MAX_BYTES as u64 {
         return Err(unavailable("invalid configuration metadata file"));
     }
-    let length = usize::try_from(before.len()).map_err(|_| preparation.exhausted())?;
-    let held = preparation.reserve(length as u64)?;
-    let mut value = Vec::new();
-    value
-        .try_reserve_exact(length)
-        .map_err(|_| preparation.exhausted())?;
-    if value.capacity() != length {
-        return Err(preparation.exhausted());
-    }
-    while value.len() < length {
-        preparation.check()?;
-        let start = value.len();
-        value.resize((start + (64 << 10)).min(length), 0);
-        file.read_exact(&mut value[start..])?;
-    }
+    let bytes = read_bytes_from(&mut file, before.len(), preparation)?;
     if sync {
         file.sync_all()?;
     }
@@ -620,6 +670,36 @@ fn read_bytes_synced(path: &Path, preparation: &Preparation, sync: bool) -> Resu
         }
     }
     preparation.check()?;
+    Ok(bytes)
+}
+
+/// Read a caller-selected already-owned source prefix into its real receiving
+/// preparation. This byte owner alone confers no file or publication identity.
+pub(crate) fn read_bytes_from<R: Read>(
+    file: &mut R,
+    length: u64,
+    preparation: &Preparation,
+) -> Result<Bytes> {
+    preparation.check()?;
+    if length > MAX_BYTES as u64 {
+        return Err(unavailable("invalid configuration metadata extent"));
+    }
+    let length = usize::try_from(length).map_err(|_| preparation.exhausted())?;
+    let held = preparation.reserve(length as u64)?;
+    let mut value = Vec::new();
+    value
+        .try_reserve_exact(length)
+        .map_err(|_| preparation.exhausted())?;
+    if value.capacity() != length {
+        return Err(preparation.exhausted());
+    }
+    while value.len() < length {
+        preparation.check()?;
+        let start = value.len();
+        value.resize((start + (64 << 10)).min(length), 0);
+        file.read_exact(&mut value[start..])?;
+    }
+    preparation.check()?;
     Ok(Bytes { value, _held: held })
 }
 
@@ -634,10 +714,20 @@ pub(crate) fn read_generation(
         .join(digest_name(identity.generation));
     checked_directory(&directory.join("generations"))?;
     let bytes = read_bytes(&path, preparation)?;
-    if Sha256Digest::of_bytes(&bytes.value, preparation.control())? != identity.generation {
+    generation_bytes(&bytes.value, identity, preparation)
+}
+
+/// Shared validation for already admitted original metadata. This establishes
+/// publication syntax and identity, not authority to replay an imported seal.
+pub(crate) fn generation_bytes(
+    bytes: &[u8],
+    identity: ConfigurationIdentity,
+    preparation: &Preparation,
+) -> Result<Owned<Generation>> {
+    if Sha256Digest::of_bytes(bytes, preparation.control())? != identity.generation {
         return Err(unavailable("configuration generation hash differs"));
     }
-    let document: Owned<Generation> = decode(&bytes.value, preparation)?;
+    let document: Owned<Generation> = decode(bytes, preparation)?;
     document.value.validate(preparation)?;
     if document.value.dataset_id != identity.dataset_id
         || document.value.lineage_id != identity.lineage_id
@@ -741,10 +831,20 @@ pub(crate) fn read_coverage(
         &directory(root, history.lineage_id)?.join("coverage.json"),
         preparation,
     )?;
-    if Sha256Digest::of_bytes(&bytes.value, preparation.control())? != history.coverage {
+    coverage_bytes(&bytes.value, dataset_id, history, preparation)
+}
+
+pub(crate) fn coverage_bytes(
+    bytes: &[u8],
+    dataset_id: Uuid,
+    history: &Root,
+    preparation: &Preparation,
+) -> Result<Owned<Coverage>> {
+    history.validate()?;
+    if Sha256Digest::of_bytes(bytes, preparation.control())? != history.coverage {
         return Err(unavailable("configuration coverage hash differs"));
     }
-    let coverage: Owned<Coverage> = decode(&bytes.value, preparation)?;
+    let coverage: Owned<Coverage> = decode(bytes, preparation)?;
     coverage.value.validate()?;
     if coverage.value.dataset_id != dataset_id || coverage.value.lineage_id != history.lineage_id {
         return Err(unavailable(
@@ -762,17 +862,38 @@ pub(crate) fn resolve(
     wanted: ConfigurationIdentity,
     preparation: &Preparation,
 ) -> Result<Owned<Generation>> {
+    resolve_using(
+        dataset_id,
+        history,
+        wanted,
+        preparation,
+        || read_coverage(root, dataset_id, history, preparation),
+        |identity| read_generation(root, identity, preparation),
+    )
+}
+
+/// Both loaders must validate the exact bytes they return using the helpers
+/// above. They borrow the caller's actual Preparation synchronously; no source
+/// or physical/replay authority is conferred by this common chain walk.
+pub(crate) fn resolve_using(
+    dataset_id: Uuid,
+    history: &Root,
+    wanted: ConfigurationIdentity,
+    preparation: &Preparation,
+    mut coverage: impl FnMut() -> Result<Owned<Coverage>>,
+    mut generation: impl FnMut(ConfigurationIdentity) -> Result<Owned<Generation>>,
+) -> Result<Owned<Generation>> {
     if wanted.dataset_id != dataset_id || wanted.lineage_id != history.lineage_id {
         return Err(unavailable("foreign configuration identity"));
     }
-    let coverage = read_coverage(root, dataset_id, history, preparation)?;
+    let coverage = coverage()?;
     let mut current = history.identity(dataset_id);
     let mut expected_ordinal = None;
     let mut expected_revision = None;
     let mut found = false;
     loop {
         preparation.check()?;
-        let document = read_generation(root, current, preparation)?;
+        let document = generation(current)?;
         if expected_ordinal.is_some_and(|ordinal| ordinal != document.value.ordinal) {
             return Err(unavailable("configuration predecessor ordinal differs"));
         }
@@ -814,7 +935,7 @@ pub(crate) fn resolve(
     // Hold at most one decoded predecessor during verification. The immutable
     // selected body is hash-checked again rather than retaining a whole second
     // generation across the walk.
-    read_generation(root, wanted, preparation)
+    generation(wanted)
 }
 
 pub(crate) fn binding(identity: ConfigurationIdentity) -> ConfigurationBinding {

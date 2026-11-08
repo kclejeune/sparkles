@@ -363,3 +363,26 @@ fn history_pair_reader_refuses_missing_unknown_duplicate_and_future_metadata() {
     std::fs::write(&file, original).unwrap();
     assert!(crate::history::read_file(&path, store.dataset_id).is_ok());
 }
+
+#[test]
+fn bound_read_source_keeps_genuine_history_view_and_configuration_credit() {
+    let store = Store::in_memory(Default::default());
+    let preparation = preparation();
+    store
+        .activate_memory_configuration_history(&preparation)
+        .unwrap();
+    let before = preparation.inner_used();
+    let view = store.evidence_view(&At::Head, &preparation).unwrap();
+    let backing = Arc::downgrade(&view.inner);
+    let charged = preparation.inner_used();
+    assert!(charged > before);
+    let source = view.read_source();
+    let last = source.clone();
+    drop(view);
+    drop(source);
+    assert!(backing.upgrade().is_some());
+    assert_eq!(preparation.inner_used(), charged);
+    drop(last);
+    assert!(backing.upgrade().is_none());
+    assert_eq!(preparation.inner_used(), before);
+}

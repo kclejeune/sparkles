@@ -11,6 +11,7 @@
 //!   `CURRENT` (TDB2 `Data-NNNN` compaction).
 
 mod backup;
+mod bound_read_source;
 #[cfg(test)]
 mod branch_ops_tests;
 #[cfg(test)]
@@ -29,6 +30,7 @@ mod compaction;
 #[cfg(test)]
 mod compaction_tests;
 pub(crate) mod configuration_history;
+pub use bound_read_source::BoundReadSource;
 mod evidence_view;
 pub use evidence_view::BoundEvidenceView;
 pub mod definitions;
@@ -2401,8 +2403,8 @@ impl Store {
                 annotated: annotated.as_ref(),
                 strict_from,
             };
-            let r = replay_wal(&from, &buf, &mut |_, _| Ok(()), &mut |seq, digest| {
-                configuration_references.observation(seq, digest)
+            let r = replay_wal(&from, &buf, &mut |_, _| Ok(()), &mut |observation| {
+                configuration_references.observation(observation)
             })?;
             if r.good != buf.len() {
                 OpenOptions::new()
@@ -8050,7 +8052,7 @@ pub(crate) fn replay_wal(
     from: &ReplayFrom<'_>,
     buf: &[u8],
     check: &mut dyn FnMut(u64, &Delta) -> Result<()>,
-    configuration: &mut dyn FnMut(u64, Option<crate::evidence::Sha256Digest>) -> Result<()>,
+    configuration: &mut dyn FnMut(wal::probe::WalCommitObservation) -> Result<()>,
 ) -> Result<Replay> {
     let cache = from.cache;
     let wal_version = wal::version_of(buf, from.path)?;
@@ -8265,16 +8267,22 @@ pub(crate) fn replay_wal(
                 // The original framing/term/sequence rules accepted this
                 // complete event. A lost/orphan reference refuses here, before
                 // any caller may truncate a tail or publish recovered data.
-                configuration(
-                    out.commits.last().map_or(from.base.seq, |c| c.seq),
-                    configuration_digest,
-                )?;
-                out.good = (i + 1) * WAL_REC;
-                out.index.note(wal::WalPoint {
+                let point = wal::WalPoint {
                     seq: out.commits.last().map_or(from.base.seq, |c| c.seq),
-                    offset: out.good as u64,
+                    offset: ((i + 1) * WAL_REC) as u64,
                     folding: from.fold_legacy && !seen_v2,
-                });
+                };
+                configuration(wal::probe::WalCommitObservation {
+                    start_offset: (txn_start * WAL_REC) as u64,
+                    point,
+                    configuration: configuration_digest,
+                    metadata: match meta {
+                        Some(Ok((_, timestamp, kind, flags))) => Some((timestamp, kind, flags)),
+                        _ => None,
+                    },
+                })?;
+                out.good = (i + 1) * WAL_REC;
+                out.index.note(point);
                 txn_start = i + 1;
             }
             // A commit that overwrites preallocated space may reach the disk in any

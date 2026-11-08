@@ -339,18 +339,13 @@ fn inspect_generation(
                         }
                         return Ok(());
                     };
-                    match primary
-                        .cached_observation(observation.point.seq, observation.configuration)
-                    {
+                    match primary.cached_observation(observation) {
                         Ok(true) => {}
                         Ok(false) => {
                             let temporary = metadata_preparation(budget)?;
-                            if let Err(error) = primary.observation(
-                                family_root,
-                                &temporary,
-                                observation.point.seq,
-                                observation.configuration,
-                            ) {
+                            if let Err(error) =
+                                primary.observation(family_root, &temporary, observation)
+                            {
                                 configuration_error = Some(error);
                             }
                         }

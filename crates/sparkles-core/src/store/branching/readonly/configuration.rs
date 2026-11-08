@@ -153,18 +153,10 @@ impl PrimaryReader {
         budget: &ColdBudget<'_>,
     ) -> Result<()> {
         budget.check()?;
-        if self
-            .header
-            .cached_observation(observation.point.seq, observation.configuration)?
-        {
+        if self.header.cached_observation(observation)? {
             return Ok(());
         }
         let temporary = preparation(budget)?;
-        self.header.observation(
-            &self.root,
-            &temporary,
-            observation.point.seq,
-            observation.configuration,
-        )
+        self.header.observation(&self.root, &temporary, observation)
     }
 }

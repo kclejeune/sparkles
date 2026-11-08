@@ -505,12 +505,7 @@ pub(crate) fn read_dataset_file_controlled(
             }
             Err(error) => return Err(error),
         };
-        let raw: crate::store::cold::Loaded<serde_json::Value> = budget.json(&bytes)?;
-        check_dataset_value(&raw.value)?;
-        let parsed: DatasetFile = budget.value_fields(raw.value, DATASET_FIELDS)?;
-        let id = parsed.id;
-        drop(parsed);
-        budget.release(raw.charge);
+        let id = dataset_id_bytes_controlled(&bytes, budget)?;
         budget.drop_vec(bytes);
         budget.check()?;
         Ok(Some(id))
@@ -522,6 +517,30 @@ pub(crate) fn read_dataset_file_controlled(
         budget.check()?;
         Ok(value)
     })
+}
+
+/// Decode an already admitted original dataset document with the same version
+/// and field grammar as the named cold reader. Only a scalar identity escapes.
+pub(crate) fn dataset_id_bytes_controlled(
+    bytes: &[u8],
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+) -> Result<uuid::Uuid> {
+    budget.check()?;
+    let start = budget.used();
+    let result = (|| {
+        let raw: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
+        check_dataset_value(&raw.value)?;
+        let parsed: DatasetFile = budget.value_fields(raw.value, DATASET_FIELDS)?;
+        let id = parsed.id;
+        drop(parsed);
+        budget.release(raw.charge);
+        budget.check()?;
+        Ok(id)
+    })();
+    if result.is_err() {
+        budget.release(budget.used() - start);
+    }
+    result
 }
 
 /// Exercise the actual closed scalar reader with caller-attributed allocation
@@ -996,12 +1015,32 @@ pub(crate) fn read_gen_commit_controlled(
             }
             Err(error) => return Err(error),
         };
-        let parsed: crate::store::cold::Loaded<serde_json::Value> = budget.json(&bytes)?;
-        check_gen_commit_value(&path, &parsed.value)?;
-        let file: GenCommitFile = budget.value(parsed.value)?;
-        check_gen_binding(&path, &file, &bytes)?;
+        let decoded = decode_gen_commit_bytes_controlled(&path, &bytes, budget)?;
         budget.drop_vec(bytes);
-        let value = decode_gen_commit_file(file, &path)?;
+        Ok(Some(decoded))
+    })();
+    if result.is_err() {
+        budget.release(budget.used() - start);
+    }
+    result
+}
+
+/// Decode the same historical codec from caller-admitted borrowed bytes. The
+/// path labels diagnostics only; this never opens or recovers a source. A caller
+/// retains its input owner/charge until this call returns. Neither decoded data
+/// nor successful parsing confers a physical source or imported replay identity.
+pub(crate) fn decode_gen_commit_bytes_controlled(
+    path: &Path,
+    bytes: &[u8],
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+) -> Result<crate::store::cold::Loaded<RetainedGenerationCommit>> {
+    let start = budget.used();
+    let result = (|| {
+        let parsed: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
+        check_gen_commit_value(path, &parsed.value)?;
+        let file: GenCommitFile = budget.value(parsed.value)?;
+        check_gen_binding(path, &file, bytes)?;
+        let value = decode_gen_commit_file(file, path)?;
         let charge =
             std::mem::size_of::<RetainedGenerationCommit>() as u64 + value.origin.capacity() as u64;
         if charge > parsed.charge {
@@ -1010,10 +1049,10 @@ pub(crate) fn read_gen_commit_controlled(
             budget.release(parsed.charge - charge);
         }
         budget.check()?;
-        Ok(Some(crate::store::cold::Loaded { value, charge }))
+        Ok(crate::store::cold::Loaded { value, charge })
     })();
     if result.is_err() {
-        // Input and parse owners have dropped; preserve caller-held storage.
+        // Only this decoder's temporaries dropped; caller-held input survives.
         budget.release(budget.used() - start);
     }
     result
@@ -2060,6 +2099,88 @@ mod tests {
             Err(Error::Unsupported(_))
         ));
         assert_eq!(std::fs::read(&path).unwrap(), future);
+    }
+
+    #[test]
+    fn controlled_generation_commit_borrowed_bytes_preserve_caller_storage() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let id = uuid::Uuid::new_v4();
+        let commit = sample_commit(42);
+        let valid = gen_commit_bytes_with_binding(
+            id,
+            "compaction",
+            &commit,
+            crate::history::ConfigurationBinding::LegacyUnbound,
+        );
+        let mut noncanonical = valid.clone();
+        noncanonical.push(b'\n');
+        let mut future: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+        future["format"] = 99.into();
+        future["commit"] = false.into();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = HistoryOptions {
+            cancel: Some(cancel.clone()),
+            ..Default::default()
+        };
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(1 << 20),
+            held: 0,
+        })
+        .unwrap();
+        budget.charge(17).unwrap();
+        for (kind, fixture) in [
+            valid.clone(),
+            noncanonical,
+            serde_json::to_vec(&future).unwrap(),
+            valid.clone(),
+            valid,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let length = fixture.len() as u64;
+            let bytes = budget
+                .read_from(&mut std::io::Cursor::new(fixture), length)
+                .unwrap();
+            let pressure = if kind == 4 { budget.available() - 1 } else { 0 };
+            budget.charge(pressure).unwrap();
+            let before = budget.used();
+            cancel.store(kind == 3, Ordering::SeqCst);
+            let result = decode_gen_commit_bytes_controlled(
+                Path::new("diagnostic-only/commit.json"),
+                &bytes,
+                &mut budget,
+            );
+            match kind {
+                0 => {
+                    let loaded = result.unwrap();
+                    assert_eq!(loaded.value.dataset_id, id);
+                    assert_eq!(loaded.value.commit, commit);
+                    assert_eq!(loaded.value.origin, "compaction");
+                    assert_eq!(budget.used(), before + loaded.charge);
+                    drop(loaded.value);
+                    budget.release(loaded.charge);
+                }
+                1 => assert!(matches!(result, Err(Error::Corrupt(_)))),
+                2 => assert!(matches!(result, Err(Error::Unsupported(_)))),
+                3 => assert!(matches!(result, Err(Error::Cancelled))),
+                4 => assert!(matches!(result, Err(Error::BudgetExceeded(_)))),
+                _ => unreachable!(),
+            }
+            cancel.store(false, Ordering::SeqCst);
+            assert_eq!(budget.used(), before);
+            budget.release(pressure);
+            budget.drop_vec(bytes);
+            assert_eq!(budget.used(), 17);
+        }
     }
 
     #[test]

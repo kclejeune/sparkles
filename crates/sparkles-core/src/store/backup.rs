@@ -237,6 +237,567 @@ pub struct BackupCapture {
     pub definitions: Vec<super::DefinitionFile>,
 }
 
+/// Genuine data capture coupled to original metadata under the same writer.
+/// This private owner establishes neither imported physical framing nor replay
+/// authority. It never accepts a public capture DTO or arbitrary lease.
+pub(super) struct ConfigurationCapture {
+    data: BackupCapture,
+    original: CapturedOriginal,
+}
+
+/// The closed primary members needed by the original framing proof. A member
+/// selects an already captured descriptor, never a new filesystem open.
+#[derive(Clone, Copy)]
+pub(super) enum CapturedPrimary {
+    Commit,
+    Meta,
+    Wal,
+}
+
+impl CapturedPrimary {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Commit => "commit.json",
+            Self::Meta => "meta.json",
+            Self::Wal => "wal.log",
+        }
+    }
+}
+
+/// Borrowing this cursor retains the genuine capture and its actual data lease.
+/// It proves only the selected descriptor/extent, not an imported identity.
+pub(super) struct CapturedReader<'a> {
+    capture: &'a ConfigurationCapture,
+    index: usize,
+    position: u64,
+}
+
+impl ConfigurationCapture {
+    pub(super) fn primary_reader(&self, member: CapturedPrimary) -> Option<CapturedReader<'_>> {
+        let index = self.data.files.iter().position(|file| {
+            file.path
+                .strip_prefix(self.data.generation.as_str())
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                == Some(member.name())
+        })?;
+        Some(CapturedReader {
+            capture: self,
+            index,
+            position: 0,
+        })
+    }
+}
+
+/// A private native primary proof. It retains the genuine captured lease and
+/// the receiving allowance, and grants no imported interval/replay authority.
+struct CheckedPrimaryCapture {
+    capture: ConfigurationCapture,
+    base: CommitInfo,
+    wal_extent: u64,
+    wal_digest: crate::evidence::Sha256Digest,
+    first_wal_seq: Option<u64>,
+    _held: crate::access::Reservation,
+}
+
+impl std::fmt::Debug for CheckedPrimaryCapture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CheckedPrimaryCapture")
+            .field("base", &self.base)
+            .field("wal_extent", &self.wal_extent)
+            .finish_non_exhaustive()
+    }
+}
+
+struct CapturedMembership {
+    seqs: Option<Vec<u64>>,
+    _held: crate::access::Reservation,
+}
+
+impl ConfigurationCapture {
+    fn annotation_membership(
+        &self,
+        preparation: &crate::access::Preparation,
+    ) -> Result<CapturedMembership> {
+        let allowance = preparation.room();
+        let mut held = preparation.reserve(allowance)?;
+        let options = crate::history::HistoryOptions {
+            cancel: Some(preparation.control().cancel.flag()),
+            deadline: preparation.control().deadline,
+        };
+        let mut budget = super::cold::ColdBudget::new(crate::history::ReadLimit {
+            options: &options,
+            memory: Some(allowance),
+            held: 0,
+        })?;
+        let value = if let Some(index) = self
+            .data
+            .files
+            .iter()
+            .position(|file| file.path == crate::annotations::FILE)
+        {
+            let mut reader = CapturedReader {
+                capture: self,
+                index,
+                position: 0,
+            };
+            crate::annotations::seqs_from(&mut reader, self.data.dataset_id, &mut budget)?.value
+        } else {
+            None
+        };
+        let charge = budget.used();
+        held.release_to(charge);
+        preparation.check()?;
+        Ok(CapturedMembership {
+            seqs: value,
+            _held: held,
+        })
+    }
+
+    fn checked_primary(
+        self,
+        preparation: &crate::access::Preparation,
+    ) -> Result<CheckedPrimaryCapture> {
+        preparation.check()?;
+        let held = preparation.reserve(
+            std::mem::size_of::<CheckedPrimaryCapture>() as u64
+                + std::mem::size_of::<super::configuration_history::primary::Header>() as u64
+                + std::mem::size_of::<sha2::Sha256>() as u64,
+        )?;
+        let bad = || {
+            super::managed_history::unavailable(
+                "captured primary differs from its actual Store basis",
+            )
+        };
+        let expected_head = if self.data.materialized {
+            CommitInfo {
+                generation: 1,
+                ..self.original.head
+            }
+        } else {
+            self.original.head
+        };
+        if self.data.commit != expected_head
+            || self.data.dataset_id != self.original.identities.logical()
+        {
+            return Err(bad());
+        }
+        let basis = if self.data.materialized {
+            CapturedBasis {
+                base: expected_head,
+                physical_owner: self.data.dataset_id,
+                dvocab_len: 0,
+                fold_legacy: false,
+            }
+        } else {
+            self.original.native.ok_or_else(bad)?
+        };
+        // This ephemeral loan admits the input, JSON scratch and decoded origin.
+        // No publication callback can run while it holds the remaining allowance.
+        let (base_binding, strict_from) = {
+            let allowance = preparation.room();
+            let _loan = preparation.reserve(allowance)?;
+            let options = crate::history::HistoryOptions {
+                cancel: Some(preparation.control().cancel.flag()),
+                deadline: preparation.control().deadline,
+            };
+            let mut budget = super::cold::ColdBudget::new(crate::history::ReadLimit {
+                options: &options,
+                memory: Some(allowance),
+                held: 0,
+            })?;
+            let mut reader = self
+                .primary_reader(CapturedPrimary::Commit)
+                .ok_or_else(bad)?;
+            let extent = reader.extent();
+            let bytes = budget.read_from(&mut reader, extent)?;
+            let decoded = crate::commit::decode_gen_commit_bytes_controlled(
+                Path::new("captured-primary/commit.json"),
+                &bytes,
+                &mut budget,
+            )?;
+            if decoded.value.dataset_id != basis.physical_owner
+                || decoded.value.commit != basis.base
+            {
+                return Err(bad());
+            }
+            (decoded.value.configuration, decoded.value.wal_strict_from)
+        };
+        let family = self.original.identities.family();
+        let coverage = {
+            let bytes = self.publication_bytes(None, preparation)?;
+            super::managed_history::coverage_bytes(
+                &bytes.value,
+                family,
+                &self.original.history,
+                preparation,
+            )?
+        };
+        let mut header = super::configuration_history::primary::Header::from_coverage(
+            family,
+            self.original.identities.logical(),
+            self.original.origin,
+            Some(self.original.history.clone()),
+            false,
+            Some(&coverage.value),
+        )?;
+        drop(coverage);
+        header.generation_using(preparation, basis.base.seq, base_binding, &mut |identity| {
+            self.resolve_publication(identity, preparation).map(|_| ())
+        })?;
+        let membership = self.annotation_membership(preparation)?;
+        // The parser itself uses fixed stack records. Its only heap buffer is
+        // admitted separately; publication decoding uses the remaining allowance.
+        let _buffer = preparation.reserve(64 << 10)?;
+        let wal = self.primary_reader(CapturedPrimary::Wal).ok_or_else(bad)?;
+        let extent = wal.extent();
+        let mut reader = std::io::BufReader::with_capacity(64 << 10, wal);
+        if reader.capacity() != 64 << 10 {
+            return Err(preparation.exhausted());
+        }
+        let options = crate::history::HistoryOptions {
+            cancel: Some(preparation.control().cancel.flag()),
+            deadline: preparation.control().deadline,
+        };
+        let budget = super::cold::ColdBudget::new(crate::history::ReadLimit {
+            options: &options,
+            memory: Some(0),
+            held: 0,
+        })?;
+        let mut last_binding = base_binding
+            .configuration()
+            .map(|identity| identity.generation);
+        let mut configuration_error = None;
+        use sha2::Digest;
+        let mut digest = sha2::Sha256::new();
+        let mut bytes_hashed = 0u64;
+        let mut first_wal_seq = None;
+        let proof = super::wal::probe::prove_prefix_recording(
+            &mut reader,
+            extent,
+            basis.base.seq,
+            self.data.commit.seq,
+            basis.fold_legacy,
+            strict_from,
+            basis.dvocab_len,
+            Some(membership.seqs.as_deref().unwrap_or(&[])),
+            Path::new("captured-primary/wal.log"),
+            &budget,
+            &mut |observation| {
+                first_wal_seq.get_or_insert(observation.point.seq);
+                if configuration_error.is_none() {
+                    configuration_error = header
+                        .observation_using(preparation, observation, &mut |identity| {
+                            self.resolve_publication(identity, preparation).map(|_| ())
+                        })
+                        .err();
+                }
+                last_binding = observation.configuration;
+                if observation.point.seq == self.data.commit.seq
+                    && let Some((timestamp, kind, flags)) = observation.metadata
+                    && (timestamp != self.data.commit.timestamp_ms
+                        || kind != self.data.commit.kind
+                        || (flags & crate::commit::WAL_FLAG_UNVALIDATED != 0)
+                            != self.data.commit.unvalidated)
+                {
+                    return Err(bad());
+                }
+                Ok(())
+            },
+            &mut |offset, record| {
+                if offset != bytes_hashed {
+                    return Err(bad());
+                }
+                digest.update(record);
+                bytes_hashed = bytes_hashed
+                    .checked_add(record.len() as u64)
+                    .ok_or_else(bad)?;
+                Ok(())
+            },
+        )?;
+        if bytes_hashed != extent
+            || proof.head.seq != self.data.commit.seq
+            || proof.head.offset != extent
+            || proof
+                .selected
+                .is_none_or(|point| point.seq != self.data.commit.seq)
+            || last_binding
+                != self
+                    .original
+                    .binding
+                    .configuration()
+                    .map(|identity| identity.generation)
+        {
+            return Err(bad());
+        }
+        if let Some(error) = configuration_error {
+            return Err(error);
+        }
+        drop(reader);
+        drop(membership);
+        preparation.check()?;
+        Ok(CheckedPrimaryCapture {
+            capture: self,
+            base: basis.base,
+            wal_extent: extent,
+            wal_digest: crate::evidence::Sha256Digest::from_digest_bytes(digest.finalize().into()),
+            first_wal_seq,
+            _held: held,
+        })
+    }
+}
+
+impl ConfigurationCapture {
+    /// Resolve the retained original closure, even after live settings change.
+    /// The receiving body owns its actual Preparation independently of this
+    /// capture. This validates publication, never a foreign WAL replay right.
+    fn resolve_publication(
+        &self,
+        wanted: crate::history::ConfigurationIdentity,
+        preparation: &crate::access::Preparation,
+    ) -> Result<super::managed_history::Owned<super::managed_history::Generation>> {
+        preparation.check()?;
+        let family = self.original.identities.family();
+        let history = &self.original.history;
+        let resolved = super::managed_history::resolve_using(
+            family,
+            history,
+            wanted,
+            preparation,
+            || {
+                let bytes = self.publication_bytes(None, preparation)?;
+                super::managed_history::coverage_bytes(&bytes.value, family, history, preparation)
+            },
+            |identity| {
+                let bytes = self.publication_bytes(Some(identity), preparation)?;
+                super::managed_history::generation_bytes(&bytes.value, identity, preparation)
+            },
+        )?;
+        preparation.check()?;
+        Ok(resolved)
+    }
+
+    fn publication_bytes(
+        &self,
+        identity: Option<crate::history::ConfigurationIdentity>,
+        preparation: &crate::access::Preparation,
+    ) -> Result<super::managed_history::Bytes> {
+        preparation.check()?;
+        let history = &self.original.history;
+        if identity.is_some_and(|identity| {
+            identity.dataset_id != self.original.identities.family()
+                || identity.lineage_id != history.lineage_id
+        }) {
+            return Err(super::managed_history::unavailable(
+                "foreign captured publication",
+            ));
+        }
+        let mut lineage = [0; 36];
+        let lineage = history.lineage_id.hyphenated().encode_lower(&mut lineage);
+        let mut digest = [0; 64];
+        if let Some(identity) = identity {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            for (at, byte) in identity.generation.as_bytes().iter().enumerate() {
+                digest[2 * at] = HEX[(byte >> 4) as usize];
+                digest[2 * at + 1] = HEX[(byte & 15) as usize];
+            }
+        }
+        let digest = std::str::from_utf8(&digest).ok();
+        let index = self
+            .data
+            .files
+            .iter()
+            .position(|file| {
+                let Some(member) = file
+                    .path
+                    .strip_prefix("evidence-history/")
+                    .and_then(|path| path.strip_prefix(&*lineage))
+                    .and_then(|path| path.strip_prefix('/'))
+                else {
+                    return false;
+                };
+                if identity.is_none() {
+                    return member == "coverage.json";
+                }
+                member
+                    .strip_prefix("generations/")
+                    .and_then(|name| name.strip_suffix(".json"))
+                    == digest
+            })
+            .ok_or_else(|| {
+                super::managed_history::unavailable(
+                    "original captured publication member is missing",
+                )
+            })?;
+        let mut reader = CapturedReader {
+            capture: self,
+            index,
+            position: 0,
+        };
+        let extent = reader.extent();
+        super::managed_history::read_bytes_from(&mut reader, extent, preparation)
+    }
+}
+
+impl CapturedReader<'_> {
+    pub(super) fn extent(&self) -> u64 {
+        self.capture.data.files[self.index].len
+    }
+}
+
+impl CapturedReader<'_> {
+    // Only Read's compile-selected capability enters production. Keeping the
+    // refusal here lets the same private branch be tested without Windows I/O.
+    fn read_checked(
+        &mut self,
+        bytes: &mut [u8],
+        independent_file_cursor: bool,
+    ) -> std::io::Result<usize> {
+        if bytes.is_empty() || self.position >= self.extent() {
+            return Ok(0);
+        }
+        let file = &self.capture.data.files[self.index];
+        if !independent_file_cursor && matches!(&file.src, FileSource::File(_)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this platform has no independent captured-file cursor backend",
+            ));
+        }
+        let count = file.read_at(self.position, bytes)?;
+        self.position += count as u64;
+        Ok(count)
+    }
+}
+
+impl std::io::Read for CapturedReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.read_checked(bytes, cfg!(unix))
+    }
+}
+
+impl std::io::Seek for CapturedReader<'_> {
+    fn seek(&mut self, request: std::io::SeekFrom) -> std::io::Result<u64> {
+        let position = match request {
+            std::io::SeekFrom::Start(position) => Some(position),
+            std::io::SeekFrom::Current(offset) => self.position.checked_add_signed(offset),
+            std::io::SeekFrom::End(offset) => self.extent().checked_add_signed(offset),
+        }
+        .filter(|position| *position <= self.extent())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek outside the captured primary extent",
+            )
+        })?;
+        self.position = position;
+        Ok(position)
+    }
+}
+
+struct CapturedOriginal {
+    identities: super::configuration_history::OriginalIdentities,
+    binding: crate::history::ConfigurationBinding,
+    history: super::managed_history::Root,
+    head: CommitInfo,
+    native: Option<CapturedBasis>,
+    origin: Option<(u64, crate::history::ConfigurationBinding)>,
+    _held: crate::access::Reservation,
+}
+
+/// Scalars selected from the actual Store under its writer, independently of
+/// any captured/decoded generation metadata.
+#[derive(Clone, Copy, Debug)]
+struct CapturedBasis {
+    base: CommitInfo,
+    physical_owner: uuid::Uuid,
+    dvocab_len: u64,
+    fold_legacy: bool,
+}
+
+impl CapturedOriginal {
+    fn under_writer(
+        store: &Store,
+        writer: &super::WriterGuard<'_>,
+        state: &Option<Arc<crate::managed::ManagedState>>,
+        preparation: &crate::access::Preparation,
+    ) -> Result<Self> {
+        let header = std::mem::size_of::<Self>()
+            .checked_add(std::mem::size_of::<ConfigurationCapture>())
+            .ok_or_else(|| preparation.exhausted())?;
+        let held = preparation.reserve(header as u64)?;
+        let identities = super::configuration_history::OriginalIdentities::capture(
+            store,
+            writer,
+            state,
+            preparation,
+        )?;
+        let binding = store.configuration_binding_at(writer.head.seq, preparation)?;
+        let history = match state.as_deref() {
+            Some(crate::managed::ManagedState::Installed(installed)) => {
+                installed.configuration_history.clone()
+            }
+            _ => None,
+        }
+        .ok_or_else(|| {
+            super::managed_history::unavailable("original capture has no published root")
+        })?;
+
+        let snapshot = store.snapshot();
+        let native = if store.root.is_some() && snapshot.generation.linked().is_none() {
+            let history = store.history.as_ref().ok_or_else(|| {
+                super::managed_history::unavailable("captured physical generation has no history")
+            })?;
+            let history = preparation.lock(history)?;
+            let generation = crate::commit::generation_number(&snapshot.generation.name);
+            let entry = history
+                .gens
+                .get(&generation)
+                .filter(|entry| entry.name == snapshot.generation.name)
+                .ok_or_else(|| {
+                    super::managed_history::unavailable("captured physical base is absent")
+                })?;
+            Some(CapturedBasis {
+                base: entry.base,
+                physical_owner: store.dataset_id,
+                dvocab_len: snapshot.dvocab_len,
+                fold_legacy: entry.fold_legacy,
+            })
+        } else {
+            None
+        };
+        let origin = store
+            .branching
+            .ident
+            .as_ref()
+            .and_then(|ident| {
+                ident
+                    .configuration_origin
+                    .as_ref()
+                    .map(|origin| (ident.from.seq, origin))
+            })
+            .map(|(seq, origin)| {
+                origin.validate(identities.family(), seq)?;
+                Ok::<_, Error>((seq, origin.binding))
+            })
+            .transpose()?;
+        if !store.same_managed_state(state) {
+            return Err(Error::Conflict(
+                "configuration changed while selecting original capture metadata".into(),
+            ));
+        }
+        preparation.check()?;
+        Ok(Self {
+            identities,
+            binding,
+            history,
+            head: writer.head,
+            native,
+            origin,
+            _held: held,
+        })
+    }
+}
+
 impl BackupCapture {
     /// The captured file at `path` (`gen-0001/wal.log`, `CURRENT`, …).
     pub fn file(&self, path: &str) -> Option<&CapturedFile> {
@@ -485,6 +1046,32 @@ impl Store {
         label: &str,
         o: &MemoryCaptureOptions,
     ) -> Result<BackupCapture> {
+        self.materialized_capture_prepared(label, o, None)
+            .map(|(capture, _)| capture)
+    }
+
+    pub(super) fn materialized_configuration_capture(
+        &self,
+        label: &str,
+        o: &MemoryCaptureOptions,
+        preparation: &crate::access::Preparation,
+    ) -> Result<ConfigurationCapture> {
+        preparation.check()?;
+        let (data, original) = self.materialized_capture_prepared(label, o, Some(preparation))?;
+        let original =
+            original.ok_or_else(|| Error::Corrupt("original capture metadata missing".into()))?;
+        preparation.check()?;
+        Ok(ConfigurationCapture { data, original })
+    }
+
+    fn materialized_capture_prepared(
+        &self,
+        label: &str,
+        o: &MemoryCaptureOptions,
+        preparation: Option<&crate::access::Preparation>,
+    ) -> Result<(BackupCapture, Option<CapturedOriginal>)> {
+        let check_preparation = || preparation.map_or(Ok(()), |preparation| preparation.check());
+        check_preparation()?;
         let report = |f: f32, msg: &str| {
             if let Some(p) = &o.progress {
                 p(f, msg);
@@ -498,8 +1085,19 @@ impl Store {
         };
         control.check()?;
         let t0 = Instant::now();
-        let (snap, next_bnode, head, prefixes, definitions, managed, managed_state, binding) = {
+        let (
+            snap,
+            next_bnode,
+            head,
+            prefixes,
+            definitions,
+            managed,
+            managed_state,
+            binding,
+            original,
+        ) = {
             let w = self.lock_writer(&control)?;
+            check_preparation()?;
             if w.poisoned {
                 return Err(Error::Poisoned);
             }
@@ -526,6 +1124,17 @@ impl Store {
             } else {
                 crate::history::ConfigurationBinding::LegacyUnbound
             };
+            let original = preparation
+                .map(|preparation| CapturedOriginal::under_writer(self, &w, &state, preparation))
+                .transpose()?;
+            if original
+                .as_ref()
+                .is_some_and(|original| original.binding != binding)
+            {
+                return Err(Error::Conflict(
+                    "configuration changed while capturing original binding".into(),
+                ));
+            }
             (
                 self.snapshot().without_cache_fill(),
                 w.next_bnode,
@@ -535,9 +1144,11 @@ impl Store {
                 managed,
                 state,
                 binding,
+                original,
             )
         };
         let lock_hold = t0.elapsed();
+        check_preparation()?;
         std::fs::create_dir_all(&o.tmp_dir)?;
         let tmp = tempfile::Builder::new()
             .prefix(MEMORY_CAPTURE_PREFIX)
@@ -564,6 +1175,7 @@ impl Store {
             }
             _ => Vec::new(),
         };
+        check_preparation()?;
         if !self.same_managed_state(&managed_state) {
             return Err(Error::Conflict(
                 "configuration changed while establishing a materialized capture; retry".into(),
@@ -574,6 +1186,7 @@ impl Store {
         let total = snap.len().max(1);
         let mut seen = 0u64;
         report(0.0, "writing quads");
+        check_preparation()?;
         let meta = self.build_from_snapshot(
             &gdir,
             &snap,
@@ -585,7 +1198,9 @@ impl Store {
                 seen += 1;
                 if seen.is_multiple_of(65_536) {
                     control.check()?;
+                    check_preparation()?;
                     report(0.7 * seen as f32 / total as f32, "writing quads");
+                    check_preparation()?;
                 }
                 Ok(true)
             },
@@ -593,6 +1208,7 @@ impl Store {
         )?;
         drop(snap);
         control.check()?;
+        check_preparation()?;
         // the head commit, held by the base of generation 1
         let commit = CommitInfo {
             generation: 1,
@@ -614,6 +1230,7 @@ impl Store {
         let mut files = Vec::new();
         let mut names: Vec<String> = Vec::new();
         for e in std::fs::read_dir(&gdir)? {
+            check_preparation()?;
             let e = e?;
             let name = e.file_name().to_string_lossy().into_owned();
             if e.file_type()?.is_file() && !name.ends_with(".tmp") {
@@ -622,6 +1239,7 @@ impl Store {
         }
         names.sort();
         for name in names {
+            check_preparation()?;
             let f = File::open(gdir.join(&name))?;
             let kind = if APPEND_FILES.contains(&name.as_str()) {
                 FileKind::Append
@@ -668,6 +1286,7 @@ impl Store {
         }
         if let Some(root) = &self.root {
             for name in OPTIONAL_META {
+                check_preparation()?;
                 if files.iter().any(|f| f.path == name) {
                     continue;
                 }
@@ -679,28 +1298,32 @@ impl Store {
             }
         }
         report(1.0, "built");
-        Ok(BackupCapture {
-            dataset_id: self.dataset_id,
-            commit,
-            generation: generation.to_string(),
-            index_format: meta.format_version,
-            index_features: meta.features.clone(),
-            files,
-            lock_hold,
-            lease: LeaseGuard {
-                generation: 1,
-                label: label.to_string(),
-                // the open handles keep reading after the directory is gone on Unix,
-                // but the upload has ended by the time the lease is dropped
-                release: Some(Box::new(move || drop(tmp))),
+        check_preparation()?;
+        Ok((
+            BackupCapture {
+                dataset_id: self.dataset_id,
+                commit,
+                generation: generation.to_string(),
+                index_format: meta.format_version,
+                index_features: meta.features.clone(),
+                files,
+                lock_hold,
+                lease: LeaseGuard {
+                    generation: 1,
+                    label: label.to_string(),
+                    // the open handles keep reading after the directory is gone on Unix,
+                    // but the upload has ended by the time the lease is dropped
+                    release: Some(Box::new(move || drop(tmp))),
+                },
+                in_memory: self.root.is_none(),
+                materialized: true,
+                branch: self.backup_branch(),
+                next_ordinal: self.backup_next_ordinal(),
+                branches_omitted: self.backup_omitted(),
+                definitions,
             },
-            in_memory: self.root.is_none(),
-            materialized: true,
-            branch: self.backup_branch(),
-            next_ordinal: self.backup_next_ordinal(),
-            branches_omitted: self.backup_omitted(),
-            definitions,
-        })
+            original,
+        ))
     }
 
     fn backup_next_ordinal(&self) -> u32 {
@@ -730,12 +1353,52 @@ impl Store {
         label: &str,
         control: &crate::guard::WriteOptions,
     ) -> Result<Option<BackupCapture>> {
+        self.capture_once_prepared(label, control, None)
+            .map(|capture| capture.map(|(data, _)| data))
+    }
+
+    pub(super) fn configuration_capture(
+        &self,
+        label: &str,
+        control: &crate::guard::WriteOptions,
+        preparation: &crate::access::Preparation,
+    ) -> Result<ConfigurationCapture> {
+        preparation.check()?;
+        if self.snapshot().generation.linked().is_some() {
+            return Err(Error::unsupported(
+                "a linked branch needs a materialized configuration capture",
+            ));
+        }
+        for _ in 0..2 {
+            if let Some((data, original)) =
+                self.capture_once_prepared(label, control, Some(preparation))?
+            {
+                let original = original
+                    .ok_or_else(|| Error::Corrupt("original capture metadata missing".into()))?;
+                preparation.check()?;
+                return Ok(ConfigurationCapture { data, original });
+            }
+        }
+        Err(Error::Conflict(
+            "the generation changed twice during original capture; retry".into(),
+        ))
+    }
+
+    fn capture_once_prepared(
+        &self,
+        label: &str,
+        control: &crate::guard::WriteOptions,
+        preparation: Option<&crate::access::Preparation>,
+    ) -> Result<Option<(BackupCapture, Option<CapturedOriginal>)>> {
+        let check_preparation = || preparation.map_or(Ok(()), |preparation| preparation.check());
+        check_preparation()?;
         let (Some(root), Some(hist)) = (&self.root, &self.history) else {
             return Err(Error::unsupported(
                 "backups of in-memory datasets are not supported",
             ));
         };
         let w = self.lock_writer(control)?;
+        check_preparation()?;
         let t0 = Instant::now();
         if w.poisoned {
             return Err(Error::Poisoned);
@@ -779,7 +1442,13 @@ impl Store {
         } else {
             self.managed_files_at(managed_state.as_deref())?
         };
+        let original = preparation
+            .map(|preparation| {
+                CapturedOriginal::under_writer(self, &w, &managed_state, preparation)
+            })
+            .transpose()?;
         self.failpoint("backup-capture-locked");
+        check_preparation()?;
         let lease_id = hist.lock().lease(gen_no, label);
         drop(w);
         let lock_hold = t0.elapsed();
@@ -797,6 +1466,7 @@ impl Store {
         let gdir = root.join(&generation);
         let mut gen_files: Vec<(String, File, u64)> = Vec::new();
         for e in std::fs::read_dir(&gdir)? {
+            check_preparation()?;
             let e = e?;
             let name = e.file_name().to_string_lossy().into_owned();
             if !e.file_type()?.is_file() || name.ends_with(".tmp") {
@@ -818,6 +1488,7 @@ impl Store {
             gen_files.push((name, f, len));
         }
         self.failpoint("backup-capture-unlocked");
+        check_preparation()?;
 
         let current = std::fs::read(root.join("CURRENT"))?;
         if String::from_utf8_lossy(&current).trim() != generation {
@@ -838,6 +1509,7 @@ impl Store {
                     control,
                 );
                 control.check()?;
+                check_preparation()?;
                 // Configure may replace settings names while descriptors open.
                 // Retry an unstable selection before interpreting its I/O result.
                 if !self.same_managed_state(&managed_state) {
@@ -904,6 +1576,7 @@ impl Store {
             serde_json::to_vec_pretty(&prefixes).unwrap(),
         ));
         for name in OPTIONAL_META {
+            check_preparation()?;
             match std::fs::read(root.join(name)) {
                 Ok(b) => files.push(meta(name, b)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -911,25 +1584,29 @@ impl Store {
             }
         }
         control.check()?;
+        check_preparation()?;
         if !self.same_managed_state(&managed_state) {
             return Ok(None);
         }
-        Ok(Some(BackupCapture {
-            dataset_id: self.dataset_id,
-            commit: head,
-            generation,
-            index_format: snap.generation.meta.format_version,
-            index_features: snap.generation.meta.features.clone(),
-            files,
-            lock_hold,
-            lease,
-            in_memory: false,
-            materialized: false,
-            branch: self.backup_branch(),
-            next_ordinal: self.backup_next_ordinal(),
-            branches_omitted: self.backup_omitted(),
-            definitions,
-        }))
+        Ok(Some((
+            BackupCapture {
+                dataset_id: self.dataset_id,
+                commit: head,
+                generation,
+                index_format: snap.generation.meta.format_version,
+                index_features: snap.generation.meta.features.clone(),
+                files,
+                lock_hold,
+                lease,
+                in_memory: false,
+                materialized: false,
+                branch: self.backup_branch(),
+                next_ordinal: self.backup_next_ordinal(),
+                branches_omitted: self.backup_omitted(),
+                definitions,
+            },
+            original,
+        )))
     }
 
     /// Best-effort history collection: removes generations nothing needs any more if the
@@ -1185,6 +1862,1328 @@ mod tests {
             assert_eq!(owner(source), owner(migration_lock), "{entries:?}");
         }
         entries
+    }
+
+    fn capture_preparation() -> crate::access::Preparation {
+        crate::access::Preparation::new(crate::task::Control::none(), 64 << 20).unwrap()
+    }
+
+    #[test]
+    fn genuine_configuration_capture_retains_actual_lease_metadata_and_fixed_prefix() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let captured = store
+            .configuration_capture("genuine", &Default::default(), &preparation)
+            .unwrap();
+        assert_eq!(leases(&store), 1);
+        assert_eq!(captured.data.lease.label(), "genuine");
+        assert_eq!(captured.original.identities.family(), store.dataset_id);
+        assert_eq!(captured.original.identities.logical(), store.dataset_id);
+        assert_eq!(
+            captured.original.identities.family_document(),
+            std::fs::read(root.join("dataset.json")).unwrap()
+        );
+        assert!(captured.original.identities.branch_document().is_none());
+        assert_eq!(
+            captured.original.binding,
+            store
+                .configuration_binding_at(captured.data.commit.seq, &preparation)
+                .unwrap()
+        );
+        let wal = captured
+            .data
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("/wal.log"))
+            .unwrap();
+        let length = wal.len;
+        let head = captured.data.commit;
+        ins(&store, 2);
+        assert!(store.head_commit().seq > head.seq);
+        assert_eq!(captured.data.commit, head);
+        assert_eq!(wal.len, length);
+        assert_eq!(wal.read_at(length, &mut [0; 1]).unwrap(), 0);
+        assert!(preparation.room() < before);
+        drop(captured);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[test]
+    fn genuine_configuration_capture_materializes_a_real_persistent_branch_family() {
+        let temporary = tempfile::tempdir().unwrap();
+        let main = history_store(&temporary.path().join("source"));
+        ins(&main, 1);
+        main.create_branch("branch", &Default::default()).unwrap();
+        let branch = main.branch("branch").unwrap();
+        assert!(branch.snapshot().generation.linked().is_some());
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let scratch = temporary.path().join("scratch");
+        let captured = branch
+            .materialized_configuration_capture(
+                "genuine-branch",
+                &MemoryCaptureOptions {
+                    tmp_dir: scratch.clone(),
+                    ..Default::default()
+                },
+                &preparation,
+            )
+            .unwrap();
+        assert_eq!(captured.original.identities.family(), main.dataset_id);
+        assert_eq!(captured.original.identities.logical(), branch.dataset_id);
+        assert_ne!(
+            captured.original.identities.family(),
+            captured.data.dataset_id
+        );
+        assert_eq!(captured.data.dataset_id, branch.dataset_id);
+        assert_eq!(captured.data.commit.seq, branch.head_commit().seq);
+        let metadata: super::super::branching::BranchFile =
+            serde_json::from_slice(captured.original.identities.branch_document().unwrap())
+                .unwrap();
+        assert_eq!(metadata.dataset_id, main.dataset_id);
+        assert_eq!(metadata.id, branch.dataset_id);
+        assert!(captured.data.materialized);
+        assert!(!captured.data.in_memory);
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 1);
+        drop(captured);
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[test]
+    fn genuine_configuration_capture_materializes_real_memory_main_and_branch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let main = Store::in_memory(StoreOptions::default());
+        let preparation = capture_preparation();
+        main.activate_memory_configuration_history(&preparation)
+            .unwrap();
+        ins(&main, 1);
+        main.create_branch("branch", &Default::default()).unwrap();
+        let scratch = temporary.path().join("scratch");
+        for name in ["main", "branch"] {
+            let store = main.branch(name).unwrap();
+            let before = preparation.room();
+            let captured = store
+                .materialized_configuration_capture(
+                    "genuine-memory",
+                    &MemoryCaptureOptions {
+                        tmp_dir: scratch.clone(),
+                        ..Default::default()
+                    },
+                    &preparation,
+                )
+                .unwrap();
+            assert_eq!(captured.original.identities.family(), main.dataset_id);
+            assert_eq!(captured.original.identities.logical(), store.dataset_id);
+            assert_eq!(captured.data.commit.seq, store.head_commit().seq);
+            let family: serde_json::Value =
+                serde_json::from_slice(captured.original.identities.family_document()).unwrap();
+            assert_eq!(family["origin"], "memory-capture");
+            assert_eq!(
+                captured.original.identities.branch_document().is_some(),
+                name != "main"
+            );
+            assert!(captured.data.materialized && captured.data.in_memory);
+            assert_eq!(
+                captured.original.binding,
+                store
+                    .configuration_binding_at(captured.data.commit.seq, &preparation)
+                    .unwrap()
+            );
+            drop(captured);
+            assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+            assert_eq!(preparation.room(), before);
+        }
+    }
+
+    #[test]
+    fn genuine_configuration_capture_refuses_live_fork_substitution_before_scratch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let main = history_store(&root);
+        main.create_branch("branch", &Default::default()).unwrap();
+        let branch = main.branch("branch").unwrap();
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let path = root.join(format!("branches/{}/branch.json", branch.dataset_id));
+        let original = std::fs::read(&path).unwrap();
+        let mut metadata: super::super::branching::BranchFile =
+            serde_json::from_slice(&original).unwrap();
+        metadata.from.branch_id = uuid::Uuid::new_v4();
+        let forged = serde_json::to_vec_pretty(&metadata).unwrap();
+        metadata.check_configuration(&forged).unwrap();
+        std::fs::write(&path, forged).unwrap();
+        let scratch = temporary.path().join("scratch");
+        let result = branch.materialized_configuration_capture(
+            "genuine-refusal",
+            &MemoryCaptureOptions {
+                tmp_dir: scratch.clone(),
+                ..Default::default()
+            },
+            &preparation,
+        );
+        std::fs::write(path, original).unwrap();
+        assert!(result.is_err());
+        drop(result);
+        assert!(!scratch.exists());
+        assert_eq!(leases(&branch), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[test]
+    fn genuine_configuration_capture_pressure_and_cancel_leave_no_lease() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let pressure = preparation.reserve(before - 64).unwrap();
+        assert!(matches!(
+            store.configuration_capture("pressure", &Default::default(), &preparation),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), 64);
+        drop(pressure);
+        assert_eq!(preparation.room(), before);
+        preparation.control().cancel.cancel();
+        assert!(matches!(
+            store.configuration_capture("cancelled", &Default::default(), &preparation),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_primary_digest_uses_exact_retained_parser_bytes_after_append() {
+        use std::io::Read;
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        ins(&store, 2);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let captured = store
+            .configuration_capture("digest", &Default::default(), &preparation)
+            .unwrap();
+        let mut wire = Vec::new();
+        captured
+            .primary_reader(CapturedPrimary::Wal)
+            .unwrap()
+            .read_to_end(&mut wire)
+            .unwrap();
+        let expected =
+            crate::evidence::Sha256Digest::of_bytes(&wire, preparation.control()).unwrap();
+        let first = captured.original.native.unwrap().base.seq + 1;
+        ins(&store, 3);
+        let checked = captured.checked_primary(&preparation).unwrap();
+        assert_eq!(checked.wal_digest, expected);
+        assert_eq!(checked.wal_extent, wire.len() as u64);
+        assert_eq!(checked.first_wal_seq, Some(first));
+        assert!(checked.capture.data.commit.seq < store.head_commit().seq);
+        drop(checked);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_primary_digest_header_only_has_no_transaction_interval() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::in_memory(StoreOptions::default());
+        let preparation = capture_preparation();
+        store
+            .activate_memory_configuration_history(&preparation)
+            .unwrap();
+        ins(&store, 1);
+        let before = preparation.room();
+        let scratch = temporary.path().join("scratch");
+        let captured = store
+            .materialized_configuration_capture(
+                "digest",
+                &MemoryCaptureOptions {
+                    tmp_dir: scratch.clone(),
+                    ..Default::default()
+                },
+                &preparation,
+            )
+            .unwrap();
+        let checked = captured.checked_primary(&preparation).unwrap();
+        assert_eq!(checked.first_wal_seq, None);
+        assert_eq!(checked.wal_extent, super::super::WAL_REC as u64);
+        assert_eq!(
+            checked.wal_digest,
+            crate::evidence::Sha256Digest::of_bytes(
+                &super::super::wal::header_record(),
+                preparation.control()
+            )
+            .unwrap()
+        );
+        assert_eq!(checked.base, checked.capture.data.commit);
+        drop(checked);
+        assert_eq!(preparation.room(), before);
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_primary_proof_retains_native_base_and_original_multi_publication_wal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let settings = crate::evidence::Settings::default();
+        let canonical = settings.canonical(&crate::task::Control::none()).unwrap();
+        store
+            .enable_managed(
+                crate::managed::OwnerKind::Evidence,
+                crate::managed::OwnerEntry::for_settings(
+                    1,
+                    settings.managed_graphs(),
+                    canonical.bytes(),
+                ),
+                canonical.bytes(),
+            )
+            .unwrap();
+        ins(&store, 2);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let captured = store
+            .configuration_capture("framing", &Default::default(), &preparation)
+            .unwrap();
+        let expected = captured.data.commit;
+        let base = captured.original.native.unwrap().base;
+        assert!(base.seq < expected.seq);
+        let receiving = capture_preparation();
+        let receiving_before = receiving.room();
+        ins(&store, 3); // its complete transaction is outside the retained extent
+        let checked = captured.checked_primary(&receiving).unwrap();
+        assert_eq!(checked.capture.data.commit, expected);
+        assert_eq!(checked.base, base);
+        assert!(checked.wal_extent > super::super::WAL_REC as u64);
+        assert_eq!(leases(&store), 1);
+        assert!(receiving.room() < receiving_before);
+        drop(checked);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+        assert_eq!(receiving.room(), receiving_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_primary_proof_reads_same_descriptor_after_wal_name_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let captured = store
+            .configuration_capture("framing", &Default::default(), &preparation)
+            .unwrap();
+        let wal = root.join(&captured.data.generation).join("wal.log");
+        let retained = wal.with_extension("retained");
+        std::fs::rename(&wal, &retained).unwrap();
+        std::fs::write(&wal, b"unrelated replacement").unwrap();
+        let result = captured.checked_primary(&preparation);
+        std::fs::remove_file(&wal).unwrap();
+        std::fs::rename(&retained, &wal).unwrap();
+        let checked = result.unwrap();
+        drop(checked);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_primary_proof_refuses_canonical_foreign_physical_base() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let mut captured = store
+            .configuration_capture("framing", &Default::default(), &preparation)
+            .unwrap();
+        let base = captured.original.native.unwrap().base;
+        let bytes = crate::commit::gen_commit_bytes_with_binding(
+            uuid::Uuid::new_v4(),
+            "native",
+            &base,
+            crate::history::ConfigurationBinding::LegacyUnbound,
+        );
+        let path = format!("{}/commit.json", captured.data.generation);
+        let file = captured
+            .data
+            .files
+            .iter_mut()
+            .find(|file| file.path == path)
+            .unwrap();
+        file.len = bytes.len() as u64;
+        file.src = FileSource::Bytes(bytes.into());
+        let result = captured.checked_primary(&preparation);
+        assert!(
+            matches!(result, Err(ref error) if error.to_string().contains("actual Store basis"))
+        );
+        drop(result);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_primary_proof_refuses_corrupt_or_incomplete_exact_wal_prefix() {
+        use std::io::Read;
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        for shorten in [false, true] {
+            let mut captured = store
+                .configuration_capture("framing", &Default::default(), &preparation)
+                .unwrap();
+            let mut reader = captured.primary_reader(CapturedPrimary::Wal).unwrap();
+            let mut wire = Vec::new();
+            reader.read_to_end(&mut wire).unwrap();
+            if shorten {
+                wire.pop();
+            } else {
+                wire[super::super::WAL_REC + 1] ^= 1;
+            }
+            let path = format!("{}/wal.log", captured.data.generation);
+            let file = captured
+                .data
+                .files
+                .iter_mut()
+                .find(|file| file.path == path)
+                .unwrap();
+            file.len = wire.len() as u64;
+            file.src = FileSource::Bytes(wire.into());
+            let result = captured.checked_primary(&preparation);
+            assert!(
+                result.is_err(),
+                "a damaged captured transaction cannot yield a proof"
+            );
+            drop(result);
+            assert_eq!(leases(&store), 0);
+            assert_eq!(preparation.room(), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_primary_proof_requires_published_closure_for_wal_references() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let mut captured = store
+            .configuration_capture("framing", &Default::default(), &preparation)
+            .unwrap();
+        let generation = captured
+            .original
+            .binding
+            .configuration()
+            .unwrap()
+            .generation();
+        let digest = generation.to_string();
+        let name = digest.strip_prefix("sha256:").unwrap();
+        let suffix = format!("/generations/{name}.json");
+        let old_len = captured.data.files.len();
+        captured
+            .data
+            .files
+            .retain(|file| !file.path.ends_with(&suffix));
+        assert_eq!(captured.data.files.len() + 1, old_len);
+        let result = captured.checked_primary(&preparation);
+        assert!(result.is_err());
+        drop(result);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_primary_proof_checks_annotated_tail_membership() {
+        let temporary = tempfile::tempdir().unwrap();
+        use std::io::{Read, Seek, SeekFrom};
+        let root = temporary.path().join("source");
+        drop(history_store(&root));
+        let store = Store::open(
+            &root,
+            StoreOptions {
+                group_commit_idle_direct: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(store.groups_commits());
+        update(
+            &store,
+            "INSERT DATA { <urn:annotated> <urn:p> <urn:o> }",
+            &QueryOptions {
+                write: crate::guard::WriteOptions {
+                    message: Some(Arc::from("retained annotation")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let captured = store
+            .configuration_capture("framing", &Default::default(), &preparation)
+            .unwrap();
+        assert!(
+            captured
+                .data
+                .files
+                .iter()
+                .any(|file| file.path == crate::annotations::FILE)
+        );
+        {
+            let mut reader = captured.primary_reader(CapturedPrimary::Wal).unwrap();
+            reader
+                .seek(SeekFrom::End(-(super::super::WAL_REC as i64)))
+                .unwrap();
+            let mut record = [0; super::super::WAL_REC];
+            reader.read_exact(&mut record).unwrap();
+            assert_eq!(record[0], super::super::WAL_COMMIT);
+            assert_ne!(
+                record[27] & crate::commit::WAL_FLAG_ANNOTATED,
+                0,
+                "the negative requires a real queued, annotated commit"
+            );
+        }
+        drop(captured.checked_primary(&preparation).unwrap());
+        assert_eq!(preparation.room(), before);
+        let mut captured = store
+            .configuration_capture("framing", &Default::default(), &preparation)
+            .unwrap();
+        captured
+            .data
+            .files
+            .retain(|file| file.path != crate::annotations::FILE);
+        let result = captured.checked_primary(&preparation);
+        assert!(
+            result.is_err(),
+            "an annotated captured tail needs its retained membership"
+        );
+        drop(result);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_primary_proof_materialized_branches_keep_publishing_family_separate() {
+        let temporary = tempfile::tempdir().unwrap();
+        let memory = Store::in_memory(StoreOptions::default());
+        let preparation = capture_preparation();
+        memory
+            .activate_memory_configuration_history(&preparation)
+            .unwrap();
+        ins(&memory, 1);
+        memory.create_branch("child", &Default::default()).unwrap();
+        let persistent = history_store(&temporary.path().join("source"));
+        ins(&persistent, 1);
+        persistent
+            .create_branch("child", &Default::default())
+            .unwrap();
+        let scratch = temporary.path().join("scratch");
+        for store in [
+            memory.branch("main").unwrap(),
+            memory.branch("child").unwrap(),
+            persistent.branch("child").unwrap(),
+        ] {
+            let before = preparation.room();
+            let captured = store
+                .materialized_configuration_capture(
+                    "framing",
+                    &MemoryCaptureOptions {
+                        tmp_dir: scratch.clone(),
+                        ..Default::default()
+                    },
+                    &preparation,
+                )
+                .unwrap();
+            let checked = captured.checked_primary(&preparation).unwrap();
+            assert_eq!(checked.base, checked.capture.data.commit);
+            assert_eq!(checked.wal_extent, super::super::WAL_REC as u64);
+            if store.is_branch() {
+                assert_ne!(
+                    checked.capture.original.identities.family(),
+                    checked.capture.data.dataset_id
+                );
+            }
+            drop(checked);
+            assert_eq!(preparation.room(), before);
+            assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_primary_proof_receiving_controls_and_credit_rollback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        for kind in 0..3 {
+            let receiving = crate::access::Preparation::new(
+                crate::task::Control {
+                    deadline: (kind == 2).then(|| Instant::now() + Duration::from_millis(10)),
+                    ..crate::task::Control::none()
+                },
+                if kind == 0 { 8192 } else { 64 << 20 },
+            )
+            .unwrap();
+            let receiving_total_before = receiving.room();
+            let pressure = (kind == 0).then(|| receiving.reserve(receiving.room() - 64).unwrap());
+            let receiving_before = receiving.room();
+            let captured = store
+                .configuration_capture("framing", &Default::default(), &preparation)
+                .unwrap();
+            if kind == 1 {
+                receiving.control().cancel.cancel();
+            }
+            if kind == 2 {
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            let result = captured.checked_primary(&receiving);
+            assert!(matches!(
+                (kind, &result),
+                (0, Err(Error::BudgetExceeded(_)))
+                    | (1, Err(Error::Cancelled))
+                    | (2, Err(Error::Timeout))
+            ));
+            drop(result);
+            assert_eq!(receiving.room(), receiving_before);
+            drop(pressure);
+            assert_eq!(receiving.room(), receiving_total_before);
+            assert_eq!(preparation.room(), before);
+            assert_eq!(leases(&store), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_captured_readers_leave_shared_kernel_cursor_unchanged() {
+        use std::io::{Read, Seek, SeekFrom};
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let captured = store
+            .configuration_capture("kernel-cursor", &Default::default(), &preparation)
+            .unwrap();
+        let mut first = captured.primary_reader(CapturedPrimary::Wal).unwrap();
+        let file = &captured.data.files[first.index];
+        let FileSource::File(raw) = &file.src else {
+            panic!("genuine WAL must retain its descriptor")
+        };
+        let mut raw = raw;
+        let mut prefix = [0; 16];
+        file.read_exact_at(0, &mut prefix).unwrap();
+        raw.seek(SeekFrom::Start(7)).unwrap();
+        let mut second = captured.primary_reader(CapturedPrimary::Wal).unwrap();
+        first.seek(SeekFrom::Start(1)).unwrap();
+        second.seek(SeekFrom::Start(5)).unwrap();
+        let mut bytes = [0; 3];
+        first.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, prefix[1..4]);
+        assert_eq!(raw.stream_position().unwrap(), 7);
+        second.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, prefix[5..8]);
+        assert_eq!(raw.stream_position().unwrap(), 7);
+        assert_eq!(first.stream_position().unwrap(), 4);
+        assert_eq!(second.stream_position().unwrap(), 8);
+        assert_eq!(first.read(&mut []).unwrap(), 0);
+        first.seek(SeekFrom::End(0)).unwrap();
+        assert_eq!(first.read(&mut bytes).unwrap(), 0);
+        assert_eq!(raw.stream_position().unwrap(), 7);
+        drop(captured);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_captured_reader_simulated_unsupported_dispatch_preserves_cursors_and_credit() {
+        use std::io::{Read, Seek, SeekFrom};
+        struct Refused<'a>(CapturedReader<'a>);
+        impl Read for Refused<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.0.read_checked(bytes, false)
+            }
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let captured = store
+            .configuration_capture("unsupported-cursor", &Default::default(), &preparation)
+            .unwrap();
+        let reader = captured.primary_reader(CapturedPrimary::Wal).unwrap();
+        let FileSource::File(raw) = &captured.data.files[reader.index].src else {
+            panic!("genuine retained file")
+        };
+        let mut raw = raw;
+        raw.seek(SeekFrom::Start(7)).unwrap();
+        let mut reader = Refused(reader);
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        let receiving = capture_preparation();
+        let receiving_before = receiving.room();
+        {
+            let allowance = receiving.room();
+            let _loan = receiving.reserve(allowance).unwrap();
+            let options = crate::history::HistoryOptions::default();
+            let mut budget = super::super::cold::ColdBudget::new(crate::history::ReadLimit {
+                options: &options,
+                memory: Some(allowance),
+                held: 0,
+            })
+            .unwrap();
+            let extent = reader.0.extent();
+            let result = budget.read_from(&mut reader, extent);
+            assert!(
+                matches!(result, Err(Error::Io(ref error)) if error.kind() == std::io::ErrorKind::Unsupported)
+            );
+            assert_eq!(budget.used(), 0);
+        }
+        assert_eq!(reader.0.stream_position().unwrap(), 0);
+        assert_eq!(raw.stream_position().unwrap(), 7);
+        reader.0.seek(SeekFrom::End(0)).unwrap();
+        assert_eq!(reader.read(&mut [0; 4]).unwrap(), 0);
+        assert_eq!(raw.stream_position().unwrap(), 7);
+        assert_eq!(receiving.room(), receiving_before);
+        assert_eq!(leases(&store), 1);
+        drop(captured);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_captured_reader_byte_backing_needs_no_file_cursor_backend() {
+        use std::io::{Read, Seek, SeekFrom};
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let mut captured = store
+            .configuration_capture("byte-cursor", &Default::default(), &preparation)
+            .unwrap();
+        let index = captured.primary_reader(CapturedPrimary::Wal).unwrap().index;
+        let mut prefix = [0; 16];
+        captured.data.files[index]
+            .read_exact_at(0, &mut prefix)
+            .unwrap();
+        // This fixture receiving copy is admitted before its actual backing.
+        let copy_held = preparation.reserve(128).unwrap();
+        captured.data.files[index].src = FileSource::Bytes(Arc::from(prefix.as_slice()));
+        captured.data.files[index].len = prefix.len() as u64;
+        let mut reader = captured.primary_reader(CapturedPrimary::Wal).unwrap();
+        reader.seek(SeekFrom::Start(2)).unwrap();
+        let mut bytes = [0; 4];
+        assert_eq!(reader.read_checked(&mut bytes, false).unwrap(), 4);
+        assert_eq!(bytes, prefix[2..6]);
+        assert_eq!(reader.stream_position().unwrap(), 6);
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        drop(captured);
+        drop(copy_held);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_configuration_capture_reader_keeps_fixed_prefix_after_append() {
+        use std::io::Read;
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let captured = store
+            .configuration_capture("cursor", &Default::default(), &preparation)
+            .unwrap();
+        assert_eq!(leases(&store), 1);
+        let mut reader = captured.primary_reader(CapturedPrimary::Wal).unwrap();
+        let extent = reader.extent();
+        ins(&store, 2);
+        let mut wire = Vec::new();
+        reader.read_to_end(&mut wire).unwrap();
+        assert_eq!(wire.len() as u64, extent);
+        assert_eq!(reader.read(&mut [0; 16]).unwrap(), 0);
+        for member in [CapturedPrimary::Commit, CapturedPrimary::Meta] {
+            let mut metadata = captured.primary_reader(member).unwrap();
+            let mut bytes = Vec::new();
+            metadata.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes.len() as u64, metadata.extent());
+            assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_ok());
+        }
+        drop(captured);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_configuration_capture_reader_seeks_only_inside_captured_extent() {
+        use std::io::{Read, Seek, SeekFrom};
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let captured = store
+            .configuration_capture("cursor", &Default::default(), &preparation)
+            .unwrap();
+        let mut reader = captured.primary_reader(CapturedPrimary::Wal).unwrap();
+        let extent = reader.extent();
+        assert!(extent > 1);
+        assert_eq!(reader.seek(SeekFrom::Start(1)).unwrap(), 1);
+        for invalid in [
+            SeekFrom::Start(u64::MAX),
+            SeekFrom::Current(i64::MIN),
+            SeekFrom::End(1),
+        ] {
+            assert_eq!(
+                reader.seek(invalid).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            assert_eq!(reader.stream_position().unwrap(), 1);
+        }
+        assert_eq!(reader.seek(SeekFrom::End(0)).unwrap(), extent);
+        assert_eq!(reader.read(&mut [0; 1]).unwrap(), 0);
+        assert_eq!(reader.seek(SeekFrom::Current(-(extent as i64))).unwrap(), 0);
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        assert_eq!(reader.stream_position().unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_configuration_capture_reader_retains_descriptor_after_path_replacement() {
+        use std::io::Read;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let captured = store
+            .configuration_capture("cursor", &Default::default(), &preparation)
+            .unwrap();
+        let path = root.join(&captured.data.generation).join("wal.log");
+        let original = std::fs::read(&path).unwrap();
+        let parked = path.with_extension("captured-original");
+        std::fs::rename(&path, &parked).unwrap();
+        std::fs::write(&path, b"foreign same-name file").unwrap();
+        let mut reader = captured.primary_reader(CapturedPrimary::Wal).unwrap();
+        let mut wire = Vec::new();
+        let result = reader.read_to_end(&mut wire);
+        // Restore the live Store's path before any outcome assertion can unwind.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(parked, path).unwrap();
+        result.unwrap();
+        assert_eq!(wire, original[..reader.extent() as usize]);
+        assert_ne!(wire, b"foreign same-name file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_configuration_capture_reader_refuses_short_captured_descriptor() {
+        use std::io::Read;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let captured = store
+            .configuration_capture("cursor", &Default::default(), &preparation)
+            .unwrap();
+        let path = root.join(&captured.data.generation).join("wal.log");
+        let original = std::fs::read(&path).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(1).unwrap();
+        let mut reader = captured.primary_reader(CapturedPrimary::Wal).unwrap();
+        let mut wire = vec![0; reader.extent() as usize];
+        let result = reader.read_exact(&mut wire);
+        // Keep the original inode and restore its bytes before Store teardown.
+        std::fs::write(&path, original).unwrap();
+        drop(captured);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_configuration_capture_reader_uses_controlled_original_generation_codec() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let captured = store
+            .configuration_capture("codec", &Default::default(), &preparation)
+            .unwrap();
+        {
+            let allowance = preparation.room();
+            let _loan = preparation.reserve(allowance).unwrap();
+            let options = crate::history::HistoryOptions {
+                cancel: Some(preparation.control().cancel.flag()),
+                deadline: preparation.control().deadline,
+            };
+            let mut budget = super::super::cold::ColdBudget::new(crate::history::ReadLimit {
+                options: &options,
+                memory: Some(allowance),
+                held: 0,
+            })
+            .unwrap();
+            let mut reader = captured.primary_reader(CapturedPrimary::Commit).unwrap();
+            let extent = reader.extent();
+            let bytes = budget.read_from(&mut reader, extent).unwrap();
+            let input_charge = budget.used();
+            let loaded = crate::commit::decode_gen_commit_bytes_controlled(
+                Path::new("captured-diagnostic-only/commit.json"),
+                &bytes,
+                &mut budget,
+            )
+            .unwrap();
+            assert_eq!(loaded.value.dataset_id, store.dataset_id);
+            assert_eq!(
+                loaded.value.commit.generation,
+                crate::commit::generation_number(&captured.data.generation)
+            );
+            assert!(loaded.value.commit.seq <= captured.data.commit.seq);
+            drop(loaded.value);
+            budget.release(loaded.charge);
+            assert_eq!(budget.used(), input_charge);
+            budget.drop_vec(bytes);
+            assert_eq!(budget.used(), 0);
+        }
+        drop(captured);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_configuration_capture_resolves_original_publication_after_live_configure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let captured = store
+            .configuration_capture("original-publication", &Default::default(), &preparation)
+            .unwrap();
+        let selected = captured.original.binding.configuration().unwrap();
+        let old_root = captured.original.history.clone();
+        let settings = crate::evidence::Settings::default();
+        let canonical = settings.canonical(&crate::task::Control::none()).unwrap();
+        store
+            .enable_managed(
+                crate::managed::OwnerKind::Evidence,
+                crate::managed::OwnerEntry::for_settings(
+                    1,
+                    settings.managed_graphs(),
+                    canonical.bytes(),
+                ),
+                canonical.bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .configuration_binding_at(captured.data.commit.seq, &preparation)
+                .unwrap(),
+            captured.original.binding,
+            "configure must not rewrite the old data publication",
+        );
+        ins(&store, 2);
+        assert!(store.head_commit().seq > captured.data.commit.seq);
+        let current = store
+            .configuration_binding_at(store.head_commit().seq, &preparation)
+            .unwrap();
+        assert_ne!(current.configuration(), Some(selected));
+        let receiving = capture_preparation();
+        let receiving_before = receiving.room();
+        let document = captured.resolve_publication(selected, &receiving).unwrap();
+        assert_eq!(document.value.dataset_id, selected.dataset_id());
+        assert_eq!(document.value.lineage_id, old_root.lineage_id);
+        drop(captured);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+        assert!(receiving.room() < receiving_before);
+        drop(document);
+        assert_eq!(receiving.room(), receiving_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_configuration_capture_refuses_valid_orphan_and_foreign_publications() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let initial = store
+            .configuration_capture("prepare-orphan", &Default::default(), &preparation)
+            .unwrap();
+        let selected = initial.original.binding.configuration().unwrap();
+        let mut document = initial.resolve_publication(selected, &preparation).unwrap();
+        document.value.ordinal += 1;
+        document.value.registry_revision += 1;
+        document.value.previous = Some(selected.generation());
+        let bytes = super::super::managed_history::encode(&document.value, &preparation).unwrap();
+        let digest =
+            crate::evidence::Sha256Digest::of_bytes(&bytes.value, preparation.control()).unwrap();
+        let orphan = crate::history::ConfigurationIdentity {
+            generation: digest,
+            ..selected
+        };
+        let validated =
+            super::super::managed_history::generation_bytes(&bytes.value, orphan, &preparation)
+                .unwrap();
+        drop(validated);
+        let name = digest.to_string();
+        let path = root
+            .join("evidence-history")
+            .join(selected.lineage_id().to_string())
+            .join("generations")
+            .join(format!("{}.json", name.strip_prefix("sha256:").unwrap()));
+        std::fs::write(&path, &bytes.value).unwrap();
+        drop(bytes);
+        drop(document);
+        drop(initial);
+        let captured = store
+            .configuration_capture("orphan-refusal", &Default::default(), &preparation)
+            .unwrap();
+        let held = preparation.room();
+        let error = captured
+            .resolve_publication(orphan, &preparation)
+            .err()
+            .expect("unpublished canonical orphan must refuse");
+        assert!(error.to_string().contains("not published"), "{error}");
+        for foreign in [
+            crate::history::ConfigurationIdentity {
+                dataset_id: uuid::Uuid::new_v4(),
+                ..selected
+            },
+            crate::history::ConfigurationIdentity {
+                lineage_id: uuid::Uuid::new_v4(),
+                ..selected
+            },
+        ] {
+            assert!(captured.resolve_publication(foreign, &preparation).is_err());
+            assert_eq!(preparation.room(), held);
+        }
+        drop(captured);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_configuration_capture_publication_receiving_controls_rollback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let captured = store
+            .configuration_capture("receiving-refusal", &Default::default(), &preparation)
+            .unwrap();
+        let selected = captured.original.binding.configuration().unwrap();
+        let small = crate::access::Preparation::new(crate::task::Control::none(), 4096).unwrap();
+        let small_before = small.room();
+        assert!(matches!(
+            captured.resolve_publication(selected, &small),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(small.room(), small_before);
+        let cancelled = capture_preparation();
+        let cancel_before = cancelled.room();
+        cancelled.control().cancel.cancel();
+        assert!(matches!(
+            captured.resolve_publication(selected, &cancelled),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(cancelled.room(), cancel_before);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let expired = crate::access::Preparation::new(
+            crate::task::Control {
+                deadline: Some(deadline),
+                ..crate::task::Control::none()
+            },
+            64 << 20,
+        )
+        .unwrap();
+        let expired_before = expired.room();
+        std::thread::sleep(
+            deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+        );
+        assert!(matches!(
+            captured.resolve_publication(selected, &expired),
+            Err(Error::Timeout)
+        ));
+        assert_eq!(expired.room(), expired_before);
+        assert_eq!(leases(&store), 1);
+        drop(captured);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_configuration_capture_materialized_publications_keep_original_family() {
+        let temporary = tempfile::tempdir().unwrap();
+        let memory = Store::in_memory(StoreOptions::default());
+        let preparation = capture_preparation();
+        memory
+            .activate_memory_configuration_history(&preparation)
+            .unwrap();
+        ins(&memory, 1);
+        memory.create_branch("child", &Default::default()).unwrap();
+        let persistent = history_store(&temporary.path().join("source"));
+        ins(&persistent, 1);
+        persistent
+            .create_branch("child", &Default::default())
+            .unwrap();
+        let persistent_child = persistent.branch("child").unwrap();
+        assert!(persistent_child.snapshot().generation.linked().is_some());
+        let scratch = temporary.path().join("scratch");
+        for store in [
+            memory.branch("main").unwrap(),
+            memory.branch("child").unwrap(),
+            persistent_child,
+        ] {
+            let before = preparation.room();
+            let captured = store
+                .materialized_configuration_capture(
+                    "original-family",
+                    &MemoryCaptureOptions {
+                        tmp_dir: scratch.clone(),
+                        ..Default::default()
+                    },
+                    &preparation,
+                )
+                .unwrap();
+            let selected = captured.original.binding.configuration().unwrap();
+            let document = captured
+                .resolve_publication(selected, &preparation)
+                .unwrap();
+            assert_eq!(
+                document.value.dataset_id,
+                captured.original.identities.family()
+            );
+            assert_eq!(selected.dataset_id(), captured.original.identities.family());
+            if captured.original.identities.branch_document().is_some() {
+                assert_ne!(selected.dataset_id(), captured.data.dataset_id);
+            }
+            drop(document);
+            drop(captured);
+            assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+            assert_eq!(preparation.room(), before);
+        }
+    }
+
+    fn supplied_capture_preparation(timeout: bool) -> crate::access::Preparation {
+        crate::access::Preparation::new(
+            crate::task::Control {
+                deadline: timeout.then(|| Instant::now() + Duration::from_secs(2)),
+                ..crate::task::Control::none()
+            },
+            64 << 20,
+        )
+        .unwrap()
+    }
+
+    fn interrupt_supplied_capture(
+        control: &crate::task::Control,
+        reached: &AtomicBool,
+        before_deadline: &AtomicBool,
+    ) {
+        reached.store(true, Ordering::SeqCst);
+        if let Some(deadline) = control.deadline {
+            before_deadline.store(Instant::now() < deadline, Ordering::SeqCst);
+            std::thread::sleep(
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+            );
+        } else {
+            control.cancel.cancel();
+        }
+    }
+
+    fn supplied_persistent_capture_refuses_after_unlock(timeout: bool) {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let preparation = supplied_capture_preparation(timeout);
+        let before = preparation.room();
+        let reached = Arc::new(AtomicBool::new(false));
+        let before_deadline = Arc::new(AtomicBool::new(false));
+        let observed = reached.clone();
+        let timely = before_deadline.clone();
+        let control = preparation.control().clone();
+        store.set_failpoint(
+            "backup-capture-unlocked",
+            Some(Arc::new(move |_| {
+                interrupt_supplied_capture(&control, &observed, &timely);
+            })),
+        );
+        // The legacy options intentionally have neither this flag nor deadline.
+        let result =
+            store.configuration_capture("supplied-control", &Default::default(), &preparation);
+        store.set_failpoint("backup-capture-unlocked", None);
+        let refused = if timeout {
+            matches!(&result, Err(Error::Timeout))
+        } else {
+            matches!(&result, Err(Error::Cancelled))
+        };
+        // An old successful owner must release its actual lease before we panic.
+        drop(result);
+        assert!(reached.load(Ordering::SeqCst), "unlocked hook not reached");
+        assert!(!timeout || before_deadline.load(Ordering::SeqCst));
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+        assert!(
+            refused,
+            "supplied Preparation must refuse persistent delivery"
+        );
+    }
+
+    fn supplied_materialized_capture_refuses_after_built(timeout: bool) {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::in_memory(StoreOptions::default());
+        let preparation = supplied_capture_preparation(timeout);
+        store
+            .activate_memory_configuration_history(&preparation)
+            .unwrap();
+        ins(&store, 1);
+        // Activation owns live history credit, which the failed capture must retain.
+        let before = preparation.room();
+        let reached = Arc::new(AtomicBool::new(false));
+        let before_deadline = Arc::new(AtomicBool::new(false));
+        let observed = reached.clone();
+        let timely = before_deadline.clone();
+        let control = preparation.control().clone();
+        let scratch = temporary.path().join("scratch");
+        let options = MemoryCaptureOptions {
+            tmp_dir: scratch.clone(),
+            progress: Some(Arc::new(move |_, message| {
+                if message == "built" {
+                    interrupt_supplied_capture(&control, &observed, &timely);
+                }
+            })),
+            ..Default::default()
+        };
+        assert!(options.cancel.is_none() && options.deadline.is_none());
+        let result =
+            store.materialized_configuration_capture("supplied-control", &options, &preparation);
+        let refused = if timeout {
+            matches!(&result, Err(Error::Timeout))
+        } else {
+            matches!(&result, Err(Error::Cancelled))
+        };
+        drop(result);
+        assert!(reached.load(Ordering::SeqCst), "built callback not reached");
+        assert!(!timeout || before_deadline.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        assert!(
+            store.history.is_none(),
+            "memory capture has no persistent history lease"
+        );
+        assert_eq!(preparation.room(), before);
+        assert!(
+            refused,
+            "supplied Preparation must refuse materialized delivery"
+        );
+    }
+
+    #[test]
+    fn genuine_configuration_capture_supplied_cancel_after_unlock() {
+        supplied_persistent_capture_refuses_after_unlock(false);
+    }
+
+    #[test]
+    fn genuine_configuration_capture_supplied_timeout_after_unlock() {
+        supplied_persistent_capture_refuses_after_unlock(true);
+    }
+
+    #[test]
+    fn genuine_configuration_capture_supplied_cancel_after_built() {
+        supplied_materialized_capture_refuses_after_built(false);
+    }
+
+    #[test]
+    fn genuine_configuration_capture_supplied_timeout_after_built() {
+        supplied_materialized_capture_refuses_after_built(true);
+    }
+
+    #[test]
+    fn genuine_configuration_capture_retries_actual_main_configuration_race() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let calls = Arc::new(AtomicU64::new(0));
+        let observed = calls.clone();
+        store.set_failpoint(
+            "backup-capture-unlocked",
+            Some(Arc::new(move |store| {
+                if observed.fetch_add(1, Ordering::SeqCst) != 0 {
+                    return;
+                }
+                let settings = crate::evidence::Settings::default();
+                let canonical = settings.canonical(&crate::task::Control::none()).unwrap();
+                store
+                    .enable_managed(
+                        crate::managed::OwnerKind::Evidence,
+                        crate::managed::OwnerEntry::for_settings(
+                            1,
+                            settings.managed_graphs(),
+                            canonical.bytes(),
+                        ),
+                        canonical.bytes(),
+                    )
+                    .unwrap();
+            })),
+        );
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let captured = store
+            .configuration_capture("racing-original", &Default::default(), &preparation)
+            .unwrap();
+        store.set_failpoint("backup-capture-unlocked", None);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(leases(&store), 1);
+        assert_eq!(
+            captured.original.binding,
+            store
+                .configuration_binding_at(captured.data.commit.seq, &preparation)
+                .unwrap()
+        );
+        drop(captured);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
     }
 
     #[test]

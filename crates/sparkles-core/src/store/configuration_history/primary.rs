@@ -46,6 +46,45 @@ impl Header {
         unreadable_history: bool,
         preparation: &Preparation,
     ) -> Result<Self> {
+        if let Some((seq, binding)) = origin {
+            binding.validate(dataset)?;
+            seq.checked_add(1)
+                .ok_or_else(|| managed_history::unavailable("primary branch boundary overflows"))?;
+        }
+        let coverage = history
+            .as_ref()
+            .map(|history| managed_history::read_coverage(root, dataset, history, preparation))
+            .transpose()?;
+        Self::from_coverage(
+            dataset,
+            branch,
+            origin,
+            history,
+            unreadable_history,
+            coverage.as_ref().map(|coverage| &coverage.value),
+        )
+    }
+
+    /// The caller supplies already authenticated, admitted coverage from its
+    /// genuine source. This scalar context never supplies an import authority.
+    pub(crate) fn from_coverage(
+        dataset: uuid::Uuid,
+        branch: uuid::Uuid,
+        origin: Option<(u64, ConfigurationBinding)>,
+        history: Option<managed_history::Root>,
+        unreadable_history: bool,
+        coverage: Option<&managed_history::Coverage>,
+    ) -> Result<Self> {
+        if let Some(coverage) = coverage
+            && (coverage.dataset_id != dataset
+                || history
+                    .as_ref()
+                    .is_none_or(|history| coverage.lineage_id != history.lineage_id))
+        {
+            return Err(managed_history::unavailable(
+                "primary coverage belongs to another publication",
+            ));
+        }
         let origin_cutoff =
             if let Some((seq, binding)) = origin {
                 binding.validate(dataset)?;
@@ -55,13 +94,9 @@ impl Header {
             } else {
                 None
             };
-        let coverage = history
-            .as_ref()
-            .map(|history| managed_history::read_coverage(root, dataset, history, preparation))
-            .transpose()?;
         let cutoff = coverage
             .as_ref()
-            .and_then(|coverage| coverage.value.branches.get(&branch))
+            .and_then(|coverage| coverage.branches.get(&branch))
             .map(|coverage| coverage.first_bound_own)
             .or(origin_cutoff);
         if history.is_some() && cutoff.is_none() {
@@ -133,6 +168,27 @@ impl Header {
         seq: u64,
         binding: ConfigurationBinding,
     ) -> Result<()> {
+        let dataset = self.dataset;
+        let history = self.history.clone();
+        self.generation_using(preparation, seq, binding, &mut |identity| {
+            managed_history::resolve(
+                root,
+                dataset,
+                history.as_ref().expect("identity checked publication"),
+                identity,
+                preparation,
+            )
+            .map(|_| ())
+        })
+    }
+
+    pub(crate) fn generation_using(
+        &mut self,
+        preparation: &Preparation,
+        seq: u64,
+        binding: ConfigurationBinding,
+        resolve: &mut dyn FnMut(ConfigurationIdentity) -> Result<()>,
+    ) -> Result<()> {
         if self
             .origin
             .is_some_and(|(root_seq, origin)| root_seq == seq && binding != origin)
@@ -141,7 +197,7 @@ impl Header {
                 "branch root configuration differs from its primary origin",
             ));
         }
-        self.binding(root, preparation, seq, binding)
+        self.binding_using(preparation, seq, binding, resolve)
     }
 
     fn raw_binding(
@@ -169,11 +225,13 @@ impl Header {
     /// decoding, file access or per-row allocation.
     pub(crate) fn cached_observation(
         &self,
-        seq: u64,
-        digest: Option<crate::evidence::Sha256Digest>,
+        observation: wal::probe::WalCommitObservation,
     ) -> Result<bool> {
         Ok(self
-            .identity(seq, self.raw_binding(digest)?)?
+            .identity(
+                observation.point.seq,
+                self.raw_binding(observation.configuration)?,
+            )?
             .is_none_or(|identity| self.last == Some(identity)))
     }
 
@@ -181,10 +239,34 @@ impl Header {
         &mut self,
         root: &Path,
         preparation: &Preparation,
-        seq: u64,
-        digest: Option<crate::evidence::Sha256Digest>,
+        observation: wal::probe::WalCommitObservation,
     ) -> Result<()> {
-        self.binding(root, preparation, seq, self.raw_binding(digest)?)
+        let dataset = self.dataset;
+        let history = self.history.clone();
+        self.observation_using(preparation, observation, &mut |identity| {
+            managed_history::resolve(
+                root,
+                dataset,
+                history.as_ref().expect("identity checked publication"),
+                identity,
+                preparation,
+            )
+            .map(|_| ())
+        })
+    }
+
+    pub(crate) fn observation_using(
+        &mut self,
+        preparation: &Preparation,
+        observation: wal::probe::WalCommitObservation,
+        resolve: &mut dyn FnMut(ConfigurationIdentity) -> Result<()>,
+    ) -> Result<()> {
+        self.binding_using(
+            preparation,
+            observation.point.seq,
+            self.raw_binding(observation.configuration)?,
+            resolve,
+        )
     }
 
     fn identity(
@@ -230,22 +312,19 @@ impl Header {
         }
     }
 
-    fn binding(
+    fn binding_using(
         &mut self,
-        root: &Path,
         preparation: &Preparation,
         seq: u64,
         binding: ConfigurationBinding,
+        resolve: &mut dyn FnMut(ConfigurationIdentity) -> Result<()>,
     ) -> Result<()> {
         preparation.check()?;
         if let Some(configuration) = self.identity(seq, binding)?
             && self.last != Some(configuration)
         {
-            let history = self
-                .history
-                .as_ref()
-                .expect("identity checked the publication root");
-            managed_history::resolve(root, self.dataset, history, configuration, preparation)?;
+            resolve(configuration)?;
+            preparation.check()?;
             self.last = Some(configuration);
         }
         Ok(())
@@ -297,16 +376,27 @@ impl<'a> References<'a> {
     /// framing, term, sequence and annotation rules accept this observation.
     pub(crate) fn observation(
         &mut self,
-        seq: u64,
-        digest: Option<crate::evidence::Sha256Digest>,
+        observation: wal::probe::WalCommitObservation,
     ) -> Result<()> {
         self.header
-            .observation(self.root, self.preparation, seq, digest)
+            .observation(self.root, self.preparation, observation)
     }
 }
 
 pub(super) fn recorded_root(
     root: &Path,
+    preparation: &Preparation,
+) -> Result<Option<managed_history::Root>> {
+    let bytes = match managed_history::read_bytes(&root.join(crate::managed::FILE), preparation) {
+        Ok(bytes) => bytes,
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    recorded_root_bytes(&bytes.value, preparation)
+}
+
+pub(super) fn recorded_root_bytes(
+    bytes: &[u8],
     preparation: &Preparation,
 ) -> Result<Option<managed_history::Root>> {
     #[derive(serde::Deserialize)]
@@ -315,11 +405,6 @@ pub(super) fn recorded_root(
         #[serde(rename = "configurationHistory")]
         history: Option<managed_history::Root>,
     }
-    let bytes = match managed_history::read_bytes(&root.join(crate::managed::FILE), preparation) {
-        Ok(bytes) => bytes,
-        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
     // Reuse the existing controlled metadata reader. This is a registry
     // envelope, not a format1 generation and not a canonical subset of it.
     let allowance = preparation.room();
@@ -333,7 +418,7 @@ pub(super) fn recorded_root(
         memory: Some(allowance),
         held: 0,
     })?;
-    let envelope = budget.json::<Envelope>(&bytes.value)?;
+    let envelope = budget.json::<Envelope>(bytes)?;
     let format = envelope.value.format.unwrap_or(1);
     if !matches!(format, 1..=3) {
         return Err(Error::Unsupported(format!(

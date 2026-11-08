@@ -803,19 +803,33 @@ pub(crate) fn seqs_controlled(
     budget: &mut crate::store::cold::ColdBudget<'_>,
 ) -> Result<crate::store::cold::Loaded<Option<Vec<u64>>>> {
     use crate::store::cold::Loaded;
+    let loaded = match budget.buffered(&root.join(FILE)) {
+        Ok(loaded) => loaded,
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Loaded {
+                value: None,
+                charge: 0,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let mut reader = loaded.value;
+    let result = seqs_from(&mut reader, dataset_id, budget);
+    drop(reader);
+    budget.release(loaded.charge);
+    result
+}
+
+/// Scan an already retained byte source with the same valid-prefix semantics.
+/// This helper neither opens a path nor supplies dataset/annotation authority.
+pub(crate) fn seqs_from<R: Read>(
+    reader: &mut R,
+    dataset_id: uuid::Uuid,
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+) -> Result<crate::store::cold::Loaded<Option<Vec<u64>>>> {
+    use crate::store::cold::Loaded;
     let before = budget.used();
     let result = (|| {
-        let loaded = match budget.buffered(&root.join(FILE)) {
-            Ok(loaded) => loaded,
-            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Loaded {
-                    value: None,
-                    charge: 0,
-                });
-            }
-            Err(error) => return Err(error),
-        };
-        let mut reader = loaded.value;
         let mut header = [0; HEADER];
         let result: Result<Option<Vec<u64>>> = (|| {
             match reader.read_exact(&mut header[..12]) {
@@ -846,7 +860,7 @@ pub(crate) fn seqs_controlled(
                 loop {
                     budget.key_step("annotation record", seqs.len())?;
                     wire.clear();
-                    if let Err(error) = budget.append_read(&mut reader, &mut wire, 9) {
+                    if let Err(error) = budget.append_read(reader, &mut wire, 9) {
                         if matches!(&error, Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof)
                         {
                             break;
@@ -859,7 +873,7 @@ pub(crate) fn seqs_controlled(
                     }
                     let extra = if flags & REC_DIGEST != 0 { 32 } else { 0 };
                     let extra = extra + if flags & REC_MESSAGE != 0 { 2 } else { 0 };
-                    if let Err(error) = budget.append_read(&mut reader, &mut wire, extra) {
+                    if let Err(error) = budget.append_read(reader, &mut wire, extra) {
                         if matches!(&error, Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof)
                         {
                             break;
@@ -871,7 +885,7 @@ pub(crate) fn seqs_controlled(
                     } else {
                         0
                     };
-                    if let Err(error) = budget.append_read(&mut reader, &mut wire, message + 4) {
+                    if let Err(error) = budget.append_read(reader, &mut wire, message + 4) {
                         if matches!(&error, Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof)
                         {
                             break;
@@ -903,8 +917,6 @@ pub(crate) fn seqs_controlled(
             scan?;
             Ok(Some(seqs))
         })();
-        drop(reader);
-        budget.release(loaded.charge);
         let value = result?;
         Ok(Loaded {
             value,
@@ -1186,6 +1198,55 @@ mod tests {
         assert_eq!(budget.used(), 0);
         let mismatch = seqs_controlled(root.path(), uuid::Uuid::new_v4(), &mut budget).unwrap();
         assert!(mismatch.value.is_none());
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn retained_annotation_reader_preserves_valid_prefix_and_version_refusal() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        struct Chunks<'a>(&'a [u8]);
+        impl Read for Chunks<'_> {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let count = output.len().min(self.0.len()).min(3);
+                output[..count].copy_from_slice(&self.0[..count]);
+                self.0 = &self.0[count..];
+                Ok(count)
+            }
+        }
+        let id = uuid::Uuid::new_v4();
+        let mut bytes = encode_header(id, 0).to_vec();
+        for seq in [7, 1, 7] {
+            bytes.extend(encode_record(
+                seq,
+                &Annotation {
+                    message: Some(Arc::from("retained")),
+                    ..Default::default()
+                },
+            ));
+        }
+        let torn = bytes.len();
+        bytes.extend(encode_record(9, &Annotation::default()));
+        *bytes.last_mut().unwrap() ^= 1;
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(8192),
+            held: 0,
+        })
+        .unwrap();
+        let loaded = seqs_from(&mut Chunks(&bytes), id, &mut budget).unwrap();
+        assert_eq!(loaded.value.as_deref(), Some([1, 7].as_slice()));
+        assert_eq!(budget.used(), loaded.charge);
+        drop(loaded.value);
+        budget.release(loaded.charge);
+        assert_eq!(budget.used(), 0);
+        assert!(torn < bytes.len());
+        bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        let result = seqs_from(&mut Chunks(&bytes), id, &mut budget);
+        assert!(matches!(result, Err(Error::Unsupported(_))));
         assert_eq!(budget.used(), 0);
     }
 

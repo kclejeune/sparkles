@@ -46,6 +46,12 @@ impl std::fmt::Debug for BoundEvidenceView {
 }
 
 impl BoundEvidenceView {
+    /// Retain the genuine RDF/configuration source and its original admission.
+    /// This owner grants no current authorization or independent output credit.
+    pub fn read_source(&self) -> super::BoundReadSource {
+        super::BoundReadSource::evidence(self.clone())
+    }
+
     pub fn dataset_id(&self) -> uuid::Uuid {
         self.inner.dataset_id
     }

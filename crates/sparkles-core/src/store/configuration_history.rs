@@ -4,8 +4,11 @@ use super::*;
 use crate::access::Preparation;
 use crate::history::{ConfigurationBinding, ConfigurationIdentity, HistoryOptions, ReadLimit};
 
+mod imported;
 pub(super) mod primary;
 mod validation;
+
+pub(super) use imported::Identities as OriginalIdentities;
 
 /// Authenticate copied primary configuration references without opening a writer,
 /// recovering a WAL or publishing the directory. Backup restores call this even
