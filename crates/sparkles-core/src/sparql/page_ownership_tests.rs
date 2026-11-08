@@ -51,14 +51,16 @@ fn selected_page_owns_only_its_actual_decoded_payload_and_survives_result_drop()
     let copies = Arc::new(AtomicUsize::new(0));
     let observed = copies.clone();
     *result.inner.ctx.chunk_hook.lock() = Some(Arc::new(move |stage, _| {
-        if stage == "term-copied" {
+        // A simple literal takes over its reconstructed key's allocation, and
+        // other terms are copied from it. Either way one term is decoded.
+        if stage == "term-copied" || stage == "owned-key-pointer" {
             observed.fetch_add(1, Ordering::SeqCst);
         }
     }));
     let pressure = result
         .inner
         .ctx
-        .charge(result.inner.ctx.memory_remaining() - (224 << 10))
+        .charge(result.inner.ctx.memory_remaining() - (120 << 10))
         .unwrap();
     let before = result.inner.ctx.live_bytes();
     let rows = result.rows_range(1..2).unwrap();
