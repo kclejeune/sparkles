@@ -791,6 +791,132 @@ fn imported_header_literals_are_checked() {
     );
 }
 
+// Namespace validation is a necessary XMLLiteral check. Accepted controls retain
+// the existing noncanonical fragment spellings, not a new canonical-value claim.
+fn xml_literal_namespaces_turtle(xml: &str) -> String {
+    format!(
+        "{}^^rdf:XMLLiteral",
+        serde_json::to_string(xml).expect("hand-built XML literal string")
+    )
+}
+
+#[test]
+fn xml_literal_namespaces_data_assertions_report_section57() {
+    let literal = xml_literal_namespaces_turtle("<p:a/>");
+    let o = strict(&decl(&format!(":a :d {literal} .")));
+    assert_profiles(
+        &o,
+        &[],
+        &[
+            (Profile::Dl, "§5.7"),
+            (Profile::El, "§5.7"),
+            (Profile::Ql, "§5.7"),
+            (Profile::Rl, "§5.7"),
+        ],
+    );
+}
+
+#[test]
+fn xml_literal_namespaces_value_restrictions_report_section57() {
+    let literal = xml_literal_namespaces_turtle("<a p:x='1'/>");
+    let o = strict(&decl(&format!(
+        ":A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :d ; owl:hasValue {literal} ] ."
+    )));
+    assert_profiles(&o, &[], &[(Profile::Dl, "§5.7")]);
+}
+
+#[test]
+fn xml_literal_namespaces_annotations_report_section57() {
+    let literal =
+        xml_literal_namespaces_turtle("<a xmlns:p='urn:u' xmlns:q='urn:u' p:x='1' q:x='2'/>");
+    let o = strict(&decl(&format!(":A rdfs:comment {literal} .")));
+    assert_profiles(&o, &[], &[(Profile::Dl, "§5.7")]);
+}
+
+#[test]
+fn xml_literal_namespaces_ontology_headers_report_section57() {
+    let literal = xml_literal_namespaces_turtle("<a xmlns:xml='urn:wrong'/>");
+    let o = strict(&decl(&format!(
+        "<http://example.org/onto> rdfs:comment {literal} ."
+    )));
+    let r = report(&o, Profile::Dl);
+    assert!(
+        !r.conforms,
+        "invalid XML namespace binding must not conform"
+    );
+    assert!(
+        r.violations
+            .iter()
+            .any(|v| v.axiom.is_none() && v.rule.ends_with("§5.7")),
+        "{:?}",
+        r.violations
+    );
+}
+
+#[test]
+fn xml_literal_namespaces_import_headers_report_section57() {
+    let main = ttl(&decl(
+        "<http://example.org/onto> owl:imports <http://example.org/lib> .",
+    ));
+    let literal = xml_literal_namespaces_turtle("<a xmlns:p=''/>");
+    let lib = ttl(&format!(
+        "<http://example.org/lib> a owl:Ontology ; rdfs:comment {literal} ."
+    ));
+    let graph_of: Vec<u32> = std::iter::repeat_n(0, main.len())
+        .chain(std::iter::repeat_n(1, lib.len()))
+        .collect();
+    let triples = main.into_iter().chain(lib).collect();
+    let o = read::read(
+        triples,
+        graph_of,
+        &[0],
+        ReadOptions {
+            mode: Mode::Strict,
+            ..Default::default()
+        },
+    );
+    assert_eq!(o.other_headers.len(), 1);
+    let r = report(&o, Profile::Dl);
+    assert!(
+        r.violations
+            .iter()
+            .any(|v| v.rule.ends_with("§5.7") && v.graph == Some(1)),
+        "{:?}",
+        r.violations
+    );
+}
+
+#[test]
+fn xml_literal_namespaces_keep_accepted_legacy_fragments_in_all_literal_positions() {
+    let literal = xml_literal_namespaces_turtle("<a xmlns='urn:u' xmlns:p='urn:u' x='1' p:x='2'/>");
+    let o = strict(&decl(&format!(
+        ":a :d {literal} .\n\
+         :A rdfs:comment {literal} .\n\
+         <http://example.org/onto> rdfs:comment {literal} ."
+    )));
+    let r = report(&o, Profile::Dl);
+    assert!(r.conforms, "{:?}", rules(&r));
+    assert!(
+        !r.violations.iter().any(|v| v.rule.ends_with("§5.7")),
+        "{:?}",
+        r.violations
+    );
+}
+
+#[test]
+fn xml_literal_namespaces_do_not_assign_a_lexical_space_to_an_unknown_datatype() {
+    let literal = serde_json::to_string("<p:a/>").expect("hand-built literal string");
+    let o = strict(&decl(&format!(
+        ":A rdfs:comment {literal}^^<http://example.org/custom-xml> ."
+    )));
+    let r = report(&o, Profile::Dl);
+    assert!(
+        !r.violations.iter().any(|v| v.rule.ends_with("§5.7")),
+        "{:?}",
+        r.violations
+    );
+}
+
 #[test]
 fn defined_datatypes_have_no_literals_or_facets() {
     let body = ":SSN a rdfs:Datatype ; owl:equivalentClass [ a rdfs:Datatype ;
@@ -1526,4 +1652,30 @@ fn partitions_leave_out_the_dl_restrictions() {
     let union = strict(&decl(":A owl:disjointUnionOf ( :B :C ) ."));
     let part = profiles::partition(&union, Profile::Rl);
     assert_eq!(part.outside_axioms().len(), 1, "{:?}", part.outside);
+}
+
+#[test]
+fn xml_literal_namespace_fixes_report_section57() {
+    for xml in [
+        "<p:a xmlns:p='urn:a b'/>",
+        "<a xmlns:unused='urn:a&#xA;b'/>",
+        "<a xmlns='urn:%'/>",
+        "<p:a xmlns:p='urn:&#x+41;'/>",
+        "<a><!--x---></a>",
+    ] {
+        let literal = xml_literal_namespaces_turtle(xml);
+        for body in [
+            format!(":a :d {literal} ."),
+            format!(":A rdfs:comment {literal} ."),
+            format!("<http://example.org/onto> rdfs:comment {literal} ."),
+        ] {
+            let o = strict(&decl(&body));
+            let r = report(&o, Profile::Dl);
+            assert!(
+                !r.conforms && r.violations.iter().any(|v| v.rule.ends_with("§5.7")),
+                "{xml:?} in {body:?}: {:?}",
+                r.violations
+            );
+        }
+    }
 }

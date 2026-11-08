@@ -205,8 +205,16 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
 * The DL check, and so every profile report, also checks literals. A literal of a
   datatype in the OWL 2 datatype map needs a lexical form of that datatype, such as an
   `xsd:byte` from -128 to 127 or an `owl:rational` such as `1/3`, and no literal can be
-  of type `owl:real` or of a datatype that a datatype definition introduces. A datatype
-  restriction can use only the facets its datatype supports, with values in the value
+  of type `owl:real` or of a datatype that a datatype definition introduces. XML
+  literals require balanced content with QName components, scoped namespace bindings
+  and unique expanded attribute names. Normalized namespace names must be URI
+  references, with relative references accepted and their spelling preserved. The
+  check retains noncanonical spellings, and
+  full XML canonical lexical and value semantics remain in item 663. Namespace
+  checking uses scratch proportional to active declarations, element depth and the
+  current tag's attributes, including decoded namespace strings. The standalone
+  lexical checker does not charge this scratch to a caller-provided memory budget.
+  A datatype restriction can use only the facets its datatype supports, with values in the value
   space each facet takes, a pattern that parses as an XML Schema regular expression and
   a language range of RFC 4647. Annotation literals and the annotations of the headers
   of the ontology and its imports are checked as well. An edit can still write an ill-typed literal, and a check reports it.
