@@ -2153,13 +2153,12 @@ impl Ctx {
 
     /// Decode one private writer cell after admitting its owned payload. Unlike the
     /// public compatibility decoder, this route cannot turn a refusal into UNDEF.
-    /// The row's charge outlives every returned term; no owning value escapes it.
-    pub(super) fn output_term(&self, id: Id, row: &Charge<'_>) -> Result<Option<Term>> {
+    /// The row's credit outlives every returned term; no owning value escapes it.
+    pub(super) fn output_term(&self, id: Id, row: &OutputCredit<'_>) -> Result<Option<Term>> {
         assert!(
-            std::ptr::eq(self, row.ctx),
+            std::ptr::eq(self, row.charge.ctx),
             "output credit belongs to its query"
         );
-        self.check_memory_failure()?;
         let decode = |key: &[u8]| -> Result<Term> {
             row.add(output_key_bytes(self, key, 0)?)?;
             Ok(id::key_to_term(key))
@@ -2205,6 +2204,18 @@ impl Ctx {
                     }
                 }
             }
+            // An eager envelope already covers key reconstruction, as in
+            // `with_vocab_key`. Checking each rebuild step and charging its scratch
+            // separately made large answers about a third slower to write.
+            Tag::Vocab if !self.envelope_refuses() => self
+                .snap
+                .generation
+                .vocab
+                .get_with(id.payload(), |key| {
+                    self.reserve_decode_checked(key.len())?;
+                    decode(key)
+                })
+                .transpose()?,
             Tag::Vocab => self
                 .with_cursor_vocab_key(id.payload(), decode)?
                 .transpose()?,
@@ -2215,7 +2226,6 @@ impl Ctx {
                 self.snap.term(id)
             }
         };
-        self.check_memory_failure()?;
         Ok(term)
     }
 
@@ -2828,6 +2838,45 @@ impl Charge<'_> {
         Ok(())
     }
 }
+/// Credit of a reused output row. The writer frees each row's terms before it decodes
+/// the next, so live output is at most the largest row so far. The credit keeps that
+/// high-water mark admitted and adds to the query's account only when a row exceeds it,
+/// which leaves one shared account update per growth instead of one per cell.
+pub(super) struct OutputCredit<'a> {
+    charge: Charge<'a>,
+    used: std::cell::Cell<u64>,
+}
+impl<'a> OutputCredit<'a> {
+    pub(super) fn new(ctx: &'a Ctx) -> Self {
+        Self {
+            charge: Charge {
+                ctx,
+                bytes: std::cell::Cell::new(0),
+                owner: std::cell::Cell::new(None),
+            },
+            used: std::cell::Cell::new(0),
+        }
+    }
+    /// Admit `bytes` more for the current row before they are allocated.
+    pub(super) fn add(&self, bytes: u64) -> Result<()> {
+        let used = self
+            .used
+            .get()
+            .checked_add(bytes)
+            .ok_or_else(|| self.charge.ctx.memory_exceeded(u64::MAX))?;
+        let held = self.charge.bytes.get();
+        if used > held {
+            self.charge.add(used - held)?;
+        }
+        self.used.set(used);
+        Ok(())
+    }
+    /// Start a new row. The caller has already dropped every term of the last one.
+    pub(super) fn reset(&self) {
+        self.used.set(0);
+    }
+}
+
 impl Drop for Charge<'_> {
     fn drop(&mut self) {
         self.ctx.release_live(self.owner.get(), self.bytes.get());

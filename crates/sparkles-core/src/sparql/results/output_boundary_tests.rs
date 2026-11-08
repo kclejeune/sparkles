@@ -276,7 +276,7 @@ fn one_cell_fits_but_the_complete_row_refuses_before_publication_and_recovers() 
     assert_eq!(blocked, MB - left);
     // A single actual decoded cell fits, including its owned string. The two
     // independent cells together exceed this same fixed remaining allowance.
-    let cell_credit = r.ctx.charge(0).unwrap();
+    let cell_credit = crate::sparql::ctx::OutputCredit::new(&r.ctx);
     let cell = r.ctx.output_term(r.table.cols[0][0], &cell_credit).unwrap();
     assert!(matches!(&cell, Some(Term::Literal(v)) if v.value().len() == LONG));
     drop(cell);
