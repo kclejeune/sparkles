@@ -590,6 +590,9 @@ pub struct Ctx {
     /// overlay, charged to the query until the context drops.
     pub(super) reasoning_memory: Vec<QueryMemoryLease>,
     pub snap: Arc<Snapshot>,
+    // Actual source and controlled mask owners precede their final setup credit.
+    pub(super) read_source: Option<crate::store::BoundReadSource>,
+    pub(super) source_view: Option<crate::access::PreparedView>,
     local: RwLock<AppendVocab>,
     values: ValueCache,
     next_bnode: AtomicU64,
@@ -718,6 +721,7 @@ pub struct Ctx {
     // Data and weak retained caches drop before final ledger ownership.
     fast: FastMemory,
     memory: std::sync::OnceLock<Arc<QueryMemoryLedger>>,
+    pub(super) source_setup: Option<crate::access::Reservation>,
 }
 
 /// Set in [`FastMemory::live`] once the ledger has taken the account over.
@@ -1077,6 +1081,9 @@ impl Ctx {
             fast: Default::default(),
             memory: Default::default(),
             snap,
+            read_source: None,
+            source_view: None,
+            source_setup: None,
             local: RwLock::new(AppendVocab::default()),
             values: Default::default(),
             next_bnode: AtomicU64::new(0),
@@ -1355,6 +1362,11 @@ impl Ctx {
         #[cfg(test)]
         CHECKS.with(|n| n.set(n.get() + 1));
         self.check_memory_failure()?;
+        if let Some(source) = &self.read_source {
+            // Source preparation has its original absolute deadline. Cursor wait
+            // pauses never extend it, and no cancellation watcher is required.
+            source.query_input().2.check()?;
+        }
         if self.calls_extensions
             && let Some(state) = &self.extension_failure
             && let Some(failure) = state.lock().as_ref()

@@ -501,24 +501,40 @@ fn make_ctx(
     dataset: Option<&QueryDataset>,
     base: Option<&oxiri::Iri<String>>,
 ) -> Result<Ctx> {
+    make_ctx_input(snap, opts, dataset, base, None)
+}
+
+fn make_ctx_input(
+    snap: Arc<Snapshot>,
+    opts: &QueryOptions,
+    dataset: Option<&QueryDataset>,
+    base: Option<&oxiri::Iri<String>>,
+    source: Option<crate::store::BoundReadSource>,
+) -> Result<Ctx> {
     #[cfg(feature = "geo")]
     let op_vertices = snap.geo_op_vertices;
-    let snap = with_union_default(snap, opts);
-    // guarded graphs are decided against the snapshot read, before any mask
-    let graphs = opts.graphs.as_ref().map(|a| a.bound(&snap));
-    // a view that hides triples reads the snapshot without them
-    let snap = match &graphs {
-        Some(a) => a.masked(&snap)?,
-        None => snap,
+    let (mut ctx, graphs) = match source {
+        Some(source) => make_source_ctx(source, opts)?,
+        None => {
+            let snap = with_union_default(snap, opts);
+            // Legacy guards are bound before their mask, as before.
+            let graphs = opts.graphs.as_ref().map(|a| a.bound(&snap));
+            let snap = match &graphs {
+                Some(a) => a.masked(&snap)?,
+                None => snap,
+            };
+            (Ctx::new(snap), graphs)
+        }
     };
-    let mut ctx = Ctx::new(snap);
     // the store's limit on one geometry operation
     #[cfg(feature = "geo")]
     ctx.geo.set_op_vertices(op_vertices);
-    ctx.deadline = match opts.timeout {
-        Some(_) => opts.effective_deadline(Instant::now())?,
-        None => opts.deadline,
-    };
+    if ctx.read_source.is_none() {
+        ctx.deadline = match opts.timeout {
+            Some(_) => opts.effective_deadline(Instant::now())?,
+            None => opts.deadline,
+        };
+    }
     ctx.cancellation = opts.cancellation.clone();
     if let Some(c) = &opts.cancel {
         ctx.cancel = c.clone();
@@ -533,7 +549,9 @@ fn make_ctx(
         .spill
         .as_ref()
         .map(|spill| Arc::new(spill.query(opts.max_spill_bytes)));
-    ctx.set_grant(opts.query_grant());
+    if ctx.read_source.is_none() {
+        ctx.set_grant(opts.query_grant());
+    }
     if let Some(m) = opts.max_rows_produced {
         ctx.max_rows_produced = m;
     }
@@ -565,7 +583,6 @@ fn make_ctx(
         ctx.opt = o;
     }
     ctx.base_iri = base.cloned();
-    let resolve = |iris: &[String]| -> Vec<Id> { iris.iter().map(|i| ctx.graph_id(i)).collect() };
     let mut ds = DatasetSpec::default();
     if !opts.default_graph_uris.is_empty() || !opts.named_graph_uris.is_empty() {
         if opts
@@ -575,10 +592,18 @@ fn make_ctx(
         {
             ds.union_default = true;
         } else if !opts.default_graph_uris.is_empty() {
-            ds.default = Some(resolve(&opts.default_graph_uris));
+            ds.default = Some(resolve_graphs(
+                &mut ctx,
+                opts.default_graph_uris.iter().map(String::as_str),
+                opts.default_graph_uris.len(),
+            )?);
         }
         if !opts.named_graph_uris.is_empty() {
-            ds.named = Some(resolve(&opts.named_graph_uris));
+            ds.named = Some(resolve_graphs(
+                &mut ctx,
+                opts.named_graph_uris.iter().map(String::as_str),
+                opts.named_graph_uris.len(),
+            )?);
         }
         // a protocol dataset replaces the store's: whichever part was not given is empty
         if (ds.default.is_some() || ds.union_default) && ds.named.is_none() {
@@ -588,29 +613,271 @@ fn make_ctx(
             ds.default = Some(Vec::new());
         }
     } else if let Some(d) = dataset {
-        ds.default = Some(resolve(
-            &d.default
-                .iter()
-                .map(|n| n.as_str().to_string())
-                .collect::<Vec<_>>(),
-        ));
-        ds.named = Some(resolve(
-            &d.named
-                .iter()
-                .flatten()
-                .map(|n| n.as_str().to_string())
-                .collect::<Vec<_>>(),
-        ));
+        ds.default = Some(resolve_graphs(
+            &mut ctx,
+            d.default.iter().map(|n| n.as_str()),
+            d.default.len(),
+        )?);
+        ds.named = Some(resolve_graphs(
+            &mut ctx,
+            d.named.iter().flatten().map(|n| n.as_str()),
+            d.named.as_ref().map_or(0, Vec::len),
+        )?);
     }
     // extra graphs merged into the store's default graph (inference overlay)
     if ds.default.is_none() && !ds.union_default && !opts.default_graph_extra.is_empty() {
-        let mut d = vec![Id::DEFAULT_GRAPH];
-        d.extend(resolve(&opts.default_graph_extra));
-        ds.default = Some(d);
+        ds.default = Some(resolve_graphs(
+            &mut ctx,
+            std::iter::once(ctx::DEFAULT_GRAPH_IRI)
+                .chain(opts.default_graph_extra.iter().map(String::as_str)),
+            opts.default_graph_extra
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid("default dataset size overflow"))?,
+        )?);
     }
     ctx.dataset = ds;
-    restrict_ctx(&mut ctx, graphs.as_ref())?;
+    if ctx.read_source.is_some() {
+        restrict_source_ctx(&mut ctx, graphs.as_ref())?;
+    } else {
+        restrict_ctx(&mut ctx, graphs.as_ref())?;
+    }
     Ok(ctx)
+}
+
+fn make_source_ctx(
+    source: crate::store::BoundReadSource,
+    opts: &QueryOptions,
+) -> Result<(Ctx, Option<Arc<crate::access::GraphAccess>>)> {
+    let (snapshot, prepared_access, preparation) = source.query_input();
+    preparation.check()?;
+    let snapshot = snapshot.clone();
+    let prepared_access = prepared_access.cloned();
+    let preparation = preparation.clone();
+    // Covers the actual Ctx Arc, snapshot header, lazy ledger/owner bookkeeping,
+    // and the fixed Arc-backed counters/default policy fields created by Ctx::new.
+    // All variable-size query/graph data needs separate admission.
+    let setup_bytes = std::mem::size_of::<Ctx>()
+        .checked_add(std::mem::size_of::<Snapshot>())
+        .and_then(|n| n.checked_add(4096))
+        .and_then(|n| u64::try_from(n).ok())
+        .ok_or_else(|| Error::invalid("checked context setup overflow"))?;
+    let setup = preparation.reserve(setup_bytes)?;
+    let grant = opts.query_grant().or_else(|| preparation.grant().cloned());
+    let domain = grant
+        .as_ref()
+        .map_or(sparkles_budget::MemoryDomain::unpooled(), |g| {
+            g.memory_domain()
+        })
+        .id();
+    let original_domain = preparation
+        .grant()
+        .map_or(sparkles_budget::MemoryDomain::unpooled(), |g| {
+            g.memory_domain()
+        })
+        .id();
+    if domain != original_domain {
+        return Err(Error::Component(Box::new(
+            crate::error::ComponentError::new(
+                "query-memory",
+                "foreign-domain",
+                "checked source belongs to another accounting domain",
+            )
+            .with_source(sparkles_budget::ParentRefused::ForeignDomain),
+        )));
+    }
+    let parent = preparation.memory_parent()?;
+    let mut ctx = Ctx::new(snapshot);
+    ctx.read_source = Some(source);
+    ctx.source_setup = Some(setup);
+    ctx.deadline = opts.effective_deadline(Instant::now())?;
+    ctx.cancellation = opts.cancellation.clone();
+    if let Some(cancel) = &opts.cancel {
+        ctx.cancel = cancel.clone();
+    }
+    ctx.set_grant(grant);
+    ctx.set_memory_parent(parent)?;
+    ctx.check()?;
+    ctx.snap = with_union_default(ctx.snap.clone(), opts);
+    let access = match prepared_access {
+        Some(access) => {
+            if opts
+                .graphs
+                .as_ref()
+                .is_some_and(|requested| !Arc::ptr_eq(requested, &access))
+            {
+                return Err(Error::invalid(
+                    "checked prepared access cannot be replaced; prepare the required policy first",
+                ));
+            }
+            access
+        }
+        None => {
+            let access = opts.graphs.as_ref().ok_or_else(|| {
+                Error::NotPermitted(
+                    "historical source query requires an explicit current access policy".into(),
+                )
+            })?;
+            let view = access.masked_controlled(&ctx.snap, &preparation)?;
+            let (snapshot, access, _) = view.query_input();
+            ctx.snap = snapshot.clone();
+            let access = access.clone();
+            ctx.source_view = Some(view);
+            access
+        }
+    };
+    ctx.check()?;
+    Ok((ctx, Some(access)))
+}
+
+fn resolve_graphs<'a>(
+    ctx: &mut Ctx,
+    iris: impl Iterator<Item = &'a str>,
+    count: usize,
+) -> Result<Vec<Id>> {
+    let Some(source) = ctx.read_source.as_ref() else {
+        return Ok(iris.map(|iri| ctx.graph_id(iri)).collect());
+    };
+    let preparation = source.query_input().2.clone();
+    let bytes = count
+        .checked_mul(std::mem::size_of::<Id>())
+        .and_then(|n| u64::try_from(n).ok())
+        .ok_or_else(|| Error::invalid("dataset graph size overflow"))?;
+    let held = preparation.reserve(bytes)?;
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(count)
+        .map_err(|_| Error::invalid("dataset graph allocation failed"))?;
+    if ids.capacity() != count {
+        return Err(Error::invalid("dataset graph capacity exceeds admission"));
+    }
+    for iri in iris {
+        ctx.check()?;
+        ids.push(ctx.graph_id(iri));
+        ctx.check()?;
+    }
+    ctx.source_setup
+        .as_mut()
+        .expect("source setup owner")
+        .merge(held);
+    Ok(ids)
+}
+
+fn restrict_source_ctx(
+    ctx: &mut Ctx,
+    access: Option<&Arc<crate::access::GraphAccess>>,
+) -> Result<()> {
+    use crate::access::PreparationBuffer as Buffer;
+    let Some(access) = access.filter(|access| !access.reads_everything()) else {
+        return Ok(());
+    };
+    let preparation = ctx
+        .read_source
+        .as_ref()
+        .expect("checked source")
+        .query_input()
+        .2
+        .clone();
+    if access.reads_all() {
+        return Ok(());
+    }
+    let mut visible = Buffer::new(&preparation)?;
+    let mut every = true;
+    let mut last = None;
+    preparation.scan(&ctx.snap, crate::index::Perm::Gspo, &[], |quad| {
+        let graph = quad[3];
+        if graph == Id::DEFAULT_GRAPH || last == Some(graph) {
+            return Ok(true);
+        }
+        last = Some(graph);
+        let allowed = preparation.with_term(&ctx.snap, graph, |term| {
+            preparation.allows(&access.read, term)
+        })?;
+        if allowed {
+            visible.push(graph)?;
+        } else {
+            every = false;
+        }
+        Ok(true)
+    })?;
+    // GSPO visits distinct graph ids in order; do not populate an uncredited
+    // snapshot policy cache or allocate an intermediate enumeration.
+    let mut dataset = std::mem::take(&mut ctx.dataset);
+    let allowed = |graph: Id| -> Result<bool> {
+        preparation.check()?;
+        if graph == Id::DEFAULT_GRAPH {
+            return Ok(access.read.default_graph());
+        }
+        if visible.binary_search(&graph).is_ok() {
+            return Ok(true);
+        }
+        if matches!(
+            graph.tag(),
+            crate::id::Tag::BNode | crate::id::Tag::Undef | crate::id::Tag::Special
+        ) {
+            return Ok(false);
+        }
+        if graph.tag() == crate::id::Tag::Local {
+            let credit = ctx.charge(0)?;
+            let term = ctx.output_term(graph, &credit)?;
+            preparation.allows(&access.read, term.as_ref())
+        } else {
+            preparation.with_term(&ctx.snap, graph, |term| {
+                preparation.allows(&access.read, term)
+            })
+        }
+    };
+    let mut kept = preparation.reserve(0)?;
+    let mut union = || -> Result<Vec<Id>> {
+        let bytes = (visible.len() as u64)
+            .checked_mul(std::mem::size_of::<Id>() as u64)
+            .ok_or_else(|| Error::invalid("visible graph size overflow"))?;
+        kept.grow_by(bytes)?;
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(visible.len())
+            .map_err(|_| Error::invalid("visible graph allocation failed"))?;
+        if ids.capacity() != visible.len() {
+            return Err(Error::invalid("visible graph capacity exceeds admission"));
+        }
+        for &graph in visible.iter() {
+            preparation.check()?;
+            ids.push(graph);
+        }
+        Ok(ids)
+    };
+    let filter = |mut ids: Vec<Id>| -> Result<Vec<Id>> {
+        let mut out = 0;
+        for index in 0..ids.len() {
+            if allowed(ids[index])? {
+                ids[out] = ids[index];
+                out += 1;
+            }
+        }
+        ids.truncate(out);
+        Ok(ids)
+    };
+    dataset.default = match dataset.default.take() {
+        None if every && (dataset.union_default || ctx.snap.union_default_graph) => None,
+        _ if dataset.union_default => Some(union()?),
+        None if ctx.snap.union_default_graph => Some(union()?),
+        None if access.read.default_graph() => None,
+        None => Some(Vec::new()),
+        Some(ids) => Some(filter(ids)?),
+    };
+    if dataset.default.is_some() {
+        dataset.union_default = false;
+    }
+    dataset.named = match dataset.named.take() {
+        None if every => None,
+        None => Some(union()?),
+        Some(ids) => Some(filter(ids)?),
+    };
+    ctx.source_setup
+        .as_mut()
+        .expect("source setup owner")
+        .merge(kept);
+    ctx.dataset = dataset;
+    ctx.graphs = Some(access.clone());
+    ctx.check()
 }
 
 /// Limit a query context's dataset to a graph view that does not read every graph (see
@@ -667,6 +934,38 @@ fn split(
 /// Execute a SPARQL query against a snapshot.
 pub fn query(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<QueryResult> {
     query_with_plan(snap, q, opts).map_err(|f| f.error)
+}
+
+/// Query a genuine retained source. Current policy is still required for an
+/// evidence source; a prepared source retains and applies its exact bound policy.
+/// The source and descendants share its original Preparation allowance. This
+/// entry does not make legacy raw result extractors a bounded ownership API.
+pub fn query_source(
+    source: crate::store::BoundReadSource,
+    store: &crate::store::Store,
+    q: &str,
+    opts: &QueryOptions,
+) -> Result<QueryResult> {
+    source.validate_query_instance(store)?;
+    source.query_input().2.check()?;
+    let started = Instant::now();
+    let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
+    let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let stack = depth::check_query(&parsed)?;
+    depth::with_stack(stack, || {
+        let snapshot = source.query_input().0.clone();
+        let start = Instant::now();
+        let prepared = prepare_query_input(snapshot, &parsed, opts, None, None, Some(source))?;
+        let plan_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let mut result = depth::with_stack(prepared.plan_depth, || {
+            execute_prepared(&parsed, opts, parse_ms, plan_ms, prepared)
+                .map_err(|failed| failed.error)
+        })?;
+        if result.kind == QueryKind::Select {
+            select_star_order(q, &mut result);
+        }
+        Ok(result)
+    })
 }
 
 /// A query that failed, with its plan as far as it ran when the failure came while it
@@ -808,10 +1107,27 @@ fn prepare_query(
     cursor_started: Option<Instant>,
     automatic: Option<&CursorOptions>,
 ) -> Result<PreparedQuery> {
+    prepare_query_input(snap, parsed, opts, cursor_started, automatic, None)
+}
+
+fn prepare_query_input(
+    snap: Arc<Snapshot>,
+    parsed: &Query,
+    opts: &QueryOptions,
+    cursor_started: Option<Instant>,
+    automatic: Option<&CursorOptions>,
+    source: Option<crate::store::BoundReadSource>,
+) -> Result<PreparedQuery> {
     let (pattern, dataset, base) = split(parsed);
     extensions::check_family(snap.dataset_id)?;
     let (demand_opts, rdfs_skipped) = demand_options(opts);
-    let mut ctx = make_ctx(snap, demand_opts.as_ref().unwrap_or(opts), dataset, base)?;
+    let mut ctx = make_ctx_input(
+        snap,
+        demand_opts.as_ref().unwrap_or(opts),
+        dataset,
+        base,
+        source,
+    )?;
     if let Some(started) = cursor_started.filter(|_| automatic.is_none()) {
         ctx.enable_cursor_accounting()?;
         ctx.deadline = opts.effective_deadline(started)?;
@@ -1494,3 +1810,6 @@ mod paid_final_table_tests {
         assert_eq!(grant.used(), 0);
     }
 }
+
+#[cfg(test)]
+mod checked_source_tests;

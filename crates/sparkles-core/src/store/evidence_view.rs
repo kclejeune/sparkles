@@ -52,6 +52,10 @@ impl BoundEvidenceView {
         super::BoundReadSource::evidence(self.clone())
     }
 
+    pub(super) fn query_input(&self) -> (&Arc<Snapshot>, &Preparation) {
+        (&self.inner.snapshot, self.inner._held.preparation())
+    }
+
     pub fn dataset_id(&self) -> uuid::Uuid {
         self.inner.dataset_id
     }

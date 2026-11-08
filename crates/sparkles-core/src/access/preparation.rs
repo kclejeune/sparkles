@@ -1069,6 +1069,10 @@ pub struct Reservation {
 }
 
 impl Reservation {
+    pub(crate) fn preparation(&self) -> &Preparation {
+        &self.preparation
+    }
+
     /// Admit more storage in an owner that already retains earlier allocations.
     pub fn grow_by(&mut self, bytes: u64) -> Result<()> {
         self.merge(self.preparation.reserve(bytes)?);
@@ -1369,6 +1373,14 @@ impl PreparedView {
         crate::store::BoundReadSource::prepared(self.clone())
     }
 
+    pub(crate) fn query_input(&self) -> (&Arc<Snapshot>, &Arc<GraphAccess>, &Preparation) {
+        (
+            &self.inner.snapshot,
+            &self.inner.access,
+            &self.inner._held.preparation,
+        )
+    }
+
     /// Bound policy to apply while consuming the physical snapshot.
     pub fn access(&self) -> &GraphAccess {
         &self.inner.access
@@ -1385,6 +1397,37 @@ impl PreparedView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_source_parent_release_wakes_outside_preparation_and_grant_locks() {
+        use crate::sparql::pool::QueryPool;
+        use std::sync::atomic::AtomicUsize;
+        let pool = QueryPool::new(64 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        let preparation =
+            Preparation::with_grant(Control::none(), 128 << 20, grant.clone()).unwrap();
+        let parent = preparation.memory_parent().unwrap();
+        let held = parent.clone().reserve(48 << 20).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let reentry = parent.clone();
+        let waiter = pool.enter(
+            32 << 20,
+            Some(Arc::new(move || {
+                drop(reentry.clone().reserve(1).unwrap());
+                observed.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+        drop(held);
+        assert!(calls.load(Ordering::SeqCst) > 0);
+        assert_eq!(preparation.inner_used(), CONTEXT_BYTES + PARENT_BYTES);
+        drop(waiter);
+        drop(parent);
+        drop(preparation);
+        assert_eq!(grant.used(), 0);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+    }
 
     #[test]
     fn checked_source_parent_shares_original_local_and_pool_ownership() {

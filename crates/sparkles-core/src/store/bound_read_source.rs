@@ -27,6 +27,34 @@ enum Source {
 }
 
 impl BoundReadSource {
+    // Only checked construction may borrow these genuine physical inputs. The
+    // query context retains this carrier before it clones or works on them.
+    pub(crate) fn query_input(
+        &self,
+    ) -> (
+        &std::sync::Arc<super::Snapshot>,
+        Option<&std::sync::Arc<crate::access::GraphAccess>>,
+        &crate::access::Preparation,
+    ) {
+        match &self.source {
+            Source::Prepared(view) => {
+                let (snapshot, access, preparation) = view.query_input();
+                (snapshot, Some(access), preparation)
+            }
+            Source::Evidence(view) => {
+                let (snapshot, preparation) = view.query_input();
+                (snapshot, None, preparation)
+            }
+        }
+    }
+
+    pub(crate) fn validate_query_instance(&self, store: &super::Store) -> crate::Result<()> {
+        match &self.source {
+            Source::Evidence(view) => view.validate_instance(store),
+            Source::Prepared(_) => Ok(()),
+        }
+    }
+
     pub(crate) fn evidence(view: BoundEvidenceView) -> Self {
         Self {
             source: Source::Evidence(view),
