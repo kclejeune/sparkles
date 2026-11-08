@@ -1431,10 +1431,7 @@ impl Reservation {
     }
 
     pub(crate) fn merge(&mut self, mut other: Self) {
-        assert!(Arc::ptr_eq(
-            &self.preparation.inner,
-            &other.preparation.inner
-        ));
+        assert!(self.preparation.inner.same(&other.preparation.inner));
         self.bytes = self.bytes.checked_add(other.bytes).expect("admitted sum");
         other.bytes = 0;
     }
