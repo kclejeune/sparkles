@@ -39,6 +39,15 @@ pub fn parse(bytes: &[u8]) -> Result<Manifest> {
     Ok(m)
 }
 
+/// Whether a configuration generation's content-addressed name agrees with its
+/// digest. Other paths have no name-derived digest and always agree.
+pub(crate) fn generation_name_matches(path: &str, sha256: &str) -> bool {
+    !crate::layout::configuration_history_path(path)
+        || path
+            .rsplit_once("/generations/")
+            .is_none_or(|(_, file)| file.strip_suffix(".json") == Some(sha256))
+}
+
 /// Everything a restore checks before writing (`422 invalid-backup` naming the field;
 /// `422 incompatible-format` for `indexFormat != index_format`):
 /// * every `path` passes `layout::valid_backup_path`, without duplicates, and the only
@@ -216,9 +225,7 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
                     "configuration history must be immutable primary data".into(),
                 );
             }
-            if let Some((_, file)) = f.path.rsplit_once("/generations/")
-                && file.strip_suffix(".json") != Some(f.sha256.as_str())
-            {
+            if !generation_name_matches(&f.path, &f.sha256) {
                 return bad(
                     &field("sha256"),
                     "configuration generation name differs from its digest".into(),

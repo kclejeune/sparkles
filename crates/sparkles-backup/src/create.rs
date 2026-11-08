@@ -559,6 +559,19 @@ impl Repository {
             branches_omitted,
             requires,
         };
+        // A retained descriptor can still read bytes changed in place after
+        // capture. A content-addressed configuration generation whose uploaded
+        // digest no longer matches its name would make restore refuse the backup.
+        if let Some(entry) = manifest
+            .files
+            .iter()
+            .find(|entry| !crate::manifest::generation_name_matches(&entry.path, &entry.sha256))
+        {
+            return Err(BackupError::internal(format!(
+                "{} changed after its capture",
+                entry.path
+            )));
+        }
         ctl.check()?;
         ctl.report(0.97, "writing the manifest");
         let body = Bytes::from(

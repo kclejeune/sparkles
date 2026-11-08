@@ -110,6 +110,38 @@ async fn configuration_history_restores_exact_native_binding_without_optional_ch
 }
 
 #[tokio::test]
+async fn configuration_history_create_refuses_a_generation_changed_after_capture() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("source");
+    let store = configuration_store(&root);
+    let capture = store.backup_capture("changed").unwrap();
+    let generations = std::fs::read_dir(root.join("evidence-history"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("generations");
+    let generation = std::fs::read_dir(&generations)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // Same length, in place: the retained descriptor reads the changed bytes.
+    let mut bytes = std::fs::read(&generation).unwrap();
+    let last = bytes.len() - 2;
+    bytes[last] = if bytes[last] == b' ' { b'\t' } else { b' ' };
+    std::fs::write(&generation, &bytes).unwrap();
+    let (repo, _) = memory_repo().await;
+    assert!(
+        repo.create(capture.into(), &opts("changed", "ds"))
+            .await
+            .is_err()
+    );
+    assert!(repo.manifest("changed").await.is_err());
+}
+
+#[tokio::test]
 async fn configuration_history_restore_cancellation_removes_staged_parents() {
     let temporary = tempfile::tempdir().unwrap();
     let store = configuration_store(&temporary.path().join("source"));
