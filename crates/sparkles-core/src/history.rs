@@ -496,13 +496,15 @@ pub(crate) struct HistoryConfig {
     pub catalog: CatalogHorizon,
 }
 
-/// Pins, retention, schedules and the catalog horizon from `history.json` (none if the
-/// file is missing).
-pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryConfig> {
+/// Read and validate one history document without startup mutation.
+fn checked_file(
+    root: &Path,
+    identify: impl FnOnce() -> Result<Option<uuid::Uuid>>,
+) -> Result<Option<HistoryFile>> {
     let bytes = match std::fs::read(root.join("history.json")) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(HistoryConfig::default());
+            return Ok(None);
         }
         Err(e) => return Err(e.into()),
     };
@@ -511,6 +513,9 @@ pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryCo
     crate::formats::check_settings("history.json", &v)?;
     let f: HistoryFile =
         serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
+    let dataset_id = identify()?.ok_or_else(|| {
+        Error::Corrupt("history.json requires its recorded dataset.json identity".into())
+    })?;
     if f.format == 1 && f.snapshots.iter().any(|pin| pin.configuration.is_some()) {
         return Err(Error::Corrupt(
             "legacy history cannot certify a configuration binding".into(),
@@ -557,6 +562,22 @@ pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryCo
             f.dataset_id
         )));
     }
+    Ok(Some(f))
+}
+
+/// Validate current history metadata without startup writers or recovery cleanup.
+/// A legacy directory without history needs no recorded identity. A present
+/// identity-bearing history requires its own dataset.json, never a fabricated ID.
+pub(crate) fn preflight_file(root: &Path) -> Result<()> {
+    checked_file(root, || commit::read_dataset_file(root)).map(|_| ())
+}
+
+/// Pins, retention, schedules and the catalog horizon from `history.json` (none if the
+/// file is missing), checked against the selected store's actual identity.
+pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryConfig> {
+    let Some(f) = checked_file(root, || Ok(Some(dataset_id)))? else {
+        return Ok(HistoryConfig::default());
+    };
     let pins = f
         .snapshots
         .into_iter()
