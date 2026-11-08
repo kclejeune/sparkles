@@ -15082,12 +15082,16 @@
             "type": "array"
           },
           "expect": {
-            "description": "The heads the caller saw: `409 head-moved` when either moved. Optional targetId pins the target branch incarnation and returns 412 when it changed.",
+            "description": "The heads the caller saw: `409 head-moved` when either moved. Optional targetId pins the target branch incarnation and returns 412 when it changed. Supplied heads must be unsigned 64-bit integers. A malformed expect object, head or UUID returns 400 invalid-merge; null is invalid. Omitted fields and an empty object are allowed.",
             "properties": {
               "source": {
+                "maximum": 18446744073709551615,
+                "minimum": 0,
                 "type": "integer"
               },
               "target": {
+                "maximum": 18446744073709551615,
+                "minimum": 0,
                 "type": "integer"
               },
               "targetId": {
@@ -18028,9 +18032,11 @@
             "type": "array"
           },
           "expect": {
-            "description": "The head of the branch written to that the caller saw: `409 head-moved` when it moved. Optional targetId pins the target branch incarnation and returns 412 when it changed.",
+            "description": "The head of the branch written to that the caller saw: `409 head-moved` when it moved. Optional targetId pins the target branch incarnation and returns 412 when it changed. Supplied heads must be unsigned 64-bit integers. A malformed expect object, head or UUID returns 400 invalid-merge; null is invalid. Omitted fields and an empty object are allowed.",
             "properties": {
               "target": {
+                "maximum": 18446744073709551615,
+                "minimum": 0,
                 "type": "integer"
               },
               "targetId": {

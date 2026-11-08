@@ -8840,7 +8840,7 @@ export interface components {
             entailments?: boolean;
             /** @description Predicate IRIs whose cells never conflict in this merge, besides the dataset's. */
             exempt?: string[];
-            /** @description The heads the caller saw: `409 head-moved` when either moved. Optional targetId pins the target branch incarnation and returns 412 when it changed. */
+            /** @description The heads the caller saw: `409 head-moved` when either moved. Optional targetId pins the target branch incarnation and returns 412 when it changed. Supplied heads must be unsigned 64-bit integers. A malformed expect object, head or UUID returns 400 invalid-merge; null is invalid. Omitted fields and an empty object are allowed. */
             expect?: {
                 source?: number;
                 target?: number;
@@ -9874,7 +9874,7 @@ export interface components {
             /** @description Include complete candidate entailment changes. Requires dryRun=true. */
             entailments?: boolean;
             exempt?: string[];
-            /** @description The head of the branch written to that the caller saw: `409 head-moved` when it moved. Optional targetId pins the target branch incarnation and returns 412 when it changed. */
+            /** @description The head of the branch written to that the caller saw: `409 head-moved` when it moved. Optional targetId pins the target branch incarnation and returns 412 when it changed. Supplied heads must be unsigned 64-bit integers. A malformed expect object, head or UUID returns 400 invalid-merge; null is invalid. Omitted fields and an empty object are allowed. */
             expect?: {
                 target?: number;
                 /** Format: uuid */
