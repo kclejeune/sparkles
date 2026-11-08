@@ -592,6 +592,11 @@ is on or off.
 | `LOAD <http(s)…>` | allowed | needs `federate` |
 | `LOAD <file:…>` | allowed today (open question 7) | needs `server-admin` |
 
+SHACL refuses SERVICE for every caller, even one with federate. The prohibition
+covers nested graph expressions, custom validators and node expressions, and is
+checked before validation executes. SHACL's execution context also disables SERVICE.
+This applies to inline drafts and stored shapes without changing their data visibility.
+
 - `QueryOptions` gains `allow_remote_load` and `allow_file_load` (default `true`), and
   `update.rs::load` checks them.
 - Handlers set `allow_service = st.allow_service && p.has(Federate)`, and set the load

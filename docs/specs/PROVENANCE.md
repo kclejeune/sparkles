@@ -401,6 +401,9 @@ Read the [design provenance](F28-ml-and-probabilistic-integration/SPEC.md#proven
 
 Read the [design provenance](U12-ontology-workbench/SPEC.md#provenance).
 
+The visual SHACL editor's record covers the W3C Recommendation, the supported SHACL 1.2
+draft list parameters and Sparkles' existing patch, branch and validation contracts.
+
 ## Standalone desktop application
 
 Read the [design provenance](U13-desktop-application/SPEC.md#provenance).

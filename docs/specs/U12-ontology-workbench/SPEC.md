@@ -1,6 +1,6 @@
 # U12: Ontology workbench
 
-> **Status:** partially complete. The ontology editor, DL Query and thesaurus editor
+> **Status:** partially complete. The ontology editor, DL Query, thesaurus editor and visual SHACL editor
 > phases are built, and the editable schema diagram is planned.
 >
 > **Roadmap:** [item 457](../../ROADMAP.md) holds this work. Each candidate phase below gets
@@ -71,7 +71,65 @@ The ontology-editing exclusions of U02 §1 and U07 §1 are lifted for this spec.
 
 This design derives from Sparkles' existing specs and code. Its phases also draw on the published papers, standards and public documentation of these sources: VocBench, PoolParty, the EBI Ontology Lookup Service, Ontobee, EDG Taxonomy, EDG Tagger, TopBraid Composer, Protégé, WebProtégé, Protégé DL Query, Cellfie, ROBOT template, DOSDP, Stardog Designer and OntoGraf. No code from another project is copied.
 
+The visual SHACL editor follows the [W3C SHACL Recommendation](https://www.w3.org/TR/shacl/)
+for shape definitions, Core parameters, RDF lists and property paths. Its additional list
+parameters follow Sparkles' supported SHACL 1.2 draft contract in
+[G03](../G03-shaclc.md). RDF editing, exact patch preconditions, branch reverts and sample
+validation reuse Sparkles' own F09, F10, C15 and SHACL implementations.
+
 ## Outcome
+
+### Visual SHACL shape editor
+
+Item 617 adds **SHACL shapes** to the Workbench at `/ui/workbench/shapes`, beside the
+dataset's existing Turtle and SHACLC text validation experience. It reads one complete
+stored graph at an exact branch revision and edits the RDF directly. Node and property
+shape trees include anonymous, nested and shared definitions. A spanning forest draws
+recursive and repeated references as link leaves and reuses the virtualized tree.
+
+Forms author the four Core target predicates and implicit class targets, severity and
+descriptive metadata, the Recommendation's Core constraints and the engine's four
+SHACL 1.2 draft list constraints. Shape references and ordered lists express logical,
+qualified and nested constraints. Paths compose predicates, inverse, sequence,
+alternative, zero-or-more, one-or-more and optional forms recursively. Unsupported RDF
+remains visible and unchanged, and malformed structures require explicit replacement.
+
+Field edits accumulate in a local draft with bounded undo and redo. Commits apply only
+the RDF delta through the existing patch endpoint, with the source branch UUID and
+commit in `H prev`. The same captured patch is previewed and committed. This preserves
+stored blank nodes and unrelated triples, including shared path and list structures.
+The strict `expect` commit IRI also checks the source UUID, so a foreign replication
+`prev` cannot bypass authoring preconditions after a dataset or branch is recreated.
+Committed undo and redo use reverts. A refresh retains active field buffers and dirty
+drafts at their original revision, and a moved or failed source disables submission.
+Discard and reload is explicit. Protected branches use session branches, and the server
+retains its graph, endpoint and write authorization.
+
+Live sample checks use the complete draft and explicit focus nodes or the declared
+targets in a selected sample graph at the captured revision. The latter mode includes
+literal target nodes. Data-graph selection, deadlines and cancellation are independent
+of the shapes graph. The existing
+validation route gained opt-in `storedBlankNodes=true` for inline RDF drafts, so their
+stored blank constants remain comparable with the data. Inline drafts remain distinct
+from shapes already stored in the snapshot and do not bind `$shapesGraph`. Ordinary
+inline parsing retains its previous document-local blank-node behavior. The UI checks
+the response source UUID and commit before reading a sample report, so replacement
+branches at the same numeric head cannot approve a draft from an earlier incarnation.
+Reserved default and union query selectors are refused as named authoring sources;
+the stored default graph is selected by leaving the graph field empty.
+
+The editor refuses graph reads above 5,000 triples or a 2 MiB decoded response before
+JSON materialization, as well as incomplete reads and unconfirmed triple visibility.
+Paths nest at most 64 levels. It retains at most 30 draft states, validates at most 100
+explicit sample nodes, displays at most 100 sample results and previews 50 changed
+triples. The full graph remains the basis of every patch. A larger graph is refused
+rather than opened as an editable partial definition. The extra session memory grows
+with the retained draft states and graph size.
+
+The [visualization guide](../../visualization/README.md#visual-shacl-shape-editor) describes
+the controls and bounds. Text transfer explicitly replaces the saved Turtle draft and
+does not install a guard or commit a shape graph. General classifier-backed entailments
+and justifications remain separate work under F24.
 
 ### Ontology metrics and expressivity
 

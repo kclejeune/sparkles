@@ -32,6 +32,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [What each class uses, and what changed](#what-each-class-uses-and-what-changed)
   * [File tools](#file-tools)
   * [Validating with SHACL and ShEx](#validating-with-shacl-and-shex)
+  * [Authoring SHACL shapes](#authoring-shacl-shapes)
   * [Drafting shapes from the data](#drafting-shapes-from-the-data)
   * [Stored queries](#stored-queries)
   * [DESCRIBE modes](#describe-modes)
@@ -1290,6 +1291,16 @@ shape map file (`--map`) or a single node (`--node`), and Jena's flag names as a
 64 schemas and 16 MiB by default, as on the server.
 `validation --grandfather` blocks only the results a write introduces, so a guard in
 `reject` mode can be installed on data that does not conform.
+
+### Authoring SHACL shapes
+
+The Workbench's **SHACL shapes** page authors stored shapes through trees and forms.
+Open `/ui/workbench/shapes?ds=NAME`, choose the branch and shapes graph, create a node or
+property shape and apply its targets, path and constraints. Enter sample focus nodes and
+a data graph to check the draft, then choose **Preview commit** and **Commit** to store
+the changes. The [visual editor guide](visualization/README.md#visual-shacl-shape-editor)
+describes draft undo, concurrent changes, permissions and graph limits. The dataset's
+Validate panel retains its Turtle and SHACLC text editors.
 
 ### Drafting shapes from the data
 

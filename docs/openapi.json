@@ -15082,13 +15082,17 @@
             "type": "array"
           },
           "expect": {
-            "description": "The heads the caller saw: `409 head-moved` when either moved.",
+            "description": "The heads the caller saw: `409 head-moved` when either moved. Optional targetId pins the target branch incarnation and returns 412 when it changed.",
             "properties": {
               "source": {
                 "type": "integer"
               },
               "target": {
                 "type": "integer"
+              },
+              "targetId": {
+                "format": "uuid",
+                "type": "string"
               }
             },
             "type": "object"
@@ -18024,10 +18028,14 @@
             "type": "array"
           },
           "expect": {
-            "description": "The head of the branch written to that the caller saw: `409 head-moved` when it moved.",
+            "description": "The head of the branch written to that the caller saw: `409 head-moved` when it moved. Optional targetId pins the target branch incarnation and returns 412 when it changed.",
             "properties": {
               "target": {
                 "type": "integer"
+              },
+              "targetId": {
+                "format": "uuid",
+                "type": "string"
               }
             },
             "type": "object"
@@ -30359,6 +30367,9 @@
           "410": {
             "$ref": "#/components/responses/Gone"
           },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
           "422": {
             "$ref": "#/components/responses/Unprocessable"
           },
@@ -37216,6 +37227,9 @@
           },
           "410": {
             "$ref": "#/components/responses/Gone"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
           },
           "422": {
             "$ref": "#/components/responses/Unprocessable"
@@ -44883,6 +44897,9 @@
           },
           "410": {
             "$ref": "#/components/responses/Gone"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
           },
           "422": {
             "$ref": "#/components/responses/Unprocessable"
@@ -54528,6 +54545,14 @@
             "$ref": "#/components/parameters/ds"
           },
           {
+            "description": "Strict authoring precondition urn:uuid:UUID#commit:N. Both source UUID and head must match under the writer lock or the response is 412. Unlike a foreign body prev, a foreign expectation is never ignored.",
+            "in": "query",
+            "name": "expect",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "$ref": "#/components/parameters/branch"
           },
           {
@@ -54771,6 +54796,14 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "Strict authoring precondition urn:uuid:UUID#commit:N. Both source UUID and head must match under the writer lock or the response is 412. Unlike a foreign body prev, a foreign expectation is never ignored.",
+            "in": "query",
+            "name": "expect",
+            "schema": {
+              "type": "string"
+            }
           },
           {
             "$ref": "#/components/parameters/branch"
@@ -56104,6 +56137,14 @@
             "name": "shapes",
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "For an inline RDF draft, resolve existing stored blank-node labels at the selected revision. New labels remain local. The default keeps all inline blank nodes local. Does not combine with shapes= or SHACLC, and does not bind $shapesGraph for the inline draft.",
+            "in": "query",
+            "name": "storedBlankNodes",
+            "schema": {
+              "type": "boolean"
             }
           },
           {
