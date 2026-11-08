@@ -1,9 +1,11 @@
 """Deliver real SIGINTs to this worker while an owned transport is being torn down.
 
-Usage: finalizer_interrupt_worker.py TARGET PHASE COUNT LEADER WORK
+Usage: finalizer_interrupt_worker.py TARGET PHASE COUNT LEADER WORK [HANDLER]
 
-TARGET is exchange or bounded. PHASE names the teardown step at which COUNT
-SIGINTs are sent to this process with os.kill: term_wait, term, kill or probe.
+TARGET is exchange or bounded. PHASE names the step at which COUNT SIGINTs are
+sent to this process with os.kill: spawn, right after the child starts, entry,
+just before teardown starts, or the teardown steps term_wait, term, kill and probe.
+HANDLER is default, or custom for a Python handler that delegates to the default.
 LEADER is timeout for a TERM-ignoring leader that outlives a tiny deadline, or a
 numeric exit for a leader that leaves one TERM-ignoring descendant behind. The
 worker writes outcome.json into WORK. It starts no provider, network or manager.
@@ -19,11 +21,15 @@ import subprocess
 import sys
 import time
 
-target, phase, count, leader, work = sys.argv[1:]
+target, phase, count, leader, work = sys.argv[1:6]
+handler = sys.argv[6] if len(sys.argv) > 6 else 'default'
 count = int(count)
 work = Path(work)
 root = Path(__file__).resolve().parents[2]
-signal.signal(signal.SIGINT, signal.default_int_handler)
+if handler == 'custom':
+    signal.signal(signal.SIGINT, lambda signum, frame: signal.default_int_handler(signum, frame))
+else:
+    signal.signal(signal.SIGINT, signal.default_int_handler)
 ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)
 
 if target == 'exchange':
@@ -52,6 +58,8 @@ class Observed(Original):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         created.append(self)
+        if len(created) == 1:
+            interrupt('spawn')
 
     def wait(self, *args, **kwargs):
         if (kwargs.get('timeout') or 0) > 1 and self.poll() is None and created and self is created[0]:
@@ -69,6 +77,17 @@ def killpg(pid, sig):
 
 
 subprocess.Popen = Observed
+sys.path.insert(0, str(root / 'scripts/boat'))
+import owned_group
+real_finish = owned_group.finish
+
+
+def finish(*args, **kwargs):
+    interrupt('entry')
+    return real_finish(*args, **kwargs)
+
+
+owned_group.finish = finish
 os.killpg = killpg
 ready = work / 'ready'
 if leader == 'timeout':
@@ -88,7 +107,8 @@ except BaseException as error:
     outcome.update(exception=type(error).__name__, message=str(error),
                    native_exit=getattr(error, 'native_exit', None),
                    cleanup_errors=getattr(error, 'cleanup_errors', None),
-                   cleanup_interrupted=getattr(error, 'cleanup_interrupted', None))
+                   cleanup_interrupted=getattr(error, 'cleanup_interrupted', None),
+                   cleanup_interrupt_error=getattr(error, 'cleanup_interrupt_error', None))
 outcome['fired'] = fired
 outcome['leader_pid'] = created[0].pid if created else None
 outcome['streams_closed'] = [s.closed for s in (created[0].stdin, created[0].stdout, created[0].stderr) if s is not None] if created else None

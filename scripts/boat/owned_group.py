@@ -6,14 +6,17 @@ leader, reaps group members this process may reap and checks that the group is
 empty. Every stage runs against one cleanup deadline that is fixed when teardown
 starts and is never reset.
 
-SIGINT is deferred for the whole teardown. Each SIGINT that arrives is counted and
+The caller installs a ``Cancellation`` before it starts the child. From then until
+teardown ends, SIGINT never raises asynchronously. The handler only records the
+signal. While the transfer runs, the caller calls ``check`` at its loop points, which
+hands the signal to the previous handler there, so the default handler raises
+KeyboardInterrupt at a known place. Once teardown starts, every SIGINT is counted and
 cleanup continues, so repeated cancellation neither skips a stage nor lengthens the
-window. A KeyboardInterrupt raised by a stage itself, such as one that arrived just
-before the deferral was installed, is counted the same way and the next stage still
-runs. The caller's streams and selector are closed in an unconditional inner finally.
-After teardown the previous SIGINT handler is restored. With Python's default
-handler the count is returned for the caller to propagate; any other handler gets
-the signal redelivered once.
+window. A KeyboardInterrupt raised by a stage itself is counted and that stage is
+attempted again, up to three times. Streams and the selector close in an
+unconditional inner finally, and the previous handler is restored afterwards.
+``conclude`` then attaches the count to a primary failure or, when there is none,
+cancels the call once closure has finished.
 """
 import os
 import signal
@@ -25,45 +28,80 @@ KILL_GRACE = 3
 WINDOW = 5
 
 
-class _Deferred:
+class Cancellation:
+    """Record SIGINT for one owned invocation instead of raising asynchronously."""
+
     def __init__(self):
-        self.count = 0
+        self.pending = 0
+        self.teardown = 0
+        self.in_teardown = False
         self.previous = None
         self.installed = False
 
     def record(self, signum, frame):
-        self.count += 1
+        if self.in_teardown:
+            self.teardown += 1
+        else:
+            self.pending += 1
 
     def install(self):
         if self.installed or threading.current_thread() is not threading.main_thread():
-            return
-        self.previous = signal.getsignal(signal.SIGINT)
-        if self.previous is None:
-            # A handler installed outside Python cannot be restored from here.
-            return
-        # Mark first so an interrupt between these lines still restores.
+            return self
+        previous = signal.getsignal(signal.SIGINT)
+        # SIG_IGN never interrupts, and a handler installed outside Python cannot be
+        # restored from here, so both are left in place.
+        if previous is None or previous is signal.SIG_IGN:
+            return self
+        self.previous = previous
         self.installed = True
         signal.signal(signal.SIGINT, self.record)
+        return self
+
+    def _default(self):
+        return self.previous is signal.default_int_handler or self.previous is signal.SIG_DFL
+
+    def check(self):
+        """Hand a SIGINT received during the transfer to the previous handler."""
+        if not self.pending or self.in_teardown:
+            return
+        self.pending = 0
+        if self._default():
+            raise KeyboardInterrupt()
+        if callable(self.previous):
+            self.previous(signal.SIGINT, None)
+
+    def begin_teardown(self):
+        self.in_teardown = True
+        self.teardown += self.pending
+        self.pending = 0
 
     def restore(self):
-        if not self.installed:
-            return self.count
-        signal.signal(signal.SIGINT, self.previous)
-        self.installed = False
-        if self.previous is signal.default_int_handler:
-            return self.count
-        if self.count and self.previous is not signal.SIG_IGN:
-            signal.raise_signal(signal.SIGINT)
-        return 0
+        if self.installed:
+            self.installed = False
+            signal.signal(signal.SIGINT, self.previous)
 
 
-def _stage(deferred, action, *args):
-    """Run one teardown stage, counting rather than propagating an interrupt."""
+ATTEMPTS = 3
+
+
+def _stage(cancel, problems, name, action, *args):
+    """Run one stage, attempting it again after an interrupt a fixed number of times."""
+    for _ in range(ATTEMPTS):
+        try:
+            return action(*args)
+        except KeyboardInterrupt:
+            cancel.teardown += 1
+    problems.append(name + ' interrupted')
+    return None
+
+
+def _attempt(action, problems):
+    # A failed caller step, such as restoring a source descriptor, must not
+    # skip group closure. It is reported as unresolved cleanup instead.
     try:
-        return action(*args)
-    except KeyboardInterrupt:
-        deferred.count += 1
-        return None
+        action()
+    except Exception as problem:
+        problems.append('prelude ' + type(problem).__name__)
 
 
 def _signal(pid, sig, problems):
@@ -106,15 +144,6 @@ def _probe(pid, end, problems):
     return False
 
 
-def _attempt(action, problems):
-    # A failed caller step, such as restoring a source descriptor, must not
-    # skip group closure. It is reported as unresolved cleanup instead.
-    try:
-        action()
-    except Exception as problem:
-        problems.append('prelude ' + type(problem).__name__)
-
-
 def _close(resource, problems):
     close = getattr(resource, 'close', None)
     if close is None or getattr(resource, 'closed', False):
@@ -125,37 +154,64 @@ def _close(resource, problems):
         problems.append('stream close ' + type(problem).__name__)
 
 
-def finish(process, closables=(), prelude=(), timeout_error=Exception):
+def finish(process, closables=(), prelude=(), timeout_error=Exception, cancel=None):
     """Close the owned group and every closable within one fixed window.
 
     Returns ``(problems, interrupts)``. ``problems`` lists unresolved closure and
-    ``interrupts`` counts deferred SIGINTs. Neither is raised here, so the caller
-    keeps its primary outcome and decides how to report both.
+    ``interrupts`` counts cancellations seen during teardown. Neither is raised
+    here, so the caller keeps its primary outcome and reports both with
+    ``conclude``. The cancellation's handler is restored before returning.
     """
-    deferred = _Deferred()
+    if cancel is None:
+        cancel = Cancellation().install()
+    cancel.begin_teardown()
     problems = []
+    end = time.monotonic() + WINDOW
     try:
         try:
-            _stage(deferred, deferred.install)
             for action in prelude:
-                _stage(deferred, _attempt, action, problems)
-            end = _stage(deferred, lambda: time.monotonic() + WINDOW)
-            if end is None:
-                end = time.monotonic() + WINDOW
+                _stage(cancel, problems, 'prelude', _attempt, action, problems)
             # A zero-exit leader is not proof that its invocation is empty.
             for sig, grace in ((signal.SIGTERM, TERM_GRACE), (signal.SIGKILL, KILL_GRACE)):
-                _stage(deferred, _signal, process.pid, sig, problems)
-                _stage(deferred, _wait, process, grace, end, sig, problems, timeout_error)
-            while True:
-                done = _stage(deferred, _probe, process.pid, end, problems)
-                if done:
-                    break
-                if done is None and time.monotonic() >= end:
+                _stage(cancel, problems, 'signal', _signal, process.pid, sig, problems)
+                _stage(cancel, problems, 'wait', _wait, process, grace, end, sig, problems, timeout_error)
+            while not _stage(cancel, problems, 'probe', _probe, process.pid, end, problems):
+                if time.monotonic() >= end:
                     problems.append('owned invocation closure unconfirmed')
                     break
         finally:
             for resource in closables:
-                _stage(deferred, _close, resource, problems)
+                _stage(cancel, problems, 'close', _close, resource, problems)
     finally:
-        interrupts = deferred.restore()
-    return problems, interrupts
+        cancel.restore()
+    return problems, cancel.teardown
+
+
+def conclude(cancel, failure, **details):
+    """Report teardown cancellation without replacing a primary failure.
+
+    With a primary failure the count is attached and a custom previous handler is
+    still called, with anything it raises recorded on the failure. Without one, the
+    default handler's cancellation is raised as KeyboardInterrupt carrying
+    ``details``, and a custom handler is called and may raise itself.
+    """
+    count = cancel.teardown
+    if not count:
+        return
+    custom = callable(cancel.previous) and not cancel._default()
+    if failure is not None:
+        failure.cleanup_interrupted = count
+        if custom:
+            try:
+                cancel.previous(signal.SIGINT, None)
+            except BaseException as error:
+                failure.cleanup_interrupt_error = type(error).__name__
+        return
+    if custom:
+        cancel.previous(signal.SIGINT, None)
+        return
+    cancelled = KeyboardInterrupt()
+    cancelled.cleanup_interrupted = count
+    for name, value in details.items():
+        setattr(cancelled, name, value)
+    raise cancelled

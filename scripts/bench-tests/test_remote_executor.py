@@ -502,6 +502,20 @@ class FinalizerInterrupt(unittest.TestCase):
                 self.assertIn('deadline',outcome['message'])
                 self.assertEqual(outcome['cleanup_interrupted'],count,outcome)
 
+    def test_interrupt_before_teardown_or_after_spawn_cannot_skip_closure(self):
+        outcome=self.check('entry',1,'timeout')
+        self.assertEqual(outcome['exception'],'ValueError',outcome);self.assertEqual(outcome['cleanup_interrupted'],1,outcome)
+        outcome=self.check('spawn',1,'timeout')
+        self.assertEqual(outcome['exception'],'KeyboardInterrupt',outcome);self.assertIsNone(outcome['cleanup_interrupted'],outcome)
+
+    def test_custom_handler_runs_after_closure_without_replacing_the_timeout(self):
+        from finalizer_interrupt import run
+        outcome=run('exchange','term_wait',1,'timeout','custom')
+        self.assertEqual(outcome['exception'],'ValueError',outcome)
+        self.assertEqual(outcome['cleanup_interrupted'],1,outcome)
+        self.assertEqual(outcome['cleanup_interrupt_error'],'KeyboardInterrupt',outcome)
+        self.assertFalse(outcome['ready_alive_after_return'],outcome);self.assertTrue(outcome['foreign_alive'],outcome)
+
     def test_interrupt_after_leader_exit_is_propagated_after_descendant_closure(self):
         for leader,phase in (('0','term'),('17','term'),('0','probe'),('17','kill')):
             with self.subTest(leader=leader,phase=phase):

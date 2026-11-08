@@ -389,7 +389,7 @@ def get(host, source, destination):
             temporary.unlink(missing_ok=True)
 
 
-def write_output(stream, block, deadline):
+def write_output(stream, block, deadline, check=None):
     """Bound a live pipe sink as well as the child and producer pipes."""
     try:
         fd=stream.fileno();kind=os.fstat(fd).st_mode
@@ -403,6 +403,7 @@ def write_output(stream, block, deadline):
         os.set_blocking(fd,False);selector.register(fd,selectors.EVENT_WRITE)
         pending=memoryview(block)
         while pending:
+            if check is not None:check()
             left=remaining(deadline)
             if not selector.select(min(left,0.2)):continue
             try:written=os.write(fd,pending)
@@ -419,8 +420,14 @@ def exchange(argv, output, limit=MAX_ARCHIVE, timeout=300, deadline=None, source
     elif hasattr(deadline,'wall_end'):deadline=OperationDeadline(min(deadline,time.monotonic()+timeout),deadline.wall_end)
     else:deadline=min(deadline,time.monotonic()+timeout)
     remaining(deadline)
-    process = subprocess.Popen(argv, stdin=subprocess.PIPE if source is not None else subprocess.DEVNULL,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    # From here until teardown ends SIGINT is only recorded. The transfer loop
+    # hands it to the previous handler at its checks, and teardown counts it.
+    cancel = owned_group.Cancellation().install()
+    try:
+        process = subprocess.Popen(argv, stdin=subprocess.PIPE if source is not None else subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    except BaseException:
+        cancel.restore();raise
     failure = None
     selector = None
     source_fd=None;pipe_source=False;source_blocking=None
@@ -445,6 +452,7 @@ def exchange(argv, output, limit=MAX_ARCHIVE, timeout=300, deadline=None, source
         total = errors = sent = 0
         pending = b''
         while selector.get_map():
+            cancel.check()
             left = remaining(deadline)
             for key, _ in selector.select(min(left, 0.2)):
                 if key.data == 'source':
@@ -475,12 +483,20 @@ def exchange(argv, output, limit=MAX_ARCHIVE, timeout=300, deadline=None, source
                     if key.data == 'stdout':
                         total += len(block)
                         if total > limit:fail('archive byte bound exceeded')
-                        write_output(output,block,deadline)
+                        write_output(output,block,deadline,cancel.check)
                     else:
                         errors += len(block)
                         if errors > stderr_limit:fail('transport stderr bound exceeded')
-                        if stderr_output is not None:write_output(stderr_output,block,deadline)
-        code = process.wait(timeout=remaining(deadline))
+                        if stderr_output is not None:write_output(stderr_output,block,deadline,cancel.check)
+        while True:
+            cancel.check()
+            left = remaining(deadline)
+            if left <= 0.2:
+                code = process.wait(timeout=left);break
+            try:
+                code = process.wait(timeout=0.2);break
+            except subprocess.TimeoutExpired:
+                pass
         return code
     except BaseException as error:
         failure = error
@@ -489,24 +505,20 @@ def exchange(argv, output, limit=MAX_ARCHIVE, timeout=300, deadline=None, source
             error.native_exit = code
         raise
     finally:
-        # Teardown defers and counts SIGINT, closes every stream in its own
-        # finally and never resets its five-second window. The primary
-        # failure stays primary; a cancellation on an otherwise returned
-        # result propagates once closure has finished.
+        # Teardown counts SIGINT, closes every stream in its own finally and
+        # never resets its five-second window. The primary failure stays
+        # primary; a cancellation on an otherwise returned result propagates
+        # once closure has finished.
         prelude=((selector.close,) if selector is not None else ())+(restore_source,)
-        cleanup,interrupted=owned_group.finish(process,(process.stdin,process.stdout,process.stderr),
-                                               prelude,subprocess.TimeoutExpired)
+        cleanup,_=owned_group.finish(process,(process.stdin,process.stdout,process.stderr),
+                                     prelude,subprocess.TimeoutExpired,cancel)
         if cleanup:
             print('remote-executor: owned transport cleanup unresolved; original outcome retained',file=sys.stderr)
-        if failure is not None:
-            if cleanup:failure.cleanup_errors=cleanup
-            if interrupted:failure.cleanup_interrupted=interrupted
-        elif interrupted:
-            cancelled=KeyboardInterrupt()
-            cancelled.native_exit=process.returncode;cancelled.cleanup_interrupted=interrupted
-            if cleanup:cancelled.cleanup_errors=cleanup
-            raise cancelled
-        elif cleanup and process.returncode==0:
+            if failure is not None:failure.cleanup_errors=cleanup
+        details={'native_exit':process.returncode}
+        if cleanup:details['cleanup_errors']=cleanup
+        owned_group.conclude(cancel,failure,**details)
+        if failure is None and cleanup and process.returncode==0:
             problem=ValueError('successful transport leader left unconfirmed invocation closure')
             problem.native_exit=0;problem.cleanup_errors=cleanup
             raise problem

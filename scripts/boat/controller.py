@@ -13,12 +13,16 @@ ROOT=Path(__file__).resolve().parent
 def bounded(argv,seconds,input_bytes=None):
     """Only Root's real adapter calls this. Kill only this new process group.
 
-    Teardown runs through owned_group.finish, which defers SIGINT, closes the pipes
-    and selector unconditionally and never extends its window. A cancellation
-    counted during teardown propagates as KeyboardInterrupt after closure, and a
-    primary exception keeps its type with the count attached.
+    SIGINT is recorded from before the child starts. The loop hands it to the
+    previous handler at its checks, and owned_group.finish counts it during
+    teardown, closes the pipes and selector unconditionally and never extends its
+    window. A teardown cancellation propagates after closure, and a primary
+    exception keeps its type with the count attached.
     """
-    child=subprocess.Popen(argv,stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,start_new_session=True)
+    cancel=owned_group.Cancellation().install()
+    try:child=subprocess.Popen(argv,stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,start_new_session=True)
+    except BaseException:
+        cancel.restore();raise
     select=None;failure=None
     try:
         select=selectors.DefaultSelector();select.register(child.stdout,selectors.EVENT_READ)
@@ -26,6 +30,7 @@ def bounded(argv,seconds,input_bytes=None):
             os.set_blocking(child.stdin.fileno(),False);select.register(child.stdin,selectors.EVENT_WRITE)
         data=bytearray();position=0;end=time.monotonic()+seconds;reason=None
         while select.get_map():
+            cancel.check()
             if time.monotonic()>=end:reason='timeout';break
             for key,mask in select.select(min(0.2,max(0,end-time.monotonic()))):
                 if mask&selectors.EVENT_WRITE:
@@ -41,25 +46,24 @@ def bounded(argv,seconds,input_bytes=None):
             if reason:break
         if reason:result={'exit':None,'error':reason,'body':None}
         else:
-            try:
-                code=child.wait(timeout=max(0.001,end-time.monotonic()))
+            code=None
+            while code is None:
+                cancel.check();left=end-time.monotonic()
+                try:code=child.wait(timeout=max(0.001,min(0.2,left)))
+                except subprocess.TimeoutExpired:
+                    if left<=0.2:break
+            if code is None:result={'exit':None,'error':'timeout','body':None}
+            else:
                 try:body=json.loads(data)
                 except (ValueError,UnicodeError):body=None
                 result={'exit':code,'error':None,'body':body}
-            except subprocess.TimeoutExpired:
-                result={'exit':None,'error':'timeout','body':None}
     except BaseException as error:
         failure=error;raise
     finally:
         prelude=(select.close,) if select is not None else ()
-        problems,interrupted=owned_group.finish(child,(getattr(child,'stdin',None),getattr(child,'stdout',None)),prelude,subprocess.TimeoutExpired)
-        if failure is not None:
-            if problems:failure.cleanup_errors=problems
-            if interrupted:failure.cleanup_interrupted=interrupted
-        elif interrupted:
-            cancelled=KeyboardInterrupt();cancelled.cleanup_interrupted=interrupted
-            if problems:cancelled.cleanup_errors=problems
-            raise cancelled
+        problems,_=owned_group.finish(child,(getattr(child,'stdin',None),getattr(child,'stdout',None)),prelude,subprocess.TimeoutExpired,cancel)
+        if failure is not None and problems:failure.cleanup_errors=problems
+        owned_group.conclude(cancel,failure,**({'cleanup_errors':problems} if problems else {}))
     if problems:return {'exit':getattr(child,'returncode',None),'error':'owned_invocation_closure_unknown','body':None}
     return result
 

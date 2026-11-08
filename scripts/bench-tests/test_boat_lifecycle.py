@@ -198,8 +198,8 @@ class BoundedFinalizerInterrupt(unittest.TestCase):
             def close(self):events.append('selector_close')
         def kill(pid,sig):
             events.append(('killpg',pid,int(sig)))
-            if stage=='term' and sig==signal.SIGTERM:raise KeyboardInterrupt()
-            if stage=='kill' and sig==signal.SIGKILL:raise KeyboardInterrupt()
+            if stage=='term' and sig==signal.SIGTERM and events.count(('killpg',pid,int(sig)))==1:raise KeyboardInterrupt()
+            if stage=='kill' and sig==signal.SIGKILL and events.count(('killpg',pid,int(sig)))==1:raise KeyboardInterrupt()
             if sig==0:
                 if stage=='probe' and events.count(('killpg',123,0))==1:raise KeyboardInterrupt()
                 raise ProcessLookupError()
@@ -222,18 +222,47 @@ class BoundedFinalizerInterrupt(unittest.TestCase):
                     self.assertIn('selector_close',events);self.assertIn('stdout_close',events)
                     self.assertEqual(error.cleanup_interrupted,1)
 
-    def test_failed_prelude_and_custom_handler_keep_closure_and_redeliver_once(self):
-        import signal,sys,subprocess,owned_group
+    def resistant(self):
+        import subprocess,sys
         child=subprocess.Popen([sys.executable,'-c','import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);print(1,flush=True);time.sleep(5)'],stdout=subprocess.PIPE,start_new_session=True)
-        self.assertEqual(child.stdout.read(2),b'1\n');seen=[]
+        self.addCleanup(lambda:child.poll() is not None or (child.kill(),child.wait()))
+        self.assertEqual(child.stdout.read(2),b'1\n');return child
+
+    def test_failed_prelude_and_custom_handler_keep_closure_and_run_once_after(self):
+        import signal,subprocess,owned_group
+        child=self.resistant();seen=[]
         def failing():
             signal.raise_signal(signal.SIGINT);raise OSError('restore failed')
         previous=signal.signal(signal.SIGINT,lambda n,f:seen.append(n))
         try:
-            problems,interrupted=owned_group.finish(child,(child.stdout,),(failing,),subprocess.TimeoutExpired)
+            cancel=owned_group.Cancellation().install()
+            problems,interrupted=owned_group.finish(child,(child.stdout,),(failing,),subprocess.TimeoutExpired,cancel)
+            self.assertEqual(seen,[])
+            owned_group.conclude(cancel,None)
         finally:signal.signal(signal.SIGINT,previous)
         self.assertEqual(child.returncode,-signal.SIGKILL);self.assertTrue(child.stdout.closed)
-        self.assertIn('prelude OSError',problems);self.assertEqual(interrupted,0);self.assertEqual(seen,[signal.SIGINT])
+        self.assertIn('prelude OSError',problems);self.assertEqual(interrupted,1);self.assertEqual(seen,[signal.SIGINT])
+
+    def test_interrupted_kill_and_close_are_attempted_again(self):
+        import signal,subprocess,owned_group
+        child=self.resistant();real=os.killpg;raised=[]
+        def kill(pid,sig):
+            if sig==signal.SIGKILL and not raised:
+                raised.append(sig);raise KeyboardInterrupt()
+            return real(pid,sig)
+        class Stream:
+            closed=False;calls=0
+            def close(self):
+                self.calls+=1
+                if self.calls==1:raise KeyboardInterrupt()
+                self.closed=True
+        stream=Stream();cancel=owned_group.Cancellation().install()
+        with patch.object(owned_group.os,'killpg',side_effect=kill):
+            problems,interrupted=owned_group.finish(child,(child.stdout,stream),(),subprocess.TimeoutExpired,cancel)
+        self.assertEqual(child.returncode,-signal.SIGKILL);self.assertEqual(problems,[])
+        self.assertTrue(stream.closed);self.assertTrue(child.stdout.closed);self.assertEqual(interrupted,2)
+        with self.assertRaises(KeyboardInterrupt)as error:owned_group.conclude(cancel,None,native_exit=child.returncode)
+        self.assertEqual(error.exception.cleanup_interrupted,2)
 
     def test_missing_group_and_dead_leader_return_without_interrupt(self):
         import sys
