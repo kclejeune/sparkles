@@ -264,6 +264,34 @@ class BoundedFinalizerInterrupt(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt)as error:owned_group.conclude(cancel,None,native_exit=child.returncode)
         self.assertEqual(error.exception.cleanup_interrupted,2)
 
+    def test_interrupt_while_disarming_cannot_leave_immediate_delivery_armed(self):
+        import signal,sys,time,owned_group
+        source=Path(owned_group.__file__).read_text().splitlines()
+        start=next(i for i,l in enumerate(source) if 'def interruptible' in l)
+        line=next(i for i in range(start,len(source)) if source[i].strip()=='self.blocking = False')+1
+        fired=[]
+        def trace(frame,event,arg):
+            if frame.f_code.co_filename==owned_group.__file__:
+                if event=='line' and frame.f_lineno==line and not fired:
+                    fired.append(line);os.kill(os.getpid(),signal.SIGINT)
+                return trace
+            return None
+        previous=signal.signal(signal.SIGINT,signal.default_int_handler)
+        cancel=owned_group.Cancellation().install()
+        try:
+            try:
+                sys.settrace(trace)
+                with cancel.interruptible():time.sleep(0.01)
+            except KeyboardInterrupt:pass
+            finally:sys.settrace(None)
+            self.assertEqual(fired,[line]);self.assertFalse(cancel.blocking)
+            os.kill(os.getpid(),signal.SIGINT)
+            self.assertEqual(cancel.pending,1)
+        except KeyboardInterrupt:
+            self.fail('SIGINT escaped after an interrupted disarm')
+        finally:
+            cancel.restore();signal.signal(signal.SIGINT,previous)
+
     def test_missing_group_and_dead_leader_return_without_interrupt(self):
         import sys
         result=controller.bounded([sys.executable,'-c','print("{}")'],2)

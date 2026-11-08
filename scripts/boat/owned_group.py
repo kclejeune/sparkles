@@ -49,8 +49,12 @@ class Cancellation:
             self.teardown += 1
         elif self.blocking:
             # Inside the caller's protected body, around a blocking call that has
-            # no loop check, the signal is delivered at once as before.
+            # no loop check, the signal is delivered at once as before. The
+            # handler disarms itself first, so a raise can never leave immediate
+            # delivery armed past the protected body.
+            self.blocking = False
             self.deliver()
+            self.blocking = True
         else:
             self.pending += 1
 

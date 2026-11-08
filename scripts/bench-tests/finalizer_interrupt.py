@@ -23,6 +23,12 @@ def _close_leftover(ready):
         # so a recycled pid never matches.
         if state != 'Z':
             if str(ready).encode() not in Path('/proc', str(pid), 'cmdline').read_bytes():
+                # It may have exited after the state read. Reap it if it is
+                # this process's child, but never signal an unmatched pid.
+                try:
+                    os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    pass
                 return
             os.kill(pid, signal.SIGKILL)
     except (FileNotFoundError, ProcessLookupError):
