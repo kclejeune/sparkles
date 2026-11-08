@@ -1395,15 +1395,24 @@ fn run_node<'ctx>(
             let (mut t, info, _) =
                 execute_limited(ctx, &n.children[0], offset.saturating_add(*limit))?;
             infos.push(info);
-            if t.lease.is_some() {
-                held.adopt(&mut t.lease)?;
-                owned_input.set(true);
-            } else {
-                held.add(t.table.mem_bytes())?;
+            t = t.slice(ctx, *offset, Some(*limit))?;
+            match t.adopt_input(ctx, &held)? {
+                InputCredit::Plain => held.add(t.table.mem_bytes())?,
+                InputCredit::Fast => preserve_fast_input = true,
+                InputCredit::Lease => owned_input.set(true),
             }
-            t.table.slice(*offset, Some(*limit))
+            t.table
         }
-        Kind::Slice { offset, limit } => child(0, infos)?.slice(*offset, *limit),
+        Kind::Slice { offset, limit } => {
+            let input = child(0, infos)?;
+            match last_input.get() {
+                InputCredit::Plain => input.slice(*offset, *limit),
+                credit => {
+                    preserve_fast_input = credit == InputCredit::Fast;
+                    Materialized::slice_paid(ctx, input, &held, *offset, *limit)?
+                }
+            }
+        }
         Kind::Group { keys, aggs } => {
             let t = child(0, infos)?;
             group(ctx, &t, keys, aggs, &mut expr_report)?
@@ -2782,9 +2791,26 @@ fn run_limited<'ctx>(
             let (t, _, stopped) = super::patternplan::run_scan(ctx, spec, &n.vars, Some(want))?;
             finish(Materialized::plain(t), Vec::new(), !stopped)
         }
+        Kind::Project(vars) => {
+            // Projection preserves row count, so one limited child run suffices.
+            // The actual Materialized owner stays live through metadata and errors.
+            let budget = if super::unionpush::limited_input(ctx, n) {
+                want
+            } else {
+                want.max(64)
+            };
+            let (input, info, complete) = execute_limited(ctx, &n.children[0], budget)?;
+            let output = match input.project(ctx, vars) {
+                Ok(output) => output,
+                Err(error) => {
+                    done.push((0, info));
+                    return Err(error);
+                }
+            };
+            finish(output, vec![info], complete)
+        }
         Kind::Filter(_)
         | Kind::Extend(..)
-        | Kind::Project(_)
         | Kind::Unpack { .. }
         | Kind::Distinct
         | Kind::IndexJoin(_) => {
@@ -2998,10 +3024,7 @@ fn run_limited<'ctx>(
             let (mut t, info, _) =
                 execute_limited(ctx, &n.children[0], offset.saturating_add(*limit))?;
             // Slice consumes the same backing; keep its ownership through the move.
-            t.table = t.table.slice(*offset, Some(*limit));
-            if let Some(lease) = &mut t.lease {
-                lease.resize(ctx.mem_limit, super::algosvc::table_capacity(&t.table)?)?;
-            }
+            t = t.slice(ctx, *offset, Some(*limit))?;
             finish(t, vec![info], true)
         }
         _ => {
@@ -10010,6 +10033,128 @@ mod path_lookup_tests {
 mod paid_eager_producer_tests {
     use super::*;
     use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn limited_identity_projection_keeps_actual_fast_child_credit() {
+        let store = scan_fixture();
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.use_cache = false;
+        let spec = default_subject_scan(&ctx);
+        let child = Node::leaf(Kind::Scan(spec), vec![0], 3.0, "paid limited scan".into());
+        let mut node = Node::leaf(
+            Kind::Project(vec![0]),
+            vec![0],
+            3.0,
+            "paid limited projection".into(),
+        );
+        node.children.push(child);
+        let before = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        let (output, _, complete) = execute_limited(&ctx, &node, 1).unwrap();
+        assert!(complete);
+        assert_eq!(output.table.len, 3);
+        assert_eq!(
+            ctx.live_bytes(),
+            super::super::algosvc::table_capacity(&output.table).unwrap(),
+            "limited projection must retain its actual prepaid child credit"
+        );
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            before
+        );
+        drop(output);
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+
+    #[test]
+    fn limited_projection_admits_missing_columns_before_allocation() {
+        use crate::algo::memory::probe;
+        use std::{cell::Cell, rc::Rc};
+        let store = scan_fixture();
+        for short in [false, true] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.use_cache = false;
+            let spec = default_subject_scan(&ctx);
+            ctx.var("missing");
+            ctx.mem_limit = 388 - u64::from(short);
+            let child = Node::leaf(Kind::Scan(spec), vec![0], 3.0, "limited source".into());
+            let mut node = Node::leaf(
+                Kind::Project(vec![0, 1]),
+                vec![0, 1],
+                3.0,
+                "limited projection".into(),
+            );
+            node.children.push(child);
+            let allocations = Rc::new(Cell::new(0));
+            let seen = allocations.clone();
+            let hook = probe::install(
+                move |point| {
+                    if let probe::Point::Allocation(name, _) = point
+                        && name.starts_with("eager-project-")
+                    {
+                        seen.set(seen.get() + 1);
+                    }
+                },
+                None,
+            );
+            let result = execute_limited(&ctx, &node, 1);
+            if short {
+                assert!(matches!(result, Err(Error::BudgetExceeded(_))));
+                assert_eq!(allocations.get(), 0);
+                assert_eq!(ctx.live_bytes(), 0);
+            } else {
+                let (output, _, complete) = result.unwrap();
+                assert!(complete);
+                assert_eq!(output.table.cols[1], [Id::UNDEF; 3]);
+                assert!(allocations.get() > 0);
+                assert_eq!(
+                    ctx.live_bytes(),
+                    super::super::algosvc::table_capacity(&output.table).unwrap()
+                );
+                drop(output);
+                assert_eq!(ctx.live_bytes(), 0);
+            }
+            drop(hook);
+        }
+    }
+
+    #[test]
+    fn eager_and_nested_limited_slice_keep_prepaid_columns_without_ledger() {
+        let store = scan_fixture();
+        for limited in [false, true] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.use_cache = false;
+            let spec = default_subject_scan(&ctx);
+            let child = Node::leaf(Kind::Scan(spec), vec![0], 3.0, "slice source".into());
+            let mut node = Node::leaf(
+                Kind::Slice {
+                    offset: 1,
+                    limit: Some(1),
+                },
+                vec![0],
+                1.0,
+                "slice".into(),
+            );
+            node.children.push(child);
+            let before = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+            let output = if limited {
+                execute_limited(&ctx, &node, 1).unwrap().0
+            } else {
+                execute_materialized(&ctx, &node).unwrap().0
+            };
+            assert_eq!(output.table.len, 1);
+            assert_eq!(output.table.cols[0].capacity(), 2);
+            assert_eq!(
+                ctx.live_bytes(),
+                super::super::algosvc::table_capacity(&output.table).unwrap()
+            );
+            assert_eq!(
+                super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+                before
+            );
+            drop(output);
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
 
     #[test]
     fn values_backing_keeps_its_actual_credit_until_drop() {

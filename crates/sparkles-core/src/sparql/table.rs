@@ -258,6 +258,83 @@ pub(super) struct Materialized<'ctx> {
     pub(super) lease: Option<super::query_memory::QueryMemoryLease>,
 }
 impl<'ctx> Materialized<'ctx> {
+    /// Slice paid backing in place. The original capacities and their actual
+    /// owner stay together; no unadmitted replacement columns overlap the input.
+    pub(super) fn slice(
+        mut self,
+        ctx: &'ctx super::ctx::Ctx,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> crate::Result<Self> {
+        ctx.check()?;
+        if self.fast.is_none() && self.lease.is_none() {
+            self.table = self.table.slice(offset, limit);
+            return Ok(self);
+        }
+        if self
+            ._ctx
+            .as_ref()
+            .is_some_and(|owner| !std::ptr::eq(owner.as_ref(), ctx))
+            || (self.fast.is_some() && self.lease.is_some())
+            || self
+                .fast
+                .as_ref()
+                .is_some_and(|credit| !credit.belongs_to(ctx))
+            || self
+                .lease
+                .as_ref()
+                .is_some_and(|credit| !std::sync::Arc::ptr_eq(&credit.ledger, ctx.memory()))
+        {
+            return Err(crate::Error::invalid("foreign materialized slice owner"));
+        }
+        let capacity = super::algosvc::table_capacity(&self.table)?;
+        if self
+            .fast
+            .as_ref()
+            .is_some_and(|credit| credit.bytes() < capacity)
+            || self
+                .lease
+                .as_ref()
+                .is_some_and(|credit| credit.bytes < capacity)
+        {
+            return Err(crate::Error::invalid("slice exceeds actual input credit"));
+        }
+        self.table = Self::slice_columns(ctx, self.table, offset, limit)?;
+        Ok(self)
+    }
+
+    pub(super) fn slice_paid(
+        ctx: &super::ctx::Ctx,
+        table: Table,
+        credit: &super::ctx::Charge<'_>,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> crate::Result<Table> {
+        ctx.check()?;
+        if !credit.belongs_to(ctx) || credit.bytes() < super::algosvc::table_capacity(&table)? {
+            return Err(crate::Error::invalid("slice lacks actual input credit"));
+        }
+        Self::slice_columns(ctx, table, offset, limit)
+    }
+
+    fn slice_columns(
+        ctx: &super::ctx::Ctx,
+        mut table: Table,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> crate::Result<Table> {
+        let start = offset.min(table.len);
+        let end = limit.map_or(table.len, |n| start.saturating_add(n).min(table.len));
+        for column in &mut table.cols {
+            ctx.check()?;
+            // Id is Copy. Moving to a lower address cannot grow this allocation.
+            column.copy_within(start..end, 0);
+            column.truncate(end - start);
+        }
+        table.len = end - start;
+        Ok(table)
+    }
+
     pub(super) fn project(
         mut self,
         ctx: &'ctx super::ctx::Ctx,
@@ -746,6 +823,61 @@ mod materialized_credit_tests {
         assert_eq!(ctx.live_bytes(), 320, "the operator still owns the credit");
         drop(held);
         assert_eq!(ctx.live_bytes(), 0);
+    }
+
+    #[test]
+    fn paid_slice_keeps_original_allocation_and_capacity_credit_at_limit() {
+        let store = Store::in_memory(StoreOptions::default());
+        for lease in [false, true] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = 320;
+            let mut input = paid_spare_table(&ctx);
+            input.table.cols[0].extend([Id::from_i64(1).unwrap(), Id::from_i64(2).unwrap()]);
+            input.table.len = 3;
+            let pointer = input.table.cols[0].as_ptr();
+            if lease {
+                input = input.into_lease_owned(&ctx).unwrap();
+            }
+            let output = input.slice(&ctx, 1, Some(1)).unwrap();
+            assert_eq!(output.table.cols[0], [Id::from_i64(1).unwrap()]);
+            assert_eq!(output.table.cols[0].as_ptr(), pointer);
+            assert_eq!(output.table.cols[0].capacity(), 8);
+            assert_eq!(ctx.live_bytes(), 320);
+            assert_eq!(output.lease.is_some(), lease);
+            drop(output);
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn paid_slice_preserves_zero_width_rows_and_refuses_foreign_or_cancelled_context() {
+        use std::sync::atomic::Ordering;
+        let store = Store::in_memory(StoreOptions::default());
+        let source = Ctx::new(store.snapshot());
+        let receiving = Ctx::new(store.snapshot());
+        let input = paid_spare_table(&source);
+        assert!(input.slice(&receiving, 0, Some(1)).is_err());
+        assert_eq!(source.live_bytes(), 0);
+        let input = paid_spare_table(&source);
+        source.cancel.store(true, Ordering::Release);
+        assert!(matches!(
+            input.slice(&source, 0, Some(1)),
+            Err(crate::Error::Cancelled)
+        ));
+        assert_eq!(source.live_bytes(), 0);
+        source.cancel.store(false, Ordering::Release);
+        let table = Table {
+            len: 7,
+            ..Table::default()
+        };
+        let input = Materialized::clone_fast(&source, &table).unwrap();
+        let credit = source.live_bytes();
+        let output = input.slice(&source, 3, Some(2)).unwrap();
+        assert_eq!(output.table.len, 2);
+        assert_eq!(output.table.width(), 0);
+        assert_eq!(source.live_bytes(), credit);
+        drop(output);
+        assert_eq!(source.live_bytes(), 0);
     }
 
     #[test]
