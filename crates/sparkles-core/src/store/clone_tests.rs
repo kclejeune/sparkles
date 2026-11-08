@@ -45,7 +45,7 @@ fn dump(s: &Store) -> Vec<String> {
 fn objects(s: &Store, subject: &str) -> Vec<String> {
     let q = format!("SELECT ?o {{ <{subject}> <urn:p> ?o }}");
     let r = crate::sparql::query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
-    r.rows()
+    r.test_application_rows()
         .into_iter()
         .map(|row| row.into_iter().flatten().map(|t| t.to_string()).collect())
         .collect()

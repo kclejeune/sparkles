@@ -114,8 +114,9 @@ fn filter(r: &mut Rng, depth: u32, k: &mut usize) -> (J, String) {
 
 fn ids(r: &sparkles_core::sparql::QueryResult) -> Vec<String> {
     r.rows()
-        .into_iter()
-        .filter_map(|row| match &row[0] {
+        .unwrap()
+        .iter()
+        .filter_map(|row| match &row.values()[0] {
             Some(Term::NamedNode(n)) => Some(n.as_str().to_string()),
             _ => None,
         })
@@ -215,8 +216,9 @@ fn graphql_answers_equal_sparql() {
                     sparkles_core::sparql::query(store.snapshot(), &q, &Default::default())
                         .unwrap()
                         .rows()
-                        .into_iter()
-                        .filter_map(|row| match &row[0] {
+                        .unwrap()
+                        .iter()
+                        .filter_map(|row| match &row.values()[0] {
                             Some(Term::Literal(l)) => Some(l.value().to_string()),
                             _ => None,
                         })

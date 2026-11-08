@@ -1264,6 +1264,8 @@ impl Tools<'_> {
             headers: None,
             held: None,
             grant: self.call.grant.clone(),
+
+            preparation: self.call.preparation.clone(),
         };
         let t = Tools {
             server: self.server,

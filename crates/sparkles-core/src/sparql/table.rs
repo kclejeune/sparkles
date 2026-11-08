@@ -14,6 +14,50 @@ pub struct Table {
     pub sorted: Vec<VarId>,
 }
 
+/// A read-only borrow of an immutable query result's identifiers. No Table or
+/// column allocation can be detached from this view's result lifetime.
+#[derive(Clone, Copy)]
+pub struct TableView<'a> {
+    table: &'a Table,
+}
+impl<'a> TableView<'a> {
+    pub(super) fn new(table: &'a Table) -> Self {
+        Self { table }
+    }
+    pub fn len(self) -> usize {
+        self.table.len()
+    }
+    pub fn is_empty(self) -> bool {
+        self.table.is_empty()
+    }
+    pub fn width(self) -> usize {
+        self.table.width()
+    }
+    pub fn variables(self) -> &'a [VarId] {
+        &self.table.vars
+    }
+    pub fn sorted(self) -> &'a [VarId] {
+        &self.table.sorted
+    }
+    pub fn columns(self) -> impl ExactSizeIterator<Item = &'a [Id]> {
+        self.table.cols.iter().map(Vec::as_slice)
+    }
+    pub fn column(self, index: usize) -> Option<&'a [Id]> {
+        self.table.cols.get(index).map(Vec::as_slice)
+    }
+    pub fn col_of(self, var: VarId) -> Option<usize> {
+        self.table.col_of(var)
+    }
+    pub fn get(self, row: usize, column: usize) -> Result<Id, crate::Error> {
+        self.table
+            .cols
+            .get(column)
+            .and_then(|values| values.get(row))
+            .copied()
+            .ok_or_else(|| crate::Error::invalid("query table cell is out of bounds"))
+    }
+}
+
 impl Table {
     pub fn new(vars: Vec<VarId>) -> Table {
         let cols = vars.iter().map(|_| Vec::new()).collect();
@@ -1028,6 +1072,149 @@ mod materialized_credit_tests {
         drop(hook);
         drop(source);
         drop(destination);
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+
+    #[test]
+    fn paid_append_nonempty_destination_funds_old_new_and_source_overlap() {
+        use crate::algo::memory::probe;
+        use std::{cell::Cell, rc::Rc, sync::Arc};
+        let store = Store::in_memory(StoreOptions::default());
+        for short in [false, true] {
+            let mut context = Ctx::new(store.snapshot());
+            context.mem_limit = 344 - u64::from(short);
+            let ctx = Arc::new(context);
+            let left = Table {
+                vars: vec![0],
+                cols: vec![vec![Id::from_i64(1).unwrap()]],
+                len: 1,
+                sorted: Vec::new(),
+            };
+            let right = Table {
+                vars: vec![0],
+                cols: vec![vec![Id::from_i64(2).unwrap()]],
+                len: 1,
+                sorted: Vec::new(),
+            };
+            let mut destination = Materialized::clone_fast(&ctx, &left).unwrap();
+            let source = Materialized::clone_fast(&ctx, &right).unwrap();
+            assert_eq!(ctx.live_bytes(), 328);
+            let original = destination.table.cols[0].as_ptr();
+            let source_pointer = source.table.cols[0].as_ptr();
+            let seen = Rc::new(Cell::new(0));
+            let observed = seen.clone();
+            let account = ctx.clone();
+            let hook = probe::install(
+                move |point| {
+                    if let probe::Point::Allocation("eager-column-grow", 2) = point {
+                        assert_eq!(
+                            account.live_bytes(),
+                            344,
+                            "real nonempty destination164+replacement16+source164 overlap"
+                        );
+                        observed.set(observed.get() + 1);
+                    }
+                },
+                None,
+            );
+            let result = destination.append_copy(&ctx, &source);
+            drop(hook);
+            if short {
+                assert!(
+                    matches!(result, Err(crate::Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory)
+                );
+                assert_eq!(seen.get(), 0);
+                assert_eq!(destination.table.cols[0].as_ptr(), original);
+                assert_eq!(destination.table.cols[0], left.cols[0]);
+                assert_eq!(destination.table.len, 1);
+                assert_eq!(ctx.live_bytes(), 328);
+            } else {
+                result.unwrap();
+                assert_eq!(seen.get(), 1);
+                assert_eq!(
+                    destination.table.cols[0],
+                    [Id::from_i64(1).unwrap(), Id::from_i64(2).unwrap()]
+                );
+                assert_eq!(destination.table.cols[0].capacity(), 2);
+                assert_eq!(ctx.live_bytes(), 336);
+            }
+            assert_eq!(source.table.cols[0].as_ptr(), source_pointer);
+            assert_eq!(source.table.cols[0], right.cols[0]);
+            drop(source);
+            drop(destination);
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn paid_append_cancellation_rolls_back_both_fully_and_partly_copied_columns() {
+        use crate::algo::memory::probe;
+        use std::{cell::Cell, rc::Rc, sync::Arc};
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Arc::new(Ctx::new(store.snapshot()));
+        let old = Table {
+            vars: vec![0, 1],
+            cols: vec![
+                vec![Id::from_i64(10).unwrap()],
+                vec![Id::from_i64(20).unwrap()],
+            ],
+            len: 1,
+            sorted: vec![0, 1],
+        };
+        let input = Table {
+            vars: vec![0, 1],
+            cols: vec![
+                vec![Id::from_i64(1).unwrap(); 2048],
+                vec![Id::from_i64(2).unwrap(); 2048],
+            ],
+            len: 2048,
+            sorted: Vec::new(),
+        };
+        let mut destination = Materialized::clone_fast(&ctx, &old).unwrap();
+        let source = Materialized::clone_fast(&ctx, &input).unwrap();
+        let copies = Rc::new(Cell::new(0));
+        let seen = copies.clone();
+        let cancel = ctx.cancel.clone();
+        let hook = probe::install(
+            move |point| {
+                if let probe::Point::Work("materialized-append-chunk", 1024) = point {
+                    seen.set(seen.get() + 1);
+                    if seen.get() == 3 {
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            },
+            None,
+        );
+        assert!(matches!(
+            destination.append_copy(&ctx, &source),
+            Err(crate::Error::Cancelled)
+        ));
+        drop(hook);
+        assert_eq!(
+            copies.get(),
+            3,
+            "column0 completed before column1 partially copied"
+        );
+        assert_eq!(destination.table.len, 1);
+        assert_eq!(destination.table.cols, old.cols);
+        assert_eq!(destination.table.sorted, old.sorted);
+        assert!(
+            destination
+                .table
+                .cols
+                .iter()
+                .all(|column| column.capacity() == 2049)
+        );
+        assert_eq!(source.table.cols, input.cols);
+        assert_eq!(source.table.len, 2048);
+        assert_eq!(
+            ctx.live_bytes(),
+            destination.fast.as_ref().unwrap().bytes() + source.fast.as_ref().unwrap().bytes()
+        );
+        drop(destination);
+        assert_eq!(ctx.live_bytes(), source.fast.as_ref().unwrap().bytes());
+        drop(source);
         assert_eq!(ctx.live_bytes(), 0);
     }
 

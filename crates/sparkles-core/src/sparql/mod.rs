@@ -375,58 +375,227 @@ pub struct Timing {
     pub total_ms: f64,
 }
 
+/// An opaque immutable result. Clones retain the same physical backing and
+/// original query account; they neither copy payload nor mint receiving credit.
+#[derive(Clone)]
 pub struct QueryResult {
     pub kind: QueryKind,
-    pub vars: Vec<String>,
-    /// SELECT solutions; columns in `vars` order
-    pub table: Table,
     pub boolean: bool,
-    /// CONSTRUCT and DESCRIBE: the triples of the default graph
-    pub triples: Vec<Triple>,
-    /// CONSTRUCT with Jena ARQ's `GRAPH` template blocks: the quads in named graphs
-    /// (the default graph's are in `triples`)
-    pub quads: Vec<Quad>,
-    pub plan: PlanInfo,
     pub timing: Timing,
-    /// Peak estimated memory of intermediate results and decoded graph output (see
-    /// [`QueryOptions::max_memory_bytes`]).
     pub mem_peak_bytes: u64,
-    /// Rows produced by all operators and distinct CONSTRUCT output (see
-    /// [`QueryOptions::max_rows_produced`]).
     pub rows_produced: u64,
-    /// DESCRIBE: the result stopped at [`describe::DescribeOptions::max_triples`]
     pub describe_truncated: bool,
-    pub ctx: Arc<Ctx>,
-    // Physical payload/context fields precede their actual final table credit.
+    inner: Arc<ResultBacking>,
+}
+
+struct ResultBacking {
+    variables: Option<Arc<cursor::Variables>>,
+    table: Table,
+    triples: Vec<Triple>,
+    quads: Vec<Quad>,
+    plan: PlanInfo,
+    depth: usize,
+    ctx: Arc<Ctx>,
     _table_credit: Option<table::FinalTableCredit>,
+    _graph_credit: Option<ctx::OutputCredit>,
+    _header: ctx::OutputCredit,
+}
+impl Drop for ResultBacking {
+    fn drop(&mut self) {
+        depth::with_stack(self.depth, || {
+            self.triples.clear();
+            self.quads.clear();
+            self.plan.children.clear();
+        });
+    }
+}
+
+// Mutable construction is private. Freeze cannot lend mutable owning fields to
+// callers or detach a credited payload, even when the public handle is cloned.
+struct ResultParts {
+    kind: QueryKind,
+    variables: Option<Arc<cursor::Variables>>,
+    table: Table,
+    boolean: bool,
+    triples: Vec<Triple>,
+    quads: Vec<Quad>,
+    plan: PlanInfo,
+    timing: Timing,
+    mem_peak_bytes: u64,
+    rows_produced: u64,
+    describe_truncated: bool,
+    ctx: Arc<Ctx>,
+    _table_credit: Option<table::FinalTableCredit>,
+    _graph_credit: Option<ctx::OutputCredit>,
+}
+impl ResultParts {
+    fn freeze(self) -> Result<QueryResult> {
+        let started = Instant::now();
+        fn levels(plan: &PlanInfo) -> usize {
+            stacker::maybe_grow(exec::PLAN_RED_ZONE, exec::PLAN_STACK_SEGMENT, || {
+                1 + plan.children.iter().map(levels).max().unwrap_or(0)
+            })
+        }
+        self.ctx.check()?;
+        let header = self
+            .ctx
+            .charge(cursor::arc_backing_bytes::<ResultBacking>(&self.ctx)?)?
+            .into_output(&self.ctx);
+        #[cfg(test)]
+        {
+            use crate::algo::memory::probe;
+            probe::at(probe::Point::Allocation("query-result-backing", 1));
+            if probe::fails("query-result-backing") {
+                return Err(Error::invalid("injected result backing allocation failure"));
+            }
+        }
+        let graph_depth = self
+            .triples
+            .iter()
+            .map(|t| output::term_depth(&t.object))
+            .chain(self.quads.iter().map(|q| output::term_depth(&q.object)))
+            .max()
+            .unwrap_or(0);
+        let depth = levels(&self.plan).max(graph_depth);
+        self.ctx.check()?;
+        let mut result = QueryResult {
+            kind: self.kind,
+            boolean: self.boolean,
+            timing: self.timing,
+            mem_peak_bytes: self.mem_peak_bytes.max(self.ctx.mem_peak()),
+            rows_produced: self.rows_produced,
+            describe_truncated: self.describe_truncated,
+            inner: Arc::new(ResultBacking {
+                variables: self.variables,
+                table: self.table,
+                triples: self.triples,
+                quads: self.quads,
+                plan: self.plan,
+                depth,
+                ctx: self.ctx,
+                _table_credit: self._table_credit,
+                _graph_credit: self._graph_credit,
+                _header: header,
+            }),
+        };
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        result.timing.exec_ms += elapsed;
+        result.timing.total_ms += elapsed;
+        Ok(result)
+    }
 }
 
 impl QueryResult {
-    /// Decode an id of this result into a term.
-    pub fn term(&self, id: Id) -> Option<Term> {
-        if id.is_undef() {
-            None
-        } else {
-            self.ctx.term(id)
+    // Test observability is absent from application/binding library builds.
+    #[cfg(test)]
+    pub(crate) fn test_context(&self) -> &Arc<Ctx> {
+        &self.inner.ctx
+    }
+    #[cfg(test)]
+    pub(crate) fn test_table(&self) -> &Table {
+        &self.inner.table
+    }
+    // Explicit application copies used only by semantic comparison fixtures.
+    // Ownership regressions use the actual public owner APIs, never this helper.
+    #[cfg(test)]
+    pub(crate) fn test_application_rows(&self) -> Vec<Vec<Option<Term>>> {
+        self.rows()
+            .expect("application test answer decoding")
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect()
+    }
+
+    pub fn variables(&self) -> &[String] {
+        self.inner
+            .variables
+            .as_ref()
+            .map_or(&[], |variables| &variables.names)
+    }
+    pub fn table(&self) -> table::TableView<'_> {
+        table::TableView::new(&self.inner.table)
+    }
+    pub fn triples(&self) -> &[Triple] {
+        &self.inner.triples
+    }
+    pub fn quads(&self) -> &[Quad] {
+        &self.inner.quads
+    }
+    pub fn plan(&self) -> &PlanInfo {
+        &self.inner.plan
+    }
+
+    /// Whether this query actually called an algorithm.
+    pub fn uses_algorithms(&self) -> bool {
+        self.inner.ctx.calls_algorithm()
+    }
+
+    /// Borrow query-time reasoning metadata while the actual result stays live.
+    pub fn reasoning(&self) -> Option<&reasoning::Applied> {
+        self.inner.ctx.reasoning.as_deref()
+    }
+
+    /// Decode an ID into an immutable owner of its original query credit.
+    /// New decoding checks current controls and can refuse; a previously decoded
+    /// owner can still borrow its payload after the result or query has stopped.
+    pub fn term(&self, id: Id) -> Result<Option<output::OwnedTerm>> {
+        self.output_budget().decode(id)
+    }
+
+    /// The original receiving account for explicit, independently owned copies.
+    pub fn output_budget(&self) -> output::OutputBudget {
+        output::OutputBudget::new(self.inner.ctx.clone())
+    }
+
+    /// Decode a complete SELECT row before publishing its credited owner.
+    pub fn row(&self, row: usize) -> Result<output::OwnedRow> {
+        self.inner.ctx.check()?;
+        if row >= self.inner.table.len() {
+            return Err(Error::invalid("query result row is out of bounds"));
         }
+        self.output_budget()
+            .decode_rows(1, self.inner.table.width(), |_, column| {
+                self.inner.table.get(row, column)
+            })?
+            .row_handle(0)
     }
 
     pub fn len(&self) -> usize {
         match self.kind {
-            QueryKind::Select => self.table.len(),
+            QueryKind::Select => self.inner.table.len(),
             QueryKind::Ask => 1,
-            _ => self.triples.len() + self.quads.len(),
+            _ => self.inner.triples.len() + self.inner.quads.len(),
         }
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Solutions as terms (convenience for tests / small results).
-    pub fn rows(&self) -> Vec<Vec<Option<Term>>> {
-        (0..self.table.len())
-            .map(|i| self.table.cols.iter().map(|c| self.term(c[i])).collect())
-            .collect()
+    /// Decode the complete SELECT answer under its original receiving account.
+    /// The immutable returned backing retains all cells and row shape until the
+    /// last row/cell/clone drops, including zero-width solutions.
+    pub fn rows(&self) -> Result<output::OwnedRows> {
+        self.output_budget().decode_rows(
+            self.inner.table.len(),
+            self.inner.table.width(),
+            |row, column| self.inner.table.get(row, column),
+        )
+    }
+
+    /// Decode only the selected half-open page under this actual result owner.
+    /// Unselected payloads are not copied. Bounds refuse before allocating.
+    pub fn rows_range(&self, range: std::ops::Range<usize>) -> Result<output::OwnedRows> {
+        self.inner.ctx.check()?;
+        if self.kind != QueryKind::Select
+            || range.start > range.end
+            || range.end > self.inner.table.len()
+        {
+            return Err(Error::invalid("query result SELECT range is out of bounds"));
+        }
+        self.output_budget()
+            .decode_rows(range.len(), self.inner.table.width(), |row, column| {
+                self.inner.table.get(range.start + row, column)
+            })
     }
 }
 
@@ -511,10 +680,23 @@ fn make_ctx_input(
     base: Option<&oxiri::Iri<String>>,
     source: Option<crate::store::BoundReadSource>,
 ) -> Result<Ctx> {
+    make_ctx_input_policy(snap, opts, dataset, base, source, None)
+}
+
+// Only the application root which just prepared this policy supplies the override.
+// Checked public sources retain the existing exact-policy replacement refusal.
+fn make_ctx_input_policy(
+    snap: Arc<Snapshot>,
+    opts: &QueryOptions,
+    dataset: Option<&QueryDataset>,
+    base: Option<&oxiri::Iri<String>>,
+    source: Option<crate::store::BoundReadSource>,
+    prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
+) -> Result<Ctx> {
     #[cfg(feature = "geo")]
     let op_vertices = snap.geo_op_vertices;
     let (mut ctx, graphs) = match source {
-        Some(source) => make_source_ctx(source, opts)?,
+        Some(source) => make_source_ctx_policy(source, opts, prepared_policy)?,
         None => {
             let snap = with_union_default(snap, opts);
             // Legacy guards are bound before their mask, as before.
@@ -645,9 +827,63 @@ fn make_ctx_input(
     Ok(ctx)
 }
 
+pub(crate) fn source_grant(
+    preparation: &crate::access::Preparation,
+    opts: &QueryOptions,
+) -> Result<Option<Arc<pool::PoolGrant>>> {
+    let original = preparation.grant();
+    if let Some(requested) = &opts.grant {
+        if original.is_some_and(|grant| Arc::ptr_eq(grant, requested)) {
+            return Ok(Some(requested.clone()));
+        }
+        let same_pool = original.is_some_and(|grant| Arc::ptr_eq(grant.pool(), requested.pool()));
+        let (code, reason) = if same_pool {
+            (
+                "foreign-grant",
+                sparkles_budget::ParentRefused::DifferentParent,
+            )
+        } else {
+            (
+                "foreign-domain",
+                sparkles_budget::ParentRefused::ForeignDomain,
+            )
+        };
+        return Err(Error::Component(Box::new(
+            crate::error::ComponentError::new(
+                "query-memory",
+                code,
+                "checked source retains its actual original grant",
+            )
+            .with_source(reason),
+        )));
+    }
+    if let Some(pool) = &opts.pool
+        && original.is_none_or(|grant| !Arc::ptr_eq(grant.pool(), pool))
+    {
+        return Err(Error::Component(Box::new(
+            crate::error::ComponentError::new(
+                "query-memory",
+                "foreign-domain",
+                "checked source belongs to another accounting pool",
+            )
+            .with_source(sparkles_budget::ParentRefused::ForeignDomain),
+        )));
+    }
+    Ok(original.cloned())
+}
+
+#[cfg(test)]
 fn make_source_ctx(
     source: crate::store::BoundReadSource,
     opts: &QueryOptions,
+) -> Result<(Ctx, Option<Arc<crate::access::GraphAccess>>)> {
+    make_source_ctx_policy(source, opts, None)
+}
+
+fn make_source_ctx_policy(
+    source: crate::store::BoundReadSource,
+    opts: &QueryOptions,
+    prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
 ) -> Result<(Ctx, Option<Arc<crate::access::GraphAccess>>)> {
     let deadline = opts.effective_deadline(Instant::now())?;
     let (snapshot, _, preparation) = source.query_input();
@@ -665,30 +901,10 @@ fn make_source_ctx(
         .and_then(|n| n.checked_add(4096))
         .and_then(|n| u64::try_from(n).ok())
         .ok_or_else(|| Error::invalid("checked context setup overflow"))?;
+    // Validate real grant/pool identity before reserving or allocating a new Ctx.
+    // A shared pool is not permission to relabel the source's existing parent.
+    let grant = source_grant(&preparation, opts)?;
     let setup = preparation.reserve(setup_bytes)?;
-    let grant = opts.query_grant().or_else(|| preparation.grant().cloned());
-    let domain = grant
-        .as_ref()
-        .map_or(sparkles_budget::MemoryDomain::unpooled(), |g| {
-            g.memory_domain()
-        })
-        .id();
-    let original_domain = preparation
-        .grant()
-        .map_or(sparkles_budget::MemoryDomain::unpooled(), |g| {
-            g.memory_domain()
-        })
-        .id();
-    if domain != original_domain {
-        return Err(Error::Component(Box::new(
-            crate::error::ComponentError::new(
-                "query-memory",
-                "foreign-domain",
-                "checked source belongs to another accounting domain",
-            )
-            .with_source(sparkles_budget::ParentRefused::ForeignDomain),
-        )));
-    }
     let parent = preparation.memory_parent()?;
     let mut ctx = Ctx::new(snapshot);
     ctx.read_source = Some(source);
@@ -716,9 +932,8 @@ fn make_source_ctx(
         .cloned();
     let access = match prepared_access {
         Some(access) => {
-            if opts
-                .graphs
-                .as_ref()
+            if prepared_policy
+                .or(opts.graphs.as_ref())
                 .is_some_and(|requested| !Arc::ptr_eq(requested, &access))
             {
                 return Err(Error::invalid(
@@ -978,20 +1193,45 @@ pub fn query_source(
     let started = Instant::now();
     let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
     let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let stack = depth::check_query(&parsed)?;
+    let mut result = execute_retained_source(source, &parsed, opts, parse_ms)?;
+    if result.kind == QueryKind::Select {
+        select_star_order(q, &mut result)?;
+    }
+    Ok(result)
+}
+
+/// Execute an already parsed query using a genuine physical source and the
+/// actual Store. The caller still supplies current policy and original controls;
+/// retaining a source grants no authority and cannot relabel its paid parent.
+pub fn execute_source(
+    source: crate::store::BoundReadSource,
+    store: &crate::store::Store,
+    parsed: &Query,
+    opts: &QueryOptions,
+    parse_ms: f64,
+) -> Result<QueryResult> {
+    source.validate_query_instance(store)?;
+    source.query_input().2.check()?;
+    execute_retained_source(source, parsed, opts, parse_ms)
+}
+
+fn execute_retained_source(
+    source: crate::store::BoundReadSource,
+    parsed: &Query,
+    opts: &QueryOptions,
+    parse_ms: f64,
+) -> Result<QueryResult> {
+    source.query_input().2.check()?;
+    let stack = depth::check_query(parsed)?;
     depth::with_stack(stack, || {
         let snapshot = source.query_input().0.clone();
         let start = Instant::now();
-        let prepared = prepare_query_input(snapshot, &parsed, opts, None, None, Some(source))?;
+        let prepared = prepare_query_input(snapshot, parsed, opts, None, None, Some(source))?;
         let plan_ms = start.elapsed().as_secs_f64() * 1000.0;
-        let mut result = depth::with_stack(prepared.plan_depth, || {
-            execute_prepared(&parsed, opts, parse_ms, plan_ms, prepared)
+        depth::with_stack(prepared.plan_depth, || {
+            execute_prepared(parsed, opts, parse_ms, plan_ms, prepared)
                 .map_err(|failed| failed.error)
-        })?;
-        if result.kind == QueryKind::Select {
-            select_star_order(q, &mut result);
-        }
-        Ok(result)
+        })
     })
 }
 
@@ -1021,7 +1261,7 @@ pub fn query_with_plan(
     let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let mut r = execute_query_with_plan(snap, &parsed, opts, parse_ms)?;
     if r.kind == QueryKind::Select {
-        select_star_order(q, &mut r);
+        select_star_order(q, &mut r)?;
     }
     Ok(r)
 }
@@ -1029,12 +1269,44 @@ pub fn query_with_plan(
 /// `SELECT *`: spargebra projects variables in sorted order; Jena (and users) expect the
 /// order of first appearance in the query text. [`query`] applies this; callers of
 /// [`execute_query`] apply it themselves.
-pub fn select_star_order(q: &str, r: &mut QueryResult) {
-    let Some(mut order) = select_star_columns(q, &r.vars) else {
-        return;
+pub fn select_star_order(q: &str, r: &mut QueryResult) -> Result<()> {
+    r.inner.ctx.check()?;
+    if !is_select_star(q) {
+        return Ok(());
+    }
+    if Arc::strong_count(&r.inner) != 1
+        || r.inner
+            .variables
+            .as_ref()
+            .is_some_and(|variables| Arc::strong_count(variables) != 1)
+    {
+        return Err(Error::invalid("cannot reorder a shared query result"));
+    }
+    let started = Instant::now();
+    let names = r.variables();
+    let longest = names.iter().map(String::len).max().unwrap_or(0);
+    let bytes = names
+        .len()
+        .checked_mul(3 * std::mem::size_of::<usize>())
+        .and_then(|bytes| longest.checked_add(64)?.checked_mul(4)?.checked_add(bytes))
+        .and_then(|bytes| bytes.checked_add(256))
+        .ok_or_else(|| r.inner.ctx.memory_exceeded(u64::MAX))?;
+    let context = r.inner.ctx.clone();
+    let _workspace =
+        context.charge(u64::try_from(bytes).map_err(|_| context.memory_exceeded(u64::MAX))?)?;
+    let Some(mut order) = select_star_columns_checked(q, names, || r.inner.ctx.check())? else {
+        return Ok(());
     };
-    // Reorder the already paid backing in place; no replacement columns or
-    // variable-name copies can escape its credit during final presentation.
+    r.inner.ctx.check()?;
+    // No fallible operation remains once the first visible permutation starts.
+    let backing = Arc::get_mut(&mut r.inner).expect("unique query result");
+    let variables = backing
+        .variables
+        .as_mut()
+        .map(|variables| Arc::get_mut(variables).expect("unique query variables"));
+    let Some(variables) = variables else {
+        return Ok(());
+    };
     for first in 0..order.len() {
         let mut at = first;
         while order[at] != at {
@@ -1043,20 +1315,34 @@ pub fn select_star_order(q: &str, r: &mut QueryResult) {
             if next == first {
                 break;
             }
-            r.vars.swap(at, next);
-            r.table.vars.swap(at, next);
-            r.table.cols.swap(at, next);
+            variables.names.swap(at, next);
+            variables.ids.swap(at, next);
+            backing.table.vars.swap(at, next);
+            backing.table.cols.swap(at, next);
             at = next;
         }
     }
+    r.mem_peak_bytes = r.mem_peak_bytes.max(context.mem_peak());
+    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+    r.timing.exec_ms += elapsed;
+    r.timing.total_ms += elapsed;
+    Ok(())
 }
 
-fn select_star_columns(q: &str, vars: &[String]) -> Option<Vec<usize>> {
+fn is_select_star(q: &str) -> bool {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE
-        .get_or_init(|| regex::Regex::new(r"(?is)\bselect\s+(distinct\s+|reduced\s+)?\*").unwrap());
-    if !re.is_match(q) {
-        return None;
+    RE.get_or_init(|| regex::Regex::new(r"(?is)\bselect\s+(distinct\s+|reduced\s+)?\*").unwrap())
+        .is_match(q)
+}
+
+fn select_star_columns_checked(
+    q: &str,
+    vars: &[String],
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<Option<Vec<usize>>> {
+    check()?;
+    if !is_select_star(q) {
+        return Ok(None);
     }
     let pos = |v: &str| {
         [format!("?{v}"), format!("${v}")]
@@ -1072,13 +1358,29 @@ fn select_star_columns(q: &str, vars: &[String]) -> Option<Vec<usize>> {
             .unwrap_or(usize::MAX)
     };
     let mut order: Vec<usize> = (0..vars.len()).collect();
+    let mut failure = None;
+    let mut position = |&i: &usize| {
+        if failure.is_some() {
+            return usize::MAX;
+        }
+        match check() {
+            Ok(()) => pos(&vars[i]),
+            Err(error) => {
+                failure = Some(error);
+                usize::MAX
+            }
+        }
+    };
     if vars.len() <= 16 {
-        order.sort_by_key(|&i| pos(&vars[i]));
+        order.sort_by_key(&mut position);
     } else {
-        // each position once, since finding one reads the query text
-        order.sort_by_cached_key(|&i| pos(&vars[i]));
+        order.sort_by_cached_key(&mut position);
     }
-    Some(order)
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    check()?;
+    Ok(Some(order))
 }
 
 pub fn execute_query(
@@ -1264,6 +1566,18 @@ fn execute_prepared(
     plan_ms: f64,
     prepared: PreparedQuery,
 ) -> std::result::Result<QueryResult, Box<Failed>> {
+    execute_prepared_parts(parsed, opts, parse_ms, plan_ms, prepared)?
+        .freeze()
+        .map_err(|error| Box::new(Failed { error, plan: None }))
+}
+
+fn execute_prepared_parts(
+    parsed: &Query,
+    opts: &QueryOptions,
+    parse_ms: f64,
+    plan_ms: f64,
+    prepared: PreparedQuery,
+) -> std::result::Result<ResultParts, Box<Failed>> {
     let PreparedQuery {
         ctx,
         mut node,
@@ -1302,9 +1616,9 @@ fn execute_prepared(
     if ctx.graphs.is_some() {
         plan.redact();
     }
-    let mut result = QueryResult {
+    let mut result = ResultParts {
         kind,
-        vars: Vec::new(),
+        variables: None,
         table: Table::default(),
         boolean: false,
         triples: Vec::new(),
@@ -1316,25 +1630,18 @@ fn execute_prepared(
         describe_truncated: false,
         ctx: ctx.clone(),
         _table_credit: None,
+        _graph_credit: None,
     };
     match parsed {
         Query::Select { .. } => {
-            let vars: Vec<table::VarId> = match &pattern {
-                GraphPattern::Project { variables, .. } => {
-                    variables.iter().map(|v| ctx.var(v.as_str())).collect()
-                }
-                GraphPattern::Distinct { inner }
-                | GraphPattern::Reduced { inner }
-                | GraphPattern::Slice { inner, .. } => {
-                    project_vars(inner, &ctx).unwrap_or_else(|| materialized.table.vars.clone())
-                }
-                _ => materialized.table.vars.clone(),
-            };
-            result.vars = vars.iter().map(|v| ctx.var_name(*v)).collect();
+            let variables = cursor::Variables::new(&ctx, &pattern, &materialized.table.vars, "")
+                .map_err(|error| failed(error, None, None))?;
+            let vars = &variables.ids;
             let retained = materialized
                 .project(&ctx, &vars)
                 .and_then(|output| output.into_retained(&ctx))
                 .map_err(|error| failed(error, None, None))?;
+            result.variables = Some(variables);
             result.table = retained.table;
             result._table_credit = retained.credit;
             // substituted variables report their bound value
@@ -1356,7 +1663,11 @@ fn execute_prepared(
             let stage = Instant::now();
             let where_plan = std::mem::take(&mut result.plan);
             match construct(&ctx, &materialized.table, template, graph_templates) {
-                Ok(t) => (result.triples, result.quads) = t,
+                Ok((triples, quads, credit)) => {
+                    result.triples = triples;
+                    result.quads = quads;
+                    result._graph_credit = Some(credit);
+                }
                 Err(e) => return Err(failed(e, Some(where_plan), Some(stage))),
             }
             result.plan = graph_root(kind, where_plan, stage);
@@ -1375,8 +1686,13 @@ fn execute_prepared(
                 Ok(d) => d,
                 Err(e) => return Err(failed(e, Some(where_plan), Some(stage))),
             };
-            result.triples = d.triples;
             result.describe_truncated = d.truncated;
+            let (triples, credit) = match d.into_output(&ctx) {
+                Ok(output) => output,
+                Err(e) => return Err(failed(e, Some(where_plan), Some(stage))),
+            };
+            result.triples = triples;
+            result._graph_credit = Some(credit);
             result.plan = graph_root(kind, where_plan, stage);
             result.plan.actual_rows = result.triples.len() as i64;
             result.plan.warnings = ctx.warnings();
@@ -1398,17 +1714,18 @@ fn execute_prepared(
     }
     // The operators' state goes with the plan, so the pool keeps only what the result
     // holds. The plan's retained charges, such as an EXISTS memo or key set, are
-    // released before the shrink, which they would otherwise keep. A graph result's
-    // triples are not measured, and it keeps its query's highest estimate as before.
-    // Decoding the result reserves its envelope again when the budget allows.
+    // released before the shrink, which they would otherwise keep. Graph payloads
+    // retain their original physical output credit rather than the query's peak.
     drop(node);
     ctx.release_work();
-    if matches!(kind, QueryKind::Select | QueryKind::Ask)
-        && let Err(error) = ctx.shrink_retained(if result._table_credit.is_some() {
-            0
-        } else {
-            result.table.capacity_bytes()
-        })
+    if (matches!(kind, QueryKind::Select | QueryKind::Ask) || result._graph_credit.is_some())
+        && let Err(error) = ctx.shrink_retained(
+            if result._table_credit.is_some() || result._graph_credit.is_some() {
+                0
+            } else {
+                result.table.capacity_bytes()
+            },
+        )
     {
         return Err(Box::new(Failed {
             error,
@@ -1440,18 +1757,6 @@ fn graph_root(kind: QueryKind, mut where_plan: PlanInfo, stage: Instant) -> Plan
         }),
         children: vec![where_plan],
         ..Default::default()
-    }
-}
-
-fn project_vars(gp: &GraphPattern, ctx: &Ctx) -> Option<Vec<table::VarId>> {
-    match gp {
-        GraphPattern::Project { variables, .. } => {
-            Some(variables.iter().map(|v| ctx.var(v.as_str())).collect())
-        }
-        GraphPattern::Distinct { inner }
-        | GraphPattern::Reduced { inner }
-        | GraphPattern::Slice { inner, .. } => project_vars(inner, ctx),
-        _ => None,
     }
 }
 
@@ -1551,92 +1856,252 @@ pub fn instantiate(
 /// blank node, gives nothing for that solution; `urn:x-arq:DefaultGraph` and
 /// `urn:x-arq:DefaultGraphNode` name the default graph. Blank nodes, the graph names'
 /// included, are fresh per solution.
-fn construct(
+// Physical output containers precede their guard on every error and final drop.
+struct Constructed<'a> {
+    triples: Vec<Triple>,
+    quads: Vec<Quad>,
+    seen: FxHashSet<Triple>,
+    seen_quads: FxHashSet<Quad>,
+    seen_storage: u64,
+    quad_storage: u64,
+    credit: Option<ctx::Charge<'a>>,
+}
+impl Drop for Constructed<'_> {
+    fn drop(&mut self) {
+        let depth = self
+            .triples
+            .iter()
+            .map(|t| output::term_depth(&t.object))
+            .chain(self.quads.iter().map(|q| output::term_depth(&q.object)))
+            .chain(self.seen.iter().map(|t| output::term_depth(&t.object)))
+            .chain(
+                self.seen_quads
+                    .iter()
+                    .map(|q| output::term_depth(&q.object)),
+            )
+            .max()
+            .unwrap_or(0);
+        depth::with_stack(depth, || {
+            self.triples.clear();
+            self.quads.clear();
+            self.seen.clear();
+            self.seen_quads.clear();
+        });
+    }
+}
+
+// Admit replacement storage while old and new allocations may coexist. The old
+// envelope is released only after reserve has freed the previous allocation.
+fn graph_vec_room<T>(ctx: &Ctx, held: &ctx::Charge<'_>, values: &mut Vec<T>) -> Result<()> {
+    if values.len() < values.capacity() {
+        return Ok(());
+    }
+    let old = values.capacity();
+    let cap = old.checked_mul(2).unwrap_or(usize::MAX).max(4);
+    let bytes = cap
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|n| u64::try_from(n).ok())
+        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+    held.add(bytes)?;
+    values
+        .try_reserve_exact(cap - values.len())
+        .map_err(|_| ctx.memory_exceeded(bytes))?;
+    if values.capacity() > cap {
+        return Err(Error::invalid("graph allocation exceeds admission"));
+    }
+    held.resize(held.bytes() - (old * std::mem::size_of::<T>()) as u64)?;
+    Ok(())
+}
+fn graph_set_room<T: std::hash::Hash + Eq>(
     ctx: &Ctx,
+    held: &ctx::Charge<'_>,
+    values: &mut FxHashSet<T>,
+    storage: &mut u64,
+) -> Result<()> {
+    if values.len() < values.capacity() {
+        return Ok(());
+    }
+    let slots = values
+        .len()
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(8))
+        .and_then(usize::checked_next_power_of_two)
+        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+    let bytes = slots
+        .checked_mul(std::mem::size_of::<T>() + std::mem::align_of::<T>() + 1)
+        .and_then(|n| n.checked_add(128))
+        .and_then(|n| u64::try_from(n).ok())
+        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+    held.add(bytes)?;
+    values
+        .try_reserve(1)
+        .map_err(|_| ctx.memory_exceeded(bytes))?;
+    if values.capacity() > slots {
+        return Err(Error::invalid("graph set exceeds admission"));
+    }
+    held.resize(held.bytes() - *storage)?;
+    *storage = bytes;
+    Ok(())
+}
+
+fn construct(
+    ctx: &Arc<Ctx>,
     t: &Table,
     template: &[TriplePattern],
     graphs: &[GraphTemplate],
-) -> Result<(Vec<Triple>, Vec<Quad>)> {
+) -> Result<(Vec<Triple>, Vec<Quad>, ctx::OutputCredit)> {
     ctx.check()?;
-    // The WHERE table stays live while decoded graph terms and their duplicate
-    // sets are built. Unlike ID tables, giant literals need their lexical bytes
-    // counted, and a template can emit many graph rows per input solution.
-    let held = ctx.charge(t.mem_bytes())?;
+    let map_bytes = ctx
+        .nvars()
+        .checked_mul(std::mem::size_of::<Option<usize>>())
+        .and_then(|n| u64::try_from(n).ok())
+        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+    let _map_credit = ctx.charge(map_bytes)?;
     let map = t.var_map(ctx.nvars());
-    let mut seen = FxHashSet::default();
-    let mut out = Vec::new();
-    let mut seen_quads = FxHashSet::default();
-    let mut quads = Vec::new();
-    let emit = |tr: Triple,
-                out: &mut Vec<Triple>,
-                seen: &mut FxHashSet<Triple>,
-                other: usize|
-     -> Result<()> {
-        if !seen.contains(&tr) {
-            ctx.check_rows(out.len().saturating_add(other).saturating_add(1))?;
-            ctx.produced(1)?;
-            // Two retained copies (output and set), plus container overhead.
-            held.add(graph_triple_bytes(&tr).saturating_mul(2).saturating_add(64))?;
-            seen.insert(tr.clone());
-            out.push(tr);
-        }
-        Ok(())
+    let mut out = Constructed {
+        triples: Vec::new(),
+        quads: Vec::new(),
+        seen: FxHashSet::default(),
+        seen_quads: FxHashSet::default(),
+        seen_storage: 0,
+        quad_storage: 0,
+        credit: Some(ctx.charge(0)?),
     };
     let mut work = 0usize;
     for i in 0..t.len() {
-        construct_row(ctx, t, &map, i, template, graphs, &mut work, &mut |q| {
-            if q.graph_name == GraphName::DefaultGraph {
-                emit(
-                    Triple::new(q.subject, q.predicate, q.object),
-                    &mut out,
-                    &mut seen,
-                    quads.len(),
-                )?;
-            } else if !seen_quads.contains(&q) {
-                ctx.check_rows(out.len().saturating_add(quads.len()).saturating_add(1))?;
-                ctx.produced(1)?;
-                held.add(graph_quad_bytes(&q).saturating_mul(2).saturating_add(64))?;
-                seen_quads.insert(q.clone());
-                quads.push(q);
-            }
-            Ok(())
-        })?;
+        construct_row(
+            ctx,
+            t,
+            &map,
+            i,
+            template,
+            graphs,
+            &mut work,
+            &mut |q, incoming| {
+                let held = out.credit.as_ref().expect("live graph credit");
+                if q.graph_name == GraphName::DefaultGraph {
+                    let tr = Triple::new(q.subject, q.predicate, q.object);
+                    if out.seen.contains(&tr) {
+                        return Ok(());
+                    }
+                    ctx.check_rows(
+                        out.triples
+                            .len()
+                            .saturating_add(out.quads.len())
+                            .saturating_add(1),
+                    )?;
+                    ctx.produced(1)?;
+                    held.adopt_charge(incoming)?;
+                    // Incoming lexical ownership is moved, not decoded or charged again.
+                    // Only the genuinely additional dedup copy is admitted here.
+                    held.add(graph_triple_bytes(&tr))?;
+                    graph_set_room(ctx, held, &mut out.seen, &mut out.seen_storage)?;
+                    graph_vec_room(ctx, held, &mut out.triples)?;
+                    out.seen.insert(tr.clone());
+                    out.triples.push(tr);
+                } else if !out.seen_quads.contains(&q) {
+                    ctx.check_rows(
+                        out.triples
+                            .len()
+                            .saturating_add(out.quads.len())
+                            .saturating_add(1),
+                    )?;
+                    ctx.produced(1)?;
+                    held.adopt_charge(incoming)?;
+                    held.add(graph_quad_bytes(&q))?;
+                    graph_set_room(ctx, held, &mut out.seen_quads, &mut out.quad_storage)?;
+                    graph_vec_room(ctx, held, &mut out.quads)?;
+                    out.seen_quads.insert(q.clone());
+                    out.quads.push(q);
+                }
+                Ok(())
+            },
+        )?;
     }
     ctx.check()?;
-    Ok((out, quads))
+    // Dispose traversal/dedup scratch before reconciling original admission down.
+    out.seen = FxHashSet::default();
+    out.seen_quads = FxHashSet::default();
+    let retained = out.triples.iter().try_fold(
+        (out.triples.capacity() as u64)
+            .checked_mul(std::mem::size_of::<Triple>() as u64)
+            .and_then(|n| {
+                n.checked_add(
+                    (out.quads.capacity() as u64).checked_mul(std::mem::size_of::<Quad>() as u64)?,
+                )
+            })
+            .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?,
+        |n, t| {
+            n.checked_add(graph_triple_bytes(t))
+                .ok_or_else(|| ctx.memory_exceeded(u64::MAX))
+        },
+    )?;
+    let retained = out.quads.iter().try_fold(retained, |n, q| {
+        n.checked_add(graph_quad_bytes(q))
+            .ok_or_else(|| ctx.memory_exceeded(u64::MAX))
+    })?;
+    let held = out.credit.as_ref().expect("live graph credit");
+    if retained > held.bytes() {
+        return Err(Error::invalid("construct exceeds original admission"));
+    }
+    held.resize(retained)?;
+    ctx.check()?;
+    let credit = out
+        .credit
+        .take()
+        .expect("validated graph credit")
+        .into_output(ctx);
+    Ok((
+        std::mem::take(&mut out.triples),
+        std::mem::take(&mut out.quads),
+        credit,
+    ))
 }
 
-/// The eager and pull graph APIs share template instantiation and per-solution
-/// blank-node identity. The emitter owns global deduplication and its budget.
+// Template blank-node identities are row work, not retained output. Their actual
+// map allocation precedes its guard on drop; emitted clones have separate credit.
+struct ConstructRow<'a> {
+    bnodes: FxHashMap<String, BlankNode>,
+    storage: u64,
+    held: ctx::Charge<'a>,
+}
+
+/// Shared eager/cursor instantiation hands the emitter each quad together with
+/// its preallocation guard. No emitter may retain the payload without adopting it.
 #[allow(clippy::too_many_arguments)]
-fn construct_row(
-    ctx: &Ctx,
+fn construct_row<'a>(
+    ctx: &'a Ctx,
     t: &Table,
     map: &[Option<usize>],
     row: usize,
     template: &[TriplePattern],
     graphs: &[GraphTemplate],
     work: &mut usize,
-    emit: &mut dyn FnMut(Quad) -> Result<()>,
+    emit: &mut dyn FnMut(Quad, &mut Option<ctx::Charge<'a>>) -> Result<()>,
 ) -> Result<()> {
-    let mut check = || -> Result<()> {
+    let mut check = || {
         *work = work.wrapping_add(1);
-        if *work & 1023 == 0 {
-            ctx.check()?;
-        }
-        Ok(())
+        ctx.check()
     };
     check()?;
-    let mut bnodes: FxHashMap<String, BlankNode> = FxHashMap::default();
+    let mut state = ConstructRow {
+        bnodes: FxHashMap::default(),
+        storage: 0,
+        held: ctx.charge(0)?,
+    };
     for tp in template {
         check()?;
-        if let Some(triple) = template_triple(ctx, t, map, row, tp, &mut bnodes)? {
-            emit(triple.in_graph(GraphName::DefaultGraph))?;
+        let mut held = Some(ctx.charge(0)?);
+        if let Some(triple) =
+            template_triple(ctx, t, map, row, tp, &mut state, held.as_ref().unwrap())?
+        {
+            emit(triple.in_graph(GraphName::DefaultGraph), &mut held)?;
         }
     }
     for graph in graphs {
         check()?;
-        let name = match template_term(ctx, t, map, row, &graph.name, &mut bnodes)? {
+        let name_credit = ctx.charge(0)?;
+        let name = match template_term(ctx, t, map, row, &graph.name, &mut state, &name_credit)? {
             Some(Term::NamedNode(n))
                 if n.as_str() == ctx::DEFAULT_GRAPH_IRI
                     || n.as_str() == ctx::DEFAULT_GRAPH_NODE_IRI =>
@@ -1649,72 +2114,153 @@ fn construct_row(
         };
         for tp in &graph.triples {
             check()?;
-            if let Some(triple) = template_triple(ctx, t, map, row, tp, &mut bnodes)? {
-                emit(triple.in_graph(name.clone()))?;
+            let mut held = Some(ctx.charge(0)?);
+            if let Some(triple) =
+                template_triple(ctx, t, map, row, tp, &mut state, held.as_ref().unwrap())?
+            {
+                let bytes = match &name {
+                    GraphName::NamedNode(n) => n.as_str().len() as u64 + 64,
+                    GraphName::BlankNode(b) => b.as_str().len() as u64 + 64,
+                    GraphName::DefaultGraph => 0,
+                };
+                held.as_ref().unwrap().add(bytes)?;
+                emit(triple.in_graph(name.clone()), &mut held)?;
             }
         }
     }
     Ok(())
 }
 
+fn graph_allocation(ctx: &Ctx, label: &'static str) -> Result<()> {
+    #[cfg(test)]
+    {
+        use crate::algo::memory::probe;
+        probe::at(probe::Point::Allocation(label, 1));
+        if probe::fails(label) {
+            return Err(Error::invalid("injected construct allocation failure"));
+        }
+    }
+    #[cfg(not(test))]
+    let _ = label;
+    ctx.check()
+}
+
+fn template_variable(
+    ctx: &Ctx,
+    t: &Table,
+    map: &[Option<usize>],
+    row: usize,
+    name: &str,
+    held: &ctx::Charge<'_>,
+) -> Result<Option<Term>> {
+    // Release the name read lock before accounting or any callback can reenter.
+    let var = { ctx.var_names.read().iter().position(|v| v == name) };
+    let Some(col) = var.and_then(|v| map.get(v).copied().flatten()) else {
+        return Ok(None);
+    };
+    let id = t.cols[col][row];
+    if id.is_undef() {
+        return Ok(None);
+    }
+    held.add(ctx.decoded_bytes(id)?)?;
+    graph_allocation(ctx, "construct-decode")?;
+    ctx.reserved_batch_term(id)
+}
+#[allow(clippy::too_many_arguments)]
 fn template_term(
     ctx: &Ctx,
     t: &Table,
     map: &[Option<usize>],
     row: usize,
     tp: &TermPattern,
-    bnodes: &mut FxHashMap<String, BlankNode>,
+    state: &mut ConstructRow<'_>,
+    held: &ctx::Charge<'_>,
 ) -> Result<Option<Term>> {
-    let mut failure = None;
-    let term = instantiate(
-        tp,
-        &mut |v| {
-            let c = map.get(ctx.var(v) as usize).copied().flatten()?;
-            let id = t.cols[c][row];
-            if id.is_undef() {
-                None
-            } else {
-                match ctx.batch_term(id) {
-                    Ok(term) => term,
-                    Err(error) => {
-                        failure = Some(error);
-                        None
-                    }
-                }
+    ctx.check()?;
+    stacker::maybe_grow(exec::PLAN_RED_ZONE, exec::PLAN_STACK_SEGMENT, || {
+        Ok(Some(match tp {
+            TermPattern::Variable(v) => {
+                return template_variable(ctx, t, map, row, v.as_str(), held);
             }
-        },
-        &mut |b| {
-            Term::BlankNode(
-                bnodes
-                    .entry(b.to_owned())
-                    .or_insert_with(|| crate::store::bnode_for(ctx.fresh_bnode()))
-                    .clone(),
-            )
-        },
-    );
-    if let Some(error) = failure {
-        Err(error)
-    } else {
-        Ok(term)
-    }
+            TermPattern::NamedNode(n) => {
+                held.add(n.as_str().len() as u64 + 64)?;
+                Term::NamedNode(n.clone())
+            }
+            TermPattern::Literal(l) => {
+                held.add(
+                    (l.value().len() as u64)
+                        .checked_add(l.datatype().as_str().len() as u64)
+                        .and_then(|n| n.checked_add(l.language().map_or(0, |s| s.len() as u64)))
+                        .and_then(|n| n.checked_add(64))
+                        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?,
+                )?;
+                graph_allocation(ctx, "construct-literal")?;
+                Term::Literal(l.clone())
+            }
+            TermPattern::BlankNode(b) => {
+                if !state.bnodes.contains_key(b.as_str()) {
+                    state.held.add(b.as_str().len() as u64 + 128)?;
+                    if state.bnodes.len() == state.bnodes.capacity() {
+                        let slots = state
+                            .bnodes
+                            .len()
+                            .checked_add(1)
+                            .and_then(|n| n.checked_mul(8))
+                            .and_then(usize::checked_next_power_of_two)
+                            .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+                        let bytes = (slots as u64)
+                            .checked_mul((std::mem::size_of::<(String, BlankNode)>() + 16) as u64)
+                            .and_then(|n| n.checked_add(128))
+                            .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+                        state.held.add(bytes)?;
+                        state
+                            .bnodes
+                            .try_reserve(1)
+                            .map_err(|_| ctx.memory_exceeded(bytes))?;
+                        if state.bnodes.capacity() > slots {
+                            return Err(Error::invalid("blank node map exceeds admission"));
+                        }
+                        state.held.resize(state.held.bytes() - state.storage)?;
+                        state.storage = bytes;
+                    }
+                    state.bnodes.insert(
+                        b.as_str().to_owned(),
+                        crate::store::bnode_for(ctx.fresh_bnode()),
+                    );
+                }
+                let node = state.bnodes.get(b.as_str()).expect("row blank node");
+                held.add(node.as_str().len() as u64 + 64)?;
+                Term::BlankNode(node.clone())
+            }
+            TermPattern::Triple(triple) => {
+                let Some(value) = template_triple(ctx, t, map, row, triple, state, held)? else {
+                    return Ok(None);
+                };
+                held.add(std::mem::size_of::<Triple>() as u64 + 64)?;
+                Term::Triple(Box::new(value))
+            }
+        }))
+    })
 }
-
+#[allow(clippy::too_many_arguments)]
 fn template_triple(
     ctx: &Ctx,
     t: &Table,
     map: &[Option<usize>],
     row: usize,
     tp: &TriplePattern,
-    bnodes: &mut FxHashMap<String, BlankNode>,
+    state: &mut ConstructRow<'_>,
+    held: &ctx::Charge<'_>,
 ) -> Result<Option<Triple>> {
-    let s = template_term(ctx, t, map, row, &tp.subject, bnodes)?;
+    let s = template_term(ctx, t, map, row, &tp.subject, state, held)?;
     let p = match &tp.predicate {
-        NamedNodePattern::NamedNode(n) => Some(Term::NamedNode(n.clone())),
-        NamedNodePattern::Variable(v) => {
-            template_term(ctx, t, map, row, &TermPattern::Variable(v.clone()), bnodes)?
+        NamedNodePattern::NamedNode(n) => {
+            held.add(n.as_str().len() as u64 + 64)?;
+            Some(Term::NamedNode(n.clone()))
         }
+        NamedNodePattern::Variable(v) => template_variable(ctx, t, map, row, v.as_str(), held)?,
     };
-    let o = template_term(ctx, t, map, row, &tp.object, bnodes)?;
+    let o = template_term(ctx, t, map, row, &tp.object, state, held)?;
     let (Some(s), Some(Term::NamedNode(p)), Some(o)) = (s, p, o) else {
         return Ok(None);
     };
@@ -1738,18 +2284,33 @@ fn graph_quad_bytes(q: &Quad) -> u64 {
 }
 
 /// Conservative retained term estimate, using borrowed terms without cloning.
-fn graph_term_bytes(t: oxrdf::TermRef<'_>) -> u64 {
+fn graph_term_bytes(mut t: oxrdf::TermRef<'_>) -> u64 {
     use oxrdf::TermRef;
-    let payload = match t {
-        TermRef::NamedNode(n) => n.as_str().len() as u64,
-        TermRef::BlankNode(b) => b.as_str().len() as u64,
-        TermRef::Literal(l) => (l.value().len() as u64)
-            .saturating_add(l.datatype().as_str().len() as u64)
-            .saturating_add(l.language().map_or(0, |s| s.len() as u64)),
-        TermRef::Triple(t) => graph_triple_bytes(t),
-    };
-    64u64.saturating_add(payload)
+    let mut bytes = 0u64;
+    loop {
+        let payload = match t {
+            TermRef::NamedNode(n) => n.as_str().len() as u64,
+            TermRef::BlankNode(b) => b.as_str().len() as u64,
+            TermRef::Literal(l) => (l.value().len() as u64)
+                .saturating_add(l.datatype().as_str().len() as u64)
+                .saturating_add(l.language().map_or(0, |s| s.len() as u64)),
+            TermRef::Triple(triple) => {
+                let subject = match &triple.subject {
+                    NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+                    NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+                };
+                bytes = bytes
+                    .saturating_add(192)
+                    .saturating_add(subject as u64)
+                    .saturating_add(triple.predicate.as_str().len() as u64);
+                t = triple.object.as_ref();
+                continue;
+            }
+        };
+        return bytes.saturating_add(64).saturating_add(payload);
+    }
 }
+
 fn graph_triple_bytes(t: &Triple) -> u64 {
     graph_term_bytes(t.subject.as_ref().into())
         .saturating_add(graph_term_bytes(t.predicate.as_ref().into()))
@@ -1778,6 +2339,8 @@ mod joinorder_tests;
 mod keyprobe_tests;
 #[cfg(test)]
 mod opt_tests;
+#[cfg(test)]
+mod page_ownership_tests;
 #[cfg(test)]
 mod pattern_tests;
 #[cfg(test)]
@@ -1815,10 +2378,10 @@ mod paid_final_table_tests {
             },
         )
         .unwrap();
-        let bytes = algosvc::table_capacity(&result.table).unwrap();
-        assert_eq!(result.table.cols, [vec![Id::UNDEF]]);
+        let bytes = algosvc::table_capacity(&result.test_table()).unwrap();
+        assert_eq!(result.test_table().cols, [vec![Id::UNDEF]]);
         assert!(
-            result.ctx.live_bytes() >= bytes,
+            result.test_context().live_bytes() >= bytes,
             "returned SELECT must retain actual table credit"
         );
         query_memory::LEDGER_OPS.with(|n| {
@@ -1828,7 +2391,7 @@ mod paid_final_table_tests {
                 "ordinary prepared output stays on its fast account"
             )
         });
-        let owner = Arc::downgrade(&result.ctx);
+        let owner = Arc::downgrade(&result.test_context());
         drop(store);
         assert!(owner.upgrade().is_some());
         assert!(grant.used() >= bytes);
@@ -1840,3 +2403,274 @@ mod paid_final_table_tests {
 
 #[cfg(test)]
 pub(crate) mod checked_source_tests;
+
+#[cfg(test)]
+mod result_backing_tests {
+    use super::*;
+    use crate::algo::memory::probe;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn context(limit: u64) -> Arc<Ctx> {
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = limit;
+        Arc::new(ctx)
+    }
+    fn parts(ctx: Arc<Ctx>) -> ResultParts {
+        ResultParts {
+            kind: QueryKind::Ask,
+            variables: None,
+            table: Table::default(),
+            boolean: true,
+            triples: Vec::new(),
+            quads: Vec::new(),
+            plan: PlanInfo::default(),
+            timing: Timing::default(),
+            mem_peak_bytes: 0,
+            rows_produced: 0,
+            describe_truncated: false,
+            ctx,
+            _table_credit: None,
+            _graph_credit: None,
+        }
+    }
+
+    #[test]
+    fn immutable_result_header_admits_before_allocation_and_clones_keep_fast_credit() {
+        let ctx = context(u64::MAX);
+        let bytes = cursor::arc_backing_bytes::<ResultBacking>(&ctx).unwrap();
+        drop(ctx);
+        for exact in [false, true] {
+            let ctx = context(bytes - u64::from(!exact));
+            let allocations = Arc::new(AtomicUsize::new(0));
+            let observed = allocations.clone();
+            let hook = probe::install(
+                move |point| {
+                    if let probe::Point::Allocation("query-result-backing", 1) = point {
+                        observed.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
+                None,
+            );
+            query_memory::LEDGER_OPS.with(|counter| counter.set(0));
+            let result = parts(ctx.clone()).freeze();
+            drop(hook);
+            assert_eq!(query_memory::LEDGER_OPS.with(|counter| counter.get()), 0);
+            if exact {
+                let result = result.unwrap();
+                assert_eq!(allocations.load(Ordering::Relaxed), 1);
+                assert_eq!(ctx.live_bytes(), bytes);
+                let clone = result.clone();
+                assert!(Arc::ptr_eq(&result.inner, &clone.inner));
+                drop(result);
+                assert_eq!(ctx.live_bytes(), bytes);
+                assert!(clone.boolean && clone.variables().is_empty());
+                drop(clone);
+            } else {
+                assert!(
+                    matches!(result, Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory)
+                );
+                assert_eq!(allocations.load(Ordering::Relaxed), 0);
+            }
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn immutable_result_header_allocation_failure_and_late_cancel_publish_nothing() {
+        for cancelled in [false, true] {
+            let ctx = context(4096);
+            let flag = ctx.cancel.clone();
+            let hook = probe::install(
+                move |point| {
+                    if cancelled && let probe::Point::Allocation("query-result-backing", 1) = point
+                    {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                },
+                (!cancelled).then_some("query-result-backing"),
+            );
+            let result = parts(ctx.clone()).freeze();
+            drop(hook);
+            if cancelled {
+                assert!(matches!(result, Err(Error::Cancelled)));
+            } else {
+                assert!(matches!(result, Err(Error::Invalid(_))));
+            }
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn checked_presentation_refuses_shared_result_without_copying_or_partial_reorder() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut result = query(
+            store.snapshot(),
+            "SELECT ?a ?z WHERE { VALUES (?a ?z) { (1 2) } }",
+            &Default::default(),
+        )
+        .unwrap();
+        let clone = result.clone();
+        let names = result.variables().to_vec();
+        let ctx = result.inner.ctx.clone();
+        let before = ctx.live_bytes();
+        assert!(matches!(
+            select_star_order("SELECT * WHERE { VALUES (?z ?a) { (2 1) } }", &mut result),
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(result.variables(), names);
+        assert_eq!(clone.variables(), names);
+        assert_eq!(ctx.live_bytes(), before);
+        drop(clone);
+        select_star_order("SELECT * WHERE { VALUES (?z ?a) { (2 1) } }", &mut result).unwrap();
+        assert_eq!(result.variables(), ["z", "a"]);
+        assert_eq!(result.table().get(0, 0).unwrap(), Id::from_i64(2).unwrap());
+        assert_eq!(ctx.live_bytes(), before);
+        drop(result);
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod eager_graph_lifecycle_tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+
+    fn returned_graph_keeps_its_actual_live_admission(query_text: &str) {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut write = store.write();
+        let subject = write
+            .intern(&oxrdf::NamedNode::new_unchecked("urn:s").into())
+            .unwrap();
+        let predicate = write
+            .intern(&oxrdf::NamedNode::new_unchecked("urn:p").into())
+            .unwrap();
+        let object = write
+            .intern(&oxrdf::Literal::new_simple_literal("x".repeat(64 << 10)).into())
+            .unwrap();
+        write
+            .insert([subject, predicate, object, Id::DEFAULT_GRAPH])
+            .unwrap();
+        write.commit().unwrap();
+        let pool = pool::QueryPool::new(16 << 20);
+        let result = query(
+            store.snapshot(),
+            query_text,
+            &QueryOptions {
+                pool: Some(pool.clone()),
+                max_memory_bytes: Some(4 << 20),
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.triples().len(), 1);
+        let Term::Literal(value) = &result.triples()[0].object else {
+            panic!("stored literal");
+        };
+        assert_eq!(value.value().len(), 64 << 10);
+        let context = result.test_context().clone();
+        assert!(
+            context.live_bytes() >= 64 << 10,
+            "the returned physical64KiB graph must keep its original live credit; observed live={}, pool={}",
+            context.live_bytes(),
+            pool.granted()
+        );
+        drop(result);
+        assert_eq!(context.live_bytes(), 0);
+        drop(context);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn returned_construct_payload_keeps_its_original_live_credit() {
+        returned_graph_keeps_its_actual_live_admission(
+            "CONSTRUCT { <urn:s> <urn:copy> ?o } WHERE { <urn:s> <urn:p> ?o }",
+        );
+    }
+    #[test]
+    fn returned_describe_payload_keeps_its_original_live_credit() {
+        returned_graph_keeps_its_actual_live_admission("DESCRIBE <urn:s>");
+    }
+    #[test]
+    fn construct_literal_refuses_before_copy_and_rolls_back_late_failure_or_cancel() {
+        use crate::algo::memory::probe;
+        use crate::error::BudgetKind;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let text = format!(
+            "CONSTRUCT {{ <urn:s> <urn:p> \"{}\" }} WHERE {{}}",
+            "x".repeat(64 << 10)
+        );
+        let Query::Construct { template, .. } = parse_query(&text, None, &[]).unwrap() else {
+            unreachable!()
+        };
+        let store = Store::in_memory(StoreOptions::default());
+        let mut context = Ctx::new(store.snapshot());
+        context.mem_limit = 16 << 10;
+        let context = Arc::new(context);
+        let copied = Arc::new(AtomicUsize::new(0));
+        let observed = copied.clone();
+        let hook = probe::install(
+            move |point| {
+                if let probe::Point::Allocation("construct-literal", 1) = point {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+            None,
+        );
+        assert!(
+            matches!(construct(&context,&Table::unit(),&template,&[]), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory)
+        );
+        drop(hook);
+        assert_eq!(copied.load(Ordering::Relaxed), 0);
+        assert_eq!(context.live_bytes(), 0);
+        for cancel in [false, true] {
+            let context = Arc::new(Ctx::new(store.snapshot()));
+            let flag = context.cancel.clone();
+            let hook = probe::install(
+                move |point| {
+                    if cancel && let probe::Point::Allocation("construct-literal", 1) = point {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                },
+                (!cancel).then_some("construct-literal"),
+            );
+            let result = construct(&context, &Table::unit(), &template, &[]);
+            drop(hook);
+            if cancel {
+                assert!(matches!(result, Err(Error::Cancelled)));
+            } else {
+                assert!(matches!(result, Err(Error::Invalid(_))));
+            }
+            assert_eq!(context.live_bytes(), 0);
+        }
+    }
+    #[test]
+    fn eager_graph_clones_keep_payload_and_original_fast_owner_until_last_drop() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = pool::QueryPool::new(16 << 20);
+        let options = QueryOptions {
+            pool: Some(pool.clone()),
+            max_memory_bytes: Some(4 << 20),
+            no_cache: true,
+            ..Default::default()
+        };
+        let text = format!(
+            "CONSTRUCT {{ _:b <urn:p> \"{}\" . _:b <urn:q> 1 }} WHERE {{}}",
+            "x".repeat(64 << 10)
+        );
+        query_memory::LEDGER_OPS.with(|n| n.set(0));
+        let result = query(store.snapshot(), &text, &options).unwrap();
+        assert_eq!(query_memory::LEDGER_OPS.with(|n| n.get()), 0);
+        assert_eq!(result.triples().len(), 2);
+        assert_eq!(result.triples()[0].subject, result.triples()[1].subject);
+        let weak = Arc::downgrade(result.test_context());
+        let last = result.clone();
+        drop(result);
+        assert!(weak.upgrade().unwrap().live_bytes() >= 64 << 10);
+        assert_eq!(last.triples().len(), 2);
+        drop(last);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(pool.granted(), 0);
+    }
+}

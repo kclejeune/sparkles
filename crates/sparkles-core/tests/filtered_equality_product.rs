@@ -463,7 +463,7 @@ fn automatic_execution_uses_the_same_result_without_changing_explicit_streaming(
         .unwrap();
         let mut rows = Vec::new();
         while let Some(batch) = cursor.next_batch().unwrap() {
-            rows.extend((0..batch.len()).map(|i| batch.row(i).unwrap()));
+            rows.extend((0..batch.len()).map(|i| batch.row(i).unwrap().values().to_vec()));
         }
         assert_eq!(bag(rows), expected(1));
     }

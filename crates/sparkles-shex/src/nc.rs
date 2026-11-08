@@ -299,6 +299,7 @@ struct Node<'a> {
     snap: &'a Snapshot,
     id: Option<Id>,
     term: OnceCell<Option<Term>>,
+    borrowed: Option<&'a Term>,
 }
 
 impl<'a> Node<'a> {
@@ -307,21 +308,25 @@ impl<'a> Node<'a> {
             snap,
             id: Some(id),
             term: OnceCell::new(),
+            borrowed: None,
         }
     }
 
-    fn unstored(snap: &'a Snapshot, term: &Term) -> Node<'a> {
+    fn unstored(snap: &'a Snapshot, term: &'a Term) -> Node<'a> {
         Node {
             snap,
             id: None,
-            term: OnceCell::from(Some(term.clone())),
+            term: OnceCell::new(),
+            borrowed: Some(term),
         }
     }
 
     fn term(&self) -> Option<&Term> {
-        self.term
-            .get_or_init(|| self.id.and_then(|id| self.snap.term(id)))
-            .as_ref()
+        self.borrowed.or_else(|| {
+            self.term
+                .get_or_init(|| self.id.and_then(|id| self.snap.term(id)))
+                .as_ref()
+        })
     }
 
     fn kind(&self) -> TermKind {
@@ -689,28 +694,53 @@ impl NcPlan {
 
     /// Why `node` fails `nc` (`None` if it does not).
     pub fn explain(&self, nc: NcId, node: Id) -> anyhow::Result<Option<ShexFailure>> {
-        let n = Node::stored(&self.snap, node);
-        Ok(self.failure(nc, &n))
+        let root = crate::shapemap::output_root(&self.snap, &Default::default(), None)?;
+        let value = match root.term(node)? {
+            Some(value) => value,
+            None => root
+                .budget()
+                .copy_term(oxrdf::NamedNodeRef::new_unchecked("urn:x-sparkles:unknown").into())?,
+        };
+        Ok(self.failure(nc, &Node::stored(&self.snap, node), value))
     }
 
-    /// Why `term`, which need not be in the store, fails `nc` (`None` if it does not).
+    /// Standalone application explanation. Canonical validation passes its already
+    /// owned term to explain_owned_term, preserving the original operation's root.
     pub fn explain_term(&self, nc: NcId, term: &Term) -> anyhow::Result<Option<ShexFailure>> {
-        if let Some(id) = self.snap.lookup_term(term) {
-            return self.explain(nc, id);
-        }
-        Ok(self.failure(nc, &Node::unstored(&self.snap, term)))
+        let root = crate::shapemap::output_root(&self.snap, &Default::default(), None)?;
+        self.explain_owned_term(nc, root.budget().copy_term(term.as_ref())?)
     }
 
-    fn failure(&self, nc: NcId, n: &Node<'_>) -> Option<ShexFailure> {
+    pub(crate) fn explain_owned_term(
+        &self,
+        nc: NcId,
+        value: sparkles_core::sparql::output::OwnedTerm,
+    ) -> anyhow::Result<Option<ShexFailure>> {
+        let part =
+            self.plans[nc.index()].first_failure(&Node::unstored(&self.snap, value.as_term()));
+        Ok(part.map(|part| self.failure_part(nc, part, value)))
+    }
+
+    fn failure(
+        &self,
+        nc: NcId,
+        n: &Node<'_>,
+        value: sparkles_core::sparql::output::OwnedTerm,
+    ) -> Option<ShexFailure> {
         let part = self.plans[nc.index()].first_failure(n)?;
+        Some(self.failure_part(nc, part, value))
+    }
+
+    fn failure_part(
+        &self,
+        nc: NcId,
+        part: Part,
+        value: sparkles_core::sparql::output::OwnedTerm,
+    ) -> ShexFailure {
         let c = &self.ncs[nc.index()];
-        let value = n
-            .term()
-            .cloned()
-            .unwrap_or_else(|| NamedNode::new_unchecked("urn:x-sparkles:unknown").into());
         let iri = |i: &str| compact_iri(i, &self.prefixes);
         let unbounded = || NumericLiteral::Integer(String::new());
-        Some(match part {
+        match part {
             Part::Kind => ShexFailure::NodeKind {
                 value,
                 constraint: c.node_kind.map_or("", |k| k.as_str()).to_ascii_uppercase(),
@@ -764,7 +794,7 @@ impl NcPlan {
                 value,
                 constraint: format!("FRACTIONDIGITS {}", c.fraction_digits.unwrap_or_default()),
             },
-        })
+        }
     }
 }
 
@@ -1060,7 +1090,10 @@ mod tests {
             .unwrap()
         {
             Some(ShexFailure::Facet { constraint, value }) => {
-                assert_eq!((constraint.as_str(), value), ("MINLENGTH 3", plain("ab")))
+                assert_eq!(
+                    (constraint.as_str(), value.as_term()),
+                    ("MINLENGTH 3", &plain("ab"))
+                )
             }
             other => panic!("{other:?}"),
         }
@@ -1154,7 +1187,7 @@ mod tests {
         match p.explain_term(NcId(0), &carol_age).unwrap() {
             Some(ShexFailure::Facet { constraint, value }) => {
                 assert_eq!(constraint, "MAXINCLUSIVE 150");
-                assert_eq!(value, carol_age);
+                assert_eq!(value.as_term(), &carol_age);
             }
             other => panic!("{other:?}"),
         }
@@ -1402,5 +1435,128 @@ mod tests {
         assert!(!holds(&snap, nc(), &typed("5", "byte")));
         // not in the value set
         assert!(!holds(&snap, nc(), &typed("abc", "integer")));
+    }
+
+    #[test]
+    fn owned_explanation_inspection_borrows_the_actual_retained_literal() {
+        use sparkles_core::sparql::{QueryOptions, pool::QueryPool};
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let pool = QueryPool::new(16 << 20);
+        let root = crate::shapemap::output_root(
+            &snap,
+            &crate::ValidateOptions {
+                selector_query: Some(QueryOptions {
+                    pool: Some(pool.clone()),
+                    max_memory_bytes: Some(4 << 20),
+                    no_cache: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let input: Term = Literal::new_simple_literal("x".repeat(64 << 10)).into();
+        let value = root.budget().copy_term(input.as_ref()).unwrap();
+        drop(input);
+        let original = value.as_term() as *const Term;
+        let node = Node::unstored(&snap, value.as_term());
+        let same_actual_term = std::ptr::eq(node.term().unwrap(), value.as_term());
+        drop(node);
+        assert!(
+            same_actual_term,
+            "inspection must borrow the original actually owned Term, not deep-clone its payload"
+        );
+        let p = plan(
+            &snap,
+            NodeConstraint {
+                node_kind: Some(NodeKind::Iri),
+                ..Default::default()
+            },
+        );
+        let failure = p
+            .explain_owned_term(NcId(0), value.clone())
+            .unwrap()
+            .unwrap();
+        let last = match failure {
+            ShexFailure::NodeKind { value, constraint } => {
+                assert_eq!(constraint, "IRI");
+                assert_eq!(value.as_term() as *const Term, original);
+                value
+            }
+            other => panic!("wrong actual literal-vs-IRI explanation: {other:?}"),
+        };
+        drop(p);
+        drop(value);
+        drop(root);
+        drop(snap);
+        drop(store);
+        assert!(pool.granted() >= 64 << 10);
+        assert!(matches!(last.as_term(), Term::Literal(l) if l.value().len() == 64 << 10));
+        drop(last);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn owned_explanation_nested_inspection_uses_no_clone_or_recursive_drop_on_small_stack() {
+        use sparkles_core::sparql::{QueryOptions, pool::QueryPool};
+        let levels = sparkles_core::nesting::MAX_TRIPLE_TERMS;
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let pool = QueryPool::new(16 << 20);
+        let root = crate::shapemap::output_root(
+            &snap,
+            &crate::ValidateOptions {
+                selector_query: Some(QueryOptions {
+                    pool: Some(pool.clone()),
+                    max_memory_bytes: Some(4 << 20),
+                    no_cache: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let input = sparkles_core::sparql::depth::with_stack(levels, || {
+            let mut input: Term = Literal::new_simple_literal("leaf").into();
+            for _ in 0..levels {
+                input = Term::Triple(Box::new(oxrdf::Triple::new(
+                    NamedNode::new_unchecked("urn:s"),
+                    NamedNode::new_unchecked("urn:p"),
+                    input,
+                )));
+            }
+            input
+        });
+        let value = root.budget().copy_term(input.as_ref()).unwrap();
+        sparkles_core::sparql::depth::with_stack(levels, || drop(input));
+        let (value, snap) = std::thread::Builder::new()
+            .stack_size(32 << 10)
+            .spawn(move || {
+                let node = Node::unstored(&snap, value.as_term());
+                assert!(std::ptr::eq(node.term().unwrap(), value.as_term()));
+                assert_eq!(node.kind(), TermKind::Triple);
+                let mut object = node.term().unwrap();
+                let mut seen = 0;
+                while let Term::Triple(triple) = object {
+                    seen += 1;
+                    object = &triple.object;
+                }
+                assert_eq!(seen, levels);
+                drop(node); // only the borrow retires on this small stack
+                (value, snap)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        drop(root);
+        drop(snap);
+        drop(store);
+        assert!(pool.granted() > 0);
+        // The real owner retains protected physical destruction on the parent.
+        drop(value);
+        assert_eq!(pool.granted(), 0);
     }
 }

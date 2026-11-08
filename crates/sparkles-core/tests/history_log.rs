@@ -995,7 +995,7 @@ mod native_history_controls {
                     &format!("{HIST} SELECT ?s ?c WHERE {{ SERVICE hist:changes {{ << ?s :p ?o >> hist:commit ?c }} }}"),
                     &opts,
                 )
-                .map(|result| result.rows().len())
+                .map(|result| result.len())
             }
         });
         let reached = paused_rx.recv_timeout(WAIT);

@@ -199,7 +199,7 @@ fn cold_generation_and_cached_backing_keep_exact_state_and_charge_owned_dictiona
         &QueryOptions::default(),
     )
     .unwrap();
-    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.len(), 1);
     assert_eq!(
         result.rows()[0][0].as_ref().unwrap().to_string(),
         "<urn:base>"

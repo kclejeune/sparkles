@@ -107,7 +107,6 @@ pub struct GraphCursor {
     failure: Option<String>,
     emitted: u64,
     template_work: usize,
-    template_bytes: u64,
     transform_ms: f64,
     ended: Option<Instant>,
     truncated: bool,
@@ -135,7 +134,7 @@ pub fn graph_cursor(
 pub(super) fn from_pattern(
     where_cursor: QueryCursor,
     spec: Spec,
-    query_bytes: usize,
+    _query_bytes: usize,
 ) -> Result<GraphCursor> {
     depth::with_stack(where_cursor.depth, || {
         let base_bytes = where_cursor
@@ -144,7 +143,7 @@ pub(super) fn from_pattern(
             .saturating_mul(2)
             .saturating_add(where_cursor.ctx.nvars() as u64 * 16 + 4096);
         let seen_charge = OwnedCharge::new(&where_cursor.ctx, base_bytes)?;
-        let map = where_cursor.vars.iter().enumerate().fold(
+        let map = where_cursor.variables.ids.iter().enumerate().fold(
             vec![None; where_cursor.ctx.nvars()],
             |mut map, (column, var)| {
                 map[*var as usize] = Some(column);
@@ -180,7 +179,6 @@ pub(super) fn from_pattern(
             failure: None,
             emitted: 0,
             template_work: 0,
-            template_bytes: query_bytes as u64 * 16,
             transform_ms: 0.0,
             ended: None,
             truncated: false,
@@ -302,7 +300,7 @@ impl GraphCursor {
                     let last = batch.is_none();
                     let table = match batch {
                         Some(buffer) => buffer,
-                        None => Buffer::new(&ctx, &self.where_cursor.vars, 0)?,
+                        None => Buffer::new(&ctx, &self.where_cursor.variables.ids, 0)?,
                     };
                     let triples = crate::sparql::describe::describe_batch(
                         &ctx,
@@ -338,19 +336,12 @@ impl GraphCursor {
                         self.input = self.where_cursor.next_batch()?;
                     }
                     let Some(batch) = &self.input else { break };
-                    let count = template
-                        .len()
-                        .saturating_add(graphs.iter().map(|g| g.triples.len()).sum::<usize>());
-                    let scratch = batch
-                        .row_bytes(self.row)?
-                        .saturating_mul(4)
-                        .saturating_add(self.template_bytes)
-                        .saturating_mul(count.max(1) as u64)
-                        .saturating_add(4096);
-                    let temporary = OwnedCharge::new(&ctx, scratch)?;
+                    // Guard precedes pending values so partial output is destroyed
+                    // before credit on every refusal. Incoming terms carry their own
+                    // predecode admission through the shared emitter.
+                    let mut pending_charge = OwnedCharge::new(&ctx, 0)?;
                     let mut pending = Vec::new();
-                    let mut pending_charge = OwnedCharge::new(&ctx, 128)?;
-                    let mut pending_bytes = 128u64;
+                    let mut pending_storage = 0u64;
                     crate::sparql::construct_row(
                         &ctx,
                         batch.owned_table(),
@@ -359,7 +350,7 @@ impl GraphCursor {
                         template,
                         graphs,
                         &mut self.template_work,
-                        &mut |quad| {
+                        &mut |quad, incoming| {
                             if self.seen.contains(&quad) {
                                 return Ok(());
                             }
@@ -369,14 +360,37 @@ impl GraphCursor {
                             self.seen_bytes =
                                 self.seen_bytes.saturating_add(bytes.saturating_mul(2));
                             self.seen_charge.resize(self.seen_bytes)?;
-                            pending_bytes = pending_bytes.saturating_add(bytes.saturating_mul(2));
-                            pending_charge.resize(pending_bytes)?;
+                            pending_charge.adopt_charge(incoming)?;
+                            if pending.len() == pending.capacity() {
+                                let cap = pending
+                                    .capacity()
+                                    .checked_mul(2)
+                                    .unwrap_or(usize::MAX)
+                                    .max(4);
+                                let storage = cap
+                                    .checked_mul(std::mem::size_of::<Quad>())
+                                    .and_then(|n| u64::try_from(n).ok())
+                                    .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+                                pending_charge.resize(
+                                    pending_charge
+                                        .bytes()
+                                        .checked_add(storage)
+                                        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?,
+                                )?;
+                                pending
+                                    .try_reserve_exact(cap - pending.len())
+                                    .map_err(|_| ctx.memory_exceeded(storage))?;
+                                if pending.capacity() > cap {
+                                    return Err(Error::invalid("pending graph exceeds admission"));
+                                }
+                                pending_charge.resize(pending_charge.bytes() - pending_storage)?;
+                                pending_storage = storage;
+                            }
                             self.seen.insert(quad.clone());
                             pending.push(quad);
                             Ok(())
                         },
                     )?;
-                    drop(temporary);
                     self.row += 1;
                     self.pending = Some(Pending {
                         quads: pending.into_iter(),

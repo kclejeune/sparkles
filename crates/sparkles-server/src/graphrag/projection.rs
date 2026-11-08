@@ -81,17 +81,17 @@ pub fn read(
             "projection.weight is not supported by this server's community build; remove it".into(),
         );
     }
-    let q = |text: &str| -> Result<Vec<Vec<Option<Term>>>, String> {
+    let q = |text: &str| -> Result<sparql::output::OwnedRows, String> {
         ctl.check().map_err(|e| e.to_string())?;
         sparql::query(snap.clone(), text, opts)
-            .map(|r| r.rows())
+            .and_then(|r| r.rows())
             .map_err(|e| e.to_string())
     };
     // the graphs the principal sees, limited to the projection's
     let mut graphs: Vec<String> = q("SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }")?
         .into_iter()
-        .filter_map(|r| match r.into_iter().next().flatten() {
-            Some(Term::NamedNode(n)) => Some(n.into_string()),
+        .filter_map(|r| match r.values().first().and_then(Option::as_ref) {
+            Some(Term::NamedNode(n)) => Some(n.as_str().to_string()),
             _ => None,
         })
         .filter(|g| !is_guarded(g) && named(settings, g))
@@ -117,6 +117,7 @@ pub fn read(
             values.join(" ")
         );
         for r in q(&text)? {
+            let r = r.values();
             ctl.check().map_err(|e| e.to_string())?;
             if let [Some(s), Some(o)] = &r[..] {
                 let (s, o) = (s.to_string(), o.to_string());

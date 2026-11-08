@@ -289,7 +289,7 @@ fn strict_rows(store: &Store, text: &str, options: &QueryOptions) -> Vec<String>
     let mut rows = Vec::new();
     while let Some(batch) = cursor.next_batch().unwrap() {
         for i in 0..batch.len() {
-            rows.push(batch.row(i).unwrap());
+            rows.push(batch.row(i).unwrap().values().to_vec());
         }
     }
     bag(rows)

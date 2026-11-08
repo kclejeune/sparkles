@@ -160,7 +160,7 @@ fn answer(snap: &Arc<Snapshot>, q: &str, opt: Optimizations) -> Vec<String> {
     let r = query(snap.clone(), &format!("{PREFIXES}{q}"), &opts)
         .unwrap_or_else(|e| panic!("{q}: {e}"));
     let mut rows: Vec<String> = r
-        .rows()
+        .test_application_rows()
         .into_iter()
         .map(|row| {
             row.into_iter()

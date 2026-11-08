@@ -218,7 +218,7 @@ fn malformed_tables() {
     bad.extend(b"\n");
     let mut out = Vec::new();
     let e = convert(Cursor::new(bad), &o, &mut |t| {
-        out.push(t);
+        out.push(t.clone());
         Ok(())
     })
     .unwrap_err();
@@ -578,7 +578,10 @@ fn loads_into_a_store() {
     )
     .unwrap();
     assert_eq!(
-        r.rows()[0][0].as_ref().unwrap().to_string(),
+        r.test_application_rows()[0][0]
+            .as_ref()
+            .unwrap()
+            .to_string(),
         format!("\"4\"^^<{XSD}integer>")
     );
     // the same table again adds nothing

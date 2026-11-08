@@ -1086,12 +1086,8 @@ pub(super) fn fetch_rows(ctx: &Ctx, url: &NamedNode, query: &str) -> Result<Rows
     let mut vars: Vec<String> = Vec::new();
     let mut rows = Vec::new();
     super::exec::fetch(ctx, url, query, &mut |sol| {
-        if vars.is_empty() && !sol.variables().is_empty() {
-            vars = sol
-                .variables()
-                .iter()
-                .map(|v| v.as_str().to_string())
-                .collect();
+        if vars.is_empty() && sol.variables().len() != 0 {
+            vars = sol.variables().map(str::to_owned).collect();
         }
         rows.push(
             vars.iter()

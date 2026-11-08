@@ -9207,6 +9207,40 @@ pub(super) fn is_local(ctx: &Ctx, url: &str) -> bool {
         .is_some_and(|l| l.resolve(url).is_some())
 }
 
+// A local decoded row retains its real query owner through the complete callback.
+// Remote parser storage is likewise borrowed for that callback, not copied into a
+// second uncredited sparesults vector merely to share the dispatch signature.
+pub(super) enum ServiceSolution<'a> {
+    Remote(&'a sparesults::QuerySolution),
+    Local {
+        names: &'a [String],
+        row: &'a super::output::OwnedRow,
+    },
+}
+impl ServiceSolution<'_> {
+    pub(super) fn get(&self, name: &str) -> Option<&oxrdf::Term> {
+        match self {
+            Self::Remote(solution) => solution.get(name),
+            Self::Local { names, row } => row
+                .values()
+                .get(names.iter().position(|variable| variable == name)?)?
+                .as_ref(),
+        }
+    }
+    pub(super) fn variables(&self) -> impl ExactSizeIterator<Item = &str> {
+        let (remote, local) = match self {
+            Self::Remote(solution) => (Some(solution.variables()), None),
+            Self::Local { names, .. } => (None, Some(*names)),
+        };
+        (0..remote.map_or_else(|| local.expect("local variables").len(), <[_]>::len)).map(
+            move |i| match remote {
+                Some(names) => names[i].as_str(),
+                None => local.expect("local variables")[i].as_str(),
+            },
+        )
+    }
+}
+
 /// Run `query` in process on the dataset `target` names, as the caller, and hand each
 /// solution to `on_solution`. The call keeps the caller's deadline, cancellation, grant,
 /// row count and outbound budget, so it can neither wait for admission behind its
@@ -9215,7 +9249,7 @@ fn fetch_local(
     ctx: &Ctx,
     target: Result<super::LocalTarget>,
     query: &str,
-    on_solution: &mut dyn FnMut(sparesults::QuerySolution) -> Result<()>,
+    on_solution: &mut dyn FnMut(ServiceSolution<'_>) -> Result<()>,
 ) -> Result<()> {
     if ctx.service_depth >= super::MAX_SERVICE_DEPTH {
         return Err(Error::Service(format!(
@@ -9250,17 +9284,15 @@ fn fetch_local(
     opts.no_plan_patterns = true;
     ctx.check()?;
     let r = super::query(snap, query, &opts)?;
-    let vars: std::sync::Arc<[oxrdf::Variable]> = r
-        .vars
-        .iter()
-        .map(|v| oxrdf::Variable::new_unchecked(v.clone()))
-        .collect();
-    for i in 0..r.table.len() {
+    for i in 0..r.table().len() {
         if i % 1024 == 0 {
             ctx.check()?;
         }
-        let row: Vec<Option<oxrdf::Term>> = r.table.row(i).iter().map(|id| r.term(*id)).collect();
-        on_solution(sparesults::QuerySolution::from((vars.clone(), row)))?;
+        let row = r.row(i)?;
+        on_solution(ServiceSolution::Local {
+            names: r.variables(),
+            row: &row,
+        })?;
     }
     Ok(())
 }
@@ -9272,7 +9304,7 @@ pub(super) fn fetch(
     ctx: &Ctx,
     url: &oxrdf::NamedNode,
     query: &str,
-    on_solution: &mut dyn FnMut(sparesults::QuerySolution) -> Result<()>,
+    on_solution: &mut dyn FnMut(ServiceSolution<'_>) -> Result<()>,
 ) -> Result<()> {
     if let Some(target) = ctx
         .local_endpoints
@@ -9363,7 +9395,8 @@ pub(super) fn fetch(
     match parser.for_reader(body).map_err(failed)? {
         sparesults::ReaderQueryResultsParserOutput::Solutions(sols) => {
             for sol in sols {
-                on_solution(sol.map_err(failed)?)?;
+                let solution = sol.map_err(failed)?;
+                on_solution(ServiceSolution::Remote(&solution))?;
             }
         }
         sparesults::ReaderQueryResultsParserOutput::Boolean(_) => {}

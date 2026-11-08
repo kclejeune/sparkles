@@ -202,10 +202,183 @@ pub struct CursorStats {
 
 /// An immutable batch. Keeping it alive keeps its capacity on the query's budget
 /// and pins the snapshot/local vocabulary needed to resolve its private IDs.
+#[derive(Clone)]
 pub struct QueryBatch {
+    inner: Arc<BatchBacking>,
+}
+
+struct BatchBacking {
     buffer: BatchBuffer,
-    variables: Arc<Vec<String>>,
+    variables: Arc<Variables>,
     ctx: Arc<Ctx>,
+    _header: OwnedCharge,
+}
+
+// Projected names and IDs have one physical owner shared by cursor and batches.
+// The vectors retire before the actual original charge, including error paths.
+pub(super) struct Variables {
+    pub(super) names: Vec<String>,
+    pub(super) ids: Vec<VarId>,
+    _charge: super::ctx::OutputCredit,
+}
+
+pub(super) fn arc_backing_bytes<T>(ctx: &Ctx) -> Result<u64> {
+    let (layout, _) = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+        .extend(std::alloc::Layout::new::<T>())
+        .map_err(|_| ctx.memory_exceeded(u64::MAX))?;
+    u64::try_from(layout.pad_to_align().size()).map_err(|_| ctx.memory_exceeded(u64::MAX))
+}
+
+impl Variables {
+    pub(super) fn new(
+        ctx: &Arc<Ctx>,
+        pattern: &spargebra::algebra::GraphPattern,
+        node_vars: &[VarId],
+        query: &str,
+    ) -> Result<Arc<Self>> {
+        use spargebra::algebra::GraphPattern;
+        fn projection(pattern: &GraphPattern) -> Option<&[oxrdf::Variable]> {
+            match pattern {
+                GraphPattern::Project { variables, .. } => Some(variables),
+                GraphPattern::Distinct { inner }
+                | GraphPattern::Reduced { inner }
+                | GraphPattern::Slice { inner, .. } => projection(inner),
+                _ => None,
+            }
+        }
+        let projected = projection(pattern);
+        let count = projected.map_or(node_vars.len(), <[_]>::len);
+        let overflow = || ctx.memory_exceeded(u64::MAX);
+        let (text_bytes, longest) = {
+            let names = ctx.var_names.read();
+            let mut bytes = 0usize;
+            let mut longest = 0usize;
+            for index in 0..count {
+                ctx.check()?;
+                let name = match projected {
+                    Some(variables) => variables[index].as_str(),
+                    None => names
+                        .get(node_vars[index] as usize)
+                        .ok_or_else(|| Error::invalid("invalid cursor output variable"))?
+                        .as_str(),
+                };
+                bytes = bytes.checked_add(name.len()).ok_or_else(overflow)?;
+                longest = longest.max(name.len());
+            }
+            (bytes, longest)
+        };
+        ctx.check()?;
+        let star = super::is_select_star(query);
+        ctx.check()?;
+        // Existing star ordering may retain its order and cached keys together,
+        // plus two pattern strings. No transient names/IDs are cloned here.
+        let workspace = if star {
+            let bytes = count
+                .checked_mul(3 * std::mem::size_of::<usize>())
+                .and_then(|n| longest.checked_add(64)?.checked_mul(4)?.checked_add(n))
+                .and_then(|n| n.checked_add(256))
+                .ok_or_else(overflow)?;
+            Some(ctx.charge(u64::try_from(bytes).map_err(|_| overflow())?)?)
+        } else {
+            None
+        };
+        let payload = count
+            .checked_mul(std::mem::size_of::<String>() + std::mem::size_of::<VarId>())
+            .and_then(|n| n.checked_add(text_bytes))
+            .ok_or_else(overflow)?;
+        let bytes = arc_backing_bytes::<Self>(ctx)?
+            .checked_add(u64::try_from(payload).map_err(|_| overflow())?)
+            .ok_or_else(overflow)?;
+        let charge = ctx.charge(bytes)?;
+        #[cfg(test)]
+        {
+            use crate::algo::memory::probe;
+            probe::at(probe::Point::Allocation("query-variable-backing", count));
+            if probe::fails("query-variable-backing") {
+                return Err(Error::invalid(
+                    "injected cursor variable allocation failure",
+                ));
+            }
+        }
+        ctx.check()?;
+        let mut names = Vec::new();
+        let mut ids = Vec::new();
+        names
+            .try_reserve_exact(count)
+            .map_err(|_| Error::invalid("cursor name allocation failed"))?;
+        ids.try_reserve_exact(count)
+            .map_err(|_| Error::invalid("cursor variable allocation failed"))?;
+        if names.capacity() != count || ids.capacity() != count {
+            return Err(Error::invalid("cursor variable capacity exceeds admission"));
+        }
+        {
+            // Drop this read guard before any charge can retire or notify a parent.
+            let original = ctx.var_names.read();
+            for index in 0..count {
+                ctx.check()?;
+                let (id, text) = match projected {
+                    Some(variables) => {
+                        let text = variables[index].as_str();
+                        let id = original
+                            .iter()
+                            .position(|name| name == text)
+                            .ok_or_else(|| Error::invalid("unregistered cursor output variable"))?;
+                        (VarId::try_from(id).map_err(|_| overflow())?, text)
+                    }
+                    None => (
+                        node_vars[index],
+                        original
+                            .get(node_vars[index] as usize)
+                            .ok_or_else(|| Error::invalid("invalid cursor output variable"))?
+                            .as_str(),
+                    ),
+                };
+                let mut copied = String::new();
+                copied
+                    .try_reserve_exact(text.len())
+                    .map_err(|_| Error::invalid("cursor name allocation failed"))?;
+                if copied.capacity() != text.len() {
+                    return Err(Error::invalid("cursor name capacity exceeds admission"));
+                }
+                for (at, character) in text.chars().enumerate() {
+                    if at.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    copied.push(character);
+                }
+                names.push(copied);
+                ids.push(id);
+            }
+        }
+        if star
+            && let Some(mut order) =
+                super::select_star_columns_checked(query, &names, || ctx.check())?
+        {
+            for first in 0..order.len() {
+                ctx.check()?;
+                let mut at = first;
+                while order[at] != at {
+                    ctx.check()?;
+                    let next = order[at];
+                    order[at] = at;
+                    if next == first {
+                        break;
+                    }
+                    names.swap(at, next);
+                    ids.swap(at, next);
+                    at = next;
+                }
+            }
+        }
+        ctx.check()?;
+        let variables = Arc::new(Self {
+            names,
+            ids,
+            _charge: charge.into_output(ctx),
+        });
+        drop(workspace);
+        Ok(variables)
+    }
 }
 
 enum BatchBuffer {
@@ -228,11 +401,38 @@ enum SharedAttempt {
 }
 
 impl QueryBatch {
+    fn new(buffer: BatchBuffer, variables: Arc<Variables>, ctx: &Arc<Ctx>) -> Result<Self> {
+        ctx.check()?;
+        let header = OwnedCharge::new(ctx, arc_backing_bytes::<BatchBacking>(ctx)?)?;
+        #[cfg(test)]
+        {
+            use crate::algo::memory::probe;
+            probe::at(probe::Point::Allocation("query-batch-backing", 1));
+            if probe::fails("query-batch-backing") {
+                return Err(Error::invalid("injected query batch allocation failure"));
+            }
+        }
+        ctx.check()?;
+        Ok(Self {
+            inner: Arc::new(BatchBacking {
+                buffer,
+                variables,
+                ctx: ctx.clone(),
+                _header: header,
+            }),
+        })
+    }
+
+    #[cfg(test)]
+    fn test_live_bytes(&self) -> u64 {
+        self.inner.ctx.live_bytes()
+    }
+
     pub fn variables(&self) -> &[String] {
-        &self.variables
+        &self.inner.variables.names
     }
     pub fn len(&self) -> usize {
-        match &self.buffer {
+        match &self.inner.buffer {
             BatchBuffer::Owned(buffer) => buffer.table.len(),
             BatchBuffer::Shared(batch) => batch.end - batch.start,
         }
@@ -241,27 +441,35 @@ impl QueryBatch {
         self.len() == 0
     }
     pub fn width(&self) -> usize {
-        self.variables.len()
+        self.inner.variables.names.len()
     }
 
-    /// Decode one cell. UNDEF is None; invalid coordinates are an error. Returned
-    /// owned terms are application memory after this call.
-    pub fn term(&self, row: usize, column: usize) -> Result<Option<Term>> {
+    /// Decode a cell into an immutable owner of its physical payload and original
+    /// query credit. UNDEF is None; invalid coordinates are an error. Cloning a
+    /// returned handle shares that same backing without copying the term.
+    /// Decoding is new work: current controls or insufficient remaining credit
+    /// can refuse it after production stops. Already decoded handles still borrow
+    /// their immutable payload without allocating or restarting production.
+    pub fn term(&self, row: usize, column: usize) -> Result<Option<super::output::OwnedTerm>> {
+        self.inner.ctx.check()?;
         if row >= self.len() || column >= self.width() {
             return Err(Error::invalid("query batch cell is out of bounds"));
         }
         let id = self.id(row, column);
-        self.ctx.batch_term(id)
+        self.output_budget().decode(id)
     }
 
-    /// The term of a key that [`QueryBatch::key`] gave for a cell of this batch, decoded
-    /// without the checks against the query's memory budget, for a caller that drops the
-    /// term at once, such as an encoder that writes it out. The charges of
-    /// [`QueryBatch::term`] for the term and its vocabulary block's scratch end with the
-    /// call, so they only refuse a term that does not fit in what remains of the budget,
-    /// and eager execution decodes its results the same way.
+    /// Receiving admission for explicit independent copies into this query.
+    pub fn output_budget(&self) -> super::output::OutputBudget {
+        super::output::OutputBudget::new(self.inner.ctx.clone())
+    }
+
+    /// Legacy uncredited encoder decode. This does not return a retained query
+    /// output owner and cannot be used as a bounded output helper. Its native
+    /// caller must retain separately admitted encoding storage through the actual
+    /// foreign copy/free point; use [`QueryBatch::term`] for retained cells.
     pub fn transient_term(&self, key: u64) -> Option<Term> {
-        self.ctx.transient_batch_term(Id(key))
+        self.inner.ctx.transient_batch_term(Id(key))
     }
 
     /// A key of the cell's term that is the same for every cell of the query that holds
@@ -275,11 +483,16 @@ impl QueryBatch {
         Ok((!id.is_undef()).then_some(id.0))
     }
 
-    pub fn row(&self, row: usize) -> Result<Vec<Option<Term>>> {
+    /// Decode one complete row before publishing its immutable credited handle.
+    /// A cell handle obtained from it retains the whole row backing.
+    pub fn row(&self, row: usize) -> Result<super::output::OwnedRow> {
+        self.inner.ctx.check()?;
         if row >= self.len() {
             return Err(Error::invalid("query batch row is out of bounds"));
         }
-        (0..self.width()).map(|c| self.term(row, c)).collect()
+        self.output_budget()
+            .decode_rows(1, self.width(), |_, column| self.id(row, column))?
+            .row_handle(0)
     }
 
     /// [`QueryBatch::term`] for a writer that has reserved [`QueryBatch::cell_bytes`] for
@@ -288,7 +501,7 @@ impl QueryBatch {
         if row >= self.len() || column >= self.width() {
             return Err(Error::invalid("query batch cell is out of bounds"));
         }
-        self.ctx.reserved_batch_term(self.id(row, column))
+        self.inner.ctx.reserved_batch_term(self.id(row, column))
     }
 
     /// [`QueryBatch::term`] for a writer that holds one reservation for its row: `cover`
@@ -303,21 +516,23 @@ impl QueryBatch {
         if row >= self.len() || column >= self.width() {
             return Err(Error::invalid("query batch cell is out of bounds"));
         }
-        self.ctx.covered_batch_term(self.id(row, column), cover)
+        self.inner
+            .ctx
+            .covered_batch_term(self.id(row, column), cover)
     }
 
     pub(super) fn row_bytes(&self, row: usize) -> Result<u64> {
         (0..self.width())
-            .map(|column| self.ctx.decoded_bytes(self.id(row, column)))
+            .map(|column| self.inner.ctx.decoded_bytes(self.id(row, column)))
             .try_fold(128u64, |total, bytes| Ok(total.saturating_add(bytes?)))
     }
 
     pub(super) fn cell_bytes(&self, row: usize, column: usize) -> Result<u64> {
-        self.ctx.decoded_bytes(self.id(row, column))
+        self.inner.ctx.decoded_bytes(self.id(row, column))
     }
 
     fn id(&self, row: usize, column: usize) -> Id {
-        match &self.buffer {
+        match &self.inner.buffer {
             BatchBuffer::Owned(buffer) => buffer.table.get(row, column),
             BatchBuffer::Shared(batch) => {
                 Id(batch.block.cols[batch.columns[column]][batch.start + row])
@@ -326,7 +541,7 @@ impl QueryBatch {
     }
 
     fn owned_table(&self) -> &Table {
-        let BatchBuffer::Owned(buffer) = &self.buffer else {
+        let BatchBuffer::Owned(buffer) = &self.inner.buffer else {
             unreachable!("graph inputs use owned ID batches")
         };
         &buffer.table
@@ -369,7 +584,7 @@ pub(super) struct TermCache {
 
 impl TermCache {
     fn new(batch: &QueryBatch) -> Result<Self> {
-        let ctx = &batch.ctx;
+        let ctx = &batch.inner.ctx;
         ctx.check()?;
         let cells = batch
             .len()
@@ -593,8 +808,7 @@ pub struct QueryCursor {
     ctx: Arc<Ctx>,
     root: Option<Operator>,
     plan: CursorPlan,
-    variables: Arc<Vec<String>>,
-    vars: Vec<VarId>,
+    variables: Arc<Variables>,
     bound: Vec<(VarId, Id)>,
     options: CursorOptions,
     status: CursorStatus,
@@ -683,15 +897,9 @@ fn from_prepared(
     kind: QueryKind,
 ) -> Result<(QueryCursor, Option<graph::Spec>, QueryKind)> {
     let ctx = prepared.ctx;
-    let mut vars =
-        super::project_vars(&prepared.pattern, &ctx).unwrap_or_else(|| prepared.node.vars.clone());
-    let names = vars.iter().map(|&v| ctx.var_name(v)).collect::<Vec<_>>();
-    let order =
-        super::select_star_columns(query, &names).unwrap_or_else(|| (0..names.len()).collect());
-    vars = order.iter().map(|&i| vars[i]).collect();
-    let variables = Arc::new(order.iter().map(|&i| names[i].clone()).collect());
     let bytes = plan_bytes(&prepared.node).saturating_add(query.len() as u64 * 16);
     let charge = OwnedCharge::new(&ctx, bytes)?;
+    let variables = Variables::new(&ctx, &prepared.pattern, &prepared.node.vars, query)?;
     let spec = graph::Spec::from_parsed(parsed, options)?;
     let root = Operator::build_for(&ctx, prepared.node, cursor.fallback, false)?;
     let plan = root.describe(&ctx);
@@ -703,7 +911,6 @@ fn from_prepared(
             root: Some(root),
             plan,
             variables,
-            vars,
             bound: prepared.bound,
             options: cursor.clone(),
             status: CursorStatus::Open,
@@ -738,7 +945,7 @@ pub fn ask_streaming(
 
 fn finish_ask(mut cursor: QueryCursor) -> Result<QueryResult> {
     let boolean = cursor.next_batch()?.is_some_and(|batch| !batch.is_empty());
-    Ok(finish_ask_result(cursor, boolean))
+    finish_ask_result(cursor, boolean)
 }
 
 fn finish_ask_with_plan(
@@ -763,16 +970,16 @@ fn finish_ask_with_plan(
             }));
         }
     };
-    Ok(finish_ask_result(cursor, boolean))
+    finish_ask_result(cursor, boolean).map_err(Into::into)
 }
 
-fn finish_ask_result(mut cursor: QueryCursor, boolean: bool) -> QueryResult {
+fn finish_ask_result(mut cursor: QueryCursor, boolean: bool) -> Result<QueryResult> {
     cursor.close();
     let stats = cursor.stats();
     let plan = depth::with_stack(cursor.depth, || cursor.plan_info());
-    QueryResult {
+    super::ResultParts {
         kind: QueryKind::Ask,
-        vars: Vec::new(),
+        variables: None,
         table: Table::default(),
         boolean,
         triples: Vec::new(),
@@ -784,7 +991,9 @@ fn finish_ask_result(mut cursor: QueryCursor, boolean: bool) -> QueryResult {
         describe_truncated: false,
         ctx: cursor.ctx.clone(),
         _table_credit: None,
+        _graph_credit: None,
     }
+    .freeze()
 }
 
 /// A collected result with depth-protected metadata and destruction.
@@ -801,7 +1010,8 @@ impl MaterializedResult {
     }
     pub fn plan_json(&self) -> Result<String> {
         depth::with_stack(self.depth, || {
-            serde_json::to_string(&self.result().plan).map_err(|e| Error::invalid(e.to_string()))
+            serde_json::to_string(&self.result().inner.plan)
+                .map_err(|e| Error::invalid(e.to_string()))
         })
     }
     /// The result itself, as the eager query APIs return it. Its plan is then dropped
@@ -1567,9 +1777,9 @@ pub fn query_execution_with_plan(
                 let mut result =
                     super::execute_query_with_plan(snapshot, &parsed, options, parse_ms)?;
                 if result.kind == QueryKind::Select {
-                    super::select_star_order(query, &mut result);
+                    super::select_star_order(query, &mut result)?;
                 }
-                let depth = levels.max(result.plan.depth());
+                let depth = levels.max(result.plan().depth());
                 return Ok(QueryExecution::Eager(Box::new(MaterializedResult {
                     result: Some(result),
                     depth,
@@ -1641,9 +1851,9 @@ pub fn query_execution_with_plan(
                     ran => ran?,
                 };
                 if result.kind == QueryKind::Select {
-                    super::select_star_order(query, &mut result);
+                    super::select_star_order(query, &mut result)?;
                 }
-                let depth = levels.max(result.plan.depth());
+                let depth = levels.max(result.plan().depth());
                 Ok(QueryExecution::Eager(Box::new(MaterializedResult {
                     result: Some(result),
                     depth,
@@ -1732,7 +1942,7 @@ impl QueryExecution {
                 emitted_rows: r.result().len() as u64,
                 rows_produced: r.result().rows_produced,
                 mem_peak_bytes: r.result().mem_peak_bytes,
-                granted_bytes: r.result().ctx.grant().map(|g| g.peak()),
+                granted_bytes: r.result().inner.ctx.grant().map(|g| g.peak()),
                 timing: r.result().timing.clone(),
                 error: None,
             },
@@ -1743,14 +1953,14 @@ impl QueryExecution {
         match self {
             Self::Select(c) => c.reasoning(),
             Self::Graph(c) => c.reasoning(),
-            Self::Eager(r) | Self::Ask(r) => r.result().ctx.reasoning.clone(),
+            Self::Eager(r) | Self::Ask(r) => r.result().inner.ctx.reasoning.clone(),
         }
     }
     pub fn cancellation_token(&self) -> Arc<std::sync::atomic::AtomicBool> {
         match self {
             Self::Select(c) => c.cancellation_token(),
             Self::Graph(c) => c.cancellation_token(),
-            Self::Eager(r) | Self::Ask(r) => r.result().ctx.cancel.clone(),
+            Self::Eager(r) | Self::Ask(r) => r.result().inner.ctx.cancel.clone(),
         }
     }
     /// The deadline without the time the query spent waiting for its consumer. The
@@ -1759,7 +1969,7 @@ impl QueryExecution {
         match self {
             Self::Select(c) => c.deadline(),
             Self::Graph(c) => c.deadline(),
-            Self::Eager(r) | Self::Ask(r) => r.result().ctx.deadline,
+            Self::Eager(r) | Self::Ask(r) => r.result().inner.ctx.deadline,
         }
     }
     /// The nanoseconds the query spent waiting for its consumer. Adding to the counter
@@ -1768,7 +1978,7 @@ impl QueryExecution {
         match self {
             Self::Select(c) => c.deadline_pause(),
             Self::Graph(c) => c.deadline_pause(),
-            Self::Eager(r) | Self::Ask(r) => r.result().ctx.deadline_pause.clone(),
+            Self::Eager(r) | Self::Ask(r) => r.result().inner.ctx.deadline_pause.clone(),
         }
     }
     pub fn plan_json(&self) -> Result<String> {
@@ -1816,7 +2026,7 @@ pub fn query_cursor(
 
 impl QueryCursor {
     pub fn variables(&self) -> &[String] {
-        &self.variables
+        &self.variables.names
     }
     pub fn plan(&self) -> &CursorPlan {
         &self.plan
@@ -1981,6 +2191,7 @@ impl QueryCursor {
     }
 
     pub(super) fn next_batch_at_most(&mut self, rows: usize) -> Result<Option<QueryBatch>> {
+        let previous_emitted = self.emitted;
         if self.shared && self.status == CursorStatus::Open {
             let began = Instant::now();
             let attempt = depth::with_stack(self.depth, || {
@@ -1988,7 +2199,7 @@ impl QueryCursor {
                 self.root.as_mut().expect("open cursor").next_shared(
                     &self.ctx,
                     &self.options,
-                    &self.vars,
+                    &self.variables.ids,
                     rows,
                 )
             });
@@ -2008,11 +2219,11 @@ impl QueryCursor {
                     if complete {
                         self.terminate(CursorStatus::Complete);
                     }
-                    return Ok(batch.map(|batch| QueryBatch {
-                        buffer: BatchBuffer::Shared(batch),
-                        variables: self.variables.clone(),
-                        ctx: self.ctx.clone(),
-                    }));
+                    return batch
+                        .map(|batch| {
+                            self.publish_batch(BatchBuffer::Shared(batch), previous_emitted)
+                        })
+                        .transpose();
                 }
                 Err(error) => {
                     // the counts so far, as the pull path keeps them
@@ -2026,13 +2237,23 @@ impl QueryCursor {
                 }
             }
         }
-        self.pull(rows).map(|b| {
-            b.map(|buffer| QueryBatch {
-                buffer: BatchBuffer::Owned(buffer),
-                variables: self.variables.clone(),
-                ctx: self.ctx.clone(),
-            })
-        })
+        self.pull(rows)?
+            .map(|buffer| self.publish_batch(BatchBuffer::Owned(buffer), previous_emitted))
+            .transpose()
+    }
+
+    fn publish_batch(&mut self, buffer: BatchBuffer, previous_emitted: u64) -> Result<QueryBatch> {
+        match QueryBatch::new(buffer, self.variables.clone(), &self.ctx) {
+            Ok(batch) => Ok(batch),
+            Err(error) => {
+                // Produced private rows are not emitted when required publication
+                // storage refuses, even if the producer had just completed.
+                self.emitted = previous_emitted;
+                self.failure = Some(error.to_string());
+                self.terminate(CursorStatus::Failed);
+                Err(error)
+            }
+        }
     }
 
     fn pull(&mut self, rows: usize) -> Result<Option<Buffer>> {
@@ -2045,7 +2266,7 @@ impl QueryCursor {
             let root = self.root.as_mut().expect("an open cursor has an operator");
             let mut batch = root.next(&self.ctx, &self.options, rows)?;
             if let Some(b) = &mut batch {
-                b.project(&self.vars)?;
+                b.project(&self.variables.ids)?;
                 for (var, id) in &self.bound {
                     if let Some(c) = b.table.col_of(*var) {
                         b.table.cols[c].fill(*id);
@@ -2116,15 +2337,15 @@ impl QueryCursor {
                 "cannot collect a partially consumed or stopped cursor".into()
             })));
         }
-        let mut output = Buffer::new(&self.ctx, &self.vars, 0)?;
+        let mut output = Buffer::new(&self.ctx, &self.variables.ids, 0)?;
         while let Some(buffer) = self.pull(self.options.batch_rows)? {
             let len = output
                 .table
                 .len
                 .checked_add(buffer.table.len)
                 .ok_or_else(|| Error::invalid("collected query row count overflow"))?;
-            let bytes = super::ctx::table_bytes(len, self.vars.len())
-                .saturating_add(self.vars.len() as u64 * 40 + 128);
+            let bytes = super::ctx::table_bytes(len, self.variables.ids.len())
+                .saturating_add(self.variables.ids.len() as u64 * 40 + 128);
             output.charge.resize(bytes)?;
             for (column, incoming) in output.table.cols.iter_mut().zip(&buffer.table.cols) {
                 column.reserve_exact(incoming.len());
@@ -2134,13 +2355,12 @@ impl QueryCursor {
             output.reconcile()?;
         }
         let stats = self.stats();
-        let vars = (*self.variables).clone();
         let plan = self.plan_info();
         let output = super::table::Materialized::with_owned(output.table, output.charge)?
             .into_retained(&self.ctx)?;
-        Ok(QueryResult {
+        super::ResultParts {
             kind: QueryKind::Select,
-            vars,
+            variables: Some(self.variables.clone()),
             table: output.table,
             boolean: false,
             triples: Vec::new(),
@@ -2152,7 +2372,9 @@ impl QueryCursor {
             describe_truncated: false,
             ctx: self.ctx.clone(),
             _table_credit: output.credit,
-        })
+            _graph_credit: None,
+        }
+        .freeze()
     }
 
     fn plan_info(&self) -> PlanInfo {
@@ -5170,7 +5392,7 @@ mod tests {
     #[test]
     fn decoded_batch_reserves_exactly_when_under_one_chunk_remains() {
         let batch = first_batch(4 << 20);
-        let ctx = batch.ctx.clone();
+        let ctx = batch.inner.ctx.clone();
         let filler = ctx.charge(ctx.memory_remaining() - (32 << 10)).unwrap();
         assert!(ctx.memory_remaining() < TERM_RESERVE);
         let decoded = batch.decoded().unwrap();
@@ -5186,7 +5408,7 @@ mod tests {
     #[test]
     fn decoded_batch_releases_its_reservation() {
         let batch = first_batch(4 << 20);
-        let ctx = batch.ctx.clone();
+        let ctx = batch.inner.ctx.clone();
         let before = ctx.memory_remaining();
         let decoded = batch.decoded().unwrap().unwrap();
         assert!(ctx.memory_remaining() < before);
@@ -5290,5 +5512,308 @@ mod tests {
             assert_eq!(ahead.first(), serial.first(), "send {send}");
             assert_eq!(ahead.last(), serial.last(), "send {send}");
         }
+    }
+}
+
+#[cfg(test)]
+mod retained_variable_tests {
+    use super::*;
+    #[test]
+    fn retained_variable_backing_keeps_actual_live_credit_after_cursor_drop() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let pool = super::super::pool::QueryPool::new(32 << 20);
+        let name = "v".repeat(128 << 10);
+        let query = format!("SELECT ?{name} WHERE {{ VALUES ?{name} {{ 1 }} }}");
+        let options = QueryOptions {
+            pool: Some(pool.clone()),
+            max_memory_bytes: Some(16 << 20),
+            no_cache: true,
+            ..Default::default()
+        };
+        let mut cursor = select_cursor(
+            store.snapshot(),
+            &query,
+            &options,
+            &CursorOptions {
+                batch_rows: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let batch = cursor.next_batch().unwrap().unwrap();
+        assert_eq!(batch.variables(), &[name]);
+        cursor.close();
+        drop(cursor);
+        let actual_name_bytes = batch.variables()[0].capacity() as u64;
+        assert_eq!(actual_name_bytes, 128 << 10);
+        eprintln!(
+            "known actual name bytes={actual_name_bytes}; actual live ledger={}; rounded pool={}",
+            batch.test_live_bytes(),
+            pool.granted()
+        );
+        assert!(
+            batch.test_live_bytes() >= actual_name_bytes,
+            "actual retained variable backing must keep its original live credit, independently of pool slack; live {} < known {}",
+            batch.test_live_bytes(),
+            actual_name_bytes
+        );
+        drop(batch);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    fn small_cursor(query: &str) -> (Arc<super::super::pool::QueryPool>, QueryCursor) {
+        let store = crate::store::Store::in_memory(Default::default());
+        let pool = super::super::pool::QueryPool::new(32 << 20);
+        let options = QueryOptions {
+            pool: Some(pool.clone()),
+            max_memory_bytes: Some(4 << 20),
+            no_cache: true,
+            ..Default::default()
+        };
+        let cursor = select_cursor(
+            store.snapshot(),
+            query,
+            &options,
+            &CursorOptions {
+                batch_rows: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        (pool, cursor)
+    }
+
+    #[test]
+    fn cursor_variables_are_paid_before_allocation_and_refusal_does_not_allocate() {
+        use crate::algo::memory::probe;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = crate::store::Store::in_memory(Default::default());
+        let pattern = spargebra::algebra::GraphPattern::Bgp {
+            patterns: Vec::new(),
+        };
+        for short in [false, true] {
+            let mut context = Ctx::new(store.snapshot());
+            let id = context.var("x");
+            let needed = arc_backing_bytes::<Variables>(&context).unwrap()
+                + std::mem::size_of::<String>() as u64
+                + std::mem::size_of::<VarId>() as u64
+                + 1;
+            context.mem_limit = needed - u64::from(short);
+            let ctx = Arc::new(context);
+            // The real original accounting root exists before this component's probe.
+            ctx.memory();
+            let allocations = Arc::new(AtomicUsize::new(0));
+            let observed = allocations.clone();
+            let account = ctx.clone();
+            let hook = probe::install(
+                move |point| {
+                    if let probe::Point::Allocation("query-variable-backing", 1) = point {
+                        observed.fetch_add(1, Ordering::Relaxed);
+                        assert_eq!(account.live_bytes(), needed);
+                    }
+                },
+                None,
+            );
+            let result = Variables::new(&ctx, &pattern, &[id], "SELECT ?x WHERE {}");
+            drop(hook);
+            if short {
+                assert!(
+                    matches!(result, Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory)
+                );
+                assert_eq!(allocations.load(Ordering::Relaxed), 0);
+            } else {
+                let variables = result.unwrap();
+                assert_eq!(variables.names, ["x"]);
+                assert_eq!(variables.ids, [id]);
+                assert_eq!(ctx.live_bytes(), needed);
+                assert_eq!(allocations.load(Ordering::Relaxed), 1);
+                drop(variables);
+            }
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn cursor_variable_allocation_failure_and_late_cancel_return_actual_credit() {
+        use crate::algo::memory::probe;
+        for cancel in [false, true] {
+            let store = crate::store::Store::in_memory(Default::default());
+            let mut context = Ctx::new(store.snapshot());
+            context.mem_limit = 4096;
+            let id = context.var("x");
+            let ctx = Arc::new(context);
+            ctx.memory();
+            let flag = ctx.cancel.clone();
+            let hook = probe::install(
+                move |point| {
+                    if cancel && let probe::Point::Allocation("query-variable-backing", 1) = point {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                },
+                (!cancel).then_some("query-variable-backing"),
+            );
+            let result = Variables::new(
+                &ctx,
+                &spargebra::algebra::GraphPattern::Bgp {
+                    patterns: Vec::new(),
+                },
+                &[id],
+                "SELECT ?x WHERE {}",
+            );
+            drop(hook);
+            if cancel {
+                assert!(matches!(result, Err(Error::Cancelled)));
+            } else {
+                assert!(matches!(result, Err(Error::Invalid(_))));
+            }
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn batch_header_refusal_precedes_allocation_and_keeps_original_names_owner() {
+        use crate::algo::memory::probe;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (pool, mut cursor) = small_cursor("SELECT ?x WHERE { VALUES ?x { 1 } }");
+        let ctx = cursor.ctx.clone();
+        let variables = cursor.variables.clone();
+        let mut buffer = Buffer::new(&ctx, &variables.ids, 1).unwrap();
+        buffer.table.cols[0].push(Id::from_i64(1).unwrap());
+        buffer.table.len = 1;
+        let header = arc_backing_bytes::<BatchBacking>(&ctx).unwrap();
+        let pressure = ctx.charge(ctx.memory_remaining() - header + 1).unwrap();
+        let allocations = Arc::new(AtomicUsize::new(0));
+        let observed = allocations.clone();
+        let hook = probe::install(
+            move |point| {
+                if let probe::Point::Allocation("query-batch-backing", 1) = point {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+            None,
+        );
+        let result = QueryBatch::new(BatchBuffer::Owned(buffer), variables.clone(), &ctx);
+        drop(hook);
+        assert!(
+            matches!(result, Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory)
+        );
+        assert_eq!(allocations.load(Ordering::Relaxed), 0);
+        assert_eq!(variables.names, ["x"]);
+        drop(pressure);
+        cursor.close();
+        drop(cursor);
+        drop(variables);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn batch_publication_failure_or_cancel_never_emits_private_rows() {
+        use crate::algo::memory::probe;
+        for cancel in [false, true] {
+            let (pool, mut cursor) = small_cursor("SELECT ?x WHERE { VALUES ?x { 1 2 } }");
+            let ctx = cursor.ctx.clone();
+            let flag = ctx.cancel.clone();
+            let hook = probe::install(
+                move |point| {
+                    if cancel && let probe::Point::Allocation("query-batch-backing", 1) = point {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                },
+                (!cancel).then_some("query-batch-backing"),
+            );
+            let result = cursor.next_batch();
+            drop(hook);
+            if cancel {
+                assert!(matches!(result, Err(Error::Cancelled)));
+            } else {
+                assert!(matches!(result, Err(Error::Invalid(_))));
+            }
+            assert_eq!(cursor.status(), CursorStatus::Failed);
+            assert_eq!(cursor.stats().emitted_rows, 0);
+            assert!(cursor.root.is_none());
+            assert!(cursor.next_batch().unwrap().is_none());
+            drop(cursor);
+            assert_eq!(ctx.live_bytes(), 0);
+            drop(ctx);
+            assert_eq!(pool.granted(), 0);
+        }
+    }
+
+    #[test]
+    fn batch_clone_keeps_one_actual_id_name_header_owner_until_last_drop() {
+        let (pool, mut cursor) =
+            small_cursor("SELECT ?x ?y WHERE { VALUES (?x ?y) { (1 UNDEF) (2 UNDEF) } }");
+        let ctx = cursor.ctx.clone();
+        let first = cursor.next_batch().unwrap().unwrap();
+        let retained = first.clone();
+        assert!(Arc::ptr_eq(&first.inner, &retained.inner));
+        assert!(Arc::ptr_eq(&first.inner.variables, &cursor.variables));
+        let backing = Arc::downgrade(&first.inner);
+        let names = Arc::downgrade(&first.inner.variables);
+        let before = ctx.live_bytes();
+        let another = retained.clone();
+        assert_eq!(ctx.live_bytes(), before);
+        drop(another);
+        cursor.close();
+        drop(cursor);
+        drop(first);
+        assert!(backing.upgrade().is_some() && names.upgrade().is_some());
+        assert_eq!(retained.variables(), &["x", "y"]);
+        assert!(retained.test_live_bytes() >= arc_backing_bytes::<BatchBacking>(&ctx).unwrap());
+        assert!(retained.key(0, 0).unwrap().is_some());
+        assert!(retained.key(0, 1).unwrap().is_none());
+        drop(retained);
+        assert!(backing.upgrade().is_none() && names.upgrade().is_none());
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn paid_cursor_variable_order_and_unbound_empty_projection_match_existing_semantics() {
+        for (query, variables, row) in [
+            (
+                "SELECT * WHERE { VALUES (?b ?a) { (2 1) } }",
+                vec!["b", "a"],
+                vec![Some(2), Some(1)],
+            ),
+            (
+                "SELECT ?missing ?b WHERE { VALUES ?b { 2 } }",
+                vec!["missing", "b"],
+                vec![None, Some(2)],
+            ),
+        ] {
+            let (pool, mut cursor) = small_cursor(query);
+            let batch = cursor.next_batch().unwrap().unwrap();
+            assert_eq!(batch.variables(), variables.as_slice());
+            let actual = batch.row(0).unwrap();
+            let expected = row
+                .into_iter()
+                .map(|value| value.map(|value| oxrdf::Literal::from(value).into()))
+                .collect::<Vec<Option<Term>>>();
+            assert_eq!(actual.values(), &expected);
+            drop(actual);
+            drop(batch);
+            drop(cursor);
+            assert_eq!(pool.granted(), 0);
+        }
+        let (pool, mut empty) = small_cursor("SELECT ?x WHERE { FILTER(false) }");
+        assert_eq!(empty.variables(), &["x"]);
+        assert!(empty.next_batch().unwrap().is_none());
+        drop(empty);
+        assert_eq!(pool.granted(), 0);
+        let (pool, mut zero) = small_cursor("SELECT * WHERE { VALUES () { () () } }");
+        let batch = zero.next_batch().unwrap().unwrap();
+        assert_eq!(batch.width(), 0);
+        assert_eq!(batch.len(), 1);
+        let retained = batch.clone();
+        zero.close();
+        drop(zero);
+        drop(batch);
+        assert!(retained.variables().is_empty());
+        drop(retained);
+        assert_eq!(pool.granted(), 0);
     }
 }

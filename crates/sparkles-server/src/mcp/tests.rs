@@ -2451,7 +2451,7 @@ fn question_schema_ranking_cannot_reveal_a_hidden_predicate_from_cached_report()
         )])
         .unwrap();
     let summary = |principal| {
-        let call = Call {
+        let mut call = Call {
             arrived: Instant::now(),
             cancel: Arc::new(AtomicBool::new(false)),
             request_id: "schema-ranking".into(),
@@ -2459,10 +2459,16 @@ fn question_schema_ranking_cannot_reveal_a_hidden_predicate_from_cached_report()
             headers: None,
             held: None,
             grant: None,
+
+            preparation: None,
         };
         let args = json!({"dataset":"t","graph":"union","query":"secret predicate","limit":1});
         match server
-            .run_now("describe_schema", args.as_object().unwrap().clone(), &call)
+            .run_now(
+                "describe_schema",
+                args.as_object().unwrap().clone(),
+                &mut call,
+            )
             .unwrap()
         {
             Outcome::Structured(value) => value,
@@ -2478,4 +2484,70 @@ fn question_schema_ranking_cannot_reveal_a_hidden_predicate_from_cached_report()
         "{restricted}"
     );
     assert_eq!(summary(Principal::local()), visible);
+}
+
+#[test]
+fn real_request_preparation_survives_branch_continuation_and_aggregate_refusal() {
+    use sparkles::{
+        BudgetKind, Error,
+        sparql::{output::NativeBudget, pool::QueryPool},
+    };
+    let server = server_with(
+        &[("t", &[FIXTURE])],
+        McpConfig {
+            query_memory_bytes: Some(128 << 10),
+            ..Default::default()
+        },
+    );
+    let pool = QueryPool::new(4 << 20);
+    let grant = Arc::new(pool.empty_grant());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut call = Call {
+        arrived: Instant::now(),
+        cancel: cancel.clone(),
+        request_id: "same request".into(),
+        principal: Principal::local(),
+        headers: None,
+        held: None,
+        grant: Some(grant.clone()),
+        preparation: None,
+    };
+    server.prepare_call(&mut call).unwrap();
+    assert_eq!(grant.used(), 1024);
+    let mut args = serde_json::json!({"branch":"review"})
+        .as_object()
+        .unwrap()
+        .clone();
+    let mut branch = super::branches::branch_call(&server, "sparql_query", &mut args, &call)
+        .unwrap()
+        .unwrap();
+    assert!(Arc::ptr_eq(branch.grant.as_ref().unwrap(), &grant));
+    server.prepare_call(&mut branch).unwrap();
+    assert_eq!(
+        grant.used(),
+        1024,
+        "continuation initialization allocates no second root"
+    );
+    let one = NativeBudget::from_preparation(call.preparation.as_ref().unwrap()).unwrap();
+    let two = NativeBudget::from_preparation(branch.preparation.as_ref().unwrap()).unwrap();
+    let output = one.text(&"x".repeat(64 << 10)).unwrap();
+    let live = grant.used();
+    assert!(
+        matches!(two.text(&"y".repeat(64 << 10)), Err(Error::BudgetExceeded(b))
+        if b.kind == BudgetKind::Memory && b.limit == 128 << 10)
+    );
+    assert_eq!(grant.used(), live);
+    cancel.store(true, Ordering::SeqCst);
+    assert!(matches!(one.check(), Err(Error::Cancelled)));
+    assert!(matches!(two.check(), Err(Error::Cancelled)));
+    drop(one);
+    drop(two);
+    drop(call);
+    drop(branch);
+    assert!(grant.used() >= output.len() as u64);
+    assert_eq!(output.len(), 64 << 10);
+    drop(output);
+    assert_eq!(grant.used(), 0);
+    drop(grant);
+    assert_eq!(pool.granted(), 0);
 }

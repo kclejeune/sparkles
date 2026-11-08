@@ -229,6 +229,6 @@ fn a13_betweenness_over_the_node_limit() {
     let e = run("").err().expect("an error over the limit").to_string();
     assert!(e.contains("algo:samples"), "{e}");
     // sampling is allowed
-    assert!(!run(" algo:samples 2 ;").unwrap().rows().is_empty());
+    assert!(!run(" algo:samples 2 ;").unwrap().is_empty());
     sparkles_core::algo::pool::set_exact_betweenness_max(100_000);
 }

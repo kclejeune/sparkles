@@ -362,7 +362,7 @@ fn read_cursor(
     let mut cursor = select_cursor(store.snapshot(), text, options, &cursor_options())?;
     while let Some(batch) = cursor.next_batch()? {
         for i in 0..batch.len() {
-            check(batch.row(i)?);
+            check(batch.row(i)?.values().to_vec());
         }
     }
     assert_eq!(cursor.status(), CursorStatus::Complete);

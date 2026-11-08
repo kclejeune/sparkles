@@ -238,7 +238,7 @@ fn forced(
 }
 
 fn rows(r: &QueryResult) -> Vec<String> {
-    r.rows()
+    r.test_application_rows()
         .into_iter()
         .map(|row| {
             row.into_iter()
@@ -280,7 +280,7 @@ fn check_snapshot(snap: &Arc<crate::store::Snapshot>, label: &str) -> usize {
     let mut missed = 0;
     for (q, op) in shapes() {
         let base = run(snap, q, without());
-        assert!(!has_op(&base.plan, "IndexJoin") && !has_op(&base.plan, "StarJoin"));
+        assert!(!has_op(&base.plan(), "IndexJoin") && !has_op(&base.plan(), "StarJoin"));
         let want = answer(q, &base);
         let unfused = Optimizations {
             star_fusion: false,
@@ -299,13 +299,13 @@ fn check_snapshot(snap: &Arc<crate::store::Snapshot>, label: &str) -> usize {
         ] {
             assert_eq!(answer(q, &r), want, "{label}, {how}: {q}");
             if how == "unfused" {
-                assert!(!has_op(&r.plan, "StarJoin"), "{label}: {q}");
+                assert!(!has_op(&r.plan(), "StarJoin"), "{label}: {q}");
             }
             if let ("walks" | "per pattern", Some(op)) = (how, op)
-                && !has_op(&r.plan, op)
+                && !has_op(&r.plan(), op)
             {
                 missed += 1;
-                tracing::info!(target: "sparkles::sparql::indexjoin_tests", "{label}, {how}: {q} lacks {op}: {:#?}", r.plan);
+                tracing::info!(target: "sparkles::sparql::indexjoin_tests", "{label}, {how}: {q} lacks {op}: {:#?}", r.plan());
             }
         }
     }
@@ -416,7 +416,7 @@ fn probing_is_chosen_by_selectivity() {
     // a rare class: one walk or probe per pattern for its 20 subjects
     let r = check("SELECT * WHERE { ?s a ex:Rare ; ex:name ?n ; ex:age ?a }");
     assert_eq!(r.len(), 20);
-    let star = find(&r.plan, "StarJoin").unwrap_or_else(|| panic!("{:#?}", r.plan));
+    let star = find(&r.plan(), "StarJoin").unwrap_or_else(|| panic!("{:#?}", r.plan()));
     let c = star.counters.as_ref().unwrap();
     assert_eq!(c["keys"], 20);
     assert!(c["seeks"].as_u64().unwrap() <= 40, "{c:?}");
@@ -426,16 +426,16 @@ fn probing_is_chosen_by_selectivity() {
         "SELECT ?s ?n ?a WHERE { ?o ex:city \"Kyoto\" . ?s ex:worksFor ?o ; ex:name ?n ; ex:age ?a }",
     );
     assert_eq!(r.len(), 120);
-    assert!(has_op(&r.plan, "IndexJoin") || has_op(&r.plan, "StarJoin"));
+    assert!(has_op(&r.plan(), "IndexJoin") || has_op(&r.plan(), "StarJoin"));
     // VALUES drive the star
     let r = check(
         "SELECT * WHERE { VALUES ?s { ex:s1 ex:s2 ex:s2 ex:s59999 ex:none } ?s ex:name ?n ; ex:age ?a }",
     );
     assert_eq!(r.len(), 4);
-    assert!(has_op(&r.plan, "StarJoin"));
+    assert!(has_op(&r.plan(), "StarJoin"));
     // every subject: scanning the patterns is cheaper
     let r = check("SELECT (COUNT(*) AS ?c) WHERE { ?s a ex:Common ; ex:name ?n ; ex:age ?a }");
-    assert!(!has_op(&r.plan, "IndexJoin") && !has_op(&r.plan, "StarJoin"));
+    assert!(!has_op(&r.plan(), "IndexJoin") && !has_op(&r.plan(), "StarJoin"));
     // switched off per query
     let off = Optimizations::ALL.disable("batched_join").unwrap();
     let r = run(
@@ -443,14 +443,14 @@ fn probing_is_chosen_by_selectivity() {
         "SELECT * WHERE { ?s a ex:Rare ; ex:name ?n ; ex:age ?a }",
         off,
     );
-    assert!(!has_op(&r.plan, "IndexJoin") && !has_op(&r.plan, "StarJoin"));
+    assert!(!has_op(&r.plan(), "IndexJoin") && !has_op(&r.plan(), "StarJoin"));
     let off = Optimizations::ALL.disable("star_fusion").unwrap();
     let r = run(
         &snap,
         "SELECT * WHERE { ?s a ex:Rare ; ex:name ?n ; ex:age ?a }",
         off,
     );
-    assert!(has_op(&r.plan, "IndexJoin") && !has_op(&r.plan, "StarJoin"));
+    assert!(has_op(&r.plan(), "IndexJoin") && !has_op(&r.plan(), "StarJoin"));
     // EXPLAIN names the operator before running it
     let opts = QueryOptions::default();
     let (_, plan) = explain(
@@ -493,7 +493,7 @@ fn index_joins_keep_input_order_and_multiplicity() {
     let q = "SELECT ?s ?x ?y WHERE { VALUES ?s { ex:b ex:a ex:c ex:b } ?s ex:p ?x ; ex:q ?y }";
     for walk in [Some(true), Some(false)] {
         let r = forced(&snap, q, Optimizations::ALL, walk);
-        assert!(has_op(&r.plan, "StarJoin"), "{:#?}", r.plan);
+        assert!(has_op(&r.plan(), "StarJoin"), "{:#?}", r.plan());
         assert_eq!(
             rows(&r),
             // a key's rows come in index order (inline integers by value)
@@ -601,7 +601,7 @@ fn keys_are_read_by_clustered_seeks() {
     let seeks = |snap: &Arc<crate::store::Snapshot>, walk: bool, opt: Optimizations| {
         let r = forced(snap, q, opt, Some(walk));
         assert_eq!(answer(q, &r), answer(q, &run(snap, q, without())), "{walk}");
-        let star = find(&r.plan, "StarJoin").unwrap_or_else(|| panic!("{:#?}", r.plan));
+        let star = find(&r.plan(), "StarJoin").unwrap_or_else(|| panic!("{:#?}", r.plan()));
         let c = star.counters.clone().unwrap();
         assert_eq!(c["keys"], 5);
         (r.len(), c["seeks"].as_u64().unwrap())
@@ -665,6 +665,8 @@ fn cursor_rows(
             out.push(
                 b.row(i)
                     .unwrap()
+                    .values()
+                    .to_vec()
                     .into_iter()
                     .map(|t| t.map_or("UNDEF".to_string(), |t| t.to_string()))
                     .collect::<Vec<_>>()

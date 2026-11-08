@@ -66,7 +66,7 @@ fn automatic(
             let mut rows = Vec::new();
             while let Some(batch) = c.next_batch()? {
                 for row in 0..batch.len() {
-                    rows.push(batch.row(row)?);
+                    rows.push(batch.row(row)?.values().to_vec());
                 }
             }
             Ok((rows, true))
@@ -239,7 +239,7 @@ fn streamed_exists_stays_within_its_memory_budget() {
                         match c.next_batch() {
                             Ok(Some(batch)) => {
                                 for row in 0..batch.len() {
-                                    rows.push(batch.row(row).unwrap());
+                                    rows.push(batch.row(row).unwrap().values().to_vec());
                                 }
                             }
                             Ok(None) => break Ok(()),
@@ -328,7 +328,7 @@ fn bind_exists_streams_from_the_key_set() {
             let mut rows = Vec::new();
             while let Some(b) = c.next_batch().unwrap() {
                 for i in 0..b.len() {
-                    rows.push(b.row(i).unwrap());
+                    rows.push(b.row(i).unwrap().values().to_vec());
                 }
             }
             assert_eq!(

@@ -178,9 +178,9 @@ fn rows(
     snap: &Arc<Snapshot>,
     q: &str,
     opts: &QueryOptions,
-) -> Result<Vec<Vec<Option<Term>>>, RunError> {
+) -> Result<sparql::output::OwnedRows, RunError> {
     sparql::query(snap.clone(), q, opts)
-        .map(|r| r.rows())
+        .and_then(|r| r.rows())
         .map_err(|e| match e {
             sparkles::Error::Cancelled => RunError::Cancelled,
             e => failed(e),
@@ -594,6 +594,7 @@ impl Run<'_> {
                 break;
             }
             for r in rows(&snap, &q, &opts)? {
+                let r = r.values();
                 let Some(e) = nt(&r[0]) else { continue };
                 let entry = info.entry(e).or_default();
                 if let Some(Term::Literal(l)) = &r[1] {
@@ -671,6 +672,7 @@ impl Run<'_> {
                 store::RDF_TYPE
             );
             for r in rows(snap, &q, opts)? {
+                let r = r.values();
                 if let (Some(s), Some(p), Some(o)) = (nt(&r[0]), nt(&r[1]), nt(&r[2])) {
                     out.push(Fact {
                         s,
@@ -701,6 +703,7 @@ impl Run<'_> {
         );
         let mut all: BTreeMap<String, Existing> = BTreeMap::new();
         for r in rows(snap, &q, &QueryOptions::default())? {
+            let r = r.values();
             let Some(Term::NamedNode(c)) = &r[0] else {
                 continue;
             };
@@ -731,6 +734,7 @@ impl Run<'_> {
         let mut summary = String::new();
         let mut findings: BTreeMap<u64, ChildFinding> = BTreeMap::new();
         for r in rows(snap, &q, &QueryOptions::default())? {
+            let r = r.values();
             if let Some(Term::Literal(l)) = &r[0] {
                 title = l.value().to_string();
             }

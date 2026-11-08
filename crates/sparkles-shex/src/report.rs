@@ -91,7 +91,7 @@ pub fn to_json(r: &ResultMap) -> serde_json::Value {
         "results": r
             .results
             .iter()
-            .map(|x| result_json(x, term_json(&x.node), label_json(&x.shape)))
+            .map(|x| result_json(x, term_json(x.node.as_term()), label_json(&x.shape)))
             .collect::<Vec<_>>(),
         "warnings": r.warnings,
         "millis": r.millis,
@@ -129,7 +129,7 @@ pub fn to_text(r: &ResultMap) -> String {
     }
     let mut s = String::new();
     for x in &r.results {
-        let node = term_str(&x.node);
+        let node = term_str(x.node.as_term());
         s.push_str(&format!(
             "{node} @ {} :: Focus = {node}, Status = {}",
             label_str(&x.shape),
@@ -163,7 +163,7 @@ mod tests {
     fn results() -> ResultMap {
         let person = ShapeLabel::Iri("http://ex.org/Person".into());
         let ok = |n: &str| ShapeResult {
-            node: iri(n),
+            node: crate::owned_test_term(iri(n)),
             shape: person.clone(),
             status: Status::Conformant,
             reason: None,
@@ -179,18 +179,18 @@ mod tests {
                 ok("http://ex.org/alice"),
                 ok("http://ex.org/bob"),
                 ShapeResult {
-                    node: iri("http://ex.org/carol"),
+                    node: crate::owned_test_term(iri("http://ex.org/carol")),
                     shape: person.clone(),
                     status: Status::Nonconformant,
                     reason: Some("ex:carol: foaf:age 200 fails MAXINCLUSIVE 150".into()),
                     failures: vec![ShexFailure::Facet {
-                        value: age,
+                        value: crate::owned_test_term(age),
                         constraint: "MAXINCLUSIVE 150".into(),
                     }],
                     prints: vec![],
                 },
                 ShapeResult {
-                    node: Literal::new_simple_literal("x").into(),
+                    node: crate::owned_test_term(Literal::new_simple_literal("x").into()),
                     shape: ShapeLabel::Start,
                     status: Status::Conformant,
                     reason: None,

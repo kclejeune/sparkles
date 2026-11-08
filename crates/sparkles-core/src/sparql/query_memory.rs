@@ -492,6 +492,70 @@ impl QueryMemoryLedger {
         }
         self.admit(&mut self.lock(), owner, limit, bytes, decode)
     }
+    /// A concrete mutable receiver adds an exact contribution alongside the
+    /// executor's existing amortized allowance. Returning it cannot consume that
+    /// allowance or strand its own bytes behind LIVE_SLACK.
+    pub(crate) fn reserve_receiving(
+        &self,
+        owner: &MemoryOwner,
+        limit: u64,
+        bytes: u64,
+    ) -> Result<()> {
+        let mut state = self.lock();
+        let prior = self.live.load(Ordering::Relaxed);
+        let live = prior
+            .checked_add(bytes)
+            .filter(|n| *n <= limit)
+            .ok_or_else(|| memory(limit, prior.saturating_add(bytes)))?;
+        let account = state
+            .owners
+            .iter_mut()
+            .find(|a| a.owner.id == owner.id)
+            .expect("receiving owner");
+        let own_live = account
+            .live
+            .checked_add(bytes)
+            .ok_or_else(|| memory(limit, u64::MAX))?;
+        let eager = account
+            .eager
+            .checked_add(bytes)
+            .ok_or_else(|| memory(limit, u64::MAX))?;
+        if let Some(lease) = &mut account.lease {
+            lease.try_grow(bytes).map_err(parent_error)?;
+        } else if let Some(grant) = &owner.grant {
+            grant.charge(bytes)?;
+        }
+        account.live = own_live;
+        account.eager = eager;
+        self.live.store(live, Ordering::Release);
+        self.peak.fetch_max(live, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn release_receiving(&self, id: u64, bytes: u64) {
+        let release = {
+            let mut state = self.lock();
+            let account = state
+                .owners
+                .iter_mut()
+                .find(|a| a.owner.id == id)
+                .expect("receiving owner");
+            assert!(
+                bytes <= account.live - account.decode,
+                "owned receiving bytes"
+            );
+            account.live -= bytes;
+            account.eager = account
+                .eager
+                .checked_sub(bytes)
+                .expect("receiving contribution");
+            self.live.fetch_sub(bytes, Ordering::Release);
+            account.retire(bytes)
+        };
+        // Pool wakeups and parent return callbacks may reenter the ledger.
+        release.finish();
+    }
+
     fn release_locked(&self, state: &mut State, id: u64, bytes: u64, decode: bool) -> Release {
         let cursor = state.cursor;
         let account = state
@@ -936,6 +1000,51 @@ mod tests {
     use crate::sparql::Ctx;
     use crate::sparql::pool::QueryPool;
     use crate::store::{Store, StoreOptions};
+    #[test]
+    fn receiving_exact_release_returns_after_unlock_with_live_sibling() {
+        let used = Arc::new(AtomicU64::new(0));
+        let returned = Arc::new(AtomicU64::new(0));
+        let callback_ledger =
+            Arc::new(std::sync::OnceLock::<std::sync::Weak<QueryMemoryLedger>>::new());
+        let take = used.clone();
+        let give = used.clone();
+        let returns = returned.clone();
+        let inspect = callback_ledger.clone();
+        let parent = MemoryDomain::unpooled().parent(
+            move |n| {
+                take.fetch_add(n, Ordering::Relaxed);
+                Ok(())
+            },
+            move |n| {
+                if n != 0 {
+                    let ledger = inspect.get().unwrap().upgrade().unwrap();
+                    assert!(
+                        ledger.state.try_lock().is_some(),
+                        "parent return may reenter ledger"
+                    );
+                    returns.fetch_add(n, Ordering::Relaxed);
+                }
+                give.fetch_sub(n, Ordering::Relaxed);
+            },
+        );
+        let ledger = QueryMemoryLedger::nested(None, parent);
+        callback_ledger.set(Arc::downgrade(&ledger)).unwrap();
+        let owner = ledger.owner(None).unwrap();
+        ledger.reserve(&owner, 256 << 10, 4096, false).unwrap();
+        let base = used.load(Ordering::Relaxed);
+        ledger.reserve_receiving(&owner, 256 << 10, 8192).unwrap();
+        assert_eq!(used.load(Ordering::Relaxed), base + 8192);
+        ledger.release_receiving(owner.id, 4096);
+        ledger.release_receiving(owner.id, 4096);
+        assert_eq!(returned.load(Ordering::Relaxed), 8192);
+        assert_eq!(used.load(Ordering::Relaxed), base);
+        assert_eq!(ledger.live.load(Ordering::Relaxed), 4096);
+        ledger.release(owner.id, 4096);
+        // No nonzero callback needs to upgrade a ledger which is already dropping.
+        ledger.shrink_eager(0).unwrap();
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+    }
+
     const MB: u64 = 1 << 20;
     fn context() -> Ctx {
         Ctx::new(Store::in_memory(StoreOptions::default()).snapshot())
@@ -996,7 +1105,10 @@ mod tests {
         ] {
             let before = LEDGER_OPS.with(|n| n.get());
             let r = query(store.snapshot(), q, &opts).unwrap();
-            assert!(!r.rows().is_empty() || !r.triples.is_empty(), "{q}");
+            assert!(
+                !r.test_application_rows().is_empty() || !r.triples().is_empty(),
+                "{q}"
+            );
             let ops = LEDGER_OPS.with(|n| n.get()) - before;
             eprintln!("{ops} ledger operations for {q}");
             assert_eq!(ops, 0, "{ops} ledger operations for {q}");

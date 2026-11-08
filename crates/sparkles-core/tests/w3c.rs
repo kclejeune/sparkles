@@ -632,9 +632,13 @@ fn cursor_answer(
             answer.vars = cursor.variables().to_vec();
             while let Some(batch) = cursor.next_batch().map_err(|e| format!("error: {e}"))? {
                 for i in 0..batch.len() {
-                    answer
-                        .rows
-                        .push(batch.row(i).map_err(|e| format!("error: {e}"))?);
+                    answer.rows.push(
+                        batch
+                            .row(i)
+                            .map_err(|e| format!("error: {e}"))?
+                            .values()
+                            .to_vec(),
+                    );
                 }
             }
         }

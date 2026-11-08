@@ -883,7 +883,7 @@ impl Dataset {
         if r.kind != QueryKind::Select {
             return Err(Error::invalid("not a SELECT query"));
         }
-        Ok(Solutions::from_result(&r))
+        Solutions::from_result(&r)
     }
 
     /// Run an ASK query.
@@ -896,28 +896,22 @@ impl Dataset {
     }
 
     /// Run a CONSTRUCT or DESCRIBE query: the triples of the default graph.
-    pub fn construct(&self, query: &str) -> Result<Vec<Triple>> {
+    pub fn construct(&self, query: &str) -> Result<ConstructedGraph> {
         let r = self.query(query)?;
         if !matches!(r.kind, QueryKind::Construct | QueryKind::Describe) {
             return Err(Error::invalid("not a CONSTRUCT or DESCRIBE query"));
         }
-        Ok(r.triples)
+        Ok(ConstructedGraph { result: r })
     }
 
     /// Run a CONSTRUCT or DESCRIBE query as quads: the default graph's triples, then the
     /// quads of a CONSTRUCT template's `GRAPH` blocks (Jena ARQ's quad templates).
-    pub fn construct_quads(&self, query: &str) -> Result<Vec<oxrdf::Quad>> {
-        let r = self.query(query)?;
-        if !matches!(r.kind, QueryKind::Construct | QueryKind::Describe) {
+    pub fn construct_quads(&self, query: &str) -> Result<ConstructedDataset> {
+        let result = self.query(query)?;
+        if !matches!(result.kind, QueryKind::Construct | QueryKind::Describe) {
             return Err(Error::invalid("not a CONSTRUCT or DESCRIBE query"));
         }
-        let mut out: Vec<oxrdf::Quad> = r
-            .triples
-            .into_iter()
-            .map(|t| t.in_graph(oxrdf::GraphName::DefaultGraph))
-            .collect();
-        out.extend(r.quads);
-        Ok(out)
+        Ok(ConstructedDataset { result })
     }
 
     /// Run a SPARQL Update request (all operations in one transaction).
@@ -1585,37 +1579,156 @@ fn each_blank_node<'a>(t: oxrdf::TermRef<'a>, f: &mut impl FnMut(oxrdf::BlankNod
     }
 }
 
-// ------------------------------------------------------------------------ solutions ----
-
-/// SELECT results as terms.
-#[derive(Clone, Debug)]
-pub struct Solutions {
-    pub vars: Vec<String>,
-    rows: Vec<Solution>,
+/// The default graph of a CONSTRUCT or DESCRIBE, retaining its original query
+/// context and physical admission. Clones share the same immutable payload.
+#[derive(Clone)]
+pub struct ConstructedGraph {
+    result: QueryResult,
+}
+impl ConstructedGraph {
+    pub fn len(&self) -> usize {
+        self.result.triples().len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.result.triples().is_empty()
+    }
+    pub fn triples(&self) -> &[Triple] {
+        self.result.triples()
+    }
+    pub fn iter(&self) -> std::slice::Iter<'_, Triple> {
+        self.triples().iter()
+    }
+    pub fn contains(&self, triple: &Triple) -> bool {
+        self.triples().contains(triple)
+    }
+}
+impl std::ops::Index<usize> for ConstructedGraph {
+    type Output = Triple;
+    fn index(&self, index: usize) -> &Triple {
+        &self.triples()[index]
+    }
+}
+impl<'a> IntoIterator for &'a ConstructedGraph {
+    type Item = &'a Triple;
+    type IntoIter = std::slice::Iter<'a, Triple>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+impl std::fmt::Debug for ConstructedGraph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
 }
 
-/// One solution: variable → term (unbound variables are absent).
-#[derive(Clone, Debug)]
+/// CONSTRUCT's default and named graphs backed by the actual query result.
+/// Iteration borrows terms and adds default graph names without allocating copies.
+#[derive(Clone)]
+pub struct ConstructedDataset {
+    result: QueryResult,
+}
+impl ConstructedDataset {
+    pub fn len(&self) -> usize {
+        self.result.triples().len() + self.result.quads().len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn iter(&self) -> ConstructedQuadIter<'_> {
+        ConstructedQuadIter {
+            graph: self,
+            front: 0,
+            end: self.len(),
+        }
+    }
+    pub fn get(&self, index: usize) -> Option<oxrdf::QuadRef<'_>> {
+        if index < self.result.triples().len() {
+            Some(
+                self.result.triples()[index]
+                    .as_ref()
+                    .in_graph(oxrdf::GraphNameRef::DefaultGraph),
+            )
+        } else {
+            self.result
+                .quads()
+                .get(index - self.result.triples().len())
+                .map(oxrdf::Quad::as_ref)
+        }
+    }
+}
+/// An allocation-free borrowed iterator that cannot outlive the graph owner.
+pub struct ConstructedQuadIter<'a> {
+    graph: &'a ConstructedDataset,
+    front: usize,
+    end: usize,
+}
+impl<'a> Iterator for ConstructedQuadIter<'a> {
+    type Item = oxrdf::QuadRef<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.front == self.end {
+            return None;
+        }
+        let index = self.front;
+        self.front += 1;
+        self.graph.get(index)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.end - self.front;
+        (n, Some(n))
+    }
+}
+impl DoubleEndedIterator for ConstructedQuadIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.front == self.end {
+            return None;
+        }
+        self.end -= 1;
+        self.graph.get(self.end)
+    }
+}
+impl ExactSizeIterator for ConstructedQuadIter<'_> {}
+impl std::iter::FusedIterator for ConstructedQuadIter<'_> {}
+impl<'a> IntoIterator for &'a ConstructedDataset {
+    type Item = oxrdf::QuadRef<'a>;
+    type IntoIter = ConstructedQuadIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+impl std::fmt::Debug for ConstructedDataset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+// ------------------------------------------------------------------------ solutions ----
+
+/// SELECT solutions with one immutable decoded backing. Retaining a solution
+/// deliberately also retains the original result's names, IDs and plan; shallow
+/// clones never copy its payload or grant additional receiving credit.
+#[derive(Clone)]
+pub struct Solutions {
+    result: QueryResult,
+    rows: crate::sparql::output::OwnedRows,
+}
+
+/// One solution retaining its actual immutable row and original variable owner.
+#[derive(Clone)]
 pub struct Solution {
-    vars: Arc<[String]>,
-    values: Vec<Option<Term>>,
+    result: QueryResult,
+    values: crate::sparql::output::OwnedRow,
 }
 
 impl Solutions {
-    pub(crate) fn from_result(r: &QueryResult) -> Solutions {
-        let vars: Arc<[String]> = r.vars.clone().into();
-        let rows = r
-            .rows()
-            .into_iter()
-            .map(|values| Solution {
-                vars: vars.clone(),
-                values,
-            })
-            .collect();
-        Solutions {
-            vars: r.vars.clone(),
+    pub(crate) fn from_result(result: &QueryResult) -> Result<Self> {
+        let rows = result.rows()?;
+        Ok(Self {
+            result: result.clone(),
             rows,
-        }
+        })
+    }
+    pub fn variables(&self) -> &[String] {
+        self.result.variables()
     }
     pub fn len(&self) -> usize {
         self.rows.len()
@@ -1623,43 +1736,113 @@ impl Solutions {
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
-    pub fn iter(&self) -> std::slice::Iter<'_, Solution> {
-        self.rows.iter()
+    pub fn iter(&self) -> SolutionsIter<'_> {
+        SolutionsIter {
+            source: SolutionsSource::Borrowed(self),
+            remaining: 0..self.len(),
+        }
     }
 }
+
+#[derive(Clone)]
+enum SolutionsSource<'a> {
+    Borrowed(&'a Solutions),
+    Owned(Solutions),
+}
+
+/// Lazy exact-size iteration over shallow credited solution handles. No adapter
+/// vector or detached term storage is allocated by either iterator form.
+#[derive(Clone)]
+pub struct SolutionsIter<'a> {
+    source: SolutionsSource<'a>,
+    remaining: std::ops::Range<usize>,
+}
+impl SolutionsIter<'_> {
+    fn solution(&self, row: usize) -> Solution {
+        let source = match &self.source {
+            SolutionsSource::Borrowed(source) => source,
+            SolutionsSource::Owned(source) => source,
+        };
+        Solution {
+            result: source.result.clone(),
+            values: source
+                .rows
+                .row_handle(row)
+                .expect("iterator's immutable row range"),
+        }
+    }
+}
+impl Iterator for SolutionsIter<'_> {
+    type Item = Solution;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.remaining.next().map(|row| self.solution(row))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.remaining.size_hint()
+    }
+}
+impl DoubleEndedIterator for SolutionsIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.remaining.next_back().map(|row| self.solution(row))
+    }
+}
+impl ExactSizeIterator for SolutionsIter<'_> {}
+impl std::iter::FusedIterator for SolutionsIter<'_> {}
 
 impl IntoIterator for Solutions {
     type Item = Solution;
-    type IntoIter = std::vec::IntoIter<Solution>;
+    type IntoIter = SolutionsIter<'static>;
     fn into_iter(self) -> Self::IntoIter {
-        self.rows.into_iter()
+        let len = self.len();
+        SolutionsIter {
+            source: SolutionsSource::Owned(self),
+            remaining: 0..len,
+        }
     }
 }
-
 impl<'a> IntoIterator for &'a Solutions {
-    type Item = &'a Solution;
-    type IntoIter = std::slice::Iter<'a, Solution>;
+    type Item = Solution;
+    type IntoIter = SolutionsIter<'a>;
     fn into_iter(self) -> Self::IntoIter {
-        self.rows.iter()
+        self.iter()
     }
 }
 
 impl Solution {
+    pub fn variables(&self) -> &[String] {
+        self.result.variables()
+    }
     /// Value of a variable (with or without the leading `?`).
     pub fn get(&self, var: &str) -> Option<&Term> {
         let var = var.trim_start_matches(['?', '$']);
-        let i = self.vars.iter().position(|v| v == var)?;
-        self.values[i].as_ref()
+        let i = self.variables().iter().position(|name| name == var)?;
+        self.values.values()[i].as_ref()
     }
-    /// `(variable, term)` pairs of the bound variables.
+    /// `(variable, term)` pairs borrowing the retained immutable row.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Term)> {
-        self.vars
+        self.variables()
             .iter()
-            .zip(&self.values)
-            .filter_map(|(v, t)| t.as_ref().map(|t| (v.as_str(), t)))
+            .zip(self.values.values())
+            .filter_map(|(name, term)| term.as_ref().map(|term| (name.as_str(), term)))
     }
     pub fn values(&self) -> &[Option<Term>] {
-        &self.values
+        self.values.values()
+    }
+}
+impl std::fmt::Debug for Solutions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Solutions")
+            .field("vars", &self.variables())
+            .field("rows", &self.rows)
+            .finish()
+    }
+}
+impl std::fmt::Debug for Solution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Solution")
+            .field("vars", &self.variables())
+            .field("values", &self.values)
+            .finish()
     }
 }
 
@@ -2270,7 +2453,7 @@ mod tests {
         .unwrap();
         let same = |q: &str| {
             let r = ds.query(q).unwrap();
-            matches!(&r.rows()[0][0], Some(Term::Literal(l)) if l.value() == "true")
+            matches!(r.row(0).unwrap().get(0).unwrap(), Some(oxrdf::TermRef::Literal(l)) if l.value() == "true")
         };
         let cdt = "PREFIX cdt: <http://w3id.org/awslabs/neptune/SPARQL-CDTs/> ";
         assert!(same(&format!(
@@ -2309,7 +2492,7 @@ mod tests {
                     "SELECT ?s WHERE { ?s <http://ex.org/q> ?o }",
                     &QueryOptions::default(),
                 )?;
-                assert_eq!(r.table.len(), 3);
+                assert_eq!(r.table().len(), 3);
                 let st = tx.update_with(
                     "DELETE WHERE { ?s <http://ex.org/p> ?o }",
                     &QueryOptions::default(),
@@ -2442,5 +2625,57 @@ mod tests {
         assert_eq!(ds.reasoning_record().unwrap().inferred, 3);
         assert!(ds.state().rdfs.read().is_some());
         assert!(ds.origin().is_none());
+    }
+}
+
+#[cfg(test)]
+mod graph_output_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn graph_handles_keep_the_real_pool_owner_after_dataset_and_first_handle_drop() {
+        let pool = crate::sparql::pool::QueryPool::new(16 << 20);
+        let dataset = Dataset::from_store_with(
+            Store::in_memory(StoreOptions::default()),
+            DatasetOptions {
+                pool: Some(pool.clone()),
+                ..Default::default()
+            },
+        );
+        let text = format!(
+            "CONSTRUCT {{ <urn:s> <urn:p> \"{}\" }} WHERE {{}}",
+            "x".repeat(64 << 10)
+        );
+        let graph = dataset.construct(&text).unwrap();
+        assert_eq!(graph.len(), 1);
+        let last = graph.clone();
+        drop(graph);
+        drop(dataset);
+        assert!(pool.granted() >= 64 << 10);
+        assert!(matches!(&last[0].object, Term::Literal(value) if value.value().len() == 64 << 10));
+        drop(last);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn quad_views_preserve_default_then_named_order_and_borrow_without_copying() {
+        let dataset = Dataset::memory();
+        let graph = dataset
+            .construct_quads(
+                "CONSTRUCT { <urn:s> <urn:p> 1 . GRAPH <urn:g> { <urn:s> <urn:q> 2 } } WHERE {}",
+            )
+            .unwrap();
+        assert_eq!(graph.len(), 2);
+        let mut iter = graph.iter();
+        assert_eq!(iter.len(), 2);
+        assert_eq!(iter.next().unwrap().graph_name, GraphNameRef::DefaultGraph);
+        assert!(
+            matches!(iter.next_back().unwrap().graph_name, GraphNameRef::NamedNode(n) if n.as_str() == "urn:g")
+        );
+        assert!(iter.next().is_none());
+        assert!(iter.next_back().is_none());
+        assert!(graph.get(2).is_none());
+        assert!(dataset.construct("ASK {}").is_err());
+        assert!(dataset.construct_quads("ASK {}").is_err());
     }
 }

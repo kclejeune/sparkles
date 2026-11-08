@@ -46,7 +46,7 @@ fn run(store: &Store, q: &str, opts: &QueryOptions, mode: ExecutionMode) -> Resu
             let mut rows = Vec::new();
             while let Some(b) = c.next_batch()? {
                 for i in 0..b.len() {
-                    rows.push(text(b.row(i).unwrap()));
+                    rows.push(text(b.row(i).unwrap().values().to_vec()));
                 }
             }
             rows

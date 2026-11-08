@@ -2962,10 +2962,10 @@ mod projection_capacity_tests {
         let query = format!("{query} }}");
         drop(super::super::query(snapshot.clone(), &query, &Default::default()).unwrap());
         let result = super::super::query(snapshot.clone(), &query, &Default::default()).unwrap();
-        assert!(!result.plan.cached);
-        assert!(result.ctx.use_cache);
+        assert!(!result.plan().cached);
+        assert!(result.test_context().use_cache);
         let mut leaves = Vec::new();
-        algo_infos(&result.plan, &mut leaves);
+        algo_infos(&result.plan(), &mut leaves);
         assert_eq!(leaves.len(), 64);
         for info in leaves {
             assert_eq!(
@@ -2988,7 +2988,7 @@ mod projection_capacity_tests {
             assert!(matches!(spec.proj.graph, GraphFilter::One(_)));
         }
         assert_eq!(
-            result.table.cols,
+            result.test_table().cols,
             graph_payload(&snapshot, &snapshot.graph_ids().unwrap())
         );
     }
@@ -3964,7 +3964,7 @@ mod projection_capacity_tests {
             ..Default::default()
         };
         let first = super::super::query(s.snapshot(), &q, &options).unwrap();
-        let expected = first.table.clone();
+        let expected = first.test_table().clone();
         drop(first);
         assert_eq!(grant.used(), 0);
         let prepared =
@@ -4579,7 +4579,7 @@ mod calls_algorithm_tests {
         let q = format!("PREFIX algo: <urn:x-sparkles:algo#> {body}");
         query(store.snapshot(), &q, &QueryOptions::default())
             .unwrap()
-            .ctx
+            .test_context()
             .calls_algorithm()
     }
 

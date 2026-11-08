@@ -34,20 +34,20 @@ fn answer(shared: bool) -> QueryResult {
         "x".repeat(LONG)
     );
     let r = query(store.snapshot(), &text, &options).unwrap();
-    assert_eq!((r.len(), r.table.width()), (2, 1));
+    assert_eq!((r.len(), r.test_table().width()), (2, 1));
     // Establish that both actual local terms fit, rather than mistake setup refusal
     // or a genuine UNDEF for the writer defect.
-    let values = r.rows();
+    let values = r.test_application_rows();
     assert_eq!(values.len(), 2);
     assert!(matches!(&values[0][0], Some(Term::Literal(v)) if v.value() == "x".repeat(LONG)));
     assert!(matches!(&values[1][0], Some(Term::Literal(v)) if v.value() == "tail"));
-    r.ctx.check_memory_failure().unwrap();
+    r.test_context().check_memory_failure().unwrap();
     r
 }
 
 fn refuse(r: &QueryResult, shared: bool) -> Budget {
     let bytes = if shared { 16 * MB } else { 2 * MB };
-    let error = match r.ctx.charge(bytes) {
+    let error = match r.test_context().charge(bytes) {
         Err(error) => error,
         Ok(_) => panic!("the fixed charge must exceed the real fixture allowance"),
     };
@@ -64,8 +64,10 @@ fn refuse(r: &QueryResult, shared: bool) -> Budget {
     );
     assert_eq!(budget.limit, if shared { 8 * MB } else { MB });
     assert!(budget.requested >= bytes);
-    r.ctx.fail_memory(&Error::BudgetExceeded(budget));
-    assert!(matches!(r.ctx.check_memory_failure(), Err(Error::BudgetExceeded(b)) if b == budget));
+    r.test_context().fail_memory(&Error::BudgetExceeded(budget));
+    assert!(
+        matches!(r.test_context().check_memory_failure(), Err(Error::BudgetExceeded(b)) if b == budget)
+    );
     budget
 }
 
@@ -229,7 +231,7 @@ fn an_actual_io_failure_keeps_its_kind_and_zero_accepted_rows() {
             matches!(format.write(&r, FailIo, &sent), Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::BrokenPipe)
         );
         assert_eq!(sent.get(), 0);
-        r.ctx.check_memory_failure().unwrap();
+        r.test_context().check_memory_failure().unwrap();
     }
 }
 
@@ -237,13 +239,13 @@ fn an_actual_io_failure_keeps_its_kind_and_zero_accepted_rows() {
 fn a_private_row_keeps_real_credit_until_its_payload_is_dropped() {
     for shared in [false, true] {
         let r = answer(shared);
-        let before = r.ctx.live_bytes();
+        let before = r.test_context().live_bytes();
         let row = output::ScratchRow::decode(&r, 0).unwrap();
         assert!(matches!(&row.terms[0], Some(Term::Literal(v)) if v.value().len() == LONG));
-        assert!(r.ctx.live_bytes() >= before + LONG as u64);
+        assert!(r.test_context().live_bytes() >= before + LONG as u64);
         drop(row);
-        assert_eq!(r.ctx.live_bytes(), before);
-        r.ctx.check_memory_failure().unwrap();
+        assert_eq!(r.test_context().live_bytes(), before);
+        r.test_context().check_memory_failure().unwrap();
     }
 }
 
@@ -265,23 +267,26 @@ fn one_cell_fits_but_the_complete_row_refuses_before_publication_and_recovers() 
         },
     )
     .unwrap();
-    assert_eq!((r.len(), r.table.width()), (1, 2));
-    let before = r.ctx.live_bytes();
+    assert_eq!((r.len(), r.test_table().width()), (1, 2));
+    let before = r.test_context().live_bytes();
     let left = LONG as u64 + 512;
     let blocker = r
-        .ctx
+        .test_context()
         .charge(MB.checked_sub(before + left).unwrap())
         .unwrap();
-    let blocked = r.ctx.live_bytes();
+    let blocked = r.test_context().live_bytes();
     assert_eq!(blocked, MB - left);
     // A single actual decoded cell fits, including its owned string. The two
     // independent cells together exceed this same fixed remaining allowance.
-    let cell_credit = r.ctx.charge(0).unwrap();
-    let cell = r.ctx.output_term(r.table.cols[0][0], &cell_credit).unwrap();
+    let cell_credit = r.test_context().charge(0).unwrap();
+    let cell = r
+        .test_context()
+        .output_term(r.test_table().cols[0][0], &cell_credit)
+        .unwrap();
     assert!(matches!(&cell, Some(Term::Literal(v)) if v.value().len() == LONG));
     drop(cell);
     drop(cell_credit);
-    assert_eq!(r.ctx.live_bytes(), blocked);
+    assert_eq!(r.test_context().live_bytes(), blocked);
     for format in [Format::Native, Format::Tsv] {
         let mut out = Vec::new();
         let sent = Cell::new(0);
@@ -295,19 +300,19 @@ fn one_cell_fits_but_the_complete_row_refuses_before_publication_and_recovers() 
                 .any(|part| part == b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
         );
         assert_eq!(
-            r.ctx.live_bytes(),
+            r.test_context().live_bytes(),
             blocked,
             "failed row returned only its own credit"
         );
-        r.ctx.check_memory_failure().unwrap();
+        r.test_context().check_memory_failure().unwrap();
     }
     drop(blocker);
-    assert_eq!(r.ctx.live_bytes(), before);
+    assert_eq!(r.test_context().live_bytes(), before);
     for format in [Format::Native, Format::Tsv] {
         let sent = Cell::new(0);
         format.write(&r, Vec::new(), &sent).unwrap();
         assert_eq!(sent.get(), 1);
-        assert_eq!(r.ctx.live_bytes(), before);
+        assert_eq!(r.test_context().live_bytes(), before);
     }
 }
 
@@ -406,18 +411,14 @@ fn an_actual_parent_ownership_refusal_keeps_its_typed_source_through_serde() {
     use sparkles_budget::{MemoryDomain, ParentRefused};
     for format in [Format::Native, Format::Tsv] {
         let store = Store::in_memory(StoreOptions::default());
-        let mut r = query(
-            store.snapshot(),
-            "SELECT (1 AS ?v) WHERE {}",
-            &Default::default(),
-        )
-        .unwrap();
-        assert_eq!(r.rows()[0][0], Some(Term::Literal(oxrdf::Literal::from(1))));
-        // The real nested-parent adapter admits zero credit but refuses required
-        // positive payload admission with a structured parent ownership error.
+        // Install the real parent before planning/allocation. Construction is
+        // admitted, then only new writer payload admission is refused; no Ctx or
+        // domain is swapped beneath already credited result storage.
+        let refuse_positive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let parent_gate = refuse_positive.clone();
         let parent = MemoryDomain::unpooled().parent(
-            |bytes| {
-                if bytes == 0 {
+            move |bytes| {
+                if bytes == 0 || !parent_gate.load(std::sync::atomic::Ordering::Relaxed) {
                     Ok(())
                 } else {
                     Err(ParentRefused::Overflow)
@@ -425,9 +426,41 @@ fn an_actual_parent_ownership_refusal_keeps_its_typed_source_through_serde() {
             },
             |_| {},
         );
-        let mut ctx = Ctx::new(store.snapshot());
-        ctx.set_memory_parent(parent).unwrap();
-        r.ctx = Arc::new(ctx);
+        let parsed = crate::sparql::parse_query("SELECT (1 AS ?v) WHERE {}", None, &[]).unwrap();
+        let (pattern, _, _) = crate::sparql::split(&parsed);
+        let mut context = Ctx::new(store.snapshot());
+        context.set_memory_parent(parent).unwrap();
+        let ctx = Arc::new(context);
+        let mut planner = crate::sparql::plan::Planner::new(&ctx);
+        planner.source = Some(&parsed);
+        let node = planner
+            .plan(pattern, &crate::sparql::ActiveGraph::Default, Vec::new())
+            .unwrap();
+        let plan_depth = node.depth();
+        ctx.attach_owner();
+        let prepared = crate::sparql::PreparedQuery {
+            ctx: ctx.clone(),
+            node,
+            pattern: pattern.clone(),
+            bound: Vec::new(),
+            kind: QueryKind::Select,
+            plan_depth,
+        };
+        let r = crate::sparql::execute_prepared(&parsed, &Default::default(), 0.0, 0.0, prepared)
+            .unwrap();
+        assert_eq!(
+            r.test_application_rows()[0][0],
+            Some(Term::Literal(oxrdf::Literal::from(1)))
+        );
+        // Discard unused peak allowance while retaining every actual payload
+        // credit, so the next positive writer request must reach this parent.
+        ctx.shrink_retained(0).unwrap();
+        let baseline = ctx.live_bytes();
+        assert!(
+            baseline > 0,
+            "the result retains its own actual metadata/table credit"
+        );
+        refuse_positive.store(true, std::sync::atomic::Ordering::Relaxed);
         let sent = Cell::new(0);
         let error = format.write(&r, Vec::new(), &sent).unwrap_err();
         let Error::Component(component) = error else {
@@ -446,6 +479,8 @@ fn an_actual_parent_ownership_refusal_keeps_its_typed_source_through_serde() {
             Some(&ParentRefused::Overflow)
         );
         assert_eq!(sent.get(), 0);
-        assert_eq!(r.ctx.live_bytes(), 0);
+        assert_eq!(r.test_context().live_bytes(), baseline);
+        drop(r);
+        assert_eq!(ctx.live_bytes(), 0);
     }
 }

@@ -62,7 +62,7 @@ fn check_select(snapshot: &Arc<Snapshot>, text: &str, expected: Vec<Vec<Option<T
         let mut rows = Vec::new();
         while let Some(batch) = cursor.next_batch().unwrap() {
             assert!(batch.len() <= batch_rows);
-            rows.extend((0..batch.len()).map(|i| batch.row(i).unwrap()));
+            rows.extend((0..batch.len()).map(|i| batch.row(i).unwrap().values().to_vec()));
         }
         assert_eq!(bag(rows), expected, "cursor batch={batch_rows}: {text}");
     }

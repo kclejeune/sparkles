@@ -915,7 +915,7 @@ fn unused_outputs_are_left_out() {
             }
             p.children.iter().find_map(find)
         }
-        (r.rows().len(), find(&r.plan).unwrap())
+        (r.len(), find(&r.plan).unwrap())
     };
     let (n, d) = plan("SELECT (COUNT(*) AS ?n) { (?s ?sc ?lit) text:query \"brown\" }");
     assert_eq!(n, 1);

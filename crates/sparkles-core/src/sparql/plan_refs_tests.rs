@@ -53,7 +53,7 @@ fn explained(s: &Store, q: &str) -> Value {
 
 fn ran(s: &Store, q: &str) -> Value {
     let r = query(s.snapshot(), q, &opts()).unwrap();
-    serde_json::to_value(&r.plan).unwrap()
+    serde_json::to_value(&r.plan()).unwrap()
 }
 
 fn nodes(j: &Value) -> Vec<&Value> {
@@ -311,7 +311,7 @@ fn predicate_pattern_operators_name_their_pattern() {
         ..opts()
     };
     let r = query(s.snapshot(), q, &off).unwrap();
-    let j = serde_json::to_value(&r.plan).unwrap();
+    let j = serde_json::to_value(&r.plan()).unwrap();
     assert_eq!(
         texts(&j),
         vec!["?s <urn:x-sparkles:hasPredicate> ?p #0".to_string()],
@@ -503,13 +503,13 @@ fn a_caller_that_shows_no_plan_gets_no_members_and_the_same_answer() {
         ..opts()
     };
     let bare = query(s.snapshot(), q, &plain).unwrap();
-    let j = serde_json::to_value(&bare.plan).unwrap();
+    let j = serde_json::to_value(&bare.plan()).unwrap();
     for n in nodes(&j) {
         assert!(n.get("patterns").is_none(), "{n}");
         assert!(n.get("filterVars").is_none(), "{n}");
         assert!(n.get("joinVars").is_none(), "{n}");
     }
-    let shown = serde_json::to_value(&named.plan).unwrap();
+    let shown = serde_json::to_value(&named.plan()).unwrap();
     assert!(!texts(&shown).is_empty(), "{shown:#}");
     assert!(
         nodes(&shown).iter().any(|n| n["filterVars"].is_array()),
@@ -585,7 +585,7 @@ fn an_in_process_service_call_names_no_patterns() {
     };
     let r = query(s.snapshot(), q, &shown).unwrap();
     assert_eq!(r.len(), 60);
-    let outer = serde_json::to_value(&r.plan).unwrap();
+    let outer = serde_json::to_value(&r.plan()).unwrap();
     assert_eq!(
         plan::PATTERNS_NAMED.with(|n| n.get()),
         texts(&outer).len(),

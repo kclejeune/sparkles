@@ -415,10 +415,15 @@ fn with_filter(
 /// The ids of parent nodes as a pattern binding `p`: a `VALUES` table of the IRIs, and
 /// one branch per blank node, bound through the query's initial bindings (blank nodes
 /// cannot be written in `VALUES`).
-pub fn seed(p: &Variable, ids: &[Term], bindings: &mut Vec<(String, Term)>) -> P {
+pub fn seed(
+    p: &Variable,
+    ids: &[impl std::borrow::Borrow<Term>],
+    bindings: &mut Vec<(String, Term)>,
+) -> P {
     let mut rows = Vec::new();
     let mut blanks = Vec::new();
     for t in ids {
+        let t: &Term = t.borrow();
         match t {
             Term::NamedNode(n) => rows.push(vec![Some(GroundTerm::NamedNode(n.clone()))]),
             Term::BlankNode(_) => blanks.push(t.clone()),
@@ -559,7 +564,7 @@ pub fn select(pattern: P) -> Query {
 pub fn node_query(
     m: &Mapping,
     g: &Group,
-    ids: &[Term],
+    ids: &[impl std::borrow::Borrow<Term>],
     slice: Option<(usize, Option<usize>)>,
 ) -> Result<Built, GqlError> {
     let n = var("n");
@@ -680,7 +685,10 @@ pub fn node_query(
 
 /// The values group of a node group: one `UNION` branch per field, tagged with its
 /// number.
-pub fn values_query(vfields: &[NamedNode], ids: &[Term]) -> (Query, Vec<(String, Term)>) {
+pub fn values_query(
+    vfields: &[NamedNode],
+    ids: &[impl std::borrow::Borrow<Term>],
+) -> (Query, Vec<(String, Term)>) {
     let (p, f, v) = (var("p"), var("f"), var("v"));
     let mut bindings = Vec::new();
     let s = seed(&p, ids, &mut bindings);

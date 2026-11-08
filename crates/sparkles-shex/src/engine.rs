@@ -45,6 +45,20 @@ pub(crate) fn validate_typed(
     fixed: Option<&typing::Fixed<'_>>,
     extra: &[(Id, PairKind)],
 ) -> anyhow::Result<(ResultMap, PairValues)> {
+    validate_typed_with_output(snap, schema, map, opts, fixed, extra, None)
+}
+
+// The incremental guard supplies only the root it created over this same candidate.
+// Public validation always creates its own original root above.
+pub(crate) fn validate_typed_with_output(
+    snap: &Arc<Snapshot>,
+    schema: &CompiledSchema,
+    map: &ShapeMap,
+    opts: &ValidateOptions,
+    fixed: Option<&typing::Fixed<'_>>,
+    extra: &[(Id, PairKind)],
+    output: Option<&sparkles_core::sparql::output::SnapshotOutputRoot>,
+) -> anyhow::Result<(ResultMap, PairValues)> {
     let started = Instant::now();
     let data = DataGraph::new(
         snap.clone(),
@@ -58,7 +72,18 @@ pub(crate) fn validate_typed(
         .into_iter()
         .chain(opts.timeout.map(|t| started + t))
         .min();
-    let (entries, mut warnings) = shapemap::expand(map, &data, schema, opts, deadline)?;
+    let owned_root;
+    let root = match output {
+        Some(root) => {
+            root.budget().check()?;
+            root
+        }
+        None => {
+            owned_root = shapemap::output_root(snap, opts, deadline)?;
+            &owned_root
+        }
+    };
+    let (entries, mut warnings) = shapemap::expand_in(map, &data, schema, opts, deadline, root)?;
     let rest;
     let opts = match opts.timeout {
         Some(t) => {
@@ -78,8 +103,9 @@ pub(crate) fn validate_typed(
     }
 
     // nodes that are not in the store get local ids
-    let mut absent: Vec<Term> = Vec::new();
-    let mut absent_ids: FxHashMap<Term, Id> = FxHashMap::default();
+    let mut absent = Vec::new();
+    let mut absent_ids: FxHashMap<sparkles_core::sparql::output::OwnedTerm, Id> =
+        FxHashMap::default();
     let nodes: Vec<Id> = entries
         .iter()
         .map(|e| match e.id {
@@ -91,7 +117,7 @@ pub(crate) fn validate_typed(
         })
         .collect();
     let ir = schema.ir();
-    let env = Env::new(ir, snap, &data, schema.prefixes(), absent, opts);
+    let env = Env::new(ir, snap, &data, schema.prefixes(), absent, opts, root);
     let seeds: Vec<(Id, PairKind)> = nodes
         .iter()
         .zip(&entries)
@@ -177,7 +203,7 @@ pub(crate) fn validate_typed(
         out.results.push(ShapeResult {
             reason: failures
                 .first()
-                .map(|f| explain::reason(&e.node, f, prefixes)),
+                .map(|f| explain::reason(e.node.as_term(), f, prefixes)),
             node: e.node,
             shape: e.shape,
             status: if ok {

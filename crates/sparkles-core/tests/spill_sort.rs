@@ -83,7 +83,7 @@ fn run(
     let mut rows = Vec::new();
     while let Some(b) = c.next_batch()? {
         for i in 0..b.len() {
-            rows.push(b.row(i).unwrap());
+            rows.push(b.row(i).unwrap().values().to_vec());
         }
         if stop_after.is_some_and(|n| rows.len() >= n) {
             return Ok(rows);
@@ -223,7 +223,7 @@ fn a_batch_too_large_to_buffer_spills_as_its_own_run() {
     let mut rows = Vec::new();
     while let Some(b) = c.next_batch().unwrap() {
         for i in 0..b.len() {
-            rows.push(b.row(i).unwrap());
+            rows.push(b.row(i).unwrap().values().to_vec());
         }
     }
     assert!(c.stats().mem_peak_bytes <= memory);
@@ -316,7 +316,7 @@ fn many_runs_merge_in_passes_and_report_them_in_the_plan() {
     let mut rows = Vec::new();
     while let Some(b) = c.next_batch().unwrap() {
         for i in 0..b.len() {
-            rows.push(b.row(i).unwrap());
+            rows.push(b.row(i).unwrap().values().to_vec());
         }
     }
     assert_eq!(
@@ -358,7 +358,7 @@ fn impure_keys_spill_with_the_values_their_runs_sorted() {
     let mut rows = Vec::new();
     while let Some(b) = c.next_batch().unwrap() {
         for i in 0..b.len() {
-            rows.push(b.row(i).unwrap());
+            rows.push(b.row(i).unwrap().values().to_vec());
         }
     }
     drop(c);
@@ -420,7 +420,7 @@ fn spilled_volatile_keys_are_evaluated_once_across_sort_pieces() {
     let mut rows = Vec::new();
     while let Some(batch) = cursor.next_batch().unwrap() {
         for row in 0..batch.len() {
-            rows.push(batch.row(row).unwrap());
+            rows.push(batch.row(row).unwrap().values().to_vec());
         }
     }
     assert_eq!(rows, expected);
@@ -497,7 +497,7 @@ fn automatic(s: &Store, q: &str, opts: &QueryOptions) -> Result<(Rows, Option<St
             let mut rows = Vec::new();
             while let Some(b) = c.next_batch()? {
                 for i in 0..b.len() {
-                    rows.push(b.row(i).unwrap());
+                    rows.push(b.row(i).unwrap().values().to_vec());
                 }
             }
             Ok((rows, Some(c.plan_json()?)))

@@ -136,7 +136,7 @@ fn strict_rows(store: &Store, text: &str, options: &QueryOptions) -> Vec<String>
     let mut rows = Vec::new();
     while let Some(batch) = cursor.next_batch().unwrap() {
         for i in 0..batch.len() {
-            rows.push(batch.row(i).unwrap());
+            rows.push(batch.row(i).unwrap().values().to_vec());
         }
     }
     bag(rows)
@@ -184,7 +184,7 @@ fn keyed_join_avoids_a_product_over_the_row_limit() {
           ?other bsbm:productFeature ?g FILTER(?f = ?g) }";
     let limit = 2000;
     let r = query(store.snapshot(), text, &options(limit, true)).unwrap();
-    assert!(!r.rows().is_empty());
+    assert!(!r.is_empty());
     assert!(query(store.snapshot(), text, &options(limit, false)).is_err());
 }
 
@@ -311,13 +311,7 @@ fn keyed_ask_limits_the_large_input_when_a_small_prefix_already_matches() {
         .unwrap();
         assert!(matches!(auto, QueryExecution::Eager(_)));
         let select = text.replacen("ASK", "SELECT * WHERE", 1) + " LIMIT 1";
-        assert_eq!(
-            query(store.snapshot(), &select, &opts)
-                .unwrap()
-                .rows()
-                .len(),
-            1
-        );
+        assert_eq!(query(store.snapshot(), &select, &opts).unwrap().len(), 1);
     }
 }
 

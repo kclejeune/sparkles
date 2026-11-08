@@ -1,7 +1,6 @@
 //! Hash joins that partition their inputs to disk when the build input outgrows memory,
 //! and merge joins that spool long runs of equal keys (X08 §6.3), checked against eager
 //! execution and in-memory cursors.
-use oxrdf::Term;
 use oxrdfio::RdfFormat;
 use sparkles_core::io::Source;
 use sparkles_core::sparql::{
@@ -99,7 +98,7 @@ fn run(
     while let Some(b) = c.next_batch()? {
         assert!(b.len() <= batch_rows);
         for i in 0..b.len() {
-            let row = b.row(i).unwrap();
+            let row = b.row(i).unwrap().values().to_vec();
             firsts.push(format!("{:?}", row[0]));
             rows.push(format!("{row:?}"));
         }
@@ -123,8 +122,9 @@ fn eager(s: &Store, q: &str) -> Vec<String> {
         query(s.snapshot(), q, &Default::default())
             .unwrap()
             .rows()
+            .unwrap()
             .into_iter()
-            .map(|r: Vec<Option<Term>>| format!("{r:?}"))
+            .map(|r| format!("{r:?}"))
             .collect(),
     )
 }

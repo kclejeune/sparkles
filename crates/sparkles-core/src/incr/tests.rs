@@ -56,7 +56,7 @@ fn oracle_as(
             }
         }
         Kind::Construct => r
-            .triples
+            .triples()
             .iter()
             .map(|t| {
                 let s = canon(&Some(Term::from(t.subject.clone())));
@@ -67,9 +67,9 @@ fn oracle_as(
         Kind::Select => {
             let idx: Vec<usize> = cols
                 .iter()
-                .map(|c| r.vars.iter().position(|v| v == c).expect("column"))
+                .map(|c| r.variables().iter().position(|v| v == c).expect("column"))
                 .collect();
-            r.rows()
+            r.test_application_rows()
                 .iter()
                 .map(|row| {
                     idx.iter()

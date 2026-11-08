@@ -24,12 +24,15 @@ struct Inner {
     used: AtomicU64,
     peak: AtomicU64,
     grant: Option<Arc<crate::sparql::pool::PoolGrant>>,
+    context_bytes: u64,
+    cancellation: Option<crate::task::Cancellation>,
+    original_controls: Option<QueryControl>,
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
         if let Some(grant) = &self.grant {
-            grant.release(CONTEXT_BYTES);
+            grant.release(self.context_bytes);
         }
     }
 }
@@ -53,6 +56,42 @@ struct QueryControl {
 }
 
 impl Preparation {
+    /// Admit one application's real request root before allocating derived work.
+    /// The supplied options are the operation's actual policy and admission, not
+    /// authority to read any source. Clones share this same allowance and controls.
+    pub fn for_request(opts: &crate::sparql::QueryOptions) -> Result<Self> {
+        Self::for_query_controls(opts, None, None, None)
+    }
+
+    /// Check a descendant's original controls before preparing its physical view.
+    /// This shares the same root and actual grant. Relative timeouts must first be
+    /// fixed to an absolute deadline, which the later source execution must reuse.
+    /// A view cannot replace an already installed descendant control set.
+    pub fn checked_for_query(&self, opts: &crate::sparql::QueryOptions) -> Result<Self> {
+        self.check()?;
+        if opts
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err(Error::Cancelled);
+        }
+        if let Some(cancellation) = &opts.cancellation {
+            cancellation.check()?;
+        }
+        let deadline = opts.effective_deadline(std::time::Instant::now())?;
+        if deadline.is_some_and(|end| std::time::Instant::now() >= end) {
+            return Err(Error::Timeout);
+        }
+        if opts.timeout.is_some() && opts.deadline.is_none() {
+            return Err(Error::invalid(
+                "checked preparation requires an absolute query deadline",
+            ));
+        }
+        crate::sparql::source_grant(self, opts)?;
+        self.with_query_controls(opts.cancel.clone(), opts.cancellation.clone(), deadline)
+    }
+
     /// Start a request with a conservative allowance for its bookkeeping.
     pub fn new(control: Control, memory_bytes: u64) -> Result<Self> {
         Self::new_with_grant(control, memory_bytes, None)
@@ -88,10 +127,140 @@ impl Preparation {
                 used: AtomicU64::new(CONTEXT_BYTES),
                 peak: AtomicU64::new(CONTEXT_BYTES),
                 grant,
+                context_bytes: CONTEXT_BYTES,
+                cancellation: None,
+                original_controls: None,
             }),
             no_wait: false,
             query: None,
         })
+    }
+
+    /// Build an application operation's real shared root. Check and charge all
+    /// fixed backing before allocating our own control, grant or Inner Arcs.
+    pub(crate) fn for_query_controls(
+        opts: &crate::sparql::QueryOptions,
+        deadline: Option<std::time::Instant>,
+        cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+        cancellation: Option<crate::task::Cancellation>,
+    ) -> Result<Self> {
+        if cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err(Error::Cancelled);
+        }
+        if let Some(cancellation) = &cancellation {
+            cancellation.check()?;
+        }
+        let deadline = deadline
+            .into_iter()
+            .chain(opts.effective_deadline(std::time::Instant::now())?)
+            .min();
+        if opts
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err(Error::Cancelled);
+        }
+        if let Some(cancellation) = &opts.cancellation {
+            cancellation.check()?;
+        }
+        if deadline.is_some_and(|end| std::time::Instant::now() >= end) {
+            return Err(Error::Timeout);
+        }
+        // Includes Inner/control, the optional new grant, and alignment/Arc headers.
+        let bytes = 1024u64;
+        let layouts = [
+            (std::mem::size_of::<Inner>(), std::mem::align_of::<Inner>()),
+            (
+                std::mem::size_of::<crate::sparql::pool::PoolGrant>(),
+                std::mem::align_of::<crate::sparql::pool::PoolGrant>(),
+            ),
+            (
+                std::mem::size_of::<std::sync::atomic::AtomicBool>(),
+                std::mem::align_of::<std::sync::atomic::AtomicBool>(),
+            ),
+        ];
+        let fixed = layouts
+            .into_iter()
+            .try_fold(0usize, |sum, (size, align)| {
+                sum.checked_add(size)?
+                    .checked_add(2 * std::mem::size_of::<usize>())?
+                    .checked_add(2 * align)
+            })
+            .ok_or_else(|| Error::invalid("receiving root header size overflow"))?;
+        if fixed as u64 > bytes {
+            return Err(Error::invalid("receiving root header exceeds admission"));
+        }
+        let limit = opts.max_memory_bytes.unwrap_or(u64::MAX);
+        if bytes > limit {
+            return Err(Error::BudgetExceeded(Budget {
+                kind: BudgetKind::Memory,
+                limit,
+                requested: bytes,
+            }));
+        }
+        let grant = if let Some(grant) = &opts.grant {
+            grant.charge(bytes)?;
+            Some(grant.clone())
+        } else if let Some(pool) = &opts.pool {
+            let grant = pool.empty_grant();
+            grant.charge(bytes)?;
+            Some(Arc::new(grant))
+        } else {
+            None
+        };
+        struct PartialHeader {
+            grant: Option<Arc<crate::sparql::pool::PoolGrant>>,
+            bytes: u64,
+        }
+        impl Drop for PartialHeader {
+            fn drop(&mut self) {
+                if let Some(grant) = &self.grant {
+                    grant.release(self.bytes);
+                }
+            }
+        }
+        let mut partial = PartialHeader {
+            grant: grant.clone(),
+            bytes,
+        };
+        #[cfg(test)]
+        {
+            use crate::algo::memory::probe;
+            probe::at(probe::Point::Allocation("output-root-preparation", 1));
+            if probe::fails("output-root-preparation") {
+                return Err(Error::invalid("injected receiving root allocation failure"));
+            }
+        }
+        let mut control = match &opts.cancel {
+            Some(flag) => Control::with_cancel(flag.clone()),
+            None => Control::none(),
+        };
+        control.deadline = deadline;
+        let root = Self {
+            inner: Arc::new(Inner {
+                control,
+                limit,
+                used: AtomicU64::new(bytes),
+                peak: AtomicU64::new(bytes),
+                grant,
+                context_bytes: bytes,
+                cancellation: opts.cancellation.clone(),
+                original_controls: Some(QueryControl {
+                    cancel,
+                    cancellation,
+                    deadline,
+                }),
+            }),
+            no_wait: false,
+            query: None,
+        };
+        partial.bytes = 0;
+        root.check()?;
+        Ok(root)
     }
 
     pub(crate) fn with_query_controls(
@@ -100,9 +269,23 @@ impl Preparation {
         cancellation: Option<crate::task::Cancellation>,
         deadline: Option<std::time::Instant>,
     ) -> Result<Self> {
-        // This private constructor consumes original source controls, never a
-        // descendant view. Silently replacing an earlier query would lose control.
-        if self.query.is_some() {
+        // Preparing a mask and executing that exact source reuse one descendant
+        // control set. A different set must never replace the existing one.
+        if let Some(original) = &self.query {
+            let same_cancel = match (&original.cancel, &cancel) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            let same_cancellation = match (&original.cancellation, &cancellation) {
+                (Some(a), Some(b)) => a.same_source(b),
+                (None, None) => true,
+                _ => false,
+            };
+            if same_cancel && same_cancellation && original.deadline == deadline {
+                self.check()?;
+                return Ok(self.clone());
+            }
             return Err(Error::invalid(
                 "checked source already has descendant controls",
             ));
@@ -219,7 +402,10 @@ impl Preparation {
     /// Poll this request's cancellation and absolute deadline.
     pub fn check(&self) -> Result<()> {
         self.inner.control.check()?;
-        if let Some(query) = &self.query {
+        if let Some(cancellation) = &self.inner.cancellation {
+            cancellation.check()?;
+        }
+        for query in self.inner.original_controls.iter().chain(self.query.iter()) {
             if query
                 .cancel
                 .as_ref()
@@ -1457,6 +1643,154 @@ impl PreparedView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_receiver_checked_views_reuse_real_parent_and_one_aggregate_allowance() {
+        use crate::sparql::{QueryOptions, output::NativeBudget, pool::QueryPool};
+        let pool = QueryPool::new(4 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        let opts = QueryOptions {
+            grant: Some(grant.clone()),
+            max_memory_bytes: Some(128 << 10),
+            deadline: Some(std::time::Instant::now() + Duration::from_secs(60)),
+            ..Default::default()
+        };
+        let root = Preparation::for_request(&opts).unwrap();
+        let child = root.checked_for_query(&opts).unwrap();
+        let same = child.checked_for_query(&opts).unwrap();
+        assert!(Arc::ptr_eq(&root.inner, &child.inner));
+        assert!(Arc::ptr_eq(&child.inner, &same.inner));
+        assert_eq!(grant.used(), 1024);
+        let first = NativeBudget::from_preparation(&child)
+            .unwrap()
+            .text(&"x".repeat(64 << 10))
+            .unwrap();
+        let used = grant.used();
+        assert!(
+            matches!(NativeBudget::from_preparation(&same).unwrap().text(&"y".repeat(64 << 10)),
+            Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory && b.limit == 128 << 10)
+        );
+        assert_eq!(grant.used(), used);
+        drop(root);
+        drop(child);
+        drop(same);
+        assert!(grant.used() >= first.len() as u64);
+        assert_eq!(first.len(), 64 << 10);
+        drop(first);
+        assert_eq!(grant.used(), 0);
+        drop(opts);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn checked_preparation_preserves_original_and_child_control_identity_without_replacement() {
+        use crate::sparql::{QueryOptions, pool::QueryPool};
+        use std::sync::atomic::AtomicBool;
+        for stopped in 0..4 {
+            let flags: [Arc<AtomicBool>; 4] =
+                std::array::from_fn(|_| Arc::new(AtomicBool::new(false)));
+            let opts = QueryOptions {
+                cancel: Some(flags[0].clone()),
+                cancellation: Some(crate::task::Cancellation::from_flags([flags[1].clone()])),
+                deadline: Some(std::time::Instant::now() + Duration::from_secs(60)),
+                max_memory_bytes: Some(1 << 20),
+                ..Default::default()
+            };
+            let root = Preparation::for_request(&opts).unwrap();
+            let mut child_opts = opts.clone();
+            child_opts.cancel = Some(flags[2].clone());
+            child_opts.cancellation =
+                Some(crate::task::Cancellation::from_flags([flags[3].clone()]));
+            let child = root.checked_for_query(&child_opts).unwrap();
+            assert!(child.checked_for_query(&child_opts).is_ok());
+            let mut changed = child_opts.clone();
+            changed.cancel = Some(Arc::new(AtomicBool::new(false)));
+            assert!(matches!(
+                child.checked_for_query(&changed),
+                Err(Error::Invalid(_))
+            ));
+            changed = child_opts.clone();
+            // Equal current flag values or an equivalent-looking composition are
+            // not proof that this is the same original cancellation source.
+            changed.cancellation = Some(crate::task::Cancellation::from_flags([flags[3].clone()]));
+            assert!(matches!(
+                child.checked_for_query(&changed),
+                Err(Error::Invalid(_))
+            ));
+            flags[stopped].store(true, Ordering::SeqCst);
+            assert!(matches!(child.check(), Err(Error::Cancelled)));
+        }
+        let pool = QueryPool::new(4 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        let root_opts = QueryOptions {
+            grant: Some(grant.clone()),
+            max_memory_bytes: Some(1 << 20),
+            ..Default::default()
+        };
+        let root = Preparation::for_request(&root_opts).unwrap();
+        let before = grant.used();
+        let foreign = Arc::new(pool.empty_grant());
+        let mut wrong = root_opts.clone();
+        wrong.grant = Some(foreign.clone());
+        assert!(
+            matches!(root.checked_for_query(&wrong), Err(Error::Component(e)) if e.code == "foreign-grant")
+        );
+        assert_eq!(grant.used(), before);
+        assert_eq!(foreign.used(), 0);
+        wrong.cancel = Some(Arc::new(AtomicBool::new(true)));
+        assert!(matches!(
+            root.checked_for_query(&wrong),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(grant.used(), before);
+        assert_eq!(foreign.used(), 0);
+        let mut relative = root_opts.clone();
+        relative.timeout = Some(Duration::from_secs(1));
+        assert!(matches!(
+            root.checked_for_query(&relative),
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(grant.used(), before);
+        drop(root);
+        assert_eq!(grant.used(), 0);
+    }
+
+    #[test]
+    fn checked_preparation_absolute_deadline_and_no_wait_apply_before_view_work() {
+        use crate::sparql::QueryOptions;
+        let root = Preparation::for_request(&QueryOptions {
+            max_memory_bytes: Some(1 << 20),
+            ..Default::default()
+        })
+        .unwrap()
+        .with_no_wait(true);
+        let end = std::time::Instant::now() + Duration::from_secs(60);
+        let opts = QueryOptions {
+            deadline: Some(end),
+            ..Default::default()
+        };
+        let child = root.checked_for_query(&opts).unwrap();
+        assert_eq!(child.query.as_ref().unwrap().deadline, Some(end));
+        let lock = Mutex::new(());
+        let held = lock.lock();
+        assert!(matches!(child.lock(&lock), Err(Error::Invalid(_))));
+        drop(held);
+        let expired = QueryOptions {
+            deadline: Some(std::time::Instant::now() - Duration::from_secs(1)),
+            ..Default::default()
+        };
+        assert!(matches!(
+            root.checked_for_query(&expired),
+            Err(Error::Timeout)
+        ));
+        let before = root.inner_used();
+        assert!(matches!(
+            child.checked_for_query(&expired),
+            Err(Error::Timeout)
+        ));
+        assert_eq!(root.inner_used(), before);
+    }
 
     #[test]
     fn checked_source_parent_release_wakes_outside_preparation_and_grant_locks() {

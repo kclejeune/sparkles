@@ -300,11 +300,11 @@ fn graphalytics_request_selects_only_available_rows_and_summary() {
     let (q, vars) = query_text(&req, &prefixes(), false).unwrap();
     let result = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
     assert_eq!(vars, ["node", "coefficient"]);
-    assert_eq!(result.rows().len(), 7);
+    assert_eq!(result.len(), 7);
     let (q, vars) = query_text(&req, &prefixes(), true).unwrap();
     assert_eq!(vars, ["summary"]);
     let result = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
-    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.len(), 1);
     let mut ordinary = req.clone();
     ordinary.params.insert("graphalytics".into(), false.into());
     assert_eq!(

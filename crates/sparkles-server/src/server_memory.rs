@@ -454,6 +454,27 @@ pub async fn granted(st: &AppState, req: Request, next: Next) -> Response {
 /// `Retry-After` when the wait passes. MCP calls, which name their class in their body,
 /// take their grant here and hand it to their tool through the request.
 pub async fn acquire(st: &AppState) -> Result<Option<PoolGrant>, crate::http::ApiError> {
+    acquire_engine(st, None)
+        .await
+        .map_err(crate::http::ApiError::from)
+}
+
+/// Admission for a transport-neutral call. Preserve the original typed refusal
+/// instead of serializing an HTTP error and reconstructing it later.
+#[cfg(any(feature = "mcp", test))]
+pub(crate) async fn acquire_for_call(
+    st: &AppState,
+    control: &sparkles::task::Control,
+) -> sparkles::Result<Option<PoolGrant>> {
+    acquire_engine(st, Some(control)).await
+}
+
+async fn acquire_engine(
+    st: &AppState,
+    control: Option<&sparkles::task::Control>,
+) -> sparkles::Result<Option<PoolGrant>> {
+    let check = || control.map_or(Ok(()), sparkles::task::Control::check);
+    check()?;
     let Some(pool) = st.catalog.pool() else {
         return Ok(None);
     };
@@ -467,23 +488,29 @@ pub async fn acquire(st: &AppState) -> Result<Option<PoolGrant>, crate::http::Ap
             let mut ticket = pool.enter(want, Some(Arc::new(move || n.notify_one())));
             let end = tokio::time::Instant::now() + st.admission.wait;
             loop {
+                check()?;
                 if let Some(g) = ticket.poll() {
                     break g;
                 }
                 tokio::select! {
                     _ = notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(10)), if control.is_some() => {
+                        check()?;
+                    }
                     _ = tokio::time::sleep_until(end) => {
+                        check()?;
                         // one last look, since the wake-up may have raced the timer
                         if let Some(g) = ticket.poll() {
                             break g;
                         }
                         pool.note_rejected();
-                        return Err(crate::http::ApiError::from(pool.exhausted(want)));
+                        return Err(pool.exhausted(want));
                     }
                 }
             }
         }
     };
+    check()?;
     st.admission.observe(started.elapsed());
     Ok(Some(grant))
 }
@@ -694,6 +721,75 @@ mod tests {
         v.extend_from_slice(args);
         v.push("serve");
         cache_sizes(&Cli::try_parse_from(v).unwrap())
+    }
+
+    fn pooled_call_fixture() -> AppState {
+        let options = sparkles::store::StoreOptions::default();
+        let mut state = AppState::standalone(options.clone(), Duration::from_secs(30));
+        let mut catalog = sparkles::catalog::CatalogOptions::from(options);
+        catalog.memory.pool_bytes = Some(2 << 20);
+        state.catalog = sparkles::Catalog::memory(catalog);
+        state.limits.query_memory_bytes = Some(2 << 20);
+        state
+    }
+
+    #[tokio::test]
+    async fn real_queued_call_cancellation_retires_its_ticket_without_an_admitted_grant() {
+        use std::sync::atomic::AtomicBool;
+        let state = pooled_call_fixture();
+        let pool = state.catalog.pool().unwrap().clone();
+        let held = pool.try_grant(2 << 20).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let control = sparkles::task::Control::with_cancel(flag.clone());
+        let mut waiting = Box::pin(acquire_for_call(&state, &control));
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        assert_eq!(pool.stats().waiting, 1);
+        flag.store(true, Ordering::SeqCst);
+        let result = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(sparkles::Error::Cancelled)));
+        assert_eq!(pool.stats().waiting, 0);
+        assert_eq!(pool.granted(), 2 << 20);
+        drop(held);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[tokio::test]
+    async fn real_queued_call_absolute_deadline_precedes_server_admission_timeout() {
+        let mut state = pooled_call_fixture();
+        state.admission.wait = Duration::from_secs(10);
+        let pool = state.catalog.pool().unwrap().clone();
+        let held = pool.try_grant(2 << 20).unwrap();
+        let mut control = sparkles::task::Control::none();
+        control.deadline = Some(Instant::now() + Duration::from_millis(500));
+        let mut waiting = Box::pin(acquire_for_call(&state, &control));
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        assert_eq!(pool.stats().waiting, 1);
+        let result = tokio::time::timeout(Duration::from_secs(3), waiting)
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(sparkles::Error::Timeout)));
+        assert_eq!(pool.stats().waiting, 0);
+        assert_eq!(pool.granted(), 2 << 20);
+        drop(held);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[tokio::test]
+    async fn call_admission_retains_the_original_typed_server_memory_refusal() {
+        let mut state = pooled_call_fixture();
+        state.admission.wait = Duration::ZERO;
+        let pool = state.catalog.pool().unwrap().clone();
+        let held = pool.try_grant(2 << 20).unwrap();
+        let result = acquire_for_call(&state, &sparkles::task::Control::none()).await;
+        assert!(
+            matches!(result, Err(sparkles::Error::BudgetExceeded(ref budget))
+            if budget.kind == sparkles::BudgetKind::ServerMemory && budget.limit == 2 << 20)
+        );
+        assert_eq!(pool.stats().waiting, 0);
+        drop(held);
+        assert_eq!(pool.granted(), 0);
     }
 
     #[test]

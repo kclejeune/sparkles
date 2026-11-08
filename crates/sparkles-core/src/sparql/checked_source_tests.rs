@@ -37,14 +37,23 @@ fn prepared_query_retains_genuine_source_credit_and_releases_on_final_result() {
     )
     .unwrap();
     assert_eq!(result.len(), 1);
-    assert!(Arc::ptr_eq(&result.ctx.snap, view.query_input().0));
-    assert!(result.ctx.read_source.is_some());
+    assert!(Arc::ptr_eq(
+        &result.test_context().snap,
+        view.query_input().0
+    ));
+    assert!(result.test_context().read_source.is_some());
     assert!(preparation.inner_used() > baseline);
-    let context = Arc::downgrade(&result.ctx);
+    let context = Arc::downgrade(&result.test_context());
     drop(view);
     drop(store);
     assert!(physical.upgrade().is_some());
-    assert_eq!(result.rows()[0][0].as_ref().unwrap().to_string(), "<urn:s>");
+    assert_eq!(
+        result.test_application_rows()[0][0]
+            .as_ref()
+            .unwrap()
+            .to_string(),
+        "<urn:s>"
+    );
     drop(result);
     assert!(context.upgrade().is_none());
     assert!(physical.upgrade().is_none());
@@ -128,7 +137,7 @@ fn source_query_uses_original_pool_and_refuses_foreign_domain_without_leak() {
         &opts(),
     )
     .unwrap();
-    assert!(Arc::ptr_eq(result.ctx.grant().unwrap(), &grant));
+    assert!(Arc::ptr_eq(result.test_context().grant().unwrap(), &grant));
     assert_eq!(grant.used(), preparation.inner_used());
     drop(result);
     assert_eq!(
@@ -176,7 +185,7 @@ fn checked_query_cannot_replace_prepared_policy_and_applies_graph_restrictions()
     )
     .unwrap();
     assert_eq!(
-        result.rows(),
+        result.test_application_rows(),
         vec![vec![Some(
             oxrdf::NamedNode::new("urn:allowed").unwrap().into()
         )]]
@@ -207,7 +216,7 @@ fn checked_query_cannot_replace_prepared_policy_and_applies_graph_restrictions()
     )
     .unwrap();
     assert_eq!(
-        result.rows(),
+        result.test_application_rows(),
         vec![vec![Some(oxrdf::NamedNode::new("urn:a").unwrap().into())]]
     );
     drop(result);
@@ -239,7 +248,10 @@ fn checked_query_preserves_source_and_option_cancellation_before_policy_work() {
     )
     .unwrap();
     control.cancel.cancel();
-    assert!(matches!(result.ctx.check(), Err(Error::Cancelled)));
+    assert!(matches!(
+        result.test_context().check(),
+        Err(Error::Cancelled)
+    ));
     assert!(matches!(
         query_source(view.read_source(), &store, "ASK {}", &opts()),
         Err(Error::Cancelled)
@@ -266,11 +278,11 @@ fn checked_source_deadline_cannot_be_extended_by_cursor_wait_credit() {
     )
     .unwrap();
     result
-        .ctx
+        .test_context()
         .deadline_pause
         .store(60_000_000_000, Ordering::Relaxed);
     std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
-    assert!(matches!(result.ctx.check(), Err(Error::Timeout)));
+    assert!(matches!(result.test_context().check(), Err(Error::Timeout)));
 }
 
 #[test]
@@ -301,10 +313,10 @@ fn historical_source_requires_current_policy_and_real_runtime_instance() {
     )
     .unwrap();
     assert_eq!(result.len(), 1);
-    assert!(result.ctx.source_view.is_some());
+    assert!(result.test_context().source_view.is_some());
     assert!(
         result
-            .ctx
+            .test_context()
             .read_source
             .as_ref()
             .unwrap()
@@ -314,7 +326,13 @@ fn historical_source_requires_current_policy_and_real_runtime_instance() {
     );
     drop(view);
     drop(store);
-    assert_eq!(result.rows()[0][0].as_ref().unwrap().to_string(), "<urn:s>");
+    assert_eq!(
+        result.test_application_rows()[0][0]
+            .as_ref()
+            .unwrap()
+            .to_string(),
+        "<urn:s>"
+    );
 }
 
 // Observation hooks are thread-local and test-only. They never alter admission.
@@ -451,20 +469,20 @@ fn checked_source_all_graph_triple_policy_is_retained_and_redacts_plan() {
     )
     .unwrap();
     assert_eq!(
-        result.rows(),
+        result.test_application_rows(),
         vec![vec![Some(
             oxrdf::NamedNode::new("urn:visible").unwrap().into()
         )]]
     );
     assert!(
         result
-            .ctx
+            .test_context()
             .graphs
             .as_ref()
             .is_some_and(|policy| Arc::ptr_eq(policy, view.query_input().1)),
         "actual bound triple policy must survive even when all graph names are readable"
     );
-    assert_redacted(&result.plan);
+    assert_redacted(&result.plan());
     let all = GraphAccess::all()
         .masked_controlled(&store.snapshot(), &preparation)
         .unwrap();
@@ -476,7 +494,7 @@ fn checked_source_all_graph_triple_policy_is_retained_and_redacts_plan() {
     )
     .unwrap();
     assert_eq!(unrestricted.len(), 2);
-    assert!(unrestricted.ctx.graphs.is_none());
+    assert!(unrestricted.test_context().graphs.is_none());
 }
 #[test]
 fn checked_source_all_graph_triple_policy_filters_history_changes() {
@@ -494,7 +512,7 @@ fn checked_source_all_graph_triple_policy_filters_history_changes() {
     )
     .unwrap();
     assert_eq!(
-        legacy.rows(),
+        legacy.test_application_rows(),
         vec![vec![Some(
             oxrdf::NamedNode::new("urn:visible").unwrap().into()
         )]]
@@ -504,8 +522,8 @@ fn checked_source_all_graph_triple_policy_filters_history_changes() {
         .unwrap();
     let actual = query_source(view.read_source(), &store, query_text, &opts()).unwrap();
     assert_eq!(
-        actual.rows(),
-        legacy.rows(),
+        actual.test_application_rows(),
+        legacy.test_application_rows(),
         "checked source must hide the same protected recorded changes as the actual policy"
     );
     store
@@ -524,7 +542,10 @@ fn checked_source_all_graph_triple_policy_filters_history_changes() {
         },
     )
     .unwrap();
-    assert_eq!(historical.rows(), legacy.rows());
+    assert_eq!(
+        historical.test_application_rows(),
+        legacy.test_application_rows()
+    );
 }
 #[derive(Debug)]
 struct PolicyView(Arc<std::sync::atomic::AtomicUsize>);
@@ -634,7 +655,7 @@ fn checked_source_policy_drops_before_original_source_credit_returns() {
         &opts(),
     )
     .unwrap();
-    let extra_context = result.ctx.clone();
+    let extra_context = result.test_context().clone();
     drop(view);
     let observations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let seen = observations.clone();
@@ -896,13 +917,13 @@ fn checked_source_query_deadline_stays_absolute_after_cursor_pause() {
         ..opts()
     };
     let result = query_source(view.read_source(), &store, "ASK {}", &options).unwrap();
-    let original_deadline = result.ctx.deadline.unwrap();
+    let original_deadline = result.test_context().deadline.unwrap();
     result
-        .ctx
+        .test_context()
         .deadline_pause
         .store(60_000_000_000, Ordering::Relaxed);
     std::thread::sleep(original_deadline.saturating_duration_since(Instant::now()));
-    assert!(matches!(result.ctx.check(), Err(Error::Timeout)));
+    assert!(matches!(result.test_context().check(), Err(Error::Timeout)));
     assert!(
         preparation.check().is_ok(),
         "one query must not mutate original source controls"
@@ -976,7 +997,7 @@ fn checked_source_empty_visible_union_preserves_policy_and_releases_credit() {
     )
     .unwrap();
     assert!(result.is_empty());
-    assert!(result.ctx.graphs.is_some());
+    assert!(result.test_context().graphs.is_some());
     drop(result);
     assert_eq!(preparation.inner_used(), before);
 }
@@ -1032,8 +1053,16 @@ fn checked_source_new_mask_policy_retires_before_original_evidence_credit() {
     )
     .unwrap();
     assert_eq!(result.len(), 1);
-    let weak_policy = Arc::downgrade(result.ctx.source_view.as_ref().unwrap().query_input().1);
-    let extra = result.ctx.clone();
+    let weak_policy = Arc::downgrade(
+        result
+            .test_context()
+            .source_view
+            .as_ref()
+            .unwrap()
+            .query_input()
+            .1,
+    );
+    let extra = result.test_context().clone();
     drop(view);
     let observations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let seen = observations.clone();
@@ -1055,4 +1084,256 @@ fn checked_source_new_mask_policy_retires_before_original_evidence_credit() {
         &[true],
         "new controlled mask and its internal policy references must retire before original evidence credit"
     );
+}
+
+#[test]
+fn same_pool_options_keep_the_actual_original_source_grant() {
+    let store = store();
+    let pool = pool::QueryPool::new(64 << 20);
+    let grant = Arc::new(pool.empty_grant());
+    let preparation = Preparation::with_grant(Control::none(), 2 << 20, grant.clone()).unwrap();
+    let view = GraphAccess::all()
+        .masked_controlled(&store.snapshot(), &preparation)
+        .unwrap();
+    let result = query_source(
+        view.read_source(),
+        &store,
+        "SELECT ?s WHERE { ?s <urn:p> ?o }",
+        &QueryOptions {
+            pool: Some(pool.clone()),
+            ..opts()
+        },
+    )
+    .unwrap();
+    assert_eq!(result.len(), 1);
+    assert!(
+        Arc::ptr_eq(result.test_context().grant().unwrap(), &grant),
+        "pool metadata must not replace the actual source grant"
+    );
+}
+#[test]
+fn same_pool_foreign_grant_cannot_relabel_the_actual_source_parent() {
+    let store = store();
+    let pool = pool::QueryPool::new(64 << 20);
+    let grant = Arc::new(pool.empty_grant());
+    let foreign = Arc::new(pool.empty_grant());
+    let preparation = Preparation::with_grant(Control::none(), 2 << 20, grant.clone()).unwrap();
+    let view = GraphAccess::all()
+        .masked_controlled(&store.snapshot(), &preparation)
+        .unwrap();
+    let before = (preparation.inner_used(), grant.used(), foreign.used());
+    let result = query_source(
+        view.read_source(),
+        &store,
+        "SELECT ?s WHERE { ?s <urn:p> ?o }",
+        &QueryOptions {
+            grant: Some(foreign.clone()),
+            ..opts()
+        },
+    );
+    assert!(
+        matches!(result,Err(Error::Component(c)) if c.code=="foreign-grant"),
+        "a real but different same-pool grant must not label the source's existing parent"
+    );
+    assert_eq!(
+        (preparation.inner_used(), grant.used(), foreign.used()),
+        before
+    );
+}
+
+#[test]
+fn original_source_grant_precedes_pool_fallback_and_refusal_precedes_new_allocation() {
+    let store = store();
+    let pool = pool::QueryPool::new(64 << 20);
+    let grant = Arc::new(pool.empty_grant());
+    let other = Arc::new(pool.empty_grant());
+    let foreign_pool = pool::QueryPool::new(64 << 20);
+    let preparation = Preparation::with_grant(Control::none(), 2 << 20, grant.clone()).unwrap();
+    let view = GraphAccess::all()
+        .masked_controlled(&store.snapshot(), &preparation)
+        .unwrap();
+    let baseline = preparation.inner_used();
+    let result = query_source(
+        view.read_source(),
+        &store,
+        "SELECT ?s WHERE { ?s <urn:p> ?o }",
+        &QueryOptions {
+            grant: Some(grant.clone()),
+            pool: Some(foreign_pool.clone()),
+            ..opts()
+        },
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(result.test_context().grant().unwrap(), &grant));
+    drop(result);
+    assert_eq!(preparation.inner_used(), baseline);
+    assert_eq!(foreign_pool.granted(), 0);
+    let pressure = preparation.reserve(preparation.room()).unwrap();
+    let before = (preparation.inner_used(), grant.used(), other.used());
+    assert!(
+        matches!(query_source(view.read_source(),&store,"ASK {}",&QueryOptions {grant:Some(other.clone()),..opts()}),Err(Error::Component(c)) if c.code=="foreign-grant")
+    );
+    assert_eq!(
+        (preparation.inner_used(), grant.used(), other.used()),
+        before
+    );
+    drop(pressure);
+    assert_eq!(preparation.inner_used(), baseline);
+}
+
+#[test]
+fn parsed_checked_request_source_reuses_preparation_controls_policy_and_final_owner() {
+    let store = store();
+    let pool = pool::QueryPool::new(16 << 20);
+    let grant = Arc::new(pool.empty_grant());
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let options = QueryOptions {
+        grant: Some(grant.clone()),
+        max_memory_bytes: Some(4 << 20),
+        cancel: Some(cancel.clone()),
+        deadline: Some(Instant::now() + std::time::Duration::from_secs(60)),
+        no_cache: true,
+        ..Default::default()
+    };
+    let root = Preparation::for_request(&options).unwrap();
+    let controlled = root.checked_for_query(&options).unwrap();
+    let access = GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(["urn:allowed"], &[])),
+        Graphs::none(),
+    );
+    let view = access
+        .masked_controlled(&store.snapshot(), &controlled)
+        .unwrap();
+    let baseline = root.inner_used();
+    let parsed = parse_query("SELECT ?s WHERE {GRAPH ?g {?s <urn:p> ?o}}", None, &[]).unwrap();
+    let result = execute_source(view.read_source(), &store, &parsed, &options, 0.125).unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.timing.parse_ms, 0.125);
+    assert!(Arc::ptr_eq(result.test_context().grant().unwrap(), &grant));
+    let last = result.row(0).unwrap().term(0).unwrap().unwrap();
+    assert_eq!(last.as_term().to_string(), "<urn:a>");
+    let source = Arc::downgrade(view.query_input().0);
+    let room = root.room();
+    let pressure = root.reserve(room).unwrap();
+    assert!(
+        matches!(execute_source(view.read_source(), &store, &parsed, &options, 0.0), Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory)
+    );
+    assert_eq!(last.as_term().to_string(), "<urn:a>");
+    drop(pressure);
+    assert!(root.inner_used() > baseline);
+    cancel.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        execute_source(view.read_source(), &store, &parsed, &options, 0.0),
+        Err(Error::Cancelled)
+    ));
+    drop(result);
+    drop(view);
+    drop(controlled);
+    drop(root);
+    drop(store);
+    assert!(source.upgrade().is_some());
+    assert!(grant.used() > 0);
+    assert_eq!(last.as_term().to_string(), "<urn:a>");
+    drop(last);
+    assert!(source.upgrade().is_none());
+    assert_eq!(grant.used(), 0);
+    drop(options);
+    drop(grant);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn parsed_historical_source_still_requires_actual_store_current_policy_and_parent() {
+    let store = store();
+    let preparation = Preparation::new(Control::none(), 8 << 20).unwrap();
+    store
+        .activate_memory_configuration_history(&preparation)
+        .unwrap();
+    let view = store
+        .evidence_view(&crate::history::At::Head, &preparation)
+        .unwrap();
+    let parsed = parse_query("ASK {}", None, &[]).unwrap();
+    let foreign = Store::in_memory(Default::default());
+    let baseline = preparation.inner_used();
+    assert!(execute_source(view.read_source(), &foreign, &parsed, &opts(), 0.0).is_err());
+    assert!(matches!(
+        execute_source(view.read_source(), &store, &parsed, &opts(), 0.0),
+        Err(Error::NotPermitted(_))
+    ));
+    assert_eq!(preparation.inner_used(), baseline);
+    let current = QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::all())),
+        ..opts()
+    };
+    let result = execute_source(view.read_source(), &store, &parsed, &current, 0.25).unwrap();
+    assert!(result.boolean);
+    assert_eq!(result.timing.parse_ms, 0.25);
+}
+
+#[test]
+fn transferred_vocabulary_literal_frees_its_buffer_before_original_preparation_credit() {
+    let _observe = Observe;
+    let store = Store::in_memory(StoreOptions::default());
+    store
+        .load(&[crate::io::Source::from_bytes(
+            format!("<urn:s> <urn:p> \"{}\" .", "x".repeat(4096)).into_bytes(),
+            crate::io::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let preparation = Preparation::new(Control::none(), 64 << 10).unwrap();
+    let original = preparation.inner_used();
+    let view = GraphAccess::all()
+        .masked_controlled(&store.snapshot(), &preparation)
+        .unwrap();
+    let view_only = preparation.inner_used();
+    let result = query_source(
+        view.read_source(),
+        &store,
+        "SELECT ?o WHERE { ?s <urn:p> ?o }",
+        &opts(),
+    )
+    .unwrap();
+    assert_eq!(result.inner.table.cols[0][0].tag(), crate::id::Tag::Vocab);
+    let before = preparation.inner_used();
+    let local_before = result.inner.ctx.live_bytes();
+    let rows = result.rows().unwrap();
+    let Some(oxrdf::Term::Literal(value)) = &rows.row(0).unwrap().values()[0] else {
+        panic!("the genuine result must retain its literal");
+    };
+    assert_eq!(value.value().len(), 4096);
+    let held = preparation.inner_used();
+    assert!(held >= before + 4098);
+    DEALLOCATION.with(|watch| {
+        watch.set((
+            value.value().as_ptr() as usize,
+            preparation.test_used_counter() as *const _ as usize,
+            0,
+            0,
+        ))
+    });
+    let last = rows.clone();
+    drop(rows);
+    assert_eq!(DEALLOCATION.with(std::cell::Cell::get).3, 0);
+    assert_eq!(preparation.inner_used(), held);
+    drop(last);
+    let (_, _, used_at_free, events) = DEALLOCATION.with(std::cell::Cell::get);
+    assert_eq!(
+        events, 1,
+        "actual final lexical-buffer deallocation must be observed"
+    );
+    assert_eq!(
+        used_at_free, held,
+        "physical buffer retires before its original parent credit"
+    );
+    assert_eq!(result.inner.ctx.live_bytes(), local_before);
+    // Ordinary live contexts may keep bounded upstream reservation slack. That
+    // is distinct from actual live bytes and exact native receiving credit.
+    let parent_after = preparation.inner_used();
+    assert!(parent_after >= before && parent_after <= held);
+    DEALLOCATION.with(|watch| watch.set((0, 0, 0, 0)));
+    drop(result);
+    assert_eq!(preparation.inner_used(), view_only);
+    drop(view);
+    assert_eq!(preparation.inner_used(), original);
 }

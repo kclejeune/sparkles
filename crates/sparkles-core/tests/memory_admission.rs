@@ -67,7 +67,7 @@ fn automatic(s: &Store, q: &str, opts: &QueryOptions) -> Auto {
                 match c.next_batch() {
                     Ok(Some(batch)) => {
                         for row in 0..batch.len() {
-                            rows.push(batch.row(row).unwrap());
+                            rows.push(batch.row(row).unwrap().values().to_vec());
                         }
                     }
                     Ok(None) => return Auto::Streamed(rows),
@@ -118,7 +118,6 @@ fn a_hash_join_whose_index_does_not_fit_is_not_streamed_without_spill() {
     // the eager result holds its pool memory until it drops
     let eager = query(s.snapshot(), q, &opts)
         .unwrap_or_else(|e| panic!("eager: {e}"))
-        .rows()
         .len();
     assert_eq!(eager, 1);
     match automatic(&s, q, &opts) {

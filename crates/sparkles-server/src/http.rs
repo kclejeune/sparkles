@@ -1991,10 +1991,11 @@ pub(crate) async fn run_query(
             .await;
         }
     };
-    let algorithmic = r.ctx.calls_algorithm();
-    let derived = r.ctx.reasoning.clone();
+    let algorithmic = r.uses_algorithms();
+    let metadata = r.clone();
+    let derived = metadata.reasoning();
     let query_ms = r.timing.total_ms;
-    let cells = r.len().saturating_mul(r.vars.len().max(3));
+    let cells = r.len().saturating_mul(r.variables().len().max(3));
     let is_ask = r.kind == QueryKind::Ask;
     let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
     let truncated = r.describe_truncated;
@@ -2005,7 +2006,7 @@ pub(crate) async fn run_query(
     {
         // refuse before serializing when even the smallest encoding is too large
         let rows = send.map_or(r.len(), |s| s.min(r.len()));
-        let min = sfmt.min_bytes(rows, r.vars.len());
+        let min = sfmt.min_bytes(rows, r.variables().len());
         if min > l {
             return Err(Error::BudgetExceeded(sparkles::Budget {
                 kind: BudgetKind::ResultBytes,
@@ -2038,7 +2039,7 @@ pub(crate) async fn run_query(
         mem_peak_bytes: Some(r.mem_peak_bytes),
         rows_produced: Some(r.rows_produced),
         timing: Some(r.timing.clone()),
-        geo_work: crate::geo::plan_work(&r.plan),
+        geo_work: crate::geo::plan_work(r.plan()),
         ..Default::default()
     };
     // The repeatable serializer owns and borrows the immutable result on each
@@ -2146,7 +2147,7 @@ pub(crate) async fn run_query(
         );
     }
     let resp = history::history_headers(resp, resolved.as_ref(), &uri);
-    let resp = with_reasoning(resp, derived.as_deref());
+    let resp = with_reasoning(resp, derived);
     // freshness is reported for the live state only
     let mut resp = match &resolved {
         Some(r) if r.historical => resp,
@@ -2237,13 +2238,11 @@ fn write_thrift_results(
     send: Option<usize>,
     sent: &std::cell::Cell<u64>,
 ) -> sparkles::Result<()> {
-    let mut out = jena_formats::ThriftResults::new(w, &r.vars)?;
-    let n = send.map_or(r.table.len(), |s| s.min(r.table.len()));
-    let mut row = Vec::with_capacity(r.vars.len());
+    let mut out = jena_formats::ThriftResults::new(w, r.variables())?;
+    let n = send.map_or(r.len(), |s| s.min(r.len()));
     for i in 0..n {
-        row.clear();
-        row.extend(r.table.cols.iter().map(|c| r.term(c[i])));
-        out.row(&row)?;
+        let row = r.row(i)?;
+        out.row(row.values())?;
         sent.set(sent.get() + 1);
     }
     out.finish()?;

@@ -122,7 +122,7 @@ fn length_filters_match_scalar_evaluation_and_stream_across_batches() {
                 .unwrap();
                 let mut rows = Vec::new();
                 while let Some(batch) = cursor.next_batch().unwrap() {
-                    rows.extend((0..batch.len()).map(|i| batch.row(i).unwrap()));
+                    rows.extend((0..batch.len()).map(|i| batch.row(i).unwrap().values().to_vec()));
                 }
                 assert_eq!(bag(rows), expected, "{condition}, batch={batch_rows}");
             }

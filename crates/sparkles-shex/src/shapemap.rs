@@ -20,6 +20,7 @@ use spargebra::algebra::GraphPattern;
 use spargebra::term::Variable;
 use sparkles_core::id::{Id, Tag};
 use sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI;
+use sparkles_core::sparql::output::{OwnedTerm, SnapshotOutputRoot};
 use sparkles_core::store::parse_bnode_label;
 use sparkles_core::validation::DataGraph;
 use std::time::Instant;
@@ -664,7 +665,7 @@ impl<'a> Parser<'a> {
 /// An association of the fixed map.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FixedEntry {
-    pub node: Term,
+    pub node: OwnedTerm,
     /// the node's store id (`None`: not in the store, so its neighbourhood is empty)
     pub id: Option<Id>,
     pub shape: ShapeLabel,
@@ -756,7 +757,8 @@ fn sparql_nodes(
     data: &DataGraph,
     opts: &ValidateOptions,
     deadline: Option<Instant>,
-) -> anyhow::Result<Vec<(Term, Option<Id>)>> {
+    root: &SnapshotOutputRoot,
+) -> anyhow::Result<Vec<(OwnedTerm, Option<Id>)>> {
     let parsed = selector_query(q).map_err(SchemaError::new)?;
     let snap = &data.snap;
     // the graphs of the data graph by name (the store's default graph included, which
@@ -794,6 +796,8 @@ fn sparql_nodes(
             (a, b) => a.clone().or_else(|| b.clone()),
         },
         default_graph_uris,
+        // The root already owns the actual bound policy prepared from base.graphs.
+        graphs: None,
         named_graph_uris: Vec::new(),
         default_graph_extra: Vec::new(),
         initial_bindings: Vec::new(),
@@ -812,25 +816,24 @@ fn sparql_nodes(
             e => SchemaError::new(format!("the SPARQL selector failed: {e}")).into(),
         }
     };
-    let mut r =
-        sparkles_core::sparql::execute_query(snap.clone(), &parsed, &qo, 0.0).map_err(failed)?;
-    sparkles_core::sparql::select_star_order(q, &mut r);
+    let mut r = root.execute(&parsed, &qo).map_err(failed)?;
+    sparkles_core::sparql::select_star_order(q, &mut r).map_err(failed)?;
     let Some(col) = r
-        .vars
+        .variables()
         .iter()
         .position(|v| v == "focus")
-        .or((!r.vars.is_empty()).then_some(0))
+        .or((!r.variables().is_empty()).then_some(0))
     else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    for &id in &r.table.cols[col] {
-        let Some(t) = r.term(id) else {
+    for &id in r.table().column(col).expect("checked projected column") {
+        let Some(t) = r.term(id).map_err(failed)? else {
             continue;
         };
         // values the query computed have no store ids, though the store may hold them
         let sid = if matches!(id.tag(), Tag::Local | Tag::Undef) {
-            snap.lookup_term(&t)
+            snap.lookup_term(t.as_term())
         } else {
             Some(id)
         };
@@ -851,32 +854,74 @@ pub fn expand(
     opts: &ValidateOptions,
     deadline: Option<Instant>,
 ) -> anyhow::Result<(Vec<FixedEntry>, Vec<String>)> {
+    let root = output_root(&data.snap, opts, deadline)?;
+    expand_in(map, data, schema, opts, deadline, &root)
+}
+
+// A single genuine original parent spans selectors, absent values and output nodes.
+pub(crate) fn output_root(
+    snap: &std::sync::Arc<sparkles_core::store::Snapshot>,
+    opts: &ValidateOptions,
+    deadline: Option<Instant>,
+) -> sparkles_core::Result<SnapshotOutputRoot> {
+    // Fixed process configuration, not one private options copy per selected node.
+    static DEFAULT: std::sync::LazyLock<sparkles_core::sparql::QueryOptions> =
+        std::sync::LazyLock::new(Default::default);
+    let timed = opts
+        .timeout
+        .map(|timeout| {
+            Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| sparkles_core::Error::invalid("validation timeout overflow"))
+        })
+        .transpose()?;
+    SnapshotOutputRoot::new_with_controls(
+        snap.clone(),
+        opts.selector_query.as_ref().unwrap_or(&DEFAULT),
+        deadline.into_iter().chain(opts.deadline).chain(timed).min(),
+        opts.cancel.clone(),
+        opts.cancellation.clone(),
+    )
+}
+
+pub(crate) fn expand_in(
+    map: &ShapeMap,
+    data: &DataGraph,
+    schema: &CompiledSchema,
+    opts: &ValidateOptions,
+    deadline: Option<Instant>,
+    root: &SnapshotOutputRoot,
+) -> anyhow::Result<(Vec<FixedEntry>, Vec<String>)> {
+    root.budget().check()?;
     let snap = &data.snap;
     let mut out = Vec::new();
     let mut warnings = Vec::new();
-    let mut seen: FxHashSet<(Term, ShapeLabel)> = FxHashSet::default();
-    let mut push =
-        |out: &mut Vec<FixedEntry>, node: Term, id: Option<Id>, a: &Association, kind: PairKind| {
-            if seen.insert((node.clone(), a.shape.clone())) {
-                out.push(FixedEntry {
-                    node,
-                    id,
-                    shape: a.shape.clone(),
-                    kind,
-                });
-            }
-        };
+    let mut seen: FxHashSet<(OwnedTerm, ShapeLabel)> = FxHashSet::default();
+    let mut push = |out: &mut Vec<FixedEntry>,
+                    node: OwnedTerm,
+                    id: Option<Id>,
+                    a: &Association,
+                    kind: PairKind| {
+        if seen.insert((node.clone(), a.shape.clone())) {
+            out.push(FixedEntry {
+                node,
+                id,
+                shape: a.shape.clone(),
+                kind,
+            });
+        }
+    };
     for a in &map.0 {
         let kind = label_kind(schema, &a.shape)?;
         match &a.node {
             NodeSelector::Term(Term::BlankNode(b)) => match parse_bnode_label(b.as_str()) {
-                Some(id) => push(&mut out, Term::BlankNode(b.clone()), Some(id), a, kind),
+                Some(id) => push(&mut out, root.budget().copy_term(b.as_ref().into())?, Some(id), a, kind),
                 None => warnings.push(format!(
                     "the blank node _:{} selects nothing: only labels of stored blank nodes (_:b…) name nodes",
                     b.as_str()
                 )),
             },
-            NodeSelector::Term(t) => push(&mut out, t.clone(), snap.lookup_term(t), a, kind),
+            NodeSelector::Term(t) => push(&mut out, root.budget().copy_term(t.as_ref())?, snap.lookup_term(t), a, kind),
             NodeSelector::Focus {
                 subject,
                 predicate,
@@ -907,13 +952,13 @@ pub fn expand(
                     }
                 };
                 for id in ids {
-                    if let Some(t) = snap.term(id) {
+                    if let Some(t) = root.term(id)? {
                         push(&mut out, t, Some(id), a, kind);
                     }
                 }
             }
             NodeSelector::Sparql(q) => {
-                for (t, id) in sparql_nodes(q, data, opts, deadline)? {
+                for (t, id) in sparql_nodes(q, data, opts, deadline, root)? {
                     push(&mut out, t, id, a, kind);
                 }
             }
@@ -1249,7 +1294,7 @@ mod tests {
     fn names(entries: &[FixedEntry]) -> Vec<String> {
         entries
             .iter()
-            .map(|e| match &e.node {
+            .map(|e| match e.node.as_term() {
                 Term::NamedNode(n) => n.as_str().trim_start_matches(EX).to_string(),
                 t => t.to_string(),
             })
@@ -1356,7 +1401,7 @@ mod tests {
         assert!(
             fixed
                 .iter()
-                .filter(|e| e.node != iri("nobody"))
+                .filter(|e| e.node.as_term() != &iri("nobody"))
                 .all(|e| e.id.is_some())
         );
 
@@ -1501,8 +1546,8 @@ mod tests {
             &data,
         );
         assert_eq!(
-            fixed[0].node,
-            Term::Literal(Literal::new_simple_literal("a"))
+            fixed[0].node.as_term(),
+            &Term::Literal(Literal::new_simple_literal("a"))
         );
         // SELECT * takes the variables in the order they appear
         let fixed = ok(

@@ -439,3 +439,648 @@ fn late_receiving_refusal_drops_constructed_terms_and_zero_width_needs_no_loop()
     drop(rows);
     assert_eq!(receiver.ctx.live_bytes(), 0);
 }
+
+#[test]
+fn relabelled_graph_scratch_retains_nested_payload_and_actual_credit() {
+    let source = oxrdf::Triple::new(
+        oxrdf::BlankNode::new_unchecked("root"),
+        oxrdf::NamedNode::new_unchecked("urn:p"),
+        Term::Triple(Box::new(oxrdf::Triple::new(
+            oxrdf::BlankNode::new_unchecked("inner"),
+            oxrdf::NamedNode::new_unchecked("urn:q"),
+            oxrdf::Literal::new_simple_literal("x".repeat(64 << 10)),
+        ))),
+    );
+    let budget = budget(1 << 20);
+    let context = Arc::downgrade(&budget.ctx);
+    let value = budget.relabel_graph_triple(&source, 2, 3, 4).unwrap();
+    let held = budget.ctx.live_bytes();
+    assert!(held >= 64 << 10);
+    let clone = value.clone();
+    assert_eq!(budget.ctx.live_bytes(), held);
+    let Term::Triple(outer) = clone.as_term() else {
+        panic!("triple payload");
+    };
+    assert_eq!(outer.subject.to_string(), "_:t2b3q4xroot");
+    assert_eq!(outer.predicate.as_str(), "urn:p");
+    let Term::Triple(inner) = &outer.object else {
+        panic!("nested triple payload");
+    };
+    assert_eq!(inner.subject.to_string(), "_:t2b3q4xinner");
+    assert_eq!(inner.predicate.as_str(), "urn:q");
+    assert!(matches!(&inner.object, Term::Literal(text) if text.value().len() == 64 << 10));
+    assert_eq!(source.subject.to_string(), "_:root");
+    drop(value);
+    drop(budget);
+    assert_eq!(context.upgrade().unwrap().live_bytes(), held);
+    drop(clone);
+    assert!(context.upgrade().is_none());
+}
+
+#[test]
+fn relabelled_graph_scratch_refuses_before_allocation_and_cancels_without_output() {
+    use crate::algo::memory::probe;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let source = oxrdf::Triple::new(
+        oxrdf::BlankNode::new_unchecked("root"),
+        oxrdf::NamedNode::new_unchecked("urn:p"),
+        oxrdf::Literal::new_simple_literal("x".repeat(64 << 10)),
+    );
+    let receiver = budget(8192);
+    let allocations = Arc::new(AtomicUsize::new(0));
+    let observed = allocations.clone();
+    let hook = probe::install(
+        move |point| {
+            if let probe::Point::Allocation("relabelled-graph-scratch", 1) = point {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+        },
+        None,
+    );
+    assert!(matches!(receiver.relabel_graph_triple(&source, 2, 3, 4),
+        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory));
+    drop(hook);
+    assert_eq!(allocations.load(Ordering::Relaxed), 0);
+    assert_eq!(receiver.ctx.live_bytes(), 0);
+    assert_eq!(source.subject.to_string(), "_:root");
+    for cancelled in [false, true] {
+        let receiver = budget(1 << 20);
+        let flag = receiver.ctx.cancel.clone();
+        let hook = probe::install(
+            move |point| {
+                if cancelled && let probe::Point::Allocation("relabelled-graph-scratch", 1) = point
+                {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            },
+            (!cancelled).then_some("relabelled-graph-scratch"),
+        );
+        let result = receiver.relabel_graph_triple(&source, 2, 3, 4);
+        drop(hook);
+        if cancelled {
+            assert!(matches!(result, Err(Error::Cancelled)));
+        } else {
+            assert!(matches!(result, Err(Error::Invalid(_))));
+        }
+        assert_eq!(receiver.ctx.live_bytes(), 0);
+    }
+}
+
+#[test]
+fn owned_text_prepays_utf8_and_keeps_original_fast_owner_until_last_clone() {
+    let source = budget(1 << 20);
+    let weak = Arc::downgrade(&source.ctx);
+    let text = "é".repeat(32 << 10);
+    LEDGER_OPS.with(|n| n.set(0));
+    let value = source.text(&text).unwrap();
+    assert_eq!(value.as_str(), text);
+    assert!(source.ctx.live_bytes() >= text.len() as u64);
+    assert_eq!(LEDGER_OPS.with(|n| n.get()), 0);
+    let last = value.clone();
+    drop(value);
+    drop(source);
+    assert_eq!(last.as_str(), text);
+    assert!(weak.upgrade().is_some());
+    drop(last);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn owned_text_refuses_before_copy_and_preserves_source_on_destination_failure() {
+    use crate::algo::memory::probe;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let source = budget(1 << 20);
+    let original = source.text(&"x".repeat(64 << 10)).unwrap();
+    let live = source.ctx.live_bytes();
+    let destination = budget(8192);
+    let allocations = Arc::new(AtomicUsize::new(0));
+    let observed = allocations.clone();
+    let hook = probe::install(
+        move |point| {
+            if let probe::Point::Allocation("owned-output-text", 1) = point {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+        },
+        None,
+    );
+    assert!(
+        matches!(original.try_copy_in(&destination),Err(Error::BudgetExceeded(b)) if b.kind==BudgetKind::Memory)
+    );
+    drop(hook);
+    assert_eq!(allocations.load(Ordering::Relaxed), 0);
+    assert_eq!(destination.ctx.live_bytes(), 0);
+    assert_eq!(source.ctx.live_bytes(), live);
+    for cancel in [false, true] {
+        let destination = budget(1 << 20);
+        let flag = destination.ctx.cancel.clone();
+        let hook = probe::install(
+            move |point| {
+                if cancel && let probe::Point::Allocation("owned-output-text", 1) = point {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            },
+            (!cancel).then_some("owned-output-text"),
+        );
+        let result = original.try_copy_in(&destination);
+        drop(hook);
+        if cancel {
+            assert!(matches!(result, Err(Error::Cancelled)));
+        } else {
+            assert!(matches!(result, Err(Error::Invalid(_))));
+        }
+        assert_eq!(destination.ctx.live_bytes(), 0);
+        assert_eq!(source.ctx.live_bytes(), live);
+    }
+    assert_eq!(original.len(), 64 << 10);
+}
+
+#[test]
+fn borrowed_term_copy_admits_before_clone_and_retains_its_receiving_owner() {
+    use crate::algo::memory::probe;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let source = Term::Literal(oxrdf::Literal::new_simple_literal("x".repeat(64 << 10)));
+    let destination = budget(8192);
+    let copies = Arc::new(AtomicUsize::new(0));
+    let observed = copies.clone();
+    let hook = probe::install(
+        move |point| {
+            if let probe::Point::Allocation("borrowed-output-term", 1) = point {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+        },
+        None,
+    );
+    assert!(
+        matches!(destination.copy_term(source.as_ref()),Err(Error::BudgetExceeded(b)) if b.kind==BudgetKind::Memory)
+    );
+    drop(hook);
+    assert_eq!(copies.load(Ordering::Relaxed), 0);
+    assert_eq!(destination.ctx.live_bytes(), 0);
+    let destination = budget(1 << 20);
+    let weak = Arc::downgrade(&destination.ctx);
+    let term = destination.copy_term(source.as_ref()).unwrap();
+    assert_eq!(term.as_term(), &source);
+    assert!(destination.ctx.live_bytes() >= 64 << 10);
+    drop(source);
+    drop(destination);
+    assert!(matches!(term.as_term(),Term::Literal(l) if l.value().len()==64 << 10));
+    drop(term);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn receiving_root_headers_refuse_before_allocation_and_faults_refund_real_pool() {
+    use crate::algo::memory::probe;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let store = Store::in_memory(StoreOptions::default());
+    let pool = QueryPool::new(16 << 20);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let hook = probe::install(
+        move |point| {
+            if let probe::Point::Allocation("output-root-preparation", 1) = point {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+        },
+        None,
+    );
+    assert!(
+        matches!(SnapshotOutputRoot::new(store.snapshot(),&super::super::QueryOptions { pool:Some(pool.clone()),max_memory_bytes:Some(512),..Default::default() }),Err(Error::BudgetExceeded(b)) if b.kind==BudgetKind::Memory && b.limit==512 && b.requested==1024)
+    );
+    drop(hook);
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert_eq!(pool.granted(), 0);
+    for existing in [false, true] {
+        let grant = Arc::new(pool.empty_grant());
+        let hook = probe::install(|_| {}, Some("output-root-preparation"));
+        assert!(matches!(
+            SnapshotOutputRoot::new(
+                store.snapshot(),
+                &super::super::QueryOptions {
+                    grant: existing.then(|| grant.clone()),
+                    pool: Some(pool.clone()),
+                    max_memory_bytes: Some(1 << 20),
+                    ..Default::default()
+                }
+            ),
+            Err(Error::Invalid(_))
+        ));
+        drop(hook);
+        assert_eq!(grant.used(), 0);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+    }
+}
+
+#[test]
+fn receiving_root_queries_and_retained_output_share_actual_aggregate_preparation() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut write = store.write();
+    let s = write
+        .intern(&oxrdf::NamedNode::new_unchecked("urn:s").into())
+        .unwrap();
+    let p = write
+        .intern(&oxrdf::NamedNode::new_unchecked("urn:p").into())
+        .unwrap();
+    let o = write
+        .intern(&oxrdf::Literal::new_simple_literal("x".repeat(32 << 10)).into())
+        .unwrap();
+    write.insert([s, p, o, Id::DEFAULT_GRAPH]).unwrap();
+    write.commit().unwrap();
+    let pool = QueryPool::new(16 << 20);
+    let opts = super::super::QueryOptions {
+        pool: Some(pool.clone()),
+        max_memory_bytes: Some(1 << 20),
+        no_cache: true,
+        ..Default::default()
+    };
+    let root = SnapshotOutputRoot::new(store.snapshot(), &opts).unwrap();
+    let physical = Arc::downgrade(root.source.query_input().0);
+    let parsed =
+        super::super::parse_query("SELECT ?o WHERE { <urn:s> <urn:p> ?o }", None, &[]).unwrap();
+    let first = root
+        .execute(
+            &parsed,
+            &super::super::QueryOptions {
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let last = first
+        .term(first.table().get(0, 0).unwrap())
+        .unwrap()
+        .unwrap();
+    let used = root
+        .budget
+        .ctx
+        .source_preparation
+        .as_ref()
+        .unwrap()
+        .inner_used();
+    let room = root.budget.ctx.source_preparation.as_ref().unwrap().room();
+    let pressure = root.budget.reserve(room).unwrap();
+    assert!(
+        matches!(root.execute(&parsed,&super::super::QueryOptions { no_cache:true,..Default::default() }),Err(Error::BudgetExceeded(b)) if b.kind==BudgetKind::Memory)
+    );
+    assert!(matches!(last.as_term(),Term::Literal(l) if l.value().len()==32 << 10));
+    drop(pressure);
+    assert_eq!(
+        root.budget
+            .ctx
+            .source_preparation
+            .as_ref()
+            .unwrap()
+            .inner_used(),
+        used
+    );
+    let second = root
+        .execute(
+            &parsed,
+            &super::super::QueryOptions {
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    drop(second);
+    drop(first);
+    drop(store);
+    drop(root);
+    assert!(physical.upgrade().is_some());
+    assert!(pool.granted() > 0);
+    assert!(matches!(last.as_term(),Term::Literal(l) if l.value().len()==32 << 10));
+    drop(last);
+    assert!(physical.upgrade().is_none());
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn receiving_root_original_controls_deadline_and_policy_survive_child_options() {
+    use crate::access::{GraphAccess, GraphRule, Graphs};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let store = Store::in_memory(StoreOptions::default());
+    store
+        .load(&[crate::io::Source::from_bytes(
+            b"<urn:a> { <urn:s> <urn:p> 1 } <urn:hidden> { <urn:h> <urn:p> 2 }".to_vec(),
+            crate::io::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let parsed =
+        super::super::parse_query("SELECT ?g WHERE { GRAPH ?g { ?s ?p ?o } }", None, &[]).unwrap();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let root = SnapshotOutputRoot::new(
+        store.snapshot(),
+        &super::super::QueryOptions {
+            deadline: Some(end),
+            graphs: Some(Arc::new(GraphAccess::graphs(
+                Graphs::Only(GraphRule::new(["urn:a"], &[])),
+                Graphs::none(),
+            ))),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let child = root
+        .execute(
+            &parsed,
+            &super::super::QueryOptions {
+                timeout: Some(std::time::Duration::from_secs(300)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(child.len(), 1);
+    assert_eq!(
+        child
+            .inner
+            .ctx
+            .source_preparation
+            .as_ref()
+            .unwrap()
+            .control()
+            .deadline,
+        Some(end)
+    );
+    assert!(
+        matches!(child.term(child.table().get(0,0).unwrap()).unwrap().unwrap().as_term(),Term::NamedNode(n) if n.as_str()=="urn:a")
+    );
+    for composed in [false, true] {
+        let flag = Arc::new(AtomicBool::new(false));
+        let opts = super::super::QueryOptions {
+            cancel: (!composed).then(|| flag.clone()),
+            cancellation: composed.then(|| crate::task::Cancellation::from_flags([flag.clone()])),
+            ..Default::default()
+        };
+        let root = SnapshotOutputRoot::new(store.snapshot(), &opts).unwrap();
+        let mut held = root.budget.reserve(4096).unwrap();
+        flag.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            root.execute(&parsed, &Default::default()),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(held.grow_to(8192), Err(Error::Cancelled)));
+        assert_eq!(held.bytes(), 4096);
+        held.release_to(0).unwrap();
+        assert_eq!(held.bytes(), 0);
+    }
+}
+
+#[test]
+fn receiving_reservations_keep_nonempty_overlap_and_refusal_preserves_all_values() {
+    struct Buffer {
+        data: Vec<u8>,
+        held: OutputReservation,
+    }
+    fn filled(b: &OutputBudget, n: usize, value: u8) -> Buffer {
+        let held = b.reserve(n as u64).unwrap();
+        let mut data = Vec::new();
+        data.try_reserve_exact(n).unwrap();
+        assert_eq!(data.capacity(), n);
+        data.resize(n, value);
+        Buffer { data, held }
+    }
+    let b = budget(8192);
+    LEDGER_OPS.with(|n| n.set(0));
+    let source = filled(&b, 1024, 1);
+    let destination = filled(&b, 2048, 2);
+    let mut replacement = filled(&b, 4096, 3);
+    let live = b.ctx.live_bytes();
+    assert_eq!(live, 7168);
+    assert!(
+        matches!(replacement.held.grow_to(8192),Err(Error::BudgetExceeded(e)) if e.kind==BudgetKind::Memory)
+    );
+    assert_eq!(replacement.held.bytes(), 4096);
+    assert_eq!(b.ctx.live_bytes(), live);
+    assert!(source.data.iter().all(|v| *v == 1));
+    assert!(destination.data.iter().all(|v| *v == 2));
+    assert!(replacement.data.iter().all(|v| *v == 3));
+    assert_eq!(LEDGER_OPS.with(|n| n.get()), 0);
+    drop(destination);
+    drop(source);
+    drop(replacement);
+    assert_eq!(b.ctx.live_bytes(), 0);
+}
+
+#[test]
+fn receiving_exact_contribution_does_not_consume_or_strand_a_live_siblings_credit() {
+    let store = Store::in_memory(StoreOptions::default());
+    let root = SnapshotOutputRoot::new(
+        store.snapshot(),
+        &super::super::QueryOptions {
+            max_memory_bytes: Some(256 << 10),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let original = root.budget.ctx.charge(4096).unwrap();
+    let sibling = vec![7u8; 4096];
+    let preparation = root.budget.ctx.source_preparation.as_ref().unwrap();
+    let base = preparation.inner_used();
+    let live = root.budget.ctx.live_bytes();
+    let mut reservation = root.budget.reserve(8192).unwrap();
+    assert_eq!(preparation.inner_used(), base + 8192);
+    assert_eq!(root.budget.ctx.live_bytes(), live + 8192);
+    reservation.grow_to(12288).unwrap();
+    assert_eq!(preparation.inner_used(), base + 12288);
+    assert!(matches!(
+        reservation.grow_to(256 << 10),
+        Err(Error::BudgetExceeded(_))
+    ));
+    assert_eq!(reservation.bytes(), 12288);
+    assert_eq!(preparation.inner_used(), base + 12288);
+    reservation.release_to(2048).unwrap();
+    assert_eq!(preparation.inner_used(), base + 2048);
+    drop(reservation);
+    assert_eq!(preparation.inner_used(), base);
+    assert_eq!(root.budget.ctx.live_bytes(), live);
+    assert!(sibling.iter().all(|b| *b == 7));
+    drop(sibling);
+    drop(original);
+}
+
+#[test]
+fn receiving_root_intersects_both_original_control_sets_without_child_renewal() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let store = Store::in_memory(StoreOptions::default());
+    let parsed = super::super::parse_query("ASK {}", None, &[]).unwrap();
+    for selected in 0..4 {
+        let flags: [Arc<AtomicBool>; 4] = std::array::from_fn(|_| Arc::new(AtomicBool::new(false)));
+        let shorter = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let root = SnapshotOutputRoot::new_with_controls(
+            store.snapshot(),
+            &super::super::QueryOptions {
+                cancel: Some(flags[0].clone()),
+                cancellation: Some(crate::task::Cancellation::from_flags([flags[1].clone()])),
+                timeout: Some(std::time::Duration::from_secs(300)),
+                ..Default::default()
+            },
+            Some(shorter),
+            Some(flags[2].clone()),
+            Some(crate::task::Cancellation::from_flags([flags[3].clone()])),
+        )
+        .unwrap();
+        assert_eq!(
+            root.source.query_input().2.control().deadline,
+            Some(shorter)
+        );
+        assert_eq!(
+            root.execute(&parsed, &Default::default()).unwrap().boolean,
+            true
+        );
+        flags[selected].store(true, Ordering::Relaxed);
+        assert!(matches!(
+            root.term(Id::DEFAULT_GRAPH),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            root.execute(&parsed, &Default::default()),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(root.budget().reserve(1), Err(Error::Cancelled)));
+    }
+}
+
+fn stored_literal_answer(shared: bool) -> super::super::QueryResult {
+    use crate::io::Source;
+    use oxrdfio::RdfFormat;
+    let store = Store::in_memory(StoreOptions::default());
+    store
+        .load(&[Source::from_bytes(
+            format!("<urn:s> <urn:p> \"{}\" .", "x".repeat(4096)).into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let result = super::super::query(
+        store.snapshot(),
+        "SELECT ?o WHERE { ?s <urn:p> ?o }",
+        &super::super::QueryOptions {
+            max_memory_bytes: Some(8192),
+            pool: shared.then(|| QueryPool::new(1 << 20)),
+            no_cache: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        result.inner.table.cols[0][0].tag(),
+        crate::id::Tag::Vocab,
+        "the witness must reconstruct a real stored vocabulary key"
+    );
+    result
+}
+
+#[test]
+fn stored_simple_literal_moves_one_admitted_buffer_within_original_eight_kib() {
+    for shared in [false, true] {
+        let result = stored_literal_answer(shared);
+        let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let events = observed.clone();
+        *result.inner.ctx.chunk_hook.lock() = Some(Arc::new(move |stage, value| {
+            if stage.starts_with("owned-key-") {
+                events.lock().push((stage, value));
+            }
+        }));
+        let before = result.inner.ctx.live_bytes();
+        LEDGER_OPS.with(|n| n.set(0));
+        let rows = result.rows().unwrap();
+        if !shared {
+            assert_eq!(
+                LEDGER_OPS.with(|n| n.get()),
+                0,
+                "ordinary transfer stays fast"
+            );
+        }
+        let Term::Literal(value) = rows.row(0).unwrap().values()[0].as_ref().unwrap() else {
+            panic!("original bound-literal oracle");
+        };
+        assert_eq!(value.value(), "x".repeat(4096));
+        let events = observed.lock();
+        let pointer = events
+            .iter()
+            .find(|(name, _)| *name == "owned-key-pointer")
+            .unwrap()
+            .1;
+        let capacity = events
+            .iter()
+            .find(|(name, _)| *name == "owned-key-capacity")
+            .unwrap()
+            .1;
+        assert_eq!(
+            value.value().as_ptr() as usize,
+            pointer,
+            "same allocation, no lexical copy"
+        );
+        assert!(capacity >= 4098);
+        assert!(result.inner.ctx.live_bytes() >= before + capacity as u64);
+        drop(events);
+        let held = result.inner.ctx.live_bytes();
+        let last = rows.clone();
+        drop(rows);
+        assert_eq!(result.inner.ctx.live_bytes(), held);
+        let weak = Arc::downgrade(&result.inner.ctx);
+        drop(result);
+        assert!(
+            matches!(&last.row(0).unwrap().values()[0], Some(Term::Literal(v)) if v.value()=="x".repeat(4096))
+        );
+        assert!(weak.upgrade().is_some());
+        drop(last);
+        assert!(weak.upgrade().is_none());
+    }
+}
+
+#[test]
+fn retained_stored_literal_prevents_second_copy_and_returns_exact_capacity() {
+    for shared in [false, true] {
+        let result = stored_literal_answer(shared);
+        let before = result.inner.ctx.live_bytes();
+        let first = result.rows().unwrap();
+        let held = result.inner.ctx.live_bytes();
+        assert!(held > before + 4096);
+        assert!(matches!(result.rows(), Err(Error::BudgetExceeded(b))
+            if b.kind == BudgetKind::Memory && b.limit == 8192 && b.requested > 8192));
+        assert_eq!(
+            result.inner.ctx.live_bytes(),
+            held,
+            "failed competing decode refunds partial storage"
+        );
+        assert!(
+            matches!(&first.row(0).unwrap().values()[0],Some(Term::Literal(v)) if v.value().len()==4096)
+        );
+        drop(first);
+        assert_eq!(result.inner.ctx.live_bytes(), before);
+        let next = result.rows().unwrap();
+        drop(next);
+        assert_eq!(result.inner.ctx.live_bytes(), before);
+    }
+}
+
+#[test]
+fn stored_literal_cancel_and_injected_failure_return_real_reconstruction_credit() {
+    use crate::algo::memory::probe;
+    use std::sync::atomic::Ordering;
+    for cancel in [false, true] {
+        let result = stored_literal_answer(false);
+        let before = result.inner.ctx.live_bytes();
+        let flag = result.inner.ctx.cancel.clone();
+        let hook = probe::install(
+            move |point| {
+                if cancel && matches!(point, probe::Point::Allocation("chunk-term", _)) {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            },
+            (!cancel).then_some("chunk-term"),
+        );
+        let failure = result.rows();
+        drop(hook);
+        if cancel {
+            assert!(matches!(failure, Err(Error::Cancelled)));
+        } else {
+            assert!(matches!(failure, Err(Error::Invalid(_))));
+        }
+        assert_eq!(result.inner.ctx.live_bytes(), before);
+    }
+}

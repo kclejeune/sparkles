@@ -1097,28 +1097,58 @@ impl Vocab {
         reserve: impl FnMut(usize) -> std::result::Result<(), E>,
         f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
-        if self.fsst.is_some() {
-            self.get_sorted_checked_as::<true, E>(ids, reserve, f)
+        let _t = ioacct::timer(Phase::VocabRead);
+        let ahead = self.ahead_for(ids);
+        if ahead.end == 0 && ids.len() > 1 {
+            self.prefetch_sorted(ids);
+        }
+        self.get_sorted_checked_dispatch(ids, reserve, f, ahead)
+    }
+
+    /// The bulk output owner admits hint metadata and reconstruction independently
+    /// of decoded payloads, retaining the same sorted/FSST/read-ahead policies.
+    pub(crate) fn get_sorted_owned_with_ahead(
+        &self,
+        ids: &[u64],
+        mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
+        f: impl FnMut(u64, &[u8]) -> crate::error::Result<()>,
+        read_ahead: bool,
+    ) -> crate::error::Result<()> {
+        let _t = ioacct::timer(Phase::VocabRead);
+        let ahead = if read_ahead {
+            self.ahead_for(ids)
         } else {
-            self.get_sorted_checked_as::<false, E>(ids, reserve, f)
+            Ahead::default()
+        };
+        if read_ahead && ahead.end == 0 && ids.len() > 1 {
+            self.prefetch_sorted_checked(ids, &mut reserve)?;
+        }
+        self.get_sorted_checked_dispatch(ids, reserve, f, ahead)
+    }
+
+    #[inline]
+    fn get_sorted_checked_dispatch<E>(
+        &self,
+        ids: &[u64],
+        reserve: impl FnMut(usize) -> std::result::Result<(), E>,
+        f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
+        ahead: Ahead,
+    ) -> std::result::Result<(), E> {
+        if self.fsst.is_some() {
+            self.get_sorted_checked_as::<true, E>(ids, reserve, f, ahead)
+        } else {
+            self.get_sorted_checked_as::<false, E>(ids, reserve, f, ahead)
         }
     }
 
-    /// [`Vocab::get_sorted_checked`] for an FSST-coded vocabulary when `F`.
     #[inline(always)]
     fn get_sorted_checked_as<const F: bool, E>(
         &self,
         ids: &[u64],
         mut reserve: impl FnMut(usize) -> std::result::Result<(), E>,
         mut f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
+        mut ahead: Ahead,
     ) -> std::result::Result<(), E> {
-        let _t = ioacct::timer(Phase::VocabRead);
-        let mut ahead = self.ahead_for(ids);
-        if ahead.end == 0 && ids.len() > 1 {
-            // scattered ids: ask for their blocks at once, so that a cold vocabulary
-            // reads them in parallel instead of faulting on one after another
-            self.prefetch_sorted(ids);
-        }
         let mut key = Vec::new();
         let data = self.data.as_slice();
         let mut i = 0;
@@ -1235,6 +1265,39 @@ impl Vocab {
         Ok(result)
     }
 
+    /// Reconstruct one key into admitted storage that the callback may retain.
+    /// Growth covers both physical buffers; settlement follows old-buffer retirement.
+    /// The callback's owner must keep that admission until its final allocation drops.
+    pub(crate) fn get_owned_with_controlled<T>(
+        &self,
+        id: u64,
+        mut grow: impl FnMut(usize, usize) -> crate::error::Result<()>,
+        mut settled: impl FnMut(usize) -> crate::error::Result<()>,
+        mut checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
+        f: impl FnOnce(Vec<u8>) -> crate::error::Result<T>,
+    ) -> crate::error::Result<Option<T>> {
+        checkpoint("starting owned vocabulary reconstruction")?;
+        if id >= self.len {
+            return Ok(None);
+        }
+        let mut f = Some(f);
+        let mut result = None;
+        self.scan_block_capacity_controlled(
+            id as usize / FC_BLOCK,
+            1 << (id as usize % FC_BLOCK),
+            &mut grow,
+            &mut settled,
+            &mut checkpoint,
+            |_, key| {
+                result = Some(f.take().expect("one selected vocabulary key")(
+                    std::mem::take(key),
+                )?);
+                Ok(false)
+            },
+        )?;
+        Ok(result)
+    }
+
     fn scan_block_controlled(
         &self,
         b: usize,
@@ -1242,6 +1305,25 @@ impl Vocab {
         reserve: &mut impl FnMut(usize) -> crate::error::Result<()>,
         checkpoint: &mut impl FnMut(&'static str) -> crate::error::Result<()>,
         mut each: impl FnMut(usize, &[u8]) -> crate::error::Result<bool>,
+    ) -> crate::error::Result<()> {
+        self.scan_block_capacity_controlled(
+            b,
+            wanted,
+            &mut |_, new| reserve(new),
+            &mut |_| Ok(()),
+            checkpoint,
+            |at, key| each(at, key),
+        )
+    }
+
+    fn scan_block_capacity_controlled(
+        &self,
+        b: usize,
+        wanted: u32,
+        grow: &mut impl FnMut(usize, usize) -> crate::error::Result<()>,
+        settled: &mut impl FnMut(usize) -> crate::error::Result<()>,
+        checkpoint: &mut impl FnMut(&'static str) -> crate::error::Result<()>,
+        mut each: impl FnMut(usize, &mut Vec<u8>) -> crate::error::Result<bool>,
     ) -> crate::error::Result<()> {
         let _timer = ioacct::timer(Phase::VocabRead);
         let data = self.data.as_slice();
@@ -1282,7 +1364,15 @@ impl Vocab {
                     if let Some(table) = coded {
                         table.measure_controlled(
                             suffix,
-                            |length| reserve(prefix.saturating_add(length)),
+                            |length| {
+                                let new = prefix.checked_add(length).ok_or_else(|| {
+                                    crate::error::Error::invalid("vocabulary scratch overflows")
+                                })?;
+                                if new > key.capacity() {
+                                    grow(key.capacity(), new)?;
+                                }
+                                Ok(())
+                            },
                             checkpoint,
                         )?
                     } else {
@@ -1295,7 +1385,7 @@ impl Vocab {
                     .checked_add(add)
                     .ok_or_else(|| crate::error::Error::invalid("vocabulary scratch overflows"))?;
                 if total > key.capacity() {
-                    reserve(total)?;
+                    grow(key.capacity(), total)?;
                     key.try_reserve_exact(total - key.len()).map_err(|_| {
                         crate::error::Error::invalid("vocabulary allocation failed")
                     })?;
@@ -1304,6 +1394,7 @@ impl Vocab {
                             "unsupported vocabulary scratch capacity",
                         ));
                     }
+                    settled(key.capacity())?;
                 }
                 if let Some(table) = coded {
                     table.decode_controlled(suffix, add, &mut key, checkpoint)?;
@@ -1314,7 +1405,7 @@ impl Vocab {
                     }
                 }
             }
-            if wanted >> at & 1 == 1 && !each(at, &key)? {
+            if wanted >> at & 1 == 1 && !each(at, &mut key)? {
                 break;
             }
             if let Some(next) = next {
@@ -1438,9 +1529,53 @@ impl Vocab {
     /// ids then finds its pages read by many requests at once, instead of one page fault
     /// at a time. Nearby pages are asked for in one range.
     pub fn prefetch_sorted(&self, ids: &[u64]) {
-        if !crate::index::io_hints() {
+        if !crate::index::io_hints()
+            || !matches!((&self.data, &self.offsets), (Bytes::Map(_), Bytes::Map(_)))
+        {
             return;
         }
+        let blocks = ids
+            .iter()
+            .take_while(|&&id| id < self.len)
+            .map(|&id| id as usize / FC_BLOCK)
+            .collect();
+        self.prefetch_blocks(blocks);
+    }
+
+    pub(crate) fn prefetch_sorted_checked(
+        &self,
+        ids: &[u64],
+        mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
+        if !crate::index::io_hints()
+            || !matches!((&self.data, &self.offsets), (Bytes::Map(_), Bytes::Map(_)))
+        {
+            return Ok(());
+        }
+        let count = ids.iter().take_while(|&&id| id < self.len).count();
+        let bytes = count
+            .checked_mul(std::mem::size_of::<usize>())
+            .ok_or_else(|| crate::error::Error::invalid("vocabulary hint size overflow"))?;
+        reserve(bytes)?;
+        let mut blocks = Vec::new();
+        blocks
+            .try_reserve_exact(count)
+            .map_err(|_| crate::error::Error::invalid("vocabulary hint allocation failed"))?;
+        if blocks.capacity() != count {
+            return Err(crate::error::Error::invalid(
+                "vocabulary hint capacity exceeds admission",
+            ));
+        }
+        blocks.extend(
+            ids.iter()
+                .take_while(|&&id| id < self.len)
+                .map(|&id| id as usize / FC_BLOCK),
+        );
+        self.prefetch_blocks(blocks);
+        Ok(())
+    }
+
+    fn prefetch_blocks(&self, mut blocks: Vec<usize>) {
         const GAP: usize = 64 << 10;
         fn advise(file: IoFile, m: &Mmap, ranges: impl Iterator<Item = (usize, usize)>) {
             let mut cur: Option<(usize, usize)> = None;
@@ -1465,11 +1600,6 @@ impl Vocab {
         let (Bytes::Map(data), Bytes::Map(offsets)) = (&self.data, &self.offsets) else {
             return;
         };
-        let mut blocks: Vec<usize> = ids
-            .iter()
-            .take_while(|&&id| id < self.len)
-            .map(|&id| id as usize / FC_BLOCK)
-            .collect();
         blocks.dedup();
         let mut word_at = usize::MAX;
         let mut seen = 0;
@@ -1567,6 +1697,7 @@ impl Vocab {
     /// Overlap the vocabulary reads of a medium-sized result decoded in row order.
     /// With a sparse index, use its in-memory offsets and hint each group once, as
     /// `find` does. Warm requests then avoid sorting their cells or repeating hints.
+    #[cfg(test)]
     pub(crate) fn prefetch_terms(&self, ids: impl Iterator<Item = u64>) {
         if !crate::index::io_hints()
             || !matches!((&self.data, &self.offsets), (Bytes::Map(_), Bytes::Map(_)))
@@ -1592,7 +1723,85 @@ impl Vocab {
             last = g;
         }
         groups.sort_unstable();
-        for g in groups {
+        self.prefetch_groups(&groups);
+    }
+
+    /// An immutable result supplies a checked maximum count. Every actual vector
+    /// is admitted before allocation and every hint bit changes only afterwards.
+    pub(crate) fn prefetch_terms_checked(
+        &self,
+        ids: impl Iterator<Item = u64>,
+        count: usize,
+        mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
+        if !crate::index::io_hints()
+            || !matches!((&self.data, &self.offsets), (Bytes::Map(_), Bytes::Map(_)))
+        {
+            return Ok(());
+        }
+        let bytes = count
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| crate::error::Error::invalid("vocabulary hint size overflow"))?;
+        reserve(bytes)?;
+        if self.sparse.is_none() {
+            let mut all = Vec::new();
+            all.try_reserve_exact(count)
+                .map_err(|_| crate::error::Error::invalid("vocabulary hint allocation failed"))?;
+            if all.capacity() != count {
+                return Err(crate::error::Error::invalid(
+                    "vocabulary hint capacity exceeds admission",
+                ));
+            }
+            for id in ids {
+                if all.len() == count {
+                    return Err(crate::error::Error::invalid(
+                        "vocabulary hint count exceeds admission",
+                    ));
+                }
+                all.push(id);
+            }
+            all.sort_unstable();
+            all.dedup();
+            return self.prefetch_sorted_checked(&all, |need| {
+                reserve(bytes.checked_add(need).ok_or_else(|| {
+                    crate::error::Error::invalid("vocabulary hint overlap overflow")
+                })?)
+            });
+        }
+        let sparse = self.sparse.as_ref().expect("checked sparse vocabulary");
+        let mut groups = Vec::new();
+        groups
+            .try_reserve_exact(count)
+            .map_err(|_| crate::error::Error::invalid("vocabulary hint allocation failed"))?;
+        if groups.capacity() != count {
+            return Err(crate::error::Error::invalid(
+                "vocabulary hint capacity exceeds admission",
+            ));
+        }
+        let mut last = usize::MAX;
+        for id in ids.filter(|&id| id < self.len) {
+            let g = id as usize / (FC_BLOCK * IDX_BLOCKS);
+            if g != last {
+                // No unadmitted push can follow a global hint-state mutation.
+                if groups.len() == count {
+                    return Err(crate::error::Error::invalid(
+                        "vocabulary hint count exceeds admission",
+                    ));
+                }
+                if sparse.first_hint(g) {
+                    groups.push(g);
+                }
+            }
+            last = g;
+        }
+        groups.sort_unstable();
+        self.prefetch_groups(&groups);
+        Ok(())
+    }
+
+    fn prefetch_groups(&self, groups: &[usize]) {
+        let s = self.sparse.as_ref().expect("sparse hint groups");
+        for &g in groups {
             let lo = g * IDX_BLOCKS;
             let hi = ((g + 1) * IDX_BLOCKS).min(self.num_blocks());
             self.offsets
@@ -3559,6 +3768,124 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn owned_controlled_keys_keep_real_capacity_for_both_codecs() {
+        use crate::{access::Preparation, task::Control};
+        struct Kept {
+            key: Vec<u8>,
+            _credit: crate::access::Reservation,
+        }
+        let mut keys = mixed_keys(90);
+        keys.sort();
+        keys.dedup();
+        for fsst in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_codec(dir.path(), &keys, fsst);
+            let vocab = Vocab::open(dir.path()).unwrap();
+            let preparation = Preparation::new(Control::none(), 4 << 20).unwrap();
+            let base = preparation.inner_used();
+            for (id, expected) in keys.iter().enumerate() {
+                let credit = std::cell::RefCell::new(Some(preparation.reserve(0).unwrap()));
+                let actual = vocab
+                    .get_owned_with_controlled(
+                        id as u64,
+                        |old, new| {
+                            let total = (old + new) as u64;
+                            credit.borrow_mut().as_mut().unwrap().grow_to(total)?;
+                            assert!(preparation.inner_used() >= base + total);
+                            Ok(())
+                        },
+                        |capacity| {
+                            credit
+                                .borrow_mut()
+                                .as_mut()
+                                .unwrap()
+                                .release_to(capacity as u64);
+                            assert_eq!(preparation.inner_used(), base + capacity as u64);
+                            Ok(())
+                        },
+                        |phase| preparation.checkpoint(phase),
+                        |key| {
+                            assert_eq!(preparation.inner_used(), base + key.capacity() as u64);
+                            Ok(Kept {
+                                key,
+                                _credit: credit.borrow_mut().take().unwrap(),
+                            })
+                        },
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&actual.key, expected);
+                assert_eq!(
+                    preparation.inner_used(),
+                    base + actual.key.capacity() as u64
+                );
+                drop(actual);
+                assert_eq!(preparation.inner_used(), base);
+            }
+        }
+    }
+
+    #[test]
+    fn owned_key_growth_requires_old_and_new_physical_capacity_together() {
+        use crate::{BudgetKind, Error, access::Preparation, task::Control};
+        let mut second = b"\"a".to_vec();
+        second.extend_from_slice(&vec![b'x'; 4096]);
+        let keys = vec![b"\"a!".to_vec(), second];
+        let dir = tempfile::tempdir().unwrap();
+        write_codec(dir.path(), &keys, false);
+        let vocab = Vocab::open(dir.path()).unwrap();
+        let preparation = Preparation::new(Control::none(), 1024 + 4098).unwrap();
+        let original = preparation.inner_used();
+        // The existing constructor's actual header is smaller than a request root.
+        // Keep a real previously admitted allocation live, leaving exactly enough
+        // room for the new key alone, but not its simultaneous old buffer.
+        struct Existing {
+            _bytes: Vec<u8>,
+            _credit: crate::access::Reservation,
+        }
+        let size = preparation.room().checked_sub(4098).unwrap() as usize;
+        let held = preparation.reserve(size as u64).unwrap();
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(size).unwrap();
+        assert_eq!(bytes.capacity(), size);
+        bytes.resize(size, 0);
+        let existing = Existing {
+            _bytes: bytes,
+            _credit: held,
+        };
+        assert_eq!(preparation.room(), 4098);
+        let base = preparation.inner_used();
+        let credit = std::cell::RefCell::new(preparation.reserve(0).unwrap());
+        let overlap = std::cell::Cell::new(false);
+        let actual = vocab.get_owned_with_controlled(
+            1,
+            |old, new| {
+                if old > 0 {
+                    assert_eq!((old, new), (2, 4098));
+                    overlap.set(true);
+                }
+                credit.borrow_mut().grow_to((old + new) as u64)
+            },
+            |capacity| {
+                credit.borrow_mut().release_to(capacity as u64);
+                Ok(())
+            },
+            |phase| preparation.checkpoint(phase),
+            |_| -> crate::Result<()> { panic!("refusal precedes output publication") },
+        );
+        assert!(
+            overlap.get(),
+            "the selected real front-coded key must reallocate"
+        );
+        assert!(matches!(actual,Err(Error::BudgetExceeded(b)) if b.kind==BudgetKind::Memory));
+        assert_eq!(preparation.inner_used(), base + 2);
+        drop(credit);
+        assert_eq!(preparation.inner_used(), base);
+        drop(existing);
+        assert_eq!(preparation.inner_used(), original);
     }
 
     #[test]

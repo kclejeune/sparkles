@@ -668,7 +668,7 @@ fn all_shortest_prunes_a_zero_weight_cycle_behind_the_target() {
          path:pathIndex ?path }} }}"
     );
     let r = query(s.snapshot(), &q, &opts).expect("the search finishes inside its deadline");
-    assert_eq!(r.rows().len(), 1);
+    assert_eq!(r.len(), 1);
     assert_eq!(sequences(&s, params), BTreeSet::from(["s a t".to_string()]));
     // with an unbound target the clique's paths are real output, and pruning keeps them
     let s = store_of(&clique_behind_target(4));

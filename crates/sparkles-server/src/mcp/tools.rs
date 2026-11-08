@@ -110,8 +110,9 @@ fn evidence_bytes(value: &Value, limit: usize, ctx: &ErrorContext) -> Result<(),
 pub(crate) fn sparql_query_full(
     server: &McpServer,
     args: Map<String, Value>,
-    call: &Call,
+    call: &mut Call,
 ) -> Result<(Outcome, Value), ToolError> {
+    server.prepare_call(call)?;
     let mut args = args;
     let on_branch = super::branches::branch_call(server, "sparql_query", &mut args, call)?;
     let call = on_branch.as_ref().unwrap_or(call);
@@ -701,6 +702,7 @@ impl Tools<'_> {
         // the grant the call was admitted with (X08-P1-grant-routing)
         o.grant = self.call.grant.clone();
         let mut opts = request.build();
+        opts.deadline = Some(deadline);
         // SERVICE and LOAD are the principal's server permissions, and the graphs its
         // grants cover, as over HTTP
         crate::auth::restrict(&mut opts, &self.call.principal, ds, endpoint);
@@ -1271,10 +1273,24 @@ impl Tools<'_> {
             )
             .map_err(|e| ctx.engine(e))?;
         opts.initial_bindings = bindings;
-        let mut r = sparql::execute_query(snap.clone(), &parsed, &opts, parse_ms)
+        let request = self
+            .call
+            .preparation
+            .as_ref()
+            .ok_or_else(|| ToolError::internal(&self.call.request_id))?;
+        let controlled = request
+            .checked_for_query(&opts)
             .map_err(|e| ctx.engine(e))?;
+        let all = sparkles::access::GraphAccess::all();
+        let access = opts.graphs.as_deref().unwrap_or(&all);
+        let physical = access
+            .masked_controlled(&snap, &controlled)
+            .map_err(|e| ctx.engine(e))?;
+        let mut r =
+            sparql::execute_source(physical.read_source(), &ds.store, &parsed, &opts, parse_ms)
+                .map_err(|e| ctx.engine(e))?;
         if r.kind == QueryKind::Select {
-            sparql::select_star_order(&a.query, &mut r);
+            sparql::select_star_order(&a.query, &mut r).map_err(|e| ctx.engine(e))?;
         }
         let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
         let whole = full.then(|| {
@@ -1292,12 +1308,10 @@ impl Tools<'_> {
                 let start = offset.min(len);
                 let end = start.saturating_add(max_rows).min(len);
                 let (vars, rows) = if kind == QueryKind::Select {
-                    let rows = (start..end)
-                        .map(|i| r.table.cols.iter().map(|c| r.term(c[i])).collect())
-                        .collect();
-                    (Some(r.vars.clone()), RowSource::Solutions(rows))
+                    let rows = r.rows_range(start..end).map_err(|e| ctx.engine(e))?;
+                    (Some(r.variables()), RowSource::Solutions(rows))
                 } else {
-                    (None, RowSource::Triples(&r.triples[start..end]))
+                    (None, RowSource::Triples(&r.triples()[start..end]))
                 };
                 let page = QueryPage {
                     dataset: &ds.name,

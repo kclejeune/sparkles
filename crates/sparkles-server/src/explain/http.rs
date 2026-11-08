@@ -89,6 +89,8 @@ async fn explain_route(
         headers: None,
         held: None,
         grant: crate::server_memory::current_grant(),
+
+        preparation: None,
     };
     let server = McpServer::new(
         st.clone(),

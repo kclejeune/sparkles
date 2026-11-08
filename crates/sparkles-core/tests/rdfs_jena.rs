@@ -164,7 +164,7 @@ fn no_schema_changes_nothing() {
             &opts,
         )
         .unwrap();
-        assert!(r.rows().is_empty());
+        assert!(r.is_empty());
     }
 }
 
@@ -223,7 +223,7 @@ fn schema_graph_follows_commits() {
     };
     let animals = |store: &Store| {
         let q = format!("{PREFIXES}SELECT ?x {{ ?x a ex:Animal }}");
-        query(store.snapshot(), &q, &opts).unwrap().rows().len()
+        query(store.snapshot(), &q, &opts).unwrap().len()
     };
     let insert = |triple: &str| {
         let u = format!("{PREFIXES}INSERT DATA {{ GRAPH ex:schema {{ {triple} }} }}");
@@ -276,7 +276,6 @@ fn many_subclasses() {
     let count = |q: &str| {
         query(s.snapshot(), &format!("{PREFIXES}{q}"), &opts)
             .unwrap()
-            .rows()
             .len()
     };
     assert_eq!(count("SELECT ?x { ?x a ex:Top }"), 20);

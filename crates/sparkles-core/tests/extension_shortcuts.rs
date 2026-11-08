@@ -55,7 +55,12 @@ fn run(s: &Store, text: &str, iri: &str, opt: Optimizations) -> (Vec<String>, us
         },
     )
     .unwrap();
-    let rows = r.rows().into_iter().map(|row| format!("{row:?}")).collect();
+    let rows = r
+        .rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| format!("{row:?}"))
+        .collect();
     (rows, calls.load(Ordering::SeqCst), r.plan)
 }
 

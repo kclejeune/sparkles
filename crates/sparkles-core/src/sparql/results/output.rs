@@ -14,21 +14,22 @@ pub(super) struct ScratchRow<'a> {
 
 impl<'a> ScratchRow<'a> {
     pub(super) fn decode(r: &'a QueryResult, index: usize) -> Result<Self> {
-        r.ctx.check_memory_failure()?;
-        let width = r.table.width();
+        r.inner.ctx.check_memory_failure()?;
+        let width = r.inner.table.width();
         let bytes = width
             .checked_mul(std::mem::size_of::<Option<Term>>())
             .and_then(|n| u64::try_from(n).ok())
-            .ok_or_else(|| r.ctx.memory_exceeded(u64::MAX))?;
-        let credit = r.ctx.charge(bytes)?;
+            .ok_or_else(|| r.inner.ctx.memory_exceeded(u64::MAX))?;
+        let credit = r.inner.ctx.charge(bytes)?;
         let mut row = Self {
             terms: Vec::with_capacity(width),
             _credit: credit,
         };
-        for col in &r.table.cols {
-            row.terms.push(r.ctx.output_term(col[index], &row._credit)?);
+        for col in &r.inner.table.cols {
+            row.terms
+                .push(r.inner.ctx.output_term(col[index], &row._credit)?);
         }
-        r.ctx.check_memory_failure()?;
+        r.inner.ctx.check_memory_failure()?;
         Ok(row)
     }
 }

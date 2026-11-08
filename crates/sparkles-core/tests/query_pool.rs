@@ -183,7 +183,14 @@ fn algorithm_warmed_public_cursor_preserves_cache_policy_and_admission_handoff()
     assert_eq!(retained.len(), 2);
     drop(cursor);
     assert!(grant.used() > 0);
-    assert!(retained.row(0).unwrap().iter().all(Option::is_some));
+    assert!(
+        retained
+            .row(0)
+            .unwrap()
+            .values()
+            .iter()
+            .all(Option::is_some)
+    );
     drop(retained);
     let rows = evidence.lock().unwrap();
     assert_eq!(rows.len(), 1);
@@ -316,7 +323,7 @@ fn algorithm_sorted_cursor_batches_survive_early_close_and_cancellation() {
             drop(cursor);
             if let Some(batch) = &retained {
                 assert!(grant.used() > 0);
-                assert!(batch.row(0).unwrap().iter().all(Option::is_some));
+                assert!(batch.row(0).unwrap().values().iter().all(Option::is_some));
             }
             drop(retained);
             assert_eq!(grant.used(), 0);
@@ -376,7 +383,7 @@ fn algorithm_concurrent_contexts_keep_separate_or_shared_grant_ownership() {
                 )
                 .unwrap();
                 set_projection_observer(None);
-                assert_eq!(result.rows().len(), 2);
+                assert_eq!(result.len(), 2);
                 let used = result.ctx.mem_peak();
                 tx.send((id, used)).unwrap();
                 wait.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -445,7 +452,7 @@ fn a_query_grows_its_grant_and_returns_it() {
         pool: Some(pool.clone()),
         ..Default::default()
     };
-    let n = query(s.snapshot(), CROSS, &opts).unwrap().rows().len();
+    let n = query(s.snapshot(), CROSS, &opts).unwrap().len();
     assert_eq!(n, 1_000_000);
     assert_eq!(pool.granted(), 0, "the grant returns with the query");
 }
@@ -461,7 +468,7 @@ fn a_short_pool_fails_the_query_with_server_memory() {
     match query(s.snapshot(), CROSS, &opts) {
         Err(Error::BudgetExceeded(b)) => assert_eq!(b.kind, BudgetKind::ServerMemory),
         Err(e) => panic!("{e}"),
-        Ok(r) => panic!("{} rows", r.rows().len()),
+        Ok(r) => panic!("{} rows", r.len()),
     }
     assert_eq!(pool.granted(), 0);
     // the query's own budget still answers first when it is lower
@@ -859,7 +866,10 @@ fn explicit_cursor_local_terms_and_retained_batches_release_their_ownership() {
     assert!(grant.used() > 0);
     assert!(grant.granted() <= 16 * MB);
     assert_eq!(
-        retained.row(0).unwrap()[1].as_ref().unwrap().to_string(),
+        retained.row(0).unwrap().values()[1]
+            .as_ref()
+            .unwrap()
+            .to_string(),
         format!("\"{lexical}\"")
     );
     drop(retained);
@@ -911,7 +921,14 @@ fn automatic_immutable_scan_releases_its_transient_contribution() {
     assert!(pool.granted() <= 16 * MB);
     drop(cursor);
     assert!(grant.used() > 0);
-    assert!(retained.row(0).unwrap().iter().all(Option::is_some));
+    assert!(
+        retained
+            .row(0)
+            .unwrap()
+            .values()
+            .iter()
+            .all(Option::is_some)
+    );
     drop(retained);
     assert_eq!(grant.used(), 0);
     drop(opts);
@@ -934,7 +951,7 @@ fn a_finished_eager_result_retains_only_what_it_holds() {
     // a million-row product reduced to a thousand distinct values
     let small = "SELECT DISTINCT ?x WHERE { ?a <urn:p> ?x . ?b <urn:p> ?y FILTER(?y >= 0) }";
     let result = query(s.snapshot(), small, &opts).unwrap();
-    assert_eq!(result.rows().len(), 1_000);
+    assert_eq!(result.len(), 1_000);
     assert!(result.mem_peak_bytes > 16 * MB, "{}", result.mem_peak_bytes);
     let grant = result.ctx.grant().unwrap().clone();
     assert!(
@@ -944,7 +961,7 @@ fn a_finished_eager_result_retains_only_what_it_holds() {
     );
     // a large result keeps its rows
     let large = query(s.snapshot(), CROSS, &opts).unwrap();
-    let rows = large.rows().len() as u64;
+    let rows = large.len() as u64;
     let kept = large.ctx.grant().unwrap().used();
     assert!(kept >= rows * 4 * 8, "{kept} for {rows} rows");
     drop(large);
@@ -994,7 +1011,7 @@ fn a_compacted_result_keeps_its_column_capacity_covered() {
     };
     let q = "SELECT ?s ?v ?w { ?s <urn:p> ?v BIND(?v + 1 AS ?w) FILTER(?w < 3) }";
     let result = query(s.snapshot(), q, &opts).unwrap();
-    assert_eq!(result.rows().len(), 2);
+    assert_eq!(result.len(), 2);
     let capacity: u64 = result
         .table
         .cols
@@ -1021,7 +1038,7 @@ fn a_result_keeps_its_blank_node_memo_covered() {
     };
     let q = "SELECT (COUNT(?b) AS ?n) { ?s <urn:p> ?v BIND(BNODE(\"x\") AS ?b) }";
     let result = query(s.snapshot(), q, &opts).unwrap();
-    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.len(), 1);
     // Eager execution never charged the memo, and the query's peak estimate covered it
     // only in part. The finished result does not drop below either.
     let used = result.ctx.grant().unwrap().used();
@@ -1046,7 +1063,7 @@ fn a_finished_result_gives_back_its_exists_state() {
     };
     let q = "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER EXISTS { ?s <urn:p> ?w } }";
     let result = query(s.snapshot(), q, &opts).unwrap();
-    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.len(), 1);
     assert!(result.mem_peak_bytes > 4 * MB, "{}", result.mem_peak_bytes);
     let used = result.ctx.grant().unwrap().used();
     assert!(

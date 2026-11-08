@@ -6,6 +6,11 @@
 //! value can never pass for a table row, a cell boundary or a status line. Long lexical
 //! forms and IRIs are cut, with a visible marker outside the quotes.
 
+mod bounded;
+mod bounded_page;
+
+pub(super) use bounded_page::{CompactPage, owned_page};
+
 use oxrdf::{Literal, NamedOrBlankNode, Term, Triple};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -346,7 +351,7 @@ pub struct QueryPage<'a> {
     /// `SELECT`, `CONSTRUCT`, ...
     pub query_type: &'static str,
     /// SELECT variables (`None` for CONSTRUCT/DESCRIBE, whose rows are triples)
-    pub vars: Option<Vec<String>>,
+    pub vars: Option<&'a [String]>,
     /// rows `offset …`, at most `max_rows` of them
     pub rows: RowSource<'a>,
     /// whether rows exist beyond `rows`
@@ -362,7 +367,7 @@ pub struct QueryPage<'a> {
 }
 
 pub enum RowSource<'a> {
-    Solutions(Vec<Vec<Option<Term>>>),
+    Solutions(sparkles::sparql::output::OwnedRows),
     Triples(&'a [Triple]),
 }
 
@@ -386,9 +391,13 @@ fn render_rows(page: &QueryPage, prefixes: &Prefixes) -> Vec<Row> {
     let mut out = Vec::with_capacity(page.rows.len());
     match &page.rows {
         RowSource::Solutions(rows) => {
-            for r in rows {
+            for r in rows.iter() {
                 let mut t = Terms::new(prefixes, page.max_chars);
-                let cells = r.iter().map(|c| c.as_ref().map(|c| t.term(c))).collect();
+                let cells = r
+                    .values()
+                    .iter()
+                    .map(|c| c.as_ref().map(|c| t.term(c)))
+                    .collect();
                 out.push(Row {
                     cells,
                     used: t.used,
@@ -399,7 +408,8 @@ fn render_rows(page: &QueryPage, prefixes: &Prefixes) -> Vec<Row> {
         RowSource::Triples(triples) => {
             for tr in triples.iter() {
                 let mut t = Terms::new(prefixes, page.max_chars);
-                let s = t.term(&Term::from(tr.subject.clone()));
+                let mut s = String::new();
+                t.subject_into(&mut s, &tr.subject);
                 let p = t.iri(tr.predicate.as_str());
                 let o = t.term(&tr.object);
                 out.push(Row {
@@ -600,6 +610,20 @@ struct Truncated {
     next: Next,
 }
 
+#[derive(Clone, Copy)]
+enum JsonVars<'a> {
+    Solutions(&'a [String]),
+    Triples,
+}
+impl Serialize for JsonVars<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Solutions(vars) => vars.serialize(serializer),
+            Self::Triples => ["subject", "predicate", "object"].serialize(serializer),
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JsonDoc<'a> {
@@ -607,7 +631,7 @@ struct JsonDoc<'a> {
     commit: u64,
     query_type: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    vars: Option<Vec<String>>,
+    vars: Option<JsonVars<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rows: Option<&'a [Vec<Option<String>>]>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -629,10 +653,7 @@ pub fn json(page: &QueryPage, prefixes: &Prefixes) -> String {
         .iter()
         .map(|c| serde_json::to_string(c).map_or(0, |s| s.len()))
         .collect();
-    let vars = page
-        .vars
-        .clone()
-        .unwrap_or_else(|| vec!["subject".into(), "predicate".into(), "object".into()]);
+    let vars = page.vars.map_or(JsonVars::Triples, JsonVars::Solutions);
     let total = page.total.filter(|_| !page.total_is_lower_bound);
     let build = |k: usize, truncated: Option<Reason>, with_rows: bool| {
         let mut used = BTreeSet::new();
@@ -645,7 +666,7 @@ pub fn json(page: &QueryPage, prefixes: &Prefixes) -> String {
             dataset: page.dataset,
             commit: page.commit,
             query_type: page.query_type,
-            vars: Some(vars.clone()),
+            vars: Some(vars),
             rows: Some(if with_rows { &cells[..k] } else { &[] }),
             boolean: None,
             total,

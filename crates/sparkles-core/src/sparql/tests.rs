@@ -59,7 +59,7 @@ fn q(s: &Store, text: &str) -> QueryResult {
 /// Solutions rendered as sorted strings for easy comparison.
 fn strs(r: &QueryResult) -> Vec<String> {
     let mut v: Vec<String> = r
-        .rows()
+        .test_application_rows()
         .into_iter()
         .map(|row| {
             row.into_iter()
@@ -91,7 +91,7 @@ fn select_star_order() {
         &s,
         "SELECT * WHERE { ?person foaf:age ?age ; foaf:name ?name } LIMIT 1",
     );
-    assert_eq!(r.vars, ["person", "age", "name"]);
+    assert_eq!(r.variables(), ["person", "age", "name"]);
 }
 
 #[test]
@@ -146,12 +146,12 @@ fn result_cache_reuses_subtrees() {
     let a = q(&s, text);
     let b = q(&s, text);
     assert_eq!(strs(&a), strs(&b));
-    assert!(has_cached(&b.plan), "second run should hit the cache");
+    assert!(has_cached(&b.plan()), "second run should hit the cache");
     assert!(s.result_cache().hits() > 0);
     // an update invalidates (new snapshot version)
     update::update(&s, "INSERT DATA { <http://ex.org/z> a <http://xmlns.com/foaf/0.1/Person> ; <http://xmlns.com/foaf/0.1/name> \"Z\" }", &QueryOptions::default()).unwrap();
     let c = q(&s, text);
-    assert!(!has_cached(&c.plan));
+    assert!(!has_cached(&c.plan()));
     assert_ne!(strs(&a), strs(&c));
 }
 
@@ -177,9 +177,9 @@ fn result_cache_hits_for_aggregates() {
         (p.operator == op && p.cached) || p.children.iter().any(|c| op_cached(c, op))
     }
     assert!(
-        op_cached(&b.plan, "GroupBy")
-            || op_cached(&b.plan, "Bind")
-            || op_cached(&b.plan, "Project"),
+        op_cached(&b.plan(), "GroupBy")
+            || op_cached(&b.plan(), "Bind")
+            || op_cached(&b.plan(), "Project"),
         "the aggregation itself should come from the cache"
     );
 }
@@ -291,7 +291,7 @@ fn rdf12_triple_terms() {
         );
         assert_eq!(strs(&r), ["rtl true"]);
         let r = q(&s, "SELECT ?t WHERE { BIND(TRIPLE(ex:a, ex:b, 1) AS ?t) }");
-        assert_eq!(r.table.len(), 1);
+        assert_eq!(r.test_table().len(), 1);
         // updates with triple terms
         update::update(
             &s,
@@ -315,7 +315,7 @@ fn rdf12_triple_terms() {
             &s,
             "CONSTRUCT { ?s ex:claimed <<( ?s ex:said ?t )>> } WHERE { ?s ex:says ?t }",
         );
-        assert_eq!(r.triples.len(), 1);
+        assert_eq!(r.triples().len(), 1);
     }
 }
 
@@ -333,15 +333,15 @@ fn limit_and_ask_stop_early() {
     s.load(&[Source::from_bytes(nt.into_bytes(), RdfFormat::Turtle, None)])
         .unwrap();
     let r = q(&s, "SELECT * WHERE { ?s ?p ?o } LIMIT 10");
-    assert_eq!(r.table.len(), 10);
-    assert!(has_desc(&r.plan, "stopped early"));
+    assert_eq!(r.test_table().len(), 10);
+    assert!(has_desc(&r.plan(), "stopped early"));
     let r = q(
         &s,
         "SELECT ?s WHERE { ?s ex:p ?v FILTER(?v > 4000) } LIMIT 5 OFFSET 2",
     );
-    assert_eq!(r.table.len(), 5);
+    assert_eq!(r.test_table().len(), 5);
     let r = q(&s, "SELECT ?s ?o WHERE { ?s ex:p ?v . ?s ex:q ?o } LIMIT 3");
-    assert_eq!(r.table.len(), 3);
+    assert_eq!(r.test_table().len(), 3);
     assert!(q(&s, "ASK { ?s ex:q ex:o3 }").boolean);
     assert!(!q(&s, "ASK { ?s ex:q ex:o9 }").boolean);
     // a limit larger than the result returns everything
@@ -349,9 +349,9 @@ fn limit_and_ask_stop_early() {
         &s,
         "SELECT ?s WHERE { ?s ex:p ?v FILTER(?v < 20) } LIMIT 100",
     );
-    assert_eq!(r.table.len(), 20);
+    assert_eq!(r.test_table().len(), 20);
     let r = q(&s, "SELECT DISTINCT ?o WHERE { ?s ex:q ?o } LIMIT 100");
-    assert_eq!(r.table.len(), 7);
+    assert_eq!(r.test_table().len(), 7);
 }
 
 #[test]
@@ -371,12 +371,12 @@ fn optional_filter_order() {
         &s,
         "SELECT ?n ?k WHERE { ?p foaf:name ?n OPTIONAL { ?p foaf:knows ?k } FILTER(?n != \"Dave\") } ORDER BY ?n ?k",
     );
-    assert_eq!(r.table.len(), 4);
+    assert_eq!(r.test_table().len(), 4);
     let rows = strs(&r);
     assert!(rows.contains(&"Carol UNDEF".to_string()), "{rows:?}");
     // ORDER BY: Alice rows first
-    let first = r.term(r.table.cols[0][0]).unwrap();
-    assert_eq!(first.to_string(), "\"Alice\"");
+    let first = r.term(r.test_table().cols[0][0]).unwrap().unwrap();
+    assert_eq!(first.as_term().to_string(), "\"Alice\"");
 }
 
 #[test]
@@ -475,7 +475,7 @@ fn temporal_components_of_inline_terms_match_parsed_literals() {
         .iter()
         .filter(|v| {
             let r = q(&s, &format!("SELECT ?d {{ VALUES ?d {{ {v} }} }}"));
-            r.rows().into_iter().flatten().flatten().any(|t| {
+            r.test_application_rows().into_iter().flatten().flatten().any(|t| {
                 matches!(&t, Term::Literal(l) if crate::id::inline_literal(l.value(), l.datatype().as_str()).is_some())
             })
         })
@@ -496,8 +496,8 @@ fn temporal_components_of_inline_terms_match_parsed_literals() {
     );
     let fast = q(&s, &format!("SELECT ?d {} {body}", fast.join(" ")));
     let slow = q(&s, &format!("SELECT ?d {} {body}", slow.join(" ")));
-    assert_eq!(fast.rows(), slow.rows());
-    assert_eq!(fast.rows().len(), values.len());
+    assert_eq!(fast.test_application_rows(), slow.test_application_rows());
+    assert_eq!(fast.test_application_rows().len(), values.len());
 }
 
 /// Decades of birth dates grouped and counted, the shape of DBpedia's
@@ -558,7 +558,7 @@ ex:k ex:born "12345-01-01"^^xsd:date .
     want.sort();
     assert_eq!(strs(&q(&s, text)), want);
     let r = q(&s, text);
-    for row in r.rows() {
+    for row in r.test_application_rows() {
         if let Some(Term::Literal(l)) = &row[0] {
             assert_eq!(l.datatype(), oxrdf::vocab::xsd::DECIMAL, "{l}");
         }
@@ -789,7 +789,7 @@ fn triple_term_subjects_follow_the_grammar() {
     );
     assert_eq!(r.len(), 1);
     assert!(
-        r.rows()[0]
+        r.test_application_rows()[0]
             .iter()
             .all(|t| matches!(t, Some(Term::Triple(_))))
     );
@@ -809,7 +809,7 @@ fn aggregates() {
     );
     assert_eq!(strs(&r), ["Person 3"]);
     // exact per-class counts come from the statistics (no delta, default graph only)
-    assert!(has_op(&r.plan, "GroupCountFromMetadata"));
+    assert!(has_op(&r.plan(), "GroupCountFromMetadata"));
     let r = q(
         &s,
         "SELECT ?t (COUNT(*) AS ?c) WHERE { ?p a ?t } GROUP BY ?t",
@@ -825,14 +825,14 @@ fn aggregates() {
     // COUNT over a full scan comes from index metadata
     let r = q(&s, "SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }");
     assert_eq!(strs(&r), ["18"]);
-    assert!(has_op(&r.plan, "CountFromIndex"));
+    assert!(has_op(&r.plan(), "CountFromIndex"));
     let r = q(
         &s,
         "SELECT (COUNT(*) AS ?n) WHERE { ?a foaf:knows ?b . ?b foaf:knows ?c }",
     );
     assert_eq!(strs(&r), ["1"]);
     // two scans joined on one variable: counted from per-key runs
-    assert!(has_op(&r.plan, "CountJoinFromRuns"));
+    assert!(has_op(&r.plan(), "CountJoinFromRuns"));
     let r = q(
         &s,
         "SELECT (COUNT(*) AS ?c) WHERE { ?a foaf:knows ?b . ?b foaf:name ?n }",
@@ -976,7 +976,7 @@ fn property_paths() {
     let r = q(&s, "SELECT ?x WHERE { ex:alice (foaf:knows|foaf:name) ?x }");
     assert_eq!(strs(&r), ["Alice", "bob", "carol"]);
     let r = q(&s, "SELECT ?x ?y WHERE { ?x foaf:knows+ ?y }");
-    assert_eq!(r.table.len(), 3);
+    assert_eq!(r.test_table().len(), 3);
     // bound from the left: join with a transitive path
     let r = q(
         &s,
@@ -996,9 +996,13 @@ fn subquery_limit_distinct() {
         &s,
         "SELECT ?n WHERE { ?p foaf:age ?a ; foaf:name ?n } ORDER BY DESC(?a) LIMIT 2",
     );
-    assert_eq!(r.table.len(), 2);
+    assert_eq!(r.test_table().len(), 2);
     assert_eq!(
-        r.term(r.table.cols[0][0]).unwrap().to_string(),
+        r.term(r.test_table().cols[0][0])
+            .unwrap()
+            .unwrap()
+            .as_term()
+            .to_string(),
         "\"Carol\"@en"
     );
     let r = q(
@@ -1022,9 +1026,9 @@ fn ask_construct_describe() {
         &s,
         "CONSTRUCT { ?b ex:knownBy ?a } WHERE { ?a foaf:knows ?b }",
     );
-    assert_eq!(r.triples.len(), 3);
+    assert_eq!(r.triples().len(), 3);
     let r = q(&s, "DESCRIBE ex:dave");
-    assert_eq!(r.triples.len(), 2);
+    assert_eq!(r.triples().len(), 2);
 }
 
 #[test]
@@ -1051,7 +1055,7 @@ fn named_graphs() {
         "SELECT ?s (COUNT(*) AS ?c) FROM ex:g1 FROM ex:g2 WHERE { ?s ex:p ?o } GROUP BY ?s",
     );
     assert_eq!(strs(&r), ["a 2", "b 1", "c 1"]);
-    assert!(has_op(&r.plan, "GroupCountFromIndex"));
+    assert!(has_op(&r.plan(), "GroupCountFromIndex"));
     let r = q(
         &s,
         "SELECT ?g (COUNT(*) AS ?c) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g",
@@ -1087,7 +1091,7 @@ fn named_graphs() {
     let r = query(s.snapshot(), "SELECT ?o WHERE { { ?s <http://ex.org/p> ?o } UNION { GRAPH ?g { ?s <http://ex.org/p> ?o } } }", &opts).unwrap();
     assert_eq!(strs(&r), ["9"]);
     let r = q(&s, "SELECT ?g ?x WHERE { GRAPH ?g { ex:a ex:p* ?x } }");
-    assert_eq!(r.table.len(), 4);
+    assert_eq!(r.test_table().len(), 4);
 }
 
 #[test]
@@ -1112,7 +1116,7 @@ fn updates() {
     assert!(!q(&s, "ASK { GRAPH ?g { ?s ?p ?o } }").boolean);
     update::update(&s, "INSERT DATA { _:b <http://ex.org/p> _:b }", &opts).unwrap();
     let r = q(&s, "SELECT ?x WHERE { ?x ex:p ?x }");
-    assert_eq!(r.table.len(), 1);
+    assert_eq!(r.test_table().len(), 1);
     update::update(&s, "DROP ALL", &opts).unwrap();
     assert!(s.snapshot().is_empty());
 }
@@ -1123,8 +1127,10 @@ fn native_json_writer_matches_document_values_for_all_result_kinds() {
         // Compare both encodings after the same JSON parser: without the
         // float_roundtrip feature, parsing a serialized f64 can differ by 1 ULP
         // from the directly constructed Value's number.
-        serde_json::from_slice(&serde_json::to_vec(&results::sparkles_json(r, send)).unwrap())
-            .unwrap()
+        serde_json::from_slice(
+            &serde_json::to_vec(&results::sparkles_json(r, send).unwrap()).unwrap(),
+        )
+        .unwrap()
     }
     let s = Store::in_memory(StoreOptions::default());
     s.load(&[Source::from_bytes(
@@ -1157,17 +1163,39 @@ fn native_json_writer_matches_document_values_for_all_result_kinds() {
     }
     // Cover all graph-name representations, including the null default graph
     // accepted by the explicit native document interface.
-    let mut r = q(&s, "CONSTRUCT { ?s <urn:p> ?o } WHERE { ?s <urn:p> ?o }");
-    let t = &r.triples[0];
-    r.quads = [
+    let parsed = parse_query(
+        "CONSTRUCT { ?s <urn:p> ?o } WHERE { ?s <urn:p> ?o }",
+        None,
+        &[],
+    )
+    .unwrap();
+    let options = QueryOptions::default();
+    let prepared = super::prepare_query(s.snapshot(), &parsed, &options, None, None).unwrap();
+    let mut parts = super::execute_prepared_parts(&parsed, &options, 0.0, 0.0, prepared).unwrap();
+    let context = parts.ctx.clone();
+    let t = &parts.triples[0];
+    let bytes = graph_triple_bytes(t)
+        .checked_mul(3)
+        .unwrap()
+        .checked_add((3 * std::mem::size_of::<Quad>()) as u64)
+        .unwrap()
+        .checked_add(256)
+        .unwrap();
+    let copy_credit = context.charge(bytes).unwrap();
+    let mut quads = Vec::new();
+    quads.try_reserve_exact(3).unwrap();
+    assert_eq!(quads.capacity(), 3);
+    for graph in [
         GraphName::DefaultGraph,
         GraphName::NamedNode(oxrdf::NamedNode::new("urn:g").unwrap()),
         GraphName::BlankNode(BlankNode::new("graph").unwrap()),
-    ]
-    .into_iter()
-    .map(|g| t.clone().in_graph(g))
-    .collect();
-    for send in [None, Some(r.triples.len()), Some(r.triples.len() + 2)] {
+    ] {
+        quads.push(t.clone().in_graph(graph));
+    }
+    parts.quads = quads;
+    parts._graph_credit = Some(copy_credit.into_output(&context));
+    let r = parts.freeze().unwrap();
+    for send in [None, Some(r.triples().len()), Some(r.triples().len() + 2)] {
         let mut out = Vec::new();
         results::write_native_json(&r, &mut out, send, None).unwrap();
         let got: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -1231,14 +1259,19 @@ fn native_json_streaming_stops_on_writer_error_and_cancel() {
     }
     let s = Store::in_memory(StoreOptions::default());
     let literal = serde_json::to_string(&"\n".repeat(40_000)).unwrap();
-    let mut r = q(
-        &s,
+    let parsed = parse_query(
         &format!("SELECT ?o WHERE {{ VALUES ?o {{ {literal} }} }}"),
-    );
-    // The inaccessible second row is a sentinel: eager preparation would decode it
-    // before the writer sees any bytes and panic. A failed/cancelled sink must stop
-    // in the first row instead. This deliberately modifies a test-only table.
-    r.table.len = 2;
+        None,
+        &[],
+    )
+    .unwrap();
+    let options = QueryOptions::default();
+    let prepared = super::prepare_query(s.snapshot(), &parsed, &options, None, None).unwrap();
+    let mut parts = super::execute_prepared_parts(&parsed, &options, 0.0, 0.0, prepared).unwrap();
+    // The inaccessible second row remains the exact first-I/O/cancel sentinel.
+    // Only the private test builder can create this deliberately malformed shape.
+    parts.table.len = 2;
+    let r = parts.freeze().unwrap();
     let mut sink = Sink {
         bytes: Vec::new(),
         fail_after: Some(128),
@@ -1363,8 +1396,8 @@ fn count_distinct_from_index() {
             // a graph variable keeps the general plan (the scan is not the group's input);
             // the others count runs or read the statistics
             assert_eq!(
-                has_op(&r.plan, "CountDistinctFromIndex")
-                    || has_op(&r.plan, "CountDistinctFromMetadata"),
+                has_op(&r.plan(), "CountDistinctFromIndex")
+                    || has_op(&r.plan(), "CountDistinctFromMetadata"),
                 !pattern.contains("?g"),
                 "{pattern} {v}"
             );
@@ -1766,7 +1799,7 @@ fn cached_results_obey_the_row_budget() {
     let full = strs(&q(&s, text));
     assert_eq!(full.len(), 3);
     // the next run is served from the cache
-    assert!(has_cached(&q(&s, text).plan));
+    assert!(has_cached(&q(&s, text).plan()));
     let limited = QueryOptions {
         max_rows: Some(2),
         prefixes: vec![("foaf".into(), "http://xmlns.com/foaf/0.1/".into())],
@@ -1876,15 +1909,15 @@ fn construct_checks_cancellation_after_where_execution() {
     .unwrap() else {
         unreachable!()
     };
-    r.ctx.cancel.store(true, Ordering::Relaxed);
+    r.test_context().cancel.store(true, Ordering::Relaxed);
     assert!(matches!(
-        construct(&r.ctx, &r.table, &template, &[]),
+        construct(r.test_context(), r.test_table(), &template, &[]),
         Err(Error::Cancelled)
     ));
     let mut ctx = Ctx::new(s.snapshot());
     ctx.deadline = Some(Instant::now() - Duration::from_secs(1));
     assert!(matches!(
-        construct(&ctx, &Table::unit(), &template, &[]),
+        construct(&Arc::new(ctx), &Table::unit(), &template, &[]),
         Err(Error::Timeout)
     ));
 }
@@ -1930,7 +1963,7 @@ fn memory_budget_applies_to_cached_results_and_updates() {
     let s = cached_store(DATA, RdfFormat::Turtle);
     let text = "SELECT * WHERE { ?a ?b ?c . ?d ?e ?f }";
     let full = q(&s, text);
-    assert!(has_cached(&q(&s, text).plan));
+    assert!(has_cached(&q(&s, text).plan()));
     let o = QueryOptions {
         max_memory_bytes: Some(full.mem_peak_bytes / 2),
         ..Default::default()
@@ -2003,12 +2036,12 @@ fn serialized_terms_match_terms_decoded_one_by_one() {
         &s,
         "SELECT ?s ?o ?x { ?s ?p ?o OPTIONAL { ?s <http://ex.org/q> ?x } }",
     );
-    assert!(r.table.len() > 70_000);
+    assert!(r.test_table().len() > 70_000);
     for send in [None, Some(66_000), Some(1_000)] {
         let mut got = Vec::new();
         results::write_solutions(&r, SolutionsFormat::Tsv, &mut got, send).unwrap();
         let vars: Vec<oxrdf::Variable> = r
-            .vars
+            .variables()
             .iter()
             .map(|v| oxrdf::Variable::new_unchecked(v.clone()))
             .collect();
@@ -2016,8 +2049,8 @@ fn serialized_terms_match_terms_decoded_one_by_one() {
             sparesults::QueryResultsSerializer::from_format(sparesults::QueryResultsFormat::Tsv)
                 .serialize_solutions_to_writer(Vec::new(), vars.clone())
                 .unwrap();
-        let n = send.unwrap_or(r.table.len());
-        for row in r.rows().into_iter().take(n) {
+        let n = send.unwrap_or(r.test_table().len());
+        for row in r.test_application_rows().into_iter().take(n) {
             ser.serialize(
                 row.iter()
                     .zip(&vars)
@@ -2102,7 +2135,7 @@ fn rows_produced_sums_every_operator_and_is_a_budget() {
         .len() as u64;
     // two scans of n rows and their n² cross product
     assert_eq!(r.len() as u64, n * n);
-    assert_eq!(r.rows_produced, plan_rows(&r.plan));
+    assert_eq!(r.rows_produced, plan_rows(&r.plan()));
     assert!(r.rows_produced >= n * n + 2 * n, "{}", r.rows_produced);
     // a budget above the largest intermediate result but below the total still fails:
     // it counts the work of all operators, not one table
@@ -2133,7 +2166,7 @@ fn rows_produced_sums_every_operator_and_is_a_budget() {
     let c = cached_store(DATA, RdfFormat::Turtle);
     q(&c, text);
     let hit = q(&c, text);
-    assert!(has_cached(&hit.plan));
+    assert!(has_cached(&hit.plan()));
     assert!(hit.rows_produced >= n * n, "{}", hit.rows_produced);
     let o = QueryOptions {
         max_rows_produced: Some(n * n - 1),
@@ -2180,7 +2213,7 @@ fn union_default_graph_per_request() {
             union_default_graph: u,
             ..Default::default()
         };
-        query(s.snapshot(), text, &opts).unwrap().table.len()
+        query(s.snapshot(), text, &opts).unwrap().test_table().len()
     };
     for store_union in [false, true] {
         let s = Store::in_memory(StoreOptions {
@@ -2481,8 +2514,8 @@ mod generator_divergences {
         let text = "PREFIX : <http://ex/> SELECT * WHERE { VALUES (?x ?k) { (UNDEF 1) (:o0 2) } \
                     ?s :p ?x . ?y :q ?v FILTER(?x = ?y) }";
         let r = query(s.snapshot(), text, &QueryOptions::default()).unwrap();
-        assert_eq!(r.rows().len(), n + 1);
-        assert!(has_op(&r.plan, "KeyedJoin"), "{:#?}", r.plan);
+        assert_eq!(r.test_application_rows().len(), n + 1);
+        assert!(has_op(&r.plan(), "KeyedJoin"), "{:#?}", r.plan());
     }
 }
 
@@ -2609,7 +2642,11 @@ fn cursor_bind_and_filter_in_parallel_match_eager() {
         "SELECT ?p ?d WHERE { ?p <urn:born> ?d FILTER(MONTH(?d) * 31 + DAY(?d) > 200) }",
     ] {
         let eager = query(s.snapshot(), q, &QueryOptions::default()).unwrap();
-        let mut want: Vec<String> = eager.rows().iter().map(|r| format!("{r:?}")).collect();
+        let mut want: Vec<String> = eager
+            .test_application_rows()
+            .iter()
+            .map(|r| format!("{r:?}"))
+            .collect();
         want.sort();
         let options = CursorOptions {
             batch_rows: 4096,

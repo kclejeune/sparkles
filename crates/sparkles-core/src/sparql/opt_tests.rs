@@ -29,7 +29,7 @@ pub(super) fn run(s: &Store, text: &str, opt: Optimizations) -> QueryResult {
 /// Solutions as exact RDF terms, sorted (a multiset).
 pub(super) fn solutions(r: &QueryResult) -> Vec<String> {
     let mut v: Vec<String> = r
-        .rows()
+        .test_application_rows()
         .into_iter()
         .map(|row| {
             row.into_iter()
@@ -58,13 +58,17 @@ pub(super) fn same_answer(s: &Store, text: &str, op: &str) -> Vec<String> {
     let (a, b) = (solutions(&fast), solutions(&slow));
     assert_eq!(a, b, "{text}");
     let taken = match op.strip_prefix("desc:") {
-        Some(d) => has_desc(&fast.plan, d),
-        None => has_op(&fast.plan, op),
+        Some(d) => has_desc(&fast.plan(), d),
+        None => has_op(&fast.plan(), op),
     };
-    assert!(taken, "{text}: optimized plan lacks {op}: {:#?}", fast.plan);
+    assert!(
+        taken,
+        "{text}: optimized plan lacks {op}: {:#?}",
+        fast.plan()
+    );
     let generic = match op.strip_prefix("desc:") {
-        Some(d) => has_desc(&slow.plan, d),
-        None => has_op(&slow.plan, op),
+        Some(d) => has_desc(&slow.plan(), d),
+        None => has_op(&slow.plan(), op),
     };
     assert!(!generic, "{text}: generic plan uses {op}");
     a
@@ -192,7 +196,7 @@ fn range_check(s: &Store, text: &str) -> bool {
         solutions(&run(s, text, Optimizations::NONE)),
         "{text}"
     );
-    has_op(&fast.plan, "IndexRangeScan")
+    has_op(&fast.plan(), "IndexRangeScan")
 }
 
 #[test]
@@ -313,13 +317,13 @@ fn non_numeric_range_filters_are_not_pushed() {
         "SELECT ?s WHERE { ?s ex:v ?v FILTER(?v > \"abc\") }",
         Optimizations::ALL,
     );
-    assert!(!has_op(&r.plan, "IndexRangeScan"));
+    assert!(!has_op(&r.plan(), "IndexRangeScan"));
     let r = run(
         &s,
         "SELECT ?s WHERE { ?s ex:v ?v FILTER(?v > \"2020-01-01\"^^xsd:date) }",
         Optimizations::ALL,
     );
-    assert!(!has_op(&r.plan, "IndexRangeScan"));
+    assert!(!has_op(&r.plan(), "IndexRangeScan"));
 }
 
 /// Pseudo-random ranges over pseudo-random mixed values.
@@ -421,7 +425,7 @@ fn incremental_grouping_matches_the_generic_aggregates() {
     };
     let slow = run(&s, q, slow);
     assert_eq!(solutions(&fast), solutions(&slow), "{q}");
-    assert!(has_desc(&fast.plan, "[incremental]") && !has_desc(&slow.plan, "[incremental]"));
+    assert!(has_desc(&fast.plan(), "[incremental]") && !has_desc(&slow.plan(), "[incremental]"));
     // not admitted: DISTINCT, expressions, GROUP_CONCAT, several keys
     for q in [
         "SELECT ?o (COUNT(DISTINCT ?a) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o",
@@ -432,7 +436,7 @@ fn incremental_grouping_matches_the_generic_aggregates() {
         "SELECT ?o ?a (COUNT(*) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o ?a",
     ] {
         let r = run(&s, q, Optimizations::ALL);
-        assert!(!has_desc(&r.plan, "[incremental]"), "{q}");
+        assert!(!has_desc(&r.plan(), "[incremental]"), "{q}");
         same_rows(&s, q);
     }
 }
@@ -479,7 +483,7 @@ fn count_joins_from_key_runs() {
     // a join on two variables, or with a third shared variable, is not admitted
     let q = "SELECT (COUNT(*) AS ?n) WHERE { ?a ex:knows ?b . ?b ex:knows ?a }";
     assert!(!has_op(
-        &run(&s, q, Optimizations::ALL).plan,
+        &run(&s, q, Optimizations::ALL).plan(),
         "CountJoinFromRuns"
     ));
     same_rows(&s, q);
@@ -525,7 +529,7 @@ fn minus_on_one_bound_variable_is_an_anti_join() {
         let a = same_answer(&s, q, "desc:anti-join on");
         assert!(!a.is_empty(), "{q}");
         let r = run(&s, q, Optimizations::ALL);
-        let mut stack = vec![&r.plan];
+        let mut stack = vec![r.plan()];
         while let Some(p) = stack.pop() {
             if p.operator == "Minus" {
                 let how = if q.contains("ex:by") || q.contains("ex:age") {
@@ -546,7 +550,7 @@ fn minus_on_one_bound_variable_is_an_anti_join() {
         "SELECT ?p WHERE { ?p a ex:C2 MINUS { ?x ex:by ?y } }",
     ] {
         let r = run(&s, q, Optimizations::ALL);
-        assert!(!has_desc(&r.plan, "anti-join on"), "{q}");
+        assert!(!has_desc(&r.plan(), "anti-join on"), "{q}");
         same_rows(&s, q);
     }
 }
@@ -607,8 +611,12 @@ fn numeric_top_k_prefilter_keeps_the_exact_order() {
             ..with
         };
         let slow = run(&s, q, without);
-        assert_eq!(fast.rows(), slow.rows(), "{q}");
-        assert!(has_desc(&fast.plan, "numeric prefilter"), "{q}");
+        assert_eq!(
+            fast.test_application_rows(),
+            slow.test_application_rows(),
+            "{q}"
+        );
+        assert!(has_desc(&fast.plan(), "numeric prefilter"), "{q}");
         let heap = run(
             &s,
             q,
@@ -617,8 +625,12 @@ fn numeric_top_k_prefilter_keeps_the_exact_order() {
                 ..with
             },
         );
-        assert_eq!(heap.rows(), slow.rows(), "{q}");
-        assert!(has_desc(&heap.plan, "top-k heap"), "{q}");
+        assert_eq!(
+            heap.test_application_rows(),
+            slow.test_application_rows(),
+            "{q}"
+        );
+        assert!(has_desc(&heap.plan(), "top-k heap"), "{q}");
     }
     // a non-numeric value disables it
     update(&s, "INSERT DATA { ex:x ex:v \"text\" }");
@@ -631,7 +643,7 @@ fn numeric_top_k_prefilter_keeps_the_exact_order() {
             ..Optimizations::ALL
         },
     );
-    assert!(!has_desc(&fast.plan, "numeric prefilter"));
+    assert!(!has_desc(&fast.plan(), "numeric prefilter"));
     assert_eq!(
         solutions(&fast),
         solutions(&run(&s, q, Optimizations::NONE))
@@ -654,8 +666,12 @@ fn topk_check(s: &Store, q: &str) -> QueryResult {
     let fast = run(s, q, Optimizations::ALL);
     super::plan::FORCE_ORDERED_TOPK.with(|f| f.set(false));
     let slow = run(s, q, without_ordered_topk());
-    assert_eq!(fast.rows(), slow.rows(), "{q}");
-    assert!(!has_op(&slow.plan, "IndexTopK"), "{q}");
+    assert_eq!(
+        fast.test_application_rows(),
+        slow.test_application_rows(),
+        "{q}"
+    );
+    assert!(!has_op(&slow.plan(), "IndexTopK"), "{q}");
     fast
 }
 
@@ -800,17 +816,25 @@ fn first_key_prefilter_keeps_the_exact_order() {
     for q in queries {
         let fast = run(&s, q, with);
         let slow = run(&s, q, without);
-        assert_eq!(fast.rows(), slow.rows(), "{q}");
-        assert!(!has_desc(&slow.plan, "first-key prefilter"), "{q}");
+        assert_eq!(
+            fast.test_application_rows(),
+            slow.test_application_rows(),
+            "{q}"
+        );
+        assert!(!has_desc(&slow.plan(), "first-key prefilter"), "{q}");
         let heap = run(&s, q, Optimizations::ALL);
-        assert_eq!(heap.rows(), slow.rows(), "{q}");
-        assert!(has_desc(&heap.plan, "top-k heap"), "{q}");
+        assert_eq!(
+            heap.test_application_rows(),
+            slow.test_application_rows(),
+            "{q}"
+        );
+        assert!(has_desc(&heap.plan(), "top-k heap"), "{q}");
         assert_eq!(
             solutions(&fast),
             solutions(&run(&s, q, Optimizations::NONE)),
             "{q}"
         );
-        kept += has_desc(&fast.plan, "first-key prefilter") as usize;
+        kept += has_desc(&fast.plan(), "first-key prefilter") as usize;
     }
     // The two queries ordered first by ?v itself meet dates with and without a
     // timezone, which are only partially ordered, so the prefilter leaves them to the
@@ -850,8 +874,12 @@ fn top_k_heap_matches_the_full_sort_on_random_data() {
     for q in &queries {
         let fast = run(&s, q, heap);
         let slow = run(&s, q, sort);
-        assert_eq!(fast.rows(), slow.rows(), "{q}");
-        used += has_desc(&fast.plan, "top-k heap") as usize;
+        assert_eq!(
+            fast.test_application_rows(),
+            slow.test_application_rows(),
+            "{q}"
+        );
+        used += has_desc(&fast.plan(), "top-k heap") as usize;
     }
     assert!(
         used * 10 >= queries.len() * 8,
@@ -880,8 +908,8 @@ fn ordered_top_k_matches_the_sort_on_random_data() {
         let mut answers = Vec::new();
         for q in &queries {
             let r = topk_check(&s, q);
-            chosen += has_op(&r.plan, "IndexTopK") as usize;
-            answers.push(r.rows());
+            chosen += has_op(&r.plan(), "IndexTopK") as usize;
+            answers.push(r.test_application_rows());
         }
         assert!(
             chosen * 10 >= queries.len() * 9,
@@ -916,7 +944,7 @@ fn ordered_top_k_matches_the_sort_on_random_data() {
             super::plan::FORCE_ORDERED_TOPK.with(|f| f.set(true));
             let r = query(before.clone(), &format!("{PREFIXES}{q}"), &opts).unwrap();
             super::plan::FORCE_ORDERED_TOPK.with(|f| f.set(false));
-            assert_eq!(&r.rows(), rows, "{q}");
+            assert_eq!(&r.test_application_rows(), rows, "{q}");
         }
     }
 }
@@ -974,14 +1002,14 @@ fn ordered_top_k_falls_back_on_values_that_are_not_totally_ordered() {
         "SELECT ?s ?v WHERE { ?s ex:w ?v } ORDER BY ?v LIMIT 5",
     ] {
         let r = topk_check(&s, q);
-        assert!(has_desc(&r.plan, "ran the generic plan"), "{q}");
+        assert!(has_desc(&r.plan(), "ran the generic plan"), "{q}");
     }
     // NaN fails the range filter: the ordered scan decides
     let r = topk_check(
         &s,
         "SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(?v > 2) } ORDER BY DESC(?v) LIMIT 5",
     );
-    assert!(has_desc(&r.plan, "[read "), "{:#?}", r.plan);
+    assert!(has_desc(&r.plan(), "[read "), "{:#?}", r.plan());
 }
 
 /// A piece whose best rows mostly fail the filter is read on, step by step, while its
@@ -1017,7 +1045,7 @@ fn ordered_top_k_reads_a_piece_until_it_cannot_win() {
         &s,
         "SELECT ?s WHERE { ?s ex:t ?v FILTER(STRSTARTS(STR(?s), \"http://ex.org/keep\")) } ORDER BY DESC(?v) LIMIT 2",
     );
-    assert!(has_op(&r.plan, "IndexTopK"));
+    assert!(has_op(&r.plan(), "IndexTopK"));
     assert_eq!(
         solutions(&r),
         ["<http://ex.org/keep_a>", "<http://ex.org/keep_c>"]
@@ -1030,7 +1058,7 @@ fn ordered_top_k_reads_a_piece_until_it_cannot_win() {
         "SELECT ?s ?v WHERE { ?s ex:u ?v } ORDER BY ?v LIMIT 320",
     ] {
         let r = topk_check(&s, q);
-        assert!(has_op(&r.plan, "IndexTopK"), "{q}");
+        assert!(has_op(&r.plan(), "IndexTopK"), "{q}");
     }
 }
 
@@ -1084,7 +1112,7 @@ fn the_largest_limit_and_offset_saturate() {
         &s,
         &format!("SELECT ?s ?v {{ ?s ex:v ?v }} ORDER BY DESC(?v) OFFSET 1 LIMIT {MAX}"),
     );
-    assert!(has_op(&r.plan, "IndexTopK"), "{:#?}", r.plan);
+    assert!(has_op(&r.plan(), "IndexTopK"), "{:#?}", r.plan());
     assert_eq!(
         solutions(&r),
         [
@@ -1128,10 +1156,14 @@ fn ordered_top_k_is_chosen_when_it_reads_less() {
     ] {
         let fast = run(&s, q, Optimizations::ALL);
         let slow = run(&s, q, without_ordered_topk());
-        assert_eq!(fast.rows(), slow.rows(), "{q}");
-        assert_eq!(fast.rows().len(), 10);
-        let read = topk_rows_read(&fast.plan);
-        assert!(read.is_some_and(|n| n < 60_000), "{q}: {:#?}", fast.plan);
+        assert_eq!(
+            fast.test_application_rows(),
+            slow.test_application_rows(),
+            "{q}"
+        );
+        assert_eq!(fast.test_application_rows().len(), 10);
+        let read = topk_rows_read(&fast.plan());
+        assert!(read.is_some_and(|n| n < 60_000), "{q}: {:#?}", fast.plan());
     }
     // the IRIs of the base vocabulary are in value order too, so ordering by the
     // subjects reads only the best end of their piece
@@ -1141,9 +1173,13 @@ fn ordered_top_k_is_chosen_when_it_reads_less() {
     ] {
         let fast = run(&s, q, Optimizations::ALL);
         let slow = run(&s, q, without_ordered_topk());
-        assert_eq!(fast.rows(), slow.rows(), "{q}");
-        let read = topk_rows_read(&fast.plan);
-        assert!(read.is_some_and(|n| n < 60_000), "{q}: {:#?}", fast.plan);
+        assert_eq!(
+            fast.test_application_rows(),
+            slow.test_application_rows(),
+            "{q}"
+        );
+        let read = topk_rows_read(&fast.plan());
+        assert!(read.is_some_and(|n| n < 60_000), "{q}: {:#?}", fast.plan());
     }
 }
 
@@ -1204,7 +1240,7 @@ fn ordered_top_k_reads_strings_from_the_low_end() {
     let plain = |s: &Store| -> Vec<String> {
         let r = run(s, "SELECT ?v WHERE { ?s ex:str ?v }", Optimizations::NONE);
         let mut v: Vec<String> = r
-            .rows()
+            .test_application_rows()
             .into_iter()
             .map(|row| match &row[0] {
                 Some(oxrdf::Term::Literal(l)) => l.value().to_string(),
@@ -1230,10 +1266,10 @@ fn ordered_top_k_reads_strings_from_the_low_end() {
                     "SELECT ?v ?s WHERE {{ ?s ex:{p} ?v }} ORDER BY {dir}(?v) LIMIT {limit} OFFSET {offset}"
                 );
                 let r = topk_check(&s, &q);
-                assert!(has_op(&r.plan, "IndexTopK"), "{q}");
+                assert!(has_op(&r.plan(), "IndexTopK"), "{q}");
                 if p == "str" && dir.is_empty() {
                     let got: Vec<String> = r
-                        .rows()
+                        .test_application_rows()
                         .into_iter()
                         .map(|row| match &row[0] {
                             Some(oxrdf::Term::Literal(l)) => l.value().to_string(),
@@ -1253,14 +1289,22 @@ fn ordered_top_k_reads_strings_from_the_low_end() {
             );
             let fast = run(&s, &q, Optimizations::ALL);
             let slow = run(&s, &q, without_ordered_topk());
-            assert_eq!(fast.rows(), slow.rows(), "{q}");
-            let read = topk_rows_read(&fast.plan);
+            assert_eq!(
+                fast.test_application_rows(),
+                slow.test_application_rows(),
+                "{q}"
+            );
+            let read = topk_rows_read(&fast.plan());
             assert!(read.is_some_and(|n| n < 1500), "{q}: {read:?}");
             // labels do not start with plain strings: the plain sort stays
             let q = q.replace("ex:big", "ex:labels");
             let r = run(&s, &q, Optimizations::ALL);
-            assert!(!has_op(&r.plan, "IndexTopK"), "{q}");
-            assert_eq!(r.rows(), run(&s, &q, without_ordered_topk()).rows(), "{q}");
+            assert!(!has_op(&r.plan(), "IndexTopK"), "{q}");
+            assert_eq!(
+                r.test_application_rows(),
+                run(&s, &q, without_ordered_topk()).test_application_rows(),
+                "{q}"
+            );
         }
         // plain strings with delta ids, among them prefixes of base strings and the
         // smallest string of all
@@ -1283,7 +1327,11 @@ fn lexical_case(body: &str, q: &str) -> QueryResult {
     load(&s, &ttl, RdfFormat::Turtle);
     let slow = run(&s, q, without_ordered_topk());
     let fast = run(&s, q, Optimizations::ALL);
-    assert_eq!(fast.rows(), slow.rows(), "{q}");
+    assert_eq!(
+        fast.test_application_rows(),
+        slow.test_application_rows(),
+        "{q}"
+    );
     topk_check(&s, q);
     fast
 }
@@ -1337,7 +1385,11 @@ fn ordered_top_k_lexical_steps_fall_back_on_partially_ordered_values() {
         &ttl,
         "SELECT ?s ?v WHERE { ?s ex:p ?v FILTER(STRSTARTS(STR(?s), \"http://ex.org/keep\")) } ORDER BY ?v LIMIT 10",
     );
-    assert!(has_desc(&r.plan, "ran the generic plan"), "{:#?}", r.plan);
+    assert!(
+        has_desc(&r.plan(), "ran the generic plan"),
+        "{:#?}",
+        r.plan()
+    );
 }
 
 /// A long plain string at the low end ties with the k-th candidate, so each of its
@@ -1357,7 +1409,11 @@ fn ordered_top_k_bounds_the_prefix_lookups_of_long_strings() {
         &ttl,
         "SELECT ?s ?v WHERE { ?s ex:p ?v } ORDER BY ?v LIMIT 10",
     );
-    assert!(has_desc(&r.plan, "ran the generic plan"), "{:#?}", r.plan);
+    assert!(
+        has_desc(&r.plan(), "ran the generic plan"),
+        "{:#?}",
+        r.plan()
+    );
 }
 
 /// IRIs whose order differs from the order of their keys' bytes under other encodings
@@ -1400,12 +1456,12 @@ fn ordered_top_k_reads_iris_in_value_order() {
                 "SELECT ?e ?s WHERE {{ ?s ex:see ?e }} ORDER BY {dir}(?e) LIMIT {limit} OFFSET {offset}"
             );
             let r = topk_check(s, &q);
-            assert!(has_op(&r.plan, "IndexTopK"), "{q}");
+            assert!(has_op(&r.plan(), "IndexTopK"), "{q}");
             if limit + offset <= 1100 {
                 // the IRIs are read from their best end, in steps of twice the rows
                 // wanted and more, and the about 520 other rows whole
                 let bound = 2 * (limit + offset) as u64 + 600;
-                let read = topk_rows_read(&r.plan);
+                let read = topk_rows_read(&r.plan());
                 assert!(read.is_some_and(|n| n <= bound), "{q}: {read:?}");
             }
             out.push((dir, limit, offset, r));
@@ -1419,7 +1475,7 @@ fn ordered_top_k_reads_iris_in_value_order() {
             "SELECT ?e ?s WHERE { ?s ex:see ?e }",
             Optimizations::NONE,
         );
-        let mut rows = r.rows();
+        let mut rows = r.test_application_rows();
         let rank = |t: &Option<oxrdf::Term>| match t {
             Some(oxrdf::Term::BlankNode(_)) => 0,
             Some(oxrdf::Term::NamedNode(_)) => 1,
@@ -1442,7 +1498,7 @@ fn ordered_top_k_reads_iris_in_value_order() {
             &format!("SELECT (COUNT(*) AS ?n) WHERE {{ ?s ex:see ?e FILTER({filter}(?e)) }}"),
             Optimizations::NONE,
         );
-        match &r.rows()[0][0] {
+        match &r.test_application_rows()[0][0] {
             Some(oxrdf::Term::Literal(l)) => l.value().parse().unwrap(),
             other => panic!("{other:?}"),
         }
@@ -1453,7 +1509,7 @@ fn ordered_top_k_reads_iris_in_value_order() {
         let mut checked = 0;
         for (dir, limit, offset, r) in queries(&s) {
             let got: Vec<String> = r
-                .rows()
+                .test_application_rows()
                 .into_iter()
                 .filter_map(|row| match &row[0] {
                     Some(oxrdf::Term::NamedNode(n)) => Some(n.as_str().to_string()),
@@ -1586,7 +1642,7 @@ fn transitive_paths_expand_large_frontiers_by_sweeps() {
     }
     // small frontiers keep per-node seeks
     let r = run(&s, "SELECT ?x WHERE { ex:y3 ex:k* ?x }", Optimizations::ALL);
-    assert!(!has_desc(&r.plan, "index sweeps"));
+    assert!(!has_desc(&r.plan(), "index sweeps"));
 }
 
 // ------------------------------------------------------- selective decoding ------
@@ -1634,7 +1690,7 @@ fn scans_decode_only_the_columns_they_read() {
     for (q, note) in queries {
         let fast = run(&a, q, Optimizations::ALL);
         if !note.is_empty() {
-            assert!(has_desc(&fast.plan, note), "{q}: {:#?}", fast.plan);
+            assert!(has_desc(&fast.plan(), note), "{q}: {:#?}", fast.plan());
         }
     }
     for (q, _) in queries {
@@ -1720,10 +1776,10 @@ fn optimized_operators_obey_the_memory_budget() {
         let text = format!("{PREFIXES}{q}");
         let full = query(s.snapshot(), &text, &budget(None)).unwrap();
         let taken = match op.strip_prefix("desc:") {
-            Some(d) => has_desc(&full.plan, d),
-            None => has_op(&full.plan, op),
+            Some(d) => has_desc(&full.plan(), d),
+            None => has_op(&full.plan(), op),
         };
-        assert!(taken, "{q}: plan lacks {op}: {:#?}", full.plan);
+        assert!(taken, "{q}: plan lacks {op}: {:#?}", full.plan());
         let peak = full.mem_peak_bytes;
         assert!(peak > 0, "{q}");
         let exact =
@@ -1746,7 +1802,7 @@ fn optimized_operators_obey_the_memory_budget() {
 
 /// Rows as exact RDF terms, in result order.
 fn ordered(r: &QueryResult) -> Vec<String> {
-    r.rows()
+    r.test_application_rows()
         .into_iter()
         .map(|row| {
             row.into_iter()
@@ -1778,6 +1834,8 @@ fn streamed(s: &Store, q: &str) -> Vec<String> {
             out.push(
                 b.row(i)
                     .unwrap()
+                    .values()
+                    .to_vec()
                     .into_iter()
                     .map(|t| t.map_or("UNDEF".to_string(), |t| t.to_string()))
                     .collect::<Vec<_>>()
@@ -2050,7 +2108,7 @@ mod cold_reads {
         let before = crate::ioacct::IoSnapshot::now();
         let r = query(s.snapshot(), &q, &opts).unwrap();
         assert_eq!(r.len(), 400);
-        let io = r.ctx.io_stats();
+        let io = r.test_context().io_stats();
         assert!(io.columns_decoded() > 0, "{io:?}");
         assert_eq!(
             io.columns_decoded(),
@@ -2105,7 +2163,7 @@ fn optional_reads_the_pattern_for_a_large_left_side() {
         "SELECT ?r ?x WHERE { ?r ex:for ?p OPTIONAL { ?r ex:rating ?x } }",
         Optimizations::ALL,
     );
-    assert!(!has_desc(&r.plan, "probed for the left side's keys"));
+    assert!(!has_desc(&r.plan(), "probed for the left side's keys"));
     same_rows(
         &s,
         "SELECT ?r ?x WHERE { ?r ex:for ?p OPTIONAL { ?r ex:rating ?x } }",
@@ -2141,7 +2199,7 @@ fn optional_with_an_unbound_left_key_reads_the_pattern() {
     let s = review_store();
     let text = "SELECT ?r ?x WHERE { { ?r ex:for ex:p7 } UNION { BIND(1 AS ?one) } OPTIONAL { ?r ex:rating ?x } }";
     let r = run(&s, text, Optimizations::ALL);
-    assert!(!has_desc(&r.plan, "probed for the left side's keys"));
+    assert!(!has_desc(&r.plan(), "probed for the left side's keys"));
     same_rows(&s, text);
 }
 
@@ -2226,7 +2284,7 @@ fn calendar_comparisons_match_the_generic_filter() {
         "SELECT ?s WHERE { ?s ex:d ?d FILTER(?d >= \"2008-02-29\"^^xsd:date) }",
         Optimizations::ALL,
     );
-    assert!(!r.rows().is_empty());
+    assert!(!r.test_application_rows().is_empty());
 }
 
 #[test]
@@ -2261,11 +2319,14 @@ fn order_keys_equal_to_a_select_expression_order_by_its_variable() {
         let b = run(&s, text, Optimizations::NONE);
         // ordered results: the rows must also come in the same order
         let rows = |r: &QueryResult| -> Vec<String> {
-            r.rows().into_iter().map(|row| format!("{row:?}")).collect()
+            r.test_application_rows()
+                .into_iter()
+                .map(|row| format!("{row:?}"))
+                .collect()
         };
         assert_eq!(rows(&a), rows(&b), "{text}");
-        assert!(has_desc(&a.plan, "(?w)"), "{text}: {:#?}", a.plan);
-        assert!(!has_desc(&b.plan, "(?w)"), "{text}");
+        assert!(has_desc(&a.plan(), "(?w)"), "{text}: {:#?}", a.plan());
+        assert!(!has_desc(&b.plan(), "(?w)"), "{text}");
     }
     // a random value is evaluated again
     let r = run(
@@ -2273,7 +2334,7 @@ fn order_keys_equal_to_a_select_expression_order_by_its_variable() {
         "SELECT ?s (RAND() * ?v AS ?w) WHERE { ?s ex:v ?v } ORDER BY (RAND() * ?v) LIMIT 2",
         Optimizations::ALL,
     );
-    assert!(!has_desc(&r.plan, "(?w)"));
+    assert!(!has_desc(&r.plan(), "(?w)"));
 }
 
 /// A later BIND gives a variable of the expression another value at the ORDER BY.
@@ -2285,9 +2346,13 @@ fn order_keys_reading_a_later_binding_are_evaluated_again() {
         "SELECT ?i WHERE { VALUES ?i { 1 2 } BIND(COALESCE(?x, ?i) AS ?sort) BIND(-?i AS ?x) } ORDER BY COALESCE(?x, ?i) LIMIT 1",
     ] {
         let a = run(&s, text, Optimizations::ALL);
-        let rows: Vec<String> = a.rows().into_iter().map(|r| format!("{r:?}")).collect();
+        let rows: Vec<String> = a
+            .test_application_rows()
+            .into_iter()
+            .map(|r| format!("{r:?}"))
+            .collect();
         assert!(rows[0].contains("\"2\""), "{text}: {rows:?}");
-        assert!(!has_desc(&a.plan, "(?sort)"), "{text}");
+        assert!(!has_desc(&a.plan(), "(?sort)"), "{text}");
     }
 }
 
@@ -2308,7 +2373,10 @@ fn order_keys_skip_a_bind_whose_variable_is_initially_bound() {
     let a = query(s.snapshot(), &text, &opts(Optimizations::ALL)).unwrap();
     let b = query(s.snapshot(), &text, &opts(Optimizations::NONE)).unwrap();
     let rows = |r: &QueryResult| -> Vec<String> {
-        r.rows().into_iter().map(|row| format!("{row:?}")).collect()
+        r.test_application_rows()
+            .into_iter()
+            .map(|row| format!("{row:?}"))
+            .collect()
     };
     assert_eq!(rows(&a), rows(&b));
     assert!(rows(&a)[0].contains("\"2\""), "{:?}", rows(&a));

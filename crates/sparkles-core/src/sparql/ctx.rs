@@ -724,6 +724,9 @@ pub struct Ctx {
     pub(super) read_source: Option<crate::store::BoundReadSource>,
     pub(super) source_preparation: Option<crate::access::Preparation>,
     pub(super) source_setup: Option<crate::access::Reservation>,
+    #[cfg(test)]
+    pub(super) chunk_hook:
+        parking_lot::Mutex<Option<Arc<dyn Fn(&'static str, usize) + Send + Sync>>>,
 }
 
 /// Set in [`FastMemory::live`] once the ledger has taken the account over.
@@ -1145,6 +1148,8 @@ impl Ctx {
             source_view: None,
             source_preparation: None,
             source_setup: None,
+            #[cfg(test)]
+            chunk_hook: parking_lot::Mutex::new(None),
             local: RwLock::new(AppendVocab::default()),
             values: Default::default(),
             next_bnode: AtomicU64::new(0),
@@ -2283,10 +2288,6 @@ impl Ctx {
             "output credit belongs to its query"
         );
         self.check_memory_failure()?;
-        let decode = |key: &[u8]| -> Result<Term> {
-            row.add(output_key_bytes(self, key, 0)?)?;
-            Ok(id::key_to_term(key))
-        };
         let term = match id.tag() {
             Tag::Undef => None,
             Tag::Local => {
@@ -2302,7 +2303,7 @@ impl Ctx {
                     None => None,
                     Some(bytes) => {
                         row.add(bytes)?;
-                        self.local.read().get(id.payload()).map(id::key_to_term)
+                        self.local.read().get(id.payload()).map(copied_output_key)
                     }
                 }
             }
@@ -2324,13 +2325,11 @@ impl Ctx {
                         self.snap
                             .generation
                             .dvocab
-                            .with(|vocab| vocab.get(id.payload()).map(id::key_to_term))
+                            .with(|vocab| vocab.get(id.payload()).map(copied_output_key))
                     }
                 }
             }
-            Tag::Vocab => self
-                .with_cursor_vocab_key(id.payload(), decode)?
-                .transpose()?,
+            Tag::Vocab => self.output_vocab_term(id.payload(), row)?,
             // Inline numbers/calendar values and blank-node labels have bounded
             // formatted text. This covers their strings and construction overlap.
             _ => {
@@ -2340,6 +2339,115 @@ impl Ctx {
         };
         self.check_memory_failure()?;
         Ok(term)
+    }
+
+    /// A vocabulary key and its final simple literal share one physical allocation.
+    /// Every capacity change stays on the actual output account, including realloc
+    /// overlap. Other key kinds keep the admitted copy path while scratch is alive.
+    fn output_vocab_term(&self, id: u64, row: &Charge<'_>) -> Result<Option<Term>> {
+        let base = row.bytes();
+        let total = |old: usize, new: usize| {
+            base.checked_add(old as u64)
+                .and_then(|n| n.checked_add(new as u64))
+                .ok_or_else(|| self.memory_exceeded(u64::MAX))
+        };
+        self.snap.generation.vocab.get_owned_with_controlled(
+            id,
+            |old, new| row.resize(total(old, new)?),
+            |capacity| row.resize(total(0, capacity)?),
+            |_| self.check(),
+            |key| self.output_owned_key(key, row),
+        )
+    }
+
+    fn output_owned_key(&self, mut key: Vec<u8>, row: &Charge<'_>) -> Result<Term> {
+        self.check()?;
+        let capacity = key.capacity() as u64;
+        #[cfg(test)]
+        {
+            self.chunk_event("owned-key-pointer", key.as_ptr() as usize);
+            self.chunk_event("owned-key-capacity", key.capacity());
+        }
+        self.check()?;
+        let term = if key.first() == Some(&b'"')
+            && key.last() == Some(&id::KEY_SEP)
+            && std::str::from_utf8(&key[1..key.len() - 1]).is_ok()
+        {
+            #[cfg(test)]
+            {
+                use crate::algo::memory::probe;
+                probe::at(probe::Point::Allocation("chunk-term", key.len()));
+                if probe::fails("chunk-term") {
+                    return Err(Error::invalid("injected chunk term allocation failure"));
+                }
+            }
+            // Move lexical bytes over the marker without allocating or shrinking
+            // capacity. Both markers' capacity stays paid until the literal drops.
+            let end = key.len() - 1;
+            key.copy_within(1..end, 0);
+            key.truncate(end - 1);
+            let value = String::from_utf8(key)
+                .map_err(|_| Error::Corrupt("invalid simple literal key".into()))?;
+            Term::Literal(oxrdf::Literal::new_simple_literal(value))
+        } else {
+            let term = self.output_key(&key, row)?;
+            drop(key);
+            row.resize(
+                row.bytes()
+                    .checked_sub(capacity)
+                    .ok_or_else(|| Error::invalid("missing output vocabulary scratch credit"))?,
+            )?;
+            term
+        };
+        if let Err(error) = self.check() {
+            drop(term);
+            return Err(error);
+        }
+        Ok(term)
+    }
+
+    #[cfg(test)]
+    pub(super) fn chunk_event(&self, stage: &'static str, count: usize) {
+        let hook = self.chunk_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(stage, count);
+        }
+    }
+
+    /// The sorted bulk decoder already borrows a reconstructed key. Admit its
+    /// actual owned representation before copying, under the same real context.
+    pub(super) fn output_key(&self, key: &[u8], storage: &Charge<'_>) -> Result<Term> {
+        if !std::ptr::eq(self, storage.ctx) {
+            return Err(Error::invalid(
+                "bulk output belongs to another query account",
+            ));
+        }
+        let decode = || {
+            self.check()?;
+            storage.add(output_key_bytes(self, key, 0)?)?;
+            #[cfg(test)]
+            {
+                use crate::algo::memory::probe;
+                probe::at(probe::Point::Allocation("chunk-term", key.len()));
+                if probe::fails("chunk-term") {
+                    return Err(Error::invalid("injected chunk term allocation failure"));
+                }
+            }
+            self.check()?;
+            let term = id::key_to_term(key);
+            #[cfg(test)]
+            self.chunk_event("term-copied", key.len());
+            if let Err(error) = self.check() {
+                drop(term);
+                return Err(error);
+            }
+            Ok(term)
+        };
+        if key.first() == Some(&b'(') {
+            super::depth::with_stack(crate::nesting::MAX_TRIPLE_TERMS, decode)
+        } else {
+            decode()
+        }
     }
 
     /// Reconstruction scratch is query-owned even when the vocabulary is mapped.
@@ -2775,7 +2883,23 @@ impl Ctx {
 /// outer Term slot already covered by its row. Ordinary lexical bytes are charged
 /// once, independently of the existing reconstruction envelope's eightfold policy.
 /// RDF-star nodes also cover their temporary component Vec and final boxed Triple.
+fn copied_output_key(key: &[u8]) -> Term {
+    if key.first() == Some(&b'(') {
+        super::depth::with_stack(crate::nesting::MAX_TRIPLE_TERMS, || id::key_to_term(key))
+    } else {
+        id::key_to_term(key)
+    }
+}
+
 fn output_key_bytes(ctx: &Ctx, key: &[u8], depth: usize) -> Result<u64> {
+    if depth == 0 && key.first() == Some(&b'(') {
+        return super::depth::with_stack(crate::nesting::MAX_TRIPLE_TERMS, || {
+            output_key_bytes_inner(ctx, key, depth)
+        });
+    }
+    output_key_bytes_inner(ctx, key, depth)
+}
+fn output_key_bytes_inner(ctx: &Ctx, key: &[u8], depth: usize) -> Result<u64> {
     let overflow = || ctx.memory_exceeded(u64::MAX);
     let malformed = || Error::Corrupt("invalid vocabulary triple-term key".into());
     if depth > crate::nesting::MAX_TRIPLE_TERMS {
@@ -2968,6 +3092,7 @@ impl Charge<'_> {
             ctx: ctx.clone(),
             owner,
             bytes,
+            exact_receiving: false,
         }
     }
 
@@ -3029,10 +3154,98 @@ pub(super) struct OutputCredit {
     ctx: Arc<Ctx>,
     owner: Option<u64>,
     bytes: u64,
+    exact_receiving: bool,
+}
+impl OutputCredit {
+    pub(super) fn receiving(ctx: &Arc<Ctx>, bytes: u64) -> Result<Self> {
+        // Ordinary parentless eager outputs keep their original lock-free account.
+        if ctx.source_preparation.is_none() {
+            return Ok(ctx.charge(bytes)?.into_output(ctx));
+        }
+        let ledger = ctx.memory();
+        let owner = ledger.owner(ctx.grant.as_ref())?;
+        ledger.reserve_receiving(&owner, ctx.mem_limit, bytes)?;
+        Ok(Self {
+            ctx: ctx.clone(),
+            owner: Some(owner.id),
+            bytes,
+            exact_receiving: true,
+        })
+    }
+    /// Move a worker's already paid payload contribution without releasing it.
+    /// Metadata buffers remain with their own original guard until they are freed.
+    pub(super) fn absorb_charge(&mut self, slot: &mut Option<Charge<'_>>) -> Result<()> {
+        let part = slot
+            .as_ref()
+            .ok_or_else(|| Error::invalid("missing worker credit"))?;
+        if self.exact_receiving
+            || !std::ptr::eq(Arc::as_ptr(&self.ctx), part.ctx)
+            || matches!((self.owner, part.owner.get()), (Some(a), Some(b)) if a != b)
+            || (part.bytes.get() != 0 && part.owner.get().is_none())
+        {
+            return Err(Error::invalid(
+                "worker payload belongs to another query account",
+            ));
+        }
+        let bytes = self
+            .bytes
+            .checked_add(part.bytes.get())
+            .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
+        let part = slot.take().expect("validated worker credit");
+        let owner = part.disarm();
+        self.owner = self.owner.or(owner);
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    pub(super) fn belongs_to(&self, ctx: &Ctx) -> bool {
+        std::ptr::eq(Arc::as_ptr(&self.ctx), ctx)
+    }
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+    pub(super) fn check(&self) -> Result<()> {
+        self.ctx.check()
+    }
+    pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
+        if self.exact_receiving {
+            let ledger = self.ctx.memory();
+            let id = self.owner.expect("receiving owner");
+            if bytes > self.bytes {
+                ledger.reserve_receiving(
+                    &ledger.owner_by_id(id),
+                    self.ctx.mem_limit,
+                    bytes - self.bytes,
+                )?;
+            } else if bytes < self.bytes {
+                ledger.release_receiving(id, self.bytes - bytes);
+            }
+            self.bytes = bytes;
+            return Ok(());
+        }
+        let held = Charge {
+            ctx: &self.ctx,
+            bytes: std::cell::Cell::new(self.bytes),
+            owner: std::cell::Cell::new(self.owner),
+        };
+        let result = held.resize(bytes);
+        let bytes = held.bytes();
+        let owner = held.disarm();
+        drop(held);
+        self.bytes = bytes;
+        self.owner = owner;
+        result
+    }
 }
 impl Drop for OutputCredit {
     fn drop(&mut self) {
-        self.ctx.release_live(self.owner, self.bytes);
+        if self.exact_receiving {
+            self.ctx
+                .memory()
+                .release_receiving(self.owner.expect("receiving owner"), self.bytes);
+        } else {
+            self.ctx.release_live(self.owner, self.bytes);
+        }
     }
 }
 
@@ -3048,6 +3261,24 @@ impl RetainedCharge {
     }
     pub(super) fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Transfer a previously validated live physical owner without returning its
+    /// bytes. The caller must validate the actual context before consuming it.
+    pub(super) fn into_output(mut self, ctx: &Arc<Ctx>) -> OutputCredit {
+        assert!(
+            std::ptr::eq(self.owner.as_ptr(), Arc::as_ptr(ctx)),
+            "retained output account owner"
+        );
+        let bytes = std::mem::take(&mut self.bytes);
+        let owner = self.id.take();
+        self.owner = Weak::new();
+        OutputCredit {
+            ctx: ctx.clone(),
+            owner,
+            bytes,
+            exact_receiving: false,
+        }
     }
     pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
         // A size that does not change takes neither the owner nor an account. A sort key
@@ -3166,6 +3397,30 @@ impl OwnedCharge {
     }
     pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
         self.lease.resize(self.ctx.mem_limit, bytes)
+    }
+    /// Adopt the actual predecoded payload guard; the existing cursor ledger is
+    /// required and checked before the source is consumed.
+    pub(super) fn adopt_charge(&mut self, source: &mut Option<Charge<'_>>) -> Result<()> {
+        let held = source
+            .as_ref()
+            .ok_or_else(|| Error::invalid("missing graph payload credit"))?;
+        if !held.belongs_to(&self.ctx)
+            || held.owner.get().is_some_and(|id| id != self.lease.owner.id)
+            || (held.bytes() != 0 && held.owner.get().is_none())
+        {
+            return Err(Error::invalid(
+                "graph payload belongs to another query account",
+            ));
+        }
+        let bytes = self
+            .lease
+            .bytes
+            .checked_add(held.bytes())
+            .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
+        let held = source.take().expect("validated graph payload");
+        held.disarm();
+        self.lease.bytes = bytes;
+        Ok(())
     }
     pub(super) fn into_parts(self) -> (Arc<Ctx>, QueryMemoryLease) {
         (self.ctx, self.lease)

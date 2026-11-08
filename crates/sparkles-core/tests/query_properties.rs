@@ -1620,7 +1620,7 @@ fn a_declared_prefix_output_streams_its_input() {
         let mut rows = Vec::new();
         while let Some(b) = c.next_batch()? {
             for i in 0..b.len() {
-                rows.push(b.row(i)?);
+                rows.push(b.row(i)?.values().to_vec());
             }
         }
         Ok(rows)

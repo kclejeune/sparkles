@@ -2,13 +2,11 @@
 
 use std::fmt;
 
-use oxrdf::Triple;
-
 use super::expr::{Expr, IntoExpr};
 use super::pattern::WhereBuilder;
 use super::render::{Pos, Renderer};
 use super::term::{IntoNode, Node};
-use crate::dataset::{Dataset, Solutions};
+use crate::dataset::{ConstructedGraph, Dataset, Solutions};
 use crate::{Error, Result};
 
 /// Prologue and parameter bindings shared by every builder.
@@ -389,7 +387,7 @@ impl ConstructBuilder {
     }
 
     /// Builds the query and runs it against `ds`.
-    pub fn execute(&self, ds: &Dataset) -> Result<Vec<Triple>> {
+    pub fn execute(&self, ds: &Dataset) -> Result<ConstructedGraph> {
         ds.construct(&self.build()?)
     }
 }
@@ -475,7 +473,7 @@ impl DescribeBuilder {
     }
 
     /// Builds the query and runs it against `ds` (the description triples).
-    pub fn execute(&self, ds: &Dataset) -> Result<Vec<Triple>> {
+    pub fn execute(&self, ds: &Dataset) -> Result<ConstructedGraph> {
         ds.construct(&self.build()?)
     }
 }

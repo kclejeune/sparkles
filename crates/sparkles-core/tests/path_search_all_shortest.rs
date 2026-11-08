@@ -492,7 +492,7 @@ fn one_cheapest_cycle_through_many_tied_ones() {
             &opts,
         )
         .unwrap_or_else(|e| panic!("{alg}: {e}"));
-        assert_eq!(r.rows().len(), n, "{alg}");
+        assert_eq!(r.len(), n, "{alg}");
     }
 }
 
@@ -557,7 +557,7 @@ fn one_cheapest_cycle_in_a_dense_zero_weight_graph() {
             &QueryOptions::default(),
         )
         .unwrap();
-        assert_eq!(r.rows().len(), 1, "{target} {alg}");
+        assert_eq!(r.len(), 1, "{target} {alg}");
         r.mem_peak_bytes
     };
     let pair = peak("ex:n1", "path:shortest");

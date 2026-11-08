@@ -49,7 +49,7 @@ fn computed_terms_beyond_the_budget_fail_the_query_in_both_modes() {
     let eager = query(s.snapshot(), Q, &budget(3 << 20));
     match eager {
         Err(error) => assert!(is_memory(&error), "{error:?}"),
-        Ok(r) => panic!("eager answered {} rows within the budget", r.rows().len()),
+        Ok(r) => panic!("eager answered {} rows within the budget", r.len()),
     }
 
     let cursor = (|| -> sparkles_core::Result<usize> {
@@ -57,7 +57,7 @@ fn computed_terms_beyond_the_budget_fail_the_query_in_both_modes() {
         let mut n = 0;
         while let Some(b) = c.next_batch()? {
             for i in 0..b.len() {
-                assert!(b.row(i)?.iter().all(Option::is_some));
+                assert!(b.row(i)?.values().iter().all(Option::is_some));
             }
             n += b.len();
         }
@@ -205,7 +205,7 @@ fn regular_expressions_on_rayon_workers_count_what_the_data_holds() {
                 let mut rows = Vec::new();
                 while let Some(b) = c.next_batch().unwrap() {
                     for i in 0..b.len() {
-                        rows.push(b.row(i).unwrap());
+                        rows.push(b.row(i).unwrap().values().to_vec());
                     }
                 }
                 assert_eq!(count(&rows), expected, "cursor {filter}");
@@ -236,7 +236,7 @@ fn a_long_literal_replacement_reserves_what_it_writes() {
     let mut rows = Vec::new();
     while let Some(b) = c.next_batch().unwrap() {
         for i in 0..b.len() {
-            rows.push(b.row(i).unwrap());
+            rows.push(b.row(i).unwrap().values().to_vec());
         }
     }
     assert_eq!(count(&rows), 20_000);
@@ -262,7 +262,7 @@ fn both_modes(
     options: &QueryOptions,
     batch_rows: usize,
 ) -> [sparkles_core::Result<usize>; 2] {
-    let eager = query(s.snapshot(), q, options).map(|r| r.rows().len());
+    let eager = query(s.snapshot(), q, options).map(|r| r.len());
     let cursor = (|| {
         let cursor_options = CursorOptions {
             batch_rows,

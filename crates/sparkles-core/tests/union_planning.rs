@@ -261,7 +261,7 @@ fn the_replanned_union_streams_across_requested_batch_sizes() {
         while let Some(batch) = cursor.next_batch().unwrap() {
             assert!(batch.len() <= rows);
             for row in 0..batch.len() {
-                actual.push(format!("{:?}", batch.row(row).unwrap()));
+                actual.push(format!("{:?}", batch.row(row).unwrap().values()));
             }
         }
         actual.sort();

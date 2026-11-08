@@ -168,8 +168,9 @@ fn main() {
                             while let Some(batch) = c.next_batch().unwrap() {
                                 stream_rows += batch.len();
                                 if last {
-                                    let rows: Vec<_> =
-                                        (0..batch.len()).map(|i| batch.row(i).unwrap()).collect();
+                                    let rows: Vec<_> = (0..batch.len())
+                                        .map(|i| batch.row(i).unwrap().values().to_vec())
+                                        .collect();
                                     stream_digest = stream_digest
                                         .wrapping_add(digest(rows.iter().map(Vec::as_slice)));
                                 }

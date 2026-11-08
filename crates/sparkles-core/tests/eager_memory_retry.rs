@@ -75,7 +75,7 @@ fn automatic(s: &Store, q: &str, opts: &QueryOptions) -> Result<(Rows, Option<St
             let mut rows = Vec::new();
             while let Some(b) = c.next_batch()? {
                 for i in 0..b.len() {
-                    rows.push(b.row(i).unwrap());
+                    rows.push(b.row(i).unwrap().values().to_vec());
                 }
             }
             Ok((rows, Some(c.plan_json()?)))

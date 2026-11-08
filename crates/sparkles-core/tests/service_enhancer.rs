@@ -577,7 +577,7 @@ fn a_limit_reaches_the_remote_query() {
                 }
                 n
             }
-            QueryExecution::Eager(r) => r.into_result().rows().len(),
+            QueryExecution::Eager(r) => r.into_result().len(),
             _ => unreachable!("a SELECT"),
         }
     };

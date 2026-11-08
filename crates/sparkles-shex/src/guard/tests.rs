@@ -713,7 +713,8 @@ fn verdicts(g: &ShexGuard, snap: &Arc<Snapshot>) -> Vec<(Term, crate::ShapeLabel
         .unwrap()
         .results
         .into_iter()
-        .map(|r| (r.node, r.shape, r.status))
+        // This test oracle deliberately makes an independent application model copy.
+        .map(|r| (r.node.as_term().clone(), r.shape, r.status))
         .collect()
 }
 

@@ -1306,3 +1306,74 @@ mod algo_catalog_registry_tests {
         assert_eq!(entries[0]["writes"], 2);
     }
 }
+
+#[cfg(test)]
+mod history_refusal_nonmutation_tests {
+    use crate::{
+        Error,
+        store::{Store, StoreOptions},
+    };
+    use std::{
+        collections::BTreeMap,
+        path::{Path, PathBuf},
+    };
+
+    fn metadata_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                let path = entry.path();
+                if kind.is_dir() {
+                    visit(root, &path, out);
+                } else {
+                    assert!(kind.is_file(), "fixture contains an unexpected non-file");
+                    if entry.file_name() != "sparkles.lock" {
+                        out.insert(
+                            path.strip_prefix(root).unwrap().to_path_buf(),
+                            std::fs::read(path).unwrap(),
+                        );
+                    }
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    #[test]
+    fn supported_corrupt_history_refuses_before_any_metadata_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("db");
+        drop(Store::open(&root, StoreOptions::default()).unwrap());
+        let path = root.join("dataset.json");
+        let mut dataset: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let original_id = crate::commit::read_dataset_file(&root).unwrap().unwrap();
+        dataset["minimumReader"] = 1.into();
+        dataset.as_object_mut().unwrap().remove("writtenBy");
+        std::fs::write(&path, serde_json::to_vec_pretty(&dataset).unwrap()).unwrap();
+        assert_eq!(
+            crate::commit::read_dataset_file(&root).unwrap(),
+            Some(original_id),
+            "real dataset identity is unchanged"
+        );
+        assert_eq!(super::settings_file("history.json").unwrap().writes, 2);
+        std::fs::write(root.join("history.json"), br#"{"format":2}"#).unwrap();
+        let before = metadata_files(&root);
+        let error = match Store::open(&root, StoreOptions::default()) {
+            Err(error) => error,
+            Ok(_) => panic!("supported malformed history must refuse"),
+        };
+        assert!(
+            matches!(error, Error::Corrupt(_)),
+            "current malformed history is corruption: {error}"
+        );
+        let after = metadata_files(&root);
+        assert_eq!(
+            after, before,
+            "a refused open must not mutate any metadata file"
+        );
+    }
+}

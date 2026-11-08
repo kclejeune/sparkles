@@ -790,7 +790,7 @@ mod betweenness_weight_domain {
                 leaf.counters.as_ref().unwrap()["cachedProjections"].as_u64(),
                 Some(1)
             );
-            assert_eq!(result.rows().len(), 4);
+            assert_eq!(result.len(), 4);
         }
 
         #[test]
@@ -1779,7 +1779,7 @@ fn graphalytics_clustering_reuses_distinct_default_projections() {
                 "{PREFIXES} SELECT ?n ?c WHERE {{ SERVICE algo:clustering {{ [] algo:predicate ex:p ; algo:graphalytics {mode} ; algo:node ?n ; algo:coefficient ?c }} }}"
             );
             let result = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
-            assert_eq!(result.rows().len(), 3);
+            assert_eq!(result.len(), 3);
             for row in result.rows() {
                 assert_eq!(short(&row[1]).parse::<f64>().unwrap(), expected);
             }
@@ -2220,7 +2220,7 @@ fn node2vec_service_budgets_walk_scratch_and_preserves_seeded_results() {
     };
     let options = QueryOptions::default();
     let short = query(s.snapshot(), &text(8), &options).unwrap();
-    assert_eq!(short.rows().len(), 2);
+    assert_eq!(short.len(), 2);
     let again = query(s.snapshot(), &text(8), &options).unwrap();
     assert_eq!(short.rows(), again.rows());
     // The same projection and embedding dimensions fit. The long walk's 200,000
@@ -2334,10 +2334,10 @@ fn r7_cached_incoming_requires_each_call_budget() {
     let warm = "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate ex:p ; algo:direction algo:forward ; algo:node ?n ; algo:component ?c } }";
     let opts = QueryOptions::default();
     let first = query(s.snapshot(), &format!("{PREFIXES}{warm}"), &opts).unwrap();
-    assert_eq!(first.rows().len(), 4096);
+    assert_eq!(first.len(), 4096);
     drop(first);
     let warmed = query(s.snapshot(), &format!("{PREFIXES}{warm}"), &opts).unwrap();
-    assert_eq!(warmed.rows().len(), 4096);
+    assert_eq!(warmed.len(), 4096);
     assert_eq!(
         find(&warmed.plan, "AlgoCall")
             .unwrap()
@@ -2363,7 +2363,7 @@ fn r7_cached_incoming_requires_each_call_budget() {
         &opts,
     )
     .unwrap();
-    assert_eq!(adequate.rows().len(), 4096);
+    assert_eq!(adequate.len(), 4096);
     let leaf = find(&adequate.plan, "AlgoCall").unwrap();
     assert_eq!(leaf.counters.as_ref().unwrap()["cachedProjections"], 1);
     println!(
@@ -2390,7 +2390,7 @@ fn r7_cached_incoming_requires_each_call_budget() {
         &opts,
     )
     .unwrap();
-    assert_eq!(unlimited.rows().len(), 4096);
+    assert_eq!(unlimited.len(), 4096);
     let leaf = find(&unlimited.plan, "AlgoCall").unwrap();
     assert_eq!(leaf.counters.as_ref().unwrap()["cachedProjections"], 1);
     assert_eq!(adequate.rows(), unlimited.rows());
