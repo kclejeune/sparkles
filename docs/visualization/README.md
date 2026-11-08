@@ -424,8 +424,8 @@ the IRI visible. Copying and navigation always keep the original IRI.
 
 ### Visual SHACL shape editor
 
-**SHACL shapes** in the Workbench opens `/ui/workbench/shapes`. The dataset's Validate
-panel also links to it. Choose a branch and one shapes graph, or enter a new graph IRI.
+**SHACL shapes** in the Workbench opens `/ui/workbench/shapes`
+([screenshot](../images/shape-editor.png)). The dataset's Validate panel also links to it. Choose a branch and one shapes graph, or enter a new graph IRI.
 The source line identifies the dataset, branch, stored graph and commit. The unnamed
 shapes graph is the stored default graph even when queries use a union default graph.
 Leave the graph field empty to edit it. Reserved default and union query selectors
@@ -445,8 +445,11 @@ Custom severities use an IRI, and literals retain their datatype, language and d
 Apply a field or path to the local draft before opening another shape or previewing.
 **Undo draft** and **Redo draft** move through up to 30 local draft states. **Preview
 commit** shows the exact RDF additions and removals, with at most 50 changed triples in
-the displayed diff. Commit uses the same source UUID, commit and precondition. Another writer's
+the displayed diff ([screenshot](../images/shape-editor-preview.png)). Commit uses the
+same source UUID, commit and precondition. Another writer's
 commit refuses the write and retains the draft until explicit discard and reload.
+While a preview is open, refreshes from the change feed wait until it closes, so the
+answer of a slow commit is still recorded for undo.
 **Undo commit** and **Redo commit** use the branch's revert operation and preserve stored
 blank-node identities. Protected branches offer **Start session**. The server applies
 the caller's graph, endpoint and write grants to every request.
@@ -466,7 +469,8 @@ at 2 MiB before parsing JSON and refuses incomplete or oversized reads. Triple-f
 views cannot establish a complete definition and do not enable editing. On a different
 branch, the editor first confirms unrestricted visibility through the SHACL route when
 the caller's branch grants are unknown. A refused confirmation leaves the source closed.
-Paths nest at most 64 levels. Unrecognized RDF stays intact and is visible in
+Paths nest at most 64 levels, and a path that reuses shared operands may expand to at
+most 1,000 steps. Unrecognized RDF stays intact and is visible in
 **Additional RDF** and **View Turtle**. A malformed path or list requires explicit
 replacement. Shared or annotated structures are retained when another field changes.
 

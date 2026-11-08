@@ -102,7 +102,10 @@ The strict `expect` commit IRI also checks the source UUID, so a foreign replica
 `prev` cannot bypass authoring preconditions after a dataset or branch is recreated.
 Committed undo and redo use reverts. A refresh retains active field buffers and dirty
 drafts at their original revision, and a moved or failed source disables submission.
-Discard and reload is explicit. Protected branches use session branches, and the server
+Discard and reload is explicit. Every accepted refresh remounts the field forms, so a
+form never keeps a list or path buffer from an earlier revision. Change-feed refreshes
+wait while a preview is open, so a commit whose answer arrives after the feed announced
+it is still recorded for undo. Protected branches use session branches, and the server
 retains its graph, endpoint and write authorization.
 
 Live sample checks use the complete draft and explicit focus nodes or the declared
@@ -120,7 +123,9 @@ the stored default graph is selected by leaving the graph field empty.
 
 The editor refuses graph reads above 5,000 triples or a 2 MiB decoded response before
 JSON materialization, as well as incomplete reads and unconfirmed triple visibility.
-Paths nest at most 64 levels. It retains at most 30 draft states, validates at most 100
+Paths nest at most 64 levels and expand to at most 1,000 steps, which bounds acyclic
+paths that reuse shared operands. A replacement path or list is checked against the
+triple limit after the structure it replaces is collected. It retains at most 30 draft states, validates at most 100
 explicit sample nodes, displays at most 100 sample results and previews 50 changed
 triples. The full graph remains the basis of every patch. A larger graph is refused
 rather than opened as an editable partial definition. The extra session memory grows

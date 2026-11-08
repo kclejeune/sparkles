@@ -175,14 +175,14 @@ the floor.
    layout of item 722.
 
 The workbench UI runs as one stream of about two lanes beside the engine work. After the
-DL Query tab, the SKOS editor and the web UI shell of item 632 come these, in order:
+DL Query tab, the SKOS editor, the web UI shell of item 632 and the visual SHACL shape
+editor of item 617 come these, in order:
 1. Inferred axioms in entity frames (622), with the inferred property and individual
    trees of item 609. Their explanation links wait for F24's justifications.
-2. The visual SHACL shape editor of item 617.
-3. Entity history (620), discussions (618) and watches (619), the last after the
+2. Entity history (620), discussions (618) and watches (619), the last after the
    notifications of item 46.
-4. Import resolution (624), bulk edits (626) and pattern-based axiom generation (623).
-5. Vocabulary governance and change requests (627), after item 459.
+3. Import resolution (624), bulk edits (626) and pattern-based axiom generation (623).
+4. Vocabulary governance and change requests (627), after item 459.
 
 Tagging documents with concepts (628) belongs to Wave B's ingest work, and real-time
 co-editing (629) comes last.
@@ -602,7 +602,7 @@ and shared capability work above. Each phase keeps its declared prerequisites an
 | 19 | **Query-time reasoning.** Phase 2 adds `auto` with its cost model, the dataset setting, hybrid Jena rules, OWL 2 QL rewriting, reuse of tables across commits, the MCP argument, the UI and the G08 mapping. Phase 3 keeps tables current through F13 after item 417, and adds `why` provenance on tables for F18. Items 190 and 193 cover Phase 1's remaining per-query costs and DESCRIBE support. | [F17](specs/F17-query-time-reasoning.md#outcome) | L | High |
 | 25 | **Query extension completion.** Dynamic dispatch, foreign callbacks, batching, additional aggregate arities and measurements remain, including native Java dispatch beside ARQ. | [P03](specs/P03-query-extensions.md#roadmap-follow-ups-2026-10-12) | M | Medium |
 | 27 | **Live query profiling and verified rewrites.** The static plan overlay is available. The running-query registry, live operator progress and hotspot views remain planned, followed by C18 Phase 6's result-equivalent rewrite suggestions and their integration in the live plan. | [U04](specs/U04-live-query-profiling.md), [C18](specs/C18-natural-language-questions-and-ingest/README.md) Phase 6 | M | Medium |
-| 457 | **Ontology workbench.** Sparkles reads, checks, edits and classifies ontologies by OWL 2 EL but cannot refactor or explain them as ontology tools do. Item 71's axiom model is the base for OWL syntaxes, refactoring, diffs, module extraction and OWL and SHACL translation in F21, the DL bridge, inferred-axiom export, justifications and repairs in F24 after item 580's EL classifier, and the editable schema diagram in U12, whose ontology editor, DL Query tab and thesaurus editor are available. A Manchester reader of class expressions and one-line axioms is available, and whole Manchester documents remain in F21's syntaxes phase. Classification stays separate from the reasoner core of item 456. | [F21](specs/F21-ontology-api.md#ontology-workbench-workstream), [U12](specs/U12-ontology-workbench/SPEC.md#outcome) | XL | High |
+| 457 | **Ontology workbench.** Sparkles reads, checks, edits and classifies ontologies by OWL 2 EL but cannot refactor or explain them as ontology tools do. Item 71's axiom model is the base for OWL syntaxes, refactoring, diffs, module extraction and OWL and SHACL translation in F21, the DL bridge, inferred-axiom export, justifications and repairs in F24 after item 580's EL classifier, and the editable schema diagram in U12, whose ontology editor, DL Query tab, thesaurus editor and visual SHACL shape editor are available. A Manchester reader of class expressions and one-line axioms is available, and whole Manchester documents remain in F21's syntaxes phase. Classification stays separate from the reasoner core of item 456. | [F21](specs/F21-ontology-api.md#ontology-workbench-workstream), [U12](specs/U12-ontology-workbench/SPEC.md#outcome) | XL | High |
 | 539 | **Ontology read budget, controls and scale.** Refuse reads above F21 §4.5's configured triple count with `507` and code `ontology-size`, and measure reads, checks and edits on LUBM and large OBO ontologies against A7. Carry primary and composed cancellation and deadlines through retained-state resolution, cache access, cold generation decoding and replay, with request and server admission accounting for complete preparation. Cold historical preparation currently polls primary cancellation and deadlines, while additional composed cancellation is checked around that preparation. | [F21](specs/F21-ontology-api.md#outcome) | S | Medium |
 | 559 | **Fetched ontology imports.** Let an ontology read fetch an `owl:imports` target that is not a graph of the dataset, through the outbound policy and only when the caller asks for it, as the reasoner's `imports: fetch` does. Reads now follow imports to graphs of the dataset only. | [F21](specs/F21-ontology-api.md#outcome) | S | Medium |
 | 565 | **Inferred ontology reads over MCP and the CLI.** Give the MCP ontology tool and the CLI's ontology commands the `inferences` member that the library, the bindings and the HTTP routes take, with the freshness of the inferences in the answer. These surfaces now read the asserted axioms only. | [F21](specs/F21-ontology-api.md#outcome) | S | Low |
@@ -843,7 +843,6 @@ Rows that need backend work name it first.
 | 658 | **Entity search at a past commit and with inferences.** The entity search reads the head of a branch and refuses `at` and `inferences`. Search a retained commit through a temporary index, and include the kinds and labels that reasoning infers, such as inferred classes and SKOS concepts typed through sub-properties. | [U12](specs/U12-ontology-workbench/SPEC.md#ontology-browser-search) | M |
 | 659 | **Word segmentation in entity search.** The entity search splits words at spaces, punctuation, camel case and digits, so a Japanese, Chinese or Thai label matches only as a whole text or a prefix of it. Segment such labels with the dictionaries of the text index. | [U12](specs/U12-ontology-workbench/SPEC.md#ontology-browser-search) | S |
 | 660 | **One entity search across the ontology pages.** The ontology editor's tree filter uses the entity search, while the thesaurus editor's label search scans labels for a substring and DL Query completes entity names on its own. Move them to `GET /$/ontology/{ds}/search`, which ranks and tolerates typos at ChEBI's size. | [U12](specs/U12-ontology-workbench/SPEC.md#ontology-browser-search) | S |
-| 617 | **Visual SHACL shape editor.** Author node and property shapes as trees and forms, with Core targets and constraints, recursive paths and severities, previewed as exact graph commits and validated live against sample data at the source revision. Preserve unrelated RDF, graph and branch identity beside the Turtle and SHACLC text. | [U12](specs/U12-ontology-workbench/SPEC.md#visual-shacl-shape-editor) | L |
 | 618 | **Discussions on entities.** Comment threads on an entity or axiom with mentions, resolve and reopen, shown in the entity frame and listed per ontology, as WebProtégé offers. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | M |
 | 619 | **Watches on entities.** Let a user watch an entity or its subtree and be told of commits that change it, through the notifications of item 46. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | S–M |
 | 620 | **Entity history.** A history tab in the entity frame listing the commits that changed the entity's axioms and annotations, with diffs and revert. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | S–M |
@@ -972,6 +971,8 @@ for them.
 | 70 | **Jena-compatible GeoSPARQL mode.** Not adopted. Sparkles keeps the answers that [COMPARISON.md](COMPARISON.md#geosparql) describes, and the number stays listed so that it is not reused. | [G01](specs/G01-geosparql/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
 
 ## Completed
+
+- **617.** The Workbench's SHACL shapes page authors node and property shapes through a tree and forms, with Core targets and constraints, recursive property paths and severities. Each draft is previewed and committed as one exact graph patch pinned to the source branch UUID and commit, and committed edits are undone through reverts. Live sample checks run against the draft at that revision, and RDF the forms do not recognize is preserved beside the Turtle and SHACLC text validator. [U12](specs/U12-ontology-workbench/SPEC.md#visual-shacl-shape-editor)
 
 - **760.** Normal CI and batch gates retain each selected nextest profile’s JUnit report and managed-target metadata under the original target lease. The retained manifest distinguishes test results from retention failures, and verification checks the retained bytes without compiler targets. [DEVELOPMENT](DEVELOPMENT.md#batch-gate)
 
