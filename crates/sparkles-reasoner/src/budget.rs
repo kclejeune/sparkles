@@ -23,6 +23,8 @@
 //! the limit when that is smaller, and keeps up to two steps of what it frees. The
 //! steps held unused count against the limit and in the peak.
 
+use parking_lot::Mutex;
+use sparkles_budget::{DomainId, MemoryLease, MemoryParent, ParentRefused, Scope};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -44,6 +46,121 @@ impl MemoryExceeded {
     }
 }
 
+/// Private failure preserves the public local error's downcast and the exact
+/// parent scope. It deliberately has no StdError implementation: conversion into
+/// anyhow unwraps Local instead of hiding it behind a new public root error.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{0}")]
+struct ParentFailureContext(String);
+
+#[derive(Debug, Clone)]
+pub(crate) enum BudgetFailure {
+    Local(MemoryExceeded),
+    Parent {
+        refusal: ParentRefused,
+        context: String,
+    },
+}
+impl BudgetFailure {
+    pub fn local(limit: usize, context: String) -> Self {
+        Self::Local(MemoryExceeded { limit, context })
+    }
+    pub fn with_context(mut self, context: String) -> Self {
+        match &mut self {
+            Self::Local(error) => {
+                if error.context.is_empty() {
+                    error.context = context;
+                }
+            }
+            Self::Parent { context: first, .. } => {
+                if first.is_empty() {
+                    *first = context;
+                }
+            }
+        }
+        self
+    }
+
+    pub fn parent(refusal: ParentRefused) -> Self {
+        Self::Parent {
+            refusal,
+            context: String::new(),
+        }
+    }
+
+    pub fn core_error(&self) -> Option<sparkles_core::Error> {
+        let Self::Parent {
+            refusal:
+                ParentRefused::Limit {
+                    limit,
+                    requested,
+                    scope,
+                },
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some(sparkles_core::Error::BudgetExceeded(
+            sparkles_core::Budget {
+                kind: match scope {
+                    Scope::Local => sparkles_core::BudgetKind::Memory,
+                    Scope::Work | Scope::Retained => sparkles_core::BudgetKind::ServerMemory,
+                },
+                limit: *limit,
+                requested: *requested,
+            },
+        ))
+    }
+
+    /// Recover a typed budget error from an anyhow chain without string matching.
+    pub fn from_anyhow(error: &anyhow::Error) -> Option<Self> {
+        if let Some(local) = error.downcast_ref::<MemoryExceeded>() {
+            return Some(Self::Local(local.clone()));
+        }
+        error
+            .downcast_ref::<ParentRefused>()
+            .copied()
+            .map(|refusal| Self::Parent {
+                refusal,
+                context: error
+                    .downcast_ref::<ParentFailureContext>()
+                    .map_or_else(String::new, |c| c.0.clone()),
+            })
+    }
+}
+impl From<MemoryExceeded> for BudgetFailure {
+    fn from(error: MemoryExceeded) -> Self {
+        Self::Local(error)
+    }
+}
+impl std::fmt::Display for BudgetFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(error) => error.fmt(f),
+            Self::Parent { refusal, context } => write!(f, "{refusal}{context}"),
+        }
+    }
+}
+impl From<BudgetFailure> for anyhow::Error {
+    fn from(error: BudgetFailure) -> Self {
+        let core = error.core_error();
+        match error {
+            BudgetFailure::Local(local) => anyhow::Error::new(local),
+            BudgetFailure::Parent { refusal, context } => {
+                let mut error = anyhow::Error::new(refusal);
+                if let Some(core) = core {
+                    error = error.context(core);
+                }
+                if !context.is_empty() {
+                    error = error.context(ParentFailureContext(context));
+                }
+                error
+            }
+        }
+    }
+}
+
 /// The memory a run has charged, its peak and its limit.
 pub(crate) struct Budget {
     limit: usize,
@@ -51,7 +168,19 @@ pub(crate) struct Budget {
     step: usize,
     used: AtomicUsize,
     peak: AtomicUsize,
+    parent: Option<Backing>,
 }
+
+/// One owned parent reservation. The atomic is the fast-path published coverage;
+/// the mutex serializes extensions and detaching retired credit, never its release.
+struct Backing {
+    parent: Arc<dyn MemoryParent>,
+    domain: DomainId,
+    reserved: AtomicUsize,
+    lease: Mutex<MemoryLease>,
+}
+const PARENT_STEP: usize = 64 << 10;
+const PARENT_SLACK: usize = 1 << 20;
 
 impl std::fmt::Debug for Budget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -59,93 +188,184 @@ impl std::fmt::Debug for Budget {
             .field("limit", &self.limit)
             .field("used", &self.used())
             .field("peak", &self.peak())
+            .field("domain", &self.parent.as_ref().map(|p| &p.domain))
             .finish()
     }
 }
 
 impl Budget {
     pub fn new(limit: Option<usize>) -> Arc<Budget> {
+        Self::with_parent(limit, None)
+    }
+
+    pub fn with_parent(limit: Option<usize>, parent: Option<Arc<dyn MemoryParent>>) -> Arc<Budget> {
         Arc::new(Budget {
             limit: limit.unwrap_or(usize::MAX),
             step: limit.map_or(MAX_STEP, |l| (l >> STEP_SHIFT).min(MAX_STEP)),
             used: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            parent: parent.map(|parent| Backing {
+                domain: parent.domain(),
+                // All MemoryParent implementations are sealed; zero never invokes
+                // a backend and cannot refuse or allocate reservation credit.
+                lease: Mutex::new(parent.clone().reserve(0).expect("zero reservation")),
+                reserved: AtomicUsize::new(0),
+                parent,
+            }),
         })
     }
 
     pub fn unlimited() -> Arc<Budget> {
         Budget::new(None)
     }
-
     pub fn used(&self) -> usize {
-        self.used.load(Ordering::Relaxed)
+        self.used.load(Ordering::SeqCst)
     }
-
     pub fn available(&self) -> usize {
         self.limit.saturating_sub(self.used())
     }
-
     pub fn peak(&self) -> usize {
         self.peak.load(Ordering::Relaxed)
     }
-
-    fn exceeded(&self) -> MemoryExceeded {
-        MemoryExceeded {
+    pub fn parent(&self) -> Option<Arc<dyn MemoryParent>> {
+        self.parent.as_ref().map(|p| p.parent.clone())
+    }
+    pub fn domain(&self) -> DomainId {
+        self.parent.as_ref().map_or_else(
+            || sparkles_budget::MemoryDomain::unpooled().id(),
+            |p| p.domain.clone(),
+        )
+    }
+    fn exceeded(&self) -> BudgetFailure {
+        BudgetFailure::Local(MemoryExceeded {
             limit: self.limit,
             context: String::new(),
+        })
+    }
+    fn overflow(&self) -> BudgetFailure {
+        if self.parent.is_some() {
+            BudgetFailure::parent(ParentRefused::Overflow)
+        } else {
+            self.exceeded()
         }
     }
-
-    /// Charge `n` bytes, or fail without charging when that passes the limit.
-    pub fn try_charge(&self, n: usize) -> Result<(), MemoryExceeded> {
-        if n == 0 {
-            return Ok(());
-        }
-        let mut cur = self.used.load(Ordering::Relaxed);
+    fn add_usage(&self, n: usize, strict: bool) -> Result<usize, BudgetFailure> {
+        let mut cur = self.used.load(Ordering::SeqCst);
         loop {
-            let next = match cur.checked_add(n) {
-                Some(x) if x <= self.limit => x,
-                _ => return Err(self.exceeded()),
-            };
+            let next = cur.checked_add(n).ok_or_else(|| self.overflow())?;
+            if strict && next > self.limit {
+                return Err(self.exceeded());
+            }
             match self
                 .used
-                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::SeqCst)
             {
-                Ok(_) => {
-                    self.peak.fetch_max(next, Ordering::Relaxed);
-                    return Ok(());
-                }
-                Err(x) => cur = x,
+                Ok(_) => return Ok(next),
+                Err(now) => cur = now,
             }
         }
     }
-
-    /// Charge `n` bytes that are already allocated, even past the limit.
-    pub fn charge(&self, n: usize) {
+    /// Charge before allocation. Parent-backed usage is covered before acceptance.
+    pub fn try_charge(&self, n: usize) -> Result<(), BudgetFailure> {
+        if n == 0 {
+            return Ok(());
+        }
+        let next = self.add_usage(n, true)?;
+        if let Some(parent) = &self.parent {
+            if next > parent.reserved.load(Ordering::SeqCst) {
+                self.used.fetch_sub(n, Ordering::SeqCst);
+                let mut lease = parent.lease.lock();
+                let next = self.add_usage(n, true)?;
+                if let Err(error) = self.grow_locked(parent, &mut lease, next) {
+                    self.used.fetch_sub(n, Ordering::SeqCst);
+                    return Err(BudgetFailure::parent(error));
+                }
+                self.peak.fetch_max(next, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
+        self.peak.fetch_max(next, Ordering::Relaxed);
+        Ok(())
+    }
+    fn grow_locked(
+        &self,
+        parent: &Backing,
+        lease: &mut MemoryLease,
+        need: usize,
+    ) -> Result<(), ParentRefused> {
+        let need = need.max(self.used.load(Ordering::SeqCst));
+        let cur = parent.reserved.load(Ordering::SeqCst);
+        if need <= cur {
+            return Ok(());
+        }
+        let ahead = need.checked_next_multiple_of(PARENT_STEP).unwrap_or(need);
+        let grow = |lease: &mut MemoryLease, target: usize| {
+            lease.try_grow(u64::try_from(target - cur).map_err(|_| ParentRefused::Overflow)?)
+        };
+        let target = match grow(lease, ahead) {
+            Ok(()) => ahead,
+            Err(ParentRefused::Limit { .. } | ParentRefused::Overflow) if ahead > need => {
+                grow(lease, need)?;
+                need
+            }
+            Err(error) => return Err(error),
+        };
+        parent.reserved.store(target, Ordering::SeqCst);
+        Ok(())
+    }
+    /// Compatibility accounting for already allocated unpooled state. A parent
+    /// always requires strict pre-admission; its refusal must be propagated.
+    pub fn charge(&self, n: usize) -> Result<(), BudgetFailure> {
+        if self.parent.is_some() {
+            return self.try_charge(n);
+        }
+        let next = self.add_usage(n, false)?;
+        self.peak.fetch_max(next, Ordering::Relaxed);
+        Ok(())
+    }
+    pub fn release(&self, n: usize) {
         if n == 0 {
             return;
         }
-        let next = self.used.fetch_add(n, Ordering::AcqRel).saturating_add(n);
-        self.peak.fetch_max(next, Ordering::Relaxed);
-    }
-
-    pub fn release(&self, n: usize) {
-        if n > 0 {
-            self.used.fetch_sub(n, Ordering::AcqRel);
+        let prior = self.used.fetch_sub(n, Ordering::SeqCst);
+        assert!(prior >= n, "release only owned reasoning bytes");
+        if let Some(parent) = &self.parent {
+            if parent.reserved.load(Ordering::SeqCst)
+                > (prior - n).saturating_add(PARENT_SLACK + PARENT_STEP)
+            {
+                self.trim(parent);
+            }
         }
     }
-
-    /// Fail when the charges passed the limit (through [`charge`](Self::charge)).
-    pub fn check(&self) -> Result<(), MemoryExceeded> {
+    fn trim(&self, parent: &Backing) {
+        let mut lease = parent.lease.lock();
+        let cur = parent.reserved.load(Ordering::SeqCst);
+        let keep = |used: usize| {
+            used.checked_next_multiple_of(PARENT_STEP)
+                .unwrap_or(cur)
+                .min(cur)
+        };
+        let first = keep(self.used.load(Ordering::SeqCst));
+        if first >= cur {
+            return;
+        }
+        // Sequentially consistent publication/read pairing with fast chargers.
+        parent.reserved.store(first, Ordering::SeqCst);
+        let final_keep = keep(self.used.load(Ordering::SeqCst)).max(first);
+        parent.reserved.store(final_keep, Ordering::SeqCst);
+        let retired = lease
+            .split(u64::try_from(cur - final_keep).expect("backed credit fits u64"))
+            .expect("split only owned parent credit");
+        drop(lease);
+        drop(retired);
+    }
+    pub fn check(&self) -> Result<(), BudgetFailure> {
         if self.used() > self.limit {
             return Err(self.exceeded());
         }
         Ok(())
     }
-
-    /// Fail when the charges ever passed the limit, also when they are back under it:
-    /// a run that reports success reports a peak within its limit.
-    pub fn check_peak(&self) -> Result<(), MemoryExceeded> {
+    pub fn check_peak(&self) -> Result<(), BudgetFailure> {
         if self.peak() > self.limit {
             return Err(self.exceeded());
         }
@@ -187,10 +407,40 @@ impl Held {
     }
 
     /// `n` bytes charged, or the error when they do not fit.
-    pub fn try_new(budget: &Arc<Budget>, n: usize) -> Result<Held, MemoryExceeded> {
+    pub fn try_new(budget: &Arc<Budget>, n: usize) -> Result<Held, BudgetFailure> {
         let mut h = Held::new(budget);
         h.try_grow(n)?;
         Ok(h)
+    }
+
+    /// Exact prepared ownership, without adding a holder-credit layer. Used to
+    /// prepare a complete migration or publication before touching its old owner.
+    pub fn try_new_exact(budget: &Arc<Budget>, n: usize) -> Result<Held, BudgetFailure> {
+        Self::new_exact_mode(budget, n, true)
+    }
+
+    pub fn new_exact_mode(
+        budget: &Arc<Budget>,
+        n: usize,
+        strict: bool,
+    ) -> Result<Held, BudgetFailure> {
+        if strict {
+            budget.try_charge(n)?;
+        } else {
+            budget.charge(n)?;
+        }
+        Ok(Held {
+            budget: budget.clone(),
+            bytes: n,
+            credit: 0,
+        })
+    }
+
+    /// Hand already charged bytes to another counter of the identical budget.
+    /// Call only after publication, outside locks if unused credit can return.
+    pub fn into_bytes(mut self) -> usize {
+        self.budget.release(std::mem::take(&mut self.credit));
+        std::mem::take(&mut self.bytes)
     }
 
     pub fn bytes(&self) -> usize {
@@ -201,22 +451,31 @@ impl Held {
         &self.budget
     }
 
-    pub fn try_grow(&mut self, n: usize) -> Result<(), MemoryExceeded> {
+    pub fn try_grow(&mut self, n: usize) -> Result<(), BudgetFailure> {
+        let next = self
+            .bytes
+            .checked_add(n)
+            .ok_or_else(|| self.budget.overflow())?;
         if n > self.credit {
             take(&self.budget, n, &mut self.credit)?;
         }
         self.credit -= n;
-        self.bytes += n;
+        self.bytes = next;
         Ok(())
     }
 
-    pub fn grow(&mut self, n: usize) {
+    pub fn grow(&mut self, n: usize) -> Result<(), BudgetFailure> {
+        let next = self
+            .bytes
+            .checked_add(n)
+            .ok_or_else(|| self.budget.overflow())?;
         if n > self.credit {
-            self.budget.charge(n - self.credit);
+            self.budget.charge(n - self.credit)?;
             self.credit = n;
         }
         self.credit -= n;
-        self.bytes += n;
+        self.bytes = next;
+        Ok(())
     }
 
     pub fn shrink(&mut self, n: usize) {
@@ -227,16 +486,17 @@ impl Held {
     }
 
     /// Hold `n` bytes: grow (even past the limit) or shrink to it.
-    pub fn set(&mut self, n: usize) {
+    pub fn set(&mut self, n: usize) -> Result<(), BudgetFailure> {
         if n > self.bytes {
-            self.grow(n - self.bytes);
+            self.grow(n - self.bytes)?;
         } else {
             self.shrink(self.bytes - n);
         }
+        Ok(())
     }
 
     /// [`set`](Self::set), failing without growing when the growth does not fit.
-    pub fn try_set(&mut self, n: usize) -> Result<(), MemoryExceeded> {
+    pub fn try_set(&mut self, n: usize) -> Result<(), BudgetFailure> {
         if n > self.bytes {
             self.try_grow(n - self.bytes)
         } else {
@@ -256,6 +516,21 @@ impl Held {
         }
     }
 
+    /// Transfer actual owned bytes between holders of the identical budget.
+    /// Failure leaves both holders unchanged; their payloads still have credit.
+    pub fn try_merge(&mut self, other: &mut Held) -> Result<(), BudgetFailure> {
+        if !Arc::ptr_eq(&self.budget, &other.budget) {
+            return Err(BudgetFailure::parent(ParentRefused::DifferentParent));
+        }
+        let total = self
+            .bytes
+            .checked_add(other.bytes)
+            .ok_or_else(|| self.budget.overflow())?;
+        self.bytes = total;
+        other.bytes = 0;
+        Ok(())
+    }
+
     /// Take the bytes of `other` over.
     pub fn absorb(&mut self, mut other: Held) {
         self.bytes += std::mem::take(&mut other.bytes);
@@ -271,9 +546,9 @@ impl Drop for Held {
 /// Charge `n` bytes more than `credit` holds, with a step beyond when that fits, and
 /// add them to `credit`.
 #[inline]
-fn take(budget: &Budget, n: usize, credit: &mut usize) -> Result<(), MemoryExceeded> {
+fn take(budget: &Budget, n: usize, credit: &mut usize) -> Result<(), BudgetFailure> {
     let need = n - *credit;
-    let want = need.saturating_add(budget.step);
+    let want = need.checked_add(budget.step).unwrap_or(need);
     if budget.try_charge(want).is_ok() {
         *credit += want;
     } else {
@@ -322,17 +597,21 @@ impl<'b> Meter<'b> {
     }
 
     #[inline]
-    pub fn add(&mut self, n: usize) -> Result<(), MemoryExceeded> {
+    pub fn add(&mut self, n: usize) -> Result<(), BudgetFailure> {
+        let next = self
+            .bytes
+            .checked_add(n)
+            .ok_or_else(|| self.budget.overflow())?;
         if n > self.credit {
             if self.strict {
                 take(self.budget, n, &mut self.credit)?;
             } else {
-                self.budget.charge(n - self.credit);
+                self.budget.charge(n - self.credit)?;
                 self.credit = n;
             }
         }
         self.credit -= n;
-        self.bytes += n;
+        self.bytes = next;
         Ok(())
     }
 
@@ -454,7 +733,7 @@ mod tests {
         assert_eq!(b.used(), 10);
         h.try_grow(90).unwrap();
         assert_eq!(b.used(), 100);
-        b.charge(200);
+        b.charge(200).unwrap();
         assert!(b.check().is_err());
         b.release(200);
         drop(h);
@@ -509,3 +788,9 @@ mod tests {
         assert_eq!(b.used(), 0);
     }
 }
+
+#[cfg(test)]
+mod parent_tests;
+
+mod warnings;
+pub(crate) use warnings::{WorkingWarnings, format_len};

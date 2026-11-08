@@ -434,7 +434,7 @@ pub(crate) fn parse_rfc3339_offset(s: &str) -> Option<i64> {
 /// vocabularies, see [`crate::vocab::delta`], 5: write-ahead logs with a header record,
 /// see [`crate::store::wal`], 6: protected managed graphs, `managed.json`, see
 /// [`crate::managed`], 7: durable source holds, `holds.json`, see [`crate::holds`]). [`crate::formats::DATASET`] lists them.
-pub const DATASET_READER: u32 = 7;
+pub const DATASET_READER: u32 = 8;
 fn legacy_reader() -> u32 {
     1
 }
@@ -850,6 +850,8 @@ struct GenCommitFile {
     /// files written before the member existed, and for logs with a header record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     wal_strict_from: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    configuration_binding: Option<crate::history::ConfigurationBinding>,
     /// Members this build does not know, added by a later release under the additive
     /// rule of X12 section 4.3. They are kept when the file is rewritten.
     #[serde(flatten)]
@@ -884,12 +886,17 @@ fn yes() -> bool {
 }
 
 pub(crate) fn gen_commit_bytes(dataset_id: uuid::Uuid, origin: &str, c: &CommitInfo) -> Vec<u8> {
-    serde_json::to_vec_pretty(&GenCommitFile {
+    serde_json::to_vec_pretty(&gen_commit_file(dataset_id, origin, c)).unwrap()
+}
+
+fn gen_commit_file(dataset_id: uuid::Uuid, origin: &str, c: &CommitInfo) -> GenCommitFile {
+    GenCommitFile {
         format: 1,
         dataset_id,
         base_seq: c.seq,
         origin: origin.to_string(),
         wal_strict_from: None,
+        configuration_binding: None,
         extra: Default::default(),
         commit: CommitJson {
             seq: c.seq,
@@ -906,8 +913,19 @@ pub(crate) fn gen_commit_bytes(dataset_id: uuid::Uuid, origin: &str, c: &CommitI
             unvalidated: c.unvalidated,
             extra: Default::default(),
         },
-    })
-    .unwrap()
+    }
+}
+
+pub(crate) fn gen_commit_bytes_with_binding(
+    dataset_id: uuid::Uuid,
+    origin: &str,
+    c: &CommitInfo,
+    binding: crate::history::ConfigurationBinding,
+) -> Vec<u8> {
+    let mut file = gen_commit_file(dataset_id, origin, c);
+    file.format = 2;
+    file.configuration_binding = Some(binding);
+    serde_json::to_vec_pretty(&file).expect("generation commit serializes")
 }
 
 /// The commit a generation's base index holds, from `gen-NNNN/commit.json`, with the
@@ -931,6 +949,7 @@ pub(crate) struct RetainedGenerationCommit {
     pub(crate) commit: CommitInfo,
     pub(crate) origin: String,
     pub(crate) wal_strict_from: Option<u64>,
+    pub(crate) configuration: crate::history::ConfigurationBinding,
 }
 
 fn decode_gen_commit_file(f: GenCommitFile, path: &Path) -> Result<RetainedGenerationCommit> {
@@ -954,6 +973,7 @@ fn decode_gen_commit_file(f: GenCommitFile, path: &Path) -> Result<RetainedGener
         },
         origin: f.origin,
         wal_strict_from: f.wal_strict_from,
+        configuration: f.configuration_binding.unwrap_or_default(),
     })
 }
 
@@ -975,6 +995,7 @@ pub(crate) fn read_gen_commit_controlled(
         let parsed: crate::store::cold::Loaded<serde_json::Value> = budget.json(&bytes)?;
         check_gen_commit_value(&path, &parsed.value)?;
         let file: GenCommitFile = budget.value(parsed.value)?;
+        check_gen_binding(&path, &file, &bytes)?;
         budget.drop_vec(bytes);
         let value = decode_gen_commit_file(file, &path)?;
         let charge =
@@ -999,7 +1020,43 @@ fn parse_gen_commit(path: &Path, b: &[u8]) -> Result<GenCommitFile> {
     let value: serde_json::Value = serde_json::from_slice(b)
         .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
     check_gen_commit_value(path, &value)?;
-    serde_json::from_value(value).map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))
+    let file: GenCommitFile = serde_json::from_value(value)
+        .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
+    check_gen_binding(path, &file, b)?;
+    Ok(file)
+}
+
+fn check_gen_binding(path: &Path, file: &GenCommitFile, bytes: &[u8]) -> Result<()> {
+    if file.format == 1 {
+        if file.configuration_binding.is_some() {
+            return Err(Error::Corrupt(format!(
+                "{}: a legacy generation cannot certify configuration",
+                path.display()
+            )));
+        }
+        return Ok(());
+    }
+    // The new authority document has a small closed schema. Bound before an
+    // independent canonical copy, including on the controlled historical path.
+    if bytes.len() > 16 << 10
+        || file.base_seq != file.commit.seq
+        || file.configuration_binding.is_none()
+        || !file.extra.is_empty()
+        || !file.commit.extra.is_empty()
+        || file.origin.len() > 128
+        || file.commit.kind.len() > 64
+        || file.commit.generation.len() > 64
+        || file.commit.timestamp.len() > 64
+        || serde_json::to_vec_pretty(file)
+            .map_err(|_| Error::Corrupt("generation metadata does not encode".into()))?
+            != bytes
+    {
+        return Err(Error::Corrupt(format!(
+            "{}: invalid canonical generation configuration binding",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// A recognizable future version is refused before interpreting the supported
@@ -1009,9 +1066,9 @@ fn check_gen_commit_value(path: &Path, value: &serde_json::Value) -> Result<()> 
         .get("format")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| Error::Corrupt(format!("{}: format is not a version", path.display())))?;
-    if format != 1 {
+    if !crate::formats::GENERATION_COMMIT.reads(format as u32) || format > u32::MAX as u64 {
         return Err(Error::Unsupported(format!(
-            "{} has format {}; this release reads format 1",
+            "{} has format {}; this release reads formats 1 and 2",
             path.display(),
             format
         )));
@@ -1595,6 +1652,9 @@ pub(crate) const WAL_FLAG_UNVALIDATED: u8 = 1;
 /// records of such commits carry it. Replay uses it to find a commit that reached the disk
 /// without its annotation (see `annotations`). Readers that predate it ignore the bit.
 pub(crate) const WAL_FLAG_ANNOTATED: u8 = 2;
+
+/// The commit seals exactly one final configuration reference data record.
+pub(crate) const WAL_FLAG_CONFIGURATION: u8 = 4;
 
 /// Fill bytes 9..33 of a WAL commit record (`rec[0]` = op, `rec[1..9]` = next blank
 /// node): seq, timestamp, kind, version, flags (byte 27) and a CRC over the

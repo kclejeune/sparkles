@@ -32,7 +32,7 @@
 //! charged to the request's memory budget. The deadline is read between rules and inside
 //! each rule's evaluation, so a rule whose candidates all fail stops at it too.
 
-use crate::budget::{Budget, Held};
+use crate::budget::{Budget, Held, WorkingWarnings};
 use crate::engine::{self, CRule, Eval, Mode, RuleInfo, Slot, Step};
 use crate::facts::Base;
 use crate::graph::{Graph, Triple};
@@ -890,7 +890,7 @@ pub fn explain(
 
 pub(crate) fn budget_errors<T>(r: anyhow::Result<T>) -> anyhow::Result<T> {
     r.map_err(|e| {
-        if e.chain().any(|c| c.is::<crate::budget::MemoryExceeded>()) {
+        if e.downcast_ref::<crate::budget::MemoryExceeded>().is_some() {
             ExplainBudgetExceeded(format!("{e:#}")).into()
         } else {
             e
@@ -912,10 +912,11 @@ fn materialized(
     g.set_budget(&budget)?;
     let terms = Terms::new(snap.clone());
     terms.set_budget(&budget)?;
-    let mut warnings = Vec::new();
+    let mut warnings = WorkingWarnings::new(&budget);
     let parsed = crate::profile_rules(input.profile, input.extras)?;
     let sources = crate::rule_sources(input.profile, input.extras)?;
-    let (rules, infos) = engine::compile_info(&parsed, &terms, &mut warnings, false);
+    let compiled = engine::compile_info(&parsed, &terms, &mut warnings, false)?;
+    let (rules, infos) = (compiled.rules(), compiled.infos());
     let rs = RuleSet {
         rules: &rules,
         infos: &infos,
@@ -923,7 +924,8 @@ fn materialized(
         geo: input
             .extras
             .geo_default_geometry
-            .then(|| crate::geo_ids(&terms)),
+            .then(|| crate::geo_ids(&terms))
+            .transpose()?,
     };
     let mut root = [0u64; 3];
     for (k, t) in triple.iter().enumerate() {
@@ -1233,7 +1235,7 @@ pub(crate) fn search_session(
         rules: p.rules,
         infos: p.infos,
         sources: p.sources,
-        geo: p.geo_default.then(|| crate::geo_ids(p.terms)),
+        geo: p.geo_default.then(|| crate::geo_ids(p.terms)).transpose()?,
     };
     search(
         p.snap,
@@ -1373,14 +1375,20 @@ mod partial_tests {
             Term::NamedNode(oxrdf::NamedNode::new(format!("http://ex.org/{local}")).unwrap())
         };
         let root = [
-            terms.id_for(&named("a")),
-            terms.id_for(&named("q")),
-            terms.id_for(&named("b")),
+            terms.id_for(&named("a")).unwrap(),
+            terms.id_for(&named("q")).unwrap(),
+            terms.id_for(&named("b")).unwrap(),
         ];
-        let premise = [root[0], terms.id_for(&named("p")), root[2]];
+        let premise = [root[0], terms.id_for(&named("p")).unwrap(), root[2]];
         let profile = Profile::Rules("[step: (<http://ex.org/a> <http://ex.org/p> <http://ex.org/b>) -> (<http://ex.org/a> <http://ex.org/q> <http://ex.org/b>)]".into());
-        let (rules, infos) =
-            engine::compile_info(&profile.rules().unwrap(), &terms, &mut Vec::new(), false);
+        let compiled = engine::compile_info(
+            &profile.rules().unwrap(),
+            &terms,
+            &mut WorkingWarnings::new(&budget),
+            false,
+        )
+        .unwrap();
+        let (rules, infos) = (compiled.rules(), compiled.infos());
         let sources = vec!["rules".into()];
         let rs = RuleSet {
             rules: &rules,

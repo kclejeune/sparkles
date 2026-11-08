@@ -783,6 +783,7 @@ fn finish_ask_result(mut cursor: QueryCursor, boolean: bool) -> QueryResult {
         rows_produced: stats.rows_produced,
         describe_truncated: false,
         ctx: cursor.ctx.clone(),
+        _table_credit: None,
     }
 }
 
@@ -2133,20 +2134,24 @@ impl QueryCursor {
             output.reconcile()?;
         }
         let stats = self.stats();
-        output.charge.retain();
+        let vars = (*self.variables).clone();
+        let plan = self.plan_info();
+        let output = super::table::Materialized::with_owned(output.table, output.charge)?
+            .into_retained(&self.ctx)?;
         Ok(QueryResult {
             kind: QueryKind::Select,
-            vars: (*self.variables).clone(),
+            vars,
             table: output.table,
             boolean: false,
             triples: Vec::new(),
             quads: Vec::new(),
-            plan: self.plan_info(),
+            plan,
             timing: stats.timing,
             mem_peak_bytes: stats.mem_peak_bytes,
             rows_produced: stats.rows_produced,
             describe_truncated: false,
             ctx: self.ctx.clone(),
+            _table_credit: output.credit,
         })
     }
 
@@ -3721,33 +3726,16 @@ fn collect_input(
     ctx: &Arc<Ctx>,
     child: &mut Operator,
     options: &CursorOptions,
-) -> Result<(super::table::Materialized, PlanInfo)> {
-    fn algorithm(n: &Node) -> bool {
-        matches!(n.kind, Kind::AlgoCall(_)) || n.children.iter().any(algorithm)
-    }
-    fn owns_algorithm(op: &Operator) -> bool {
-        matches!(&op.state,State::Fallback {node,..} if algorithm(node))
-            || op.children.iter().any(owns_algorithm)
-    }
-    let keep_lease = owns_algorithm(child);
+) -> Result<(super::table::Materialized<'static>, PlanInfo)> {
     let mut input = Buffer::new(ctx, &child.vars, 0)?;
     input.set_order(&child.order)?;
     while let Some(batch) = child.next(ctx, options, options.batch_rows)? {
         merge::append(ctx, &mut input, &batch.table, 0..batch.table.len)?;
     }
-    if !keep_lease {
-        let Buffer { mut table, charge } = input;
-        drop(charge);
-        table.sorted.clone_from(&child.order);
-        return Ok((super::table::Materialized::plain(table), child.info.clone()));
-    }
     input.set_order(&child.order)?;
     let info = child.info.clone();
     Ok((
-        super::table::Materialized {
-            table: input.table,
-            lease: Some(input.charge.into_lease()),
-        },
+        super::table::Materialized::with_owned(input.table, input.charge)?,
         info,
     ))
 }
@@ -4219,6 +4207,143 @@ fn successor(mut key: Key) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn collected_values(
+        width: usize,
+        rows: usize,
+    ) -> (
+        Arc<Ctx>,
+        super::super::table::Materialized<'static>,
+        Arc<super::super::pool::QueryPool>,
+        Id,
+    ) {
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(2 << 20);
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 4 << 20;
+        ctx.set_grant(Some(Arc::new(pool.empty_grant())));
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        ctx.attach_owner();
+        let value = if width == 0 {
+            Id::UNDEF
+        } else {
+            ctx.intern_term(&Term::Literal(oxrdf::Literal::new_simple_literal(
+                "retained local value ".repeat(4),
+            )))
+        };
+        ctx.check_memory_failure().unwrap();
+        let vars: Vec<_> = (0..width).map(|i| ctx.var(&format!("v{i}"))).collect();
+        let mut table = Table::new(vars.clone());
+        for _ in 0..rows {
+            table.push_row(&vec![value; width]);
+        }
+        let node = Node::leaf(
+            Kind::Values(table),
+            vars,
+            rows as f64,
+            "owned values".into(),
+        );
+        let plan = OwnedCharge::new(&ctx, plan_bytes(&node)).unwrap();
+        let mut child = Operator::build(&ctx, node, FallbackPolicy::RejectMaterialization).unwrap();
+        let (output, info) = collect_input(&ctx, &mut child, &CursorOptions::default()).unwrap();
+        drop(child);
+        drop(plan);
+        drop(info);
+        (ctx, output, pool, value)
+    }
+
+    #[test]
+    fn collected_plain_cursor_input_keeps_actual_credit_and_context() {
+        let (ctx, output, pool, value) = collected_values(1, 1024);
+        // On the old ordinary collection path this is the intended first failure,
+        // after a successful real collection, rather than a refused input fixture.
+        let bytes = output
+            .lease
+            .as_ref()
+            .expect("collected input owns its credit")
+            .bytes;
+        assert!(bytes >= super::super::algosvc::table_capacity(&output.table).unwrap());
+        assert!(ctx.live_bytes() >= bytes);
+        assert_eq!(output.table.len, 1024);
+        assert_eq!(output.table.get(0, 0), value);
+        assert_eq!(output.table.get(1023, 0), value);
+        let weak = Arc::downgrade(&ctx);
+        drop(ctx);
+        assert!(pool.granted() > 0);
+        let retained = weak
+            .upgrade()
+            .expect("collected table retains its actual context");
+        let decoder = super::super::output::OutputBudget::new(retained.clone());
+        let term = decoder.decode(value).unwrap().unwrap();
+        assert_eq!(
+            term.as_term(),
+            &Term::Literal(oxrdf::Literal::new_simple_literal(
+                "retained local value ".repeat(4)
+            ))
+        );
+        drop(term);
+        drop(decoder);
+        drop(retained);
+        drop(output);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn collected_zero_width_input_retains_nonempty_rows_and_credit() {
+        let (ctx, output, pool, _) = collected_values(0, 3);
+        assert_eq!(output.table.width(), 0);
+        assert_eq!(output.table.len, 3);
+        assert!(output.lease.as_ref().unwrap().bytes >= 3 * 8 + 128);
+        let weak = Arc::downgrade(&ctx);
+        drop(ctx);
+        assert!(weak.upgrade().is_some());
+        assert!(pool.granted() > 0);
+        drop(output);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn collected_input_refuses_foreign_credit_adoption_without_releasing_backing() {
+        use crate::store::{Store, StoreOptions};
+        let (ctx, mut output, pool, value) = collected_values(1, 16);
+        let store = Store::in_memory(StoreOptions::default());
+        let mut receiver = Ctx::new(store.snapshot());
+        receiver.enable_cursor_accounting().unwrap();
+        let held = receiver.charge(0).unwrap();
+        let bytes = output.lease.as_ref().unwrap().bytes;
+        let live = ctx.live_bytes();
+        let granted = pool.granted();
+        assert!(held.adopt(&mut output.lease).is_err());
+        assert_eq!(output.lease.as_ref().unwrap().bytes, bytes);
+        assert_eq!(ctx.live_bytes(), live);
+        assert_eq!(pool.granted(), granted);
+        assert_eq!(output.table.get(0, 0), value);
+        drop(held);
+        drop(output);
+        drop(ctx);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn materialized_input_refuses_insufficient_owned_credit_without_leak() {
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        ctx.attach_owner();
+        let charge = OwnedCharge::new(&ctx, 0).unwrap();
+        let mut table = Table::new(vec![ctx.var("v")]);
+        table.push_row(&[Id::UNDEF]);
+        let before = ctx.live_bytes();
+        assert!(super::super::table::Materialized::with_owned(table, charge).is_err());
+        assert_eq!(ctx.live_bytes(), before);
+        assert_eq!(Arc::strong_count(&ctx), 1);
+    }
 
     #[test]
     fn grouping_releases_an_exhausted_hash_join_working_set() {

@@ -128,33 +128,38 @@ impl Expand {
             };
             let rows = input.table.len;
             let Buffer { table, charge } = input;
-            let mut input = Some(table);
-            // The kernel holds its input under its own charge while it runs.
-            drop(charge);
-            let table = match (&self.edges, &self.node.kind) {
+            let mut input = Some(crate::sparql::table::Materialized::with_owned(
+                table, charge,
+            )?);
+            let mut output = match (&self.edges, &self.node.kind) {
                 (Some((edges, _)), Kind::Path { spec, .. }) => {
                     let input = input.take().expect("one input table per batch");
-                    // The kernel holds its input while it runs, as eager execution does.
-                    let _held = OwnedCharge::new(ctx, super::capacity_bytes(&input))?;
-                    exec::path_batch(ctx, spec, edges, &input, &self.node.vars)?
+                    let table = exec::path_batch(ctx, spec, edges, &input.table, &self.node.vars)?;
+                    // Keep the actual input allocation paid through output admission.
+                    // The path kernel's own output admission remains a separate edge.
+                    let charge = OwnedCharge::new(ctx, super::capacity_bytes(&table))?;
+                    Buffer { table, charge }
                 }
                 _ => {
                     let info = child.info.clone();
-                    exec::execute_with_inputs(ctx, &self.node, &mut |_| {
+                    let mut output = exec::execute_with_inputs(ctx, &self.node, &mut |_| {
                         Ok((
-                            crate::sparql::table::Materialized::plain(
-                                input.take().expect("one input table per batch"),
-                            ),
+                            input.take().expect("one input table per batch"),
                             info.clone(),
                         ))
                     })?
-                    .0
-                    .table
+                    .0;
+                    if output.lease.is_none() {
+                        return Err(crate::Error::invalid(
+                            "expansion output lost its admitted input credit",
+                        ));
+                    }
+                    let charge = OwnedCharge::adopt(ctx, &mut output.lease)?;
+                    Buffer {
+                        table: output.table,
+                        charge,
+                    }
                 }
-            };
-            let mut output = Buffer {
-                charge: OwnedCharge::new(ctx, super::capacity_bytes(&table))?,
-                table,
             };
             output.project(vars)?;
             if rows > 0 {

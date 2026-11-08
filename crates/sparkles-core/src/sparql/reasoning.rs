@@ -133,7 +133,9 @@ pub trait ReasoningProvider: Send + Sync {
 /// The derivations of one query.
 pub trait ReasoningSession: Send {
     /// Whether rules can give facts that match the pattern (`None` is a variable).
-    fn intensional(&self, s: Option<&Term>, p: Option<&Term>, o: Option<&Term>) -> bool;
+    /// Interning a constant may require memory. Return its refusal directly; the
+    /// caller stops before preparing demands or checking later patterns.
+    fn intensional(&self, s: Option<&Term>, p: Option<&Term>, o: Option<&Term>) -> Result<bool>;
     /// Make the program for the demands the query can ask for. Demand `i` of later
     /// calls is `demands[i]`.
     fn prepare(&mut self, demands: &[Demand]) -> Result<Vec<DemandInfo>>;
@@ -513,7 +515,7 @@ pub(crate) fn apply(
                     const_term(&t.object).as_ref(),
                 )
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         // the stored facts each pattern's constants match: of an intensional pattern with
         // none, its derived facts may be many, so it counts as the largest
         let estimates: Vec<u64> = group
@@ -606,7 +608,7 @@ pub(crate) fn apply(
     let mut path_demands: Vec<usize> = Vec::new();
     for p in &collect.paths {
         let pt = p.as_ref().map(|n| Term::NamedNode(n.clone()));
-        if session.intensional(None, pt.as_ref(), None) {
+        if session.intensional(None, pt.as_ref(), None)? {
             let d = Demand {
                 s: DemandTerm::Var,
                 p: pt.map_or(DemandTerm::Var, DemandTerm::Const),

@@ -1,11 +1,12 @@
 //! Rule compilation and semi-naive forward chaining over id-level triples.
 
-use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_grown};
+use crate::budget::{Budget, BudgetFailure, Held, WorkingWarnings, table_bytes, table_grown};
+mod compile_credit;
 use crate::builtins::{BuiltinKind, HeadAction};
 use crate::facts::{BaseRange, Memo};
 use crate::graph::{Cands, Graph, Triple};
 use crate::parser::{BuiltinCall, Clause, Direction, Node, Rule};
-use crate::terms::{Terms, anchored_regex};
+use crate::terms::{BudgetRegex, Terms};
 use oxrdf::Term;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -41,7 +42,7 @@ pub(crate) struct CBuiltin {
     /// variables the call binds
     pub outputs: Vec<usize>,
     /// pre-compiled pattern for `regex` with a constant pattern
-    pub regex: Option<regex::Regex>,
+    pub regex: Option<Arc<BudgetRegex>>,
 }
 
 #[derive(Debug)]
@@ -59,13 +60,13 @@ pub(crate) struct CRule {
     pub head: Vec<CHead>,
 }
 
-struct FlatRule {
+struct FlatRule<'a> {
     name: String,
     line: usize,
     /// the index of the parsed rule it came from
     parsed: usize,
-    body: Vec<Clause>,
-    head: Vec<Clause>,
+    body: Vec<&'a Clause>,
+    head: Vec<&'a Clause>,
 }
 
 /// What an explanation names of a compiled rule: its variables by number, the names of
@@ -79,35 +80,49 @@ pub(crate) struct RuleInfo {
     pub parsed: usize,
 }
 
+#[cfg(test)]
+thread_local! { static COMPILE_FLATTENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 /// Flatten nested rules in heads: `B1 -> [H <- B2]` materializes exactly like
 /// `B1, B2 -> H` (and the same for nested forward rules).
-fn flatten(
-    r: &Rule,
-    prefix: &[Clause],
+fn flatten<'a>(
+    r: &'a Rule,
+    prefix: &[&'a Clause],
     name: String,
     (line, parsed): (usize, usize),
-    out: &mut Vec<FlatRule>,
+    out: &mut Vec<FlatRule<'a>>,
 ) {
-    let mut body = prefix.to_vec();
-    body.extend(
-        r.body
+    #[cfg(test)]
+    COMPILE_FLATTENS.with(|n| n.set(n.get() + 1));
+    let own_body = r
+        .body
+        .iter()
+        .filter(|c| !matches!(c, Clause::Rule(_)))
+        .count();
+    let mut body = Vec::with_capacity(prefix.len() + own_body);
+    body.extend_from_slice(prefix);
+    body.extend(r.body.iter().filter(|c| !matches!(c, Clause::Rule(_))));
+    let mut head = Vec::with_capacity(
+        r.head
             .iter()
             .filter(|c| !matches!(c, Clause::Rule(_)))
-            .cloned(),
+            .count(),
     );
-    let mut head = Vec::new();
     let mut nested = 0;
     for c in &r.head {
         match c {
             Clause::Rule(inner) => {
                 nested += 1;
-                let n = inner
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("{name}/{nested}"));
+                let n = inner.name.clone().unwrap_or_else(|| {
+                    use std::fmt::Write;
+                    let mut n =
+                        String::with_capacity(name.len() + 1 + compile_credit::digits(nested));
+                    write!(&mut n, "{name}/{nested}").expect("String formatting");
+                    n
+                });
                 flatten(inner, &body, n, (inner.line, parsed), out);
             }
-            c => head.push(c.clone()),
+            c => head.push(c),
         }
     }
     if !head.is_empty() || nested == 0 {
@@ -121,18 +136,57 @@ fn flatten(
     }
 }
 
-fn vars_of(n: &Node, out: &mut Vec<String>) {
-    match n {
-        Node::Var(v) => out.push(v.clone()),
-        Node::Functor(_, a) => a.iter().for_each(|x| vars_of(x, out)),
-        _ => {}
+/// Private compiled payloads lend immutable syntax to the whole evaluation.
+pub(crate) struct CompiledRules {
+    rules: Vec<CRule>,
+    _held: Held,
+}
+impl CompiledRules {
+    pub fn as_slice(&self) -> &[CRule] {
+        &self.rules
+    }
+    pub fn iter(&self) -> std::slice::Iter<'_, CRule> {
+        self.rules.iter()
+    }
+}
+impl std::ops::Deref for CompiledRules {
+    type Target = [CRule];
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+pub(crate) struct CompiledInfo {
+    rules: CompiledRules,
+    infos: Vec<RuleInfo>,
+    _infos_held: Held,
+}
+impl CompiledInfo {
+    pub fn rules(&self) -> &[CRule] {
+        self.rules.as_slice()
+    }
+    pub fn infos(&self) -> &[RuleInfo] {
+        &self.infos
+    }
+    pub fn into_rules(self) -> CompiledRules {
+        let Self {
+            rules,
+            infos,
+            _infos_held,
+        } = self;
+        drop(infos);
+        drop(_infos_held);
+        rules
     }
 }
 
 /// Compile parsed rules for materialization. Unsupported rules are skipped with a
 /// warning, backward rules among them.
-pub(crate) fn compile(rules: &[Rule], terms: &Terms, warnings: &mut Vec<String>) -> Vec<CRule> {
-    compile_with(rules, terms, warnings, false).0
+pub(crate) fn compile(
+    rules: &[Rule],
+    terms: &Terms,
+    warnings: &mut WorkingWarnings,
+) -> Result<CompiledRules, BudgetFailure> {
+    compile_with(rules, terms, warnings, false).map(CompiledInfo::into_rules)
 }
 
 /// [`compile`], with backward rules too when `backward` is set (for query-time
@@ -141,85 +195,168 @@ pub(crate) fn compile(rules: &[Rule], terms: &Terms, warnings: &mut Vec<String>)
 pub(crate) fn compile_info(
     rules: &[Rule],
     terms: &Terms,
-    warnings: &mut Vec<String>,
+    warnings: &mut WorkingWarnings,
     backward: bool,
-) -> (Vec<CRule>, Vec<RuleInfo>) {
+) -> Result<CompiledInfo, BudgetFailure> {
     compile_with(rules, terms, warnings, backward)
+}
+
+fn compiler_message(args: std::fmt::Arguments<'_>) -> Result<String, BudgetFailure> {
+    use std::fmt::Write;
+    let len = crate::budget::format_len(args)?;
+    let mut message = String::with_capacity(len);
+    message.write_fmt(args).expect("private String formatting");
+    Ok(message)
+}
+fn compiler_label(rule: &Rule) -> Result<String, BudgetFailure> {
+    match &rule.name {
+        Some(name) => Ok(name.clone()),
+        None => compiler_message(format_args!("rule@line {}", rule.line)),
+    }
 }
 
 fn compile_with(
     rules: &[Rule],
     terms: &Terms,
-    warnings: &mut Vec<String>,
+    warnings: &mut WorkingWarnings,
     backward: bool,
-) -> (Vec<CRule>, Vec<RuleInfo>) {
-    let mut flat = Vec::new();
+) -> Result<CompiledInfo, BudgetFailure> {
+    let budget = terms.budget();
+    let (bytes, emitted) = compile_credit::prewalk(rules, backward)?;
+    let mut working = Held::try_new_exact(&budget, bytes)?;
+    let mut flat = Vec::with_capacity(emitted);
     for (parsed, r) in rules.iter().enumerate() {
         if r.direction == Direction::Backward && !backward {
-            warnings.push(format!(
+            warnings.push_fmt(format_args!(
                 "rule '{}' (line {}): backward rules ('<-') are not supported by forward materialization; skipped",
-                r.label(),
+                compiler_label(r)?,
                 r.line
-            ));
+            ))?;
             continue;
         }
         if r.body.iter().any(|c| matches!(c, Clause::Rule(_))) {
-            warnings.push(format!(
+            warnings.push_fmt(format_args!(
                 "rule '{}': nested rule in a body; skipped",
-                r.label()
-            ));
+                compiler_label(r)?
+            ))?;
             continue;
         }
-        flatten(r, &[], r.label(), (r.line, parsed), &mut flat);
+        flatten(r, &[], compiler_label(r)?, (r.line, parsed), &mut flat);
     }
-    let mut out = Vec::new();
-    let mut infos = Vec::new();
-    let mut occurrence = 0;
-    for f in flat {
-        match compile_one(&f, terms, warnings) {
+    let mut out = Vec::with_capacity(emitted);
+    let mut infos = Vec::with_capacity(emitted);
+    let mut occurrence = 0usize;
+    for f in &flat {
+        match compile_one(f, terms, warnings, &budget) {
             Ok(Some((mut c, info))) => {
                 for call in &mut c.builtins {
                     call.origin = occurrence;
-                    occurrence += 1;
+                    occurrence = occurrence.checked_add(1).ok_or_else(|| {
+                        BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow)
+                    })?;
                 }
                 out.push(c);
                 infos.push(info);
             }
             Ok(None) => {}
-            Err(msg) => warnings.push(format!("rule '{}': {msg}; skipped", f.name)),
+            Err(CompileFailure::Unsupported(msg)) => {
+                warnings.push_fmt(format_args!("rule '{}': {msg}; skipped", f.name))?
+            }
+            Err(CompileFailure::Memory(error)) => return Err(error),
         }
     }
-    (out, infos)
+    let mut rule_bytes = out
+        .capacity()
+        .checked_mul(size_of::<CRule>())
+        .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+    let mut info_bytes = infos
+        .capacity()
+        .checked_mul(size_of::<RuleInfo>())
+        .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+    for rule in &out {
+        rule_bytes = rule_bytes
+            .checked_add(compile_credit::rule_bytes(rule)?)
+            .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+    }
+    for info in &infos {
+        info_bytes = info_bytes
+            .checked_add(compile_credit::info_bytes(info)?)
+            .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+    }
+    let retained = rule_bytes
+        .checked_add(info_bytes)
+        .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+    if retained > working.bytes() {
+        working.try_grow(retained - working.bytes())?;
+    }
+    let rules = CompiledRules {
+        rules: out,
+        _held: working.split(rule_bytes),
+    };
+    let compiled = CompiledInfo {
+        rules,
+        infos,
+        _infos_held: working.split(info_bytes),
+    };
+    drop(flat);
+    drop(working);
+    Ok(compiled)
 }
 
-fn compile_one(
-    f: &FlatRule,
+enum CompileFailure {
+    Unsupported(String),
+    Memory(BudgetFailure),
+}
+impl From<String> for CompileFailure {
+    fn from(value: String) -> Self {
+        Self::Unsupported(value)
+    }
+}
+impl From<&str> for CompileFailure {
+    fn from(value: &str) -> Self {
+        Self::Unsupported(value.into())
+    }
+}
+impl From<BudgetFailure> for CompileFailure {
+    fn from(value: BudgetFailure) -> Self {
+        Self::Memory(value)
+    }
+}
+
+fn compile_one<'a>(
+    f: &FlatRule<'a>,
     terms: &Terms,
-    warnings: &mut Vec<String>,
-) -> Result<Option<(CRule, RuleInfo)>, String> {
-    let mut vars: FxHashMap<String, usize> = FxHashMap::default();
-    let mut builtin_names: Vec<String> = Vec::new();
-    let mut var = |v: &str| -> usize {
+    warnings: &mut WorkingWarnings,
+    budget: &Arc<Budget>,
+) -> Result<Option<(CRule, RuleInfo)>, CompileFailure> {
+    let body_shape = compile_credit::Shape::clauses(f.body.iter().copied())?;
+    let head_shape = compile_credit::Shape::clauses(f.head.iter().copied())?;
+    let mut vars: FxHashMap<&'a str, usize> =
+        FxHashMap::with_capacity_and_hasher(body_shape.vars + head_shape.vars, Default::default());
+    let mut builtin_names: Vec<String> = Vec::with_capacity(body_shape.builtins);
+    let mut var = |v: &'a str| -> usize {
         let n = vars.len();
-        *vars.entry(v.to_string()).or_insert(n)
+        *vars.entry(v).or_insert(n)
     };
-    let slot = |n: &Node, var: &mut dyn FnMut(&str) -> usize| -> Result<Slot, String> {
-        Ok(match n {
-            Node::Var(v) => Slot::Var(var(v)),
-            Node::Const(t) => Slot::Const(terms.id_for_rule(t)),
-            Node::Any => Slot::Any,
-            Node::Functor(name, _) => {
-                return Err(format!(
-                    "functor term '{name}(…)' is not supported by forward materialization"
-                ));
-            }
-        })
-    };
-    let mut atoms = Vec::new();
-    let mut builtins = Vec::new();
+    let slot =
+        |n: &'a Node, var: &mut dyn FnMut(&'a str) -> usize| -> Result<Slot, CompileFailure> {
+            Ok(match n {
+                Node::Var(v) => Slot::Var(var(v)),
+                Node::Const(t) => Slot::Const(terms.id_for_rule(t)?),
+                Node::Any => Slot::Any,
+                Node::Functor(name, _) => {
+                    return Err(compiler_message(format_args!(
+                        "functor term '{name}(…)' is not supported by forward materialization"
+                    ))?
+                    .into());
+                }
+            })
+        };
+    let mut atoms = Vec::with_capacity(body_shape.atoms);
+    let mut builtins = Vec::with_capacity(body_shape.builtins);
     // variables bound at the current textual position (Jena evaluates bodies left to right)
-    let mut bound: HashSet<String> = HashSet::new();
-    for c in &f.body {
+    let mut bound: HashSet<&str> = HashSet::with_capacity(body_shape.vars);
+    for &c in &f.body {
         match c {
             Clause::Triple(t) => {
                 let a = Atom {
@@ -227,11 +364,11 @@ fn compile_one(
                     p: slot(&t.predicate, &mut var)?,
                     o: slot(&t.object, &mut var)?,
                 };
-                let mut vs = Vec::new();
                 for n in [&t.subject, &t.predicate, &t.object] {
-                    vars_of(n, &mut vs);
+                    if let Node::Var(v) = n {
+                        bound.insert(v.as_str());
+                    }
                 }
-                bound.extend(vs);
                 atoms.push(a);
             }
             Clause::Builtin(b) => {
@@ -243,16 +380,26 @@ fn compile_one(
                         }
                         continue;
                     }
-                    return Err(format!("unknown or unsupported builtin '{}'", b.name));
+                    return Err(compiler_message(format_args!(
+                        "unknown or unsupported builtin '{}'",
+                        b.name
+                    ))?
+                    .into());
                 };
-                kind.check_arity(b.args.len())
-                    .map_err(|e| format!("{}: {e}", b.name))?;
-                let mut args = Vec::new();
+                if !kind.accepts_arity(b.args.len()) {
+                    return Err(compiler_message(format_args!(
+                        "{}: wrong number of arguments ({})",
+                        b.name,
+                        b.args.len()
+                    ))?
+                    .into());
+                }
+                let mut args = Vec::with_capacity(b.args.len());
                 for (i, a) in b.args.iter().enumerate() {
                     // noValue: variables not bound at this position act as wildcards
                     if kind == BuiltinKind::NoValue
                         && let Node::Var(v) = a
-                        && !bound.contains(v)
+                        && !bound.contains(v.as_str())
                     {
                         args.push(Slot::Any);
                         continue;
@@ -262,38 +409,46 @@ fn compile_one(
                         && kind.input_positions(b.args.len()).contains(&i)
                         && kind != BuiltinKind::NoValue
                     {
-                        return Err(format!("wildcard as input of builtin '{}'", b.name));
+                        return Err(compiler_message(format_args!(
+                            "wildcard as input of builtin '{}'",
+                            b.name
+                        ))?
+                        .into());
                     }
                     args.push(s);
                 }
-                let inputs: Vec<usize> = kind
-                    .input_positions(args.len())
-                    .into_iter()
-                    .filter_map(|i| match args[i] {
-                        Slot::Var(v) => Some(v),
-                        _ => None,
-                    })
-                    .collect();
-                let outputs: Vec<usize> = kind
-                    .output_positions(args.len())
-                    .into_iter()
-                    .filter_map(|i| match args[i] {
-                        Slot::Var(v) => Some(v),
-                        _ => None,
-                    })
-                    .collect();
+                let mut inputs = Vec::with_capacity(args.len());
+                for i in kind.input_positions(args.len()) {
+                    if let Slot::Var(v) = args[i] {
+                        inputs.push(v);
+                    }
+                }
+                let mut outputs = Vec::with_capacity(args.len());
+                for i in kind.output_positions(args.len()) {
+                    if let Slot::Var(v) = args[i] {
+                        outputs.push(v);
+                    }
+                }
                 for (i, a) in b.args.iter().enumerate() {
                     if kind.output_positions(b.args.len()).contains(&i)
                         && let Node::Var(v) = a
                     {
-                        bound.insert(v.clone());
+                        bound.insert(v.as_str());
                     }
                 }
                 let regex = match (kind, b.args.get(1)) {
-                    (BuiltinKind::Regex, Some(Node::Const(Term::Literal(l)))) => Some(
-                        anchored_regex(l.value())
-                            .ok_or_else(|| format!("invalid regex '{}'", l.value()))?,
-                    ),
+                    (BuiltinKind::Regex, Some(Node::Const(Term::Literal(l)))) => {
+                        Some(match BudgetRegex::compile(l.value(), budget)? {
+                            Some(regex) => regex,
+                            None => {
+                                return Err(compiler_message(format_args!(
+                                    "invalid regex '{}'",
+                                    l.value()
+                                ))?
+                                .into());
+                            }
+                        })
+                    }
                     _ => None,
                 };
                 builtins.push(CBuiltin {
@@ -309,8 +464,8 @@ fn compile_one(
             Clause::Rule(_) => unreachable!("flattened"),
         }
     }
-    let mut head = Vec::new();
-    for c in &f.head {
+    let mut head = Vec::with_capacity(head_shape.clauses);
+    for &c in &f.head {
         match c {
             Clause::Triple(t) => {
                 let s = slot(&t.subject, &mut var)?;
@@ -323,29 +478,32 @@ fn compile_one(
             }
             Clause::Builtin(b) => match HeadAction::from_name(&b.name) {
                 Some(Ok(action)) => {
-                    let args = b
-                        .args
-                        .iter()
-                        .map(|a| slot(a, &mut var))
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut args = Vec::with_capacity(b.args.len());
+                    for argument in &b.args {
+                        args.push(slot(argument, &mut var)?);
+                    }
                     if args.len() != 3 {
-                        return Err(format!("{} expects 3 arguments", b.name));
+                        return Err(compiler_message(format_args!(
+                            "{} expects 3 arguments",
+                            b.name
+                        ))?
+                        .into());
                     }
                     head.push(CHead::Action(action, args));
                 }
                 // Jena's tabling directives: every predicate is tabled here
                 Some(Err(())) if matches!(b.name.as_str(), "table" | "tableAll") => {}
                 Some(Err(())) => {
-                    warnings.push(format!(
+                    warnings.push_fmt(format_args!(
                         "rule '{}': head builtin '{}' ignored",
                         f.name, b.name
-                    ));
+                    ))?;
                 }
                 None => {
-                    warnings.push(format!(
+                    warnings.push_fmt(format_args!(
                         "rule '{}': unsupported head builtin '{}' ignored",
                         f.name, b.name
-                    ));
+                    ))?;
                 }
             },
             Clause::Rule(_) => unreachable!("flattened"),
@@ -376,21 +534,29 @@ fn compile_one(
             bound_vars[v] = true;
         }
     }
+    let check_head_slot = |s: Slot| -> Result<(), CompileFailure> {
+        if let Slot::Var(v) = s
+            && !bound_vars[v]
+        {
+            let name = vars.iter().find(|(_, i)| **i == v).map_or("", |(n, _)| *n);
+            return Err(compiler_message(format_args!(
+                "head variable ?{name} is not bound by the body"
+            ))?
+            .into());
+        }
+        Ok(())
+    };
     for h in &rule.head {
-        let slots: Vec<Slot> = match h {
-            CHead::Triple(s, p, o) => vec![*s, *p, *o],
-            CHead::Action(_, a) => a.clone(),
-        };
-        for s in slots {
-            if let Slot::Var(v) = s
-                && !bound_vars[v]
-            {
-                let name = vars
-                    .iter()
-                    .find(|(_, i)| **i == v)
-                    .map(|(n, _)| n.clone())
-                    .unwrap_or_default();
-                return Err(format!("head variable ?{name} is not bound by the body"));
+        match h {
+            CHead::Triple(s, p, o) => {
+                for slot in [*s, *p, *o] {
+                    check_head_slot(slot)?;
+                }
+            }
+            CHead::Action(_, args) => {
+                for slot in args {
+                    check_head_slot(*slot)?;
+                }
             }
         }
     }
@@ -401,7 +567,7 @@ fn compile_one(
     }
     let mut names = vec![String::new(); nvars];
     for (n, &i) in &vars {
-        names[i] = n.clone();
+        names[i] = (*n).to_owned();
     }
     let info = RuleInfo {
         vars: names,
@@ -413,7 +579,7 @@ fn compile_one(
 }
 
 /// `bound(?x…)` / `unbound(?x…)` are resolved statically from the textual position.
-fn static_bound_test(b: &BuiltinCall, bound: &HashSet<String>) -> Result<Option<bool>, String> {
+fn static_bound_test(b: &BuiltinCall, bound: &HashSet<&str>) -> Result<Option<bool>, String> {
     let want = match b.name.as_str() {
         "bound" => true,
         "unbound" => false,
@@ -422,7 +588,7 @@ fn static_bound_test(b: &BuiltinCall, bound: &HashSet<String>) -> Result<Option<
     let mut all = true;
     for a in &b.args {
         let is_bound = match a {
-            Node::Var(v) => bound.contains(v),
+            Node::Var(v) => bound.contains(v.as_str()),
             Node::Any => false,
             _ => true,
         };
@@ -833,9 +999,9 @@ impl<'a> Eval<'a> {
 
     /// Stop the evaluation with a memory error (the first one is kept), and the other
     /// threads of the iteration with it.
-    pub fn fail(&mut self, e: MemoryExceeded) {
+    pub fn fail(&mut self, e: BudgetFailure) {
         let e = e.with_context(format!(" (rule '{}')", self.rule.name));
-        self.err.get_or_insert(anyhow::Error::new(e));
+        self.err.get_or_insert(e.into());
         self.stop = true;
         self.abort.store(true, Ordering::Relaxed);
     }
@@ -855,7 +1021,10 @@ impl<'a> Eval<'a> {
             // the old buffer is freed
             self.held().shrink(cap * TRIPLE);
             let spare = self.out.capacity() - next;
-            self.held().grow(spare * TRIPLE);
+            if let Err(error) = self.held().grow(spare * TRIPLE) {
+                self.fail(error);
+                return false;
+            }
         }
         self.out.push(t);
         true
@@ -874,7 +1043,10 @@ impl<'a> Eval<'a> {
             self.seen.reserve(1);
             self.held().shrink(table_bytes(cap, TRIPLE) + next);
             let cap = self.seen.capacity();
-            self.held().grow(table_bytes(cap, TRIPLE));
+            if let Err(error) = self.held().grow(table_bytes(cap, TRIPLE)) {
+                self.fail(error);
+                return None;
+            }
         }
         Some(self.seen.insert(t))
     }
@@ -1480,11 +1652,11 @@ fn split_at<'g>(
             batch.reserve_exact(per_item);
         }
         batch.push(b);
-        Ok::<(), MemoryExceeded>(())
+        Ok::<(), BudgetFailure>(())
     };
     let flush = |batch: &mut Vec<Vec<u64>>, items: &mut Vec<Item<'g>>, held: &mut Held| {
         if batch.is_empty() {
-            return Ok::<(), MemoryExceeded>(());
+            return Ok::<(), BudgetFailure>(());
         }
         held.try_grow(size_of::<Item<'_>>())?;
         let b = seal_batch(std::mem::take(batch), held);
@@ -1586,7 +1758,7 @@ pub(crate) struct RuleIndex {
 
 impl RuleIndex {
     /// The index of `rules`, charged to `budget` before it is allocated.
-    pub(crate) fn new(rules: &[CRule], budget: &Arc<Budget>) -> Result<RuleIndex, MemoryExceeded> {
+    pub(crate) fn new(rules: &[CRule], budget: &Arc<Budget>) -> Result<RuleIndex, BudgetFailure> {
         let always_rule = |r: &CRule| {
             r.atoms.iter().any(|a| !matches!(a.p, Slot::Const(_)))
                 || implicit_fact_reads(r).next().is_some()
@@ -1647,7 +1819,7 @@ impl RuleIndex {
         g: &Graph,
         ds: u32,
         budget: &Arc<Budget>,
-    ) -> Result<Option<(Vec<usize>, Held)>, MemoryExceeded> {
+    ) -> Result<Option<(Vec<usize>, Held)>, BudgetFailure> {
         if ds < g.offset() || g.predicate_count() > self.atoms {
             return Ok(None);
         }
@@ -1779,15 +1951,18 @@ pub(crate) fn run_observed(
     };
     let mut iteration = 0usize;
     let (mut ds, mut de) = (start.unwrap_or(0).min(base_len), base_len);
-    let memory = |e: MemoryExceeded, iteration: usize| -> anyhow::Error {
-        anyhow::Error::new(e.with_context(format!(" (in iteration {})", iteration + 1)))
+    let memory = |e: BudgetFailure, iteration: usize| -> anyhow::Error {
+        e.with_context(format!(" (in iteration {})", iteration + 1))
+            .into()
     };
     let index = RuleIndex::new(rules, &limits.budget).map_err(|e| memory(e, 0))?;
     // an observer of merge boundaries needs every fact to follow from the facts before
     // its boundary in one rule step, which a closure does not
-    let mut closures = (limits.closures && boundary.is_none())
-        .then(|| crate::closure::Closures::detect(rules, terms, start))
-        .flatten();
+    let mut closures = if limits.closures && boundary.is_none() {
+        crate::closure::Closures::detect(rules, terms, start)?
+    } else {
+        None
+    };
     if let Some(c) = &closures {
         tracing::debug!(operators = ?c.describe(rules), "closure operators");
     }
@@ -1893,9 +2068,9 @@ pub(crate) fn run_observed(
                 for _ in 0..MAX_SPLIT_DEPTH {
                     let split =
                         split_at(gr, terms, r, p, *ri, d, &first, &abort, limits, split_min)
-                            .map_err(|e| match e.downcast::<MemoryExceeded>() {
-                                Ok(m) => memory(m, iteration),
-                                Err(e) => e,
+                            .map_err(|e| match BudgetFailure::from_anyhow(&e) {
+                                Some(m) => memory(m, iteration),
+                                None => e,
                             })?;
                     let Some((items, held)) = split else {
                         break;
@@ -2023,9 +2198,9 @@ pub(crate) fn run_observed(
             let mut ok = Vec::with_capacity(results.len());
             for (ri, out, held, err) in results {
                 if let Some(e) = err {
-                    return Err(match e.downcast::<MemoryExceeded>() {
-                        Ok(m) => memory(m, iteration),
-                        Err(e) => e.context("reading the input graphs"),
+                    return Err(match BudgetFailure::from_anyhow(&e) {
+                        Some(m) => memory(m, iteration),
+                        None => e.context("reading the input graphs"),
                     });
                 }
                 outs_held.absorb(held);
@@ -2071,9 +2246,9 @@ pub(crate) fn run_observed(
         let before = g.len();
         let outs: Vec<Vec<Triple>> = results.drain(..).map(|(_, out)| out).collect();
         g.merge(outs, outs_held)
-            .map_err(|e| match e.downcast::<MemoryExceeded>() {
-                Ok(m) => memory(m.with_context(overflow.clone()), iteration),
-                Err(e) => e,
+            .map_err(|e| match BudgetFailure::from_anyhow(&e) {
+                Some(m) => memory(m.with_context(overflow.clone()), iteration),
+                None => e,
             })?;
         if let Some(note) = boundary.as_mut() {
             note(g.len());
@@ -2091,9 +2266,9 @@ pub(crate) fn run_observed(
                     (max_out, limits.max_inferred),
                     rules,
                 )
-                .map_err(|e| match e.downcast::<MemoryExceeded>() {
-                    Ok(m) => memory(m, iteration),
-                    Err(e) => e,
+                .map_err(|e| match BudgetFailure::from_anyhow(&e) {
+                    Some(m) => memory(m, iteration),
+                    None => e,
                 })?;
             new += stepped.added as u32;
             refresh = stepped.refresh;
@@ -2405,3 +2580,6 @@ mod index_tests {
         assert!(index.candidates(&g, 0, &small).is_err());
     }
 }
+
+#[cfg(test)]
+mod compiler_credit_tests;

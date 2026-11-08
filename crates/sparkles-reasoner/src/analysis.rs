@@ -3,7 +3,7 @@
 //! These controls are opt-in. Ordinary materializations keep their allocation and
 //! caching policy. An analysis reserves one unused blank range in its private copies.
 
-use crate::budget::{Budget, MemoryExceeded};
+use crate::budget::{Budget, BudgetFailure};
 use crate::diagnostics::LiteralTypings;
 use crate::terms::Terms;
 use oxrdf::{Literal, Term};
@@ -69,7 +69,7 @@ pub struct AnalysisContext {
     program: Arc<str>,
     typings: Mutex<Option<LiteralTypings>>,
     typing_budget: Arc<Budget>,
-    failed: OnceLock<MemoryExceeded>,
+    failed: OnceLock<BudgetFailure>,
 }
 
 impl AnalysisContext {
@@ -77,7 +77,7 @@ impl AnalysisContext {
         witnesses: Arc<WitnessMap>,
         max_typing_memory: Option<usize>,
         program: String,
-    ) -> Result<Arc<Self>, MemoryExceeded> {
+    ) -> anyhow::Result<Arc<Self>> {
         let program = {
             let mut state = witnesses.state.lock().unwrap();
             if let Some(program) = state.programs.get(program.as_str()) {
@@ -99,7 +99,7 @@ impl AnalysisContext {
         }))
     }
 
-    pub(crate) fn check(&self) -> Result<(), MemoryExceeded> {
+    pub(crate) fn check(&self) -> Result<(), BudgetFailure> {
         if let Some(error) = self.failed.get() {
             return Err(error.clone());
         }
@@ -110,26 +110,25 @@ impl AnalysisContext {
                 .deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            return Err(MemoryExceeded {
-                limit: self.witnesses.budget.peak(),
-                context: " while stopping an entailment analysis".into(),
-            });
+            return Err(BudgetFailure::local(
+                self.witnesses.budget.peak(),
+                " while stopping an entailment analysis".into(),
+            ));
         }
         Ok(())
     }
 
-    pub(crate) fn fail(&self, error: MemoryExceeded) {
+    pub(crate) fn fail(&self, error: BudgetFailure) {
         let _ = self.failed.set(error);
     }
 
-    pub(crate) fn witness(&self, key: Vec<String>) -> Result<u64, MemoryExceeded> {
+    pub(crate) fn witness(&self, key: Vec<String>) -> Result<u64, BudgetFailure> {
         self.allocate(key)
     }
 
-    pub(crate) fn allocate(&self, key: Vec<String>) -> Result<u64, MemoryExceeded> {
-        let fail = |message: &str| MemoryExceeded {
-            limit: self.witnesses.budget.peak(),
-            context: format!(" while {message}"),
+    pub(crate) fn allocate(&self, key: Vec<String>) -> Result<u64, BudgetFailure> {
+        let fail = |message: &str| {
+            BudgetFailure::local(self.witnesses.budget.peak(), format!(" while {message}"))
         };
         if self.witnesses.cancel.load(Ordering::Relaxed)
             || self
@@ -161,7 +160,7 @@ impl AnalysisContext {
         &self,
         terms: &Terms,
         facts: &rustc_hash::FxHashSet<[u64; 3]>,
-    ) -> Result<(), MemoryExceeded> {
+    ) -> Result<(), BudgetFailure> {
         let mut found = Vec::new();
         for triple in facts {
             if self.witnesses.cancel.load(Ordering::Relaxed)
@@ -170,10 +169,10 @@ impl AnalysisContext {
                     .deadline
                     .is_some_and(|deadline| Instant::now() >= deadline)
             {
-                return Err(MemoryExceeded {
-                    limit: self.typing_budget.peak(),
-                    context: " while stopping diagnostic capture".into(),
-                });
+                return Err(BudgetFailure::local(
+                    self.typing_budget.peak(),
+                    " while stopping diagnostic capture".into(),
+                ));
             }
             if let (Some(subject), Some(predicate), Some(object)) = (
                 terms.term(triple[0]),

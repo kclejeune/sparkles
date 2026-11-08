@@ -20,9 +20,7 @@
 //! allocation first, with the old one, and the merge charges its working buffers before
 //! it allocates them ([`crate::budget`]).
 
-use crate::budget::{
-    Budget, Held, MemoryExceeded, Meter, table_bytes, table_capacity, table_grown,
-};
+use crate::budget::{Budget, BudgetFailure, Held, Meter, table_bytes, table_capacity, table_grown};
 use crate::facts::{Base, Memo, Probe, ProbeFilter};
 use hashbrown::HashTable;
 use rayon::prelude::*;
@@ -80,7 +78,7 @@ fn push_row(
     r: u32,
     m: &mut Meter<'_>,
     spilled: &mut isize,
-) -> Result<(), MemoryExceeded> {
+) -> Result<(), BudgetFailure> {
     let cap = e.capacity();
     if e.len() == cap {
         m.add(spill((cap * 2).max(8)))?;
@@ -101,7 +99,7 @@ fn extend_rows(
     rows: &[u32],
     m: &mut Meter<'_>,
     spilled: &mut isize,
-) -> Result<(), MemoryExceeded> {
+) -> Result<(), BudgetFailure> {
     let cap = e.capacity();
     let want = e.len() + rows.len();
     if want > cap {
@@ -122,7 +120,7 @@ fn entry<'m, K: std::hash::Hash + Eq>(
     m: &'m mut Lists<K>,
     k: K,
     meter: &mut Meter<'_>,
-) -> Result<&'m mut List, MemoryExceeded> {
+) -> Result<&'m mut List, BudgetFailure> {
     if m.len() == m.capacity() && !m.contains_key(&k) {
         let old = lists_bytes(m);
         meter.add(table_growth::<K>(m.len(), m.capacity()))?;
@@ -191,11 +189,11 @@ pub(crate) struct Graph {
     dead_rows: u32,
     /// the heap of the index lists beyond their inline rows
     spilled: usize,
-    /// the graph's heap, charged to the run's budget
-    held: Held,
     /// predicates of bookkeeping facts (the magic facts of a demand program) that atoms
     /// and `noValue` builtins with a variable predicate do not see
     hidden: Option<Arc<FxHashSet<u64>>>,
+    /// Returned only after every owned graph payload above has been destroyed.
+    held: Held,
 }
 
 impl Default for Graph {
@@ -319,13 +317,19 @@ impl Graph {
         for m in &mut g.index {
             *m = HashTable::with_capacity(n / SHARDS);
         }
-        g.settle();
+        g.settle().expect("unpooled graph construction");
         g
     }
 
     /// [`with_capacity`](Self::with_capacity), charged to `budget` before it allocates.
-    pub fn try_with_capacity(n: usize, budget: &Arc<Budget>) -> Result<Graph, MemoryExceeded> {
-        let bytes = n * size_of::<Triple>() + SHARDS * table_bytes(table_capacity(n / SHARDS), 4);
+    pub fn try_with_capacity(n: usize, budget: &Arc<Budget>) -> Result<Graph, BudgetFailure> {
+        let bytes = n
+            .checked_mul(size_of::<Triple>())
+            .and_then(|rows| {
+                (SHARDS * table_bytes(table_capacity(n / SHARDS), 4)).checked_add(rows)
+            })
+            .and_then(|n| n.checked_add(Self::fixed_heap_bytes()))
+            .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
         let mut held = Held::try_new(budget, bytes)?;
         let mut g = Graph::with_capacity(n);
         // strict: the estimate above may fall short of the heap, and settling must not
@@ -336,16 +340,24 @@ impl Graph {
     }
 
     /// Charge the graph's heap to `budget` from now on, or fail when it does not fit.
-    pub fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), MemoryExceeded> {
+    pub fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), BudgetFailure> {
         self.held = Held::try_new(budget, self.heap_bytes())?;
         Ok(())
     }
 
+    /// Install already prepared credit; the caller retires the old owner after
+    /// every component has committed and after leaving any enclosing lock.
+    pub(crate) fn replace_credit(&mut self, held: Held) -> Held {
+        assert_eq!(held.bytes(), self.heap_bytes());
+        std::mem::replace(&mut self.held, held)
+    }
+
     /// [`set_budget`](Self::set_budget), charging even past the limit.
-    pub fn charge_to(&mut self, budget: &Arc<Budget>) {
+    pub fn charge_to(&mut self, budget: &Arc<Budget>) -> Result<(), BudgetFailure> {
         let mut h = Held::new(budget);
-        h.grow(self.heap_bytes());
+        h.grow(self.heap_bytes())?;
         self.held = h;
+        Ok(())
     }
 
     /// The budget the graph's heap is charged to.
@@ -356,13 +368,13 @@ impl Graph {
     /// Bring the charge of the graph's heap in line with [`heap_bytes`](Self::heap_bytes),
     /// releasing what freed allocations held (and charging, past the limit if need be,
     /// what grew beyond the estimates).
-    pub fn settle(&mut self) {
+    pub fn settle(&mut self) -> Result<(), BudgetFailure> {
         let n = self.heap_bytes();
-        self.held.set(n);
+        self.held.set(n)
     }
 
     /// [`settle`](Self::settle), failing instead of charging past the limit.
-    pub fn try_settle(&mut self) -> Result<(), MemoryExceeded> {
+    pub fn try_settle(&mut self) -> Result<(), BudgetFailure> {
         let n = self.heap_bytes();
         self.held.try_set(n)
     }
@@ -392,10 +404,7 @@ impl Graph {
             + table_bytes(self.distinct_o.capacity(), 16);
         n += self.dead.capacity() * size_of::<u64>();
         // the shard vectors themselves
-        n += SHARDS
-            * (size_of::<HashTable<u32>>()
-                + size_of::<FxHashSet<Triple>>()
-                + 5 * size_of::<Lists<u64>>());
+        n += Self::fixed_heap_bytes();
         n + self.spilled
     }
 
@@ -404,7 +413,7 @@ impl Graph {
     /// rows and rehashes the index while a run waits, so a closure kept for small runs
     /// gets this room once, after its commit. The growth is charged before it is
     /// allocated, and a charge past the limit fails.
-    pub fn try_reserve_rows(&mut self, min: usize, want: usize) -> Result<(), MemoryExceeded> {
+    pub fn try_reserve_rows(&mut self, min: usize, want: usize) -> Result<(), BudgetFailure> {
         let (len, cap) = (self.triples.len(), self.triples.capacity());
         if cap - len < min {
             let new = len + want.max(min);
@@ -439,6 +448,21 @@ impl Graph {
         }
     }
 
+    /// Construct directly under the receiving owner before allocating shard vectors.
+    pub fn with_base_in(base: Arc<Base>, budget: &Arc<Budget>) -> Result<Graph, BudgetFailure> {
+        let held = Held::try_new_exact(budget, Self::fixed_heap_bytes())?;
+        let mut graph = Self::with_base(base);
+        graph.held = held;
+        Ok(graph)
+    }
+
+    fn fixed_heap_bytes() -> usize {
+        SHARDS
+            * (size_of::<HashTable<u32>>()
+                + size_of::<FxHashSet<Triple>>()
+                + 5 * size_of::<Lists<u64>>())
+    }
+
     /// A graph over the same base tier and row numbers as this one, with room for `n`
     /// in-memory rows, charged to `budget` before it allocates when `strict` (and
     /// otherwise even past the limit).
@@ -447,12 +471,12 @@ impl Graph {
         n: usize,
         budget: &Arc<Budget>,
         strict: bool,
-    ) -> Result<Graph, MemoryExceeded> {
-        let mut g = if strict {
+    ) -> Result<Graph, BudgetFailure> {
+        let mut g = if strict || budget.parent().is_some() {
             Graph::try_with_capacity(n, budget)?
         } else {
             let mut g = Graph::with_capacity(n);
-            g.charge_to(budget);
+            g.charge_to(budget)?;
             g
         };
         g.offset = self.offset;
@@ -465,7 +489,7 @@ impl Graph {
     /// before [`offset`](Self::offset), which are only read as a whole, so the new tier
     /// may hold more facts than that. The cache of base facts that merges found is
     /// emptied, since the new tier may not hold them.
-    pub fn set_base(&mut self, base: Arc<Base>) {
+    pub fn set_base(&mut self, base: Arc<Base>) -> Result<(), BudgetFailure> {
         debug_assert!(self.base.is_some() && self.offset > 0);
         debug_assert!(
             self.base
@@ -477,14 +501,14 @@ impl Graph {
         for k in &mut self.in_base {
             *k = FxHashSet::default();
         }
-        self.settle();
+        self.settle()
     }
 
     /// [`set_base`](Self::set_base), returning the tier it replaced.
-    pub fn swap_base(&mut self, base: Arc<Base>) -> Option<Arc<Base>> {
+    pub fn swap_base(&mut self, base: Arc<Base>) -> Result<Option<Arc<Base>>, BudgetFailure> {
         let old = self.base.clone();
-        self.set_base(base);
-        old
+        self.set_base(base)?;
+        Ok(old)
     }
 
     /// The base tier, to change, while no one else shares it.
@@ -545,7 +569,7 @@ impl Graph {
     pub fn try_add_batch(
         &mut self,
         ts: impl IntoIterator<Item = Triple>,
-    ) -> Result<usize, MemoryExceeded> {
+    ) -> Result<usize, BudgetFailure> {
         self.add_rows(ts, true)
     }
 
@@ -553,7 +577,7 @@ impl Graph {
         &mut self,
         ts: impl IntoIterator<Item = Triple>,
         strict: bool,
-    ) -> Result<usize, MemoryExceeded> {
+    ) -> Result<usize, BudgetFailure> {
         let start = self.triples.len();
         let budget = self.held.budget().clone();
         let mut m = Meter::new(&budget, strict);
@@ -599,10 +623,9 @@ impl Graph {
         self.held.adopt(m.into_bytes());
         // after an error the graph is unusable, and settling would charge what was
         // allocated beyond the failed charge, past the limit
-        if r.is_ok() {
-            self.settle();
-        }
-        r.map(|()| new)
+        r?;
+        self.settle()?;
+        Ok(new)
     }
 
     /// Merge the outputs of an iteration, in order: each triple that is not in the graph
@@ -615,9 +638,9 @@ impl Graph {
     /// allocated; a charge past the limit fails the merge, and the graph is unusable
     /// after an error.
     pub fn merge(&mut self, outs: Vec<Vec<Triple>>, outs_held: Held) -> anyhow::Result<usize> {
-        let r = self.merge_charged(outs, outs_held);
-        self.settle();
-        r
+        let result = self.merge_charged(outs, outs_held)?;
+        self.settle()?;
+        Ok(result)
     }
 
     fn merge_charged(
@@ -688,7 +711,7 @@ impl Graph {
         // per shard: the first occurrence of each triple that is new, in position order,
         // those of them the base tier may hold, those whose predicate and object decide
         // it, and the bytes charged for them
-        type Dedup = Result<(Vec<u64>, Vec<u64>, Vec<u64>, usize), MemoryExceeded>;
+        type Dedup = Result<(Vec<u64>, Vec<u64>, Vec<u64>, usize), BudgetFailure>;
         let deduped: Vec<Dedup> = self
             .index
             .par_iter()
@@ -943,7 +966,7 @@ impl Graph {
     /// Add the in-memory rows from `start` (an index of `triples`) to the secondary
     /// indexes, with one task per index shard when there are many. Growth is charged to
     /// `m` (and its strictness) before it is allocated.
-    fn fill(&mut self, start: usize, m: &mut Meter<'_>) -> Result<(), MemoryExceeded> {
+    fn fill(&mut self, start: usize, m: &mut Meter<'_>) -> Result<(), BudgetFailure> {
         let n = self.triples.len() - start;
         if n == 0 {
             return Ok(());
@@ -1031,7 +1054,7 @@ impl Graph {
         // per task: whether it counts subjects, the predicates whose distinct subjects (or
         // objects) grew and by how much, the change of the lists' heap beyond their inline
         // rows, and the bytes it charged
-        type Filled = Result<(bool, Vec<(u64, u32)>, isize, usize), MemoryExceeded>;
+        type Filled = Result<(bool, Vec<(u64, u32)>, isize, usize), BudgetFailure>;
         let run = |task: Fill<'_>| -> Filled {
             let mut grew: FxHashMap<u64, u32> = FxHashMap::default();
             let mut meter = Meter::new(budget, strict);
@@ -1132,7 +1155,7 @@ impl Graph {
 
     /// Build the per-subject (`subjects`) or per-object index if it is missing, its
     /// growth charged before it is allocated: with `strict`, failing past the limit.
-    pub fn ensure_index(&mut self, subjects: bool, strict: bool) -> Result<(), MemoryExceeded> {
+    pub fn ensure_index(&mut self, subjects: bool, strict: bool) -> Result<(), BudgetFailure> {
         let present = if subjects {
             self.by_s.is_some()
         } else {
@@ -1146,7 +1169,7 @@ impl Graph {
         let mut spilled = 0isize;
         let col = if subjects { 0 } else { 2 };
         let mut v: Vec<Lists<u64>> = shards();
-        let r = (|| {
+        let r: Result<(), BudgetFailure> = (|| {
             for (i, t) in self.triples.iter().enumerate() {
                 let e = entry(&mut v[shard1(t[col])], t[col], &mut meter)?;
                 push_row(e, self.offset + i as u32, &mut meter, &mut spilled)?;
@@ -1162,8 +1185,8 @@ impl Graph {
             self.spilled = (self.spilled as isize + spilled).max(0) as usize;
         }
         self.held.adopt(meter.into_bytes());
-        self.settle();
-        r
+        r?;
+        self.settle()
     }
     /// The row of a live in-memory triple.
     #[inline]
@@ -1202,27 +1225,43 @@ impl Graph {
 
     /// Mark the row of a live in-memory triple dead; returns false if the triple is not
     /// live.
-    pub fn kill(&mut self, t: &Triple) -> bool {
-        let (triples, off) = (&self.triples, self.offset);
-        let Ok(e) =
-            self.index[shard3(t)].find_entry(hash3(t), |&r| triples[(r - off) as usize] == *t)
-        else {
-            return false;
+    pub fn kill(&mut self, t: &Triple) -> Result<bool, BudgetFailure> {
+        let Some(&row) = self.index[shard3(t)].find(hash3(t), |&r| {
+            self.triples[(r - self.offset) as usize] == *t
+        }) else {
+            return Ok(false);
         };
-        let (i, _) = e.remove();
-        let i = i - self.offset;
+        let i = row - self.offset;
         let w = i as usize / 64;
         if self.dead.len() <= w {
+            let want = w
+                .checked_add(1)
+                .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
             let cap = self.dead.capacity();
-            self.dead.resize(w + 1, 0);
-            // a few bits per row, charged as they grow
-            self.held
-                .grow((self.dead.capacity() - cap) * size_of::<u64>());
+            if want > cap {
+                let next = cap.checked_mul(2).unwrap_or(want).max(want).max(4);
+                let bytes = next.checked_mul(size_of::<u64>()).ok_or_else(|| {
+                    BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow)
+                })?;
+                self.held.try_grow(bytes)?;
+                self.dead.reserve_exact(next - self.dead.len());
+                self.held.shrink(cap * size_of::<u64>());
+                let excess = self.dead.capacity() - next;
+                self.held.try_grow(excess * size_of::<u64>())?;
+            }
+            self.dead.resize(want, 0);
         }
+        // No row or index changes before its required dead-bit storage is backed.
+        self.index[shard3(t)]
+            .find_entry(hash3(t), |&r| {
+                self.triples[(r - self.offset) as usize] == *t
+            })
+            .expect("exclusive row stayed present")
+            .remove();
         self.dead[w] |= 1 << (i % 64);
         self.dead_rows += 1;
         self.live -= 1;
-        true
+        Ok(true)
     }
 
     /// Number of dead rows.
@@ -1616,8 +1655,8 @@ mod tests {
     fn dead_rows() {
         let mut g = Graph::default();
         g.add_batch([[1, 10, 2], [1, 10, 3]]);
-        assert!(g.kill(&[1, 10, 2]));
-        assert!(!g.kill(&[1, 10, 2]));
+        assert!(g.kill(&[1, 10, 2]).unwrap());
+        assert!(!g.kill(&[1, 10, 2]).unwrap());
         assert!(!g.alive(0) && g.alive(1) && g.alive(5));
         assert_eq!(g.position(&[1, 10, 2]), None);
         assert_eq!(g.objects(&mut Memo::default(), 1, 10, 2), [3]);
@@ -1788,7 +1827,8 @@ mod tests {
             &sparkles_core::sparql::QueryOptions::default(),
         )
         .unwrap();
-        g.set_base(Arc::new(Base::new(store.snapshot(), &graphs).unwrap()));
+        g.set_base(Arc::new(Base::new(store.snapshot(), &graphs).unwrap()))
+            .unwrap();
         assert_eq!(before, (1, 1));
         assert_eq!(
             (g.distinct_subjects(), g.distinct_objects()),

@@ -25,7 +25,7 @@ pub(super) fn load_dir(root: &Path) -> Option<ManagedState> {
             });
         }
     };
-    let state = crate::managed::decode(&bytes, |owner| {
+    let mut state = crate::managed::decode(&bytes, |owner| {
         let path = root.join(owner.settings_file());
         match std::fs::metadata(&path) {
             Ok(m) if m.len() > crate::managed::MAX_SETTINGS_BYTES as u64 => {
@@ -42,6 +42,20 @@ pub(super) fn load_dir(root: &Path) -> Option<ManagedState> {
             Err(e) => Err(e.into()),
         }
     });
+    // A settings mismatch can still be repaired against a verified old root. A
+    // missing/corrupt anchored lineage cannot be reset through that repair path.
+    let history_check = crate::managed::recorded_history(&bytes).and_then(|history| {
+        if history.is_some() {
+            verified_history_registry(root, &bytes)?;
+        }
+        Ok(())
+    });
+    if let Err(error) = history_check {
+        state = ManagedState::Unavailable {
+            reason: error.to_string(),
+            repairable: false,
+        };
+    }
     if let ManagedState::Unavailable { reason, .. } = &state {
         tracing::error!(target: "sparkles::store", "{}: writes are refused: {reason}", root.display());
     }
@@ -58,6 +72,27 @@ pub struct ManagedSnapshot {
     pub settings: BTreeMap<OwnerKind, Arc<[u8]>>,
     /// Why writes are refused until an owner is enabled again, when they are.
     pub unavailable: Option<String>,
+}
+
+/// Retains the one actual admission state through guards, bulk builds and queues.
+pub(super) struct AdmittedManaged {
+    pub(super) configuration: crate::history::ConfigurationBinding,
+    state: Option<Arc<ManagedState>>,
+}
+
+impl AdmittedManaged {
+    pub(super) fn admit_ids(
+        &self,
+        snap: &Snapshot,
+        graphs: impl Iterator<Item = Id>,
+        capability: Option<&ManagedWrite>,
+    ) -> Result<()> {
+        Store::admit_managed_ids_at(self.state.as_ref(), snap, graphs, capability)
+    }
+
+    pub(super) fn fence(&self) -> Result<Option<GraphFence>> {
+        Ok(Admission::start(self.state.as_ref(), None)?.map(|a| a.installed().iris()))
+    }
 }
 
 impl Store {
@@ -227,7 +262,8 @@ impl Store {
                 |i| i.graphs.clone(),
             );
             let mut files = current.map(|i| i.settings.clone()).unwrap_or_default();
-            graphs.revision += 1;
+            graphs.revision = graphs.revision.checked_add(1)
+                .ok_or_else(|| Error::invalid("managed registry revision overflow"))?;
             // A graph that stays protected keeps its nonce; one that becomes protected
             // gets a new random one, which nobody could have known before.
             let previous = graphs.owners.get(&owner);
@@ -359,7 +395,10 @@ impl Store {
             // Protecting the graph again chooses a new nonce, so a record written while
             // it is detached never carries the nonce of a protection.
             entry.protections.remove(graph);
-            graphs.revision += 1;
+            graphs.revision = graphs
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid("managed registry revision overflow"))?;
             Ok((Installed::new(graphs, current.settings.clone())?, None))
         })
     }
@@ -411,7 +450,7 @@ impl Store {
             }
             (i, _, _) => i,
         };
-        let (next, written) = change(installed)?;
+        let (mut next, written) = change(installed)?;
         for (owner, entry) in &next.graphs.owners {
             let matches = next
                 .settings
@@ -427,6 +466,77 @@ impl Store {
                 ));
             }
         }
+        let previous_history = installed.and_then(|i| i.configuration_history.as_ref());
+        let preparation = previous_history
+            .map(|_| super::managed_history::administrative_preparation())
+            .transpose()?;
+        let mut prepared_history = match (previous_history, preparation.as_ref()) {
+            (Some(history), Some(preparation)) => {
+                let ordinal = if let Some(root) = &self.root {
+                    let current = super::managed_history::resolve(
+                        root,
+                        self.owner_dataset_id(),
+                        history,
+                        history.identity(self.owner_dataset_id()),
+                        preparation,
+                    )?;
+                    current.value.ordinal
+                } else {
+                    installed
+                        .and_then(|i| i.history_memory.as_ref())
+                        .filter(|memory| {
+                            memory.prepared.identity == history.identity(self.owner_dataset_id())
+                        })
+                        .ok_or_else(|| {
+                            super::managed_history::unavailable(
+                                "in-memory configuration lineage missing",
+                            )
+                        })?
+                        .prepared
+                        .document
+                        .value
+                        .ordinal
+                };
+                let prepared = super::managed_history::prepare(
+                    self.owner_dataset_id(),
+                    history.lineage_id,
+                    ordinal
+                        .checked_add(1)
+                        .ok_or_else(|| Error::invalid("configuration ordinal overflow"))?,
+                    Some(history.current_generation),
+                    &next,
+                    preparation,
+                )?;
+                next.configuration_history = Some(super::managed_history::Root {
+                    current_generation: prepared.identity.generation,
+                    ..history.clone()
+                });
+                Some(prepared)
+            }
+            _ => None,
+        };
+        if self.root.is_none()
+            && let Some(prepared) = prepared_history.take()
+        {
+            let previous = installed
+                .and_then(|i| i.history_memory.as_ref())
+                .ok_or_else(|| {
+                    super::managed_history::unavailable("in-memory configuration lineage missing")
+                })?
+                .clone();
+            let old_size = previous.retained();
+            let memory = super::managed_history::MemoryHistory::next(prepared, previous)?;
+            let snapshot = self.snapshot();
+            let data = snapshot
+                .generation
+                .disk_bytes()
+                .checked_add(super::delta_bytes(&snapshot.delta))
+                .and_then(|n| n.checked_add(snapshot.generation.dvocab.with(|v| v.bytes()) as u64))
+                .and_then(|n| n.checked_add(memory.retained() - old_size))
+                .ok_or_else(|| Error::invalid("configuration memory size overflow"))?;
+            self.check_memory(data)?;
+            next.history_memory = Some(memory);
+        }
         // From the first registry file written until the new registry is installed,
         // the files may no longer match the installed registry. An error or unwind
         // in between leaves the family refusing every write, so that no ordinary
@@ -436,20 +546,67 @@ impl Store {
             armed: false,
         };
         if let Some(root) = &self.root {
+            let _quota_invalidation = RegistryQuota(&self.quota);
             // 1. the reader that enforces the registry, before anything relies on it
-            crate::commit::require_reader(root, crate::managed::READER)?;
+            crate::commit::require_reader(
+                root,
+                if previous_history.is_some() {
+                    super::managed_history::READER
+                } else {
+                    crate::managed::READER
+                },
+            )?;
             self.failpoint("managed-reader-raised");
+            let _history_reservation = if let (Some(prepared), Some(preparation)) =
+                (prepared_history.as_ref(), preparation.as_ref())
+            {
+                let additional = (prepared.bytes.value.len() as u64)
+                    .checked_add(next.settings.values().map(|b| b.len() as u64).sum::<u64>())
+                    .and_then(|n| {
+                        n.checked_add((prepared.bytes.value.len() as u64).saturating_mul(2))
+                    })
+                    .ok_or_else(|| Error::invalid("configuration disk size overflow"))?;
+                let reservation = self.quota.reserve(additional);
+                self.check_disk(self.quota.unwritten())?;
+                self.quota.check_commit(self.quota.unwritten())?;
+                self.quota.invalidate();
+                let persisted = super::managed_history::persist(root, prepared, preparation);
+                self.quota.invalidate();
+                persisted?;
+                self.failpoint("managed-history-written");
+                Some(reservation)
+            } else {
+                None
+            };
             fence.armed = true;
             // 2. the owner's settings, which the registry's digest names
-            if let Some(owner) = written {
+            if next.configuration_history.is_some() {
+                // A verified historical root can repair interrupted settings. Write
+                // every owner from that complete candidate, not an old digest paired
+                // with another owner's damaged mutable file.
+                for (owner, bytes) in &next.settings {
+                    write_atomic(&root.join(owner.settings_file()), bytes)?;
+                    sync_dir(root)?;
+                }
+            } else if let Some(owner) = written {
                 let bytes = &next.settings[&owner];
                 write_atomic(&root.join(owner.settings_file()), bytes)?;
                 sync_dir(root)?;
             }
             self.failpoint("managed-settings-written");
             // 3. the commit point
+            let _root_bytes = preparation
+                .as_ref()
+                .map(|preparation| {
+                    let bytes = prepared_history
+                        .as_ref()
+                        .map_or(0, |p| p.bytes.value.len() as u64);
+                    preparation.reserve(bytes.saturating_mul(2).saturating_add(4096))
+                })
+                .transpose()?;
             write_atomic(&root.join(crate::managed::FILE), &next.file_bytes())?;
             sync_dir(root)?;
+            self.quota.invalidate();
             self.failpoint("managed-published");
         }
         let graphs = next.graphs.clone();
@@ -507,27 +664,65 @@ impl Store {
     /// Admit a candidate commit's changes, as WAL records, against the registry: a
     /// managed graph changes only with its owner's capability. A single load and a
     /// `None` check when no registry is installed and no capability is given.
-    pub(crate) fn admit_managed_log(
+    pub(super) fn admit_managed_commit(
         &self,
         snap: &Snapshot,
         log: &[(u8, [Id; 4])],
+        bulk: impl Iterator<Item = Id>,
         managed: Option<&ManagedWrite>,
-    ) -> Result<()> {
-        self.admit_managed_ids(snap, log.iter().map(|(_, q)| q[3]), managed)
+    ) -> Result<AdmittedManaged> {
+        // Both graph checks and the returned reference use this one actual state.
+        // Configure may install a later state while guard callbacks run; it cannot
+        // replace the reference that admitted this publication.
+        let admitted = self.capture_managed_admission(managed)?;
+        admitted.admit_ids(snap, log.iter().map(|(_, q)| q[3]), managed)?;
+        admitted.admit_ids(snap, bulk, None)?;
+        Ok(admitted)
     }
 
-    /// [`admit_managed_log`](Self::admit_managed_log) for the graphs `graphs`.
-    pub(crate) fn admit_managed_ids(
+    /// The replay preview checks a log before its guard without publishing a
+    /// transaction. Real commits retain their admitted state through publication.
+    pub(super) fn admit_managed_log(
         &self,
+        snapshot: &Snapshot,
+        log: &[(u8, [Id; 4])],
+        managed: Option<&ManagedWrite>,
+    ) -> Result<()> {
+        self.admit_managed_commit(snapshot, log, std::iter::empty(), managed)
+            .map(|_| ())
+    }
+
+    pub(super) fn capture_managed_admission(
+        &self,
+        capability: Option<&ManagedWrite>,
+    ) -> Result<AdmittedManaged> {
+        let state = self.family.managed.load_full();
+        Admission::start(state.as_ref(), capability)?;
+        let configuration = match state.as_deref() {
+            Some(ManagedState::Installed(i)) => i.configuration_history.as_ref().map_or(
+                crate::history::ConfigurationBinding::LegacyUnbound,
+                |history| {
+                    super::managed_history::binding(history.identity(self.owner_dataset_id()))
+                },
+            ),
+            _ => crate::history::ConfigurationBinding::LegacyUnbound,
+        };
+        Ok(AdmittedManaged {
+            configuration,
+            state,
+        })
+    }
+
+    fn admit_managed_ids_at(
+        state: Option<&Arc<ManagedState>>,
         snap: &Snapshot,
         graphs: impl Iterator<Item = Id>,
         managed: Option<&ManagedWrite>,
     ) -> Result<()> {
-        let state = self.family.managed.load();
         if state.is_none() && managed.is_none() {
             return Ok(());
         }
-        let Some(mut admission) = Admission::start(state.as_ref(), managed)? else {
+        let Some(mut admission) = Admission::start(state, managed)? else {
             return Ok(());
         };
         let mut last = None;
@@ -554,13 +749,6 @@ impl Store {
             admission.key(key)?;
         }
         Ok(())
-    }
-
-    /// The managed graph IRIs a bulk build refuses quads in, after refusing an
-    /// unavailable registry. `None` when no graph is managed.
-    pub(crate) fn managed_fence(&self) -> Result<Option<GraphFence>> {
-        let state = self.family.managed.load();
-        Ok(Admission::start(state.as_ref(), None)?.map(|a| a.installed().iris()))
     }
 
     /// The registry's files for a backup or clone: `managed.json` and each owner's
@@ -650,6 +838,15 @@ struct UncertainRegistry<'a> {
     armed: bool,
 }
 
+/// Registry/history files can remain after a failed preparation. Future quota
+/// checks must measure those real bytes, including after an unwind.
+struct RegistryQuota<'a>(&'a Arc<super::quota::Quota>);
+impl Drop for RegistryQuota<'_> {
+    fn drop(&mut self) {
+        self.0.invalidate();
+    }
+}
+
 impl Drop for UncertainRegistry<'_> {
     fn drop(&mut self) {
         if self.armed {
@@ -678,6 +875,9 @@ fn recorded_entries(root: &Path) -> Result<Option<Installed>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    if crate::managed::recorded_history(&bytes)?.is_some() {
+        return verified_history_registry(root, &bytes).map(Some);
+    }
     let mut raw: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| Error::Corrupt(format!("{}: {e}", crate::managed::FILE)))?;
     if let Some(o) = raw.as_object_mut() {
@@ -699,6 +899,39 @@ fn recorded_entries(root: &Path) -> Result<Option<Installed>> {
         settings,
     )
     .map(Some)
+}
+
+/// The old generation supplies exact owner bytes only after its entire anchored
+/// lineage and the registry document have been checked. Current bytes alone are
+/// never retroactively certified by this recovery helper.
+fn verified_history_registry(root: &Path, bytes: &[u8]) -> Result<Installed> {
+    let history = crate::managed::recorded_history(bytes)?
+        .ok_or_else(|| super::managed_history::unavailable("configuration history root missing"))?;
+    let dataset_id = crate::commit::read_dataset_file(root)?.ok_or_else(|| {
+        super::managed_history::unavailable("configuration dataset identity missing")
+    })?;
+    let preparation = super::managed_history::administrative_preparation()?;
+    let document = super::managed_history::resolve(
+        root,
+        dataset_id,
+        &history,
+        history.identity(dataset_id),
+        &preparation,
+    )?;
+    match crate::managed::decode(bytes, |owner| {
+        Ok(document
+            .value
+            .owner_settings
+            .get(&owner)
+            .map(|text| text.as_bytes().to_vec()))
+    }) {
+        ManagedState::Installed(installed) if document.value.matches_installed(&installed) => {
+            Ok(installed)
+        }
+        _ => Err(super::managed_history::unavailable(
+            "published configuration and registry differ",
+        )),
+    }
 }
 
 fn rootless_repair(reason: &str) -> Error {

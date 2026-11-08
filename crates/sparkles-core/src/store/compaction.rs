@@ -398,6 +398,7 @@ pub(crate) struct TapCommit {
     /// the blank-node counter after the commit
     pub next_bnode: u64,
     pub changes: Vec<(u8, [Id; 4])>,
+    pub configuration: crate::history::ConfigurationBinding,
 }
 
 /// A run owns its tap through an identity token. Cancellation can disable it
@@ -720,15 +721,17 @@ impl CatchUp {
                 }
                 data.extend_from_slice(&rec);
             }
+            let configuration_flags = wal::append_configuration(&mut data, c.configuration)?;
             rec[0] = WAL_COMMIT;
             rec[1..9].copy_from_slice(&c.next_bnode.to_le_bytes());
             // WAL_FLAG_ANNOTATED is not carried: the commits copied here were durable,
             // annotation included, before the compaction took the writer lock.
-            let flags = if c.info.unvalidated {
-                commit::WAL_FLAG_UNVALIDATED
-            } else {
-                0
-            };
+            let flags = configuration_flags
+                | if c.info.unvalidated {
+                    commit::WAL_FLAG_UNVALIDATED
+                } else {
+                    0
+                };
             commit::seal_wal_commit(
                 &mut rec,
                 c.info.seq,
@@ -1110,7 +1113,7 @@ impl Store {
         };
         let cancelled = || o.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
         // start: the snapshot to build, with the tap on from its commit
-        let (snap0, base, next_bnode, name, dir, tmp) = {
+        let (snap0, base, base_configuration, next_bnode, name, dir, tmp) = {
             let mut w = self.lock_writer(&crate::guard::WriteOptions {
                 cancel: o.cancel.clone(),
                 ..Default::default()
@@ -1134,6 +1137,22 @@ impl Store {
                 ti.checkpoint()?;
             }
             let snap = self.snapshot();
+            // The base keeps the original data commit's admission, even when a
+            // newer configuration was installed while that commit stayed Head.
+            let base_configuration = if matches!(self.managed_state_shared().as_deref(),
+                Some(crate::managed::ManagedState::Installed(i)) if i.configuration_history.is_some())
+            {
+                let control = o
+                    .cancel
+                    .as_ref()
+                    .map_or_else(crate::task::Control::none, |flag| {
+                        crate::task::Control::with_cancel(flag.clone())
+                    });
+                let preparation = crate::access::Preparation::new(control, 64 << 20)?;
+                self.configuration_binding_at(w.head.seq, &preparation)?
+            } else {
+                crate::history::ConfigurationBinding::LegacyUnbound
+            };
             let (dir, name, tmp) = match &self.root {
                 Some(root) => {
                     let cur = commit::generation_number(&snap.generation.name);
@@ -1156,7 +1175,15 @@ impl Store {
                 commits: Vec::new(),
             });
             run.started = true;
-            (snap, w.head, w.next_bnode, name, dir, tmp)
+            (
+                snap,
+                w.head,
+                base_configuration,
+                w.next_bnode,
+                name,
+                dir,
+                tmp,
+            )
         };
         if self.root.is_some() {
             run.dir = Some(dir.clone());
@@ -1345,7 +1372,12 @@ impl Store {
             std::fs::remove_file(dir.join(BUILDING_FILE))?;
             write_synced(
                 &dir.join("commit.json"),
-                &commit::gen_commit_bytes(self.dataset_id, "compaction", &base),
+                &commit::gen_commit_bytes_with_binding(
+                    self.dataset_id,
+                    "compaction",
+                    &base,
+                    base_configuration,
+                ),
             )?;
             sync_dir(&dir)?;
             sync_dir(root)?;

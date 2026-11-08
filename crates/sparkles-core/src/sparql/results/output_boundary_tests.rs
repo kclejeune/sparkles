@@ -399,3 +399,53 @@ fn classifier_still_translates_its_actual_io_refusals() {
     assert!(matches!(limited.classify(error), Error::Cancelled));
     assert_eq!((limited.written(), sent.get()), (0, 0));
 }
+
+#[test]
+fn an_actual_parent_ownership_refusal_keeps_its_typed_source_through_serde() {
+    use crate::sparql::ctx::Ctx;
+    use sparkles_budget::{MemoryDomain, ParentRefused};
+    for format in [Format::Native, Format::Tsv] {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut r = query(
+            store.snapshot(),
+            "SELECT (1 AS ?v) WHERE {}",
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(r.rows()[0][0], Some(Term::Literal(oxrdf::Literal::from(1))));
+        // The real nested-parent adapter admits zero credit but refuses required
+        // positive payload admission with a structured parent ownership error.
+        let parent = MemoryDomain::unpooled().parent(
+            |bytes| {
+                if bytes == 0 {
+                    Ok(())
+                } else {
+                    Err(ParentRefused::Overflow)
+                }
+            },
+            |_| {},
+        );
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.set_memory_parent(parent).unwrap();
+        r.ctx = Arc::new(ctx);
+        let sent = Cell::new(0);
+        let error = format.write(&r, Vec::new(), &sent).unwrap_err();
+        let Error::Component(component) = error else {
+            panic!("lost parent origin: {error:?}")
+        };
+        assert_eq!(
+            (component.component, component.code.as_str()),
+            ("query-memory", "ownership")
+        );
+        assert_eq!(
+            component
+                .source
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<ParentRefused>(),
+            Some(&ParentRefused::Overflow)
+        );
+        assert_eq!(sent.get(), 0);
+        assert_eq!(r.ctx.live_bytes(), 0);
+    }
+}

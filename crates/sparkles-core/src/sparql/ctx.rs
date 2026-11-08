@@ -860,6 +860,52 @@ impl Ctx {
         )
     }
 
+    /// A distinct reasoning child sharing this query's live total and original
+    /// backing. Construct it only when reasoning starts; ordinary execution keeps
+    /// its existing lazy fast account. The child retains accounting, not this Ctx.
+    pub fn memory_parent(&self) -> Result<Arc<dyn sparkles_budget::MemoryParent>> {
+        self.memory()
+            .child_parent(self.grant.clone(), self.mem_limit)
+    }
+
+    /// Attach a seed subcontext to its outer query before any charge. It retains
+    /// its own ledger/data lifetime and never reuses the outer primary owner id.
+    pub(crate) fn set_memory_parent(
+        &mut self,
+        parent: Arc<dyn sparkles_budget::MemoryParent>,
+    ) -> Result<()> {
+        if self.memory.get().is_some()
+            || self.fast.live.load(Ordering::Relaxed) != 0
+            || self.fast.eager.load(Ordering::Relaxed) != 0
+            || self.fast.peak.load(Ordering::Relaxed) != 0
+        {
+            return Err(Error::invalid(
+                "upstream query memory is set before the first charge",
+            ));
+        }
+        let factory = self
+            .grant
+            .as_ref()
+            .map_or(sparkles_budget::MemoryDomain::unpooled(), |g| {
+                g.memory_domain()
+            });
+        if factory.id() != parent.domain() {
+            return Err(Error::Component(Box::new(
+                crate::error::ComponentError::new(
+                    "query-memory",
+                    "foreign-domain",
+                    "upstream memory belongs to another accounting domain",
+                ),
+            )));
+        }
+        let ledger = QueryMemoryLedger::nested(self.grant.clone(), parent);
+        self.memory
+            .set(ledger)
+            .map_err(|_| Error::invalid("query memory already initialized"))?;
+        self.fast.live.store(PROMOTED, Ordering::Release);
+        Ok(())
+    }
+
     /// The grant the query charges, if it has one.
     pub fn grant(&self) -> Option<&Arc<PoolGrant>> {
         self.grant.as_ref()
@@ -2752,6 +2798,55 @@ pub struct Charge<'a> {
     owner: std::cell::Cell<Option<u64>>,
 }
 impl Charge<'_> {
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes.get()
+    }
+
+    pub(super) fn belongs_to(&self, ctx: &Ctx) -> bool {
+        std::ptr::eq(self.ctx, ctx)
+    }
+
+    /// Reconcile retained physical storage without moving it to a ledger account.
+    /// Callers admit growth before allocating and release a shrink after dropping it.
+    pub(super) fn resize(&self, bytes: u64) -> Result<()> {
+        let current = self.bytes.get();
+        if bytes > current {
+            self.add(bytes - current)?;
+        } else if bytes < current {
+            self.ctx.release_live(self.owner.get(), current - bytes);
+            self.bytes.set(bytes);
+        }
+        Ok(())
+    }
+
+    /// Consume another live charge on this exact context without a release interval.
+    /// Every check precedes mutation, including for an empty but owned source.
+    pub(super) fn adopt_charge(&self, source: &mut Option<Charge<'_>>) -> Result<()> {
+        let part = source
+            .as_ref()
+            .ok_or_else(|| Error::invalid("missing materialized input credit"))?;
+        if !std::ptr::eq(self.ctx, part.ctx)
+            || matches!((self.owner.get(), part.owner.get()), (Some(a), Some(b)) if a != b)
+            || (self.bytes.get() != 0 && self.owner.get().is_none())
+            || (part.bytes.get() != 0 && part.owner.get().is_none())
+        {
+            return Err(Error::invalid(
+                "materialized input belongs to another query account",
+            ));
+        }
+        let bytes = self
+            .bytes
+            .get()
+            .checked_add(part.bytes.get())
+            .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
+        let owner = self.owner.get().or(part.owner.get());
+        let part = source.take().expect("checked live input credit");
+        part.disarm();
+        self.owner.set(owner);
+        self.bytes.set(bytes);
+        Ok(())
+    }
+
     pub fn add(&self, bytes: u64) -> Result<()> {
         if bytes == 0 {
             return Ok(());
@@ -2783,6 +2878,22 @@ impl Charge<'_> {
         self.bytes.set(0);
         self.owner.take()
     }
+    /// Transfer this already admitted physical allocation to an immutable output.
+    /// The receiving context is the actual account owner, not a domain token.
+    pub(super) fn into_output(self, ctx: &Arc<Ctx>) -> OutputCredit {
+        assert!(
+            std::ptr::eq(self.ctx, Arc::as_ptr(ctx)),
+            "output account owner"
+        );
+        let bytes = self.bytes.get();
+        let owner = self.disarm();
+        OutputCredit {
+            ctx: ctx.clone(),
+            owner,
+            bytes,
+        }
+    }
+
     /// Move query-only input ownership into the returned backing without a release
     /// interval. Existing nonalgorithm kernels retain their estimate policy.
     pub(super) fn output_lease(&self, bytes: u64) -> Result<QueryMemoryLease> {
@@ -2831,6 +2942,20 @@ impl Charge<'_> {
 impl Drop for Charge<'_> {
     fn drop(&mut self) {
         self.ctx.release_live(self.owner.get(), self.bytes.get());
+    }
+}
+
+/// Final physical output credit. Retaining the real context keeps its original
+/// fast account or promoted ledger alive. Moving a paid charge here never returns
+/// and reacquires its credit and never forces fast eager queries onto the ledger.
+pub(super) struct OutputCredit {
+    ctx: Arc<Ctx>,
+    owner: Option<u64>,
+    bytes: u64,
+}
+impl Drop for OutputCredit {
+    fn drop(&mut self) {
+        self.ctx.release_live(self.owner, self.bytes);
     }
 }
 
@@ -2965,11 +3090,8 @@ impl OwnedCharge {
     pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
         self.lease.resize(self.ctx.mem_limit, bytes)
     }
-    pub(super) fn retain(mut self) {
-        self.lease.bytes = 0;
-    }
-    pub(super) fn into_lease(self) -> QueryMemoryLease {
-        self.lease
+    pub(super) fn into_parts(self) -> (Arc<Ctx>, QueryMemoryLease) {
+        (self.ctx, self.lease)
     }
 }
 
@@ -2997,6 +3119,95 @@ pub enum TermKind {
 mod charge_tests {
     use super::*;
     use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn eager_charge_transfer_keeps_the_actual_fast_credit_at_the_limit() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 12_288;
+        let output = ctx.charge(4096).unwrap();
+        let mut input = Some(ctx.charge(8192).unwrap());
+        assert_eq!(ctx.live_bytes(), ctx.mem_limit);
+        output.adopt_charge(&mut input).unwrap();
+        assert!(input.is_none());
+        assert_eq!(output.bytes.get(), 12_288);
+        assert_eq!(ctx.live_bytes(), ctx.mem_limit);
+        assert!(ctx.memory.get().is_none(), "transfer must not promote");
+        output.resize(4096).unwrap();
+        assert_eq!(ctx.live_bytes(), 4096);
+        output.resize(8192).unwrap();
+        assert_eq!(ctx.live_bytes(), 8192);
+        drop(output);
+        assert_eq!(ctx.live_bytes(), 0);
+        assert!(ctx.memory.get().is_none());
+    }
+
+    #[test]
+    fn eager_charge_transfer_rejects_a_different_context_on_the_same_grant() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(32 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        let one = pooled(&store, &grant);
+        let two = pooled(&store, &grant);
+        let output = one.charge(4096).unwrap();
+        let mut input = Some(two.charge(8192).unwrap());
+        let used = grant.used();
+        assert!(output.adopt_charge(&mut input).is_err());
+        assert_eq!(output.bytes.get(), 4096);
+        assert_eq!(input.as_ref().unwrap().bytes.get(), 8192);
+        assert_eq!(one.live_bytes(), 4096);
+        assert_eq!(two.live_bytes(), 8192);
+        assert_eq!(grant.used(), used);
+        assert!(one.memory.get().is_none() && two.memory.get().is_none());
+    }
+
+    #[test]
+    fn eager_charge_transfer_refuses_empty_foreign_accounts_and_overflow_unchanged() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let output = ctx.charge(4096).unwrap();
+        // These states exercise validation only; no fictitious credit is released.
+        let foreign = Charge {
+            ctx: &ctx,
+            bytes: std::cell::Cell::new(0),
+            owner: std::cell::Cell::new(Some(PRIMARY + 1)),
+        };
+        let mut input = Some(foreign);
+        let refused = output.adopt_charge(&mut input);
+        let foreign_owner = input.as_ref().unwrap().owner.get();
+        input.as_ref().unwrap().disarm();
+        assert!(refused.is_err());
+        assert_eq!(foreign_owner, Some(PRIMARY + 1));
+        assert_eq!(output.bytes.get(), 4096);
+        let part = input.as_ref().unwrap();
+        part.owner.set(Some(PRIMARY));
+        part.bytes.set(u64::MAX);
+        let refused = output.adopt_charge(&mut input);
+        let source_bytes = input.as_ref().unwrap().bytes.get();
+        input.as_ref().unwrap().disarm();
+        assert!(refused.is_err());
+        assert_eq!(source_bytes, u64::MAX);
+        assert_eq!(output.bytes.get(), 4096);
+        assert_eq!(ctx.live_bytes(), 4096);
+        assert!(ctx.memory.get().is_none());
+    }
+
+    #[test]
+    fn eager_charge_resize_refusal_preserves_the_admitted_storage() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 8192;
+        let charge = ctx.charge(4096).unwrap();
+        assert!(charge.resize(8193).is_err());
+        assert_eq!(charge.bytes.get(), 4096);
+        assert_eq!(ctx.live_bytes(), 4096);
+        charge.resize(0).unwrap();
+        assert_eq!(ctx.live_bytes(), 0);
+        let mut empty = Some(ctx.charge(0).unwrap());
+        charge.adopt_charge(&mut empty).unwrap();
+        assert!(empty.is_none());
+        assert!(ctx.memory.get().is_none());
+    }
 
     /// A decimal value gets the id of its canonical literal, inline or query-local.
     #[test]

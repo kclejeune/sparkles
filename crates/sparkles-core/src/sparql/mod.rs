@@ -32,6 +32,7 @@ mod joinorder;
 mod keyfilter;
 mod keyprobe;
 pub mod lateral;
+pub mod output;
 pub mod pathsearch;
 pub mod patternplan;
 pub mod plan;
@@ -396,6 +397,8 @@ pub struct QueryResult {
     /// DESCRIBE: the result stopped at [`describe::DescribeOptions::max_triples`]
     pub describe_truncated: bool,
     pub ctx: Arc<Ctx>,
+    // Physical payload/context fields precede their actual final table credit.
+    _table_credit: Option<table::FinalTableCredit>,
 }
 
 impl QueryResult {
@@ -701,15 +704,25 @@ pub fn query_with_plan(
 /// order of first appearance in the query text. [`query`] applies this; callers of
 /// [`execute_query`] apply it themselves.
 pub fn select_star_order(q: &str, r: &mut QueryResult) {
-    let Some(order) = select_star_columns(q, &r.vars) else {
+    let Some(mut order) = select_star_columns(q, &r.vars) else {
         return;
     };
-    r.vars = order.iter().map(|&i| r.vars[i].clone()).collect();
-    r.table.vars = order.iter().map(|&i| r.table.vars[i]).collect();
-    r.table.cols = order
-        .iter()
-        .map(|&i| std::mem::take(&mut r.table.cols[i]))
-        .collect();
+    // Reorder the already paid backing in place; no replacement columns or
+    // variable-name copies can escape its credit during final presentation.
+    for first in 0..order.len() {
+        let mut at = first;
+        while order[at] != at {
+            let next = order[at];
+            order[at] = at;
+            if next == first {
+                break;
+            }
+            r.vars.swap(at, next);
+            r.table.vars.swap(at, next);
+            r.table.cols.swap(at, next);
+            at = next;
+        }
+    }
 }
 
 fn select_star_columns(q: &str, vars: &[String]) -> Option<Vec<usize>> {
@@ -934,7 +947,7 @@ fn execute_prepared(
         }
         Box::new(Failed { error, plan })
     };
-    let (table, mut plan) = match exec::execute(&ctx, &node) {
+    let (materialized, mut plan) = match exec::execute_materialized(&ctx, &node) {
         Ok(r) => r,
         Err(e) => return Err(failed(e, None, None)),
     };
@@ -959,6 +972,7 @@ fn execute_prepared(
         rows_produced: 0,
         describe_truncated: false,
         ctx: ctx.clone(),
+        _table_credit: None,
     };
     match parsed {
         Query::Select { .. } => {
@@ -969,12 +983,17 @@ fn execute_prepared(
                 GraphPattern::Distinct { inner }
                 | GraphPattern::Reduced { inner }
                 | GraphPattern::Slice { inner, .. } => {
-                    project_vars(inner, &ctx).unwrap_or_else(|| table.vars.clone())
+                    project_vars(inner, &ctx).unwrap_or_else(|| materialized.table.vars.clone())
                 }
-                _ => table.vars.clone(),
+                _ => materialized.table.vars.clone(),
             };
             result.vars = vars.iter().map(|v| ctx.var_name(*v)).collect();
-            result.table = table.project(&vars);
+            let retained = materialized
+                .project(&ctx, &vars)
+                .and_then(|output| output.into_retained(&ctx))
+                .map_err(|error| failed(error, None, None))?;
+            result.table = retained.table;
+            result._table_credit = retained.credit;
             // substituted variables report their bound value
             for (v, id) in &bound {
                 if let Some(c) = result.table.col_of(*v) {
@@ -982,7 +1001,10 @@ fn execute_prepared(
                 }
             }
         }
-        Query::Ask { .. } => result.boolean = !table.is_empty(),
+        Query::Ask { .. } => {
+            result.boolean = !materialized.table.is_empty();
+            drop(materialized);
+        }
         Query::Construct {
             template,
             graph_templates,
@@ -990,12 +1012,13 @@ fn execute_prepared(
         } => {
             let stage = Instant::now();
             let where_plan = std::mem::take(&mut result.plan);
-            match construct(&ctx, &table, template, graph_templates) {
+            match construct(&ctx, &materialized.table, template, graph_templates) {
                 Ok(t) => (result.triples, result.quads) = t,
                 Err(e) => return Err(failed(e, Some(where_plan), Some(stage))),
             }
             result.plan = graph_root(kind, where_plan, stage);
             result.plan.actual_rows = (result.triples.len() + result.quads.len()) as i64;
+            drop(materialized);
         }
         Query::Describe { .. } => {
             // a dataset the query or the protocol gave, or the inference overlay
@@ -1005,7 +1028,7 @@ fn execute_prepared(
                 || !opts.default_graph_extra.is_empty();
             let stage = Instant::now();
             let where_plan = std::mem::take(&mut result.plan);
-            let d = match describe::describe(&ctx, &table, &opts.describe, explicit) {
+            let d = match describe::describe(&ctx, &materialized.table, &opts.describe, explicit) {
                 Ok(d) => d,
                 Err(e) => return Err(failed(e, Some(where_plan), Some(stage))),
             };
@@ -1014,6 +1037,7 @@ fn execute_prepared(
             result.plan = graph_root(kind, where_plan, stage);
             result.plan.actual_rows = result.triples.len() as i64;
             result.plan.warnings = ctx.warnings();
+            drop(materialized);
         }
     }
     result.timing = Timing {
@@ -1037,7 +1061,11 @@ fn execute_prepared(
     drop(node);
     ctx.release_work();
     if matches!(kind, QueryKind::Select | QueryKind::Ask)
-        && let Err(error) = ctx.shrink_retained(result.table.capacity_bytes())
+        && let Err(error) = ctx.shrink_retained(if result._table_credit.is_some() {
+            0
+        } else {
+            result.table.capacity_bytes()
+        })
     {
         return Err(Box::new(Failed {
             error,
@@ -1421,3 +1449,48 @@ mod stats_tests;
 mod strfilter_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod paid_final_table_tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn prepared_select_retains_actual_fast_table_credit_after_return() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = pool::QueryPool::new(1 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        query_memory::LEDGER_OPS.with(|n| n.set(0));
+        let result = query(
+            store.snapshot(),
+            "SELECT ?value WHERE { VALUES ?value { UNDEF } }",
+            &QueryOptions {
+                no_cache: true,
+                grant: Some(grant.clone()),
+                max_memory_bytes: Some(1 << 16),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let bytes = algosvc::table_capacity(&result.table).unwrap();
+        assert_eq!(result.table.cols, [vec![Id::UNDEF]]);
+        assert!(
+            result.ctx.live_bytes() >= bytes,
+            "returned SELECT must retain actual table credit"
+        );
+        query_memory::LEDGER_OPS.with(|n| {
+            assert_eq!(
+                n.get(),
+                0,
+                "ordinary prepared output stays on its fast account"
+            )
+        });
+        let owner = Arc::downgrade(&result.ctx);
+        drop(store);
+        assert!(owner.upgrade().is_some());
+        assert!(grant.used() >= bytes);
+        drop(result);
+        assert!(owner.upgrade().is_none());
+        assert_eq!(grant.used(), 0);
+    }
+}

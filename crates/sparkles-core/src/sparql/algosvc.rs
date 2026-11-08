@@ -1155,7 +1155,10 @@ pub(super) fn run(
     input: Option<Table>,
     edges: Option<Table>,
     vars: &[VarId],
-) -> Result<(Materialized, serde_json::Map<String, serde_json::Value>)> {
+) -> Result<(
+    Materialized<'static>,
+    serde_json::Map<String, serde_json::Value>,
+)> {
     let started = Instant::now();
     let limit = spec.num("maxMemory").map_or(u64::MAX, Num::u64);
     let ctl = Control::for_query(ctx, limit)?;
@@ -1318,12 +1321,12 @@ pub(super) fn run(
     // `run_node` counts the table once, when this call returns to it
     Ok((out, counters))
 }
-fn append(
+fn append<'ctx>(
     ctx: &Ctx,
-    mut left: Materialized,
-    right: Materialized,
+    mut left: Materialized<'ctx>,
+    right: Materialized<'ctx>,
     ctl: &Control,
-) -> Result<Materialized> {
+) -> Result<Materialized<'ctx>> {
     ctl.check()?;
     let n = left
         .table
@@ -1566,7 +1569,7 @@ impl<'a> Builder<'a> {
         }
         Ok(())
     }
-    fn finish(mut self, len: usize, ctx: &Ctx) -> Result<Materialized> {
+    fn finish(mut self, len: usize, ctx: &Ctx) -> Result<Materialized<'static>> {
         ctx.check_output_rows(len)?;
         let mut cols = Buffer::new("algorithm-table-cols", self.cols.len(), self.ctl)?;
         for col in self.cols.drain() {
@@ -1589,7 +1592,7 @@ impl<'a> Builder<'a> {
         self.ctl.charge(extra)?;
         let bytes = table_capacity(&table)?;
         let lease = self.ctl.output_lease(bytes)?;
-        Ok(Materialized { table, lease })
+        Ok(Materialized::with_lease(table, lease))
     }
 }
 pub(super) fn table_capacity(t: &Table) -> Result<u64> {
@@ -1633,7 +1636,7 @@ fn summary_row(
     stats: algo::Stats,
     vars: &[VarId],
     ctl: &Control,
-) -> Result<Materialized> {
+) -> Result<Materialized<'static>> {
     ctx.check()?;
     ctx.check_output_rows(1)?;
     let mut b = Builder::new(vars, ctl)?;
@@ -1702,7 +1705,7 @@ fn rows(
     par: &Par,
     ctl: &Control,
     vars: &[VarId],
-) -> Result<Materialized> {
+) -> Result<Materialized<'static>> {
     let o = &spec.outs;
     // a call that asks for the summary alone reports one row (GDS's stats mode)
     let stats_only = spec.stats_only();
@@ -3171,13 +3174,10 @@ mod projection_capacity_tests {
             sorted: Vec::new(),
         }
     }
-    fn admit_append(table: Table, ctl: &Control) -> Materialized {
+    fn admit_append(table: Table, ctl: &Control) -> Materialized<'static> {
         let bytes = table_capacity(&table).unwrap();
         ctl.charge(bytes).unwrap();
-        Materialized {
-            table,
-            lease: ctl.output_lease(bytes).unwrap(),
-        }
+        Materialized::with_lease(table, ctl.output_lease(bytes).unwrap())
     }
     #[test]
     fn append_reuses_spare_capacity_and_grows_once_for_large_parts() {

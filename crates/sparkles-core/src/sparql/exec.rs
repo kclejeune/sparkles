@@ -7,7 +7,7 @@ use super::plan::{
     Agg, GraphFilter, JoinAlgo, Kind, Node, OrderedTopK, PathEnd, PathSpec, RangeSpec, ScanSpec,
 };
 use super::sortkey::{Entry, Screen, SortKey, TopK};
-use super::table::{Materialized, Table, VarId};
+use super::table::{InputCredit, Materialized, Table, VarId};
 use super::value::{NumOp, Value, arith, order_cmp};
 use crate::error::{Error, Result};
 use crate::id::Id;
@@ -826,13 +826,24 @@ pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
     let (output, info) = execute_owned(ctx, n)?;
     Ok((output.table, info))
 }
-pub(super) fn execute_owned(ctx: &Ctx, n: &Node) -> Result<(Materialized, PlanInfo)> {
+pub(super) fn execute_owned(ctx: &Ctx, n: &Node) -> Result<(Materialized<'static>, PlanInfo)> {
+    let (output, info) = execute_owned_inner(ctx, n, contains_algorithm(n))?;
+    Ok((output.into_lease_owned(ctx)?, info))
+}
+pub(super) fn execute_materialized<'ctx>(
+    ctx: &'ctx Ctx,
+    n: &Node,
+) -> Result<(Materialized<'ctx>, PlanInfo)> {
     execute_owned_inner(ctx, n, contains_algorithm(n))
 }
 fn contains_algorithm(n: &Node) -> bool {
     matches!(n.kind, Kind::AlgoCall(_)) || n.children.iter().any(contains_algorithm)
 }
-fn execute_owned_inner(ctx: &Ctx, n: &Node, algorithm: bool) -> Result<(Materialized, PlanInfo)> {
+fn execute_owned_inner<'ctx>(
+    ctx: &'ctx Ctx,
+    n: &Node,
+    algorithm: bool,
+) -> Result<(Materialized<'ctx>, PlanInfo)> {
     ctx.check()
         .inspect_err(|_| fail(ctx, n, Instant::now(), Vec::new()))?;
     let results = &ctx.snap.results;
@@ -887,12 +898,17 @@ fn execute_owned_inner(ctx: &Ctx, n: &Node, algorithm: bool) -> Result<(Material
     Ok((t, info))
 }
 
-fn execute_uncached(ctx: &Ctx, n: &Node, algorithm: bool) -> Result<(Materialized, PlanInfo)> {
+fn execute_uncached<'ctx>(
+    ctx: &'ctx Ctx,
+    n: &Node,
+    algorithm: bool,
+) -> Result<(Materialized<'ctx>, PlanInfo)> {
     execute_node(ctx, n, None, algorithm, None)
 }
 
 /// The inputs of an operator, from a caller that produces each child's table itself.
-pub(super) type Inputs<'a> = &'a mut dyn FnMut(usize) -> Result<(Materialized, PlanInfo)>;
+pub(super) type Inputs<'scope, 'ctx> =
+    &'scope mut dyn FnMut(usize) -> Result<(Materialized<'ctx>, PlanInfo)>;
 
 /// Whether `execute_with_inputs` reads every child of a node of this kind only as an
 /// input table. Other kinds run a child plan themselves, read their child scans in
@@ -908,22 +924,22 @@ pub(super) fn reads_inputs(n: &Node) -> bool {
 
 /// Run one operator over input tables that `inputs` produces, child by child, without
 /// the result cache. Only kinds that `reads_inputs` admits may run this way.
-pub(super) fn execute_with_inputs(
-    ctx: &Ctx,
+pub(super) fn execute_with_inputs<'ctx>(
+    ctx: &'ctx Ctx,
     n: &Node,
-    inputs: Inputs<'_>,
-) -> Result<(Materialized, PlanInfo)> {
+    inputs: Inputs<'_, 'ctx>,
+) -> Result<(Materialized<'ctx>, PlanInfo)> {
     debug_assert!(reads_inputs(n));
     execute_node(ctx, n, Some(inputs), contains_algorithm(n), None)
 }
 
-fn execute_node(
-    ctx: &Ctx,
+fn execute_node<'ctx>(
+    ctx: &'ctx Ctx,
     n: &Node,
-    inputs: Option<Inputs<'_>>,
+    inputs: Option<Inputs<'_, 'ctx>>,
     algorithm: bool,
     equality: Option<(VarId, VarId)>,
-) -> Result<(Materialized, PlanInfo)> {
+) -> Result<(Materialized<'ctx>, PlanInfo)> {
     let start = Instant::now();
     let mut failing = Failing {
         ctx,
@@ -1009,19 +1025,20 @@ fn fail_at(ctx: &Ctx, n: &Node, start: Instant, mut known: Vec<(usize, PlanInfo)
 // One caller: inlined so that the success path returns its table and plan directly.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn run_node(
-    ctx: &Ctx,
+fn run_node<'ctx>(
+    ctx: &'ctx Ctx,
     n: &Node,
-    mut inputs: Option<Inputs<'_>>,
+    mut inputs: Option<Inputs<'_, 'ctx>>,
     start: Instant,
     infos: &mut Vec<PlanInfo>,
     failing: &mut bool,
     algorithm: bool,
     equality: Option<(VarId, VarId)>,
-) -> Result<(Materialized, PlanInfo)> {
+) -> Result<(Materialized<'ctx>, PlanInfo)> {
     // the children's tables count against the memory budget until this operator is done
     let held = ctx.charge(0)?;
     let owned_input = std::cell::Cell::new(false);
+    let last_input = std::cell::Cell::new(InputCredit::Plain);
     let filtered_cross = inputs.is_none().then(|| string_cross_hint(n)).flatten();
     let mut child = |i: usize, infos: &mut Vec<PlanInfo>| -> Result<Table> {
         let (mut t, info) = match inputs.as_mut() {
@@ -1039,11 +1056,12 @@ fn run_node(
             )?,
         };
         infos.push(info);
-        if t.lease.is_some() {
-            held.adopt(&mut t.lease)?;
-            owned_input.set(true);
-        } else {
-            held.add(t.table.mem_bytes())?;
+        let credit = t.adopt_input(ctx, &held)?;
+        last_input.set(credit);
+        match credit {
+            InputCredit::Lease => owned_input.set(true),
+            InputCredit::Fast => {}
+            InputCredit::Plain => held.add(t.table.mem_bytes())?,
         }
         Ok(t.table)
     };
@@ -1053,16 +1071,27 @@ fn run_node(
     // expressions evaluated per distinct value
     let mut expr_report = ExprReport::default();
     let mut output_lease = None;
+    let mut output_fast = None;
+    let mut preserve_fast_input = false;
     let mut table = match &n.kind {
         Kind::Empty => Table::empty(n.vars.clone()),
-        Kind::Values(t) => t.clone(),
+        Kind::Values(t) => {
+            let (table, credit) = Materialized::clone_fast(ctx, t)?.into_fast_parts()?;
+            output_fast = Some(credit);
+            table
+        }
         Kind::Scan(spec) => {
             note = column_note(spec);
-            scan(ctx, spec, &n.vars)?
+            let (table, credit) = scan(ctx, spec, &n.vars, &n.sorted)?.into_fast_parts()?;
+            output_fast = Some(credit);
+            table
         }
         Kind::RangeScan(spec, range) => {
             note = column_note(spec);
-            range_scan(ctx, spec, range, &n.vars)?
+            let (table, credit) =
+                range_scan(ctx, spec, range, &n.vars, &n.sorted)?.into_fast_parts()?;
+            output_fast = Some(credit);
+            table
         }
         Kind::OrderedTopK(spec) => match ordered_topk(ctx, spec, &n.vars)? {
             Some((t, read)) => {
@@ -1331,7 +1360,16 @@ fn run_node(
             note = pre;
             t
         }
-        Kind::Project(vars) => child(0, infos)?.project(vars),
+        Kind::Project(vars) => {
+            let input = child(0, infos)?;
+            match last_input.get() {
+                InputCredit::Plain => input.project(vars),
+                credit => {
+                    preserve_fast_input = credit == InputCredit::Fast;
+                    Materialized::project_paid(ctx, input, &held, vars)?
+                }
+            }
+        }
         Kind::Distinct => distinct(child(0, infos)?),
         Kind::PatternCount(spec) => {
             let input = if n.children.is_empty() {
@@ -1593,7 +1631,7 @@ fn run_node(
         } else {
             table.sorted.clear();
         }
-    } else {
+    } else if output_fast.is_none() {
         table.sorted = n.sorted.clone();
     }
     if let Some(x) = expr_report.note() {
@@ -1605,14 +1643,28 @@ fn run_node(
     if output_lease.is_none() && owned_input.get() {
         output_lease = Some(held.output_lease(super::algosvc::table_capacity(&table)?)?);
     }
-    drop(held);
-    if let Some(lease) = &mut output_lease {
-        lease.resize(ctx.mem_limit, super::algosvc::table_capacity(&table)?)?;
-        ctx.check_output_rows(table.len())?;
+    let paid_fast = output_fast.is_some() || preserve_fast_input;
+    let mut output = if preserve_fast_input {
+        Materialized::with_fast(table, held)?
     } else {
-        ctx.check_output(table.len(), table.width())?;
+        drop(held);
+        match output_fast {
+            Some(credit) => Materialized::with_fast(table, credit)?,
+            None => Materialized::with_lease(table, output_lease),
+        }
+    };
+    if let Some(lease) = &mut output.lease {
+        lease.resize(
+            ctx.mem_limit,
+            super::algosvc::table_capacity(&output.table)?,
+        )?;
+        ctx.check_output_rows(output.table.len())?;
+    } else if paid_fast {
+        ctx.check_output_rows(output.table.len())?;
+    } else {
+        ctx.check_output(output.table.len(), output.table.width())?;
     }
-    ctx.produced(table.len())?;
+    ctx.produced(output.table.len())?;
     let info = PlanInfo {
         fidelity: node_fidelity(ctx, n),
         refs: node_refs(ctx, n),
@@ -1625,7 +1677,7 @@ fn run_node(
         sorted_on: names(ctx, &n.sorted),
         estimated_rows: n.est.round(),
         estimated_cost: n.cost.round(),
-        actual_rows: table.len() as i64,
+        actual_rows: output.table.len() as i64,
         time_ms: start.elapsed().as_secs_f64() * 1000.0,
         cached: false,
         children: std::mem::take(infos),
@@ -1633,13 +1685,7 @@ fn run_node(
         warnings: Vec::new(),
     };
     *failing = false;
-    Ok((
-        Materialized {
-            table,
-            lease: output_lease,
-        },
-        info,
-    ))
+    Ok((output, info))
 }
 
 /// Both operators' counters (the expression cache's next to those of EXISTS).
@@ -2610,8 +2656,13 @@ fn count_distinct_scan(ctx: &Ctx, spec: &ScanSpec) -> Result<u64> {
     Ok(n)
 }
 
-fn scan(ctx: &Ctx, spec: &ScanSpec, vars: &[VarId]) -> Result<Table> {
-    Ok(scan_limited(ctx, spec, vars, None)?.0)
+fn scan<'ctx>(
+    ctx: &'ctx Ctx,
+    spec: &ScanSpec,
+    vars: &[VarId],
+    sorted: &[VarId],
+) -> Result<Materialized<'ctx>> {
+    Ok(scan_limited(ctx, spec, vars, sorted, None)?.0)
 }
 
 /// Apply a row-preserving / row-reducing unary operator to its input.
@@ -2683,7 +2734,11 @@ pub(super) fn apply_blocking(
 /// early; operators whose output over a prefix of their input is a subset of their full
 /// output re-run with a geometrically growing input budget until they have enough rows.
 /// Returns `(table, info, complete)`; `complete` means no further rows exist.
-fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Materialized, PlanInfo, bool)> {
+fn execute_limited<'ctx>(
+    ctx: &'ctx Ctx,
+    n: &Node,
+    want: usize,
+) -> Result<(Materialized<'ctx>, PlanInfo, bool)> {
     ctx.check()
         .inspect_err(|_| fail(ctx, n, Instant::now(), Vec::new()))?;
     let start = Instant::now();
@@ -2699,14 +2754,14 @@ fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Materialized, Pl
 
 /// [`execute_limited`] after its first check. Children whose plans are final before a
 /// failure go to `done` with their index.
-fn run_limited(
-    ctx: &Ctx,
+fn run_limited<'ctx>(
+    ctx: &'ctx Ctx,
     n: &Node,
     want: usize,
     start: Instant,
     done: &mut Vec<(usize, PlanInfo)>,
-) -> Result<(Materialized, PlanInfo, bool)> {
-    let finish = |t: Materialized, children: Vec<PlanInfo>, complete: bool| {
+) -> Result<(Materialized<'ctx>, PlanInfo, bool)> {
+    let finish = |t: Materialized<'ctx>, children: Vec<PlanInfo>, complete: bool| {
         ctx.produced(t.table.len())?;
         let mut info = describe(ctx, n);
         info.children = children;
@@ -2720,8 +2775,8 @@ fn run_limited(
     };
     match &n.kind {
         Kind::Scan(spec) => {
-            let (t, truncated) = scan_limited(ctx, spec, &n.vars, Some(want))?;
-            finish(Materialized::plain(t), Vec::new(), !truncated)
+            let (t, truncated) = scan_limited(ctx, spec, &n.vars, &n.sorted, Some(want))?;
+            finish(t, Vec::new(), !truncated)
         }
         Kind::PatternScan(spec) => {
             let (t, _, stopped) = super::patternplan::run_scan(ctx, spec, &n.vars, Some(want))?;
@@ -2773,7 +2828,7 @@ fn run_limited(
                 } else {
                     None
                 };
-                let out = Materialized { table: out, lease };
+                let out = Materialized::with_lease(out, lease);
                 if out.table.len() >= want || complete {
                     let (t, mut info, complete) = finish(out, vec![cinfo], complete)?;
                     if let Kind::Filter(exprs) = &n.kind {
@@ -2876,7 +2931,7 @@ fn run_limited(
                     } else {
                         None
                     };
-                    return finish(Materialized { table: out, lease }, infos, complete);
+                    return finish(Materialized::with_lease(out, lease), infos, complete);
                 }
                 runs = Some(pinfo);
                 budget = budget.saturating_mul(8);
@@ -2914,7 +2969,7 @@ fn run_limited(
             } else {
                 None
             };
-            finish(Materialized { table: out, lease }, infos, complete)
+            finish(Materialized::with_lease(out, lease), infos, complete)
         }
         // A path without inputs is walked one start node at a time until it has the
         // rows asked for, so that an ASK or a LIMIT over a closure with two unbound
@@ -2957,13 +3012,14 @@ fn run_limited(
 }
 
 /// Scan with an optional row limit; returns `(table, truncated)`.
-pub(super) fn scan_limited(
-    ctx: &Ctx,
+pub(super) fn scan_limited<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &ScanSpec,
     vars: &[VarId],
+    sorted: &[VarId],
     limit: Option<usize>,
-) -> Result<(Table, bool)> {
-    let mut t = Table::new(vars.to_vec());
+) -> Result<(Materialized<'ctx>, bool)> {
+    let mut t = Materialized::empty_fast(ctx, vars, sorted)?;
     // the exact number of rows under the prefix (at most two block decodes, and those
     // blocks are read by the scan anyway) bounds the output: reserve it once instead of
     // growing every column by repeated doubling
@@ -2972,10 +3028,8 @@ pub(super) fn scan_limited(
         .unwrap_or(usize::MAX)
         .min(limit.unwrap_or(usize::MAX))
         .min(ctx.max_rows.saturating_add(1))
-        .min(ctx.rows_within_budget(vars.len()).saturating_add(1));
-    for c in &mut t.cols {
-        c.reserve_exact(cap);
-    }
+        .min(ctx.rows_within_budget(vars.len()));
+    t.reserve_rows(ctx, cap)?;
     let truncated = scan_into(
         ctx,
         spec,
@@ -2989,8 +3043,14 @@ pub(super) fn scan_limited(
 
 /// A scan restricted to id ranges of its first free column: exact ranges are copied,
 /// the others filtered. The output keeps the scan's order.
-fn range_scan(ctx: &Ctx, spec: &ScanSpec, range: &RangeSpec, vars: &[VarId]) -> Result<Table> {
-    let mut t = Table::new(vars.to_vec());
+fn range_scan<'ctx>(
+    ctx: &'ctx Ctx,
+    spec: &ScanSpec,
+    range: &RangeSpec,
+    vars: &[VarId],
+    sorted: &[VarId],
+) -> Result<Materialized<'ctx>> {
+    let mut t = Materialized::empty_fast(ctx, vars, sorted)?;
     let bound = |v: u64, fill: u64| {
         let mut k = pad(&spec.prefix, fill);
         k[spec.prefix.len()] = v;
@@ -3001,14 +3061,27 @@ fn range_scan(ctx: &Ctx, spec: &ScanSpec, range: &RangeSpec, vars: &[VarId]) -> 
         if r.exact {
             scan_into(ctx, spec, lo, hi, None, &mut t)?;
         } else {
-            let mut part = Table::new(vars.to_vec());
+            let mut part = Materialized::empty_fast(ctx, vars, &[])?;
             scan_into(ctx, spec, lo, hi, None, &mut part)?;
-            if !part.is_empty() {
-                apply_range_filter(ctx, &mut part, range.var, &range.filter)?;
-                t.append(part);
+            if !part.table.is_empty() {
+                apply_range_filter(ctx, &mut part.table, range.var, &range.filter)?;
+                let rows = t
+                    .table
+                    .len
+                    .checked_add(part.table.len)
+                    .ok_or_else(|| Error::invalid("range output rows overflow"))?;
+                ctx.check_output_rows(rows)?;
+                t.reserve_rows(ctx, rows)?;
+                for (column, source) in t.table.cols.iter_mut().zip(&part.table.cols) {
+                    for block in source.chunks(1024) {
+                        ctx.check()?;
+                        column.extend_from_slice(block);
+                    }
+                }
+                t.table.len = rows;
             }
         }
-        ctx.check_output(t.len(), t.width())?;
+        ctx.check_output_rows(t.table.len())?;
     }
     Ok(t)
 }
@@ -3964,76 +4037,126 @@ pub(super) fn ordered_topk(
     }
 }
 
-/// Append the scan's rows with keys in `[lo, hi]` to `t`, stopping after `limit` rows in
-/// total; returns whether rows may remain.
-fn scan_into(
+// The paid sink keeps its actual guard around every physical growth. Raw-table
+// callers remain explicit legacy internal paths until their producer migration.
+trait ScanSink {
+    fn table(&self) -> &Table;
+    fn table_mut(&mut self) -> &mut Table;
+    fn prepare(&mut self, ctx: &Ctx, rows: usize) -> Result<()>;
+    fn check_output(&self, ctx: &Ctx) -> Result<()>;
+}
+impl ScanSink for Table {
+    fn table(&self) -> &Table {
+        self
+    }
+    fn table_mut(&mut self) -> &mut Table {
+        self
+    }
+    fn prepare(&mut self, _ctx: &Ctx, _rows: usize) -> Result<()> {
+        Ok(())
+    }
+    fn check_output(&self, ctx: &Ctx) -> Result<()> {
+        ctx.check_output(self.len(), self.width())
+    }
+}
+impl ScanSink for Materialized<'_> {
+    fn table(&self) -> &Table {
+        &self.table
+    }
+    fn table_mut(&mut self) -> &mut Table {
+        &mut self.table
+    }
+    fn prepare(&mut self, ctx: &Ctx, rows: usize) -> Result<()> {
+        ctx.check_output_rows(rows)?;
+        self.reserve_rows(ctx, rows)
+    }
+    fn check_output(&self, ctx: &Ctx) -> Result<()> {
+        ctx.check_output_rows(self.table.len())
+    }
+}
+
+/// Append the scan's rows with keys in `[lo, hi]`, stopping at the row limit.
+fn scan_into<T: ScanSink>(
     ctx: &Ctx,
     spec: &ScanSpec,
     lo: crate::index::Key,
     hi: crate::index::Key,
     limit: Option<usize>,
-    t: &mut Table,
+    t: &mut T,
 ) -> Result<bool> {
     let limit = limit.unwrap_or(usize::MAX);
     let mut truncated = false;
-    let kcs: Vec<usize> = spec.cols.iter().map(|(k, _)| *k).collect();
     let mut last: Option<[u64; 4]> = None;
     let mut n = 0usize;
-    let mut row = |k: &[u64; 4], t: &mut Table| {
-        if !spec.graph.accepts(k[spec.graph_col]) {
-            return;
+    let mut row = |k: &[u64; 4], t: &mut T| -> Result<()> {
+        if t.table().len >= limit || !spec.graph.accepts(k[spec.graph_col]) {
+            return Ok(());
         }
         if spec.eqs.iter().any(|&(a, b)| k[a] != k[b]) {
-            return;
+            return Ok(());
         }
         if spec.dedup {
             let mut proj = [0u64; 4];
-            for (i, &kc) in kcs.iter().enumerate() {
+            for (i, &(kc, _)) in spec.cols.iter().enumerate() {
                 proj[i] = k[kc];
             }
             if last == Some(proj) {
-                return;
+                return Ok(());
             }
             last = Some(proj);
         }
-        for (c, &kc) in kcs.iter().enumerate() {
-            t.cols[c].push(Id(k[kc]));
+        let rows = t
+            .table()
+            .len
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid("scan output rows overflow"))?;
+        t.prepare(ctx, rows)?;
+        let table = t.table_mut();
+        for (c, &(kc, _)) in spec.cols.iter().enumerate() {
+            table.cols[c].push(Id(k[kc]));
         }
-        t.len += 1;
+        table.len = rows;
+        Ok(())
     };
     ctx.snap
         .scan_between_cols(spec.perm, lo, hi, scan_mask(spec), |chunk| {
-            if t.len >= limit {
+            if t.table().len >= limit {
                 truncated = true;
                 return Ok(false);
             }
             match chunk {
                 Chunk::Block(b, s, e) if !spec.dedup && block_passes(spec, b, s, e) => {
-                    let e = e.min(s.saturating_add(limit - t.len));
-                    for (c, &kc) in kcs.iter().enumerate() {
-                        t.cols[c].extend(b.cols[kc][s..e].iter().map(|&x| Id(x)));
+                    let e = e.min(s.saturating_add(limit - t.table().len));
+                    let rows = t
+                        .table()
+                        .len
+                        .checked_add(e - s)
+                        .ok_or_else(|| Error::invalid("scan output rows overflow"))?;
+                    t.prepare(ctx, rows)?;
+                    let table = t.table_mut();
+                    for (c, &(kc, _)) in spec.cols.iter().enumerate() {
+                        table.cols[c].extend(b.cols[kc][s..e].iter().map(|&x| Id(x)));
                     }
-                    t.len += e - s;
+                    table.len = rows;
                     n += e - s;
                 }
                 Chunk::Block(b, s, e) => {
                     for i in s..e {
-                        row(&b.key(i), t);
+                        row(&b.key(i), t)?;
                     }
                     n += e - s;
                 }
                 Chunk::Row(k) => {
-                    row(&k, t);
+                    row(&k, t)?;
                     n += 1;
                 }
             }
             if n > 1 << 16 {
                 n = 0;
                 ctx.check()?;
-                ctx.check_output(t.len(), t.width())?;
+                t.check_output(ctx)?;
             }
-            if t.len >= limit {
-                // there may be more matching rows after this point
+            if t.table().len >= limit {
                 truncated = true;
                 return Ok(false);
             }
@@ -4552,7 +4675,11 @@ pub(super) fn join_tables(
 
 /// Algorithm output uses the same pair-generation and materialization semantics.
 /// The final backing is admitted while the two inputs and pair array are still live.
-pub(super) fn join_algorithm_tables(ctx: &Ctx, l: &Table, r: &Table) -> Result<Materialized> {
+pub(super) fn join_algorithm_tables(
+    ctx: &Ctx,
+    l: &Table,
+    r: &Table,
+) -> Result<Materialized<'static>> {
     use crate::algo::memory;
     let lay = layout(l, r);
     let pairs = join_pairs(ctx, l, r, &lay, false, &mut None)?;
@@ -4568,10 +4695,8 @@ pub(super) fn join_algorithm_tables(ctx: &Ctx, l: &Table, r: &Table) -> Result<M
         128,
         if lay.vars.is_empty() { col } else { 0 },
     ])?;
-    let mut out = Materialized {
-        table: Table::empty(Vec::new()),
-        lease: Some(ctx.output_lease(bytes)?),
-    };
+    let mut out =
+        Materialized::with_lease(Table::empty(Vec::new()), Some(ctx.output_lease(bytes)?));
     out.table = materialize(l, r, &lay, &pairs);
     let ctl = crate::algo::Control::with_cancellation(
         ctx.cancel.clone(),
@@ -9878,5 +10003,220 @@ mod path_lookup_tests {
             };
             assert!(matches!(g.neighbours(hub, true), Err(Error::Timeout)));
         }
+    }
+}
+
+#[cfg(test)]
+mod paid_eager_producer_tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn values_backing_keeps_its_actual_credit_until_drop() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.use_cache = false;
+        ctx.var("value");
+        let table = Table {
+            vars: vec![0],
+            cols: vec![vec![Id::UNDEF]],
+            len: 1,
+            sorted: Vec::new(),
+        };
+        let expected = super::super::algosvc::table_capacity(&table).unwrap();
+        ctx.mem_limit = expected;
+        let node = Node::leaf(Kind::Values(table), vec![0], 1.0, "paid values".into());
+        let (output, _) = execute_owned_inner(&ctx, &node, false).unwrap();
+        assert_eq!(output.table.cols, [vec![Id::UNDEF]]);
+        assert_eq!(
+            ctx.live_bytes(),
+            expected,
+            "values backing must retain its actual prepaid credit"
+        );
+        drop(output);
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+
+    fn scan_fixture() -> Store {
+        let store = Store::in_memory(StoreOptions::default());
+        store.load(&[crate::io::Source::from_bytes(
+            b"<urn:s0> <urn:p> 1 . <urn:s1> <urn:p> 2 . <urn:s2> <urn:p> 3 . <urn:g> { <urn:s0> <urn:p> 1 . }".to_vec(),
+            crate::io::RdfFormat::TriG, None,
+        )]).unwrap();
+        store
+    }
+
+    fn default_subject_scan(ctx: &Ctx) -> ScanSpec {
+        ScanSpec {
+            perm: Perm::Gspo,
+            prefix: vec![Id::DEFAULT_GRAPH.0],
+            cols: vec![(1, ctx.var("subject"))],
+            eqs: Vec::new(),
+            graph: GraphFilter::Default,
+            graph_col: 0,
+            dedup: false,
+            src: None,
+        }
+    }
+
+    #[test]
+    fn actual_full_and_limited_scan_retain_prepaid_spare_capacity() {
+        let store = scan_fixture();
+        for limit in [None, Some(1)] {
+            let mut ctx = Ctx::new(store.snapshot());
+            let spec = default_subject_scan(&ctx);
+            ctx.mem_limit = if limit.is_some() { 168 } else { 184 };
+            let (output, truncated) = scan_limited(&ctx, &spec, &[0], &[0], limit).unwrap();
+            assert_eq!(output.table.len, limit.unwrap_or(3));
+            assert_eq!(output.table.cols[0].capacity(), limit.unwrap_or(3));
+            assert_eq!(output.table.sorted, [0]);
+            assert_eq!(truncated, limit.is_some());
+            assert_eq!(ctx.live_bytes(), ctx.mem_limit);
+            drop(output);
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn scan_metadata_refusal_allocation_failure_and_cancel_precede_growth() {
+        use crate::algo::memory::probe;
+        use std::{cell::Cell, rc::Rc};
+        let store = scan_fixture();
+        for reason in ["budget", "allocation", "cancel"] {
+            let mut ctx = Ctx::new(store.snapshot());
+            let spec = default_subject_scan(&ctx);
+            if reason == "budget" {
+                ctx.mem_limit = 159;
+            }
+            if reason == "cancel" {
+                ctx.cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+            let seen = Rc::new(Cell::new(0));
+            let observed = seen.clone();
+            let hook = probe::install(
+                move |point| {
+                    if let probe::Point::Allocation(name, _) = point
+                        && name.starts_with("eager-")
+                    {
+                        observed.set(observed.get() + 1);
+                    }
+                },
+                (reason == "allocation").then_some("eager-vars"),
+            );
+            let result = scan_limited(&ctx, &spec, &[0], &[0], None);
+            match reason {
+                "budget" => assert!(matches!(result, Err(Error::BudgetExceeded(_)))),
+                "cancel" => assert!(matches!(result, Err(Error::Cancelled))),
+                _ => assert!(matches!(result, Err(Error::Invalid(_)))),
+            }
+            assert_eq!(seen.get(), usize::from(reason == "allocation"));
+            drop(hook);
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn paid_scan_dedup_keeps_actual_reserved_columns_until_drop() {
+        let store = scan_fixture();
+        let ctx = Ctx::new(store.snapshot());
+        let subject = ctx.var("subject");
+        let object = ctx.var("object");
+        let predicate = ctx.intern_term(&oxrdf::NamedNode::new("urn:p").unwrap().into());
+        let spec = ScanSpec {
+            perm: Perm::Pso,
+            prefix: vec![predicate.0],
+            cols: vec![(1, subject), (2, object)],
+            eqs: Vec::new(),
+            graph: GraphFilter::All,
+            graph_col: 3,
+            dedup: true,
+            src: None,
+        };
+        let before = ctx.live_bytes();
+        let (output, _) =
+            scan_limited(&ctx, &spec, &[subject, object], &[subject, object], None).unwrap();
+        assert_eq!(output.table.len, 3);
+        assert_eq!(output.table.cols[0].capacity(), 4);
+        assert_eq!(
+            ctx.live_bytes() - before,
+            super::super::algosvc::table_capacity(&output.table).unwrap()
+        );
+        drop(output);
+        assert_eq!(ctx.live_bytes(), before);
+    }
+
+    #[test]
+    fn exact_and_filtered_ranges_keep_destination_and_partial_owners() {
+        use super::super::plan::IdRange;
+        let store = scan_fixture();
+        for exact in [false, true] {
+            let ctx = Ctx::new(store.snapshot());
+            let object = ctx.var("object");
+            let subject = ctx.var("subject");
+            let predicate = ctx.intern_term(&oxrdf::NamedNode::new("urn:p").unwrap().into());
+            let spec = ScanSpec {
+                perm: Perm::Pos,
+                prefix: vec![predicate.0],
+                cols: vec![(1, object), (2, subject)],
+                eqs: Vec::new(),
+                graph: GraphFilter::Default,
+                graph_col: 3,
+                dedup: false,
+                src: None,
+            };
+            let range = RangeSpec {
+                var: object,
+                ranges: vec![IdRange {
+                    lo: 0,
+                    hi: u64::MAX,
+                    exact,
+                }],
+                filter: Vec::new(),
+            };
+            let before = ctx.live_bytes();
+            let output =
+                range_scan(&ctx, &spec, &range, &[object, subject], &[object, subject]).unwrap();
+            assert_eq!(output.table.len, 3);
+            assert!(output.table.cols[0].windows(2).all(|w| w[0] < w[1]));
+            assert_eq!(
+                ctx.live_bytes() - before,
+                super::super::algosvc::table_capacity(&output.table).unwrap()
+            );
+            drop(output);
+            assert_eq!(ctx.live_bytes(), before);
+        }
+    }
+
+    #[test]
+    fn identity_projection_keeps_actual_fast_credit_without_reallocation() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.use_cache = false;
+        ctx.var("value");
+        let table = Table {
+            vars: vec![0],
+            cols: vec![vec![Id::UNDEF]],
+            len: 1,
+            sorted: Vec::new(),
+        };
+        let expected = super::super::algosvc::table_capacity(&table).unwrap();
+        ctx.mem_limit = expected;
+        let child = Node::leaf(Kind::Values(table), vec![0], 1.0, "paid values".into());
+        let mut node = Node::leaf(
+            Kind::Project(vec![0]),
+            vec![0],
+            1.0,
+            "paid projection".into(),
+        );
+        node.children.push(child);
+        let (output, _) = execute_owned_inner(&ctx, &node, false).unwrap();
+        assert_eq!(output.table.cols, [vec![Id::UNDEF]]);
+        assert_eq!(
+            ctx.live_bytes(),
+            expected,
+            "identity projection must retain its actual child credit"
+        );
+        drop(output);
+        assert_eq!(ctx.live_bytes(), 0);
     }
 }

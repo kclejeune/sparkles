@@ -3236,9 +3236,10 @@ impl<'a> Planner<'a> {
         if !scan.est.is_finite() || scan.est > POINT_ROWS || !spec.eqs.is_empty() {
             return Ok(None);
         }
-        let (rows, _) = super::exec::scan_limited(self.ctx, spec, &scan.vars, Some(2))?;
-        Ok(match (rows.len(), rows.col_of(v)) {
-            (1, Some(c)) => Some((v, rows.cols[c][0])).filter(|(_, id)| !id.is_undef()),
+        let (rows, _) =
+            super::exec::scan_limited(self.ctx, spec, &scan.vars, &scan.sorted, Some(2))?;
+        Ok(match (rows.table.len(), rows.table.col_of(v)) {
+            (1, Some(c)) => Some((v, rows.table.cols[c][0])).filter(|(_, id)| !id.is_undef()),
             _ => None,
         })
     }

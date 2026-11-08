@@ -14,6 +14,7 @@
 pub mod authority;
 mod preparation;
 pub mod triples;
+pub(crate) use preparation::Buffer as PreparationBuffer;
 pub(crate) use preparation::sort_by as sort_by_prepared;
 pub use preparation::{Exemptions, Preparation, PreparedView, Reservation};
 pub use triples::{Caller, Limits, Mask, Protection, Rule, TripleRules};

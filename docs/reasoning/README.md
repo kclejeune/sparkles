@@ -89,6 +89,12 @@ request or on every write, and the schema report counts what the data holds.
   the source of an explanation. The `reasoning` parameter of the HTTP endpoints, the
   `--reasoning` flag of `sparkles query` and the `reasoning` argument of the MCP tools are
   read into a mode. `Auto` is refused until a cost-based choice exists.
+* Embedded query providers implement `ReasoningSession::intensional` with a
+  `Result<bool>` return. Constant interning can refuse a memory reservation, and
+  callers propagate that refusal before preparing demands. Implementations that
+  previously returned a Boolean wrap successful values in `Ok` and return allocation
+  failures with `Err`. `AnalysisContext::new` returns `anyhow::Result<Arc<Self>>`.
+  A local reasoning limit still supports downcasting to `MemoryLimitExceeded`.
 * `POST /$/reason/{ds}/explain` returns derivation trees from materialized inferences,
   RDFS on read or the demand engine ([API.md](../API.md#explanations),
   [F18](../specs/F18-explanations-and-entailment-diffs.md#outcome)). A tree has well-founded

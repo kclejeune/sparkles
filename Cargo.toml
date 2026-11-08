@@ -13,6 +13,7 @@ repository = "https://github.com/kclejeune/sparkles"
 [workspace.dependencies]
 sparkles = { path = "crates/sparkles" }
 sparkles-core = { path = "crates/sparkles-core" }
+sparkles-budget = { path = "crates/sparkles-budget" }
 sparkles-reasoner = { path = "crates/sparkles-reasoner" }
 sparkles-shacl = { path = "crates/sparkles-shacl" }
 sparkles-shaclc = { path = "crates/sparkles-shaclc" }

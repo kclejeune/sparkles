@@ -227,13 +227,770 @@ impl Table {
     }
 }
 
-/// Private algorithm ownership. Backing is destroyed before its admission lease.
-pub(super) struct Materialized {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum InputCredit {
+    Plain,
+    Fast,
+    Lease,
+}
+
+pub(super) enum FinalTableCredit {
+    Fast {
+        _credit: super::ctx::OutputCredit,
+    },
+    Lease {
+        _credit: super::query_memory::QueryMemoryLease,
+    },
+}
+
+/// Protect final construction, including errors before QueryResult is published.
+pub(super) struct RetainedMaterialized {
     pub(super) table: Table,
+    _ctx: std::sync::Arc<super::ctx::Ctx>,
+    pub(super) credit: Option<FinalTableCredit>,
+}
+
+/// Private materialization ownership. Payload and context precede admission credit.
+pub(super) struct Materialized<'ctx> {
+    pub(super) table: Table,
+    _ctx: Option<std::sync::Arc<super::ctx::Ctx>>,
+    fast: Option<super::ctx::Charge<'ctx>>,
     pub(super) lease: Option<super::query_memory::QueryMemoryLease>,
 }
-impl Materialized {
+impl<'ctx> Materialized<'ctx> {
+    pub(super) fn project(
+        mut self,
+        ctx: &'ctx super::ctx::Ctx,
+        vars: &[VarId],
+    ) -> crate::Result<Self> {
+        let held = ctx.charge(0)?;
+        let kind = self.adopt_input(ctx, &held)?;
+        if kind == InputCredit::Plain {
+            return Ok(Self::plain(self.table.project(vars)));
+        }
+        let table = Self::project_paid(ctx, self.table, &held, vars)?;
+        let mut output = Self::with_fast(table, held)?;
+        if kind == InputCredit::Lease {
+            let credit = output.fast.as_ref().expect("actual projected owner");
+            output.lease = Some(credit.output_lease(credit.bytes())?);
+            output.fast.take();
+        }
+        Ok(output)
+    }
+
+    pub(super) fn into_retained(
+        self,
+        ctx: &std::sync::Arc<super::ctx::Ctx>,
+    ) -> crate::Result<RetainedMaterialized> {
+        let foreign_context = self
+            ._ctx
+            .as_ref()
+            .is_some_and(|owner| !std::sync::Arc::ptr_eq(owner, ctx));
+        if foreign_context
+            || (self.fast.is_some() && self.lease.is_some())
+            || self
+                .fast
+                .as_ref()
+                .is_some_and(|credit| !credit.belongs_to(ctx))
+        {
+            return Err(crate::Error::invalid("foreign final materialization owner"));
+        }
+        let capacity = super::algosvc::table_capacity(&self.table)?;
+        if self
+            .fast
+            .as_ref()
+            .is_some_and(|credit| credit.bytes() < capacity)
+        {
+            return Err(crate::Error::invalid(
+                "final table exceeds prepaid fast credit",
+            ));
+        }
+        if let Some(lease) = &self.lease {
+            if !std::sync::Arc::ptr_eq(&lease.ledger, ctx.memory())
+                || lease.service.is_some()
+                || lease.bytes < capacity
+            {
+                return Err(crate::Error::invalid(
+                    "foreign or active-service final table credit",
+                ));
+            }
+        }
+        let Self {
+            table, fast, lease, ..
+        } = self;
+        let credit = match fast {
+            Some(credit) => Some(FinalTableCredit::Fast {
+                _credit: credit.into_output(ctx),
+            }),
+            None => lease.map(|credit| FinalTableCredit::Lease { _credit: credit }),
+        };
+        Ok(RetainedMaterialized {
+            table,
+            _ctx: ctx.clone(),
+            credit,
+        })
+    }
+
+    /// Project an already paid input. Metadata overlaps the original backing;
+    /// retained columns move without copying or releasing their actual credit.
+    pub(super) fn project_paid(
+        ctx: &super::ctx::Ctx,
+        mut source: Table,
+        credit: &super::ctx::Charge<'_>,
+        vars: &[VarId],
+    ) -> crate::Result<Table> {
+        use crate::algo::memory::{bytes, sum};
+        ctx.check()?;
+        if !credit.belongs_to(ctx) || credit.bytes() < super::algosvc::table_capacity(&source)? {
+            return Err(crate::Error::invalid(
+                "projection lacks actual input credit",
+            ));
+        }
+        if vars == source.vars {
+            return Ok(source);
+        }
+        if vars.iter().enumerate().any(|(i, v)| vars[..i].contains(v)) {
+            return Err(crate::Error::invalid("duplicate paid projection variable"));
+        }
+        let sorted_len = source
+            .sorted
+            .iter()
+            .take_while(|v| vars.contains(v))
+            .count();
+        let missing = vars.iter().filter(|v| source.col_of(**v).is_none()).count();
+        let cells = missing
+            .checked_mul(source.len)
+            .ok_or_else(|| crate::Error::invalid("projection cells overflow"))?;
+        let metadata = sum(&[
+            128,
+            bytes::<VarId>(vars.len())?,
+            bytes::<Vec<Id>>(vars.len())?,
+            bytes::<VarId>(sorted_len)?,
+            bytes::<Id>(cells)?,
+            if vars.is_empty() {
+                bytes::<Id>(source.len)?
+            } else {
+                0
+            },
+        ])?;
+        let mut additional = Some(ctx.charge(metadata)?);
+        let projected = Self::copied(ctx, "eager-project-vars", vars)?;
+        let mut columns = Self::allocate("eager-project-columns", vars.len())?;
+        let mut sorted = Self::allocate("eager-project-sorted", sorted_len)?;
+        sorted.extend_from_slice(&source.sorted[..sorted_len]);
+        for &var in vars {
+            ctx.check()?;
+            match source.col_of(var) {
+                Some(c) => columns.push(std::mem::take(&mut source.cols[c])),
+                None => {
+                    let mut column = Self::allocate("eager-project-missing", source.len)?;
+                    for start in (0..source.len).step_by(1024) {
+                        ctx.check()?;
+                        column.resize(start.saturating_add(1024).min(source.len), Id::UNDEF);
+                    }
+                    columns.push(column);
+                }
+            }
+        }
+        let output = Table {
+            vars: projected,
+            cols: columns,
+            len: source.len,
+            sorted,
+        };
+        credit.adopt_charge(&mut additional)?;
+        drop(source);
+        let retained = super::algosvc::table_capacity(&output)?;
+        if retained > credit.bytes() {
+            return Err(crate::Error::invalid(
+                "projected backing exceeds its prepaid credit",
+            ));
+        }
+        credit.resize(retained)?;
+        Ok(output)
+    }
+
+    fn allocate<T>(name: &'static str, capacity: usize) -> crate::Result<Vec<T>> {
+        #[cfg(test)]
+        {
+            use crate::algo::memory::probe;
+            probe::at(probe::Point::Allocation(name, capacity));
+            if probe::fails(name) {
+                return Err(crate::Error::invalid("injected eager allocation failure"));
+            }
+        }
+        let _ = name;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(capacity)
+            .map_err(|e| crate::Error::invalid(format!("eager allocation failed: {e}")))?;
+        if std::mem::size_of::<T>() != 0 && values.capacity() != capacity {
+            return Err(crate::Error::invalid(
+                "unsupported eager allocation capacity",
+            ));
+        }
+        Ok(values)
+    }
+
+    fn copied<T: Copy>(
+        ctx: &super::ctx::Ctx,
+        name: &'static str,
+        values: &[T],
+    ) -> crate::Result<Vec<T>> {
+        let mut copy = Self::allocate(name, values.len())?;
+        for part in values.chunks(1024) {
+            ctx.check()?;
+            copy.extend_from_slice(part);
+        }
+        Ok(copy)
+    }
+
+    /// Clone only after paying the receiving allocation, independently of its source.
+    pub(super) fn clone_fast(ctx: &'ctx super::ctx::Ctx, source: &Table) -> crate::Result<Self> {
+        use crate::algo::memory::{bytes, sum};
+        ctx.check()?;
+        ctx.check_output_rows(source.len)?;
+        if source.vars.len() != source.cols.len()
+            || source.cols.iter().any(|c| c.len() != source.len)
+        {
+            return Err(crate::Error::invalid("inconsistent eager source table"));
+        }
+        let data = source
+            .cols
+            .iter()
+            .try_fold(0, |n, c| sum(&[n, bytes::<Id>(c.len())?]))?;
+        let size = sum(&[
+            128,
+            bytes::<VarId>(source.vars.len())?,
+            bytes::<Vec<Id>>(source.cols.len())?,
+            bytes::<VarId>(source.sorted.len())?,
+            data,
+            if source.width() == 0 {
+                bytes::<Id>(source.len)?
+            } else {
+                0
+            },
+        ])?;
+        let credit = ctx.charge(size)?;
+        let vars = Self::copied(ctx, "eager-vars", &source.vars)?;
+        let mut cols = Self::allocate("eager-columns", source.cols.len())?;
+        for column in &source.cols {
+            cols.push(Self::copied(ctx, "eager-column", column)?);
+        }
+        let sorted = Self::copied(ctx, "eager-sorted", &source.sorted)?;
+        Self::with_fast(
+            Table {
+                vars,
+                cols,
+                len: source.len,
+                sorted,
+            },
+            credit,
+        )
+    }
+
+    pub(super) fn empty_fast(
+        ctx: &'ctx super::ctx::Ctx,
+        vars: &[VarId],
+        sorted: &[VarId],
+    ) -> crate::Result<Self> {
+        use crate::algo::memory::{bytes, sum};
+        ctx.check()?;
+        let credit = ctx.charge(sum(&[
+            128,
+            bytes::<VarId>(vars.len())?,
+            bytes::<Vec<Id>>(vars.len())?,
+            bytes::<VarId>(sorted.len())?,
+        ])?)?;
+        let vars = Self::copied(ctx, "eager-vars", vars)?;
+        let mut cols = Self::allocate("eager-columns", vars.len())?;
+        for _ in &vars {
+            cols.push(Vec::new());
+        }
+        let sorted = Self::copied(ctx, "eager-sorted", sorted)?;
+        Self::with_fast(
+            Table {
+                vars,
+                cols,
+                len: 0,
+                sorted,
+            },
+            credit,
+        )
+    }
+
+    /// Admit the old and replacement column simultaneously, then retire the old Vec.
+    pub(super) fn reserve_rows(&mut self, ctx: &super::ctx::Ctx, rows: usize) -> crate::Result<()> {
+        use crate::algo::memory::{bytes, sum};
+        ctx.check()?;
+        let credit = self
+            .fast
+            .as_ref()
+            .filter(|c| c.belongs_to(ctx))
+            .ok_or_else(|| crate::Error::invalid("missing actual fast table owner"))?;
+        if self.table.width() == 0 {
+            let size = sum(&[
+                128,
+                bytes::<VarId>(self.table.vars.capacity())?,
+                bytes::<Vec<Id>>(self.table.cols.capacity())?,
+                bytes::<VarId>(self.table.sorted.capacity())?,
+                bytes::<Id>(rows.max(self.table.len))?,
+            ])?;
+            return credit.resize(size);
+        }
+        for column in &mut self.table.cols {
+            if rows <= column.capacity() {
+                continue;
+            }
+            let capacity = if column.capacity() == 0 {
+                rows
+            } else {
+                column
+                    .capacity()
+                    .checked_mul(2)
+                    .map(|n| n.max(rows))
+                    .ok_or_else(|| crate::Error::invalid("eager column growth overflow"))?
+            };
+            let mut additional = Some(ctx.charge(bytes::<Id>(capacity)?)?);
+            let mut replacement = Self::allocate("eager-column-grow", capacity)?;
+            for part in column.chunks(1024) {
+                ctx.check()?;
+                replacement.extend_from_slice(part);
+            }
+            credit.adopt_charge(&mut additional)?;
+            let old = std::mem::replace(column, replacement);
+            let retired = bytes::<Id>(old.capacity())?;
+            drop(old);
+            #[cfg(test)]
+            crate::algo::memory::probe::at(crate::algo::memory::probe::Point::Work(
+                "eager-column-old-dropped",
+                capacity,
+            ));
+            credit.resize(credit.bytes() - retired)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn into_fast_parts(self) -> crate::Result<(Table, super::ctx::Charge<'ctx>)> {
+        if self.fast.is_none() || self.lease.is_some() || self._ctx.is_some() {
+            return Err(crate::Error::invalid(
+                "not an exclusively fast materialization",
+            ));
+        }
+        let Self { table, fast, .. } = self;
+        Ok((table, fast.expect("checked actual fast owner")))
+    }
+
+    /// Explicit legacy owning conversion. Prepared fast output must use its ArcCtx.
+    pub(super) fn into_lease_owned(
+        mut self,
+        ctx: &super::ctx::Ctx,
+    ) -> crate::Result<Materialized<'static>> {
+        if let Some(credit) = &self.fast {
+            if !credit.belongs_to(ctx) || self.lease.is_some() || self._ctx.is_some() {
+                return Err(crate::Error::invalid("foreign fast materialization owner"));
+            }
+            self.lease = Some(credit.output_lease(credit.bytes())?);
+            self.fast.take();
+        }
+        self.into_unborrowed()
+    }
+
+    /// Leave the borrowed execution scope only when no fast-account borrow remains.
+    /// Move the physical backing and its existing owners together, without recharging.
+    pub(super) fn into_unborrowed(self) -> crate::Result<Materialized<'static>> {
+        if self.fast.is_some() {
+            return Err(crate::Error::invalid(
+                "borrowed materialized credit cannot leave its query context",
+            ));
+        }
+        let Self {
+            table,
+            _ctx,
+            fast: _,
+            lease,
+        } = self;
+        Ok(Materialized {
+            table,
+            _ctx,
+            fast: None,
+            lease,
+        })
+    }
+
     pub(super) fn plain(table: Table) -> Self {
-        Self { table, lease: None }
+        Self::with_lease(table, None)
+    }
+
+    pub(super) fn with_lease(
+        table: Table,
+        lease: Option<super::query_memory::QueryMemoryLease>,
+    ) -> Self {
+        Self {
+            table,
+            _ctx: None,
+            fast: None,
+            lease,
+        }
+    }
+
+    pub(super) fn with_owned(table: Table, charge: super::ctx::OwnedCharge) -> crate::Result<Self> {
+        let bytes = charge.bytes();
+        let (ctx, lease) = charge.into_parts();
+        // Protect the physical drop order before any checked validation can refuse.
+        let owned = Self {
+            table,
+            _ctx: Some(ctx),
+            fast: None,
+            lease: Some(lease),
+        };
+        if bytes < super::algosvc::table_capacity(&owned.table)? {
+            return Err(crate::Error::invalid(
+                "materialized table exceeds its owned credit",
+            ));
+        }
+        Ok(owned)
+    }
+
+    /// The caller admitted this storage before allocating it on the fast account.
+    pub(super) fn with_fast(table: Table, charge: super::ctx::Charge<'ctx>) -> crate::Result<Self> {
+        let bytes = charge.bytes();
+        let owned = Self {
+            table,
+            _ctx: None,
+            fast: Some(charge),
+            lease: None,
+        };
+        if bytes < super::algosvc::table_capacity(&owned.table)? {
+            return Err(crate::Error::invalid(
+                "materialized table exceeds its fast credit",
+            ));
+        }
+        Ok(owned)
+    }
+
+    /// Move an actual input owner before its table enters an eager kernel.
+    pub(super) fn adopt_input(
+        &mut self,
+        ctx: &super::ctx::Ctx,
+        held: &super::ctx::Charge<'_>,
+    ) -> crate::Result<InputCredit> {
+        if !held.belongs_to(ctx)
+            || self
+                ._ctx
+                .as_ref()
+                .is_some_and(|owner| !std::ptr::eq(std::sync::Arc::as_ptr(owner), ctx))
+            || (self.fast.is_some() && self.lease.is_some())
+        {
+            return Err(crate::Error::invalid(
+                "materialized input belongs to another query context",
+            ));
+        }
+        if self.fast.is_some() {
+            held.adopt_charge(&mut self.fast)?;
+            Ok(InputCredit::Fast)
+        } else if self.lease.is_some() {
+            held.adopt(&mut self.lease)?;
+            Ok(InputCredit::Lease)
+        } else {
+            Ok(InputCredit::Plain)
+        }
+    }
+}
+
+#[cfg(test)]
+mod materialized_credit_tests {
+    use super::*;
+    use crate::sparql::ctx::Ctx;
+    use crate::store::{Store, StoreOptions};
+
+    fn paid_spare_table(ctx: &Ctx) -> Materialized<'_> {
+        // Admit the exact outer and spare column capacities before allocating them.
+        let credit = ctx.charge(128 + 4 * 4 + 4 * 24 + 8 * 8 + 4 * 4).unwrap();
+        let mut vars = Vec::with_capacity(4);
+        vars.push(0);
+        let mut column = Vec::with_capacity(8);
+        column.push(Id::UNDEF);
+        let mut cols = Vec::with_capacity(4);
+        cols.push(column);
+        let mut sorted = Vec::with_capacity(4);
+        sorted.push(0);
+        Materialized::with_fast(
+            Table {
+                vars,
+                cols,
+                len: 1,
+                sorted,
+            },
+            credit,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn spare_table_input_moves_actual_credit_without_reserving_again() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 320;
+        let mut input = paid_spare_table(&ctx);
+        assert_eq!(ctx.live_bytes(), 320);
+        let held = ctx.charge(0).unwrap();
+        assert!(matches!(
+            input.adopt_input(&ctx, &held).unwrap(),
+            InputCredit::Fast
+        ));
+        assert!(input.fast.is_none());
+        assert_eq!(held.bytes(), 320);
+        assert_eq!(ctx.live_bytes(), 320);
+        drop(input);
+        assert_eq!(ctx.live_bytes(), 320, "the operator still owns the credit");
+        drop(held);
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+
+    #[test]
+    fn foreign_operator_refusal_keeps_the_actual_input_and_credit_together() {
+        let store = Store::in_memory(StoreOptions::default());
+        let source = Ctx::new(store.snapshot());
+        let receiving = Ctx::new(store.snapshot());
+        let mut input = paid_spare_table(&source);
+        let held = receiving.charge(0).unwrap();
+        assert!(input.adopt_input(&receiving, &held).is_err());
+        assert_eq!(input.table.cols[0].capacity(), 8);
+        assert_eq!(input.fast.as_ref().unwrap().bytes(), 320);
+        assert_eq!(source.live_bytes(), 320);
+        assert_eq!(receiving.live_bytes(), 0);
+        drop(input);
+        assert_eq!(source.live_bytes(), 0);
+    }
+
+    #[test]
+    fn undersized_fast_credit_refuses_and_retires_the_protected_partial_backing() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let credit = ctx.charge(127).unwrap();
+        assert!(Materialized::with_fast(Table::default(), credit).is_err());
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+
+    #[test]
+    fn borrowed_fast_backing_cannot_escape_the_context_lifetime() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 320;
+        let input = paid_spare_table(&ctx);
+        assert_eq!(ctx.live_bytes(), 320);
+        assert!(input.into_unborrowed().is_err());
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+
+    #[test]
+    fn unborrowed_output_moves_its_real_owner_and_credit_at_the_limit() {
+        use std::sync::Arc;
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 128;
+        let ctx = Arc::new(ctx);
+        let credit = super::super::ctx::OwnedCharge::new(&ctx, 128).unwrap();
+        let input = Materialized::with_owned(Table::default(), credit).unwrap();
+        let output = input.into_unborrowed().unwrap();
+        assert_eq!(ctx.live_bytes(), 128);
+        assert_eq!(output.lease.as_ref().unwrap().bytes, 128);
+        let owner = Arc::downgrade(&ctx);
+        drop(ctx);
+        assert_eq!(owner.upgrade().unwrap().live_bytes(), 128);
+        assert_eq!(output.table.len, 0);
+        drop(output);
+        assert!(owner.upgrade().is_none());
+    }
+
+    #[test]
+    fn fast_column_growth_pays_old_and_new_before_allocation() {
+        use crate::algo::memory::probe;
+        use std::{cell::Cell, rc::Rc, sync::Arc};
+        for short in [false, true] {
+            let store = Store::in_memory(StoreOptions::default());
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = 252 - u64::from(short);
+            let ctx = Arc::new(ctx);
+            let mut output = Materialized::empty_fast(&ctx, &[0], &[]).unwrap();
+            output.reserve_rows(&ctx, 4).unwrap();
+            output.table.cols[0].push(Id::UNDEF);
+            output.table.len = 1;
+            assert_eq!(ctx.live_bytes(), 188);
+            let seen = Rc::new(Cell::new(false));
+            let observed = seen.clone();
+            let owner = ctx.clone();
+            let hook = probe::install(
+                move |point| {
+                    if let probe::Point::Allocation("eager-column-grow", 8) = point {
+                        assert_eq!(owner.live_bytes(), 252, "old32 and new64 coexist");
+                        observed.set(true);
+                    }
+                },
+                None,
+            );
+            let result = output.reserve_rows(&ctx, 5);
+            if short {
+                assert!(matches!(result, Err(crate::Error::BudgetExceeded(_))));
+                assert!(!seen.get());
+                assert_eq!(output.table.cols[0].capacity(), 4);
+                assert_eq!(ctx.live_bytes(), 188);
+            } else {
+                result.unwrap();
+                assert!(seen.get());
+                assert_eq!(output.table.cols[0].capacity(), 8);
+                assert_eq!(ctx.live_bytes(), 220);
+            }
+            assert_eq!(output.table.cols[0], [Id::UNDEF]);
+            drop(hook);
+            drop(output);
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn failed_fast_replacement_keeps_original_backing_and_credit() {
+        use crate::algo::memory::probe;
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let mut output = Materialized::empty_fast(&ctx, &[0], &[]).unwrap();
+        output.reserve_rows(&ctx, 4).unwrap();
+        output.table.cols[0].push(Id::UNDEF);
+        output.table.len = 1;
+        let hook = probe::install(|_| {}, Some("eager-column-grow"));
+        assert!(output.reserve_rows(&ctx, 5).is_err());
+        assert_eq!(output.table.cols[0], [Id::UNDEF]);
+        assert_eq!(output.table.cols[0].capacity(), 4);
+        assert_eq!(ctx.live_bytes(), 188);
+        drop(hook);
+        drop(output);
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+
+    #[test]
+    fn paid_projection_pays_metadata_overlap_and_missing_columns() {
+        use crate::algo::memory::probe;
+        use std::{cell::Cell, rc::Rc, sync::Arc};
+        for short in [false, true] {
+            let store = Store::in_memory(StoreOptions::default());
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = 420 - u64::from(short);
+            let ctx = Arc::new(ctx);
+            let mut input = Materialized::empty_fast(&ctx, &[0], &[]).unwrap();
+            input.reserve_rows(&ctx, 8).unwrap();
+            input.table.cols[0].extend([Id::UNDEF, Id(7)]);
+            input.table.len = 2;
+            let held = ctx.charge(0).unwrap();
+            input.adopt_input(&ctx, &held).unwrap();
+            let observed = Rc::new(Cell::new(false));
+            let seen = observed.clone();
+            let owner = ctx.clone();
+            let hook = probe::install(
+                move |point| {
+                    if let probe::Point::Allocation("eager-project-vars", _) = point {
+                        assert_eq!(owner.live_bytes(), 420, "old220 and new200 coexist");
+                        seen.set(true);
+                    }
+                },
+                None,
+            );
+            let output = Materialized::project_paid(&ctx, input.table, &held, &[0, 1]);
+            if short {
+                assert!(matches!(output, Err(crate::Error::BudgetExceeded(_))));
+                assert!(!observed.get());
+                assert_eq!(ctx.live_bytes(), 220);
+                drop(held);
+            } else {
+                let output = Materialized::with_fast(output.unwrap(), held).unwrap();
+                assert!(observed.get());
+                assert_eq!(output.table.cols[0], [Id::UNDEF, Id(7)]);
+                assert_eq!(output.table.cols[0].capacity(), 8);
+                assert_eq!(output.table.cols[1], [Id::UNDEF, Id::UNDEF]);
+                assert_eq!(ctx.live_bytes(), 264);
+                drop(output);
+            }
+            drop(hook);
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn failed_paid_projection_keeps_credit_until_partial_backing_retires() {
+        use crate::algo::memory::probe;
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let mut input = Materialized::empty_fast(&ctx, &[0], &[]).unwrap();
+        input.reserve_rows(&ctx, 8).unwrap();
+        input.table.cols[0].extend([Id::UNDEF, Id(7)]);
+        input.table.len = 2;
+        let held = ctx.charge(0).unwrap();
+        input.adopt_input(&ctx, &held).unwrap();
+        let hook = probe::install(|_| {}, Some("eager-project-missing"));
+        assert!(Materialized::project_paid(&ctx, input.table, &held, &[0, 1]).is_err());
+        assert_eq!(ctx.live_bytes(), 220);
+        drop(hook);
+        drop(held);
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+
+    #[test]
+    fn zero_width_projection_retires_columns_before_credit_shrink() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let mut input = Materialized::empty_fast(&ctx, &[0], &[]).unwrap();
+        input.reserve_rows(&ctx, 8).unwrap();
+        input.table.cols[0].extend([Id::UNDEF, Id(7)]);
+        input.table.len = 2;
+        let held = ctx.charge(0).unwrap();
+        input.adopt_input(&ctx, &held).unwrap();
+        let table = Materialized::project_paid(&ctx, input.table, &held, &[]).unwrap();
+        let output = Materialized::with_fast(table, held).unwrap();
+        assert!(output.table.cols.is_empty());
+        assert_eq!(output.table.len, 2);
+        assert_eq!(ctx.live_bytes(), 144);
+        drop(output);
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+
+    #[test]
+    fn final_fast_output_refuses_a_different_context_on_the_same_grant() {
+        use std::sync::Arc;
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(1 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        let mut first = Ctx::new(store.snapshot());
+        first.set_grant(Some(grant.clone()));
+        let mut second = Ctx::new(store.snapshot());
+        second.set_grant(Some(grant.clone()));
+        let first = Arc::new(first);
+        let second = Arc::new(second);
+        let input = paid_spare_table(&first);
+        assert_eq!(first.live_bytes(), 320);
+        assert!(input.into_retained(&second).is_err());
+        assert_eq!(first.live_bytes(), 0);
+        assert_eq!(second.live_bytes(), 0);
+        drop(first);
+        drop(second);
+        assert_eq!(grant.used(), 0);
+    }
+
+    #[test]
+    fn final_retained_guard_keeps_real_fast_context_without_ledger() {
+        use std::sync::Arc;
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 320;
+        let ctx = Arc::new(ctx);
+        super::super::query_memory::LEDGER_OPS.with(|n| n.set(0));
+        let input = paid_spare_table(&ctx);
+        let retained = input.into_retained(&ctx).unwrap();
+        super::super::query_memory::LEDGER_OPS.with(|n| assert_eq!(n.get(), 0));
+        let owner = Arc::downgrade(&ctx);
+        drop(ctx);
+        assert_eq!(retained.table.cols[0], [Id::UNDEF]);
+        assert_eq!(owner.upgrade().unwrap().live_bytes(), 320);
+        drop(retained);
+        assert!(owner.upgrade().is_none());
     }
 }
