@@ -277,10 +277,15 @@ fn one_cell_fits_but_the_complete_row_refuses_before_publication_and_recovers() 
     // A single actual decoded cell fits, including its owned string. The two
     // independent cells together exceed this same fixed remaining allowance.
     let cell_credit = crate::sparql::ctx::OutputCredit::new(&r.ctx);
-    let cell = r.ctx.output_term(r.table.cols[0][0], &cell_credit).unwrap();
+    let key_credit = crate::sparql::ctx::OutputCredit::new(&r.ctx);
+    let cell = r
+        .ctx
+        .output_term(r.table.cols[0][0], &cell_credit, &key_credit)
+        .unwrap();
     assert!(matches!(&cell, Some(Term::Literal(v)) if v.value().len() == LONG));
     drop(cell);
     drop(cell_credit);
+    drop(key_credit);
     assert_eq!(r.ctx.live_bytes(), blocked);
     for format in [Format::Native, Format::Tsv] {
         let mut out = Vec::new();
@@ -398,4 +403,101 @@ fn classifier_still_translates_its_actual_io_refusals() {
     assert!(matches!(&error, Error::Io(_)));
     assert!(matches!(limited.classify(error), Error::Cancelled));
     assert_eq!((limited.written(), sent.get()), (0, 0));
+}
+
+/// A stored answer whose first value is a long vocabulary literal and whose second
+/// is short, both served from the vocabulary rather than the query's local terms.
+fn stored(long: usize) -> (tempfile::TempDir, QueryResult) {
+    use crate::io::{RdfFormat, Source};
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), StoreOptions::default()).unwrap();
+    let data = format!(
+        "<urn:0> <urn:p> \"{}\" .\n<urn:1> <urn:p> \"a\" .\n",
+        "z".repeat(long)
+    );
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let r = query(
+        store.snapshot(),
+        "SELECT ?o WHERE { ?s <urn:p> ?o } ORDER BY ?s",
+        &QueryOptions {
+            no_cache: true,
+            max_memory_bytes: Some(MB),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(r.len(), 2);
+    assert!(
+        r.table.cols[0]
+            .iter()
+            .all(|id| id.tag() == crate::id::Tag::Vocab)
+    );
+    (directory, r)
+}
+
+#[test]
+fn vocabulary_reconstruction_scratch_is_admitted_before_it_is_allocated() {
+    const K: usize = 64 << 10;
+    let (_directory, r) = stored(K);
+    let before = r.ctx.live_bytes();
+    // The row and its owned literal fit, but not the key's rebuild scratch beside it.
+    let blocker = r
+        .ctx
+        .charge(r.ctx.memory_remaining() - (K as u64 + 4096))
+        .unwrap();
+    let blocked = r.ctx.live_bytes();
+    for format in [Format::Native, Format::Tsv] {
+        let sent = Cell::new(0);
+        let error = format.write(&r, Vec::new(), &sent).unwrap_err();
+        assert!(
+            matches!(error, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory && b.limit == MB),
+            "{error:?}"
+        );
+        assert_eq!(sent.get(), 0);
+        assert_eq!(r.ctx.live_bytes(), blocked);
+        r.ctx.check_memory_failure().unwrap();
+    }
+    drop(blocker);
+    for format in [Format::Native, Format::Tsv] {
+        let sent = Cell::new(0);
+        format.write(&r, Vec::new(), &sent).unwrap();
+        assert_eq!(sent.get(), 2);
+        assert_eq!(r.ctx.live_bytes(), before);
+    }
+}
+
+#[test]
+fn a_recorded_refusal_stays_the_error_of_a_reused_row() {
+    let r = answer(false);
+    let mut row = output::ScratchRow::new(&r).unwrap();
+    // Leave too little room for the long first cell, so its own growth would refuse
+    // with a different request if the recorded refusal were not checked first.
+    let blocker = r.ctx.charge(r.ctx.memory_remaining() - 64).unwrap();
+    let budget = refuse(&r, false);
+    exact_refusal(row.load(0).map(|_| ()), budget);
+    drop(row);
+    drop(blocker);
+}
+
+#[test]
+fn an_outlier_row_does_not_make_a_later_small_row_refuse() {
+    let (_directory, r) = stored(8192);
+    let expected = r.rows();
+    let live = r.ctx.live_bytes();
+    let mut row = output::ScratchRow::new(&r).unwrap();
+    assert_eq!(row.load(0).unwrap(), &expected[0][..]);
+    // The writer keeps the outlier's credit. The small row fits inside it, so no
+    // further admission happens however little room the query has left.
+    let pressure = r.ctx.charge(r.ctx.memory_remaining()).unwrap();
+    assert_eq!(row.load(1).unwrap(), &expected[1][..]);
+    drop(row);
+    drop(pressure);
+    assert_eq!(r.ctx.live_bytes(), live);
+    r.ctx.check_memory_failure().unwrap();
 }

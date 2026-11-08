@@ -2154,9 +2154,16 @@ impl Ctx {
     /// Decode one private writer cell after admitting its owned payload. Unlike the
     /// public compatibility decoder, this route cannot turn a refusal into UNDEF.
     /// The row's credit outlives every returned term; no owning value escapes it.
-    pub(super) fn output_term(&self, id: Id, row: &OutputCredit<'_>) -> Result<Option<Term>> {
+    /// `keys` admits the vocabulary's reconstruction scratch before it is allocated.
+    /// It keeps the largest scratch admitted so far for the rest of the writer call.
+    pub(super) fn output_term(
+        &self,
+        id: Id,
+        row: &OutputCredit<'_>,
+        keys: &OutputCredit<'_>,
+    ) -> Result<Option<Term>> {
         assert!(
-            std::ptr::eq(self, row.charge.ctx),
+            std::ptr::eq(self, row.charge.ctx) && std::ptr::eq(self, keys.charge.ctx),
             "output credit belongs to its query"
         );
         let decode = |key: &[u8]| -> Result<Term> {
@@ -2204,20 +2211,19 @@ impl Ctx {
                     }
                 }
             }
-            // An eager envelope already covers key reconstruction, as in
-            // `with_vocab_key`. Checking each rebuild step and charging its scratch
-            // separately made large answers about a third slower to write.
-            Tag::Vocab if !self.envelope_refuses() => self
+            // Reconstruction scratch is query-owned even when the vocabulary is mapped.
+            // Twice the requested size covers old and new buffers during reallocation.
+            // The writer's high-water credit admits it without a fresh account update
+            // for every cell, which made large answers about a third slower to write.
+            Tag::Vocab => self
                 .snap
                 .generation
                 .vocab
-                .get_with(id.payload(), |key| {
-                    self.reserve_decode_checked(key.len())?;
-                    decode(key)
-                })
-                .transpose()?,
-            Tag::Vocab => self
-                .with_cursor_vocab_key(id.payload(), decode)?
+                .get_with_checked(
+                    id.payload(),
+                    |need| keys.reserve((need as u64).saturating_mul(2)),
+                    decode,
+                )?
                 .transpose()?,
             // Inline numbers/calendar values and blank-node labels have bounded
             // formatted text. This covers their strings and construction overlap.
@@ -2869,6 +2875,15 @@ impl<'a> OutputCredit<'a> {
             self.charge.add(used - held)?;
         }
         self.used.set(used);
+        Ok(())
+    }
+    /// Hold at least `bytes` in total, for scratch whose size replaces rather than
+    /// adds to what was held before.
+    pub(super) fn reserve(&self, bytes: u64) -> Result<()> {
+        let held = self.charge.bytes.get();
+        if bytes > held {
+            self.charge.add(bytes - held)?;
+        }
         Ok(())
     }
     /// Start a new row. The caller has already dropped every term of the last one.

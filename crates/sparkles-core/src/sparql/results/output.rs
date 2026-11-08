@@ -12,6 +12,7 @@ pub(super) struct ScratchRow<'a> {
     // before their actual query/parent credit can notify a returning owner.
     pub(super) terms: Vec<Option<Term>>,
     credit: OutputCredit<'a>,
+    keys: OutputCredit<'a>,
     r: &'a QueryResult,
 }
 
@@ -25,6 +26,7 @@ impl<'a> ScratchRow<'a> {
         Ok(Self {
             terms: Vec::with_capacity(width),
             credit,
+            keys: OutputCredit::new(&r.ctx),
             r,
         })
     }
@@ -39,12 +41,14 @@ impl<'a> ScratchRow<'a> {
     /// Decode row `index` into this scratch, replacing the previous row.
     pub(super) fn load(&mut self, index: usize) -> Result<&[Option<Term>]> {
         let r = self.r;
+        // A refusal recorded while the last row was written stays the writer's error.
+        r.ctx.check_memory_failure()?;
         self.terms.clear();
         self.credit.reset();
         self.credit.add(Self::slots(r, r.table.width())?)?;
         for col in &r.table.cols {
             self.terms
-                .push(r.ctx.output_term(col[index], &self.credit)?);
+                .push(r.ctx.output_term(col[index], &self.credit, &self.keys)?);
         }
         r.ctx.check_memory_failure()?;
         Ok(&self.terms)
