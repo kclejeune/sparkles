@@ -560,6 +560,17 @@ capabilities and remaining work are described by the spec status and Outcome.
     `crates/sparkles/src/handles/`, `crates/sparkles/src/dataset.rs`,
     `jvm/gradle/libs.versions.toml`) and specs C02, C08, C12, C12b, C17, F16, F17, F18, P01,
     P04, P05, P06 and AUDIT §5.
+- **XML literal namespace checks:** written from [OWL 2 Structural Syntax §4.8](https://www.w3.org/TR/owl2-syntax/#XML_Literals),
+  its normative reference to [RDF Concepts 2004 §5.1](https://www.w3.org/TR/2004/REC-rdf-concepts-20040210/#section-XMLLiteral),
+  [Namespaces in XML 1.0](https://www.w3.org/TR/REC-xml-names/),
+  [XML 1.0 §§2.5, 3.3.3 and 4.1](https://www.w3.org/TR/xml/) and
+  [RFC 3986](https://www.rfc-editor.org/rfc/rfc3986#appendix-A).
+  RDF 1.1 Concepts §5.3 is non-normative and does not replace OWL 2's normative
+  linkage here. Namespace conformance is a necessary condition. Full canonical
+  lexical and value semantics remain in item 663. The existing `oxiri` dependency
+  validates borrowed URI references after an ASCII check, without resolving or
+  rewriting namespace values. No ontology library implementation source was read
+  or copied.
 - **Implementation (Phase 1):** written from the W3C OWL 2 Structural Specification,
   Mapping to RDF Graphs and Profiles recommendations (second edition), re-read for the
   implementation, and checked against the W3C OWL 2 test cases, the approved export
@@ -865,9 +876,16 @@ be in that datatype's lexical space (§5.7). The lexical spaces follow XML Schem
 Part 2 for the `xsd:` datatypes, without trimming white space, with the ranges of the
 integer datatypes and the `xsd:language` pattern. `owl:rational` takes the forms of §4.1,
 `owl:real` has none, `rdf:PlainLiteral` is a string, `@` and an empty or well-formed
-language tag, and `rdf:XMLLiteral` is well-balanced XML content without namespace
-resolution, whose entity references are the five that XML predefines. Each pair of a datatype restriction must be in the facet space of its
-datatype (§7.5), so the facet must be one of the datatype's normative facets and its
+language tag. The `rdf:XMLLiteral` check requires balanced XML content, QName
+components, scoped namespace declarations, the reserved `xml` and `xmlns` bindings
+and unique expanded attribute names. Namespace values undergo XML attribute-value
+normalization, with character references and the five predefined entities. A nonempty
+normalized namespace name must be an RFC 3986 URI reference. Relative and
+same-document references remain accepted, and names retain their case and percent
+spelling for comparison. The check retains noncanonical fragment spellings. It does not establish the full canonical
+lexical space required by OWL 2 §4.8 through RDF Concepts 2004 §5.1, or compare XML
+canonical values, which remains part of item 663. Each pair of a datatype restriction
+must be in the facet space of its datatype (§7.5), so the facet must be one of the datatype's normative facets and its
 value must be in the value space the facet ranges over. The value is judged by its data
 value, so `"3.0"^^xsd:decimal` is a valid length and an `xsd:token` is a valid pattern.
 A pattern must parse as an XML Schema regular expression and a language range must

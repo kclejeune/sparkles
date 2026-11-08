@@ -17,6 +17,9 @@
 
 use crate::model::*;
 use crate::vocab;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 use std::str::FromStr;
 
 const XSD: &str = vocab::XSD;
@@ -678,12 +681,13 @@ fn base64(s: &str) -> bool {
     }
 }
 
-/// `rdf:XMLLiteral`: well-balanced XML content, as RDF 1.1 Concepts defines its
-/// lexical space. The check covers balanced and properly nested element tags, quoted
-/// attribute values, references, comments, processing instructions and CDATA sections,
-/// and characters of XML 1.0. It does not resolve namespace prefixes.
+/// The namespace-well-formed XML content required of `rdf:XMLLiteral`. This checks
+/// necessary markup, character and namespace conditions, retaining the accepted
+/// fragment spellings. It does not establish the full canonical lexical/value
+/// contract of OWL 2's normative RDF Concepts 2004 reference.
 fn xml_content(s: &str) -> bool {
-    let mut open: Vec<&str> = Vec::new();
+    let mut open: Vec<(&str, usize)> = Vec::new();
+    let mut namespaces = XmlNamespaces::default();
     let mut rest = s;
     while let Some(i) = rest.find(['<', '&']) {
         if !xml_text(&rest[..i]) {
@@ -702,7 +706,7 @@ fn xml_content(s: &str) -> bool {
             let Some(end) = r.find("-->") else {
                 return false;
             };
-            if r[..end].contains("--") || !xml_chars(&r[..end]) {
+            if r[..end].contains("--") || r[..end].ends_with('-') || !xml_chars(&r[..end]) {
                 return false;
             }
             rest = &r[end + 3..];
@@ -728,19 +732,28 @@ fn xml_content(s: &str) -> bool {
                 return false;
             };
             let n = r[..end].trim_end_matches([' ', '\t', '\r', '\n']);
-            if open.pop() != Some(n) {
+            let Some((opened, checkpoint)) = open.pop() else {
+                return false;
+            };
+            if opened != n {
                 return false;
             }
+            namespaces.restore(checkpoint);
             rest = &r[end + 1..];
         } else {
             let r = &rest[1..];
-            let Some((n, after, empty)) = start_tag(r) else {
+            let Some(tag) = start_tag(r) else {
                 return false;
             };
-            if !empty {
-                open.push(n);
+            let Some(checkpoint) = namespaces.enter(&tag) else {
+                return false;
+            };
+            if tag.empty {
+                namespaces.restore(checkpoint);
+            } else {
+                open.push((tag.name, checkpoint));
             }
-            rest = after;
+            rest = tag.after;
         }
     }
     open.is_empty() && xml_text(rest)
@@ -754,52 +767,241 @@ fn xml_text(s: &str) -> bool {
 /// The body of a reference `&…;`: a character reference or one of the five entities
 /// XML predefines, since a fragment has no document type to declare others.
 fn reference(body: &str) -> bool {
+    reference_character(body).is_some()
+}
+
+/// The existing self-contained reference vocabulary, also used when normalizing
+/// namespace declarations. Character references are not whitespace-normalized.
+fn reference_character(body: &str) -> Option<char> {
     if let Some(h) = body.strip_prefix("#x") {
-        return !h.is_empty()
-            && u32::from_str_radix(h, 16)
-                .ok()
-                .and_then(char::from_u32)
-                .is_some_and(is_xml_char);
+        if h.is_empty() || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        return u32::from_str_radix(h, 16)
+            .ok()
+            .and_then(char::from_u32)
+            .filter(|c| is_xml_char(*c));
     }
     if let Some(d) = body.strip_prefix('#') {
-        return digits(d)
-            && d.parse::<u32>()
-                .ok()
-                .and_then(char::from_u32)
-                .is_some_and(is_xml_char);
+        if !digits(d) {
+            return None;
+        }
+        return d
+            .parse::<u32>()
+            .ok()
+            .and_then(char::from_u32)
+            .filter(|c| is_xml_char(*c));
     }
-    matches!(body, "amp" | "lt" | "gt" | "quot" | "apos")
+    match body {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => None,
+    }
+}
+
+const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
+
+/// A QName has one optional colon, with an NCName on both sides.
+fn xml_qname(s: &str) -> Option<(Option<&str>, &str)> {
+    match s.split_once(':') {
+        Some((prefix, local)) if name(prefix, false) && name(local, false) => {
+            Some((Some(prefix), local))
+        }
+        None if name(s, false) => Some((None, s)),
+        _ => None,
+    }
+}
+
+/// XML 1.0 line-ending and CDATA attribute-value normalization, without collapsing
+/// spaces or applying literal-whitespace normalization to referenced characters.
+fn xml_namespace_value(s: &str) -> Option<Cow<'_, str>> {
+    if !s.contains(['&', '\t', '\r', '\n']) {
+        return Some(Cow::Borrowed(s));
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        rest = &rest[c.len_utf8()..];
+        match c {
+            '&' => {
+                let end = rest.find(';')?;
+                out.push(reference_character(&rest[..end])?);
+                rest = &rest[end + 1..];
+            }
+            '\r' => {
+                rest = rest.strip_prefix('\n').unwrap_or(rest);
+                out.push(' ');
+            }
+            '\t' | '\n' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    Some(Cow::Owned(out))
+}
+
+struct XmlNamespace<'a> {
+    id: usize,
+    value: Rc<Cow<'a, str>>,
+}
+
+/// Only declarations introduced by active elements are retained. A checkpoint is
+/// an undo-stack position, not a copy of the inherited namespace map. URI aliases
+/// share a local identity so attributes do not repeatedly compare long URI text.
+#[derive(Default)]
+struct XmlNamespaces<'a> {
+    bindings: BTreeMap<&'a str, XmlNamespace<'a>>,
+    values: BTreeMap<Rc<Cow<'a, str>>, usize>,
+    undo: Vec<(&'a str, Option<XmlNamespace<'a>>)>,
+    next_id: usize,
+}
+
+impl<'a> XmlNamespaces<'a> {
+    fn declare(&mut self, prefix: &'a str, value: Cow<'a, str>) -> Option<()> {
+        // Namespace names are URI references, not the wider IRI language. Parse
+        // the borrowed normalized spelling without resolving or rewriting it.
+        if !value.is_empty() && (!value.is_ascii() || oxiri::IriRef::parse(value.as_ref()).is_err())
+        {
+            return None;
+        }
+        if prefix == "xmlns" || value == XMLNS_NAMESPACE {
+            return None;
+        }
+        if prefix == "xml" {
+            return (value == XML_NAMESPACE).then_some(());
+        }
+        if value == XML_NAMESPACE || (!prefix.is_empty() && value.is_empty()) {
+            return None;
+        }
+        let namespace = if let Some((value, &id)) = self.values.get_key_value(&value) {
+            XmlNamespace {
+                id,
+                value: Rc::clone(value),
+            }
+        } else {
+            // Each new id consumes a nonempty declaration in the input, so an
+            // addressable str cannot contain enough declarations to overflow it.
+            self.next_id += 1;
+            let value = Rc::new(value);
+            self.values.insert(Rc::clone(&value), self.next_id);
+            XmlNamespace {
+                id: self.next_id,
+                value,
+            }
+        };
+        let previous = self.bindings.insert(prefix, namespace);
+        self.undo.push((prefix, previous));
+        Some(())
+    }
+
+    fn uri_id(&self, prefix: &str) -> Option<usize> {
+        if prefix == "xml" {
+            Some(0)
+        } else {
+            self.bindings.get(prefix).map(|namespace| namespace.id)
+        }
+    }
+
+    fn enter(&mut self, tag: &XmlStartTag<'a>) -> Option<usize> {
+        let checkpoint = self.undo.len();
+        for &(attribute, value) in &tag.attributes {
+            match xml_qname(attribute)? {
+                (None, "xmlns") => self.declare("", xml_namespace_value(value)?)?,
+                (Some("xmlns"), prefix) => self.declare(prefix, xml_namespace_value(value)?)?,
+                _ => {}
+            }
+        }
+        if let (Some(prefix), _) = xml_qname(tag.name)? {
+            if prefix == "xmlns" {
+                return None;
+            }
+            self.uri_id(prefix)?;
+        }
+        let mut expanded = BTreeSet::new();
+        for &(attribute, _) in &tag.attributes {
+            let (prefix, local) = xml_qname(attribute)?;
+            if attribute == "xmlns" || prefix == Some("xmlns") {
+                continue;
+            }
+            // The default namespace never applies to unprefixed attributes.
+            let uri = match prefix {
+                Some(prefix) => Some(self.uri_id(prefix)?),
+                None => None,
+            };
+            if !expanded.insert((uri, local)) {
+                return None;
+            }
+        }
+        Some(checkpoint)
+    }
+
+    fn restore(&mut self, checkpoint: usize) {
+        while self.undo.len() > checkpoint {
+            let (prefix, previous) = self.undo.pop().expect("namespace undo entry");
+            let current = self
+                .bindings
+                .remove(prefix)
+                .expect("active namespace binding");
+            if let Some(previous) = previous {
+                self.bindings.insert(prefix, previous);
+            }
+            // The table and this removed binding are the final two owners when
+            // no active or shadowed declaration still needs the URI.
+            if Rc::strong_count(&current.value) == 2 {
+                self.values.remove(current.value.as_ref());
+            }
+        }
+    }
+}
+
+struct XmlStartTag<'a> {
+    name: &'a str,
+    attributes: Vec<(&'a str, &'a str)>,
+    after: &'a str,
+    empty: bool,
 }
 
 /// A start tag after its `<`: its name, the text after its `>` and whether it is an
 /// empty-element tag.
-fn start_tag(r: &str) -> Option<(&str, &str, bool)> {
+fn start_tag(r: &str) -> Option<XmlStartTag<'_>> {
     let end_name = r.find(|c: char| !is_name_char(c)).unwrap_or(r.len());
     let n = &r[..end_name];
-    if !name(n, true) {
-        return None;
-    }
+    xml_qname(n)?;
     let mut rest = &r[end_name..];
-    let mut seen: Vec<&str> = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut attributes = Vec::new();
     loop {
         let trimmed = rest.trim_start_matches([' ', '\t', '\r', '\n']);
         let spaced = trimmed.len() < rest.len();
         rest = trimmed;
         if let Some(after) = rest.strip_prefix("/>") {
-            return Some((n, after, true));
+            return Some(XmlStartTag {
+                name: n,
+                attributes,
+                after,
+                empty: true,
+            });
         }
         if let Some(after) = rest.strip_prefix('>') {
-            return Some((n, after, false));
+            return Some(XmlStartTag {
+                name: n,
+                attributes,
+                after,
+                empty: false,
+            });
         }
         if !spaced {
             return None;
         }
         let end_attr = rest.find(|c: char| !is_name_char(c)).unwrap_or(rest.len());
         let attr = &rest[..end_attr];
-        if !name(attr, true) || seen.contains(&attr) {
+        xml_qname(attr)?;
+        if !seen.insert(attr) {
             return None;
         }
-        seen.push(attr);
         rest = rest[end_attr..].trim_start_matches([' ', '\t', '\r', '\n']);
         rest = rest
             .strip_prefix('=')?
@@ -819,6 +1021,7 @@ fn start_tag(r: &str) -> Option<(&str, &str, bool)> {
             }
             v = &v[end + 1..];
         }
+        attributes.push((attr, value));
         rest = &body[close + 1..];
     }
 }
@@ -1245,5 +1448,349 @@ mod tests {
         assert_eq!(xml("<a b=\"&nbsp;\"/>"), Some(false));
         assert_eq!(xml("<?pi ok?>"), Some(true));
         assert_eq!(xml("<?pi \u{1}?>"), Some(false));
+    }
+
+    // These tests strengthen the implemented XMLLiteral namespace check. Positive
+    // cases preserve accepted fragment spellings; they do not establish the full
+    // OWL 2 / RDF 2004 canonical lexical or value-space contract tracked by 663.
+    #[test]
+    fn xml_literal_namespaces_reject_undeclared_element_prefixes() {
+        assert_eq!(lexical(vocab::RDF_XML_LITERAL, "<p:a/>"), Some(false));
+    }
+
+    #[test]
+    fn xml_literal_namespaces_reject_undeclared_attribute_prefixes() {
+        assert_eq!(lexical(vocab::RDF_XML_LITERAL, "<a p:x='1'/>"), Some(false));
+    }
+
+    #[test]
+    fn xml_literal_namespaces_require_qname_components() {
+        for xml in [
+            "<a:b:c xmlns:a='urn:u'/>",
+            "<:a/>",
+            "<a: xmlns:a='urn:u'/>",
+            "<a xmlns:p='urn:u' p:x:y='1'/>",
+            "<a :x='1'/>",
+        ] {
+            assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(false), "{xml:?}");
+        }
+    }
+
+    #[test]
+    fn xml_literal_namespaces_reject_wrong_xml_binding() {
+        let xml = "<a xmlns:xml='urn:wrong' xml:lang='en'/>";
+        assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(false));
+    }
+
+    #[test]
+    fn xml_literal_namespaces_reject_aliases_for_the_xml_namespace() {
+        for xml in [
+            "<a xmlns:p='http://www.w3.org/XML/1998/namespace'/>",
+            "<a xmlns='http://www.w3.org/XML/1998/namespace'/>",
+        ] {
+            assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(false), "{xml:?}");
+        }
+    }
+
+    #[test]
+    fn xml_literal_namespaces_reject_xmlns_declarations() {
+        let xml = "<a xmlns:xmlns='urn:u'/>";
+        assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(false));
+    }
+
+    #[test]
+    fn xml_literal_namespaces_reject_aliases_for_the_xmlns_namespace() {
+        for xml in [
+            "<a xmlns:p='http://www.w3.org/2000/xmlns/'/>",
+            "<a xmlns='http://www.w3.org/2000/xmlns/'/>",
+        ] {
+            assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(false), "{xml:?}");
+        }
+    }
+
+    #[test]
+    fn xml_literal_namespaces_reject_xmlns_element_prefixes() {
+        assert_eq!(lexical(vocab::RDF_XML_LITERAL, "<xmlns:a/>"), Some(false));
+    }
+
+    #[test]
+    fn xml_literal_namespaces_reject_prefixed_undeclarations() {
+        let xml = "<a xmlns:p=''/>";
+        assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(false));
+    }
+
+    #[test]
+    fn xml_literal_namespaces_require_unique_expanded_attributes() {
+        let xml = "<a xmlns:p='urn:u' xmlns:q='urn:u' p:x='1' q:x='2'/>";
+        assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(false));
+    }
+
+    #[test]
+    fn xml_literal_namespaces_decode_references_before_attribute_uniqueness() {
+        let xml = "<a xmlns:p='urn:ns' xmlns:q='urn:n&#115;' p:x='1' q:x='2'/>";
+        assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(false));
+    }
+
+    #[test]
+    fn xml_literal_namespaces_decode_references_before_reserved_binding_checks() {
+        let xml = "<a xmlns:p='http://www.w3.org/&#x58;ML/1998/namespace'/>";
+        assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(false));
+    }
+
+    #[test]
+    fn xml_literal_namespaces_do_not_leak_child_or_empty_element_bindings() {
+        for xml in [
+            "<a xmlns:p='urn:u'/><p:b/>",
+            "<a><b xmlns:p='urn:u'><p:c/></b><p:d/></a>",
+            "<a><b xmlns:p='urn:u'/><p:c/></a>",
+        ] {
+            assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(false), "{xml:?}");
+        }
+    }
+
+    #[test]
+    fn xml_literal_namespaces_normalize_literal_attribute_whitespace() {
+        for xml in [
+            "<a xmlns:p='urn:a\r\nb' xmlns:q='urn:a b' p:x='1' q:x='2'/>",
+            "<a xmlns:p='urn:a\tb' xmlns:q='urn:a&#x20;b' p:x='1' q:x='2'/>",
+        ] {
+            // Both declarations have the same normalized name, so attributes
+            // cannot become distinct by comparing the raw declaration spelling.
+            assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(false), "{xml:?}");
+        }
+    }
+
+    #[test]
+    fn xml_literal_namespaces_keep_well_scoped_legacy_fragment_forms() {
+        for xml in [
+            "<p:a xmlns:p='urn:u'/>",
+            "<a xmlns:p='urn:u' p:x='1'/>",
+            "<a xml:lang='en' xml:space='preserve'/>",
+            "<a xmlns:xml='http://www.w3.org/XML/1998/namespace' xml:lang='en'/>",
+            "<a xmlns:xml='http://www.w3.org/&#x58;ML/1998/namespace'/>",
+            "<a xmlns='urn:u'><b xmlns=''/></a>",
+            "<a xmlns:p='urn:u'><p:b/></a><c/>",
+            "<p:a xmlns:p='relative/path'/>",
+            "<π:δ xmlns:π='urn:greek' π:κ='v'/>",
+        ] {
+            assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(true), "{xml:?}");
+        }
+    }
+
+    #[test]
+    fn xml_literal_namespaces_do_not_apply_the_default_to_attributes() {
+        let xml = "<a xmlns='urn:u' xmlns:p='urn:u' x='1' p:x='2'/>";
+        assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(true));
+    }
+
+    #[test]
+    fn xml_literal_namespaces_restore_shadowed_bindings() {
+        let xml = "<a xmlns:p='urn:outer'>\
+                   <b xmlns:p='urn:inner' xmlns:q='urn:outer' p:x='1' q:x='2'/>\
+                   <c xmlns:q='urn:inner' p:x='1' q:x='2'/>\
+                   </a>";
+        assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(true));
+    }
+
+    #[test]
+    fn xml_literal_namespaces_compare_namespace_strings_without_iri_rewriting() {
+        for xml in [
+            "<a xmlns:p='urn:Case' xmlns:q='urn:case' p:x='1' q:x='2'/>",
+            "<a xmlns:p='urn:u:%61' xmlns:q='urn:u:a' p:x='1' q:x='2'/>",
+        ] {
+            assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(true), "{xml:?}");
+        }
+    }
+
+    #[test]
+    fn xml_literal_namespaces_ignore_namespace_looking_markup_in_data() {
+        let xml = "<a><!-- <p:missing/> --><![CDATA[<p:missing/>]]><?pi p:missing?></a>";
+        assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(true));
+    }
+
+    #[test]
+    fn xml_literal_namespaces_do_not_introduce_a_validity_depth_ceiling() {
+        let xml = format!(
+            "<r xmlns:p='urn:u'>{}{}</r>",
+            "<p:n>".repeat(2048),
+            "</p:n>".repeat(2048)
+        );
+        assert_eq!(lexical(vocab::RDF_XML_LITERAL, &xml), Some(true));
+    }
+
+    #[test]
+    fn xml_literal_namespaces_allow_many_distinct_expanded_attributes() {
+        let mut xml = String::from("<a");
+        for i in 0..512 {
+            xml.push_str(&format!(" xmlns:p{i}='urn:ns:{i}'"));
+        }
+        for i in 0..512 {
+            xml.push_str(&format!(" p{i}:x='v'"));
+        }
+        xml.push_str("/>");
+        assert_eq!(lexical(vocab::RDF_XML_LITERAL, &xml), Some(true));
+    }
+
+    #[test]
+    fn xml_literal_namespaces_keep_lexical_end_tag_matching() {
+        let xml = "<p:a xmlns:p='urn:u' xmlns:q='urn:u'></q:a>";
+        assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(false));
+    }
+
+    #[test]
+    fn xml_literal_namespace_normalization_preserves_reference_whitespace() {
+        assert_eq!(
+            xml_namespace_value(" a\r\nb\rc\td\ne &#xA;&#x9;&#xD;&amp;&lt;&gt;&quot;&apos; "),
+            Some(Cow::Owned(" a b c d e \n\t\r&<>\"' ".to_string()))
+        );
+        assert!(matches!(
+            xml_namespace_value(" urn:unchanged  spelling "),
+            Some(Cow::Borrowed(" urn:unchanged  spelling "))
+        ));
+        assert_ne!(
+            xml_namespace_value("urn:a&#x9;b"),
+            xml_namespace_value("urn:a b")
+        );
+        assert_eq!(
+            xml_namespace_value("urn:a\tb"),
+            xml_namespace_value("urn:a b")
+        );
+        assert!(!xml_content(
+            "<e xmlns:p='urn:a&#x9;b' xmlns:q='urn:a b' p:x='1' q:x='2'/>"
+        ));
+        assert!(!xml_content(
+            "<e xmlns:p='urn:a\tb' xmlns:q='urn:a b' p:x='1' q:x='2'/>"
+        ));
+    }
+
+    #[test]
+    fn xml_literal_namespace_declarations_apply_to_the_whole_start_tag() {
+        assert!(xml_content(
+            "<p:e p:x='1' xmlns:p='urn:p'><p:f q:x='2' xmlns:q='urn:q'/></p:e>"
+        ));
+        assert!(!xml_content(
+            "<p:e p:x='1' q:x='2' xmlns:q='urn:p' xmlns:p='urn:p'/>"
+        ));
+    }
+
+    #[test]
+    fn xml_literal_namespace_normalized_bindings_restore_across_siblings() {
+        assert!(xml_content(
+            "<e xmlns:p='urn:a&amp;b'><p:e xmlns:p='urn:other'/><p:f/></e>"
+        ));
+        assert!(!xml_content(
+            "<e xmlns:p='urn:a&amp;b'><p:e xmlns:p='urn:other'/><f \
+             xmlns:q='urn:a&#38;b' p:x='1' q:x='2'/></e>"
+        ));
+        assert!(xml_content(
+            "<e xmlns:p='urn:a&amp;b'/><e xmlns:p='urn:other' p:x='1'/>"
+        ));
+    }
+
+    #[test]
+    fn xml_literal_namespace_uri_reference_syntax() {
+        for xml in [
+            "<p:a xmlns:p='urn:a b'/>",
+            "<a xmlns='urn:%'/>",
+            "<p:a xmlns:p='urn:%GG'/>",
+            "<p:a xmlns:p='urn:a&#x9;b'/>",
+            "<a xmlns:unused='urn:a&#xA;b'/>",
+            "<a xmlns='urn:a&#xD;b'/>",
+            "<a xmlns='urn:a&lt;b'/>",
+            "<a xmlns='urn:a&#34;b'/>",
+            "<a xmlns='http://['/>",
+            "<a xmlns='urn:é'/>",
+            "<a xmlns='urn:a\tb'/>",
+            "<a xmlns='urn:a\r\nb'/>",
+            "<a xmlns='urn:a\rb'/>",
+        ] {
+            assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(false), "{xml:?}");
+        }
+    }
+
+    #[test]
+    fn xml_literal_namespace_uri_reference_controls() {
+        for namespace in [
+            "relative/path",
+            "../relative",
+            "#fragment",
+            "?query",
+            "urn:u:%61",
+            "urn:u:%6a",
+            "urn:u:a",
+            "urn:Case",
+            "urn:case",
+            "http://example.org/path?x=1&amp;y=2#f",
+            "http://[::1]/",
+            "http://[v1.a]/",
+            "urn:encoded:%20%09%0A%0D",
+        ] {
+            let xml = format!("<p:a xmlns:p='{namespace}' p:x='1'/>");
+            assert_eq!(lexical(vocab::RDF_XML_LITERAL, &xml), Some(true), "{xml:?}");
+        }
+        for xml in [
+            "<a xmlns='urn:outer'><b xmlns=''/></a>",
+            "<xml:a xml:lang='en'/>",
+            "<xml:a xmlns:xml='http://www.w3.org/XML/1998/namespace'/>",
+            "<a xmlns:p='urn:Case' xmlns:q='urn:case' p:x='1' q:x='2'/>",
+            "<a xmlns:p='urn:u:%61' xmlns:q='urn:u:a' p:x='1' q:x='2'/>",
+            "<a xmlns:p='urn:u:%6a' xmlns:q='urn:u:%6A' p:x='1' q:x='2'/>",
+        ] {
+            assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(true), "{xml:?}");
+        }
+        let aliased = "<a xmlns:p='urn:a&amp;b' xmlns:q='urn:a&#38;b' p:x='1' q:x='2'/>";
+        assert_eq!(lexical(vocab::RDF_XML_LITERAL, aliased), Some(false));
+    }
+
+    #[test]
+    fn xml_literal_namespace_rejects_nonxml_hex_reference_spelling() {
+        for xml in [
+            "&#x+41;",
+            "<p:a xmlns:p='urn:&#x+41;'/>",
+            "<a x='&#x+41;'/>",
+            "&#x;",
+            "&#X41;",
+            "&#x-41;",
+            "&#x4+1;",
+            "&#x 41;",
+            "&#xD800;",
+            "&#x0;",
+            "&#x110000;",
+        ] {
+            assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(false), "{xml:?}");
+        }
+        for xml in [
+            "&#x41;&#xAF;&#xaf;&#x000041;&#65;&amp;&lt;&gt;&quot;&apos;",
+            "<a x='&#x41;&#65;'/>",
+            "<p:a xmlns:p='urn:&#x41;'/>",
+        ] {
+            assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(true), "{xml:?}");
+        }
+        assert_eq!(
+            xml_namespace_value("&#x9;&#xA;&#xD;"),
+            Some(Cow::Owned("\t\n\r".to_string()))
+        );
+    }
+
+    #[test]
+    fn xml_literal_namespace_rejects_comment_trailing_hyphen() {
+        for xml in [
+            "<a><!--x---></a>",
+            "<!--x--->",
+            "<!----->",
+            "<!--x--y-->",
+            "<!--x",
+            "<!--\u{1}-->",
+        ] {
+            assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(false), "{xml:?}");
+        }
+        for xml in [
+            "<!---->",
+            "<!--x-->",
+            "<!--x-y-->",
+            "<a><!-- <p:undeclared/> --></a>",
+        ] {
+            assert_eq!(lexical(vocab::RDF_XML_LITERAL, xml), Some(true), "{xml:?}");
+        }
     }
 }
