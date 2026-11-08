@@ -572,7 +572,13 @@ pub fn key_to_term(key: &[u8]) -> Term {
 
 #[inline]
 fn utf8(b: &[u8]) -> String {
-    String::from_utf8_lossy(b).into_owned()
+    // Stored keys are almost always valid. The standard validator checks ASCII a word
+    // at a time, which the lossy decoder's chunk scan does not, and decoding a large
+    // answer runs this once for every text part of every cell.
+    match std::str::from_utf8(b) {
+        Ok(text) => text.to_owned(),
+        Err(_) => String::from_utf8_lossy(b).into_owned(),
+    }
 }
 
 /// Canonicalize a numeric/boolean literal term: used when *computing* values so that
