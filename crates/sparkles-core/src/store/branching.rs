@@ -11,7 +11,10 @@
 //! lock. An upstream's history lock may be taken while a branch's writer lock is held,
 //! never the reverse.
 
+mod capture;
 pub(super) mod readonly;
+#[cfg(test)]
+pub(in crate::store) use capture::canonical_test_table;
 
 use super::link::{LINK_FILE, LinkFile, Segment};
 use super::*;
@@ -77,7 +80,7 @@ pub(crate) struct GenHold {
     pub generation: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Entry {
     pub name: String,
@@ -102,7 +105,7 @@ pub(crate) struct Entry {
 
 /// A deleted branch: kept so that the commits other branches merged from it still have
 /// a known starting point.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Tombstone {
     pub name: String,
@@ -111,7 +114,7 @@ pub(crate) struct Tombstone {
     pub from: FromRef,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MainEntry {
     #[serde(default)]
@@ -120,7 +123,7 @@ pub(crate) struct MainEntry {
     pub note: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TableFile {
     /// 1, or 2 while the table lists retired branches, which an older build that reads

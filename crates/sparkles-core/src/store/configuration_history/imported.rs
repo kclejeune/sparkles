@@ -3,6 +3,40 @@
 
 mod documents;
 mod identities;
+
+/// Only the fixed original history member is exposed to the genuine capture.
+/// Opened retains the established anchored, no-follow component semantics.
+pub(in crate::store) fn original_history_document(
+    root: &Path,
+    preparation: &Preparation,
+) -> Result<Option<managed_history::Bytes>> {
+    original_document(root, "history.json", preparation)
+}
+
+pub(in crate::store) fn original_branch_table_document(
+    root: &Path,
+    preparation: &Preparation,
+) -> Result<Option<managed_history::Bytes>> {
+    original_document(root, "branches.json", preparation)
+}
+
+fn original_document(
+    root: &Path,
+    name: &str,
+    preparation: &Preparation,
+) -> Result<Option<managed_history::Bytes>> {
+    // Only the two fixed supplier call sites above choose this component.
+    let directory = documents::Opened::root(root, preparation)?;
+    let file = match directory.child(name, false, preparation) {
+        Ok(file) => file,
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    file.bytes(None, preparation).map(Some)
+}
+
 mod physical;
 
 pub(in crate::store) use identities::Identities;
@@ -14,7 +48,7 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 const FORMAT: u32 = 1;
-const MAX_MEMBERS: usize = 4096;
+pub(in crate::store) const MAX_MEMBERS: usize = 4096;
 const ROOT_FILE: &str = "evidence-history/origin.json";
 
 /// Physical storage is independent of the family's mutable identity. Main stays
@@ -65,9 +99,9 @@ struct SourceRoot {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SourceFile {
-    bytes: u64,
-    sha256: Sha256Digest,
+pub(in crate::store) struct SourceFile {
+    pub(in crate::store) bytes: u64,
+    pub(in crate::store) sha256: Sha256Digest,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -91,6 +125,46 @@ struct Descriptor {
     files: BTreeMap<String, SourceFile>,
     sources: Vec<Sha256Digest>,
     intervals: Vec<SourceInterval>,
+}
+
+/// Syntax-only access to the native source's closed small-member table. It
+/// grants no Store, RDF, physical-base, range or current permission authority.
+pub(in crate::store) struct SourceManifest(managed_history::Owned<Descriptor>);
+
+impl SourceManifest {
+    pub(in crate::store) fn decode_native(bytes: &[u8], preparation: &Preparation) -> Result<Self> {
+        let descriptor = Descriptor::decode(bytes, preparation)?;
+        if !descriptor.value.sources.is_empty() || descriptor.value.roots.len() != 1 {
+            return Err(managed_history::unavailable(
+                "native source transport cannot omit an inherited closure",
+            ));
+        }
+        Ok(Self(descriptor))
+    }
+
+    pub(in crate::store) fn member_count(&self) -> usize {
+        self.0.value.files.len()
+    }
+
+    pub(in crate::store) fn visit(
+        &self,
+        preparation: &Preparation,
+        mut member: impl FnMut(&str, u64, Sha256Digest) -> Result<()>,
+    ) -> Result<()> {
+        for (name, pin) in &self.0.value.files {
+            preparation.check()?;
+            member(name, pin.bytes, pin.sha256)?;
+        }
+        preparation.check()
+    }
+}
+
+pub(in crate::store) fn verify_staged_native_source(
+    directory: &Path,
+    source: Sha256Digest,
+    preparation: &Preparation,
+) -> Result<()> {
+    documents::verify_staged_native(directory, source, preparation)
 }
 
 fn version(format: u32) -> Result<()> {
@@ -146,7 +220,7 @@ fn primary_metadata(path: &str) -> bool {
 
 /// Original small members only. In particular, no WAL, RDF index, arbitrary
 /// nested path or recursively copied import directory is a source member.
-fn source_member(path: &str) -> bool {
+pub(in crate::store) fn source_member(path: &str) -> bool {
     if let Some(rest) = path.strip_prefix("branches/") {
         let Some((id, member)) = rest.split_once('/') else {
             return false;
@@ -361,6 +435,56 @@ impl Descriptor {
         owned.value.validate(preparation)?;
         Ok(owned)
     }
+}
+
+/// Syntax/encoding only. A descriptor cannot supply a capture, physical proof,
+/// view or permission. The genuine producer separately retains its actual owner.
+pub(in crate::store) fn encode_native_descriptor(
+    family: Uuid,
+    logical: Uuid,
+    head: u64,
+    generation_name: &str,
+    files: BTreeMap<String, SourceFile>,
+    interval: Option<(u64, Sha256Digest, u64)>,
+    preparation: &Preparation,
+) -> Result<managed_history::Bytes> {
+    preparation.check()?;
+    if !generation(generation_name) || family.is_nil() || logical.is_nil() {
+        return Err(managed_history::unavailable("invalid native source root"));
+    }
+    // One root/interval, bounded generation/key strings and tree/vector nodes.
+    // The caller keeps the admitted file-map storage through this synchronous call.
+    let _structure = preparation.reserve(4096)?;
+    let roots = BTreeMap::from([(
+        "main".to_owned(),
+        SourceRoot {
+            logical_id: logical,
+            head,
+            generation: generation_name.to_owned(),
+        },
+    )]);
+    let intervals = interval
+        .map(|(end, sha256, first_seq)| SourceInterval {
+            root: "main".to_owned(),
+            generation: generation_name.to_owned(),
+            start: 0,
+            end,
+            sha256,
+            first_seq,
+            last_seq: head,
+        })
+        .into_iter()
+        .collect();
+    let descriptor = Descriptor {
+        format: FORMAT,
+        family_id: family,
+        roots,
+        files,
+        sources: Vec::new(),
+        intervals,
+    };
+    descriptor.validate(preparation)?;
+    managed_history::encode(&descriptor, preparation)
 }
 
 #[cfg(test)]

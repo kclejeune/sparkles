@@ -213,72 +213,11 @@ impl Documents {
 
     /// Recheck the descriptor's exact length/hash on every original metadata use.
     fn read(&self, path: &str, preparation: &Preparation) -> Result<managed_history::Bytes> {
-        let member = self
-            .descriptor
-            .value
-            .files
-            .get(path)
-            .ok_or_else(|| managed_history::unavailable("original document is not declared"))?;
-        if !source_member(path) {
-            return Err(managed_history::unavailable(
-                "invalid original document path",
-            ));
-        }
-        let directory = self.directory.child("source", true, preparation)?;
-        let bytes = directory
-            .relative(path, false, preparation)?
-            .bytes(Some(member.bytes), preparation)?;
-        if Sha256Digest::of_bytes(&bytes.value, preparation.control())? != member.sha256 {
-            return Err(managed_history::unavailable(
-                "original document digest differs",
-            ));
-        }
-        Ok(bytes)
+        read_member(&self.directory, &self.descriptor.value, path, preparation)
     }
 
     fn identities(&self, preparation: &Preparation) -> Result<()> {
-        let family = self.read("family-dataset.json", preparation)?;
-        if dataset_id(&family.value, preparation)? != self.descriptor.value.family_id {
-            return Err(managed_history::unavailable(
-                "original publisher family differs",
-            ));
-        }
-        drop(family);
-        for (name, root) in &self.descriptor.value.roots {
-            let prefix = if name == "main" { "" } else { "branches/" };
-            let _names =
-                preparation.reserve((name.len() as u64).saturating_mul(4).saturating_add(512))?;
-            let base = if prefix.is_empty() {
-                String::new()
-            } else {
-                format!("{prefix}{name}/")
-            };
-            let bytes = self.read(&format!("{base}dataset.json"), preparation)?;
-            if dataset_id(&bytes.value, preparation)? != root.logical_id {
-                return Err(managed_history::unavailable(
-                    "original logical dataset differs",
-                ));
-            }
-            drop(bytes);
-            let current = self.read(&format!("{base}CURRENT"), preparation)?;
-            if std::str::from_utf8(&current.value).ok().map(str::trim)
-                != Some(root.generation.as_str())
-            {
-                return Err(managed_history::unavailable("original CURRENT differs"));
-            }
-            drop(current);
-            if root.logical_id != self.descriptor.value.family_id {
-                let branch = self.read(&format!("{base}branch.json"), preparation)?;
-                branch_identity(
-                    &branch.value,
-                    self.descriptor.value.family_id,
-                    root.logical_id,
-                    root.head,
-                    preparation,
-                )?;
-            }
-        }
-        preparation.check()
+        source_identities(&self.directory, &self.descriptor.value, preparation)
     }
 
     /// Authenticate a candidate's original publication through its declared
@@ -319,6 +258,124 @@ impl Documents {
             },
         )
     }
+}
+
+pub(super) fn verify_staged_native(
+    path: &Path,
+    source: Sha256Digest,
+    preparation: &Preparation,
+) -> Result<()> {
+    let directory = Opened::root(path, preparation)?;
+    let encoded = directory
+        .child("origin.json", false, preparation)?
+        .bytes(None, preparation)?;
+    if Sha256Digest::of_bytes(&encoded.value, preparation.control())? != source {
+        return Err(managed_history::unavailable(
+            "staged source descriptor digest differs",
+        ));
+    }
+    let manifest = SourceManifest::decode_native(&encoded.value, preparation)?;
+    drop(encoded);
+    manifest.visit(preparation, |path, _, _| {
+        drop(read_member(
+            &directory,
+            &manifest.0.value,
+            path,
+            preparation,
+        )?);
+        Ok(())
+    })?;
+    source_identities(&directory, &manifest.0.value, preparation)
+}
+
+fn read_member(
+    directory: &Opened,
+    descriptor: &Descriptor,
+    path: &str,
+    preparation: &Preparation,
+) -> Result<managed_history::Bytes> {
+    let member = descriptor
+        .files
+        .get(path)
+        .ok_or_else(|| managed_history::unavailable("original document is not declared"))?;
+    if !source_member(path) {
+        return Err(managed_history::unavailable(
+            "invalid original document path",
+        ));
+    }
+    let directory = directory.child("source", true, preparation)?;
+    let bytes = directory
+        .relative(path, false, preparation)?
+        .bytes(Some(member.bytes), preparation)?;
+    if Sha256Digest::of_bytes(&bytes.value, preparation.control())? != member.sha256 {
+        return Err(managed_history::unavailable(
+            "original document digest differs",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn source_identities(
+    directory: &Opened,
+    descriptor: &Descriptor,
+    preparation: &Preparation,
+) -> Result<()> {
+    let family = read_member(directory, descriptor, "family-dataset.json", preparation)?;
+    if dataset_id(&family.value, preparation)? != descriptor.family_id {
+        return Err(managed_history::unavailable(
+            "original publisher family differs",
+        ));
+    }
+    drop(family);
+    for (name, root) in &descriptor.roots {
+        let prefix = if name == "main" { "" } else { "branches/" };
+        let _names =
+            preparation.reserve((name.len() as u64).saturating_mul(4).saturating_add(512))?;
+        let base = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{prefix}{name}/")
+        };
+        let bytes = read_member(
+            directory,
+            descriptor,
+            &format!("{base}dataset.json"),
+            preparation,
+        )?;
+        if dataset_id(&bytes.value, preparation)? != root.logical_id {
+            return Err(managed_history::unavailable(
+                "original logical dataset differs",
+            ));
+        }
+        drop(bytes);
+        let current = read_member(
+            directory,
+            descriptor,
+            &format!("{base}CURRENT"),
+            preparation,
+        )?;
+        if std::str::from_utf8(&current.value).ok().map(str::trim) != Some(root.generation.as_str())
+        {
+            return Err(managed_history::unavailable("original CURRENT differs"));
+        }
+        drop(current);
+        if root.logical_id != descriptor.family_id {
+            let branch = read_member(
+                directory,
+                descriptor,
+                &format!("{base}branch.json"),
+                preparation,
+            )?;
+            branch_identity(
+                &branch.value,
+                descriptor.family_id,
+                root.logical_id,
+                root.head,
+                preparation,
+            )?;
+        }
+    }
+    preparation.check()
 }
 
 pub(super) fn dataset_id(bytes: &[u8], preparation: &Preparation) -> Result<Uuid> {

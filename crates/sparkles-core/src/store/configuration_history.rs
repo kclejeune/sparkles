@@ -9,6 +9,11 @@ pub(super) mod primary;
 mod validation;
 
 pub(super) use imported::Identities as OriginalIdentities;
+pub(super) use imported::{
+    MAX_MEMBERS as SOURCE_MEMBER_LIMIT, SourceFile as SourceFilePin, SourceManifest,
+    encode_native_descriptor, original_branch_table_document, original_history_document,
+    source_member as source_metadata_member, verify_staged_native_source,
+};
 
 /// Authenticate copied primary configuration references without opening a writer,
 /// recovering a WAL or publishing the directory. Backup restores call this even

@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub(crate) mod capture;
 mod configuration;
 pub(crate) use configuration::{
     BranchConfigurationOrigin, ConfigurationSelector, PinnedConfiguration,
@@ -489,11 +490,46 @@ pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryCo
         }
         Err(e) => return Err(e.into()),
     };
+    decode_file(&bytes, dataset_id, None)
+}
+
+// The capture reader uses the same legacy semantics and format2 validation as
+// ordinary open. Its caller retains a real Preparation loan across all decoded
+// containers; no decoded metadata escapes that loan.
+fn decode_file(
+    bytes: &[u8],
+    dataset_id: uuid::Uuid,
+    budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
+) -> Result<HistoryConfig> {
+    if let Some(budget) = budget {
+        return decode_file_controlled(bytes, dataset_id, budget);
+    }
     let v: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
+        serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
     crate::formats::check_settings("history.json", &v)?;
     let f: HistoryFile =
         serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
+    checked_file(f, bytes, dataset_id, &|| Ok(()))
+}
+
+fn decode_file_controlled(
+    bytes: &[u8],
+    dataset_id: uuid::Uuid,
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+) -> Result<HistoryConfig> {
+    let raw: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
+    crate::formats::check_settings("history.json", &raw.value)?;
+    let f: HistoryFile = budget.value(raw.value)?;
+    checked_file(f, bytes, dataset_id, &|| budget.check())
+}
+
+fn checked_file(
+    f: HistoryFile,
+    bytes: &[u8],
+    dataset_id: uuid::Uuid,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<HistoryConfig> {
+    check()?;
     if f.format == 1 && f.snapshots.iter().any(|pin| pin.configuration.is_some()) {
         return Err(Error::Corrupt(
             "legacy history cannot certify a configuration binding".into(),
@@ -511,6 +547,7 @@ pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryCo
         }
         let mut names = std::collections::BTreeSet::new();
         for pin in &f.snapshots {
+            check()?;
             let configuration = pin.configuration.as_ref().ok_or_else(|| {
                 Error::Corrupt("named snapshot configuration binding is missing".into())
             })?;
@@ -540,24 +577,23 @@ pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryCo
             f.dataset_id
         )));
     }
-    let pins = f
-        .snapshots
-        .into_iter()
-        .map(|p| {
-            let created_ms = commit::parse_rfc3339_ms(&p.created).unwrap_or(0);
-            (
-                p.name,
-                Pin {
-                    seq: p.seq,
-                    created_ms,
-                    note: p.note,
-                    expires_ms: p.expires.as_deref().and_then(commit::parse_rfc3339_ms),
-                    warm: p.warm,
-                    configuration: p.configuration,
-                },
-            )
-        })
-        .collect();
+    let mut pins = BTreeMap::new();
+    for p in f.snapshots {
+        check()?;
+        let created_ms = commit::parse_rfc3339_ms(&p.created).unwrap_or(0);
+        pins.insert(
+            p.name,
+            Pin {
+                seq: p.seq,
+                created_ms,
+                note: p.note,
+                expires_ms: p.expires.as_deref().and_then(commit::parse_rfc3339_ms),
+                warm: p.warm,
+                configuration: p.configuration,
+            },
+        );
+    }
+    check()?;
     Ok(HistoryConfig {
         pins,
         retention: f.retention,

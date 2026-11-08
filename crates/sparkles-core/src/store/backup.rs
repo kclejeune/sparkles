@@ -10,6 +10,8 @@
 //! not affect the backup.
 
 use super::Store;
+mod transport;
+
 use crate::commit::CommitInfo;
 use crate::error::{Error, Result};
 use std::fs::File;
@@ -306,6 +308,155 @@ impl std::fmt::Debug for CheckedPrimaryCapture {
             .field("base", &self.base)
             .field("wal_extent", &self.wal_extent)
             .finish_non_exhaustive()
+    }
+}
+
+/// Native source metadata only. Its actual checked data lease and encoded
+/// receiving bytes remain owned together; this is not an imported replay token.
+struct PreparedNativeSource {
+    primary: CheckedPrimaryCapture,
+    descriptor: super::managed_history::Bytes,
+    digest: crate::evidence::Sha256Digest,
+    _held: crate::access::Reservation,
+}
+
+impl CheckedPrimaryCapture {
+    fn describe_native(
+        self,
+        preparation: &crate::access::Preparation,
+    ) -> Result<PreparedNativeSource> {
+        use super::configuration_history::{
+            SOURCE_MEMBER_LIMIT, SourceFilePin, source_metadata_member,
+        };
+        use sha2::Digest;
+        preparation.check()?;
+        let held = preparation.reserve(std::mem::size_of::<PreparedNativeSource>() as u64)?;
+        let identities = &self.capture.original.identities;
+        let aliases = 1
+            + usize::from(identities.branch_document().is_some())
+            + usize::from(self.capture.original.pins.is_some())
+            + usize::from(self.capture.original.table.is_some());
+        let members = self
+            .capture
+            .data
+            .files
+            .iter()
+            .filter(|file| source_metadata_member(&file.path))
+            .count()
+            .checked_add(aliases)
+            .ok_or_else(|| preparation.exhausted())?;
+        if members > SOURCE_MEMBER_LIMIT {
+            return Err(super::managed_history::unavailable(
+                "native source metadata has too many members",
+            ));
+        }
+        // Conservatively cover each tree node, bounded path/capacity and
+        // allocator slack. This loan outlives the map's synchronous encoding.
+        let per_member = std::mem::size_of::<(String, SourceFilePin)>()
+            .checked_add(256)
+            .and_then(|size| size.checked_add(512))
+            .ok_or_else(|| preparation.exhausted())?;
+        let map_bytes = members
+            .checked_mul(per_member)
+            .ok_or_else(|| preparation.exhausted())?;
+        let _map =
+            preparation.reserve(u64::try_from(map_bytes).map_err(|_| preparation.exhausted())?)?;
+        let _buffer = preparation.reserve(64 << 10)?;
+        let mut buffer = [0; 64 << 10];
+        let mut files = std::collections::BTreeMap::new();
+        for (index, file) in self.capture.data.files.iter().enumerate() {
+            if !source_metadata_member(&file.path) {
+                continue;
+            }
+            preparation.checkpoint("captured-source-member")?;
+            if file.path.len() > 256 || file.len > super::managed_history::MAX_BYTES as u64 {
+                return Err(super::managed_history::unavailable(
+                    "native source metadata exceeds its closed bounds",
+                ));
+            }
+            let mut reader = CapturedReader {
+                capture: &self.capture,
+                index,
+                position: 0,
+            };
+            let mut digest = sha2::Sha256::new();
+            while reader.position < file.len {
+                preparation.check()?;
+                let count = std::io::Read::read(&mut reader, &mut buffer)?;
+                if count == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "native source metadata is shorter than its captured extent",
+                    )
+                    .into());
+                }
+                digest.update(&buffer[..count]);
+            }
+            preparation.check()?;
+            let pin = SourceFilePin {
+                bytes: file.len,
+                sha256: crate::evidence::Sha256Digest::from_digest_bytes(digest.finalize().into()),
+            };
+            if files.insert(file.path.clone(), pin).is_some() {
+                return Err(super::managed_history::unavailable(
+                    "duplicate native source metadata",
+                ));
+            }
+        }
+        // Family identity is independent of this logical/physical output.
+        for (name, bytes) in [
+            ("family-dataset.json", Some(identities.family_document())),
+            ("branch.json", identities.branch_document()),
+            (
+                "history.json",
+                self.capture
+                    .original
+                    .pins
+                    .as_ref()
+                    .map(|bytes| bytes.value.as_slice()),
+            ),
+            (
+                "branches.json",
+                self.capture
+                    .original
+                    .table
+                    .as_ref()
+                    .map(|bytes| bytes.value.as_slice()),
+            ),
+        ] {
+            let Some(bytes) = bytes else {
+                continue;
+            };
+            preparation.check()?;
+            let pin = SourceFilePin {
+                bytes: bytes.len() as u64,
+                sha256: crate::evidence::Sha256Digest::of_bytes(bytes, preparation.control())?,
+            };
+            if files.insert(name.to_owned(), pin).is_some() {
+                return Err(super::managed_history::unavailable(
+                    "ambiguous original identity member",
+                ));
+            }
+        }
+        let descriptor = super::configuration_history::encode_native_descriptor(
+            identities.family(),
+            identities.logical(),
+            self.capture.data.commit.seq,
+            &self.capture.data.generation,
+            files,
+            self.first_wal_seq
+                .map(|first| (self.wal_extent, self.wal_digest, first)),
+            preparation,
+        )?;
+        let digest =
+            crate::evidence::Sha256Digest::of_bytes(&descriptor.value, preparation.control())?;
+        preparation.checkpoint("captured-source-delivery")?;
+        Ok(PreparedNativeSource {
+            primary: self,
+            descriptor,
+            digest,
+            _held: held,
+        })
     }
 }
 
@@ -701,6 +852,8 @@ struct CapturedOriginal {
     head: CommitInfo,
     native: Option<CapturedBasis>,
     origin: Option<(u64, crate::history::ConfigurationBinding)>,
+    pins: Option<super::managed_history::Bytes>,
+    table: Option<super::managed_history::Bytes>,
     _held: crate::access::Reservation,
 }
 
@@ -742,28 +895,58 @@ impl CapturedOriginal {
             super::managed_history::unavailable("original capture has no published root")
         })?;
 
+        // Family table precedes this logical Store's history mutex in the
+        // existing writer/table/history lock order.
+        let options = crate::guard::WriteOptions {
+            cancel: Some(preparation.control().cancel.flag()),
+            deadline: preparation.control().deadline,
+            ..Default::default()
+        };
+        let set = store.try_branch_set(&options)?.ok_or_else(|| {
+            super::managed_history::unavailable("original family branch set is unavailable")
+        })?;
+        let table = set.original_table(preparation)?;
         let snapshot = store.snapshot();
-        let native = if store.root.is_some() && snapshot.generation.linked().is_none() {
-            let history = store.history.as_ref().ok_or_else(|| {
-                super::managed_history::unavailable("captured physical generation has no history")
-            })?;
+        let (native, pins) = if let Some(history) = &store.history {
             let history = preparation.lock(history)?;
-            let generation = crate::commit::generation_number(&snapshot.generation.name);
-            let entry = history
-                .gens
-                .get(&generation)
-                .filter(|entry| entry.name == snapshot.generation.name)
-                .ok_or_else(|| {
-                    super::managed_history::unavailable("captured physical base is absent")
-                })?;
-            Some(CapturedBasis {
-                base: entry.base,
-                physical_owner: store.dataset_id,
-                dvocab_len: snapshot.dvocab_len,
-                fold_legacy: entry.fold_legacy,
-            })
+            let root = store.root.as_ref().ok_or_else(|| {
+                super::managed_history::unavailable("persistent history has no Store root")
+            })?;
+            let pins = super::configuration_history::original_history_document(root, preparation)?;
+            crate::history::capture::validate_persistent(
+                pins.as_ref().map(|bytes| bytes.value.as_slice()),
+                store.dataset_id,
+                &history,
+                preparation,
+            )?;
+            let native = if snapshot.generation.linked().is_none() {
+                let generation = crate::commit::generation_number(&snapshot.generation.name);
+                let entry = history
+                    .gens
+                    .get(&generation)
+                    .filter(|entry| entry.name == snapshot.generation.name)
+                    .ok_or_else(|| {
+                        super::managed_history::unavailable("captured physical base is absent")
+                    })?;
+                Some(CapturedBasis {
+                    base: entry.base,
+                    physical_owner: store.dataset_id,
+                    dvocab_len: snapshot.dvocab_len,
+                    fold_legacy: entry.fold_legacy,
+                })
+            } else {
+                None
+            };
+            (native, pins)
+        } else if let Some(history) = &store.mem_history {
+            let history = preparation.lock(history)?;
+            let pins =
+                crate::history::capture::encode_memory(store.dataset_id, &history, preparation)?;
+            (None, Some(pins))
         } else {
-            None
+            return Err(super::managed_history::unavailable(
+                "original capture has no actual pin history",
+            ));
         };
         let origin = store
             .branching
@@ -793,6 +976,8 @@ impl CapturedOriginal {
             head: writer.head,
             native,
             origin,
+            pins,
+            table,
             _held: held,
         })
     }
@@ -1868,6 +2053,395 @@ mod tests {
         crate::access::Preparation::new(crate::task::Control::none(), 64 << 20).unwrap()
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn genuine_original_family_table_retains_bytes_across_live_rename() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        store.create_branch("child", &Default::default()).unwrap();
+        let child = store.branch("child").unwrap();
+        let original = std::fs::read(root.join("branches.json")).unwrap();
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let captured = store
+            .configuration_capture("table", &Default::default(), &preparation)
+            .unwrap();
+        assert_eq!(captured.original.table.as_ref().unwrap().value, original);
+        let scratch = temporary.path().join("scratch");
+        let child_capture = child
+            .materialized_configuration_capture(
+                "table",
+                &MemoryCaptureOptions {
+                    tmp_dir: scratch.clone(),
+                    ..Default::default()
+                },
+                &preparation,
+            )
+            .unwrap();
+        assert_eq!(
+            child_capture.original.table.as_ref().unwrap().value,
+            original
+        );
+        assert_ne!(
+            child_capture.original.identities.family(),
+            child_capture.data.dataset_id
+        );
+        store.rename_branch("child", "renamed").unwrap();
+        assert_ne!(std::fs::read(root.join("branches.json")).unwrap(), original);
+        let source = captured
+            .checked_primary(&preparation)
+            .unwrap()
+            .describe_native(&preparation)
+            .unwrap();
+        inspect_native_descriptor(&source, &preparation, |value| {
+            assert_eq!(value["files"]["branches.json"]["bytes"], original.len());
+            assert_eq!(
+                value["files"]["branches.json"]["sha256"],
+                crate::evidence::Sha256Digest::of_bytes(&original, preparation.control())
+                    .unwrap()
+                    .to_string()
+            );
+            assert_eq!(value["roots"].as_object().unwrap().len(), 1);
+        });
+        assert_eq!(
+            child_capture.original.table.as_ref().unwrap().value,
+            original
+        );
+        drop(child_capture);
+        drop(source);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_original_family_table_refuses_valid_live_substitutions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        store.create_branch("child", &Default::default()).unwrap();
+        let original = std::fs::read(root.join("branches.json")).unwrap();
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        for field in [
+            "fork",
+            "protected",
+            "note",
+            "ordinal",
+            "missing",
+            "symlink",
+            "version",
+        ] {
+            std::fs::remove_file(root.join("branches.json")).unwrap();
+            if field == "symlink" {
+                let other = temporary.path().join("valid-table.json");
+                std::fs::write(&other, &original).unwrap();
+                std::os::unix::fs::symlink(other, root.join("branches.json")).unwrap();
+            } else if field != "missing" {
+                let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+                match field {
+                    "fork" => {
+                        value["branches"][0]["from"]["branchId"] =
+                            uuid::Uuid::new_v4().to_string().into()
+                    }
+                    "protected" => value["branches"][0]["protected"] = true.into(),
+                    "note" => value["branches"][0]["note"] = "substitute".into(),
+                    "ordinal" => value["nextOrdinal"] = 77.into(),
+                    "version" => value["format"] = 999.into(),
+                    _ => unreachable!(),
+                }
+                std::fs::write(
+                    root.join("branches.json"),
+                    super::super::branching::canonical_test_table(value),
+                )
+                .unwrap();
+                if field != "version" {
+                    super::super::branching::read_branch_table(&root).unwrap();
+                }
+            }
+            assert!(
+                store
+                    .configuration_capture("changed-table", &Default::default(), &preparation)
+                    .is_err(),
+                "{field}"
+            );
+            assert_eq!(leases(&store), 0);
+            assert_eq!(preparation.room(), before);
+            let _ = std::fs::remove_file(root.join("branches.json"));
+            std::fs::write(root.join("branches.json"), &original).unwrap();
+        }
+        // Ordinary legacy whitespace and unknown extensions do not change the
+        // full decoded semantic table and must remain accepted.
+        let mut legacy: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        legacy["unknownLegacyExtension"] = true.into();
+        let wire = serde_json::to_vec(&legacy).unwrap();
+        std::fs::write(root.join("branches.json"), &wire).unwrap();
+        let captured = store
+            .configuration_capture("legacy-table", &Default::default(), &preparation)
+            .unwrap();
+        assert_eq!(captured.original.table.as_ref().unwrap().value, wire);
+        drop(captured);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_original_memory_family_table_keeps_family_separate_from_logical() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::in_memory(StoreOptions::default());
+        let preparation = capture_preparation();
+        store
+            .activate_memory_configuration_history(&preparation)
+            .unwrap();
+        ins(&store, 1);
+        store.create_branch("child", &Default::default()).unwrap();
+        let child = store.branch("child").unwrap();
+        let before = preparation.room();
+        let capture = child
+            .materialized_configuration_capture(
+                "memory-table",
+                &MemoryCaptureOptions {
+                    tmp_dir: temporary.path().join("scratch"),
+                    ..Default::default()
+                },
+                &preparation,
+            )
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&capture.original.table.as_ref().unwrap().value).unwrap();
+        assert_eq!(value["datasetId"], store.dataset_id.to_string());
+        assert_ne!(store.dataset_id, child.dataset_id);
+        assert_eq!(value["branches"][0]["id"], child.dataset_id.to_string());
+        assert_eq!(value["branches"][0]["name"], "child");
+        assert_eq!(
+            value["branches"][0]["from"]["branchId"],
+            store.dataset_id.to_string()
+        );
+        assert_eq!(value["branches"][0]["from"]["seq"], 1);
+        assert_eq!(capture.original.identities.logical(), child.dataset_id);
+        drop(capture);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_original_history_keeps_exact_pins_after_live_changes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        store
+            .create_snapshot("selected", &At::Head, Some("original note".into()))
+            .unwrap();
+        store
+            .set_retention(crate::history::Retention {
+                keep_commits: Some(3),
+                ..Default::default()
+            })
+            .unwrap();
+        let original = std::fs::read(root.join("history.json")).unwrap();
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let capture = store
+            .configuration_capture("pins", &Default::default(), &preparation)
+            .unwrap();
+        assert_eq!(capture.original.pins.as_ref().unwrap().value, original);
+        store.delete_snapshot("selected").unwrap();
+        store.create_snapshot("later", &At::Head, None).unwrap();
+        assert_ne!(std::fs::read(root.join("history.json")).unwrap(), original);
+        let source = capture
+            .checked_primary(&preparation)
+            .unwrap()
+            .describe_native(&preparation)
+            .unwrap();
+        inspect_native_descriptor(&source, &preparation, |value| {
+            assert_eq!(value["files"]["history.json"]["bytes"], original.len());
+            assert_eq!(
+                value["files"]["history.json"]["sha256"],
+                crate::evidence::Sha256Digest::of_bytes(&original, preparation.control())
+                    .unwrap()
+                    .to_string()
+            );
+        });
+        assert_eq!(
+            source.primary.capture.original.pins.as_ref().unwrap().value,
+            original
+        );
+        drop(source);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_original_history_refuses_valid_live_pin_substitutions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        store
+            .create_snapshot("selected", &At::Head, Some("original".into()))
+            .unwrap();
+        let original = std::fs::read(root.join("history.json")).unwrap();
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        for field in ["seq", "note", "warm", "selector", "retention"] {
+            let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            match field {
+                "seq" => changed["snapshots"][0]["seq"] = 0.into(),
+                "note" => changed["snapshots"][0]["note"] = "substitute".into(),
+                "warm" => changed["snapshots"][0]["warm"] = true.into(),
+                "selector" => {
+                    changed["snapshots"][0]["configuration"]["selector"] =
+                        serde_json::to_value(crate::history::ConfigurationSelector::Commit {
+                            seq: 1,
+                        })
+                        .unwrap()
+                }
+                "retention" => changed["retention"]["keepCommits"] = 99.into(),
+                _ => unreachable!(),
+            }
+            // Re-encode through the actual closed schema so the refusal proves
+            // live-state binding rather than malformed/canonical JSON rejection.
+            std::fs::write(
+                root.join("history.json"),
+                crate::history::capture::canonical_test_history(changed),
+            )
+            .unwrap();
+            crate::history::read_file(&root, store.dataset_id).unwrap();
+            assert!(
+                store
+                    .configuration_capture("substitution", &Default::default(), &preparation)
+                    .is_err(),
+                "{field}"
+            );
+            assert_eq!(leases(&store), 0);
+            assert_eq!(preparation.room(), before);
+        }
+        std::fs::write(root.join("history.json"), original).unwrap();
+        drop(
+            store
+                .configuration_capture("valid", &Default::default(), &preparation)
+                .unwrap(),
+        );
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_original_history_refuses_missing_foreign_version_and_symlink() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        store.create_snapshot("selected", &At::Head, None).unwrap();
+        let original = std::fs::read(root.join("history.json")).unwrap();
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        for damage in ["missing", "foreign", "version", "symlink"] {
+            std::fs::remove_file(root.join("history.json")).unwrap();
+            match damage {
+                "missing" => {}
+                "foreign" | "version" => {
+                    let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+                    if damage == "foreign" {
+                        changed["datasetId"] = uuid::Uuid::new_v4().to_string().into();
+                    } else {
+                        changed["format"] = 999.into();
+                    }
+                    std::fs::write(
+                        root.join("history.json"),
+                        crate::history::capture::canonical_test_history(changed),
+                    )
+                    .unwrap();
+                }
+                "symlink" => {
+                    let other = temporary.path().join("valid-history.json");
+                    std::fs::write(&other, &original).unwrap();
+                    std::os::unix::fs::symlink(other, root.join("history.json")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                store
+                    .configuration_capture("damaged", &Default::default(), &preparation)
+                    .is_err(),
+                "{damage}"
+            );
+            assert_eq!(leases(&store), 0);
+            assert_eq!(preparation.room(), before);
+            let _ = std::fs::remove_file(root.join("history.json"));
+            std::fs::write(root.join("history.json"), &original).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_original_history_accepts_legacy_semantics_without_rewriting_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let store = Store::open(&root, StoreOptions::default()).unwrap();
+        ins(&store, 1);
+        store.create_snapshot("legacy", &At::Head, None).unwrap();
+        drop(store);
+        let preparation = capture_preparation();
+        crate::migrate::activate_configuration_history(&root, false, &preparation).unwrap();
+        let store = Store::open(&root, StoreOptions::default()).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("history.json")).unwrap()).unwrap();
+        assert_eq!(value["format"], 1);
+        let mut stale = value["snapshots"][0].clone();
+        stale["seq"] = 0.into();
+        value["snapshots"].as_array_mut().unwrap().insert(0, stale);
+        value["unknownLegacyExtension"] = true.into();
+        let wire = serde_json::to_vec(&value).unwrap();
+        std::fs::write(root.join("history.json"), &wire).unwrap();
+        let before = preparation.room();
+        let captured = store
+            .configuration_capture("legacy", &Default::default(), &preparation)
+            .unwrap();
+        assert_eq!(captured.original.pins.as_ref().unwrap().value, wire);
+        drop(captured);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_original_memory_history_borrows_pin_metadata_without_snapshot_clone() {
+        let store = Store::in_memory(StoreOptions::default());
+        let preparation = capture_preparation();
+        store
+            .activate_memory_configuration_history(&preparation)
+            .unwrap();
+        ins(&store, 1);
+        store
+            .create_snapshot("selected", &At::Head, Some("memory".into()))
+            .unwrap();
+        let history = store.mem_history.as_ref().unwrap().lock();
+        let before_credit = preparation.room();
+        let before_owners = Arc::strong_count(&history.pins["selected"].1);
+        let document =
+            crate::history::capture::encode_memory(store.dataset_id, &history, &preparation)
+                .unwrap();
+        assert_eq!(
+            Arc::strong_count(&history.pins["selected"].1),
+            before_owners
+        );
+        let value: serde_json::Value = serde_json::from_slice(&document.value).unwrap();
+        assert_eq!(value["datasetId"], store.dataset_id.to_string());
+        assert_eq!(value["snapshots"][0]["name"], "selected");
+        assert_eq!(value["snapshots"][0]["note"], "memory");
+        assert_eq!(value["snapshots"][0]["seq"], 1);
+        assert_eq!(value["format"], 2);
+        assert!(!value["snapshots"][0]["configuration"].is_null());
+        drop(document);
+        assert_eq!(preparation.room(), before_credit);
+    }
+
     #[test]
     fn genuine_configuration_capture_retains_actual_lease_metadata_and_fixed_prefix() {
         let temporary = tempfile::tempdir().unwrap();
@@ -2057,6 +2631,279 @@ mod tests {
         ));
         assert_eq!(leases(&store), 0);
         assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    fn inspect_native_descriptor(
+        source: &PreparedNativeSource,
+        preparation: &crate::access::Preparation,
+        inspect: impl FnOnce(&serde_json::Value),
+    ) {
+        let allowance = preparation.room();
+        let _loan = preparation.reserve(allowance).unwrap();
+        let options = crate::history::HistoryOptions::default();
+        let mut budget = super::super::cold::ColdBudget::new(crate::history::ReadLimit {
+            options: &options,
+            memory: Some(allowance),
+            held: 0,
+        })
+        .unwrap();
+        let parsed = budget.json(&source.descriptor.value).unwrap();
+        inspect(&parsed.value);
+        drop(parsed.value);
+        budget.release(parsed.charge);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_native_source_descriptor_retains_actual_prefix_and_small_metadata() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let checked = store
+            .configuration_capture("descriptor", &Default::default(), &preparation)
+            .unwrap()
+            .checked_primary(&preparation)
+            .unwrap();
+        let head = checked.capture.data.commit.seq;
+        let expected_wal = checked.wal_digest;
+        let extent = checked.wal_extent;
+        let first = checked.first_wal_seq.unwrap();
+        let source = checked.describe_native(&preparation).unwrap();
+        assert_eq!(leases(&store), 1);
+        ins(&store, 2);
+        assert!(head < store.head_commit().seq);
+        assert_eq!(
+            source.digest,
+            crate::evidence::Sha256Digest::of_bytes(
+                &source.descriptor.value,
+                preparation.control()
+            )
+            .unwrap()
+        );
+        inspect_native_descriptor(&source, &preparation, |value| {
+            assert_eq!(value["format"], 1);
+            assert_eq!(value["familyId"], store.dataset_id.to_string());
+            assert_eq!(
+                value["roots"]["main"]["logicalId"],
+                store.dataset_id.to_string()
+            );
+            assert_eq!(value["roots"]["main"]["head"], head);
+            assert_eq!(value["sources"].as_array().unwrap().len(), 0);
+            let intervals = value["intervals"].as_array().unwrap();
+            assert_eq!(intervals.len(), 1);
+            assert_eq!(intervals[0]["start"], 0);
+            assert_eq!(intervals[0]["end"], extent);
+            assert_eq!(intervals[0]["firstSeq"], first);
+            assert_eq!(intervals[0]["lastSeq"], head);
+            assert_eq!(intervals[0]["sha256"], expected_wal.to_string());
+            let files = value["files"].as_object().unwrap();
+            for required in [
+                "dataset.json",
+                "family-dataset.json",
+                "managed.json",
+                "CURRENT",
+            ] {
+                assert!(files.contains_key(required));
+            }
+            assert!(files.keys().any(|path| path.ends_with("/commit.json")));
+            assert!(files.keys().any(|path| path.ends_with("/meta.json")));
+            assert!(files.keys().any(|path| path.ends_with("/coverage.json")));
+            assert!(
+                files
+                    .keys()
+                    .all(|path| !path.ends_with("wal.log") && !path.ends_with(".dat"))
+            );
+        });
+        drop(source);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_native_source_materialized_family_and_base_only_descriptor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let preparation = capture_preparation();
+        let memory = Store::in_memory(StoreOptions::default());
+        memory
+            .activate_memory_configuration_history(&preparation)
+            .unwrap();
+        ins(&memory, 1);
+        memory.create_branch("child", &Default::default()).unwrap();
+        let persistent = history_store(&temporary.path().join("source"));
+        ins(&persistent, 1);
+        persistent
+            .create_branch("child", &Default::default())
+            .unwrap();
+        let scratch = temporary.path().join("scratch");
+        for store in [
+            memory.branch("main").unwrap(),
+            memory.branch("child").unwrap(),
+            persistent.branch("child").unwrap(),
+        ] {
+            let before = preparation.room();
+            let source = store
+                .materialized_configuration_capture(
+                    "descriptor",
+                    &MemoryCaptureOptions {
+                        tmp_dir: scratch.clone(),
+                        ..Default::default()
+                    },
+                    &preparation,
+                )
+                .unwrap()
+                .checked_primary(&preparation)
+                .unwrap()
+                .describe_native(&preparation)
+                .unwrap();
+            inspect_native_descriptor(&source, &preparation, |value| {
+                assert_eq!(value["familyId"], store.owner_dataset_id().to_string());
+                assert_eq!(
+                    value["roots"]["main"]["logicalId"],
+                    store.dataset_id.to_string()
+                );
+                assert!(value["intervals"].as_array().unwrap().is_empty());
+                assert!(value["sources"].as_array().unwrap().is_empty());
+                if store.is_branch() {
+                    assert_ne!(store.dataset_id, store.owner_dataset_id());
+                    assert!(
+                        value["files"]
+                            .as_object()
+                            .unwrap()
+                            .contains_key("branch.json")
+                    );
+                }
+            });
+            assert!(std::fs::read_dir(&scratch).unwrap().next().is_some());
+            drop(source);
+            assert_eq!(preparation.room(), before);
+            assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_native_source_metadata_pin_uses_original_descriptor_after_replace() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let checked = store
+            .configuration_capture("descriptor", &Default::default(), &preparation)
+            .unwrap()
+            .checked_primary(&preparation)
+            .unwrap();
+        let name = format!("{}/commit.json", checked.capture.data.generation);
+        let path = root.join(&name);
+        let expected = crate::evidence::Sha256Digest::of_bytes(
+            &std::fs::read(&path).unwrap(),
+            preparation.control(),
+        )
+        .unwrap();
+        let retained = path.with_extension("retained");
+        std::fs::rename(&path, &retained).unwrap();
+        std::fs::write(&path, b"replacement, never a source").unwrap();
+        let result = checked.describe_native(&preparation);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&retained, &path).unwrap();
+        let source = result.unwrap();
+        inspect_native_descriptor(&source, &preparation, |value| {
+            assert_eq!(value["files"][&name]["sha256"], expected.to_string());
+        });
+        drop(source);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_native_source_missing_required_member_cannot_encode() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        let mut checked = store
+            .configuration_capture("descriptor", &Default::default(), &preparation)
+            .unwrap()
+            .checked_primary(&preparation)
+            .unwrap();
+        let old = checked.capture.data.files.len();
+        checked
+            .capture
+            .data
+            .files
+            .retain(|file| file.path != "managed.json");
+        assert_eq!(checked.capture.data.files.len() + 1, old);
+        let result = checked.describe_native(&preparation);
+        assert!(
+            matches!(&result, Err(error) if error.to_string().contains("invalid imported source descriptor"))
+        );
+        drop(result);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_native_source_receiving_pressure_and_late_controls_rollback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = history_store(&temporary.path().join("source"));
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let before = preparation.room();
+        for kind in 0..3 {
+            let checked = store
+                .configuration_capture("descriptor", &Default::default(), &preparation)
+                .unwrap()
+                .checked_primary(&preparation)
+                .unwrap();
+            let control = crate::task::Control {
+                deadline: (kind == 2).then(|| Instant::now() + Duration::from_secs(2)),
+                ..crate::task::Control::none()
+            };
+            let callback = control.clone();
+            let reached = Arc::new(AtomicBool::new(false));
+            let timely = Arc::new(AtomicBool::new(false));
+            let observed = reached.clone();
+            let before_deadline = timely.clone();
+            let receiving = crate::access::Preparation::new(
+                crate::task::Control {
+                    progress: crate::task::Progress::new(move |_, stage| {
+                        if stage == "captured-source-delivery" && kind != 0 {
+                            interrupt_supplied_capture(&callback, &observed, &before_deadline);
+                        }
+                    }),
+                    ..control
+                },
+                if kind == 0 { 8192 } else { 64 << 20 },
+            )
+            .unwrap();
+            let receiving_before = receiving.room();
+            let result = checked.describe_native(&receiving);
+            assert!(matches!(
+                (kind, &result),
+                (0, Err(Error::BudgetExceeded(_)))
+                    | (1, Err(Error::Cancelled))
+                    | (2, Err(Error::Timeout))
+            ));
+            drop(result);
+            if kind != 0 {
+                assert!(reached.load(Ordering::SeqCst));
+            }
+            if kind == 2 {
+                assert!(timely.load(Ordering::SeqCst));
+            }
+            assert_eq!(leases(&store), 0);
+            assert_eq!(receiving.room(), receiving_before);
+            assert_eq!(preparation.room(), before);
+        }
     }
 
     #[cfg(unix)]
