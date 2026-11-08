@@ -989,6 +989,7 @@ impl ChangeLog {
         let file = match segs.last() {
             Some(s) if !s.sealed => Some(super::wal::open_for_append(
                 s.path.as_ref().expect("persistent"),
+                super::wal::PLAIN_VERSION,
             )?),
             _ => None,
         };

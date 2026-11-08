@@ -1677,14 +1677,18 @@ impl Store {
         }
         super::write_synced(
             &gdir.join("commit.json"),
-            &crate::commit::gen_commit_bytes_with_binding(
+            &crate::commit::gen_commit_bytes_for(
                 self.dataset_id,
                 "memory",
                 &commit,
+                self.configuration_activated(),
                 binding,
             ),
         )?;
-        super::wal::create(&gdir.join("wal.log"))?;
+        super::wal::create(
+            &gdir.join("wal.log"),
+            super::wal::version_for(self.configuration_activated()),
+        )?;
         super::sync_dir(&gdir)?;
         crate::commit::Catalog::create(&dir.join("commits.bin"), self.dataset_id, commit)?;
         let mut files = Vec::new();
@@ -1731,6 +1735,10 @@ impl Store {
             crate::commit::dataset_file_bytes(self.dataset_id, "memory", commit.timestamp_ms);
         if !managed.is_empty() {
             dataset = crate::commit::with_reader(&dataset, crate::managed::READER)?;
+        }
+        // the capture holds version 2 files of an activated store, which need its reader
+        if !history_files.is_empty() {
+            dataset = crate::commit::with_reader(&dataset, super::managed_history::READER)?;
         }
         files.push(meta_file("dataset.json", dataset));
         for (name, bytes) in managed {
@@ -2027,8 +2035,11 @@ impl Store {
         }
         let dataset = if managed.is_empty() && history_files.is_empty() {
             dataset
-        } else {
+        } else if history_files.is_empty() {
             crate::commit::with_reader(&dataset, crate::managed::READER)?
+        } else {
+            // an activated store's files need the configuration-history reader
+            crate::commit::with_reader(&dataset, super::managed_history::READER)?
         };
         files.push(meta("dataset.json", dataset));
         for (name, bytes) in managed {
@@ -3533,8 +3544,9 @@ mod tests {
         assert_eq!(checked.wal_extent, super::super::WAL_REC as u64);
         assert_eq!(
             checked.wal_digest,
+            // an activated store's capture starts its log with the version 2 header
             crate::evidence::Sha256Digest::of_bytes(
-                &super::super::wal::header_record(),
+                &super::super::wal::configuration_header_record(),
                 preparation.control()
             )
             .unwrap()

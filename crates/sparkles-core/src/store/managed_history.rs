@@ -15,6 +15,68 @@ use uuid::Uuid;
 
 pub(crate) const READER: u32 = 8;
 pub(crate) const FORMAT: u32 = 1;
+
+/// Whether the files at `root` record an activation of configuration history,
+/// whatever its registry says. Activation raises the dataset reader of every
+/// branch to [`READER`] and publishes the lineage under `evidence-history/`,
+/// and it runs on a copy that replaces the root only once it is complete. A
+/// root with either record is therefore activated, and a registry that is
+/// missing or names no history root must refuse rather than read as legacy.
+pub(crate) fn activation_recorded(root: &Path) -> Result<bool> {
+    let reader = crate::commit::read_dataset_versions(root)?
+        .is_some_and(|versions| versions.minimum_reader >= READER);
+    if reader {
+        return Ok(true);
+    }
+    match std::fs::symlink_metadata(root.join(DIRECTORY)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Refuse an activated root whose registry no longer names its history root.
+pub(crate) fn check_activated_registry(
+    root: &Path,
+    state: Option<&crate::managed::ManagedState>,
+) -> Result<()> {
+    let anchored = match state {
+        Some(crate::managed::ManagedState::Installed(installed)) => {
+            installed.configuration_history.is_some()
+        }
+        // An unavailable registry already refuses what depends on it.
+        Some(crate::managed::ManagedState::Unavailable { .. }) => return Ok(()),
+        None => false,
+    };
+    if !anchored && activation_recorded(root)? {
+        return Err(unavailable(
+            "activated configuration history has no published managed registry root",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a family has activated configuration history. Activation is a
+/// closed-dataset migration that publishes the registry's history root and
+/// raises every branch's dataset reader to [`READER`]. Only then does the store
+/// write version 2 logs, generation `commit.json` format 2 and `managed.json`
+/// format 3, so a store that never activates keeps the versions that older
+/// releases read. A registry that cannot be enforced still records activation in
+/// the family's dataset reader.
+pub(crate) fn activated(
+    state: Option<&crate::managed::ManagedState>,
+    family_root: Option<&Path>,
+) -> bool {
+    match state {
+        Some(crate::managed::ManagedState::Installed(installed)) => {
+            installed.configuration_history.is_some()
+        }
+        Some(crate::managed::ManagedState::Unavailable { .. }) => family_root
+            .and_then(|root| crate::commit::read_dataset_versions(root).ok().flatten())
+            .is_some_and(|versions| versions.minimum_reader >= READER),
+        None => false,
+    }
+}
 pub(crate) const MAX_BYTES: usize = 64 << 20;
 const PARSE_BYTES: u64 = 32;
 const DIRECTORY: &str = "evidence-history";
@@ -1313,7 +1375,7 @@ pub(crate) fn activate_copy(
         let version = super::wal::descriptor_version(&mut file, &branch.hot)?;
         if version == 1 {
             file.seek(SeekFrom::Start(0))?;
-            file.write_all(&super::wal::header_record())?;
+            file.write_all(&super::wal::configuration_header_record())?;
             file.sync_all()?;
         } else if version != crate::formats::WAL_VERSION {
             return Err(unavailable("activation WAL version changed"));

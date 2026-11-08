@@ -2394,10 +2394,15 @@ impl Store {
                 &tmp.join(BRANCH_FILE),
                 &serde_json::to_vec_pretty(&bf).expect("serializes"),
             )?;
-            write_synced(
-                &tmp.join("dataset.json"),
-                &commit::dataset_file_bytes(e.id, "branch", self.now_ms()),
-            )?;
+            // A branch of an activated family writes version 2 files from its first
+            // generation, so it records the configuration-history reader first.
+            let dataset = commit::dataset_file_bytes(e.id, "branch", self.now_ms());
+            let dataset = if self.configuration_activated() {
+                commit::with_reader(&dataset, super::managed_history::READER)?
+            } else {
+                dataset
+            };
+            write_synced(&tmp.join("dataset.json"), &dataset)?;
             // the first generation is gen-0001, linked or built (0 names in-memory ones)
             let gen_no: u32 = 1;
             let gen_name = format!("gen-{gen_no:04}");
@@ -2433,7 +2438,10 @@ impl Store {
                 )?;
                 write_synced(&gdir.join("delta.vocab"), &[])?;
             }
-            super::wal::create(&gdir.join("wal.log"))?;
+            super::wal::create(
+                &gdir.join("wal.log"),
+                super::wal::version_for(self.configuration_activated()),
+            )?;
             let commit_bytes = match configuration_origin {
                 Some(origin) => {
                     commit::gen_commit_bytes_with_binding(e.id, "branch", &base, origin.binding)

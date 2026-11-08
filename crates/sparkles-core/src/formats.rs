@@ -879,7 +879,13 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             continue;
         };
-        match check_settings(s.name, &v) {
+        let checked = check_settings(s.name, &v).and_then(|found| {
+            if matches!(s.name, "history.json" | "branch.json") && found >= 2 {
+                admit_configuration_version(dir, s.name, found)?;
+            }
+            Ok(found)
+        });
+        match checked {
             Ok(_) => {}
             Err(Error::Unsupported(m)) if fenced => {
                 out.push(Error::Unsupported(format!("{}: {m}", dir.display())))
@@ -982,6 +988,29 @@ fn settings_stamp_format(s: &SettingsFile, v: &serde_json::Value) -> u32 {
 /// The version of a settings file's JSON object, from its member: absent is 1. A
 /// version newer than this build writes is refused, since the file may mean something
 /// this build would misread.
+/// Refuse `version` of `what` in the dataset at `root` unless the dataset records
+/// the reader of configuration history. Only activation writes the versions that
+/// need it (logs 2, generation `commit.json` 2, `managed.json` 3, `history.json` 2
+/// and `branch.json` 2), and it raises the dataset reader first. A dataset that
+/// records an older reader holds none of them, so one there is a newer file that
+/// this dataset does not admit, refused as a newer release's file is. A directory
+/// without `dataset.json`, such as a capture being assembled, gives no bound.
+pub(crate) fn admit_configuration_version(
+    root: &std::path::Path,
+    what: &str,
+    version: u32,
+) -> Result<()> {
+    let reader = crate::store::managed_history::READER;
+    match crate::commit::read_dataset_versions(root)? {
+        Some(versions) if versions.minimum_reader < reader => Err(Error::Unsupported(format!(
+            "{what} has version {version}, which a dataset records only with configuration \
+             history (reader {reader}); this dataset records reader {}",
+            versions.minimum_reader
+        ))),
+        _ => Ok(()),
+    }
+}
+
 pub fn check_settings(name: &str, v: &serde_json::Value) -> Result<u32> {
     let s = registered(name);
     let member = s.member;

@@ -50,7 +50,7 @@ use std::io::{BufReader, Seek, SeekFrom};
 pub const MAGIC: [u8; 8] = *b"\x89SPKWAL\n";
 
 /// The dataset reader (`minimumReader` of `dataset.json`) that reads log headers.
-pub const HEADER_READER: u32 = 8;
+pub const HEADER_READER: u32 = 5;
 
 /// Constant-size transaction state for forward, reverse and cold-prefix readers.
 /// Structural refusal is evaluated only after the transaction checksum succeeds,
@@ -166,11 +166,37 @@ pub(crate) fn descriptor_version(file: &mut File, path: &Path) -> Result<u32> {
     }
 }
 
-/// The header record of a new log.
+/// The version of the logs that a store without configuration history writes.
+/// Older releases read it, so an ordinary store stays readable by them.
+pub(crate) const PLAIN_VERSION: u32 = 1;
+
+/// The version of a new log in a store whose configuration history is
+/// `activated`. Only activated stores write version 2, whose sealed
+/// configuration records need the dataset reader that activation records.
+pub(crate) fn version_for(activated: bool) -> u32 {
+    if activated {
+        crate::formats::WAL_VERSION
+    } else {
+        PLAIN_VERSION
+    }
+}
+
+/// The header record of a new log of a store without configuration history.
+#[cfg(test)]
 pub(crate) fn header_record() -> [u8; WAL_REC] {
+    header_record_of(PLAIN_VERSION)
+}
+
+/// The header record of a new log of an activated store.
+pub(crate) fn configuration_header_record() -> [u8; WAL_REC] {
+    header_record_of(crate::formats::WAL_VERSION)
+}
+
+/// The header record of a new log of `version`.
+pub(crate) fn header_record_of(version: u32) -> [u8; WAL_REC] {
     let mut r = [0u8; WAL_REC];
     r[..8].copy_from_slice(&MAGIC);
-    r[8..12].copy_from_slice(&crate::formats::WAL_VERSION.to_le_bytes());
+    r[8..12].copy_from_slice(&version.to_le_bytes());
     r
 }
 
@@ -184,6 +210,14 @@ pub(crate) fn header_version(rec: &[u8], path: &Path) -> Result<u32> {
     let v = u32::from_le_bytes(rec[8..12].try_into().unwrap());
     // a newer version may define the bytes after its version, so check it first
     crate::formats::WAL.check(&path.display().to_string(), v, None)?;
+    // a version only activation writes is newer than a dataset without it admits,
+    // whatever the bytes after it hold (`gen-NNNN/wal.log` under the dataset root)
+    if v > PLAIN_VERSION
+        && let Some(root) = path.parent().and_then(Path::parent)
+        && !root.as_os_str().is_empty()
+    {
+        crate::formats::admit_configuration_version(root, &path.display().to_string(), v)?;
+    }
     // every version this build reads leaves them zero
     if rec[12..WAL_REC].iter().any(|&b| b != 0) {
         return Err(damaged());
@@ -236,9 +270,9 @@ pub(crate) const HEADER_BYTES: u64 = WAL_REC as u64;
 /// Create a new, empty log at `path` (which must not exist): its header record, synced.
 /// The caller syncs the directory and has already made the dataset require
 /// [`HEADER_READER`] (every persistent store does when it opens).
-pub(crate) fn create(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create(path: &Path, version: u32) -> std::io::Result<()> {
     let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
-    f.write_all(&header_record())?;
+    f.write_all(&header_record_of(version))?;
     f.sync_all()
 }
 
@@ -246,8 +280,8 @@ pub(crate) fn create(path: &Path) -> std::io::Result<()> {
 /// with its header (see [`create`]) if it does not exist. It is not opened in append
 /// mode: a store that preallocates writes each commit at the log's logical end, which
 /// lies before the zero bytes that follow it.
-pub(crate) fn open_for_append(path: &Path) -> std::io::Result<File> {
-    match create(path) {
+pub(crate) fn open_for_append(path: &Path, version: u32) -> std::io::Result<File> {
+    match create(path, version) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
@@ -1753,7 +1787,7 @@ mod tests {
     fn direct_writes_keep_the_log_bytes_exact() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal.log");
-        let log = open_for_append(&path).unwrap();
+        let log = open_for_append(&path, PLAIN_VERSION).unwrap();
         let Some(mut direct) = DirectLog::open(&path, &log) else {
             // no direct I/O on this file system (or OS): commits take the buffered path
             return;

@@ -992,6 +992,23 @@ fn gen_commit_file(dataset_id: uuid::Uuid, origin: &str, c: &CommitInfo) -> GenC
     }
 }
 
+/// A generation's `commit.json`: format 2 with `binding` in a store whose
+/// configuration history is activated, and the format 1 that older releases
+/// read in any other store.
+pub(crate) fn gen_commit_bytes_for(
+    dataset_id: uuid::Uuid,
+    origin: &str,
+    c: &CommitInfo,
+    activated: bool,
+    binding: crate::history::ConfigurationBinding,
+) -> Vec<u8> {
+    if activated {
+        gen_commit_bytes_with_binding(dataset_id, origin, c, binding)
+    } else {
+        gen_commit_bytes(dataset_id, origin, c)
+    }
+}
+
 pub(crate) fn gen_commit_bytes_with_binding(
     dataset_id: uuid::Uuid,
     origin: &str,
@@ -1258,6 +1275,17 @@ fn check_gen_commit_value(path: &Path, value: &serde_json::Value) -> Result<()> 
             path.display(),
             format
         )));
+    }
+    // format 2 is written only once configuration history is activated
+    if format >= 2
+        && let Some(root) = path.parent().and_then(Path::parent)
+        && !root.as_os_str().is_empty()
+    {
+        crate::formats::admit_configuration_version(
+            root,
+            &path.display().to_string(),
+            format as u32,
+        )?;
     }
     Ok(())
 }

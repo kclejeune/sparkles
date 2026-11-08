@@ -2188,7 +2188,11 @@ impl Store {
         if ctx.is_none() {
             crate::formats::check_dataset_tree(root)?;
             // the dataset's managed-graph registry, which its branches share
-            if let Some(state) = managed::load_dir(root) {
+            let state = managed::load_dir(root);
+            // An activated family cannot fall back to legacy absence of its
+            // registry or of its history root, before anything is written.
+            managed_history::check_activated_registry(root, state.as_ref())?;
+            if let Some(state) = state {
                 family.managed.store(Some(Arc::new(state)));
             }
         } else {
@@ -2461,7 +2465,13 @@ impl Store {
         // files it creates (a log with a header record) before it creates any.
         commit::note_writer(root)?;
         let wal_existed = wal_path.exists();
-        let wal = wal::open_for_append(&wal_path)?;
+        let wal = wal::open_for_append(
+            &wal_path,
+            wal::version_for(managed_history::activated(
+                family.managed.load().as_deref(),
+                Some(root),
+            )),
+        )?;
         if !wal_existed {
             // a new log starts with its header record
             wal_len = wal::HEADER_BYTES;
@@ -5666,14 +5676,18 @@ impl Store {
             // CURRENT switches durably, and only after that is the old generation removed.
             write_synced(
                 &dir.join("commit.json"),
-                &commit::gen_commit_bytes_with_binding(
+                &commit::gen_commit_bytes_for(
                     self.dataset_id,
                     "bulk",
                     &head,
+                    self.configuration_activated(),
                     configuration,
                 ),
             )?;
-            let wal = wal::open_for_append(&dir.join("wal.log"))?;
+            let wal = wal::open_for_append(
+                &dir.join("wal.log"),
+                wal::version_for(self.configuration_activated()),
+            )?;
             let wal_size = wal.metadata()?.len();
             sync_dir(&dir)?;
             sync_dir(root)?;

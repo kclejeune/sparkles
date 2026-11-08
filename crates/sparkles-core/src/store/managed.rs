@@ -25,6 +25,22 @@ pub(super) fn load_dir(root: &Path) -> Option<ManagedState> {
             });
         }
     };
+    // format 3 is written only once configuration history is activated, so in a
+    // dataset without it the file is a newer release's registry
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let Some(format) = value.get("format").and_then(serde_json::Value::as_u64)
+        && format >= 3
+        && let Err(error) = crate::formats::admit_configuration_version(
+            root,
+            crate::managed::FILE,
+            u32::try_from(format).unwrap_or(u32::MAX),
+        )
+    {
+        return Some(ManagedState::Unavailable {
+            reason: error.to_string(),
+            repairable: false,
+        });
+    }
     let mut state = crate::managed::decode(&bytes, |owner| {
         let path = root.join(owner.settings_file());
         match std::fs::metadata(&path) {
@@ -103,6 +119,16 @@ impl Store {
     /// The running registry state, shared and not copied, for controlled readers.
     pub(crate) fn managed_state_shared(&self) -> Option<Arc<ManagedState>> {
         self.managed_state()
+    }
+
+    /// Whether this store's family has activated configuration history, which
+    /// selects the newer versions of the files it writes from now on (see
+    /// [`super::managed_history::activated`]).
+    pub(crate) fn configuration_activated(&self) -> bool {
+        super::managed_history::activated(
+            self.managed_state().as_deref(),
+            self.managed_root().as_deref(),
+        )
     }
 
     pub(super) fn same_managed_state(&self, captured: &Option<Arc<ManagedState>>) -> bool {
@@ -803,8 +829,14 @@ impl Store {
                     }
                     Err(e) => return Err(e.into()),
                 };
-                if crate::managed::recorded_history(&bytes)?.is_some() {
-                    return refuse("its anchored configuration history is unavailable");
+                // A registry of a newer format is refused as a copy, as any other
+                // registry whose dependencies this build cannot name.
+                match crate::managed::recorded_history(&bytes) {
+                    Ok(Some(_)) => {
+                        return refuse("its anchored configuration history is unavailable");
+                    }
+                    Ok(None) => {}
+                    Err(error) => return refuse(&error.to_string()),
                 }
                 let owners = match crate::managed::recorded_owners(&bytes) {
                     Ok(owners) => owners,

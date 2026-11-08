@@ -1284,7 +1284,10 @@ impl Store {
             cache: self.cache.clone(),
             delta: gen_.base_delta(),
             wal: if persistent {
-                Some(BufWriter::new(wal::open_for_append(&dir.join("wal.log"))?))
+                Some(BufWriter::new(wal::open_for_append(
+                    &dir.join("wal.log"),
+                    wal::version_for(self.configuration_activated()),
+                )?))
             } else {
                 None
             },
@@ -1372,10 +1375,11 @@ impl Store {
             std::fs::remove_file(dir.join(BUILDING_FILE))?;
             write_synced(
                 &dir.join("commit.json"),
-                &commit::gen_commit_bytes_with_binding(
+                &commit::gen_commit_bytes_for(
                     self.dataset_id,
                     "compaction",
                     &base,
+                    self.configuration_activated(),
                     base_configuration,
                 ),
             )?;
