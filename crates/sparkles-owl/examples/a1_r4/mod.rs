@@ -245,7 +245,7 @@ fn admission<M: Meter>(axioms: &[Axiom], case: &Value, row: &Value, deadline: In
             };
             (
                 "refused",
-                json!({"error": error(result.as_ref().err().expect("error")), "retained_estimated_bytes": Value::Null,
+                json!({"error": error(result.as_ref().expect_err("error")), "retained_estimated_bytes": Value::Null,
                 "peak_estimated_bytes": Value::Null, "estimate_unavailable_reason": "public error result has no Stats"}),
                 proper,
             )

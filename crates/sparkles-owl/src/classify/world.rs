@@ -192,15 +192,6 @@ fn key_add(count: &mut usize, more: usize) -> Result<(), Halt> {
     *count = count.checked_add(more).ok_or(Halt::Memory(usize::MAX))?;
     Ok(())
 }
-fn key_pairs(members: usize) -> Result<usize, Halt> {
-    let before = members.saturating_sub(1);
-    let (a, b) = if members.is_multiple_of(2) {
-        (members / 2, before)
-    } else {
-        (members, before / 2)
-    };
-    a.checked_mul(b).ok_or(Halt::Memory(usize::MAX))
-}
 fn key_member(ix: &Index, view: &dyn View, individual: Ex, class: Ex) -> bool {
     let mut member = false;
     view.with(individual, &mut |st, real| {
@@ -1734,13 +1725,6 @@ mod numeric_resource_tests {
         assert!(matches!(aggregate, Err(Halt::Memory(usize::MAX))));
         assert_eq!(allocated.events, 0);
         assert!(key_live(&[isize::MAX as usize, 1]).is_err());
-        assert!(key_pairs(usize::MAX).is_err());
-        for n in 0..30 {
-            assert_eq!(
-                key_pairs(n).unwrap(),
-                (0..n).map(|i| n - i - 1).sum::<usize>()
-            );
-        }
     }
 
     fn fixture() -> Vec<crate::model::Axiom> {
