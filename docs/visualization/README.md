@@ -424,8 +424,9 @@ the IRI visible. Copying and navigation always keep the original IRI.
 
 ### Visual SHACL shape editor
 
-**SHACL shapes** in the Workbench opens `/ui/workbench/shapes`
-([screenshot](../images/shape-editor.png)). The dataset's Validate panel also links to it. Choose a branch and one shapes graph, or enter a new graph IRI.
+**SHACL shapes** in the Workbench opens `/ui/workbench/shapes`, which the
+[editor screenshot](../images/shape-editor.png) shows. The dataset's Validate panel also
+links to it. Choose a branch and one shapes graph, or enter a new graph IRI.
 The source line identifies the dataset, branch, stored graph and commit. The unnamed
 shapes graph is the stored default graph even when queries use a union default graph.
 Leave the graph field empty to edit it. Reserved default and union query selectors
@@ -445,8 +446,8 @@ Custom severities use an IRI, and literals retain their datatype, language and d
 Apply a field or path to the local draft before opening another shape or previewing.
 **Undo draft** and **Redo draft** move through up to 30 local draft states. **Preview
 commit** shows the exact RDF additions and removals, with at most 50 changed triples in
-the displayed diff ([screenshot](../images/shape-editor-preview.png)). Commit uses the
-same source UUID, commit and precondition. Another writer's
+the displayed diff, as the [preview screenshot](../images/shape-editor-preview.png)
+shows. Commit uses the same source UUID, commit and precondition. Another writer's
 commit refuses the write and retains the draft until explicit discard and reload.
 While a preview is open, refreshes from the change feed wait until it closes, so the
 answer of a slow commit is still recorded for undo.

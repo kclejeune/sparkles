@@ -300,8 +300,8 @@ editor and browser and the app shell. The collapsed panel below it has more work
     <td><img src="docs/images/shape-editor-preview.png" alt="The preview of a shape edit that raises the minimum count of the Name property shape from 1 to 2, with the RDF patch pinned to the source commit, the one triple it removes and the one it adds, and a button that commits it"></td>
   </tr>
   <tr>
-    <td>The SHACL shape editor: shapes as a tree, with forms for targets, paths and constraints</td>
-    <td>A shape edit previewed as one exact RDF patch before it commits</td>
+    <td>The SHACL shape editor shows shapes as a tree and edits their targets, paths and constraints in forms.</td>
+    <td>Each shape edit is previewed as one exact RDF patch before it commits.</td>
   </tr>
   <tr>
     <td><img src="docs/images/forms-nested.png" alt="The editing form of a SKOS concept with its SKOS-XL labels as nested forms, the stored label edited to All animals and a new French label added from the label shape's template, with the previewed commit listing the triples it adds and removes"></td>
