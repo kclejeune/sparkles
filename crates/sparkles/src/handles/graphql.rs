@@ -168,7 +168,7 @@ pub fn guard_shapes(
         };
         let q = format!("CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH {n} {{ ?s ?p ?o }} }}");
         if let Ok(r) = crate::sparql::query(snap.clone(), &q, &QueryOptions::default()) {
-            for t in &r.triples {
+            for t in r.triples() {
                 graph.insert(t);
             }
         }
@@ -372,7 +372,7 @@ pub fn draft_of(
                 let q = format!("CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH {n} {{ ?s ?p ?o }} }}");
                 let res = crate::sparql::query(snap.clone(), &q, &qopts)?;
                 let mut graph = oxrdf::Graph::new();
-                for t in &res.triples {
+                for t in res.triples() {
                     graph.insert(t);
                 }
                 (graph, false)

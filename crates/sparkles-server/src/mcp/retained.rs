@@ -186,7 +186,10 @@ mod tests {
             .json(&serde_json::json!({"source":"same actual preparation"}))
             .unwrap();
         let result = result(text, Some(structured), Some(meta), budget.clone()).unwrap();
-        ServerJsonRpcMessage::response(ServerResult::RetainedToolResult(result), 9.into())
+        ServerJsonRpcMessage::response(
+            ServerResult::RetainedToolResult(result),
+            rmcp::model::NumberOrString::Number(9),
+        )
     }
 
     #[test]

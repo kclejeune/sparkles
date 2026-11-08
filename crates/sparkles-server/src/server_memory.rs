@@ -742,7 +742,7 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let control = sparkles::task::Control::with_cancel(flag.clone());
         let mut waiting = Box::pin(acquire_for_call(&state, &control));
-        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        assert!(futures_util::FutureExt::now_or_never(waiting.as_mut()).is_none());
         assert_eq!(pool.stats().waiting, 1);
         flag.store(true, Ordering::SeqCst);
         let result = tokio::time::timeout(Duration::from_secs(2), waiting)
@@ -764,7 +764,7 @@ mod tests {
         let mut control = sparkles::task::Control::none();
         control.deadline = Some(Instant::now() + Duration::from_millis(500));
         let mut waiting = Box::pin(acquire_for_call(&state, &control));
-        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        assert!(futures_util::FutureExt::now_or_never(waiting.as_mut()).is_none());
         assert_eq!(pool.stats().waiting, 1);
         let result = tokio::time::timeout(Duration::from_secs(3), waiting)
             .await

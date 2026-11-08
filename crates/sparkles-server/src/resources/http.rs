@@ -599,9 +599,9 @@ async fn header_read(
             let opts = CallerContext::for_caller(&st, &ds, &p).read_options();
             let q = HEADER_QUERY.replace("GRAPH <GRAPH>", &format!("GRAPH <{}>", l.graph));
             let rows = sparkles::sparql::query(ds.store.snapshot(), &q, &opts)
-                .map(|r| r.rows())
+                .and_then(|r| r.rows())
                 .map_err(ApiError::from)?;
-            let Some(row) = rows.first() else {
+            let Some(row) = rows.iter().next() else {
                 graphs.push(json!({
                     "dataset": l.dataset,
                     "graph": l.graph,
@@ -620,7 +620,7 @@ async fn header_read(
             ];
             let h: BTreeMap<&str, Option<String>> = names
                 .iter()
-                .zip(row.iter())
+                .zip(row.values().iter())
                 .map(|(n, t)| (*n, term_str(t)))
                 .collect();
             let differs = disagreements(r, &h);

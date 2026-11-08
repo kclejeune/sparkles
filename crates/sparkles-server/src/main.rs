@@ -4088,7 +4088,7 @@ fn run() -> Result<()> {
                     "\nparse {:.2} ms · plan {:.2} ms · exec {:.2} ms · total {:.2} ms",
                     r.timing.parse_ms, r.timing.plan_ms, r.timing.exec_ms, r.timing.total_ms
                 );
-                print_plan_stderr(&r.plan);
+                print_plan_stderr(r.plan());
             }
             Ok(())
         }
@@ -5928,7 +5928,7 @@ fn print_table(
         tools::table::write_boolean(r.boolean, out)?;
         return Ok(());
     }
-    tools::table::write_table(&r.vars, &r.rows(), &store.prefixes(), out)?;
+    tools::table::write_table(r.variables(), r.rows()?.iter(), &store.prefixes(), out)?;
     Ok(())
 }
 

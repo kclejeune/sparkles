@@ -77,10 +77,12 @@ fn rows(s: &Store, q: &str) -> Vec<Vec<String>> {
     let mut v: Vec<Vec<String>> = sparql::query(s.snapshot(), q, &QueryOptions::default())
         .unwrap()
         .rows()
+        .unwrap()
         .into_iter()
         .map(|r| {
-            r.into_iter()
-                .map(|t| t.map(|t| t.to_string()).unwrap_or_default())
+            r.values()
+                .iter()
+                .map(|t| t.as_ref().map(|t| t.to_string()).unwrap_or_default())
                 .collect()
         })
         .collect();

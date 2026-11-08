@@ -1293,11 +1293,17 @@ impl Tools<'_> {
             sparql::select_star_order(&a.query, &mut r).map_err(|e| ctx.engine(e))?;
         }
         let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-        let whole = full.then(|| {
-            let mut j = sparql::results::sparkles_json(&r, Some(max_rows));
-            j["meta"]["commit"] = snap.commit.into();
-            j
-        });
+        // The asking pipeline keeps this document as an application value, as it did
+        // before results became retained owners. Retaining it under its query credit
+        // belongs to the Ask outcome migration.
+        let whole = full
+            .then(|| {
+                let j = sparql::results::sparkles_json_with_commit(&r, Some(max_rows), snap.commit)
+                    .map_err(|e| ctx.engine(e))?;
+                serde_json::from_str::<Value>(j.as_str())
+                    .map_err(|e| ctx.engine(sparkles::Error::invalid(e.to_string())))
+            })
+            .transpose()?;
         let text = match r.kind {
             QueryKind::Ask => match format {
                 Format::Table => render::ask_table(snap.commit, r.boolean),
@@ -1509,7 +1515,7 @@ impl Tools<'_> {
         let (plan, stop, error) = match sparql::query_with_plan(snap.clone(), &a.query, &opts) {
             Ok(r) => {
                 out["rows"] = (r.len() as u64).into();
-                (r.plan, None, None)
+                (r.plan().clone(), None, None)
             }
             Err(f) => {
                 let stop = crate::explain::Stop::of_error(&f.error, Some(timeout.as_secs_f64()))
@@ -1575,7 +1581,7 @@ impl Tools<'_> {
         )
         .map_err(|e| ctx.engine(e))?;
         let triples: Vec<Value> = r
-            .triples
+            .triples()
             .iter()
             .take(max)
             .map(|t| {
@@ -1590,7 +1596,7 @@ impl Tools<'_> {
         Ok(json!({
             "mode": mode.name(),
             "triples": triples,
-            "truncated": r.triples.len() > max,
+            "truncated": r.triples().len() > max,
         }))
     }
 
@@ -2215,7 +2221,12 @@ impl Queries<'_> {
         opts.timeout = Some(remaining(self.deadline)?);
         opts.initial_bindings = vec![("r".to_string(), self.resource.clone())];
         opts.initial_bindings.extend(extra);
-        Ok(sparql::query(self.snap.clone(), q, &opts)?.rows())
+        // An application copy, as before the retained row owners.
+        Ok(sparql::query(self.snap.clone(), q, &opts)?
+            .rows()?
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect())
     }
 
     fn ask(&self, outgoing: bool) -> Result<bool, Error> {
@@ -2366,8 +2377,8 @@ pub(super) fn labels_of(
     let mut opts = opts.clone();
     opts.timeout = Some(remaining(deadline)?);
     opts.initial_bindings = Vec::new();
-    for row in sparql::query(snap.clone(), &q, &opts)?.rows() {
-        if let [Some(Term::NamedNode(x)), Some(p), Some(Term::Literal(l))] = row.as_slice()
+    for row in sparql::query(snap.clone(), &q, &opts)?.rows()? {
+        if let [Some(Term::NamedNode(x)), Some(p), Some(Term::Literal(l))] = row.values()
             && let Some(rank) = label_rank(p)
         {
             out.entry(x.as_str().to_string())

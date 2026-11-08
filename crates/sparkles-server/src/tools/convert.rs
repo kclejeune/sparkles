@@ -1137,12 +1137,12 @@ fn table_one(
     let mut checker = r.check.then(|| TermChecker::new(WARNINGS_SHOWN));
     let mut failed: Option<anyhow::Error> = None;
     let res = sparkles::tabular::convert(reader, &opts, &mut |t| {
-        let q = t.in_graph(GraphName::DefaultGraph);
         if let Some(c) = &mut checker {
-            c.quad(q.as_ref());
+            c.quad(t.as_ref().in_graph(oxrdf::GraphNameRef::DefaultGraph));
         }
+        // The converter lends each triple. The output keeps its own copy.
         if let Some(out) = out.as_deref_mut()
-            && let Err(e) = out.write(q)
+            && let Err(e) = out.write(t.clone().in_graph(GraphName::DefaultGraph))
         {
             failed = Some(e);
             return Err(sparkles::Error::invalid("the output failed"));

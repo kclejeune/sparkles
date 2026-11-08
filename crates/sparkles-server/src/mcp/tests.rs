@@ -2492,6 +2492,7 @@ fn real_request_preparation_survives_branch_continuation_and_aggregate_refusal()
         BudgetKind, Error,
         sparql::{output::NativeBudget, pool::QueryPool},
     };
+    use std::sync::atomic::Ordering;
     let server = server_with(
         &[("t", &[FIXTURE])],
         McpConfig {

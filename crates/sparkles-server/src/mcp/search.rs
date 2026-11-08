@@ -419,8 +419,8 @@ fn types_of(
     );
     let mut opts = opts.clone();
     opts.timeout = Some(remaining(deadline)?);
-    for row in sparql::query(snap.clone(), &q, &opts)?.rows() {
-        if let [Some(Term::NamedNode(x)), Some(t)] = row.as_slice() {
+    for row in sparql::query(snap.clone(), &q, &opts)?.rows()? {
+        if let [Some(Term::NamedNode(x)), Some(t)] = row.values() {
             let v = out.entry(x.as_str().to_string()).or_default();
             if v.len() < 3 {
                 v.push(t.clone());

@@ -660,6 +660,11 @@ impl<'a> RowRef<'a> {
     }
 }
 
+impl AsRef<[Option<Term>]> for OwnedRow {
+    fn as_ref(&self) -> &[Option<Term>] {
+        self.values()
+    }
+}
 impl std::fmt::Debug for OwnedRow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.values().fmt(f)
