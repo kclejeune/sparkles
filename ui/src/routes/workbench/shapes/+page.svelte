@@ -720,7 +720,10 @@
         </div>
         <div class="panel-body">
           <label
-            >Sample selection<select class="select" bind:value={sampleMode}
+            >Sample selection<select
+              class="select"
+              aria-label="Sample selection"
+              bind:value={sampleMode}
               ><option value="nodes">Explicit focus nodes</option><option value="targets"
                 >All targets in the sample graph</option
               ></select

@@ -275,7 +275,14 @@ test('blocks protected/read-only writes and server guard refusals without losing
   await page.route(`**/${ds}/patch?**`, (route) =>
     route.fulfill({
       status: 422,
-      json: { dryRun: true, outcome: 'rejected', wouldCommit: false, head: 1 },
+      json: {
+        error: 'Validation refused the write: 1 blocking result',
+        dryRun: true,
+        outcome: 'rejected',
+        wouldCommit: false,
+        head: 1,
+        validation: { status: 'rejected', blocking: 1, total: 1, results: [] },
+      },
     }),
   );
   await page.getByRole('button', { name: 'Preview commit', exact: true }).click();
