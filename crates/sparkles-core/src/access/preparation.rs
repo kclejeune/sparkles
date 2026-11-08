@@ -40,6 +40,16 @@ impl Drop for Inner {
 pub struct Preparation {
     inner: Arc<Inner>,
     no_wait: bool,
+    query: Option<QueryControl>,
+}
+
+// Inline shallow control handles add no allocation or independent allowance.
+// Only checked source construction creates this view over a genuine root.
+#[derive(Clone)]
+struct QueryControl {
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    cancellation: Option<crate::task::Cancellation>,
+    deadline: Option<std::time::Instant>,
 }
 
 impl Preparation {
@@ -80,7 +90,31 @@ impl Preparation {
                 grant,
             }),
             no_wait: false,
+            query: None,
         })
+    }
+
+    pub(crate) fn with_query_controls(
+        &self,
+        cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+        cancellation: Option<crate::task::Cancellation>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self> {
+        // This private constructor consumes original source controls, never a
+        // descendant view. Silently replacing an earlier query would lose control.
+        if self.query.is_some() {
+            return Err(Error::invalid(
+                "checked source already has descendant controls",
+            ));
+        }
+        let mut view = self.clone();
+        view.query = Some(QueryControl {
+            cancel,
+            cancellation,
+            deadline,
+        });
+        view.check()?;
+        Ok(view)
     }
 
     pub(crate) fn grant(&self) -> Option<&Arc<crate::sparql::pool::PoolGrant>> {
@@ -149,6 +183,8 @@ impl Preparation {
     }
 
     fn release_bytes(&self, bytes: u64) {
+        #[cfg(test)]
+        crate::sparql::checked_source_tests::observe_release(self, bytes);
         self.inner.used.fetch_sub(bytes, Ordering::Relaxed);
         if let Some(grant) = &self.inner.grant {
             // No preparation lock is held when a grant invokes synchronous wakeups.
@@ -159,6 +195,11 @@ impl Preparation {
     #[cfg(test)]
     pub(crate) fn inner_used(&self) -> u64 {
         self.inner.used.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_used_counter(&self) -> &AtomicU64 {
+        &self.inner.used
     }
 
     /// The allowance not yet reserved. Other clones may reserve it at any moment, so
@@ -177,7 +218,26 @@ impl Preparation {
 
     /// Poll this request's cancellation and absolute deadline.
     pub fn check(&self) -> Result<()> {
-        self.inner.control.check()
+        self.inner.control.check()?;
+        if let Some(query) = &self.query {
+            if query
+                .cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                return Err(Error::Cancelled);
+            }
+            if let Some(cancellation) = &query.cancellation {
+                cancellation.check()?;
+            }
+            if query
+                .deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                return Err(Error::Timeout);
+            }
+        }
+        Ok(())
     }
 
     /// The cancellation, deadline and progress of this request.

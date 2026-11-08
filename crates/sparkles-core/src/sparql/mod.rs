@@ -649,11 +649,14 @@ fn make_source_ctx(
     source: crate::store::BoundReadSource,
     opts: &QueryOptions,
 ) -> Result<(Ctx, Option<Arc<crate::access::GraphAccess>>)> {
-    let (snapshot, prepared_access, preparation) = source.query_input();
-    preparation.check()?;
+    let deadline = opts.effective_deadline(Instant::now())?;
+    let (snapshot, _, preparation) = source.query_input();
+    let preparation = preparation.with_query_controls(
+        opts.cancel.clone(),
+        opts.cancellation.clone(),
+        deadline,
+    )?;
     let snapshot = snapshot.clone();
-    let prepared_access = prepared_access.cloned();
-    let preparation = preparation.clone();
     // Covers the actual Ctx Arc, snapshot header, lazy ledger/owner bookkeeping,
     // and the fixed Arc-backed counters/default policy fields created by Ctx::new.
     // All variable-size query/graph data needs separate admission.
@@ -690,15 +693,27 @@ fn make_source_ctx(
     let mut ctx = Ctx::new(snapshot);
     ctx.read_source = Some(source);
     ctx.source_setup = Some(setup);
-    ctx.deadline = opts.effective_deadline(Instant::now())?;
+    ctx.source_preparation = Some(preparation.clone());
+    ctx.deadline = deadline;
     ctx.cancellation = opts.cancellation.clone();
     if let Some(cancel) = &opts.cancel {
         ctx.cancel = cancel.clone();
     }
     ctx.set_grant(grant);
     ctx.set_memory_parent(parent)?;
+    #[cfg(test)]
+    checked_source_tests::observe_source_context(&ctx);
     ctx.check()?;
     ctx.snap = with_union_default(ctx.snap.clone(), opts);
+    // Declare this sharing handle after Ctx: even an early refusal must destroy
+    // every local policy clone before the original source's credit is returned.
+    let prepared_access = ctx
+        .read_source
+        .as_ref()
+        .expect("checked source")
+        .query_input()
+        .1
+        .cloned();
     let access = match prepared_access {
         Some(access) => {
             if opts
@@ -735,10 +750,14 @@ fn resolve_graphs<'a>(
     iris: impl Iterator<Item = &'a str>,
     count: usize,
 ) -> Result<Vec<Id>> {
-    let Some(source) = ctx.read_source.as_ref() else {
+    let Some(_source) = ctx.read_source.as_ref() else {
         return Ok(iris.map(|iri| ctx.graph_id(iri)).collect());
     };
-    let preparation = source.query_input().2.clone();
+    let preparation = ctx
+        .source_preparation
+        .as_ref()
+        .expect("source controls")
+        .clone();
     let bytes = count
         .checked_mul(std::mem::size_of::<Id>())
         .and_then(|n| u64::try_from(n).ok())
@@ -771,14 +790,13 @@ fn restrict_source_ctx(
         return Ok(());
     };
     let preparation = ctx
-        .read_source
+        .source_preparation
         .as_ref()
-        .expect("checked source")
-        .query_input()
-        .2
+        .expect("source controls")
         .clone();
     if access.reads_all() {
-        return Ok(());
+        ctx.graphs = Some(access.clone());
+        return ctx.check();
     }
     let mut visible = Buffer::new(&preparation)?;
     let mut every = true;
@@ -799,8 +817,13 @@ fn restrict_source_ctx(
         }
         Ok(true)
     })?;
+    #[cfg(test)]
+    checked_source_tests::observe_union(&preparation, None);
     // GSPO visits distinct graph ids in order; do not populate an uncredited
     // snapshot policy cache or allocate an intermediate enumeration.
+    // A failed second union must destroy the first union payload before its
+    // actual credit returns. Locals drop in reverse declaration order.
+    let mut kept = preparation.reserve(0)?;
     let mut dataset = std::mem::take(&mut ctx.dataset);
     let allowed = |graph: Id| -> Result<bool> {
         preparation.check()?;
@@ -826,7 +849,6 @@ fn restrict_source_ctx(
             })
         }
     };
-    let mut kept = preparation.reserve(0)?;
     let mut union = || -> Result<Vec<Id>> {
         let bytes = (visible.len() as u64)
             .checked_mul(std::mem::size_of::<Id>() as u64)
@@ -842,6 +864,8 @@ fn restrict_source_ctx(
             preparation.check()?;
             ids.push(graph);
         }
+        #[cfg(test)]
+        checked_source_tests::observe_union(&preparation, Some((ids.as_ptr() as usize, bytes)));
         Ok(ids)
     };
     let filter = |mut ids: Vec<Id>| -> Result<Vec<Id>> {
@@ -938,6 +962,9 @@ pub fn query(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<QueryR
 
 /// Query a genuine retained source. Current policy is still required for an
 /// evidence source; a prepared source retains and applies its exact bound policy.
+/// Neither source grants current authorization. Trusted callers must establish
+/// current authority and source availability, and prepare a changed required
+/// policy rather than bypass a rejected override by retrying without one.
 /// The source and descendants share its original Preparation allowance. This
 /// entry does not make legacy raw result extractors a bounded ownership API.
 pub fn query_source(
@@ -1812,4 +1839,4 @@ mod paid_final_table_tests {
 }
 
 #[cfg(test)]
-mod checked_source_tests;
+pub(crate) mod checked_source_tests;

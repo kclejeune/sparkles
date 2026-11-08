@@ -352,35 +352,52 @@ pub struct HistoryOptions {
     pub deadline: Option<std::time::Instant>,
 }
 
+// A prepared scan must poll the complete same-root control view, including
+// composed query cancellation, inside decoders and their lock waits. Ordinary
+// historical readers keep the existing HistoryOptions behavior unchanged.
+pub(crate) trait ReadControl: Send + Sync {
+    fn check_read(&self) -> Result<()>;
+}
+
+impl ReadControl for HistoryOptions {
+    fn check_read(&self) -> Result<()> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(Error::Cancelled);
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(Error::Timeout);
+        }
+        Ok(())
+    }
+}
+
+impl ReadControl for crate::access::Preparation {
+    fn check_read(&self) -> Result<()> {
+        self.check()
+    }
+}
+
 /// Fixed selector/result/error metadata, including bounded snapshot names.
 pub(crate) const READ_METADATA_BYTES: u64 = 1024;
 
 /// One read's preparation limit. This does not resize the shared history cache.
 #[derive(Clone, Copy)]
 pub(crate) struct ReadLimit<'a> {
-    pub(crate) options: &'a HistoryOptions,
+    pub(crate) options: &'a dyn ReadControl,
     pub(crate) memory: Option<u64>,
     pub(crate) held: u64,
 }
 
 impl ReadLimit<'_> {
     pub(crate) fn check(&self, bytes: u64) -> Result<()> {
-        use std::sync::atomic::Ordering;
-        if self
-            .options
-            .cancel
-            .as_ref()
-            .is_some_and(|c| c.load(Ordering::Relaxed))
-        {
-            return Err(Error::Cancelled);
-        }
-        if self
-            .options
-            .deadline
-            .is_some_and(|t| std::time::Instant::now() >= t)
-        {
-            return Err(Error::Timeout);
-        }
+        self.options.check_read()?;
         if let Some(limit) = self.memory
             && bytes.saturating_add(self.held) > limit
         {

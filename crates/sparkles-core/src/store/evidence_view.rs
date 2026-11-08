@@ -46,6 +46,11 @@ impl std::fmt::Debug for BoundEvidenceView {
 }
 
 impl BoundEvidenceView {
+    #[cfg(test)]
+    pub(crate) fn test_source_bytes(&self) -> u64 {
+        self.inner._held.bytes()
+    }
+
     /// Retain the genuine RDF/configuration source and its original admission.
     /// This owner grants no current authorization or independent output credit.
     pub fn read_source(&self) -> super::BoundReadSource {

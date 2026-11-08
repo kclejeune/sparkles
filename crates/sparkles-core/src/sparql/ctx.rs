@@ -590,9 +590,6 @@ pub struct Ctx {
     /// overlay, charged to the query until the context drops.
     pub(super) reasoning_memory: Vec<QueryMemoryLease>,
     pub snap: Arc<Snapshot>,
-    // Actual source and controlled mask owners precede their final setup credit.
-    pub(super) read_source: Option<crate::store::BoundReadSource>,
-    pub(super) source_view: Option<crate::access::PreparedView>,
     local: RwLock<AppendVocab>,
     values: ValueCache,
     next_bnode: AtomicU64,
@@ -721,6 +718,11 @@ pub struct Ctx {
     // Data and weak retained caches drop before final ledger ownership.
     fast: FastMemory,
     memory: std::sync::OnceLock<Arc<QueryMemoryLedger>>,
+    // All ordinary payloads, including graphs and ledger callbacks, retire before
+    // their actual sources. A new mask can share its original source's backing.
+    pub(super) source_view: Option<crate::access::PreparedView>,
+    pub(super) read_source: Option<crate::store::BoundReadSource>,
+    pub(super) source_preparation: Option<crate::access::Preparation>,
     pub(super) source_setup: Option<crate::access::Reservation>,
 }
 
@@ -1141,6 +1143,7 @@ impl Ctx {
             snap,
             read_source: None,
             source_view: None,
+            source_preparation: None,
             source_setup: None,
             local: RwLock::new(AppendVocab::default()),
             values: Default::default(),
@@ -1420,7 +1423,11 @@ impl Ctx {
         #[cfg(test)]
         CHECKS.with(|n| n.set(n.get() + 1));
         self.check_memory_failure()?;
-        if let Some(source) = &self.read_source {
+        if let Some(preparation) = &self.source_preparation {
+            // Both source and query absolute controls apply during preparation
+            // and execution, without cursor wait extensions or renewed deadlines.
+            preparation.check()?;
+        } else if let Some(source) = &self.read_source {
             // Source preparation has its original absolute deadline. Cursor wait
             // pauses never extend it, and no cancellation watcher is required.
             source.query_input().2.check()?;
