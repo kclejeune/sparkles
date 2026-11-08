@@ -117,13 +117,16 @@ fn strict_reopened_same_uuid_is_a_foreign_runtime_before_parse() {
 fn ordinary_unbound_retained_commit_name_and_time_remain_supported() {
     let dir = tempfile::tempdir().unwrap();
     let store = super::super::Store::open(dir.path(), Default::default()).unwrap();
-    let clock = Arc::new(std::sync::atomic::AtomicI64::new(1000));
+    // Commit times are clamped to be monotonic, so the fixture clock starts
+    // after the creation commit and separates the two writes.
+    let base = store.head_commit().timestamp_ms + 100_000;
+    let clock = Arc::new(std::sync::atomic::AtomicI64::new(base));
     let observed = clock.clone();
     store.set_clock(Arc::new(move || observed.load(Ordering::Relaxed)));
     update(&store, "INSERT DATA { <urn:first> <urn:p> 1 }");
     let first = store.head_commit();
     store.create_snapshot("legacy", &At::Head, None).unwrap();
-    clock.store(2000, Ordering::Relaxed);
+    clock.store(base + 1_000, Ordering::Relaxed);
     update(&store, "INSERT DATA { <urn:second> <urn:p> 2 }");
     let prep = preparation();
     assert!(store.evidence_view(&At::Commit(first.seq), &prep).is_err());
@@ -141,7 +144,8 @@ fn ordinary_unbound_retained_commit_name_and_time_remain_supported() {
                 policy.clone(),
                 "SELECT ?s WHERE { ?s <urn:p> ?o }"
             ),
-            ["<urn:first>"]
+            ["<urn:first>"],
+            "{at:?}"
         );
     }
 }
