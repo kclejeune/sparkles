@@ -1,3 +1,6 @@
+#[cfg(test)]
+pub(crate) mod test_alloc;
+
 pub mod access;
 pub mod algo;
 pub mod annotations;

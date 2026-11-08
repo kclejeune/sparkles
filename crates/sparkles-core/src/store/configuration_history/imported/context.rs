@@ -608,8 +608,17 @@ fn resolve_prior(
     pending
         .try_reserve_exact(count)
         .map_err(|_| preparation.exhausted())?;
-    pending.push(start);
     visited[start] = true;
+    // ImportedUnbound refers only to a declared earlier-source dependency.
+    // The starting source's own publication cannot establish that ancestry.
+    for digest in &sources.nodes[start].descriptor.value.sources {
+        preparation.check()?;
+        let next = source_index(sources, *digest)?;
+        if !visited[next] {
+            visited[next] = true;
+            pending.push(next);
+        }
+    }
     while let Some(index) = pending.pop() {
         preparation.check()?;
         let node = &sources.nodes[index];
@@ -646,4 +655,17 @@ fn resolve_prior(
     Err(managed_history::unavailable(
         "imported base publication is not in its reachable original sources",
     ))
+}
+
+#[cfg(test)]
+impl Sources {
+    /// Tests enter the private resolver through real captured source owners.
+    pub(in crate::store) fn test_resolve_prior(
+        &self,
+        start: Sha256Digest,
+        identity: ConfigurationIdentity,
+        preparation: &Preparation,
+    ) -> Result<()> {
+        resolve_prior(self, source_index(self, start)?, identity, preparation)
+    }
 }

@@ -53,6 +53,11 @@ impl Preparation {
         self.inner.used.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_used_counter(&self) -> &AtomicU64 {
+        &self.inner.used
+    }
+
     /// The allowance not yet reserved. Other clones may reserve it at any moment, so
     /// this only sizes work; storage still needs a [`reserve`](Self::reserve).
     pub(crate) fn room(&self) -> u64 {

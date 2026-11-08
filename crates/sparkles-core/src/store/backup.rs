@@ -298,6 +298,8 @@ struct CheckedPrimaryCapture {
     wal_extent: u64,
     wal_digest: crate::evidence::Sha256Digest,
     first_wal_seq: Option<u64>,
+    metadata_pin: super::configuration_history::SourceFilePin,
+    commit_pin: super::configuration_history::SourceFilePin,
     _held: crate::access::Reservation,
 }
 
@@ -397,6 +399,23 @@ impl CheckedPrimaryCapture {
                 bytes: file.len,
                 sha256: crate::evidence::Sha256Digest::from_digest_bytes(digest.finalize().into()),
             };
+            // These exact bytes supplied the actual producer/basis proof.
+            // A later read of the same mutable FD cannot mint another pin.
+            let checked = match file
+                .path
+                .strip_prefix(self.capture.data.generation.as_str())
+            {
+                Some("/meta.json") => Some(&self.metadata_pin),
+                Some("/commit.json") => Some(&self.commit_pin),
+                _ => None,
+            };
+            if checked
+                .is_some_and(|checked| checked.bytes != pin.bytes || checked.sha256 != pin.sha256)
+            {
+                return Err(super::managed_history::unavailable(
+                    "checked primary member changed before descriptor",
+                ));
+            }
             if files.insert(file.path.clone(), pin).is_some() {
                 return Err(super::managed_history::unavailable(
                     "duplicate native source metadata",
@@ -509,7 +528,7 @@ impl ConfigurationCapture {
         &self,
         expected: crate::evidence::Sha256Digest,
         preparation: &crate::access::Preparation,
-    ) -> Result<()> {
+    ) -> Result<super::configuration_history::SourceFilePin> {
         preparation.check()?;
         // The fixed streaming hash state is paid before lending the remaining
         // allowance to input/JSON/type decoding. No serialized Meta Vec exists.
@@ -559,7 +578,12 @@ impl ConfigurationCapture {
                 "captured index metadata differs from its actual physical producer",
             ));
         }
-        preparation.check()
+        let pin = super::configuration_history::SourceFilePin {
+            bytes: extent,
+            sha256: crate::evidence::Sha256Digest::of_bytes(&bytes, preparation.control())?,
+        };
+        preparation.check()?;
+        Ok(pin)
     }
 
     fn checked_primary(
@@ -596,10 +620,10 @@ impl ConfigurationCapture {
             return Err(bad());
         }
         let basis = self.original.native.ok_or_else(bad)?;
-        self.check_metadata_basis(basis.metadata, preparation)?;
+        let metadata_pin = self.check_metadata_basis(basis.metadata, preparation)?;
         // This ephemeral loan admits the input, JSON scratch and decoded origin.
         // No publication callback can run while it holds the remaining allowance.
-        let (base_binding, strict_from) = {
+        let (base_binding, strict_from, commit_pin) = {
             let allowance = preparation.room();
             let _loan = preparation.reserve(allowance)?;
             let options = crate::history::HistoryOptions {
@@ -626,7 +650,15 @@ impl ConfigurationCapture {
             {
                 return Err(bad());
             }
-            (decoded.value.configuration, decoded.value.wal_strict_from)
+            let pin = super::configuration_history::SourceFilePin {
+                bytes: extent,
+                sha256: crate::evidence::Sha256Digest::of_bytes(&bytes, preparation.control())?,
+            };
+            (
+                decoded.value.configuration,
+                decoded.value.wal_strict_from,
+                pin,
+            )
         };
         let family = self.original.identities.family();
         let coverage = {
@@ -747,6 +779,8 @@ impl ConfigurationCapture {
             wal_extent: extent,
             wal_digest: crate::evidence::Sha256Digest::from_digest_bytes(digest.finalize().into()),
             first_wal_seq,
+            metadata_pin,
+            commit_pin,
             _held: held,
         })
     }
@@ -5317,5 +5351,66 @@ mod tests {
         let s = Store::open(&root, StoreOptions::default()).unwrap();
         assert_eq!(s.restored_from(), Some(from));
         assert_eq!(s.forked_from(), Some(fork));
+    }
+    #[cfg(unix)]
+    fn checked_member_handoff_refuses_mutation(member: &str) {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        let store = history_store(&root);
+        ins(&store, 1);
+        let preparation = capture_preparation();
+        let room = preparation.room();
+        let checked = store
+            .configuration_capture("checked-member-handoff", &Default::default(), &preparation)
+            .unwrap()
+            .checked_primary(&preparation)
+            .unwrap();
+        let path = root.join(&checked.capture.data.generation).join(member);
+        let original = std::fs::read(&path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        let quads = if member == "meta.json" {
+            &mut value["quads"]
+        } else {
+            &mut value["commit"]["quads"]
+        };
+        let before = quads.as_u64().unwrap();
+        assert!(
+            before < 9,
+            "keep this genuine valid mutation the same length"
+        );
+        *quads = (before + 1).into();
+        let changed = serde_json::to_vec_pretty(&value).unwrap();
+        assert_ne!(changed, original);
+        assert_eq!(changed.len(), original.len());
+        // This keeps the captured FD and extent; it changes a known typed value
+        // after the actual producer/basis check and before descriptor hashing.
+        std::fs::write(&path, changed).unwrap();
+        let result = checked.describe_native(&preparation);
+        std::fs::write(&path, &original).unwrap();
+        let refused = result.as_ref().err().is_some_and(|error| {
+            error.code() == "evidence-unavailable"
+                && error
+                    .to_string()
+                    .contains("checked primary member changed before descriptor")
+        });
+        drop(result);
+        assert_eq!(leases(&store), 0);
+        assert_eq!(preparation.room(), room);
+        assert!(
+            refused,
+            "a descriptor must not mint a new pin for changed checked {member} bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_checked_metadata_pin_survives_until_source_descriptor() {
+        checked_member_handoff_refuses_mutation("meta.json");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genuine_checked_commit_pin_survives_until_source_descriptor() {
+        checked_member_handoff_refuses_mutation("commit.json");
     }
 }
