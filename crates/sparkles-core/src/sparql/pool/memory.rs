@@ -1,7 +1,7 @@
 //! Explicit reservation adapters. Ordinary query accounting does not call these.
 
 use super::*;
-use sparkles_budget::{DomainId, MemoryParent, ParentRefused, Scope};
+use sparkles_budget::{DomainId, ParentHandle, ParentRefused, Scope};
 
 /// Reserved credit in the fixed work and retained branches. These counters are
 /// neither local live estimates, the cache eviction-policy estimate nor RSS.
@@ -57,7 +57,7 @@ impl QueryPool {
     /// observes background ownership immediately.
     /// Release can invoke the pool's synchronous wake callbacks, including in Drop.
     /// They must not panic; see [`QueryPool::enter`]. Panics are not contained.
-    pub fn work_parent(self: &Arc<Self>) -> Arc<dyn MemoryParent> {
+    pub fn work_parent(self: &Arc<Self>) -> ParentHandle {
         let held = Arc::new(Mutex::new(0u64));
         let take = held.clone();
         let reserve_pool = self.clone();
@@ -96,7 +96,7 @@ impl QueryPool {
     /// A retained-cache parent in this domain's fixed C branch. Separate returned
     /// handles use the same branch counter. Policy changes never enlarge C or
     /// revoke reservations held by callers after eviction.
-    pub fn retained_parent(self: &Arc<Self>) -> Arc<dyn MemoryParent> {
+    pub fn retained_parent(self: &Arc<Self>) -> ParentHandle {
         let take = self.clone();
         let give = self.clone();
         self.domain.parent(
@@ -138,7 +138,7 @@ impl PoolGrant {
     /// only pool backing. An owner retaining this parent also retains the grant.
     /// Release can invoke the pool's synchronous wake callbacks, including in Drop.
     /// They must not panic; see [`QueryPool::enter`]. Panics are not contained.
-    pub fn memory_parent(self: &Arc<Self>) -> Arc<dyn MemoryParent> {
+    pub fn memory_parent(self: &Arc<Self>) -> ParentHandle {
         let take = self.clone();
         let give = self.clone();
         self.pool.domain.parent(

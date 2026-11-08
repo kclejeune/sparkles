@@ -24,7 +24,7 @@
 //! steps held unused count against the limit and in the peak.
 
 use parking_lot::Mutex;
-use sparkles_budget::{DomainId, MemoryLease, MemoryParent, ParentRefused, Scope};
+use sparkles_budget::{DomainId, MemoryLease, ParentHandle, ParentRefused, Scope};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -174,7 +174,7 @@ pub(crate) struct Budget {
 /// One owned parent reservation. The atomic is the fast-path published coverage;
 /// the mutex serializes extensions and detaching retired credit, never its release.
 struct Backing {
-    parent: Arc<dyn MemoryParent>,
+    parent: ParentHandle,
     domain: DomainId,
     reserved: AtomicUsize,
     lease: Mutex<MemoryLease>,
@@ -198,7 +198,7 @@ impl Budget {
         Self::with_parent(limit, None)
     }
 
-    pub fn with_parent(limit: Option<usize>, parent: Option<Arc<dyn MemoryParent>>) -> Arc<Budget> {
+    pub fn with_parent(limit: Option<usize>, parent: Option<ParentHandle>) -> Arc<Budget> {
         Arc::new(Budget {
             limit: limit.unwrap_or(usize::MAX),
             step: limit.map_or(MAX_STEP, |l| (l >> STEP_SHIFT).min(MAX_STEP)),
@@ -206,9 +206,9 @@ impl Budget {
             peak: AtomicUsize::new(0),
             parent: parent.map(|parent| Backing {
                 domain: parent.domain(),
-                // All MemoryParent implementations are sealed; zero never invokes
+                // ParentHandle has no public backend implementation; zero never invokes
                 // a backend and cannot refuse or allocate reservation credit.
-                lease: Mutex::new(parent.clone().reserve(0).expect("zero reservation")),
+                lease: Mutex::new(parent.reserve(0).expect("zero reservation")),
                 reserved: AtomicUsize::new(0),
                 parent,
             }),
@@ -227,7 +227,7 @@ impl Budget {
     pub fn peak(&self) -> usize {
         self.peak.load(Ordering::Relaxed)
     }
-    pub fn parent(&self) -> Option<Arc<dyn MemoryParent>> {
+    pub fn parent(&self) -> Option<ParentHandle> {
         self.parent.as_ref().map(|p| p.parent.clone())
     }
     pub fn domain(&self) -> DomainId {

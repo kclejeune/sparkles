@@ -2,7 +2,7 @@
 use super::pool::PoolGrant;
 use crate::error::{Budget, BudgetKind, Error, Result};
 use parking_lot::Mutex;
-use sparkles_budget::{MemoryDomain, MemoryLease, MemoryParent, ParentRefused, Scope};
+use sparkles_budget::{MemoryDomain, MemoryLease, ParentHandle, ParentRefused, Scope};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,7 +17,7 @@ struct State {
     next: u64,
     cursor: bool,
     calls: usize,
-    upstream: Option<Arc<dyn MemoryParent>>,
+    upstream: Option<ParentHandle>,
 }
 /// The owner id of an eager context's fast account, the first owner of its ledger.
 pub(crate) const PRIMARY: u64 = 1;
@@ -240,16 +240,13 @@ impl QueryMemoryLedger {
             }),
         })
     }
-    pub(crate) fn nested(
-        grant: Option<Arc<PoolGrant>>,
-        parent: Arc<dyn MemoryParent>,
-    ) -> Arc<Self> {
+    pub(crate) fn nested(grant: Option<Arc<PoolGrant>>, parent: ParentHandle) -> Arc<Self> {
         let mut ledger = Self::seeded(grant, 0, 0, 0);
         let state = Arc::get_mut(&mut ledger)
             .expect("fresh ledger")
             .state
             .get_mut();
-        state.owners[0].lease = Some(parent.clone().reserve(0).expect("sealed zero reservation"));
+        state.owners[0].lease = Some(parent.reserve(0).expect("sealed zero reservation"));
         state.upstream = Some(parent);
         ledger
     }
@@ -327,7 +324,7 @@ impl QueryMemoryLedger {
             let lease = state
                 .upstream
                 .as_ref()
-                .map(|parent| parent.clone().reserve(0).expect("sealed zero reservation"));
+                .map(|parent| parent.reserve(0).expect("sealed zero reservation"));
             state.owners.push(Account {
                 exact,
                 owner: owner.clone(),
@@ -346,7 +343,7 @@ impl QueryMemoryLedger {
         self: &Arc<Self>,
         grant: Option<Arc<PoolGrant>>,
         limit: u64,
-    ) -> Result<Arc<dyn MemoryParent>> {
+    ) -> Result<ParentHandle> {
         let factory = grant
             .as_ref()
             .map_or(MemoryDomain::unpooled(), |g| g.memory_domain());

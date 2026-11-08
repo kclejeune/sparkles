@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(super) mod controlled;
+pub(crate) mod controlled;
 
 pub use crate::INFERRED_GRAPH;
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";

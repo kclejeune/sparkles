@@ -10,10 +10,79 @@ pub(crate) fn prepare(
     snap: &Arc<Snapshot>,
     preparation: &Preparation,
 ) -> Result<PreparedView> {
+    prepare_input(Input::Legacy { original, snap }, preparation)
+}
+
+pub(crate) fn prepare_selected(
+    selected: crate::store::bound_read_source::PreparedRead,
+    preparation: &Preparation,
+) -> Result<PreparedView> {
+    prepare_input(Input::Selected(selected), preparation)
+}
+
+enum Input<'a> {
+    Legacy {
+        original: &'a GraphAccess,
+        snap: &'a Arc<Snapshot>,
+    },
+    Selected(crate::store::bound_read_source::PreparedRead),
+}
+
+impl Input<'_> {
+    fn original(&self) -> &GraphAccess {
+        match self {
+            Self::Legacy { original, .. } => original,
+            Self::Selected(selected) => selected.policy(),
+        }
+    }
+
+    fn snapshot(&self) -> &Arc<Snapshot> {
+        match self {
+            Self::Legacy { snap, .. } => snap,
+            Self::Selected(selected) => selected.snapshot(),
+        }
+    }
+
+    fn selected(self) -> Option<crate::store::bound_read_source::PreparedRead> {
+        match self {
+            Self::Legacy { .. } => None,
+            Self::Selected(selected) => Some(selected),
+        }
+    }
+}
+
+fn finish(
+    access: Arc<GraphAccess>,
+    snapshot: Arc<Snapshot>,
+    held: Reservation,
+    preparation: &Preparation,
+    input: Input<'_>,
+) -> Result<PreparedView> {
+    PreparedView::new_selected(access, snapshot, held, preparation, input.selected())
+}
+
+fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<PreparedView> {
+    // The legacy cache stores raw snapshots without their paid view owner.
+    // A strict Store-minted preparation must not install its newly paid mask
+    // there or consume that unowned cached alias as proof of retention.
+    let use_legacy_cache = matches!(&input, Input::Legacy { .. });
+    let original = input.original();
+    let snap = input.snapshot();
     preparation.stage("preparing permission view")?;
     // The input snapshot and its persistent delta belong to the caller. The returned
     // view is charged only for storage this preparation creates or keeps alive alone.
     let mut held = preparation.reserve(PreparedView::header_bytes()?)?;
+    if matches!(&input, Input::Selected(_)) {
+        // The strict view additionally retains the invocation's original policy,
+        // not merely the bound copies. Admit its shared backing before cloning it.
+        let read_bytes = graphs_bytes(&original.read, preparation)?;
+        let write_bytes = graphs_bytes(&original.write, preparation)?;
+        let original_bytes = 256u64
+            .checked_add(read_bytes)
+            .and_then(|bytes| bytes.checked_add(write_bytes))
+            .ok_or_else(|| preparation.exhausted())?;
+        held.merge(preparation.reserve(original_bytes)?);
+    }
     // Shared policy definitions are retained too. Inspect their sizes with controls
     // before taking the returned owner's Arc references.
     if let Some(rules) = &original.triples {
@@ -57,7 +126,7 @@ pub(crate) fn prepare(
     let Some(rules) = access.triples.as_ref().filter(|_| hides) else {
         // A policy that hides no triples keeps an existing mask, which only hides more.
         preparation.check()?;
-        return PreparedView::new(access, snap.clone(), held, preparation);
+        return finish(access, snap.clone(), held, preparation, input);
     };
     for rule in &rules.rules {
         preparation.check()?;
@@ -79,16 +148,20 @@ pub(crate) fn prepare(
         }
         drop(key_held);
         preparation.check()?;
-        return PreparedView::new(access, snap.clone(), held, preparation);
+        return finish(access, snap.clone(), held, preparation, input);
     }
-    let existing = snap.counts.prepared_mask_slot(&key, preparation)?;
+    let existing = if use_legacy_cache {
+        snap.counts.prepared_mask_slot(&key, preparation)?
+    } else {
+        None
+    };
     if let Some(slot) = &existing {
         let slot = preparation.lock(slot)?;
         if let Some(cached) = &*slot {
             // The view may outlive the cache entry, so it owns the mask's own storage.
             held.merge(preparation.reserve(mask_storage(cached))?);
             preparation.check()?;
-            return PreparedView::new(access, cached.clone(), held, preparation);
+            return finish(access, cached.clone(), held, preparation, input);
         }
     }
     // Build outside the slot lock. User progress and controlled provider helpers
@@ -97,18 +170,20 @@ pub(crate) fn prepare(
     let (snapshot, derived) = apply_controlled(snap, hidden, &key, preparation)?;
     held.merge(derived);
     preparation.check()?;
-    if let Some(slot) = existing {
-        let mut slot = preparation.lock(&slot)?;
-        if slot.is_none() {
-            *slot = Some(snapshot.clone());
+    if use_legacy_cache {
+        if let Some(slot) = existing {
+            let mut slot = preparation.lock(&slot)?;
+            if slot.is_none() {
+                *slot = Some(snapshot.clone());
+            }
+        } else {
+            snap.counts
+                .cache_prepared_mask(key, snapshot.clone(), preparation)?;
         }
-    } else {
-        snap.counts
-            .cache_prepared_mask(key, snapshot.clone(), preparation)?;
     }
     drop(key_held);
     preparation.check()?;
-    PreparedView::new(access, snapshot, held, preparation)
+    finish(access, snapshot, held, preparation, input)
 }
 
 fn already_masked() -> Error {

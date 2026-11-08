@@ -8,6 +8,25 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
+/// A cooperative computation stop, separate from byte admission or authority.
+/// A retained partial result may finalize under its original byte parent while
+/// its original work control remains stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkStopped {
+    Cancelled,
+    Timeout,
+}
+
+impl fmt::Display for WorkStopped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Cancelled => "computation was cancelled",
+            Self::Timeout => "computation deadline expired",
+        })
+    }
+}
+impl std::error::Error for WorkStopped {}
+
 /// The identity of an accounting domain. It neither constructs parents nor retains
 /// a dataset, query or payload. Clones refer to the same identity allocation.
 #[derive(Clone)]
@@ -127,52 +146,190 @@ impl MemoryDomain {
         &self,
         reserve: impl Fn(u64) -> Result<(), ParentRefused> + Send + Sync + 'static,
         release: impl Fn(u64) + Send + Sync + 'static,
-    ) -> Arc<dyn MemoryParent> {
-        Arc::new(Parent {
-            domain: self.id(),
-            reserve: Box::new(reserve),
-            release: Box::new(release),
+    ) -> ParentHandle {
+        // Compatibility constructor for existing trusted backends. It does not
+        // certify admission of their separately captured allocations.
+        self.parent_with_header(
+            reserve,
+            move |_: &ParentHandle, bytes| release(bytes),
+            (),
+            u64::MAX,
+        )
+        .expect("the representable fixed parent layout fits u64")
+    }
+
+    /// Bind a paid backend after admitting both its actual allocation layouts.
+    /// The caller supplies its genuine header owner; it is stored inline after
+    /// both callbacks. Release borrows the live handle for safe reentrancy.
+    /// This does not qualify allocations hidden in unrelated callback captures.
+    pub fn parent_with_header<R, G, H>(
+        &self,
+        reserve: R,
+        release: G,
+        header: H,
+        admitted: u64,
+    ) -> Result<ParentHandle, ParentRefused>
+    where
+        R: Fn(u64) -> Result<(), ParentRefused> + Send + Sync + 'static,
+        G: Fn(&ParentHandle, u64) + Send + Sync + 'static,
+        H: Send + Sync + 'static,
+    {
+        // Couple stack-owned captures before any fallible check. On refusal
+        // their payloads retire before the real header owner.
+        let backend = Backend {
+            reserve,
+            release,
+            _header: header,
+        };
+        let arc = arc_layout::<ParentState>()?;
+        let boxed = u64::try_from(std::alloc::Layout::new::<Backend<R, G, H>>().size())
+            .map_err(|_| ParentRefused::Overflow)?;
+        let required = arc.checked_add(boxed).ok_or(ParentRefused::Overflow)?;
+        if required > admitted {
+            return Err(ParentRefused::InsufficientCredit {
+                reserved: admitted,
+                requested: required,
+            });
+        }
+        let backend = BackendOwner(Some(Box::new(backend)));
+        Ok(ParentHandle {
+            inner: Shared::new(ParentState {
+                domain: self.id(),
+                backend,
+            }),
         })
     }
 }
 
-mod private {
-    pub trait Sealed {}
+fn arc_layout<T>() -> Result<u64, ParentRefused> {
+    let counters = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>();
+    let (layout, _) = counters
+        .extend(std::alloc::Layout::new::<T>())
+        .map_err(|_| ParentRefused::Overflow)?;
+    u64::try_from(layout.pad_to_align().size()).map_err(|_| ParentRefused::Overflow)
 }
 
-/// An object-safe reservation source. Implementations are bound through
-/// [`MemoryDomain::parent`]; there is no public unowned release operation.
+// This sized owner has no Weak/raw/Arc conversion. Every strong Drop consumes
+// its Arc through into_inner. The sole winner receives T only after the Arc
+// allocation was freed; losers receive nothing. All clones use this same path.
+struct Shared<T>(Option<Arc<T>>);
+impl<T> Shared<T> {
+    fn new(value: T) -> Self {
+        Self(Some(Arc::new(value)))
+    }
+    fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(
+            self.0.as_ref().expect("live owner"),
+            other.0.as_ref().expect("live owner"),
+        )
+    }
+}
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0.as_deref().expect("live owner")
+    }
+}
+impl<T> Drop for Shared<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take().and_then(Arc::into_inner) {
+            drop(value);
+        }
+    }
+}
+
+trait BackendOps: Send + Sync {
+    fn reserve(&self, bytes: u64) -> Result<(), ParentRefused>;
+    fn release(&self, parent: &ParentHandle, bytes: u64);
+    fn retire(self: Box<Self>);
+}
+struct Backend<R, G, H> {
+    reserve: R,
+    release: G,
+    _header: H,
+}
+// The callee's moved-out Box parameter is freed before its returned T can be
+// destroyed by the caller. Stable safe Rust, without Box::into_inner or unsafe.
+fn unbox<T>(boxed: Box<T>) -> T {
+    *boxed
+}
+impl<R, G, H> BackendOps for Backend<R, G, H>
+where
+    R: Fn(u64) -> Result<(), ParentRefused> + Send + Sync,
+    G: Fn(&ParentHandle, u64) + Send + Sync,
+    H: Send + Sync,
+{
+    fn reserve(&self, bytes: u64) -> Result<(), ParentRefused> {
+        (self.reserve)(bytes)
+    }
+    fn release(&self, parent: &ParentHandle, bytes: u64) {
+        (self.release)(parent, bytes);
+    }
+    fn retire(self: Box<Self>) {
+        drop(unbox(self));
+    }
+}
+struct BackendOwner(Option<Box<dyn BackendOps>>);
+impl BackendOwner {
+    fn get(&self) -> &dyn BackendOps {
+        self.0.as_deref().expect("live backend")
+    }
+}
+impl Drop for BackendOwner {
+    fn drop(&mut self) {
+        if let Some(backend) = self.0.take() {
+            backend.retire();
+        }
+    }
+}
+struct ParentState {
+    domain: DomainId,
+    backend: BackendOwner,
+}
+
+/// An opaque shallow byte-admission handle with no raw Arc or Weak escape.
+/// It grants no authority or independent allowance. Construct one per operation
+/// and share that exact handle; equal domains alone do not permit lease merging.
 ///
 /// ```compile_fail
 /// use sparkles_budget::MemoryDomain;
 /// let parent = MemoryDomain::new().parent(|_| Ok(()), |_| {});
-/// parent.release(1); // Only an owned lease can return credit.
+/// let weak = std::sync::Arc::downgrade(&parent);
 /// ```
-pub trait MemoryParent: private::Sealed + Send + Sync {
-    fn domain(&self) -> DomainId;
-    fn reserve(self: Arc<Self>, bytes: u64) -> Result<MemoryLease, ParentRefused>;
+#[derive(Clone)]
+pub struct ParentHandle {
+    inner: Shared<ParentState>,
 }
-
-struct Parent {
-    domain: DomainId,
-    reserve: Box<dyn Fn(u64) -> Result<(), ParentRefused> + Send + Sync>,
-    release: Box<dyn Fn(u64) + Send + Sync>,
-}
-
-impl private::Sealed for Parent {}
-impl MemoryParent for Parent {
-    fn domain(&self) -> DomainId {
-        self.domain.clone()
+impl ParentHandle {
+    pub fn domain(&self) -> DomainId {
+        self.inner.domain.clone()
     }
-
-    fn reserve(self: Arc<Self>, bytes: u64) -> Result<MemoryLease, ParentRefused> {
+    pub fn same_parent(&self, other: &Self) -> bool {
+        self.inner.same(&other.inner)
+    }
+    pub fn reserve(&self, bytes: u64) -> Result<MemoryLease, ParentRefused> {
         if bytes != 0 {
-            (self.reserve)(bytes)?;
+            self.inner.backend.get().reserve(bytes)?;
         }
         Ok(MemoryLease {
-            parent: self,
+            parent: self.clone(),
             bytes,
         })
+    }
+    fn release(&self, bytes: u64) {
+        self.inner.backend.get().release(self, bytes);
+    }
+}
+impl fmt::Debug for ParentHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParentHandle")
+            .field("domain", &self.domain())
+            .finish_non_exhaustive()
     }
 }
 
@@ -187,7 +344,7 @@ impl MemoryParent for Parent {
 /// let duplicate = lease.clone();
 /// ```
 pub struct MemoryLease {
-    parent: Arc<Parent>,
+    parent: ParentHandle,
     bytes: u64,
 }
 
@@ -206,7 +363,7 @@ impl MemoryLease {
     }
 
     pub fn domain(&self) -> DomainId {
-        self.parent.domain.clone()
+        self.parent.domain()
     }
 
     /// Add backed credit before publishing the larger owned amount.
@@ -216,7 +373,7 @@ impl MemoryLease {
             .checked_add(bytes)
             .ok_or(ParentRefused::Overflow)?;
         if bytes != 0 {
-            (self.parent.reserve)(bytes)?;
+            self.parent.inner.backend.get().reserve(bytes)?;
             self.bytes = next;
         }
         Ok(())
@@ -233,7 +390,7 @@ impl MemoryLease {
             })?;
         self.bytes = next;
         if bytes != 0 {
-            (self.parent.release)(bytes);
+            self.parent.release(bytes);
         }
         Ok(())
     }
@@ -259,7 +416,7 @@ impl MemoryLease {
         if self.domain() != other.domain() {
             return Err(ParentRefused::ForeignDomain);
         }
-        if !Arc::ptr_eq(&self.parent, &other.parent) {
+        if !self.parent.same_parent(&other.parent) {
             return Err(ParentRefused::DifferentParent);
         }
         let next = self
@@ -273,12 +430,11 @@ impl MemoryLease {
 
     /// Prepare destination credit before retiring the original contribution. This
     /// may conservatively refuse a move that cannot temporarily back both owners.
-    pub fn try_move_to(&mut self, parent: Arc<dyn MemoryParent>) -> Result<(), ParentRefused> {
+    pub fn try_move_to(&mut self, parent: ParentHandle) -> Result<(), ParentRefused> {
         if self.domain() != parent.domain() {
             return Err(ParentRefused::ForeignDomain);
         }
-        let current: Arc<dyn MemoryParent> = self.parent.clone();
-        if Arc::ptr_eq(&current, &parent) {
+        if self.parent.same_parent(&parent) {
             return Ok(());
         }
         let replacement = parent.reserve(self.bytes)?;
@@ -297,7 +453,7 @@ impl MemoryLease {
 impl Drop for MemoryLease {
     fn drop(&mut self) {
         if self.bytes != 0 {
-            (self.parent.release)(self.bytes);
+            self.parent.release(self.bytes);
         }
     }
 }
@@ -346,7 +502,7 @@ pub struct LiveCredit {
 }
 
 impl LiveCredit {
-    pub fn new(parent: Arc<dyn MemoryParent>) -> Self {
+    pub fn new(parent: ParentHandle) -> Self {
         Self {
             live: 0,
             lease: parent.reserve(0).expect("zero reservation cannot refuse"),
@@ -421,7 +577,7 @@ impl LiveCredit {
         Ok(())
     }
 
-    pub fn try_move_to(&mut self, parent: Arc<dyn MemoryParent>) -> Result<(), ParentRefused> {
+    pub fn try_move_to(&mut self, parent: ParentHandle) -> Result<(), ParentRefused> {
         self.lease.try_move_to(parent)
     }
 

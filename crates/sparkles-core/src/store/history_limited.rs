@@ -1,6 +1,6 @@
 //! Request-scoped historical view preparation. No write or authority is granted here.
 use super::*;
-use crate::history::{At, HistoryOptions, ReadLimit, Resolved};
+use crate::history::{At, HistoryOptions, ReadControl, ReadLimit, Resolved};
 
 /// Where a pinned read starts: an open store, or a branch read without opening it.
 enum PinnedSource<'a> {
@@ -518,6 +518,24 @@ impl Store {
         self.snapshot_pinned_limited(store, at, options, max_memory_bytes)
     }
 
+    pub(super) fn snapshot_at_prepared(
+        &self,
+        logical: &Store,
+        at: &At,
+        preparation: &crate::access::Preparation,
+        memory: u64,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
+        if self.is_branch()
+            || self.owner_dataset_id() != logical.owner_dataset_id()
+            || !Arc::ptr_eq(&self.family, &logical.family)
+        {
+            return Err(Error::invalid(
+                "physical selection requires the actual owning main Store",
+            ));
+        }
+        self.snapshot_pinned_limited(logical, at, preparation, memory)
+    }
+
     /// The state of the branch whose identity is `branch` at `at`, within
     /// `max_memory_bytes`, through this dataset's main store. `branch` is the dataset
     /// id for `main` or the id of a listed branch, so a renamed branch keeps resolving
@@ -567,7 +585,7 @@ impl Store {
         &self,
         store: &Store,
         at: &At,
-        options: &HistoryOptions,
+        options: &dyn ReadControl,
         memory: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
         self.snapshot_from_limited(
@@ -582,7 +600,7 @@ impl Store {
         &self,
         start: PinnedSource<'_>,
         at: &At,
-        options: &HistoryOptions,
+        options: &dyn ReadControl,
         memory: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
         use PinnedSource as Source;
@@ -615,7 +633,7 @@ impl Store {
                 Source::Resident(store) => (
                     store.branch_id(),
                     store
-                        .snapshot_at_limited(requested, options, memory)
+                        .snapshot_at_inner(requested, options, Some(memory))
                         .map(|(snapshot, resolved)| OriginRead::View(snapshot, resolved)),
                 ),
                 Source::Cold(id) => (

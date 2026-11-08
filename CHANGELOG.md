@@ -4,6 +4,17 @@
 
 ### Compatibility
 
+The experimental Rust memory-admission API uses an opaque `ParentHandle` in place
+of `Arc<dyn MemoryParent>`. Parent leases, live credit, query contexts and reasoner
+budgets accept that same handle. Consumers share it with `clone()` and compare
+parents with `same_parent()`; raw Arc and Weak conversion is unavailable. A paid
+backend uses `MemoryDomain::parent_with_header`, whose release callback borrows
+the live handle for reentrant admission. The compatibility `parent` constructor
+retains its two callback arguments but does not certify admission of separate
+captured allocations. This is an unreleased Rust source API change; HTTP and CLI
+wire contracts are unchanged.
+
+
 The adopted HTTP, CLI and public library compatibility policy is documented.
 HTTP descriptions and the standard CLI command tree have compatibility guards against
 a commit-labeled development baseline. No published release baseline exists.

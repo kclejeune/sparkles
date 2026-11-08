@@ -357,6 +357,9 @@ pub struct HistoryOptions {
 // historical readers keep the existing HistoryOptions behavior unchanged.
 pub(crate) trait ReadControl: Send + Sync {
     fn check_read(&self) -> Result<()>;
+    fn no_wait(&self) -> bool {
+        false
+    }
 }
 
 impl ReadControl for HistoryOptions {
@@ -381,6 +384,10 @@ impl ReadControl for HistoryOptions {
 impl ReadControl for crate::access::Preparation {
     fn check_read(&self) -> Result<()> {
         self.check()
+    }
+
+    fn no_wait(&self) -> bool {
+        self.refuses_wait()
     }
 }
 
@@ -427,6 +434,14 @@ impl ReadLimit<'_> {
         &self,
         lock: &'m parking_lot::RwLock<T>,
     ) -> Result<parking_lot::RwLockReadGuard<'m, T>> {
+        if self.options.no_wait() {
+            self.check(0)?;
+            let held = lock.try_read().ok_or_else(|| {
+                Error::invalid("controlled view preparation would wait (no_wait)")
+            })?;
+            self.check(0)?;
+            return Ok(held);
+        }
         crate::task::read_lock(lock, || self.check(0))
     }
 
@@ -436,6 +451,13 @@ impl ReadLimit<'_> {
     ) -> Result<parking_lot::MutexGuard<'m, T>> {
         loop {
             self.check(0)?;
+            if self.options.no_wait() {
+                let held = mutex.try_lock().ok_or_else(|| {
+                    Error::invalid("controlled view preparation would wait (no_wait)")
+                })?;
+                self.check(0)?;
+                return Ok(held);
+            }
             if let Some(guard) = mutex.try_lock_for(std::time::Duration::from_millis(10)) {
                 self.check(0)?;
                 return Ok(guard);

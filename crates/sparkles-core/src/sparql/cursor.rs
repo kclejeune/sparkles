@@ -834,12 +834,48 @@ pub fn select_cursor(
         .map(|(c, _, _)| c)
 }
 
+/// Open a checked SELECT over a genuine Store-minted physical source. Origin,
+/// original current policy, original grant and controls are checked before
+/// parsing. The selected source remains retained through cursor/batch ownership.
+/// Legacy Snapshot-only preparations cannot satisfy this strict entry point.
+/// This does not close legacy parser/result/native ownership outside this route.
+pub fn select_source_cursor(
+    source: crate::store::BoundReadSource,
+    store: &crate::store::Store,
+    query: &str,
+    options: &QueryOptions,
+    cursor: &CursorOptions,
+) -> Result<QueryCursor> {
+    source.validate_strict_use(store, options)?;
+    let snapshot = source.query_input().0.clone();
+    open_pattern_cursor_input(
+        snapshot,
+        query,
+        options,
+        cursor,
+        Some(QueryKind::Select),
+        Some(source),
+    )
+    .map(|(cursor, _, _)| cursor)
+}
+
 fn open_pattern_cursor(
     snapshot: Arc<Snapshot>,
     query: &str,
     options: &QueryOptions,
     cursor: &CursorOptions,
     expected: Option<QueryKind>,
+) -> Result<(QueryCursor, Option<graph::Spec>, QueryKind)> {
+    open_pattern_cursor_input(snapshot, query, options, cursor, expected, None)
+}
+
+fn open_pattern_cursor_input(
+    snapshot: Arc<Snapshot>,
+    query: &str,
+    options: &QueryOptions,
+    cursor: &CursorOptions,
+    expected: Option<QueryKind>,
+    source: Option<crate::store::BoundReadSource>,
 ) -> Result<(QueryCursor, Option<graph::Spec>, QueryKind)> {
     if cursor.batch_rows == 0 || cursor.batch_bytes == 0 {
         return Err(Error::invalid(
@@ -872,7 +908,22 @@ fn open_pattern_cursor(
         let levels = depth::check_query(&parsed)?;
         depth::with_stack(levels, || {
             let planning = Instant::now();
-            let prepared = super::prepare_query(snapshot, &parsed, options, Some(started), None)?;
+            // The public strict boundary validated the original invocation Arc.
+            // Pass only its retained already-bound policy internally; guards
+            // must not be rebound against the masked physical snapshot.
+            let bound_policy = source
+                .as_ref()
+                .and_then(|source| source.query_input().1)
+                .cloned();
+            let prepared = super::prepare_query_input_policy(
+                snapshot,
+                &parsed,
+                options,
+                Some(started),
+                None,
+                source,
+                bound_policy.as_ref(),
+            )?;
             let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
             let levels = levels.max(prepared.plan_depth);
             from_prepared(

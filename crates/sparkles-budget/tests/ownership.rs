@@ -1,8 +1,8 @@
 use sparkles_budget::{
-    LIVE_SLACK, LIVE_STEP, LiveCredit, MemoryDomain, MemoryParent, ParentRefused, Scope,
+    LIVE_SLACK, LIVE_STEP, LiveCredit, MemoryDomain, ParentHandle, ParentRefused, Scope,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 
 #[derive(Default)]
 struct Counts {
@@ -11,7 +11,7 @@ struct Counts {
     releases: AtomicUsize,
 }
 
-fn parent(domain: &MemoryDomain, limit: u64) -> (Arc<dyn MemoryParent>, Arc<Counts>) {
+fn parent(domain: &MemoryDomain, limit: u64) -> (ParentHandle, Arc<Counts>) {
     let counts = Arc::new(Counts::default());
     let take = counts.clone();
     let give = counts.clone();
@@ -315,37 +315,30 @@ fn unwinding_frees_payload_before_return_and_zero_credit_never_calls_backend() {
 fn release_can_reenter_the_parent_without_a_primitive_lock_or_cycle() {
     let domain = MemoryDomain::new();
     let reserved = Arc::new(AtomicU64::new(0));
-    let slot = Arc::new(Mutex::new(None::<std::sync::Weak<dyn MemoryParent>>));
     let take = reserved.clone();
     let give = reserved.clone();
-    let callback = slot.clone();
     let once = Arc::new(AtomicBool::new(false));
     let seen = once.clone();
-    let p = domain.parent(
-        move |n| {
-            take.fetch_add(n, Ordering::SeqCst);
-            Ok(())
-        },
-        move |n| {
-            give.fetch_sub(n, Ordering::SeqCst);
-            if !seen.swap(true, Ordering::SeqCst) {
-                let p = callback
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .upgrade()
-                    .unwrap();
-                drop(p.reserve(1).unwrap());
-            }
-        },
-    );
-    *slot.lock().unwrap() = Some(Arc::downgrade(&p));
-    drop(p.clone().reserve(10).unwrap());
+    let p = domain
+        .parent_with_header(
+            move |n| {
+                take.fetch_add(n, Ordering::SeqCst);
+                Ok(())
+            },
+            move |parent: &ParentHandle, n| {
+                give.fetch_sub(n, Ordering::SeqCst);
+                if !seen.swap(true, Ordering::SeqCst) {
+                    drop(parent.reserve(1).unwrap());
+                }
+            },
+            (),
+            u64::MAX,
+        )
+        .unwrap();
+    drop(p.reserve(10).unwrap());
     assert!(once.load(Ordering::SeqCst));
     assert_eq!(reserved.load(Ordering::SeqCst), 0);
     drop(p);
-    assert!(slot.lock().unwrap().as_ref().unwrap().upgrade().is_none());
 }
 
 #[test]

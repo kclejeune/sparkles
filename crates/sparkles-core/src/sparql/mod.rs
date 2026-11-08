@@ -69,7 +69,7 @@ pub use cursor::{
     AskResult, CursorOptions, CursorPlan, CursorStats, CursorStatus, ExecutionMode, FallbackPolicy,
     GraphBatch, GraphCursor, MaterializedResult, QueryBatch, QueryCursor, QueryExecution,
     ask_streaming, graph_cursor, query_cursor, query_execution, query_execution_with_plan,
-    select_cursor,
+    select_cursor, select_source_cursor,
 };
 pub use exec::{PlanFidelity, PlanInfo};
 pub use policy::{Consumer, PolicyError, choose_execution};
@@ -1447,15 +1447,29 @@ fn prepare_query_input(
     automatic: Option<&CursorOptions>,
     source: Option<crate::store::BoundReadSource>,
 ) -> Result<PreparedQuery> {
+    prepare_query_input_policy(snap, parsed, opts, cursor_started, automatic, source, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_query_input_policy(
+    snap: Arc<Snapshot>,
+    parsed: &Query,
+    opts: &QueryOptions,
+    cursor_started: Option<Instant>,
+    automatic: Option<&CursorOptions>,
+    source: Option<crate::store::BoundReadSource>,
+    prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
+) -> Result<PreparedQuery> {
     let (pattern, dataset, base) = split(parsed);
     extensions::check_family(snap.dataset_id)?;
     let (demand_opts, rdfs_skipped) = demand_options(opts);
-    let mut ctx = make_ctx_input(
+    let mut ctx = make_ctx_input_policy(
         snap,
         demand_opts.as_ref().unwrap_or(opts),
         dataset,
         base,
         source,
+        prepared_policy,
     )?;
     if let Some(started) = cursor_started.filter(|_| automatic.is_none()) {
         ctx.enable_cursor_accounting()?;

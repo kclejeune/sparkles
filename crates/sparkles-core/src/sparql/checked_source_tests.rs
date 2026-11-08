@@ -377,9 +377,44 @@ impl Drop for Observe {
     }
 }
 
+// Retain the genuine counter owner throughout a selected-allocation watch.
+// The allocator only reads its AtomicU64 and records Copy TLS data.
+pub(crate) struct AllocationWatch {
+    _preparation: Preparation,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl AllocationWatch {
+    pub(crate) fn new(pointer: usize, preparation: &Preparation) -> Self {
+        DEALLOCATION.with(|watch| {
+            assert_eq!(watch.get().0, 0, "one selected allocation per test thread");
+            watch.set((
+                pointer,
+                preparation.test_used_counter() as *const _ as usize,
+                0,
+                0,
+            ));
+        });
+        Self {
+            _preparation: preparation.clone(),
+            _thread: std::marker::PhantomData,
+        }
+    }
+    pub(crate) fn observed(&self) -> (u64, usize) {
+        DEALLOCATION.with(|watch| {
+            let (_, _, used, count) = watch.get();
+            (used, count)
+        })
+    }
+}
+impl Drop for AllocationWatch {
+    fn drop(&mut self) {
+        DEALLOCATION.with(|watch| watch.set((0, 0, 0, 0)));
+    }
+}
+
 struct SourceAllocationObserver;
 // SAFETY: System receives exactly the original allocation layouts. Only the
-// selected test thread watches one actual Vec allocation. Its Preparation stays
+// selected test thread watches one actual backing allocation. Its Preparation stays
 // alive until the watch is cleared; the counter points into that retained Inner.
 // The allocator only reads an atomic and updates Copy TLS cells, never allocates,
 // invokes a callback or panics. Other unit-test allocations pass through unchanged.

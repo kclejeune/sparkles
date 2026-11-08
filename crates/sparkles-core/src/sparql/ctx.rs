@@ -930,7 +930,7 @@ impl Ctx {
     /// A distinct reasoning child sharing this query's live total and original
     /// backing. Construct it only when reasoning starts; ordinary execution keeps
     /// its existing lazy fast account. The child retains accounting, not this Ctx.
-    pub fn memory_parent(&self) -> Result<Arc<dyn sparkles_budget::MemoryParent>> {
+    pub fn memory_parent(&self) -> Result<sparkles_budget::ParentHandle> {
         self.memory()
             .child_parent(self.grant.clone(), self.mem_limit)
     }
@@ -939,7 +939,7 @@ impl Ctx {
     /// its own ledger/data lifetime and never reuses the outer primary owner id.
     pub(crate) fn set_memory_parent(
         &mut self,
-        parent: Arc<dyn sparkles_budget::MemoryParent>,
+        parent: sparkles_budget::ParentHandle,
     ) -> Result<()> {
         if self.memory.get().is_some()
             || self.fast.live.load(Ordering::Relaxed) != 0
