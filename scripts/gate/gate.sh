@@ -337,7 +337,10 @@ wall() {
 }
 
 fetch() {
-  mkdir -p "$dest"
+  case $primary in
+    boat:*) python3 "$RX_DIR/remote-executor.py" invalidate-mirror "$dest" || return 97 ;;
+    *) mkdir -p "$dest" ;;
+  esac
   if [ "$helper" = none ]; then
     # --delete keeps an earlier run's gate.exit from standing in for a rerun's result.
     rx_sync -- -a --delete "$primary:$pout/" "$dest/" || return 97

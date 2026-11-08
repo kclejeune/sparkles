@@ -120,11 +120,16 @@ records the mode, bundle digest, prerequisite IDs and prerequisite coverage dige
 compiler targets, agent authentication and private evidence history.
 
 Boat artifacts travel over its explicit SSH transport with byte-preserving stdin and
-stdout. Individual files are checked by SHA-256. Screen and gate archive transfers are bounded to
+stdout. Individual files are checked by SHA-256. Sender and receiver share a finite operation
+deadline capped by the original admission end. No blocked chunk renews that deadline.
+Archive creation checks byte, member and expanded bounds during traversal and writing.
+Screen and gate archive transfers are bounded to
 4 GiB and 100,000 members, including expanded size, and refuse escaping paths, links and
 device entries before extraction. Nextest archives use a 32-GiB expanded bound, set explicitly with
 `TEST_PARTITION_ARCHIVE_MAX_BYTES` up to 64 GiB, and retain their SHA-256. Larger
-workloads need an explicit artifact-transport extension. Failed and interrupted runs retain their owned
+workloads need an explicit artifact-transport extension. A Boat fetch with `--delete` first retains the previous tree beside its destination,
+then validates a fresh staged tree before publishing it. Failed fetches leave no old
+`gate.exit` at the current result path. Failed and interrupted runs retain their owned
 worker directories and local receipt paths. Cleanup never stops another job or the
 warm sandbox. The lifecycle owner decides retention and verified stop after evidence
 and leases are closed.

@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import math
+import shutil
 import os
 from pathlib import Path
 import re
@@ -217,6 +218,110 @@ def remote_path(spec):
     return None
 
 
+def operation_deadline(host, seconds=300):
+    """Freeze the original admission end once for all phases of one operation."""
+    now = time.monotonic()
+    if boat_id(host):
+        data = admission(host)
+        return min(now + seconds, now + data['expires_at'] - time.time() - 30)
+    return now + seconds
+
+
+def remaining(deadline):
+    left = deadline - time.monotonic()
+    if left <= 0:
+        fail('transfer deadline exceeded before dispatch')
+    return left
+
+
+class ArchiveWriter:
+    def __init__(self, stream, limit, deadline):
+        self.stream, self.limit, self.deadline, self.bytes = stream, limit, deadline, 0
+    def write(self, data):
+        remaining(self.deadline)
+        if self.bytes + len(data) > self.limit:
+            fail('archive byte bound exceeded during creation')
+        written = self.stream.write(data)
+        self.bytes += written
+        return written
+
+
+def pack_directory(stream, source, excluded, deadline):
+    writer = ArchiveWriter(stream, MAX_ARCHIVE, deadline)
+    count = expanded = 0
+    def add(tar, path, name):
+        nonlocal count, expanded
+        remaining(deadline)
+        info = path.lstat()
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+            fail('unsafe outbound archive member')
+        relative = Path(name)
+        if relative.is_absolute() or '..' in relative.parts:
+            fail('unsafe outbound archive path')
+        count += 1
+        expanded += info.st_size if stat.S_ISREG(info.st_mode) else 0
+        if count > MAX_MEMBERS or expanded > MAX_ARCHIVE:
+            fail('outbound archive member or expanded bound exceeded')
+        member = tar.gettarinfo(str(path), arcname=name)
+        if member.isdir():
+            tar.addfile(member)
+            with os.scandir(path) as children:
+                for child in children:
+                    add(tar, Path(child.path), str(relative / child.name))
+        else:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as data:
+                opened = os.fstat(data.fileno())
+                identity = lambda row: (row.st_dev, row.st_ino, row.st_size, row.st_mtime_ns)
+                if not stat.S_ISREG(opened.st_mode) or identity(opened) != identity(info):
+                    fail('outbound member changed before packing')
+                tar.addfile(member, data)
+                if identity(os.fstat(data.fileno())) != identity(info):
+                    fail('outbound member changed during packing')
+    item = Path(source)
+    if item.is_symlink():
+        fail('outbound source is a symlink')
+    with tarfile.open(fileobj=writer, mode='w|') as tar:
+        if source.endswith('/'):
+            with os.scandir(item) as children:
+                for child in children:
+                    if child.name not in excluded:
+                        add(tar, Path(child.path), child.name)
+        else:
+            add(tar, item, item.name)
+    stream.seek(0)
+
+
+def invalidate_mirror(destination):
+    """Keep prior accepted evidence outside the current run authority path."""
+    target = Path(destination)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink() or (target.exists() and not target.is_dir()):
+        fail('mirror destination must be an owned directory')
+    if target.exists():
+        previous = Path(tempfile.mkdtemp(prefix='.'+target.name+'.previous.', dir=target.parent))
+        target.rename(previous / 'results')
+    return target
+
+
+def fetch_mirror(host, path, destination, deadline):
+    target = invalidate_mirror(destination)
+    with tempfile.TemporaryDirectory(prefix='.'+target.name+'.fetch.', dir=target.parent) as tmp:
+        stage = Path(tmp) / 'results'
+        stage.mkdir()
+        with tempfile.TemporaryFile(buffering=0) as archive:
+            code = receive(host, 'tar -C '+shlex.quote(path.rstrip('/'))+' -cf - .', archive, deadline)
+            if code:
+                return code
+            archive.seek(0)
+            extract(archive, stage)
+        remaining(deadline)
+        if target.exists() or target.is_symlink():
+            fail('mirror destination appeared during fetch')
+        stage.rename(target)
+    return 0
+
+
 def sync(args):
     if len(args) < 2:
         fail('sync requires source and destination')
@@ -235,47 +340,33 @@ def sync(args):
         if option == '--exclude' and pending:
             excluded.append(pending.pop(0)); continue
         fail('unsupported Boat sync option: ' + option)
+    host, path = src or dst
+    deadline = operation_deadline(host)
+    if '--delete' in options and dst:
+        fail('Boat upload does not delete remote evidence')
     if dst and not source.endswith('/') and not destination.endswith('/'):
         if excluded or not Path(source).is_file():
             fail('direct Boat file copy requires a regular file')
-        return put(dst[0], source, dst[1])
-    # --delete is deliberately refused for Boat: retaining old evidence is safer
-    # than mirroring into an existing result tree. Gate fetch uses fresh staging.
-    if '--delete' in options and dst:
-        fail('Boat upload does not delete remote evidence')
+        return put(host, source, path, deadline)
+    if src and '--delete' in options:
+        return fetch_mirror(host, path, destination, deadline)
     with tempfile.TemporaryFile(buffering=0) as archive:
         if src:
-            host, path = src
-            text = 'tar -C ' + shlex.quote(path.rstrip('/')) + ' -cf - .'
-            code = receive(host, text, archive)
+            code = receive(host, 'tar -C '+shlex.quote(path.rstrip('/'))+' -cf - .', archive, deadline)
             if code:
                 return code
             archive.seek(0)
             extract(archive, destination)
         else:
-            host, path = dst
-            item = Path(source)
-            with tarfile.open(fileobj=archive, mode='w') as tar:
-                if source.endswith('/'):
-                    for child in sorted(item.iterdir()):
-                        if child.name not in excluded:
-                            tar.add(child, arcname=child.name, recursive=True)
-                else:
-                    tar.add(item, arcname=item.name)
-            if archive.tell() > MAX_ARCHIVE:
-                fail('archive byte bound exceeded')
-            archive.seek(0)
-            # Validate locally before sending; the remote validates again before
-            # writing, so neither endpoint trusts tar headers from transport.
-            with tempfile.TemporaryDirectory() as check:
-                extract(archive, check)
-            archive.seek(0)
+            pack_directory(archive, source, excluded, deadline)
             text = shlex.join(['python3', '-I', '-c', EXTRACT, path, str(MAX_ARCHIVE), str(MAX_MEMBERS)])
-            return run(host, text, stdin=archive).returncode
+            return send(host, text, archive, deadline)
     return 0
 
 
-def put(host, source, destination):
+def put(host, source, destination, deadline=None):
+    deadline = operation_deadline(host) if deadline is None else deadline
+    remaining(deadline)
     path = Path(source)
     if not path.is_file() or path.is_symlink() or path.stat().st_size > MAX_ARCHIVE:
         fail('upload must be a bounded regular file')
@@ -286,22 +377,25 @@ def put(host, source, destination):
             't=$(mktemp "${p}.XXXXXXXX"); cat > "$t"; '
             'test "$(sha256sum "$t" | cut -d\' \' -f1)" = ' + digest + '; mv "$t" "$p"')
     with path.open('rb') as stream:
-        return run(host, text, stdin=stream).returncode
+        return send(host, text, stream, deadline)
 
 
 def get(host, source, destination):
+    deadline = operation_deadline(host)
     target = Path(destination)
     with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
         temporary = Path(stream.name)
         try:
-            code = receive(host, 'cat ' + shlex.quote(source), stream)
+            code = receive(host, 'cat ' + shlex.quote(source), stream, deadline)
             if code:
                 return code
             stream.flush()
             with temporary.open('rb') as check:
                 actual = hashlib.file_digest(check, 'sha256').hexdigest()
-            expected = run(host, 'sha256sum ' + shlex.quote(source), capture_output=True,
-                           timeout=30, check=True).stdout.decode().split()[0]
+            with tempfile.TemporaryFile(buffering=0) as proof:
+                code = exchange(command(host, 'sha256sum ' + shlex.quote(source)), proof, limit=1024, deadline=deadline)
+                if code:return code
+                proof.seek(0); expected = proof.read().decode().split()[0]
             if actual != expected:
                 fail('download digest mismatch')
             temporary.replace(target)
@@ -310,48 +404,80 @@ def get(host, source, destination):
             temporary.unlink(missing_ok=True)
 
 
-def collect(argv, output, limit=MAX_ARCHIVE, timeout=300):
-    process = subprocess.Popen(argv, stdout=subprocess.PIPE, start_new_session=True)
+def exchange(argv, output, limit=MAX_ARCHIVE, timeout=300, deadline=None, source=None):
+    deadline = time.monotonic()+timeout if deadline is None else min(deadline, time.monotonic()+timeout)
+    remaining(deadline)
+    process = subprocess.Popen(argv, stdin=subprocess.PIPE if source is not None else subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     finished = False
     selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
+    selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
+    selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
+    if source is not None:
+        os.set_blocking(process.stdin.fileno(), False)
+        selector.register(process.stdin, selectors.EVENT_WRITE, 'stdin')
+    total = errors = sent = 0
+    pending = b''
     try:
-        total = 0
-        deadline = time.monotonic() + timeout
         while selector.get_map():
-            left = deadline - time.monotonic()
-            if left <= 0:
-                fail('transfer deadline exceeded')
-            for key, _ in selector.select(min(left, 1)):
-                block = os.read(key.fd, min(1024**2, limit-total+1))
-                if not block:
-                    selector.unregister(key.fileobj); continue
-                total += len(block)
-                if total > limit:
-                    fail('archive byte bound exceeded')
-                output.write(block)
-        code = process.wait(timeout=max(0.1, deadline-time.monotonic()))
-        finished = True
+            left = remaining(deadline)
+            for key, _ in selector.select(min(left, 0.2)):
+                if key.data == 'stdin':
+                    if not pending:
+                        pending = source.read(65536)
+                    if not pending:
+                        selector.unregister(key.fileobj); process.stdin.close(); continue
+                    if sent + len(pending) > MAX_ARCHIVE:
+                        fail('outbound transfer byte bound exceeded')
+                    try:written = os.write(key.fd, pending)
+                    except BrokenPipeError:
+                        selector.unregister(key.fileobj); process.stdin.close(); continue
+                    sent += written; pending = pending[written:]
+                else:
+                    block = os.read(key.fd, 65536)
+                    if not block:
+                        selector.unregister(key.fileobj); continue
+                    if key.data == 'stdout':
+                        total += len(block)
+                        if total > limit:fail('archive byte bound exceeded')
+                        output.write(block)
+                    else:
+                        errors += len(block)
+                        if errors > 1024*1024:fail('transport stderr bound exceeded')
+        code = process.wait(timeout=remaining(deadline))
+        finished = code == 0
         return code
+    except BaseException as error:
+        code = process.poll()
+        if code is not None and code != 0:
+            error.native_exit = code
+        raise
     finally:
         selector.close()
-        process.stdout.close()
         if not finished:
             try:os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:pass
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-            # The leader may have exited before a descendant that ignores TERM.
-            # This session contains only this invocation's local transport children.
+            try:process.wait(timeout=2)
+            except subprocess.TimeoutExpired:pass
             try:os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:pass
             process.wait()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None and not stream.closed:stream.close()
 
 
-def receive(host, text, output):
-    return collect(command(host, text), output, limit=MAX_ARCHIVE)
+def collect(argv, output, limit=MAX_ARCHIVE, timeout=300, deadline=None):
+    return exchange(argv, output, limit, timeout, deadline)
+
+
+def receive(host, text, output, deadline=None):
+    return collect(command(host, text), output, limit=MAX_ARCHIVE, deadline=deadline)
+
+
+def send(host, text, source, deadline):
+    remaining(deadline)
+    with tempfile.TemporaryFile(buffering=0) as response:
+        return exchange(command(host, text), response, limit=1024*1024, deadline=deadline, source=source)
 
 
 COVERAGE = r"""import hashlib,json,subprocess,sys
@@ -367,17 +493,17 @@ print(json.dumps({'commit':revision,'objects':len(ids),'objects_sha256':hashlib.
 """
 
 
-def coverage(host, revision):
+def coverage(host, revision, deadline=None):
     if not revision:
         return None
     local = subprocess.run([sys.executable, '-I', '-c', COVERAGE, '.', revision],
-                           capture_output=True, timeout=130)
+                           capture_output=True, timeout=130 if deadline is None else min(130, remaining(deadline)))
     if local.returncode:
         fail('local source object coverage could not be established')
     expected = json.loads(local.stdout)
     text = shlex.join(['python3', '-I', '-c', COVERAGE]) + ' "$HOME/gate/repo.git" ' + shlex.quote(revision)
     with tempfile.TemporaryFile(buffering=0) as result:
-        code = collect(command(host, text), result, limit=65536, timeout=130)
+        code = collect(command(host, text), result, limit=65536, timeout=130, deadline=deadline)
         if code:
             return None
         result.seek(0)
@@ -390,6 +516,7 @@ def bundle(host, full, base, record=None):
     boat_id(host)
     if not re.fullmatch('[a-f0-9]{40}', full) or (base and not re.fullmatch('[a-f0-9]{40}', base)):
         fail('source transfer requires full commit identities')
+    deadline = operation_deadline(host)
     evidence = {'schema': 1, 'worker': host, 'source': full, 'base': base,
                 'mode': None, 'bundle_sha256': None, 'prerequisite_proof': None,
                 'prerequisites': [], 'status': 'checking'}
@@ -397,11 +524,11 @@ def bundle(host, full, base, record=None):
         if record:
             Path(record).write_text(json.dumps(evidence, indent=2)+'\n')
     retain()
-    existing = coverage(host, full)
+    existing = coverage(host, full, deadline)
     if existing:
         evidence.update(mode='reuse', prerequisite_proof=existing, status='verified')
         retain(); return 0
-    prerequisite = coverage(host, base) if base else None
+    prerequisite = coverage(host, base, deadline) if base else None
     evidence.update(mode='incremental' if prerequisite else 'full-seed', prerequisite_proof=prerequisite)
     retain()
     objects = subprocess.run(['git', 'rev-parse', '--path-format=absolute', '--git-path', 'objects'],
@@ -416,7 +543,7 @@ def bundle(host, full, base, record=None):
             argv = ['git', '-C', str(repo), '-c', 'pack.threads=1', '-c', 'pack.windowMemory=32m',
                     'bundle', 'create', '-', ref, *(['^'+base] if prerequisite else [])]
             try:
-                code = collect(argv, packet)
+                code = collect(argv, packet, deadline=deadline)
             except (ValueError, OSError, subprocess.SubprocessError):
                 evidence['status'] = 'creation-refused-or-incomplete'; retain()
                 raise
@@ -443,11 +570,11 @@ def bundle(host, full, base, record=None):
                     'test "$(sha256sum "$f" | cut -d\' \' -f1)" = ' + evidence['bundle_sha256'] + '; '
                     'git -C "$HOME/gate/repo.git" fetch -q "$f" refs/heads/source:refs/heads/gate-' + full[:8] +
                     '; code=$?; rm -f "$f"; exit "$code"')
-            code = run(host, text, stdin=packet).returncode
+            code = send(host, text, packet, deadline)
             evidence['exit'] = code
             if code:
                 evidence['status'] = 'uncertain-or-failed'; retain(); return code
-    if not coverage(host, full):
+    if not coverage(host, full, deadline):
         evidence['status'] = 'post-transfer-coverage-unproven'; retain()
         fail('worker source coverage unproven after transfer')
     evidence['status'] = 'verified'; retain()
@@ -458,6 +585,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
     ex = sub.add_parser('exec'); ex.add_argument('host'); ex.add_argument('command')
+    iv = sub.add_parser('invalidate-mirror'); iv.add_argument('destination')
     va = sub.add_parser('validate'); va.add_argument('host')
     ec = sub.add_parser('extract-command'); ec.add_argument('destination'); ec.add_argument('--max-bytes', type=int, default=MAX_ARCHIVE)
     ad = sub.add_parser('admit'); ad.add_argument('host'); ad.add_argument('--minimum', type=int, default=300)
@@ -467,6 +595,8 @@ def main():
         transfer = sub.add_parser(action); transfer.add_argument('host'); transfer.add_argument('source'); transfer.add_argument('destination')
     bu = sub.add_parser('bundle'); bu.add_argument('host'); bu.add_argument('full'); bu.add_argument('base', nargs='?', default=''); bu.add_argument('--record')
     args = parser.parse_args()
+    if args.action == 'invalidate-mirror':
+        invalidate_mirror(args.destination); return 0
     if args.action == 'validate':
         admission(args.host); return 0
     if args.action == 'extract-command':

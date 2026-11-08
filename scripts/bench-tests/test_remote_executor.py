@@ -130,6 +130,8 @@ class LocalTransport(unittest.TestCase):
             return ['bash', '-c', text]
         self.transport = patch.object(RX, 'command', side_effect=command)
         self.transport.start(); self.addCleanup(self.transport.stop)
+        self.deadline = patch.object(RX, 'operation_deadline', side_effect=lambda host, seconds=300:time.monotonic()+seconds)
+        self.deadline.start(); self.addCleanup(self.deadline.stop)
 
     def test_binary_roundtrip_and_identity_quoting(self):
         source = self.root / 'local ; $(bad)'
@@ -180,6 +182,75 @@ class LocalTransport(unittest.TestCase):
             RX.sync(['-a', str(source)+'/', 'boat:bx_test:'+str(self.root/'out')+'/'])
         self.assertFalse((self.root/'out').exists())
 
+    def test_delete_mirror_cannot_reuse_old_success_or_failed_current_output(self):
+        src=self.root/'fresh';src.mkdir();dst=self.root/'current';dst.mkdir()
+        (dst/'gate.exit').write_text('0\n');(dst/'old').write_text('old evidence')
+        for value,expected in [(None,99),('17',17),('0',0),(None,99)]:
+            if value is None:(src/'gate.exit').unlink(missing_ok=True)
+            else:(src/'gate.exit').write_text(value+'\n')
+            (src/'run-id').write_text('fresh-'+str(expected))
+            self.assertEqual(RX.sync(['-a','--delete','boat:bx_test:'+str(src)+'/',str(dst)+'/']),0)
+            code=int((dst/'gate.exit').read_text()) if (dst/'gate.exit').exists() else 99
+            self.assertEqual(code,expected)
+            self.assertFalse((dst/'old').exists())
+            self.assertEqual((dst/'run-id').read_text(),'fresh-'+str(expected))
+        previous=list(self.root.glob('.current.previous.*/results'))
+        self.assertTrue(any((d/'old').exists() for d in previous))
+        with patch.object(RX,'receive',return_value=17):
+            self.assertEqual(RX.sync(['-a','--delete','boat:bx_test:'+str(src)+'/',str(dst)+'/']),17)
+        self.assertFalse(dst.exists())
+        self.assertEqual(list(self.root.glob('.current.fetch.*')),[])
+
+    def test_pack_refuses_before_spool_limit_and_never_dispatches(self):
+        src=self.root/'large';src.mkdir();(src/'blob').write_bytes(b'x'*131072)
+        with tempfile.TemporaryFile(buffering=0) as out,patch.object(RX,'MAX_ARCHIVE',65536):
+            with self.assertRaises(ValueError):RX.pack_directory(out,str(src)+'/',[],time.monotonic()+2)
+            self.assertLessEqual(out.seek(0,2),65536)
+        calls=len(self.calls)
+        with patch.object(RX,'MAX_ARCHIVE',65536),self.assertRaises(ValueError):
+            RX.sync(['-a',str(src)+'/','boat:bx_test:/unused/'])
+        self.assertEqual(len(self.calls),calls)
+
+    def test_pack_padding_exact_limit_members_exclusions_and_construction_deadline(self):
+        src=self.root/'small';src.mkdir();(src/'keep').write_bytes(b'x'*100);(src/'exclude').write_bytes(b'y')
+        with tempfile.TemporaryFile(buffering=0) as out:
+            RX.pack_directory(out,str(src)+'/',['exclude'],time.monotonic()+2)
+            size=out.seek(0,2)
+            self.assertGreater(size,100)
+        for limit,accept in [(size,True),(size-1,False)]:
+            with self.subTest(limit=limit),tempfile.TemporaryFile(buffering=0) as out,patch.object(RX,'MAX_ARCHIVE',limit):
+                if accept:RX.pack_directory(out,str(src)+'/',['exclude'],time.monotonic()+2)
+                else:
+                    with self.assertRaises(ValueError):RX.pack_directory(out,str(src)+'/',['exclude'],time.monotonic()+2)
+                self.assertLessEqual(out.seek(0,2),limit)
+        with tempfile.TemporaryFile() as out,patch.object(RX,'MAX_MEMBERS',1),self.assertRaises(ValueError):
+            RX.pack_directory(out,str(src)+'/',[],time.monotonic()+2)
+        nested=src/'nested';nested.mkdir();(nested/'file').write_bytes(b'x')
+        with tempfile.TemporaryFile() as out,patch.object(RX,'MAX_MEMBERS',1),self.assertRaises(ValueError):
+            RX.pack_directory(out,str(nested),[],time.monotonic()+2)
+        with tempfile.TemporaryFile() as out,self.assertRaises(ValueError):
+            RX.pack_directory(out,str(src)+'/',[],time.monotonic()-1)
+
+    def test_sender_deadline_covers_blocked_input_missing_ack_and_numeric_exit(self):
+        payload=self.root/'payload';payload.write_bytes(b'x'*131072)
+        for text in ('sleep 2','cat >/dev/null; sleep 2'):
+            with self.subTest(text=text),patch.object(RX,'command',return_value=['bash','-c',text]),payload.open('rb') as data:
+                began=time.monotonic()
+                with self.assertRaises(ValueError):RX.send('boat:bx_test',text,data,time.monotonic()+0.04)
+                self.assertLess(time.monotonic()-began,1)
+        with patch.object(RX,'command',return_value=['bash','-c','cat >/dev/null; exit 17']),payload.open('rb') as data:
+            self.assertEqual(RX.send('boat:bx_test','ignored',data,time.monotonic()+1),17)
+        calls=len(self.calls)
+        with payload.open('rb') as data,self.assertRaises(ValueError):
+            RX.send('boat:bx_test','ignored',data,time.monotonic()-1)
+        self.assertEqual(len(self.calls),calls)
+
+    def test_legacy_ssh_delete_is_delegated_without_changing_arguments(self):
+        args=['-a','--delete','wally:gate/out/test/',str(self.root/'dest')+'/']
+        with patch.object(RX.subprocess,'call',return_value=17) as call:
+            self.assertEqual(RX.sync(args),17)
+            call.assert_called_once_with(['rsync',*args])
+
     def test_bundle_preserves_valid_history_and_excludes_untracked_private_files(self):
         repo = self.root / 'repo'; repo.mkdir()
         def git(*args):
@@ -224,6 +295,44 @@ class LocalTransport(unittest.TestCase):
         self.assertNotEqual(run('cat-file', '-e', private_blob).returncode, 0)
         self.assertEqual(run('fsck', '--no-dangling').returncode, 0)
         self.assertEqual(run('diff', '--name-only', base, full).stdout.strip(), 'source')
+
+
+class GateFetchFixture(unittest.TestCase):
+    def test_actual_whole_and_already_merged_fetch_never_accept_stale_exit(self):
+        source=(ROOT/'scripts/gate/gate.sh').read_text().splitlines()
+        selected=[];inside=False
+        for line in source:
+            if any(line.startswith(name+'() {') for name in ('wall','fetch','finished')):inside=True
+            if inside:
+                selected.append(line)
+                if line=='}':inside=False
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);remote=root/'remote';remote.mkdir();fresh=remote/'source';fresh.mkdir()
+            bridge=root/'bridge.py'
+            bridge.write_text("import importlib.util,os,subprocess,sys,time\n"
+                +"s=importlib.util.spec_from_file_location('rx',"+repr(str(ROOT/'scripts/remote-executor.py'))+");r=importlib.util.module_from_spec(s);s.loader.exec_module(r)\n"
+                +"r.command=lambda h,c:['bash','-c','cd '+os.environ['REMOTE_FIXTURE']+'; '+c]\n"
+                +"r.operation_deadline=lambda h:time.monotonic()+5\n"
+                +"a=sys.argv[1:];raise SystemExit(r.sync(a[1:] if a[:1]==['--'] else a))\n")
+            for index,(old,value,helper,expected) in enumerate([(0,None,'none',99),(0,17,'none',17),(17,0,'none',0),(0,17,'other',17)]):
+                dest=root/f'accepted-{index}';dest.mkdir();(dest/'gate.exit').write_text(str(old))
+                if value is None:(fresh/'gate.exit').unlink(missing_ok=True)
+                else:(fresh/'gate.exit').write_text(str(value))
+                (fresh/'run-id').write_text('fresh-'+str(index))
+                program="\n".join(selected)+r'''
+rx_sync() { python3 "$BRIDGE" "$@"; }
+rx_exec() { (cd "$REMOTE_FIXTURE" && bash -c "$2"); }
+primary=boat:bx_fixture
+pout=source
+name=fixture
+fetch || exit "$?"
+code=$(cat "$dest/gate.exit" 2>/dev/null || echo 99)
+exit "$code"
+'''
+                result=subprocess.run(['bash','-c',program],env=dict(os.environ,HOME=str(remote),REMOTE_FIXTURE=str(remote),BRIDGE=str(bridge),RX_DIR=str(ROOT/'scripts'),dest=str(dest),helper=helper),capture_output=True,text=True,timeout=10)
+                self.assertEqual(result.returncode,expected,result.stderr)
+                self.assertEqual((dest/'run-id').read_text(),'fresh-'+str(index))
+                self.assertTrue(list(root.glob('.'+dest.name+'.previous.*/results/gate.exit')))
 
 
 class ScreenAcceptance(unittest.TestCase):
