@@ -2156,6 +2156,7 @@ impl Ctx {
     /// The row's credit outlives every returned term; no owning value escapes it.
     /// `key` is the writer's reused reconstruction buffer, and `keys` admits its
     /// growth before it is allocated and holds that credit until the buffer is freed.
+    #[cfg(test)]
     pub(super) fn output_term(
         &self,
         id: Id,
@@ -2163,16 +2164,30 @@ impl Ctx {
         keys: &OutputCredit<'_>,
         key: &mut Vec<u8>,
     ) -> Result<Option<Term>> {
+        let mut out = Vec::with_capacity(1);
+        self.output_term_into(id, row, keys, key, &mut out)?;
+        Ok(out.pop().flatten())
+    }
+
+    /// [`Ctx::output_term`], pushing the cell onto `out`. A decoded term is built in
+    /// place in the row rather than returned through the vocabulary's callback and
+    /// its nested results, whose copies of each term cost a large answer about a
+    /// tenth of its writing time.
+    #[inline]
+    pub(super) fn output_term_into(
+        &self,
+        id: Id,
+        row: &OutputCredit<'_>,
+        keys: &OutputCredit<'_>,
+        key: &mut Vec<u8>,
+        out: &mut Vec<Option<Term>>,
+    ) -> Result<()> {
         assert!(
             std::ptr::eq(self, row.charge.ctx) && std::ptr::eq(self, keys.charge.ctx),
             "output credit belongs to its query"
         );
-        let decode = |key: &[u8]| -> Result<Term> {
-            row.add(output_key_bytes(self, key, 0)?)?;
-            Ok(id::key_to_term(key))
-        };
-        let term = match id.tag() {
-            Tag::Undef => None,
+        match id.tag() {
+            Tag::Undef => out.push(None),
             Tag::Local => {
                 // Keys are append-only. Read the estimate, leave the vocabulary lock,
                 // then admit before taking the lock again to allocate the term.
@@ -2182,13 +2197,12 @@ impl Ctx {
                     .get(id.payload())
                     .map(|key| output_key_bytes(self, key, 0))
                     .transpose()?;
-                match bytes {
-                    None => None,
-                    Some(bytes) => {
-                        row.add(bytes)?;
-                        self.local.read().get(id.payload()).map(id::key_to_term)
-                    }
+                if let Some(bytes) = bytes {
+                    row.add(bytes)?;
                 }
+                out.push(
+                    bytes.and_then(|_| self.local.read().get(id.payload()).map(id::key_to_term)),
+                );
             }
             Tag::Delta => {
                 let bytes = self
@@ -2201,16 +2215,15 @@ impl Ctx {
                             .map(|key| output_key_bytes(self, key, 0))
                     })
                     .transpose()?;
-                match bytes {
-                    None => None,
-                    Some(bytes) => {
-                        row.add(bytes)?;
-                        self.snap
-                            .generation
-                            .dvocab
-                            .with(|vocab| vocab.get(id.payload()).map(id::key_to_term))
-                    }
+                if let Some(bytes) = bytes {
+                    row.add(bytes)?;
                 }
+                out.push(bytes.and_then(|_| {
+                    self.snap
+                        .generation
+                        .dvocab
+                        .with(|vocab| vocab.get(id.payload()).map(id::key_to_term))
+                }));
             }
             // Reconstruction scratch is query-owned even when the vocabulary is mapped.
             // Twice the requested size covers old and new buffers during reallocation.
@@ -2218,25 +2231,30 @@ impl Ctx {
             // admits growth without an account update per cell. A fresh buffer per
             // cell reallocated while rebuilding nearly every key and made large
             // answers about a third slower to write.
-            Tag::Vocab => self
-                .snap
-                .generation
-                .vocab
-                .get_with_checked_in(
+            Tag::Vocab => {
+                let found = self.snap.generation.vocab.get_with_checked_in(
                     id.payload(),
                     key,
                     |need| keys.reserve((need as u64).saturating_mul(2)),
-                    decode,
-                )?
-                .transpose()?,
+                    |key| -> Result<()> {
+                        row.add(output_key_bytes(self, key, 0)?)?;
+                        out.push(Some(id::key_to_term(key)));
+                        Ok(())
+                    },
+                )?;
+                match found {
+                    Some(pushed) => pushed?,
+                    None => out.push(None),
+                }
+            }
             // Inline numbers/calendar values and blank-node labels have bounded
             // formatted text. This covers their strings and construction overlap.
             _ => {
                 row.add(256)?;
-                self.snap.term(id)
+                out.push(self.snap.term(id));
             }
-        };
-        Ok(term)
+        }
+        Ok(())
     }
 
     /// Reconstruction scratch is query-owned even when the vocabulary is mapped.

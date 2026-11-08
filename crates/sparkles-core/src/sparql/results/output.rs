@@ -50,12 +50,13 @@ impl<'a> ScratchRow<'a> {
         self.credit.reset();
         self.credit.add(Self::slots(r, r.table.width())?)?;
         for col in &r.table.cols {
-            self.terms.push(r.ctx.output_term(
+            r.ctx.output_term_into(
                 col[index],
                 &self.credit,
                 &self.keys,
                 &mut self.key,
-            )?);
+                &mut self.terms,
+            )?;
         }
         r.ctx.check_memory_failure()?;
         Ok(&self.terms)
