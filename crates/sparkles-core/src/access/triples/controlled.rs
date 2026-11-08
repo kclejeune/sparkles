@@ -75,8 +75,8 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
     if matches!(&input, Input::Selected(_)) {
         // The strict view additionally retains the invocation's original policy,
         // not merely the bound copies. Admit its shared backing before cloning it.
-        let read_bytes = graphs_bytes(&original.read, preparation)?;
-        let write_bytes = graphs_bytes(&original.write, preparation)?;
+        let read_bytes = retained_graphs_bytes(&original.read, preparation)?;
+        let write_bytes = retained_graphs_bytes(&original.write, preparation)?;
         let original_bytes = 256u64
             .checked_add(read_bytes)
             .and_then(|bytes| bytes.checked_add(write_bytes))
@@ -221,6 +221,25 @@ fn strings_bytes(values: &Vec<String>, preparation: &Preparation) -> Result<u64>
 }
 
 fn graphs_bytes(graphs: &Graphs, preparation: &Preparation) -> Result<u64> {
+    sized_graphs_bytes(graphs, preparation, false)
+}
+
+/// The retained original policy of a strict view keeps the invocation's own
+/// top-level guard providers alive. Binding resolves them before masking, so
+/// the view never calls them again. Their opaque interior belongs to the
+/// caller's policy, and the view admits a fixed handle for each extended
+/// provider lifetime instead of refusing every data-dependent guard.
+fn retained_graphs_bytes(graphs: &Graphs, preparation: &Preparation) -> Result<u64> {
+    sized_graphs_bytes(graphs, preparation, true)
+}
+
+const RETAINED_PROVIDER_BYTES: u64 = 128;
+
+fn sized_graphs_bytes(
+    graphs: &Graphs,
+    preparation: &Preparation,
+    retain_providers: bool,
+) -> Result<u64> {
     let Graphs::Only(rule) = graphs else {
         return Ok(0);
     };
@@ -235,7 +254,9 @@ fn graphs_bytes(graphs: &Graphs, preparation: &Preparation) -> Result<u64> {
         // Legacy binding leaves guards in triple/protection graph definitions
         // unresolved. Retaining their opaque provider Arc would bypass admission;
         // invoking or clearing it here would change that established policy.
-        if guard.decide.is_some() {
+        if guard.decide.is_some() && retain_providers {
+            bytes = bytes.saturating_add(RETAINED_PROVIDER_BYTES);
+        } else if guard.decide.is_some() {
             return Err(Error::Unsupported(
                 "controlled permission preparation cannot retain unresolved nested guard providers"
                     .into(),
