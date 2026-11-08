@@ -2667,6 +2667,13 @@ async function revert(req, res, url, seg, ctx) {
       fail(res, 410, `commit ${seq} is outside the kept history`, { code: 'history-gone' }), true
     );
   const head = headCommit(ds).seq;
+  if (body.expect?.targetId != null && body.expect.targetId !== (ds.branchId ?? ds.id))
+    return (
+      fail(res, 412, 'the target branch identity changed since it was read', {
+        code: 'precondition-failed',
+      }),
+      true
+    );
   if (body.expect?.target != null && body.expect.target !== head)
     return (
       fail(res, 409, `the branch is at commit ${head}, not ${body.expect.target}`, {
