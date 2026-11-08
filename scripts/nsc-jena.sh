@@ -2,6 +2,7 @@
 # The realistic Jena comparison of scripts/bench-bindings/jena.py on an ephemeral Namespace
 # instance (namespace.so), driven through the `nsc` CLI. See docs/DEVELOPMENT.md.
 #
+#   scripts/jena-remote.sh --executor nsc|boat:bx_ID [options]
 #   scripts/nsc-jena.sh [options] [-- jena.py options...]
 #
 # The JVM bindings and their native library are built here, before any instance exists,
@@ -16,9 +17,10 @@
 # results directory, logs and env.txt (kernel, CPU, memory, Java) are downloaded to OUT.
 #
 # Options:
+#   --executor E        nsc (default) or admitted boat:bx_ID
 #   --out DIR           results directory (default .artifacts/nsc-jena/<UTC time>)
 #   --extra-lib PATH    another native library to ship, repeatable. An arm uses it with
-#                       -Dsparkles.native.path=/root/nsc-jena/repo/native/NAME
+#                       -Dsparkles.native.path=@REMOTE@/repo/native/NAME
 #   --no-build          ship the bindings as they are built
 #   --machine-type T    Namespace machine type (default linux/amd64:8x16)
 #   --duration D        instance lifetime cap, as nsc takes it (default 4h)
@@ -30,6 +32,8 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CACHE=${SPARKLES_NSC_CACHE:-$HOME/.cache/sparkles-nsc}
+# shellcheck source=scripts/remote-screen.sh
+. "$ROOT/scripts/remote-screen.sh"
 MACHINE=linux/amd64:8x16
 DURATION=4h
 OUT=
@@ -50,6 +54,7 @@ usage() {
 while [ $# -gt 0 ]; do
   case $1 in
     --out) OUT=$2 ;;
+    --executor) EXECUTOR=$2 ;;
     --extra-lib) EXTRA_LIBS+=("$(realpath "$2")") ;;
     --no-build)
       BUILD=0
@@ -67,7 +72,8 @@ while [ $# -gt 0 ]; do
   esac
   shift 2 || usage 1
 done
-for t in nsc zstd uv curl; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
+screen_check
+for t in zstd uv curl; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
 OUT=$(realpath -m "${OUT:-$ROOT/.artifacts/nsc-jena/$(date -u +%Y%m%dT%H%M%SZ)}")
 mkdir -p "$OUT/logs"
 
@@ -103,7 +109,7 @@ for e in "${entries[@]}"; do
   [ -e "$e" ] || continue
   n="$i-$(basename "$e")"
   cp -a "$e" "$STAGE/repo/cp/$n"
-  cp_remote+=("$REMOTE/repo/cp/$n")
+  cp_remote+=("@REMOTE@/repo/cp/$n")
   i=$((i + 1))
 done
 bb=$STAGE/repo/jvm/sparkles-jena/build/bindings-bench
@@ -141,6 +147,10 @@ mkdir -p jdk && tar -xzf jdk.tar.gz -C jdk --strip-components=1
 export JAVA=$PWD/jdk/bin/java
 export LD_LIBRARY_PATH=$PWD/repo/native
 export BENCH_COMMIT
+for i in "${!ARGS[@]}"; do ARGS[i]=${ARGS[i]//@REMOTE@/$PWD}; done
+for classpath in repo/jvm/sparkles-jena/build/bindings-bench/classpath*.txt; do
+  sed -i "s|@REMOTE@|$PWD|g" "$classpath"
+done
 PYBIN=$(ls -d "$PWD"/cpython-*/bin)/python3
 {
   echo "kernel: $(uname -r)"
@@ -158,28 +168,26 @@ ID=
 destroy() {
   [ -n "$ID" ] || return 0
   echo "destroying $ID"
-  nsc destroy --force "$ID" > "$OUT/logs/destroy.log" 2>&1 || echo "destroying $ID failed; run nsc destroy $ID" >&2
+  screen_destroy > "$OUT/logs/destroy.log" 2>&1 || {
+    echo "cleanup uncertain; reconcile $OUT/logs/destroy.log and the exact recorded units" >&2
+    return 97
+  }
   ID=
 }
 trap destroy EXIT
 trap 'exit 130' INT TERM
-nsc create --bare --machine_type "$MACHINE" --duration "$DURATION" --purpose "sparkles jena use cases" \
-  --cidfile "$OUT/instance.id" --output_json_to "$OUT/instance.json" > "$OUT/logs/create.log" 2>&1 || {
-  [ -s "$OUT/instance.id" ] && ID=$(cat "$OUT/instance.id")
-  die "nsc create failed; see $OUT/logs/create.log"
-}
-ID=$(cat "$OUT/instance.id")
+screen_create "sparkles Jena comparison" || die "executor acquire failed; reconcile $OUT before retrying"
 echo "instance $ID"
 for f in repo.tar.zst python.tar.zst jdk.tar.gz run.env remote.sh; do
-  nsc instance upload "$ID" "$STAGE/$f" "$REMOTE/$f" --mkdir >> "$OUT/logs/upload.log" 2>&1 || die "the upload of $f failed"
+  screen_upload "$STAGE/$f" "$REMOTE/$f" >> "$OUT/logs/upload.log" 2>&1 || die "the upload of $f failed"
 done
-nsc ssh -T "$ID" -- "cd $REMOTE && setsid nohup bash remote.sh > nohup.log 2>&1 < /dev/null &"
+screen_launch remote.sh nohup.log
 seen=0
 fails=0
 status=
 while :; do
   sleep "$POLL"
-  if ! r=$(nsc ssh -T "$ID" -- "tail -n +$((seen + 1)) $REMOTE/work/progress.log 2> /dev/null; [ -f $REMOTE/work/done ] && echo __DONE__ \$(cat $REMOTE/work/done)" 2> /dev/null); then
+  if ! r=$(screen_exec "tail -n +$((seen + 1)) $REMOTE/work/progress.log 2> /dev/null; [ -f $REMOTE/work/done ] && echo __DONE__ \$(cat $REMOTE/work/done)" 2> /dev/null); then
     fails=$((fails + 1))
     [ "$fails" -lt 10 ] || die "lost contact with $ID"
     continue
@@ -197,9 +205,20 @@ while :; do
   done <<< "$r"
   [ -z "$status" ] || break
 done
-nsc ssh -T "$ID" -- "cd $REMOTE/work && tar -czf ../results.tgz results logs env.txt progress.log configs" || true
-nsc instance download "$ID" "$REMOTE/results.tgz" "$OUT/results.tgz" > "$OUT/logs/download.log" 2>&1 || echo "the download failed" >&2
+screen_exec "cd $REMOTE/work && tar -czf ../results.tgz results logs env.txt progress.log configs" || die "packing Jena results failed"
+screen_download "$REMOTE/results.tgz" "$OUT/results.tgz" > "$OUT/logs/download.log" 2>&1 || die "the download failed"
+screen_unpack "$OUT/results.tgz" "$OUT" || die "extracting Jena results failed"
 destroy
-tar -xzf "$OUT/results.tgz" -C "$OUT" 2> /dev/null || true
 rm -f "$STAGE"/*.zst "$STAGE"/jdk.tar.gz
 echo "status: $status; results in $OUT"
+
+case $status in
+  'exit 0') ;;
+  'exit '*)
+    code=${status#exit }
+    case $code in '' | *[!0-9]*) die "invalid Jena exit record" ;; esac
+    [ "$code" -ge 0 ] && [ "$code" -le 255 ] || die "invalid Jena exit record"
+    exit "$code"
+    ;;
+  *) die "missing Jena exit record" ;;
+esac

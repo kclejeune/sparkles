@@ -59,7 +59,7 @@ fi
 echo "building in scope $unit on $(uname -n): MemoryMax=$mem, CARGO_BUILD_JOBS=$jobs, mbx $have"
 systemd-run --user --scope -q --collect --unit "$unit" \
   -p MemoryMax="$mem" -p MemorySwapMax=2G -p OOMPolicy=continue -- \
-  env CARGO_BUILD_JOBS="$jobs" flock "$lock" bash "$dir/bin/nsc-build.sh" "$dir/out/sparkles" "$@"
+  env MBX_REMOTE_TOKEN_FILE="${MBX_REMOTE_TOKEN_FILE:-}" CARGO_BUILD_JOBS="$jobs" flock "$lock" bash "$dir/bin/nsc-build.sh" "$dir/out/sparkles" "$@"
 
 {
   echo "cc: $(cc --version 2> /dev/null | head -1)"

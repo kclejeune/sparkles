@@ -17,7 +17,7 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS = ["nsc-bench.sh", "nsc-writes.sh", "nsc-build.sh", "nsc-build-host.sh",
+SCRIPTS = ["remote-executor.sh", "remote-executor.py", "remote-screen.sh", "nsc-bench.sh", "nsc-writes.sh", "nsc-build.sh", "nsc-build-host.sh",
            "nsc-build-remote.sh", "nsc-writes-remote.sh", "cargo-sparkles-task", "gate/config.sh"]
 
 TOOLS = {
@@ -69,6 +69,13 @@ if 'stop' in a:
     if f.exists():
         try:os.killpg(int(f.read_text().split()[0]),signal.SIGKILL)
         except ProcessLookupError:pass
+        (state/(name+'.stopped')).touch()
+if 'is-active' in a:
+    name=a[-1] if '.' in a[-1] else a[-1]+'.service'
+    f=state/'units'/name
+    if not f.exists() or (state/(name+'.stopped')).exists():raise SystemExit(3)
+    try:os.kill(int(f.read_text().split()[0]),0)
+    except ProcessLookupError:raise SystemExit(3)
 """,
     "mbx": """#!/usr/bin/env python3
 import json,os,pathlib,subprocess,sys,time
@@ -353,7 +360,7 @@ class BuildHost(unittest.TestCase):
             result = subprocess.run(["bash", str(self.repo / "scripts/nsc-writes.sh"), "--out", str(out),
                                      *args, f"a={self.sha}", f"b={self.sha}:--flag"], env=self.env,
                                     capture_output=True, text=True, timeout=60)
-            self.assertIn("nsc create failed", result.stderr, result.stderr)
+            self.assertIn("executor acquire failed", result.stderr, result.stderr)
             return result, out
 
         result, out = writes("--build-host", "h2", "--cargo-args", "--features text")

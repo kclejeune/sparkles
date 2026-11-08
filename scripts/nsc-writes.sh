@@ -4,6 +4,7 @@
 # (namespace.so), driven through the `nsc` CLI. It is the write-side sibling of
 # scripts/nsc-bench.sh, which measures queries. See docs/DEVELOPMENT.md.
 #
+#   scripts/writes-remote.sh --executor nsc|boat:bx_ID [options]
 #   scripts/nsc-writes.sh [options] NAME=REF[:FLAGS] NAME=REF[:FLAGS] [...]
 #
 # A variant is a name (a shell identifier: letters, digits and underscores, not starting
@@ -62,12 +63,15 @@
 #                       SPARKLES_NSC_BUILD_HOSTS is set, else local)
 #   --machine-type T    Namespace machine type (default linux/amd64:8x16)
 #   --duration D        instance lifetime cap, as nsc takes it (default 2h)
+#   --executor E        nsc (default) or admitted boat:bx_ID
 #   --out DIR           new results directory; any existing path is refused
 #                       (default .artifacts/nsc-writes/<UTC time>.<unique suffix>)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CACHE=${SPARKLES_NSC_CACHE:-$HOME/.cache/sparkles-nsc}
+# shellcheck source=scripts/remote-screen.sh
+. "$ROOT/scripts/remote-screen.sh"
 PEOPLE=100000
 SCENARIOS="serial-literal writers mixed"
 ROUNDS=3
@@ -115,6 +119,7 @@ while [ $# -gt 0 ]; do
     --machine-type) MACHINE=$2 ;;
     --duration) DURATION=$2 ;;
     --out) OUT=$2 ;;
+    --executor) EXECUTOR=$2 ;;
     -h | --help) usage ;;
     -*) die "unknown option $1 (see --help)" ;;
     *)
@@ -140,7 +145,8 @@ for spec in "${ARGS[@]}"; do
   # the remote script keeps each variant's settings in variables named after it
   [[ ${spec%%=*} =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "variant name ${spec%%=*} is not a shell identifier (letters, digits and underscores)"
 done
-for t in nsc zstd python3 cargo rustc cc flock; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
+screen_check
+for t in zstd python3 cargo rustc cc flock; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
 if [ -n "$OUT" ]; then
   # Resolve symlinks and .. in the parent, while preserving the final name so
   # even a dangling destination symlink must be refused by the exclusive mkdir.
@@ -384,7 +390,14 @@ destroy() {
   local t
   [ -n "$ID" ] || return 0
   echo "destroying $ID"
-  nsc destroy --force "$ID" > "$OUT/logs/destroy.log" 2>&1 || echo "nsc-writes: destroying $ID failed; run nsc destroy $ID" >&2
+  screen_destroy > "$OUT/logs/destroy.log" 2>&1 || {
+    echo "cleanup uncertain; reconcile $OUT/logs/destroy.log and the exact recorded units" >&2
+    return 97
+  }
+  if [ "$EXECUTOR" != nsc ]; then
+    ID=
+    return
+  fi
   t=$(now)
   local s min
   s=$(secs "$T_CREATE" "$t")
@@ -396,25 +409,19 @@ trap destroy EXIT
 trap 'exit 130' INT TERM
 
 T_CREATE=$(now)
-nsc create --bare --machine_type "$MACHINE" --duration "$DURATION" \
-  --purpose "sparkles nsc-writes $VARIANTS" --cidfile "$OUT/instance.id" \
-  --output_json_to "$OUT/instance.json" > "$OUT/logs/create.log" 2>&1 || {
-  [ -s "$OUT/instance.id" ] && ID=$(cat "$OUT/instance.id")
-  die "nsc create failed, see $OUT/logs/create.log"
-}
-ID=$(cat "$OUT/instance.id")
+screen_create "sparkles writes $VARIANTS" || die "executor acquire failed; reconcile $OUT before retrying"
 T_UP=$(now)
 note "instance: $ID ($MACHINE, capped at $DURATION)"
 note "phase create: $(secs "$T_CREATE" "$T_UP") s"
 
-rsh() { nsc ssh -T "$ID" -- "$@"; }
+rsh() { screen_exec "$@"; }
 for f in "$STAGE"/bin-*.zst "$STAGE/data.nt.zst" "$STAGE/write-bench" "$STAGE/libiofault.so" "$STAGE/nsc-writes-remote.sh" "$STAGE/run.env"; do
-  nsc instance upload "$ID" "$f" "$REMOTE/$(basename "$f")" --mkdir > "$OUT/logs/upload.log" 2>&1 || die "upload of $f failed"
+  screen_upload "$f" "$REMOTE/$(basename "$f")" > "$OUT/logs/upload.log" 2>&1 || die "upload of $f failed"
 done
 T_SENT=$(now)
 note "phase upload: $(secs "$T_UP" "$T_SENT") s"
 
-rsh "cd $REMOTE && setsid nohup bash nsc-writes-remote.sh > nohup.log 2>&1 < /dev/null &" ||
+screen_launch nsc-writes-remote.sh nohup.log ||
   die "could not start the remote run"
 seen=0
 fails=0
@@ -443,8 +450,8 @@ T_RAN=$(now)
 note "phase remote run: $(secs "$T_SENT" "$T_RAN") s"
 
 rsh "cd $REMOTE && tar -czf results.tgz results" || die "could not pack the results"
-nsc instance download "$ID" "$REMOTE/results.tgz" "$OUT/results.tgz" > "$OUT/logs/download.log" 2>&1 || die "download failed"
-tar -xzf "$OUT/results.tgz" -C "$OUT"
+screen_download "$REMOTE/results.tgz" "$OUT/results.tgz" > "$OUT/logs/download.log" 2>&1 || die "download failed"
+screen_unpack "$OUT/results.tgz" "$OUT"
 note "phase download: $(secs "$T_RAN" "$(now)") s"
 destroy
 rm -f "$STAGE"/bin-*.zst "$STAGE/data.nt.zst"

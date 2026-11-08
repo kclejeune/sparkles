@@ -35,7 +35,8 @@ adds to this file and does not override it.
   isolation or additional parallel capacity, after checking the worker's tools, memory,
   disk and competing work. Reuse a warm worker for ordinary fix and test iterations.
   Namespace remains a fallback for a measured resource need or a workflow without a
-  qualified Boat replacement. See [remote executors](docs/DEVELOPMENT.md#remote-executors).
+  qualified Boat replacement. Provider-neutral commands accept an admitted `boat:bx_ID`
+  worker and never create or stop it. See [remote executors](docs/REMOTE-EXECUTORS.md).
 - The benchmark host, which `SPARKLES_BENCH_HOST` names, runs no builds or gates. Keep
   other designated benchmark workers available for comparisons, and start a benchmark
   only after other heavy work has left its host, so the engine under test runs alone.
@@ -51,8 +52,8 @@ adds to this file and does not override it.
 - Run heavy builds and tests in a memory-capped scope where systemd is available, such
   as `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=2G -p OOMPolicy=continue`,
   so that an out-of-memory kill ends that command and not the session or terminal around it.
-- Never run two `mise run bench:nsc` screens of the same commit at once, since they share
-  the commit's source directory.
+- Never run two query screens of the same commit at once, since their build cache entries
+  share source boundaries. A Boat screen holds one worker lock across both arms and reruns.
 - Record remote worker and conversation IDs, source identity and resource deadlines in
   the lane's notes. Reconcile an uncertain launch before retrying it. Retain results and
   release owned jobs and Boxington leases before stopping or deleting a worker. Keep

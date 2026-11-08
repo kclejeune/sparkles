@@ -1,0 +1,290 @@
+"""Provider contracts using bounded local fixtures, never provider qualification."""
+import hashlib
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import tarfile
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[2]
+SPEC = importlib.util.spec_from_file_location('remote_executor', ROOT / 'scripts/remote-executor.py')
+RX = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(RX)
+
+
+class Admission(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / 'receipt.json'
+        self.value = dict(schema=1, worker='bx_test', environment='sparkles', environment_version=8,
+                          expires_at=int(time.time()) + 3600, owner='test-owner',
+                          guard_unit='boat-owned-warm-qual-test.service',
+                          guard_boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                          guard_invocation_id='a' * 32,
+                          toolchain_manifest_path='/home/user/.local/state/sparkles-boat/toolchain.json',
+                          toolchain_manifest_sha256='b' * 64,
+                          bootstrap_lock_path='/home/user/.local/state/sparkles-boat/bootstrap.lock',
+                          worker_env_path='/home/user/worker.env', worker_env_sha256='c' * 64)
+        self.path.write_text(json.dumps(self.value))
+        self.env = patch.dict(os.environ, SPARKLES_BOAT_ADMISSION=str(self.path))
+        self.env.start(); self.addCleanup(self.env.stop)
+        self.guard = patch.object(RX.subprocess, 'run', return_value=subprocess.CompletedProcess(
+            [], 0, 'ActiveState=active\nInvocationID=' + 'a' * 32 + '\n', ''))
+        self.guard.start(); self.addCleanup(self.guard.stop)
+
+    def test_exact_warm_identity_and_binary_safe_command(self):
+        result = RX.command('boat:bx_test', "printf '%s' 'a;$(bad)' && cat")
+        self.assertEqual(result[:8], ['boat', '--no-update', 'ssh', 'bx_test', '--', 'bash', '-c', result[7]])
+        decoded = shlex.split(result[-1])
+        self.assertEqual(len(decoded), 1)
+        self.assertIn("printf '%s' 'a;$(bad)' && cat", decoded[0])
+        self.assertIn('worker.env', decoded[0])
+        self.assertFalse(any(action in result for action in ('create', 'resume', 'stop', 'snapshot')))
+
+    def test_identity_expiry_unknown_schema_and_guard_replacement_refuse(self):
+        for changed in (dict(worker='bx_other'), dict(schema=2), dict(expires_at=time.time()-1),
+                        dict(guard_boot_id='other'), dict(guard_invocation_id='d'*32)):
+            with self.subTest(changed=changed):
+                self.path.write_text(json.dumps({**self.value, **changed}))
+                with self.assertRaises(ValueError):
+                    RX.admission('boat:bx_test')
+
+    def test_receipt_directory_selects_only_the_exact_worker(self):
+        (self.path.parent/'bx_test.json').write_text(self.path.read_text())
+        with patch.dict(os.environ,SPARKLES_BOAT_ADMISSION=str(self.path.parent)):
+            self.assertEqual(RX.admission('boat:bx_test')['worker'],'bx_test')
+            with self.assertRaises(OSError):RX.admission('boat:bx_other')
+
+    def test_remaining_lifetime_is_a_job_constraint(self):
+        with self.assertRaises(ValueError):
+            RX.admission('boat:bx_test', 7200)
+
+    def test_unsafe_selectors_refuse_before_execution(self):
+        for host in ('boat:current', 'boat:bx_test;echo', '-oProxyCommand=bad', 'h x', 'a:12'):
+            with self.subTest(host=host), self.assertRaises(ValueError):
+                RX.boat_id(host)
+
+    def test_ssh_remains_explicit_and_needs_no_boat_receipt(self):
+        self.assertEqual(RX.command('wally', 'exit 17'), [*RX.SSH, 'wally', 'exit 17'])
+
+
+class Archive(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def archive(self, name='results/exit', data=b'17\n', kind=tarfile.REGTYPE, target=''):
+        stream = tempfile.TemporaryFile()
+        self.addCleanup(stream.close)
+        with tarfile.open(fileobj=stream, mode='w') as t:
+            member = tarfile.TarInfo(name)
+            member.type = kind; member.linkname = target
+            member.size = len(data) if kind == tarfile.REGTYPE else 0
+            t.addfile(member, io.BytesIO(data) if member.isfile() else None)
+        stream.seek(0)
+        return stream
+
+    def test_results_are_extracted_with_numeric_exit_intact(self):
+        RX.extract(self.archive(), self.root / 'out')
+        self.assertEqual((self.root / 'out/results/exit').read_bytes(), b'17\n')
+
+    def test_traversal_absolute_links_devices_and_existing_symlink_refuse(self):
+        for name, kind, target in (('../escape', tarfile.REGTYPE, ''),
+                                   ('/escape', tarfile.REGTYPE, ''),
+                                   ('results/link', tarfile.SYMTYPE, '../../escape'),
+                                   ('results/link', tarfile.LNKTYPE, '/escape'),
+                                   ('device', tarfile.CHRTYPE, '')):
+            with self.subTest(name=name, kind=kind), self.assertRaises(ValueError):
+                RX.extract(self.archive(name, kind=kind, target=target), self.root / 'out')
+        outside = self.root / 'outside'; outside.mkdir()
+        out = self.root / 'with-link'; out.mkdir(); (out / 'results').symlink_to(outside)
+        with self.assertRaises(ValueError):
+            RX.extract(self.archive(), out)
+        self.assertFalse((outside / 'exit').exists())
+
+    def test_expanded_and_member_bounds_are_enforced(self):
+        with patch.object(RX, 'MAX_MEMBERS', 0), self.assertRaises(ValueError):
+            RX.extract(self.archive(), self.root / 'out')
+        with patch.object(RX, 'MAX_ARCHIVE', 100), self.assertRaises(ValueError):
+            RX.extract(self.archive(data=b'x' * 200), self.root / 'out')
+
+
+class LocalTransport(unittest.TestCase):
+    """Execute the wire commands against a local fixture; no provider CLI is used."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.calls = []
+        def command(host, text):
+            self.calls.append((host, text))
+            return ['bash', '-c', text]
+        self.transport = patch.object(RX, 'command', side_effect=command)
+        self.transport.start(); self.addCleanup(self.transport.stop)
+
+    def test_binary_roundtrip_and_identity_quoting(self):
+        source = self.root / 'local ; $(bad)'
+        source.write_bytes(bytes(range(256)) * 16)
+        remote = self.root / 'remote ; $(bad)'
+        result = self.root / 'copy'
+        self.assertEqual(RX.put('boat:bx_test', source, str(remote)), 0)
+        self.assertEqual(RX.get('boat:bx_test', str(remote), result), 0)
+        self.assertEqual(source.read_bytes(), result.read_bytes())
+        self.assertFalse((self.root / 'bad').exists())
+
+    def test_numeric_exit_and_receive_limit(self):
+        with tempfile.TemporaryFile() as output:
+            self.assertEqual(RX.receive('boat:bx_test', 'exit 17', output), 17)
+            with patch.object(RX, 'MAX_ARCHIVE', 4), self.assertRaises(ValueError):
+                RX.receive('boat:bx_test', "printf '12345678'", output)
+
+    def test_transfer_refusal_stops_owned_children_after_the_leader_exits(self):
+        child_file=self.root/'child.pid'
+        text="(trap '' TERM; exec sleep 60) & echo $! > "+shlex.quote(str(child_file))+"; printf '12345678'"
+        with tempfile.TemporaryFile() as output, self.assertRaises(ValueError):
+            RX.collect(['bash','-c',text],output,limit=4,timeout=2)
+        child=int(child_file.read_text())
+        deadline=time.monotonic()+2
+        while True:
+            try:state=Path('/proc',str(child),'stat').read_text().split(') ',1)[1].split()[0]
+            except FileNotFoundError:break
+            if state=='Z':break
+            self.assertLess(time.monotonic(),deadline,'owned transfer child survived refusal')
+            time.sleep(0.02)
+
+    def test_directory_transfer_and_direct_file_destination(self):
+        source = self.root / 'src'; source.mkdir(); (source / 'exit').write_text('17\n')
+        remote = self.root / 'remote'
+        self.assertEqual(RX.sync(['-a', str(source)+'/', 'boat:bx_test:'+str(remote)+'/']), 0)
+        out = self.root / 'out'
+        self.assertEqual(RX.sync(['-a', 'boat:bx_test:'+str(remote)+'/', str(out)+'/']), 0)
+        self.assertEqual((out / 'exit').read_text(), '17\n')
+        direct = self.root / 'direct'
+        self.assertEqual(RX.sync(['-a', str(source/'exit'), 'boat:bx_test:'+str(direct)]), 0)
+        self.assertTrue(direct.is_file())
+        with self.assertRaises(ValueError):
+            RX.sync(['-a', '--delete', str(source)+'/', 'boat:bx_test:'+str(remote)+'/'])
+
+    def test_unsafe_archive_transfer_does_not_write_the_destination(self):
+        source = self.root / 'src'; source.mkdir(); (source/'link').symlink_to('/etc/passwd')
+        with self.assertRaises(ValueError):
+            RX.sync(['-a', str(source)+'/', 'boat:bx_test:'+str(self.root/'out')+'/'])
+        self.assertFalse((self.root/'out').exists())
+
+    def test_bundle_preserves_valid_history_and_excludes_untracked_private_files(self):
+        repo = self.root / 'repo'; repo.mkdir()
+        def git(*args):
+            return subprocess.run(['git', '-C', str(repo), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                                   '-c', 'commit.gpgsign=false', *args], check=True, capture_output=True, text=True).stdout.strip()
+        git('init', '-q')
+        (repo/'old-private-evidence').write_text('historical file must not travel')
+        git('add', '.'); git('commit', '-qm', 'initial')
+        old_blob = git('rev-parse', 'HEAD:old-private-evidence')
+        git('rm', 'old-private-evidence'); (repo/'source').write_text('base')
+        git('add', '.'); git('commit', '-qm', 'base'); base = git('rev-parse', 'HEAD')
+        (repo/'source').write_text('candidate'); git('commit', '-qam', 'candidate'); full = git('rev-parse', 'HEAD')
+        (repo/'untracked-private-evidence').write_text('must not travel')
+        private_blob = git('hash-object', 'untracked-private-evidence')
+        before = Path.cwd()
+        home = self.root / 'worker'; home.mkdir()
+        try:
+            os.chdir(repo)
+            with patch.dict(os.environ, HOME=str(home)):
+                record=self.root/'transfer.json'
+                self.assertEqual(RX.bundle('boat:bx_test', full, base, record), 0, record.read_text())
+                self.assertEqual(json.loads(record.read_text())['mode'],'full-seed')
+                transfers=sum('fetch -q' in text for _,text in self.calls)
+                self.assertEqual(RX.bundle('boat:bx_test', full, base, record),0)
+                self.assertEqual(json.loads(record.read_text())['mode'],'reuse')
+                self.assertEqual(sum('fetch -q' in text for _,text in self.calls),transfers)
+                (repo/'source').write_text('incremental');git('commit','-qam','next')
+                next_full=git('rev-parse','HEAD')
+                self.assertEqual(RX.bundle('boat:bx_test',next_full,full,record),0,record.read_text())
+                incremental=json.loads(record.read_text())
+                self.assertEqual(incremental['mode'],'incremental')
+                self.assertEqual(incremental['prerequisite_proof']['commit'],full)
+                self.assertIn(full,incremental['prerequisites'])
+                self.assertRegex(incremental['bundle_sha256'],r'^[0-9a-f]{64}$')
+        finally:
+            os.chdir(before)
+        remote = home / 'gate/repo.git'
+        run = lambda *a: subprocess.run(['git', '-C', str(remote), *a], capture_output=True, text=True)
+        self.assertEqual(run('show', full+':source').stdout, 'candidate')
+        self.assertEqual(run('merge-base', base, full).stdout.strip(), base)
+        self.assertEqual(run('cat-file', '-e', old_blob).returncode, 0)
+        self.assertNotEqual(run('cat-file', '-e', private_blob).returncode, 0)
+        self.assertEqual(run('fsck', '--no-dangling').returncode, 0)
+        self.assertEqual(run('diff', '--name-only', base, full).stdout.strip(), 'source')
+
+
+class ScreenAcceptance(unittest.TestCase):
+    def test_unknown_launch_is_recorded_once_and_cleanup_retains_lock_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            receipt = root/'admission.json'; receipt.write_text(json.dumps({'expires_at':time.time()+3600}))
+            program = r'''
+set -euo pipefail
+. "$SCRIPTS/remote-screen.sh"
+EXECUTOR=boat:bx_test
+SCREEN_LOCK=sparkles-screen-lock-owned
+REMOTE=/home/user/lanes/remote-screens/owned
+OUT=$RESULTS
+screen_exec() { printf '%s\n' "$1" >> "$OUT/commands"; return 255; }
+code=0
+screen_launch nsc-bench-remote.sh nohup.log || code=$?
+test "$code" = 255
+test "$(wc -l < "$OUT/workload-units")" = 1
+screen_destroy && exit 1
+'''
+            result = subprocess.run(['bash', '-c', program], env=dict(os.environ, SCRIPTS=str(ROOT/'scripts'), RESULTS=tmp),
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 97, result.stderr)
+            commands = (root/'commands').read_text()
+            self.assertEqual(commands.count('systemd-run'), 1)
+            self.assertNotIn('stop sparkles-screen-lock-owned', commands)
+            self.assertNotIn('resume', commands)
+
+
+
+class JenaStaging(unittest.TestCase):
+    def test_unique_remote_root_rebases_classpath_and_extra_library_and_records_exit(self):
+        source = (ROOT/'scripts/nsc-jena.sh').read_text()
+        body = source.split('cat > "$STAGE/remote.sh" << \'EOF\'\n', 1)[1].split('\nEOF', 1)[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            seed = root/'seed'; seed.mkdir()
+            classpath = Path('repo/jvm/sparkles-jena/build/bindings-bench/classpath.txt')
+            (seed/classpath).parent.mkdir(parents=True)
+            (seed/classpath).write_text('@REMOTE@/repo/cp/a.jar\n')
+            with tarfile.open(root/'repo.tar.zst', 'w') as t:t.add(seed/'repo', arcname='repo')
+            python = seed/'cpython-test/bin/python3'; python.parent.mkdir(parents=True)
+            python.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > python.args\nexit 17\n'); python.chmod(0o755)
+            with tarfile.open(root/'python.tar.zst', 'w') as t:t.add(seed/'cpython-test', arcname='cpython-test')
+            java = seed/'jdk/bin/java'; java.parent.mkdir(parents=True)
+            java.write_text('#!/bin/sh\necho java-fixture\n'); java.chmod(0o755)
+            with tarfile.open(root/'jdk.tar.gz', 'w:gz') as t:t.add(seed/'jdk', arcname='jdk')
+            bin_dir=root/'bin'; bin_dir.mkdir()
+            zstd=bin_dir/'zstd'; zstd.write_text('#!/bin/sh\ncat "${@: -1}"\n'.replace('#!/bin/sh','#!/usr/bin/env bash')); zstd.chmod(0o755)
+            (root/'run.env').write_text("BENCH_COMMIT=fixture\nARGS=('--arm' 'test=sparkles-mem;-Dsparkles.native.path=@REMOTE@/repo/native/lib.so')\n")
+            (root/'remote.sh').write_text(body)
+            result=subprocess.run(['bash','remote.sh'],cwd=root,env=dict(os.environ,PATH=str(bin_dir)+os.pathsep+os.environ['PATH']),capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual((root/'work/done').read_text(),'exit 17\n')
+            self.assertEqual((root/classpath).read_text(),str(root)+'/repo/cp/a.jar\n')
+            self.assertIn(str(root)+'/repo/native/lib.so',(root/'python.args').read_text())
+            status_body=source[source.rindex('case $status in'):]
+            exit_result=subprocess.run(['bash','-c','die() { exit 97; }; status="exit 17"\n'+status_body],capture_output=True,text=True)
+            self.assertEqual(exit_result.returncode,17)
+
+
+if __name__ == '__main__':
+    unittest.main()

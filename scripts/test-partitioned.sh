@@ -11,7 +11,8 @@
 # Usage: scripts/test-partitioned.sh [options] [-- nextest filter arguments]
 #   --hosts "A B"    remote machines. An entry is an ssh host, or nsc or nsc:MACHINE for an
 #                    ephemeral Namespace instance that the script creates and destroys
-#                    (MACHINE as nsc create takes it, default 16x32)
+#                    (MACHINE as nsc create takes it, default 16x32). boat:bx_ID uses an
+#                    already admitted warm worker through SPARKLES_BOAT_ADMISSION.
 #   --no-local       run no share on this machine
 #   --partition K    hash, count or slice (default slice)
 #   --transport T    ssh (default) or hc, which starts each ssh host's share as a named hc
@@ -49,6 +50,8 @@
 # is active, its load average exceeds half its processors, or it has less than
 # TEST_PARTITION_MIN_FREE_GB (default 40) GiB free under its home directory.
 set -euo pipefail
+# shellcheck source=scripts/remote-executor.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/remote-executor.sh"
 
 main() {
   cd "$(dirname "$0")/.."
@@ -149,6 +152,7 @@ main() {
 
   declare -A seen_host=()
   for h in $hosts; do
+    case ${h#*@} in forge | forge.* | vault | vault.*) die "$h cannot run test shares" ;; esac
     case $h in
       nsc | nsc:*) ;;
       *)
@@ -158,6 +162,11 @@ main() {
         ;;
     esac
     case $h in
+      boat:*)
+        rx_admit "$h" --minimum "$share_timeout" > "$out/boat-admission-${h#boat:}.json" || die "Boat share admission failed"
+        share_host+=("$h")
+        share_kind+=(boat)
+        ;;
       nsc | nsc:*)
         share_host+=("$h")
         share_kind+=(nsc)
@@ -218,6 +227,8 @@ doc = json.load(open(sys.argv[1]))
 print(sum(c["filter-match"]["status"] == "matches" for s in doc["rust-suites"].values() for c in s["testcases"].values()))
 ' "$out/list.json")
   note "tests selected: $expected in $n shares, partitioned by $kind"
+
+  sha256sum "$archive" > "$out/archive.sha256"
 
   # ---------------------------------------------------------------- start the shares
   declare -g -A share_pid=()
@@ -321,12 +332,10 @@ fail_log() {
   die "$1, see $2"
 }
 
-ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30)
-
 # "idle" or the reason a host is busy.
 probe() {
   # shellcheck disable=SC2016
-  ssh "${ssh_opts[@]}" "$1" "min=$min_free"'
+  rx_exec "$1" "min=$min_free"'
     if [ -e "$HOME/lanes/.heavy.lock" ] && ! flock -n "$HOME/lanes/.heavy.lock" true; then echo "busy: heavy lock held"; exit; fi
     u=$(systemctl --user list-units "gate-*" --state=active --plain --no-legend 2> /dev/null | wc -l)
     [ "$u" = 0 ] || { echo "busy: $u gate units"; exit; }
@@ -397,7 +406,7 @@ run_remote() {
     runas="su share -c"
   else
     # shellcheck disable=SC2029
-    rsh() { ssh "${ssh_opts[@]}" "$h" "$1"; }
+    rsh() { rx_exec "$h" "$1"; }
   fi
 
   # The run directory has the checkout's absolute path. Refuse one that is not ours, and one
@@ -445,11 +454,21 @@ run_remote() {
   # The archive is extracted as it arrives, so the machine never stores it whole. nextest
   # writes GNU tar entries that BusyBox tar refuses, so a machine without GNU tar, such as a
   # bare Namespace instance, extracts it with Python.
-  local untar="if tar --version 2> /dev/null | grep -q GNU; then tar -C $root -xf -; else python3 -c 'import sys, tarfile; t = tarfile.open(fileobj=sys.stdin.buffer, mode=\"r|\"); t.extractall(sys.argv[1], filter=\"tar\") if hasattr(tarfile, \"tar_filter\") else t.extractall(sys.argv[1])' $root; fi"
+  local untar
+  untar=$(python3 "$RX_DIR/remote-executor.py" extract-command "$root" --max-bytes "${TEST_PARTITION_ARCHIVE_MAX_BYTES:-34359738368}") || return 97
   if ! rsh "zstd -dcq | { $untar; }" < "$archive" || ! rsh "cat > $s/cargo-nextest && chmod +x $s/cargo-nextest" < "$nextest"; then
     echo "copying the archive or cargo-nextest failed" >&2
     echo 95 > "$d/exit"
     return
+  fi
+
+  # Recheck after local build and transfer; they may have used most of the lease.
+  if [ "$how" = boat ]; then
+    if ! rx_admit "$h" --minimum "$share_timeout" > "$d/admission.json"; then
+      echo 91 > "$d/exit"
+      remote_cleanup
+      return
+    fi
   fi
 
   # The share script, started detached so that it outlives a dropped connection.
@@ -462,7 +481,7 @@ $(share_prologue "$s")
 cd $root
 env_file=$(printf '%q' "$env_file")
 if [ -n "\$env_file" ] && [ -f "\$env_file" ]; then set -a; . "\$env_file"; set +a; fi
-if command -v mise > /dev/null; then
+if [ '$how' != boat ] && command -v mise > /dev/null; then
   mise trust -q . > /dev/null 2>&1
   mise install -q > /dev/null 2>&1
   eval "\$(mise env -s bash 2> /dev/null)"
@@ -484,7 +503,7 @@ if command -v patchelf > /dev/null; then
   done
 fi
 # A test runs rustfmt. A machine without it gets the pinned toolchain's through rustup.
-if ! rustfmt --version > /dev/null 2>&1 && command -v rustup > /dev/null; then
+if [ '$how' != boat ] && ! rustfmt --version > /dev/null 2>&1 && command -v rustup > /dev/null; then
   channel=\$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
   rustup toolchain install "\$channel" --profile minimal -c rustfmt > /dev/null 2>&1
   PATH=\$(dirname "\$(rustup which rustfmt --toolchain "\$channel")"):\$PATH
@@ -636,9 +655,9 @@ cleanup() {
     [ -f "$f" ] || continue
     h=$(cat "$f")
     # shellcheck disable=SC2029
-    ssh "${ssh_opts[@]}" "$h" "bash -s" <<< "$(stop_share)" > /dev/null 2>&1 ||
+    if rx_exec "$h" "bash -s" <<< "$(stop_share)" > /dev/null 2>&1; then rm -f "$f"; else
       echo "test-partitioned.sh: could not confirm that the share on $h stopped; check it and remove $root.share-lock there" >&2
-    rm -f "$f"
+    fi
   done
   while read -r id; do
     [ -n "$id" ] || continue

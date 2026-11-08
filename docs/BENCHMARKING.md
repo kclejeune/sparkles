@@ -1044,6 +1044,20 @@ thousands of instructions, which vary by a few percent. A few cases move by up t
 between processes with the addresses their data lands at, which is why the gate compares
 ranges over processes. The screen takes about half a minute on forge after its build.
 
+### Explicit remote executors
+
+`mise run bench:remote --executor boat:bx_ID A B` uses an admitted warm Boat worker.
+`bench:remote-writes` and `bench:jena-remote` expose the matching write and Jena commands.
+Their [admission and transport contract](REMOTE-EXECUTORS.md) keeps lifecycle ownership
+separate from workloads. Both arms and all flagged-query reruns stay on one isolated
+worker with matching binaries, compiler and runtime configuration. The query defaults,
+answer checks and 1.10 regression threshold match the Namespace command.
+
+Boat adapter contract tests do not qualify the performance screen. The required
+Namespace screen remains in force until item 762 has real lifecycle, workload and
+full-denominator comparison evidence. Small smoke workloads establish transport and
+correctness only. Published numbers still come from the benchmark host.
+
 ### Namespace query screens
 
 `scripts/nsc-bench.sh A B` (`mise run bench:nsc A B`) compares the query times of two
