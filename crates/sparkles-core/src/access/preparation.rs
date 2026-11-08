@@ -14,12 +14,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const CONTEXT_BYTES: u64 = 256;
+// Conservative backing for the sealed parent, two boxed callbacks and retained
+// shallow preparation handles. Admit before constructing those allocations.
+const PARENT_BYTES: u64 = 512;
 
 struct Inner {
     control: Control,
     limit: u64,
     used: AtomicU64,
     peak: AtomicU64,
+    grant: Option<Arc<crate::sparql::pool::PoolGrant>>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(grant) = &self.grant {
+            grant.release(CONTEXT_BYTES);
+        }
+    }
 }
 
 /// Shared cancellation, absolute deadline and memory accounting for preparing views.
@@ -33,9 +45,31 @@ pub struct Preparation {
 impl Preparation {
     /// Start a request with a conservative allowance for its bookkeeping.
     pub fn new(control: Control, memory_bytes: u64) -> Result<Self> {
+        Self::new_with_grant(control, memory_bytes, None)
+    }
+
+    /// Prepare source ownership and descendant queries in one local allowance,
+    /// backed by this genuine original pool grant. Later metadata cannot replace
+    /// the grant that paid existing source payloads.
+    pub fn with_grant(
+        control: Control,
+        memory_bytes: u64,
+        grant: Arc<crate::sparql::pool::PoolGrant>,
+    ) -> Result<Self> {
+        Self::new_with_grant(control, memory_bytes, Some(grant))
+    }
+
+    fn new_with_grant(
+        control: Control,
+        memory_bytes: u64,
+        grant: Option<Arc<crate::sparql::pool::PoolGrant>>,
+    ) -> Result<Self> {
         control.check()?;
         if memory_bytes < CONTEXT_BYTES {
             return Err(memory(memory_bytes));
+        }
+        if let Some(grant) = &grant {
+            grant.charge(CONTEXT_BYTES)?;
         }
         Ok(Self {
             inner: Arc::new(Inner {
@@ -43,9 +77,83 @@ impl Preparation {
                 limit: memory_bytes,
                 used: AtomicU64::new(CONTEXT_BYTES),
                 peak: AtomicU64::new(CONTEXT_BYTES),
+                grant,
             }),
             no_wait: false,
         })
+    }
+
+    pub(crate) fn grant(&self) -> Option<&Arc<crate::sparql::pool::PoolGrant>> {
+        self.inner.grant.as_ref()
+    }
+
+    /// One checked descendant shares the actual preparation root. The callbacks
+    /// retain genuine ownership and original admission, not a domain label.
+    pub(crate) fn memory_parent(&self) -> Result<Arc<dyn sparkles_budget::MemoryParent>> {
+        let header = self.reserve(PARENT_BYTES)?;
+        let take = self.clone();
+        let give = self.clone();
+        let domain = self
+            .inner
+            .grant
+            .as_ref()
+            .map_or(sparkles_budget::MemoryDomain::unpooled(), |grant| {
+                grant.memory_domain()
+            });
+        Ok(domain.parent(
+            move |bytes| take.reserve_bytes(bytes),
+            move |bytes| {
+                let _keep_header = &header;
+                give.release_bytes(bytes);
+            },
+        ))
+    }
+
+    fn reserve_bytes(&self, bytes: u64) -> std::result::Result<(), sparkles_budget::ParentRefused> {
+        use sparkles_budget::{ParentRefused, Scope};
+        let mut used = self.inner.used.load(Ordering::Relaxed);
+        let next = loop {
+            let next = used.checked_add(bytes).ok_or(ParentRefused::Overflow)?;
+            if next > self.inner.limit {
+                return Err(ParentRefused::Limit {
+                    limit: self.inner.limit,
+                    requested: next,
+                    scope: Scope::Local,
+                });
+            }
+            match self.inner.used.compare_exchange_weak(
+                used,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break next,
+                Err(actual) => used = actual,
+            }
+        };
+        if let Some(grant) = &self.inner.grant
+            && let Err(error) = grant.charge(bytes)
+        {
+            self.inner.used.fetch_sub(bytes, Ordering::Relaxed);
+            let Error::BudgetExceeded(budget) = error else {
+                unreachable!("grant charge only refuses memory")
+            };
+            return Err(ParentRefused::Limit {
+                limit: budget.limit,
+                requested: budget.requested,
+                scope: Scope::Work,
+            });
+        }
+        self.inner.peak.fetch_max(next, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn release_bytes(&self, bytes: u64) {
+        self.inner.used.fetch_sub(bytes, Ordering::Relaxed);
+        if let Some(grant) = &self.inner.grant {
+            // No preparation lock is held when a grant invokes synchronous wakeups.
+            grant.release(bytes);
+        }
     }
 
     #[cfg(test)]
@@ -557,30 +665,20 @@ impl Preparation {
     /// releases its allowance, after its owner has dropped the storage.
     pub fn reserve(&self, bytes: u64) -> Result<Reservation> {
         self.check()?;
-        let mut used = self.inner.used.load(Ordering::Relaxed);
-        loop {
-            let next = used
-                .checked_add(bytes)
-                .filter(|&n| n <= self.inner.limit)
-                .ok_or_else(|| memory(self.inner.limit))?;
-            match self.inner.used.compare_exchange_weak(
-                used,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.inner.peak.fetch_max(next, Ordering::Relaxed);
-                    let held = Reservation {
-                        preparation: self.clone(),
-                        bytes,
-                    };
-                    self.check()?;
-                    return Ok(held);
-                }
-                Err(actual) => used = actual,
+        self.reserve_bytes(bytes).map_err(|error| match error {
+            sparkles_budget::ParentRefused::Limit {
+                scope: sparkles_budget::Scope::Local,
+                ..
             }
-        }
+            | sparkles_budget::ParentRefused::Overflow => memory(self.inner.limit),
+            error => parent_error(error),
+        })?;
+        let held = Reservation {
+            preparation: self.clone(),
+            bytes,
+        };
+        self.check()?;
+        Ok(held)
     }
 
     /// Wait for a provider's mutex under the same request controls.
@@ -723,6 +821,28 @@ fn lossy(mut bytes: &[u8], preparation: &Preparation) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+fn parent_error(error: sparkles_budget::ParentRefused) -> Error {
+    match error {
+        sparkles_budget::ParentRefused::Limit {
+            limit,
+            requested,
+            scope,
+        } => Error::BudgetExceeded(Budget {
+            kind: if scope == sparkles_budget::Scope::Local {
+                BudgetKind::Memory
+            } else {
+                BudgetKind::ServerMemory
+            },
+            limit,
+            requested,
+        }),
+        error => Error::Component(Box::new(
+            crate::error::ComponentError::new("preparation-memory", "ownership", error.to_string())
+                .with_source(error),
+        )),
+    }
 }
 
 fn memory(limit: u64) -> Error {
@@ -967,10 +1087,7 @@ impl Reservation {
     /// Release the allowance above `bytes` once the owner retains no more than that.
     pub(crate) fn release_to(&mut self, bytes: u64) {
         if bytes < self.bytes {
-            self.preparation
-                .inner
-                .used
-                .fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+            self.preparation.release_bytes(self.bytes - bytes);
             self.bytes = bytes;
         }
     }
@@ -991,10 +1108,7 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.preparation
-            .inner
-            .used
-            .fetch_sub(self.bytes, Ordering::Relaxed);
+        self.preparation.release_bytes(self.bytes);
     }
 }
 
@@ -1271,6 +1385,73 @@ impl PreparedView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_source_parent_shares_original_local_and_pool_ownership() {
+        use crate::sparql::pool::QueryPool;
+        let pool = QueryPool::new(64 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        let preparation = Preparation::with_grant(Control::none(), 4096, grant.clone()).unwrap();
+        assert_eq!(grant.used(), CONTEXT_BYTES);
+        let source = preparation.reserve(1024).unwrap();
+        let parent = preparation.memory_parent().unwrap();
+        assert_eq!(parent.domain(), pool.domain());
+        let baseline = preparation.inner_used();
+        let output = parent.clone().reserve(4096 - baseline).unwrap();
+        assert_eq!((preparation.inner_used(), grant.used()), (4096, 4096));
+        assert!(matches!(
+            parent.clone().reserve(1),
+            Err(sparkles_budget::ParentRefused::Limit {
+                scope: sparkles_budget::Scope::Local,
+                requested: 4097,
+                ..
+            })
+        ));
+        drop(source);
+        assert_eq!((preparation.inner_used(), grant.used()), (3072, 3072));
+        drop(output);
+        drop(parent);
+        assert_eq!(
+            (preparation.inner_used(), grant.used()),
+            (CONTEXT_BYTES, CONTEXT_BYTES)
+        );
+        drop(preparation);
+        assert_eq!(grant.used(), 0);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn checked_source_parent_refusal_rolls_back_without_changing_source_credit() {
+        use crate::sparql::pool::QueryPool;
+        let pool = QueryPool::new(64 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        let preparation =
+            Preparation::with_grant(Control::none(), u64::MAX, grant.clone()).unwrap();
+        let parent = preparation.memory_parent().unwrap();
+        let source = preparation.reserve(1024).unwrap();
+        let baseline = (preparation.inner_used(), grant.used());
+        assert!(matches!(
+            parent.clone().reserve(64 << 20),
+            Err(sparkles_budget::ParentRefused::Limit {
+                scope: sparkles_budget::Scope::Work,
+                ..
+            })
+        ));
+        assert_eq!((preparation.inner_used(), grant.used()), baseline);
+        assert!(matches!(
+            parent.clone().reserve(u64::MAX),
+            Err(sparkles_budget::ParentRefused::Overflow)
+        ));
+        assert_eq!((preparation.inner_used(), grant.used()), baseline);
+        drop(source);
+        drop(preparation);
+        let credit = parent.clone().reserve(17).unwrap();
+        assert_eq!(grant.used(), CONTEXT_BYTES + PARENT_BYTES + 17);
+        drop(credit);
+        drop(parent);
+        assert_eq!(grant.used(), 0);
+    }
 
     #[test]
     fn bound_read_source_keeps_real_prepared_backing_and_credit_until_last_clone() {

@@ -129,7 +129,7 @@ impl QueryPool {
 
 impl PoolGrant {
     /// The factory stays inside SPARQL accounting; consumers receive identity only.
-    pub(in crate::sparql) fn memory_domain(&self) -> &MemoryDomain {
+    pub(crate) fn memory_domain(&self) -> &MemoryDomain {
         &self.pool.domain
     }
 
