@@ -891,3 +891,58 @@ fn accounting_refresh_preserves_admission_and_required_public_polls() {
     assert_eq!(terminal.peak(), 16);
     assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
 }
+
+#[test]
+fn a_one_shot_cancellation_during_parallel_normalization_is_reported() {
+    // Unit builds lower PARALLEL_AXIOMS to 64, so these axioms take the gauged
+    // parallel normalization. The callback answers true exactly once, at each poll in
+    // turn, so a stop that any admission swallows lets the run finish.
+    let mut text = String::from("Prefix(:=<urn:cancel663:>) Ontology(");
+    for i in 0..96 {
+        text.push_str(&format!("SubClassOf(:C{i} :C{}) ", i + 1));
+    }
+    text.push(')');
+    let doc = crate::ofn_read::parse(&text).unwrap();
+    let refs: Vec<_> = doc.axioms.iter().map(|a| &a.kind).collect();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let mut sat = crate::classify::Saturation::new();
+    let out = sat
+        .classify(
+            &refs,
+            None,
+            &Limits {
+                threads: 4,
+                cancelled: Some(Arc::new(move || {
+                    counted.fetch_add(1, AtomicOrdering::Relaxed);
+                    false
+                })),
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    assert!(out.complete);
+    let total = calls.load(AtomicOrdering::Relaxed);
+    assert!(total > 0);
+    let mut swallowed = Vec::new();
+    for at in 1..=total {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let s = seen.clone();
+        let mut sat = crate::classify::Saturation::new();
+        let r = sat.classify(
+            &refs,
+            None,
+            &Limits {
+                threads: 4,
+                cancelled: Some(Arc::new(move || {
+                    s.fetch_add(1, AtomicOrdering::Relaxed) + 1 == at
+                })),
+                ..Limits::default()
+            },
+        );
+        if seen.load(AtomicOrdering::Relaxed) >= at && !matches!(r, Err(Error::Cancelled)) {
+            swallowed.push((at, r.map(|o| o.complete)));
+        }
+    }
+    assert!(swallowed.is_empty(), "of {total} polls: {swallowed:?}");
+}

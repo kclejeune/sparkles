@@ -1128,12 +1128,7 @@ impl Saturation {
                     if extra > told {
                         let grown = extra - told;
                         told = extra;
-                        if !gauge.tell(grown) {
-                            return Err(Error::Memory {
-                                limit: limits.max_memory.unwrap_or(usize::MAX),
-                                used: gauge.base + gauge.held.load(Ordering::Relaxed),
-                            });
-                        }
+                        gauge.tell(grown)?;
                     }
                     Ok(())
                 };
@@ -2126,12 +2121,7 @@ fn normalize_axioms<'k>(
             let now = it.bytes() + it.merge_bytes() + out.ax.rough_bytes();
             let grown = now.saturating_sub(told);
             told = told.max(now);
-            if !g.tell(grown) {
-                return Err(Error::Memory {
-                    limit: limits.max_memory.unwrap_or(usize::MAX),
-                    used: g.base + g.held.load(Ordering::Relaxed),
-                });
-            }
+            g.tell(grown)?;
         }
         Ok(())
     };
@@ -2189,36 +2179,44 @@ struct Gauge<'a> {
 }
 
 impl Gauge<'_> {
-    /// Adds `grown` bytes, and answers false once the chunks pass the budget, the pool
-    /// refuses the growth, or another chunk found either.
-    fn tell(&self, grown: usize) -> bool {
+    /// Adds `grown` bytes, and answers [`Error::Memory`] once the chunks pass the
+    /// budget, the pool refuses the growth, or another chunk found either. The numeric
+    /// admission also polls the run, and its cancellation or deadline stays that error,
+    /// since a one-shot cancellation must not turn into a serial retry.
+    fn tell(&self, grown: usize) -> Result<(), Error> {
+        let over = || {
+            self.over.store(true, Ordering::Relaxed);
+            Error::Memory {
+                limit: self.limits.max_memory.unwrap_or(usize::MAX),
+                used: self.base + self.held.load(Ordering::Relaxed),
+            }
+        };
         if self.over.load(Ordering::Relaxed) {
-            return false;
+            return Err(over());
         }
         let used = self.base + self.held.fetch_add(grown, Ordering::Relaxed) + grown;
         if let Some(numeric) = &self.numeric {
-            if numeric.grow_base(grown).is_err() {
-                self.over.store(true, Ordering::Relaxed);
-                return false;
+            match numeric.grow_base(grown) {
+                Ok(()) => {}
+                Err(Error::Memory { .. }) => return Err(over()),
+                Err(e) => return Err(e),
             }
             *self.peak.lock() = numeric.peak();
-            return true;
+            return Ok(());
         }
         if self.limits.max_memory.is_some_and(|m| used > m) {
-            self.over.store(true, Ordering::Relaxed);
-            return false;
+            return Err(over());
         }
         let mut peak = self.peak.lock();
         let more = used.saturating_sub(*peak);
         if more == 0 {
-            return true;
+            return Ok(());
         }
         if self.limits.charge.as_ref().is_some_and(|f| !f(more)) {
-            self.over.store(true, Ordering::Relaxed);
-            return false;
+            return Err(over());
         }
         *peak = used;
-        true
+        Ok(())
     }
 }
 
