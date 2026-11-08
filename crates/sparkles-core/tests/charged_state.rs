@@ -42,9 +42,9 @@ fn is_memory(error: &Error) -> bool {
 fn computed_terms_beyond_the_budget_fail_the_query_in_both_modes() {
     let s = store();
     let all = query(s.snapshot(), Q, &Default::default()).unwrap();
-    let rows = all.rows();
+    let rows = all.rows().unwrap();
     assert_eq!(rows.len(), ROWS);
-    assert!(rows.iter().all(|r| r.iter().all(Option::is_some)));
+    assert!(rows.iter().all(|r| r.values().iter().all(Option::is_some)));
 
     let eager = query(s.snapshot(), Q, &budget(3 << 20));
     match eager {
@@ -92,9 +92,9 @@ fn a_finished_result_decodes_its_values_within_a_small_budget() {
         &budget(8192),
     )
     .unwrap();
-    let rows = r.rows();
+    let rows = r.rows().unwrap();
     assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
+    match &rows.row(0).unwrap().values()[0] {
         Some(oxrdf::Term::Literal(l)) => assert_eq!(l.value(), long),
         other => panic!("{other:?}"),
     }
@@ -124,9 +124,9 @@ fn a_refused_template_term_leaves_the_store_unchanged() {
         &Default::default(),
     )
     .unwrap();
-    let rows = r.rows();
+    let rows = r.rows().unwrap();
     assert_eq!(rows.len(), 1, "the deletion was not applied");
-    match &rows[0][0] {
+    match &rows.row(0).unwrap().values()[0] {
         Some(oxrdf::Term::Literal(l)) => assert_eq!(l.value(), "old"),
         other => panic!("{other:?}"),
     }
@@ -141,7 +141,7 @@ fn a_regular_expression_beyond_the_budget_fails_the_query_in_both_modes() {
     // the budgeted queries run first, since the result cache would answer them
     match query(s.snapshot(), q, &budget(32 << 10)) {
         Err(error) => assert!(is_memory(&error), "{error:?}"),
-        Ok(r) => panic!("eager answered {:?} within the budget", r.rows()),
+        Ok(r) => panic!("eager answered {:?} within the budget", r.rows().unwrap()),
     }
     let mut c = select_cursor(
         s.snapshot(),
@@ -157,18 +157,18 @@ fn a_regular_expression_beyond_the_budget_fails_the_query_in_both_modes() {
             b.map(|b| b.len())
         ),
     }
-    let rows = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    let rows = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .rows()
+        .unwrap();
     assert_eq!(rows.len(), 1);
-    assert!(rows[0][0].is_some());
+    assert!(rows.row(0).unwrap().values()[0].is_some());
 }
 
-fn count(rows: &[Vec<Option<oxrdf::Term>>]) -> u64 {
-    match rows {
-        [row] => match &row[0] {
-            Some(oxrdf::Term::Literal(l)) => l.value().parse().unwrap(),
-            other => panic!("not a count: {other:?}"),
-        },
-        _ => panic!("{} rows", rows.len()),
+fn count(row: &[Option<oxrdf::Term>]) -> u64 {
+    match &row[0] {
+        Some(oxrdf::Term::Literal(l)) => l.value().parse().unwrap(),
+        other => panic!("not a count: {other:?}"),
     }
 }
 
@@ -193,8 +193,18 @@ fn regular_expressions_on_rayon_workers_count_what_the_data_holds() {
         .install(|| {
             for (filter, expected) in cases {
                 let q = format!("SELECT (COUNT(*) AS ?c) WHERE {{ ?s <urn:p> ?o {filter} }}");
-                let eager = query(s.snapshot(), &q, &Default::default()).unwrap().rows();
-                assert_eq!(count(&eager), expected, "eager {filter}");
+                let eager = query(s.snapshot(), &q, &Default::default())
+                    .unwrap()
+                    .rows()
+                    .unwrap();
+                assert_eq!(
+                    count({
+                        assert_eq!(eager.len(), 1);
+                        eager.row(0).unwrap().values()
+                    }),
+                    expected,
+                    "eager {filter}"
+                );
                 let mut c = select_cursor(
                     s.snapshot(),
                     &q,
@@ -208,7 +218,14 @@ fn regular_expressions_on_rayon_workers_count_what_the_data_holds() {
                         rows.push(b.row(i).unwrap().values().to_vec());
                     }
                 }
-                assert_eq!(count(&rows), expected, "cursor {filter}");
+                assert_eq!(
+                    count({
+                        assert_eq!(rows.len(), 1);
+                        &rows[0]
+                    }),
+                    expected,
+                    "cursor {filter}"
+                );
             }
         });
 }
@@ -224,8 +241,17 @@ fn a_long_literal_replacement_reserves_what_it_writes() {
     let q = format!(
         r#"SELECT (STRLEN(REPLACE(?x, "^a", "{long}")) AS ?n) WHERE {{ VALUES ?x {{ "a{long}" }} }}"#
     );
-    let eager = query(s.snapshot(), &q, &budget(16 << 20)).unwrap().rows();
-    assert_eq!(count(&eager), 20_000);
+    let eager = query(s.snapshot(), &q, &budget(16 << 20))
+        .unwrap()
+        .rows()
+        .unwrap();
+    assert_eq!(
+        count({
+            assert_eq!(eager.len(), 1);
+            eager.row(0).unwrap().values()
+        }),
+        20_000
+    );
     let mut c = select_cursor(
         s.snapshot(),
         &q,
@@ -239,7 +265,13 @@ fn a_long_literal_replacement_reserves_what_it_writes() {
             rows.push(b.row(i).unwrap().values().to_vec());
         }
     }
-    assert_eq!(count(&rows), 20_000);
+    assert_eq!(
+        count({
+            assert_eq!(rows.len(), 1);
+            &rows[0]
+        }),
+        20_000
+    );
 }
 
 fn ntriples(lines: impl Iterator<Item = String>) -> Store {

@@ -1,6 +1,8 @@
 //! Graph algorithms (`SERVICE algo:…`, spec F14): the acceptance examples, parameter
 //! errors, access control, write-back through SPARQL Update, and the budgets.
 
+include!("support/retained_rows_eq.rs");
+
 use sparkles_core::access::{Caller, GraphAccess, Graphs, Limits, Protection, Rule, TripleRules};
 use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::sparql::update::update;
@@ -785,7 +787,7 @@ mod betweenness_weight_domain {
                 &Default::default(),
             )
             .unwrap();
-            let leaf = find(&result.plan, "AlgoCall").unwrap();
+            let leaf = find(result.plan(), "AlgoCall").unwrap();
             assert_eq!(
                 leaf.counters.as_ref().unwrap()["cachedProjections"].as_u64(),
                 Some(1)
@@ -857,11 +859,12 @@ fn rows_with(s: &Store, q: &str, opts: &QueryOptions) -> Vec<BTreeMap<String, St
     let r =
         query(s.snapshot(), &format!("{PREFIXES}{q}"), opts).unwrap_or_else(|e| panic!("{q}: {e}"));
     r.rows()
+        .unwrap()
         .iter()
         .map(|row| {
-            r.vars
+            r.variables()
                 .iter()
-                .zip(row)
+                .zip(row.values())
                 .map(|(v, t)| (v.clone(), short(t)))
                 .collect()
         })
@@ -933,10 +936,10 @@ fn projection_cache_read(
     opts: &QueryOptions,
 ) -> (usize, u64) {
     let result = query(snap, &format!("{PREFIXES}{q}"), opts).unwrap();
-    let rows = result.rows();
+    let rows = result.rows().unwrap();
     assert_eq!(rows.len(), 4);
-    let components: BTreeSet<_> = rows.iter().map(|r| short(&r[1])).collect();
-    let leaf = find(&result.plan, "AlgoCall").expect("algorithm executed");
+    let components: BTreeSet<_> = rows.iter().map(|r| short(&r.values()[1])).collect();
+    let leaf = find(result.plan(), "AlgoCall").expect("algorithm executed");
     (
         components.len(),
         leaf.counters.as_ref().unwrap()["cachedProjections"]
@@ -1175,18 +1178,18 @@ fn projection_cache_triple_masks_remain_separate() {
             &masked,
         )
         .unwrap();
-        let rows = result.rows();
+        let rows = result.rows().unwrap();
         assert_eq!(rows.len(), 4);
         assert_eq!(
             rows.iter()
-                .map(|r| short(&r[1]))
+                .map(|r| short(&r.values()[1]))
                 .collect::<BTreeSet<_>>()
                 .len(),
             2
         );
         // Access-controlled plans intentionally redact runtime counters. Semantic
         // results still distinguish this mask from the warmed unrestricted view.
-        assert!(find(&result.plan, "AlgoCall").unwrap().counters.is_none());
+        assert!(find(result.plan(), "AlgoCall").unwrap().counters.is_none());
     }
 }
 
@@ -1206,16 +1209,16 @@ fn noncacheable_view_with_enabled_result_backend_neither_reads_nor_populates() {
     let q = format!("{PREFIXES}{PROJECTION_WCC}");
     let opts = QueryOptions::default();
     let components = |r: &sparkles_core::sparql::QueryResult| {
-        let rows = r.rows();
+        let rows = r.rows().unwrap();
         assert_eq!(rows.len(), 4);
         rows.iter()
-            .map(|row| short(&row[1]))
+            .map(|row| short(&row.values()[1]))
             .collect::<BTreeSet<_>>()
             .len()
     };
     assert_eq!(components(&query(s.snapshot(), &q, &opts).unwrap()), 2);
     let committed = query(s.snapshot(), &q, &opts).unwrap();
-    assert!(committed.plan.cached);
+    assert!(committed.plan().cached);
     assert_eq!(components(&committed), 2);
     let mut t = projection_cache_txn(&s);
     let bridge = projection_cache_bridge(&mut t);
@@ -1228,12 +1231,12 @@ fn noncacheable_view_with_enabled_result_backend_neither_reads_nor_populates() {
     assert!(pending.results.enabled());
     for _ in 0..2 {
         let result = query(Arc::new(pending.clone()), &q, &opts).unwrap();
-        assert!(!result.plan.cached);
+        assert!(!result.plan().cached);
         assert_eq!(components(&result), 1);
     }
     drop(t);
     let committed = query(s.snapshot(), &q, &opts).unwrap();
-    assert!(committed.plan.cached);
+    assert!(committed.plan().cached);
     assert_eq!(components(&committed), 2);
 }
 
@@ -1780,11 +1783,11 @@ fn graphalytics_clustering_reuses_distinct_default_projections() {
             );
             let result = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
             assert_eq!(result.len(), 3);
-            for row in result.rows() {
-                assert_eq!(short(&row[1]).parse::<f64>().unwrap(), expected);
+            for row in result.rows().unwrap() {
+                assert_eq!(short(&row.values()[1]).parse::<f64>().unwrap(), expected);
             }
             if round == 1 {
-                let leaf = find(&result.plan, "AlgoCall").expect("algorithm executed");
+                let leaf = find(result.plan(), "AlgoCall").expect("algorithm executed");
                 assert_eq!(leaf.counters.as_ref().unwrap()["cachedProjections"], 1);
             }
         }
@@ -2159,7 +2162,8 @@ fn plan_of(s: &Store, q: &str) -> sparkles_core::sparql::PlanInfo {
         &QueryOptions::default(),
     )
     .unwrap()
-    .plan
+    .plan()
+    .clone()
 }
 
 fn find<'a>(
@@ -2222,7 +2226,7 @@ fn node2vec_service_budgets_walk_scratch_and_preserves_seeded_results() {
     let short = query(s.snapshot(), &text(8), &options).unwrap();
     assert_eq!(short.len(), 2);
     let again = query(s.snapshot(), &text(8), &options).unwrap();
-    assert_eq!(short.rows(), again.rows());
+    assert_retained_rows_eq!(short.rows().unwrap(), again.rows().unwrap());
     // The same projection and embedding dimensions fit. The long walk's 200,000
     // bytes of capacity alone exceed the budget before the walk is allocated.
     let error = match query(s.snapshot(), &text(50_000), &options) {
@@ -2234,9 +2238,12 @@ fn node2vec_service_budgets_walk_scratch_and_preserves_seeded_results() {
         "{error}"
     );
     // Failure releases the call's native temporaries and does not poison a retry.
-    assert_eq!(
-        query(s.snapshot(), &text(8), &options).unwrap().rows(),
-        short.rows()
+    assert_retained_rows_eq!(
+        query(s.snapshot(), &text(8), &options)
+            .unwrap()
+            .rows()
+            .unwrap(),
+        short.rows().unwrap()
     );
 }
 
@@ -2298,8 +2305,9 @@ fn concurrent_calls_agree_and_share_the_thread_budget() {
             let r = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
             let mut rows: Vec<String> = r
                 .rows()
+                .unwrap()
                 .iter()
-                .map(|row| format!("{} {}", short(&row[0]), short(&row[1])))
+                .map(|row| format!("{} {}", short(&row.values()[0]), short(&row.values()[1])))
                 .collect();
             rows.sort();
             rows
@@ -2339,7 +2347,7 @@ fn r7_cached_incoming_requires_each_call_budget() {
     let warmed = query(s.snapshot(), &format!("{PREFIXES}{warm}"), &opts).unwrap();
     assert_eq!(warmed.len(), 4096);
     assert_eq!(
-        find(&warmed.plan, "AlgoCall")
+        find(warmed.plan(), "AlgoCall")
             .unwrap()
             .counters
             .as_ref()
@@ -2364,7 +2372,7 @@ fn r7_cached_incoming_requires_each_call_budget() {
     )
     .unwrap();
     assert_eq!(adequate.len(), 4096);
-    let leaf = find(&adequate.plan, "AlgoCall").unwrap();
+    let leaf = find(adequate.plan(), "AlgoCall").unwrap();
     assert_eq!(leaf.counters.as_ref().unwrap()["cachedProjections"], 1);
     println!(
         "R7_ADEQUATE_1048576 peak_bytes={}",
@@ -2391,9 +2399,9 @@ fn r7_cached_incoming_requires_each_call_budget() {
     )
     .unwrap();
     assert_eq!(unlimited.len(), 4096);
-    let leaf = find(&unlimited.plan, "AlgoCall").unwrap();
+    let leaf = find(unlimited.plan(), "AlgoCall").unwrap();
     assert_eq!(leaf.counters.as_ref().unwrap()["cachedProjections"], 1);
-    assert_eq!(adequate.rows(), unlimited.rows());
+    assert_retained_rows_eq!(adequate.rows().unwrap(), unlimited.rows().unwrap());
     assert!(
         matches!(cold, Err(sparkles_core::Error::BudgetExceeded(_))),
         "expected cold incoming refusal"

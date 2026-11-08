@@ -31,9 +31,9 @@ fn store(data: &str) -> Store {
 }
 
 fn run(store: &Store, q: &str, opts: &QueryOptions, mode: ExecutionMode) -> Result<Rows, Error> {
-    let text = |row: Vec<Option<Term>>| -> Vec<String> {
-        row.into_iter()
-            .map(|t| t.map(|t| t.to_string()).unwrap_or_default())
+    let text = |row: &[Option<Term>]| -> Vec<String> {
+        row.iter()
+            .map(|t| t.as_ref().map(|t| t.to_string()).unwrap_or_default())
             .collect()
     };
     let mut rows = match query_execution(store.snapshot(), q, opts, &Default::default(), mode)? {
@@ -41,12 +41,17 @@ fn run(store: &Store, q: &str, opts: &QueryOptions, mode: ExecutionMode) -> Resu
         QueryExecution::Eager(r) if r.result().kind == QueryKind::Ask => {
             return Ok(Rows::Ask(r.result().boolean));
         }
-        QueryExecution::Eager(r) => r.into_result().rows().into_iter().map(text).collect(),
+        QueryExecution::Eager(r) => r
+            .into_result()
+            .rows()?
+            .iter()
+            .map(|row| text(row.values()))
+            .collect(),
         QueryExecution::Select(mut c) => {
             let mut rows = Vec::new();
             while let Some(b) = c.next_batch()? {
                 for i in 0..b.len() {
-                    rows.push(text(b.row(i).unwrap().values().to_vec()));
+                    rows.push(text(b.row(i)?.values()));
                 }
             }
             rows

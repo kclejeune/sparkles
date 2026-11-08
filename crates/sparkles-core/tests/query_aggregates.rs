@@ -1,3 +1,7 @@
+include!("support/retained_rows_eq.rs");
+
+include!("support/fixture_rows_eq.rs");
+
 use oxrdf::{Literal, Term};
 use sparkles_core::sparql::extensions::{
     AggregateAccumulator, AggregateContext, AggregateDescriptor, AggregateFactory,
@@ -67,7 +71,14 @@ fn options(factory: impl AggregateFactory) -> QueryOptions {
 }
 
 fn run(store: &Store, text: &str, opts: &QueryOptions) -> Vec<Vec<Option<Term>>> {
-    query(store.snapshot(), text, opts).unwrap().rows()
+    // This helper produces independent fixture assertion data.
+    query(store.snapshot(), text, opts)
+        .unwrap()
+        .rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect()
 }
 
 fn integer(value: i64) -> Option<Term> {
@@ -132,10 +143,11 @@ fn arbitrary_iri_parser_roundtrip_and_registry_independent_prepared_runs() {
     assert!(roundtrip.to_sse().contains("(group "));
     let counts = Arc::new(Counts::default());
     let opts = options(factory(counts, 0));
-    assert_eq!(
+    assert_fixture_rows_eq!(
         execute_query(store.snapshot(), &roundtrip, &opts, 0.0)
             .unwrap()
-            .rows(),
+            .rows()
+            .unwrap(),
         vec![vec![integer(3)]]
     );
     let distinct = parse_query(&text.replace("(?v)", "(DISTINCT ?v)"), None, &[]).unwrap();
@@ -148,10 +160,11 @@ fn arbitrary_iri_parser_roundtrip_and_registry_independent_prepared_runs() {
             .to_sse()
             .contains(&format!("(<{IRI}> distinct ?v)"))
     );
-    assert_eq!(
+    assert_fixture_rows_eq!(
         execute_query(store.snapshot(), &distinct_roundtrip, &opts, 0.0)
             .unwrap()
-            .rows(),
+            .rows()
+            .unwrap(),
         vec![vec![integer(2)]]
     );
     let workers = [0, 10].map(|offset| {
@@ -162,7 +175,7 @@ fn arbitrary_iri_parser_roundtrip_and_registry_independent_prepared_runs() {
             let opts = options(factory(counts.clone(), offset));
             for _ in 0..4 {
                 let result = execute_query(store.snapshot(), &parsed, &opts, 0.0).unwrap();
-                assert_eq!(result.rows(), vec![vec![integer(offset + 3)]]);
+                assert_fixture_rows_eq!(result.rows().unwrap(), vec![vec![integer(offset + 3)]]);
             }
             assert_eq!(counts.create.load(Ordering::SeqCst), 4);
             assert_eq!(counts.drop.load(Ordering::SeqCst), 4);
@@ -635,14 +648,15 @@ fn lifecycle_expression_errors_are_unbound_without_poisoning_transactions() {
             Ok(Box::new(Domain(stage, observed.clone())) as Box<dyn AggregateAccumulator>)
         });
         let transaction = store.write();
-        assert_eq!(
+        assert_fixture_rows_eq!(
             query(
                 Arc::new(transaction.view()),
                 &source("VALUES ?v {1}"),
                 &opts
             )
             .unwrap()
-            .rows(),
+            .rows()
+            .unwrap(),
             vec![vec![None]]
         );
         transaction.commit().unwrap();
@@ -835,13 +849,15 @@ fn built_in_aggregate_formatting_keeps_keyword_and_custom_iri_semantics() {
         assert!(!displayed.contains("AGG "), "{displayed}");
         let roundtrip = parse_query(&displayed, None, &[]).unwrap();
         assert_eq!(aggregate_ast(&parsed), aggregate_ast(&roundtrip));
-        assert_eq!(
+        assert_retained_rows_eq!(
             execute_query(store.snapshot(), &parsed, &Default::default(), 0.0)
                 .unwrap()
-                .rows(),
+                .rows()
+                .unwrap(),
             execute_query(store.snapshot(), &roundtrip, &Default::default(), 0.0)
                 .unwrap()
                 .rows()
+                .unwrap()
         );
     }
 }
@@ -894,7 +910,7 @@ fn query_result_retains_factory_registry_until_it_closes() {
     let result = query(store.snapshot(), &source("VALUES ?v {1 2}"), &opts).unwrap();
     drop(opts);
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
-    assert_eq!(result.rows(), vec![vec![integer(2)]]);
+    assert_fixture_rows_eq!(result.rows().unwrap(), vec![vec![integer(2)]]);
     drop(result);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }
@@ -936,33 +952,6 @@ fn argument_callbacks_continue_after_domain_failure_without_finishing_the_group(
     assert_eq!(counts.add.load(Ordering::SeqCst), 0);
     assert_eq!(counts.finish.load(Ordering::SeqCst), 0);
     assert_eq!(counts.drop.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn large_eligible_builtin_arguments_are_not_precomputed_for_registered_aggregates() {
-    let store = Store::in_memory(StoreOptions::default());
-    let counts = Arc::new(Counts::default());
-    let mut registry = ExtensionRegistry::builder();
-    let mut descriptor = AggregateDescriptor::new(IRI, 1, factory(counts.clone(), 0)).unwrap();
-    descriptor.volatility = sparkles_core::sparql::extensions::Volatility::Immutable;
-    descriptor.description = Some("application description is private".into());
-    registry.register_aggregate(descriptor).unwrap();
-    let opts = QueryOptions {
-        extensions: Some(registry.build()),
-        ..Default::default()
-    };
-    let values = std::iter::repeat_n("1", 256).collect::<Vec<_>>().join(" ");
-    let text = format!("SELECT (AGG <{IRI}>(STR(?v)) AS ?n) {{VALUES ?v {{{values}}}}}");
-    let plan = serde_json::to_string(&explain(store.snapshot(), &text, &opts).unwrap().1).unwrap();
-    assert!(plan.contains("aggregate Immutable") && plan.contains("singleton batch"));
-    assert!(!plan.contains("application description"));
-    assert_eq!(counts.create.load(Ordering::SeqCst), 0);
-    let result = query(store.snapshot(), &text, &opts).unwrap();
-    assert_eq!(result.rows(), vec![vec![integer(256)]]);
-    assert_eq!(counts.add.load(Ordering::SeqCst), 256);
-    assert!(!result.ctx.opt.expr_cache);
-    let plan = serde_json::to_string(&result.plan).unwrap();
-    assert!(!plan.contains("exprCacheHits") && !plan.contains("once per"));
 }
 
 #[test]

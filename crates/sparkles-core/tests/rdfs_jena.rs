@@ -116,13 +116,14 @@ fn suite(name: &str, failures: &mut Vec<String>) -> usize {
         }
         let ours: Rows = r
             .rows()
+            .unwrap()
             .into_iter()
             .map(|row| {
                 let mut v: Vec<(String, String)> = r
-                    .vars
+                    .variables()
                     .iter()
-                    .zip(row)
-                    .filter_map(|(k, t)| Some((k.clone(), t?.to_string())))
+                    .zip(row.values())
+                    .filter_map(|(k, t)| Some((k.clone(), t.as_ref()?.to_string())))
                     .collect();
                 v.sort();
                 v
@@ -200,8 +201,9 @@ fn update_where_sees_derived_triples() {
     .unwrap();
     let mut xs: Vec<String> = r
         .rows()
+        .unwrap()
         .into_iter()
-        .map(|row| match &row[0] {
+        .map(|row| match &row.values()[0] {
             Some(Term::NamedNode(n)) => n.as_str().to_string(),
             other => panic!("{other:?}"),
         })

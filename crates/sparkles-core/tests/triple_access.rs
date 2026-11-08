@@ -476,16 +476,18 @@ fn answer(s: &Store, q: &str, opts: &QueryOptions) -> Vec<String> {
     let mut out: Vec<String> = match r.kind {
         QueryKind::Select => r
             .rows()
+            .unwrap()
             .into_iter()
             .map(|row| {
-                row.iter()
+                row.values()
+                    .iter()
                     .map(|t| t.as_ref().map_or("-".to_string(), |t| t.to_string()))
                     .collect::<Vec<_>>()
                     .join(" ")
             })
             .collect(),
         QueryKind::Ask => vec![r.boolean.to_string()],
-        _ => r.triples.iter().map(|t| t.to_string()).collect(),
+        _ => r.triples().iter().map(|t| t.to_string()).collect(),
     };
     out.sort();
     out

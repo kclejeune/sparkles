@@ -56,8 +56,8 @@ fn fixture() -> Store {
 
 type Rows = Vec<Vec<Option<Term>>>;
 
-fn sorted(mut rows: Rows) -> Vec<String> {
-    let mut out: Vec<String> = rows.drain(..).map(|r| format!("{r:?}")).collect();
+fn sorted(rows: impl IntoIterator<Item = impl std::fmt::Debug>) -> Vec<String> {
+    let mut out: Vec<String> = rows.into_iter().map(|r| format!("{r:?}")).collect();
     out.sort();
     out
 }
@@ -80,7 +80,15 @@ fn automatic(s: &Store, q: &str, opts: &QueryOptions) -> Result<(Rows, Option<St
             }
             Ok((rows, Some(c.plan_json()?)))
         }
-        QueryExecution::Eager(r) => Ok((r.into_result().rows(), None)),
+        QueryExecution::Eager(r) => Ok((
+            r.into_result()
+                .rows()?
+                .iter()
+                // Independent assertion rows, matching the cursor fixture branch.
+                .map(|row| row.values().to_vec())
+                .collect(),
+            None,
+        )),
         _ => unreachable!("a SELECT"),
     }
 }
@@ -92,7 +100,12 @@ const MEMORY: u64 = 12 << 20;
 #[test]
 fn q4_eager_memory_failure_runs_again_as_a_cursor_without_spill() {
     let s = fixture();
-    let expected = sorted(query(s.snapshot(), Q4, &Default::default()).unwrap().rows());
+    let expected = sorted(
+        query(s.snapshot(), Q4, &Default::default())
+            .unwrap()
+            .rows()
+            .unwrap(),
+    );
     assert!(expected.len() > 1000, "{}", expected.len());
     let opts = QueryOptions {
         max_memory_bytes: Some(MEMORY),

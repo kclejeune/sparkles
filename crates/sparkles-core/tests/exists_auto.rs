@@ -2,6 +2,8 @@
 //! count over a large input whose EXISTS patterns have cursor plans streams, and its
 //! answers match eager execution exactly.
 
+include!("support/retained_rows_eq.rs");
+
 use oxrdf::Term;
 use oxrdfio::RdfFormat;
 use sparkles_core::io::Source;
@@ -41,7 +43,7 @@ fn store() -> Store {
     s
 }
 
-fn bag(rows: Vec<Vec<Option<Term>>>) -> Vec<String> {
+fn bag(rows: impl IntoIterator<Item = impl std::fmt::Debug>) -> Vec<String> {
     let mut rows = rows
         .into_iter()
         .map(|r| format!("{r:?}"))
@@ -50,7 +52,7 @@ fn bag(rows: Vec<Vec<Option<Term>>>) -> Vec<String> {
     rows
 }
 
-fn ordered(rows: Vec<Vec<Option<Term>>>) -> Vec<String> {
+fn ordered(rows: impl IntoIterator<Item = impl std::fmt::Debug>) -> Vec<String> {
     rows.into_iter().map(|r| format!("{r:?}")).collect()
 }
 
@@ -71,7 +73,15 @@ fn automatic(
             }
             Ok((rows, true))
         }
-        QueryExecution::Eager(r) => Ok((r.into_result().rows(), false)),
+        QueryExecution::Eager(r) => Ok((
+            r.into_result()
+                .rows()?
+                .iter()
+                // Independent assertion rows, matching the cursor fixture branch.
+                .map(|row| row.values().to_vec())
+                .collect(),
+            false,
+        )),
         _ => panic!("{q}: not a SELECT"),
     }
 }
@@ -113,7 +123,10 @@ const PER_KEY: &[&str] = &[
 fn keyed_bind_and_optional_exists_stream_and_match_eager() {
     let s = store();
     for q in KEYED {
-        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .rows()
+            .unwrap();
         for rows in [4096, 10_000] {
             let cursor = CursorOptions {
                 batch_rows: rows,
@@ -133,7 +146,8 @@ fn large_groupings_with_exists_stream_and_match_eager() {
     for q in STREAMED {
         let expected = query(s.snapshot(), q, &Default::default())
             .unwrap_or_else(|e| panic!("{q}: {e}"))
-            .rows();
+            .rows()
+            .unwrap();
         for rows in [4096, 10_000] {
             let cursor = CursorOptions {
                 batch_rows: rows,
@@ -155,7 +169,10 @@ fn large_groupings_with_exists_stream_and_match_eager() {
 fn exists_evaluated_per_key_stays_eager_and_matches() {
     let s = store();
     for q in PER_KEY {
-        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .rows()
+            .unwrap();
         let (got, streamed) = automatic(&s, q, &Default::default(), &Default::default())
             .unwrap_or_else(|e| panic!("{q}: {e}"));
         assert!(!streamed, "{q}: streamed");
@@ -220,7 +237,10 @@ fn streamed_exists_honors_cancellation() {
 fn streamed_exists_stays_within_its_memory_budget() {
     let s = store();
     for q in STREAMED.iter().step_by(2) {
-        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .rows()
+            .unwrap();
         for memory in [512 << 10, 4 << 20, 64 << 20] {
             let opts = QueryOptions {
                 max_memory_bytes: Some(memory),
@@ -258,7 +278,7 @@ fn streamed_exists_stays_within_its_memory_budget() {
                 }
                 Ok(QueryExecution::Eager(r)) => {
                     assert_eq!(
-                        bag(r.into_result().rows()),
+                        bag(r.into_result().rows().unwrap()),
                         bag(expected.clone()),
                         "{q}; {memory}"
                     )
@@ -284,7 +304,10 @@ fn exists_with_an_outer_bound_risky_variable_stays_eager() {
         "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER EXISTS { ?s <urn:q> ?o FILTER(?v >= 0) } }",
         "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER NOT EXISTS { ?o <urn:r> ?k } }",
     ] {
-        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .rows()
+            .unwrap();
         let (got, streamed) = automatic(&s, q, &Default::default(), &Default::default())
             .unwrap_or_else(|e| panic!("{q}: {e}"));
         assert!(!streamed, "{q}: streamed");
@@ -311,9 +334,12 @@ fn bind_exists_streams_from_the_key_set() {
         KEYED[1],
         "SELECT ?b (COUNT(*) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o } BIND(EXISTS { ?o <urn:r> ?k } AS ?b) } GROUP BY ?b ORDER BY ?b",
     ] {
-        let expected = query(s.snapshot(), q, &per_key).unwrap().rows();
-        assert_eq!(
-            query(s.snapshot(), q, &Default::default()).unwrap().rows(),
+        let expected = query(s.snapshot(), q, &per_key).unwrap().rows().unwrap();
+        assert_retained_rows_eq!(
+            query(s.snapshot(), q, &Default::default())
+                .unwrap()
+                .rows()
+                .unwrap(),
             expected,
             "{q}"
         );

@@ -201,7 +201,10 @@ fn cold_generation_and_cached_backing_keep_exact_state_and_charge_owned_dictiona
     .unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(
-        result.rows()[0][0].as_ref().unwrap().to_string(),
+        result.row(0).unwrap().values()[0]
+            .as_ref()
+            .unwrap()
+            .to_string(),
         "<urn:base>"
     );
     // This is now a cache hit with no new dictionary decode. The retained owned

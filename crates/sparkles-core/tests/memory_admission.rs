@@ -78,7 +78,15 @@ fn automatic(s: &Store, q: &str, opts: &QueryOptions) -> Auto {
                 }
             }
         }
-        Ok(QueryExecution::Eager(r)) => Auto::Eager(r.into_result().rows()),
+        Ok(QueryExecution::Eager(r)) => Auto::Eager(
+            r.into_result()
+                .rows()
+                .unwrap()
+                .iter()
+                // Independent assertion rows, matching the cursor fixture branch.
+                .map(|row| row.values().to_vec())
+                .collect(),
+        ),
         Ok(_) => panic!("{q}: not a SELECT"),
         Err(e) => {
             eprintln!("refused before a cursor: {e}");

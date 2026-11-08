@@ -41,11 +41,12 @@ fn rows_with(s: &Store, q: &str, opts: &QueryOptions) -> Vec<BTreeMap<String, St
     let r =
         query(s.snapshot(), &format!("{PREFIXES}{q}"), opts).unwrap_or_else(|e| panic!("{q}: {e}"));
     r.rows()
+        .unwrap()
         .iter()
         .map(|row| {
-            r.vars
+            r.variables()
                 .iter()
-                .zip(row)
+                .zip(row.values())
                 .map(|(v, t)| (v.clone(), short(t)))
                 .collect()
         })

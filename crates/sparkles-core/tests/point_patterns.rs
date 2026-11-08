@@ -178,7 +178,7 @@ fn point_patterns_leave_volatile_filters_at_their_original_input() {
         .unwrap();
         assert_eq!(r.len(), 3);
         assert_eq!(
-            assignments(&r.plan),
+            assignments(r.plan()),
             usize::from(substituted),
             "{condition}"
         );

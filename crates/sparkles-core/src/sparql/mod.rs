@@ -2688,3 +2688,11 @@ mod eager_graph_lifecycle_tests {
         assert_eq!(pool.granted(), 0);
     }
 }
+
+// Integration fixtures that inspect private output ownership remain unit tests.
+#[cfg(test)]
+#[path = "../../tests/private/query_aggregates.rs"]
+mod fixture_query_aggregates;
+#[cfg(test)]
+#[path = "../../tests/private/query_pool.rs"]
+mod fixture_query_pool;

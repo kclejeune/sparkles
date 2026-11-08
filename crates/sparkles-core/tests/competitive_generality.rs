@@ -10,7 +10,7 @@ use sparkles_core::sparql::{
 use sparkles_core::store::{Snapshot, Store, StoreOptions};
 use std::sync::Arc;
 
-fn bag(rows: Vec<Vec<Option<Term>>>) -> Vec<String> {
+fn bag(rows: impl IntoIterator<Item = impl std::fmt::Debug>) -> Vec<String> {
     let mut rows: Vec<_> = rows.into_iter().map(|row| format!("{row:?}")).collect();
     rows.sort();
     rows
@@ -39,12 +39,12 @@ fn check_select(snapshot: &Arc<Snapshot>, text: &str, expected: Vec<Vec<Option<T
     let expected = bag(expected);
     for fast in [false, true] {
         let result = query(snapshot.clone(), text, &options(fast)).unwrap();
-        assert_eq!(bag(result.rows()), expected, "fast={fast}: {text}");
+        assert_eq!(bag(result.rows().unwrap()), expected, "fast={fast}: {text}");
         if fast {
             assert!(
-                keyed(&result.plan),
+                keyed(result.plan()),
                 "the optimized join must run: {:#?}",
-                result.plan
+                result.plan()
             );
         }
     }
@@ -196,7 +196,7 @@ fn pure_union_asks_match_full_select_answers_for_early_late_and_absent_matches()
                         ask.boolean, expected,
                         "n={n}, reverse={reverse}, fast={fast}, sought={sought}"
                     );
-                    assert_eq!(!select.table.is_empty(), expected);
+                    assert_eq!(!select.is_empty(), expected);
                 }
             }
         }

@@ -1,4 +1,6 @@
 //! External sorts that spill sorted runs to disk under a small memory budget (X08 §6.4).
+include!("support/fixture_rows_eq.rs");
+
 use oxrdf::Term;
 use oxrdfio::RdfFormat;
 use sparkles_core::io::Source;
@@ -119,9 +121,12 @@ fn numbered_distinct_can_spill_partially_ordered_scan_input() {
     let tmp = tempfile::tempdir().unwrap();
     let spill = spill(tmp.path());
     let q = "SELECT DISTINCT ?s ?v { ?s <urn:p> ?o BIND(STR(?o) AS ?v) } ORDER BY DESC(?v) ?s";
-    let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    let expected = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .rows()
+        .unwrap();
     let actual = run(&s, q, MEMORY, Some(spill.clone()), None).unwrap();
-    assert_eq!(actual, expected);
+    assert_fixture_rows_eq!(&expected, &actual);
     assert!(spill.written_bytes() > 0);
     assert_eq!(spill.reserved_bytes(), 0);
     assert!(leftovers(tmp.path()).is_empty());
@@ -148,7 +153,10 @@ fn spilled_order_by_matches_eager_order_with_ties_and_expressions() {
             true,
         ),
     ] {
-        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .rows()
+            .unwrap();
         // Without a place to spill the cursor runs out of memory.
         match run(&s, q, MEMORY, None, None) {
             Err(Error::BudgetExceeded(b)) => assert!(
@@ -187,14 +195,23 @@ fn spilled_order_by_keeps_a_total_order_on_the_sort_keys() {
     let tmp = tempfile::tempdir().unwrap();
     let spill = spill(tmp.path());
     let q = "SELECT ?o ?s WHERE { ?s <urn:p> ?o } ORDER BY ?o";
-    let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    let expected = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .rows()
+        .unwrap();
     let rows = run(&s, q, MEMORY, Some(spill.clone()), None).unwrap();
     let keys = |rows: &[Vec<Option<Term>>]| {
         rows.iter()
             .map(|r| format!("{:?}", r[0]))
             .collect::<Vec<_>>()
     };
-    assert_eq!(keys(&rows), keys(&expected));
+    assert_eq!(
+        keys(&rows),
+        expected
+            .iter()
+            .map(|r| format!("{:?}", r.values()[0]))
+            .collect::<Vec<_>>()
+    );
 }
 
 /// A batch that cannot be copied into an empty sort buffer becomes a run by itself, so a
@@ -205,7 +222,10 @@ fn a_batch_too_large_to_buffer_spills_as_its_own_run() {
     let tmp = tempfile::tempdir().unwrap();
     let spill = spill(tmp.path());
     let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?o) ?s";
-    let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    let expected = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .rows()
+        .unwrap();
     // The query's decoded value cache holds up to an eighth of its budget, which this
     // sort's 20,000-row batch leaves no room for at MEMORY, so the budget leaves an
     // eighth of itself for the cache on top of what the batch needs.
@@ -228,7 +248,7 @@ fn a_batch_too_large_to_buffer_spills_as_its_own_run() {
     }
     assert!(c.stats().mem_peak_bytes <= memory);
     drop(c);
-    assert_eq!(rows, expected);
+    assert_fixture_rows_eq!(&expected, &rows);
     assert_eq!(spill.reserved_bytes(), 0);
     assert!(leftovers(tmp.path()).is_empty());
 }
@@ -287,7 +307,10 @@ fn small_sorts_with_spill_never_touch_the_disk() {
     let tmp = tempfile::tempdir().unwrap();
     let spill = spill(tmp.path());
     let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?o) ?s";
-    let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    let expected = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .rows()
+        .unwrap();
     let rows = run(&s, q, 64 << 20, Some(spill.clone()), None).unwrap();
     assert_eq!(
         rows.iter().map(|r| format!("{r:?}")).collect::<Vec<_>>(),
@@ -306,7 +329,10 @@ fn many_runs_merge_in_passes_and_report_them_in_the_plan() {
     let tmp = tempfile::tempdir().unwrap();
     let spill = spill(tmp.path());
     let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?o) ?s";
-    let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    let expected = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .rows()
+        .unwrap();
     let opts = QueryOptions {
         max_memory_bytes: Some(MEMORY),
         spill: Some(spill.clone()),
@@ -346,7 +372,10 @@ fn impure_keys_spill_with_the_values_their_runs_sorted() {
     let tmp = tempfile::tempdir().unwrap();
     let spill = spill(tmp.path());
     let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY (RAND()) ?s";
-    let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    let expected = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .rows()
+        .unwrap();
     // The random keys are interned for the whole query, so they need memory that the
     // spilled runs do not free.
     let opts = QueryOptions {
@@ -367,7 +396,14 @@ fn impure_keys_spill_with_the_values_their_runs_sorted() {
         rows.sort();
         rows
     };
-    assert_eq!(bag(&rows), bag(&expected));
+    assert_eq!(bag(&rows), {
+        let mut expected = expected
+            .iter()
+            .map(|r| format!("{r:?}"))
+            .collect::<Vec<_>>();
+        expected.sort();
+        expected
+    });
     assert!(spill.written_bytes() > 0);
     assert!(leftovers(tmp.path()).is_empty());
 }
@@ -383,7 +419,7 @@ fn spilled_volatile_keys_are_evaluated_once_across_sort_pieces() {
     let s = store(ROWS);
     let expected = query(s.snapshot(),
         "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(<http://www.w3.org/2001/XMLSchema#integer>(STRAFTER(STR(?s), \"urn:s:\"))) ?s",
-        &Default::default()).unwrap().rows();
+        &Default::default()).unwrap().rows().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
     let mut descriptor = ScalarDescriptor::new(
@@ -423,7 +459,7 @@ fn spilled_volatile_keys_are_evaluated_once_across_sort_pieces() {
             rows.push(batch.row(row).unwrap().values().to_vec());
         }
     }
-    assert_eq!(rows, expected);
+    assert_fixture_rows_eq!(&expected, &rows);
     assert_eq!(calls.load(Ordering::SeqCst), ROWS);
     assert_eq!(cursor.status(), CursorStatus::Complete);
     assert!(cursor.stats().mem_peak_bytes <= MEMORY);
@@ -502,7 +538,15 @@ fn automatic(s: &Store, q: &str, opts: &QueryOptions) -> Result<(Rows, Option<St
             }
             Ok((rows, Some(c.plan_json()?)))
         }
-        QueryExecution::Eager(r) => Ok((r.into_result().rows(), None)),
+        QueryExecution::Eager(r) => Ok((
+            r.into_result()
+                .rows()?
+                .iter()
+                // Independent assertion rows, matching the cursor fixture branch.
+                .map(|row| row.values().to_vec())
+                .collect(),
+            None,
+        )),
         _ => unreachable!("a SELECT"),
     }
 }
@@ -513,7 +557,10 @@ fn automatic_execution_streams_or_retries_sorts_that_outgrow_memory() {
     let tmp = tempfile::tempdir().unwrap();
     let spill = spill(tmp.path());
     let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?o) ?s";
-    let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    let expected = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .rows()
+        .unwrap();
     let opts = QueryOptions {
         max_memory_bytes: Some(MEMORY),
         spill: Some(spill.clone()),
@@ -521,7 +568,7 @@ fn automatic_execution_streams_or_retries_sorts_that_outgrow_memory() {
     };
     // Eager execution would hold more than half the budget, so the query streams.
     let (rows, plan) = automatic(&s, q, &opts).unwrap();
-    assert_eq!(rows, expected);
+    assert_fixture_rows_eq!(&expected, &rows);
     let plan = plan.expect("a cursor");
     assert!(!plan.contains("eagerMemoryRetry"), "{plan}");
     assert!(plan.contains("spilledBytes"), "{plan}");
@@ -543,7 +590,7 @@ fn automatic_execution_streams_or_retries_sorts_that_outgrow_memory() {
     )
     .unwrap();
     let (rows, plan) = automatic(&s, q, &opts).unwrap();
-    assert_eq!(rows, expected);
+    assert_fixture_rows_eq!(&expected, &rows);
     let plan = plan.expect("a retried cursor");
     assert!(plan.contains("\"eagerMemoryRetry\":1"), "{plan}");
     assert_eq!(spill.eager_retries(), 1);

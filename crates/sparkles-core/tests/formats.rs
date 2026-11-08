@@ -125,7 +125,7 @@ fn listing(
         .map(|r| format!("{r:?}"))
         .collect();
     rows.sort();
-    (rows, uses(&r.plan))
+    (rows, uses(r.plan()))
 }
 
 fn same_predicate_listing(snap: &std::sync::Arc<sparkles_core::store::Snapshot>) {

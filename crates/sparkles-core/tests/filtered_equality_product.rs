@@ -54,7 +54,7 @@ fn fixture_with_suffix(suffix: &str) -> Store {
     store
 }
 
-fn bag(rows: Vec<Vec<Option<Term>>>) -> Vec<String> {
+fn bag(rows: impl IntoIterator<Item = impl std::fmt::Debug>) -> Vec<String> {
     let mut result = rows
         .into_iter()
         .map(|r| format!("{r:?}"))
@@ -93,10 +93,10 @@ fn q5a_fixture_has_an_independent_distinct_and_duplicate_bag_oracle() {
         ..Default::default()
     };
     let distinct = query(store.snapshot(), Q5A, &options).unwrap();
-    assert_eq!(bag(distinct.rows()), expected(1));
+    assert_eq!(bag(distinct.rows().unwrap()), expected(1));
     let query_text = Q5A.replace("SELECT DISTINCT", "SELECT");
     let duplicate_bag = query(store.snapshot(), &query_text, &options).unwrap();
-    assert_eq!(bag(duplicate_bag.rows()), expected(6));
+    assert_eq!(bag(duplicate_bag.rows().unwrap()), expected(6));
 }
 
 #[test]
@@ -111,7 +111,7 @@ fn q5a_string_equality_avoids_reserving_nonmatching_product_rows() {
     // Both source relations and all 192 matching bag rows fit. The 6,144-row
     // unfiltered product does not fit and must not be reserved before equality.
     let result = query(store.snapshot(), Q5A, &options).unwrap();
-    assert_eq!(bag(result.rows()), expected(1));
+    assert_eq!(bag(result.rows().unwrap()), expected(1));
 }
 
 fn equality_candidates(p: &sparkles_core::sparql::PlanInfo) -> Vec<i64> {
@@ -143,8 +143,8 @@ fn q5a_candidate_index_keeps_bags_orientation_and_the_original_residual() {
             text
         };
         let r = query(store.snapshot(), &text, &options).unwrap();
-        assert_eq!(bag(r.rows()), expected(6));
-        assert_eq!(equality_candidates(&r.plan), [192]);
+        assert_eq!(bag(r.rows().unwrap()), expected(6));
+        assert_eq!(equality_candidates(r.plan()), [192]);
         let ordinary = query(
             store.snapshot(),
             &text,
@@ -156,7 +156,7 @@ fn q5a_candidate_index_keeps_bags_orientation_and_the_original_residual() {
             },
         )
         .unwrap();
-        assert_eq!(bag(ordinary.rows()), expected(6));
+        assert_eq!(bag(ordinary.rows().unwrap()), expected(6));
         assert_eq!(ordinary.rows_produced - r.rows_produced, 6_144 - 192);
     }
     let ordinary = query(
@@ -171,7 +171,7 @@ fn q5a_candidate_index_keeps_bags_orientation_and_the_original_residual() {
     )
     .unwrap();
     assert!(
-        equality_candidates(&ordinary.plan).is_empty(),
+        equality_candidates(ordinary.plan()).is_empty(),
         "cheap products keep their ordinary kernel"
     );
 }
@@ -186,7 +186,10 @@ fn filtered_candidates_never_poison_the_unfiltered_cross_cache_key() {
     };
     for _ in 0..2 {
         assert_eq!(
-            bag(query(store.snapshot(), Q5A, &options).unwrap().rows()),
+            bag(query(store.snapshot(), Q5A, &options)
+                .unwrap()
+                .rows()
+                .unwrap()),
             expected(1)
         );
     }
@@ -219,7 +222,10 @@ fn filtered_candidates_never_poison_the_unfiltered_cross_cache_key() {
     )
     .unwrap();
     assert_eq!(
-        bag(query(store.snapshot(), Q5A, &options).unwrap().rows()),
+        bag(query(store.snapshot(), Q5A, &options)
+            .unwrap()
+            .rows()
+            .unwrap()),
         expected(1)
     );
 }
@@ -255,7 +261,7 @@ fn numeric_language_error_and_unbound_domains_keep_value_equality() {
         )
         .unwrap();
         assert_eq!(result.len(), count, "{text}");
-        assert!(equality_candidates(&result.plan).is_empty());
+        assert!(equality_candidates(result.plan()).is_empty());
     }
     // The entire domain must be proved. A numeric outlier must not get discarded
     // by an index built from the strings before it; the original budget still holds.
@@ -374,8 +380,8 @@ fn equality_index_is_charged_and_empty_products_and_cancellation_stay_safe() {
         },
     )
     .unwrap();
-    assert_eq!(bag(result.rows()), expected(1));
-    assert_eq!(equality_candidates(&result.plan), [192]);
+    assert_eq!(bag(result.rows().unwrap()), expected(1));
+    assert_eq!(equality_candidates(result.plan()), [192]);
     assert!(result.mem_peak_bytes <= memory);
     assert!(
         matches!(query(store.snapshot(), Q5A, &QueryOptions { optimizations: Some(legacy_optimizations()),
@@ -443,7 +449,7 @@ fn automatic_execution_uses_the_same_result_without_changing_explicit_streaming(
     let QueryExecution::Eager(result) = auto else {
         panic!("this SELECT keeps ordinary automatic policy")
     };
-    assert_eq!(bag(result.result().rows()), expected(1));
+    assert_eq!(bag(result.result().rows().unwrap()), expected(1));
     for batch_rows in [1, 7, 4096] {
         let mut cursor = select_cursor(
             store.snapshot(),
@@ -532,6 +538,9 @@ fn retained_string_payloads_must_fit_the_same_query_memory_budget() {
         },
     )
     .unwrap();
-    assert_eq!(bag(result.rows()), expected_with_suffix(1, &suffix));
+    assert_eq!(
+        bag(result.rows().unwrap()),
+        expected_with_suffix(1, &suffix)
+    );
     assert!(result.mem_peak_bytes <= 128 << 10);
 }

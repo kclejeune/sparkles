@@ -38,8 +38,12 @@ fn parsed_inline_integer_bounds_select_vocabulary_key_filtering() {
             },
         )
         .unwrap();
-        assert_eq!(r.rows(), vec![vec![Some(oxrdf::Literal::from(100).into())]]);
-        assert!(keys(&r.plan), "{condition}: {:?}", r.plan);
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            r.row(0).unwrap().values(),
+            &[Some(oxrdf::Literal::from(100).into())]
+        );
+        assert!(keys(r.plan()), "{condition}: {:?}", r.plan());
     }
 }
 
@@ -94,17 +98,23 @@ fn length_filters_match_scalar_evaluation_and_stream_across_batches() {
             format!("STRLEN({argument}) >= 0"),
         ] {
             let text = format!("SELECT ?s ?v WHERE {{ ?s <urn:value> ?v FILTER({condition}) }}");
-            let bag = |rows: Vec<Vec<Option<oxrdf::Term>>>| {
+            fn bag(rows: impl IntoIterator<Item = impl std::fmt::Debug>) -> Vec<String> {
                 let mut v = rows
                     .into_iter()
                     .map(|r| format!("{r:?}"))
                     .collect::<Vec<_>>();
                 v.sort();
                 v
-            };
-            let expected = bag(query(store.snapshot(), &text, &scalar).unwrap().rows());
+            }
+            let expected = bag(query(store.snapshot(), &text, &scalar)
+                .unwrap()
+                .rows()
+                .unwrap());
             assert_eq!(
-                bag(query(store.snapshot(), &text, &fast).unwrap().rows()),
+                bag(query(store.snapshot(), &text, &fast)
+                    .unwrap()
+                    .rows()
+                    .unwrap()),
                 expected,
                 "{condition}"
             );

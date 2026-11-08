@@ -23,6 +23,10 @@ fn rows(snapshot: Arc<Snapshot>) -> Vec<Vec<Option<oxrdf::Term>>> {
     )
     .unwrap()
     .rows()
+    .unwrap()
+    .iter()
+    .map(|row| row.values().to_vec())
+    .collect()
 }
 fn durable_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut pending = vec![root.to_owned()];

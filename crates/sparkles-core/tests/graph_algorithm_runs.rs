@@ -60,9 +60,11 @@ fn select(s: &Store, q: &str) -> Vec<Vec<String>> {
     )
     .unwrap();
     r.rows()
+        .unwrap()
         .into_iter()
         .map(|row| {
-            row.into_iter()
+            row.values()
+                .iter()
                 .map(|t| match t {
                     Some(oxrdf::Term::Literal(l)) => l.value().to_string(),
                     Some(oxrdf::Term::NamedNode(n)) => n.as_str().to_string(),

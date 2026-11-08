@@ -150,7 +150,7 @@ fn oracle() -> Vec<String> {
     rows
 }
 
-fn bag(rows: Vec<Vec<Option<Term>>>) -> Vec<String> {
+fn bag(rows: impl IntoIterator<Item = impl std::fmt::Debug>) -> Vec<String> {
     let mut result = rows
         .into_iter()
         .map(|r| format!("{r:?}"))
@@ -191,7 +191,7 @@ fn q6_fixture_matches_an_independent_oracle_with_and_without_the_key() {
     // the generic product fits this limit, so both plans can answer
     for keyed in [true, false] {
         let r = query(store.snapshot(), Q6, &options(1_000_000, keyed)).unwrap();
-        assert_eq!(bag(r.rows()), expected, "keyed {keyed}");
+        assert_eq!(bag(r.rows().unwrap()), expected, "keyed {keyed}");
     }
 }
 
@@ -202,8 +202,8 @@ fn q6_pairs_by_the_condition_equality_instead_of_the_product() {
     // this limit. The pairs of rows with the same author and the result do not.
     let limit = 4096;
     let r = query(store.snapshot(), Q6, &options(limit, true)).unwrap();
-    assert_eq!(bag(r.rows()), oracle());
-    let notes = keyed_candidates(&r.plan);
+    assert_eq!(bag(r.rows().unwrap()), oracle());
+    let notes = keyed_candidates(r.plan());
     assert_eq!(notes.len(), 1, "{notes:?}");
     let generic = query(store.snapshot(), Q6, &options(limit, false));
     assert!(generic.is_err(), "the product should exceed {limit} rows");
@@ -263,7 +263,7 @@ fn keyed_optional_keeps_value_equality_errors_and_unbound_values() {
         );
         let run = |keyed| {
             let r = query(store.snapshot(), &text, &options(1_000_000, keyed)).unwrap();
-            (bag(r.rows()), keyed_candidates(&r.plan).len())
+            (bag(r.rows().unwrap()), keyed_candidates(r.plan()).len())
         };
         let (on, used) = run(true);
         let (off, unused) = run(false);
@@ -309,7 +309,7 @@ fn keyed_optional_streams_in_a_cursor_with_the_same_answers() {
         let eager = query(store.snapshot(), &text, &options(1_000_000, false)).unwrap();
         assert_eq!(
             strict_rows(&store, &text, &options(1_000_000, true)),
-            bag(eager.rows()),
+            bag(eager.rows().unwrap()),
             "{condition}"
         );
     }
@@ -333,8 +333,8 @@ fn keyed_optional_charges_its_chunk_within_a_small_budget() {
         },
     )
     .unwrap();
-    assert_eq!(bag(r.rows()), oracle());
-    assert_eq!(keyed_candidates(&r.plan).len(), 1);
+    assert_eq!(bag(r.rows().unwrap()), oracle());
+    assert_eq!(keyed_candidates(r.plan()).len(), 1);
     assert!(
         r.mem_peak_bytes <= budget,
         "{} > {budget}",
@@ -367,12 +367,12 @@ fn application_callbacks_in_the_condition_keep_the_generic_join() {
     let r = query(store.snapshot(), text, &options).unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
-        bag(r.rows()),
+        bag(r.rows().unwrap()),
         bag(vec![vec![Some(Term::NamedNode(
             NamedNode::new("urn:b").unwrap()
         ))]])
     );
-    assert!(keyed_candidates(&r.plan).is_empty());
+    assert!(keyed_candidates(r.plan()).is_empty());
 }
 
 /// A keyed OPTIONAL that has finished releases its equality index, so a cursor that

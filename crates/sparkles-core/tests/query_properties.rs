@@ -146,7 +146,14 @@ fn options(d: PropertyDescriptor) -> QueryOptions {
     }
 }
 fn run(s: &Store, source: &str, opts: &QueryOptions) -> Vec<Vec<Option<Term>>> {
-    query(s.snapshot(), source, opts).unwrap().rows()
+    query(s.snapshot(), source, opts)
+        .unwrap()
+        .rows()
+        .unwrap()
+        .iter()
+        // Independent fixture assertion cells; these do not retain engine credit.
+        .map(|row| row.values().to_vec())
+        .collect()
 }
 
 #[test]

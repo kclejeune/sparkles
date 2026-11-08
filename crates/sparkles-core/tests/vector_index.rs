@@ -233,8 +233,9 @@ fn the_delta_is_overlaid_exactly() {
         )
         .unwrap();
         r.rows()
+            .unwrap()
             .into_iter()
-            .map(|r| r[0].as_ref().unwrap().to_string())
+            .map(|r| r.values()[0].as_ref().unwrap().to_string())
             .collect::<Vec<_>>()
     };
     assert_eq!(sparql("\"ef:200\""), sparql("\"exact:true\""));
@@ -653,7 +654,7 @@ fn inserted_rows_join_the_graph() {
         &QueryOptions::default(),
     )
     .unwrap();
-    let plan = format!("{:?}", r.plan);
+    let plan = format!("{:?}", r.plan());
     assert!(plan.contains("overlayPending"), "{plan}");
 }
 

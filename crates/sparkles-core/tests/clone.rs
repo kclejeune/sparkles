@@ -29,8 +29,15 @@ fn dump(s: &Store) -> Vec<String> {
 fn select(s: &Store, q: &str) -> Vec<String> {
     let r = query(s.snapshot(), q, &QueryOptions::default()).unwrap();
     r.rows()
+        .unwrap()
         .into_iter()
-        .map(|row| row.into_iter().flatten().map(|t| t.to_string()).collect())
+        .map(|row| {
+            row.values()
+                .iter()
+                .flatten()
+                .map(|t| t.to_string())
+                .collect()
+        })
         .collect()
 }
 

@@ -897,9 +897,11 @@ fn time_bounds_select_commits_by_their_timestamps() {
 fn select(snap: Arc<sparkles_core::store::Snapshot>, q: &str, o: &QueryOptions) -> Vec<String> {
     let r = sparkles_core::sparql::query(snap, q, o).unwrap_or_else(|e| panic!("{q}: {e}"));
     r.rows()
+        .unwrap()
         .into_iter()
         .map(|row| {
-            row.iter()
+            row.values()
+                .iter()
                 .map(|t| match t {
                     None => "-".to_string(),
                     Some(Term::Literal(l)) => l.value().to_string(),
