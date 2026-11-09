@@ -65,10 +65,11 @@ impl DlAx {
             + super::saturate::table_bytes(self.hyp.capacity(), 8)
             + self.atmost.capacity() * 16
             + self.rdis.capacity() * 8
+            + self.ne.capacity() * std::mem::size_of::<(Ex, Vec<Ex>)>()
             + self
                 .ne
                 .iter()
-                .map(|(_, es)| 32 + es.capacity() * 4)
+                .map(|(_, es)| es.capacity() * 4)
                 .sum::<usize>()
     }
 }
@@ -152,37 +153,43 @@ struct Norm<'a> {
 const MAX_MIN: u32 = 64;
 
 /// Whether a class expression in a positive (`pos`) or negative position needs counting: a
-/// maximum above zero in a positive position or a minimum above one in a negative one.
-fn needs_counting(c: &ClassExpression, pos: bool) -> bool {
+/// maximum above zero in a positive position or a minimum above one in a negative one, and
+/// in a `rooted` run also a minimum above one in a positive position and a maximum above
+/// zero in a negative one, whose dual is such a minimum, since a nominal can make the
+/// successors meet and the existential restriction would lose that.
+fn needs_counting(c: &ClassExpression, pos: bool, rooted: bool) -> bool {
     use ClassExpression as C;
     let sub = |f: &Option<Box<ClassExpression>>, p: bool| {
-        f.as_deref().is_some_and(|f| needs_counting(f, p))
+        f.as_deref().is_some_and(|f| needs_counting(f, p, rooted))
     };
     match c {
         C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
-            cs.iter().any(|c| needs_counting(c, pos))
+            cs.iter().any(|c| needs_counting(c, pos, rooted))
         }
-        C::ObjectComplementOf(f) => needs_counting(f, !pos),
-        C::ObjectSomeValuesFrom(_, f) | C::ObjectAllValuesFrom(_, f) => needs_counting(f, pos),
-        C::ObjectMinCardinality(n, _, f) => (!pos && *n >= 2) || sub(f, pos),
-        C::ObjectMaxCardinality(n, _, f) => (pos && *n >= 1) || sub(f, !pos),
+        C::ObjectComplementOf(f) => needs_counting(f, !pos, rooted),
+        C::ObjectSomeValuesFrom(_, f) | C::ObjectAllValuesFrom(_, f) => {
+            needs_counting(f, pos, rooted)
+        }
+        C::ObjectMinCardinality(n, _, f) => ((!pos || rooted) && *n >= 2) || sub(f, pos),
+        C::ObjectMaxCardinality(n, _, f) => ((pos || rooted) && *n >= 1) || sub(f, !pos),
         C::ObjectExactCardinality(n, _, f) => *n >= 1 || sub(f, pos) || sub(f, !pos),
         _ => false,
     }
 }
 
-/// Whether an axiom needs counting.
-fn axiom_counts(ax: &AxiomKind) -> bool {
+/// Whether an axiom needs counting, in a `rooted` run or not.
+fn axiom_counts(ax: &AxiomKind, rooted: bool) -> bool {
     use AxiomKind as K;
+    let either =
+        |c: &ClassExpression| needs_counting(c, false, rooted) || needs_counting(c, true, rooted);
     match ax {
-        K::SubClassOf(c, d) => needs_counting(c, false) || needs_counting(d, true),
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => cs
-            .iter()
-            .any(|c| needs_counting(c, false) || needs_counting(c, true)),
-        K::DisjointUnion(_, cs) => cs
-            .iter()
-            .any(|c| needs_counting(c, false) || needs_counting(c, true)),
-        K::ObjectPropertyDomain(_, c) | K::ObjectPropertyRange(_, c) => needs_counting(c, true),
+        K::SubClassOf(c, d) => needs_counting(c, false, rooted) || needs_counting(d, true, rooted),
+        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => cs.iter().any(either),
+        K::DisjointUnion(_, cs) => cs.iter().any(either),
+        K::ObjectPropertyDomain(_, c) | K::ObjectPropertyRange(_, c) => {
+            needs_counting(c, true, rooted)
+        }
+        K::ClassAssertion(c, _) => rooted && needs_counting(c, true, rooted),
         // disjoint and asymmetric roles read the role literals of successor terms (DL9)
         K::FunctionalObjectProperty(_)
         | K::InverseFunctionalObjectProperty(_)
@@ -906,6 +913,21 @@ impl Norm<'_> {
                 }
                 Ok(())
             }
+            // the assertions outside OWL 2 EL, read as singleton inclusions
+            K::ClassAssertion(c, i) if self.rooted => {
+                self.sub(vec![C::ObjectOneOf([i.clone()].into())], vec![c.clone()])
+            }
+            K::ObjectPropertyAssertion(p, a, b) if self.rooted => self.sub(
+                vec![C::ObjectOneOf([a.clone()].into())],
+                vec![C::ObjectHasValue(p.clone(), b.clone())],
+            ),
+            K::NegativeObjectPropertyAssertion(p, a, b) if self.rooted => self.sub(
+                vec![
+                    C::ObjectOneOf([a.clone()].into()),
+                    C::ObjectHasValue(p.clone(), b.clone()),
+                ],
+                vec![C::Class(Class::nothing())],
+            ),
             _ => Err("an axiom Tier D does not take"),
         }
     }
@@ -927,7 +949,6 @@ pub fn normalize(
     rooted_allowed: bool,
 ) -> Result<Option<(Vec<bool>, DlAx)>, Halt> {
     let mut taken = vec![false; axioms.len()];
-    let counting = counting_allowed && axioms.iter().any(|k| axiom_counts(k));
     // individuals make the run rooted: those the EL part interned before the
     // normalization, and those the axioms outside it name
     let rooted = rooted_allowed
@@ -935,6 +956,7 @@ pub fn normalize(
             || axioms
                 .iter()
                 .any(|k| crate::model::Signature::names_individual(k)));
+    let counting = counting_allowed && axioms.iter().any(|k| axiom_counts(k, rooted));
     // every object property has its inverse
     let named: Vec<ObjectProperty> = it
         .roles
@@ -1177,10 +1199,17 @@ mod tests {
     }
 
     fn run_rooted(axioms: &[AxiomKind]) -> Option<(Vec<bool>, DlAx, Axioms, Interner)> {
+        run_rooted_counting(axioms, true)
+    }
+
+    fn run_rooted_counting(
+        axioms: &[AxiomKind],
+        counting: bool,
+    ) -> Option<(Vec<bool>, DlAx, Axioms, Interner)> {
         let mut it = Interner::new();
         let mut ax = Axioms::default();
         let refs: Vec<&AxiomKind> = axioms.iter().collect();
-        normalize(&refs, &mut it, &mut ax, None, &|| false, true, true)
+        normalize(&refs, &mut it, &mut ax, None, &|| false, counting, true)
             .unwrap()
             .map(|(t, d)| (t, d, ax, it))
     }
@@ -1266,8 +1295,22 @@ mod tests {
             c("D"),
             ClassExpression::ObjectMinCardinality(2, role("r"), Some(Box::new(one_of(&["o"])))),
         );
-        let (t, _, _, _) = run_rooted(&[union(), min.clone()]).unwrap();
+        let (t, _, _, _) = run_rooted_counting(&[union(), min.clone()], false).unwrap();
         assert_eq!(t, vec![true, false]);
+        // with counting allowed it alone turns counting on
+        let (t, d, ax, _) = run_rooted_counting(&[union(), min.clone()], true).unwrap();
+        assert_eq!(t, vec![true, true]);
+        assert!(d.counting);
+        assert_eq!(d.ne.len(), 1);
+        assert!(ax.disjoint.is_empty());
+        // and so does a maximum in a negative position, whose dual is a minimum of two
+        let max = AxiomKind::SubClassOf(
+            ClassExpression::ObjectMaxCardinality(1, role("r"), Some(Box::new(one_of(&["o"])))),
+            c("D"),
+        );
+        let (t, d, _, _) = run_rooted_counting(&[union(), max], true).unwrap();
+        assert_eq!(t, vec![true, true]);
+        assert!(d.counting);
         // without individuals the minimum is read as the existential restriction
         let (t, _, _, _) = run(&[
             union(),
@@ -1338,6 +1381,39 @@ mod tests {
         assert!(with(AxiomKind::InverseFunctionalObjectProperty(role("r"))).is_none());
         // without the inverse the maximum is taken
         assert!(with(AxiomKind::SubClassOf(c("G"), c("H"))).is_some());
+    }
+
+    #[test]
+    fn assertions_outside_el_are_singleton_inclusions() {
+        let inv = ObjectPropertyExpression::InverseOf(ObjectProperty::new("http://ex.org/r"));
+        let union_bc =
+            ClassExpression::ObjectUnionOf(std::collections::BTreeSet::from([c("B"), c("C")]));
+        let (t, d, ax, it) = run_rooted(&[
+            union(),
+            AxiomKind::ClassAssertion(union_bc, ind("a")),
+            AxiomKind::ObjectPropertyAssertion(inv.clone(), ind("a"), ind("b")),
+            AxiomKind::NegativeObjectPropertyAssertion(inv, ind("b"), ind("c")),
+        ])
+        .unwrap();
+        assert_eq!(t, vec![true, true, true, true]);
+        // {a} ⊑ B ⊔ C
+        assert!(d.clauses.iter().any(|(b, h)| {
+            b.len() == 1 && nominal(&it, b[0]) && h.len() == 2 || {
+                // or through a fresh class below {a}
+                b.len() == 1
+                    && ax.subs.iter().any(|&(n, y)| nominal(&it, n) && y == b[0])
+                    && h.len() == 2
+            }
+        }));
+        // {a} ⊑ ∃r⁻.{b}
+        let inv_into = |e: Ex| matches!(it.nodes[e as usize], Node::Exist(r, f) if nominal(&it, f) && matches!(it.roles[r as usize], RoleName::Inverse(_)));
+        assert!(ax.subs.iter().any(|&(n, e)| nominal(&it, n) && inv_into(e)));
+        // {b} ⊓ ∃r⁻.{c} ⊑ ⊥
+        assert!(
+            ax.subs
+                .iter()
+                .any(|&(e, b)| b == BOTTOM && matches!(it.nodes[e as usize], Node::Conj(..)))
+        );
     }
 
     #[test]
