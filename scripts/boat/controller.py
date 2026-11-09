@@ -216,12 +216,15 @@ def observer_sources():
 def props(text):
     return dict(line.split('=',1) for line in text.splitlines() if '=' in line)
 
-def remote_entry():
+def remote_entry(home=None):
     """The remote command of every provider session: Python on stdin, started from the
-    worker's own state directory, so nothing a session runs lands in a startup checkout."""
-    state=profile()['worker_home']+'/.local/state/sparkles-boat'
-    need(re.fullmatch('/[A-Za-z0-9_./+-]+',state) is not None,'remote state directory')
-    return ['/usr/bin/env','-C',state,'/usr/bin/python3','-I','-B','-']
+    worker's home, so nothing a session runs lands in a startup checkout.
+
+    The home always exists, unlike the state directory before provisioning, so a
+    diagnostic can still report an absent state directory."""
+    home=profile()['worker_home'] if home is None else home
+    need(isinstance(home,str) and re.fullmatch('/[A-Za-z0-9_./+-]+',home) is not None,'remote working directory')
+    return ['/usr/bin/env','-C',home,'/usr/bin/python3','-I','-B','-']
 
 class RealIO:
     def __init__(self,r,op):self.r=r;self.op=Path(op);self.boat_path=r['boat']['path']

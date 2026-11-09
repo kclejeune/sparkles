@@ -652,7 +652,7 @@ class RemoteTransport(unittest.TestCase):
                 self_test.assertEqual(shlex.split(' '.join(words)),words)
                 # The session starts from the worker's state directory, here a local
                 # stand-in, while the provider lands it in the checkout.
-                self_test.assertEqual(words[:3],['/usr/bin/env','-C',controller.profile()['worker_home']+'/.local/state/sparkles-boat'])
+                self_test.assertEqual(words[:3],['/usr/bin/env','-C',controller.profile()['worker_home']])
                 # This host has no /usr/bin/python3, so the local interpreter stands in.
                 self_test.assertEqual(words[3],'/usr/bin/python3')
                 words=[*words[:2],str(state),sys.executable,*words[4:]]
@@ -1617,10 +1617,40 @@ class RemoteSessionDirectory(unittest.TestCase):
             def __init__(self):pass
             def boat(self,args,seconds=20,input_bytes=None,json_mode=True):seen.append(args);return {'exit':0,'error':None,'body':{}}
         IO().remote_python('print(1)',[],10)
-        self.assertEqual(seen[0][3:],['/usr/bin/env','-C',p['worker_home']+'/.local/state/sparkles-boat','/usr/bin/python3','-I','-B','-'])
+        self.assertEqual(seen[0][3:],['/usr/bin/env','-C',p['worker_home'],'/usr/bin/python3','-I','-B','-'])
 
     def test_no_session_starts_python_in_the_landing_directory(self):
         root=Path(__file__).resolve().parents[1]
         for name in ('boat/controller.py','boat/job_environment.py'):
             text=(root/name).read_text()
             self.assertNotRegex(text,r"'--',\s*'/usr/bin/python3'",name)
+
+
+class UntrackedRoundOne(UntrackedDiagnostics):
+    """Credential parents, the git output bound, unbound profiles and an absent state directory."""
+    def test_a_credential_like_parent_hides_its_children(self):
+        d=diagnostic_module();repo=self.repository()
+        for parent in ('.ssh','secrets','config/tokens'):
+            (repo/parent).mkdir(parents=True);(repo/parent/'tracked').write_text('t')
+        self.git(repo,'add','-f','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','commit','-qm','y')
+        for parent in ('.ssh','secrets','config/tokens'):(repo/parent/'DO_NOT_COPY_child').write_text('x')
+        (repo/'plain.txt').write_text('p')
+        row=d.untracked([str(repo)])[str(repo)]
+        self.assertEqual([p['path'] for p in row['paths']],['plain.txt']);self.assertEqual(row['omitted_credential_like'],3)
+        self.assertNotIn('DO_NOT_COPY',json.dumps(row))
+
+    def test_git_output_is_read_within_a_byte_bound(self):
+        import subprocess as sp,shutil as sh
+        d=diagnostic_module();repo=self.repository();made=[];real=sp.Popen
+        def popen(argv,*a,**k):
+            child=real([sh.which('head'),'-c','50000000','/dev/zero'],*a,**k);made.append(child);return child
+        with patch.object(d.subprocess,'Popen',popen),patch.object(d.subprocess,'run',side_effect=AssertionError('unbounded run')):
+            row=d.untracked([str(repo)])[str(repo)]
+        self.assertTrue(row['truncated']);self.assertEqual(len(made),1);self.assertIsNotNone(made[0].poll())
+
+    def test_the_session_entry_needs_no_bound_profile(self):
+        import common
+        saved=common._PROFILE;common._PROFILE=None
+        try:self.assertEqual(controller.remote_entry('/home/user'),['/usr/bin/env','-C','/home/user','/usr/bin/python3','-I','-B','-'])
+        finally:common._PROFILE=saved
+        self.assertIn("remote_entry(profile['worker_home'])",(Path(__file__).resolve().parents[1]/'boat/job_environment.py').read_text())
