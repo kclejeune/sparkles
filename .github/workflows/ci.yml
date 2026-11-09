@@ -245,7 +245,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           shared-key: clippy-${{ matrix.platform }}
-          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           # the binding crates are workspaces of their own that share the root target
           workspaces: |
             . -> target
@@ -310,7 +310,7 @@ jobs:
               echo "::endgroup::"
             done
           done
-      - if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
+      - if: ${{ github.ref == 'refs/heads/main' }}
         uses: actions/cache/save@v4
         with:
           path: *mbx-store
@@ -365,7 +365,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           shared-key: tests
-          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: UI placeholder
         run: *ui-placeholder
       - uses: actions/cache/restore@v4
@@ -413,7 +413,7 @@ jobs:
           echo "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/archive/build-workspace"
           cp "$RUNNER_TEMP/archive/build-workspace" "$RUNNER_TEMP/heavy/"
           ls -l "$RUNNER_TEMP"/archive/* "$RUNNER_TEMP"/heavy/* "$RUNNER_TEMP"/server/*
-      - if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
+      - if: ${{ github.ref == 'refs/heads/main' }}
         uses: actions/cache/save@v4
         with:
           path: *mbx-store
