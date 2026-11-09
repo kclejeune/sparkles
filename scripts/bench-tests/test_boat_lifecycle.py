@@ -1746,6 +1746,23 @@ class TransientStatOnlyStatus(unittest.TestCase):
                     self.assertLessEqual(len(seen),2)
                     self.assertEqual([e['xy'] for e in caught.exception.source_drift['status']['entries']],[' M' if change=='content' else '??'])
 
+    def test_a_reread_listing_with_any_other_drift_is_refused(self):
+        # Review round 3. The change appears only after the first listing, while the
+        # helper's reread is clean or attributable, so only the reread's listing sees it.
+        link=lambda clean:dict(clean,status_sha256=self.line('crates/LICENSE'))
+        for change in ('content','untracked'):
+            for reread in ('clean','attributable'):
+                with self.subTest(change=change,reread=reread):
+                    repo=self.linked();clean=self.source(repo);seen=[]
+                    def observe():
+                        if len(seen)==1:
+                            if change=='content':(repo/'a.txt').write_text('changed\n')
+                            else:(repo/'new.txt').write_text('x\n')
+                        seen.append(link(clean) if not seen or reread=='attributable' else clean);return seen[-1]
+                    with self.assertRaises(self.O['SourceDrift']) as caught:self.O['startup_source'](repo,clean,observe,None,lambda s:None)
+                    self.assertEqual(len(seen),2)
+                    self.assertEqual([e['xy'] for e in caught.exception.source_drift['status']['entries']],[' M' if change=='content' else '??'])
+
     def test_a_link_line_still_listed_keeps_the_item_778_path(self):
         repo=self.linked();clean=self.source(repo);self.stale_link_size(repo);rows=[]
         def observe():rows.append(self.source(repo));return rows[-1]
