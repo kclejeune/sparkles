@@ -74,11 +74,7 @@ The ontology-editing exclusions of U02 §1 and U07 §1 are lifted for this spec.
 
 Item 624 resolves `owl:imports` within the dataset. Imported content is always an
 ordinary named graph of the dataset, so history, exports, backups, grants and protected
-branches treat it like any other graph, and no read fetches anything. A server-wide
-store of pinned source versions, loaded on demand into a cached layer outside the
-branch's history, was set aside. It would keep imported copies out of exports and share
-them across datasets, but it needs the C30 source store, the durable jobs of item 339
-and a cache format of its own.
+branches treat it like any other graph, and no read fetches anything.
 
 ### Import map
 
@@ -94,8 +90,9 @@ name is at most 4 KiB.
 
 The map is not a C19 settings kind, because the settings routes answer every reader
 with the whole object. `GET /$/ontology/{ds}/imports` answers the map with an entity
-tag of its revision. A caller with `admin` on the dataset sees every entry, and any
-other caller sees only the entries whose graph the caller can read.
+tag of its revision. A caller with `admin` on the dataset sees every entry. Any other
+caller sees only the entries whose graph holds triples that the caller's masked view of
+the branch shows, so a graph whose triples are all hidden counts as absent.
 `PATCH /$/ontology/{ds}/imports` sets and removes entries with `admin` and an `If-Match`
 that names the map's revision. Every write of the map holds the dataset's import-map
 lock, so map writes are serialized.
@@ -112,7 +109,7 @@ sources in turn.
    resolves to every graph they list in this dataset, each once, in the order of the
    resources' ids.
 
-A candidate graph counts only when it holds triples and the caller can read it. An
+A candidate graph counts only when the caller's masked view shows triples in it. An
 import that no source resolves is unresolved, and an answer never names a graph the
 caller cannot read. The server reads the resource catalog for this lookup itself, and an
 answer shows only the resolved graphs, never a resource or another dataset's
@@ -134,8 +131,9 @@ A change to the map or to the vocabulary resources changes what a read resolves
 without a commit. Every read therefore takes the map and resource entries it could use
 as part of its request. The ontology cache keys a kept read by a digest of those
 entries, and the entity tags of the summary, the hierarchy and the term reads add the
-digest after the format, as in `owl.<digest>`. A tag that names the commit still
-satisfies an edit's `If-Match` whatever its digest, because an edit checks the commit.
+digest after the format, as in `owl.<digest>`. The tag parser of conditional writes
+reads the format before the dot, so a tag that names the commit still satisfies an
+edit's `If-Match` whatever its digest, because an edit checks the commit.
 
 ### XML catalogs
 
@@ -169,8 +167,10 @@ parsed document in one commit on the branch. It then writes the map entry with s
 
 A refresh is the same action, and it always downloads the document again without a
 conditional request, since the recorded ETag belongs to one branch and one location.
-When the parsed document equals the graph's current triples on the requested branch,
-no commit is made, and only the entry's ETag, digest and time are updated. A refused
+The map entry is always written in full with the graph, location, branch, head commit,
+ETag, digest and time of this fetch. When the document has no blank nodes and equals
+the graph's current triples on the requested branch, the graph is left alone and no
+commit is made. A document with blank nodes replaces the graph's triples in a commit. A refused
 destination, a timeout or a document that does not parse changes nothing. Reads still
 never fetch, and item 559 keeps fetching on read.
 
