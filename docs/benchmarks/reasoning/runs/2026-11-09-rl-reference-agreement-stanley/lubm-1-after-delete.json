@@ -1,0 +1,21 @@
+{
+ "sparkles": 84941,
+ "reference": 84941,
+ "common": 84941,
+ "subset": false,
+ "differences": {
+  "sparkles": {
+   "total": 0,
+   "by_explanation": {},
+   "by_predicate": {},
+   "examples": {}
+  },
+  "reference": {
+   "total": 0,
+   "by_explanation": {},
+   "by_predicate": {},
+   "examples": {}
+  }
+ },
+ "unexplained": 0
+}

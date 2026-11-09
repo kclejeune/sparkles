@@ -1,0 +1,15 @@
+# The comparisons, from a checkout at the lane's commit with SPARKLES set to the binary
+# that env.txt names and NMO to the flake's Nemo.
+scripts/rl-reference/bench.sh lubm 1 WORK/lubm-1          # RUNS=2 MEM_MAX=8G
+scripts/rl-reference/bench.sh owl2bench 1 WORK/owl2bench-1  # RUNS=1 MEM_MAX=8G
+python3 -I scripts/rl-reference/w3c.py all.rdf WORK/w3c
+
+# bench.sh ran compare.sh on the base data (lubm-1-aligned.json, lubm-1-core.json,
+# owl2bench-1-aligned.json, owl2bench-1-core.json) and compared the closures that
+# incremental maintenance left after inserting and deleting its change
+# (*-after-insert.json, lubm-1-after-delete.json). Its deletion run on OWL2Bench(1) ran out
+# of the 8G limit, and was repeated by hand on a copy of the materialized store with the
+# change deleted (owl2bench-1-delete.txt):
+sparkles update --loc del.db --update delete.ru
+systemd-run --user --scope -q -p MemoryMax=16G -p MemorySwapMax=0 timeout 600 \
+  sparkles infer --loc del.db --profile owl-rl --threads 16

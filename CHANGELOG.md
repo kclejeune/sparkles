@@ -36,6 +36,16 @@ it.
 
 ### Added
 
+Roadmap item 791 adds Nemo 0.10.1 as the reference for the `owl-rl` materialization. The
+flake builds it from its checksum-pinned release binaries as `.#nemo`, and
+`scripts/rl-reference/owl2rl.rls` writes the OWL 2 RL/RDF rules of OWL 2 Profiles for it.
+`mise run test:rl-reference` compares the closures triple for triple on the W3C OWL 2 RL
+test cases, and `mise run bench:rl-reference` does so on LUBM or OWL2Bench before it
+times full materialization and incremental insertion and deletion. The closures are equal
+on LUBM(1), OWL2Bench(1) and 66 test cases. RDFox is not a reference, because its
+evaluation agreement restricts publishing benchmark results. Deleting 1% of OWL2Bench(1)'s
+data triples ran out of 16 GiB in incremental maintenance, and roadmap item 798 covers it.
+
 Roadmap item 651 adds a `claims` mode to `POST /$/ingest/{ds}` and `sparkles ingest`. It registers
 the document's source and chunks as the other modes do and proposes the extracted facts
 as claim occurrences of one evidence batch, with their passages and supporting evidence

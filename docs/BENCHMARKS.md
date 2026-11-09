@@ -65,6 +65,7 @@ partially complete and planned implementation scope.
 | Bindings and model-assisted workflows | Partial coverage | The listed APIs, models and question sets have measurements. Selected API controls and internal A/B runs do not replace a complete peer-suite refresh. |
 | Spatial and query-time reasoning comparisons | Unmeasured against peers | Conformance and internal measurements do not establish comparative performance. |
 | OWL 2 EL classification | Measured against ELK, Konclude, Whelk, HermiT and ROBOT | [Times and memory beside ELK 0.6.0](benchmarks/el-classification/RESULTS.md#against-elk) and [beside the other reference reasoners](benchmarks/el-classification/RESULTS.md#reference-reasoners) on GO, ChEBI lite and the largest ORE 2015 EL ontologies are published. The classifier is ahead of ELK and Konclude on every ontology and thread count measured. |
+| OWL 2 RL materialization | Closures checked against Nemo, times unpublished | The derived graphs equal those of Nemo 0.10.1 running the W3C OWL 2 RL/RDF rules on LUBM, OWL2Bench and the W3C OWL 2 RL test cases, as the [agreement results](benchmarks/reasoning/RESULTS.md#owl-2-rl-reference-agreement) show. Times against Nemo on the benchmark host remain open. |
 | Evidence and maintained analysis | Unmeasured | C25 provides authenticated evidence proposals and resolution, and C27 supplies temporal profile resources and queries. Review-controlled projections and the managed analysis work in C26, F22 and C22b remain planned. |
 
 ## Reading the comparisons

@@ -1,0 +1,39 @@
+{
+ "sparkles": 85098,
+ "reference": 67268,
+ "common": 67268,
+ "subset": true,
+ "differences": {
+  "sparkles": {
+   "total": 17830,
+   "by_explanation": {
+    "unexplained": 17830
+   },
+   "by_predicate": {
+    "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>": 17524,
+    "<http://www.w3.org/2000/01/rdf-schema#subClassOf>": 180,
+    "<http://www.w3.org/2000/01/rdf-schema#domain>": 63,
+    "<http://www.w3.org/2000/01/rdf-schema#range>": 47,
+    "<http://www.w3.org/2000/01/rdf-schema#subPropertyOf>": 8,
+    "<http://www.w3.org/2002/07/owl#equivalentProperty>": 7,
+    "<http://www.w3.org/2002/07/owl#inverseOf>": 1
+   },
+   "examples": {
+    "unexplained": [
+     "<http://swat.cse.lehigh.edu/onto/univ-bench.owl#AdministrativeStaff> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2000/01/rdf-schema#Class> .",
+     "<http://swat.cse.lehigh.edu/onto/univ-bench.owl#AdministrativeStaff> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2000/01/rdf-schema#Resource> .",
+     "<http://swat.cse.lehigh.edu/onto/univ-bench.owl#AdministrativeStaff> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://www.w3.org/2000/01/rdf-schema#Resource> .",
+     "<http://swat.cse.lehigh.edu/onto/univ-bench.owl#Article> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2000/01/rdf-schema#Class> .",
+     "<http://swat.cse.lehigh.edu/onto/univ-bench.owl#Article> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2000/01/rdf-schema#Resource> ."
+    ]
+   }
+  },
+  "reference": {
+   "total": 0,
+   "by_explanation": {},
+   "by_predicate": {},
+   "examples": {}
+  }
+ },
+ "unexplained": 0
+}
