@@ -6,7 +6,7 @@
   // the editor's preview, so it is one previewed commit on the session's undo stack. An edit
   // above BULK_LIMIT changes is refused, as is a graph with more than BULK_SCAN_LIMIT axioms
   // of the type an edit reads (lib/bulk-edit.ts).
-  import { onDestroy } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import * as api from '$lib/api';
   import {
     BULK_ENTITY_LIMIT,
@@ -197,6 +197,7 @@
   type Row = { subject: string; property: string; before: string | null; after: string | null };
   let plan = $state<{
     commit: number | null;
+    mode: Mode;
     op: Op | null;
     label: string;
     rows: Row[];
@@ -208,17 +209,20 @@
   let error = $state<string | null>(null);
   let run = 0;
 
-  // a new commit, graph or branch makes the plan and its reads stale
+  /** Drop the plan and any calculation still reading, whose answer belongs to old inputs. */
+  function invalidate() {
+    run++;
+    busy = false;
+    plan = null;
+    error = null;
+  }
+  // a new commit, graph, branch or operation makes the plan and its reads stale
   $effect(() => {
     void target;
     void graph;
     void commit;
-    plan = null;
-  });
-  $effect(() => {
     void mode;
-    plan = null;
-    error = null;
+    untrack(invalidate);
   });
 
   const shown = (v: unknown): string =>
@@ -238,13 +242,14 @@
   async function compute() {
     const my = ++run;
     const at = commit;
+    const m = mode;
     busy = true;
     error = null;
     plan = null;
     try {
-      const p = await build();
-      if (my !== run) return;
-      plan = { ...p, commit: at };
+      const p = await build(m);
+      if (my !== run || m !== mode || at !== commit) return;
+      plan = { ...p, commit: at, mode: m };
     } catch (e) {
       if (my === run) error = api.errorMessage(e);
     } finally {
@@ -252,7 +257,7 @@
     }
   }
 
-  type Built = Omit<NonNullable<typeof plan>, 'commit'>;
+  type Built = Omit<NonNullable<typeof plan>, 'commit' | 'mode'>;
   const refuse = (refusal: string): Built => ({
     op: null,
     label: '',
@@ -279,14 +284,19 @@
           refusal: changes.length ? null : 'Nothing matches, so the edit would change nothing.',
         };
 
-  async function build(): Promise<Built> {
-    if (mode === 'replace') {
+  /**
+   * The plan of operation `m`. Every input is read before the first await, so a field changed
+   * while the graph is read cannot mix into the plan.
+   */
+  async function build(m: Mode): Promise<Built> {
+    const ents = [...entities];
+    if (m === 'replace') {
       const props: PropertyScope =
         propKind === 'one' ? { kind: 'one', iri: iriOf(propText) ?? '' } : { kind: propKind };
       if (props.kind === 'one' && !props.iri)
         return refuse('Name the annotation property to search.');
       if (langKind === 'tag' && !langTag.trim()) return refuse('Type the language tag to keep to.');
-      if (scope === 'list' && !entities.length) return refuse('Add entities to the list first.');
+      if (scope === 'list' && !ents.length) return refuse('Add entities to the list first.');
       const spec = {
         find,
         replace,
@@ -294,36 +304,36 @@
         caseSensitive,
         properties: props,
         lang: langFilter(),
-        entities: scope === 'list' ? new Set(entities) : null,
+        entities: scope === 'list' ? new Set(ents) : null,
       };
       const re = compileFind(spec);
       if (typeof re === 'string') return refuse(re);
+      const label = (n: number) =>
+        `Replace "${spec.find}" with "${spec.replace}" in ${fmtCount(n, 'annotation')}`;
       const r = findMatches(await read('AnnotationAssertion'), spec, re);
+      if (r.zeroWidth != null)
+        return refuse(
+          `The pattern matches empty text inside "${r.zeroWidth}", where the replacement would be inserted between characters. Make it match at least one character.`,
+        );
       const notes = r.emptied
         ? [
             `${fmtCount(r.emptied, 'value')} would become empty and ${r.emptied === 1 ? 'is' : 'are'} left out. Remove ${r.emptied === 1 ? 'it' : 'them'} with Remove annotation instead.`,
           ]
         : [];
-      return ofChanges(
-        r.changes,
-        `Replace "${find}" with "${replace}" in ${fmtCount(r.changes.length, 'annotation')}`,
-        notes,
-        'annotation',
-        'annotations',
-      );
+      return ofChanges(r.changes, label(r.changes.length), notes, 'annotation', 'annotations');
     }
-    if (mode === 'set' || mode === 'remove') {
-      if (!entities.length) return refuse('Add entities to the list first.');
+    if (m === 'set' || m === 'remove') {
+      if (!ents.length) return refuse('Add entities to the list first.');
       const p = iriOf(property);
       if (!p) return refuse('Name the annotation property as a prefixed name or an IRI.');
-      const held = await read('AnnotationAssertion');
-      if (mode === 'set') {
+      if (m === 'set') {
         const v: AnnValue | null = valueOf(valueText, valueLang, valueType, valueIri, prefixes);
         if (v == null)
           return refuse(
             valueIri ? 'Name the value as a prefixed name or an IRI.' : 'Type the value to set.',
           );
-        const r = setAnnotation(entities, p, v, setMode, held);
+        const how = setMode;
+        const r = setAnnotation(ents, p, v, how, await read('AnnotationAssertion'));
         const notes = r.unchanged
           ? [
               `${fmtCount(r.unchanged, 'entity', 'entities')} already ${r.unchanged === 1 ? 'holds' : 'hold'} the value.`,
@@ -331,7 +341,7 @@
           : [];
         return ofChanges(
           r.changes,
-          `Set ${shorten(p, prefixes) ?? p} on ${fmtCount(entities.length - r.unchanged, 'entity', 'entities')}`,
+          `Set ${shorten(p, prefixes) ?? p} on ${fmtCount(ents.length - r.unchanged, 'entity', 'entities')}`,
           notes,
           'annotation',
           'annotations',
@@ -345,9 +355,9 @@
       } else if (removeKind === 'value') {
         const text = valueIri ? iriOf(valueText) : valueText;
         if (!text) return refuse('Type the value to remove.');
-        filter = { kind: 'value', text };
+        filter = { kind: 'value', text, iri: valueIri };
       } else filter = { kind: 'any' };
-      const changes = removeAnnotation(entities, p, filter, held);
+      const changes = removeAnnotation(ents, p, filter, await read('AnnotationAssertion'));
       return ofChanges(
         changes,
         `Remove ${shorten(p, prefixes) ?? p} from ${fmtCount(new Set(changes.map((c) => c.subject)).size, 'entity', 'entities')}`,
@@ -357,13 +367,14 @@
       );
     }
     // move
-    if (!entities.length) return refuse('Add the classes to move to the entity list.');
+    if (!ents.length) return refuse('Add the classes to move to the entity list.');
     const to = toTop ? null : parent?.term.type === 'uri' ? parent.term.value : undefined;
     if (to === undefined) return refuse('Pick the new parent class, or move to the top.');
-    const m = planMove(entities, to, await read('SubClassOf'), keepParents && !toTop, name);
-    if (!m.ok) return { ...refuse(m.reason), count: entities.length };
-    const op = m.op.kind === 'axioms' ? m.op : null;
-    const rows: Row[] = m.moved.map((c) => ({
+    const keep = keepParents && !toTop;
+    const mv = planMove(ents, to, await read('SubClassOf'), keep, name);
+    if (!mv.ok) return { ...refuse(mv.reason), count: ents.length };
+    const op = mv.op.kind === 'axioms' ? mv.op : null;
+    const rows: Row[] = mv.moved.map((c) => ({
       subject: c,
       property: 'SubClassOf',
       before:
@@ -374,13 +385,13 @@
       after: to ? name(to) : null,
     }));
     return {
-      op: m.op,
-      label: `Move ${fmtCount(m.moved.length, 'class', 'classes')} ${to ? `under ${name(to)}` : 'to the top'}`,
+      op: mv.op,
+      label: `Move ${fmtCount(mv.moved.length, 'class', 'classes')} ${to ? `under ${name(to)}` : 'to the top'}`,
       rows,
-      count: m.moved.length,
-      notes: m.unchanged.length
+      count: mv.moved.length,
+      notes: mv.unchanged.length
         ? [
-            `${fmtCount(m.unchanged.length, 'class', 'classes')} already ${m.unchanged.length === 1 ? 'is' : 'are'} in place.`,
+            `${fmtCount(mv.unchanged.length, 'class', 'classes')} already ${mv.unchanged.length === 1 ? 'is' : 'are'} in place.`,
           ]
         : [],
       refusal: null,
@@ -671,7 +682,7 @@
             <thead>
               <tr>
                 <th>Entity</th>
-                <th>{mode === 'move' ? 'Parents' : 'Property'}</th>
+                <th>{plan.mode === 'move' ? 'Parents' : 'Property'}</th>
                 <th>Before</th>
                 <th>After</th>
               </tr>
@@ -680,9 +691,9 @@
               {#each plan.rows.slice(0, ROWS_SHOWN) as r, i (i)}
                 <tr>
                   <td title={r.subject}>{name(r.subject)}</td>
-                  <td>{mode === 'move' ? '' : name(r.property)}</td>
+                  <td>{plan.mode === 'move' ? '' : name(r.property)}</td>
                   <td class="del">{r.before ?? ''}</td>
-                  <td class="ins">{r.after ?? (mode === 'move' ? 'the top' : '')}</td>
+                  <td class="ins">{r.after ?? (plan.mode === 'move' ? 'the top' : '')}</td>
                 </tr>
               {/each}
             </tbody>
@@ -694,7 +705,9 @@
           The ontology changed since these changes were listed. List them again.
         </p>
       {:else if plan.op && !readonly}
-        <button class="btn primary" onclick={() => plan?.op && onedit(plan.op, plan.label)}
+        <button
+          class="btn primary"
+          onclick={() => plan?.op && plan.mode === mode && onedit(plan.op, plan.label)}
           >Preview the edit</button
         >
       {/if}

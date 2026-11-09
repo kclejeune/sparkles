@@ -66,6 +66,11 @@ const whoami = (name: string, level: string) => ({
 test('find and replace in labels is one commit that undo takes back', async ({ page, request }) => {
   const branch = 'bulk-replace';
   await newBranch(request, branch);
+  // every write of a bulk edit reads and writes the graph without its imports, as it planned
+  const writes: unknown[] = [];
+  page.on('request', (r) => {
+    if (r.method() === 'POST' && r.url().includes('/axioms')) writes.push(r.postDataJSON());
+  });
   try {
     await openBulk(page, branch);
     const form = page.getByRole('form', { name: 'Find and replace' });
@@ -92,6 +97,8 @@ test('find and replace in labels is one commit that undo takes back', async ({ p
     expect((await messages(request, branch))[0]).toBe(
       'Replace "student" with "learner" in 2 annotations',
     );
+    expect(writes.length).toBeGreaterThan(0);
+    for (const w of writes) expect(w).toMatchObject({ imports: false });
     // a new head clears the listed changes, which belonged to the old one
     await expect(c).toHaveCount(0);
 
@@ -113,6 +120,16 @@ test('a regular expression keeps the annotations of an annotated value', async (
   const branch = 'bulk-regex';
   await newBranch(request, branch);
   try {
+    // the label of GraduateStudent carries an axiom annotation
+    const seeded = await request.post(`/uni@${branch}/update`, {
+      headers: { 'Content-Type': 'application/sparql-update' },
+      data: `PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+INSERT DATA { [] a owl:Axiom ; owl:annotatedSource <${UNI}GraduateStudent> ;
+  owl:annotatedProperty rdfs:label ; owl:annotatedTarget "Graduate student"@en ;
+  rdfs:comment "from the handbook"@en . }`,
+    });
+    expect(seeded.ok(), await seeded.text()).toBe(true);
     await openBulk(page, branch);
     const form = page.getByRole('form', { name: 'Find and replace' });
     await form.getByRole('textbox', { name: 'Find' }).fill('^(\\w+) student$');
@@ -121,6 +138,25 @@ test('a regular expression keeps the annotations of an annotated value', async (
     await form.getByRole('button', { name: 'Find' }).click();
     await expect(changes(page).locator('tbody tr')).toHaveCount(1);
     await expect(changes(page)).toContainText('"Graduate learner"@en');
+    await changes(page).getByRole('button', { name: 'Preview the edit' }).click();
+    await expect(preview(page).locator('.axioms.ins')).toContainText('[1 annotation]');
+    await commitPreview(page);
+    const r = await request.get(
+      `/$/ontology/uni@${branch}/axioms?type=AnnotationAssertion&about=${encodeURIComponent(`${UNI}GraduateStudent`)}&limit=100`,
+    );
+    const label = ((await r.json()).axioms as { axiom: Record<string, unknown> }[]).find(
+      (a) => (a.axiom.value as { '@value'?: string })?.['@value'] === 'Graduate learner',
+    );
+    expect(label?.axiom.annotations).toEqual([
+      {
+        property: 'http://www.w3.org/2000/01/rdf-schema#comment',
+        value: { '@value': 'from the handbook', '@language': 'en' },
+      },
+    ]);
+    // a pattern that matches empty text between characters is refused
+    await form.getByRole('textbox', { name: 'Find' }).fill('(?=e)');
+    await form.getByRole('button', { name: 'Find' }).click();
+    await expect(changes(page).getByRole('alert')).toContainText('matches empty text inside');
     // a pattern that is not valid is refused before any read
     await form.getByRole('textbox', { name: 'Find' }).fill('(');
     await form.getByRole('button', { name: 'Find' }).click();
@@ -225,6 +261,41 @@ test('moves classes under a new parent and refuses a cycle', async ({ page, requ
     expect(sub.some((a) => a.startsWith('SubClassOf(uni:Professor ObjectSomeValuesFrom'))).toBe(
       true,
     );
+  } finally {
+    await request.delete(`/$/branches/uni/${branch}?force=true`);
+  }
+});
+
+test('switching operation while the graph is read drops the pending changes', async ({
+  page,
+  request,
+}) => {
+  const branch = 'bulk-race';
+  await newBranch(request, branch);
+  try {
+    let release!: () => void;
+    const held = new Promise<void>((done) => (release = done));
+    await page.route('**/axioms?**', async (route) => {
+      if (route.request().method() === 'GET') await held;
+      await route.continue().catch(() => {});
+    });
+    await openBulk(page, branch);
+    await pasteEntities(page, 'uni:Student');
+    const ops = page.getByRole('group', { name: 'Bulk edit' });
+    await ops.getByRole('button', { name: 'Set annotation' }).click();
+    const form = page.getByRole('form', { name: 'Set an annotation' });
+    await form.getByRole('textbox', { name: 'Value' }).fill('Reviewed');
+    await form.getByRole('button', { name: 'List the changes' }).click();
+    await expect(form.getByRole('button', { name: 'Reading…' })).toBeVisible();
+    await ops.getByRole('button', { name: 'Move classes' }).click();
+    release();
+    await page.waitForTimeout(1000);
+    await expect(changes(page)).toHaveCount(0);
+    await expect(
+      page
+        .getByRole('form', { name: 'Move classes' })
+        .getByRole('button', { name: 'List the changes' }),
+    ).toBeEnabled();
   } finally {
     await request.delete(`/$/branches/uni/${branch}?force=true`);
   }

@@ -9,7 +9,6 @@ import {
   axiomKey,
   isLit,
   resolveInput,
-  withAnnotations,
   type AnnValue,
   type AxiomItem,
   type AxiomJson,
@@ -30,6 +29,12 @@ const OWL_THING = WELL_KNOWN.owl + 'Thing';
  * preview stays readable and the edit's answer lists every axiom it changed.
  */
 export const BULK_LIMIT = 1_000;
+/**
+ * The most axioms one bulk edit adds and removes together, which keeps the edit's answer
+ * listing every axiom it changed. Only a move can reach it, through classes with many parents.
+ */
+export const BULK_AXIOM_LIMIT = 10_000;
+const fmt = (n: number) => n.toLocaleString('en-US');
 /** The most entities the entity list holds. */
 export const BULK_ENTITY_LIMIT = BULK_LIMIT;
 /**
@@ -122,6 +127,11 @@ export type FindResult = {
   changes: Change[];
   /** Values the replacement would leave empty, which are left out. */
   emptied: number;
+  /**
+   * A value in which the pattern matches empty text, such as a lookahead or a word boundary,
+   * where the replacement would be inserted between characters. The find is then refused.
+   */
+  zeroWidth: string | null;
 };
 
 const assertionOf = (it: AxiomItem | AxiomJson): AxiomJson | null => {
@@ -146,6 +156,7 @@ export function findMatches(
   const changes: Change[] = [];
   const seen = new Set<string>();
   let emptied = 0;
+  let zeroWidth: string | null = null;
   for (const it of axioms) {
     const a = assertionOf(it);
     if (!a) continue;
@@ -157,6 +168,11 @@ export function findMatches(
     if (!isTextLiteral(v) || !langMatches(v['@language'], spec.lang)) continue;
     re.lastIndex = 0;
     if (!re.test(v['@value'])) continue;
+    re.lastIndex = 0;
+    if ([...v['@value'].matchAll(re)].some((m) => m[0] === '')) {
+      zeroWidth ??= v['@value'];
+      continue;
+    }
     re.lastIndex = 0;
     const text = spec.regex
       ? v['@value'].replace(re, spec.replace)
@@ -176,7 +192,7 @@ export function findMatches(
       after: { ...a, value: { ...v, '@value': text } },
     });
   }
-  return { changes, emptied };
+  return { changes, emptied, zeroWidth };
 }
 
 // --- set and remove ----------------------------------------------------------------------
@@ -204,7 +220,7 @@ export function setAnnotation(
     l.push(a);
     held.set(a.subject as string, l);
   }
-  const newKey = (s: string) => axiomKey(annotationAssertion(property, s, value));
+  const newKey = valueKey(value);
   const sameSlot = (v: AnnValue) =>
     typeof value === 'string'
       ? true
@@ -214,11 +230,11 @@ export function setAnnotation(
   let unchanged = 0;
   for (const s of new Set(entities)) {
     const mine = held.get(s) ?? [];
-    const has = mine.some((a) => axiomKey(withAnnotations(a, [])) === newKey(s));
+    const has = mine.some((a) => valueKey(a.value as AnnValue) === newKey);
     const drop =
       mode === 'replace'
         ? mine.filter(
-            (a) => axiomKey(withAnnotations(a, [])) !== newKey(s) && sameSlot(a.value as AnnValue),
+            (a) => valueKey(a.value as AnnValue) !== newKey && sameSlot(a.value as AnnValue),
           )
         : [];
     if (has && !drop.length) {
@@ -237,11 +253,23 @@ export function setAnnotation(
   return { changes, unchanged };
 }
 
-/** Which values a removal takes: every value, those in a language, or one exact text. */
+/**
+ * The identity of an annotation value as RDF compares it: an IRI, or a literal's text with its
+ * language tag in lower case, since tags compare without case, and its datatype, with a plain
+ * literal and an `xsd:string` the same.
+ */
+export function valueKey(v: AnnValue): string {
+  if (typeof v === 'string') return JSON.stringify(['iri', v]);
+  const lang = v['@language']?.toLowerCase();
+  const type = lang ? RDF + 'langString' : (v['@type'] ?? XSD + 'string');
+  return JSON.stringify(['lit', v['@value'], lang ?? '', type]);
+}
+
+/** Which values a removal takes: every value, those in a language, or one exact value. */
 export type RemoveFilter =
   | { kind: 'any' }
   | { kind: 'lang'; lang: LangFilter }
-  | { kind: 'value'; text: string };
+  | { kind: 'value'; text: string; iri: boolean };
 
 /** Remove the annotations of `property` that pass `filter` from each of `entities`. */
 export function removeAnnotation(
@@ -258,10 +286,12 @@ export function removeAnnotation(
     if (!a || a.property !== property || !want.has(a.subject as string)) continue;
     const v = a.value as AnnValue;
     if (filter.kind === 'lang' && !(isLit(v) && langMatches(v['@language'], filter.lang))) continue;
-    if (filter.kind === 'value') {
-      const text = isLit(v) ? v['@value'] : v;
-      if (text !== filter.text) continue;
-    }
+    // an IRI value matches only an IRI, and a text value only a literal of that text
+    if (
+      filter.kind === 'value' &&
+      (filter.iri ? v !== filter.text : !isLit(v) || v['@value'] !== filter.text)
+    )
+      continue;
     const k = axiomKey(a);
     if (seen.has(k)) continue;
     seen.add(k);
@@ -385,6 +415,11 @@ export function planMove(
     return { ok: false, reason: 'Every class is already where the move would put it.' };
   if (moved.length > BULK_LIMIT)
     return { ok: false, reason: overLimit(moved.length, 'class', 'classes') };
+  if (add.length + remove.length > BULK_AXIOM_LIMIT)
+    return {
+      ok: false,
+      reason: `The move would change ${fmt(add.length + remove.length)} SubClassOf axioms, more than the ${fmt(BULK_AXIOM_LIMIT)} that one bulk edit may change. Move fewer classes at once.`,
+    };
   return { ok: true, op: { kind: 'axioms', add, remove, declare: false }, moved, unchanged };
 }
 

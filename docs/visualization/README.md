@@ -643,7 +643,11 @@ with its old and new value, and opens the editor's preview of one `axioms` edit,
 dry run shows the changed triples and the commit is one entry of the undo stack. An edit
 of more than 1,000 changes is refused with its count, and so is a graph that holds more
 than 100,000 annotation assertions or `SubClassOf` axioms, since a partial read could miss
-matches. A commit that lands after the changes were listed clears them. Readers and
+matches. A move also refuses more than 10,000 changed axioms in all. A pattern that matches
+empty text, such as a lookahead, is refused. A value removed as an IRI removes only that IRI,
+and language tags compare without case, so setting a value an entity already holds leaves it
+and its axiom annotations alone. A commit that lands after the changes were listed clears
+them. Readers and
 protected branches can list changes but get no preview. New annotations and parents are
 not declared, and the cycle check follows only the graph's own named `SubClassOf` axioms.
 Item 770 covers bulk edits of larger ontologies.

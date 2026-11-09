@@ -130,6 +130,17 @@ describe('find and replace', () => {
     expect(r.emptied).toBe(1);
   });
 
+  it('refuses a pattern that matches empty text inside a value', () => {
+    for (const find of ['(?=.)', '\\b', 'x*']) {
+      const s = spec({ find, regex: true, replace: 'X' });
+      const re = compileFind(s);
+      if (typeof re === 'string') continue;
+      const r = findMatches([ann('A', LABEL, { '@value': 'abc' })], s, re);
+      expect(r.zeroWidth, find).toBe('abc');
+      expect(r.changes, find).toHaveLength(0);
+    }
+  });
+
   it('refuses an empty find, a bad pattern and a pattern that matches nothing at all', () => {
     expect(compileFind({ find: '', regex: false, caseSensitive: false })).toMatch(/Type/);
     expect(compileFind({ find: '(', regex: true, caseSensitive: false })).toMatch(/not valid/);
@@ -181,6 +192,46 @@ describe('set and remove an annotation', () => {
     expect(iri.changes.filter((c) => c.before).length).toBe(2);
   });
 
+  it('keeps an annotated value whose language tag differs only in case', () => {
+    const held = [
+      ann('A', COMMENT, { '@value': 'checked', '@language': 'en' }, [
+        { property: LABEL, value: { '@value': 'source' } },
+      ]),
+    ];
+    const up = { '@value': 'checked', '@language': 'EN' };
+    for (const mode of ['add', 'replace'] as const) {
+      const r = setAnnotation([EX + 'A'], COMMENT, up, mode, held);
+      expect(r.changes, mode).toEqual([]);
+      expect(r.unchanged, mode).toBe(1);
+    }
+    // a plain literal and an xsd:string are one value
+    const plain = [ann('A', COMMENT, { '@value': 'x' })];
+    const typed = { '@value': 'x', '@type': XSD + 'string' };
+    expect(setAnnotation([EX + 'A'], COMMENT, typed, 'replace', plain).changes).toEqual([]);
+  });
+
+  it('removes an IRI value without the literal of the same text, and the other way round', () => {
+    const held = [
+      ann('A', COMMENT, EX + 'Doc'),
+      ann('A', COMMENT, { '@value': EX + 'Doc' }),
+      ann('A', COMMENT, { '@value': EX + 'Doc', '@type': XSD + 'anyURI' }),
+    ];
+    const iri = removeAnnotation(
+      [EX + 'A'],
+      COMMENT,
+      { kind: 'value', text: EX + 'Doc', iri: true },
+      held,
+    );
+    expect(iri.map((c) => c.before)).toEqual([held[0]]);
+    const lit = removeAnnotation(
+      [EX + 'A'],
+      COMMENT,
+      { kind: 'value', text: EX + 'Doc', iri: false },
+      held,
+    );
+    expect(lit.map((c) => c.before)).toEqual([held[1], held[2]]);
+  });
+
   it('removes every value, those of a language or one exact text', () => {
     const held = [
       ann('A', COMMENT, { '@value': 'one', '@language': 'en' }),
@@ -198,9 +249,14 @@ describe('set and remove an annotation', () => {
       held,
     );
     expect(fr.map((c) => c.before)).toEqual([held[1]]);
-    const one = removeAnnotation(ents, COMMENT, { kind: 'value', text: 'one' }, held);
+    const one = removeAnnotation(ents, COMMENT, { kind: 'value', text: 'one', iri: false }, held);
     expect(one.map((c) => c.before)).toEqual([held[0]]);
-    const doc = removeAnnotation(ents, COMMENT, { kind: 'value', text: EX + 'Doc' }, held);
+    const doc = removeAnnotation(
+      ents,
+      COMMENT,
+      { kind: 'value', text: EX + 'Doc', iri: true },
+      held,
+    );
     expect(doc.map((c) => c.before)).toEqual([held[2]]);
   });
 
@@ -286,6 +342,13 @@ describe('moving classes', () => {
       ok: false,
       reason: 'Professor is below Person, so the move would make a cycle.',
     });
+  });
+
+  it('refuses a move that would change more axioms than one edit lists', () => {
+    const parents = Array.from({ length: 10_001 }, (_, i) => sub('Many', `P${i}`));
+    const r = planMove([EX + 'Many'], EX + 'Agent', parents, false);
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.reason).toMatch(/10,002 SubClassOf axioms, more than the 10,000/);
   });
 
   it('refuses a move of more classes than the bound', () => {

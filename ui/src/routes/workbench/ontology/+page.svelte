@@ -1078,11 +1078,21 @@
     if (seq != null) session.own.add(seq);
     void loadAll();
   };
-  const edit = (op: Op, label: string, after?: () => void, fromFrame: string | null = null) => {
+  /**
+   * Preview `op`. `selection` is the graphs the edit reads and writes, the page's own unless
+   * the edit was planned from another reading, as a bulk edit is from the graph alone.
+   */
+  const edit = (
+    op: Op,
+    label: string,
+    after?: () => void,
+    fromFrame: string | null = null,
+    selection: Selection = sel,
+  ) => {
     // an edit names the commit the summary read, which a large ontology's summary may still be reading
     if (readonly || !etag)
       return void toasts.push('info', 'The ontology is still being read', 'Try again in a moment.');
-    const origin = { target, sel: { ...sel }, etag, head: summary?.commit ?? null };
+    const origin = { target, sel: { ...selection }, etag, head: summary?.commit ?? null };
     session.edit(op, label, after);
     previewPin = { ...origin, op: session.previewOp!, frameContext: fromFrame };
   };
@@ -1509,7 +1519,9 @@
               {prefixes}
               {annotationProperties}
               name={nameOf}
-              onedit={(op, label) => edit(op, label)}
+              onedit={(op, label) =>
+                // the plan was read without the imports, and its edit reads and writes the same
+                edit(op, label, undefined, null, { graph, imports: false })}
             />{/key}
         </div>
       </section>

@@ -25,11 +25,13 @@ const TURTLE = `
 @prefix owl: <${OWL}> .
 @prefix uni: <${UNI}> .
 
-<${GRAPH}> a owl:Ontology .
+<${GRAPH}> a owl:Ontology ; owl:imports <${OTHER}> .
 uni:Agent a owl:Class ; rdfs:label "Agent"@en .
 uni:Person a owl:Class ; rdfs:subClassOf uni:Agent ; rdfs:label "Person"@en .
 uni:Student a owl:Class ; rdfs:subClassOf uni:Person ; rdfs:label "Student"@en , "Étudiant"@fr .
 uni:GraduateStudent a owl:Class ; rdfs:subClassOf uni:Student ; rdfs:label "Graduate student"@en .
+[] a owl:Axiom ; owl:annotatedSource uni:GraduateStudent ; owl:annotatedProperty rdfs:label ;
+  owl:annotatedTarget "Graduate student"@en ; rdfs:comment "from the handbook"@en .
 uni:Employee a owl:Class ; rdfs:subClassOf uni:Person ; rdfs:label "Employee"@en .
 uni:Professor a owl:Class ; rdfs:subClassOf uni:Employee ; rdfs:label "Professor"@en .
 [] a owl:Axiom ; owl:annotatedSource uni:GraduateStudent ; owl:annotatedProperty rdfs:subClassOf ;
@@ -91,7 +93,9 @@ open.beforeAll(async ({ request }) => {
   expect(r.ok(), await r.text()).toBe(true);
   for (const [g, data] of [
     [GRAPH, TURTLE],
-    [OTHER, `<${UNI}Student> <${RDFS}label> "Student elsewhere"@en .`],
+    // the imported graph already holds the label the replacement writes, which the
+    // edit must still add to the edited graph
+    [OTHER, `<${OTHER}> a <${OWL}Ontology> . <${UNI}Student> <${RDFS}label> "learner"@en .`],
   ]) {
     const loaded = await request.post(`/${DS}/data?graph=${encodeURIComponent(g)}`, {
       headers: { 'Content-Type': 'text/turtle' },
@@ -121,11 +125,21 @@ open('find and replace in labels is one commit on the branch', async ({ page, re
     .poll(() => count(request, target, inGraph(`?s <${RDFS}label> "learner"@en`)))
     .toBe(1);
   expect(await count(request, target, inGraph(`?s <${RDFS}label> "Graduate learner"@en`))).toBe(1);
+  // the annotated label keeps its annotation on the new value
+  expect(
+    await count(
+      request,
+      target,
+      inGraph(
+        `?x <${OWL}annotatedTarget> "Graduate learner"@en ; <${RDFS}comment> "from the handbook"@en`,
+      ),
+    ),
+  ).toBe(1);
   // the French label, the other graph and main are untouched
   expect(await count(request, target, inGraph(`?s <${RDFS}label> "Étudiant"@fr`))).toBe(1);
-  expect(
-    await count(request, target, `GRAPH <${OTHER}> { ?s <${RDFS}label> "Student elsewhere"@en }`),
-  ).toBe(1);
+  expect(await count(request, target, `GRAPH <${OTHER}> { ?s <${RDFS}label> "learner"@en }`)).toBe(
+    1,
+  );
   expect(await count(request, DS, inGraph(`?s <${RDFS}label> "Student"@en`))).toBe(1);
   const log = await request.get(`/$/commits/${DS}?branch=${BRANCH}&limit=1`);
   expect((await log.json()).commits[0].message).toBe(
@@ -135,7 +149,9 @@ open('find and replace in labels is one commit on the branch', async ({ page, re
 
 open('a move drops an annotated parent, and undo restores it', async ({ page, request }) => {
   const target = `${DS}@${BRANCH}`;
-  const reified = inGraph(`?x <${OWL}annotatedSource> <${UNI}GraduateStudent>`);
+  const reified = inGraph(
+    `?x <${OWL}annotatedSource> <${UNI}GraduateStudent> ; <${OWL}annotatedProperty> <${RDFS}subClassOf>`,
+  );
   const before = await count(request, target, inGraph('?s ?p ?o'));
   expect(await count(request, target, reified)).toBe(1);
   await openBulk(page, DS, BRANCH);
