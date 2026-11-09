@@ -28,9 +28,16 @@
 //! each context registered for every constant of its body, or for a constant of its head
 //! when the body is empty (r-Pred). That context resolves each body atom, read with y as x,
 //! with its own clauses where it is maximal, and takes the head with y read as x. The
-//! journal's r-Pred has a clause without a body reach every context, but a context that
-//! never registered for one of the clause's constants has no literal over that constant
-//! that the clause resolves with.
+//! journal's r-Pred has a clause without a body reach every context. Here a context also
+//! registers for the constants of every other maximal literal, such as `x ≈ u`, and of the
+//! ground literals in its bodies, and a clause without a body reaches the contexts
+//! registered for one of its constants. That loses no inference: in a context, every
+//! inference with such a clause has a second premise of the context that mentions one of
+//! the clause's constants in a maximal literal or in its body, since a rule's premises
+//! meet at a shared literal or a term an ontology clause's role atom binds, and an
+//! inference between two root clauses happens in the root, whose conclusion follows the
+//! same routing. The journal's system Sequoia holds the ABox's facts back from a context
+//! in the same way until the context mentions their constant (its Section 7.3.2).
 //!
 //! A maximal literal over `f_e(u)` in the root takes Succ: the root registers with e's
 //! hypothetical successor, which has the empty core, records the constant u for the edge and
@@ -710,6 +717,16 @@ pub(super) fn on_max<S: Sink>(
             out.dl().grow(grown);
         }
     }
+    // a maximal literal over a constant that is no root successor trigger, such as x ≈ u,
+    // registers the context for its constants, so that the root's clauses without a body
+    // over them reach it
+    if let Some(root) = dx.root
+        && trigger_of(v).is_none()
+    {
+        let mut us = Vec::new();
+        consts(v, &mut us);
+        edge_to(root, me, st, us, out);
+    }
     if ground_trigger(v) {
         ground_out(ix, st, l, out);
     }
@@ -1101,6 +1118,12 @@ pub(super) fn register_body<S: Sink>(ix: &Index, me: Ex, st: &mut State, c: &Cla
             }
         }
     }
+    edge_to(root, me, st, us, out);
+}
+
+/// The context `me`, other than the root, registers with the root for the constants
+/// `us`, once each.
+fn edge_to<S: Sink>(root: Ex, me: Ex, st: &mut State, us: Vec<u32>, out: &mut S) {
     if us.is_empty() {
         return;
     }
@@ -2561,5 +2584,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_maximal_equality_to_a_constant_registers_for_it() {
+        // {o} ⊑ {p} with o above p gives the root ⊤ → o ≈ p. A context whose only clause is
+        // ⊤ → x ≈ o takes it, as the journal's r-Pred gives every context a root clause
+        // without a body, and Eq gives it ⊤ → x ≈ p
+        let mut s = Sig::new();
+        let np = s.ind("p");
+        let no = s.ind("o");
+        let z = s.class("Z");
+        s.sub(no, np);
+        let d = saturate_after(s, &[z], Some(z), |ix, _| {
+            vec![(vec![], vec![XLit::Eq(RTerm::X, c(no, ix))])]
+        });
+        let (o, p) = (c(no, &d.ix), c(np, &d.ix));
+        assert!(Rooted::a_gt(o, p));
+        let has = |h: XLit| {
+            d.clauses_of(z)
+                .iter()
+                .any(|(b, hs)| b.is_empty() && hs == &vec![h])
+        };
+        assert!(has(XLit::Eq(RTerm::X, o)), "the seed is kept");
+        assert!(has(XLit::Eq(RTerm::X, p)), "{:?}", d.clauses_of(z));
     }
 }
