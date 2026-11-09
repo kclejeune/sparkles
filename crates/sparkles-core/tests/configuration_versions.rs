@@ -258,3 +258,66 @@ fn an_ordinary_store_without_a_registry_still_opens() {
     let store = Store::open(&root, StoreOptions::default()).unwrap();
     insert(&store, 2);
 }
+
+/// Rewrite the version of every headed log under `root` to `version`, leaving the
+/// bytes after it zero, as a version 2 log of an activated store has them.
+fn set_wal_versions(root: &Path, version: u32) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().is_some_and(|name| name == "wal.log") {
+                let mut bytes = std::fs::read(&path).unwrap();
+                if bytes.len() >= 33 && bytes[..8] == *b"\x89SPKWAL\n" {
+                    bytes[8..12].copy_from_slice(&version.to_le_bytes());
+                    std::fs::write(&path, bytes).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn migration_and_activation_refuse_a_version_the_reader_does_not_admit() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("db");
+    drop(ordinary(&root));
+    set_wal_versions(&root, 2);
+    let plan = sparkles_core::migrate::plan(&root).unwrap();
+    assert!(
+        plan.refused
+            .iter()
+            .any(|refusal| refusal.contains("wal.log")),
+        "{plan:?}"
+    );
+    let preparation = Preparation::new(Control::none(), 64 << 20).unwrap();
+    let refused =
+        sparkles_core::migrate::activate_configuration_history(&root, false, &preparation);
+    assert!(
+        matches!(refused, Err(sparkles_core::Error::Unsupported(_))),
+        "{refused:?}"
+    );
+    assert!(reader(&root) < 8);
+    assert!(!root.join("evidence-history").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_generation_is_checked_as_the_generation_it_names() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("db");
+    drop(ordinary(&root));
+    let generation = current(&root);
+    let payload = root.join("payload");
+    std::fs::rename(&generation, &payload).unwrap();
+    std::os::unix::fs::symlink(&payload, &generation).unwrap();
+    set_wal_versions(&payload, 2);
+    let refused = Store::open(&root, StoreOptions::default());
+    assert!(
+        matches!(refused, Err(sparkles_core::Error::Unsupported(_))),
+        "{:?}",
+        refused.map(|_| ())
+    );
+}

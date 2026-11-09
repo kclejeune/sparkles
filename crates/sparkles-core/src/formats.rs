@@ -1048,9 +1048,15 @@ pub(crate) fn check_configuration_versions(dir: &std::path::Path) -> Result<()> 
         if !name
             .strip_prefix("gen-")
             .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
-            || !entry.file_type()?.is_dir()
         {
             continue;
+        }
+        // open follows a symlinked generation, so this check follows it too
+        match std::fs::metadata(entry.path()) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
         }
         let generation = entry.path();
         let wal = generation.join("wal.log");

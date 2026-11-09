@@ -238,6 +238,11 @@ fn inspect_dir(plan: &mut Plan, dir: &Path, prefix: &str, by: Option<&str>) -> R
         // the message already names the directory
         plan.refused.push(e.to_string());
     }
+    // the generation versions that this dataset's reader admits, as open checks them,
+    // before activation or any other step raises the reader
+    if let Err(e) = formats::check_configuration_versions(dir) {
+        plan.refused.push(format!("{prefix}{e}"));
+    }
     inspect_store(plan, dir, prefix, by)
 }
 

@@ -555,7 +555,13 @@ fn activation_refuses_unpublished_retained_base_before_modifying_current() {
     std::fs::write(&path, &bytes).unwrap();
     let hot = primary_wal(&root);
     let hot_before = std::fs::read(&hot).unwrap();
-    assert!(crate::migrate::configuration_history_plan(&root, &preparation()).is_err());
+    // a format 2 commit.json in a dataset without the configuration reader is
+    // refused by the plan itself, as open refuses it, before activation starts
+    match crate::migrate::configuration_history_plan(&root, &preparation()) {
+        Err(_) => {}
+        Ok(plan) => assert!(!plan.refused.is_empty(), "{plan:?}"),
+    }
+    assert!(crate::migrate::activate_configuration_history(&root, false, &preparation()).is_err());
     assert_eq!(std::fs::read(hot).unwrap(), hot_before);
     assert_eq!(std::fs::read(path).unwrap(), bytes);
     assert!(!root.join("evidence-history").exists());
