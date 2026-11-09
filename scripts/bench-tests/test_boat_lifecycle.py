@@ -705,12 +705,41 @@ class JobClosureProgram(unittest.TestCase):
                 return '\n\n'.join('Id=%s\nActiveState=inactive\nMainPID=0'%u for u in args[3:-1])
         io=Timed(self.f['release'],self.f['operation'])
         units=tuple('lane-%d.service'%n for n in range(8))
-        with self.assertRaises(controller.Refusal):io.job_closure(units,60)
-        self.assertEqual(io.spent,[('remote',50),('local',8)])
+        # Both calls overrun their timeouts and still end inside the bound.
+        q=io.job_closure(units,60);self.assertEqual(q['local_units_closed'],{u:True for u in units})
+        self.assertEqual(io.spent,[('remote',38),('local',14)]);self.assertLessEqual(io.t,1060)
         io=Timed(self.f['release'],self.f['operation']);io.remote_python=lambda p,a,s:(setattr(io,'t',io.t+s-12),{'exit':0,'error':None,'body':{}})[1]
         io.system=lambda args,seconds=15:(setattr(io,'t',io.t+1),'\n\n'.join('Id=%s\nActiveState=inactive\nMainPID=0'%u for u in args[3:-1]))[1]
         self.assertEqual(io.job_closure(units,60)['local_units_closed'],{u:True for u in units})
         with self.assertRaises(controller.Refusal):io.job_closure(units,14)
+
+    def test_teardown_stays_inside_the_bound_with_and_without_local_units(self):
+        class Slow(controller.RealIO):
+            def __init__(self,r,op):super().__init__(r,op);self.t=0.0
+            def mono(self):return self.t
+            # Every bounded call runs to its timeout and then uses its full teardown window.
+            def remote_python(self,program,args,seconds):self.t+=seconds+controller.owned_group.WINDOW;return {'exit':None,'error':'timeout','body':None}
+            def system(self,args,seconds=15):self.t+=seconds+controller.owned_group.WINDOW;raise controller.Refusal('systemd command failed')
+        for units in [(),('job.service',)]:
+            io=Slow(self.f['release'],self.f['operation'])
+            with self.assertRaises(controller.Refusal):io.job_closure(units,90)
+            self.assertLessEqual(io.t,90,units)
+        class Quiet(Slow):
+            def remote_python(self,program,args,seconds):
+                self.t+=seconds+controller.owned_group.WINDOW;return {'exit':0,'error':None,'body':{}}
+        io=Quiet(self.f['release'],self.f['operation'])
+        with self.assertRaises(controller.Refusal):io.job_closure(('job.service',),90)
+        self.assertLessEqual(io.t,90)
+
+    def test_local_unit_names_resolve_like_systemctl(self):
+        class Local(controller.RealIO):
+            def remote_python(self,program,args,seconds):return {'exit':0,'error':None,'body':{}}
+            def system(self,args,seconds=15):
+                self.asked=args[3:-1];return '\n\n'.join('Id=%s\nActiveState=inactive\nMainPID=0'%u for u in self.asked)
+        io=Local(self.f['release'],self.f['operation'])
+        q=io.job_closure(('job','job.v1','build.scope','lane.service'),60)
+        self.assertEqual(io.asked,['job.service','job.v1.service','build.scope','lane.service'])
+        self.assertEqual(q['local_units_closed'],{'job':True,'job.v1':True,'build.scope':True,'lane.service':True})
 
     def test_lock_files_of_another_mode_link_or_kind_refuse(self):
         op=self.f['operation'];io=controller.RealIO(self.f['release'],op);lock=op/controller.JOB_LOCK

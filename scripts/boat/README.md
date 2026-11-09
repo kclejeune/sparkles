@@ -201,8 +201,9 @@ dbus and the allowed provider session, any installer, shell or build tool and an
 descendant of those. Detached work, such as a partition share under `setsid`, is caught
 this way. An mbx lease lives only as long as its mbx process, so the process check
 covers the Boxington leases. Each named local job unit must also be inactive, and at
-most eight can be named. One bound covers the SSH check and the single local `systemctl`
-query, and a check that ends after it counts as failed. Each check is kept as
+most eight can be named, and a name without a unit suffix means a service. One bound
+covers the SSH check and the single local `systemctl` query, including the teardown of
+each call, and a check that ends after it counts as failed. Each check is kept as
 `closure-watch-check-NNNN.json`. An open job is checked again every 30 seconds.
 
 Every Boat command takes the operation's `jobs.lock` shared when its admission is

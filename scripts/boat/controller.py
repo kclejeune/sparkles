@@ -143,6 +143,11 @@ def bounded(argv,seconds,input_bytes=None,limit=None):
     return result
 
 
+UNIT_SUFFIXES=('service','scope','socket','timer','target','slice','mount','automount','path','swap','device')
+def unit_name(unit):
+    """The full unit name systemctl resolves, with .service added when no unit suffix is given."""
+    return unit if unit.rsplit('.',1)[-1] in UNIT_SUFFIXES and '.' in unit else unit+'.service'
+
 def observer_sources():
     """The maintained sources that every remote observer program is composed from."""
     common=(ROOT/'config_schema.py').read_text()+'\n'+(ROOT/'common.py').read_text()
@@ -233,22 +238,28 @@ class RealIO:
         fd=getattr(self,'_jobs',None);self._jobs=None
         if fd is not None:os.close(fd)
     def job_closure(self,local_units,seconds=60):
-        """One check of the worker's job units and processes and the local job units, all within ``seconds``."""
-        end=self.mono()+seconds
+        """One check of the worker's job units and processes and the local job units.
+
+        Each bounded call may spend owned_group.WINDOW seconds in teardown after its
+        own timeout, so the timeouts leave that much, and the whole check with its
+        teardown ends within ``seconds``.
+        """
+        end=self.mono()+seconds;teardown=owned_group.WINDOW+1
         common,definitions,observer=observer_sources()
         program=common+'\n'+definitions+'\n'+observer+'\n'+JOB_CLOSURE_ENTRY
-        remote=end-self.mono()-(10 if local_units else 0);need(remote>=5,'job closure bound exhausted')
+        remote=end-self.mono()-teardown-((10+teardown) if local_units else 0);need(remote>=5,'job closure bound exhausted')
         r=self.remote_python(program,[json.dumps(profile()),json.dumps(list(JOB_UNIT_PREFIXES))],remote)
         need(r['exit']==0 and isinstance(r['body'],dict),'worker job closure check failed')
         b=r['body'];local={}
         if local_units:
-            left=end-self.mono();need(left>=1,'job closure bound exhausted')
+            names={unit:unit_name(unit) for unit in local_units}
+            left=end-self.mono()-teardown;need(left>=1,'job closure bound exhausted')
             # One systemctl call for every named unit, bounded by what is left.
-            text=self.system(['systemctl','--user','show',*local_units,'--property=Id,ActiveState,MainPID'],max(1,int(left)))
+            text=self.system(['systemctl','--user','show',*names.values(),'--property=Id,ActiveState,MainPID'],int(left))
             blocks=[props(x) for x in text.strip().split('\n\n')] if text.strip() else []
             seen={x.get('Id'):x for x in blocks}
-            for unit in local_units:
-                x=seen.get(unit if '.' in unit else unit+'.service',{})
+            for unit,name in names.items():
+                x=seen.get(name,{})
                 local[unit]=x.get('ActiveState') in ('inactive','failed') and x.get('MainPID')=='0'
         need(self.mono()<=end,'job closure bound exhausted')
         return {'list_exit':b.get('list_exit'),'units':b.get('units'),'unit_count':b.get('unit_count'),'processes':b.get('processes'),'process_count':b.get('process_count'),'boot_id':b.get('boot_id'),'local_units_closed':local}
