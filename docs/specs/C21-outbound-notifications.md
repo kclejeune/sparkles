@@ -538,8 +538,13 @@ These points differ from the design or settle what it left open.
   delivery that does not fit ends `dropped`, as §6.5 says for the single queue, and
   only the channel that is full drops. A retry waits in its channel's queue, so a
   channel that times out or fails delays only its own deliveries, and raising an event
-  never waits for a delivery. The kind holds at most 32 channels, which bounds the
-  threads, and a channel's thread ends after 30 seconds with an empty queue. The
+  never waits for a delivery. The kind holds at most 32 channels. A channel that is
+  removed or renamed keeps its queue and thread until its waiting deliveries are done,
+  and at most 64 queues exist at once, so a delivery that would need one more ends
+  `dropped`. A channel's thread ends once its queue is empty and the settings no
+  longer have the channel, or after 30 seconds with an empty queue otherwise. The
+  delivery code reads the kind only when it passes the kind's checks, so a runtime
+  layer written with more than 32 channels leaves notifications off. The
   gauges `sparkles_notifications_channel_queued{channel}` and
   `sparkles_notifications_channel_queue_capacity{channel}` show each queue, and the
   channel entries of `GET /$/notifications` gain `queued`, `inFlight` and
@@ -587,15 +592,9 @@ These points differ from the design or settle what it left open.
   that is cancelled sends nothing, as now. A policy whose last success is older than twice
   its schedule's interval raises `backup.overdue`, which clears on the next success as
   other conditions do.
-* **Delivery that a slow channel cannot delay.** One worker thread (`worker` in
-  `notify/mod.rs`) sends every delivery in turn, so a channel that times out delays
-  the others by up to `timeoutSecs` per attempt. The queue becomes one queue per
-  channel, each with its own worker thread and its share of the 1,000 entries (at
-  least 50), so a slow or failing channel holds only its own deliveries. Retries wait
-  in the channel's own queue. The settings have no cap on channels today, so the
-  kind gains one (32), which bounds the threads. Acceptance: with one webhook that never
-  answers and one that answers at once, a test send to the second arrives within a
-  second while the first is timing out.
+* **Delivery that a slow channel cannot delay.** This part is built, as the Outcome
+  above records. Each channel has its own queue and thread, and the kind holds at most
+  32 channels.
 
 
 ### Durable application delivery

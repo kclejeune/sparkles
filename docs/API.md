@@ -14383,7 +14383,12 @@ hangs or fails delays only its own deliveries, and raising an event never waits 
 A channel's queue holds its share of 1,000 deliveries, which is 1,000 divided by the
 number of channels and at least 50, counting the delivery in flight. A retry waits in
 its channel's queue. A delivery that does not fit is dropped with the result `dropped`
-and a warning in the log. The queues live in the process, and a restart loses them.
+and a warning in the log. A channel that is removed or renamed keeps its queue until
+its waiting deliveries are done, and the server keeps at most 64 queues, so a delivery
+that would need another queue past that is dropped too. The queues live in the
+process, and a restart loses them. Settings that fail the kind's checks, such as a
+runtime layer with more than 32 channels, leave notifications off with a warning in
+the log.
 
 | Method | Path | Needs | Effect |
 |---|---|---|---|

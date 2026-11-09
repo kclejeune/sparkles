@@ -44,8 +44,12 @@ pub const STATE_FILE: &str = "notifications-state.json";
 /// The longest a worker waits before it looks at the server again.
 const IDLE: Duration = Duration::from_millis(500);
 /// How long a channel's worker stays with an empty queue before it ends. The next
-/// delivery to the channel starts a new one.
+/// delivery to the channel starts a new one. The worker of a channel that the settings
+/// no longer have ends as soon as its queue is empty.
 const LINGER: Duration = Duration::from_secs(30);
+/// The most channel queues, and so delivery threads, at once: the channels of the
+/// settings and those that were removed or renamed while their deliveries wait.
+const MAX_LANES: usize = 2 * config::MAX_CHANNELS;
 
 /// How serious an event is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -306,13 +310,19 @@ impl Inner {
 }
 
 /// The effective `notifications` settings, or the defaults (off) when they do not
-/// read.
+/// read or do not pass the kind's checks, such as a runtime layer that an older release
+/// wrote with more channels than the cap.
 pub fn settings(st: &AppState) -> NotifySettings {
-    let r = crate::settings::server::resolved_kind(st, &crate::settings::NOTIFICATIONS);
-    config::parse(&r.effective).unwrap_or_else(|e| {
-        tracing::warn!(target: "sparkles::notify", "notification settings: {e}");
+    effective(st).unwrap_or_else(|e| {
+        tracing::warn!(target: "sparkles::notify", "notification settings, notifications are off: {e}");
         NotifySettings::default()
     })
+}
+
+/// The effective `notifications` settings, checked.
+fn effective(st: &AppState) -> Result<NotifySettings, String> {
+    let r = crate::settings::server::resolved_kind(st, &crate::settings::NOTIFICATIONS);
+    config::parse(&r.effective).and_then(|s| s.validate().map(|()| s))
 }
 
 /// The host name, for the envelope's `server` without the setting.
@@ -358,6 +368,17 @@ impl Notifier {
         let cap = share(channels);
         let mut g = self.shared.inner.lock();
         for j in jobs {
+            if !g.lanes.contains_key(&j.channel) && g.lanes.len() >= MAX_LANES {
+                tracing::warn!(target: "sparkles::notify", channel = j.channel.as_str(), event = j.event,
+                    "the queues of removed channels still hold deliveries, a delivery is dropped");
+                g.record(
+                    &j,
+                    "dropped",
+                    json!({ "error": "too many channels have queued deliveries" }),
+                    0,
+                );
+                continue;
+            }
             let lane = g
                 .lanes
                 .entry(j.channel.clone())
@@ -499,6 +520,8 @@ enum Attempt {
 /// for [`LINGER`].
 fn worker(shared: Arc<Shared>, weak: Weak<AppState>, name: String) {
     let mut idle_since = Instant::now();
+    // whether the settings no longer have the channel, checked while the queue is empty
+    let mut removed = false;
     loop {
         let job = {
             let mut g = shared.inner.lock();
@@ -523,7 +546,7 @@ fn worker(shared: Arc<Shared>, weak: Weak<AppState>, name: String) {
                     wake.wait_for(&mut g, (due - now).min(IDLE));
                     None
                 }
-                None if now.duration_since(idle_since) >= LINGER => {
+                None if now.duration_since(idle_since) >= LINGER || removed => {
                     g.lanes.remove(&name);
                     return;
                 }
@@ -541,7 +564,16 @@ fn worker(shared: Arc<Shared>, weak: Weak<AppState>, name: String) {
             }
             return;
         };
-        let Some(mut job) = job else { continue };
+        let Some(mut job) = job else {
+            let empty = shared
+                .inner
+                .lock()
+                .lanes
+                .get(&name)
+                .is_some_and(|l| l.queue.is_empty());
+            removed = empty && !effective(&st).is_ok_and(|c| c.channels.contains_key(&name));
+            continue;
+        };
         let outcome = attempt(&st, &job.channel, &job.config, &job.envelope, &job.delivery);
         drop(st);
         idle_since = Instant::now();

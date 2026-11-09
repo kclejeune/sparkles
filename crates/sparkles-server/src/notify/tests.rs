@@ -662,6 +662,8 @@ fn a_newer_state_file_is_refused() {
 struct Stalled {
     port: u16,
     accepted: Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Stalled {
@@ -669,20 +671,40 @@ impl Stalled {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         let accepted: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
-        let a = accepted.clone();
-        std::thread::spawn(move || {
+        let stop: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let (a, s) = (accepted.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
             let mut held = Vec::new();
             for c in l.incoming() {
+                if s.load(Ordering::SeqCst) {
+                    return;
+                }
                 let Ok(c) = c else { continue };
                 a.fetch_add(1, Ordering::SeqCst);
                 held.push(c);
             }
         });
-        Stalled { port, accepted }
+        Stalled {
+            port,
+            accepted,
+            stop,
+            thread: Some(thread),
+        }
     }
 
     fn url(&self) -> String {
         format!("http://127.0.0.1:{}/hook", self.port)
+    }
+}
+
+impl Drop for Stalled {
+    /// Stop accepting and close the held connections.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 }
 
@@ -821,4 +843,114 @@ async fn the_kind_has_at_most_32_channels() {
     let (s, v) = f.patch(json!({ "channels": channels })).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
     assert!(v.to_string().contains("at most 32"), "{v}");
+}
+
+/// Channels that were renamed while their deliveries wait still have queues, but the
+/// queues of all channels, current and removed, are at most 64, so the threads stay
+/// bounded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn renamed_channels_do_not_add_threads_without_bound() {
+    let slow = Stalled::start();
+    let f = fixture(None, true);
+    let set = |prefix: &str| {
+        let channels: serde_json::Map<String, Value> = (0..32)
+            .map(|i| {
+                (
+                    format!("{prefix}{i}"),
+                    json!({"type": "webhook", "url": slow.url()}),
+                )
+            })
+            .collect();
+        let names: Vec<String> = channels.keys().cloned().collect();
+        json!({
+            "enabled": true,
+            "channels": channels,
+            "routes": {"*": names},
+            "delivery": {"attempts": 1, "backoffSecs": 1, "maxBackoffSecs": 1, "timeoutSecs": 20},
+        })
+    };
+    let lanes = |st: &AppState| st.notifier.shared.inner.lock().lanes.len();
+    let mut previous: Option<&str> = None;
+    for prefix in ["a", "b", "c"] {
+        let mut body = set(prefix);
+        if let Some(p) = previous {
+            for n in 0..32 {
+                body["channels"][format!("{p}{n}")] = Value::Null;
+            }
+        }
+        let (s, v) = f.patch(body).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        raise(&f.st, event("backup.failed"), None, Utc::now());
+        previous = Some(prefix);
+    }
+    assert_eq!(lanes(&f.st), MAX_LANES, "{}", status_json(&f.st));
+    let m = f.metrics().await;
+    assert!(m.contains(r#"sparkles_notifications_sent_total{channel="c0",event="backup.failed",result="dropped"} 1"#), "{m}");
+}
+
+/// The queue of a channel that was removed ends once it is empty, without waiting for
+/// the idle time of a current channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removed_channel_gives_back_its_queue() {
+    let rx = Receiver::start(vec![]);
+    let f = fixture(None, true);
+    f.patch(json!({
+        "enabled": true,
+        "channels": {"hook": {"type": "webhook", "url": rx.url()}},
+        "routes": {"*": ["hook"]},
+    }))
+    .await;
+    raise(&f.st, event("backup.failed"), None, Utc::now());
+    settled(&f.st, "hook", 1).await;
+    assert!(f.st.notifier.shared.inner.lock().lanes.contains_key("hook"));
+    let (s, v) = f
+        .patch(json!({"channels": {"hook": null}, "routes": {"*": null}}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let mut gone = false;
+    for _ in 0..100 {
+        if !f.st.notifier.shared.inner.lock().lanes.contains_key("hook") {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(gone, "the removed channel's queue is still there");
+}
+
+/// A runtime layer written before the cap, with 33 channels, is not delivered to past
+/// the cap of threads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runtime_layer_past_the_cap_is_refused_on_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let channels: serde_json::Map<String, Value> = (0..33)
+        .map(|i| {
+            (
+                format!("c{i}"),
+                json!({"type": "webhook", "url": "https://hooks.example.org/x"}),
+            )
+        })
+        .collect();
+    std::fs::write(
+        data.join(config::NOTIFICATIONS_FILE),
+        json!({"enabled": true, "channels": channels, "routes": {"*": ["c0"]}}).to_string(),
+    )
+    .unwrap();
+    let mut st = AppState::new(
+        &data,
+        sparkles::store::StoreOptions::default(),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    crate::settings::server::start(&mut st, None, &Default::default()).unwrap();
+    let st = Arc::new(st);
+    let cfg = settings(&st);
+    assert!(!cfg.enabled);
+    assert!(cfg.channels.is_empty());
+    assert_eq!(
+        raise(&st, event("backup.failed"), None, Utc::now()),
+        Raised::Disabled
+    );
 }
