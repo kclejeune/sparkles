@@ -5,30 +5,37 @@
 #
 #   nsc-build-remote.sh DIR UNIT RUNTIME [feature and dependency-resolution flags...]
 #   nsc-build-remote.sh --status DIR UNIT OFFSET
+#   nsc-build-remote.sh --cancel DIR UNIT
 #   nsc-build-remote.sh --run DIR [flags...]
 #
-# The first form checks the host and starts the build detached, then returns at once. The
-# build runs in the transient systemd user scope UNIT, so that it can be listed and stopped
-# by name, an out-of-memory kill ends the build alone, and a dropped ssh connection does not
-# end it. RUNTIME is the scope's RuntimeMaxSec. The scope has the gate's memory cap, the
-# smaller of 24G and the host's RAM less 2G, with 2G of swap (SPARKLES_NSC_BUILD_MEMORY_MAX
-# overrides it). Inside it the build holds ~/lanes/.heavy.lock, which gates and other heavy
-# work on the host share, and waits for it when another process holds it. CARGO_BUILD_JOBS
-# defaults to the gate's value for the cap. The host's own Boxington cache serves the build,
-# with the remote cache settings the caller's environment gives it. The detached process
-# inherits that environment, so a Boat job's local-only mbx settings reach the build
-# unchanged. DIR/launched records the start, so a repeated start after a lost reply never
-# starts a second build. A refused start records its exit status in DIR/start.exit.
+# The first form checks the host and starts the build detached, and returns once the build
+# runs in the transient systemd user scope UNIT. The scope can be listed and stopped by name,
+# an out-of-memory kill ends the build alone, and a dropped ssh connection does not end it.
+# RUNTIME is the scope's RuntimeMaxSec. The scope has the gate's memory cap, the smaller of
+# 24G and the host's RAM less 2G, with 2G of swap (SPARKLES_NSC_BUILD_MEMORY_MAX overrides
+# it). Inside it the build holds ~/lanes/.heavy.lock, which gates and other heavy work on the
+# host share, and waits for it when another process holds it. CARGO_BUILD_JOBS defaults to
+# the gate's value for the cap. The host's own Boxington cache serves the build, with the
+# remote cache settings the caller's environment gives it. The detached process inherits
+# that environment, so a Boat job's local-only mbx settings reach the build unchanged.
+#
+# A start, a status query and a cancellation take DIR/launch.lock. A start claims the build
+# by creating DIR/launched, so a repeated start after a lost reply starts nothing, and a start
+# after a cancellation (DIR/cancelled) is refused. A refused start, including one whose
+# systemd-run fails, records its exit status in DIR/start.exit.
 #
 # --status prints one state line and then the build log from byte OFFSET, at most 1 MiB.
 # The state is `running`, `exited N` with the build's exit status, `refused N` for a refused
-# start, `gone` when the scope ended without an exit status, or `unlaunched`.
+# start, `gone` when the build was claimed but neither runs nor recorded an exit status, or
+# `unlaunched`. --cancel fences any later start, stops the scope and succeeds only when the
+# scope is no longer active.
 #
-# --run is the build inside the scope. Holding the lock, it moves DIR/src to the stable path
-# ~/lanes/nsc-build-work/<commit>[-<hash of the flags>]/src, builds there and moves the tree
-# back when it ends. The binary goes to DIR/out/sparkles with its SHA-256
-# in DIR/out/sha256. DIR/out/info.txt gets the host's cc, c++ and rustc versions in the form
-# of build.txt, DIR/out/rustc.txt and cargo.txt the verbose versions, and DIR/out/env.txt the
+# --run is the build inside the scope. Holding the heavy lock, it moves DIR/src to the stable
+# path ~/lanes/nsc-build-work/<commit>[-<hash of the flags>]/src, builds there and moves the
+# tree back when it ends. Every process of the build inherits the lock, so the lock lasts as
+# long as any of them. The binary goes to DIR/out/sparkles with its SHA-256 in
+# DIR/out/sha256. DIR/out/info.txt gets the host's cc, c++ and rustc versions in the form of
+# build.txt, DIR/out/rustc.txt and cargo.txt the verbose versions, and DIR/out/env.txt the
 # build variables that were set. Its exit status goes to DIR/exit. The caller removes DIR.
 set -euo pipefail
 
@@ -42,20 +49,35 @@ if [ "${1:-}" = --status ]; then
   [ "$#" = 4 ] || fail 'usage: nsc-build-remote.sh --status DIR UNIT OFFSET'
   dir=$2 unit=$3 offset=$4
   case $offset in '' | *[!0-9]*) fail "bad log offset $offset" ;; esac
+  # A start in progress holds the lock, so its state is read once it has finished.
+  exec 8>> "$dir/launch.lock"
+  flock -s -w 60 8 || fail "the start in $dir holds its lock"
   # The scope writes DIR/exit before it ends, so a scope seen inactive has its status
   # written when it finished normally.
   if systemctl --user is-active --quiet "$unit.scope"; then
     echo running
   elif [ -f "$dir/exit" ]; then
     echo "exited $(cat "$dir/exit")"
-  elif [ -f "$dir/start.exit" ] && [ ! -e "$dir/launched" ]; then
+  elif [ -f "$dir/start.exit" ]; then
     echo "refused $(cat "$dir/start.exit")"
   elif [ -e "$dir/launched" ]; then
     echo gone
   else
     echo unlaunched
   fi
-  if [ -f "$dir/build.log" ]; then tail -c +$((offset + 1)) "$dir/build.log" | head -c 1048576; fi
+  # head ends the pipe after the chunk, so tail's SIGPIPE is not a failure.
+  if [ -f "$dir/build.log" ]; then { tail -c +$((offset + 1)) "$dir/build.log" | head -c 1048576; } || true; fi
+  exit 0
+fi
+
+if [ "${1:-}" = --cancel ]; then
+  [ "$#" = 3 ] || fail 'usage: nsc-build-remote.sh --cancel DIR UNIT'
+  dir=$2 unit=$3
+  exec 8>> "$dir/launch.lock"
+  flock -w 60 8 || fail "the start in $dir holds its lock"
+  : > "$dir/cancelled"
+  systemctl --user stop "$unit.scope" > /dev/null 2>&1 || true
+  if systemctl --user is-active --quiet "$unit.scope"; then exit 1; fi
   exit 0
 fi
 
@@ -64,14 +86,13 @@ if [ "${1:-}" = --run ]; then
   shift 2
   # One revision with one set of flags always builds at the same path, which the commit
   # and the flags name. mbx records each checkout's predictions of its compiler actions,
-  # and a rebuild at the same path finds its own, so it restores every crate from the
-  # store. A rebuild at a new path takes the latest predictions of the same command, which
-  # name another revision's crates when revisions alternate, and the crates it then
-  # compiles embed the new path, so their dependents miss as well.
+  # and a rebuild at the same path finds its own. A rebuild at a new path takes the latest
+  # predictions of the same command, which name another revision's crates when revisions
+  # alternate, and the crates it then compiles embed the new path, so their dependents
+  # miss as well.
   key=${dir##*/}
   key=${key%.*}
-  [ "$#" = 0 ] || key=$key-$(printf '%s
-' "$@" | sha256sum | cut -c1-16)
+  [ "$#" = 0 ] || key=$key-$(printf '%s\n' "$@" | sha256sum | cut -c1-16)
   work=$HOME/lanes/nsc-build-work/$key
   # shellcheck disable=SC2329 # the EXIT trap calls it
   finish() {
@@ -95,8 +116,7 @@ if [ "${1:-}" = --run ]; then
   mv -T "$dir/src" "$work/src"
   echo "building in $work/src"
   cd "$work/src"
-  # This shell alone holds the lock, so no process the build leaves behind keeps it.
-  bash "$dir/bin/nsc-build.sh" "$dir/out/sparkles" "$@" 9>&-
+  bash "$dir/bin/nsc-build.sh" "$dir/out/sparkles" "$@"
   {
     echo "cc: $(cc --version 2> /dev/null | head -1)"
     echo "c++: $(c++ --version 2> /dev/null | head -1)"
@@ -120,7 +140,9 @@ dir=$1
 unit=$2
 runtime=$3
 shift 3
-[ -d "$dir/src" ] && [ -d "$dir/bin" ] || fail "$dir has no src and bin directories"
+[ -d "$dir/bin" ] || fail "$dir has no bin directory"
+exec 8>> "$dir/launch.lock"
+flock -w 60 8 || fail "another start in $dir holds its lock"
 if [ -e "$dir/launched" ]; then
   echo "the build in scope $unit was already started"
   exit 0
@@ -128,9 +150,11 @@ fi
 # shellcheck disable=SC2329 # the EXIT trap calls it
 refused() {
   local code=$?
-  [ -e "$dir/launched" ] || echo "$code" > "$dir/start.exit"
+  [ "$code" = 0 ] || [ -f "$dir/start.exit" ] || echo "$code" > "$dir/start.exit"
 }
 trap refused EXIT
+[ ! -e "$dir/cancelled" ] || fail "the build in $dir was cancelled"
+[ -d "$dir/src" ] || fail "$dir has no src directory"
 case $runtime in '' | *[!0-9]* | 0) fail "bad runtime $runtime" ;; esac
 cd "$dir/src"
 # The copied scripts come first, so the build uses the caller's nsc-build.sh and finds the
@@ -156,19 +180,31 @@ mkdir -p "$HOME/lanes" "$dir/out"
 echo "building in scope $unit on $(uname -n): MemoryMax=$mem, CARGO_BUILD_JOBS=$jobs, RuntimeMaxSec=$runtime, mbx $have"
 : > "$dir/launched"
 # The build runs in its own session with no tie to this connection, and its output goes
-# to DIR/build.log, which --status reads.
+# to DIR/build.log, which --status reads. The launcher does not hold the start lock, and
+# setsid runs in place, so its PID becomes the build's process inside the scope.
 setsid nohup systemd-run --user --scope -q --collect --unit "$unit" \
   -p MemoryMax="$mem" -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec="$runtime" -- \
   env CARGO_BUILD_JOBS="$jobs" bash "$dir/bin/nsc-build-remote.sh" --run "$dir" "$@" \
-  > "$dir/build.log" 2>&1 < /dev/null &
+  > "$dir/build.log" 2>&1 < /dev/null 8>&- &
+launcher=$!
 # Return once the scope holds the build, so that the end of this connection's session can
-# no longer reach a process still on its way into the scope.
-for _ in $(seq 1 40); do
+# no longer reach a process still on its way into the scope. A launcher that ends before
+# the scope is active, with no exit status of the build, is a refused start.
+for _ in $(seq 1 80); do
   if systemctl --user is-active --quiet "$unit.scope" || [ -f "$dir/exit" ]; then
     echo "started"
     exit 0
   fi
+  if ! kill -0 "$launcher" 2> /dev/null; then
+    code=0
+    wait "$launcher" || code=$?
+    if [ "$code" != 0 ] && [ ! -f "$dir/exit" ] && ! systemctl --user is-active --quiet "$unit.scope"; then
+      echo "$code" > "$dir/start.exit"
+      echo "systemd-run could not start the scope $unit (exit $code); see $dir/build.log" >&2
+      exit "$code"
+    fi
+  fi
   sleep 0.25
 done
-echo "the scope $unit did not start within 10 seconds; see $dir/build.log" >&2
+echo "the scope $unit did not start within 20 seconds; see $dir/build.log" >&2
 exit 0

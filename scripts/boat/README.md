@@ -220,7 +220,8 @@ or credential-bearing template.
 A remote build on the worker runs detached in its named `nsc-build-*` scope, which the
 closure watch's unit check covers, and survives a dropped job connection. It builds each
 revision at the stable path `~/lanes/nsc-build-work/<commit>`, so a rebuild of a commit
-finds mbx's predictions for that path and restores its crates from the local store. The
+finds mbx's predictions for that path and takes its crates from the local store when the
+store still holds them. The
 [remote executors](../../docs/REMOTE-EXECUTORS.md#source-results-and-cleanup) guide
 describes both.
 

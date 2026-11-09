@@ -36,7 +36,8 @@ if not home.is_dir() or (home/'unreachable').exists():
 env=dict(os.environ,HOME=str(home))
 # FAKE_SSH_DROP=TEXT:N drops the connection of the first N commands that contain TEXT,
 # after the remote command has started and has received at most 4 KiB of input. The
-# remote command keeps running, as on a real host.
+# remote command keeps running, as on a real host. With FAKE_SSH_DROP_BYTES=K the first K
+# bytes of its output reach the caller before the drop.
 drop=os.environ.get('FAKE_SSH_DROP','')
 if drop:
     text,count=drop.rsplit(':',1)
@@ -44,9 +45,12 @@ if drop:
     done=int(counter.read_text()) if counter.exists() else 0
     if text in cmd and done<int(count):
         counter.write_text(str(done+1))
-        p=subprocess.Popen(['bash','-c',cmd],cwd=home,env=env,start_new_session=True,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL)
+        keep=int(os.environ.get('FAKE_SSH_DROP_BYTES','0'))
+        p=subprocess.Popen(['bash','-c',cmd],cwd=home,env=env,start_new_session=True,stdin=subprocess.PIPE,
+                           stdout=subprocess.PIPE if keep else subprocess.DEVNULL)
         try:p.stdin.write(sys.stdin.buffer.read(4096));p.stdin.close()
         except BrokenPipeError:pass
+        if keep:sys.stdout.buffer.write(p.stdout.read(keep));sys.stdout.flush()
         time.sleep(0.3)
         sys.stderr.write('Connection to '+host+' closed by remote host.\\n');os._exit(255)
 p=subprocess.Popen(['bash','-c',cmd],cwd=home,env=env,start_new_session=True)
@@ -54,7 +58,7 @@ signal.signal(signal.SIGINT,lambda *_:os._exit(255))
 raise SystemExit(p.wait())
 """,
     "systemd-run": """#!/usr/bin/env python3
-import os,pathlib,sys
+import os,pathlib,sys,time
 a=sys.argv[1:];unit=None;props=[]
 while a and a[0].startswith('-'):
     o=a.pop(0)
@@ -66,6 +70,10 @@ while a and a[0].startswith('-'):
 state=pathlib.Path(os.environ['FAKE_HOSTS'])/'units'
 state.mkdir(exist_ok=True)
 if unit:
+    # FAKE_SCOPE_DELAY stalls the creation of a named scope, and FAKE_SCOPE_FAIL refuses it.
+    time.sleep(float(os.environ.get('FAKE_SCOPE_DELAY','0')))
+    if os.environ.get('FAKE_SCOPE_FAIL'):
+        sys.stderr.write('Failed to start transient scope unit\\n');raise SystemExit(1)
     if '.' not in unit:unit+='.scope'
     # A detached build is already a session leader, whose group the stop can kill.
     if os.getsid(0)!=os.getpid():os.setsid()
@@ -102,6 +110,8 @@ if a==['--version']:print('mbx 9.9.9');raise SystemExit(0)
 if a[:2]==['sparkles-task','--']:raise SystemExit(subprocess.run(a[2:]).returncode)
 with open(os.environ['FAKE_BUILDS'],'a') as s:s.write(json.dumps({'home':os.environ['HOME'],'cwd':os.getcwd(),'args':a,'jobs':os.environ.get('CARGO_BUILD_JOBS'),'target_override':os.environ.get('CARGO_TARGET_DIR'),'cache_override':os.environ.get('MBX_CACHE_DIR')})+'\\n')
 pathlib.Path(os.environ['FAKE_HOSTS'],'build-started').touch()
+for i in range(int(os.environ.get('FAKE_BUILD_LOG_LINES','0'))):print(f'log line {i:07d}')
+sys.stdout.flush()
 time.sleep(float(os.environ.get('FAKE_BUILD_DELAY','0')))
 if os.environ.get('FAKE_BUILD_FAIL'):raise SystemExit(17)
 assert pathlib.Path('ui/build/index.html').read_text().startswith('<!doctype html>')
@@ -162,7 +172,8 @@ class BuildHost(unittest.TestCase):
                         SPARKLES_NSC_BUILD_RETRY_SECONDS="0.1")
         for name in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET", "SPARKLES_NSC_BUILD_HOSTS",
                      "SPARKLES_NSC_BUILD_CONFIG", "CARGO_BUILD_JOBS", "SPARKLES_NSC_BUILD_RETRIES",
-                     "SPARKLES_NSC_BUILD_MEMORY_MAX", "FAKE_SSH_DROP"):
+                     "SPARKLES_NSC_BUILD_MEMORY_MAX", "FAKE_SSH_DROP", "FAKE_SSH_DROP_BYTES", "FAKE_SCOPE_DELAY", "FAKE_SCOPE_FAIL",
+                     "FAKE_BUILD_LOG_LINES", "SPARKLES_NSC_BUILD_DEADLINE", "SPARKLES_NSC_BUILD_RUNTIME"):
             self.env.pop(name, None)
         self.runs = 0
         self.holders = []
@@ -445,6 +456,125 @@ class BuildHost(unittest.TestCase):
         record.unlink()
         self.assertFalse(ok("boat:bx_worker"))
         self.assertIn("bh_entry_host_ok", (self.repo / "scripts/nsc-bench.sh").read_text())
+
+    def remote_dir(self):
+        """A scratch directory on h1 with the scripts and a source tree, as bh_build leaves it."""
+        d = self.hosts / "h1" / "lanes" / "nsc-build" / f"{self.sha}.direct"
+        (d / "bin").mkdir(parents=True)
+        (d / "src").mkdir()
+        for name in ("nsc-build.sh", "nsc-build-remote.sh", "cargo-sparkles-task"):
+            shutil.copy(self.repo / "scripts" / name, d / "bin" / name)
+        return d
+
+    def remote(self, *args, env=None):
+        return subprocess.run(["bash", str(self.repo / "scripts/nsc-build-remote.sh"), *args],
+                              env=dict(env or self.env, HOME=str(self.hosts / "h1")),
+                              capture_output=True, text=True, timeout=60)
+
+    def test_a_cancel_fences_a_stalled_start_and_a_later_one(self):
+        """Cleanup that arrives while a start is still creating its scope waits for the start and
+        then stops the scope, and a start after the cancellation starts nothing."""
+        d = self.remote_dir()
+        env = dict(self.env, FAKE_SCOPE_DELAY="1.5", FAKE_BUILD_DELAY="60")
+        start = subprocess.Popen(["bash", str(self.repo / "scripts/nsc-build-remote.sh"), str(d), "u-fence", "600"],
+                                 env=dict(env, HOME=str(self.hosts / "h1")), stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
+        deadline = time.monotonic() + 10
+        while not (d / "launched").exists():
+            self.assertLess(time.monotonic(), deadline, "the start did not claim the build")
+            time.sleep(0.02)
+        cancel = self.remote("--cancel", str(d), "u-fence")
+        out, err = start.communicate(timeout=30)
+        self.assertEqual(cancel.returncode, 0, cancel.stderr)
+        self.assertIn("started", out, err)
+        # The stop came after the scope existed, so it ended the scope.
+        calls = (self.hosts / "systemctl.log").read_text().splitlines()
+        self.assertTrue(any(line.endswith("stop u-fence.scope") for line in calls), calls)
+        self.assertTrue((self.hosts / "u-fence.scope.stopped").exists())
+        scope = int((self.hosts / "units" / "u-fence.scope").read_text().split()[0])
+        time.sleep(0.2)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(scope, 0)
+        self.assertEqual(self.remote("--status", str(d), "u-fence", "0").stdout.splitlines()[0], "gone")
+        # A start whose earlier attempt was lost is refused once the build is cancelled.
+        (d / "launched").unlink()
+        again = self.remote(str(d), "u-fence", "600", env=env)
+        self.assertEqual(again.returncode, 3)
+        self.assertIn("was cancelled", again.stderr)
+        self.assertEqual(self.remote("--status", str(d), "u-fence", "0").stdout.splitlines()[0], "refused 3")
+
+    def test_a_scope_that_systemd_refuses_is_a_refused_start(self):
+        env = dict(self.env, FAKE_SCOPE_FAIL="1")
+        d = self.remote_dir()
+        result = self.remote(str(d), "u-fail", "600", env=env)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.remote("--status", str(d), "u-fail", "0").stdout.splitlines()[0], "refused 1")
+        shutil.rmtree(d)
+        result, out = self.bench("--build-host", "h1", env=env, ok_stop=False)
+        log = (out / "logs" / "build-A.log").read_text()
+        self.assertIn("refused the build with exit 1", log)
+        self.assertNotIn("retrying", log)
+        self.assertEqual(self.builds(), [])
+        self.assertEqual(self.scratch("h1"), [])
+
+    def test_a_build_without_runtime_left_is_not_started(self):
+        env = dict(self.env, SPARKLES_NSC_BUILD_DEADLINE=str(int(time.time()) + 200))
+        result, out = self.bench("--build-host", "h1", env=env, ok_stop=False)
+        log = (out / "logs" / "build-A.log").read_text()
+        self.assertIn("too little to start it", log)
+        self.assertIn("refused the build with exit 75", log)
+        self.assertFalse((self.hosts / "units").exists())
+        self.assertEqual(self.builds(), [])
+        self.assertEqual(self.scratch("h1"), [])
+        # A deadline further away caps the scope's runtime.
+        env = dict(self.env, SPARKLES_NSC_BUILD_DEADLINE=str(int(time.time()) + 1000))
+        result, out = self.bench("--build-host", "h1", env=env)
+        [unit] = list((self.hosts / "units").iterdir())
+        runtime = int(unit.read_text().split("RuntimeMaxSec=")[1].split()[0])
+        self.assertTrue(900 <= runtime <= 1000, runtime)
+
+    def test_cleanup_of_an_unreachable_host_gives_up_within_its_budget(self):
+        (self.hosts / "h1" / "unreachable").touch()
+        program = ('. "$1/scripts/nsc-build-host.sh"; BH_RHOST=h1 BH_RDIR=/nowhere/lanes/nsc-build/x.y '
+                   'BH_RUNIT=nsc-build-x-y; code=0; bh_cleanup || code=$?; echo "code $code"')
+        result = subprocess.run(["bash", "-c", program, "bash", str(self.repo)],
+                                env=dict(self.env, SPARKLES_NSC_BUILD_RETRIES="8"),
+                                capture_output=True, text=True, timeout=60)
+        self.assertIn("code 97", result.stdout, result.stderr)
+        self.assertIn("stopping nsc-build-x-y.scope failed 4 times", result.stderr)
+        self.assertIn("reconcile nsc-build-x-y.scope", result.stderr)
+        self.assertEqual(self.ssh_log.read_text().count("--cancel"), 4)
+        self.assertNotIn("rm -rf", self.ssh_log.read_text())
+
+    def test_a_poll_dropped_after_part_of_its_reply_copies_the_log_once(self):
+        env = dict(self.env, FAKE_SSH_DROP="--status:2", FAKE_SSH_DROP_BYTES="40", FAKE_BUILD_DELAY="1",
+                   FAKE_BUILD_LOG_LINES="20")
+        result, out = self.bench("--build-host", "h1", env=env)
+        log = (out / "logs" / "build-A.log").read_text()
+        self.assertEqual((self.hosts / "drops").read_text(), "2")
+        self.assertEqual(log.count("building in /"), 1, log)
+        self.assertEqual([line for line in log.splitlines() if line.startswith("log line")],
+                         [f"log line {i:07d}" for i in range(20)])
+        self.assertIn("built on h1, sha256", log)
+
+    def test_a_log_larger_than_one_poll_is_copied_whole(self):
+        lines = 200000
+        env = dict(self.env, FAKE_BUILD_LOG_LINES=str(lines), SPARKLES_NSC_BUILD_RETRIES="2")
+        result, out = self.bench("--build-host", "h1", env=env)
+        log = (out / "logs" / "build-A.log").read_text()
+        self.assertNotIn("polling the build on h1 failed", log)
+        got = [line for line in log.splitlines() if line.startswith("log line")]
+        self.assertEqual(len(got), lines)
+        self.assertEqual(got[-1], f"log line {lines - 1:07d}")
+        self.assertIn("built on h1, sha256", log)
+
+    def test_a_boat_write_screen_keeps_entries_of_its_own_worker(self):
+        program = '. "$1/scripts/nsc-build-host.sh"; BH_ARG=$2; echo "[$(bh_entry_key_suffix)]"'
+        for arg, suffix in (("boat:bx_worker", "-bx_worker"), ("h1", ""), ("local", ""), ("", "")):
+            result = subprocess.run(["bash", "-c", program, "bash", str(self.repo), arg], env=self.env,
+                                    capture_output=True, text=True)
+            self.assertEqual(result.stdout.strip(), f"[{suffix}]", arg)
+        self.assertIn("key=$sha-$args_hash$(bh_entry_key_suffix)", (self.repo / "scripts/nsc-writes.sh").read_text())
 
     def test_an_interrupt_stops_the_scope_and_removes_the_scratch(self):
         out = self.root / "out-interrupted"

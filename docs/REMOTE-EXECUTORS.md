@@ -163,8 +163,9 @@ host with a newer glibc do not run there. The executor does not choose the build
 so the screen names the worker as its build host and passes two revisions rather than
 binary paths. The screen keeps each binary in its local cache with a record of the host
 that built it. A later screen with the same worker as its build host reuses a cached
-binary only when that worker built it, so repeating a screen of the same revisions skips
-both builds and never runs a binary built on another host.
+binary only when that worker built it, so a repeated screen of the same revisions skips
+both builds. A write screen with a Boat build host keeps its cache entries under a key
+that names the worker, with the same effect.
 
 ```sh
 mise run bench:remote --executor "$worker" --build-host "$worker" origin/main HEAD
@@ -209,20 +210,23 @@ shares immutable compiler cache entries and cannot retain deleted files in a reu
 source directory. While it holds the host's heavy lock, the build moves that directory
 to a stable path named by the commit and a hash of its cargo flags, builds there and
 moves it back. mbx records the predicted compiler actions of each checkout path, and a
-rebuild at the same path finds its own predictions and restores every crate from the
-store. A rebuild at a new path takes the latest predictions of the same command, which
-name the other revision's crates when a screen alternates two revisions. The crates it
-then compiles embed the new path in their metadata, so every crate that depends on them
-misses as well, and the rebuilt binary differs from the first.
+rebuild of an unchanged commit at the same path finds its own predictions, so its crates
+come from the store when the store still holds them. A rebuild at a new path takes the
+latest predictions of the same command, which name the other revision's crates when a
+screen alternates two revisions. The crates it then compiles embed the new path in their
+metadata, so the crates that depend on them miss as well, and the rebuilt binary differs
+from the first.
 
 A remote build runs detached from the ssh connection in its named `nsc-build-*` scope.
 The caller polls the scope over a fresh connection for its log and recorded exit
-status. Every remote step can be repeated, so a step whose connection drops is retried a
-bounded number of times. A start whose reply was lost is resolved from the build's own
-state, so it never starts a second build, and a start the host refuses fails at once.
-When contact cannot be restored within the retry bound, the build fails. Its cleanup
-then stops the scope, or names the scope for reconciliation when it cannot reach the
-host either. The closure watch's unit check covers the detached scope. A gate receives a standard bounded Git bundle of the exact
+status. Each remote step is written so that repeating it does not change what an earlier
+attempt did, and a step whose connection drops is retried a bounded number of times. A
+start whose reply was lost is resolved from the build's recorded state, and a start the
+host refuses fails at once. A cancellation takes the same lock as a start and fences any
+later one. The scope's runtime limit is set at the start from the remaining admitted
+lifetime, less the closure watch's lead and a minute. When contact cannot be restored
+within the retry bound, the build fails. Its cleanup then stops the scope, or names the
+scope for reconciliation when it cannot reach the host within its own shorter bound. The closure watch's unit check covers the detached scope. A gate receives a standard bounded Git bundle of the exact
 commit and comparison base. Temporary bundle refs live outside the caller's repository.
 The first bounded seed preserves a complete valid history and the original merge-base
 selection. Later jobs reuse an exact commit whose reachable object coverage matches

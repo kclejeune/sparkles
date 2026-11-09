@@ -24,11 +24,14 @@
 # remote step can be repeated, so a step whose connection drops is retried up to
 # SPARKLES_NSC_BUILD_RETRIES times (default 8), SPARKLES_NSC_BUILD_RETRY_SECONDS apart
 # (default 20), and a lost reply never starts a second build. The scope's RuntimeMaxSec is
-# SPARKLES_NSC_BUILD_RUNTIME (default 14400), or less for a Boat worker with less admitted
-# lifetime. The binary and its build record come back over ssh and the SHA-256 is checked.
-# The scratch directory is removed when the build ends in any way: after a failure, and
-# from the caller's EXIT trap (bh_cleanup) after an interrupt or lost contact, which also
-# stops the scope. Cleanup touches only the directory and scope this run created.
+# SPARKLES_NSC_BUILD_RUNTIME (default 14400), less when SPARKLES_NSC_BUILD_DEADLINE or a
+# Boat worker's admitted lifetime leaves less, and a start with under 300 seconds is
+# refused. The binary and its build record come back over ssh and the SHA-256 is checked.
+# The scope is stopped and the scratch directory removed when the build ends in any way:
+# after a failure, and from the caller's EXIT trap (bh_cleanup) after an interrupt or lost
+# contact. A Boat worker keeps the directory as evidence. Cleanup touches only the
+# directory and scope this run created, and fails with 97 when it cannot confirm that the
+# scope has stopped.
 
 BH_SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BH_ROOT=$(cd "$BH_SELF_DIR/.." && pwd)
@@ -46,6 +49,7 @@ BH_RDIR=
 BH_RUNIT=
 BH_START_REFUSED=
 BH_SEND_ATTEMPT=1
+BH_ADMISSION=
 
 # bh_ui_placeholder DIR: the server embeds ui/build. Its build script writes a placeholder,
 # but does not rerun for a second source tree in a shared target directory.
@@ -63,6 +67,12 @@ bh_entry_host_ok() {
     boat:*) grep -qxF "build host: $BH_ARG" "$1" 2> /dev/null ;;
     *) return 0 ;;
   esac
+}
+
+# bh_entry_key_suffix: the suffix of a write-screen cache key for this run's --build-host. A
+# Boat worker keeps entries of its own, for the reason bh_entry_host_ok gives.
+bh_entry_key_suffix() {
+  case $BH_ARG in boat:*) echo "-${BH_ARG#boat:}" ;; esac
 }
 
 # bh_check_arg: refuse a malformed --build-host before any work
@@ -166,37 +176,70 @@ bh_resolve() {
   esac
 }
 
-# bh_retry DESCRIPTION COMMAND...: run COMMAND until it succeeds, at most
+# bh_rx SECONDS HOST COMMAND: run COMMAND on HOST, ending the attempt after SECONDS. The
+# transport gets SIGINT first, so a Boat transfer tears down its owned process group.
+bh_rx() {
+  timeout -s INT -k 10 "$1" python3 "$RX_DIR/remote-executor.py" exec "$2" "$3"
+}
+
+# bh_retry DESCRIPTION OUTPUT COMMAND...: run COMMAND until it succeeds, at most
 # SPARKLES_NSC_BUILD_RETRIES times (default 8), waiting SPARKLES_NSC_BUILD_RETRY_SECONDS
-# (default 20) between attempts. Every remote step it wraps can be repeated after a dropped
-# connection without changing what an earlier attempt did.
+# (default 20) between attempts. Each attempt writes its standard output to a file of its
+# own. Only the successful attempt's output reaches OUTPUT, a file, or standard output for
+# -, where a failed attempt's output goes to standard error.
+# Every remote step it wraps can be repeated after a dropped connection without changing
+# what an earlier attempt did.
 bh_retry() {
-  local what=$1 n=1 max=${SPARKLES_NSC_BUILD_RETRIES:-8} code
-  shift
+  local what=$1 output=$2 n=1 max=${SPARKLES_NSC_BUILD_RETRIES:-8} wait=${SPARKLES_NSC_BUILD_RETRY_SECONDS:-20} code attempt
+  shift 2
+  if [ -n "${BH_CLEANUP_RETRY:-}" ]; then
+    # Cleanup must finish inside a caller's hard-kill grace.
+    max=4
+    [ "${wait%.*}" -le 5 ] || wait=5
+  fi
+  attempt=$(mktemp)
   while :; do
     code=0
-    "$@" || code=$?
-    [ "$code" != 0 ] || return 0
+    "$@" > "$attempt" || code=$?
+    if [ "$code" = 0 ]; then
+      if [ "$output" != - ]; then
+        mv -- "$attempt" "$output"
+      else
+        cat -- "$attempt"
+        rm -f -- "$attempt"
+      fi
+      return 0
+    fi
+    [ "$output" != - ] || cat -- "$attempt" >&2
     if [ "$n" -ge "$max" ]; then
+      rm -f -- "$attempt"
       echo "$what failed $n times, the last with exit $code" >&2
       return "$code"
     fi
     echo "$what failed with exit $code (attempt $n of $max), retrying" >&2
     n=$((n + 1))
-    sleep "${SPARKLES_NSC_BUILD_RETRY_SECONDS:-20}"
+    sleep "$wait"
   done
 }
 
-# bh_cleanup: stop the scope and remove the scratch directory of an unfinished remote build
+# bh_cancel HOST DIR UNIT: fence later starts of the build and stop its scope. A scratch
+# directory that never received the scripts has no build to stop.
+bh_cancel() {
+  # shellcheck disable=SC2029 # the unit and directory are this run's and expand here
+  bh_rx 30 "$1" "if [ -f $2/bin/nsc-build-remote.sh ]; then bash $2/bin/nsc-build-remote.sh --cancel $2 $3; else systemctl --user stop $3.scope > /dev/null 2>&1; ! systemctl --user is-active --quiet $3.scope; fi" < /dev/null
+}
+
+# bh_cleanup: stop the scope and remove the scratch directory of an unfinished remote build.
+# It retries at most 4 times, 5 seconds apart, with 30 seconds for each attempt, so it ends
+# within about 3 minutes even when the host cannot be reached.
 bh_cleanup() {
   [ -n "$BH_RDIR" ] || return 0
-  # shellcheck disable=SC2029 # the unit and directory are this run's and expand here
-  if ! bh_retry "stopping $BH_RUNIT.scope" rx_exec "$BH_RHOST" "systemctl --user stop $BH_RUNIT.scope > /dev/null 2>&1; ! systemctl --user is-active --quiet $BH_RUNIT.scope" < /dev/null; then
+  if ! BH_CLEANUP_RETRY=1 bh_retry "stopping $BH_RUNIT.scope" - bh_cancel "$BH_RHOST" "$BH_RDIR" "$BH_RUNIT"; then
     echo "could not confirm scope closure at $BH_RHOST:$BH_RDIR; keep its evidence and reconcile $BH_RUNIT.scope" >&2
     return 97
   fi
   case $BH_RHOST in boat:*) echo "retained source/build evidence at $BH_RHOST:$BH_RDIR" ;;
-  *) bh_retry "removing $BH_RDIR" rx_exec "$BH_RHOST" "rm -rf -- $BH_RDIR" < /dev/null ;;
+  *) BH_CLEANUP_RETRY=1 bh_retry "removing $BH_RDIR" - bh_rx 30 "$BH_RHOST" "rm -rf -- $BH_RDIR" < /dev/null ;;
   esac
   BH_RDIR=
   BH_RUNIT=
@@ -219,45 +262,80 @@ bh_build() {
 # lost reply finds the directory this run named and prints it again.
 bh_scratch() {
   # shellcheck disable=SC2029 # the path expands here
-  rx_exec "$1" "mkdir -p \$HOME/lanes/nsc-build && mkdir -p \$HOME/$2 && cd \$HOME/$2 && pwd -P" < /dev/null
+  bh_rx 60 "$1" "mkdir -p \$HOME/lanes/nsc-build && mkdir -p \$HOME/$2 && cd \$HOME/$2 && pwd -P" < /dev/null
 }
 
-# bh_send_scripts HOST DIR TMP: copy the build scripts into DIR/bin.
+# bh_publish DIR NAME PART: shell text that renames the extracted PART to DIR/NAME unless an
+# earlier attempt did. DIR/NAME.claim records the publication under DIR/stage.lock and stays
+# when the build moves DIR/src away, so a late attempt never publishes a second tree.
+bh_publish() {
+  echo "exec 7>> $1/stage.lock && flock 7 && if [ -e $1/$2.claim ]; then rm -rf -- $3; else mkdir $1/$2.claim && mv -T $3 $1/$2; fi"
+}
+
+# bh_send_scripts HOST DIR TMP: copy the build scripts into DIR/bin. Each attempt extracts into
+# its own directory, so an attempt whose connection dropped cannot change a published tree.
 bh_send_scripts() {
+  local part=$2/bin.part.$BH_SEND_ATTEMPT
+  BH_SEND_ATTEMPT=$((BH_SEND_ATTEMPT + 1))
   # shellcheck disable=SC2029
-  tar -C "$3" -cf - . | rx_exec "$1" "mkdir -p $2/bin && tar -x -C $2/bin"
+  tar -C "$3" -cf - . | bh_rx 120 "$1" \
+    "if [ -e $2/bin.claim ]; then cat > /dev/null; exit 0; fi; rm -rf -- $part && mkdir $part && tar -x -C $part && $(bh_publish "$2" bin "$part")"
 }
 
-# bh_send_source HOST DIR COMMIT: extract the commit's archive into DIR/src. Each attempt
-# extracts into its own directory and renames it to DIR/src only when complete, so an
-# attempt whose connection dropped can neither leave a partial tree nor disturb a later one.
+# bh_send_source HOST DIR COMMIT: extract the commit's archive into DIR/src, in the same way.
 bh_send_source() {
   local part=$2/src.part.$BH_SEND_ATTEMPT
   BH_SEND_ATTEMPT=$((BH_SEND_ATTEMPT + 1))
   # Source mtimes stay current, as in a local build.
   # shellcheck disable=SC2029
-  git -C "$BH_ROOT" archive "$3" | rx_exec "$1" \
-    "if [ -d $2/src ]; then cat > /dev/null; exit 0; fi; rm -rf -- $part && mkdir $part && tar -x -m -C $part && mkdir -p $part/ui/build && cp $2/bin/ui-index.html $part/ui/build/index.html && mv -T $part $2/src"
+  git -C "$BH_ROOT" archive "$3" | bh_rx 900 "$1" \
+    "if [ -e $2/src.claim ]; then cat > /dev/null; exit 0; fi; rm -rf -- $part && mkdir $part && tar -x -m -C $part && mkdir -p $part/ui/build && cp $2/bin/ui-index.html $part/ui/build/index.html && $(bh_publish "$2" src "$part")"
 }
 
-# bh_fetch HOST DIR OUT: copy DIR/out back into OUT.
+# bh_fetch HOST DIR OUT: copy DIR/out back into OUT. The archive is extracted only when it
+# arrived whole, so a repeat replaces the same files.
 bh_fetch() {
   # shellcheck disable=SC2029
-  rx_exec "$1" "tar -C $2/out -cf - ." < /dev/null | python3 "$RX_DIR/remote-executor.py" unpack "$3"
+  bh_rx 600 "$1" "tar -C $2/out -cf - ." < /dev/null | python3 "$RX_DIR/remote-executor.py" unpack "$3"
+}
+
+# bh_runtime: the scope's RuntimeMaxSec for a start now. It is SPARKLES_NSC_BUILD_RUNTIME
+# (default 14400), no later than SPARKLES_NSC_BUILD_DEADLINE (a Unix time) when that is set,
+# and for a Boat worker no later than the admitted lifetime less 960 seconds, the closure
+# watch's 900-second lead and a minute, so a build ends before the closure check whether or
+# not its cleanup can reach the worker.
+bh_runtime() {
+  local runtime=${SPARKLES_NSC_BUILD_RUNTIME:-14400} left
+  if [ -n "${SPARKLES_NSC_BUILD_DEADLINE:-}" ]; then
+    left=$((SPARKLES_NSC_BUILD_DEADLINE - $(date +%s)))
+    [ "$left" -ge "$runtime" ] || runtime=$left
+  fi
+  if [ -n "$BH_ADMISSION" ]; then
+    left=$(rx_runtime "$BH_ADMISSION" --reserve 960 2> /dev/null) || left=0
+    [ "$left" -ge "$runtime" ] || runtime=$left
+  fi
+  echo "$runtime"
 }
 
 # bh_start HOST DIR UNIT ARGS: start the detached build. When the reply is lost, the build's
 # state decides. A build that started, even one that already ended, counts as started, and a
 # start that the host refused sets BH_START_REFUSED to its exit status, so neither is
-# started again.
+# started again. A start with less than 300 seconds of runtime left is refused here.
 bh_start() {
-  local code=0 state tmp
+  local code=0 state tmp runtime
+  runtime=$(bh_runtime)
+  if [ "$runtime" -lt 300 ]; then
+    echo "only $runtime seconds remain for the build, which is too little to start it" >&2
+    BH_START_REFUSED=75
+    return 0
+  fi
+  echo "starting the build with RuntimeMaxSec=$runtime"
   # shellcheck disable=SC2029
-  rx_exec "$1" "bash $2/bin/nsc-build-remote.sh $4" < /dev/null || code=$?
+  bh_rx 120 "$1" "bash $2/bin/nsc-build-remote.sh $2 $3 $runtime $4" < /dev/null || code=$?
   [ "$code" != 0 ] || return 0
   tmp=$(mktemp)
   # shellcheck disable=SC2029
-  if rx_exec "$1" "bash $2/bin/nsc-build-remote.sh --status $2 $3 0" < /dev/null > "$tmp"; then
+  if bh_rx 90 "$1" "bash $2/bin/nsc-build-remote.sh --status $2 $3 0" < /dev/null > "$tmp"; then
     state=$(head -n 1 "$tmp")
   else
     state=unknown
@@ -275,14 +353,14 @@ bh_start() {
 
 # bh_wait HOST DIR UNIT: follow the detached build until it records its exit status, and
 # return that status. The build log is copied as it grows. A poll that fails, as when the
-# connection drops, is repeated with bh_retry's limits and never restarts the build. A scope
-# that ended without an exit status, seen on two polls, is a failed build.
+# connection drops, is repeated with bh_retry's limits and never restarts the build. A build
+# that was claimed but neither runs nor recorded a status, seen on two polls, has failed.
 bh_wait() {
   local host=$1 dir=$2 unit=$3 offset=0 gone=0 tmp state got
   tmp=$(mktemp)
   while :; do
     # shellcheck disable=SC2029
-    if ! bh_retry "polling the build on $host" rx_exec "$host" "bash $dir/bin/nsc-build-remote.sh --status $dir $unit $offset" < /dev/null > "$tmp"; then
+    if ! bh_retry "polling the build on $host" "$tmp" bh_rx 90 "$host" "bash $dir/bin/nsc-build-remote.sh --status $dir $unit $offset" < /dev/null; then
       rm -f -- "$tmp"
       echo "lost contact with the build on $host; it may still be running in $unit.scope" >&2
       return 1
@@ -313,30 +391,32 @@ bh_wait() {
         return 1
         ;;
     esac
-    sleep "${SPARKLES_NSC_BUILD_POLL_SECONDS:-15}"
+    # A full chunk means more of the log is waiting.
+    [ "$got" -ge 1048576 ] || sleep "${SPARKLES_NSC_BUILD_POLL_SECONDS:-15}"
   done
 }
 
 bh_build_steps() {
-  local host=$1 sha=$2 out=$3 tmp args got want suffix runtime
+  local host=$1 sha=$2 out=$3 tmp args got want suffix
   shift 3
   BH_RHOST=$host
-  runtime=${SPARKLES_NSC_BUILD_RUNTIME:-14400}
+  BH_ADMISSION=
   case $host in boat:*)
     mkdir -p "$out"
     rx_admit "$host" --minimum "${SPARKLES_REMOTE_MIN_LIFETIME:-1800}" > "$out/admission.json" || return
-    # The scope ends no later than the admitted lifetime.
-    got=$(rx_runtime "$out/admission.json" --reserve 60) || return
-    [ "$got" -ge "$runtime" ] || runtime=$got
+    BH_ADMISSION=$out/admission.json
     ;;
   esac
   # The name is chosen here, so a retry after a lost reply reuses the same directory.
   suffix=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 8) || true
-  BH_RDIR=$(bh_retry "creating the scratch directory on $host" bh_scratch "$host" "lanes/nsc-build/$sha.$suffix") || {
-    BH_RDIR=
+  tmp=$(mktemp)
+  if ! bh_retry "creating the scratch directory on $host" "$tmp" bh_scratch "$host" "lanes/nsc-build/$sha.$suffix"; then
+    rm -f -- "$tmp"
     echo "could not create the scratch directory on $host" >&2
     return 1
-  }
+  fi
+  BH_RDIR=$(cat "$tmp")
+  rm -f -- "$tmp"
   # The path is used unquoted in remote commands and removed at the end, so it must be
   # exactly the directory named above.
   if ! [[ $BH_RDIR =~ ^/[A-Za-z0-9._/-]+/lanes/nsc-build/$sha\.$suffix$ ]]; then
@@ -349,21 +429,23 @@ bh_build_steps() {
   tmp=$(mktemp -d)
   cp "$BH_SELF_DIR/nsc-build.sh" "$BH_SELF_DIR/nsc-build-remote.sh" "$BH_SELF_DIR/cargo-sparkles-task" "$tmp/"
   echo "$BH_UI_PLACEHOLDER" > "$tmp/ui-index.html"
-  if ! bh_retry "copying the build scripts to $host" bh_send_scripts "$host" "$BH_RDIR" "$tmp"; then
+  BH_SEND_ATTEMPT=1
+  if ! bh_retry "copying the build scripts to $host" - bh_send_scripts "$host" "$BH_RDIR" "$tmp"; then
     rm -rf -- "$tmp"
     echo "copying the build scripts to $host failed" >&2
     return 1
   fi
   rm -rf -- "$tmp"
-  BH_SEND_ATTEMPT=1
-  bh_retry "copying the source of $sha to $host" bh_send_source "$host" "$BH_RDIR" "$sha" || {
+  bh_retry "copying the source of $sha to $host" - bh_send_source "$host" "$BH_RDIR" "$sha" || {
     echo "copying the source of $sha to $host failed" >&2
     return 1
   }
-  args=$(printf '%q ' "$BH_RDIR" "$BH_RUNIT" "$runtime" "$@")
+  # printf would print a quoted empty word for no flags.
+  args=
+  [ "$#" = 0 ] || args=$(printf '%q ' "$@")
   # A start repeated after a lost reply finds DIR/launched and starts nothing.
   BH_START_REFUSED=
-  bh_retry "starting the build on $host" bh_start "$host" "$BH_RDIR" "$BH_RUNIT" "$args" || {
+  bh_retry "starting the build on $host" - bh_start "$host" "$BH_RDIR" "$BH_RUNIT" "$args" || {
     echo "starting the build on $host failed" >&2
     return 1
   }
@@ -378,7 +460,7 @@ bh_build_steps() {
     return "$build_code"
   fi
   mkdir -p "$out"
-  bh_retry "copying the binary back from $host" bh_fetch "$host" "$BH_RDIR" "$out" || {
+  bh_retry "copying the binary back from $host" - bh_fetch "$host" "$BH_RDIR" "$out" || {
     echo "copying the binary back from $host failed" >&2
     return 1
   }
