@@ -60,6 +60,14 @@ def extension_names(names):
     require(accepted==list(range(1,len(accepted)+1))and len(accepted)<=len(numbers),'lifetime extension acceptance without its receipt')
     return numbers
 
+def accepted_extensions(names):
+    """The number of extension acceptances that no veto withdrew."""
+    names=set(names);found=0
+    for name in names:
+        m=re.fullmatch(r'lifetime-extension-([0-9]{4})-accepted\.json',name)
+        if m and 'lifetime-extension-%s-vetoed.json'%m[1] not in names:found+=1
+    return found
+
 def printable(text):return isinstance(text,str)and 0<len(text)<=200 and all(' '<=c<='~'for c in text)
 
 def iso_unix(value):

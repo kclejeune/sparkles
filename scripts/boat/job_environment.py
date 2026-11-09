@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import stat
 import sys
@@ -12,7 +13,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import read_owned, write_new
 from config_schema import validate_profile
-from qualified_worker_admission import CLOSURE_RESERVE, export_operation, lifetime_left, operation_lifetime, validate_admission
+from qualified_worker_admission import CLOSURE_RESERVE, accepted_extensions, export_operation, lifetime_left, operation_lifetime, validate_admission
 import controller
 
 SCHEMA = 'sparkles.boat.job-admission'
@@ -81,6 +82,14 @@ def context(profile_path, qualification_path, worker, now, guard_reader=None):
         require(not (path.parent/name).exists(), 'operation is stopping or closed')
     # The lifetime includes any receipted extension of this same operation.
     lifetime = operation_lifetime(path.parent, qualification)
+    # The closure watch fences the end it is about to close at. Only an extension
+    # the guard accepted after that fence admits jobs again.
+    names = os.listdir(path.parent)
+    fences = sorted(n for n in names if re.fullmatch(r'closure-watch-fence-[0-9]{4}\.json', n))
+    if fences:
+        fence = json.loads(read_owned(path.parent/fences[-1], 65536))
+        require(isinstance(fence, dict) and type(fence.get('accepted_extensions')) is int, 'closure watch fence unreadable')
+        require(accepted_extensions(names) > fence['accepted_extensions'], 'operation is closing at its deadline')
     validate_admission(qualification, Path('/proc/sys/kernel/random/boot_id').read_text().strip(), live, now, profile, lifetime['wall_end'])
     require(qualification['safe_owner']['uid']==os.getuid(), 'qualification local owner mismatch')
     release = json.loads(read_owned(path.parent/'release.json'))

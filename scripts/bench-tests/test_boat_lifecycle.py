@@ -622,12 +622,42 @@ class LifetimeExtension(unittest.TestCase):
         self.assertEqual(controller.guard_deadlines(io,self.intent),(self.intent['deadline_mono'],self.intent['deadline_wall']))
 
 
+class RemoteTransport(unittest.TestCase):
+    """The provider joins the words after ``--`` into one remote shell command."""
+    def run_remote(self,method,*args):
+        import shlex,subprocess
+        root=Path(tempfile.mkdtemp(dir=self.tmp.name));f=fixture(root);controller.bind_release_profile(f['release'])
+        calls=[]
+        class Capture(controller.RealIO):
+            def boat(self,argv,seconds=20,input_bytes=None,json_mode=True):
+                calls.append(argv);words=argv[argv.index('--')+1:]
+                # What the worker's shell would run after joining the words.
+                self_test.assertEqual(shlex.split(' '.join(words)),words)
+                r=subprocess.run(words,input=input_bytes,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=30)
+                return {'exit':r.returncode,'error':None,'body':json.loads(r.stdout)}
+        self_test=self;io=Capture(f['release'],f['operation'])
+        return getattr(io,method)(*args),calls
+
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+
+    def test_remote_programs_survive_shell_joining_and_run(self):
+        boot,_=self.run_remote('worker_boot_id')
+        self.assertEqual(boot,Path('/proc/sys/kernel/random/boot_id').read_text().strip())
+        check,calls=self.run_remote('job_closure',())
+        self.assertEqual(calls[0][-4:],['/usr/bin/python3','-I','-B','-'])
+        self.assertEqual(check['list_exit'],0);self.assertIsInstance(check['units'],list);self.assertIsInstance(check['processes'],list)
+        self.assertEqual(check['boot_id'],boot)
+        with self.assertRaises(controller.Refusal):self.run_remote('metadata_closed')
+
+
 class WatchIO(ExtendIO):
     """The fixture's warm operation with a scripted worker job-closure check."""
     def __init__(self,f,wall=None,boot=None,checks=None):
         super().__init__(f,wall,boot);self.checks=list(checks or []);self.check_times=[];self.frozen_at=[];self.local_seen=[]
+        self.frozen=False;self.freeze_delay=0;self.on_freeze=None
     def job_closure(self,local_units):
-        self.check_times.append((self.w,self.t));self.local_seen.append(tuple(local_units))
+        self.check_times.append((self.w,self.t,self.frozen));self.local_seen.append(tuple(local_units))
         state=self.checks.pop(0) if self.checks else 'closed'
         if state=='error':raise OSError('provider said /home/private')
         row={'list_exit':0,'units':[],'unit_count':0,'processes':[],'process_count':0,'boot_id':WORKER_BOOT_ID,'local_units_closed':{u:True for u in local_units}}
@@ -636,7 +666,11 @@ class WatchIO(ExtendIO):
         if state=='boot':row['boot_id']='11111111-2222-3333-4444-555555555555'
         if state=='local':row['local_units_closed']={u:False for u in local_units}
         return row
-    def freeze_extensions(self):self.frozen_at.append(self.t);self.frozen=True;return True
+    def freeze_extensions(self):
+        if self.freeze_delay:self.wait(self.freeze_delay)
+        if self.on_freeze:self.on_freeze()
+        self.frozen_at.append(self.t);self.frozen=True;return True
+    def thaw_extensions(self):self.frozen=False
 
 
 class ClosureWatch(unittest.TestCase):
@@ -653,26 +687,73 @@ class ClosureWatch(unittest.TestCase):
         return controller.closure_watch(self.f['release'],io,lead,local_units,observe=lambda r,x:self.observed.append(x.exists('stop-trigger.json')))
 
     def read(self,name):return json.loads((self.op/name).read_text())
+    def left(self,w,t,end=None):
+        wall_end,boot_end,_=end or self.end;return min(wall_end-w,boot_end-t)
+
+    def extend(self,at_left,seconds=3600,accept=True):
+        io=ExtendIO(self.f,self.f['now']+self.left(self.f['now'],self.f['boot_now'])-at_left,self.f['boot_now']+self.left(self.f['now'],self.f['boot_now'])-at_left)
+        path=environment_fact(self.f,self.root/'environment-fact.json',io.wall())
+        with patch.object(self.qwa,'current_boot_id',return_value=io.local_boot):
+            receipt=controller.extend_operation(self.f['release'],io,seconds,path,'second lane on the warm worker')
+        if accept:controller.guard_deadlines(ExtendIO(self.f,io.wall(),io.mono()),self.intent)
+        return io,receipt
+
+    def admit(self,io):
+        with patch.object(self.qwa,'boottime',return_value=io.mono()):
+            return env.load_job_admission(self.f['admission'],self.f['profile_path'],self.f['profile']['worker'],io.wall(),lambda unit:self.f['guard'])
 
     def test_closed_jobs_finish_at_the_lead_before_the_end(self):
-        io=WatchIO(self.f);wall_end,boot_end,_=self.end
+        io=WatchIO(self.f)
         self.assertEqual(self.watch(io),'FINISHED')
-        self.assertEqual(len(io.check_times),1);w,t=io.check_times[0]
-        self.assertLessEqual(min(wall_end-w,boot_end-t),900);self.assertGreater(min(wall_end-w,boot_end-t),900-31)
+        fence=self.read('closure-watch-fence-0001.json');self.assertEqual(fence['accepted_extensions'],0)
+        self.assertLessEqual(self.left(fence['observed_wall'],fence['observed_boottime']),900)
+        # A settle after the fence, a check outside the lock and the publishing check under it.
+        self.assertEqual(len(io.check_times),2);self.assertGreaterEqual(io.check_times[0][1]-fence['observed_boottime'],controller.WATCH_SETTLE)
+        self.assertEqual([x[2] for x in io.check_times],[False,True])
         closed=self.read('root-job-closed.json')
-        self.assertEqual(closed['operation_id'],self.f['release']['guard_unit']);self.assertTrue(closed['all_native_and_leases_closed'])
-        self.assertEqual(closed['receipt_sha256'],self.qwa.receipt_digest(self.read('closure-watch-check-0001.json')))
+        self.assertEqual(closed['closure_check'],'closure-watch-check-0002.json');self.assertTrue(closed['all_native_and_leases_closed'])
+        self.assertEqual(closed['receipt_sha256'],self.qwa.receipt_digest(self.read('closure-watch-check-0002.json')))
         controller.matching_root_job_closed(self.f['release'],io,closed)
         self.assertTrue(io.exists('stop-trigger.json'));self.assertEqual(self.observed,[True]);self.assertEqual(io.calls,[])
         self.assertEqual(len(io.frozen_at),1);self.assertFalse(io.frozen)
 
-    def test_open_jobs_are_checked_again_until_they_close(self):
-        io=WatchIO(self.f,checks=['unit','process','error','closed'])
+    def test_a_job_started_while_the_lock_is_awaited_is_not_closed_over(self):
+        io=WatchIO(self.f,checks=['closed','unit','closed','closed']);io.freeze_delay=90
         self.assertEqual(self.watch(io),'FINISHED')
-        self.assertEqual(len(io.check_times),4);self.assertEqual(io.check_times[1][1]-io.check_times[0][1],30)
+        self.assertFalse(self.read('closure-watch-check-0002.json')['closed'])
+        self.assertEqual(self.read('root-job-closed.json')['closure_check'],'closure-watch-check-0004.json')
+        self.assertTrue(io.check_times[3][2])
+
+    def test_the_fence_refuses_admission_until_an_accepted_extension(self):
+        io=WatchIO(self.f,checks=['unit']*400)
+        self.admit(io)
+        self.assertEqual(self.watch(io),'UNRESOLVED_JOB_OPEN')
+        with self.assertRaisesRegex(Exception,'closing at its deadline'):self.admit(ExtendIO(self.f,io.wall()-200,io.mono()-200))
+
+    def test_an_extension_after_the_fence_reopens_admission_and_moves_the_end(self):
+        io=WatchIO(self.f,checks=['unit','unit']);calls=[0]
+        original=io.job_closure
+        def closure(units):
+            calls[0]+=1
+            if calls[0]==2:
+                # The lifecycle owner extends while the job still runs.
+                with self.assertRaisesRegex(Exception,'closing at its deadline'):self.admit(io)
+                ext,receipt=self.extend(self.left(io.w,io.t),3600);self.receipt=receipt
+                self.admit(ext)
+            return original(units)
+        io.job_closure=closure
+        self.assertEqual(self.watch(io),'FINISHED')
+        self.assertEqual(self.read('closure-watch-fence-0002.json')['accepted_extensions'],1)
+        self.assertLessEqual(self.receipt['boot_end']-io.check_times[-1][1],900)
+        self.assertEqual(self.read('closure-watch-fence-0001.json')['accepted_extensions'],0)
+
+    def test_open_jobs_are_checked_again_until_they_close(self):
+        io=WatchIO(self.f,checks=['unit','process','error','closed','closed'])
+        self.assertEqual(self.watch(io),'FINISHED')
+        self.assertEqual(len(io.check_times),5);self.assertEqual(io.check_times[1][1]-io.check_times[0][1],30)
         self.assertFalse(self.read('closure-watch-check-0001.json')['closed']);self.assertFalse(self.read('closure-watch-check-0002.json')['closed'])
         self.assertFalse(io.exists('closure-watch-check-0003.json'));self.assertTrue(self.read('closure-watch-check-0004.json')['closed'])
-        self.assertEqual(self.read('root-job-closed.json')['closure_check'],'closure-watch-check-0004.json')
+        self.assertEqual(self.read('root-job-closed.json')['closure_check'],'closure-watch-check-0005.json')
 
     def test_a_job_that_never_closes_leaves_the_guard_stop_path(self):
         for state in ['unit','boot','local']:
@@ -681,8 +762,8 @@ class ClosureWatch(unittest.TestCase):
                 self.assertEqual(self.watch(io,local_units=('lane-screen.service',)),'UNRESOLVED_JOB_OPEN')
                 self.assertFalse(io.exists('root-job-closed.json'));self.assertFalse(io.exists('stop-trigger.json'));self.assertEqual(self.observed,[])
                 q=self.read('closure-watch-unresolved.json');self.assertEqual(q['reason_code'],'job_open')
-                wall_end,boot_end,_=self.end;w,t=io.check_times[-1]
-                self.assertLessEqual(min(wall_end-w,boot_end-t),controller.WATCH_FLOOR+30)
+                w,t,_=io.check_times[-1]
+                self.assertLessEqual(self.left(w,t),controller.WATCH_FLOOR+30)
                 self.assertEqual(io.local_seen[0],('lane-screen.service',))
 
     def test_an_error_on_every_check_is_coded_without_its_text(self):
@@ -692,34 +773,21 @@ class ClosureWatch(unittest.TestCase):
         self.assertTrue(code.startswith('unexpected:OSError:'));self.assertNotIn('private',code)
 
     def test_an_accepted_extension_moves_the_check_to_its_new_end(self):
-        wall_end,boot_end,_=self.end;left=min(wall_end-self.f['now'],boot_end-self.f['boot_now'])
-        io=ExtendIO(self.f,self.f['now']+left-600,self.f['boot_now']+left-600)
-        path=environment_fact(self.f,self.root/'environment-fact.json',io.wall())
-        with patch.object(self.qwa,'current_boot_id',return_value=io.local_boot):
-            receipt=controller.extend_operation(self.f['release'],io,3600,path,'second lane on the warm worker')
-        controller.guard_deadlines(ExtendIO(self.f,io.wall(),io.mono()),self.intent)
+        io,receipt=self.extend(600,3600)
         watch=WatchIO(self.f,io.wall(),io.mono())
         self.assertEqual(self.watch(watch),'FINISHED')
-        w,t=watch.check_times[0]
+        w,t,_=watch.check_times[0];wall_end,boot_end,_=self.end
         self.assertLessEqual(receipt['boot_end']-t,900);self.assertGreater(t,boot_end)
 
     def test_an_unaccepted_extension_is_awaited_then_grants_nothing(self):
-        wall_end,boot_end,_=self.end;left=min(wall_end-self.f['now'],boot_end-self.f['boot_now'])
-        io=ExtendIO(self.f,self.f['now']+left-600,self.f['boot_now']+left-600)
-        path=environment_fact(self.f,self.root/'environment-fact.json',io.wall())
-        with patch.object(self.qwa,'current_boot_id',return_value=io.local_boot):
-            controller.extend_operation(self.f['release'],io,3600,path,'second lane on the warm worker')
+        io,_=self.extend(600,3600,accept=False)
         watch=WatchIO(self.f,io.wall(),io.mono())
         self.assertTrue(controller.watch_ends(self.f['release'],watch)[2])
         self.assertEqual(self.watch(watch),'FINISHED')
-        self.assertGreaterEqual(watch.t-watch.frozen_at[0],controller.WATCH_ACCEPT)
+        self.assertGreaterEqual(watch.check_times[-1][1]-watch.frozen_at[0],controller.WATCH_ACCEPT)
 
     def test_an_extension_accepted_while_waiting_keeps_the_worker(self):
-        wall_end,boot_end,_=self.end;left=min(wall_end-self.f['now'],boot_end-self.f['boot_now'])
-        io=ExtendIO(self.f,self.f['now']+left-600,self.f['boot_now']+left-600)
-        path=environment_fact(self.f,self.root/'environment-fact.json',io.wall())
-        with patch.object(self.qwa,'current_boot_id',return_value=io.local_boot):
-            receipt=controller.extend_operation(self.f['release'],io,3600,path,'second lane on the warm worker')
+        io,receipt=self.extend(600,3600,accept=False)
         watch=WatchIO(self.f,io.wall(),io.mono());f=self.f;intent=self.intent;original=watch.wait
         def wait(n):
             original(n)
@@ -728,6 +796,11 @@ class ClosureWatch(unittest.TestCase):
         self.assertEqual(self.watch(watch),'FINISHED')
         self.assertEqual(len(watch.frozen_at),2);self.assertLessEqual(receipt['boot_end']-watch.check_times[-1][1],900)
 
+    def test_real_one_second_wait_still_spaces_the_checks(self):
+        io=WatchIO(self.f,checks=['unit','closed']);step=io.wait
+        io.wait=lambda n:step(min(n,1))
+        self.assertEqual(self.watch(io),'FINISHED');self.assertGreaterEqual(io.check_times[1][1]-io.check_times[0][1],30)
+
     def test_existing_closure_is_observed_and_terminal_states_end_the_watch(self):
         io=WatchIO(self.f);io.record('closed.json',{'worker':'x'})
         self.assertEqual(self.watch(io),'CLOSED');self.assertEqual(io.check_times,[])
@@ -735,11 +808,9 @@ class ClosureWatch(unittest.TestCase):
         self.assertEqual(self.watch(io),'GUARD_UNRESOLVED')
         self.setUp();io=WatchIO(self.f);io.trigger()
         self.assertEqual(self.watch(io),'UNRESOLVED_JOB_OPEN');self.assertEqual(self.read('closure-watch-unresolved.json')['reason_code'],'stop_triggered_without_job_closure')
-
-    def test_real_one_second_wait_still_spaces_the_checks(self):
-        io=WatchIO(self.f,checks=['unit','closed']);step=io.wait
-        io.wait=lambda n:step(min(n,1))
-        self.assertEqual(self.watch(io),'FINISHED');self.assertGreaterEqual(io.check_times[1][1]-io.check_times[0][1],30)
+        # A stop trigger that appears while the lock is awaited prevents publication.
+        self.setUp();io=WatchIO(self.f);io.on_freeze=io.trigger
+        self.assertEqual(self.watch(io),'UNRESOLVED_JOB_OPEN');self.assertFalse(io.exists('root-job-closed.json'))
 
     def test_one_watch_per_operation_and_bounded_arguments(self):
         io=WatchIO(self.f);self.watch(io)

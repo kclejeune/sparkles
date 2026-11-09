@@ -8,7 +8,7 @@ identity_check=identity
 import qualified_worker_admission as lifetime
 from qualified_worker_admission import make_admission
 import owned_group
-import argparse,fcntl,math,secrets,selectors,signal,subprocess,time,shlex,base64
+import argparse,ast,fcntl,math,secrets,selectors,signal,subprocess,time,shlex,base64
 
 # An extension act publishes within EXTEND_ACT_MAX seconds of its start, and the
 # guard waits up to FREEZE_WAIT for it before it stops at its deadline. The guard
@@ -29,9 +29,33 @@ WATCH_POLL=30
 WATCH_FLOOR=60
 WATCH_CHECKS=400
 WATCH_ACCEPT=15
+WATCH_SETTLE=60
 # Job work on the worker: the screen and build units the remote executor and the
 # build host start, and the processes that build or serve a revision. An mbx
 # lease lives only as long as its mbx process, so the process check covers it.
+# A remote phase's reason code is kept only in one of these forms. A refusal
+# code must name one of the packet's own literal refusal reasons.
+FIXED_REASONS=frozenset({'startup_unobserved','startup_busy:unallowed_processes','startup_busy:bootstrap_lock_held','startup_busy:lock_or_manifest_absent','existing_phase_pending','unreported'})
+def packet_refusals():
+    found=set()
+    for name in ('common.py','config_schema.py','metadata-probe.py','startup-observer.py','remote-launcher.py'):
+        for node in ast.walk(ast.parse((ROOT/name).read_text())):
+            if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id in ('need','require','Refusal'):
+                for arg in node.args:
+                    if isinstance(arg,ast.Constant) and isinstance(arg.value,str):found.add(arg.value)
+    return frozenset(found)
+def remote_reason(code):
+    """The code itself when it has a known form, otherwise 'malformed'."""
+    if not isinstance(code,str):return 'unreported' if code is None else 'malformed'
+    if code in FIXED_REASONS:return code
+    if re.fullmatch(r'(launcher:)?unexpected:[A-Za-z_][A-Za-z0-9_]{0,63}(:[A-Za-z_<>][A-Za-z0-9_<>]{0,63}:[0-9]{1,7})?',code):return code
+    if re.fullmatch(r'unit_unhealthy:(open|[a-z-]{1,32}:[0-9a-z]{1,12})',code):return code
+    m=re.fullmatch(r'(launcher:)?refusal:(.{1,150})',code)
+    if m and m[2] in {bounded_text('refusal:'+x)[len('refusal:'):] for x in packet_refusals()}:return code
+    return 'malformed'
+def remote_name(value):
+    return value if isinstance(value,str) and re.fullmatch(r'[ -~]{1,16}',value) else None
+
 JOB_UNIT_PREFIXES=('sparkles-screen-','nsc-build-')
 JOB_PROCESSES=frozenset({'cargo','rustc','mbx','sparkles','sparkles-server','cc','cc1','cc1plus','ld','ld.lld','mold','clang','hyperfine'})
 JOB_CLOSURE_PROGRAM='''import json,os,subprocess,sys
@@ -141,9 +165,18 @@ class RealIO:
     def thaw_extensions(self):
         fd=getattr(self,'_frozen',None);self._frozen=None
         if fd is not None:os.close(fd)
+    def remote_python(self,program,args,seconds):
+        """Run a maintained program on the worker through stdin.
+
+        The provider joins the words after ``--`` into one remote shell command,
+        so a program or argument given as argv would be split by that shell. The
+        program and its arguments travel as stdin bytes, as the phase launcher's do.
+        """
+        source=('import sys\nsys.argv=[\'remote\']+'+repr([str(a) for a in args])+'\n'+program).encode()
+        return self.boat(['ssh',worker_id(),'--','/usr/bin/python3','-I','-B','-'],seconds,source,json_mode=False)
     def worker_boot_id(self):
         code="import json;print(json.dumps({'boot_id':open('/proc/sys/kernel/random/boot_id').read().strip()}))"
-        r=self.boat(['ssh',worker_id(),'--','/usr/bin/python3','-I','-B','-c',code],20,json_mode=False)
+        r=self.remote_python(code,[],20)
         need(r['exit']==0 and isinstance(r['body'],dict) and isinstance(r['body'].get('boot_id'),str),'worker boot identity unavailable')
         return r['body']['boot_id']
     def boat(self,args,seconds=20,input_bytes=None,json_mode=True):
@@ -182,7 +215,7 @@ class RealIO:
         return safe
     def job_closure(self,local_units):
         """One bounded check of the worker's job units and processes and the local job units."""
-        r=self.boat(['ssh',worker_id(),'--','/usr/bin/python3','-I','-B','-c',JOB_CLOSURE_PROGRAM,json.dumps(list(JOB_UNIT_PREFIXES)),json.dumps(sorted(JOB_PROCESSES))],60,json_mode=False)
+        r=self.remote_python(JOB_CLOSURE_PROGRAM,[json.dumps(list(JOB_UNIT_PREFIXES)),json.dumps(sorted(JOB_PROCESSES))],60)
         need(r['exit']==0 and isinstance(r['body'],dict),'worker job closure check failed')
         b=r['body']
         local={}
@@ -240,7 +273,7 @@ if c:
  if root.exists():closed=closed and all(not f.read_text().strip()for f in root.rglob('cgroup.procs'))
 print(json.dumps({'closed':closed,'unit':u,'properties':p}))
 """
-        r=self.boat(['ssh',worker_id(),'--','/usr/bin/python3','-I','-B','-c',code,unit],20,json_mode=False)
+        r=self.remote_python(code,[unit],20)
         need(r['exit']==0 and isinstance(r['body'],dict) and r['body'].get('closed')is True and r['body'].get('unit')==unit,'metadata closure query failed')
         self.record('qualification-closed.json',r['body']);return True
     def phase(self,phase,observation_seconds=0):
@@ -286,18 +319,18 @@ if __name__=='__main__':
     def startup_refused(self,result):
         """Keep the first refused startup's bounded reason, never its free text."""
         if self.exists('startup-refused.json'):return
-        code=result.get('reason_code');rows=result.get('unallowed')
+        rows=result.get('unallowed')
         terminal=result.get('terminal_properties') if isinstance(result.get('terminal_properties'),dict) else {}
         def row(x):
-            return {'pid':x.get('pid') if type(x.get('pid'))is int else None,'comm':bounded_text(x.get('comm',''),16),'uid':x.get('uid') if type(x.get('uid'))is int else None,
-                    'ppid':x.get('ppid') if type(x.get('ppid'))is int else None,'parent_comm':None if x.get('parent_comm') is None else bounded_text(x['parent_comm'],16),
+            return {'pid':x.get('pid') if type(x.get('pid'))is int else None,'comm':remote_name(x.get('comm')),'uid':x.get('uid') if type(x.get('uid'))is int else None,
+                    'ppid':x.get('ppid') if type(x.get('ppid'))is int else None,'parent_comm':remote_name(x.get('parent_comm')),
                     'parent_uid':x.get('parent_uid') if type(x.get('parent_uid'))is int else None}
-        safe={'reason_code':bounded_text(code) if isinstance(code,str) and code else 'unreported',
+        safe={'reason_code':remote_reason(result.get('reason_code')),
               'phase_closed':result.get('phase_closed') is True,'existing_phase_pending':result.get('existing_phase_pending') is True,
               'unallowed':[row(x) for x in rows[:32] if isinstance(x,dict)] if isinstance(rows,list) else [],
               'unallowed_count':result.get('unallowed_count') if type(result.get('unallowed_count'))is int else None,
               'elapsed_seconds':result.get('elapsed_seconds') if type(result.get('elapsed_seconds'))in(int,float) else None,
-              'terminal':{k:bounded_text(terminal[k],32) for k in ('ExecMainStatus','Result') if isinstance(terminal.get(k),str)},'observed_wall':self.wall()}
+              'terminal':{k:terminal[k] for k in ('ExecMainStatus','Result') if isinstance(terminal.get(k),str) and re.fullmatch(r'[a-z0-9-]{1,32}',terminal[k])},'observed_wall':self.wall()}
         try:self.record('startup-refused.json',safe)
         except FileExistsError:pass
     def stop_quiescent(self):
@@ -727,11 +760,13 @@ def watch_ends(r,io):
     wall,boot=lifetime.original_ends(intent,guard,handoff)
     wall,boot=min(wall,intent['deadline_wall']),min(boot,intent['deadline_mono'])
     names=io.names();numbers=lifetime.extension_names(names)
+    io.watch_granted=0
     if not numbers:return wall,boot,False
     try:
         identity=lifetime.operation_identity(intent,guard,io.read('qualification.json'),r['guard_unit'],profile())
         ext_wall,ext_boot,granted=lifetime.apply_extensions(names,io.read,intent,wall,boot,identity)
     except Exception:return wall,boot,False
+    io.watch_granted=granted
     following=granted+1
     pending=following in numbers and 'lifetime-extension-%04d-accepted.json'%following not in names and 'lifetime-extension-%04d-vetoed.json'%following not in names
     return ext_wall,ext_boot,pending
@@ -751,23 +786,35 @@ def closure_watch(r,io,lead=WATCH_LEAD,local_units=(),poll=WATCH_POLL,observe=aw
 
     A worker kept warm past its jobs would otherwise reach the guard's deadline
     with no job-closure record, and the guard would leave it to the provider TTL.
-    WATCH_LEAD seconds before the present end, extensions included, the watch
-    checks that no job unit or job process remains on the worker and that the
-    named local job units are inactive. It then publishes the job-closure record
-    and the stop trigger while it holds the extension lock, so no extension act
-    can publish after that decision, and observes the guard's verified stop. An
-    open job is checked again every ``poll`` seconds. If none closes by
-    WATCH_FLOOR seconds before the end, the watch records that and leaves the
-    guard's stop path unchanged.
+    ``lead`` seconds before the present end, extensions included, the watch
+    records a fence for that end, which job admission refuses, and waits
+    WATCH_SETTLE seconds for jobs admitted just before to start. It then checks
+    that no job unit or job process remains on the worker and that the named
+    local job units are inactive. When a check finds them closed, it takes the
+    extension lock, waits out a pending acceptance, reads the end again and, if
+    no extension moved it, checks the jobs once more and publishes the
+    job-closure record from that check with the stop trigger while it holds the
+    lock. It then observes the guard's verified stop. An open job is checked
+    again every ``poll`` seconds. If none closes by WATCH_FLOOR seconds before
+    the end, the watch records that and leaves the guard's stop path unchanged.
     """
     need(type(lead)is int and 300<=lead<=3600,'closure watch lead out of range')
     need(all(isinstance(u,str) and re.fullmatch(r'[A-Za-z0-9@_.:-]{1,200}',u) for u in local_units),'local job unit name')
     need(io.exists('root-handoff.json') and io.exists('qualified-worker-admission.json') and io.exists('guard-admission.json'),'no qualified Root handoff to watch')
     io.record('closure-watch.json',{'worker':worker_id(),'operation_id':r['guard_unit'],'lead_seconds':lead,'poll_seconds':poll,'local_units':list(local_units),'started_wall':io.wall(),'started_boottime':io.mono()})
-    checks=0;last='not_checked'
+    checks=0;last='not_checked';fences=0;fenced=None
     def unresolved(code):
         io.record('closure-watch-unresolved.json',{'worker':worker_id(),'reason_code':code,'checks':checks,'observed_wall':io.wall(),'action':'the guard keeps its own deadline stop; Root must establish job closure or reconcile the worker'})
         return 'UNRESOLVED_JOB_OPEN'
+    def check_jobs():
+        nonlocal checks,last
+        checks+=1
+        try:check=io.job_closure(local_units)
+        except Exception as error:last=reason_code(error);return None
+        check['observed_unix']=io.wall();check['closed']=job_closed(r,io,check)
+        io.record('closure-watch-check-%04d.json'%checks,check)
+        if not check['closed']:last='job_open'
+        return check
     while True:
         if io.exists('closed.json'):return 'CLOSED'
         if io.exists('unresolved.json'):return 'GUARD_UNRESOLVED'
@@ -779,17 +826,17 @@ def closure_watch(r,io,lead=WATCH_LEAD,local_units=(),poll=WATCH_POLL,observe=aw
         if left>lead:pause(io,min(poll,left-lead));continue
         if io.exists('stop-trigger.json'):return unresolved('stop_triggered_without_job_closure')
         if checks>=WATCH_CHECKS:return unresolved('closure_check_bound')
-        checks+=1
-        try:check=io.job_closure(local_units)
-        except Exception as error:check=None;last=reason_code(error)
-        if check is not None:
-            check['observed_unix']=io.wall();closed=job_closed(r,io,check);check['closed']=closed
-            io.record('closure-watch-check-%04d.json'%checks,check)
-            if not closed:last='job_open'
-        if check is None or not closed:pause(io,poll);continue
+        if fenced!=(wall,boot):
+            # Job admission refuses from here until an extension moves this end.
+            # Jobs admitted just before get WATCH_SETTLE seconds to start their units.
+            fences+=1;fenced=(wall,boot)
+            io.record('closure-watch-fence-%04d.json'%fences,{'worker':worker_id(),'wall_end':wall,'boot_end':boot,'accepted_extensions':io.watch_granted,'observed_wall':io.wall(),'observed_boottime':io.mono()})
+            pause(io,WATCH_SETTLE);continue
+        check=check_jobs()
+        if check is None or not check['closed']:pause(io,poll);continue
         if not io.freeze_extensions():
-            last='extension_act_running';io.wait(1);continue
-        moved=False
+            last='extension_act_running';pause(io,1);continue
+        published=False
         try:
             # An act published before the lock may still await the guard's
             # acceptance, which the guard gives within a second of its next pass.
@@ -799,16 +846,20 @@ def closure_watch(r,io,lead=WATCH_LEAD,local_units=(),poll=WATCH_POLL,observe=aw
             while pending and io.mono()<end:
                 io.wait(1);wall,boot,pending=watch_ends(r,io)
             wall,boot,pending=watch_ends(r,io)
-            moved=min(wall-io.wall(),boot-io.mono())>lead
-            if not moved:
-                need(io.wall()-check['observed_unix']<=120,'closure check went stale before publication')
-                admission=io.read('qualified-worker-admission.json');handoff=io.read('root-handoff.json')
-                row={'observed_unix':check['observed_unix'],'verified_by_Root':True,'receipt_sha256':lifetime.receipt_digest(check),'worker':worker_id(),
-                     'operation_id':r['guard_unit'],'local_guard':admission['local_guard'],'job_release_sha256':handoff['separate_job_release']['job_release_sha256'],
-                     'all_native_and_leases_closed':True,'closure_check':'closure-watch-check-%04d.json'%checks}
-                matching_root_job_closed(r,io,row);io.record('root-job-closed.json',row);io.trigger()
+            left=min(wall-io.wall(),boot-io.mono())
+            if left<=lead and left>WATCH_FLOOR and fenced==(wall,boot) and not any(io.exists(n) for n in ('stop-trigger.json','closed.json','unresolved.json')):
+                # The record is published only from a check made under this lock,
+                # after the fence and any extension wait.
+                check=check_jobs()
+                if check is not None and check['closed']:
+                    admission=io.read('qualified-worker-admission.json');handoff=io.read('root-handoff.json')
+                    row={'observed_unix':check['observed_unix'],'verified_by_Root':True,'receipt_sha256':lifetime.receipt_digest(check),'worker':worker_id(),
+                         'operation_id':r['guard_unit'],'local_guard':admission['local_guard'],'job_release_sha256':handoff['separate_job_release']['job_release_sha256'],
+                         'all_native_and_leases_closed':True,'closure_check':'closure-watch-check-%04d.json'%checks}
+                    need(io.wall()-check['observed_unix']<=WATCH_ACCEPT,'closure check went stale before publication')
+                    matching_root_job_closed(r,io,row);io.record('root-job-closed.json',row);io.trigger();published=True
         finally:io.thaw_extensions()
-        if moved:continue
+        if not published:pause(io,poll);continue
         observe(r,io);return 'FINISHED'
 
 def closure_watch_entry(op,lead,local_units):

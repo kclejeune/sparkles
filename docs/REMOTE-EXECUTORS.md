@@ -150,9 +150,17 @@ guard's stop does not depend on the provider TTL. The
 [scheduled closure](../scripts/boat/README.md#scheduled-closure) section describes it.
 
 A Boat screen builds both revisions on the worker with mbx, because binaries built on a
-host with a newer glibc do not run there. A Boat screen and a Namespace screen of the
-same revisions therefore run different binaries, and the Boat screen is judged by its
-ratios and noise against Namespace rather than by identical binaries.
+host with a newer glibc do not run there. The executor does not choose the build host,
+so the screen names the worker as its build host and passes two revisions rather than
+binary paths.
+
+```sh
+mise run bench:remote --executor "$worker" --build-host "$worker" origin/main HEAD
+```
+
+A Boat screen and a Namespace screen of the same revisions therefore run different
+binaries, and the Boat screen is judged by its ratios and noise against Namespace rather
+than by identical binaries.
 
 The operator establishes actual native/cgroup/lease closure before supplying the fresh
 job-closure receipt. `boat:finish` validates that evidence and observes the guard's

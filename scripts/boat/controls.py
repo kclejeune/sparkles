@@ -511,13 +511,16 @@ class Controls(unittest.TestCase):
         for pid in UNKNOWN_SESSION:del rows[pid]
         with tempfile.TemporaryDirectory(prefix='boat-v2-session-') as d:
             root=Path(d);(root/'bootstrap.lock').touch(mode=0o600);m=root/'toolchain.json';m.write_text('ASCII');m.chmod(0o600);clock=Clock()
-            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause)
+            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause,lambda rows:(1220,5))
             self.assertTrue(q['startup_closed']);self.assertTrue(q['qualification_eligible'])
+            # Without the system manager's own user-manager identity none of its children is allowed.
+            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause)
+            self.assertFalse(q['startup_closed']);self.assertEqual(len(q['unallowed']),17)
     def test_observed_listing_unknowns_refuse_with_bounded_inventory(self):
         rows=observed_session_rows()
         with tempfile.TemporaryDirectory(prefix='boat-v2-session-') as d:
             root=Path(d);(root/'bootstrap.lock').touch(mode=0o600);m=root/'toolchain.json';m.write_text('ASCII');m.chmod(0o600);clock=Clock()
-            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause)
+            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause,lambda rows:(1220,5))
         self.assertFalse(q['startup_closed']);self.assertEqual(q['reason_code'],'startup_busy:unallowed_processes')
         self.assertEqual({x['pid'] for x in q['unallowed']},UNKNOWN_SESSION|set(UNPARENTED));self.assertEqual(q['unallowed_count'],7)
         row={x['pid']:x for x in q['unallowed']}[8008]
@@ -528,7 +531,8 @@ class Controls(unittest.TestCase):
         def busy(extra):
             rows=observed_session_rows(unparented=False)
             for pid in UNKNOWN_SESSION:del rows[pid]
-            rows.update(extra);return {x['pid'] for x in scan(rows,{'pid':11,'start':1},12,set())}
+            rows.update(extra);return {x['pid'] for x in scan(rows,{'pid':11,'start':1},12,set(),manager)}
+        manager=(1220,5)
         self.assertEqual(busy({}),set())
         # An allowed name under another parent, a parent of the wrong uid, a user
         # manager that is not init's child and an unknown name all stay busy.
@@ -537,18 +541,32 @@ class Controls(unittest.TestCase):
         # Another uid's process was never startup work unless it is an installer.
         self.assertEqual(busy({30:{'pid':30,'ppid':1,'uid':1001,'comm':'pulseaudio','start':5,'group':30}}),set())
         self.assertEqual(busy({30:{'pid':30,'ppid':1,'uid':0,'comm':'pipewire','start':5,'group':30},31:{'pid':31,'ppid':30,'uid':1000,'comm':'pipewire','start':5,'group':30}}),{31})
-        self.assertEqual(busy({30:{'pid':30,'ppid':1,'uid':1000,'comm':'systemd','start':5,'group':30},31:{'pid':31,'ppid':30,'uid':1000,'comm':'gvfsd','start':5,'group':30}}),set())
+        # A second process named systemd is not the manager the system manager reports.
+        self.assertEqual(busy({30:{'pid':30,'ppid':1,'uid':1000,'comm':'systemd','start':5,'group':30},31:{'pid':31,'ppid':30,'uid':1000,'comm':'gvfsd','start':5,'group':30}}),{31})
+        # Names never stand in for the anchors.
+        for name in ['init','user-manager','systemd']:
+            self.assertEqual(busy({30:{'pid':30,'ppid':9999,'uid':0,'comm':name,'start':5,'group':30},31:{'pid':31,'ppid':30,'uid':1000,'comm':'pulseaudio','start':5,'group':30}}),{31})
+            self.assertEqual(busy({30:{'pid':30,'ppid':9999,'uid':1000,'comm':name,'start':5,'group':30},31:{'pid':31,'ppid':30,'uid':1000,'comm':'pipewire','start':5,'group':30}}),{30,31} if name!='systemd' else {31})
+        # A reused manager pid with another start time is not the manager.
+        manager=(1220,6);self.assertEqual(len(busy({})),17);manager=(1220,5)
         self.assertEqual(busy({30:{'pid':30,'ppid':4543,'uid':1000,'comm':'systemd','start':5,'group':30},31:{'pid':31,'ppid':30,'uid':1000,'comm':'gvfsd','start':5,'group':30}}),{31})
         self.assertEqual(busy({30:{'pid':30,'ppid':1,'uid':1000,'comm':'ibus-daemonx','start':5,'group':30}}),{30})
         self.assertEqual(busy({30:{'pid':30,'ppid':1,'uid':0,'comm':'sudo','start':5,'group':30}}),{30})
         # An allowed child of an allowed process whose own parent is unknown stays busy.
         self.assertEqual(busy({30:{'pid':30,'ppid':9999,'uid':1000,'comm':'ibus-daemon','start':5,'group':30},31:{'pid':31,'ppid':30,'uid':1000,'comm':'ibus-memconf','start':5,'group':30}}),{30,31})
+    def test_user_manager_comes_from_the_system_manager(self):
+        rows=observed_session_rows();um=OBSERVER['user_manager']
+        with patch.dict(OBSERVER,{'command':lambda argv,seconds=15:b'MainPID=1220\n'}):self.assertEqual(um(rows,1000),(1220,5))
+        for answer in [b'MainPID=0\n',b'MainPID=4541\n',b'MainPID=1220 x\n',b'']:
+            with patch.dict(OBSERVER,{'command':lambda argv,seconds=15,a=answer:a}):self.assertIsNone(um(rows,1000))
+        def fail(argv,seconds=15):raise OBSERVER['Refusal']('qualification command failed')
+        with patch.dict(OBSERVER,{'command':fail}):self.assertIsNone(um(rows,1000))
     def test_allowed_name_started_by_installer_stays_tracked(self):
         rows=observed_session_rows(unparented=False);tracked=set()
         for pid in UNKNOWN_SESSION:del rows[pid]
         rows[40]={'pid':40,'ppid':1,'uid':1000,'comm':'bash','start':5,'group':40};rows[41]={'pid':41,'ppid':40,'uid':1000,'comm':'pulseaudio','start':5,'group':40}
-        scan=OBSERVER['foreign_startup'];self.assertEqual({x['pid'] for x in scan(rows,{'pid':11,'start':1},12,tracked)},{40,41})
-        del rows[40];rows[41]['ppid']=1;self.assertEqual({x['pid'] for x in scan(rows,{'pid':11,'start':1},12,tracked)},{41})
+        scan=OBSERVER['foreign_startup'];self.assertEqual({x['pid'] for x in scan(rows,{'pid':11,'start':1},12,tracked,(1220,5))},{40,41})
+        del rows[40];rows[41]['ppid']=1;self.assertEqual({x['pid'] for x in scan(rows,{'pid':11,'start':1},12,tracked,(1220,5))},{41})
     def test_live_installer_never_checkpoint_success(self):
         with tempfile.TemporaryDirectory(prefix='boat-v2-live-installer-') as d:
             root=Path(d);(root/'bootstrap.lock').touch(mode=0o600);m=root/'toolchain.json';m.write_text('ASCII');m.chmod(0o600);rows=proc_fixture();rows[20]={'pid':20,'ppid':1,'uid':1000,'comm':'bash','start':1,'group':20};clock=Clock()
@@ -633,6 +651,14 @@ class Controls(unittest.TestCase):
         io.refusal_body={'startup_closed':False,'phase_closed':True};self.assertFalse(PhaseIO.startup(io,intent,False))
         fresh=PhaseIO(fixture());fresh.refusal_body={'startup_closed':False,'phase_closed':False,'failure':'arbitrary provider text'};self.assertFalse(fresh.startup(intent,True))
         self.assertEqual(fresh.read('startup-refused.json')['reason_code'],'unreported');self.assertNotIn('arbitrary',json.dumps(fresh.read('startup-refused.json')))
+        for code,kept in [('/private/provider-token=SECRET',False),('refusal:startup cgroup',True),('launcher:refusal:remote user',True),('refusal:invented secret text',False),
+                          ('unexpected:KeyError:observe:12',True),('unexpected:Key Error',False),('unit_unhealthy:exit-code:1',True),('startup_busy:unallowed_processes',True),(['x'],False),({'a':1},False)]:
+            io=PhaseIO(fixture());io.refusal_body={'startup_closed':False,'phase_closed':True,'reason_code':code,
+                'unallowed':[{'pid':1,'comm':{'secret':'SECRET'},'uid':1000,'ppid':0,'parent_comm':['SECRET'],'parent_uid':'0'},{'pid':2,'comm':'x'*40,'uid':1000,'ppid':1,'parent_comm':'ok','parent_uid':0}],
+                'terminal_properties':{'Result':'exit-code','ExecMainStatus':'/SECRET'}}
+            io.startup(intent,False);q=io.read('startup-refused.json')
+            self.assertEqual(q['reason_code'],code if kept else 'malformed',code);self.assertNotIn('SECRET',json.dumps(q))
+            self.assertEqual([(x['comm'],x['parent_comm'],x['parent_uid']) for x in q['unallowed']],[(None,None,None),(None,'ok',0)]);self.assertEqual(q['terminal'],{'Result':'exit-code'})
         io=InertIO(fixture());io.startup_bad=True
         with self.assertRaises(Refusal):c.drive(io.r,io)
         self.assertEqual(io.read('qualification-failed.json')['reason_code'],'refusal:startup still busy or unknown')

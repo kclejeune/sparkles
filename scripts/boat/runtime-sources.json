@@ -1,9 +1,9 @@
 {
   "files": {
     "README.md": {
-      "bytes": 13965,
+      "bytes": 14695,
       "mode": 420,
-      "sha256": "a5f0faf8e9e2c0f3b418d947b79c05192633f1a8eb6ce53c33e5bc7633ca780d"
+      "sha256": "f86df80f9bf2d1eab9d8f5aa14db25cfdce49b09875a4c0562d8833b124497d3"
     },
     "common.py": {
       "bytes": 13896,
@@ -16,14 +16,14 @@
       "sha256": "e25e6f2070a71461366145e3a4f126e5f46a7bfa97334ed56e074622eec18b08"
     },
     "controller.py": {
-      "bytes": 62436,
+      "bytes": 65736,
       "mode": 420,
-      "sha256": "d244543f7f8a6ffe180f791407619727b9cc6c0d8f2101ffb04238d5c0adffd5"
+      "sha256": "0af2dab850c890b33ce1251e37c319d6828231fa30bd1cacb9eabccc093cd49f"
     },
     "controls.py": {
-      "bytes": 68732,
+      "bytes": 71723,
       "mode": 420,
-      "sha256": "ec05977a5cdc3b6f6e5ca1f4a089bb6a79be47d161ab95ca3ad4dfb7dcfdd559"
+      "sha256": "532aea18736f79b49e7526a219f9483c6c684731b0f0e79187211d6890483f3b"
     },
     "job-closure.FALSE.json": {
       "bytes": 269,
@@ -31,9 +31,9 @@
       "sha256": "b26f69930360afa4f7fd27f813684c7154efeed8c2507375c904f7d1677f0be8"
     },
     "job_environment.py": {
-      "bytes": 10318,
+      "bytes": 10949,
       "mode": 420,
-      "sha256": "f83cc45e42e3176e706c26f8c0fa2beb077843dd71d559a912eaa5725aaa9a07"
+      "sha256": "30de918b7d537212c639107b642d7e465e8feb631af542d89b1af655f8fa3723"
     },
     "metadata-probe.py": {
       "bytes": 12985,
@@ -51,9 +51,9 @@
       "sha256": "52545934cada5c517218506cdc9f6ac743649d47f9d9f278d3fce4204e5968ae"
     },
     "qualified_worker_admission.py": {
-      "bytes": 19396,
+      "bytes": 19724,
       "mode": 420,
-      "sha256": "e6463517d6eab734028faa26f9b8672fd0f805c1d8c8bcec34a956bcc8c2050a"
+      "sha256": "5d2e77df1a09223b81a1999393e3168bb592672a207cebc685ad67021b85b773"
     },
     "release.FALSE.json": {
       "bytes": 2781,
@@ -66,9 +66,9 @@
       "sha256": "4c22463e1a40b3c18dab8e9bd16fe31e19532e853f1d5770b4a7f123fbf60072"
     },
     "startup-observer.py": {
-      "bytes": 12129,
+      "bytes": 13009,
       "mode": 420,
-      "sha256": "c08fb1a01a795059bfea7f35d2acfbd5a0ebfcd504b395ecefa46f7f722a7859"
+      "sha256": "e42382b86ae5b0545ad000b76b4fc37a6e174b0d15c613e9d07f73fa10d0e985"
     },
     "update_sources.py": {
       "bytes": 1367,

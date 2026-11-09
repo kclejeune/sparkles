@@ -53,16 +53,20 @@ systemd, its PAM helper and dbus. It also treats any installer, shell or build t
 startup work, whatever its uid, and tracks every descendant of startup work by PID and
 start time. The provider's desktop session, which the first SSH connection starts, runs
 more than 30 such processes for the worker's whole life, so that rule alone never closes.
-`PROVIDER_SESSION` in `startup-observer.py` allows those processes by their exact name and
-parent, as observed on an admitted worker. An allowed process has the worker's uid and a
-parent that is pid 1 as root, the worker's own user manager under pid 1, or another
-allowed process of the worker's uid. A process under any other parent, a name outside the
+The session tables in `startup-observer.py` allow those processes by their exact name
+and parent, as observed on an admitted worker. An allowed process has the worker's uid
+and a parent that is pid 1 as root, the worker's user manager or another allowed process
+of the worker's uid. The user manager is the main process that the system manager
+reports for `user@UID.service`, matched by pid and start time, and a parent's name never
+stands in for pid 1 or the manager. A process under any other parent, a name outside the
 table and any descendant of tracked startup work still count as startup work. Adding an
 entry needs the observed listing and an independent review.
 
 Every refusal records a bounded reason code. A refusal of this package keeps its literal
 reason, and any other exception records only its type and the function and line where it
-was raised, never its text. A busy startup reports up to 32 of the processes it counted,
+was raised, never its text. The controller keeps a remote code only in one of these
+forms, and a refusal code only when it names one of the packet's own refusal reasons.
+Any other value is recorded as `malformed`. A busy startup reports up to 32 of the processes it counted,
 each with its pid, name, uid and parent's name and uid, and never a command line or
 environment. The controller keeps the first refused startup in `startup-refused.json` and
 the code of a failed qualification in `qualification-failed.json`. An unresolved stop
@@ -189,18 +193,22 @@ mise run boat:closure-watch --unit "$LOCAL_WATCH_UNIT" --operation "$OWNED_OPERA
 ```
 
 The watch reads the guard's present end, with the extensions the guard accepted, and
-waits until `--lead` seconds before it. It then checks over SSH that no
+waits until `--lead` seconds before it. It then records `closure-watch-fence-NNNN.json`
+for that end, and job admission refuses the operation from then on until the guard
+accepts a further extension. After 60 seconds, which lets a job admitted just before the
+fence start its units, it checks over SSH that no
 `sparkles-screen-*` or `nsc-build-*` unit is active on the worker, that no build, mbx or
 server process runs there, and that the worker's boot is the qualified one. Each named
 local job unit must also be inactive. An mbx lease lives only as long as its mbx
 process, so the process check covers the Boxington leases. Each check is kept as
 `closure-watch-check-NNNN.json`. An open job is checked again every 30 seconds.
 
-Once a check finds every job closed, the watch takes the extension lock and reads the
-end again. An extension the guard accepted in the meantime moves the check to the new
-end. Otherwise the watch publishes `root-job-closed.json` from that check and the stop
-trigger while it holds the lock, and then observes the guard's verified stop as `finish`
-does. If no check finds the jobs closed by 60 seconds before the end, the watch records
+Once a check finds every job closed, the watch takes the extension lock, waits up to 15
+seconds for the guard to accept an extension published before it, and reads the end
+again. An extension the guard accepted in the meantime moves the check to the new end.
+Otherwise the watch checks the jobs once more and, if they are still closed, publishes
+`root-job-closed.json` from that check and the stop trigger while it holds the lock. It
+then observes the guard's verified stop as `finish` does. If no check finds the jobs closed by 60 seconds before the end, the watch records
 `closure-watch-unresolved.json` with the last reason code and leaves the guard's own
 deadline stop in place. One watch runs per operation.
 
