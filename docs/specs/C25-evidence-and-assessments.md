@@ -1994,8 +1994,9 @@ Before every model attempt and before every commit, where C22 already checks its
 settings, its models and the principal's view, the run also compares the dataset's
 current evidence settings with those its view recorded. Any difference stops the run
 before it publishes, as a changed GraphRAG setting does. Decisions published while the
-run waits or writes do not stop it, because its reports record the source commit they
-were read at, and the next refresh reads the decisions as §5 of C22 reads facts.
+run waits or writes do not stop it, because its reports record the source commit and
+the configuration they were read at, and the next refresh reads the decisions again
+under the rules below.
 
 #### What a run reads
 
@@ -2003,11 +2004,26 @@ The run reads the view's snapshot throughout. Its projection reads the graphs of
 `projection.graphs` and the policy's output graph, whether or not the projection names
 the output graph. It leaves out every other graph that the view's evidence settings give
 a role, which covers source records, proposal, decision, support and identity graphs
-and the output graphs of other policies, even when the projection names them. A
-proposition that this policy has not accepted therefore never becomes a fact of a
-report, and neither does a projection of another policy. A projection that names no
-other graph reads the accepted projection alone. The principal's graph grants and
-triple protections apply to the output graph as to every other graph.
+and the output graphs of other policies, even when the projection names them. No record
+of the evidence profile other than this policy's accepted projection therefore becomes a
+fact of a report. An ordinary graph that the projection names can still assert a
+proposition that the policy rejected, as it can today, so a report built under a policy
+mixes accepted evidence with ordinary assertions unless its projection names no other
+graph. The principal's graph grants and triple protections apply to the output graph as
+to every other graph.
+
+A triple of the output graph enters an input only with evidence the report can cite.
+For every such triple that an input renders, which covers a leaf's chosen facts, a
+parent's edges between children and folded facts, and the labels and types of the
+entity lines, the run reads the claims of the policy's live acceptance supports that
+project it, through `sparkles::evidence::with_policy_claims` with the principal's view.
+A claim counts only when its occurrence is visible to the principal under the rules of
+[claim states](#claim-states) and its state is `accepted`, and it counts with its
+current decision. A triple of the output graph with no such claim, because the view
+hides its supports or they exceed the record bound of 10,000, is left out of every
+input unless another graph of the projection also holds it, in which case it enters as
+an ordinary fact with no claim. It still links its ends when the hierarchy is computed,
+as every edge the principal can read does.
 
 The rejected alternative reads only the output graph. Ordinary data such as an
 organisation chart often links the entities of accepted claims into communities, and a
@@ -2015,30 +2031,25 @@ configuration that wants accepted evidence alone gets it by naming no other grap
 
 #### Citations of claims and decisions
 
-For every fact of a community's input, which is a leaf's chosen facts or a parent's
-edges between children and folded facts, the run reads the claims of the policy's live
-acceptance supports that project it, through `sparkles::evidence::with_policy_claims`
-with the principal's view. A claim counts only when its occurrence is visible to the
-principal under the rules of [claim states](#claim-states) and its state is `accepted`,
-and it counts with its current decision. A fact of an ordinary graph has no claim. A
-projected fact whose supports the principal's view hides, or whose supports exceed the
-record bound of 10,000, has none either, as in recall.
+The prompt does not change. The model sees the input as C22 §3.2 renders it and cites
+facts by number, so the prompt version `community-1`, the estimate and the reservations
+stay as they are. The server attaches the claims to the findings after the checks of
+C22 §3.4. A finding that cites a fact gains `gr:citesClaim` for each claim of that fact
+and `gr:citesDecision` for each claim's current decision, each IRI once per finding.
 
-The prompt does not change. The model sees the facts as C22 §3.2 renders them and
-cites them by number, so the prompt version `community-1`, the estimate and the
-reservations stay as they are. The server attaches the claims to the findings after the
-checks of C22 §3.4. A finding that cites a fact gains `gr:citesClaim` for each claim of
-that fact and `gr:citesDecision` for each claim's current decision. The report gains
-`gr:reviewPolicy` with the policy's IRI and `gr:policyVersion` with the version it was
-read under. Its generating activity gains `prov:used` for every claim and every decision
-behind any fact of its input, cited or not, since the activity consumed the whole input.
-A report of a higher level records the claims of its own edges and folded facts, and
-reaches its children's through `gr:citesReport`. A failed report records none.
-
-A community's claims are read within one evidence read with the resolver's shared
-preparation allowance. More than 10,000 visible occurrences behind one community's input
-refuse the run as `incomplete-evidence` before the estimate, naming the community, so a
-report never records a partial list of its inputs.
+The report gains `gr:reviewPolicy` with the policy's IRI, `gr:policyVersion` with the
+version it was read under, and `gr:evidenceConfiguration`, a literal that joins the
+configuration history's lineage UUID and the SHA-256 of the selected configuration
+generation with a slash. The source commit alone cannot name that configuration, since
+Head and an explicit commit can select different configurations at one sequence. Its
+generating activity gains `prov:used` for every claim and every decision behind any
+triple of its input, cited or not, and for every child report a parent's input read,
+since the activity consumed the whole input. Each IRI appears once. These are activity
+records of the reports graph and not assessments, so the 64-input bound of an
+assessment does not apply to them, and their bounds are those below. A report of a
+higher level reaches its children's claims through those child reports. A failed report
+records no claim. A person's edit of a report keeps its citations, policy and
+configuration and has no activity, as C22 §4 says of edits.
 
 The rejected alternative sends each fact's claims to the model and lets it cite them.
 The claims of a fact are a function of the fact under the policy, so the server
@@ -2052,6 +2063,19 @@ the inputs of its community to readers that its footprint does not cover, which 
 forbids. The `prov:used` triples inside the guarded reports graph let a reader for whom
 the graph is proven follow the inputs with SPARQL.
 
+#### Bounds
+
+A community's claims are read within one evidence read with the resolver's shared
+preparation allowance. More than 10,000 visible occurrences behind one community's input
+refuse the run as `incomplete-evidence` before the estimate, naming the community. A run
+keeps the occurrences it reads in one table whose entries the inputs name by position,
+and counts them as it reads them. More than 1,000,000 distinct occurrences in a run, or
+more than 1,000,000 links between the triples of its inputs and their occurrences,
+refuse the run in the same way. A report never records a partial list of its inputs,
+and nothing is truncated. A report therefore names at most 10,000 claims with their
+decisions in `prov:used`, and a finding cites at most the occurrences of the facts it
+cites.
+
 #### Access
 
 A report's footprint of C22 §6.2 also lists the policy's decisions and supports graphs
@@ -2060,28 +2084,46 @@ projection read. The stored citations name claims and decisions from those graph
 their visibility was decided there, so a reader is admitted only when it may read every
 one of them under the same protections as the principal. A report therefore never shows
 a reader a claim or decision that its own view hides, and the coverage rules of C22 §6.3
-and the guard apply unchanged.
+and the guard apply unchanged. The source-record graphs stay out of the footprint,
+because no field of a stored report is read from them.
 
 #### Refresh
 
-The fact digest of C22's refresh covers, for a fact with claims, the policy's IRI and
-version and the sorted pairs of claim and current decision as well as the fact. A
+The fact digest of C22's refresh covers, for a triple with claims, the policy's IRI and
+version and the sorted pairs of claim and current decision as well as the triple. A
 changed support, a new acceptance of a projected triple or a new policy version
 therefore counts as a changed fact toward `minChangedFraction`, as a changed triple
-does. A report is also rewritten, whatever the fraction, when it does not record the
-run's policy and version, or records a policy that the run does not have, and when a
-claim it cites is no longer accepted under the policy at the run's view or no longer
-has the decision the report cites as its current one. A withdrawal, a reversal or a
-superseding decision of anything a report cites therefore rewrites that report, while a
-new acceptance follows the fraction. An edited report keeps the citations of the report
-it revises, so the same check applies to it.
+does.
+
+The GraphRAG state records, for each report written under a policy, the pairs of claim
+and decision its input used, and a parent's pairs include those of every child report
+its input read, so they cover a replaced child revision that the parent still reflects.
+The state's format becomes version 3. This build reads version 2 states, whose reports
+record no policy, and a release that reads only version 2 refuses version 3 as a newer
+file. A report is rewritten, whatever the fraction, when it does not record the run's
+policy and version, or records a policy that the run does not have, and when one of its
+recorded pairs has ended. A pair has ended when its claim is not accepted under the
+policy at the run's view and the principal's access, or its decision is no longer the
+claim's current one. A claim whose current decision or withdrawal the principal can no
+longer see counts as ended, since its state can no longer be shown. A parent is
+rewritten whenever a child is rewritten for one of these reasons, whatever the share of
+its children that changed. A withdrawal, a reversal or a superseding decision of
+anything a report read therefore rewrites that report and its ancestors, while a new
+acceptance follows the fraction. An edited report keeps the pairs of the report it
+revises, so the same check applies to it.
 
 The automatic refresh of C22 §5 counts the changes of the output graph as it counts those
-of the projection's graphs. A commit that adds a decision under the policy to its
-decisions graph, a support to its supports graph or a withdrawal to a proposal graph
-also makes the dataset due, because such a change can end a support without changing
-the output graph. The refresh then applies the rules above, so a decision that ends
-nothing a report cites rewrites nothing.
+of the projection's graphs. It also makes the dataset due, without any new commit, when
+the settings' policy, the policy's version or the selected configuration generation
+differs from the one the last build recorded, so enabling, switching or removing
+`reviewPolicy` and a settings-only change take effect on an idle dataset. A commit that
+adds a decision to the policy's decisions graph, a support to its supports graph or a
+withdrawal to a proposal graph makes the dataset due as well, because such a change can
+end a support without changing the output graph. That check reads the change feed
+without the principal's view, so a record hidden from the principal still starts a
+refresh, and it reports only that the policy's evidence changed, naming no record or
+graph. The refresh then applies the rules above, so a decision that ends nothing a
+report read rewrites nothing.
 
 A rewrite spends tokens within `tokensPerDay` like any other. When the budget stops a
 run, a report waiting for its rewrite keeps its earlier citations, which name what it
@@ -2090,13 +2132,13 @@ a report `stale` while it waits.
 
 #### Reading reports
 
-`GET /$/graphrag/{ds}/community` reports `reviewPolicy`, with the policy's `iri` and
-`version`, on a report that records one, and gives each finding `claims` and
-`decisions`, the IRIs it cites. The findings of `community_reports` and of a global
-answer's `reports` gain the same two lists. A report without a policy has neither
-member, so existing responses are unchanged. Every path reads the report through the
+`GET /$/graphrag/{ds}/community` reports `reviewPolicy`, with the policy's `iri`,
+`version` and `configuration`, on a report that records one, and gives each finding
+`claims` and `decisions`, the IRIs it cites. The reports of `community_reports` and of a
+global answer's `reports` gain the same members. A report without a policy has none of
+them, so existing responses are unchanged. Every path reads the report through the
 guard of C22 §6, so the lists reach only readers for whom the reports graph is proven.
-`sparkles graphrag reports` prints the policy and the counts of cited claims.
+`sparkles graphrag reports` lists titles and statuses and does not change.
 
 A global answer still refuses `reviewPolicy`, because recall's argument names the policy
 whose claims an answer reads, not the policy its reports were built under. Roadmap item
@@ -2111,14 +2153,19 @@ Build tests with stub providers cover a run without a policy whose reports and
 responses match today's, a policy on an unactivated store, an unknown policy, a matching
 policy named as a review policy and a principal without the policy's grants, each refused
 before any model call. They cover a projection that names a proposal graph and another
-policy's output, which are not read, an accepted fact whose finding cites its claim and
-decision, `prov:used` on the activity for a fact the findings do not cite, a fact with
-two supports, a hidden support and a fact of an ordinary graph. They also cover a
-footprint that lists the evidence graphs, a reader without a proposal graph who is not
-admitted, a change of evidence settings during a run, a withdrawal and a reversal that
-rewrite a cited report below the fraction, a new acceptance that follows the fraction, a
-policy version change, and an automatic refresh started by a decision. Router tests
-read the new members through `/community`, `community_reports` and a global answer.
+policy's output, which are not read, an ordinary graph that asserts the proposition of a
+rejected claim, an accepted fact whose finding cites its claim and decision, `prov:used`
+for a fact the findings do not cite and for a label read from the output graph, a fact
+with two supports, and a projected fact with a hidden support that is left out. They
+also cover a footprint that lists the evidence graphs, a reader without a proposal graph
+who is not admitted, a change of evidence settings during a run, the configuration
+recorded after a settings-only change at one sequence, the run bounds, a withdrawal and
+a reversal that rewrite a cited report below the fraction, a withdrawal behind one of
+twenty children that rewrites their parent, a hidden superseding decision beside a
+surviving second support, a new acceptance that follows the fraction, a policy version
+change without a data write, and an automatic refresh started by a decision. Router
+tests read the new members through `/community`, `community_reports` and a global
+answer.
 
 ### Scope changes
 
