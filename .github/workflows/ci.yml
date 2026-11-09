@@ -77,6 +77,9 @@ env:
   # The target is a plain directory in the checkout, which rust-cache saves and restores,
   # rather than a view into mbx's store.
   MBX_TARGET_VIEWS: "0"
+  # mbx would replace each build script with a launcher whose binary lives in the target's
+  # profile directory, which rust-cache's cleanup removes, so build scripts run directly.
+  MBX_BUILD_SCRIPT_EXECUTION: "0"
   # The saved mbx stores stay small enough for GitHub's 10 GB repository cache.
   MBX_GC_MAX_SIZE: 3GiB
   CARGO_TERM_COLOR: always
@@ -244,14 +247,10 @@ jobs:
         with: { cache: false, rustflags: "" }
       - uses: Swatinem/rust-cache@v2.9.3
         with:
+          cache-bin: false
+          env-vars: &rust-cache-env CARGO CC CFLAGS CXX CMAKE RUST MBX
           shared-key: clippy-${{ matrix.platform }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          # the binding crates are workspaces of their own that share the root target
-          workspaces: |
-            . -> target
-            crates/sparkles-py -> ../../target
-            crates/sparkles-ffi -> ../../target
-            crates/sparkles-node -> ../../target
       # The server's build script writes ui/build/index.html when it is missing, and the
       # write is newer than the build, so every later Cargo command in the job would build
       # the server and relink its tests again. The same placeholder, written first, avoids
@@ -270,10 +269,10 @@ jobs:
         id: mbx-store
         with:
           path: &mbx-store |
-            ~/.cache/mbx
-            !~/.cache/mbx/targets
-          key: mbx-store-clippy-${{ matrix.platform }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
-          restore-keys: mbx-store-clippy-${{ matrix.platform }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+            ${{ runner.os == 'macOS' && '~/Library/Caches/mbx' || '~/.cache/mbx' }}
+            !${{ runner.os == 'macOS' && '~/Library/Caches/mbx' || '~/.cache/mbx' }}/targets
+          key: mbx-store-clippy-${{ matrix.platform }}-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-clippy-${{ matrix.platform }}-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
       # local mode: no remote cache, and no link cache, which would add every test binary
       # to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
@@ -310,6 +309,11 @@ jobs:
               echo "::endgroup::"
             done
           done
+      - name: Collect the mbx store to its size limit
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          mbx gc
+          du -sh "$(mbx cache dir)"
       - if: ${{ github.ref == 'refs/heads/main' }}
         uses: actions/cache/save@v4
         with:
@@ -364,6 +368,8 @@ jobs:
           fi
       - uses: Swatinem/rust-cache@v2.9.3
         with:
+          cache-bin: false
+          env-vars: *rust-cache-env
           shared-key: tests
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: UI placeholder
@@ -372,8 +378,8 @@ jobs:
         id: mbx-store
         with:
           path: *mbx-store
-          key: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
-          restore-keys: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+          key: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
       # local mode: no remote cache, and no link cache, which would add every test binary
       # to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
@@ -413,6 +419,11 @@ jobs:
           echo "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/archive/build-workspace"
           cp "$RUNNER_TEMP/archive/build-workspace" "$RUNNER_TEMP/heavy/"
           ls -l "$RUNNER_TEMP"/archive/* "$RUNNER_TEMP"/heavy/* "$RUNNER_TEMP"/server/*
+      - name: Collect the mbx store to its size limit
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          mbx gc
+          du -sh "$(mbx cache dir)"
       - if: ${{ github.ref == 'refs/heads/main' }}
         uses: actions/cache/save@v4
         with:
@@ -468,14 +479,16 @@ jobs:
         run: *add-swap
       - uses: Swatinem/rust-cache@v2.9.3
         with:
+          cache-bin: false
+          env-vars: *rust-cache-env
           shared-key: tests
           save-if: false
       - uses: actions/cache/restore@v4
         id: mbx-store
         with:
           path: *mbx-store
-          key: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
-          restore-keys: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+          key: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
       # local mode: no remote cache, and no link cache, which would add every test binary
       # to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
@@ -614,6 +627,8 @@ jobs:
           sudo swapon /swapfile-ci
       - uses: Swatinem/rust-cache@v2.9.3
         with:
+          cache-bin: false
+          env-vars: *rust-cache-env
           shared-key: tests
           save-if: false
       - name: UI placeholder
@@ -622,8 +637,8 @@ jobs:
         id: mbx-store
         with:
           path: *mbx-store
-          key: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
-          restore-keys: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+          key: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
       # local mode: no remote cache, and no link cache, which would add every test binary
       # to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
@@ -707,8 +722,10 @@ jobs:
           sudo swapon /swapfile-ci
       - uses: Swatinem/rust-cache@v2.9.3
         with:
+          cache-bin: false
+          env-vars: *rust-cache-env
           shared-key: tests-${{ matrix.platform }}
-          save-if: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: UI placeholder
         run: *ui-placeholder
       # local mode: no remote cache, and no link cache, which would add every test binary

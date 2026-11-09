@@ -1189,24 +1189,27 @@ caches carry the build between runs, and each covers what the other cannot.
 workspace crates' own outputs. Cargo's fingerprints then find every dependency fresh, but
 a fresh checkout makes every workspace source newer than its fingerprint, so Cargo
 compiles every workspace crate again. The rust-cache key holds the job kind, the compiler
-version, the Cargo lock files and manifests and the Cargo and Rust environment variables.
-Clippy keeps one cache for each platform, which also covers the three binding workspaces
-in the shared target. Build tests keeps another, which the doctests and the manual
-feature jobs restore without saving. The manual arm64 and macOS test jobs restore a key
-for their own platform and never save. A run saves only on `main` and only when no entry
-has its exact key, so a new entry appears when the lock files, the manifests or the
-toolchain change.
+version, the root workspace's lock file and manifests and the Cargo, Rust and Boxington
+environment variables. The cleanup before a save keeps the root workspace's dependencies,
+so the binding crates' own dependencies come from the object store below instead. Clippy
+keeps one cache for each platform. Build tests keeps another, which the doctests and the
+manual feature jobs restore without saving. The manual arm64 and macOS test jobs keep a
+cache for their own platform. A run saves only on `main` and only when no entry has its
+exact key, so a new entry appears when the lock file, the manifests or the toolchain
+change. `MBX_BUILD_SCRIPT_EXECUTION` is 0, because Boxington's build-script launchers
+name a binary in the target's profile directory that the cleanup removes.
 
 `actions/cache` saves Boxington's object store, which finds a compiled crate by the hash
 of its inputs, so a workspace crate whose sources and dependencies did not change is
 restored instead of compiled. Clippy and Build tests each save their store under the
-commit on `main`, and every run restores the latest store saved for its job kind and
-toolchain. The doctests and the feature jobs restore the test build's store.
-`MBX_GC_MAX_SIZE` keeps each store under 3 GiB, and the link cache is off, since it would
-add every test binary to the store.
+commit on `main`, and every run restores the latest store saved for its job kind, its
+platform, the Boxington version and the toolchain. The doctests and the feature jobs
+restore the test build's store. Before a save, `mbx gc` trims the store to the 3 GiB of
+`MBX_GC_MAX_SIZE`. The link cache is off, since it would add every test binary to the
+store.
 
-Pull requests, fork pull requests and manual runs restore both caches from `main` and
-save neither. The test build's target entry is about 0.8 GB and Clippy's about 0.5 GB,
+Pull requests, fork pull requests and runs on other branches restore both caches from
+`main` and save neither. The test build's target entry is about 0.8 GB and Clippy's about 0.5 GB,
 and each commit's two stores add about 0.3 and 0.2 GB. GitHub's 10 GB repository cache
 drops the least recently used entries first, so it keeps the stores of about the last
 fifteen main commits next to the other workflows' caches.
