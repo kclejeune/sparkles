@@ -427,6 +427,23 @@ class BuildHost(unittest.TestCase):
         self.assertEqual(self.builds(), [])
         self.assertEqual(self.scratch("h1"), [])
 
+    def test_a_boat_screen_reuses_only_binaries_built_on_its_worker(self):
+        """A Boat worker may have an older glibc than the host that built a cached binary."""
+        record = self.root / "build.txt"
+        program = '. "$1/scripts/nsc-build-host.sh"; BH_ARG=$2; bh_entry_host_ok "$3"'
+        def ok(arg):
+            return subprocess.run(["bash", "-c", program, "bash", str(self.repo), arg, str(record)],
+                                  env=self.env, capture_output=True, text=True).returncode == 0
+        for host, boat_ok in (("local (stanley)", False), ("h1", False), ("boat:bx_other", False),
+                              ("boat:bx_worker", True)):
+            record.write_text(f"built: now\ncargo args: \nbuild host: {host}\ncc: cc test\n")
+            self.assertEqual(ok("boat:bx_worker"), boat_ok, host)
+            self.assertTrue(ok(""), host)
+            self.assertTrue(ok("h2"), host)
+        record.unlink()
+        self.assertFalse(ok("boat:bx_worker"))
+        self.assertIn("bh_entry_host_ok", (self.repo / "scripts/nsc-bench.sh").read_text())
+
     def test_an_interrupt_stops_the_scope_and_removes_the_scratch(self):
         out = self.root / "out-interrupted"
         process = subprocess.Popen(

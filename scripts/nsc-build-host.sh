@@ -54,6 +54,17 @@ bh_ui_placeholder() {
   echo "$BH_UI_PLACEHOLDER" > "$1/ui/build/index.html"
 }
 
+# bh_entry_host_ok BUILD_RECORD: whether a cached binary whose build record is BUILD_RECORD
+# suits this run's --build-host. A Boat worker runs the binaries it builds, and its glibc can
+# be older than that of the host that built an entry, so a Boat build host accepts only an
+# entry built on that worker. Every other choice accepts an entry from any host.
+bh_entry_host_ok() {
+  case $BH_ARG in
+    boat:*) grep -qxF "build host: $BH_ARG" "$1" 2> /dev/null ;;
+    *) return 0 ;;
+  esac
+}
+
 # bh_check_arg: refuse a malformed --build-host before any work
 bh_check_arg() {
   case $BH_ARG in
