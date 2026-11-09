@@ -568,6 +568,18 @@ pub fn validate_node(
     engine::validate_node(snap, schema, node, shape, opts)
 }
 
+// Explicit application input construction for semantic test fixtures only. These
+// owners are real and must never replace the engine's original receiving parent.
+#[cfg(test)]
+pub(crate) fn owned_test_term(term: Term) -> sparkles_core::sparql::output::OwnedTerm {
+    let store = sparkles_core::store::Store::in_memory(Default::default());
+    shapemap::output_root(&store.snapshot(), &Default::default(), None)
+        .unwrap()
+        .budget()
+        .copy_term(term.as_ref())
+        .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,16 +641,4 @@ mod tests {
             "nonconformant"
         );
     }
-}
-
-// Explicit application input construction for semantic test fixtures only. These
-// owners are real and must never replace the engine's original receiving parent.
-#[cfg(test)]
-pub(crate) fn owned_test_term(term: Term) -> sparkles_core::sparql::output::OwnedTerm {
-    let store = sparkles_core::store::Store::in_memory(Default::default());
-    shapemap::output_root(&store.snapshot(), &Default::default(), None)
-        .unwrap()
-        .budget()
-        .copy_term(term.as_ref())
-        .unwrap()
 }
