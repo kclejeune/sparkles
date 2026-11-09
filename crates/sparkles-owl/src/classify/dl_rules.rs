@@ -36,7 +36,7 @@
 //! Every rule reads only its own context's state and sends conclusions to itself, to the
 //! successors it registered with or to the predecessors it holds, as the EL rules do.
 
-use super::dl_clause::{Clause, EQ, F, Lit, Made, NE, RL, RY, Store, Table, Term, X, Y};
+use super::dl_clause::{Clause, EQ, F, Lit, Lits, Made, NE, RL, RY, Store, Table, Term, X, Y};
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Sink, State, flatten, table_bytes};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -353,6 +353,8 @@ impl DlIx {
 #[derive(Default)]
 pub struct DlRun {
     pub table: Table,
+    /// the literals of a rooted run that the packed forms cannot hold
+    pub lits: Lits,
     /// whether the Succ rule takes the eager strategy instead of the cautious one
     pub eager: bool,
     stores: AtomicUsize,
@@ -375,7 +377,7 @@ impl DlRun {
         }
     }
     pub fn bytes(&self) -> usize {
-        self.table.bytes() + self.stores.load(Ordering::Relaxed)
+        self.table.bytes() + self.lits.bytes() + self.stores.load(Ordering::Relaxed)
     }
     fn grow(&self, bytes: usize) {
         self.stores.fetch_add(bytes, Ordering::Relaxed);

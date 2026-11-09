@@ -42,6 +42,9 @@ pub const RL: u64 = 4;
 pub const EQ: u64 = 5;
 /// `f(x) ≉ t`, with t a smaller successor term or y
 pub const NE: u64 = 6;
+/// A literal of a rooted run that the six forms above cannot hold, by its id in the run's
+/// [`Lits`]: one that mentions a constant, a loop `s(x, x)`, or an equality of x and y.
+pub const XL: u64 = 7;
 
 /// A term an equality relates to a successor term: the predecessor y or a successor
 /// term `g(x)`, coded as 0 for y and `g + 1`, so that the code orders the terms.
@@ -165,6 +168,194 @@ impl Lit {
         };
         (self.fun(), k, self.atom())
     }
+    /// The literal of a rooted run with id `id` in the run's [`Lits`].
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the rooted rules of item 603 phase 6 read it")
+    )]
+    #[inline]
+    fn xl(id: u32) -> Lit {
+        Lit((XL << KIND_SHIFT) | id as u64)
+    }
+    /// The id in the run's [`Lits`] of a literal of kind [`XL`].
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the rooted rules of item 603 phase 6 read it")
+    )]
+    #[inline]
+    pub fn xid(self) -> u32 {
+        debug_assert_eq!(self.kind(), XL);
+        self.0 as u32
+    }
+}
+
+/// A term of a rooted run: the context's variable x, the predecessor y, a successor term
+/// `f_e(x)`, a constant, or a successor term `f_e(u)` of a constant in the root context.
+/// Constants are numbered by the index's individuals and then those the run makes for its
+/// own encoding. The derived order is only the canonical order of a literal's terms.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the rooted rules of item 603 phase 6 read it")
+)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum RTerm {
+    X,
+    Y,
+    Fx(Ex),
+    C(u32),
+    Fc(Ex, u32),
+}
+
+/// A literal of a rooted run in its general form: an atom `B(t)`, a role atom `S(s, t)`, an
+/// equality or an inequality. Two terms of an equality or a role atom are kept in a
+/// canonical order, a role atom's by its inverse, so that one literal has one form.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the rooted rules of item 603 phase 6 read it")
+)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum XLit {
+    Atom(Ex, RTerm),
+    Role(Role, RTerm, RTerm),
+    Eq(RTerm, RTerm),
+    Ne(RTerm, RTerm),
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the rooted rules of item 603 phase 6 read it")
+)]
+impl XLit {
+    /// The canonical form: an equality's terms and a role atom's in order, the role atom
+    /// read by the inverse role when it swaps them, which `inv` gives.
+    pub fn canon(self, inv: impl Fn(Role) -> Option<Role>) -> XLit {
+        match self {
+            XLit::Role(s, a, b) if a > b => match inv(s) {
+                Some(i) => XLit::Role(i, b, a),
+                None => self,
+            },
+            XLit::Eq(a, b) if a > b => XLit::Eq(b, a),
+            XLit::Ne(a, b) if a > b => XLit::Ne(b, a),
+            _ => self,
+        }
+    }
+}
+
+/// The literals of a rooted run that the packed forms cannot hold, interned: a literal of
+/// kind [`XL`] holds its id here. Entries never move, so a worker reads one without a lock,
+/// and only a new literal takes the lock of the map.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the rooted rules of item 603 phase 6 read it")
+)]
+#[derive(Default)]
+pub struct Lits {
+    ids: parking_lot::Mutex<FxHashMap<XLit, u32>>,
+    recs: Segs<XLit>,
+    next: AtomicU32,
+    bytes: AtomicUsize,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the rooted rules of item 603 phase 6 read it")
+)]
+impl Lits {
+    /// The literal of `l`, packed when one of the six packed forms holds it and interned
+    /// otherwise, or true or false for an equality or inequality of a term with itself.
+    /// `inv` gives a role's inverse.
+    pub fn lit(&self, l: XLit, inv: impl Fn(Role) -> Option<Role> + Copy) -> Made {
+        use RTerm::*;
+        let packed = match l {
+            XLit::Atom(a, X) => Some(Lit::x(a)),
+            XLit::Atom(a, Y) => Some(Lit::y(a)),
+            XLit::Atom(a, Fx(e)) => Some(Lit::f(e, a)),
+            XLit::Role(s, Y, X) => Some(Lit::ry(s)),
+            XLit::Role(s, X, Y) => inv(s).map(Lit::ry),
+            XLit::Role(s, X, Fx(f)) => Some(Lit::rl(f, s)),
+            XLit::Role(s, Fx(f), X) => inv(s).map(|i| Lit::rl(f, i)),
+            XLit::Eq(a, b) | XLit::Ne(a, b) if a == b => {
+                return if matches!(l, XLit::Eq(..)) {
+                    Made::True
+                } else {
+                    Made::False
+                };
+            }
+            XLit::Eq(a, b) => packed_pair(EQ, a, b),
+            XLit::Ne(a, b) => packed_pair(NE, a, b),
+            _ => None,
+        };
+        if let Some(p) = packed {
+            return Made::Lit(p);
+        }
+        let l = l.canon(inv);
+        let mut ids = self.ids.lock();
+        let cap = ids.capacity();
+        let id = *ids.entry(l).or_insert_with(|| {
+            let id = self.next.fetch_add(1, Ordering::Relaxed);
+            let _ = self.recs.slot(id, &self.bytes).set(l);
+            id
+        });
+        let grown = table_bytes(ids.capacity(), 24).saturating_sub(table_bytes(cap, 24));
+        self.bytes.fetch_add(grown, Ordering::Relaxed);
+        Made::Lit(Lit::xl(id))
+    }
+
+    /// The general form of any literal, canonical as [`XLit::canon`] makes it.
+    pub fn view(&self, l: Lit, inv: impl Fn(Role) -> Option<Role>) -> XLit {
+        use RTerm::Fx;
+        let fun = |t: Term| match t {
+            Term::Y => RTerm::Y,
+            Term::Fun(g) => Fx(g),
+        };
+        match l.kind() {
+            Y => XLit::Atom(l.atom(), RTerm::Y),
+            RY => XLit::Role(l.atom(), RTerm::Y, RTerm::X).canon(inv),
+            X => XLit::Atom(l.atom(), RTerm::X),
+            F => XLit::Atom(l.atom(), Fx(l.fun())),
+            RL => XLit::Role(l.atom(), RTerm::X, Fx(l.fun())).canon(inv),
+            EQ => XLit::Eq(Fx(l.fun()), fun(l.term())).canon(inv),
+            NE => XLit::Ne(Fx(l.fun()), fun(l.term())).canon(inv),
+            _ => *self
+                .recs
+                .slot(l.xid(), &self.bytes)
+                .get()
+                .expect("a literal the run interned"),
+        }
+    }
+
+    /// The literals interned.
+    pub fn len(&self) -> usize {
+        self.next.load(Ordering::Relaxed) as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The bytes of the map and of the segments.
+    pub fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// The packed form of an equality or inequality of two terms when both are y or successor
+/// terms over x and they differ.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the rooted rules of item 603 phase 6 read it")
+)]
+fn packed_pair(kind: u64, a: RTerm, b: RTerm) -> Option<Lit> {
+    let t = |r: RTerm| match r {
+        RTerm::Y => Some(Term::Y),
+        RTerm::Fx(g) => Some(Term::Fun(g)),
+        _ => None,
+    };
+    let (a, b) = (t(a)?, t(b)?);
+    match Lit::pair(kind, a, b) {
+        Made::Lit(l) => Some(l),
+        _ => None,
+    }
 }
 
 /// The key of the total order on the atoms over x: the fresh classes of the normalization
@@ -231,7 +422,7 @@ impl Clause {
         let head = self.head();
         if let Some(&m) = head
             .iter()
-            .filter(|l| l.kind() >= F)
+            .filter(|l| matches!(l.kind(), F | RL | EQ | NE))
             .max_by_key(|l| l.succ_key())
         {
             out.push(m);
@@ -265,43 +456,56 @@ fn subset(a: &[Lit], b: &[Lit]) -> bool {
     true
 }
 
-/// One segment of a [`Table`], made on first use.
-type Segment = OnceLock<Box<[OnceLock<Clause>]>>;
+/// One segment of a [`Segs`], made on first use.
+type Segment<T> = OnceLock<Box<[OnceLock<T>]>>;
 
-/// The clauses that contexts send one another, by id: an append-only table whose entries
-/// never move, so that a worker reads one without a lock.
-pub struct Table {
-    next: AtomicU32,
-    segs: Box<[Segment]>,
-    bytes: AtomicUsize,
+/// An append-only list whose entries never move, in segments that double, so that a worker
+/// reads an entry without a lock.
+struct Segs<T> {
+    segs: Box<[Segment<T>]>,
 }
 
-/// The entries of the first segment of [`Table`]; each further one doubles.
+/// The entries of the first segment of [`Segs`]; each further one doubles.
 const SEG0: usize = 1024;
 
-impl Default for Table {
-    fn default() -> Table {
-        Table {
-            next: AtomicU32::new(0),
+impl<T> Default for Segs<T> {
+    fn default() -> Segs<T> {
+        Segs {
             segs: (0..32).map(|_| OnceLock::new()).collect(),
-            bytes: AtomicUsize::new(0),
         }
     }
 }
 
-impl Table {
-    fn slot(&self, id: u32) -> &OnceLock<Clause> {
+impl<T> Segs<T> {
+    /// The slot of entry `id`, whose segment is made on first use and its bytes added to
+    /// `bytes`.
+    fn slot(&self, id: u32, bytes: &AtomicUsize) -> &OnceLock<T> {
         let off = id as usize;
         let k = (off / SEG0 + 1).ilog2() as usize;
         let at = off - SEG0 * ((1 << k) - 1);
         let seg = self.segs[k].get_or_init(|| {
-            self.bytes.fetch_add(
-                (SEG0 << k) * std::mem::size_of::<OnceLock<Clause>>(),
+            bytes.fetch_add(
+                (SEG0 << k) * std::mem::size_of::<OnceLock<T>>(),
                 Ordering::Relaxed,
             );
             (0..SEG0 << k).map(|_| OnceLock::new()).collect()
         });
         &seg[at]
+    }
+}
+
+/// The clauses that contexts send one another, by id: an append-only table whose entries
+/// never move, so that a worker reads one without a lock.
+#[derive(Default)]
+pub struct Table {
+    next: AtomicU32,
+    segs: Segs<Clause>,
+    bytes: AtomicUsize,
+}
+
+impl Table {
+    fn slot(&self, id: u32) -> &OnceLock<Clause> {
+        self.segs.slot(id, &self.bytes)
     }
 
     pub fn push(&self, c: Clause) -> u32 {
@@ -493,6 +697,7 @@ impl Store {
             for &l in max.iter() {
                 match l.kind() {
                     X => self.by_x.entry(l.atom()).or_default().push(id),
+                    XL => unreachable!("a rooted literal in a store without the rooted order"),
                     RL => {
                         self.by_f.entry(l.fun()).or_default().push(id);
                         self.index_succ(l, id);
@@ -678,6 +883,129 @@ mod tests {
             );
         }
         assert_eq!(s.take_grown(), 0, "the bytes are handed over once");
+    }
+
+    /// A role's inverse for the tests: roles pair up as 2k and 2k + 1.
+    fn inv(r: Role) -> Option<Role> {
+        Some(r ^ 1)
+    }
+
+    #[test]
+    fn a_literal_the_packed_forms_hold_stays_packed() {
+        use RTerm::*;
+        let lits = Lits::default();
+        let cases = [
+            (XLit::Atom(4, X), Lit::x(4)),
+            (XLit::Atom(4, Y), Lit::y(4)),
+            (XLit::Atom(4, Fx(9)), Lit::f(9, 4)),
+            (XLit::Role(2, Y, X), Lit::ry(2)),
+            (XLit::Role(2, X, Y), Lit::ry(3)),
+            (XLit::Role(2, X, Fx(9)), Lit::rl(9, 2)),
+            (XLit::Role(2, Fx(9), X), Lit::rl(9, 3)),
+        ];
+        for (x, l) in cases {
+            assert_eq!(lits.lit(x, inv), Made::Lit(l), "{x:?}");
+            assert_eq!(lits.view(l, inv), x.canon(inv), "{x:?}");
+        }
+        for (a, b) in [(Fx(9), Y), (Y, Fx(9)), (Fx(3), Fx(9))] {
+            let Made::Lit(e) = lits.lit(XLit::Eq(a, b), inv) else {
+                panic!()
+            };
+            assert_eq!(e.kind(), EQ);
+            assert_eq!(lits.view(e, inv), XLit::Eq(a, b).canon(inv));
+            let Made::Lit(n) = lits.lit(XLit::Ne(a, b), inv) else {
+                panic!()
+            };
+            assert_eq!(n.kind(), NE);
+        }
+        assert!(lits.is_empty(), "nothing packed is interned");
+    }
+
+    #[test]
+    fn a_literal_with_a_constant_is_interned_once() {
+        use RTerm::*;
+        let lits = Lits::default();
+        let get = |x: XLit| match lits.lit(x, inv) {
+            Made::Lit(l) => l,
+            m => panic!("{x:?} gave {m:?}"),
+        };
+        let a = get(XLit::Atom(5, C(1)));
+        assert_eq!(a.kind(), XL);
+        assert_eq!(get(XLit::Atom(5, C(1))), a);
+        assert_ne!(get(XLit::Atom(5, C(2))), a);
+        assert_ne!(get(XLit::Atom(6, C(1))), a);
+        // an equality's terms and a role atom's direction have one form
+        assert_eq!(get(XLit::Eq(X, C(3))), get(XLit::Eq(C(3), X)));
+        assert_ne!(get(XLit::Eq(X, C(3))), get(XLit::Ne(X, C(3))));
+        assert_eq!(get(XLit::Role(4, X, C(3))), get(XLit::Role(5, C(3), X)));
+        assert_ne!(get(XLit::Role(4, X, C(3))), get(XLit::Role(4, C(3), X)));
+        // the loop and the equality of x and y have no packed form
+        assert_eq!(get(XLit::Role(4, X, X)).kind(), XL);
+        assert_eq!(get(XLit::Eq(X, Y)).kind(), XL);
+        assert_eq!(get(XLit::Atom(5, Fc(9, 2))).kind(), XL);
+        assert_eq!(lits.lit(XLit::Eq(C(3), C(3)), inv), Made::True);
+        assert_eq!(lits.lit(XLit::Ne(C(3), C(3)), inv), Made::False);
+        assert_eq!(
+            lits.view(get(XLit::Role(5, C(3), X)), inv),
+            XLit::Role(4, X, C(3))
+        );
+        assert_eq!(lits.view(a, inv), XLit::Atom(5, C(1)));
+        assert!(lits.bytes() > 0);
+    }
+
+    #[test]
+    fn interned_literals_sort_after_the_packed_ones_and_no_order_selects_them() {
+        let lits = Lits::default();
+        let Made::Lit(g) = lits.lit(XLit::Atom(1, RTerm::C(0)), inv) else {
+            panic!()
+        };
+        let Made::Lit(e) = lits.lit(XLit::Eq(RTerm::Fx(u32::MAX >> 3), RTerm::Y), inv) else {
+            panic!()
+        };
+        for l in [
+            Lit::y(9),
+            Lit::ry(9),
+            Lit::x(9),
+            Lit::f(9, 9),
+            Lit::rl(9, 9),
+            e,
+        ] {
+            assert!(g > l, "{l:?}");
+        }
+        // the order of the runs without constants never selects an interned literal
+        let c = Clause::new(vec![], vec![Lit::x(3), g]);
+        let mut max = Vec::new();
+        c.maximal(&Index::default(), &mut max);
+        assert!(max.iter().all(|l| l.kind() != XL), "{max:?}");
+    }
+
+    #[test]
+    fn workers_intern_one_literal_once() {
+        let lits = Lits::default();
+        let ids: Vec<Vec<Lit>> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..4)
+                .map(|_| {
+                    s.spawn(|| {
+                        (0..3000u32)
+                            .map(
+                                |i| match lits.lit(XLit::Atom(i % 1500, RTerm::C(i % 7)), inv) {
+                                    Made::Lit(l) => l,
+                                    _ => unreachable!(),
+                                },
+                            )
+                            .collect()
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(ids.windows(2).all(|w| w[0] == w[1]));
+        // i mod 1500 and i mod 7 repeat together only after 10,500
+        assert_eq!(lits.len(), 3000);
+        for (i, l) in ids[0].iter().enumerate() {
+            let i = i as u32;
+            assert_eq!(lits.view(*l, inv), XLit::Atom(i % 1500, RTerm::C(i % 7)));
+        }
     }
 
     #[test]
