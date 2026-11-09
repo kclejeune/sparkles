@@ -69,6 +69,13 @@ pub enum Concl {
     /// Tier D: the successor sent a clause over its predecessor, by its id in the run's
     /// table
     PredC(Ex, u32),
+    /// Tier D in a rooted run: the source context sends the root the marker of a root
+    /// successor trigger, by its id in the run's literals, and registers with the root for
+    /// each of its constants (r-Succ)
+    RHyp(Ex, u32),
+    /// Tier D in a rooted run: the root sent a clause, by its id in the run's table
+    /// (r-Pred)
+    RPred(u32),
 }
 
 // a conclusion takes three words, so that the to-do lists and outboxes keep their size
@@ -378,7 +385,9 @@ impl State {
             | Concl::PredIn(..)
             | Concl::Succ(..)
             | Concl::DEdge(..)
-            | Concl::PredC(..) => false,
+            | Concl::PredC(..)
+            | Concl::RHyp(..)
+            | Concl::RPred(..) => false,
         }
     }
 
@@ -1676,7 +1685,13 @@ fn apply_rules<S: Sink, R: Rules>(
         Concl::Hyp(a) if R::DISJ => dl_rules::hyp(st, a, out),
         Concl::DEdge(u, e) if R::DISJ => dl_rules::dedge(ix, me, st, u, e, out),
         Concl::PredC(v, c) if R::DISJ => dl_rules::pred_c(ix, st, v, c, out),
-        Concl::Hyp(_) | Concl::DEdge(..) | Concl::PredC(..) => {
+        Concl::RHyp(v, l) if R::DISJ => dl_root::rhyp(ix, st, v, l, out),
+        Concl::RPred(c) if R::DISJ => dl_root::rpred_c(ix, st, c, out),
+        Concl::Hyp(_)
+        | Concl::DEdge(..)
+        | Concl::PredC(..)
+        | Concl::RHyp(..)
+        | Concl::RPred(..) => {
             unreachable!("a conclusion of Tier D in a saturation without it")
         }
     }

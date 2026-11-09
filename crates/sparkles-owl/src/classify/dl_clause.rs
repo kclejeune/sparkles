@@ -170,7 +170,7 @@ impl Lit {
     }
     /// The literal of a rooted run with id `id` in the run's [`Lits`].
     #[inline]
-    fn xl(id: u32) -> Lit {
+    pub(super) fn xl(id: u32) -> Lit {
         Lit((XL << KIND_SHIFT) | id as u64)
     }
     /// The id in the run's [`Lits`] of a literal of kind [`XL`].
@@ -223,6 +223,12 @@ impl XLit {
             XLit::Ne(a, b) if a > b => XLit::Ne(b, a),
             _ => self,
         }
+    }
+
+    /// Whether the literal is ground: its terms are constants.
+    pub fn is_ground(self) -> bool {
+        let (ts, n) = terms_of(self);
+        ts[..n].iter().all(|t| matches!(t, RTerm::C(_)))
     }
 }
 
@@ -795,6 +801,9 @@ pub struct Store {
     pub by_xl: FxHashMap<Lit, Vec<u32>>,
     /// in a rooted run, the processed clauses by the terms of their maximal literals
     pub terms: Option<Box<ByTerm>>,
+    /// in a rooted run, the processed clauses by each ground literal of their bodies, which
+    /// the Join rule resolves
+    pub by_ground: FxHashMap<Lit, Vec<u32>>,
     /// every clause by each literal of its head, for the clauses a new one subsumes
     by_lit: FxHashMap<Lit, Vec<u32>>,
     /// every clause by the last literal of its head, which is the most specific, for
@@ -825,6 +834,12 @@ impl Store {
             + table_bytes(self.by_xl.capacity(), 32)
             + self.by_xl.values().map(|v| v.capacity() * 4).sum::<usize>()
             + self.terms.as_ref().map_or(0, |t| t.bytes())
+            + table_bytes(self.by_ground.capacity(), 32)
+            + self
+                .by_ground
+                .values()
+                .map(|v| v.capacity() * 4)
+                .sum::<usize>()
     }
 
     pub fn is_idle(&self) -> bool {
@@ -966,6 +981,21 @@ impl Store {
                     t.index(o.view(l), id);
                 }
                 self.grown += t.bytes().saturating_sub(before);
+                let body = self.clauses[id as usize].c.body();
+                let ground: Vec<Lit> = body
+                    .iter()
+                    .copied()
+                    .filter(|&l| l.kind() == XL && o.view(l).is_ground())
+                    .collect();
+                for l in ground {
+                    let table = table_bytes(self.by_ground.capacity(), 32);
+                    let v = self.by_ground.entry(l).or_default();
+                    let cap = v.capacity();
+                    v.push(id);
+                    let list = (v.capacity() - cap) * 4;
+                    self.grown +=
+                        table_bytes(self.by_ground.capacity(), 32).saturating_sub(table) + list;
+                }
             }
             if let Some(l) = self.max_of(id, |l| l.kind() == F)
                 && !ix.disjoint_of(ix.head(l.atom())).is_empty()

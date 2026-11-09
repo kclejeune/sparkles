@@ -434,7 +434,7 @@ impl DlRun {
         }
         over
     }
-    fn empty(&self) -> u32 {
+    pub(super) fn empty(&self) -> u32 {
         *self
             .empty
             .get_or_init(|| self.table.push(Clause::new(Vec::new(), Vec::new())))
@@ -794,7 +794,7 @@ const PRODUCT_POLL: usize = 256;
 /// the run, found there or made by another worker, leaves the rest of the inference undone
 /// and marks the context's store interrupted, a store made for the mark if the context has
 /// none, so that the dependency record of a partial answer counts the context as open.
-fn drain<S: Sink>(ix: &Index, st: &mut State, found: Found, out: &mut S) {
+pub(super) fn drain<S: Sink>(ix: &Index, st: &mut State, found: Found, out: &mut S) {
     drain_with(ix, st, found, out, derive);
 }
 
@@ -1638,6 +1638,7 @@ fn rooted_hyper(ix: &Index, d: Ex, prem: &Side, found: &mut Found, lits: &Lits) 
 
 /// The context became unsatisfiable: its registered predecessors learn it.
 pub fn bottom<S: Sink>(me: Ex, st: &mut State, out: &mut S) {
+    super::dl_root::bottom(st, out);
     let Some(x) = dl(st) else { return };
     if x.dpreds.is_empty() {
         return;
@@ -1703,8 +1704,7 @@ fn meets(ix: &Index, c: &Clause, r: Role) -> bool {
 
 /// Whether a literal of a rooted run is ground: its terms are constants.
 fn is_ground(v: super::dl_clause::XLit) -> bool {
-    let (ts, n) = super::dl_clause::terms_of(v);
-    ts[..n].iter().all(|t| matches!(t, RTerm::C(_)))
+    v.is_ground()
 }
 
 /// Whether a clause of a rooted run goes to the predecessors: its body holds atoms over x,
@@ -1735,7 +1735,7 @@ pub(super) fn pred_ready(ix: &Index, dx: &DlIx, lits: &Lits, c: &Clause) -> bool
 }
 
 /// The table id of a stored clause over the predecessor, `None` once it is dead.
-fn pred_id<S: Sink>(x: &mut DlSt, i: u32, out: &mut S) -> Option<u32> {
+pub(super) fn pred_id<S: Sink>(x: &mut DlSt, i: u32, out: &mut S) -> Option<u32> {
     let s = &mut x.store.clauses[i as usize];
     if s.dead {
         return None;
@@ -2051,6 +2051,10 @@ fn process<S: Sink>(
     let dx = dix(ix);
     // in a rooted run a clause can go to the predecessors and still have maximal literals
     let rooted = dx.root.is_some();
+    let mut found = Found::default();
+    if rooted {
+        super::dl_root::join_body(ix, st, c, &mut found, &out.dl().lits);
+    }
     if if rooted {
         pred_ready(ix, dx, &out.dl().lits, c)
     } else {
@@ -2059,6 +2063,7 @@ fn process<S: Sink>(
         // Pred: the clause goes to the predecessors whose role meets its role atoms
         let x = ds(st);
         let Some(cid) = pred_id(x, id, out) else {
+            drain(ix, st, found, out);
             return;
         };
         for &(u, e) in &x.dpreds {
@@ -2079,10 +2084,10 @@ fn process<S: Sink>(
             ds(st).store.preds.push(id);
         }
         if !rooted || max.is_empty() {
+            drain(ix, st, found, out);
             return;
         }
     }
-    let mut found = Found::default();
     let mut ps: Vec<(Role, Ex)> = Vec::new();
     let mut es: Vec<Ex> = Vec::new();
     for &l in max {
@@ -2205,6 +2210,7 @@ fn process<S: Sink>(
                     }
                 }
             }
+            XL if rooted => super::dl_root::on_max(ix, me, st, l, &prem, &mut found, out),
             _ => {}
         }
     }
