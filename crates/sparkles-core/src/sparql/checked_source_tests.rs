@@ -151,6 +151,64 @@ fn source_query_uses_original_pool_and_refuses_foreign_domain_without_leak() {
     assert_eq!(pool.granted(), 0);
 }
 
+/// A graph result over a prepared source keeps its query's admitted high point on the
+/// source's parent until the result drops (X14 stage 4), as an unnested graph result
+/// keeps it on its pool. Construction frees its duplicate set before the result returns,
+/// so a nested account that shrank on release would hand that excess back early.
+#[test]
+fn source_graph_results_keep_their_admitted_high_point_until_dropped() {
+    let store = Store::in_memory(StoreOptions::default());
+    let object = "x".repeat(100_000);
+    let mut body = String::new();
+    for i in 0..300 {
+        body.push_str(&format!("<urn:s{i}> <urn:p> \"{object}\" .\n"));
+    }
+    update::update(
+        &store,
+        &format!("INSERT DATA {{ {body} }}"),
+        &Default::default(),
+    )
+    .unwrap();
+    // DESCRIBE's decoded-output estimate charges about 960 MB here.
+    let preparation = Preparation::new(Control::none(), 2 << 30).unwrap();
+    let view = GraphAccess::all()
+        .masked_controlled(&store.snapshot(), &preparation)
+        .unwrap();
+    let source_bytes = preparation.inner_used();
+    for q in [
+        "CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }",
+        "CONSTRUCT { GRAPH <urn:g> { ?s <urn:q> ?o . ?s <urn:q> ?o } } WHERE { ?s <urn:p> ?o }",
+        "DESCRIBE ?s WHERE { ?s <urn:p> ?o }",
+    ] {
+        let result = query_source(view.read_source(), &store, q, &opts()).unwrap();
+        assert_eq!(result.len(), 300, "{q}");
+        let peak = result.mem_peak_bytes;
+        assert!(peak >= 30_000_000, "{q}");
+        assert!(
+            preparation.inner_used() - source_bytes >= peak,
+            "{q}: {} retained below the admitted high point {peak}",
+            preparation.inner_used() - source_bytes
+        );
+        let kept = result.clone();
+        drop(result);
+        assert!(preparation.inner_used() - source_bytes >= peak, "{q}");
+        drop(kept);
+        assert_eq!(preparation.inner_used(), source_bytes, "{q}");
+    }
+    // A SELECT result still keeps only what it retains.
+    let result = query_source(
+        view.read_source(),
+        &store,
+        "SELECT ?s WHERE { ?s <urn:p> ?o }",
+        &opts(),
+    )
+    .unwrap();
+    assert_eq!(result.len(), 300);
+    assert!(preparation.inner_used() - source_bytes < 30_000_000);
+    drop(result);
+    assert_eq!(preparation.inner_used(), source_bytes);
+}
+
 #[test]
 fn checked_query_cannot_replace_prepared_policy_and_applies_graph_restrictions() {
     let store = store();

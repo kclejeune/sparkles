@@ -584,7 +584,10 @@ impl QueryMemoryLedger {
                 .checked_sub(bytes)
                 .expect("owned exact child credit");
             bytes
-        } else if (cursor && account.owner.grant.is_some()) || account.lease.is_some() {
+        } else if cursor && (account.owner.grant.is_some() || account.lease.is_some()) {
+            // An eager account keeps its admitted high point until the result drops
+            // (X14 stage 4), whether a grant or a parent's lease backs it. Only a
+            // finished SELECT or ASK lowers it, through `shrink_eager`.
             account.shrink_live()
         } else {
             0

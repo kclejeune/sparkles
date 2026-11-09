@@ -191,34 +191,46 @@ fn nested_foreign_domain_refuses_before_changing_the_context() {
     assert_eq!(pool.granted(), 0);
 }
 
+/// A nested cursor release returns its excess to the parent at once, and a pool waker
+/// it runs may reenter both ledgers. A nested eager release keeps the admitted high point
+/// until the result drops (X14 stage 4), so it wakes nobody.
 #[test]
 fn nested_release_waker_can_reenter_both_ledgers() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let pool = super::super::pool::QueryPool::new(64 << 20);
-    let outer = child_ctx(&pool, 64 << 20);
-    let executor = outer.charge(1 << 20).unwrap();
-    let mut nested = child_ctx(&pool, 64 << 20);
-    nested
-        .set_memory_parent(outer.memory_parent().unwrap())
-        .unwrap();
-    let callback = nested.memory_parent().unwrap();
-    let allocated = nested.charge(48 << 20).unwrap();
-    let called = std::sync::Arc::new(AtomicUsize::new(0));
-    let seen = called.clone();
-    let waiter = pool.enter(
-        32 << 20,
-        Some(std::sync::Arc::new(move || {
-            drop(callback.clone().reserve(1).unwrap());
-            seen.fetch_add(1, Ordering::SeqCst);
-        })),
-    );
-    drop(allocated);
-    assert!(called.load(Ordering::SeqCst) > 0);
-    assert_eq!(nested.live_bytes(), 0);
-    assert_eq!(outer.live_bytes(), 1 << 20);
-    drop(waiter);
-    drop(nested);
-    drop(executor);
-    drop(outer);
-    assert_eq!(pool.granted(), 0);
+    for cursor in [false, true] {
+        let pool = super::super::pool::QueryPool::new(64 << 20);
+        let outer = child_ctx(&pool, 64 << 20);
+        let executor = outer.charge(1 << 20).unwrap();
+        let mut nested = child_ctx(&pool, 64 << 20);
+        nested
+            .set_memory_parent(outer.memory_parent().unwrap())
+            .unwrap();
+        if cursor {
+            nested.memory().cursor_mode().unwrap();
+        }
+        let callback = nested.memory_parent().unwrap();
+        let allocated = nested.charge(48 << 20).unwrap();
+        let called = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = called.clone();
+        let waiter = pool.enter(
+            32 << 20,
+            Some(std::sync::Arc::new(move || {
+                drop(callback.clone().reserve(1).unwrap());
+                seen.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+        drop(allocated);
+        assert_eq!(called.load(Ordering::SeqCst) > 0, cursor);
+        assert_eq!(nested.live_bytes(), 0);
+        if cursor {
+            assert_eq!(outer.live_bytes(), 1 << 20);
+        } else {
+            assert!(outer.live_bytes() >= (48 << 20) + (1 << 20));
+        }
+        drop(waiter);
+        drop(nested);
+        drop(executor);
+        drop(outer);
+        assert_eq!(pool.granted(), 0, "cursor {cursor}");
+    }
 }
