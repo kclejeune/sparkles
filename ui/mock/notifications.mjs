@@ -218,7 +218,8 @@ function check(cfg) {
       if (!channels[c])
         fail(['routes', key], `routes.${key}: no channel named ${JSON.stringify(c)}`);
   }
-  const d = cfg.delivery ?? {};
+  // an omitted member takes its default, as the server's typed check does
+  const d = { ...DEFAULTS.delivery, ...(cfg.delivery ?? {}) };
   if (!(d.attempts >= 1 && d.attempts <= 10))
     fail(['delivery', 'attempts'], 'delivery.attempts: a number from 1 to 10');
   if (d.maxBackoffSecs < d.backoffSecs)

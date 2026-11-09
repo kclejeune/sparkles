@@ -268,6 +268,12 @@ test('the mock refuses a reset that leaves a route to a missing channel', async 
   });
   expect(res.status()).toBe(400);
   expect((await (await request.get(URL)).json()).runtime.routes['*']).toEqual([]);
+  // a PUT that leaves out the delivery takes its defaults
+  kind = await (await request.get(URL)).json();
+  const body = { ...kind.effective };
+  delete body.delivery;
+  res = await request.put(URL, { headers: { 'If-Match': kind.etag }, data: body });
+  expect(res.ok()).toBe(true);
   // restating a locked value is no change
   kind = await (await request.get(URL)).json();
   res = await request.patch(URL, {
