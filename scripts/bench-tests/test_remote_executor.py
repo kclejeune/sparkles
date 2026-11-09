@@ -112,9 +112,28 @@ class Admission(unittest.TestCase):
     def test_exact_warm_identity_and_binary_safe_command(self):
         result=RX.command('boat:bx_fixture',"printf '%s' 'a;$(bad)' && cat")
         self.assertEqual(result[:4],[self.fixtures['release']['boat']['path'],'--no-update','ssh','bx_fixture'])
-        decoded=shlex.split(result[-1]);self.assertEqual(len(decoded),1)
-        self.assertIn("a;$(bad)",decoded[0]);self.assertNotIn('; . ',decoded[0])
+        # The provider passes each word after -- to the worker as one argument, quoting
+        # it there (observed on bx_gy2ytgh8: `-- echo 'a  b' '$HOME'` printed `a  b $HOME`).
+        # So bash -c receives the script itself, never a quoted copy of it.
+        # Bash run over ssh reads ~/.bashrc even with -c, and the worker's prepends
+        # /usr/local/cargo/bin to PATH (observed on bx_gy2ytgh8), so no shell reads it.
+        # An inherited BASH_ENV or ENV would still run startup code, so both are cleared.
+        words=result[result.index('--')+1:]
+        self.assertEqual(words[:9],['/usr/bin/env','-u','BASH_ENV','-u','ENV','/bin/bash','--norc','--noprofile','-c']);self.assertEqual(len(words),10)
+        script=words[9];self.assertFalse(script.startswith(("'",'"')),script[:20])
+        self.assertIn('exec env -u BASH_ENV -u ENV ',script);self.assertIn(' /bin/bash --norc --noprofile -c ',script)
+        import shutil as sh,subprocess,os,tempfile as tf
+        with tf.TemporaryDirectory() as t:
+            marker=Path(t)/'ran';startup=Path(t)/'startup';startup.write_text('touch '+shlex.quote(str(marker))+'\n')
+            local=[sh.which('env'),*words[1:5],sh.which('bash'),*words[6:9],'echo ok']
+            out=subprocess.run(local,env={'PATH':os.environ['PATH'],'BASH_ENV':str(startup),'ENV':str(startup)},capture_output=True,text=True,timeout=10)
+            self.assertEqual(out.stdout,'ok\n');self.assertFalse(marker.exists())
+        self.assertIn("a;$(bad)",script);self.assertNotIn('; . ',script)
+        import subprocess as sp
+        self.assertEqual(sp.run(['bash','-n','-c',script],capture_output=True,timeout=10).returncode,0)
         self.assertFalse(any(action in result for action in ('create','resume','stop','snapshot')))
+        # The session leaves the provider's landing directory before it runs anything.
+        self.assertTrue(script.startswith('set -e; cd '+shlex.quote(self.fixtures['profile']['worker_home'])+'; '),script[:80])
 
     def test_identity_expiry_unknown_schema_and_guard_replacement_refuse(self):
         for changed in (dict(worker='bx_other'),dict(version=2),dict(unexpected='NOT_A_SECRET')):

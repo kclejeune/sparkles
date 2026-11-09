@@ -127,12 +127,25 @@ was acknowledged and the worker was seen running. During the hold the controller
 `diagnostic-probe.py` on the worker and keeps its output in `diagnostics.json`. The
 program reads the process table, the package's state directory listing and every phase's
 `probe-result.json`, the host memory summary, free disk space and the package's user
-units, and whether each command that admission checks is on the worker's path. It reads no other file, so the token and the repository are never opened. It
+units, and whether each command that admission checks is on the worker's path. For each
+startup checkout it lists up to 200 untracked paths that git does not ignore, relative
+to the checkout, with each path's kind, size, mode and mtime from `lstat`. An untracked
+directory is one entry. A path with any component that looks like a credential is left
+out and only counted. A component looks like one when it contains a stem such as
+`token`, `secret`, `netrc`, `id_rsa`, `.pem`, `.env`, `.ssh` or `.aws` anywhere, which
+also catches backup and editor copies. Git's listing is read up to 4 MiB. It reads no
+other file, so the token and the content of the repository are never opened. It
 opens each directory by name under its parent and never through a symbolic link, accepts
 only private directories of the worker, and reads a result only when it is a private
 single-link regular file shaped as a phase result. Results, then process rows, then
-listings are dropped until the output fits the transport bound and the receipt fits its
-1 MiB bound. A failed read is kept in `diagnostics-failed-NNNN.json` and retried after 15
+listings, then untracked paths are dropped until the output fits the transport bound and
+the receipt fits its 1 MiB bound.
+
+Every provider session the controller and `job_environment.py` open runs its program
+through `/usr/bin/env -C` from the worker's home, which always exists and lies outside
+the startup checkout, and `remote-executor.py`
+job commands change to the worker's home before they run anything. No session starts in
+the provider's landing directory, which may be a startup checkout. A failed read is kept in `diagnostics-failed-NNNN.json` and retried after 15
 seconds. The hold ends 300 seconds before the controller unit's 2,700-second runtime limit
 and 600 seconds before the guard's deadline. Each read ends 15 seconds before the hold, so
 the transport's own teardown fits inside it too. Any error ends the hold, so the

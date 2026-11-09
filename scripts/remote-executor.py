@@ -93,8 +93,15 @@ def command(host, text):
                    'file':data['_envfile'], 'body':boat_environment.environment_body(profile).decode(), 'check':True}
         check = shlex.join(['/usr/bin/python3','-I','-B','-c',boat_environment.REMOTE,json.dumps(payload)])+' >/dev/null'
         values = [key+'='+value for key,value in boat_environment.environment(profile).items()]
-        wrapped = 'set -e; '+check+'; cd '+shlex.quote(profile['worker_home'])+'; exec '+shlex.join(['env',*values,'/bin/bash','-c',text])
-        return [data['_cli']['path'], '--no-update', 'ssh', worker, '--', '/bin/bash', '-c', shlex.quote(wrapped)]
+        # Leave the provider's landing directory first, so nothing runs in a checkout.
+        # Bash started over ssh reads ~/.bashrc even for -c, and a worker's may put
+        # another cargo first on PATH, so neither shell reads a startup file, and an
+        # inherited BASH_ENV or ENV is cleared before each starts.
+        quiet = ['-u', 'BASH_ENV', '-u', 'ENV']
+        wrapped = 'set -e; cd '+shlex.quote(profile['worker_home'])+'; '+check+'; exec '+shlex.join(['env',*quiet,*values,'/bin/bash','--norc','--noprofile','-c',text])
+        # The provider passes each word to the worker as one argument, so the script
+        # goes to bash -c as it is, not as a quoted copy.
+        return [data['_cli']['path'], '--no-update', 'ssh', worker, '--', '/usr/bin/env', *quiet, '/bin/bash', '--norc', '--noprofile', '-c', wrapped]
     return [*SSH, host, text]
 
 

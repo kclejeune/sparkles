@@ -169,7 +169,7 @@ def prepare(profile_path, operation, worker, output, check=False):
     # Program and payload bytes never depend on provider argv shell joining.
     program=('import sys\nsys.argv=["job-environment",'+repr(json.dumps(payload))+']\n'+REMOTE).encode()
     result = controller.bounded([release['boat']['path'], '--no-update', 'ssh', worker, '--',
-                                 '/usr/bin/python3', '-I', '-B', '-'], seconds, program,
+                                 *controller.remote_entry(profile['worker_home'])], seconds, program,
                                limit=lambda: lifetime_left(lifetime, time.time())-CLOSURE_RESERVE)
     require(result['exit']==0 and result['body']==expected, 'job environment result uncertain; reconcile with --check')
     # Recheck the original guard, source/profile and deadline after transport, and
