@@ -719,11 +719,16 @@ The address is the `email` of a configured user, the OIDC `email` claim with
 layer tells the watches each time a provider or proxy vouches for an OIDC or proxy
 identity, so a group taken away on any route reaches the follower's authorization and the
 next attempt at once, and the time of that vouching is checked against
-`watches.identityMaxAgeDays`. The tests in `crates/sparkles-server/src/watches/tests.rs`
+`watches.identityMaxAgeDays`. The latest word takes effect from memory even when it
+cannot be saved on the watches, and it stays in memory until a later vouching saves it.
+The follower keeps a watch whose branch it cannot find while a dataset is opening,
+failed to open, or is being deleted or renamed, including a deletion or rename that
+starts while it reads the catalog. The tests in `crates/sparkles-server/src/watches/tests.rs`
 send a batch through the test mail server to the owner alone while `*` routes to the same
 channel, and cover a removed watch, a user without an address, a proxy account whose
 address header is missing or malformed, an identity older than the bound, groups taken
-away by a request to another route, and the refused route keys. Cloudflare Access
+away by a request to another route, a revocation that cannot be saved, and the refused
+route keys. Cloudflare Access
 assertions give no address, and an OIDC provider that sends `email` only from UserInfo
 gives one only when the server reads UserInfo for the name or groups claim. Item 809
 covers both.

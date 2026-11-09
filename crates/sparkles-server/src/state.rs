@@ -350,7 +350,9 @@ struct Leaving<'a> {
 
 impl Drop for Leaving<'_> {
     fn drop(&mut self) {
-        self.st.leaving.lock().remove(&self.name);
+        let mut l = self.st.leaving.lock();
+        l.remove(&self.name);
+        self.st.lifecycle.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -372,6 +374,9 @@ pub struct AppState {
     /// Datasets being deleted or renamed. Lookups do not find them, so no request can
     /// take a handle that would make the delete or rename fail.
     leaving: Mutex<BTreeSet<String>>,
+    /// Counts the starts and ends of deletions and renames, so a reader of the catalog
+    /// can tell that one came while it read.
+    lifecycle: AtomicU64,
     /// Kept independently so completed workers release server ownership before
     /// publishing their terminal task status.
     pub tasks: Arc<Mutex<Vec<Task>>>,
@@ -758,6 +763,7 @@ impl AppState {
             admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
             leaving: Mutex::new(BTreeSet::new()),
+            lifecycle: AtomicU64::new(0),
             tasks: Arc::new(Mutex::new(Vec::new())),
             task_counter: AtomicU64::new(1),
             started: Instant::now(),
@@ -837,6 +843,7 @@ impl AppState {
             admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
             leaving: Mutex::new(BTreeSet::new()),
+            lifecycle: AtomicU64::new(0),
             tasks: Arc::new(Mutex::new(Vec::new())),
             task_counter: AtomicU64::new(1),
             started: Instant::now(),
@@ -1242,6 +1249,13 @@ impl AppState {
         !self.leaving.lock().is_empty()
     }
 
+    /// How many deletions and renames started or ended since the server started. A
+    /// reader that sees the same count before and after reading the catalog read it
+    /// with no deletion or rename moving a dataset meanwhile.
+    pub fn lifecycle(&self) -> u64 {
+        self.lifecycle.load(Ordering::SeqCst)
+    }
+
     /// Hold `name` as leaving, as a deletion that is draining does (tests).
     #[cfg(test)]
     pub(crate) fn leave_for_tests(&self, name: &str) -> impl Drop + '_ {
@@ -1251,12 +1265,15 @@ impl AppState {
     /// Mark `name` as leaving until the guard drops. A second delete or rename of the
     /// same dataset is refused meanwhile.
     fn leave(&self, name: &str) -> Result<Leaving<'_>> {
-        if !self.leaving.lock().insert(name.to_string()) {
+        let mut l = self.leaving.lock();
+        if !l.insert(name.to_string()) {
             return Err(sparkles::Error::Conflict(format!(
                 "dataset /{name} is already being deleted or renamed"
             ))
             .into());
         }
+        self.lifecycle.fetch_add(1, Ordering::SeqCst);
+        drop(l);
         Ok(Leaving {
             st: self,
             name: name.to_string(),

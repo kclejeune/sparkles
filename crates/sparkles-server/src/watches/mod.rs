@@ -47,8 +47,8 @@ const CURSOR_SAVE: Duration = Duration::from_secs(30);
 /// How long a provider's word on an owner that changed nothing but its time may wait
 /// before it is saved.
 const VOUCH_SAVE: Duration = Duration::from_secs(3600);
-/// The identities whose latest vouching is kept in memory before the record starts
-/// again.
+/// The identities whose latest vouching is kept in memory before the ones already
+/// recorded on their watches are forgotten. Words not recorded yet are never forgotten.
 const VOUCHED_MAX: usize = 10_000;
 
 /// What a watch covers.
@@ -309,6 +309,10 @@ pub struct Watches {
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
     pub(crate) before_create: Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// runs in [`follow::locate`] after its first checks (tests)
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) before_scan: Mutex<Option<Box<dyn FnMut() + Send>>>,
     /// wakes the follower when the watches change
     wake: Condvar,
     /// counts every change of the set of watches, so the follower knows to rebuild
@@ -484,11 +488,10 @@ impl Watches {
         let key = Owner::named(who.kind, &who.name).key();
         let mut m = self.vouched.lock();
         if !m.contains_key(&key) && m.len() >= VOUCHED_MAX {
-            // keep the words that are not on the watches yet
+            // a word that is not on the watches yet is kept past the bound, since
+            // dropping it would give the owner back what the watches still hold; there
+            // are at most as many as owners of watches
             m.retain(|_, v| v.pending);
-            if m.len() >= VOUCHED_MAX {
-                m.clear();
-            }
         }
         let v = m.entry(key).or_insert_with(|| {
             // the owner's watches hold what was vouched before the server started
@@ -505,11 +508,14 @@ impl Watches {
                 pending: false,
             }
         });
+        let before = v.owner.groups.clone();
         if v.owner
             .vouch(groups.then_some(&who.groups[..]), email, &now_text(now))
         {
             v.pending = true;
         }
+        // the groups that matching follows changed, saved or not
+        let regroup = v.owner.groups != before;
         if !v.pending && v.written.is_some_and(|t| t.elapsed() < VOUCH_SAVE) {
             return;
         }
@@ -520,10 +526,6 @@ impl Watches {
             v.pending = false;
             return;
         }
-        let groups_changed = b
-            .watches
-            .iter()
-            .any(|w| w.owner.same(&o) && w.owner.groups != o.groups);
         let r = g.change(st, |b| {
             for w in b.watches.iter_mut().filter(|w| w.owner.same(&o)) {
                 w.owner.take_vouched(&o);
@@ -534,20 +536,23 @@ impl Watches {
             Ok(()) => {
                 v.written = Some(Instant::now());
                 v.pending = false;
-                if groups_changed {
-                    self.bump(&g);
-                }
             }
             Err(e) => {
-                // matching and mail already follow the word kept in memory; the next
-                // vouching tries to record it again
+                // matching and mail already follow the word kept in memory, which is
+                // kept until the next vouching records it
                 tracing::warn!(target: "sparkles::watches", "cannot record the groups of {}: {e:?}", o.key());
-                self.bump(&g);
+                v.pending = true;
             }
+        }
+        // a retry of the same word changes nothing the follower reads
+        if regroup {
+            self.bump(&g);
         }
         drop(g);
         drop(m);
-        self.changed();
+        if regroup {
+            self.changed();
+        }
     }
 
     /// `owner` with what its provider or proxy last vouched for since the start, which

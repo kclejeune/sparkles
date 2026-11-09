@@ -1221,6 +1221,140 @@ async fn a_revocation_that_cannot_be_saved_still_ends_mail() {
     );
 }
 
+/// Review finding email-ui-r2 1: words that could not be recorded outlast a full
+/// memory of vouchings.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unrecorded_revocation_outlasts_a_full_memory() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut s = server();
+    mailing(&s, 9).await;
+    s.proxied("/$/ping", "pam", "staff", Some("pam@example.org"))
+        .await;
+    s.st.watches
+        .create(
+            &s.st,
+            &Owner::named(Kind::Proxy, "pam"),
+            new_watch(&s, G, "urn:a"),
+            Utc::now(),
+        )
+        .unwrap();
+    s.update("alice", "main", &label("urn:a", "A")).await;
+    s.follow().await;
+    let b = s.st.watches.batches.waiting().pop().unwrap();
+    let dir = s.st.data_dir.clone();
+    let mode = |m| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o500);
+    s.proxied("/$/ping", "pam", "others", Some("pam@example.org"))
+        .await;
+    {
+        // owners whose words could not be recorded either fill the memory
+        let mut m = s.st.watches.vouched.lock();
+        for i in m.len()..VOUCHED_MAX {
+            let owner = Owner::named(Kind::Proxy, &format!("p{i}"));
+            m.insert(
+                owner.key(),
+                Vouch {
+                    owner,
+                    written: None,
+                    pending: true,
+                },
+            );
+        }
+    }
+    s.proxied("/$/ping", "quinn", "staff", None).await;
+    let e = build(&s, &b, Utc::now());
+    mode(0o700);
+    assert!(e.is_err(), "mailed under groups that were taken away");
+    s.update("alice", "main", &label("urn:a", "A2")).await;
+    s.follow().await;
+    let (ws, _, _) = s.st.watches.snapshot(&s.st).unwrap();
+    let w = ws.iter().find(|x| x.owner.name == "pam").unwrap();
+    assert_eq!(
+        w.matches.len(),
+        1,
+        "a match under groups that were taken away"
+    );
+    s.proxied("/$/ping", "pam", "others", Some("pam@example.org"))
+        .await;
+    let file = std::fs::read_to_string(s.st.data_dir.join(FILE)).unwrap();
+    assert!(file.contains("others"), "the revocation was not recorded");
+}
+
+/// Review finding email-ui-r2 3: retrying a record that failed does not make the
+/// follower authorize again.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_retried_record_leaves_the_follower_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = server();
+    s.proxied("/$/ping", "pam", "staff", Some("pam@example.org"))
+        .await;
+    s.st.watches
+        .create(
+            &s.st,
+            &Owner::named(Kind::Proxy, "pam"),
+            new_watch(&s, G, "urn:a"),
+            Utc::now(),
+        )
+        .unwrap();
+    let dir = s.st.data_dir.clone();
+    let mode = |m| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
+    let file = || std::fs::read_to_string(s.st.data_dir.join(FILE)).unwrap();
+    mode(0o500);
+    let v0 = s.st.watches.version();
+    s.proxied("/$/ping", "pam", "others", Some("pam@example.org"))
+        .await;
+    let v1 = s.st.watches.version();
+    assert!(v1 > v0, "the follower did not hear of new groups");
+    s.proxied("/$/ping", "pam", "others", Some("pam@example.org"))
+        .await;
+    assert_eq!(s.st.watches.version(), v1, "a retry woke the follower");
+    assert!(!file().contains("others"));
+    mode(0o700);
+    s.proxied("/$/ping", "pam", "others", Some("pam@example.org"))
+        .await;
+    assert!(file().contains("others"), "the record was not retried");
+    assert_eq!(s.st.watches.version(), v1, "a retry woke the follower");
+}
+
+/// Review finding email-ui-r2 2: a deletion or rename that starts while the follower
+/// reads the catalog removes no watch. The catalog's own window, where a dataset that
+/// is renamed is in no list, cannot be paused from here, so the test starts and ends
+/// a deletion inside the follower's reading instead.
+#[tokio::test]
+async fn a_rename_during_the_catalog_read_removes_no_watch() {
+    let mut s = server();
+    let w = s
+        .watch(
+            "bob",
+            json!({"dataset": "ds", "graph": G, "entity": "urn:a"}),
+        )
+        .await;
+    let id = w["id"].as_str().unwrap().to_string();
+    assert!(s.st.delete("ds").unwrap());
+    let st = s.st.clone();
+    let mut once = true;
+    *s.st.watches.before_scan.lock() = Some(Box::new(move || {
+        if std::mem::take(&mut once) {
+            drop(st.leave_for_tests("elsewhere"));
+        }
+    }));
+    let kept = |s: &Srv| {
+        s.st.watches
+            .snapshot(&s.st)
+            .unwrap()
+            .0
+            .iter()
+            .any(|x| x.id == id)
+    };
+    s.follow().await;
+    assert!(kept(&s), "removed while a rename moved a dataset");
+    s.follow().await;
+    *s.st.watches.before_scan.lock() = None;
+    assert!(!kept(&s));
+}
+
 #[test]
 fn routes_never_carry_watch_mail() {
     let check = |v: J| crate::notify::config::parse(&v).and_then(|c| c.validate());

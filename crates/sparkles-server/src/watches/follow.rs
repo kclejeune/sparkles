@@ -162,15 +162,22 @@ pub(crate) enum Place {
 /// Find branch `bid`, last seen in dataset `dataset`. A dataset keeps its branches'
 /// ids through a rename, so every dataset of the catalog is searched. The branch is
 /// gone only when the server is past its startup, every declared dataset is open,
-/// none is being deleted or renamed and none holds the branch, so a deletion or a
-/// rename that is still draining, and a dataset that has not opened or failed to,
-/// removes no watch.
+/// no deletion or rename is under way or starts while the catalog is read, and none
+/// holds the branch, so a deletion or a rename that is still draining, and a dataset
+/// that has not opened or failed to, removes no watch.
 pub(crate) fn locate(st: &AppState, dataset: &str, bid: uuid::Uuid) -> Place {
+    // a deletion or rename that starts after the check below can take a dataset out
+    // of the catalog while it is read, which the count tells
+    let lives = st.lifecycle();
     // the catalog lists open datasets only: one that is still opening, held back by
     // startup or kept closed after a failed open may hold the branch
     let mut unsure = st.any_leaving()
         || st.phase() == crate::obs::Phase::Starting
         || !st.unavailable_datasets().is_empty();
+    #[cfg(test)]
+    if let Some(f) = st.watches.before_scan.lock().as_mut() {
+        f();
+    }
     let mut names: Vec<String> = st.catalog.list().into_iter().map(|i| i.name).collect();
     // the last known dataset first, which holds the branch unless it was renamed
     names.sort_by_key(|n| n != dataset);
@@ -185,7 +192,11 @@ pub(crate) fn locate(st: &AppState, dataset: &str, bid: uuid::Uuid) -> Place {
             Err(_) => unsure = true,
         }
     }
-    if unsure { Place::Unknown } else { Place::Gone }
+    if unsure || st.lifecycle() != lives {
+        Place::Unknown
+    } else {
+        Place::Gone
+    }
 }
 
 /// What one run of a follower found.
