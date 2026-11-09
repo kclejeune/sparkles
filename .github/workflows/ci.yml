@@ -77,6 +77,8 @@ env:
   # The target is a plain directory in the checkout, which rust-cache saves and restores,
   # rather than a view into mbx's store.
   MBX_TARGET_VIEWS: "0"
+  # The saved mbx stores stay small enough for GitHub's 10 GB repository cache.
+  MBX_GC_MAX_SIZE: 3GiB
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
   NEXTEST_VERSION: "0.9.146"
@@ -260,7 +262,20 @@ jobs:
             mkdir -p ui/build
             printf '%s' '<!doctype html><title>Sparkles</title><p>The UI has not been built. Run <code>pnpm -C ui install &amp;&amp; pnpm -C ui build</code> and rebuild the server.</p>' > ui/build/index.html
           fi
-      # local mode: no remote cache, and no link cache, since the store is not kept
+      # mbx's object store keeps the workspace crates' outputs by the hash of their inputs,
+      # so a crate whose sources and dependencies did not change is not compiled again,
+      # while Cargo's fingerprints in the restored target cover only the dependencies.
+      # Main runs save the store under the commit, and other runs restore the latest.
+      - uses: actions/cache/restore@v4
+        id: mbx-store
+        with:
+          path: &mbx-store |
+            ~/.cache/mbx
+            !~/.cache/mbx/targets
+          key: mbx-store-clippy-${{ matrix.platform }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-clippy-${{ matrix.platform }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+      # local mode: no remote cache, and no link cache, which would add every test binary
+      # to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
           backend: local
@@ -295,6 +310,11 @@ jobs:
               echo "::endgroup::"
             done
           done
+      - if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
+        uses: actions/cache/save@v4
+        with:
+          path: *mbx-store
+          key: ${{ steps.mbx-store.outputs.cache-primary-key }}
       - name: Disk space after Clippy
         if: ${{ always() }}
         run: df -h "$GITHUB_WORKSPACE"
@@ -348,7 +368,14 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
       - name: UI placeholder
         run: *ui-placeholder
-      # local mode: no remote cache, and no link cache, since the store is not kept
+      - uses: actions/cache/restore@v4
+        id: mbx-store
+        with:
+          path: *mbx-store
+          key: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+      # local mode: no remote cache, and no link cache, which would add every test binary
+      # to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
           backend: local
@@ -386,6 +413,11 @@ jobs:
           echo "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/archive/build-workspace"
           cp "$RUNNER_TEMP/archive/build-workspace" "$RUNNER_TEMP/heavy/"
           ls -l "$RUNNER_TEMP"/archive/* "$RUNNER_TEMP"/heavy/* "$RUNNER_TEMP"/server/*
+      - if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
+        uses: actions/cache/save@v4
+        with:
+          path: *mbx-store
+          key: ${{ steps.mbx-store.outputs.cache-primary-key }}
       - name: Disk space after test archive
         if: ${{ always() }}
         run: &free-disk-report scripts/ci-free-disk.sh report
@@ -438,7 +470,14 @@ jobs:
         with:
           shared-key: tests
           save-if: false
-      # local mode: no remote cache, and no link cache, since the store is not kept
+      - uses: actions/cache/restore@v4
+        id: mbx-store
+        with:
+          path: *mbx-store
+          key: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+      # local mode: no remote cache, and no link cache, which would add every test binary
+      # to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
           backend: local
@@ -579,7 +618,14 @@ jobs:
           save-if: false
       - name: UI placeholder
         run: *ui-placeholder
-      # local mode: no remote cache, and no link cache, since the store is not kept
+      - uses: actions/cache/restore@v4
+        id: mbx-store
+        with:
+          path: *mbx-store
+          key: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+      # local mode: no remote cache, and no link cache, which would add every test binary
+      # to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
           backend: local
@@ -665,7 +711,8 @@ jobs:
           save-if: false
       - name: UI placeholder
         run: *ui-placeholder
-      # local mode: no remote cache, and no link cache, since the store is not kept
+      # local mode: no remote cache, and no link cache, which would add every test binary
+      # to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
           backend: local
