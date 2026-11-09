@@ -2492,7 +2492,7 @@ fn server_settings(put: &mut dyn FnMut(&str, J)) {
                 "at": string(),
                 "event": string(),
                 "id": string(),
-                "status": with_desc(int(), "The HTTP status of a delivery."),
+                "status": with_desc(int(), "The HTTP status of a webhook or ntfy delivery, or the SMTP reply code of an email delivery."),
                 "error": with_desc(string(), "Why a delivery failed. It never holds a secret."),
             }),
         ))
@@ -2507,20 +2507,23 @@ fn server_settings(put: &mut dyn FnMut(&str, J)) {
                 json!({
                     "enabled": boolean(),
                     "channels": array(obj(
-                        &["name", "type", "target", "secrets", "lastSuccess", "lastFailure", "sent", "failed"],
+                        &["name", "type", "target", "secrets", "lastSuccess", "lastFailure", "sent", "failed", "queued", "inFlight", "queueCapacity"],
                         json!({
                             "name": string(),
-                            "type": string_enum(&["webhook", "ntfy"]),
+                            "type": string_enum(&["webhook", "ntfy", "email"]),
                             "target": with_desc(string(), "Where the channel delivers, without credentials."),
                             "secrets": with_desc(strings(), "The secrets the channel names."),
                             "lastSuccess": delivery(),
                             "lastFailure": delivery(),
                             "sent": with_desc(int(), "Deliveries that succeeded since the start."),
                             "failed": with_desc(int(), "Deliveries that failed, were refused or were dropped since the start."),
+                            "queued": with_desc(int(), "Deliveries waiting in the channel's queue."),
+                            "inFlight": with_desc(boolean(), "Whether the channel's thread is sending a delivery."),
+                            "queueCapacity": with_desc(int(), "The deliveries the channel's queue holds, the one in flight included."),
                         }),
                     )),
                     "routes": any_object("The routes from event types to channels."),
-                    "queued": with_desc(int(), "Deliveries waiting in the queue."),
+                    "queued": with_desc(int(), "Deliveries waiting in every channel's queue."),
                     "active": array(obj(
                         &["key", "event", "first", "last", "count"],
                         json!({
@@ -2546,9 +2549,9 @@ fn server_settings(put: &mut dyn FnMut(&str, J)) {
                 &["channel", "type", "result", "status", "id", "latencyMs"],
                 json!({
                     "channel": string(),
-                    "type": string_enum(&["webhook", "ntfy"]),
+                    "type": string_enum(&["webhook", "ntfy", "email"]),
                     "result": string_enum(&["ok"]),
-                    "status": with_desc(int(), "The HTTP status the channel answered."),
+                    "status": with_desc(int(), "The HTTP status the channel answered, or the SMTP reply code of an email channel."),
                     "id": with_desc(string(), "The envelope's id."),
                     "latencyMs": int(),
                 }),

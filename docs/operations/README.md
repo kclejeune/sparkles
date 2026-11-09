@@ -69,7 +69,7 @@ callers and records the selected numeric user in its receipt.
   The settings file declares and locks them, and a dataset admin changes them through the
   settings API, the Settings tab or Fuseki's `/{ds}/prefixes`. Loaded data never replaces
   a declared prefix.
-* The server pushes signed Standard Webhooks and ntfy notifications when memory review
+* The server pushes signed Standard Webhooks, ntfy and email notifications when memory review
   waits too long, a backup policy run fails, or a provider's daily token budget is used
   up ([C21](../specs/C21-outbound-notifications.md), [API.md](../API.md#notifications),
   [USAGE.md](../USAGE.md#sending-notifications)). Channels and routes are a server settings

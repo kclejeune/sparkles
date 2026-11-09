@@ -9723,13 +9723,15 @@ export interface components {
             channels: {
                 /** @description Deliveries that failed, were refused or were dropped since the start. */
                 failed: number;
+                /** @description Whether the channel's thread is sending a delivery. */
+                inFlight: boolean;
                 lastFailure: {
                     at: string;
                     /** @description Why a delivery failed. It never holds a secret. */
                     error?: string;
                     event: string;
                     id?: string;
-                    /** @description The HTTP status of a delivery. */
+                    /** @description The HTTP status of a webhook or ntfy delivery, or the SMTP reply code of an email delivery. */
                     status?: number;
                 } | null;
                 lastSuccess: {
@@ -9738,10 +9740,14 @@ export interface components {
                     error?: string;
                     event: string;
                     id?: string;
-                    /** @description The HTTP status of a delivery. */
+                    /** @description The HTTP status of a webhook or ntfy delivery, or the SMTP reply code of an email delivery. */
                     status?: number;
                 } | null;
                 name: string;
+                /** @description The deliveries the channel's queue holds, the one in flight included. */
+                queueCapacity: number;
+                /** @description Deliveries waiting in the channel's queue. */
+                queued: number;
                 /** @description The secrets the channel names. */
                 secrets: string[];
                 /** @description Deliveries that succeeded since the start. */
@@ -9749,10 +9755,10 @@ export interface components {
                 /** @description Where the channel delivers, without credentials. */
                 target: string;
                 /** @enum {string} */
-                type: "webhook" | "ntfy";
+                type: "webhook" | "ntfy" | "email";
             }[];
             enabled: boolean;
-            /** @description Deliveries waiting in the queue. */
+            /** @description Deliveries waiting in every channel's queue. */
             queued: number;
             recent: {
                 [key: string]: unknown;
@@ -9770,10 +9776,10 @@ export interface components {
             latencyMs: number;
             /** @enum {string} */
             result: "ok";
-            /** @description The HTTP status the channel answered. */
+            /** @description The HTTP status the channel answered, or the SMTP reply code of an email channel. */
             status: number;
             /** @enum {string} */
-            type: "webhook" | "ntfy";
+            type: "webhook" | "ntfy" | "email";
         };
         OAuthError: {
             /**

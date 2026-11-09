@@ -14276,8 +14276,8 @@ Notification channels name their credentials with the same secrets, and the answ
 
 ### Notifications
 
-The server can push notifications to a webhook or an ntfy topic when something needs a
-person. The design is in [C21](specs/C21-outbound-notifications.md). The configuration
+The server can push notifications to a webhook, an ntfy topic or mail addresses when
+something needs a person. The design is in [C21](specs/C21-outbound-notifications.md). The configuration
 is the server-wide settings kind `notifications`, at `/$/server/settings/notifications`
 with the routes of [Server settings](#server-settings). Its layers are the built-in
 defaults, the settings file's `server.notifications` object and the runtime layer in
@@ -14324,6 +14324,31 @@ An `ntfy` channel has `server` (`https://ntfy.sh` by default), `topic`, an optio
 `token` secret sent as a bearer token, `priority` from 1 to 5 and `tags`. The server
 publishes `{topic, title, message, priority, tags, click}` to the root of `server`.
 Without `priority`, the event's severity gives 3, 4 or 5.
+
+An `email` channel has `host`, `port`, `tls`, `username`, `password`, `from` and `to`.
+
+```json
+{ "type": "email", "host": "smtp.example.org", "port": 587, "tls": "starttls", "username": "sparkles", "password": { "secret": "smtp" }, "from": "sparkles@example.org", "to": ["ops@example.org"] }
+```
+
+`tls` is `starttls`, the default, for STARTTLS on the submission port, or `tls` for
+TLS from the first byte. The port defaults to 587 with `starttls` and 465 with `tls`.
+There is no plain mode, and a server that does not offer STARTTLS is refused before
+the server sends a password or a message. The server checks the mail server's
+certificate against the system's roots. With `username`, it authenticates with SASL
+PLAIN, and `password` names the secret that holds the password. `from` and `to` are
+ASCII mail addresses, with 1 to 20 recipients. The outbound policy checks the host
+before the server connects. A `4xx` reply is retried like a transient failure, and a
+`5xx` reply ends the delivery. A recipient that the server refuses fails the whole
+delivery.
+
+The message has the notification's title as its subject and a plain-text body with
+the summary, the link, the event type, the severity, the server, the dataset, the time,
+the id and the data as indented JSON. The body is UTF-8, sent as 7-bit text when it is
+ASCII and as quoted-printable otherwise, and a subject outside ASCII is sent as encoded
+words. The `Message-ID` is the notification's `id` at the domain of `from`, so the
+retries of one delivery carry the same one, and an `X-Sparkles-Event` header holds the
+event type.
 
 A credential is always a secret reference. A channel member such as `token` that holds a
 string is a `400`, and the error does not quote it. A route that names an unknown
@@ -14393,7 +14418,7 @@ the log.
 | Method | Path | Needs | Effect |
 |---|---|---|---|
 | GET | `/$/notifications` | `server-admin` | `{enabled, channels, routes, queued, active, recent}`. Each channel has its `name`, `type`, `target` without credentials, `secrets`, `lastSuccess`, `lastFailure`, `sent`, `failed`, `queued`, `inFlight` and `queueCapacity`. `active` lists the conditions that were notified, and `recent` the last 50 deliveries with their `result` (`ok`, `failed`, `refused` or `dropped`) and `attempts`. |
-| POST | `/$/notifications/test/{channel}` | `server-admin` | Sends a `notification.test` now, in one attempt. `200` with `{channel, type, result, status, id, latencyMs}`, `404` with `unknown-channel`, or `502` with `delivery-failed` or `outbound-refused` and the error. |
+| POST | `/$/notifications/test/{channel}` | `server-admin` | Sends a `notification.test` now, in one attempt. `200` with `{channel, type, result, status, id, latencyMs}`, where `status` is the HTTP status or, for email, the SMTP reply code. `404` with `unknown-channel`, or `502` with `delivery-failed` or `outbound-refused` and the error. |
 
 The metrics are `sparkles_notifications_sent_total{channel,event,result}`,
 `sparkles_notifications_retries_total{channel}`,

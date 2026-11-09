@@ -1,5 +1,5 @@
 //! Outbound notifications (spec C21): events that a person should hear about, sent to
-//! webhooks and ntfy topics.
+//! webhooks, ntfy topics and mail addresses.
 //!
 //! [`raise`] routes an event to the channels of the `notifications` settings kind,
 //! skips it while a lasting condition with the same key was notified less than its
@@ -18,6 +18,7 @@ pub mod config;
 pub mod events;
 pub mod http;
 mod sign;
+mod smtp;
 #[cfg(test)]
 mod tests;
 
@@ -718,6 +719,22 @@ fn attempt(
                 headers.push(("webhook-timestamp".to_string(), ts.to_string()));
             }
             (url, headers, body)
+        }
+        Channel::Email(e) => {
+            let password = match &e.password {
+                Some(p) => match read(&p.secret, &mut secrets) {
+                    Ok(v) => Some(v),
+                    Err(a) => return a,
+                },
+                None => None,
+            };
+            let refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
+            return match smtp::send(&st.outbound, name, e, password.as_deref(), env, timeout) {
+                Attempt::Ok(c) => Attempt::Ok(c),
+                Attempt::Retry(m, a) => Attempt::Retry(scrub(m, &refs), a),
+                Attempt::Failed(m) => Attempt::Failed(scrub(m, &refs)),
+                Attempt::Refused(m) => Attempt::Refused(scrub(m, &refs)),
+            };
         }
         Channel::Ntfy(n) => {
             let severity = match env["severity"].as_str() {

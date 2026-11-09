@@ -27,7 +27,10 @@ pub const MEMBERS: &[&str] = &[
 const DELIVERY_MEMBERS: &[&str] = &["attempts", "backoffSecs", "maxBackoffSecs", "timeoutSecs"];
 
 /// The members of a channel that name a secret.
-const SECRET_MEMBERS: &[&str] = &["token", "urlSecret", "signingSecret"];
+const SECRET_MEMBERS: &[&str] = &["token", "urlSecret", "signingSecret", "password"];
+
+/// The most recipients of an email channel.
+const MAX_RECIPIENTS: usize = 20;
 
 /// The ntfy server a channel uses without `server`.
 pub const NTFY_SH: &str = "https://ntfy.sh";
@@ -92,6 +95,7 @@ impl Default for NotifySettings {
 pub enum Channel {
     Webhook(Webhook),
     Ntfy(Ntfy),
+    Email(Email),
 }
 
 impl Channel {
@@ -99,6 +103,7 @@ impl Channel {
         match self {
             Channel::Webhook(_) => "webhook",
             Channel::Ntfy(_) => "ntfy",
+            Channel::Email(_) => "email",
         }
     }
 
@@ -111,6 +116,13 @@ impl Channel {
                 (None, None) => String::new(),
             },
             Channel::Ntfy(n) => format!("{}/{}", n.server.trim_end_matches('/'), n.topic),
+            Channel::Email(e) => format!(
+                "{} port {} ({}) to {}",
+                e.host,
+                e.port(),
+                e.tls.as_str(),
+                e.to.join(", ")
+            ),
         }
     }
 
@@ -123,6 +135,7 @@ impl Channel {
                 .map(|s| s.secret.as_str())
                 .collect(),
             Channel::Ntfy(n) => n.token.iter().map(|s| s.secret.as_str()).collect(),
+            Channel::Email(e) => e.password.iter().map(|s| s.secret.as_str()).collect(),
         }
     }
 }
@@ -163,6 +176,87 @@ pub struct Ntfy {
     pub priority: Option<u8>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+}
+
+/// How an email channel reaches its server (§4.3). There is no plain mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EmailTls {
+    /// STARTTLS on the submission port (RFC 3207, RFC 6409)
+    #[default]
+    Starttls,
+    /// TLS from the first byte (RFC 8314)
+    Tls,
+}
+
+impl EmailTls {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EmailTls::Starttls => "starttls",
+            EmailTls::Tls => "tls",
+        }
+    }
+}
+
+/// An email channel (§4.3).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Email {
+    pub host: String,
+    /// 587 with STARTTLS and 465 with TLS by default
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub tls: EmailTls,
+    /// the SASL PLAIN user name; without it the channel does not authenticate
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<SecretRef>,
+    pub from: String,
+    pub to: Vec<String>,
+}
+
+impl Email {
+    pub fn port(&self) -> u16 {
+        self.port.unwrap_or(match self.tls {
+            EmailTls::Starttls => 587,
+            EmailTls::Tls => 465,
+        })
+    }
+}
+
+/// Whether `s` is a mailbox address that SMTP carries without SMTPUTF8: printable
+/// ASCII with one `@`, a local part and a domain, and none of the characters that
+/// would end the address in a command or a header.
+pub fn check_address(s: &str) -> Result<(), String> {
+    let ok = s.len() <= 254
+        && s.chars().all(|c| {
+            c.is_ascii_graphic()
+                && !matches!(
+                    c,
+                    '<' | '>' | ',' | '"' | '(' | ')' | ';' | ':' | '\\' | '[' | ']'
+                )
+        })
+        && match s.split_once('@') {
+            Some((l, d)) => {
+                !l.is_empty()
+                    && l.len() <= 64
+                    && !d.contains('@')
+                    && d.split('.').count() >= 1
+                    && d.split('.').all(|p| {
+                        !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                    })
+            }
+            None => false,
+        };
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "{s:?} is not a mail address such as ops@example.org"
+        ))
+    }
 }
 
 /// `delivery` (§5.1, §6.2).
@@ -274,6 +368,18 @@ pub fn parse(v: &Value) -> Result<NotifySettings, String> {
             }
         }
     }
+    if let Some(Value::Object(channels)) = v.get("channels") {
+        for (name, c) in channels {
+            if c.get("type").and_then(Value::as_str) == Some("email")
+                && let Some(t) = c.get("tls")
+                && !matches!(t.as_str(), Some("starttls" | "tls"))
+            {
+                return Err(format!(
+                    "channels.{name}.tls: starttls or tls; an email channel never connects without TLS"
+                ));
+            }
+        }
+    }
     serde_json::from_value(v.clone()).map_err(|e| e.to_string())
 }
 
@@ -347,6 +453,47 @@ impl NotifySettings {
                 crate::models::check_secret_name(s).map_err(at)?;
             }
             match c {
+                Channel::Email(e) => {
+                    let host_ok = !e.host.is_empty()
+                        && e.host.len() <= 253
+                        && (e.host.parse::<std::net::IpAddr>().is_ok()
+                            || e.host.split('.').all(|l| {
+                                !l.is_empty()
+                                    && l.len() <= 63
+                                    && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                            }));
+                    if !host_ok {
+                        return Err(at("host: a host name or an IP address".into()));
+                    }
+                    if e.port == Some(0) {
+                        return Err(at("port: a port from 1 to 65535".into()));
+                    }
+                    check_address(&e.from).map_err(|m| at(format!("from: {m}")))?;
+                    if e.to.is_empty() || e.to.len() > MAX_RECIPIENTS {
+                        return Err(at(format!("to: 1 to {MAX_RECIPIENTS} mail addresses")));
+                    }
+                    for t in &e.to {
+                        check_address(t).map_err(|m| at(format!("to: {m}")))?;
+                    }
+                    match (&e.username, &e.password) {
+                        (Some(u), _)
+                            if u.is_empty()
+                                || u.len() > 256
+                                || u.chars().any(|c| c.is_control()) =>
+                        {
+                            return Err(at(
+                                "username: 1 to 256 characters without control characters".into(),
+                            ));
+                        }
+                        (None, Some(_)) => {
+                            return Err(at("password: a password needs a username".into()));
+                        }
+                        (Some(_), None) => {
+                            return Err(at("username: a username needs a password secret".into()));
+                        }
+                        _ => {}
+                    }
+                }
                 Channel::Webhook(w) => match (&w.url, &w.url_secret) {
                     (Some(u), None) => check_url(u, true).map_err(|e| at(format!("url: {e}")))?,
                     (None, Some(_)) => {}

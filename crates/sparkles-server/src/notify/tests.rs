@@ -97,6 +97,11 @@ struct Fixture {
 /// A server with the settings file `settings` and the outbound policy's
 /// `allow_private`.
 fn fixture(settings: Option<Value>, allow_private: bool) -> Fixture {
+    fixture_with(settings, allow_private, None)
+}
+
+/// [`fixture`] with an outbound policy that also trusts the PEM roots `roots`.
+fn fixture_with(settings: Option<Value>, allow_private: bool, roots: Option<&[u8]>) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let mut st = AppState::new(
         &dir.path().join("data"),
@@ -105,6 +110,7 @@ fn fixture(settings: Option<Value>, allow_private: bool) -> Fixture {
     )
     .unwrap();
     st.outbound.allow_private = allow_private;
+    st.outbound.tls.extra_roots_pem = roots.map(<[u8]>::to_vec);
     let file = settings.map(|s| {
         let f = dir.path().join("settings.json");
         std::fs::write(&f, s.to_string()).unwrap();
@@ -953,4 +959,489 @@ async fn a_runtime_layer_past_the_cap_is_refused_on_reading() {
         raise(&st, event("backup.failed"), None, Utc::now()),
         Raised::Disabled
     );
+}
+// ------------------------------------------------------------------ email (§4.3) ------
+
+const TEST_CA: &[u8] = include_bytes!("../tls/testdata/ca.pem");
+const TEST_CERT: &[u8] = include_bytes!("../tls/testdata/cert-a.pem");
+const TEST_KEY: &[u8] = include_bytes!("../tls/testdata/key-a.pem");
+
+trait Rw: Read + Write {}
+impl<T: Read + Write> Rw for T {}
+
+/// How the fake mail server offers TLS.
+#[derive(Clone, Copy, PartialEq)]
+enum SmtpMode {
+    /// STARTTLS on a plain connection
+    Starttls,
+    /// TLS from the first byte
+    Tls,
+    /// a plain server without STARTTLS
+    Plain,
+}
+
+/// One message the fake mail server took, or the commands of a session that ended
+/// before DATA.
+#[derive(Clone, Debug, Default)]
+struct Mail {
+    /// whether the commands after the greeting ran over TLS
+    secure: bool,
+    /// `\0user\0password` decoded from AUTH PLAIN
+    auth: Option<String>,
+    from: String,
+    to: Vec<String>,
+    data: String,
+    commands: Vec<String>,
+}
+
+/// A local mail server inside the test process that answers RCPT with `rcpt` in turn
+/// and then 250.
+struct FakeSmtp {
+    port: u16,
+    got: Arc<Mutex<Vec<Mail>>>,
+}
+
+fn server_tls() -> Arc<rustls::ServerConfig> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(TEST_CERT)
+        .map(Result::unwrap)
+        .collect();
+    let key = PrivateKeyDer::from_pem_slice(TEST_KEY).unwrap();
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    Arc::new(
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap(),
+    )
+}
+
+fn read_line(s: &mut dyn Rw) -> Option<String> {
+    let mut out = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        match s.read(&mut b) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {
+                out.push(b[0]);
+                if b[0] == b'\n' {
+                    return Some(String::from_utf8_lossy(&out).into_owned());
+                }
+            }
+        }
+    }
+}
+
+enum Next {
+    Done,
+    Upgrade,
+}
+
+/// One SMTP session on `s` until QUIT, a closed connection or STARTTLS.
+fn smtp_session(
+    s: &mut dyn Rw,
+    mode: SmtpMode,
+    secure: bool,
+    greet: bool,
+    rcpt: &Mutex<std::vec::IntoIter<u16>>,
+    mail: &mut Mail,
+) -> Next {
+    if greet {
+        let _ = s.write_all(b"220 fake.example ESMTP\r\n");
+    }
+    mail.secure = secure;
+    loop {
+        let Some(line) = read_line(s) else {
+            return Next::Done;
+        };
+        let cmd = line.trim_end().to_string();
+        let upper = cmd.to_ascii_uppercase();
+        mail.commands.push(if upper.starts_with("AUTH") {
+            "AUTH PLAIN [token]".into()
+        } else {
+            cmd.clone()
+        });
+        let reply: String = if upper.starts_with("EHLO") {
+            let tls = if mode == SmtpMode::Starttls && !secure {
+                "250-STARTTLS\r\n"
+            } else {
+                ""
+            };
+            format!("250-fake.example greets you\r\n{tls}250-AUTH LOGIN PLAIN\r\n250 8BITMIME\r\n")
+        } else if upper == "STARTTLS" {
+            let _ = s.write_all(b"220 ready\r\n");
+            return Next::Upgrade;
+        } else if let Some(t) = cmd.strip_prefix("AUTH PLAIN ") {
+            use base64::Engine as _;
+            let d = base64::engine::general_purpose::STANDARD
+                .decode(t.trim())
+                .unwrap_or_default();
+            mail.auth = Some(String::from_utf8_lossy(&d).into_owned());
+            "235 ok\r\n".into()
+        } else if let Some(f) = upper.strip_prefix("MAIL FROM:") {
+            let _ = f;
+            mail.from = cmd["MAIL FROM:".len()..]
+                .trim_matches(['<', '>'])
+                .to_string();
+            "250 ok\r\n".into()
+        } else if upper.starts_with("RCPT TO:") {
+            let code = rcpt.lock().next().unwrap_or(250);
+            if code == 250 {
+                mail.to
+                    .push(cmd["RCPT TO:".len()..].trim_matches(['<', '>']).to_string());
+                "250 ok\r\n".into()
+            } else {
+                format!("{code} not now\r\n")
+            }
+        } else if upper == "DATA" {
+            let _ = s.write_all(b"354 go on\r\n");
+            let mut data = String::new();
+            while let Some(l) = read_line(s) {
+                if l == ".\r\n" {
+                    break;
+                }
+                data.push_str(&l);
+            }
+            mail.data = data;
+            "250 queued\r\n".into()
+        } else if upper == "QUIT" {
+            let _ = s.write_all(b"221 bye\r\n");
+            return Next::Done;
+        } else {
+            "500 what\r\n".into()
+        };
+        let _ = s.write_all(reply.as_bytes());
+        let _ = s.flush();
+    }
+}
+
+impl FakeSmtp {
+    fn start(mode: SmtpMode, rcpt: Vec<u16>) -> FakeSmtp {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let got: Arc<Mutex<Vec<Mail>>> = Arc::default();
+        let g = got.clone();
+        let config = server_tls();
+        std::thread::spawn(move || {
+            let rcpt = Mutex::new(rcpt.into_iter());
+            for c in l.incoming() {
+                let Ok(tcp) = c else { continue };
+                let _ = tcp.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut mail = Mail::default();
+                let tls_stream = |tcp: std::net::TcpStream| {
+                    rustls::StreamOwned::new(
+                        rustls::ServerConnection::new(config.clone()).unwrap(),
+                        tcp,
+                    )
+                };
+                match mode {
+                    SmtpMode::Tls => {
+                        let mut s = tls_stream(tcp);
+                        smtp_session(&mut s, mode, true, true, &rcpt, &mut mail);
+                    }
+                    SmtpMode::Starttls | SmtpMode::Plain => {
+                        let mut tcp = tcp;
+                        if let Next::Upgrade =
+                            smtp_session(&mut tcp, mode, false, true, &rcpt, &mut mail)
+                        {
+                            let mut s = tls_stream(tcp);
+                            smtp_session(&mut s, mode, true, false, &rcpt, &mut mail);
+                        }
+                    }
+                }
+                g.lock().push(mail);
+            }
+        });
+        FakeSmtp { port, got }
+    }
+
+    fn got(&self) -> Vec<Mail> {
+        self.got.lock().clone()
+    }
+
+    /// The sessions once `n` have ended, since a session ends after the client has its
+    /// last reply.
+    fn wait(&self, n: usize) -> Vec<Mail> {
+        for _ in 0..200 {
+            if self.got.lock().len() >= n {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.got()
+    }
+}
+
+fn email_channel(port: u16, tls: &str) -> Value {
+    json!({
+        "type": "email", "host": "127.0.0.1", "port": port, "tls": tls,
+        "username": "sparkles", "password": {"secret": "smtp"},
+        "from": "sparkles@example.org", "to": ["ops@example.org", "oncall@example.org"]
+    })
+}
+
+/// §4.3: a message submitted over STARTTLS with AUTH PLAIN, whose password comes from
+/// a secret and appears in no answer, and whose subject is the title.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn email_is_submitted_over_starttls() {
+    let smtp = FakeSmtp::start(SmtpMode::Starttls, vec![]);
+    let f = fixture_with(None, true, Some(TEST_CA));
+    f.secret("smtp", "s3cret-smtp-pass");
+    let (s, v) = f
+        .patch(json!({
+            "enabled": true,
+            "baseUrl": "https://sparkles.example.org",
+            "channels": {"mail": email_channel(smtp.port, "starttls")},
+            "routes": {"backup.*": ["mail"]},
+            "delivery": fast(),
+        }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    raise(&f.st, event("backup.failed"), None, Utc::now());
+    let v = settled(&f.st, "mail", 1).await;
+    let c = channel_of(&v, "mail");
+    assert_eq!(c["sent"], 1, "{v}");
+    assert_eq!(c["lastSuccess"]["status"], 250);
+    assert_eq!(c["type"], "email");
+    assert_eq!(c["secrets"], json!(["smtp"]));
+    let got = smtp.wait(1);
+    assert_eq!(got.len(), 1);
+    let m = &got[0];
+    assert!(m.secure, "{m:?}");
+    assert_eq!(m.auth.as_deref(), Some("\0sparkles\0s3cret-smtp-pass"));
+    assert_eq!(m.from, "sparkles@example.org");
+    assert_eq!(m.to, ["ops@example.org", "oncall@example.org"]);
+    // STARTTLS comes before AUTH and MAIL, and EHLO is sent again over TLS
+    let at = |p: &str| m.commands.iter().position(|c| c.starts_with(p)).unwrap();
+    assert!(at("STARTTLS") < at("AUTH"), "{:?}", m.commands);
+    assert_eq!(
+        m.commands.iter().filter(|c| c.starts_with("EHLO")).count(),
+        2
+    );
+    assert!(m.data.contains("Subject: Title\r\n"), "{}", m.data);
+    assert!(
+        m.data
+            .contains("To: ops@example.org, oncall@example.org\r\n")
+    );
+    assert!(
+        m.data
+            .contains("Content-Type: text/plain; charset=utf-8\r\n")
+    );
+    assert!(
+        m.data
+            .contains("\r\n\r\nSummary\r\n\r\nhttps://sparkles.example.org/ui/server\r\n"),
+        "{}",
+        m.data
+    );
+    assert!(m.data.contains("Event: backup.failed\r\n"));
+    assert!(m.data.contains("\"x\": 1"), "{}", m.data);
+    let (_, v) = f.send("GET", "/$/notifications", None).await;
+    assert!(!v.to_string().contains("s3cret-smtp-pass"), "{v}");
+    let (_, v) = f
+        .send("GET", "/$/server/settings/notifications", None)
+        .await;
+    assert!(!v.to_string().contains("s3cret-smtp-pass"), "{v}");
+}
+
+/// Implicit TLS on its own port, through a test send, and a 451 that is retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn email_over_implicit_tls_retries_a_4xx() {
+    let smtp = FakeSmtp::start(SmtpMode::Tls, vec![451]);
+    let f = fixture_with(None, true, Some(TEST_CA));
+    f.secret("smtp", "s3cret-smtp-pass");
+    let (s, v) = f
+        .patch(json!({
+            "enabled": true,
+            "channels": {"mail": email_channel(smtp.port, "tls")},
+            "routes": {"*": ["mail"]},
+            "delivery": fast(),
+        }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // the test send has one attempt, so the 451 fails it
+    let (s, v) = f.send("POST", "/$/notifications/test/mail", None).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    assert!(v.to_string().contains("SMTP 451"), "{v}");
+    let (s, v) = f.send("POST", "/$/notifications/test/mail", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["result"], "ok");
+    assert_eq!(v["status"], 250);
+    assert!(smtp.wait(2)[1].secure);
+    assert!(
+        smtp.got()[1]
+            .data
+            .contains("Subject: Test notification\r\n")
+    );
+    // a delivery retries a 451 and succeeds on the second attempt
+    let smtp2 = FakeSmtp::start(SmtpMode::Tls, vec![451]);
+    let (s, v) = f
+        .patch(json!({"channels": {"mail": email_channel(smtp2.port, "tls")}}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    raise(&f.st, event("backup.failed"), None, Utc::now());
+    let v = settled(&f.st, "mail", 3).await;
+    assert_eq!(
+        channel_of(&v, "mail")["lastSuccess"]["event"],
+        "backup.failed",
+        "{v}"
+    );
+    assert_eq!(smtp2.wait(2).len(), 2);
+    assert!(
+        f.metrics()
+            .await
+            .contains(r#"sparkles_notifications_retries_total{channel="mail"} 1"#)
+    );
+}
+
+/// A 550 ends the delivery after one attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn email_does_not_retry_a_5xx() {
+    let smtp = FakeSmtp::start(SmtpMode::Starttls, vec![550]);
+    let f = fixture_with(None, true, Some(TEST_CA));
+    f.secret("smtp", "s3cret-smtp-pass");
+    f.patch(json!({
+        "enabled": true,
+        "channels": {"mail": email_channel(smtp.port, "starttls")},
+        "routes": {"*": ["mail"]},
+        "delivery": fast(),
+    }))
+    .await;
+    raise(&f.st, event("backup.failed"), None, Utc::now());
+    let v = settled(&f.st, "mail", 1).await;
+    let c = channel_of(&v, "mail");
+    assert_eq!(c["failed"], 1);
+    assert!(
+        c["lastFailure"]["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("SMTP 550"),
+        "{v}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(smtp.wait(1).len(), 1);
+    assert!(
+        !f.metrics()
+            .await
+            .contains(r#"sparkles_notifications_retries_total{channel="mail"}"#)
+    );
+}
+
+/// A server without STARTTLS gets neither the password nor the message, and one whose
+/// certificate the server does not trust gets nothing past the handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn email_never_goes_out_in_the_clear() {
+    let plain = FakeSmtp::start(SmtpMode::Plain, vec![]);
+    let f = fixture_with(None, true, Some(TEST_CA));
+    f.secret("smtp", "s3cret-smtp-pass");
+    f.patch(json!({"channels": {"mail": email_channel(plain.port, "starttls")}}))
+        .await;
+    let (s, v) = f.send("POST", "/$/notifications/test/mail", None).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    assert!(v.to_string().contains("does not offer STARTTLS"), "{v}");
+    let got = plain.wait(1);
+    assert_eq!(got.len(), 1);
+    assert!(got[0].auth.is_none());
+    assert!(
+        !got[0].commands.iter().any(|c| c.starts_with("MAIL")),
+        "{:?}",
+        got[0].commands
+    );
+    // without the test CA the certificate is not trusted
+    let tls = FakeSmtp::start(SmtpMode::Starttls, vec![]);
+    let f = fixture(None, true);
+    f.secret("smtp", "s3cret-smtp-pass");
+    f.patch(json!({"channels": {"mail": email_channel(tls.port, "starttls")}}))
+        .await;
+    let (s, v) = f.send("POST", "/$/notifications/test/mail", None).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    assert!(v.to_string().contains("TLS"), "{v}");
+    assert!(
+        tls.wait(1)
+            .iter()
+            .all(|m| m.auth.is_none() && m.data.is_empty())
+    );
+}
+
+/// The outbound policy checks the mail host before any connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_outbound_policy_refuses_a_private_mail_server() {
+    let smtp = FakeSmtp::start(SmtpMode::Starttls, vec![]);
+    let f = fixture_with(None, false, Some(TEST_CA));
+    f.secret("smtp", "s3cret-smtp-pass");
+    f.patch(json!({"channels": {"mail": email_channel(smtp.port, "starttls")}}))
+        .await;
+    let (s, v) = f.send("POST", "/$/notifications/test/mail", None).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    assert_eq!(v["code"], "outbound-refused");
+    assert!(smtp.got().is_empty());
+}
+
+/// The email channel's settings: no plain mode, secret passwords and checked addresses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_email_channel_settings_are_checked() {
+    let f = fixture(None, true);
+    let base = email_channel(587, "starttls");
+    let with = |k: &str, v: Value| {
+        let mut c = base.clone();
+        c[k] = v;
+        json!({"channels": {"mail": c}})
+    };
+    for (body, what) in [
+        (with("tls", json!("none")), "tls"),
+        (with("password", json!("inline-pass-value")), "password"),
+        (with("from", json!("not an address")), "from"),
+        (with("to", json!([])), "to"),
+        (with("to", json!(["a@example.org>, evil@x.org"])), "to"),
+        (with("host", json!("bad host")), "host"),
+    ] {
+        let (s, v) = f.patch(body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{what}: {v}");
+        assert!(v.to_string().contains(what), "{what}: {v}");
+        assert!(!v.to_string().contains("inline-pass-value"), "{v}");
+    }
+    let mut c = base.clone();
+    c.as_object_mut().unwrap().remove("password");
+    let (s, v) = f.patch(json!({"channels": {"mail": c}})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let (s, v) = f.patch(json!({"channels": {"mail": base}})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (_, v) = f.send("GET", "/$/notifications", None).await;
+    assert_eq!(
+        channel_of(&v, "mail")["target"],
+        "127.0.0.1 port 587 (starttls) to ops@example.org, oncall@example.org"
+    );
+}
+
+/// The message: an encoded subject outside ASCII, quoted-printable text, and a body line
+/// that starts with a dot.
+#[test]
+fn the_email_message_is_rfc_5322() {
+    let e: config::Email = serde_json::from_value(json!({
+        "host": "smtp.example.org", "from": "s@example.org", "to": ["o@example.org"]
+    }))
+    .unwrap();
+    assert_eq!(e.port(), 587);
+    let env = json!({
+        "id": "abc", "type": "backup.failed", "time": "2026-10-10T09:00:00Z",
+        "server": "s", "severity": "critical", "title": "Sauvegarde échouée",
+        "summary": ".leading dot and caf\u{e9}", "data": {}
+    });
+    let m = String::from_utf8(smtp::message(&e, &env)).unwrap();
+    assert!(m.contains("Subject: =?utf-8?B?"), "{m}");
+    assert!(m.contains("Content-Transfer-Encoding: quoted-printable\r\n"));
+    assert!(m.contains("\r\n..leading dot and caf=C3=A9\r\n"), "{m}");
+    assert!(
+        m.contains("Date: Sat, 10 Oct 2026 09:00:00 +0000\r\n"),
+        "{m}"
+    );
+    assert!(m.contains("Message-ID: <abc@example.org>\r\n"));
+    assert!(m.ends_with("\r\n.\r\n"));
+    assert!(!m.contains("Data:"));
+    assert_eq!(smtp::subject("plain"), "plain");
+    assert_eq!(smtp::quoted_printable("a=b \n"), "a=3Db=20\r\n");
+    let long = "x".repeat(200);
+    assert!(smtp::quoted_printable(&long).lines().all(|l| l.len() <= 76));
 }

@@ -1,6 +1,6 @@
 # C21: Outbound notifications
 
-> **Status:** implemented in part (Phase 1)
+> **Status:** implemented in part (Phases 1 and 2)
 >
 > **Phases:** Phase 1 is the `notifications` settings kind, the webhook and ntfy
 > channels, delivery with retries, deduplication and repeats, a test send, delivery
@@ -482,6 +482,13 @@ capabilities and remaining work are described by the spec status and Outcome.
   (2026-10-10). It adds no dependency. HMAC-SHA256 is written on the `sha2` crate the
   server already uses, and checked against the vectors of RFC 4231 and the example of
   the Standard Webhooks reference libraries.
+- **Implementation:** Phase 2, the email channel, from §4.3, RFC 5321, RFC 5322, RFC 3207,
+  RFC 4954, RFC 6409, RFC 8314, RFC 2045 and RFC 2047 (2026-11-09). It adds no crate to
+  the tree. The SMTP client is written in `notify/smtp.rs` on `rustls` and
+  `rustls-platform-verifier`, which reqwest already brought in. They became direct
+  dependencies of the server, and `rustls` is no longer behind the `tls` feature. The
+  `lettre` crate was not taken, since the channel needs only EHLO, STARTTLS, AUTH PLAIN,
+  MAIL, RCPT, DATA and QUIT.
 - **Rejected** (spec §13):
   - notifications through Alertmanager only;
   - a configuration file of its own;
@@ -493,7 +500,7 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
-Phase 1 landed on 2026-10-10. Phases 2 and 3 are not built.
+Phase 1 landed on 2026-10-10 and Phase 2 on 2026-11-09. Phase 3 is not built.
 
 The module `crates/sparkles-server/src/notify/` holds the settings type, the delivery
 queue and worker, the events, the routes and the HMAC signing. It is not behind a cargo
@@ -557,6 +564,26 @@ These points differ from the design or settle what it left open.
 - The OpenAPI description gained a shared `502` response, `BadGateway`.
 - The Notifications section of the UI is Phase 3. The server page's Models section
   was changing in parallel work, and the API and CLI cover the operations.
+- The email channel of Phase 2 is a small SMTP client in `notify/smtp.rs` on rustls,
+  without a mail crate. `tls` is `starttls` or `tls`, and a plain value is refused when
+  the kind is written. The port defaults to 587 or 465. A channel with `username` needs
+  `password`, a secret reference, and authenticates with AUTH PLAIN only when the server
+  lists it. The certificate is checked against the platform's roots through the
+  verifier reqwest uses, and an internal CA has to be in the system's trust store,
+  since the channel has no `caCert` of its own. Any `4xx` reply is retried and any
+  `5xx` reply ends the delivery, including a `5xx` to one recipient of several. A
+  failed TLS handshake ends the delivery without a retry. The client refuses data that
+  a server sends after its STARTTLS reply and before the handshake, which would let a
+  man in the middle inject commands. The subject is the title, and the body is the
+  summary, the link, the event type, severity, server, dataset, time and id, and the
+  data as indented JSON. It is 7-bit when it is ASCII and quoted-printable otherwise,
+  and a subject outside ASCII is encoded words in Base64. The `Message-ID` is the
+  envelope's `id` at the domain of `from`. A delivery's `status` is the SMTP reply code
+  250. The tests run a mail server inside the test process with STARTTLS and with
+  implicit TLS on the test certificates of `tls/testdata`, check AUTH PLAIN and the
+  message, retry a `451` and not a `550`, refuse a server without STARTTLS and one
+  whose certificate is not trusted, refuse a loopback mail server without
+  `--outbound-allow-private`, and check that the password appears in no answer.
 - The NixOS module needed no new option. Its option descriptions and the user docs show
   `settings.server.notifications` with a secret from sops-nix, and no VM test was added.
 
@@ -565,16 +592,7 @@ These points differ from the design or settle what it left open.
 **Email, the UI section, backup coverage and independent delivery** (item 46, Tier 5,
 [ROADMAP](../ROADMAP.md)).
 
-* **The email channel (Phase 2).** §4.3 designs it: submission over STARTTLS or implicit
-  TLS, SASL PLAIN, a plain connection refused, the outbound policy's host check before
-  connecting, `4xx` retried and `5xx` not. It is built as written. The remaining choice
-  is the crate: `lettre` with its rustls back end and without its native-tls and
-  sendmail features, recorded in PROVENANCE with its dependency count, or a small SMTP
-  client in `notify/` if that tree is large, since the channel needs only EHLO,
-  STARTTLS, AUTH PLAIN, MAIL, RCPT and DATA. The tests run a local SMTP receiver as the
-  webhook tests run an HTTP one, and cover A-level cases for STARTTLS, a refused plain
-  server, a `451` retried and a `550` not, and a password from a secret that never
-  appears in the status.
+* **The email channel (Phase 2).** This part is built, as the Outcome above records.
 * **The administration UI (Phase 3).** §11 designs a Notifications section on the server
   page next to Models, showing `GET /$/notifications`, editing the kind with C19's
   settings components and a Send test button per channel. The Models section that

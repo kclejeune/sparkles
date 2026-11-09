@@ -27,7 +27,18 @@ The `expect` heads of `POST /$/merge/{ds}`, `POST /$/cherry-pick/{ds}` and
 branch UUID, or a null in their place, now returns `400` instead of being ignored.
 Omitted fields and an empty object keep their previous meaning.
 
+The channel `type` of `GET /$/notifications` and of a test send's answer can be
+`email`. Clients that match the type against `webhook` and `ntfy` alone need a case for
+it.
+
 ### Added
+
+Notifications have an email channel (item 46, spec C21 Phase 2). It submits a message
+over STARTTLS on port 587 or over TLS on port 465, authenticates with SASL PLAIN with a
+password from a secret, and never sends in the clear, so a mail server without
+STARTTLS is refused. A `4xx` reply is retried and a `5xx` reply is not. The subject is
+the notification's title and the plain-text body holds its summary, link and data. The
+SMTP client is part of the server and adds no crate to the tree.
 
 The ontology editor's entity frame has a History view (item 620). It lists the branch's
 commits that changed a triple naming the entity in the editor's graph, newest first and

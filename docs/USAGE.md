@@ -2468,7 +2468,7 @@ and the request shapes are in [API.md](API.md#service-options-loop-bulk-and-cach
 ## Sending notifications
 
 The server can tell a person when something needs them. It sends a notification to a
-webhook or an ntfy topic when agent memory has waited for review too long, when a
+webhook, an ntfy topic or mail addresses when agent memory has waited for review too long, when a
 backup policy run fails, and when a model provider's daily token budget is used up.
 Notifications are off until the configuration turns them on.
 
@@ -2523,6 +2523,18 @@ with `"urlSecret": {"secret": NAME}` in place of `url`. An ntfy channel publishe
 `https://ntfy.sh` unless `server` names another ntfy server. A topic on the public
 server can be read by anyone who guesses its name, so use an access token with a
 reserved topic, or a server of your own.
+
+An email channel submits a message to a mail server with STARTTLS on port 587, or with
+TLS on port 465 when `tls` is `tls`. It never sends in the clear, so a server that does
+not offer STARTTLS is refused. The password goes into a secret like any other
+credential:
+
+```json
+{ "type": "email", "host": "smtp.example.org", "username": "sparkles", "password": { "secret": "smtp" }, "from": "sparkles@example.org", "to": ["ops@example.org"] }
+```
+
+The subject is the notification's title, and the body holds the summary, the link and
+the event's data.
 
 Each dataset decides how long its memory review may wait. The event fires when the
 oldest open review branch, such as a scheduled consolidation's, is older than
