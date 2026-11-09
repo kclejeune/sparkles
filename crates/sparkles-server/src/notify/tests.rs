@@ -1640,3 +1640,69 @@ fn email_header_lines_stay_within_the_limits() {
     assert!(header.contains("To: rrr"), "{header}");
     assert_eq!(header.matches("@example.org,\r\n ").count(), 19, "{header}");
 }
+
+/// A mail server on loopback that writes `greeting` to each connection and closes it;
+/// the connections it took.
+fn one_line_server(greeting: &'static [u8]) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let n: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+    let n2 = n.clone();
+    std::thread::spawn(move || {
+        for c in l.incoming().take(4) {
+            let Ok(mut c) = c else { continue };
+            n2.fetch_add(1, Ordering::SeqCst);
+            let _ = c.write_all(greeting);
+        }
+    });
+    (port, n)
+}
+
+/// A connection that ends within a line is a transient failure, which is retried, and
+/// a line without its CRLF is not SMTP, which is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn email_reply_framing() {
+    let f = fixture_with(None, true, Some(TEST_CA));
+    f.secret("smtp", "s3cret-smtp-pass");
+    let (cut, cuts) = one_line_server(b"220 ready");
+    let (bare, bares) = one_line_server(b"220 ready\n");
+    f.patch(json!({
+        "enabled": true,
+        "channels": {
+            "cut": email_channel(cut, "starttls"),
+            "bare": email_channel(bare, "starttls"),
+        },
+        "routes": {"*": ["bare", "cut"]},
+        "delivery": {"attempts": 2, "backoffSecs": 0.05, "maxBackoffSecs": 1, "timeoutSecs": 5},
+    }))
+    .await;
+    raise(&f.st, event("backup.failed"), None, Utc::now());
+    let v = settled(&f.st, "cut", 1).await;
+    let v = if channel_of(&v, "bare")["failed"] == 0 {
+        settled(&f.st, "bare", 1).await
+    } else {
+        v
+    };
+    assert_eq!(cuts.load(Ordering::SeqCst), 2, "{v}");
+    assert_eq!(bares.load(Ordering::SeqCst), 1, "{v}");
+    assert!(
+        channel_of(&v, "bare")["lastFailure"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not SMTP"),
+        "{v}"
+    );
+}
+
+/// A password inside the AUTH token does not leave part of the token readable.
+#[test]
+fn overlapping_secrets_are_scrubbed_whole() {
+    use base64::Engine as _;
+    let token = base64::engine::general_purpose::STANDARD.encode("\0aasparkles\0c3Bhcmts");
+    assert_eq!(token, "AGFhc3BhcmtsZXMAYzNCaGNtdHM=");
+    let out = smtp::scrub(
+        format!("554 rejected {token} for c3Bhcmts"),
+        &["c3Bhcmts", &token],
+    );
+    assert_eq!(out, "554 rejected [redacted] for [redacted]");
+}

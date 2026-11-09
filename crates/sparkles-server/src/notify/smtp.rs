@@ -145,12 +145,21 @@ impl Session {
                 return Err(Stop::Io("the mail server closed the connection".into()));
             }
             if line.last() != Some(&b'\n') {
-                return Err(Stop::Fatal(
-                    "the mail server's reply line is too long".into(),
-                ));
+                return Err(if line.len() >= MAX_LINE {
+                    Stop::Fatal("the mail server's reply line is too long".into())
+                } else {
+                    // the connection ended within a line, which another attempt may
+                    // not see
+                    Stop::Io("the mail server closed the connection".into())
+                });
             }
-            let l = String::from_utf8_lossy(&line);
-            let l = l.trim_end_matches(['\r', '\n']);
+            // each line ends with exactly one CRLF and holds no other CR or LF
+            let body = line
+                .strip_suffix(b"\r\n")
+                .filter(|b| !b.contains(&b'\r') && !b.contains(&b'\n'))
+                .ok_or_else(|| Stop::Fatal("the mail server's reply is not SMTP".into()))?;
+            let l = String::from_utf8_lossy(body);
+            let l = l.as_ref();
             let code = l
                 .get(..3)
                 .filter(|c| c.bytes().all(|b| b.is_ascii_digit()))
@@ -324,12 +333,14 @@ fn connect(
     })
 }
 
-/// `s` with each of `secrets` replaced, whatever their length.
+/// `s` with each of `secrets` replaced, whatever their length. The longest go first,
+/// so that a secret inside another, such as the password inside the AUTH token, does
+/// not break up the longer one and leave part of it readable.
 pub(super) fn scrub(mut s: String, secrets: &[&str]) -> String {
-    for k in secrets {
-        if !k.is_empty() {
-            s = s.replace(k, "[redacted]");
-        }
+    let mut sorted: Vec<&str> = secrets.iter().copied().filter(|k| !k.is_empty()).collect();
+    sorted.sort_by_key(|k| std::cmp::Reverse(k.len()));
+    for k in sorted {
+        s = s.replace(k, "[redacted]");
     }
     s
 }
