@@ -668,9 +668,9 @@ mod tests {
             .unwrap();
             assert!(result.boolean);
             if indexed {
-                assert!(find(&result.plan(), "IndexJoin", "").is_some(), "{pattern}");
+                assert!(find(result.plan(), "IndexJoin", "").is_some(), "{pattern}");
             }
-            let scan = find(&result.plan(), "IndexScan", "urn:p").unwrap();
+            let scan = find(result.plan(), "IndexScan", "urn:p").unwrap();
             observed.push((pattern, scan.actual_rows));
             assert!(scan.fidelity().stopped_early);
             let capped = query(
@@ -685,7 +685,7 @@ mod tests {
             .unwrap();
             assert!(capped.boolean);
             assert_eq!(
-                find(&capped.plan(), "IndexScan", "urn:p")
+                find(capped.plan(), "IndexScan", "urn:p")
                     .unwrap()
                     .actual_rows,
                 64,
@@ -714,7 +714,7 @@ mod tests {
         .unwrap();
         assert!(changed.boolean);
         assert_eq!(
-            find(&changed.plan(), "IndexScan", "urn:p")
+            find(changed.plan(), "IndexScan", "urn:p")
                 .unwrap()
                 .actual_rows,
             64,
@@ -1113,7 +1113,7 @@ mod tests {
             }
             p.children.iter().find_map(wide)
         }
-        let wide = wide(&r.plan()).expect("wide scan is retained in the physical plan");
+        let wide = wide(r.plan()).expect("wide scan is retained in the physical plan");
         assert_eq!(
             wide.actual_rows, -1,
             "the cheaper branch must answer ASK before any wide scan"

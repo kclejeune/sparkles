@@ -2965,7 +2965,7 @@ mod projection_capacity_tests {
         assert!(!result.plan().cached);
         assert!(result.test_context().use_cache);
         let mut leaves = Vec::new();
-        algo_infos(&result.plan(), &mut leaves);
+        algo_infos(result.plan(), &mut leaves);
         assert_eq!(leaves.len(), 64);
         for info in leaves {
             assert_eq!(

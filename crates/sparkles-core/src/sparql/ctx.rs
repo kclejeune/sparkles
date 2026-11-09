@@ -725,9 +725,12 @@ pub struct Ctx {
     pub(super) source_preparation: Option<crate::access::Preparation>,
     pub(super) source_setup: Option<crate::access::Reservation>,
     #[cfg(test)]
-    pub(super) chunk_hook:
-        parking_lot::Mutex<Option<Arc<dyn Fn(&'static str, usize) + Send + Sync>>>,
+    pub(super) chunk_hook: parking_lot::Mutex<Option<ChunkHook>>,
 }
+
+/// A test observer of the chunks a retained output takes.
+#[cfg(test)]
+pub(super) type ChunkHook = Arc<dyn Fn(&'static str, usize) + Send + Sync>;
 
 /// Set in [`FastMemory::live`] once the ledger has taken the account over.
 const PROMOTED: u64 = 1 << 63;

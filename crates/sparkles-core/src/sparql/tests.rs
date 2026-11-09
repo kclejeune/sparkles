@@ -146,12 +146,12 @@ fn result_cache_reuses_subtrees() {
     let a = q(&s, text);
     let b = q(&s, text);
     assert_eq!(strs(&a), strs(&b));
-    assert!(has_cached(&b.plan()), "second run should hit the cache");
+    assert!(has_cached(b.plan()), "second run should hit the cache");
     assert!(s.result_cache().hits() > 0);
     // an update invalidates (new snapshot version)
     update::update(&s, "INSERT DATA { <http://ex.org/z> a <http://xmlns.com/foaf/0.1/Person> ; <http://xmlns.com/foaf/0.1/name> \"Z\" }", &QueryOptions::default()).unwrap();
     let c = q(&s, text);
-    assert!(!has_cached(&c.plan()));
+    assert!(!has_cached(c.plan()));
     assert_ne!(strs(&a), strs(&c));
 }
 
@@ -177,9 +177,9 @@ fn result_cache_hits_for_aggregates() {
         (p.operator == op && p.cached) || p.children.iter().any(|c| op_cached(c, op))
     }
     assert!(
-        op_cached(&b.plan(), "GroupBy")
-            || op_cached(&b.plan(), "Bind")
-            || op_cached(&b.plan(), "Project"),
+        op_cached(b.plan(), "GroupBy")
+            || op_cached(b.plan(), "Bind")
+            || op_cached(b.plan(), "Project"),
         "the aggregation itself should come from the cache"
     );
 }
@@ -334,7 +334,7 @@ fn limit_and_ask_stop_early() {
         .unwrap();
     let r = q(&s, "SELECT * WHERE { ?s ?p ?o } LIMIT 10");
     assert_eq!(r.test_table().len(), 10);
-    assert!(has_desc(&r.plan(), "stopped early"));
+    assert!(has_desc(r.plan(), "stopped early"));
     let r = q(
         &s,
         "SELECT ?s WHERE { ?s ex:p ?v FILTER(?v > 4000) } LIMIT 5 OFFSET 2",
@@ -809,7 +809,7 @@ fn aggregates() {
     );
     assert_eq!(strs(&r), ["Person 3"]);
     // exact per-class counts come from the statistics (no delta, default graph only)
-    assert!(has_op(&r.plan(), "GroupCountFromMetadata"));
+    assert!(has_op(r.plan(), "GroupCountFromMetadata"));
     let r = q(
         &s,
         "SELECT ?t (COUNT(*) AS ?c) WHERE { ?p a ?t } GROUP BY ?t",
@@ -825,14 +825,14 @@ fn aggregates() {
     // COUNT over a full scan comes from index metadata
     let r = q(&s, "SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }");
     assert_eq!(strs(&r), ["18"]);
-    assert!(has_op(&r.plan(), "CountFromIndex"));
+    assert!(has_op(r.plan(), "CountFromIndex"));
     let r = q(
         &s,
         "SELECT (COUNT(*) AS ?n) WHERE { ?a foaf:knows ?b . ?b foaf:knows ?c }",
     );
     assert_eq!(strs(&r), ["1"]);
     // two scans joined on one variable: counted from per-key runs
-    assert!(has_op(&r.plan(), "CountJoinFromRuns"));
+    assert!(has_op(r.plan(), "CountJoinFromRuns"));
     let r = q(
         &s,
         "SELECT (COUNT(*) AS ?c) WHERE { ?a foaf:knows ?b . ?b foaf:name ?n }",
@@ -1055,7 +1055,7 @@ fn named_graphs() {
         "SELECT ?s (COUNT(*) AS ?c) FROM ex:g1 FROM ex:g2 WHERE { ?s ex:p ?o } GROUP BY ?s",
     );
     assert_eq!(strs(&r), ["a 2", "b 1", "c 1"]);
-    assert!(has_op(&r.plan(), "GroupCountFromIndex"));
+    assert!(has_op(r.plan(), "GroupCountFromIndex"));
     let r = q(
         &s,
         "SELECT ?g (COUNT(*) AS ?c) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g",
@@ -1396,8 +1396,8 @@ fn count_distinct_from_index() {
             // a graph variable keeps the general plan (the scan is not the group's input);
             // the others count runs or read the statistics
             assert_eq!(
-                has_op(&r.plan(), "CountDistinctFromIndex")
-                    || has_op(&r.plan(), "CountDistinctFromMetadata"),
+                has_op(r.plan(), "CountDistinctFromIndex")
+                    || has_op(r.plan(), "CountDistinctFromMetadata"),
                 !pattern.contains("?g"),
                 "{pattern} {v}"
             );
@@ -1799,7 +1799,7 @@ fn cached_results_obey_the_row_budget() {
     let full = strs(&q(&s, text));
     assert_eq!(full.len(), 3);
     // the next run is served from the cache
-    assert!(has_cached(&q(&s, text).plan()));
+    assert!(has_cached(q(&s, text).plan()));
     let limited = QueryOptions {
         max_rows: Some(2),
         prefixes: vec![("foaf".into(), "http://xmlns.com/foaf/0.1/".into())],
@@ -1963,7 +1963,7 @@ fn memory_budget_applies_to_cached_results_and_updates() {
     let s = cached_store(DATA, RdfFormat::Turtle);
     let text = "SELECT * WHERE { ?a ?b ?c . ?d ?e ?f }";
     let full = q(&s, text);
-    assert!(has_cached(&q(&s, text).plan()));
+    assert!(has_cached(q(&s, text).plan()));
     let o = QueryOptions {
         max_memory_bytes: Some(full.mem_peak_bytes / 2),
         ..Default::default()
@@ -2135,7 +2135,7 @@ fn rows_produced_sums_every_operator_and_is_a_budget() {
         .len() as u64;
     // two scans of n rows and their n² cross product
     assert_eq!(r.len() as u64, n * n);
-    assert_eq!(r.rows_produced, plan_rows(&r.plan()));
+    assert_eq!(r.rows_produced, plan_rows(r.plan()));
     assert!(r.rows_produced >= n * n + 2 * n, "{}", r.rows_produced);
     // a budget above the largest intermediate result but below the total still fails:
     // it counts the work of all operators, not one table
@@ -2166,7 +2166,7 @@ fn rows_produced_sums_every_operator_and_is_a_budget() {
     let c = cached_store(DATA, RdfFormat::Turtle);
     q(&c, text);
     let hit = q(&c, text);
-    assert!(has_cached(&hit.plan()));
+    assert!(has_cached(hit.plan()));
     assert!(hit.rows_produced >= n * n, "{}", hit.rows_produced);
     let o = QueryOptions {
         max_rows_produced: Some(n * n - 1),
@@ -2515,7 +2515,7 @@ mod generator_divergences {
                     ?s :p ?x . ?y :q ?v FILTER(?x = ?y) }";
         let r = query(s.snapshot(), text, &QueryOptions::default()).unwrap();
         assert_eq!(r.test_application_rows().len(), n + 1);
-        assert!(has_op(&r.plan(), "KeyedJoin"), "{:#?}", r.plan());
+        assert!(has_op(r.plan(), "KeyedJoin"), "{:#?}", r.plan());
     }
 }
 

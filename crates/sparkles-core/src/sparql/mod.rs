@@ -1652,7 +1652,7 @@ fn execute_prepared_parts(
                 .map_err(|error| failed(error, None, None))?;
             let vars = &variables.ids;
             let retained = materialized
-                .project(&ctx, &vars)
+                .project(&ctx, vars)
                 .and_then(|output| output.into_retained(&ctx))
                 .map_err(|error| failed(error, None, None))?;
             result.variables = Some(variables);
@@ -1911,7 +1911,7 @@ fn graph_vec_room<T>(ctx: &Ctx, held: &ctx::Charge<'_>, values: &mut Vec<T>) -> 
         return Ok(());
     }
     let old = values.capacity();
-    let cap = old.checked_mul(2).unwrap_or(usize::MAX).max(4);
+    let cap = old.saturating_mul(2).max(4);
     let bytes = cap
         .checked_mul(std::mem::size_of::<T>())
         .and_then(|n| u64::try_from(n).ok())
@@ -2392,7 +2392,7 @@ mod paid_final_table_tests {
             },
         )
         .unwrap();
-        let bytes = algosvc::table_capacity(&result.test_table()).unwrap();
+        let bytes = algosvc::table_capacity(result.test_table()).unwrap();
         assert_eq!(result.test_table().cols, [vec![Id::UNDEF]]);
         assert!(
             result.test_context().live_bytes() >= bytes,
@@ -2405,7 +2405,7 @@ mod paid_final_table_tests {
                 "ordinary prepared output stays on its fast account"
             )
         });
-        let owner = Arc::downgrade(&result.test_context());
+        let owner = Arc::downgrade(result.test_context());
         drop(store);
         assert!(owner.upgrade().is_some());
         assert!(grant.used() >= bytes);

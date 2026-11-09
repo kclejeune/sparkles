@@ -43,7 +43,7 @@ fn prepared_query_retains_genuine_source_credit_and_releases_on_final_result() {
     ));
     assert!(result.test_context().read_source.is_some());
     assert!(preparation.inner_used() > baseline);
-    let context = Arc::downgrade(&result.test_context());
+    let context = Arc::downgrade(result.test_context());
     drop(view);
     drop(store);
     assert!(physical.upgrade().is_some());
@@ -517,7 +517,7 @@ fn checked_source_all_graph_triple_policy_is_retained_and_redacts_plan() {
             .is_some_and(|policy| Arc::ptr_eq(policy, view.query_input().1)),
         "actual bound triple policy must survive even when all graph names are readable"
     );
-    assert_redacted(&result.plan());
+    assert_redacted(result.plan());
     let all = GraphAccess::all()
         .masked_controlled(&store.snapshot(), &preparation)
         .unwrap();

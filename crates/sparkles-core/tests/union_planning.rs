@@ -73,9 +73,9 @@ fn a_selective_pattern_limits_work_inside_union_branches() {
                 names.sort_by_key(|row| row.values()[0].as_ref().unwrap().to_string());
                 assert_eq!(
                     names.iter().map(|row| row.values()).collect::<Vec<_>>(),
-                    vec![
+                    [
                         vec![Some(Term::Literal(Literal::new_simple_literal("Alice")))],
-                        vec![Some(Term::Literal(Literal::new_simple_literal("Bob")))],
+                        vec![Some(Term::Literal(Literal::new_simple_literal("Bob")))]
                     ]
                     .iter()
                     .map(Vec::as_slice)
@@ -382,9 +382,9 @@ fn outer_filters_keep_the_original_join_boundary() {
             names.sort_by_key(|row| row.values()[0].as_ref().unwrap().to_string());
             assert_eq!(
                 names.iter().map(|row| row.values()).collect::<Vec<_>>(),
-                vec![
+                [
                     vec![Some(Term::Literal(Literal::new_simple_literal("Alice")))],
-                    vec![Some(Term::Literal(Literal::new_simple_literal("Bob")))],
+                    vec![Some(Term::Literal(Literal::new_simple_literal("Bob")))]
                 ]
                 .iter()
                 .map(Vec::as_slice)

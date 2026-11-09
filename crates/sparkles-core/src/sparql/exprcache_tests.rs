@@ -76,9 +76,9 @@ fn check(snap: &Arc<crate::store::Snapshot>, q: &str) -> bool {
     assert_eq!(a, b, "{q}");
     assert_eq!(a, c, "{q}");
     let mut n = Vec::new();
-    notes(&off.plan(), &mut n);
+    notes(off.plan(), &mut n);
     assert!(n.is_empty(), "{q}: cache ran while off: {n:?}");
-    counter(&on.plan(), "exprCacheMisses") > 0
+    counter(on.plan(), "exprCacheMisses") > 0
 }
 
 fn xorshift(seed: u64) -> impl FnMut() -> u64 {
@@ -399,13 +399,13 @@ fn admission_and_counters() {
         Optimizations::ALL,
     );
     let (hits, misses) = (
-        counter(&r.plan(), "exprCacheHits"),
-        counter(&r.plan(), "exprCacheMisses"),
+        counter(r.plan(), "exprCacheHits"),
+        counter(r.plan(), "exprCacheMisses"),
     );
     assert_eq!(hits + misses, rows, "{:#?}", r.plan());
     assert!(misses < 200 && hits > rows / 2, "{hits} {misses}");
     let mut n = Vec::new();
-    notes(&r.plan(), &mut n);
+    notes(r.plan(), &mut n);
     assert!(n[0].contains("once per"), "{n:?}");
 
     // values that hardly repeat: row by row, with the reason
@@ -429,9 +429,9 @@ fn admission_and_counters() {
         Optimizations::ALL,
     );
     let mut n = Vec::new();
-    notes(&r.plan(), &mut n);
+    notes(r.plan(), &mut n);
     assert!(n.len() == 1 && n[0].contains("row by row"), "{n:?}");
-    assert_eq!(counter(&r.plan(), "exprCacheSkipped"), 1);
+    assert_eq!(counter(r.plan(), "exprCacheSkipped"), 1);
 
     // impure expressions are evaluated on every row
     for (q, col) in [
@@ -447,7 +447,7 @@ fn admission_and_counters() {
     ] {
         let r = run_on(snap.clone(), q, Optimizations::ALL);
         let mut n = Vec::new();
-        notes(&r.plan(), &mut n);
+        notes(r.plan(), &mut n);
         assert!(n.is_empty(), "{q}: {n:?}");
         let distinct: std::collections::HashSet<_> = r
             .test_application_rows()
@@ -464,7 +464,7 @@ fn admission_and_counters() {
         "SELECT ?s ?x WHERE { ?s ex:v ?v BIND(CONCAT(\"a\", STR(YEAR(NOW()))) AS ?x) }",
         Optimizations::ALL,
     );
-    assert_eq!(counter(&r.plan(), "exprCacheMisses"), 1, "{:#?}", r.plan());
+    assert_eq!(counter(r.plan(), "exprCacheMisses"), 1, "{:#?}", r.plan());
 
     // the base IRI resolves relative IRIs the same way for every row
     let q =
@@ -475,7 +475,7 @@ fn admission_and_counters() {
     let q = "SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(STRLEN(STR(?v)) > 1 && ?s != ex:s3 && EXISTS { ?s ex:w ?w }) }";
     let r = run_on(snap.clone(), q, Optimizations::ALL);
     let mut n = Vec::new();
-    notes(&r.plan(), &mut n);
+    notes(r.plan(), &mut n);
     assert!(n.iter().any(|n| n.contains("STRLEN")), "{n:?}");
     assert!(!n.iter().any(|n| n.contains("EXISTS")), "{n:?}");
     check(&snap, q);

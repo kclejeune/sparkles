@@ -48,13 +48,13 @@ fn class_counts_from_statistics() {
     assert_ne!(before, after);
     // switched off, the index runs are counted
     let r = run(&s, q, without_metadata_counts());
-    assert!(!has_op(&r.plan(), "GroupCountFromMetadata"));
-    assert!(has_op(&r.plan(), "GroupCountFromIndex"));
+    assert!(!has_op(r.plan(), "GroupCountFromMetadata"));
+    assert!(has_op(r.plan(), "GroupCountFromIndex"));
     assert_eq!(solutions(&r), after);
     // after compaction the statistics are exact by themselves
     s.compact().unwrap();
     let r = run(&s, q, Optimizations::ALL);
-    assert!(has_desc(&r.plan(), "[from statistics]"), "{:#?}", r.plan());
+    assert!(has_desc(r.plan(), "[from statistics]"), "{:#?}", r.plan());
     assert_eq!(same_answer(&s, q, "GroupCountFromMetadata"), after);
     // named graphs: a default-graph query leaves their quads out
     update(
@@ -111,7 +111,7 @@ fn predicate_counts_from_statistics() {
     // counts per predicate do not tell
     let union = "SELECT ?p (COUNT(*) AS ?c) WHERE { GRAPH <urn:x-arq:UnionGraph> { ?s ?p ?o } } GROUP BY ?p";
     assert!(!has_op(
-        &run(&s, union, Optimizations::ALL).plan(),
+        run(&s, union, Optimizations::ALL).plan(),
         "GroupCountFromMetadata"
     ));
     same_rows(&s, union);
@@ -154,7 +154,7 @@ fn distinct_counts_from_statistics() {
         "SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s ex:knows ex:s7 }",
     ] {
         let r = run(&s, q, Optimizations::ALL);
-        assert!(!has_op(&r.plan(), "CountDistinctFromMetadata"), "{q}");
+        assert!(!has_op(r.plan(), "CountDistinctFromMetadata"), "{q}");
         same_rows(&s, q);
     }
     // the delta is corrected for: a new subject and object, a literal that is there
@@ -168,7 +168,7 @@ fn distinct_counts_from_statistics() {
     for q in queries {
         after.push(same_answer(&s, q, "desc:delta quads]"));
         let r = run(&s, q, without_metadata_counts());
-        assert!(has_op(&r.plan(), "CountDistinctFromIndex"), "{q}");
+        assert!(has_op(r.plan(), "CountDistinctFromIndex"), "{q}");
     }
     assert_ne!(before, after);
     // after compaction they are exact by themselves
@@ -268,7 +268,7 @@ fn statistics_answers(snap: &Arc<Snapshot>, opt: Optimizations) -> (Vec<Vec<Stri
             let text = format!("{PREFIXES}{q}");
             let r = query(snap.clone(), &text, &opts).unwrap_or_else(|e| panic!("{q}: {e}"));
             let corrected =
-                has_desc(&r.plan(), "corrected for") || has_desc(&r.plan(), "graphs not read");
+                has_desc(r.plan(), "corrected for") || has_desc(r.plan(), "graphs not read");
             (solutions(&r), corrected)
         })
         .unzip()

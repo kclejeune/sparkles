@@ -363,7 +363,7 @@ fn optional_and_join_queries_give_the_same_rows_with_each_switch() {
                 ] {
                     let r = run(&snap, q, opt);
                     assert_eq!(answer(&r), want, "round {round} pass {pass}, {how}: {q}");
-                    if how == "all" && has_note(&r.plan(), "OptionalJoin", "[merge on") {
+                    if how == "all" && has_note(r.plan(), "OptionalJoin", "[merge on") {
                         merges += 1;
                     }
                 }

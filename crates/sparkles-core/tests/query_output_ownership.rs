@@ -391,7 +391,7 @@ fn retained_batch_variable_names_keep_original_credit_after_cursor_close() {
     )
     .unwrap();
     let batch = cursor.next_batch().unwrap().unwrap();
-    assert_eq!(batch.variables(), &[name.clone()]);
+    assert_eq!(batch.variables(), std::slice::from_ref(&name));
     cursor.close();
     drop(cursor);
     assert_eq!(batch.variables()[0].len(), 128 << 10);

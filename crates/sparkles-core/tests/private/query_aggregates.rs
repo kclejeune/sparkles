@@ -79,7 +79,7 @@ fn large_eligible_builtin_arguments_are_not_precomputed_for_registered_aggregate
     assert!(!plan.contains("application description"));
     assert_eq!(counts.create.load(Ordering::SeqCst), 0);
     let result = query(store.snapshot(), &text, &opts).unwrap();
-    assert_fixture_rows_eq!(result.rows().unwrap(), vec![vec![integer(256)]]);
+    assert_fixture_rows_eq!(result.rows().unwrap(), [vec![integer(256)]]);
     assert_eq!(counts.add.load(Ordering::SeqCst), 256);
     assert!(!result.inner.ctx.opt.expr_cache);
     let plan = serde_json::to_string(&result.plan()).unwrap();

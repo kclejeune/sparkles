@@ -233,12 +233,12 @@ impl BoundReadSource {
         let policy = opts.graphs.as_ref().ok_or_else(|| {
             Error::NotPermitted("strict source requires this invocation's current policy".into())
         })?;
-        if let Source::Prepared(view) = &self.source {
-            if !view.is_original_policy(policy) {
-                return Err(Error::NotPermitted(
-                    "strict source cannot replace its original current policy".into(),
-                ));
-            }
+        if let Source::Prepared(view) = &self.source
+            && !view.is_original_policy(policy)
+        {
+            return Err(Error::NotPermitted(
+                "strict source cannot replace its original current policy".into(),
+            ));
         }
         // Validate complete controls, actual grant and absolute deadline before
         // query parsing can allocate or obscure a source/policy refusal.

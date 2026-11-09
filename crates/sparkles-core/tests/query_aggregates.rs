@@ -148,7 +148,7 @@ fn arbitrary_iri_parser_roundtrip_and_registry_independent_prepared_runs() {
             .unwrap()
             .rows()
             .unwrap(),
-        vec![vec![integer(3)]]
+        [vec![integer(3)]]
     );
     let distinct = parse_query(&text.replace("(?v)", "(DISTINCT ?v)"), None, &[]).unwrap();
     let displayed = distinct.to_string();
@@ -165,7 +165,7 @@ fn arbitrary_iri_parser_roundtrip_and_registry_independent_prepared_runs() {
             .unwrap()
             .rows()
             .unwrap(),
-        vec![vec![integer(2)]]
+        [vec![integer(2)]]
     );
     let workers = [0, 10].map(|offset| {
         let store = store.clone();
@@ -175,7 +175,7 @@ fn arbitrary_iri_parser_roundtrip_and_registry_independent_prepared_runs() {
             let opts = options(factory(counts.clone(), offset));
             for _ in 0..4 {
                 let result = execute_query(store.snapshot(), &parsed, &opts, 0.0).unwrap();
-                assert_fixture_rows_eq!(result.rows().unwrap(), vec![vec![integer(offset + 3)]]);
+                assert_fixture_rows_eq!(result.rows().unwrap(), [vec![integer(offset + 3)]]);
             }
             assert_eq!(counts.create.load(Ordering::SeqCst), 4);
             assert_eq!(counts.drop.load(Ordering::SeqCst), 4);
@@ -657,7 +657,7 @@ fn lifecycle_expression_errors_are_unbound_without_poisoning_transactions() {
             .unwrap()
             .rows()
             .unwrap(),
-            vec![vec![None]]
+            [vec![None]]
         );
         transaction.commit().unwrap();
         assert_eq!(
@@ -910,7 +910,7 @@ fn query_result_retains_factory_registry_until_it_closes() {
     let result = query(store.snapshot(), &source("VALUES ?v {1 2}"), &opts).unwrap();
     drop(opts);
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
-    assert_fixture_rows_eq!(result.rows().unwrap(), vec![vec![integer(2)]]);
+    assert_fixture_rows_eq!(result.rows().unwrap(), [vec![integer(2)]]);
     drop(result);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }

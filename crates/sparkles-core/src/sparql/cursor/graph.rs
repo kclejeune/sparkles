@@ -362,11 +362,7 @@ impl GraphCursor {
                             self.seen_charge.resize(self.seen_bytes)?;
                             pending_charge.adopt_charge(incoming)?;
                             if pending.len() == pending.capacity() {
-                                let cap = pending
-                                    .capacity()
-                                    .checked_mul(2)
-                                    .unwrap_or(usize::MAX)
-                                    .max(4);
+                                let cap = pending.capacity().saturating_mul(2).max(4);
                                 let storage = cap
                                     .checked_mul(std::mem::size_of::<Quad>())
                                     .and_then(|n| u64::try_from(n).ok())

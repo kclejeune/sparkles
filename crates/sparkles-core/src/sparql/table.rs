@@ -529,13 +529,14 @@ impl<'ctx> Materialized<'ctx> {
                 "final table exceeds prepaid fast credit",
             ));
         }
-        if let Some(lease) = &self.lease {
-            if !ctx.owns_ledger(&lease.ledger) || lease.service.is_some() || lease.bytes < capacity
-            {
-                return Err(crate::Error::invalid(
-                    "foreign or active-service final table credit",
-                ));
-            }
+        if let Some(lease) = &self.lease
+            && (!ctx.owns_ledger(&lease.ledger)
+                || lease.service.is_some()
+                || lease.bytes < capacity)
+        {
+            return Err(crate::Error::invalid(
+                "foreign or active-service final table credit",
+            ));
         }
         let Self {
             table, fast, lease, ..

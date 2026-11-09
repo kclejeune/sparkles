@@ -926,10 +926,7 @@ fn receiving_root_intersects_both_original_control_sets_without_child_renewal() 
             root.source.query_input().2.control().deadline,
             Some(shorter)
         );
-        assert_eq!(
-            root.execute(&parsed, &Default::default()).unwrap().boolean,
-            true
-        );
+        assert!(root.execute(&parsed, &Default::default()).unwrap().boolean);
         flags[selected].store(true, Ordering::Relaxed);
         assert!(matches!(
             root.term(Id::DEFAULT_GRAPH),

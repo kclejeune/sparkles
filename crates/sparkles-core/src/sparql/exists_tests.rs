@@ -72,10 +72,10 @@ fn check(snap: &Arc<Snapshot>, text: &str) -> (Vec<String>, bool) {
     let a = rows(&on, ordered);
     assert_eq!(a, rows(&off, ordered), "{text}");
     assert!(
-        !decorrelated(&off.plan()),
+        !decorrelated(off.plan()),
         "{text}: switched off, yet decorrelated"
     );
-    (a, decorrelated(&on.plan()))
+    (a, decorrelated(on.plan()))
 }
 
 /// Shapes, and whether the rewrite applies to them (when the outer rows bind a key).
@@ -518,22 +518,22 @@ fn explain_shows_decorrelation_and_why_not() {
     assert_eq!(rows(&on, false), rows(&off, false));
     assert_eq!(on.len(), 3000 - 3000 / 7 - 1);
     assert!(
-        has_desc(&on.plan(), "[NOT EXISTS decorrelated on ?y:"),
+        has_desc(on.plan(), "[NOT EXISTS decorrelated on ?y:"),
         "{:#?}",
         on.plan()
     );
-    assert!(!has_desc(&off.plan(), "decorrelated"));
+    assert!(!has_desc(off.plan(), "decorrelated"));
     // every outer row probed, none evaluated per row; one key per object with a q
-    assert_eq!(counter(&on.plan(), "existsProbed"), Some(3000));
-    assert_eq!(counter(&on.plan(), "existsPerRow"), Some(0));
-    assert_eq!(counter(&on.plan(), "existsKeys"), Some(100));
-    assert_eq!(counter(&on.plan(), "existsSolutions"), Some(150));
+    assert_eq!(counter(on.plan(), "existsProbed"), Some(3000));
+    assert_eq!(counter(on.plan(), "existsPerRow"), Some(0));
+    assert_eq!(counter(on.plan(), "existsKeys"), Some(100));
+    assert_eq!(counter(on.plan(), "existsSolutions"), Some(150));
     // a filter over an outer variable the pattern does not bind: per row, and why
     let q = "SELECT ?x WHERE { ?x ex:p ?y FILTER EXISTS { ?y ex:q ?z FILTER(?z != ?x) } }";
     let r = explain_of(&s, q, Optimizations::ALL);
     assert!(
         has_desc(
-            &r.plan(),
+            r.plan(),
             "[EXISTS per row: the outer solutions bind a variable"
         ),
         "{:#?}",
@@ -543,7 +543,7 @@ fn explain_shows_decorrelation_and_why_not() {
     let q = "SELECT ?x WHERE { ?x ex:p ?y FILTER EXISTS { ?y ex:q ?z OPTIONAL { ?z ex:r ?w } } }";
     let r = explain_of(&s, q, Optimizations::ALL);
     assert!(
-        has_desc(&r.plan(), "[EXISTS per row: it has an OPTIONAL]"),
+        has_desc(r.plan(), "[EXISTS per row: it has an OPTIONAL]"),
         "{:#?}",
         r.plan()
     );
@@ -551,7 +551,7 @@ fn explain_shows_decorrelation_and_why_not() {
     let q = "SELECT ?y WHERE { VALUES ?y { ex:o1 ex:o2 } FILTER EXISTS { ?y ex:q ?z . ?x ex:p ?y . ?x ex:p ?w } }";
     let r = explain_of(&s, q, Optimizations::ALL);
     assert!(
-        has_desc(&r.plan(), "costs less than the whole pattern"),
+        has_desc(r.plan(), "costs less than the whole pattern"),
         "{:#?}",
         r.plan()
     );
@@ -562,7 +562,7 @@ fn explain_shows_decorrelation_and_why_not() {
         Optimizations::ALL,
     );
     assert!(r.boolean);
-    assert!(has_desc(&r.plan(), "decorrelated"), "{:#?}", r.plan());
+    assert!(has_desc(r.plan(), "decorrelated"), "{:#?}", r.plan());
 }
 
 /// A key set over the memory budget leaves the EXISTS to per-row evaluation: the query
@@ -587,13 +587,13 @@ fn decorrelation_falls_back_under_the_memory_budget() {
     let off = query(s.snapshot(), &q, &budget(without(), None)).unwrap();
     let peak = off.mem_peak_bytes;
     let on = query(s.snapshot(), &q, &budget(Optimizations::ALL, None)).unwrap();
-    assert!(decorrelated(&on.plan()), "{:#?}", on.plan());
+    assert!(decorrelated(on.plan()), "{:#?}", on.plan());
     assert!(on.mem_peak_bytes > peak, "{} vs {peak}", on.mem_peak_bytes);
     let tight = query(s.snapshot(), &q, &budget(Optimizations::ALL, Some(peak))).unwrap();
     assert_eq!(rows(&tight, false), rows(&off, false));
-    assert!(!decorrelated(&tight.plan()), "{:#?}", tight.plan());
+    assert!(!decorrelated(tight.plan()), "{:#?}", tight.plan());
     assert!(
-        has_desc(&tight.plan(), "memory budget"),
+        has_desc(tight.plan(), "memory budget"),
         "{:#?}",
         tight.plan()
     );
@@ -627,7 +627,7 @@ fn an_eager_exists_memo_is_charged() {
         format!("{PREFIXES}SELECT ?x WHERE {{ ?x ex:p ?y FILTER NOT EXISTS {{ ?y ex:q ?z }} }}");
     let peak = |distinct: bool| {
         let r = query(data(distinct).snapshot(), &q, &opts(without())).unwrap();
-        assert!(!decorrelated(&r.plan()), "{:#?}", r.plan());
+        assert!(!decorrelated(r.plan()), "{:#?}", r.plan());
         let answers = if distinct { N / 2 } else { 0 };
         assert_eq!(r.test_application_rows().len(), answers);
         r.mem_peak_bytes

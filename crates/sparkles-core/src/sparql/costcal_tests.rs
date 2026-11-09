@@ -139,7 +139,7 @@ fn measure(
         plan.push(r.timing.plan_ms);
         rows = r.test_table().len();
         let mut f = Vec::new();
-        flatten(&r.plan(), "0".into(), &mut f);
+        flatten(r.plan(), "0".into(), &mut f);
         if per_op.is_empty() {
             per_op = vec![Vec::new(); f.len()];
         }
