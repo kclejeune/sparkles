@@ -1714,6 +1714,21 @@ class TransientStatOnlyStatus(unittest.TestCase):
         with self.assertRaises(self.O['SourceDrift']):self.O['startup_source'](repo,clean,observe,None,pauses.append)
         self.assertEqual((len(rows),pauses),(4,[1,1]))
 
+    def test_a_reread_with_any_other_drift_is_refused_at_once(self):
+        # Review round 1. A content change seen on a reread is drift even when a later
+        # observation is clean again, and no further reread follows it.
+        repo=self.linked();clean=self.source(repo);(repo/'a.txt').write_text('changed\n');dirty=self.source(repo);(repo/'a.txt').write_text('a\n')
+        self.assertNotEqual(dirty['tracked_diff_sha256'],clean['tracked_diff_sha256'])
+        rows=[dict(clean,status_sha256=self.line('crates/LICENSE')),dirty,clean];seen=[]
+        def observe():seen.append(rows[len(seen)]);return seen[-1]
+        with self.assertRaises(self.O['SourceDrift']) as caught:self.O['startup_source'](repo,clean,observe,None,lambda s:None)
+        self.assertEqual(len(seen),2);self.assertTrue(caught.exception.source_drift['fields']['tracked_diff_sha256']['differs'])
+        # So is an untracked file or another status the links cannot account for.
+        for other in (hashlib.sha256(b'?? new.txt\0').hexdigest(),self.line('a.txt')):
+            rows=[dict(clean,status_sha256=self.line('crates/LICENSE')),dict(clean,status_sha256=other),clean];seen=[]
+            with self.assertRaises(self.O['SourceDrift']):self.O['startup_source'](repo,clean,observe,None,lambda s:None)
+            self.assertEqual(len(seen),2)
+
     def test_a_link_line_still_listed_keeps_the_item_778_path(self):
         repo=self.linked();clean=self.source(repo);self.stale_link_size(repo);rows=[]
         def observe():rows.append(self.source(repo));return rows[-1]

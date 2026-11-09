@@ -174,7 +174,9 @@ def startup_source(repo,expected,observe,env,pause=None):
     listing cannot show the hashed lines (item 788), the hash must belong to ` M` lines of
     HEAD-matching links. Up to SOURCE_REREADS further observations, a second apart, then
     look for one that equals the recording or is stat-only by a listing read right after
-    it. Anything else raises SourceDrift with the last pair read.
+    it. A reread that is neither and whose status the links cannot account for in the
+    same way is drift at once, so a change seen between two clean observations is never
+    accepted. SourceDrift names the last pair read.
     """
     first=observe()
     if first==expected:return first,None
@@ -189,6 +191,9 @@ def startup_source(repo,expected,observe,env,pause=None):
         again=observe();now=status_record(repo,env)
         if again==expected or stat_only_status(expected,again,now):
             return first,dict(public_status(now),stat_only=True,transient=True,attributed=[raw.decode('utf-8','replace') for raw in names])
+        try:still=stat_only_lines(expected,again,repo,env)
+        except Exception:still=None
+        if still is None:break
     raise SourceDrift('existing source drift',repo,expected,again,now)
 
 class SourceDrift(Refusal):

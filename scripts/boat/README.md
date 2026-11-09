@@ -157,14 +157,15 @@ diff while its new size still marks it. The qualification keeps the lines as
 `stat_only_status` beside the checkout's source observations.
 
 The helper hashes its status listing a moment before the probe lists it, and the stale
-line can clear in between. On one resume the helper hashed the link's ` M` line and the
-probe's listing was empty a second later, so the lines could not be checked. The probe
-then accepts the hashed status only when it equals the hash of ` M` lines of tracked
+line can clear in between, which leaves the probe's listing empty. The probe then
+accepts the hashed status only when it equals the hash of ` M` lines of tracked
 symbolic links, in git's order, whose index entry holds the blob HEAD records and whose
 raw target hashes to that blob. At most eight links are tried, and a credential-like
 path never accounts for a status. The probe then observes the checkout again, up to three
 times a second apart, and needs an observation equal to the recording or one that its
-own listing shows to be stat-only as above. The record marks such a status `transient`
+own listing shows to be stat-only as above. A reread whose status the links cannot
+account for in the same way, or whose other fields differ, is a refusal at once, even
+when a later observation would be clean. The record marks such a status `transient`
 and names the links it attributed. No index refresh is used, since git keeps a size
 mismatch without reading the link and a refresh would only write the startup checkout's
 index. Any other status change
