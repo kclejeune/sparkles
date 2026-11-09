@@ -22,7 +22,14 @@ export type Editor = 'ontology' | 'thesaurus' | 'shapes';
  * discussions.
  * The tree's entity kind is `kind` (no `kind`: classes).
  */
-export const ONTOLOGY_TABS = ['tree', 'dlquery', 'header', 'history', 'discussions'] as const;
+export const ONTOLOGY_TABS = [
+  'tree',
+  'dlquery',
+  'header',
+  'history',
+  'discussions',
+  'bulk',
+] as const;
 export type OntologyTab = (typeof ONTOLOGY_TABS)[number];
 /** The Thesaurus editor's tabs: the tree (no `tab`), the history and the validation report. */
 export const THESAURUS_TABS = ['tree', 'history', 'validation'] as const;

@@ -99,6 +99,7 @@
   import EditorHistory from '$components/EditorHistory.svelte';
   import EntityHistory from '$components/EntityHistory.svelte';
   import Discussions from '$components/Discussions.svelte';
+  import BulkEdit from '$components/BulkEdit.svelte';
   import { isDiscussionGraph } from '$lib/discussions';
   import TreeCrumbs from '$components/TreeCrumbs.svelte';
 
@@ -110,6 +111,7 @@
     ['header', 'Header'],
     ['history', 'History'],
     ['discussions', 'Discussions'],
+    ['bulk', 'Bulk edits'],
   ];
 
   type Tab = OntologyTab;
@@ -659,7 +661,8 @@
   // header, the DL query or the create dialog needs them, and not when it opens
   let needKey = '';
   $effect(() => {
-    const need = !!selected || tab === 'header' || tab === 'dlquery' || createOpen;
+    const need =
+      !!selected || tab === 'header' || tab === 'dlquery' || tab === 'bulk' || createOpen;
     const key = `${selected ?? ''}\u0000${tab}\u0000${createOpen}`;
     const missing = PICKER_KINDS.some((k) => !listed.has(k));
     const failed = listFailed;
@@ -1493,6 +1496,21 @@
             onedit={(op, label) => edit(op, label)}
             onrename={openRename}
           />
+        </div>
+      </section>
+    {:else if tab === 'bulk' && summary}
+      <section class="panel" aria-label="Bulk edits">
+        <div class="panel-body">
+          {#key `${target}|${graph}`}<BulkEdit
+              {target}
+              {graph}
+              commit={summary.commit ?? null}
+              {readonly}
+              {prefixes}
+              {annotationProperties}
+              name={nameOf}
+              onedit={(op, label) => edit(op, label)}
+            />{/key}
         </div>
       </section>
     {:else if tab === 'discussions' && summary}
