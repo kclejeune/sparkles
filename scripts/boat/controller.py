@@ -39,7 +39,7 @@ def packet_refusals():
     found=set()
     for name in ('common.py','config_schema.py','metadata-probe.py','startup-observer.py','remote-launcher.py','diagnostic-probe.py'):
         for node in ast.walk(ast.parse((ROOT/name).read_text())):
-            if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id in ('need','require','Refusal'):
+            if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id in ('need','require','Refusal','SourceDrift'):
                 for arg in node.args:
                     if isinstance(arg,ast.Constant) and isinstance(arg.value,str):found.add(arg.value)
     return frozenset(found)
@@ -93,6 +93,8 @@ def phase_evidence(result):
     events=result.get('memory_events')
     if isinstance(events,dict):evidence['memory_events']={k:v for k,v in list(events.items())[:16] if isinstance(k,str) and re.fullmatch(r'[a-z_]{1,32}',k) and isinstance(v,str) and re.fullmatch(r'[0-9]{1,20}',v)}
     out['evidence']=evidence
+    drift=drift_evidence(result.get('source_drift'))
+    if drift is not None:out['source_drift']=drift
     return out
 
 def record_refusal(io,phase,error=None,result=None,code=None,failed=()):

@@ -524,6 +524,55 @@ fn lang_literal(lex: String, tag: &str) -> Literal {
     }
 }
 
+/// An IRI or literal key whose text parts are all valid UTF-8, split once so that a
+/// caller can size the term before it builds the same term as [`key_to_term`].
+pub(crate) enum TextKey<'a> {
+    Iri(&'a str),
+    Simple(&'a str),
+    Lang(&'a str, &'a str),
+    Typed(&'a str, &'a str),
+}
+
+impl<'a> TextKey<'a> {
+    /// The split key, or `None` for a blank-node or triple-term key and for any key
+    /// whose text [`key_to_term`] would have to decode lossily.
+    #[inline]
+    pub(crate) fn parse(key: &'a [u8]) -> Option<Self> {
+        match key.first() {
+            Some(b'"') => {
+                let sep = key.iter().rposition(|&b| b == KEY_SEP).unwrap_or(key.len());
+                let lex = std::str::from_utf8(&key[1..sep]).ok()?;
+                let suffix = key.get(sep + 1..).unwrap_or(&[]);
+                match suffix.split_first() {
+                    None => Some(Self::Simple(lex)),
+                    Some((&b'@', tag)) => Some(Self::Lang(lex, std::str::from_utf8(tag).ok()?)),
+                    Some((&first, iri)) if first.is_ascii() => {
+                        Some(Self::Typed(lex, std::str::from_utf8(iri).ok()?))
+                    }
+                    Some(_) => None,
+                }
+            }
+            Some(b'_' | b'(') => None,
+            Some(b'<') => std::str::from_utf8(&key[1..]).ok().map(Self::Iri),
+            _ => std::str::from_utf8(key).ok().map(Self::Iri),
+        }
+    }
+
+    /// The term [`key_to_term`] gives for the parsed key.
+    #[inline]
+    pub(crate) fn into_term(self) -> Term {
+        match self {
+            Self::Iri(iri) => Term::NamedNode(NamedNode::new_unchecked(iri)),
+            Self::Simple(lex) => Term::Literal(Literal::new_simple_literal(lex)),
+            Self::Lang(lex, tag) => Term::Literal(lang_literal(lex.to_owned(), tag)),
+            Self::Typed(lex, iri) => Term::Literal(Literal::new_typed_literal(
+                lex,
+                NamedNode::new_unchecked(iri),
+            )),
+        }
+    }
+}
+
 /// Parse a vocabulary key back into a term.
 pub fn key_to_term(key: &[u8]) -> Term {
     match key.first() {
