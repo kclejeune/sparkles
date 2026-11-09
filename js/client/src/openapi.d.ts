@@ -2195,7 +2195,7 @@ export interface paths {
         };
         /**
          * Diff the axioms of two commits
-         * @description The axioms that differ between the commits `from` and `to` (the head by default), with the graph of each. The terminology of each state is read as the summary reads it, and the two sets of axioms are compared. With `assertions=true`, the assertions that the triples changed between the two commits carry are added and removed too. When no triple of the graphs read changed, the diff is empty. `format=text` answers `+ axiom` and `- axiom` lines in functional-style syntax. A caller whose grants limit endpoints needs the `diff` endpoint.
+         * @description The axioms that differ between the commits `from` and `to` (the head by default), with the graph of each. The terminology of each state is read as the summary reads it, and the two sets of axioms are compared. With `assertions=true`, the assertions that the triples changed between the two commits carry are added and removed too. When no triple of the graphs read changed, the diff is empty. `format=text` answers `+ axiom` and `- axiom` lines in functional-style syntax. With `entity`, only the axioms that mention that IRI are kept, which is how the entity frame's history reads one commit. A caller whose grants limit endpoints needs the `diff` endpoint.
          */
         get: operations["diffOntology"];
         put?: never;
@@ -18175,6 +18175,8 @@ export interface operations {
                 to?: string;
                 /** @description Also diff the assertions that the changed triples carry. */
                 assertions?: boolean;
+                /** @description An entity IRI. Only the axioms that mention it are listed and counted. */
+                entity?: string;
                 /** @description `json` (the default) or `text`. */
                 format?: "json" | "text";
                 /** @description The most axioms listed on each side, from 1 to 10,000 (1,000 by default). */
