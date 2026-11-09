@@ -1827,6 +1827,17 @@ class TransientStatOnlyStatus(unittest.TestCase):
         # The same lines out of git's order are not a listing git could print.
         self.refused(repo,clean,[dict(clean,status_sha256=self.line('z-link','b-link')),clean])
 
+    def test_an_index_listing_larger_than_a_mebibyte_is_read(self):
+        # Run 13. The startup checkout's `ls-files --stage -z` is about 1.6 MB, more than
+        # the probe's 1 MiB command bound, so the attribution failed and op-13 refused.
+        repo=self.linked();d=repo/'many';d.mkdir()
+        for n in range(12000):(d/('f%05d-'%n+'x'*40)).touch()
+        self.git(repo,'add','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','-c','commit.gpgsign=false','commit','-qm','many')
+        self.assertGreater(len(self.git(repo,'ls-files','--stage','-z')),1024*1024)
+        clean=self.source(repo);self.assertEqual(self.O['head_links'](repo,None),[b'crates/LICENSE'])
+        first,stale=self.O['startup_source'](repo,clean,iter([dict(clean,status_sha256=self.line('crates/LICENSE')),clean]).__next__,None)
+        self.assertEqual(stale['attributed'],['crates/LICENSE'])
+
     def test_more_links_than_the_bound_are_not_attributed(self):
         repo=self.linked()
         for n in range(self.O['LINK_LISTING_MAX']):os.symlink('a.txt',repo/f'link-{n}')

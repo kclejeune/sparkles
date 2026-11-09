@@ -134,16 +134,35 @@ def public_status(status):
 # could produce, and only links whose index entry, HEAD entry and worktree target agree
 # can account for it. At most LINK_LISTING_MAX links are tried, every subset in git's order.
 LINK_LISTING_MAX=8
+INDEX_LISTING_MAX=64*1024*1024
+def index_listing(repo,env,seconds=30):
+    """The NUL-separated entries of `git ls-files --stage -z`, read in bounded chunks."""
+    p=subprocess.Popen(['git','-C',str(repo),'-c','core.fsmonitor=false','--no-optional-locks','ls-files','--stage','-z'],
+                       stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env,cwd=repo)
+    end=__import__('time').monotonic()+seconds;total=0;rest=b''
+    try:
+        while True:
+            need(__import__('time').monotonic()<end,'index listing time bound')
+            part=p.stdout.read1(1024*1024)
+            if not part:break
+            total+=len(part);need(total<=INDEX_LISTING_MAX,'index listing bound')
+            items=(rest+part).split(b'\0');rest=items.pop()
+            yield from items
+        need(p.wait(max(1,end-__import__('time').monotonic()))==0 and not rest,'qualification command failed')
+    finally:
+        if p.poll() is None:p.kill();p.wait()
+        p.stdout.close()
 def head_links(repo,env):
     """The tracked symbolic links whose index blob is HEAD's and whose raw target matches it.
 
     Returns None when the checkout has more than LINK_LISTING_MAX tracked links."""
-    data=command(['git','-C',str(repo),'-c','core.fsmonitor=false','--no-optional-locks','ls-files','--stage','-z'],15,env,repo)
+    # The whole index listing of a large checkout exceeds the 1 MiB bound of ``command``,
+    # so it is read in a stream and only link entries are kept, within INDEX_LISTING_MAX.
     links=[]
-    for item in data.split(b'\0'):
+    for item in index_listing(repo,env):
         m=re.fullmatch(rb'120000 ([0-9a-f]{40,64}) 0\t(.+)',item,re.S)
         if m:links.append((m[1],m[2]))
-    if len(links)>LINK_LISTING_MAX:return None
+        if len(links)>LINK_LISTING_MAX:return None
     out=[]
     for blob,raw in links:
         full=os.path.join(os.fsencode(str(repo)),raw)
