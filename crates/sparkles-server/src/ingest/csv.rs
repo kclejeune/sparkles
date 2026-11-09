@@ -690,6 +690,8 @@ mod tests {
             language: None,
             class_enum: vec!["ex:Person".into(), "ex:Team".into(), "ex:Group".into()],
             predicate_enum: vec!["ex:name".into(), "ex:memberOf".into()],
+            prefixes: serde_json::Value::Null,
+            label_predicate: None,
         };
         let mut notes = Vec::new();
         let (m, specs) = build(

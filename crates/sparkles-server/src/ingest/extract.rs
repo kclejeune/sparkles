@@ -52,6 +52,10 @@ pub struct Vocabulary {
     /// the enumerations of `ingest_profile`'s JSON Schema
     pub class_enum: Vec<String>,
     pub predicate_enum: Vec<String>,
+    /// the prefixes of the profile's prefixed names
+    pub prefixes: Value,
+    /// the predicate that labels new entities
+    pub label_predicate: Option<String>,
 }
 
 fn strings(v: &Value) -> Vec<String> {
@@ -113,6 +117,8 @@ impl Vocabulary {
             language: p["language"].as_str().map(str::to_string),
             class_enum,
             predicate_enum,
+            prefixes: p["prefixes"].clone(),
+            label_predicate: p["labelPredicate"].as_str().map(str::to_string),
         })
     }
 
@@ -391,7 +397,8 @@ pub fn locate(chars: &[char], from: usize, to: usize, quote: &str) -> Option<(us
     None
 }
 
-/// Run the extraction over every chunk.
+/// Run the extraction over every chunk. With `limit`, the extraction stops calling the
+/// model and answers `too-large` once it has more facts than that.
 pub fn extract(
     r: &mut Run,
     models: &Models,
@@ -399,6 +406,7 @@ pub fn extract(
     v: &Vocabulary,
     text: &str,
     chunks: &[(usize, usize)],
+    limit: Option<usize>,
 ) -> Result<Extraction, Failed> {
     let chars: Vec<char> = text.chars().collect();
     let schema = OutputSchema {
@@ -496,6 +504,19 @@ pub fn extract(
             "provider": pair.provider, "model": pair.model,
             "facts": out.facts.len() - before,
         }));
+        if let Some(limit) = limit
+            && out.facts.len() > limit
+        {
+            return Err(Failed(json!({
+                "code": "too-large",
+                "status": 413,
+                "message": format!(
+                    "the extraction passed {limit} facts at chunk {} of {}: one evidence batch holds at most {limit} claims",
+                    ci + 1,
+                    chunks.len()
+                ),
+            })));
+        }
     }
     if out.chunks_failed == chunks.len() && !chunks.is_empty() {
         return Err(Failed::new(
@@ -679,7 +700,7 @@ fn bare(s: &str) -> String {
 
 /// What linking decided for one entity (§7.5).
 #[derive(Clone, Debug)]
-enum Link {
+pub(super) enum Link {
     Existing(String),
     /// written with the first candidate and flagged
     Ambiguous(String, Vec<String>),
@@ -696,17 +717,28 @@ pub struct Proposals {
     pub min_confidence: f64,
 }
 
-/// Link the extraction's entities and write its facts on `branch` (or, for a preview,
-/// check them with a dry run on `main` without writing).
-pub fn propose(
-    r: &mut Run,
-    v: &Vocabulary,
-    ex: &Extraction,
-    registered: &Value,
-    branch: Option<&str>,
-    preview: bool,
-    converted: &super::convert::Converted,
-) -> Result<Proposals, Failed> {
+/// The entities of an extraction and what linking decided for each (§7.5).
+pub(super) struct Linked {
+    /// (normalized name, class) of each entity
+    pub entities: Vec<(String, String)>,
+    /// the entity of each mention key that a fact uses
+    pub entity_of: HashMap<String, usize>,
+    pub links: Vec<Link>,
+    /// the prefixes of the candidates' prefixed names
+    pub prefixes: Value,
+}
+
+fn merge_prefixes(into: &mut Value, from: &Value) {
+    if let (Some(into), Some(from)) = (into.as_object_mut(), from.as_object()) {
+        for (k, v) in from {
+            into.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+}
+
+/// Link the entities of `ex` with `link_entities`, as the caller, on `branch`.
+pub(super) fn link(r: &mut Run, ex: &Extraction, branch: Option<&str>) -> Result<Linked, Failed> {
+    let mut prefixes = json!({});
     r.ctx.progress.status(super::Status::Linking, 0.82, None);
     // the entities: mentions with the same normalized name and class are one (§7.5)
     let norm = |s: &str| fold_ws(s).to_lowercase();
@@ -760,8 +792,9 @@ pub fn propose(
         let out = r.tool(
             "link_entities",
             json!({ "mentions": mentions, "k": 3 }),
-            if preview { None } else { branch },
+            branch,
         )?;
+        merge_prefixes(&mut prefixes, &out["prefixes"]);
         for m in out["mentions"].as_array().into_iter().flatten() {
             let cands: Vec<String> = m["candidates"]
                 .as_array()
@@ -779,6 +812,31 @@ pub fn propose(
             links.push(Link::New(Vec::new()));
         }
     }
+    Ok(Linked {
+        entities,
+        entity_of,
+        links,
+        prefixes,
+    })
+}
+
+/// Link the extraction's entities and write its facts on `branch` (or, for a preview,
+/// check them with a dry run on `main` without writing).
+pub fn propose(
+    r: &mut Run,
+    v: &Vocabulary,
+    ex: &Extraction,
+    registered: &Value,
+    branch: Option<&str>,
+    preview: bool,
+    converted: &super::convert::Converted,
+) -> Result<Proposals, Failed> {
+    let Linked {
+        entities,
+        entity_of,
+        links,
+        ..
+    } = link(r, ex, if preview { None } else { branch })?;
     r.ctx.progress.status(super::Status::Writing, 0.9, None);
     let rendition = bare(registered["rendition"].as_str().unwrap_or(""));
     let graph = registered["graph"].as_str().unwrap_or("").to_string();
@@ -1200,6 +1258,8 @@ mod estimate_tests {
             language: None,
             class_enum: vec!["ex:Person".into()],
             predicate_enum: Vec::new(),
+            prefixes: serde_json::Value::Null,
+            label_predicate: None,
         };
         let text = "x".repeat(4000);
         let chunks = [(0, 2000), (2000, 4000)];

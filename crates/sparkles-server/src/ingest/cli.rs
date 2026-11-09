@@ -26,9 +26,16 @@ pub struct IngestArgs {
     #[arg(required = true)]
     pub files: Vec<PathBuf>,
     /// branch writes the proposals on a review branch, preview writes nothing and prints
-    /// them, auto merges them into main when every check passes
-    #[arg(long, value_name = "MODE", default_value = "branch", value_parser = ["branch", "preview", "auto"])]
+    /// them, auto merges them into main when every check passes, claims registers the
+    /// source and proposes its facts as claims of one evidence batch
+    #[arg(long, value_name = "MODE", default_value = "branch", value_parser = ["branch", "preview", "auto", "claims"])]
     pub mode: String,
+    /// claims mode: the evidence source-record graph, when the settings name several
+    #[arg(long, value_name = "IRI")]
+    pub source_graph: Option<String>,
+    /// claims mode: the evidence proposal graph, when the settings name several
+    #[arg(long, value_name = "IRI")]
+    pub proposal_graph: Option<String>,
     /// The review branch (default: ingest.<slug>-<n>)
     #[arg(long, value_name = "NAME")]
     pub branch: Option<String>,
@@ -81,7 +88,7 @@ pub fn run_cli(args: IngestArgs, store_opts: StoreOptions) -> Result<()> {
     if !args.loc.is_dir() {
         bail!("--loc {}: not a database directory", args.loc.display());
     }
-    let mode = Mode::parse(&args.mode).context("--mode is branch, preview or auto")?;
+    let mode = Mode::parse(&args.mode).context("--mode is branch, preview, auto or claims")?;
     let pairs = args
         .pairs
         .iter()
@@ -152,6 +159,8 @@ pub fn run_cli(args: IngestArgs, store_opts: StoreOptions) -> Result<()> {
             message: None,
             pairs: pairs.clone(),
             source: None,
+            source_graph: args.source_graph.clone(),
+            proposal_graph: args.proposal_graph.clone(),
         };
         let ctx = Ctx {
             server: &server,

@@ -35,6 +35,9 @@ pub enum Mode {
     /// a registered source of agent memory: its facts are written on `main` into the
     /// source's graph, which `agentGraphs` matches, so they are unreviewed (§8.10.5)
     Memory,
+    /// the source registered and its facts proposed as claims of one evidence batch, in
+    /// one commit, for a review policy to project (spec C25)
+    Claims,
 }
 
 impl Mode {
@@ -44,6 +47,7 @@ impl Mode {
             "preview" => Some(Mode::Preview),
             "auto" => Some(Mode::Auto),
             "memory" => Some(Mode::Memory),
+            "claims" => Some(Mode::Claims),
             _ => None,
         }
     }
@@ -54,6 +58,7 @@ impl Mode {
             Mode::Preview => "preview",
             Mode::Auto => "auto",
             Mode::Memory => "memory",
+            Mode::Claims => "claims",
         }
     }
 }
@@ -92,6 +97,10 @@ pub struct Request {
     pub pairs: Vec<Pair>,
     /// extract from this registered source, named by its graph, instead of `bytes`
     pub source: Option<String>,
+    /// claims mode: the evidence source-record graph, when the settings name several
+    pub source_graph: Option<String>,
+    /// claims mode: the evidence proposal graph, when the settings name several
+    pub proposal_graph: Option<String>,
 }
 
 /// Where a run reports progress and waits for its confirmation.
@@ -308,7 +317,7 @@ pub fn slug(s: &str) -> String {
 }
 
 /// The name a file or URL gives a document, without its directories.
-fn base_name(s: &str) -> &str {
+pub(super) fn base_name(s: &str) -> &str {
     let s = s.split(['?', '#']).next().unwrap_or(s);
     let s = s.trim_end_matches('/');
     s.rsplit('/').next().unwrap_or(s)
@@ -334,6 +343,12 @@ pub(crate) struct Limits {
 }
 
 fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
+    if req.mode == Mode::Claims {
+        return match &req.source {
+            Some(src) => super::claims::run_source(r, req, src),
+            None => super::claims::run(r, req),
+        };
+    }
     if let Some(src) = &req.source {
         return run_existing(r, req, src);
     }
@@ -468,7 +483,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     reg.insert("rendition".into(), rendition_extras(&converted));
     let base_head = ds.store.snapshot().commit;
     let branch = match req.mode {
-        Mode::Preview | Mode::Memory => None,
+        Mode::Preview | Mode::Memory | Mode::Claims => None,
         Mode::Branch | Mode::Auto => Some(review_branch(r, req, &ds, title.as_deref())?),
     };
     let registered = if req.mode == Mode::Preview {
@@ -543,7 +558,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     };
     let models = ctx.models.expect("an extraction has providers");
     // 6. extraction, linking and the proposals
-    let ex = super::extract::extract(r, models, &pairs, &vocab, &converted.text, &chunks)?;
+    let ex = super::extract::extract(r, models, &pairs, &vocab, &converted.text, &chunks, None)?;
     let proposals = super::extract::propose(
         r,
         &vocab,
@@ -578,7 +593,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
             let why = auto_blocker(&proposals, &limits);
             merge_if(r, b, &message, why, &mut out)?;
         }
-        Mode::Branch | Mode::Memory => {}
+        Mode::Branch | Mode::Memory | Mode::Claims => {}
     }
     ctx.progress.status(Status::Writing, 0.99, None);
     Ok(out)
@@ -587,7 +602,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
 /// Estimate an extraction, report the estimate, check the dataset's daily budget, and
 /// wait for a confirmation when the estimate is above the dataset's threshold (§7.9).
 #[allow(clippy::too_many_arguments)]
-fn confirm_estimate(
+pub(super) fn confirm_estimate(
     r: &Run,
     req: &Request,
     models: &Models,
@@ -726,7 +741,125 @@ fn run_existing(r: &mut Run, req: &Request, source: &str) -> Result<Value, Faile
             "the dataset's ingestion has no provider and model in the extract role: enable ingest in its assistant settings, with a provider that may receive documents",
         ));
     };
-    // 1. the source and its current rendition
+    let ReadSource {
+        found,
+        graph,
+        rendition,
+        text,
+        chunks,
+        ..
+    } = read_source(r, source)?;
+    let title = req
+        .title
+        .clone()
+        .or_else(|| found["title"].as_str().map(str::to_string));
+    if req.mode == Mode::Memory && !crate::assist::memory_settings(st, &ds).is_agent_graph(&graph) {
+        return Err(Failed::new(
+            "not-agent-memory",
+            format!(
+                "memory mode writes on main only into graphs that agentGraphs matches, and <{graph}> is not one: use branch mode"
+            ),
+        ));
+    }
+    let profile = req.profile.clone().unwrap_or_else(|| "default".into());
+    let ingest = crate::mcp::memory::ingest::ingest_settings(st, &ds);
+    let limits = Limits {
+        confirm_tokens: ingest.confirm_tokens.unwrap_or(DEFAULT_CONFIRM_TOKENS),
+        auto_confidence: ingest.auto_confidence.unwrap_or(DEFAULT_AUTO_CONFIDENCE),
+    };
+    let vocab = super::extract::Vocabulary::read(r, &profile)?;
+    confirm_estimate(
+        r,
+        req,
+        models,
+        &pairs,
+        &vocab,
+        &text,
+        &chunks,
+        &limits,
+        (&ds, &settings),
+    )?;
+    r.check()?;
+    // 3. the branch, unless the facts are agent memory written on main
+    let branch = match req.mode {
+        Mode::Memory | Mode::Preview | Mode::Claims => None,
+        Mode::Branch | Mode::Auto => Some(review_branch(r, req, &ds, title.as_deref())?),
+    };
+    let mut out = json!({
+        "outcome": "proposed",
+        "mode": req.mode.as_str(),
+        "source": found["source"],
+        "graph": graph,
+        "rendition": rendition,
+        "length": found["length"],
+        "chunks": chunks.len(),
+        "profile": profile,
+    });
+    if let Some(b) = &branch {
+        out["branch"] = b.clone().into();
+        out["review"] = review_link(&ds.name, b).into();
+    }
+    let converted = Converted {
+        text,
+        media_type: found["format"]
+            .as_str()
+            .unwrap_or("text/markdown")
+            .to_string(),
+        title: title.clone(),
+        page_starts: Vec::new(),
+        images: Vec::new(),
+        ocr_pages: Vec::new(),
+        omitted_pages: Vec::new(),
+        notes: Vec::new(),
+    };
+    let registered =
+        json!({ "rendition": format!("<{rendition}>"), "graph": format!("<{graph}>") });
+    let ex =
+        match super::extract::extract(r, models, &pairs, &vocab, &converted.text, &chunks, None) {
+            Ok(ex) => ex,
+            Err(e) => {
+                discard_branch(r, req, branch.as_deref());
+                return Err(e);
+            }
+        };
+    let proposals = super::extract::propose(
+        r,
+        &vocab,
+        &ex,
+        &registered,
+        branch.as_deref(),
+        false,
+        &converted,
+    )?;
+    let facts_ok = proposals.summary["proposed"].as_u64().unwrap_or(0);
+    out["outcome"] = if facts_ok > 0 { "proposed" } else { "no-facts" }.into();
+    for (k, v) in proposals.summary.as_object().into_iter().flatten() {
+        out[k] = v.clone();
+    }
+    if req.mode == Mode::Auto {
+        let b = branch.as_deref().expect("auto has a branch");
+        let message = format!("Ingest {}", title.as_deref().unwrap_or("a source"));
+        let why = auto_blocker(&proposals, &limits);
+        merge_if(r, b, &message, why, &mut out)?;
+    }
+    ctx.progress.status(Status::Writing, 0.99, None);
+    Ok(out)
+}
+
+/// A registered source, named by its graph or IRI, and the text of its current
+/// rendition.
+pub(super) struct ReadSource {
+    pub found: Value,
+    pub prefixes: Value,
+    pub graph: String,
+    pub rendition: String,
+    pub text: String,
+    pub chunks: Vec<(usize, usize)>,
+}
+
+/// Read a registered source and its current rendition's text, chunk by chunk.
+pub(super) fn read_source(r: &Run, source: &str) -> Result<ReadSource, Failed> {
+    let ctx = r.ctx;
     ctx.progress
         .status(Status::Registering, 0.05, Some("reading the source".into()));
     let listed = r.tool(
@@ -755,18 +888,6 @@ fn run_existing(r: &mut Run, req: &Request, source: &str) -> Result<Value, Faile
         })?;
     let graph = expand_iri(found["graph"].as_str().unwrap_or(""), &prefixes);
     let rendition = expand_iri(found["rendition"].as_str().unwrap_or(""), &prefixes);
-    let title = req
-        .title
-        .clone()
-        .or_else(|| found["title"].as_str().map(str::to_string));
-    if req.mode == Mode::Memory && !crate::assist::memory_settings(st, &ds).is_agent_graph(&graph) {
-        return Err(Failed::new(
-            "not-agent-memory",
-            format!(
-                "memory mode writes on main only into graphs that agentGraphs matches, and <{graph}> is not one: use branch mode"
-            ),
-        ));
-    }
     // 2. the text, chunk by chunk
     let mut text = String::new();
     let mut chunks: Vec<(usize, usize)> = Vec::new();
@@ -799,88 +920,14 @@ fn run_existing(r: &mut Run, req: &Request, source: &str) -> Result<Value, Faile
             _ => break,
         }
     }
-    let profile = req.profile.clone().unwrap_or_else(|| "default".into());
-    let ingest = crate::mcp::memory::ingest::ingest_settings(st, &ds);
-    let limits = Limits {
-        confirm_tokens: ingest.confirm_tokens.unwrap_or(DEFAULT_CONFIRM_TOKENS),
-        auto_confidence: ingest.auto_confidence.unwrap_or(DEFAULT_AUTO_CONFIDENCE),
-    };
-    let vocab = super::extract::Vocabulary::read(r, &profile)?;
-    confirm_estimate(
-        r,
-        req,
-        models,
-        &pairs,
-        &vocab,
-        &text,
-        &chunks,
-        &limits,
-        (&ds, &settings),
-    )?;
-    r.check()?;
-    // 3. the branch, unless the facts are agent memory written on main
-    let branch = match req.mode {
-        Mode::Memory | Mode::Preview => None,
-        Mode::Branch | Mode::Auto => Some(review_branch(r, req, &ds, title.as_deref())?),
-    };
-    let mut out = json!({
-        "outcome": "proposed",
-        "mode": req.mode.as_str(),
-        "source": found["source"],
-        "graph": graph,
-        "rendition": rendition,
-        "length": found["length"],
-        "chunks": chunks.len(),
-        "profile": profile,
-    });
-    if let Some(b) = &branch {
-        out["branch"] = b.clone().into();
-        out["review"] = review_link(&ds.name, b).into();
-    }
-    let converted = Converted {
+    Ok(ReadSource {
+        found,
+        prefixes,
+        graph,
+        rendition,
         text,
-        media_type: found["format"]
-            .as_str()
-            .unwrap_or("text/markdown")
-            .to_string(),
-        title: title.clone(),
-        page_starts: Vec::new(),
-        images: Vec::new(),
-        ocr_pages: Vec::new(),
-        omitted_pages: Vec::new(),
-        notes: Vec::new(),
-    };
-    let registered =
-        json!({ "rendition": format!("<{rendition}>"), "graph": format!("<{graph}>") });
-    let ex = match super::extract::extract(r, models, &pairs, &vocab, &converted.text, &chunks) {
-        Ok(ex) => ex,
-        Err(e) => {
-            discard_branch(r, req, branch.as_deref());
-            return Err(e);
-        }
-    };
-    let proposals = super::extract::propose(
-        r,
-        &vocab,
-        &ex,
-        &registered,
-        branch.as_deref(),
-        false,
-        &converted,
-    )?;
-    let facts_ok = proposals.summary["proposed"].as_u64().unwrap_or(0);
-    out["outcome"] = if facts_ok > 0 { "proposed" } else { "no-facts" }.into();
-    for (k, v) in proposals.summary.as_object().into_iter().flatten() {
-        out[k] = v.clone();
-    }
-    if req.mode == Mode::Auto {
-        let b = branch.as_deref().expect("auto has a branch");
-        let message = format!("Ingest {}", title.as_deref().unwrap_or("a source"));
-        let why = auto_blocker(&proposals, &limits);
-        merge_if(r, b, &message, why, &mut out)?;
-    }
-    ctx.progress.status(Status::Writing, 0.99, None);
-    Ok(out)
+        chunks,
+    })
 }
 
 /// Why `auto` mode keeps the proposals on the branch, if it does (§7.7).
@@ -908,7 +955,7 @@ fn auto_blocker(p: &super::extract::Proposals, limits: &Limits) -> Option<String
 }
 
 /// The pages, OCR pages and omitted pages of a rendition, for `register_converted`.
-fn rendition_extras(c: &Converted) -> Value {
+pub(super) fn rendition_extras(c: &Converted) -> Value {
     json!({
         "pageStarts": c.page_starts,
         "ocrPages": c.ocr_pages,

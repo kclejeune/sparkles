@@ -698,7 +698,7 @@ struct Request {
 
 /// The authenticated principal's IRI: `urn:x-sparkles:principal:` and its log name,
 /// percent-encoded, as `assert_facts` records it.
-pub(super) fn principal_iri(p: &Principal) -> NamedNode {
+pub(crate) fn principal_iri(p: &Principal) -> NamedNode {
     use std::fmt::Write as _;
     let name: String = match crate::http::author(p) {
         Some(a) => a.to_string(),
@@ -746,7 +746,7 @@ impl sparkles::evidence::AuthorityFence for CallerFence {
     }
 }
 
-fn record_json(r: &sparkles::evidence::ProposedRecord) -> J {
+pub(crate) fn record_json(r: &sparkles::evidence::ProposedRecord) -> J {
     json!({
         "key": r.key,
         "kind": kind_name(r.kind),
@@ -755,6 +755,45 @@ fn record_json(r: &sparkles::evidence::ProposedRecord) -> J {
         "recordDigest": r.digest.to_string(),
         "existing": r.existing,
     })
+}
+
+/// The caller's authority fence, for a proposal made outside `POST /{ds}/claims`.
+pub(crate) fn caller_fence(
+    st: Arc<AppState>,
+    p: Principal,
+) -> Arc<dyn sparkles::evidence::AuthorityFence> {
+    Arc::new(CallerFence { st, p })
+}
+
+/// Propose `input` on `logical`, a branch of `main` or `main` itself, as `p`, reading
+/// references with `p`'s query view as `POST /{ds}/claims` does. A claims ingestion
+/// publishes its batch and its source registration this way.
+pub(crate) fn propose_ingested(
+    st: &Arc<AppState>,
+    (main, logical): (&Arc<crate::state::Dataset>, &Arc<crate::state::Dataset>),
+    p: &Principal,
+    input: &sparkles::evidence::EvidenceInput,
+    options: &ProposeOptions,
+    control: &sparkles::task::Control,
+) -> ApiResult<sparkles::evidence::Proposed> {
+    type Policy = Option<Arc<sparkles::access::GraphAccess>>;
+    let mut policies: std::collections::HashMap<(uuid::Uuid, String), Policy> =
+        std::collections::HashMap::new();
+    let mut read = |ds: &sparkles::Dataset, branch: &str| -> Policy {
+        policies
+            .entry((ds.dataset_id(), branch.to_string()))
+            .or_insert_with(|| policy(st, p, ds, branch))
+            .clone()
+    };
+    Ok(sparkles::evidence::propose(
+        Some(&st.catalog),
+        &main.dataset,
+        &logical.dataset,
+        input,
+        options,
+        &mut read,
+        control,
+    )?)
 }
 
 /// `POST /{ds}/claims`: propose one batch. `200` with the operation and its records,

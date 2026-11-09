@@ -13,7 +13,7 @@
 //! reads more than its caps (C17 §7) allow, and every query runs under the call's
 //! deadline, memory budget and row limit.
 
-mod assert;
+pub(crate) mod assert;
 pub(crate) use assert::{date_time, now_ms, principal_iri};
 mod brief;
 pub(crate) mod check;
