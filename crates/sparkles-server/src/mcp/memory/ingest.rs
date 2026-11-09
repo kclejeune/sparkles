@@ -958,12 +958,15 @@ fn bookkeeping(iri: &str) -> bool {
 
 impl Tools<'_> {
     pub(crate) fn register_source(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
-        self.register_source_with(args, &RenditionExtras::default())
+        self.register_source_with(args, &RenditionExtras::default(), false)
     }
 
     /// `register_source` for a converted document (`POST /$/ingest`): its arguments with
     /// a `rendition` object of the page offsets, OCR pages and omitted pages of the
-    /// conversion, which the rendition records.
+    /// conversion, which the rendition records. With `plan: true` nothing is written:
+    /// the result carries the registration's SPARQL Update as `update` and the head it
+    /// was read at as `head`, so that a claims ingestion publishes it in the commit of
+    /// its evidence batch (spec C25, ingestion into claim proposals).
     pub(crate) fn register_converted(
         &self,
         mut args: Map<String, Value>,
@@ -972,13 +975,19 @@ impl Tools<'_> {
             Some(v) => RenditionExtras::parse(&v)?,
             None => RenditionExtras::default(),
         };
-        self.register_source_with(args, &extras)
+        let plan = match args.remove("plan") {
+            None => false,
+            Some(Value::Bool(b)) => b,
+            Some(_) => return Err(ToolError::bad_argument("plan is true or false")),
+        };
+        self.register_source_with(args, &extras, plan)
     }
 
     fn register_source_with(
         &self,
         args: Map<String, Value>,
         extras: &RenditionExtras,
+        plan: bool,
     ) -> Result<Outcome, ToolError> {
         let t0 = Instant::now();
         let a: RegisterArgs = parse(args)?;
@@ -1426,6 +1435,14 @@ impl Tools<'_> {
             out["staleFacts"] = stale.into();
         }
         out["chunks"] = chunk_json(&mut terms, false).into();
+        if plan {
+            out["committed"] = false.into();
+            out["head"] = r.snap.commit.into();
+            out["update"] = update.into();
+            out["elapsedMs"] = number((t0.elapsed().as_secs_f64() * 1e6).round() / 1000.0);
+            out["prefixes"] = json!(terms.used());
+            return Ok(Outcome::Structured(out));
+        }
         match sparkles::sparql::update::update_as(&ds.store, &update, &opts, CommitKind::Update) {
             Err(Error::DryRun(pv)) => {
                 out["committed"] = false.into();

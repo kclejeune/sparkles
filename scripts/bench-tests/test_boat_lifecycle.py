@@ -36,7 +36,7 @@ class EnvironmentAdmission(unittest.TestCase):
         original=self.f['qualified_path'].read_bytes()
         self.assertEqual(hashlib.sha256(original).hexdigest(),self.f['job']['qualification']['sha256'])
         self.assertIsNone(json.loads(original)['runtime_env_file'])
-        self.assertEqual(set(env.environment(p)),{'PATH','RUSTUP_TOOLCHAIN','RUSTUP_AUTO_INSTALL','MBX_REMOTE_TOKEN_FILE'})
+        self.assertEqual(set(env.environment(p)),{'PATH','RUSTUP_TOOLCHAIN','RUSTUP_AUTO_INSTALL','MBX_REMOTE_URL','MBX_GC_MAX_TOTAL_SIZE','MBX_GC_MIN_FREE_SIZE'})
 
     def test_changed_qualification_bytes_or_env_proof_does_not_grant_authority(self):
         original=self.f['qualified_path'].read_bytes()
@@ -638,23 +638,30 @@ class LifetimeExtension(unittest.TestCase):
 
 
 class RemoteTransport(unittest.TestCase):
-    """The provider joins the words after ``--`` into one remote shell command."""
+    """Remote programs run whether the provider passes the words after ``--`` as arguments, as observed, or joins them."""
     def run_remote(self,method,*args):
         import shlex,subprocess
         root=Path(tempfile.mkdtemp(dir=self.tmp.name));f=fixture(root);controller.bind_release_profile(f['release'])
         shim=root/'bin';shim.mkdir();fake=shim/'systemctl'
         fake.write_text('#!/bin/sh\nfor a in "$@"; do case "$a" in show) echo LoadState=not-found; echo MainPID=0;; esac; done\n');fake.chmod(0o700)
-        calls=[]
+        calls=[];state=root/'state';state.mkdir();checkout=root/'checkout';checkout.mkdir()
         class Capture(controller.RealIO):
             def boat(self,argv,seconds=20,input_bytes=None,json_mode=True):
                 calls.append(argv);words=argv[argv.index('--')+1:]
                 # What the worker's shell would run after joining the words.
                 self_test.assertEqual(shlex.split(' '.join(words)),words)
+                # The session starts from the worker's state directory, here a local
+                # stand-in, while the provider lands it in the checkout.
+                self_test.assertEqual(words[:3],['/usr/bin/env','-C',controller.profile()['worker_home']])
+                # This host has no /usr/bin/python3, so the local interpreter stands in.
+                self_test.assertEqual(words[3],'/usr/bin/python3')
+                words=[*words[:2],str(state),sys.executable,*words[4:]]
                 # An inert systemctl answers in place of the host's managers.
-                r=subprocess.run(words,input=input_bytes,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=30,env={'PATH':str(shim)})
+                r=subprocess.run(words,input=input_bytes,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=30,env={'PATH':str(shim)},cwd=checkout)
                 return {'exit':r.returncode,'error':None,'body':json.loads(r.stdout)}
         self_test=self;io=Capture(f['release'],f['operation'])
-        return getattr(io,method)(*args),calls
+        try:return getattr(io,method)(*args),calls
+        finally:self.assertEqual(sorted(os.listdir(checkout)),[],'a session wrote into the checkout')
 
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
@@ -1544,3 +1551,149 @@ class SourceDriftBounds(SourceDriftRecord):
             r=controls.fixture();io=controls.InertIO(r);controller.bind_release_profile(r)
             controller.record_refusal(io,'metadata',controller.Refusal('metadata refused: probe_not_qualified'),{'qualified':False,'reason_code':'refusal:'+reason},failed=['probe_not_qualified'])
             self.assertEqual(io.read('metadata-refused.json')['remote_reason_code'],'refusal:'+reason)
+
+
+def diagnostic_module():
+    import importlib.util as u
+    spec=u.spec_from_file_location('diagnostic_probe',Path(__file__).resolve().parents[1]/'boat/diagnostic-probe.py');d=u.module_from_spec(spec);spec.loader.exec_module(d);return d
+
+
+class UntrackedDiagnostics(unittest.TestCase):
+    """The diagnostic hold names a startup checkout's untracked, unignored paths."""
+    def git(self,repo,*args):
+        import subprocess as sp;return sp.run(['git','-C',str(repo),*args],check=True,capture_output=True,timeout=30).stdout
+
+    def repository(self):
+        tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup);repo=Path(tmp.name)/'repo';repo.mkdir()
+        self.git(repo,'init','-q');(repo/'.gitignore').write_text('target/\n*.log\n');(repo/'a.txt').write_text('a\n')
+        self.git(repo,'add','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','-c','commit.gpgsign=false','commit','-qm','x')
+        return repo
+
+    def test_untracked_paths_are_listed_with_sizes_and_mtimes(self):
+        d=diagnostic_module();repo=self.repository()
+        (repo/'target').mkdir();(repo/'target/x').write_text('ignored');(repo/'run.log').write_text('ignored')
+        (repo/'new.txt').write_text('12345');os.utime(repo/'new.txt',(1700000000,1700000000))
+        (repo/'.mise').mkdir();(repo/'.mise/state').write_text('s')
+        (repo/'.env').write_text('KEY=DO_NOT_COPY');(repo/'deploy-token.txt').write_text('DO_NOT_COPY');(repo/'id_ed25519').write_text('DO_NOT_COPY')
+        row=d.untracked([str(repo)])[str(repo)]
+        paths={p['path']:p for p in row['paths']}
+        self.assertEqual(sorted(paths),['.mise/','new.txt'])
+        self.assertEqual((paths['new.txt']['kind'],paths['new.txt']['bytes'],paths['new.txt']['mtime_ns']),('file',5,1700000000*10**9))
+        self.assertEqual(paths['.mise/']['kind'],'directory')
+        self.assertEqual((row['omitted_credential_like'],row['total'],row['truncated']),(3,5,False))
+        self.assertNotIn('DO_NOT_COPY',json.dumps(row));self.assertNotIn('deploy-token',json.dumps(row))
+
+    def test_the_listing_stops_at_its_bound(self):
+        d=diagnostic_module();repo=self.repository()
+        for n in range(d.UNTRACKED_MAX+50):(repo/('f%04d'%n)).write_text('x')
+        row=d.untracked([str(repo)])[str(repo)]
+        self.assertEqual((len(row['paths']),row['total'],row['truncated']),(d.UNTRACKED_MAX,d.UNTRACKED_MAX+50,True))
+
+    def test_a_missing_checkout_is_reported_not_raised(self):
+        d=diagnostic_module();row=d.untracked(['/nonexistent/checkout'])['/nonexistent/checkout']
+        self.assertIn('unread',row);self.assertEqual(row['paths'],[])
+
+    def test_collect_reports_the_untracked_paths_of_the_given_checkouts(self):
+        d=diagnostic_module();repo=self.repository();(repo/'new.txt').write_text('n')
+        with tempfile.TemporaryDirectory() as t:
+            home=Path(t);(home/'.local/state/sparkles-boat').mkdir(parents=True)
+            with patch.object(d,'units',return_value={'rows':[]}):body=d.collect(home,os.getuid(),[str(repo)])
+        self.assertEqual([p['path'] for p in body['untracked'][str(repo)]['paths']],['new.txt'])
+
+    def test_the_hold_passes_the_startup_checkouts(self):
+        controller.bind_profile(controls.synthetic_profile());seen=[]
+        class IO(controller.RealIO):
+            def __init__(self):pass
+            def remote_python(self,program,args,seconds):seen.append(args);return {'exit':0,'error':None,'body':{'schema':1}}
+        IO().diagnose(30)
+        self.assertEqual(seen,[sorted(set(controller.profile()['startup_repositories'].values()))])
+
+
+class RemoteSessionDirectory(unittest.TestCase):
+    """Every provider session starts its program from the worker's state directory, never a checkout."""
+    def test_remote_python_starts_in_the_state_directory(self):
+        p=controller.bind_profile(controls.synthetic_profile());seen=[]
+        class IO(controller.RealIO):
+            def __init__(self):pass
+            def boat(self,args,seconds=20,input_bytes=None,json_mode=True):seen.append(args);return {'exit':0,'error':None,'body':{}}
+        IO().remote_python('print(1)',[],10)
+        self.assertEqual(seen[0][3:],['/usr/bin/env','-C',p['worker_home'],'/usr/bin/python3','-I','-B','-'])
+
+    def test_no_session_starts_python_in_the_landing_directory(self):
+        root=Path(__file__).resolve().parents[1]
+        for name in ('boat/controller.py','boat/job_environment.py'):
+            text=(root/name).read_text()
+            self.assertNotRegex(text,r"'--',\s*'/usr/bin/python3'",name)
+
+
+class UntrackedRoundOne(UntrackedDiagnostics):
+    """Credential parents, the git output bound, unbound profiles and an absent state directory."""
+    def test_a_credential_like_parent_hides_its_children(self):
+        d=diagnostic_module();repo=self.repository()
+        for parent in ('.ssh','secrets','config/tokens'):
+            (repo/parent).mkdir(parents=True);(repo/parent/'tracked').write_text('t')
+        self.git(repo,'add','-f','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','-c','commit.gpgsign=false','commit','-qm','y')
+        for parent in ('.ssh','secrets','config/tokens'):(repo/parent/'DO_NOT_COPY_child').write_text('x')
+        (repo/'plain.txt').write_text('p')
+        row=d.untracked([str(repo)])[str(repo)]
+        self.assertEqual([p['path'] for p in row['paths']],['plain.txt']);self.assertEqual(row['omitted_credential_like'],3)
+        self.assertNotIn('DO_NOT_COPY',json.dumps(row))
+
+    def test_git_output_is_read_within_a_byte_bound(self):
+        import subprocess as sp,shutil as sh
+        d=diagnostic_module();repo=self.repository();made=[];real=sp.Popen
+        def popen(argv,*a,**k):
+            child=real([sh.which('head'),'-c','50000000','/dev/zero'],*a,**k);made.append(child);return child
+        with patch.object(d.subprocess,'Popen',popen),patch.object(d.subprocess,'run',side_effect=AssertionError('unbounded run')):
+            row=d.untracked([str(repo)])[str(repo)]
+        self.assertTrue(row['truncated']);self.assertEqual(len(made),1);self.assertIsNotNone(made[0].poll())
+
+    def test_the_session_entry_needs_no_bound_profile(self):
+        import common
+        saved=common._PROFILE;common._PROFILE=None
+        try:self.assertEqual(controller.remote_entry('/home/user'),['/usr/bin/env','-C','/home/user','/usr/bin/python3','-I','-B','-'])
+        finally:common._PROFILE=saved
+        self.assertIn("remote_entry(profile['worker_home'])",(Path(__file__).resolve().parents[1]/'boat/job_environment.py').read_text())
+
+
+class UntrackedRoundTwo(unittest.TestCase):
+    """Newlines in names, the exact byte cap and names at the cut."""
+    def test_names_with_newlines_are_still_matched(self):
+        d=diagnostic_module()
+        for name in ('secret\nDO_NOT_COPY','config/tokens\n/DO_NOT_COPY','.env.prod\nDO_NOT_COPY'):
+            self.assertTrue(d.credential_like(name),repr(name))
+        self.assertFalse(d.credential_like('plain\nname.txt'))
+
+    def test_the_cap_keeps_exit_status_and_whole_names(self):
+        import shutil as sh
+        d=diagnostic_module();sh_=sh.which('sh')
+        run=lambda script,limit:d.bounded_git([sh_,'-c',script],limit,10)
+        self.assertEqual(run("printf 'abcd'; exit 7",4),(b'abcd',False,7))
+        self.assertEqual(run("printf 'abcd'",4),(b'abcd',False,0))
+        self.assertEqual(run("printf 'abcde'",4),(b'abcd',True,None))
+        self.assertEqual(run("printf 'ab'; exit 3",4),(b'ab',False,3))
+        self.assertEqual(d.listed_names(b'a\0b\0',True),[b'a',b'b'])
+        self.assertEqual(d.listed_names(b'a\0bc',True),[b'a'])
+        self.assertEqual(d.listed_names(b'a\0b',False),[b'a',b'b'])
+
+
+class UntrackedRoundThree(unittest.TestCase):
+    """Backup and editor copies of credential names are omitted too."""
+    def test_backup_suffixes_and_prefixes_are_matched(self):
+        d=diagnostic_module()
+        for name in ('.netrc.bak','.npmrc~','deploy.pem.bak','#.env#','.env.swp','old/.ssh.orig/x','id_ed25519.pub','server.key.old','.aws-backup/config','my-token-copy','secrets.tar.gz','.git-credentials~'):
+            self.assertTrue(d.credential_like(name),repr(name))
+        for name in ('plain.txt','.mise/state','src/main.rs','.venv/','__pycache__/','environment.md'):
+            self.assertFalse(d.credential_like(name),repr(name))
+
+
+class UntrackedRoundFour(UntrackedDiagnostics):
+    """Every name that carries a credential dot-name anywhere is omitted and counted."""
+    def test_env_names_anywhere_are_omitted(self):
+        d=diagnostic_module()
+        for name in ('.envrc','backup.env','backup.env.bak','x/.envrc/y','old.ssh/config','prod.aws.json'):
+            self.assertTrue(d.credential_like(name),repr(name))
+        repo=self.repository()
+        for name in ('.envrc','backup.env','backup.env.bak','plain.txt'):(repo/name).write_text('DO_NOT_COPY')
+        row=d.untracked([str(repo)])[str(repo)]
+        self.assertEqual(([p['path'] for p in row['paths']],row['omitted_credential_like']),(['plain.txt'],3))

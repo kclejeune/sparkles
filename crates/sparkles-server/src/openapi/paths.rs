@@ -4030,7 +4030,7 @@ fn assist(p: &mut Paths) {
             "Datasets",
             "Ingest a document",
         )
-        .doc("Starts an ingestion task: converts the document, registers it as a source on a review branch, and extracts its facts with the `extract` role into proposals there. A CSV or TSV file gets a C05 mapping draft instead, and nothing is written. Needs `read` on the dataset; every write runs as the caller, so it needs what `register_source` and `assert_facts` need. A PDF that needs OCR on a server without it fails with `needs-ocr` and its pages.")
+        .doc("Starts an ingestion task: converts the document, registers it as a source on a review branch, and extracts its facts with the `extract` role into proposals there. A CSV or TSV file gets a C05 mapping draft instead, and nothing is written. Needs `read` on the dataset; every write runs as the caller, so it needs what `register_source` and `assert_facts` need. A PDF that needs OCR on a server without it fails with `needs-ocr` and its pages. In `claims` mode the source is registered and its facts are proposed as claims of one evidence batch in a single commit, which needs what `POST /{ds}/claims` needs.")
         .see("ingestion")
         .body(
             true,

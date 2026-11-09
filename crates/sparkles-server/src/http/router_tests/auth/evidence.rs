@@ -362,3 +362,127 @@ async fn a_token_revoked_before_publication_writes_nothing() {
     let r = propose(&s, &bearer(&token), &body).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
 }
+
+/// A claims ingestion (spec C25, "Ingestion into claim proposals") needs `write` on the
+/// update endpoint and update grants on the evidence graphs it writes, and a caller
+/// without them is refused before any model call.
+#[tokio::test]
+async fn a_claims_ingestion_needs_evidence_write_before_any_model_call() {
+    use crate::models::mock::{self, MockModel};
+    let h = |pw: &str| hash_password_with(pw, 8, 1, 1).unwrap();
+    let s = build(Fixture {
+        extra: format!(
+            r#"
+[[users]]
+name = "gsrc"
+password = "{gsrc}"
+[[users.grants]]
+dataset = "wiki"
+level = "write"
+graphs = ["http://ex.org/src/*"]
+"#,
+            gsrc = h("gsrc-pw")
+        ),
+        ..Default::default()
+    });
+    let m = MockModel::start(|_, _| (200, mock::openai(r#"{"mentions":[],"facts":[]}"#)));
+    let cfg = serde_json::json!({ "providers": { "cheap": {
+            "kind": "openai", "endpoint": m.url(), "requestTimeoutSecs": 5,
+            "allowedModels": ["m"], "structuredOutput": "json-schema" } },
+        "roles": { "extract": [{ "provider": "cheap", "model": "m" }] } });
+    s.state
+        .models
+        .store(Some(Arc::new(crate::models::Models::new(
+            crate::models::ModelsConfig::parse(&cfg.to_string()).unwrap(),
+            Default::default(),
+            sparkles::outbound::OutboundPolicy {
+                allow_private: true,
+                ..Default::default()
+            },
+        ))));
+    let json = |user: &str| {
+        [
+            ("authorization", b(user)),
+            ("content-type", "application/json".to_string()),
+        ]
+    };
+    let put = |path: String, body: serde_json::Value| {
+        let app = s.app.clone();
+        async move {
+            let headers = json("alice");
+            let hs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            call(&app, "PUT", &path, &hs, &body.to_string()).await
+        }
+    };
+    for ds in ["wiki", "team-a"] {
+        let r = put(
+            format!("/$/assistant/{ds}"),
+            serde_json::json!({ "enabled": true, "ingest": true, "send": "documents" }),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let r = put(
+            format!("/$/evidence/{ds}/settings"),
+            serde_json::json!({"format": 1, "profile": 1, "enabled": true,
+                "sourceRecords": ["urn:ev:sources"], "proposals": ["urn:ev:claims"]}),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    }
+    let ingest = |user: &'static str, ds: &'static str, graph: &'static str| {
+        let app = s.app.clone();
+        async move {
+            let headers = json(user);
+            let hs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let body = serde_json::json!({ "text": "# Notes\n\nThe wiki has one page.\n",
+                "format": "text/markdown", "mode": "claims", "graph": graph });
+            let r = call(
+                &app,
+                "POST",
+                &format!("/$/ingest/{ds}"),
+                &hs,
+                &body.to_string(),
+            )
+            .await;
+            if r.status != StatusCode::ACCEPTED {
+                return r.json();
+            }
+            let id = r.json()["id"].as_str().unwrap().to_string();
+            let w = call(
+                &app,
+                "GET",
+                &format!("/$/ingest/{ds}/{id}?wait=30"),
+                &hs,
+                "",
+            )
+            .await;
+            assert_eq!(w.status, StatusCode::OK, "{}", w.text());
+            w.json()
+        }
+    };
+    let head = |ds: &str| s.state.get(ds).unwrap().store.head_commit().seq;
+    // bob only reads team-a
+    let at = head("team-a");
+    let v = ingest("bob", "team-a", "http://ex.org/doc").await;
+    assert_eq!(v["error"]["code"], "forbidden", "{v}");
+    assert_eq!(head("team-a"), at);
+    // gsrc writes one graph of wiki, but not the evidence graphs
+    let at = head("wiki");
+    let v = ingest("gsrc", "wiki", "http://ex.org/src/doc").await;
+    assert_eq!(v["error"]["code"], "forbidden", "{v}");
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("urn:ev:"),
+        "{v}"
+    );
+    assert_eq!(head("wiki"), at);
+    assert!(
+        m.requests().is_empty(),
+        "no model call before the grants pass"
+    );
+    // bob writes wiki: the grants pass and the extraction runs
+    let v = ingest("bob", "wiki", "http://ex.org/doc").await;
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(v["result"]["mode"], "claims", "{v}");
+    assert!(!m.requests().is_empty());
+    assert_eq!(head("wiki"), at + 1);
+}

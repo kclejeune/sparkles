@@ -1495,7 +1495,7 @@ export interface paths {
         put?: never;
         /**
          * Ingest a document
-         * @description Starts an ingestion task: converts the document, registers it as a source on a review branch, and extracts its facts with the `extract` role into proposals there. A CSV or TSV file gets a C05 mapping draft instead, and nothing is written. Needs `read` on the dataset; every write runs as the caller, so it needs what `register_source` and `assert_facts` need. A PDF that needs OCR on a server without it fails with `needs-ocr` and its pages.
+         * @description Starts an ingestion task: converts the document, registers it as a source on a review branch, and extracts its facts with the `extract` role into proposals there. A CSV or TSV file gets a C05 mapping draft instead, and nothing is written. Needs `read` on the dataset; every write runs as the caller, so it needs what `register_source` and `assert_facts` need. A PDF that needs OCR on a server without it fails with `needs-ocr` and its pages. In `claims` mode the source is registered and its facts are proposed as claims of one evidence batch in a single commit, which needs what `POST /{ds}/claims` needs.
          */
         post: operations["startIngest"];
         delete?: never;
@@ -8382,7 +8382,7 @@ export interface components {
             allowPartial?: boolean;
             /** @description The namespace of a table's rows in its mapping draft. */
             base?: string;
-            /** @description The review branch (default `ingest.<slug>-<n>`). */
+            /** @description The review branch (default `ingest.<slug>-<n>`). In `claims` mode, an existing branch for the commit, `main` by default. */
             branch?: string;
             /** @description Confirm the estimate in advance. */
             confirm?: boolean;
@@ -8400,14 +8400,18 @@ export interface components {
             /** @description The commit message of the registration. */
             message?: string;
             /**
-             * @description `memory` extracts a registered `source` of agent memory and writes its facts on main into the source's graph, which `agentGraphs` must match.
+             * @description `memory` extracts a registered `source` of agent memory and writes its facts on main into the source's graph, which `agentGraphs` must match. `claims` registers the source and proposes its facts as claims of one evidence batch in the same commit, for a review policy to project; it needs enabled evidence settings, `write` on the update endpoint, update grants on the evidence graphs and `keepText`.
              * @enum {string}
              */
-            mode?: "branch" | "preview" | "auto" | "memory";
+            mode?: "branch" | "preview" | "auto" | "memory" | "claims";
             /** @description The file name, which may say the format. */
             name?: string;
             /** @description The ingest profile (default `default`). */
             profile?: string;
+            /** @description In `claims` mode, the evidence proposal graph when the settings name several. */
+            proposalGraph?: string;
+            /** @description In `claims` mode, the evidence source-record graph when the settings name several. */
+            sourceGraph?: string;
             title?: string;
             /** @description Where the document comes from; fetched through the outbound policy when there is no text or file, and the source's IRI by default. */
             url?: string;
@@ -8453,7 +8457,7 @@ export interface components {
             allowPartial?: boolean;
             /** @description The namespace of a table's rows in its mapping draft. */
             base?: string;
-            /** @description The review branch (default `ingest.<slug>-<n>`). */
+            /** @description The review branch (default `ingest.<slug>-<n>`). In `claims` mode, an existing branch for the commit, `main` by default. */
             branch?: string;
             /** @description Confirm the estimate in advance. */
             confirm?: boolean;
@@ -8470,16 +8474,20 @@ export interface components {
             /** @description The commit message of the registration. */
             message?: string;
             /**
-             * @description `memory` extracts a registered `source` of agent memory and writes its facts on main into the source's graph, which `agentGraphs` must match.
+             * @description `memory` extracts a registered `source` of agent memory and writes its facts on main into the source's graph, which `agentGraphs` must match. `claims` registers the source and proposes its facts as claims of one evidence batch in the same commit, for a review policy to project; it needs enabled evidence settings, `write` on the update endpoint, update grants on the evidence graphs and `keepText`.
              * @enum {string}
              */
-            mode?: "branch" | "preview" | "auto" | "memory";
+            mode?: "branch" | "preview" | "auto" | "memory" | "claims";
             /** @description The file name, which may say the format. */
             name?: string;
             /** @description The ingest profile (default `default`). */
             profile?: string;
+            /** @description In `claims` mode, the evidence proposal graph when the settings name several. */
+            proposalGraph?: string;
             /** @description The graph IRI of a registered source to extract from instead of a document: its current rendition goes through the estimate, the `extract` role and linking. Leave out text, url and the file. */
             source?: string;
+            /** @description In `claims` mode, the evidence source-record graph when the settings name several. */
+            sourceGraph?: string;
             /** @description The document's text. */
             text?: string;
             title?: string;
@@ -8515,7 +8523,7 @@ export interface components {
             message?: string;
             /** @description From 0 to 1. */
             progress: number;
-            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, a table's mapping draft and preview, or a workbook's drafts for each sheet. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted. */
+            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `already-proposed`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, a table's mapping draft and preview, or a workbook's drafts for each sheet. A `claims` ingestion reports the evidence operation, commit, first availability, revision, records and their counts by kind, the claims, failed facts, flagged entities and `factGuard` `not-run`. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted. */
             result?: {
                 [key: string]: unknown;
             };
@@ -9801,13 +9809,15 @@ export interface components {
             channels: {
                 /** @description Deliveries that failed, were refused or were dropped since the start. */
                 failed: number;
+                /** @description Whether the channel's thread is sending a delivery. */
+                inFlight: boolean;
                 lastFailure: {
                     at: string;
                     /** @description Why a delivery failed. It never holds a secret. */
                     error?: string;
                     event: string;
                     id?: string;
-                    /** @description The HTTP status of a delivery. */
+                    /** @description The HTTP status of a webhook or ntfy delivery, or the SMTP reply code of an email delivery. */
                     status?: number;
                 } | null;
                 lastSuccess: {
@@ -9816,10 +9826,14 @@ export interface components {
                     error?: string;
                     event: string;
                     id?: string;
-                    /** @description The HTTP status of a delivery. */
+                    /** @description The HTTP status of a webhook or ntfy delivery, or the SMTP reply code of an email delivery. */
                     status?: number;
                 } | null;
                 name: string;
+                /** @description The deliveries the channel's queue holds, the one in flight included. */
+                queueCapacity: number;
+                /** @description Deliveries waiting in the channel's queue. */
+                queued: number;
                 /** @description The secrets the channel names. */
                 secrets: string[];
                 /** @description Deliveries that succeeded since the start. */
@@ -9827,10 +9841,10 @@ export interface components {
                 /** @description Where the channel delivers, without credentials. */
                 target: string;
                 /** @enum {string} */
-                type: "webhook" | "ntfy";
+                type: "webhook" | "ntfy" | "email";
             }[];
             enabled: boolean;
-            /** @description Deliveries waiting in the queue. */
+            /** @description Deliveries waiting in every channel's queue. */
             queued: number;
             recent: {
                 [key: string]: unknown;
@@ -9848,10 +9862,10 @@ export interface components {
             latencyMs: number;
             /** @enum {string} */
             result: "ok";
-            /** @description The HTTP status the channel answered. */
+            /** @description The HTTP status the channel answered, or the SMTP reply code of an email channel. */
             status: number;
             /** @enum {string} */
-            type: "webhook" | "ntfy";
+            type: "webhook" | "ntfy" | "email";
         };
         OAuthError: {
             /**

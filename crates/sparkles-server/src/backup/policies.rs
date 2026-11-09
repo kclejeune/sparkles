@@ -513,10 +513,12 @@ impl Policies {
             .values()
             .map(|e| e.config.clone())
             .collect();
-        entries
+        let next = entries
             .iter()
             .filter_map(|p| self.evaluate(st, p, now))
-            .min()
+            .min();
+        self.check_overdue(st, &entries, now);
+        next
     }
 
     /// Scheduler step of one policy (see [`evaluate_all`](Self::evaluate_all)).
@@ -589,11 +591,56 @@ impl Policies {
                     let run = skipped(&format!("too many backup tasks: {}", e.message()));
                     self.record(&mut self.inner.lock(), run);
                 }
-                Err(e) => tracing::warn!(target: "sparkles::backup", policy = p.name.as_str(),
-                    "policy run not started: {}", e.message()),
+                Err(e) => {
+                    tracing::warn!(target: "sparkles::backup", policy = p.name.as_str(),
+                        "policy run not started: {}", e.message());
+                    crate::notify::events::backup_policy_error(
+                        st,
+                        &p.name,
+                        &p.repository,
+                        "start",
+                        &e.message(),
+                        now,
+                    );
+                }
             }
         }
         next
+    }
+
+    /// `backup.overdue` for each policy (spec C21): an enabled policy that has missed
+    /// two scheduled instants since its last success while no run of it goes on. The
+    /// conditions of policies that are gone are cleared.
+    fn check_overdue(&self, st: &Arc<AppState>, policies: &[PolicyConfig], now: DateTime<Utc>) {
+        for p in policies {
+            let (last, running) = {
+                let inner = self.inner.lock();
+                let last = inner
+                    .state
+                    .policies
+                    .get(&p.name)
+                    .and_then(|x| x.last_success.as_deref())
+                    .and_then(parse_time);
+                (last, inner.running.contains_key(&p.name))
+            };
+            let second = last.and_then(|last| {
+                policy::check_policy(p)
+                    .ok()
+                    .filter(|_| p.enabled)
+                    .and_then(|(s, tz)| policy::next_runs(&s, tz, last, 2).get(1).copied())
+            });
+            crate::notify::events::backup_overdue(
+                st,
+                &p.name,
+                &p.repository,
+                last,
+                second,
+                running,
+                now,
+            );
+        }
+        let names: Vec<&str> = policies.iter().map(|p| p.name.as_str()).collect();
+        crate::notify::events::backup_policies_present(st, &names);
     }
 }
 
@@ -734,7 +781,7 @@ impl Run<'_> {
             engine: &*engine,
             run: Some(self),
         };
-        let mut run = sparkles::backup::policy::run(
+        let mut run = match sparkles::backup::policy::run(
             &adapter,
             p,
             self.trigger,
@@ -742,7 +789,29 @@ impl Run<'_> {
             self.started,
             &self.h.control(),
             || self.still_enabled(),
-        )?;
+        ) {
+            Ok(run) => run,
+            Err(e) => {
+                // a run that stops before it records a result tells the operator's
+                // channels too, unless it was cancelled (spec C21)
+                if !e.is_cancelled()
+                    && !self
+                        .h
+                        .cancel_flag()
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    crate::notify::events::backup_policy_error(
+                        self.st,
+                        &p.name,
+                        &p.repository,
+                        "run",
+                        e.message(),
+                        pols.now(),
+                    );
+                }
+                return Err(e.into());
+            }
+        };
         let cancelled = run.reason.as_deref() == Some("cancelled");
         let ok = run
             .datasets
@@ -830,6 +899,14 @@ impl Run<'_> {
             Err(e) => {
                 tracing::warn!(target: "sparkles::backup", repository = repo.as_str(),
                     "gc after retention not started: {}", e.message());
+                crate::notify::events::backup_gc(
+                    self.st,
+                    repo,
+                    "start",
+                    false,
+                    Some(e.message()),
+                    now,
+                );
                 None
             }
         }

@@ -50,9 +50,18 @@ rustup default.
 Development credentials stay on the owned development worker. They are excluded from
 source packets, result manifests and reusable snapshot seeds. GitHub Actions retains
 its separate OIDC authentication. A mode-0600 worker environment file contains only
-literal PATH, `RUSTUP_TOOLCHAIN`, `RUSTUP_AUTO_INSTALL` and `MBX_REMOTE_TOKEN_FILE`
-assignments. The last names a file and never contains a token. Admission binds the
+literal PATH, `RUSTUP_TOOLCHAIN`, `RUSTUP_AUTO_INSTALL`, `MBX_REMOTE_URL`,
+`MBX_GC_MAX_TOTAL_SIZE` and `MBX_GC_MIN_FREE_SIZE` assignments. Admission binds the
 environment file by digest.
+
+Boat jobs build with MBX in local-only mode. The empty `MBX_REMOTE_URL` overrides the
+worker's configured remote cache, and the job shell drops any inherited token setting.
+The local store stays in MBX's default cache directory in the worker home, which the
+normal stop's snapshot keeps for the next resume. Its 64 GiB budget holds two release
+builds and the workspace test builds, and its 45 GiB free-space floor keeps the disk
+headroom that qualification requires. `admit` asks the pinned `mbx` for these effective
+settings and refuses a remote URL, a token setting or another budget. Laptops, gate
+hosts and other ssh hosts keep their own MBX configuration.
 
 ## Qualification and job admission
 
@@ -70,7 +79,7 @@ deadline, local guard boot/invocation, actual manifest/bootstrap lock and source
 review hashes. The receipt's `runtime_env_file` remains null.
 
 `boat:job-env` validates that original receipt and prepares a deterministic mode-0600
-worker file containing literal PATH and token FILE path. Its small
+worker file containing literal PATH, Rust and local-only MBX values. Its small
 `sparkles.boat.job-admission` version-1 record references the unchanged qualification
 file and its SHA-256, plus actual environment path, SHA-256, byte count, mode and UID.
 It adds no authority or lifetime. Adapters validate the original qualification with the

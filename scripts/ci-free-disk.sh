@@ -2,7 +2,7 @@
 # Free disk on a GitHub-hosted Ubuntu runner for the CI test build and its shards, and
 # record the least free space the job reaches.
 #
-# Usage: scripts/ci-free-disk.sh start | wait | report
+# Usage: scripts/ci-free-disk.sh start [GIB] | wait | report
 #
 # `start` removes, in the background, preinstalled toolchains that the Rust jobs never
 # use: the Android SDK, .NET, Haskell, Swift, PowerShell, Julia, the browsers, CodeQL
@@ -10,7 +10,9 @@
 # starts a sampler that writes the free space of the workspace's file system every five
 # seconds. `wait` blocks until the removal ends, for at most ten minutes, and `report`
 # prints the free space now and the least the sampler saw. On any other runner, such as
-# a persistent larger runner, `start` removes nothing and only starts the sampler.
+# a persistent larger runner, `start` removes nothing and only starts the sampler. With
+# GIB, `start` also removes nothing when the file system already has that many GiB free,
+# so the job neither waits for the removal nor shares the disk with it.
 set -euo pipefail
 
 dir="${RUNNER_TEMP:?RUNNER_TEMP is not set}/free-disk"
@@ -29,6 +31,14 @@ case "${1:-}" in
       echo "not a GitHub-hosted Linux runner, so nothing is removed"
       touch "$dir/done"
       exit 0
+    fi
+    if [ -n "${2:-}" ]; then
+      free_gib=$(df --output=avail -B1G "${GITHUB_WORKSPACE:-.}" | tail -n1 | tr -d ' ')
+      if [ "$free_gib" -ge "$2" ]; then
+        echo "$free_gib GiB free, at least $2 GiB, so nothing is removed"
+        touch "$dir/done"
+        exit 0
+      fi
     fi
     paths=(
       /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
@@ -64,7 +74,7 @@ case "${1:-}" in
     fi
     ;;
   *)
-    echo "usage: $0 start | wait | report" >&2
+    echo "usage: $0 start [GIB] | wait | report" >&2
     exit 2
     ;;
 esac
