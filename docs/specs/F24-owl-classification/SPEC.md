@@ -891,8 +891,17 @@ and ore_ont_10140 after 1.4 and 1.7 s against 0.6 and 0.5 s. The cost is not cou
 with every exact cardinality read as an existential restriction do not finish on the base
 either, item 728. The normalization of a clause with a universal or a maximum
 beside a class or an existential restriction keeps the class in the clause's body, which
-classifies BioTop in 56 ms on one thread and 27 ms on four against 940 and 350 ms before,
-item 712.
+classifies BioTop in 56 ms on one thread and 27 ms on four against 940 and 350 ms before.
+Each clause store then indexes its processed clauses by their maximal literal over a
+successor term, so that the premises of one such literal are found without scanning the
+others of its term, and Pred checks that a new premise fits a place of a predecessor clause
+before it gathers the clause's other premises. The inferences are the same, and in
+interleaved runs on the laptop BioTop classifies in 0.59 of the time of the build before
+on one thread and 0.44 on four, 44 and 23 ms, which ties Konclude's 23 ms, item 712. The
+index holds one more id for each processed clause whose maximal literal is over a successor
+term, which raises the peak heap of a one-thread run by 9.6% on BioTop, from 17.7 to 19.4
+MiB, and by 3.3 to 3.5% on ore_ont_5438, ore_ont_13103 and ore_ont_16680. The speed costs
+that memory, and the estimate counts it.
 
 The classifier's answers equal HermiT 1.4.5.519's on the generated and hand-written
 `alc`, `alch` and `shi` fixtures that the rules take whole, and are the same on one and
@@ -907,7 +916,7 @@ their taxonomies equal the reference on all nine. Eight files of the strata have
 individuals or data properties and stay sound, and ore_ont_3215 passes the budget. Of the 13
 development files that classify slower than Konclude without them, the disjunctive rules
 take only ore_ont_5940, whose taxonomy is now complete and faster than Konclude's. ore_ont_12141, BioTop,
-classifies slower than Konclude, item 712. The taxonomies of the 298 ORE 2015 EL
+classifies in Konclude's time on four threads, item 712. The taxonomies of the 298 ORE 2015 EL
 ontologies, GO, ChEBI lite and every development file that the disjunctive rules do not
 take are byte for byte those of the Horn tier on one and eight threads. The saturation's
 arms for the disjunctive rules compile away in other runs. They first made the one worker's
