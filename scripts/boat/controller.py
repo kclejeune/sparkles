@@ -214,15 +214,14 @@ print(json.dumps({'closed':closed,'unit':u,'properties':p}))
         observer=(ROOT/'startup-observer.py').read_text()
         entry="""
 if __name__=='__main__':
-    payload=json.loads(sys.argv[1]);bind_profile(payload['pins'])
-    try:
-        result=observe_startup(payload) if payload['phase']!='metadata' else qualify_with_startup_lock(payload)
-    except Exception:
-        result={'qualified':False,'startup_closed':False,'engine_or_job_started':False,'failure':'bounded phase refused; no arbitrary error content'}
+    payload=json.loads(sys.argv[1])
+    def bound(x):
+        bind_profile(x['pins']);return observe_startup(x) if x['phase']!='metadata' else qualify_with_startup_lock(x)
+    result,closed=run_phase(payload,bound,bound)
     result.update({'program_sha256':payload['program_sha256'],'phase':payload['phase'],'unit':payload['operation_tag']+'-'+payload['phase']+'.service'})
     write_new(Path(payload['result_directory']),'probe-result.json',result)
     print(json.dumps(result))
-    raise SystemExit(0 if (result.get('startup_closed')is True if payload['phase']!='metadata' else result.get('qualified')is True) else 1)
+    raise SystemExit(0 if closed else 1)
 """
         program=(common+'\n'+definitions+'\n'+observer+'\n'+entry).encode()
         source=(ROOT/'remote-launcher.py').read_text().replace('COMMON_SOURCE_LITERAL',repr(common)).replace('PAYLOAD_JSON_LITERAL',repr(json.dumps(payload))).replace('PROBE_BASE64_LITERAL',repr(base64.b64encode(program).decode())).encode()
@@ -243,10 +242,28 @@ if __name__=='__main__':
         # Existing remote operation only reads its atomic receipt/unit; no second
         # observer/installer invocation, even after foreground disconnect.
         result=self.phase('startup',seconds)
-        if result.get('startup_closed')is not True or result.get('phase_closed')is not True:return False
+        if result.get('startup_closed')is not True or result.get('phase_closed')is not True:
+            self.startup_refused(result);return False
         self.record('startup-closed.json',result)
         if allow_qualification:need(result.get('qualification_eligible')is True,'allowed startup produced unadopted manifest')
         return True
+    def startup_refused(self,result):
+        """Keep the first refused startup's bounded reason, never its free text."""
+        if self.exists('startup-refused.json'):return
+        code=result.get('reason_code');rows=result.get('unallowed')
+        terminal=result.get('terminal_properties') if isinstance(result.get('terminal_properties'),dict) else {}
+        def row(x):
+            return {'pid':x.get('pid') if type(x.get('pid'))is int else None,'comm':bounded_text(x.get('comm',''),16),'uid':x.get('uid') if type(x.get('uid'))is int else None,
+                    'ppid':x.get('ppid') if type(x.get('ppid'))is int else None,'parent_comm':None if x.get('parent_comm') is None else bounded_text(x['parent_comm'],16),
+                    'parent_uid':x.get('parent_uid') if type(x.get('parent_uid'))is int else None}
+        safe={'reason_code':bounded_text(code) if isinstance(code,str) and code else 'unreported',
+              'phase_closed':result.get('phase_closed') is True,'existing_phase_pending':result.get('existing_phase_pending') is True,
+              'unallowed':[row(x) for x in rows[:32] if isinstance(x,dict)] if isinstance(rows,list) else [],
+              'unallowed_count':result.get('unallowed_count') if type(result.get('unallowed_count'))is int else None,
+              'elapsed_seconds':result.get('elapsed_seconds') if type(result.get('elapsed_seconds'))in(int,float) else None,
+              'terminal':{k:bounded_text(terminal[k],32) for k in ('ExecMainStatus','Result') if isinstance(terminal.get(k),str)},'observed_wall':self.wall()}
+        try:self.record('startup-refused.json',safe)
+        except FileExistsError:pass
     def stop_quiescent(self):
         if self.exists('stop-startup-closed.json'):return True
         result=self.phase('stopcheck',5)
@@ -322,8 +339,8 @@ def drive(r,io):
             io.record('qualified-worker-admission.json',admission)
             return 'QUALIFIED_ROOT_HANDOFF_GUARD_ACTIVE'
         return 'QUALIFIED_STOP_REQUESTED'
-    except Exception:
-        io.record('qualification-failed.json',{'qualification':False,'resume_not_retried':True,'Root_must_reconcile_if_guard_unresolved':True})
+    except Exception as error:
+        io.record('qualification-failed.json',{'qualification':False,'resume_not_retried':True,'Root_must_reconcile_if_guard_unresolved':True,'reason_code':reason_code(error)})
         raise
     finally:
         if not io.exists('no-ready-confirmed.json') and not io.exists('root-handoff.json'):io.trigger()
@@ -346,12 +363,12 @@ def reconcile_stop(r,io):
             need(io.metadata_closed(), 'owned metadata closure unavailable')
         if io.exists('root-handoff.json'):
             closed=io.read('root-job-closed.json');matching_root_job_closed(r,io,closed)
-    except Exception:
-        io.record('unresolved.json',{'worker':worker_id(),'stop_submitted':False,'ownership_retained_by_Root':True,'action':'Root must establish owned metadata/job/lease closure before normal stop; providerTTL remains finite; retain guard evidence.'})
+    except Exception as error:
+        io.record('unresolved.json',{'worker':worker_id(),'stop_submitted':False,'ownership_retained_by_Root':True,'reason_code':reason_code(error),'action':'Root must establish owned metadata/job/lease closure before normal stop; providerTTL remains finite; retain guard evidence.'})
         return False
     try:need(io.stop_quiescent(),'startup not currently quiescent')
-    except Exception:
-        io.record('unresolved.json',{'worker':worker_id(),'stop_submitted':False,'ownership_retained_by_Root':True,'action':'current bootstrap-lock/installer closure unavailable; no clean stop claim'})
+    except Exception as error:
+        io.record('unresolved.json',{'worker':worker_id(),'stop_submitted':False,'ownership_retained_by_Root':True,'reason_code':reason_code(error),'action':'current bootstrap-lock/installer closure unavailable; no clean stop claim'})
         return False
     request=io.wall();stop_end=io.mono()+120;io.record('stop-intent.json',{'worker':worker_id(),'requested_wall':request,'force':False,'single_request':True})
     result=io.boat(['stop',worker_id()],20);operation=None
@@ -360,7 +377,7 @@ def reconcile_stop(r,io):
         s=b.get('operation') or b.get('stop')
         if isinstance(s,dict) and isinstance(s.get('id'),str) and s['id'].startswith('stop_'):operation=s['id']
     io.record('stop-submission.json',{'exit':result['exit'],'transport_error':result['error'],'operation_id':operation,'completed':False})
-    end=stop_end;count=0
+    end=stop_end;count=0;last='stop_not_observed'
     while io.mono()+50<end:
         try:
             info=io.info();count+=1;io.record(f'stop-info-{count:04d}.json',info)
@@ -376,8 +393,8 @@ def reconcile_stop(r,io):
                 matching_root_job_closed(r,io,closed)
             io.record('closed.json',{'worker':worker_id(),'stop_operation':op,'safe_info':info,'stopped_confirmed':True,'snapshot_available':True,'owned_metadata_closed':True,'private_credential_snapshot':True,'guard_may_exit':True})
             return True
-        except (Refusal,FileNotFoundError):io.wait(1)
-    io.record('unresolved.json',{'worker':worker_id(),'stop_operation':operation,'resume_retried':False,'stop_retried_or_forced':False,'ownership_retained_by_Root':True,'action':'Root must reconcile exact worker/operation; retain failed guard unit, do not declare shutdown/disarm/clean.'})
+        except (Refusal,FileNotFoundError) as error:last=reason_code(error);io.wait(1)
+    io.record('unresolved.json',{'worker':worker_id(),'stop_operation':operation,'reason_code':last,'resume_retried':False,'stop_retried_or_forced':False,'ownership_retained_by_Root':True,'action':'Root must reconcile exact worker/operation; retain failed guard unit, do not declare shutdown/disarm/clean.'})
     return False
 
 def guard_deadlines(io,intent):
@@ -678,7 +695,7 @@ def main():
         if io.exists('root-handoff.json'):
             closed=io.read('root-job-closed.json');matching_root_job_closed(r,io,closed)
         io.trigger();return 0
-    except Exception:
+    except Exception as error:
         # Never print arbitrary subprocess/provider exception text or environment.
-        print(json.dumps({'status':'REFUSED_OR_UNCERTAIN','worker':worker_id(),'resume_retry':False,'Root_reconcile_owned_guard_and_receipts':True}));return 1
+        print(json.dumps({'status':'REFUSED_OR_UNCERTAIN','worker':worker_id(),'resume_retry':False,'Root_reconcile_owned_guard_and_receipts':True,'reason_code':reason_code(error)}));return 1
 if __name__=='__main__':raise SystemExit(main())

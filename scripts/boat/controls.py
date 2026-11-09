@@ -135,10 +135,12 @@ class DiskIO(InertIO):
 
 class PhaseIO(InertIO):
     startup=c.RealIO.startup
+    startup_refused=c.RealIO.startup_refused
     def __init__(self,r):super().__init__(r);self.phase_calls=[];self.pending=False;self.bad_manifest=False;self.delay=0
     def phase(self,phase,seconds=0):
         self.phase_calls.append((phase,seconds))
         if self.delay:self.wait(self.delay)
+        if getattr(self,'refusal_body',None) is not None:return copy.deepcopy(self.refusal_body)
         return {'startup_closed':not self.pending,'phase_closed':not self.pending,'qualification_eligible':not self.bad_manifest,'bootstrap_occurrence':'unknown'}
 
 class Clock:
@@ -148,6 +150,62 @@ class Clock:
 
 def proc_fixture():
     return {1:{'pid':1,'ppid':0,'uid':0,'comm':'systemd','start':1,'group':1},10:{'pid':10,'ppid':1,'uid':0,'comm':'sshd','start':1,'group':10},11:{'pid':11,'ppid':10,'uid':1000,'comm':'python3','start':1,'group':11},12:{'pid':12,'ppid':1,'uid':1000,'comm':'python3','start':1,'group':12},13:{'pid':13,'ppid':11,'uid':1000,'comm':'systemd-run','start':1,'group':11}}
+
+# The 39 uid-1000 rows that `ps -u 1000 -o pid,ppid,lstart,etimes,comm` listed on
+# the admitted large worker bx_gy2ytgh8 (environment v8) right after its first
+# SSH connection, with pid 1 added as root's init. The startup observer counted
+# 35 busy processes there, these rows less the seven infrastructure rows plus a
+# bash, a sudo and a fusermount3 whose parents the listing did not show. Those
+# three hang from pid 9999 here, which is absent like pid 8001, the unlisted
+# parent of dbus-run-sessio.
+OBSERVED_SESSION="""976 1 pulseaudio
+1220 1 systemd
+1244 1220 (sd-pam)
+1264 1220 pipewire
+1265 1220 pipewire
+1266 1220 wireplumber
+1267 1220 pipewire-pulse
+1276 1220 dbus-daemon
+1759 1220 gvfsd
+1781 1220 gvfsd-fuse
+1830 1220 at-spi-bus-laun
+1837 1830 dbus-daemon
+1842 1220 xdg-desktop-por
+1882 1220 xdg-document-po
+1903 1220 xdg-permission-
+2132 1220 cua-driver
+2217 1220 dconf-service
+4541 1 ascii-agent-sup
+4543 4541 ascii-agents-se
+8008 8001 dbus-run-sessio
+8095 1 ibus-daemon
+8096 8008 dbus-daemon
+8097 8008 ascii-desktop
+8101 8097 openbox
+8103 8095 ibus-memconf
+8104 8095 ibus-ui-gtk3
+8105 8095 ibus-extension-
+8107 1 ibus-x11
+8111 1220 ibus-portal
+8136 1220 at-spi2-registr
+8149 8095 ibus-engine-sim
+8172 1 sunshine
+8193 1220 gnome-keyring-d
+8194 1220 gnome-keyring-d
+8273 1 dbus-launch
+8274 1 dbus-daemon
+8276 1 at-spi-bus-laun
+8282 8276 dbus-daemon
+8294 1 at-spi2-registr"""
+UNPARENTED={20001:('bash',1000),20002:('sudo',0),20003:('fusermount3',1000)}
+def observed_session_rows(unparented=True):
+    rows=proc_fixture()
+    for line in OBSERVED_SESSION.splitlines():
+        pid,ppid,comm=line.split(' ',2);rows[int(pid)]={'pid':int(pid),'ppid':int(ppid),'uid':1000,'comm':comm,'start':5,'group':int(pid)}
+    if unparented:
+        for pid,(comm,uid) in UNPARENTED.items():rows[pid]={'pid':pid,'ppid':9999,'uid':uid,'comm':comm,'start':5,'group':pid}
+    return rows
+UNKNOWN_SESSION={8008,8096,8097,8101}
 
 class LoadedGuardIO(InertIO):
     # Exercise the actual RealIO.arm gate with entirely inert systemd methods.
@@ -242,9 +300,11 @@ class Controls(unittest.TestCase):
     def test_unknown_owned_metadata_closure_does_not_fake_stop(self):
         r=fixture();io=InertIO(r);io.record('metadata-started.json',{});io.closure=False
         self.assertFalse(c.reconcile_stop(r,io));self.assertTrue(io.exists('unresolved.json'));self.assertEqual(io.calls,[])
+        self.assertTrue(io.read('unresolved.json')['reason_code'].startswith('refusal:'))
     def test_snapshot_failure_never_shutdown_success_or_retry(self):
         r=fixture();io=InertIO(r);io.started=True;io.stopped_bad=True
         self.assertFalse(c.reconcile_stop(r,io));self.assertFalse(io.exists('closed.json'));self.assertTrue(io.exists('unresolved.json'));self.assertEqual([x[0] for x in io.calls],['stop'])
+        self.assertTrue(io.read('unresolved.json')['reason_code'].startswith('refusal:'))
     def test_stop_timeout_can_reconcile_fresh_operation(self):
         r=fixture();io=InertIO(r);io.started=True;io.mode='stop_timeout'
         self.assertTrue(c.reconcile_stop(r,io));self.assertEqual([x[0] for x in io.calls],['stop'])
@@ -441,6 +501,54 @@ class Controls(unittest.TestCase):
         scan=OBSERVER['foreign_startup'];self.assertEqual({x['pid']for x in scan(rows,{'pid':11,'start':1},12,tracked)},{20,21,22})
         del rows[20];rows[21]['comm']='renamed';self.assertEqual({x['pid']for x in scan(rows,{'pid':11,'start':1},12,tracked)},{21,22})
         del rows[21];del rows[22];self.assertEqual(scan(rows,{'pid':11,'start':1},12,tracked),[])
+    def test_observed_listing_counts_35_busy(self):
+        # The diagnosis's own count on bx_gy2ytgh8, from the old rule alone.
+        rows=observed_session_rows();infra={'systemd','(sd-pam)','dbus-daemon'}
+        old=[r for p,r in rows.items() if p not in (1,10,11,12,13) and ((r['uid']==1000 and r['comm'] not in infra) or r['comm'] in OBSERVER['INSTALLER'])]
+        self.assertEqual(len(old),35)
+    def test_observed_provider_session_admits_checkpoint(self):
+        rows=observed_session_rows(unparented=False)
+        for pid in UNKNOWN_SESSION:del rows[pid]
+        with tempfile.TemporaryDirectory(prefix='boat-v2-session-') as d:
+            root=Path(d);(root/'bootstrap.lock').touch(mode=0o600);m=root/'toolchain.json';m.write_text('ASCII');m.chmod(0o600);clock=Clock()
+            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause)
+            self.assertTrue(q['startup_closed']);self.assertTrue(q['qualification_eligible'])
+    def test_observed_listing_unknowns_refuse_with_bounded_inventory(self):
+        rows=observed_session_rows()
+        with tempfile.TemporaryDirectory(prefix='boat-v2-session-') as d:
+            root=Path(d);(root/'bootstrap.lock').touch(mode=0o600);m=root/'toolchain.json';m.write_text('ASCII');m.chmod(0o600);clock=Clock()
+            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause)
+        self.assertFalse(q['startup_closed']);self.assertEqual(q['reason_code'],'startup_busy:unallowed_processes')
+        self.assertEqual({x['pid'] for x in q['unallowed']},UNKNOWN_SESSION|set(UNPARENTED));self.assertEqual(q['unallowed_count'],7)
+        row={x['pid']:x for x in q['unallowed']}[8008]
+        self.assertEqual(row,{'pid':8008,'comm':'dbus-run-sessio','uid':1000,'ppid':8001,'parent_comm':None,'parent_uid':None})
+        self.assertEqual({x['pid']:x['parent_comm'] for x in q['unallowed']}[8097],'dbus-run-sessio')
+    def test_provider_session_allowance_binds_parent_and_uid(self):
+        scan=OBSERVER['foreign_startup']
+        def busy(extra):
+            rows=observed_session_rows(unparented=False)
+            for pid in UNKNOWN_SESSION:del rows[pid]
+            rows.update(extra);return {x['pid'] for x in scan(rows,{'pid':11,'start':1},12,set())}
+        self.assertEqual(busy({}),set())
+        # An allowed name under another parent, a parent of the wrong uid, a user
+        # manager that is not init's child and an unknown name all stay busy.
+        self.assertEqual(busy({30:{'pid':30,'ppid':1220,'uid':1000,'comm':'pulseaudio','start':5,'group':30}}),{30})
+        self.assertEqual(busy({30:{'pid':30,'ppid':8095,'uid':1000,'comm':'pipewire','start':5,'group':30}}),{30})
+        # Another uid's process was never startup work unless it is an installer.
+        self.assertEqual(busy({30:{'pid':30,'ppid':1,'uid':1001,'comm':'pulseaudio','start':5,'group':30}}),set())
+        self.assertEqual(busy({30:{'pid':30,'ppid':1,'uid':0,'comm':'pipewire','start':5,'group':30},31:{'pid':31,'ppid':30,'uid':1000,'comm':'pipewire','start':5,'group':30}}),{31})
+        self.assertEqual(busy({30:{'pid':30,'ppid':1,'uid':1000,'comm':'systemd','start':5,'group':30},31:{'pid':31,'ppid':30,'uid':1000,'comm':'gvfsd','start':5,'group':30}}),set())
+        self.assertEqual(busy({30:{'pid':30,'ppid':4543,'uid':1000,'comm':'systemd','start':5,'group':30},31:{'pid':31,'ppid':30,'uid':1000,'comm':'gvfsd','start':5,'group':30}}),{31})
+        self.assertEqual(busy({30:{'pid':30,'ppid':1,'uid':1000,'comm':'ibus-daemonx','start':5,'group':30}}),{30})
+        self.assertEqual(busy({30:{'pid':30,'ppid':1,'uid':0,'comm':'sudo','start':5,'group':30}}),{30})
+        # An allowed child of an allowed process whose own parent is unknown stays busy.
+        self.assertEqual(busy({30:{'pid':30,'ppid':9999,'uid':1000,'comm':'ibus-daemon','start':5,'group':30},31:{'pid':31,'ppid':30,'uid':1000,'comm':'ibus-memconf','start':5,'group':30}}),{30,31})
+    def test_allowed_name_started_by_installer_stays_tracked(self):
+        rows=observed_session_rows(unparented=False);tracked=set()
+        for pid in UNKNOWN_SESSION:del rows[pid]
+        rows[40]={'pid':40,'ppid':1,'uid':1000,'comm':'bash','start':5,'group':40};rows[41]={'pid':41,'ppid':40,'uid':1000,'comm':'pulseaudio','start':5,'group':40}
+        scan=OBSERVER['foreign_startup'];self.assertEqual({x['pid'] for x in scan(rows,{'pid':11,'start':1},12,tracked)},{40,41})
+        del rows[40];rows[41]['ppid']=1;self.assertEqual({x['pid'] for x in scan(rows,{'pid':11,'start':1},12,tracked)},{41})
     def test_live_installer_never_checkpoint_success(self):
         with tempfile.TemporaryDirectory(prefix='boat-v2-live-installer-') as d:
             root=Path(d);(root/'bootstrap.lock').touch(mode=0o600);m=root/'toolchain.json';m.write_text('ASCII');m.chmod(0o600);rows=proc_fixture();rows[20]={'pid':20,'ppid':1,'uid':1000,'comm':'bash','start':1,'group':20};clock=Clock()
@@ -468,6 +576,66 @@ class Controls(unittest.TestCase):
         io=PhaseIO(fixture());io.bad_manifest=True
         with self.assertRaises(Refusal):io.startup({'mono':100,'wall':io.wall()},True)
         self.assertTrue(io.exists('startup-closed.json'));self.assertFalse(io.read('startup-closed.json')['qualification_eligible'])
+    def test_reason_code_is_bounded_and_literal_only_for_refusals(self):
+        self.assertEqual(reason_code(Refusal('startup unit identity')),'refusal:startup unit identity')
+        code=reason_code(Refusal('x\n\x00'+'y'*400));self.assertTrue(code.startswith('refusal:x??'));self.assertLessEqual(len(code),REASON_MAX)
+        try:{}['secret-looking-key']
+        except KeyError as error:code=reason_code(error)
+        self.assertRegex(code,r'^unexpected:KeyError:test_reason_code_is_bounded_and_literal_only_for_refusals:[0-9]+$');self.assertNotIn('secret',code)
+        try:raise OSError(2,'/home/worker/private path')
+        except OSError as error:code=reason_code(error)
+        self.assertNotIn('private',code);self.assertRegex(code,'^unexpected:(OSError|FileNotFoundError):')
+    def test_phase_entry_records_reason_code_for_every_refusal(self):
+        case=self
+        for failure,expected in [('refusal','refusal:startup cgroup'),(FileNotFoundError(2,'/sys/fs/cgroup/x/memory.swap.peak'),'unexpected:FileNotFoundError:'),(None,'startup_busy:unallowed_processes')]:
+            class Capture(InertIO):
+                phase=c.RealIO.phase
+                def boat(self,args,seconds,input_bytes,json_mode=False):
+                    tree=ast.parse(input_bytes.decode());values={}
+                    for node in tree.body:
+                        if isinstance(node,ast.Assign)and isinstance(node.targets[0],ast.Name)and node.targets[0].id in ('PAYLOAD','CODE'):values[node.targets[0].id]=ast.literal_eval(node.value)
+                    import base64
+                    program=base64.b64decode(values['CODE']).decode();payload=json.loads(values['PAYLOAD']);parsed=ast.parse(program)
+                    ns={'__name__':'inert_generated_definitions'};exec(compile(program,'actual-generated-program','exec'),ns)
+                    with tempfile.TemporaryDirectory(prefix='boat-v2-phase-entry-') as d:
+                        payload.update(result_directory=d,program_sha256=digest(program.encode()),launcher_identity={'pid':11,'start':1})
+                        def observe(x):
+                            if failure=='refusal':ns['need'](False,'startup cgroup')
+                            if failure is not None:raise failure
+                            return {'startup_closed':False,'installer_quiescent':False,'qualification_eligible':False,'reason_code':'startup_busy:unallowed_processes','unallowed':[],'unallowed_count':0,'engine_or_job_started':False}
+                        ns['observe_startup']=observe
+                        ns['sys']=type('Args',(),{'argv':['inert',json.dumps(payload)]})()
+                        ns['__name__']='__main__'
+                        with patch('builtins.print'):
+                            with case.assertRaises(SystemExit)as status:exec(compile(ast.Module(body=[parsed.body[-1]],type_ignores=[]),'actual-generated-entry','exec'),ns)
+                        case.assertEqual(status.exception.code,1);result=load(Path(d)/'probe-result.json')
+                        case.assertFalse(result['startup_closed']);case.assertTrue(result['reason_code'].startswith(expected),result['reason_code'])
+                        case.assertNotIn('memory.swap.peak',json.dumps(result));case.assertIn('elapsed_seconds',result)
+                    return {'exit':0,'error':None,'body':result}
+            io=Capture(fixture());self.assertTrue(io.phase('startup',10)['reason_code'].startswith(expected))
+    def test_launcher_refusal_prints_bounded_reason_code(self):
+        case=self
+        class Capture(InertIO):
+            phase=c.RealIO.phase
+            def boat(self,args,seconds,input_bytes,json_mode=False):
+                printed=[]
+                with patch('builtins.print',side_effect=lambda x:printed.append(x)):
+                    exec(compile(input_bytes.decode(),'actual-generated-launcher','exec'),{'__name__':'__main__'})
+                body=json.loads(printed[-1]);case.assertEqual(body['reason_code'],'launcher:refusal:remote user');case.assertFalse(body['startup_closed'])
+                return {'exit':0,'error':None,'body':body}
+        io=Capture(fixture());self.assertEqual(io.phase('startup',10)['reason_code'],'launcher:refusal:remote user')
+    def test_startup_refusal_receipt_and_failed_qualification_name_the_reason(self):
+        io=PhaseIO(fixture());intent={'mono':100,'wall':io.wall()}
+        io.refusal_body={'startup_closed':False,'phase_closed':True,'qualification_eligible':False,'reason_code':'startup_busy:unallowed_processes','unallowed':[{'pid':8008,'comm':'dbus-run-sessio','uid':1000,'ppid':8001,'parent_comm':None,'parent_uid':None}],'unallowed_count':1,'elapsed_seconds':25.1,'terminal_properties':{'ExecMainStatus':'1','Result':'exit-code','ControlGroup':'/x'}}
+        self.assertFalse(io.startup(intent,True));q=io.read('startup-refused.json')
+        self.assertEqual(q['reason_code'],'startup_busy:unallowed_processes');self.assertEqual(q['unallowed'][0]['comm'],'dbus-run-sessio');self.assertEqual(q['terminal'],{'ExecMainStatus':'1','Result':'exit-code'})
+        self.assertFalse(io.startup(intent,False));self.assertEqual(io.read('startup-refused.json'),q)
+        io.refusal_body={'startup_closed':False,'phase_closed':True};self.assertFalse(PhaseIO.startup(io,intent,False))
+        fresh=PhaseIO(fixture());fresh.refusal_body={'startup_closed':False,'phase_closed':False,'failure':'arbitrary provider text'};self.assertFalse(fresh.startup(intent,True))
+        self.assertEqual(fresh.read('startup-refused.json')['reason_code'],'unreported');self.assertNotIn('arbitrary',json.dumps(fresh.read('startup-refused.json')))
+        io=InertIO(fixture());io.startup_bad=True
+        with self.assertRaises(Refusal):c.drive(io.r,io)
+        self.assertEqual(io.read('qualification-failed.json')['reason_code'],'refusal:startup still busy or unknown')
     def test_ready_before_hook_completion_never_qualifies(self):
         io=InertIO(fixture());io.startup_bad=True
         with self.assertRaises(Refusal):c.drive(io.r,io)
