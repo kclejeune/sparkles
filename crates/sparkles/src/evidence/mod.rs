@@ -94,8 +94,8 @@ pub mod resolve;
 pub mod review;
 
 pub use propose::{
-    AuthorityFence, Options as ProposeOptions, Proposed, ProposedRecord, operation_recorded,
-    propose, reconcile_operation_holds,
+    AuthorityFence, Options as ProposeOptions, OrdinaryChanges, Proposed, ProposedRecord,
+    operation_id, operation_iri, operation_recorded, propose, reconcile_operation_holds,
 };
 pub use review::dependents::{
     self, Dependence, Dependent, Dependents, MAX_CHANGED, dependents as find_dependents,
@@ -110,8 +110,8 @@ pub use review::{
 };
 pub use sparkles_core::evidence::review::{DecisionInput, Disposition, WithdrawalInput};
 pub use sparkles_core::evidence::{
-    ASSESSMENT_INPUT_KINDS, MAX_ASSESSMENT_INPUTS, MAX_IDENTITIES, MAX_IDENTITY_ENTITIES,
-    MIN_IDENTITY_ENTITIES,
+    ASSESSMENT_INPUT_KINDS, MAX_ASSESSMENT_INPUTS, MAX_CLAIMS, MAX_IDENTITIES,
+    MAX_IDENTITY_ENTITIES, MIN_IDENTITY_ENTITIES,
 };
 pub use sparkles_core::evidence::{
     AssessmentInput, ClaimInput, Confidence, ConfidenceFacets, EvidenceInput, EvidenceLinkInput,

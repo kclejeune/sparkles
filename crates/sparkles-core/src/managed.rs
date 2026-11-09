@@ -611,6 +611,16 @@ impl ManagedWrite {
         }
     }
 
+    /// Whether any owner manages `graph` in the registry this capability is valid for.
+    /// A registry this build cannot enforce answers `true` for every graph, so that a
+    /// writer refuses rather than treats a graph as ordinary.
+    pub fn managed_by_any(&self, graph: &str) -> bool {
+        match &*self.state {
+            ManagedState::Installed(i) => i.graphs.owner_of(graph).is_some(),
+            ManagedState::Unavailable { .. } => true,
+        }
+    }
+
     /// The owner's settings file in the registry this capability is valid for, so that
     /// a writer plans from the same registry state that its commit is checked against.
     pub fn settings(&self) -> Option<Arc<[u8]>> {

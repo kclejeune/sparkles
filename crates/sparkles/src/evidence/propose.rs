@@ -132,6 +132,26 @@ pub struct Options {
     pub write: Option<Arc<GraphAccess>>,
     /// The caller's authority, checked right before publication.
     pub authority: Option<Arc<dyn AuthorityFence>>,
+    /// Ordinary quads that publish in the same commit as the batch, such as the source
+    /// graph an ingestion registers with its proposals. They must lie in named graphs
+    /// that no owner of the managed-graph registry protects.
+    pub ordinary: Option<OrdinaryChanges>,
+}
+
+/// Ordinary changes of a proposal's commit: quads deleted, then quads inserted, outside
+/// every managed graph. An idempotent replay writes none of them, because the first
+/// publication carried them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OrdinaryChanges {
+    pub delete: Vec<oxrdf::Quad>,
+    pub insert: Vec<oxrdf::Quad>,
+}
+
+impl OrdinaryChanges {
+    /// Whether there is nothing to change.
+    pub fn is_empty(&self) -> bool {
+        self.delete.is_empty() && self.insert.is_empty()
+    }
 }
 
 impl Options {
@@ -149,6 +169,7 @@ impl Options {
             author: None,
             write: None,
             authority: None,
+            ordinary: None,
         }
     }
 }
@@ -534,6 +555,33 @@ pub fn propose(
             ),
         ));
     }
+    // Ordinary changes stay outside every managed graph, of any owner, so that the
+    // evidence capability carries no write into a graph it does not type.
+    let ordinary = options.ordinary.as_ref().filter(|o| !o.is_empty());
+    if let Some(o) = ordinary {
+        for q in o.delete.iter().chain(&o.insert) {
+            let oxrdf::GraphName::NamedNode(g) = &q.graph_name else {
+                return Err(Error::invalid(
+                    "ordinary changes of a proposal lie in named graphs",
+                ));
+            };
+            if capability.managed_by_any(g.as_str()) {
+                return Err(managed(
+                    ManagedErrorKind::Protected,
+                    format!(
+                        "graph <{}> is managed by a profile; a proposal's ordinary changes cannot write it",
+                        g.as_str()
+                    ),
+                ));
+            }
+            if let Some(access) = &options.write {
+                let term = Term::NamedNode(g.clone());
+                if !access.writable(Some(&term)) {
+                    return Err(GraphAccess::refused(Some(&term)));
+                }
+            }
+        }
+    }
     let records: Vec<ProtectedGraph> = record_graphs(&settings)
         .into_iter()
         .map(|g| {
@@ -677,6 +725,19 @@ pub fn propose(
         let ids = t.encode_quad(q, &mut labels)?;
         t.insert(ids)?;
     }
+    if let Some(o) = ordinary {
+        for q in &o.delete {
+            control.check()?;
+            let ids = t.encode_quad(q, &mut labels)?;
+            t.delete(ids)?;
+        }
+        for q in &o.insert {
+            control.check()?;
+            let ids = t.encode_quad(q, &mut labels)?;
+            t.insert(ids)?;
+        }
+    }
+    main.store().failpoint("evidence-before-commit");
     let committed = t.commit();
     // The authority guard is released once the commit published or was refused.
     drop(release);
