@@ -90,7 +90,9 @@ open(
     await openDiscussion(page, DS, BRANCH);
     await comment(page, 'Should @ana review this class?');
     const compose = page.getByRole('form', { name: 'New thread' });
-    await compose.getByRole('combobox', { name: 'About' }).selectOption({ index: 1 });
+    const about = compose.getByRole('combobox', { name: 'About' });
+    const subClass = await about.locator('option', { hasText: 'SubClassOf' }).first().textContent();
+    await about.selectOption({ label: subClass!.trim() });
     await comment(page, 'Is Employee the right parent?');
     const threads = threadsOf(page);
     await expect(threads.locator('.axiom')).toContainText('SubClassOf');
