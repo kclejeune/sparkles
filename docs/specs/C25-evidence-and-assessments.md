@@ -1289,6 +1289,107 @@ reviewed claims under their review state, identity resolution and access are
 651. Reports and community summaries that draw on accepted evidence are
 652. The bindings remain item 509.
 
+### Historical configuration for evidence views
+
+Item 761 is the storage and restore prerequisite of item 650. A selected evidence
+view must pair its retained RDF revision with a complete authenticated managed
+configuration, including owner settings and graph protection nonces. The current
+policy version, a projection or a caller-provided digest cannot establish that
+historical configuration. This work remains planned and does not change the
+available evidence operations described above.
+
+Head selects the configuration actually installed when its RDF snapshot is
+captured. An explicit commit selects the configuration that admitted that data
+publication. These can differ at the same numeric sequence when an administrator
+changes settings without writing RDF. A time selector uses its resolved RDF
+commit's admitted configuration. An opaque captured-view token or a durable bound
+named snapshot can replay an exact Head pair. An ordinary same-sequence named pin
+retains its existing binding rather than acquiring today's configuration.
+
+Immutable complete configuration generations are reachable from the managed
+registry's durable publication root. Each ordinary, grouped and bulk data
+publication retains its own admission generation through validation and final
+publication. A configuration installed while an older admitted writer finishes
+does not relabel that writer's commit. Configuration history initially retains
+every published generation, with bounded encoding, decoding and predecessor
+walks. Retained configuration cannot restore missing RDF or erased sources.
+
+Persistent activation uses the closed-dataset migration and recovery path. It
+records the actual branch heads and the first future own sequence that requires a
+binding. It does not certify earlier commits or legacy pins from current settings.
+In-memory activation has its own exclusive boundary and makes no disk durability
+claim. Genuinely unmarked stores preserve their existing RDF behavior, while an
+anchored history or a covered commit cannot fall back to legacy absence when a
+reference, flag, generation or coverage file is missing. Complete accepted seals
+are authenticated before recovery can truncate a log or expose recovered data.
+
+The newer file versions are written only after activation, so a store that never
+activates stays readable by older releases. Such a store writes version 1 logs,
+generation `commit.json` format 1 and `managed.json` format 2, and its dataset
+records reader 5, or the managed-graph reader when it has managed graphs.
+Activation first raises the dataset reader of every branch to 8, the
+configuration-history reader. It then upgrades each current log header in place
+and publishes the registry root. From then on the family writes version 2 logs,
+`commit.json` format 2, `managed.json` format 3, `history.json` format 2 and
+`branch.json` format 2. Branches and captures of an activated family record reader 8
+before they write any of these. An older release refuses an activated dataset by its
+reader before it reads anything else. A dataset's recorded reader also bounds the
+versions this build accepts in it. Open and reidentification check every generation's
+log and `commit.json` and the dataset's settings and registry against it, before they
+read or change them. One of these versions in a dataset that records an older reader
+is refused as a newer release's file. Bounded history readers do not repeat the check,
+so it adds no read to their allowance.
+
+A family root records activation when its dataset reader is at least 8 or when it
+holds an `evidence-history` directory. Activation runs on a migration copy that
+replaces the root only once it is complete, so a live root is never half activated.
+An activated root whose `managed.json` is missing, or names no history root, refuses
+to open with `evidence-unavailable` and is not read as a legacy store. The refusal
+writes nothing.
+
+The prepared native capture is private and has no public caller. Before anything
+calls it, it must charge its copied metadata to the caller's preparation before
+allocating it, or stream that metadata from the retained descriptors. This covers the
+cloned prefix map, its serialized form and whole-file reads of optional metadata such
+as `annotations.bin`. As written, a store with a large annotation history can allocate
+more than a small receiving allowance admits.
+
+Backups retain one coherent family configuration around their data capture,
+including a branch capture racing main configuration. Their immutable source
+descriptors and complete published closure remain valid after later settings
+changes. The required backup feature identifies versioned configuration-history
+files through a closed path grammar. Missing, corrupt or unsupported dependencies
+refuse before destination publication, including restores without an optional
+integrity check and encrypted restores.
+
+Keeping a dataset identity preserves native bindings. A new identity preserves
+old generation bytes and original small identity and base documents as source
+provenance. Its versioned origin descriptor identifies the source family and
+logical branch and authenticates disjoint exact imported WAL intervals. Only those
+verified intervals permit imported RDF replay. Foreign references outside them
+refuse. Later own publications use a genuine destination generation, while old
+explicit revisions remain unavailable as native historical evidence of the new
+identity. Repeated identity changes retain earlier imported origins and add only
+new imported suffixes, without duplicating large WAL files. Rebuild clones have no
+old WAL history and establish their own destination root explicitly.
+
+A clone of a dataset whose configuration history is activated is refused with an
+`unsupported` error before anything is captured or written, because a clone copies
+the registry's history root without the evidence-history closure and native
+generations that the root names. Such a dataset is copied by a backup and a restore
+that keeps its identity. Roadmap item 764 adds clones that carry or rebuild the
+closure.
+
+Historical configuration supplies semantics, never current access. Source
+retention, current graph protections, caller grants and provider admission remain
+independent restrictions through Recall, Ask, queued responses and publication.
+Read, query and output owners retain the actual selected view through their last
+physical consumer. A borrowed cloneable snapshot or a separate metadata token
+does not establish that lifetime, and newly copied output needs its receiving
+budget. Item 650 additionally owns the named policy and matching-map consumer
+integration, reviewed claim-occurrence citations and A10 treatment of source
+instructions as untrusted data.
+
 ### Evidence operations over MCP
 
 Roadmap item 653 exposes `propose_claims`, `review_claims`, `withdraw_claims`,

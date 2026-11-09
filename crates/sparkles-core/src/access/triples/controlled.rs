@@ -13,7 +13,7 @@ pub(crate) fn prepare(
     preparation.stage("preparing permission view")?;
     // The input snapshot and its persistent delta belong to the caller. The returned
     // view is charged only for storage this preparation creates or keeps alive alone.
-    let mut held = preparation.reserve(1024)?;
+    let mut held = preparation.reserve(PreparedView::header_bytes()?)?;
     // Shared policy definitions are retained too. Inspect their sizes with controls
     // before taking the returned owner's Arc references.
     if let Some(rules) = &original.triples {
@@ -57,7 +57,7 @@ pub(crate) fn prepare(
     let Some(rules) = access.triples.as_ref().filter(|_| hides) else {
         // A policy that hides no triples keeps an existing mask, which only hides more.
         preparation.check()?;
-        return Ok(PreparedView::new(access, snap.clone(), held));
+        return PreparedView::new(access, snap.clone(), held, preparation);
     };
     for rule in &rules.rules {
         preparation.check()?;
@@ -79,7 +79,7 @@ pub(crate) fn prepare(
         }
         drop(key_held);
         preparation.check()?;
-        return Ok(PreparedView::new(access, snap.clone(), held));
+        return PreparedView::new(access, snap.clone(), held, preparation);
     }
     let existing = snap.counts.prepared_mask_slot(&key, preparation)?;
     if let Some(slot) = &existing {
@@ -88,7 +88,7 @@ pub(crate) fn prepare(
             // The view may outlive the cache entry, so it owns the mask's own storage.
             held.merge(preparation.reserve(mask_storage(cached))?);
             preparation.check()?;
-            return Ok(PreparedView::new(access, cached.clone(), held));
+            return PreparedView::new(access, cached.clone(), held, preparation);
         }
     }
     // Build outside the slot lock. User progress and controlled provider helpers
@@ -108,7 +108,7 @@ pub(crate) fn prepare(
     }
     drop(key_held);
     preparation.check()?;
-    Ok(PreparedView::new(access, snapshot, held))
+    PreparedView::new(access, snapshot, held, preparation)
 }
 
 fn already_masked() -> Error {

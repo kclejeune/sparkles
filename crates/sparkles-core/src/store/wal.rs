@@ -52,11 +52,151 @@ pub const MAGIC: [u8; 8] = *b"\x89SPKWAL\n";
 /// The dataset reader (`minimumReader` of `dataset.json`) that reads log headers.
 pub const HEADER_READER: u32 = 5;
 
-/// The header record of a new log.
+/// Constant-size transaction state for forward, reverse and cold-prefix readers.
+/// Structural refusal is evaluated only after the transaction checksum succeeds,
+/// preserving existing torn-tail treatment for an uncommitted damaged suffix.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ConfigurationRecords {
+    digest: Option<[u8; 32]>,
+    invalid: bool,
+}
+
+impl ConfigurationRecords {
+    pub(crate) fn data(&mut self, record: &[u8; WAL_REC]) {
+        match record[0] {
+            WAL_CONFIGURATION => {
+                if self.digest.is_some() {
+                    self.invalid = true;
+                }
+                self.digest = Some(record[1..WAL_REC].try_into().expect("whole WAL record"));
+            }
+            WAL_INSERT | WAL_DELETE => {
+                if self.digest.is_some() {
+                    self.invalid = true;
+                }
+            }
+            _ => self.invalid = true,
+        }
+    }
+
+    pub(crate) fn finish(
+        self,
+        version: u32,
+        flags: u8,
+    ) -> Result<Option<crate::evidence::Sha256Digest>> {
+        crate::formats::WAL.check("configuration transaction", version, None)?;
+        let required = flags & commit::WAL_FLAG_CONFIGURATION != 0;
+        let allowed = commit::WAL_FLAG_UNVALIDATED
+            | commit::WAL_FLAG_ANNOTATED
+            | commit::WAL_FLAG_CONFIGURATION;
+        if self.invalid
+            || required != self.digest.is_some()
+            || (version < 2 && (required || self.digest.is_some()))
+            || (version >= 2 && flags & !allowed != 0)
+        {
+            return Err(Error::Corrupt(
+                "invalid sealed WAL configuration binding".into(),
+            ));
+        }
+        Ok(self
+            .digest
+            .map(crate::evidence::Sha256Digest::from_digest_bytes))
+    }
+}
+
+pub(crate) fn configuration_records(
+    data: &[u8],
+    version: u32,
+    flags: u8,
+) -> Result<Option<crate::evidence::Sha256Digest>> {
+    if !data.len().is_multiple_of(WAL_REC) {
+        return Err(Error::Corrupt(
+            "partial configuration transaction record".into(),
+        ));
+    }
+    let mut records = ConfigurationRecords::default();
+    for record in data.as_chunks::<WAL_REC>().0 {
+        records.data(record);
+    }
+    records.finish(version, flags)
+}
+
+pub(crate) fn append_configuration(
+    data: &mut Vec<u8>,
+    binding: crate::history::ConfigurationBinding,
+) -> Result<u8> {
+    match binding {
+        crate::history::ConfigurationBinding::Known { configuration } => {
+            let mut record = [0; WAL_REC];
+            record[0] = WAL_CONFIGURATION;
+            record[1..].copy_from_slice(configuration.generation.as_bytes());
+            data.extend_from_slice(&record);
+            Ok(commit::WAL_FLAG_CONFIGURATION)
+        }
+        crate::history::ConfigurationBinding::LegacyUnbound => Ok(0),
+        crate::history::ConfigurationBinding::ImportedUnbound { .. } => Err(Error::Corrupt(
+            "a new own commit cannot borrow an imported configuration binding".into(),
+        )),
+    }
+}
+
+/// Decode the header from the caller's actual descriptor, never another path open.
+pub(crate) fn descriptor_version(file: &mut File, path: &Path) -> Result<u32> {
+    let position = file.stream_position()?;
+    let result = (|| {
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = [0; WAL_REC];
+        let mut length = 0;
+        while length < WAL_REC {
+            let count = file.read(&mut bytes[length..])?;
+            if count == 0 {
+                break;
+            }
+            length += count;
+        }
+        committed_version_of(&bytes[..length], path)
+    })();
+    let restored = file.seek(SeekFrom::Start(position));
+    match result {
+        Err(error) => Err(error),
+        Ok(version) => {
+            restored?;
+            Ok(version)
+        }
+    }
+}
+
+/// The version of the logs that a store without configuration history writes.
+/// Older releases read it, so an ordinary store stays readable by them.
+pub(crate) const PLAIN_VERSION: u32 = 1;
+
+/// The version of a new log in a store whose configuration history is
+/// `activated`. Only activated stores write version 2, whose sealed
+/// configuration records need the dataset reader that activation records.
+pub(crate) fn version_for(activated: bool) -> u32 {
+    if activated {
+        crate::formats::WAL_VERSION
+    } else {
+        PLAIN_VERSION
+    }
+}
+
+/// The header record of a new log of a store without configuration history.
+#[cfg(test)]
 pub(crate) fn header_record() -> [u8; WAL_REC] {
+    header_record_of(PLAIN_VERSION)
+}
+
+/// The header record of a new log of an activated store.
+pub(crate) fn configuration_header_record() -> [u8; WAL_REC] {
+    header_record_of(crate::formats::WAL_VERSION)
+}
+
+/// The header record of a new log of `version`.
+pub(crate) fn header_record_of(version: u32) -> [u8; WAL_REC] {
     let mut r = [0u8; WAL_REC];
     r[..8].copy_from_slice(&MAGIC);
-    r[8..12].copy_from_slice(&crate::formats::WAL_VERSION.to_le_bytes());
+    r[8..12].copy_from_slice(&version.to_le_bytes());
     r
 }
 
@@ -82,6 +222,16 @@ pub(crate) fn version_of(buf: &[u8], path: &Path) -> Result<u32> {
     match buf.first() {
         Some(&WAL_HEADER) => header_version(buf, path),
         _ => Ok(0),
+    }
+}
+
+/// The version of a log for replay, from its first complete record only. A
+/// header record cut short by a crash is a torn tail with no committed record,
+/// as it is to the record-by-record readers, so it reads as an empty log (0).
+pub(crate) fn committed_version_of(buf: &[u8], path: &Path) -> Result<u32> {
+    match buf.get(..WAL_REC) {
+        Some(record) => version_of(record, path),
+        None => Ok(0),
     }
 }
 
@@ -112,9 +262,9 @@ pub(crate) const HEADER_BYTES: u64 = WAL_REC as u64;
 /// Create a new, empty log at `path` (which must not exist): its header record, synced.
 /// The caller syncs the directory and has already made the dataset require
 /// [`HEADER_READER`] (every persistent store does when it opens).
-pub(crate) fn create(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create(path: &Path, version: u32) -> std::io::Result<()> {
     let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
-    f.write_all(&header_record())?;
+    f.write_all(&header_record_of(version))?;
     f.sync_all()
 }
 
@@ -122,8 +272,8 @@ pub(crate) fn create(path: &Path) -> std::io::Result<()> {
 /// with its header (see [`create`]) if it does not exist. It is not opened in append
 /// mode: a store that preallocates writes each commit at the log's logical end, which
 /// lies before the zero bytes that follow it.
-pub(crate) fn open_for_append(path: &Path) -> std::io::Result<File> {
-    match create(path) {
+pub(crate) fn open_for_append(path: &Path, version: u32) -> std::io::Result<File> {
+    match create(path, version) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
@@ -562,6 +712,8 @@ pub(crate) struct WalCursor {
     at: WalPoint,
     /// the data records of the transaction last read
     txn: Vec<u8>,
+    version: u32,
+    configuration: Option<crate::evidence::Sha256Digest>,
 }
 
 impl WalCursor {
@@ -582,12 +734,15 @@ impl WalCursor {
             .max(WAL_REC as u64);
         limit.check(held.saturating_add(capacity.max(WAL_REC as u64)))?;
         let mut file = File::open(path)?;
+        let version = descriptor_version(&mut file, path)?;
         file.seek(SeekFrom::Start(from.offset))?;
         Ok(WalCursor {
             r: BufReader::with_capacity(capacity as usize, file),
             path: path.to_path_buf(),
             at: from,
             txn: Vec::new(),
+            version,
+            configuration: None,
         })
     }
 
@@ -596,12 +751,15 @@ impl WalCursor {
     }
 
     pub fn new(mut file: File, path: &Path, from: WalPoint) -> Result<WalCursor> {
+        let version = descriptor_version(&mut file, path)?;
         file.seek(SeekFrom::Start(from.offset))?;
         Ok(WalCursor {
             r: BufReader::with_capacity(1 << 20, file),
             path: path.to_path_buf(),
             at: from,
             txn: Vec::new(),
+            version,
+            configuration: None,
         })
     }
 
@@ -617,6 +775,10 @@ impl WalCursor {
     /// Where the cursor stands: after the last transaction read.
     pub fn position(&self) -> WalPoint {
         self.at
+    }
+
+    pub(crate) fn configuration(&self) -> Option<crate::evidence::Sha256Digest> {
+        self.configuration
     }
 
     /// The next complete transaction: its commit's number and its data records (whole
@@ -640,6 +802,7 @@ impl WalCursor {
         limited: Option<(&crate::history::ReadLimit<'_>, u64)>,
     ) -> Result<Option<(u64, &[u8], u64)>> {
         self.txn.clear();
+        self.configuration = None;
         let mut rec = [0u8; WAL_REC];
         let mut offset = self.at.offset;
         loop {
@@ -653,7 +816,7 @@ impl WalCursor {
             }
             offset += WAL_REC as u64;
             match rec[0] {
-                WAL_INSERT | WAL_DELETE => {
+                WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION => {
                     if let Some((limit, held)) = limited
                         && self.txn.len() + WAL_REC > self.txn.capacity()
                     {
@@ -678,7 +841,11 @@ impl WalCursor {
                 WAL_COMMIT => break,
                 // the header record where the log starts
                 WAL_HEADER if offset == WAL_REC as u64 => {
-                    header_version(&rec, &self.path)?;
+                    if header_version(&rec, &self.path)? != self.version {
+                        return Err(Error::Corrupt(
+                            "WAL header changed during cursor read".into(),
+                        ));
+                    }
                 }
                 // the log's end: its preallocated space, or a torn last transaction
                 _ if is_zero_record(&rec) => return Ok(None),
@@ -705,7 +872,8 @@ impl WalCursor {
             None => commit::open_wal_commit(&rec, &self.txn),
         };
         let (seq, folding) = match metadata {
-            Some(Ok((seq, _, _, _))) => {
+            Some(Ok((seq, _, _, flags))) => {
+                self.configuration = configuration_records(&self.txn, self.version, flags)?;
                 if seq != prev + 1 {
                     return Err(Error::Corrupt(format!(
                         "{}: commit {seq} follows commit {prev}",
@@ -720,9 +888,20 @@ impl WalCursor {
                     self.path.display()
                 )));
             }
+            None if self.version >= 1 => {
+                return Err(Error::Corrupt(
+                    "framed WAL transaction has no commit metadata".into(),
+                ));
+            }
             // legacy records before the first with metadata fold into the base
-            None if self.at.folding => (prev, true),
-            None => (prev + 1, false),
+            None if self.at.folding => {
+                configuration_records(&self.txn, self.version, 0)?;
+                (prev, true)
+            }
+            None => {
+                configuration_records(&self.txn, self.version, 0)?;
+                (prev + 1, false)
+            }
         };
         self.at = WalPoint {
             seq,
@@ -796,6 +975,9 @@ pub(crate) fn apply_forward(
             )));
         };
         for rec in txn.as_chunks::<WAL_REC>().0 {
+            if rec[0] == WAL_CONFIGURATION {
+                continue;
+            }
             let q = record_quad(rec);
             let in_base = spo.contains(cache, &Perm::Spo.to_key(&q))?;
             apply(delta, &q, rec[0] == WAL_INSERT, in_base);
@@ -852,6 +1034,9 @@ pub(crate) fn apply_forward_limited(
             )));
         };
         for record in txn.as_chunks::<WAL_REC>().0 {
+            if record[0] == WAL_CONFIGURATION {
+                continue;
+            }
             // Each changed quad can add one key to every permutation. Check before
             // mutation, while the validated transaction remains in memory.
             limit.check(
@@ -921,6 +1106,7 @@ pub(crate) fn apply_backward(
         )));
     }
     let mut file = File::open(path)?;
+    let version = descriptor_version(&mut file, path)?;
     let spo = generation.perm(Perm::Spo);
     // the transaction being collected: its commit record, then its data records from
     // the last to the first
@@ -938,7 +1124,9 @@ pub(crate) fn apply_backward(
             fwd.extend_from_slice(r);
         }
         match commit::open_wal_commit(commit, &fwd) {
-            Some(Ok((s, _, _, _))) if s == *seq => {}
+            Some(Ok((s, _, _, flags))) if s == *seq => {
+                configuration_records(&fwd, version, flags).map_err(Backward::Failed)?;
+            }
             Some(Ok((s, _, _, _))) => {
                 return Err(corrupt(format!("found commit {s} where {seq} ends")));
             }
@@ -950,6 +1138,9 @@ pub(crate) fn apply_backward(
             None => return Err(Backward::Legacy),
         }
         for r in data {
+            if r[0] == WAL_CONFIGURATION {
+                continue;
+            }
             let q = record_quad(r);
             let in_base = spo.contains(cache, &Perm::Spo.to_key(&q))?;
             apply(delta, &q, r[0] != WAL_INSERT, in_base);
@@ -979,7 +1170,7 @@ pub(crate) fn apply_backward(
                     }
                     commit = Some(*rec);
                 }
-                WAL_INSERT | WAL_DELETE if commit.is_some() => data.push(*rec),
+                WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION if commit.is_some() => data.push(*rec),
                 op => {
                     return Err(corrupt(format!(
                         "unexpected record type {op} before byte {end}"
@@ -1021,6 +1212,7 @@ pub(crate) fn apply_backward_limited(
         )));
     }
     let mut file = File::open(path)?;
+    let version = descriptor_version(&mut file, path)?;
     let spo = generation.perm(Perm::Spo);
     // the transaction being collected: its commit record, then its data records from
     // the last to the first
@@ -1065,7 +1257,9 @@ pub(crate) fn apply_backward_limited(
                     .saturating_add(fwd.capacity() as u64),
             )?,
         ) {
-            Some(Ok((s, _, _, _))) if s == *seq => {}
+            Some(Ok((s, _, _, flags))) if s == *seq => {
+                configuration_records(&fwd, version, flags).map_err(Backward::Failed)?;
+            }
             Some(Ok((s, _, _, _))) => {
                 return Err(corrupt(format!("found commit {s} where {seq} ends")));
             }
@@ -1077,6 +1271,9 @@ pub(crate) fn apply_backward_limited(
             None => return Err(Backward::Legacy),
         }
         for r in data {
+            if r[0] == WAL_CONFIGURATION {
+                continue;
+            }
             limit.check(
                 super::history_limited::preparation_mutation_bytes(delta)
                     .saturating_add(held_buffers)
@@ -1149,7 +1346,7 @@ pub(crate) fn apply_backward_limited(
                     }
                     commit = Some(*rec);
                 }
-                WAL_INSERT | WAL_DELETE if commit.is_some() => {
+                WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION if commit.is_some() => {
                     if data.len() == data.capacity() {
                         let next = data.capacity().saturating_mul(2).max(1);
                         limit.check(
@@ -1234,6 +1431,79 @@ fn allocation_refused(limit: &crate::history::ReadLimit<'_>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_wal_checks_sealed_placement_flags_and_version() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("wal.log");
+        let mut configuration = [7; WAL_REC];
+        configuration[0] = WAL_CONFIGURATION;
+        let mut quad = [0; WAL_REC];
+        quad[0] = WAL_INSERT;
+        let identity = crate::evidence::Sha256Digest::from_digest_bytes([7; 32]);
+        let valid = [quad, configuration].concat();
+        let fixture = |version: u32, data: &[u8], flags: u8| {
+            let mut header = header_record();
+            header[8..12].copy_from_slice(&version.to_le_bytes());
+            let mut seal = [0; WAL_REC];
+            seal[0] = WAL_COMMIT;
+            commit::seal_wal_commit(&mut seal, 1, 10, commit::CommitKind::Update, flags, data);
+            [header.as_slice(), data, seal.as_slice()].concat()
+        };
+        for (version, data, flags, accepted) in [
+            (2, valid.clone(), commit::WAL_FLAG_CONFIGURATION, true),
+            (2, quad.to_vec(), 0, true),
+            (2, valid.clone(), 0, false),
+            (2, quad.to_vec(), commit::WAL_FLAG_CONFIGURATION, false),
+            (
+                2,
+                [configuration, configuration].concat(),
+                commit::WAL_FLAG_CONFIGURATION,
+                false,
+            ),
+            (
+                2,
+                [configuration, quad].concat(),
+                commit::WAL_FLAG_CONFIGURATION,
+                false,
+            ),
+            (1, valid.clone(), commit::WAL_FLAG_CONFIGURATION, false),
+            (0, valid.clone(), commit::WAL_FLAG_CONFIGURATION, false),
+            (
+                2,
+                valid.clone(),
+                commit::WAL_FLAG_CONFIGURATION | 128,
+                false,
+            ),
+        ] {
+            let bytes = if version == 0 {
+                fixture(version, &data, flags)[WAL_REC..].to_vec()
+            } else {
+                fixture(version, &data, flags)
+            };
+            std::fs::write(&path, bytes).unwrap();
+            let mut cursor = WalCursor::open(&path, p(0, 0)).unwrap();
+            let result = cursor.next().map(|r| r.map(|(seq, _)| seq));
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "version={version} flags={flags} data={data:?}"
+            );
+            if accepted {
+                assert_eq!(result.unwrap(), Some(1));
+                assert_eq!(
+                    cursor.configuration(),
+                    if flags == 0 { None } else { Some(identity) }
+                );
+            }
+        }
+        // A changed payload with the old seal remains a checksum failure, rather
+        // than being accepted because the metadata's placement happens to be valid.
+        let mut damaged = fixture(2, &valid, commit::WAL_FLAG_CONFIGURATION);
+        damaged[WAL_REC + 1] ^= 1;
+        std::fs::write(&path, damaged).unwrap();
+        assert!(WalCursor::open(&path, p(0, 0)).unwrap().next().is_err());
+    }
 
     fn p(seq: u64, offset: u64) -> WalPoint {
         WalPoint {
@@ -1509,7 +1779,7 @@ mod tests {
     fn direct_writes_keep_the_log_bytes_exact() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal.log");
-        let log = open_for_append(&path).unwrap();
+        let log = open_for_append(&path, PLAIN_VERSION).unwrap();
         let Some(mut direct) = DirectLog::open(&path, &log) else {
             // no direct I/O on this file system (or OS): commits take the buffered path
             return;

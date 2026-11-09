@@ -34,6 +34,8 @@ pub(super) struct Pending {
     pub info: CommitInfo,
     pub snapshot: Arc<Snapshot>,
     pub changes: Vec<(u8, [Id; 4])>,
+    pub configuration: crate::history::ConfigurationBinding,
+    _managed_admission: Option<super::managed::AdmittedManaged>,
     pub author: Option<Arc<str>>,
     /// a descriptor of the log, for the leader's buffered write and synchronization
     pub wal: File,
@@ -712,6 +714,7 @@ impl Store {
             self.guard_committed(c.seq);
         }
         self.deltas.noted(c.seq, generation, &p.changes);
+        self.note_configuration(c.seq, p.configuration);
         self.current.store(p.snapshot.clone());
         self.commits.send_replace(c.seq);
         // after the publication: a worker that takes these pairs reads this state
@@ -835,6 +838,7 @@ impl WriteTxn<'_> {
             }
             data.extend_from_slice(&rec);
         }
+        let configuration_flags = wal::append_configuration(&mut data, self.configuration)?;
         rec[0] = WAL_COMMIT;
         rec[1..9].copy_from_slice(&w.next_bnode.to_le_bytes());
         commit::seal_wal_commit_unfenced(
@@ -842,15 +846,17 @@ impl WriteTxn<'_> {
             c.seq,
             c.timestamp_ms,
             c.kind,
-            (if c.unvalidated {
-                commit::WAL_FLAG_UNVALIDATED
-            } else {
-                0
-            }) | (if ann.is_some() {
-                commit::WAL_FLAG_ANNOTATED
-            } else {
-                0
-            }),
+            configuration_flags
+                | (if c.unvalidated {
+                    commit::WAL_FLAG_UNVALIDATED
+                } else {
+                    0
+                })
+                | (if ann.is_some() {
+                    commit::WAL_FLAG_ANNOTATED
+                } else {
+                    0
+                }),
             unfenced,
             &data,
         );
@@ -871,6 +877,7 @@ impl WriteTxn<'_> {
                     info: c,
                     next_bnode: w.next_bnode,
                     changes: self.log.clone(),
+                    configuration: self.configuration,
                 });
             } else {
                 w.tap = None;
@@ -881,6 +888,8 @@ impl WriteTxn<'_> {
             info: c,
             snapshot: snapshot.clone(),
             changes: std::mem::take(&mut self.log),
+            configuration: self.configuration,
+            _managed_admission: self.managed_admission.take(),
             author: self.opts.author.clone(),
             wal: owned_wal,
             wal_start,

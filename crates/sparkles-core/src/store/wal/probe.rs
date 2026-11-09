@@ -5,8 +5,8 @@ use crate::store::cold::ColdBudget;
 /// The same durability evidence as `wal_torn_from`, without retaining the log or
 /// materializing any data transaction. The caller owns this exact file descriptor
 /// and its captured extent; a path replacement cannot select another log.
-fn durable_after(
-    reader: &mut BufReader<File>,
+fn durable_after<R: Read + Seek>(
+    reader: &mut BufReader<R>,
     extent: u64,
     at: usize,
     seq: u64,
@@ -33,7 +33,7 @@ fn durable_after(
             budget.key_step("WAL durability record", index)?;
             reader.read_exact(&mut record)?;
             match record[0] {
-                WAL_INSERT | WAL_DELETE => crc.update(&record),
+                WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION => crc.update(&record),
                 WAL_COMMIT => {
                     match commit::open_wal_commit_with_crc(&record, crc) {
                         Some(Ok((s, ..)))
@@ -107,6 +107,153 @@ mod tests {
         out[0] = WAL_COMMIT;
         commit::seal_wal_commit_unfenced(&mut out, seq, 100, CommitKind::Update, 0, unfenced, data);
         out
+    }
+
+    #[test]
+    fn normal_record_observer_excludes_actual_durability_lookahead_rereads() {
+        struct Counted {
+            cursor: std::io::Cursor<Vec<u8>>,
+            read_bytes: usize,
+        }
+        impl Read for Counted {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.cursor.read(output)?;
+                self.read_bytes += count;
+                Ok(count)
+            }
+        }
+        impl Seek for Counted {
+            fn seek(&mut self, seek: SeekFrom) -> std::io::Result<u64> {
+                self.cursor.seek(seek)
+            }
+        }
+        let mut wire = header_record().to_vec();
+        for seq in [1, 2] {
+            let mut data = [0; WAL_REC];
+            data[0] = WAL_INSERT;
+            wire.extend_from_slice(&data);
+            let mut commit = [0; WAL_REC];
+            commit[0] = WAL_COMMIT;
+            commit::seal_wal_commit_unfenced(
+                &mut commit,
+                seq,
+                100,
+                CommitKind::Update,
+                if seq == 1 {
+                    commit::WAL_FLAG_ANNOTATED
+                } else {
+                    0
+                },
+                0,
+                &data,
+            );
+            wire.extend_from_slice(&commit);
+        }
+        let options = HistoryOptions::default();
+        let budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(0),
+            held: 0,
+        })
+        .unwrap();
+        let mut reader = BufReader::with_capacity(
+            WAL_REC,
+            Counted {
+                cursor: std::io::Cursor::new(wire.clone()),
+                read_bytes: 0,
+            },
+        );
+        let mut observed = Vec::new();
+        let mut offsets = Vec::new();
+        let proof = prove_prefix_recording(
+            &mut reader,
+            wire.len() as u64,
+            0,
+            2,
+            false,
+            None,
+            u64::MAX,
+            Some(&[]),
+            Path::new("record-observer"),
+            &budget,
+            &mut |_| Ok(()),
+            &mut |offset, record| {
+                offsets.push(offset);
+                observed.extend_from_slice(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(proof.head.seq, 2);
+        assert_eq!(proof.head.offset, wire.len() as u64);
+        assert!(
+            reader.get_ref().read_bytes > wire.len(),
+            "missing middle membership must actually cause lookahead"
+        );
+        assert_eq!(
+            observed, wire,
+            "only ordinary parser records enter the digest"
+        );
+        assert_eq!(
+            offsets,
+            (0..5)
+                .map(|index| index * WAL_REC as u64)
+                .collect::<Vec<_>>()
+        );
+        let mut unchanged = BufReader::with_capacity(WAL_REC, std::io::Cursor::new(&wire));
+        let old = prove_prefix_with(
+            &mut unchanged,
+            wire.len() as u64,
+            0,
+            2,
+            false,
+            None,
+            u64::MAX,
+            Some(&[]),
+            Path::new("record-observer"),
+            &budget,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(old.head.seq, proof.head.seq);
+        assert_eq!(old.head.offset, proof.head.offset);
+    }
+
+    #[test]
+    fn normal_record_observer_refusal_never_returns_a_prefix_proof() {
+        let mut wire = header_record().to_vec();
+        wire.extend_from_slice(&data(1));
+        let options = HistoryOptions::default();
+        let budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(0),
+            held: 0,
+        })
+        .unwrap();
+        let mut reader = BufReader::new(std::io::Cursor::new(&wire));
+        let mut observed = 0;
+        let result = prove_prefix_recording(
+            &mut reader,
+            wire.len() as u64,
+            0,
+            0,
+            false,
+            None,
+            u64::MAX,
+            None,
+            Path::new("record-observer"),
+            &budget,
+            &mut |_| Ok(()),
+            &mut |offset, _| {
+                if offset > 0 {
+                    return Err(Error::Cancelled);
+                }
+                observed += 1;
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(observed, 1);
     }
 
     #[test]
@@ -290,6 +437,80 @@ mod tests {
     }
 
     #[test]
+    fn physical_observations_distinguish_folded_sequences_and_skip_the_header() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("wal.log");
+        let options = HistoryOptions::default();
+        for (headed, modern, folding) in [
+            (true, true, false),
+            (false, true, false),
+            (false, false, true),
+            (false, false, false),
+        ] {
+            let mut wire = if headed {
+                header_record().to_vec()
+            } else {
+                Vec::new()
+            };
+            let data = data(0);
+            for seq in [11, 12] {
+                wire.extend_from_slice(&data);
+                let record = if modern {
+                    commit_record(seq, &data, 0)
+                } else {
+                    let mut record = [0; WAL_REC];
+                    record[0] = WAL_COMMIT;
+                    record
+                };
+                wire.extend_from_slice(&record);
+            }
+            std::fs::write(&path, &wire).unwrap();
+            let mut budget = ColdBudget::new(ReadLimit {
+                options: &options,
+                memory: Some(4096),
+                held: 0,
+            })
+            .unwrap();
+            let mut reader = budget.buffered(&path).unwrap().value;
+            let mut observed = Vec::new();
+            let proof = prove_prefix_with(
+                &mut reader,
+                wire.len() as u64,
+                10,
+                u64::MAX,
+                folding,
+                None,
+                u64::MAX,
+                None,
+                &path,
+                &budget,
+                &mut |record| {
+                    observed.push((record.point.seq, record.start_offset, record.point.offset));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let start = if headed { WAL_REC as u64 } else { 0 };
+            let first_seq = if folding { 10 } else { 11 };
+            let last_seq = if folding { 10 } else { 12 };
+            assert_eq!(
+                observed,
+                [
+                    (first_seq, start, start + 2 * WAL_REC as u64),
+                    (
+                        last_seq,
+                        start + 2 * WAL_REC as u64,
+                        start + 4 * WAL_REC as u64
+                    ),
+                ],
+                "headed={headed} modern={modern} folding={folding}"
+            );
+            assert_eq!(proof.head.offset, wire.len() as u64);
+            assert_eq!(std::fs::read(&path).unwrap(), wire);
+        }
+    }
+
+    #[test]
     fn scalar_commit_observations_are_controlled_and_provisional_until_final_proof() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("wal.log");
@@ -325,7 +546,12 @@ mod tests {
             &path,
             &budget,
             &mut |record| {
-                observed.push((record.point.seq, record.point.offset, record.metadata));
+                observed.push((
+                    record.point.seq,
+                    record.start_offset,
+                    record.point.offset,
+                    record.metadata,
+                ));
                 Ok(())
             },
         )
@@ -334,8 +560,8 @@ mod tests {
         assert_eq!(
             observed,
             [
-                (11, 66, Some((100, CommitKind::Update, 0))),
-                (12, 132, Some((100, CommitKind::Update, 0)))
+                (11, 0, 66, Some((100, CommitKind::Update, 0))),
+                (12, 66, 132, Some((100, CommitKind::Update, 0)))
             ]
         );
         std::fs::write(&path, &wire[..66]).unwrap();
@@ -353,7 +579,12 @@ mod tests {
             &path,
             &budget,
             &mut |record| {
-                observed.push((record.point.seq, record.point.offset, record.metadata));
+                observed.push((
+                    record.point.seq,
+                    record.start_offset,
+                    record.point.offset,
+                    record.metadata,
+                ));
                 Ok(())
             },
         );
@@ -459,13 +690,17 @@ pub(crate) struct ProvenWal {
 /// The origin reader resolves timestamps/counts; this is not admission or identity.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WalCommitObservation {
+    /// Actual first byte of this transaction, after a header or the prior commit.
+    /// This framing position is not itself authenticated imported authority.
+    pub(crate) start_offset: u64,
     pub(crate) point: WalPoint,
     pub(crate) metadata: Option<(i64, CommitKind, u8)>,
+    pub(crate) configuration: Option<crate::evidence::Sha256Digest>,
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prove_prefix_with(
-    reader: &mut BufReader<File>,
+pub(crate) fn prove_prefix_with<R: Read + Seek>(
+    reader: &mut BufReader<R>,
     extent: u64,
     base: u64,
     target: u64,
@@ -477,6 +712,110 @@ pub(crate) fn prove_prefix_with(
     budget: &ColdBudget<'_>,
     visit: &mut dyn FnMut(WalCommitObservation) -> Result<()>,
 ) -> Result<ProvenWal> {
+    prove_prefix_recording(
+        reader,
+        extent,
+        base,
+        target,
+        fold_legacy,
+        strict_from,
+        dvocab_len,
+        annotated,
+        path,
+        budget,
+        visit,
+        &mut |_, _| Ok(()),
+    )
+}
+
+/// Observe the fixed records used by the ordinary parser, never its durability
+/// lookahead/rereads. Both record bytes and commit observations remain provisional
+/// until the complete prefix proof succeeds. This grants no source identity.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_prefix_recording<
+    R: Read + Seek,
+    F: FnMut(u64, &[u8; WAL_REC]) -> Result<()>,
+>(
+    reader: &mut BufReader<R>,
+    extent: u64,
+    base: u64,
+    target: u64,
+    fold_legacy: bool,
+    strict_from: Option<u64>,
+    dvocab_len: u64,
+    annotated: Option<&[u64]>,
+    path: &Path,
+    budget: &ColdBudget<'_>,
+    visit: &mut dyn FnMut(WalCommitObservation) -> Result<()>,
+    record_used: &mut F,
+) -> Result<ProvenWal> {
+    prove_prefix_bounded(
+        reader,
+        extent,
+        base,
+        target,
+        fold_legacy,
+        strict_from,
+        dvocab_len,
+        annotated,
+        path,
+        budget,
+        visit,
+        record_used,
+        false,
+    )
+}
+
+/// Prove the log only through commit `target`, as a past-state read of `target`
+/// replays it. Damage to a later commit, durable or not, belongs to the reads of
+/// that commit, so it cannot refuse an earlier one. Observations end at `target`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_prefix_through<R: Read + Seek>(
+    reader: &mut BufReader<R>,
+    extent: u64,
+    base: u64,
+    target: u64,
+    fold_legacy: bool,
+    strict_from: Option<u64>,
+    dvocab_len: u64,
+    annotated: Option<&[u64]>,
+    path: &Path,
+    budget: &ColdBudget<'_>,
+    visit: &mut dyn FnMut(WalCommitObservation) -> Result<()>,
+) -> Result<ProvenWal> {
+    prove_prefix_bounded(
+        reader,
+        extent,
+        base,
+        target,
+        fold_legacy,
+        strict_from,
+        dvocab_len,
+        annotated,
+        path,
+        budget,
+        visit,
+        &mut |_, _| Ok(()),
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_prefix_bounded<R: Read + Seek, F: FnMut(u64, &[u8; WAL_REC]) -> Result<()>>(
+    reader: &mut BufReader<R>,
+    extent: u64,
+    base: u64,
+    target: u64,
+    fold_legacy: bool,
+    strict_from: Option<u64>,
+    dvocab_len: u64,
+    annotated: Option<&[u64]>,
+    path: &Path,
+    budget: &ColdBudget<'_>,
+    visit: &mut dyn FnMut(WalCommitObservation) -> Result<()>,
+    record_used: &mut F,
+    stop_at_target: bool,
+) -> Result<ProvenWal> {
     check_strict_from(path, strict_from)?;
     reader.seek(SeekFrom::Start(0))?;
     let mut head = WalPoint {
@@ -485,11 +824,17 @@ pub(crate) fn prove_prefix_with(
         folding: fold_legacy,
     };
     let mut selected = (target == base).then_some(head);
+    if stop_at_target && selected.is_some() && !head.folding {
+        budget.check()?;
+        return Ok(ProvenWal { head, selected });
+    }
     let mut framing = Framing::of(strict_from);
     let mut crc = flate2::Crc::new();
     let mut needed = 0;
     let mut seen_modern = false;
     let mut header = false;
+    let mut wal_version = 0;
+    let mut configuration = ConfigurationRecords::default();
     let mut record = [0; WAL_REC];
     let corrupt = || Error::Corrupt(format!("{}: invalid committed WAL prefix", path.display()));
     for index in 0..(extent / WAL_REC as u64) as usize {
@@ -498,12 +843,14 @@ pub(crate) fn prove_prefix_with(
         match record[0] {
             WAL_HEADER if index == 0 => {
                 header = true;
-                if header_version(&record, path)? == 1 {
+                wal_version = header_version(&record, path)?;
+                if wal_version >= 1 {
                     framing = Framing::Strict { from: 1 };
                 }
                 head.offset = WAL_REC as u64;
             }
             WAL_INSERT | WAL_DELETE => {
+                configuration.data(&record);
                 crc.update(&record);
                 let quad = std::array::from_fn(|j| {
                     Id(u64::from_le_bytes(
@@ -511,6 +858,10 @@ pub(crate) fn prove_prefix_with(
                     ))
                 });
                 needed = needed.max(delta_ids_end(std::iter::once(&quad)));
+            }
+            WAL_CONFIGURATION => {
+                configuration.data(&record);
+                crc.update(&record);
             }
             WAL_COMMIT => {
                 let meta = commit::open_wal_commit_with_crc(&record, crc);
@@ -524,6 +875,13 @@ pub(crate) fn prove_prefix_with(
                     }
                     break;
                 }
+                let configuration_digest = configuration.finish(
+                    wal_version,
+                    match &meta {
+                        Some(Ok((_, _, _, flags))) => *flags,
+                        _ => 0,
+                    },
+                )?;
                 if let (Some(seqs), Some(Ok((seq, _, _, flags)))) = (annotated, &meta)
                     && flags & commit::WAL_FLAG_ANNOTATED != 0
                     && seqs.binary_search(seq).is_err()
@@ -542,6 +900,7 @@ pub(crate) fn prove_prefix_with(
                     _ if fold_legacy && !seen_modern => {}
                     _ => head.seq = next,
                 }
+                let start_offset = head.offset;
                 head.offset = (index as u64 + 1) * WAL_REC as u64;
                 head.folding = fold_legacy && !seen_modern;
                 if head.seq == target {
@@ -549,15 +908,23 @@ pub(crate) fn prove_prefix_with(
                 }
                 budget.check()?;
                 visit(WalCommitObservation {
+                    start_offset,
                     point: head,
+                    configuration: configuration_digest,
                     metadata: match meta {
                         Some(Ok((_, timestamp, kind, flags))) => Some((timestamp, kind, flags)),
                         _ => None,
                     },
                 })?;
                 budget.check()?;
+                // Folded legacy commits share one number, so a folding prefix
+                // continues to the first commit that ends the fold.
+                if stop_at_target && selected.is_some() && !head.folding {
+                    return Ok(ProvenWal { head, selected });
+                }
                 crc = flate2::Crc::new();
                 needed = 0;
+                configuration = ConfigurationRecords::default();
             }
             _ => {
                 let next = head.seq.checked_add(1).ok_or_else(corrupt)?;
@@ -567,6 +934,7 @@ pub(crate) fn prove_prefix_with(
                 break;
             }
         }
+        record_used(index as u64 * WAL_REC as u64, &record)?;
     }
     // A headerless generation recorded these bytes durable before raising its
     // framing boundary. EOF and partial records cannot erase that evidence. A

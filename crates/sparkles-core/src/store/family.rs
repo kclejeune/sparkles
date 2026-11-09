@@ -9,7 +9,7 @@ use crate::guard::WriteOptions;
 use crate::{Error, Result};
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Retained last by each store and branch set, after their owned resources.
@@ -21,17 +21,82 @@ pub(crate) struct Family {
     pub(crate) managed: arc_swap::ArcSwapOption<crate::managed::ManagedState>,
     /// The durable source holds of main and every branch (see [`crate::holds`]).
     pub(crate) holds: crate::holds::FamilyHolds,
+    /// Selection made under this opening's actual root process exclusion. This
+    /// scalar is not a proof of an imported physical base or WAL interval.
+    origin: OnceLock<Option<crate::evidence::Sha256Digest>>,
     _owner_lock: Option<Arc<super::ProcessLock>>,
 }
 
 impl Family {
     pub(crate) fn new(owner_lock: Option<Arc<super::ProcessLock>>) -> Arc<Self> {
+        let origin = OnceLock::new();
+        if owner_lock.is_none() {
+            // Memory families have no imported on-disk namespace.
+            origin.set(None).expect("new memory family selection");
+        }
         Arc::new(Self {
             gate: Arc::new(FamilyGate::default()),
             managed: arc_swap::ArcSwapOption::empty(),
             holds: Default::default(),
+            origin,
             _owner_lock: owner_lock,
         })
+    }
+
+    pub(super) fn select_opening_origin(
+        &self,
+        root: &std::path::Path,
+        lock: &Arc<super::ProcessLock>,
+        preparation: &crate::access::Preparation,
+    ) -> Result<()> {
+        preparation.check()?;
+        if !self
+            ._owner_lock
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, lock))
+            || self.origin.get().is_some()
+        {
+            return Err(Error::invalid(
+                "origin selection needs the genuine unopened family",
+            ));
+        }
+        super::verify_database_lock(root, lock)?;
+        let selected = super::configuration_history::opening_origin_selection(root, preparation)?;
+        super::verify_database_lock(root, lock)?;
+        preparation.check()?;
+        self.origin
+            .set(selected)
+            .map_err(|_| Error::invalid("family origin selection was already installed"))
+    }
+
+    pub(super) fn verify_origin_lock(
+        &self,
+        root: &std::path::Path,
+        lock: &Arc<super::ProcessLock>,
+    ) -> Result<()> {
+        if self.origin.get().is_none()
+            || !self
+                ._owner_lock
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, lock))
+        {
+            return Err(Error::invalid(
+                "import context needs this family's actual root lock",
+            ));
+        }
+        super::verify_database_lock(root, lock)
+    }
+
+    pub(super) fn check_origin_selection(
+        &self,
+        selected: Option<crate::evidence::Sha256Digest>,
+    ) -> Result<()> {
+        if self.origin.get() != Some(&selected) {
+            return Err(super::managed_history::unavailable(
+                "imported origin differs from the genuine live opening selection",
+            ));
+        }
+        Ok(())
     }
 }
 

@@ -11,6 +11,7 @@
 //!   `CURRENT` (TDB2 `Data-NNNN` compaction).
 
 mod backup;
+mod bound_read_source;
 #[cfg(test)]
 mod branch_ops_tests;
 #[cfg(test)]
@@ -28,6 +29,10 @@ mod commit_stats;
 mod compaction;
 #[cfg(test)]
 mod compaction_tests;
+pub(crate) mod configuration_history;
+pub use bound_read_source::BoundReadSource;
+mod evidence_view;
+pub use evidence_view::BoundEvidenceView;
 pub mod definitions;
 mod deltas;
 mod describe;
@@ -56,6 +61,7 @@ mod lock;
 #[cfg(test)]
 mod lock_tests;
 mod managed;
+pub(crate) mod managed_history;
 pub use holds::{Acquired, HoldPublication};
 pub use managed::ManagedSnapshot;
 #[cfg(test)]
@@ -1592,6 +1598,7 @@ struct BulkCommit {
     start_len: u64,
     /// the commit may change the default graph
     default_graph: bool,
+    admission: Option<managed::AdmittedManaged>,
 }
 
 /// What [`Store::build_generation`] builds a bulk commit's generation from.
@@ -1899,6 +1906,7 @@ fn lock_dir(root: &Path) -> Result<ProcessLock> {
 }
 pub(crate) const WAL_DELETE: u8 = 2;
 pub(crate) const WAL_COMMIT: u8 = 3;
+pub(crate) const WAL_CONFIGURATION: u8 = 4;
 /// The type byte of the header record that starts a log written by this release (see
 /// [`wal::header_record`]). It is never a data or commit record type.
 pub(crate) const WAL_HEADER: u8 = 0x89;
@@ -2180,12 +2188,22 @@ impl Store {
         if ctx.is_none() {
             crate::formats::check_dataset_tree(root)?;
             // the dataset's managed-graph registry, which its branches share
-            if let Some(state) = managed::load_dir(root) {
+            let state = managed::load_dir(root);
+            // An activated family cannot fall back to legacy absence of its
+            // registry or of its history root, before anything is written.
+            managed_history::check_activated_registry(root, state.as_ref())?;
+            if let Some(state) = state {
                 family.managed.store(Some(Arc::new(state)));
             }
         } else {
             commit::check_dataset_compatibility(root)?;
             crate::formats::check_dataset_dir(root)?;
+        }
+        let configuration_preparation = managed_history::administrative_preparation()?;
+        if ctx.is_none() {
+            // Pin import selection before generation creation, replay, recovery
+            // or catalog changes. Branches share this actual family's receipt.
+            family.select_opening_origin(root, &lock, &configuration_preparation)?;
         }
         let current_file = root.join("CURRENT");
         if !current_file.exists() {
@@ -2284,41 +2302,69 @@ impl Store {
         // WAL commits without metadata that precede the first one with it are part of a
         // baseline commit (written by an older version before the upgrade)
         let mut fold_legacy = true;
-        let (base, rebased) = match commit::read_gen_commit(&root.join(&name))? {
-            Some((id, c, origin)) if !migrating => {
-                if id != dataset_id {
-                    return Err(Error::Corrupt(format!(
-                        "{name}/commit.json belongs to dataset {id}, not {dataset_id}"
-                    )));
+        let (base, rebased, base_configuration) =
+            match commit::read_gen_commit_full(&root.join(&name))? {
+                Some(physical) if !migrating => {
+                    let commit::RetainedGenerationCommit {
+                        dataset_id: id,
+                        commit: c,
+                        origin,
+                        configuration: binding,
+                        ..
+                    } = physical;
+                    if id != dataset_id {
+                        return Err(Error::Corrupt(format!(
+                            "{name}/commit.json belongs to dataset {id}, not {dataset_id}"
+                        )));
+                    }
+                    fold_legacy = origin == "baseline";
+                    (c, false, binding)
                 }
-                fold_legacy = origin == "baseline";
-                (c, false)
-            }
-            // a generation without commit metadata (built by an older version): its
-            // content becomes a baseline commit after the last cataloged one
-            _ => {
-                let prev = match commit::read_catalog(&catalog_path)? {
-                    Some((id, recs)) if id == dataset_id && !migrating => recs.last().copied(),
-                    _ => None,
-                };
-                let c = CommitInfo {
-                    seq: prev.map_or(0, |c| c.seq + 1),
-                    timestamp_ms: prev.map_or(0, |c| c.timestamp_ms).max(commit::now_ms()),
-                    kind: CommitKind::Baseline,
-                    inserted: gen_.meta.quads,
-                    deleted: 0,
-                    quads: gen_.meta.quads,
-                    generation: gen_no,
-                    bulk: false,
-                    // counts relative to an earlier commit are unknown
-                    exact: prev.is_none(),
-                    reconstructed: false,
-                    default_graph: true,
-                    unvalidated: false,
-                };
-                (c, true)
-            }
+                // a generation without commit metadata (built by an older version): its
+                // content becomes a baseline commit after the last cataloged one
+                _ => {
+                    let prev = match commit::read_catalog(&catalog_path)? {
+                        Some((id, recs)) if id == dataset_id && !migrating => recs.last().copied(),
+                        _ => None,
+                    };
+                    let c = CommitInfo {
+                        seq: prev.map_or(0, |c| c.seq + 1),
+                        timestamp_ms: prev.map_or(0, |c| c.timestamp_ms).max(commit::now_ms()),
+                        kind: CommitKind::Baseline,
+                        inserted: gen_.meta.quads,
+                        deleted: 0,
+                        quads: gen_.meta.quads,
+                        generation: gen_no,
+                        bulk: false,
+                        // counts relative to an earlier commit are unknown
+                        exact: prev.is_none(),
+                        reconstructed: false,
+                        default_graph: true,
+                        unvalidated: false,
+                    };
+                    (c, true, crate::history::ConfigurationBinding::LegacyUnbound)
+                }
+            };
+        let configuration_root = if ctx.is_some() {
+            link::dataset_root_of(root)?
+        } else {
+            root.to_path_buf()
         };
+        let configuration_state = family.managed.load_full();
+        let mut configuration_references = configuration_history::primary::References::new(
+            &configuration_root,
+            ctx.as_ref().map_or(dataset_id, |ctx| ctx.ident.dataset_id),
+            dataset_id,
+            ctx.as_ref().and_then(|ctx| {
+                ctx.ident
+                    .configuration_origin
+                    .as_ref()
+                    .map(|origin| (ctx.ident.from.seq, origin))
+            }),
+            configuration_state.as_deref(),
+            &configuration_preparation,
+        )?;
+        configuration_references.generation(base.seq, base_configuration)?;
         // replay the WAL (a linked generation's onto the delta of its starting commit)
         let wal_path = root.join(&name).join("wal.log");
         let mut delta = gen_.base_delta();
@@ -2366,7 +2412,9 @@ impl Store {
                 annotated: annotated.as_ref(),
                 strict_from,
             };
-            let r = replay_wal(&from, &buf, &mut |_, _| Ok(()))?;
+            let r = replay_wal(&from, &buf, &mut |_, _| Ok(()), &mut |observation| {
+                configuration_references.observation(observation)
+            })?;
             if r.good != buf.len() {
                 OpenOptions::new()
                     .write(true)
@@ -2386,6 +2434,9 @@ impl Store {
             next_bnode = r.next_bnode.max(bnode_floor);
             wal_text = r.touched;
         }
+        drop(configuration_references);
+        drop(configuration_state);
+        drop(configuration_preparation);
         let mut base = base;
         if rebased {
             // record the baseline: in the generation, the catalog, and (for an upgrade)
@@ -2414,7 +2465,13 @@ impl Store {
         // files it creates (a log with a header record) before it creates any.
         commit::note_writer(root)?;
         let wal_existed = wal_path.exists();
-        let wal = wal::open_for_append(&wal_path)?;
+        let wal = wal::open_for_append(
+            &wal_path,
+            wal::version_for(managed_history::activated(
+                family.managed.load().as_deref(),
+                Some(root),
+            )),
+        )?;
         if !wal_existed {
             // a new log starts with its header record
             wal_len = wal::HEADER_BYTES;
@@ -3047,9 +3104,9 @@ impl Store {
         };
         let entry = h.gens[&owner].clone();
         let generation = if memory.is_some() {
-            self.history_generation_limited(&mut h, owner, current, &live, &limit)?
+            self.history_generation_limited(&mut h, owner, current, &live, &limit, seq)?
         } else {
-            self.history_generation(&mut h, owner, current, &live, &entry)?
+            self.history_generation(&mut h, owner, current, &live, &entry, seq)?
         };
         let limit = if memory.is_some() && !Arc::ptr_eq(&generation, &live.generation) {
             limit.holding(generation.retained_bytes_limited(&limit)?)?
@@ -3189,10 +3246,23 @@ impl Store {
         current: u32,
         live: &Snapshot,
         entry: &crate::history::GenEntry,
+        through: u64,
     ) -> Result<Arc<Generation>> {
         if owner == current {
             return Ok(live.generation.clone());
         }
+        let history_options = crate::history::HistoryOptions::default();
+        let history_limit = crate::history::ReadLimit {
+            options: &history_options,
+            memory: None,
+            held: 0,
+        };
+        branching::readonly::authenticate_retained_generation(
+            self,
+            entry,
+            &history_limit,
+            through,
+        )?;
         if let Some(i) = h.open.iter().position(|(n, _)| *n == owner) {
             let e = h.open.remove(i);
             let g = e.1.clone();
@@ -3395,6 +3465,16 @@ impl Store {
         at: &crate::history::At,
         o: &crate::history::SnapshotOptions,
     ) -> Result<(crate::history::NamedSnapshot, bool)> {
+        self.create_snapshot_selected(name, at, o, None)
+    }
+
+    fn create_snapshot_selected(
+        &self,
+        name: &str,
+        at: &crate::history::At,
+        o: &crate::history::SnapshotOptions,
+        selected: Option<&crate::history::PinnedConfiguration>,
+    ) -> Result<(crate::history::NamedSnapshot, bool)> {
         let (note, expires_ms) = (o.note.clone(), o.expires_ms);
         if !crate::history::valid_name(name) {
             return Err(Error::invalid(format!(
@@ -3404,8 +3484,15 @@ impl Store {
         if note.as_ref().is_some_and(|n| n.len() > 1024) {
             return Err(Error::invalid("the note is longer than 1024 bytes"));
         }
+        if expires_ms.is_some_and(|expiry| {
+            commit::parse_rfc3339_ms(&commit::rfc3339_ms(expiry)) != Some(expiry)
+        }) {
+            return Err(Error::invalid(
+                "snapshot expiry is outside the supported timestamp range",
+            ));
+        }
         if self.mem_history.is_some() {
-            return self.mem_create_snapshot(name, at, o);
+            return self.mem_create_snapshot_selected(name, at, o, selected);
         }
         let (Some(root), Some(hist)) = (&self.root, &self.history) else {
             return Err(Error::HistoryUnsupported(
@@ -3418,9 +3505,15 @@ impl Store {
         let r = self.resolve_with(at, head)?;
         let seq = r.commit.seq;
         let current = commit::generation_number(&self.snapshot().generation.name);
-        let mut h = hist.lock();
+        let h = hist.lock();
         if let Some(p) = h.pins.get(name) {
-            if p.seq == seq {
+            if p.seq == seq
+                && selected.is_none_or(|selected| {
+                    p.configuration
+                        .as_ref()
+                        .is_some_and(|existing| existing.binding == selected.binding)
+                })
+            {
                 return Ok((self.named(&h, name, p, current, head.seq), false));
             }
             return Err(Error::Conflict(format!(
@@ -3434,6 +3527,16 @@ impl Store {
                 self.opts.max_snapshots
             )));
         }
+        drop(h);
+        let preparation = managed_history::administrative_preparation()?;
+        let configuration = match selected {
+            Some(selected) => {
+                selected.validate(self.owner_dataset_id())?;
+                Some(selected.clone())
+            }
+            None => self.pin_configuration_at(at, seq, &preparation)?,
+        };
+        let mut h = hist.lock();
         let Some(owner) = h.owner(seq, current, head.seq) else {
             return Err(self.history_gone(&h, seq, head.seq, None, Some(r.commit)));
         };
@@ -3460,6 +3563,7 @@ impl Store {
             note,
             expires_ms,
             warm: o.warm,
+            configuration,
         };
         h.pins.insert(name.to_string(), pin.clone());
         if let Err(e) = crate::history::write_file(
@@ -3946,6 +4050,7 @@ impl Store {
                                 .as_chunks::<WAL_REC>()
                                 .0
                                 .iter()
+                                .filter(|record| record[0] != WAL_CONFIGURATION)
                                 .map(|r| wal::record_quad(r))
                                 .collect(),
                         ));
@@ -4915,6 +5020,16 @@ impl Store {
     /// In-memory stores stay within [`StoreOptions::max_memory_bytes`]: `StorageFull`
     /// when a commit would make the data about `size` bytes.
     fn check_memory(&self, size: u64) -> Result<()> {
+        let history = self.family.managed.load();
+        let configuration = match history.as_deref() {
+            Some(crate::managed::ManagedState::Installed(i)) => {
+                i.history_memory.as_ref().map_or(0, |m| m.retained())
+            }
+            _ => 0,
+        };
+        let size = size
+            .checked_add(configuration)
+            .ok_or_else(|| Error::invalid("dataset memory size overflow"))?;
         match self.opts.max_memory_bytes {
             Some(max) if self.root.is_none() && size > max => {
                 let h = crate::error::human_bytes;
@@ -4962,6 +5077,10 @@ impl Store {
             force: false,
             merge: None,
             managed: None,
+            configuration: crate::history::ConfigurationBinding::LegacyUnbound,
+            managed_admission: None,
+            configuration_expected: matches!(self.family.managed.load().as_deref(),
+                Some(crate::managed::ManagedState::Installed(i)) if i.configuration_history.is_some()),
             stamp: None,
         }
     }
@@ -5137,6 +5256,7 @@ impl Store {
                 net_del: 0,
                 start_len: snap.len(),
                 default_graph: sources_reach_default_graph(sources),
+                admission: None,
             };
             let check = (crate::guard::Changes::Unknown, o);
             Ok(self
@@ -5352,6 +5472,7 @@ impl Store {
             start_len,
             default_graph: graphs.contains(&Id::DEFAULT_GRAPH)
                 || sources_reach_default_graph(sources),
+            admission: None,
         };
         let check = (crate::guard::Changes::Unknown, o);
         let (_, r) = self.rebuild_locked(&mut w, &snap, sources, &[], &graphs, bulk, check)?;
@@ -5388,11 +5509,16 @@ impl Store {
         // The graphs it drops are checked here, and its sources are checked quad by quad
         // while the build reads them.
         self.check_protected(bulk.kind)?;
-        self.admit_managed_ids(snap, drop_graphs.iter().copied(), None)?;
+        let admitted = match bulk.admission {
+            Some(admitted) => admitted,
+            None => self.capture_managed_admission(None)?,
+        };
+        admitted.admit_ids(snap, drop_graphs.iter().copied(), None)?;
+        let configuration = admitted.configuration;
         let fence = if extra.is_empty() {
             None
         } else {
-            self.managed_fence()?
+            admitted.fence()?
         };
         let started = std::time::Instant::now();
         let before = snap.len();
@@ -5550,9 +5676,18 @@ impl Store {
             // CURRENT switches durably, and only after that is the old generation removed.
             write_synced(
                 &dir.join("commit.json"),
-                &commit::gen_commit_bytes(self.dataset_id, "bulk", &head),
+                &commit::gen_commit_bytes_for(
+                    self.dataset_id,
+                    "bulk",
+                    &head,
+                    self.configuration_activated(),
+                    configuration,
+                ),
             )?;
-            let wal = wal::open_for_append(&dir.join("wal.log"))?;
+            let wal = wal::open_for_append(
+                &dir.join("wal.log"),
+                wal::version_for(self.configuration_activated()),
+            )?;
             let wal_size = wal.metadata()?.len();
             sync_dir(&dir)?;
             sync_dir(root)?;
@@ -5642,6 +5777,7 @@ impl Store {
         // a new generation needs its own spatial base
         self.rebuild_geo_locked(&mut new_snap, snap);
         self.remember_past(head.seq);
+        self.note_configuration(head.seq, configuration);
         self.current.store(Arc::new(new_snap));
         self.commits.send_replace(head.seq);
         // and its own vector indexes, built in the background
@@ -6236,6 +6372,11 @@ pub struct WriteTxn<'s> {
     merge: Option<branching::MergeRec>,
     /// the capability to change one owner's managed graphs ([`Self::set_managed`])
     managed: Option<crate::managed::ManagedWrite>,
+    /// The immutable generation returned by the one actual managed admission.
+    configuration: crate::history::ConfigurationBinding,
+    managed_admission: Option<managed::AdmittedManaged>,
+    /// Activation excludes live writers, so this presence cannot change mid-write.
+    configuration_expected: bool,
     /// the commit time fixed by [`Self::managed_stamp`]
     stamp: Option<i64>,
 }
@@ -6827,13 +6968,22 @@ impl WriteTxn<'_> {
         // The base snapshot decodes the terms this transaction added, which its
         // generation's update vocabulary holds.
         if self.is_dirty() || self.force {
-            self.store
-                .admit_managed_log(&self.base, &self.log, self.managed.as_ref())
-                .and_then(|()| {
-                    self.store
-                        .admit_managed_ids(&self.base, self.bulk.iter().map(|q| q[3]), None)
-                })
+            let admitted = self
+                .store
+                .admit_managed_commit(
+                    &self.base,
+                    &self.log,
+                    self.bulk.iter().map(|q| q[3]),
+                    self.managed.as_ref(),
+                )
                 .map_err(|e| self.store.after_refusal(e, Some(&self.opts)))?;
+            self.configuration = admitted.configuration;
+            self.managed_admission = Some(admitted);
+            if self.configuration_expected != self.configuration.configuration().is_some() {
+                return Err(managed_history::unavailable(
+                    "configuration coverage changed during an admitted writer",
+                ));
+            }
         }
         // a write cancelled (its client gone) or past its deadline publishes nothing
         self.opts.check()?;
@@ -6886,6 +7036,7 @@ impl WriteTxn<'_> {
             start_len: self.base.len(),
             default_graph: self.log.iter().any(|(_, q)| q[3] == Id::DEFAULT_GRAPH)
                 || bulk.iter().any(|q| q[3] == Id::DEFAULT_GRAPH),
+            admission: self.managed_admission.take(),
         };
         let log = std::mem::take(&mut self.log);
         let check = (
@@ -6980,7 +7131,9 @@ impl WriteTxn<'_> {
         }
         let w = &mut **self.guard;
         if let Some(wal) = w.wal.as_mut() {
-            let mut data = Vec::with_capacity((self.log.len() + 1) * WAL_REC);
+            let mut data = Vec::with_capacity(
+                (self.log.len() + 1 + usize::from(self.configuration_expected)) * WAL_REC,
+            );
             let mut rec = [0u8; WAL_REC];
             for (op, q) in &self.log {
                 rec[0] = *op;
@@ -6989,13 +7142,15 @@ impl WriteTxn<'_> {
                 }
                 data.extend_from_slice(&rec);
             }
+            let configuration_flags = wal::append_configuration(&mut data, self.configuration)?;
             rec[0] = WAL_COMMIT;
             rec[1..9].copy_from_slice(&next_bnode.to_le_bytes());
-            let flags = if c.unvalidated {
-                commit::WAL_FLAG_UNVALIDATED
-            } else {
-                0
-            };
+            let flags = configuration_flags
+                | if c.unvalidated {
+                    commit::WAL_FLAG_UNVALIDATED
+                } else {
+                    0
+                };
             // the record says no earlier commit may be missing from disk, so a fence
             // that is still running would make that untrue
             debug_assert!(
@@ -7121,6 +7276,7 @@ impl WriteTxn<'_> {
                     info: c,
                     next_bnode,
                     changes: self.log.clone(),
+                    configuration: self.configuration,
                 });
             } else {
                 self.guard.tap = None;
@@ -7175,6 +7331,7 @@ impl WriteTxn<'_> {
         let snap = Arc::new(snap);
         // before the publication: a view runtime woken by it finds the changes
         self.store.deltas.noted(c.seq, gen_, &self.log);
+        self.store.note_configuration(c.seq, self.configuration);
         self.store.current.store(snap.clone());
         self.store.commits.send_replace(c.seq);
         // after the publication: a worker that takes these pairs reads this state
@@ -7193,7 +7350,7 @@ impl WriteTxn<'_> {
 
     /// The bytes the commit appends to the WAL.
     fn wal_bytes(&self) -> u64 {
-        (self.log.len() as u64 + 1) * WAL_REC as u64
+        (self.log.len() as u64 + 1 + u64::from(self.configuration_expected)) * WAL_REC as u64
     }
 
     /// The most this commit may preallocate in the WAL past its records (see
@@ -7733,14 +7890,26 @@ pub(crate) fn wal_end(dir: &Path, base: &CommitInfo, fold_legacy: bool) -> u64 {
         return base.seq;
     };
     let recs = buf.as_chunks::<WAL_REC>().0;
+    let Ok(version) = wal::committed_version_of(&buf, &dir.join("wal.log")) else {
+        return base.seq;
+    };
     let (mut end, mut txn_start, mut seen_v2) = (base.seq, 0usize, false);
     for (i, rec) in recs.iter().enumerate() {
         match rec[0] {
-            WAL_INSERT | WAL_DELETE => {}
+            WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION => {}
             WAL_HEADER if i == 0 => txn_start = 1,
             WAL_COMMIT => {
                 match commit::open_wal_commit(rec, &buf[txn_start * WAL_REC..i * WAL_REC]) {
-                    Some(Ok((seq, _, _, _))) => {
+                    Some(Ok((seq, _, _, flags))) => {
+                        if wal::configuration_records(
+                            &buf[txn_start * WAL_REC..i * WAL_REC],
+                            version,
+                            flags,
+                        )
+                        .is_err()
+                        {
+                            break;
+                        }
                         seen_v2 = true;
                         end = seq;
                     }
@@ -7831,7 +8000,7 @@ pub(crate) fn wal_torn_from(buf: &[u8], at: usize, seq: u64, framing: Framing) -
         // transaction starts after the run of data records before this one.
         let start = recs[at + 1..i]
             .iter()
-            .rposition(|r| !matches!(r[0], WAL_INSERT | WAL_DELETE))
+            .rposition(|r| !matches!(r[0], WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION))
             .map_or(at + 1, |p| at + 2 + p);
         match commit::open_wal_commit(rec, &buf[start * WAL_REC..i * WAL_REC]) {
             // the damaged commit's own record, after damage among its data, fails
@@ -7908,8 +8077,10 @@ pub(crate) fn replay_wal(
     from: &ReplayFrom<'_>,
     buf: &[u8],
     check: &mut dyn FnMut(u64, &Delta) -> Result<()>,
+    configuration: &mut dyn FnMut(wal::probe::WalCommitObservation) -> Result<()>,
 ) -> Result<Replay> {
     let cache = from.cache;
+    let wal_version = wal::committed_version_of(buf, from.path)?;
     let recs = buf.as_chunks::<WAL_REC>().0;
     let dvocab_len = from.generation.dvocab.len();
     let mut out = Replay {
@@ -7964,12 +8135,13 @@ pub(crate) fn replay_wal(
         });
         match rec[0] {
             WAL_INSERT | WAL_DELETE => pending.push((rec[0], q)),
+            WAL_CONFIGURATION => {}
             // the header record that starts a log written by this release: the replay
             // accepts it as the log's first complete part
             WAL_HEADER if i == 0 => {
                 // every record after a version 1 header is strictly framed, and a
                 // `walStrictFrom` (which only headerless logs get) does not apply
-                if wal::header_version(rec, from.path)? == 1 {
+                if wal::header_version(rec, from.path)? >= 1 {
                     framing = Framing::Strict { from: 1 };
                 }
                 txn_start = 1;
@@ -7997,6 +8169,16 @@ pub(crate) fn replay_wal(
                         (i + 1) * WAL_REC
                     )));
                 }
+                // A complete sealed malformed binding is corruption, even in the
+                // last transaction. It must not become a convenient torn tail.
+                let configuration_digest = wal::configuration_records(
+                    &buf[txn_start * WAL_REC..i * WAL_REC],
+                    wal_version,
+                    match &meta {
+                        Some(Ok((_, _, _, flags))) => *flags,
+                        _ => 0,
+                    },
+                )?;
                 // A commit's new terms and its WAL records are synced at the same time
                 // (see `sync_commit_reused`): after a crash, a commit that was not durable yet
                 // may name terms that did not reach `delta.vocab`.
@@ -8107,12 +8289,25 @@ pub(crate) fn replay_wal(
                 if from.keep_touched && out.commits.len() > before {
                     out.touched.push((out.commits.last().unwrap().seq, touched));
                 }
-                out.good = (i + 1) * WAL_REC;
-                out.index.note(wal::WalPoint {
+                // The original framing/term/sequence rules accepted this
+                // complete event. A lost/orphan reference refuses here, before
+                // any caller may truncate a tail or publish recovered data.
+                let point = wal::WalPoint {
                     seq: out.commits.last().map_or(from.base.seq, |c| c.seq),
-                    offset: out.good as u64,
+                    offset: ((i + 1) * WAL_REC) as u64,
                     folding: from.fold_legacy && !seen_v2,
-                });
+                };
+                configuration(wal::probe::WalCommitObservation {
+                    start_offset: (txn_start * WAL_REC) as u64,
+                    point,
+                    configuration: configuration_digest,
+                    metadata: match meta {
+                        Some(Ok((_, timestamp, kind, flags))) => Some((timestamp, kind, flags)),
+                        _ => None,
+                    },
+                })?;
+                out.good = (i + 1) * WAL_REC;
+                out.index.note(point);
                 txn_start = i + 1;
             }
             // A commit that overwrites preallocated space may reach the disk in any

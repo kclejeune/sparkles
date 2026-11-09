@@ -1,5 +1,7 @@
 //! Read-only origin descriptors captured under the family's opening/table guards.
 //! Physical files describe lineage; they confer neither write nor receipt authority.
+mod configuration;
+
 use super::*;
 use crate::store::cold::{ColdBudget, Loaded};
 
@@ -10,7 +12,7 @@ fn check_identity(
     family: uuid::Uuid,
     entry: &Entry,
     budget: &mut ColdBudget<'_>,
-) -> Result<()> {
+) -> Result<Option<crate::history::ConfigurationBinding>> {
     let start = budget.used();
     budget.charge(
         (root.as_os_str().len() as u64)
@@ -34,6 +36,7 @@ fn check_identity(
             object.entry("format").or_insert(1.into());
         }
         let descriptor: BranchFile = budget.value(raw.value)?;
+        descriptor.check_configuration(&bytes)?;
         if descriptor.dataset_id != family
             || descriptor.id != entry.id
             || descriptor.ordinal != entry.ordinal
@@ -48,7 +51,11 @@ fn check_identity(
                 "retained branch dataset identity is missing or foreign".into(),
             ));
         }
-        budget.check()
+        budget.check()?;
+        Ok(descriptor
+            .configuration_origin
+            .as_ref()
+            .map(|origin| origin.binding))
     })();
     // Parsed names/extensions and temporary paths drop before their charge returns.
     budget.release(budget.used() - start);
@@ -62,6 +69,7 @@ struct Current {
     base: CommitInfo,
     folding: bool,
     strict_from: Option<u64>,
+    configuration: crate::history::ConfigurationBinding,
 }
 
 fn current_controlled(
@@ -156,6 +164,7 @@ fn current_controlled(
             base: physical.value.commit,
             folding: physical.value.origin == "baseline",
             strict_from: physical.value.wal_strict_from,
+            configuration: physical.value.configuration,
         };
         drop(physical.value);
         budget.release(physical.charge);
@@ -203,6 +212,8 @@ fn prove_file_with(
     )?;
     let result = (|| {
         let annotations = crate::annotations::seqs_controlled(root, id, budget)?;
+        let mut primary = configuration::PrimaryReader::load(root, id, budget)?;
+        primary.generation(generation, budget)?;
         let path = generation.dir.join("wal.log");
         let loaded = match budget.buffered(&path) {
             Ok(loaded) => loaded,
@@ -227,7 +238,8 @@ fn prove_file_with(
         };
         let mut reader = loaded.value;
         let extent = reader.get_ref().metadata()?.len();
-        wal::probe::prove_prefix_with(
+        let mut configuration_error = None;
+        let proof = wal::probe::prove_prefix_with(
             &mut reader,
             extent,
             generation.base.seq,
@@ -238,12 +250,139 @@ fn prove_file_with(
             annotations.value.as_deref(),
             &path,
             budget,
-            visit,
-        )
+            &mut |observation| {
+                // Observations are provisional until the original complete
+                // framing/durable-bound proof succeeds. Never publish a prefix
+                // merely because a configuration target happened to validate.
+                if configuration_error.is_none()
+                    && let Err(error) = primary.observation(observation, budget)
+                {
+                    configuration_error = Some(error);
+                }
+                visit(observation)
+            },
+        )?;
+        if let Some(error) = configuration_error {
+            return Err(error);
+        }
+        Ok(proof)
     })();
     // These are temporary proof buffers and membership, never retained on a view.
     budget.release(budget.used() - start);
     result
+}
+
+/// A resident Store lends the same bounded physical proof to a retained
+/// generation before exposing its raw log through history/diff/change readers.
+/// The caller holds history exclusion; no parent Store is opened or recovered.
+pub(in crate::store) fn authenticate_retained_generation(
+    store: &Store,
+    entry: &crate::history::GenEntry,
+    limit: &crate::history::ReadLimit<'_>,
+    through: u64,
+) -> Result<()> {
+    let mut budget = ColdBudget::new(*limit)?;
+    budget.charge(
+        (entry.dir.as_os_str().len() as u64)
+            .saturating_mul(4)
+            .saturating_add(entry.name.len() as u64 * 4)
+            .saturating_add(2048),
+    )?;
+    let physical = commit::read_gen_commit_controlled(&entry.dir, &mut budget)?;
+    if physical.as_ref().is_some_and(|physical| {
+        physical.value.dataset_id != store.dataset_id || physical.value.commit.seq != entry.base.seq
+    }) {
+        return Err(Error::Corrupt(
+            "retained primary generation identity differs".into(),
+        ));
+    }
+    let generation = Current {
+        name: entry.name.clone(),
+        number: commit::generation_number(&entry.name),
+        dir: entry.dir.clone(),
+        base: entry.base,
+        folding: entry.fold_legacy,
+        strict_from: physical
+            .as_ref()
+            .and_then(|physical| physical.value.wal_strict_from),
+        configuration: physical.as_ref().map_or(
+            crate::history::ConfigurationBinding::LegacyUnbound,
+            |physical| physical.value.configuration,
+        ),
+    };
+    if let Some(physical) = physical {
+        drop(physical.value);
+        budget.release(physical.charge);
+    }
+    let mut primary = configuration::PrimaryReader::for_store(store, &mut budget)?;
+    primary.generation(&generation, &budget)?;
+    let vocabulary = cold::head_vocabulary_controlled(
+        &entry.dir,
+        store.root.as_deref().ok_or_else(|| {
+            Error::HistoryUnsupported("retained primary root is unavailable".into())
+        })?,
+        &mut budget,
+    )?;
+    let terms = vocabulary.value.len_limited(&budget.owned_limit()?)?;
+    let root = store.root.as_deref().expect("checked persistent root");
+    // This variant uses the actual resident family capture, including main.
+    let annotations = crate::annotations::seqs_controlled(root, store.dataset_id, &mut budget)?;
+    let path = entry.dir.join("wal.log");
+    let loaded = match budget.buffered(&path) {
+        Ok(loaded) => loaded,
+        Err(Error::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound && generation.strict_from.is_none() =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut reader = loaded.value;
+    let extent = reader.get_ref().metadata()?.len();
+    let mut configuration_error = None;
+    let mut observe = |observation| {
+        if configuration_error.is_none()
+            && let Err(error) = primary.observation(observation, &budget)
+        {
+            configuration_error = Some(error);
+        }
+        Ok(())
+    };
+    // A read of one commit needs that commit's prefix, as its replay reads it.
+    // Readers of the whole log pass `u64::MAX` and prove all of it.
+    if through == u64::MAX {
+        wal::probe::prove_prefix_with(
+            &mut reader,
+            extent,
+            entry.base.seq,
+            u64::MAX,
+            entry.fold_legacy,
+            generation.strict_from,
+            terms,
+            annotations.value.as_deref(),
+            &path,
+            &budget,
+            &mut observe,
+        )?;
+    } else {
+        wal::probe::prove_prefix_through(
+            &mut reader,
+            extent,
+            entry.base.seq,
+            through,
+            entry.fold_legacy,
+            generation.strict_from,
+            terms,
+            annotations.value.as_deref(),
+            &path,
+            &budget,
+            &mut observe,
+        )?;
+    }
+    if let Some(error) = configuration_error {
+        return Err(error);
+    }
+    budget.check()
 }
 
 fn head_controlled(
@@ -337,6 +476,7 @@ fn generation_for(
                 base: identity.value.commit,
                 folding: identity.value.origin == "baseline",
                 strict_from: identity.value.wal_strict_from,
+                configuration: identity.value.configuration,
             };
             drop(identity.value);
             budget.release(identity.charge);
@@ -366,6 +506,7 @@ fn generation_for(
 
 pub(in crate::store) enum Purpose {
     Snapshot,
+    Configuration,
     Clock,
     TimeGone(i64),
 }
@@ -374,6 +515,10 @@ pub(in crate::store) enum OriginRead {
     Clock(i64),
     Resident(Arc<Store>),
     View(Arc<Snapshot>, crate::history::Resolved),
+    Configuration {
+        binding: crate::history::ConfigurationBinding,
+        first_bound_own: Option<u64>,
+    },
     Inherited(CommitRef),
 }
 
@@ -426,7 +571,8 @@ impl Store {
                 .saturating_add(4096),
         )?;
         let root = set.branch_root(id);
-        check_identity(&root, set.dataset_id, entry, &mut budget)?;
+        let root_configuration = check_identity(&root, set.dataset_id, entry, &mut budget)?;
+        let first_bound_own = root_configuration.and_then(|_| entry.from.seq.checked_add(1));
         let current = current_controlled(&root, id, &mut budget)?;
         let head = head_controlled(&root, id, &current.value, &mut budget)?;
         if let Purpose::TimeGone(ms) = purpose {
@@ -455,6 +601,14 @@ impl Store {
                     branch_id: entry.from.branch_id,
                     seq,
                 }));
+            }
+            if seq == entry.from.seq && matches!(purpose, Purpose::Configuration) {
+                // The child's primary root wins even when all of its root RDF
+                // is now served by a retained ancestor generation.
+                return Ok(OriginRead::Configuration {
+                    binding: root_configuration.unwrap_or_default(),
+                    first_bound_own,
+                });
             }
         }
         let mut selection =
@@ -523,6 +677,65 @@ impl Store {
                 &mut budget,
             )?);
         };
+        if matches!(purpose, Purpose::Configuration) {
+            if metadata.seq == selected.value.base.seq {
+                return Ok(OriginRead::Configuration {
+                    binding: selected.value.configuration,
+                    first_bound_own,
+                });
+            }
+            let vocabulary =
+                cold::head_vocabulary_controlled(&selected.value.dir, &root, &mut budget)?;
+            let terms = vocabulary.value.len_limited(&budget.owned_limit()?)?;
+            let mut digest = None;
+            let proof = prove_file_with(
+                &root,
+                id,
+                &selected.value,
+                metadata.seq,
+                terms,
+                &mut budget,
+                &mut |observation| {
+                    if observation.point.seq == metadata.seq && !observation.point.folding {
+                        digest = observation.configuration;
+                    }
+                    Ok(())
+                },
+            )?;
+            if proof.selected.is_none() {
+                return Err(super::super::managed_history::unavailable(
+                    "retained configuration WAL state is unavailable",
+                ));
+            }
+            let binding = match digest {
+                None => crate::history::ConfigurationBinding::LegacyUnbound,
+                Some(generation) => {
+                    let state = self.managed_state_shared();
+                    let lineage = match state.as_deref() {
+                        Some(crate::managed::ManagedState::Installed(installed)) => {
+                            installed.configuration_history.as_ref()
+                        }
+                        _ => None,
+                    }
+                    .ok_or_else(|| {
+                        super::super::managed_history::unavailable(
+                            "retained WAL binding has no configuration lineage",
+                        )
+                    })?;
+                    crate::history::ConfigurationBinding::Known {
+                        configuration: crate::history::ConfigurationIdentity {
+                            dataset_id: self.owner_dataset_id(),
+                            lineage_id: lineage.lineage_id,
+                            generation,
+                        },
+                    }
+                }
+            };
+            return Ok(OriginRead::Configuration {
+                binding,
+                first_bound_own,
+            });
+        }
         let geo = historical_geo_controlled(&root, &set.opts, &mut budget)?;
         let loaded = match cold::read_link_controlled(&selected.value.dir, &mut budget)? {
             Some(file) => Generation::open_linked_controlled(

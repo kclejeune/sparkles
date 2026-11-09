@@ -238,6 +238,11 @@ fn inspect_dir(plan: &mut Plan, dir: &Path, prefix: &str, by: Option<&str>) -> R
         // the message already names the directory
         plan.refused.push(e.to_string());
     }
+    // the generation versions that this dataset's reader admits, as open checks them,
+    // before activation or any other step raises the reader
+    if let Err(e) = formats::check_configuration_versions(dir) {
+        plan.refused.push(format!("{prefix}{e}"));
+    }
     inspect_store(plan, dir, prefix, by)
 }
 
@@ -844,7 +849,7 @@ pub fn migrate_with(
     keep_old: bool,
     hook: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<Outcome> {
-    let (plan, out) = migrate_planned_with(root, keep_old, hook)?;
+    let (plan, out) = migrate_planned_with(root, keep_old, hook, None)?;
     match out {
         Some(o) => Ok(o),
         None => Err(Error::Unsupported(plan.refused.join("; "))),
@@ -854,13 +859,68 @@ pub fn migrate_with(
 /// [`migrate`] that also returns the [`Plan`] it ran under the locks, for a report. The
 /// outcome is `None` when the database is outside the window, which the plan explains.
 pub fn migrate_planned(root: &Path, keep_old: bool) -> Result<(Plan, Option<Outcome>)> {
-    migrate_planned_with(root, keep_old, &mut |_| Ok(()))
+    migrate_planned_with(root, keep_old, &mut |_| Ok(()), None)
+}
+
+/// Inspect explicit configuration-history activation without changing the dataset.
+/// The cutoffs describe real current data heads; they do not certify earlier data.
+pub fn configuration_history_plan(
+    root: &Path,
+    preparation: &crate::access::Preparation,
+) -> Result<Plan> {
+    preparation.check()?;
+    let root = absolute(root)?;
+    require_named(&root)?;
+    let _migration = lock_migration(&root)?;
+    let mut plan = plan_locked(&root)?;
+    add_configuration_activation(&mut plan, &root, preparation)?;
+    Ok(plan)
+}
+
+fn add_configuration_activation(
+    plan: &mut Plan,
+    root: &Path,
+    preparation: &crate::access::Preparation,
+) -> Result<()> {
+    if !plan.in_window() || plan.interrupted.is_some() {
+        return Ok(());
+    }
+    if crate::store::managed_history::activation_needed(root, preparation)? {
+        let _inventory = crate::store::managed_history::activation_inventory(root, preparation)?;
+        plan.steps.push(PlannedStep { kind: "configuration-generation", file: "managed.json".into(), from: 0, to: 1,
+            summary: "activate complete configuration generations with genuine future-commit coverage on a checked copy" });
+    }
+    Ok(())
+}
+
+/// Activate configuration history using ordinary closed-store migration recovery.
+/// All stores must be closed. No previous commit is rebound to current settings.
+pub fn activate_configuration_history(
+    root: &Path,
+    keep_old: bool,
+    preparation: &crate::access::Preparation,
+) -> Result<Outcome> {
+    activate_configuration_history_with(root, keep_old, preparation, &mut |_| Ok(()))
+}
+
+/// Activation with the same interruption hooks as [`migrate_with`], plus named
+/// configuration-file boundaries on the unpublished copy.
+#[doc(hidden)]
+pub fn activate_configuration_history_with(
+    root: &Path,
+    keep_old: bool,
+    preparation: &crate::access::Preparation,
+    hook: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<Outcome> {
+    let (plan, outcome) = migrate_planned_with(root, keep_old, hook, Some(preparation))?;
+    outcome.ok_or_else(|| Error::Unsupported(plan.refused.join("; ")))
 }
 
 fn migrate_planned_with(
     root: &Path,
     keep_old: bool,
     hook: &mut dyn FnMut(&str) -> Result<()>,
+    activation: Option<&crate::access::Preparation>,
 ) -> Result<(Plan, Option<Outcome>)> {
     let root = &absolute(root)?;
     require_named(root)?;
@@ -879,7 +939,10 @@ fn migrate_planned_with(
         db_lock = Some(rolled);
     }
 
-    let plan = plan_locked(root)?;
+    let mut plan = plan_locked(root)?;
+    if let Some(preparation) = activation {
+        add_configuration_activation(&mut plan, root, preparation)?;
+    }
     if !plan.in_window() {
         return Ok((plan, None));
     }
@@ -916,10 +979,20 @@ fn migrate_planned_with(
     })?;
     hook("copied")?;
     for p in &plan.steps {
+        if p.kind == "configuration-generation" {
+            continue;
+        }
         let s = step(p.kind, p.from).expect("planned from STEPS");
         (s.run)(&work, Path::new(&p.file)).inspect_err(|_| {
             let _ = remove_work(&work);
         })?;
+    }
+    if let Some(preparation) = activation {
+        crate::store::managed_history::activate_copy(&work, preparation, hook).inspect_err(
+            |_| {
+                let _ = remove_work(&work);
+            },
+        )?;
     }
     // the copy, and the files the steps rewrote, take the modes and owners of the originals
     let owner = std::fs::metadata(root)?;
