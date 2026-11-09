@@ -135,21 +135,29 @@ def public_status(status):
 # can account for it. At most LINK_LISTING_MAX links are tried, every subset in git's order.
 LINK_LISTING_MAX=8
 INDEX_LISTING_MAX=64*1024*1024
-def index_listing(repo,env,seconds=30):
-    """The NUL-separated entries of `git ls-files --stage -z`, read in bounded chunks."""
-    p=subprocess.Popen(['git','-C',str(repo),'-c','core.fsmonitor=false','--no-optional-locks','ls-files','--stage','-z'],
+def index_listing(repo,env,seconds=30,argv=None):
+    """The NUL-separated entries of `git ls-files --stage -z`, read in bounded chunks.
+
+    Every read waits only for the time left, and output or an exit after the deadline refuses."""
+    import selectors,time
+    p=subprocess.Popen(argv or ['git','-C',str(repo),'-c','core.fsmonitor=false','--no-optional-locks','ls-files','--stage','-z'],
                        stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env,cwd=repo)
-    end=__import__('time').monotonic()+seconds;total=0;rest=b''
+    end=time.monotonic()+seconds;total=0;rest=b'';sel=selectors.DefaultSelector();sel.register(p.stdout,selectors.EVENT_READ)
+    left=lambda:end-time.monotonic()
     try:
         while True:
-            need(__import__('time').monotonic()<end,'index listing time bound')
-            part=p.stdout.read1(1024*1024)
+            need(left()>0 and sel.select(left()),'index listing time bound')
+            part=os.read(p.stdout.fileno(),1024*1024)
+            need(left()>0,'index listing time bound')
             if not part:break
             total+=len(part);need(total<=INDEX_LISTING_MAX,'index listing bound')
             items=(rest+part).split(b'\0');rest=items.pop()
             yield from items
-        need(p.wait(max(1,end-__import__('time').monotonic()))==0 and not rest,'qualification command failed')
+        try:code=p.wait(max(0.001,left()))
+        except subprocess.TimeoutExpired:raise Refusal('index listing time bound') from None
+        need(code==0 and not rest and left()>0,'qualification command failed')
     finally:
+        sel.close()
         if p.poll() is None:p.kill();p.wait()
         p.stdout.close()
 def head_links(repo,env):

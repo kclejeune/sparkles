@@ -1838,6 +1838,21 @@ class TransientStatOnlyStatus(unittest.TestCase):
         first,stale=self.O['startup_source'](repo,clean,iter([dict(clean,status_sha256=self.line('crates/LICENSE')),clean]).__next__,None)
         self.assertEqual(stale['attributed'],['crates/LICENSE'])
 
+    def test_the_index_listing_is_bounded_in_time(self):
+        # Review round 4. A stalled git refuses at the deadline, before output and after a
+        # complete record, and its process is gone afterwards.
+        import sys,time
+        for code in ('import time;time.sleep(30)','import sys,time;sys.stdout.buffer.write(b"a\\0");sys.stdout.flush();time.sleep(30)'):
+            with self.subTest(code=code):
+                start=time.monotonic();rows=[]
+                with self.assertRaises(self.O['Refusal']):
+                    for item in self.O['index_listing'](Path('.'),None,0.5,[sys.executable,'-c',code]):rows.append(item)
+                self.assertLess(time.monotonic()-start,5)
+        # A complete listing that ends in time is read whole.
+        self.assertEqual(list(self.O['index_listing'](Path('.'),None,5,[sys.executable,'-c','import sys;sys.stdout.buffer.write(b"a\\0b\\0")'])),[b'a',b'b'])
+        with self.assertRaises(self.O['Refusal']):list(self.O['index_listing'](Path('.'),None,5,[sys.executable,'-c','import sys;sys.stdout.buffer.write(b"a\\0b");sys.exit(0)']))
+        with self.assertRaises(self.O['Refusal']):list(self.O['index_listing'](Path('.'),None,5,[sys.executable,'-c','import sys;sys.exit(3)']))
+
     def test_more_links_than_the_bound_are_not_attributed(self):
         repo=self.linked()
         for n in range(self.O['LINK_LISTING_MAX']):os.symlink('a.txt',repo/f'link-{n}')
