@@ -160,6 +160,11 @@ connected graph inspection and editing. The
 [ontology editor](visualization/README.md#ontology-editor) edits OWL classes, properties,
 individuals and annotations as previewed commits beside asserted trees, kept inferred
 class groups and strict materialization-backed property and individual views, and its DL Query tab answers Manchester class expressions with the reasoning used.
+Its entity frame lists the commits that changed an entity and holds
+[discussion threads](visualization/README.md#ontology-editor) on the entity and its
+axioms, with mentions, replies, resolve and reopen, which the editor's Discussions tab
+lists for the ontology. Threads are Web Annotation RDF in a named graph on the branch,
+so each comment is a commit.
 The [thesaurus editor](visualization/README.md#thesaurus-editor) edits SKOS concept
 schemes, concepts, collections and SKOS-XL labels in a concept tree, and checks them
 against the integrity conditions of the SKOS Reference. The
@@ -196,6 +201,8 @@ datasets and saved queries alone.
 ![The SHACL shape editor with the shape tree and the form of a property shape with a sequence path](images/shape-editor.png)
 
 ![The ontology editor's History view of Professor on a branch, with three commits and the opened one showing the annotation it added, its full diff link and its revert](images/entity-history.png)
+
+![The ontology editor's Discussion view of Professor with an open thread that mentions a colleague and has a reply, a thread on one of its axioms, and the composer](images/ontology-discussions.png)
 
 [Editing forms](visualization/README.md#nested-form-read-models) generated from SHACL
 shapes edit a resource with its nested blank-node children, ordered lists and value
