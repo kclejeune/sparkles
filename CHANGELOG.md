@@ -34,7 +34,9 @@ commits that changed a triple naming the entity in the editor's graph, newest fi
 in bounded pages, opens each to the axioms mentioning the entity that it added and
 removed, and reverts a commit as one previewed commit for a caller who can write the
 branch. `GET /$/ontology/{ds}/diff` takes `entity` to keep only the axioms that mention
-one IRI.
+one IRI. A change set names a subject that has neither an `rdfs:label` nor a
+`skos:prefLabel` by its `sh:name`, so the shape editor's preview names a shape as its form
+does.
 
 The derived-table cache has a process-wide `--derived-table-cache-mb` budget and
 metrics-protected capacity, occupancy, hit and miss counters in the server statistics.

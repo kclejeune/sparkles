@@ -398,9 +398,10 @@ a little memory for the list of rows, about the size of the open nodes' ids, in 
 page whose size does not grow with the tree.
 
 A change set is drawn the same way wherever the pages show one, in the edit previews and in
-the history tabs. Each subject is a block named by its label, with every added or removed
-property and value on a line of its own and a sign beside it, and the plain N-Quads are one
-tab away.
+the history tabs. Each subject is a block named by its `rdfs:label` or `skos:prefLabel`,
+or by its `sh:name` when it has neither, so a shape in the shape editor's preview carries
+the name the form shows. Every added or removed property and value is on a line of its own
+with a sign beside it, and the plain N-Quads are one tab away.
 
 ### Rendering preferences
 
