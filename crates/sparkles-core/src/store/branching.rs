@@ -11,7 +11,10 @@
 //! lock. An upstream's history lock may be taken while a branch's writer lock is held,
 //! never the reverse.
 
+mod capture;
 pub(super) mod readonly;
+#[cfg(test)]
+pub(in crate::store) use capture::canonical_test_table;
 
 use super::link::{LINK_FILE, LinkFile, Segment};
 use super::*;
@@ -77,7 +80,7 @@ pub(crate) struct GenHold {
     pub generation: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Entry {
     pub name: String,
@@ -102,7 +105,7 @@ pub(crate) struct Entry {
 
 /// A deleted branch: kept so that the commits other branches merged from it still have
 /// a known starting point.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Tombstone {
     pub name: String,
@@ -111,7 +114,7 @@ pub(crate) struct Tombstone {
     pub from: FromRef,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MainEntry {
     #[serde(default)]
@@ -120,7 +123,7 @@ pub(crate) struct MainEntry {
     pub note: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TableFile {
     /// 1, or 2 while the table lists retired branches, which an older build that reads
@@ -234,7 +237,7 @@ pub(crate) struct BranchFile {
 }
 
 impl BranchFile {
-    fn check_configuration(&self, encoded: &[u8]) -> Result<()> {
+    pub(crate) fn check_configuration(&self, encoded: &[u8]) -> Result<()> {
         if self.format == 1 {
             if self.configuration_origin.is_some() {
                 return Err(Error::Corrupt(
@@ -334,6 +337,25 @@ pub(crate) fn write_initial_table(root: &Path, id: uuid::Uuid, next_ordinal: u64
     let mut t = TableFile::new(id);
     t.next_ordinal = next_ordinal.min(u16::MAX as u64 + 1) as u32;
     write_table(root, &t)
+}
+
+/// Bounded initial table for a closed, unpublished imported destination. No
+/// old branch entries become live members of the new family.
+pub(super) fn initial_import_table_bytes(
+    id: uuid::Uuid,
+    next_ordinal: u32,
+    preparation: &crate::access::Preparation,
+) -> Result<super::managed_history::Bytes> {
+    preparation.check()?;
+    if id.is_nil() || !(1..=u16::MAX as u32 + 1).contains(&next_ordinal) {
+        return Err(Error::invalid(
+            "invalid imported destination blank-node range",
+        ));
+    }
+    let _temporary = preparation.reserve(4096)?;
+    let mut table = TableFile::new(id);
+    table.next_ordinal = next_ordinal;
+    super::managed_history::encode_pretty(&table, preparation)
 }
 
 /// The branch table of a database directory, read without opening it (`None` when the
@@ -2372,10 +2394,15 @@ impl Store {
                 &tmp.join(BRANCH_FILE),
                 &serde_json::to_vec_pretty(&bf).expect("serializes"),
             )?;
-            write_synced(
-                &tmp.join("dataset.json"),
-                &commit::dataset_file_bytes(e.id, "branch", self.now_ms()),
-            )?;
+            // A branch of an activated family writes version 2 files from its first
+            // generation, so it records the configuration-history reader first.
+            let dataset = commit::dataset_file_bytes(e.id, "branch", self.now_ms());
+            let dataset = if self.configuration_activated() {
+                commit::with_reader(&dataset, super::managed_history::READER)?
+            } else {
+                dataset
+            };
+            write_synced(&tmp.join("dataset.json"), &dataset)?;
             // the first generation is gen-0001, linked or built (0 names in-memory ones)
             let gen_no: u32 = 1;
             let gen_name = format!("gen-{gen_no:04}");
@@ -2411,7 +2438,10 @@ impl Store {
                 )?;
                 write_synced(&gdir.join("delta.vocab"), &[])?;
             }
-            super::wal::create(&gdir.join("wal.log"))?;
+            super::wal::create(
+                &gdir.join("wal.log"),
+                super::wal::version_for(self.configuration_activated()),
+            )?;
             let commit_bytes = match configuration_origin {
                 Some(origin) => {
                     commit::gen_commit_bytes_with_binding(e.id, "branch", &base, origin.binding)
@@ -2504,7 +2534,7 @@ impl Store {
             return Err(self.history_gone(&h, seq, head.seq, None, Some(r.commit)));
         };
         let entry = h.gens[&owner].clone();
-        let generation = self.history_generation(&mut h, owner, current, &live, &entry)?;
+        let generation = self.history_generation(&mut h, owner, current, &live, &entry, seq)?;
         if owner == current {
             generation.dvocab.sync()?;
         }

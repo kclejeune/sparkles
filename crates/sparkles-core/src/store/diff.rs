@@ -986,7 +986,8 @@ impl Store {
                     "generation {no} was collected while it was read; retry"
                 )));
             };
-            let generation = self.history_generation(&mut h, no, current, &live, &entry)?;
+            let generation =
+                self.history_generation(&mut h, no, current, &live, &entry, u64::MAX)?;
             let file = File::open(entry.dir.join("wal.log"))?;
             (generation, entry, file)
         };

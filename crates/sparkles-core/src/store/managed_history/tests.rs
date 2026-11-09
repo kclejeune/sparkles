@@ -269,3 +269,33 @@ fn immutable_generation_does_not_follow_or_overwrite_an_alias() {
     assert!(persist(directory.path(), &first, &preparation).is_err());
     assert_eq!(std::fs::read(unrelated).unwrap(), first.bytes.value);
 }
+
+#[test]
+fn activation_is_recorded_by_the_reader_or_the_history_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let dataset = |reader: u32| {
+        let bytes = crate::commit::dataset_file_bytes(uuid::Uuid::new_v4(), "create", 0);
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["minimumReader"] = reader.into();
+        std::fs::write(root.join("dataset.json"), value.to_string()).unwrap();
+    };
+    assert!(!activation_recorded(root).unwrap());
+    dataset(crate::store::wal::HEADER_READER);
+    assert!(!activation_recorded(root).unwrap());
+    check_activated_registry(root, None).unwrap();
+    dataset(READER);
+    assert!(activation_recorded(root).unwrap());
+    assert_eq!(
+        check_activated_registry(root, None).unwrap_err().code(),
+        "evidence-unavailable"
+    );
+    // the history directory alone records activation too
+    dataset(crate::store::wal::HEADER_READER);
+    std::fs::create_dir(root.join(DIRECTORY)).unwrap();
+    assert!(activation_recorded(root).unwrap());
+    assert_eq!(
+        check_activated_registry(root, None).unwrap_err().code(),
+        "evidence-unavailable"
+    );
+}

@@ -221,7 +221,7 @@ impl Store {
             &gdir.join("commit.json"),
             &commit::gen_commit_bytes(id, "clone", &root),
         )?;
-        super::wal::create(&gdir.join("wal.log"))?;
+        super::wal::create(&gdir.join("wal.log"), super::wal::PLAIN_VERSION)?;
         sync_dir(&gdir)?;
         write_atomic(
             &dir.join("dataset.json"),
@@ -378,6 +378,7 @@ impl Store {
     /// the writer lock (no commit falls in between), and lease its generation when its
     /// files may be shared.
     fn clone_capture(&self, opts: &CloneOptions) -> Result<Capture> {
+        self.failpoint("clone-admitting");
         let share = opts.mode != CloneMode::Rebuild && opts.at.is_none();
         let (snap, next_bnode, lease, definitions, managed) = {
             let w = self.lock_writer(&crate::guard::WriteOptions {
@@ -386,6 +387,14 @@ impl Store {
                 no_wait: opts.no_wait,
                 ..Default::default()
             })?;
+            // A clone copies the registry, whose history root names an
+            // evidence-history closure and native generations of this identity that
+            // a clone does not carry (roadmap item 764). The writer's family permit
+            // excludes activation, so the state checked here is the one captured.
+            // Refuse before anything is captured or written.
+            if self.configuration_activated() {
+                return Err(activated_clone_refused());
+            }
             let snap = self.snapshot();
             // under the same lock as the snapshot: a definition changed after it is
             // not the clone's. Read before the lease is taken, so that a failure
@@ -760,3 +769,13 @@ impl Drop for CleanDir<'_> {
 #[cfg(test)]
 #[path = "clone_tests.rs"]
 mod tests;
+
+/// The refusal of a clone whose source family has activated configuration history.
+fn activated_clone_refused() -> Error {
+    Error::Unsupported(
+        "cloning a store whose configuration history is activated is not supported: the \
+         clone would keep the registry's history root without its evidence-history closure. \
+         Back the store up and restore it with its identity kept instead"
+            .into(),
+    )
+}

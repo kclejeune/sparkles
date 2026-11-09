@@ -502,6 +502,16 @@ impl Repository {
             })
             .collect();
         let has_text = entries.iter().any(|e| e.path == "text.json");
+        let mut requires = Vec::new();
+        if !defined.is_empty() {
+            requires.push("definitions".to_string());
+        }
+        if entries
+            .iter()
+            .any(|entry| layout::configuration_history_path(&entry.path))
+        {
+            requires.push("evidence-configuration-history/1".to_string());
+        }
         let manifest = Manifest {
             format: layout::FORMAT,
             kind: layout::MANIFEST_KIND.to_string(),
@@ -547,12 +557,21 @@ impl Repository {
                 .epoch()
                 .map(|epoch| serde_json::json!({"scheme":"sparkles-repo-v1","epoch":epoch})),
             branches_omitted,
-            requires: if defined.is_empty() {
-                Vec::new()
-            } else {
-                vec!["definitions".to_string()]
-            },
+            requires,
         };
+        // A retained descriptor can still read bytes changed in place after
+        // capture. A content-addressed configuration generation whose uploaded
+        // digest no longer matches its name would make restore refuse the backup.
+        if let Some(entry) = manifest
+            .files
+            .iter()
+            .find(|entry| !crate::manifest::generation_name_matches(&entry.path, &entry.sha256))
+        {
+            return Err(BackupError::internal(format!(
+                "{} changed after its capture",
+                entry.path
+            )));
+        }
         ctl.check()?;
         ctl.report(0.97, "writing the manifest");
         let body = Bytes::from(

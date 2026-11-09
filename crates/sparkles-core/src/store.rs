@@ -29,7 +29,7 @@ mod commit_stats;
 mod compaction;
 #[cfg(test)]
 mod compaction_tests;
-mod configuration_history;
+pub(crate) mod configuration_history;
 pub use bound_read_source::BoundReadSource;
 mod evidence_view;
 pub use evidence_view::BoundEvidenceView;
@@ -2188,12 +2188,22 @@ impl Store {
         if ctx.is_none() {
             crate::formats::check_dataset_tree(root)?;
             // the dataset's managed-graph registry, which its branches share
-            if let Some(state) = managed::load_dir(root) {
+            let state = managed::load_dir(root);
+            // An activated family cannot fall back to legacy absence of its
+            // registry or of its history root, before anything is written.
+            managed_history::check_activated_registry(root, state.as_ref())?;
+            if let Some(state) = state {
                 family.managed.store(Some(Arc::new(state)));
             }
         } else {
             commit::check_dataset_compatibility(root)?;
             crate::formats::check_dataset_dir(root)?;
+        }
+        let configuration_preparation = managed_history::administrative_preparation()?;
+        if ctx.is_none() {
+            // Pin import selection before generation creation, replay, recovery
+            // or catalog changes. Branches share this actual family's receipt.
+            family.select_opening_origin(root, &lock, &configuration_preparation)?;
         }
         let current_file = root.join("CURRENT");
         if !current_file.exists() {
@@ -2292,41 +2302,69 @@ impl Store {
         // WAL commits without metadata that precede the first one with it are part of a
         // baseline commit (written by an older version before the upgrade)
         let mut fold_legacy = true;
-        let (base, rebased) = match commit::read_gen_commit(&root.join(&name))? {
-            Some((id, c, origin)) if !migrating => {
-                if id != dataset_id {
-                    return Err(Error::Corrupt(format!(
-                        "{name}/commit.json belongs to dataset {id}, not {dataset_id}"
-                    )));
+        let (base, rebased, base_configuration) =
+            match commit::read_gen_commit_full(&root.join(&name))? {
+                Some(physical) if !migrating => {
+                    let commit::RetainedGenerationCommit {
+                        dataset_id: id,
+                        commit: c,
+                        origin,
+                        configuration: binding,
+                        ..
+                    } = physical;
+                    if id != dataset_id {
+                        return Err(Error::Corrupt(format!(
+                            "{name}/commit.json belongs to dataset {id}, not {dataset_id}"
+                        )));
+                    }
+                    fold_legacy = origin == "baseline";
+                    (c, false, binding)
                 }
-                fold_legacy = origin == "baseline";
-                (c, false)
-            }
-            // a generation without commit metadata (built by an older version): its
-            // content becomes a baseline commit after the last cataloged one
-            _ => {
-                let prev = match commit::read_catalog(&catalog_path)? {
-                    Some((id, recs)) if id == dataset_id && !migrating => recs.last().copied(),
-                    _ => None,
-                };
-                let c = CommitInfo {
-                    seq: prev.map_or(0, |c| c.seq + 1),
-                    timestamp_ms: prev.map_or(0, |c| c.timestamp_ms).max(commit::now_ms()),
-                    kind: CommitKind::Baseline,
-                    inserted: gen_.meta.quads,
-                    deleted: 0,
-                    quads: gen_.meta.quads,
-                    generation: gen_no,
-                    bulk: false,
-                    // counts relative to an earlier commit are unknown
-                    exact: prev.is_none(),
-                    reconstructed: false,
-                    default_graph: true,
-                    unvalidated: false,
-                };
-                (c, true)
-            }
+                // a generation without commit metadata (built by an older version): its
+                // content becomes a baseline commit after the last cataloged one
+                _ => {
+                    let prev = match commit::read_catalog(&catalog_path)? {
+                        Some((id, recs)) if id == dataset_id && !migrating => recs.last().copied(),
+                        _ => None,
+                    };
+                    let c = CommitInfo {
+                        seq: prev.map_or(0, |c| c.seq + 1),
+                        timestamp_ms: prev.map_or(0, |c| c.timestamp_ms).max(commit::now_ms()),
+                        kind: CommitKind::Baseline,
+                        inserted: gen_.meta.quads,
+                        deleted: 0,
+                        quads: gen_.meta.quads,
+                        generation: gen_no,
+                        bulk: false,
+                        // counts relative to an earlier commit are unknown
+                        exact: prev.is_none(),
+                        reconstructed: false,
+                        default_graph: true,
+                        unvalidated: false,
+                    };
+                    (c, true, crate::history::ConfigurationBinding::LegacyUnbound)
+                }
+            };
+        let configuration_root = if ctx.is_some() {
+            link::dataset_root_of(root)?
+        } else {
+            root.to_path_buf()
         };
+        let configuration_state = family.managed.load_full();
+        let mut configuration_references = configuration_history::primary::References::new(
+            &configuration_root,
+            ctx.as_ref().map_or(dataset_id, |ctx| ctx.ident.dataset_id),
+            dataset_id,
+            ctx.as_ref().and_then(|ctx| {
+                ctx.ident
+                    .configuration_origin
+                    .as_ref()
+                    .map(|origin| (ctx.ident.from.seq, origin))
+            }),
+            configuration_state.as_deref(),
+            &configuration_preparation,
+        )?;
+        configuration_references.generation(base.seq, base_configuration)?;
         // replay the WAL (a linked generation's onto the delta of its starting commit)
         let wal_path = root.join(&name).join("wal.log");
         let mut delta = gen_.base_delta();
@@ -2374,7 +2412,9 @@ impl Store {
                 annotated: annotated.as_ref(),
                 strict_from,
             };
-            let r = replay_wal(&from, &buf, &mut |_, _| Ok(()))?;
+            let r = replay_wal(&from, &buf, &mut |_, _| Ok(()), &mut |observation| {
+                configuration_references.observation(observation)
+            })?;
             if r.good != buf.len() {
                 OpenOptions::new()
                     .write(true)
@@ -2394,6 +2434,9 @@ impl Store {
             next_bnode = r.next_bnode.max(bnode_floor);
             wal_text = r.touched;
         }
+        drop(configuration_references);
+        drop(configuration_state);
+        drop(configuration_preparation);
         let mut base = base;
         if rebased {
             // record the baseline: in the generation, the catalog, and (for an upgrade)
@@ -2422,7 +2465,13 @@ impl Store {
         // files it creates (a log with a header record) before it creates any.
         commit::note_writer(root)?;
         let wal_existed = wal_path.exists();
-        let wal = wal::open_for_append(&wal_path)?;
+        let wal = wal::open_for_append(
+            &wal_path,
+            wal::version_for(managed_history::activated(
+                family.managed.load().as_deref(),
+                Some(root),
+            )),
+        )?;
         if !wal_existed {
             // a new log starts with its header record
             wal_len = wal::HEADER_BYTES;
@@ -3055,9 +3104,9 @@ impl Store {
         };
         let entry = h.gens[&owner].clone();
         let generation = if memory.is_some() {
-            self.history_generation_limited(&mut h, owner, current, &live, &limit)?
+            self.history_generation_limited(&mut h, owner, current, &live, &limit, seq)?
         } else {
-            self.history_generation(&mut h, owner, current, &live, &entry)?
+            self.history_generation(&mut h, owner, current, &live, &entry, seq)?
         };
         let limit = if memory.is_some() && !Arc::ptr_eq(&generation, &live.generation) {
             limit.holding(generation.retained_bytes_limited(&limit)?)?
@@ -3197,10 +3246,23 @@ impl Store {
         current: u32,
         live: &Snapshot,
         entry: &crate::history::GenEntry,
+        through: u64,
     ) -> Result<Arc<Generation>> {
         if owner == current {
             return Ok(live.generation.clone());
         }
+        let history_options = crate::history::HistoryOptions::default();
+        let history_limit = crate::history::ReadLimit {
+            options: &history_options,
+            memory: None,
+            held: 0,
+        };
+        branching::readonly::authenticate_retained_generation(
+            self,
+            entry,
+            &history_limit,
+            through,
+        )?;
         if let Some(i) = h.open.iter().position(|(n, _)| *n == owner) {
             let e = h.open.remove(i);
             let g = e.1.clone();
@@ -5614,14 +5676,18 @@ impl Store {
             // CURRENT switches durably, and only after that is the old generation removed.
             write_synced(
                 &dir.join("commit.json"),
-                &commit::gen_commit_bytes_with_binding(
+                &commit::gen_commit_bytes_for(
                     self.dataset_id,
                     "bulk",
                     &head,
+                    self.configuration_activated(),
                     configuration,
                 ),
             )?;
-            let wal = wal::open_for_append(&dir.join("wal.log"))?;
+            let wal = wal::open_for_append(
+                &dir.join("wal.log"),
+                wal::version_for(self.configuration_activated()),
+            )?;
             let wal_size = wal.metadata()?.len();
             sync_dir(&dir)?;
             sync_dir(root)?;
@@ -7824,7 +7890,7 @@ pub(crate) fn wal_end(dir: &Path, base: &CommitInfo, fold_legacy: bool) -> u64 {
         return base.seq;
     };
     let recs = buf.as_chunks::<WAL_REC>().0;
-    let Ok(version) = wal::version_of(&buf, &dir.join("wal.log")) else {
+    let Ok(version) = wal::committed_version_of(&buf, &dir.join("wal.log")) else {
         return base.seq;
     };
     let (mut end, mut txn_start, mut seen_v2) = (base.seq, 0usize, false);
@@ -8011,9 +8077,10 @@ pub(crate) fn replay_wal(
     from: &ReplayFrom<'_>,
     buf: &[u8],
     check: &mut dyn FnMut(u64, &Delta) -> Result<()>,
+    configuration: &mut dyn FnMut(wal::probe::WalCommitObservation) -> Result<()>,
 ) -> Result<Replay> {
     let cache = from.cache;
-    let wal_version = wal::version_of(buf, from.path)?;
+    let wal_version = wal::committed_version_of(buf, from.path)?;
     let recs = buf.as_chunks::<WAL_REC>().0;
     let dvocab_len = from.generation.dvocab.len();
     let mut out = Replay {
@@ -8104,7 +8171,7 @@ pub(crate) fn replay_wal(
                 }
                 // A complete sealed malformed binding is corruption, even in the
                 // last transaction. It must not become a convenient torn tail.
-                wal::configuration_records(
+                let configuration_digest = wal::configuration_records(
                     &buf[txn_start * WAL_REC..i * WAL_REC],
                     wal_version,
                     match &meta {
@@ -8222,12 +8289,25 @@ pub(crate) fn replay_wal(
                 if from.keep_touched && out.commits.len() > before {
                     out.touched.push((out.commits.last().unwrap().seq, touched));
                 }
-                out.good = (i + 1) * WAL_REC;
-                out.index.note(wal::WalPoint {
+                // The original framing/term/sequence rules accepted this
+                // complete event. A lost/orphan reference refuses here, before
+                // any caller may truncate a tail or publish recovered data.
+                let point = wal::WalPoint {
                     seq: out.commits.last().map_or(from.base.seq, |c| c.seq),
-                    offset: out.good as u64,
+                    offset: ((i + 1) * WAL_REC) as u64,
                     folding: from.fold_legacy && !seen_v2,
-                });
+                };
+                configuration(wal::probe::WalCommitObservation {
+                    start_offset: (txn_start * WAL_REC) as u64,
+                    point,
+                    configuration: configuration_digest,
+                    metadata: match meta {
+                        Some(Ok((_, timestamp, kind, flags))) => Some((timestamp, kind, flags)),
+                        _ => None,
+                    },
+                })?;
+                out.good = (i + 1) * WAL_REC;
+                out.index.note(point);
                 txn_start = i + 1;
             }
             // A commit that overwrites preallocated space may reach the disk in any

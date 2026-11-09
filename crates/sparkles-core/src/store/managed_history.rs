@@ -9,15 +9,85 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub(crate) const READER: u32 = 8;
 pub(crate) const FORMAT: u32 = 1;
+
+/// Whether the files at `root` record an activation of configuration history,
+/// whatever its registry says. Activation raises the dataset reader of every
+/// branch to [`READER`] and publishes the lineage under `evidence-history/`,
+/// and it runs on a copy that replaces the root only once it is complete. A
+/// root with either record is therefore activated, and a registry that is
+/// missing or names no history root must refuse rather than read as legacy.
+pub(crate) fn activation_recorded(root: &Path) -> Result<bool> {
+    let reader = crate::commit::read_dataset_versions(root)?
+        .is_some_and(|versions| versions.minimum_reader >= READER);
+    if reader {
+        return Ok(true);
+    }
+    match std::fs::symlink_metadata(root.join(DIRECTORY)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Refuse an activated root whose registry no longer names its history root.
+pub(crate) fn check_activated_registry(
+    root: &Path,
+    state: Option<&crate::managed::ManagedState>,
+) -> Result<()> {
+    let anchored = match state {
+        Some(crate::managed::ManagedState::Installed(installed)) => {
+            installed.configuration_history.is_some()
+        }
+        // An unavailable registry refuses what depends on it, but only a readable
+        // history root keeps an activated family from reading as legacy.
+        Some(crate::managed::ManagedState::Unavailable { .. }) => {
+            match std::fs::read(root.join(crate::managed::FILE)) {
+                Ok(bytes) => matches!(crate::managed::recorded_history(&bytes), Ok(Some(_))),
+                Err(_) => false,
+            }
+        }
+        None => false,
+    };
+    if !anchored && activation_recorded(root)? {
+        return Err(unavailable(
+            "activated configuration history has no published managed registry root",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a family has activated configuration history. Activation is a
+/// closed-dataset migration that publishes the registry's history root and
+/// raises every branch's dataset reader to [`READER`]. Only then does the store
+/// write version 2 logs, generation `commit.json` format 2 and `managed.json`
+/// format 3, so a store that never activates keeps the versions that older
+/// releases read. A registry that cannot be enforced still records activation in
+/// the family's dataset reader.
+pub(crate) fn activated(
+    state: Option<&crate::managed::ManagedState>,
+    family_root: Option<&Path>,
+) -> bool {
+    match state {
+        Some(crate::managed::ManagedState::Installed(installed)) => {
+            installed.configuration_history.is_some()
+        }
+        Some(crate::managed::ManagedState::Unavailable { .. }) => family_root
+            .and_then(|root| crate::commit::read_dataset_versions(root).ok().flatten())
+            .is_some_and(|versions| versions.minimum_reader >= READER),
+        None => false,
+    }
+}
 pub(crate) const MAX_BYTES: usize = 64 << 20;
 const PARSE_BYTES: u64 = 32;
 const DIRECTORY: &str = "evidence-history";
+
+pub(super) mod capture;
 
 #[cfg(test)]
 mod tests;
@@ -114,11 +184,17 @@ pub(crate) struct Prepared {
 /// overlap and decoding. It does not preallocate those bytes. Controlled readers
 /// and prepared mutations still use their caller's own, possibly smaller limit.
 pub(crate) fn administrative_preparation() -> Result<Preparation> {
+    administrative_preparation_with(crate::task::Control::none())
+}
+
+pub(crate) fn administrative_preparation_with(
+    control: crate::task::Control,
+) -> Result<Preparation> {
     let allowance = (MAX_BYTES as u64)
         .checked_mul(PARSE_BYTES * 2 + 8)
         .and_then(|bytes| bytes.checked_add(16 << 20))
         .ok_or_else(|| unavailable("configuration administrative allowance overflows"))?;
-    Preparation::new(crate::task::Control::none(), allowance)
+    Preparation::new(control, allowance)
 }
 
 /// Persistent linked ownership avoids copying every old generation on a change.
@@ -443,6 +519,14 @@ impl Write for Encoder<'_> {
 }
 
 pub(crate) fn encode<T: Serialize>(value: &T, preparation: &Preparation) -> Result<Bytes> {
+    encode_json(value, preparation, false)
+}
+
+pub(crate) fn encode_pretty<T: Serialize>(value: &T, preparation: &Preparation) -> Result<Bytes> {
+    encode_json(value, preparation, true)
+}
+
+fn encode_json<T: Serialize>(value: &T, preparation: &Preparation, pretty: bool) -> Result<Bytes> {
     let mut writer = Encoder {
         bytes: Bytes {
             value: Vec::new(),
@@ -451,7 +535,11 @@ pub(crate) fn encode<T: Serialize>(value: &T, preparation: &Preparation) -> Resu
         preparation,
         failure: None,
     };
-    let result = serde_json::to_writer(&mut writer, value);
+    let result = if pretty {
+        serde_json::to_writer_pretty(&mut writer, value)
+    } else {
+        serde_json::to_writer(&mut writer, value)
+    };
     if let Some(error) = writer.failure {
         return Err(error);
     }
@@ -483,6 +571,17 @@ pub(crate) fn decode<T: DeserializeOwned + Serialize>(
     bytes: &[u8],
     preparation: &Preparation,
 ) -> Result<Owned<T>> {
+    decode_with_version(bytes, preparation, version)
+}
+
+/// Keep each document type's version refusal ahead of body decoding. This
+/// factors only the canonical admitted codec; it supplies no publication or
+/// source authority. Existing generation/coverage callers still accept only1.
+pub(crate) fn decode_with_version<T: DeserializeOwned + Serialize>(
+    bytes: &[u8],
+    preparation: &Preparation,
+    validate_version: fn(u32) -> Result<()>,
+) -> Result<Owned<T>> {
     if bytes.len() > MAX_BYTES {
         return Err(preparation.exhausted());
     }
@@ -504,7 +603,7 @@ pub(crate) fn decode<T: DeserializeOwned + Serialize>(
     if let Some(error) = header_reader.failure {
         return Err(error);
     }
-    version(
+    validate_version(
         header
             .map_err(|_| unavailable("configuration format is not a version"))?
             .format,
@@ -550,6 +649,58 @@ fn digest_name(digest: Sha256Digest) -> String {
     format!("{}.json", &digest.to_string()[7..])
 }
 
+/// Read one already anchored ordinary metadata FD. The caller owns directory
+/// traversal and content-address authentication; this never reopens a name.
+pub(crate) fn read_opened(
+    mut file: std::fs::File,
+    expected_length: Option<u64>,
+    preparation: &Preparation,
+) -> Result<Bytes> {
+    preparation.check()?;
+    let before = file.metadata()?;
+    if !before.is_file()
+        || before.len() > MAX_BYTES as u64
+        || expected_length.is_some_and(|length| length != before.len())
+    {
+        return Err(unavailable("invalid original configuration metadata FD"));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let length = usize::try_from(before.len()).map_err(|_| preparation.exhausted())?;
+    let held = preparation.reserve(length as u64)?;
+    let mut value = Vec::new();
+    value
+        .try_reserve_exact(length)
+        .map_err(|_| preparation.exhausted())?;
+    if value.capacity() != length {
+        return Err(preparation.exhausted());
+    }
+    while value.len() < length {
+        preparation.check()?;
+        let start = value.len();
+        value.resize((start + (64 << 10)).min(length), 0);
+        file.read_exact(&mut value[start..])?;
+    }
+    let after = file.metadata()?;
+    if before.len() != after.len() || before.modified()? != after.modified()? {
+        return Err(unavailable(
+            "original metadata changed while reading its FD",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
+            return Err(unavailable("original metadata FD identity changed"));
+        }
+    }
+    preparation.check()?;
+    Ok(Bytes { value, _held: held })
+}
+
 pub(crate) fn read_bytes(path: &Path, preparation: &Preparation) -> Result<Bytes> {
     read_bytes_synced(path, preparation, false)
 }
@@ -568,21 +719,7 @@ fn read_bytes_synced(path: &Path, preparation: &Preparation, sync: bool) -> Resu
     if !before.is_file() || before.len() > MAX_BYTES as u64 {
         return Err(unavailable("invalid configuration metadata file"));
     }
-    let length = usize::try_from(before.len()).map_err(|_| preparation.exhausted())?;
-    let held = preparation.reserve(length as u64)?;
-    let mut value = Vec::new();
-    value
-        .try_reserve_exact(length)
-        .map_err(|_| preparation.exhausted())?;
-    if value.capacity() != length {
-        return Err(preparation.exhausted());
-    }
-    while value.len() < length {
-        preparation.check()?;
-        let start = value.len();
-        value.resize((start + (64 << 10)).min(length), 0);
-        file.read_exact(&mut value[start..])?;
-    }
+    let bytes = read_bytes_from(&mut file, before.len(), preparation)?;
     if sync {
         file.sync_all()?;
     }
@@ -612,6 +749,36 @@ fn read_bytes_synced(path: &Path, preparation: &Preparation, sync: bool) -> Resu
         }
     }
     preparation.check()?;
+    Ok(bytes)
+}
+
+/// Read a caller-selected already-owned source prefix into its real receiving
+/// preparation. This byte owner alone confers no file or publication identity.
+pub(crate) fn read_bytes_from<R: Read>(
+    file: &mut R,
+    length: u64,
+    preparation: &Preparation,
+) -> Result<Bytes> {
+    preparation.check()?;
+    if length > MAX_BYTES as u64 {
+        return Err(unavailable("invalid configuration metadata extent"));
+    }
+    let length = usize::try_from(length).map_err(|_| preparation.exhausted())?;
+    let held = preparation.reserve(length as u64)?;
+    let mut value = Vec::new();
+    value
+        .try_reserve_exact(length)
+        .map_err(|_| preparation.exhausted())?;
+    if value.capacity() != length {
+        return Err(preparation.exhausted());
+    }
+    while value.len() < length {
+        preparation.check()?;
+        let start = value.len();
+        value.resize((start + (64 << 10)).min(length), 0);
+        file.read_exact(&mut value[start..])?;
+    }
+    preparation.check()?;
     Ok(Bytes { value, _held: held })
 }
 
@@ -626,10 +793,20 @@ pub(crate) fn read_generation(
         .join(digest_name(identity.generation));
     checked_directory(&directory.join("generations"))?;
     let bytes = read_bytes(&path, preparation)?;
-    if Sha256Digest::of_bytes(&bytes.value, preparation.control())? != identity.generation {
+    generation_bytes(&bytes.value, identity, preparation)
+}
+
+/// Shared validation for already admitted original metadata. This establishes
+/// publication syntax and identity, not authority to replay an imported seal.
+pub(crate) fn generation_bytes(
+    bytes: &[u8],
+    identity: ConfigurationIdentity,
+    preparation: &Preparation,
+) -> Result<Owned<Generation>> {
+    if Sha256Digest::of_bytes(bytes, preparation.control())? != identity.generation {
         return Err(unavailable("configuration generation hash differs"));
     }
-    let document: Owned<Generation> = decode(&bytes.value, preparation)?;
+    let document: Owned<Generation> = decode(bytes, preparation)?;
     document.value.validate(preparation)?;
     if document.value.dataset_id != identity.dataset_id
         || document.value.lineage_id != identity.lineage_id
@@ -733,10 +910,20 @@ pub(crate) fn read_coverage(
         &directory(root, history.lineage_id)?.join("coverage.json"),
         preparation,
     )?;
-    if Sha256Digest::of_bytes(&bytes.value, preparation.control())? != history.coverage {
+    coverage_bytes(&bytes.value, dataset_id, history, preparation)
+}
+
+pub(crate) fn coverage_bytes(
+    bytes: &[u8],
+    dataset_id: Uuid,
+    history: &Root,
+    preparation: &Preparation,
+) -> Result<Owned<Coverage>> {
+    history.validate()?;
+    if Sha256Digest::of_bytes(bytes, preparation.control())? != history.coverage {
         return Err(unavailable("configuration coverage hash differs"));
     }
-    let coverage: Owned<Coverage> = decode(&bytes.value, preparation)?;
+    let coverage: Owned<Coverage> = decode(bytes, preparation)?;
     coverage.value.validate()?;
     if coverage.value.dataset_id != dataset_id || coverage.value.lineage_id != history.lineage_id {
         return Err(unavailable(
@@ -754,17 +941,38 @@ pub(crate) fn resolve(
     wanted: ConfigurationIdentity,
     preparation: &Preparation,
 ) -> Result<Owned<Generation>> {
+    resolve_using(
+        dataset_id,
+        history,
+        wanted,
+        preparation,
+        || read_coverage(root, dataset_id, history, preparation),
+        |identity| read_generation(root, identity, preparation),
+    )
+}
+
+/// Both loaders must validate the exact bytes they return using the helpers
+/// above. They borrow the caller's actual Preparation synchronously; no source
+/// or physical/replay authority is conferred by this common chain walk.
+pub(crate) fn resolve_using(
+    dataset_id: Uuid,
+    history: &Root,
+    wanted: ConfigurationIdentity,
+    preparation: &Preparation,
+    mut coverage: impl FnMut() -> Result<Owned<Coverage>>,
+    mut generation: impl FnMut(ConfigurationIdentity) -> Result<Owned<Generation>>,
+) -> Result<Owned<Generation>> {
     if wanted.dataset_id != dataset_id || wanted.lineage_id != history.lineage_id {
         return Err(unavailable("foreign configuration identity"));
     }
-    let coverage = read_coverage(root, dataset_id, history, preparation)?;
+    let coverage = coverage()?;
     let mut current = history.identity(dataset_id);
     let mut expected_ordinal = None;
     let mut expected_revision = None;
     let mut found = false;
     loop {
         preparation.check()?;
-        let document = read_generation(root, current, preparation)?;
+        let document = generation(current)?;
         if expected_ordinal.is_some_and(|ordinal| ordinal != document.value.ordinal) {
             return Err(unavailable("configuration predecessor ordinal differs"));
         }
@@ -806,7 +1014,7 @@ pub(crate) fn resolve(
     // Hold at most one decoded predecessor during verification. The immutable
     // selected body is hash-checked again rather than retaining a whole second
     // generation across the walk.
-    read_generation(root, wanted, preparation)
+    generation(wanted)
 }
 
 pub(crate) fn binding(identity: ConfigurationIdentity) -> ConfigurationBinding {
@@ -942,6 +1150,13 @@ fn activation_branch(root: &Path, preparation: &Preparation) -> Result<Activatio
     }
     head.checked_add(1)
         .ok_or_else(|| unavailable("activation cutoff overflows"))?;
+    // Activation covers the physical branch, including pinned/retired
+    // generations. It must not bless a previously unanchored reference merely
+    // because compaction moved that reference out of CURRENT.
+    drop(cursor);
+    drop(physical);
+    drop(_decode);
+    activation_retained_generations(root, id, preparation)?;
     Ok(ActivationBranch {
         root: root.to_path_buf(),
         id,
@@ -949,6 +1164,110 @@ fn activation_branch(root: &Path, preparation: &Preparation) -> Result<Activatio
         hot,
         _held: held,
     })
+}
+
+fn activation_retained_generations(root: &Path, id: Uuid, preparation: &Preparation) -> Result<()> {
+    use super::{WAL_COMMIT, WAL_CONFIGURATION, WAL_HEADER, WAL_REC};
+    use std::io::{BufReader, Seek, SeekFrom};
+
+    for entry in std::fs::read_dir(root)? {
+        preparation.check()?;
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.strip_prefix("gen-").is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        }) {
+            continue;
+        }
+        if !entry.file_type()?.is_dir() {
+            return Err(unavailable("activation generation is not a directory"));
+        }
+        let _scratch = preparation.reserve(
+            (root.as_os_str().len() as u64)
+                .saturating_add(name.len() as u64)
+                .saturating_mul(8)
+                .saturating_add((64 << 10) + 4096),
+        )?;
+        let directory = entry.path();
+        let allowance = preparation.room();
+        let strict_from = {
+            let _decode = preparation.reserve(allowance)?;
+            let options = crate::history::HistoryOptions {
+                cancel: Some(preparation.control().cancel.flag()),
+                deadline: preparation.control().deadline,
+            };
+            let mut budget = super::cold::ColdBudget::new(crate::history::ReadLimit {
+                options: &options,
+                memory: Some(allowance),
+                held: 0,
+            })?;
+            let physical = crate::commit::read_gen_commit_controlled(&directory, &mut budget)?;
+            if let Some(physical) = &physical
+                && (physical.value.dataset_id != id
+                    || physical.value.configuration != ConfigurationBinding::LegacyUnbound)
+            {
+                return Err(unavailable(
+                    "activation found a foreign or unpublished retained generation binding",
+                ));
+            }
+            physical.and_then(|physical| physical.value.wal_strict_from)
+        };
+        let path = directory.join("wal.log");
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let mut file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && strict_from.is_none() => {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !file.metadata()?.is_file() {
+            return Err(unavailable("activation retained WAL is not a regular file"));
+        }
+        // Reuse the version and seal decoders. This is a negative preflight,
+        // not a replacement recovery parser or a reconstructed commit catalog.
+        super::wal::descriptor_version(&mut file, &path)?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::with_capacity(64 << 10, file);
+        let mut crc = flate2::Crc::new();
+        let mut record = [0; WAL_REC];
+        let mut first = true;
+        loop {
+            preparation.check()?;
+            match reader.read_exact(&mut record) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error.into()),
+            }
+            if record[0] == WAL_CONFIGURATION {
+                return Err(unavailable(
+                    "activation found unpublished retained WAL configuration data",
+                ));
+            }
+            if record[0] == WAL_COMMIT {
+                if let Some(Ok((_, _, _, flags))) =
+                    crate::commit::open_wal_commit_with_crc(&record, crc)
+                    && flags & crate::commit::WAL_FLAG_CONFIGURATION != 0
+                {
+                    return Err(unavailable(
+                        "activation found an unpublished retained WAL configuration flag",
+                    ));
+                }
+                crc = flate2::Crc::new();
+            } else if !(first && record[0] == WAL_HEADER) {
+                crc.update(&record);
+            }
+            first = false;
+        }
+    }
+    preparation.check()
 }
 
 /// Inventory all physical branch roots, including retired roots. This reads only;
@@ -1062,7 +1381,7 @@ pub(crate) fn activate_copy(
         let version = super::wal::descriptor_version(&mut file, &branch.hot)?;
         if version == 1 {
             file.seek(SeekFrom::Start(0))?;
-            file.write_all(&super::wal::header_record())?;
+            file.write_all(&super::wal::configuration_header_record())?;
             file.sync_all()?;
         } else if version != crate::formats::WAL_VERSION {
             return Err(unavailable("activation WAL version changed"));

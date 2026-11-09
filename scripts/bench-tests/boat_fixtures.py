@@ -47,4 +47,5 @@ def fixture(root):
     admission=root/'admission.json';write(admission,job)
     return {'profile':profile,'profile_path':path,'qualified':qualified,'qualified_path':original,
             'release':release,'operation':operation,'job':job,'admission':admission,
-            'guard':io.records['guard-admission.json']['loaded'],'now':io.wall()}
+            'guard':io.records['guard-admission.json']['loaded'],'now':io.wall(),'boot_now':io.mono(),
+            'boot_id':io.records['guard-admission.json']['boot_id']}

@@ -278,7 +278,7 @@ pub fn pause(root: &Path, path: &str, reason: &str) -> Result<()> {
 
 /// Create the directories of relative path `rel` under `root`, refusing any that exists
 /// as a link or a file, and return the file's full path. `rel` has been checked
-/// against the definition grammar, so it has no `.`, `..` or empty segments.
+/// against its caller's closed path grammar, so it has no `.`, `..` or empty segments.
 pub fn stage_file(root: &Path, rel: &str) -> Result<std::path::PathBuf> {
     let mut parts: Vec<&str> = rel.split('/').collect();
     let file = parts.pop().unwrap_or_default();

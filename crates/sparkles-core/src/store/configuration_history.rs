@@ -4,6 +4,29 @@ use super::*;
 use crate::access::Preparation;
 use crate::history::{ConfigurationBinding, ConfigurationIdentity, HistoryOptions, ReadLimit};
 
+#[allow(
+    dead_code,
+    reason = "private item 761 import machinery that stays unwired until item 650 consumers agree"
+)]
+mod imported;
+pub(super) mod primary;
+mod validation;
+
+pub(super) use imported::Identities as OriginalIdentities;
+pub(super) use imported::{
+    MAX_MEMBERS as SOURCE_MEMBER_LIMIT, SourceFile as SourceFilePin, SourceManifest,
+    Sources as OriginalSources, encode_first_destination_origin, encode_native_descriptor,
+    opening_origin_selection, original_branch_table_document, original_history_document,
+    source_member as source_metadata_member, verify_staged_native_source,
+};
+
+/// Authenticate copied primary configuration references without opening a writer,
+/// recovering a WAL or publishing the directory. Backup restores call this even
+/// when the caller disabled optional index integrity checking.
+pub(crate) fn validate_copy(root: &Path, required: bool, preparation: &Preparation) -> Result<()> {
+    validation::validate(root, required, preparation)
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -418,3 +441,6 @@ impl Store {
         Ok(binding)
     }
 }
+
+#[cfg(test)]
+pub(super) use imported::{canonical_descriptor_test_value, canonical_origin_test_value};

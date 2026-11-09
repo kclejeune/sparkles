@@ -10,6 +10,209 @@ use sparkles_backup::{
 };
 use sparkles_core::store::{Store, StoreOptions};
 
+fn configuration_store(root: &std::path::Path) -> Store {
+    drop(Store::open(root, StoreOptions::default()).unwrap());
+    let preparation =
+        sparkles_core::access::Preparation::new(sparkles_core::task::Control::none(), 64 << 20)
+            .unwrap();
+    sparkles_core::migrate::activate_configuration_history(root, false, &preparation).unwrap();
+    let store = Store::open(root, StoreOptions::default()).unwrap();
+    upd(&store, "INSERT DATA { <urn:history> <urn:p> 1 }");
+    store
+}
+
+#[tokio::test]
+async fn configuration_history_restores_exact_native_binding_without_optional_check() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = configuration_store(&temporary.path().join("source"));
+    let preparation =
+        sparkles_core::access::Preparation::new(sparkles_core::task::Control::none(), 64 << 20)
+            .unwrap();
+    let at = sparkles_core::history::At::Commit(store.head_commit().seq);
+    let source = store.evidence_view(&at, &preparation).unwrap();
+    let (repo, _) = memory_repo().await;
+    repo.create(
+        store.backup_capture("native").unwrap().into(),
+        &opts("native", "ds"),
+    )
+    .await
+    .unwrap();
+    let manifest = repo.manifest("native").await.unwrap();
+    assert!(
+        manifest
+            .requires
+            .iter()
+            .any(|feature| feature == "evidence-configuration-history/1")
+    );
+    assert_eq!(
+        manifest
+            .files
+            .iter()
+            .filter(|file| file.path.starts_with("evidence-history/"))
+            .count(),
+        2
+    );
+    let destination = temporary.path().join("kept");
+    let report = repo
+        .restore(
+            "native",
+            &destination,
+            &RestoreOptions {
+                identity: sparkles_backup::Identity::Keep,
+                check: sparkles_backup::CheckLevel::None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.identity, "kept");
+    for file in manifest
+        .files
+        .iter()
+        .filter(|file| file.path.starts_with("evidence-history/"))
+    {
+        assert_eq!(
+            std::fs::read(destination.join(&file.path)).unwrap(),
+            std::fs::read(temporary.path().join("source").join(&file.path)).unwrap()
+        );
+        let mut parent = destination.join(&file.path);
+        while parent.pop() && parent != destination {
+            assert!(std::fs::symlink_metadata(&parent).unwrap().is_dir());
+        }
+    }
+    let restored = Store::open(&destination, StoreOptions::default()).unwrap();
+    assert_eq!(restored.dataset_id(), store.dataset_id());
+    assert_eq!(restored.head_commit(), store.head_commit());
+    assert_eq!(
+        restored
+            .evidence_view(&at, &preparation)
+            .unwrap()
+            .configuration(),
+        source.configuration()
+    );
+    // A fresh identity must not reinterpret foreign native references while
+    // imported-origin support is still an open implementation obligation.
+    let unsupported = temporary.path().join("fresh");
+    assert!(
+        repo.restore(
+            "native",
+            &unsupported,
+            &RestoreOptions {
+                identity: sparkles_backup::Identity::New,
+                check: sparkles_backup::CheckLevel::None,
+                ..Default::default()
+            }
+        )
+        .await
+        .is_err()
+    );
+    assert!(!unsupported.exists());
+}
+
+#[tokio::test]
+async fn configuration_history_create_refuses_a_generation_changed_after_capture() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("source");
+    let store = configuration_store(&root);
+    let capture = store.backup_capture("changed").unwrap();
+    let generations = std::fs::read_dir(root.join("evidence-history"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("generations");
+    let generation = std::fs::read_dir(&generations)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // Same length, in place: the retained descriptor reads the changed bytes.
+    let mut bytes = std::fs::read(&generation).unwrap();
+    let last = bytes.len() - 2;
+    bytes[last] = if bytes[last] == b' ' { b'\t' } else { b' ' };
+    std::fs::write(&generation, &bytes).unwrap();
+    let (repo, _) = memory_repo().await;
+    assert!(
+        repo.create(capture.into(), &opts("changed", "ds"))
+            .await
+            .is_err()
+    );
+    assert!(repo.manifest("changed").await.is_err());
+}
+
+#[tokio::test]
+async fn configuration_history_restore_cancellation_removes_staged_parents() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = configuration_store(&temporary.path().join("source"));
+    let (repo, _) = memory_repo().await;
+    repo.create(
+        store.backup_capture("cancelled").unwrap().into(),
+        &opts("cancelled", "ds"),
+    )
+    .await
+    .unwrap();
+    let destination = temporary.path().join("cancelled");
+    let ctl = sparkles_backup::Ctl::default();
+    let cancel = ctl.cancel.clone();
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = cancelled.clone();
+    let staged = destination.clone();
+    let error = repo
+        .restore(
+            "cancelled",
+            &destination,
+            &sparkles_backup::RestoreOptions {
+                check: sparkles_backup::CheckLevel::None,
+                ctl: sparkles_backup::Ctl {
+                    progress: Some(std::sync::Arc::new(move |_, message: &str| {
+                        if message.starts_with("downloading ") {
+                            assert!(staged.join("evidence-history").is_dir());
+                            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    })),
+                    ..ctl
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), sparkles_backup::Code::Cancelled);
+    assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!destination.exists());
+    assert!(repo.locks().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn configuration_history_missing_closure_never_publishes_a_restore() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = configuration_store(&temporary.path().join("source"));
+    let mut capture = store.backup_capture("missing").unwrap();
+    capture
+        .files
+        .retain(|file| !file.path.contains("/generations/"));
+    let (repo, _) = memory_repo().await;
+    repo.create(capture.into(), &opts("missing", "ds"))
+        .await
+        .unwrap();
+    let destination = temporary.path().join("restored");
+    assert!(
+        repo.restore(
+            "missing",
+            &destination,
+            &RestoreOptions {
+                check: sparkles_backup::CheckLevel::None,
+                ..Default::default()
+            }
+        )
+        .await
+        .is_err()
+    );
+    assert!(!destination.exists());
+}
+
 fn level(level: VerifyLevel) -> VerifyOptions {
     VerifyOptions {
         level,

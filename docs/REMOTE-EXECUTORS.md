@@ -64,6 +64,25 @@ name a directory of exact-worker `bx_ID.json` files. Unknown schemas, changed or
 qualification bytes, profile/source drift, a replaced local guard and insufficient
 remaining lifetime are refused.
 
+Remaining lifetime comes from the original operation receipts on every call. The
+controller intent, guard observation and handoff give an original wall end and the
+same instant on `CLOCK_BOOTTIME` for the guard's boot and invocation. Each check
+takes the earlier of the two remaining times and subtracts the 30-second closure
+reserve, so a wall clock moved backward cannot lengthen the lifetime and a suspend
+counts even when the wall clock misses it. A different boot refuses the admission.
+A warm worker reused across many jobs and lanes keeps that one original end, since
+every job-admission record references the same qualification and receipts. No call,
+job environment or lane renews it. Only a new qualification by the lifecycle owner,
+with its own recorded intent, guard and handoff receipts, gives a worker more time.
+`admit --minimum` uses this measure. Environment preparation and each operation
+also check both ends while they run, so a suspend during a transfer is counted.
+`admit` prints a version-2 `sparkles.boat.adapter-observation` that records the
+original wall and BOOTTIME ends. Its `expires_at` is the effective wall end at that
+observation and is never later than the original. Scripts take a job runtime from a
+saved observation with `remote-executor.py runtime FILE --reserve SECONDS`, which
+measures both ends again and refuses another version, another boot or an exhausted
+lifetime.
+
 ## Warm worker commands
 
 The [complete sequence](../scripts/boat/README.md#one-warm-worker-sequence) runs

@@ -145,7 +145,7 @@ pub const ROOT_FILES: [&str; 21] = [
 /// and a file name of `[A-Za-z0-9._-]{1,64}` other than `.` and `..`. Anything else
 /// (absolute paths, `..`, more levels) is refused before a path is joined.
 pub fn valid_backup_path(p: &str) -> bool {
-    if ROOT_FILES.contains(&p) {
+    if ROOT_FILES.contains(&p) || configuration_history_path(p) {
         return true;
     }
     let Some((dir, file)) = p.split_once('/') else {
@@ -159,6 +159,34 @@ pub fn valid_backup_path(p: &str) -> bool {
         && file
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+}
+
+/// Primary configuration history has a closed path grammar. In particular, a
+/// required feature never grants access to arbitrary nested dataset files.
+pub fn configuration_history_path(path: &str) -> bool {
+    let canonical_uuid = |value: &str| {
+        Uuid::parse_str(value).is_ok_and(|id| !id.is_nil() && id.to_string() == value)
+    };
+    let mut parts = path.split('/');
+    if parts.next() != Some("evidence-history") {
+        return false;
+    }
+    let Some(lineage) = parts.next() else {
+        return false;
+    };
+    if lineage == "origin.json" {
+        return parts.next().is_none();
+    }
+    if !canonical_uuid(lineage) {
+        return false;
+    }
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("coverage.json"), None, None) => true,
+        (Some("generations"), Some(file), None) => {
+            file.strip_suffix(".json").is_some_and(valid_blob_id)
+        }
+        _ => false,
+    }
 }
 
 /// A generation directory name: `gen-` and 4 to 8 digits.
@@ -362,6 +390,39 @@ mod tests {
             "CURRENT/x",
         ] {
             assert!(!valid_backup_path(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn configuration_history_paths_are_closed_and_canonical() {
+        let lineage = "0b6e5c1a-0000-4000-8000-000000000001";
+        let generation = format!(
+            "evidence-history/{lineage}/generations/{}.json",
+            "ab".repeat(32)
+        );
+        for path in [
+            format!("evidence-history/{lineage}/coverage.json"),
+            generation.clone(),
+            "evidence-history/origin.json".into(),
+        ] {
+            assert!(configuration_history_path(&path), "{path}");
+            assert!(valid_backup_path(&path), "{path}");
+        }
+        for path in [
+            generation.replace("ab", "AB"),
+            generation.replace(lineage, "00000000-0000-0000-0000-000000000000"),
+            generation.replace(lineage, &lineage.to_uppercase()),
+            format!("evidence-history/{lineage}/generations/../coverage.json"),
+            format!(
+                "evidence-history/{lineage}/generations/{}.json/extra",
+                "ab".repeat(32)
+            ),
+            format!("evidence-history/{lineage}/other.json"),
+            format!("evidence-history/{lineage}/coverage.json/"),
+            "evidence-history/origin.json/extra".into(),
+            "evidence-history/../managed.json".into(),
+        ] {
+            assert!(!valid_backup_path(&path), "{path}");
         }
     }
 

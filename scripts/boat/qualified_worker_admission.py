@@ -17,6 +17,39 @@ def release_profile(release):
     raw=release.get('_profile_json');require(isinstance(raw,str)and hashlib.sha256(raw.encode()).hexdigest()==release.get('profile_sha256'),'explicit profile hash')
     p=validate_profile(json.loads(raw));require(p['worker']==release.get('worker')and p['profile_review_sha256']==release.get('profile_review_sha256'),'profile/release review')
     return p
+CLOSURE_RESERVE=30
+
+def boottime():return time.clock_gettime(time.CLOCK_BOOTTIME)
+def current_boot_id():return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+
+def original_ends(intent,guard,handoff):
+    """Return the original (wall, BOOTTIME) end pair from the protected receipts.
+
+    The wall end is the qualification's expires_at. The BOOTTIME end is the same
+    instant on the guard's boot, taken through the guard's paired observation and
+    never later than the intent's own BOOTTIME deadline.
+    """
+    wall=min(intent['deadline_wall'],handoff['deadline_wall'],guard['observed_wall']+intent['deadline_mono']-guard['observed_boottime'])
+    boot=min(intent['deadline_mono'],guard['observed_boottime']+wall-guard['observed_wall'])
+    return wall,boot
+
+def operation_lifetime(operation,qualification):
+    """Recover the original end pair, tied to the qualification's boot and guard invocation."""
+    root=Path(operation).absolute();require(root.resolve()==root,'canonical operation')
+    intent,guard,handoff=(owned_json(root/n)for n in('controller-intent.json','guard-admission.json','root-handoff.json'))
+    for value in(intent['deadline_wall'],intent['deadline_mono'],handoff['deadline_wall'],guard['observed_wall'],guard['observed_boottime']):
+        require(type(value)in(int,float)and value==value and abs(value)!=float('inf'),'finite original clock receipts')
+    wall,boot=original_ends(intent,guard,handoff);local=qualification['local_guard']
+    require(datetime.fromtimestamp(wall,timezone.utc).isoformat().replace('+00:00','Z')==qualification['expires_at'],'original clock receipts differ from qualification')
+    require(guard.get('boot_id')==local['boot_id']and guard.get('loaded',{}).get('InvocationID')==local['invocation_id'],'original clock boot/guard identity')
+    return {'wall_end':wall,'boot_end':boot,'boot_id':local['boot_id'],'invocation_id':local['invocation_id']}
+
+def lifetime_left(lifetime,now_wall,now_boot=None,boot_id=None):
+    """Seconds of original lifetime left, the earlier of the wall and BOOTTIME ends."""
+    require((current_boot_id()if boot_id is None else boot_id)==lifetime['boot_id'],'local boot changed since qualification')
+    now_boot=boottime()if now_boot is None else now_boot
+    return min(lifetime['wall_end']-now_wall,lifetime['boot_end']-now_boot)
+
 def make_admission(release,intent,qualification,startup,guard,handoff,now):
     p=release_profile(release);worker=p['worker'];env=p['future_environment'];home=p['worker_home']
     require(release.get('authorized_by_Root')is True and release.get('worker')==worker and intent.get('worker')==worker and handoff.get('worker')==worker,'exact qualified worker/Root operation')
@@ -28,7 +61,7 @@ def make_admission(release,intent,qualification,startup,guard,handoff,now):
     require(loaded.get('Id')==unit and loaded.get('ActiveState')=='active' and int(loaded.get('MainPID','0'))==guard.get('pid'),'local guard binding')
     require(re.fullmatch('[0-9a-f]{32}',loaded.get('InvocationID',''))is not None and re.fullmatch('[0-9a-f-]{36}',guard.get('boot_id',''))is not None,'local guard invocation/boot identity')
     require(type(guard.get('uid'))is int and guard['uid']>=0,'safe local owner')
-    expires=min(intent['deadline_wall'],handoff['deadline_wall'],guard['observed_wall']+intent['deadline_mono']-guard['observed_boottime']);require(now<expires and expires<=intent['wall']+10500,'earlier effective deadline')
+    expires,_=original_ends(intent,guard,handoff);require(now<expires and expires<=intent['wall']+10500,'earlier effective deadline')
     manifest=qualification.get('actual_toolchain_manifest',{});require(manifest.get('path')==home+'/.local/state/sparkles-boat/toolchain.json' and manifest.get('sha256')==p['saved_toolchain_manifest_sha256'],'actual manifest pin')
     lock=qualification.get('bootstrap_lock',{});require(lock.get('path')==home+'/.local/state/sparkles-boat/bootstrap.lock' and lock.get('held_during_checkpoint')is True,'actual bootstrap checkpoint')
     require(qualification.get('runtime_env_file')is None,'no runtime env file created/adopted by this exporter')

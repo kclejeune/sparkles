@@ -522,19 +522,51 @@ pub(crate) fn file_bytes(graphs: &ManagedGraphs) -> Vec<u8> {
     file_bytes_with_history(graphs, None)
 }
 
-fn file_bytes_with_history(
-    graphs: &ManagedGraphs,
-    history: Option<&crate::store::managed_history::Root>,
-) -> Vec<u8> {
-    let file = ManagedFile {
+fn managed_file<'a>(
+    graphs: &'a ManagedGraphs,
+    history: Option<&'a crate::store::managed_history::Root>,
+) -> ManagedFile<'a> {
+    ManagedFile {
         // A legacy configuration change does not activate history or fabricate a
         // coverage boundary. Only an anchored root writes the new primary form.
         format: if history.is_some() { FORMAT } else { 2 },
         revision: graphs.revision,
         owners: graphs.owners.iter().map(|(o, e)| (o.as_str(), e)).collect(),
         configuration_history: history,
-    };
-    serde_json::to_vec_pretty(&file).expect("managed.json serializes")
+    }
+}
+
+fn file_bytes_with_history(
+    graphs: &ManagedGraphs,
+    history: Option<&crate::store::managed_history::Root>,
+) -> Vec<u8> {
+    serde_json::to_vec_pretty(&managed_file(graphs, history)).expect("managed.json serializes")
+}
+
+impl Installed {
+    /// The length and SHA-256 of [`Installed::file_bytes`], streamed through the
+    /// hash so that no encoding of the registry is materialized.
+    pub(crate) fn file_pin(&self) -> (u64, [u8; 32]) {
+        use sha2::Digest;
+        struct Pin(sha2::Sha256, u64);
+        impl std::io::Write for Pin {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                self.1 += bytes.len() as u64;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut pin = Pin(sha2::Sha256::new(), 0);
+        serde_json::to_writer_pretty(
+            &mut pin,
+            &managed_file(&self.graphs, self.configuration_history.as_ref()),
+        )
+        .expect("managed.json serializes");
+        (pin.1, pin.0.finalize().into())
+    }
 }
 
 /// The capability to change one owner's managed graphs in one write transaction

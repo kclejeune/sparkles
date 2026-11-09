@@ -343,9 +343,10 @@ thread_local! {
     static RELEASE_OBSERVER: std::cell::RefCell<Option<ReleaseObserver>> = const { std::cell::RefCell::new(None) };
     static UNION_OBSERVER: std::cell::RefCell<Option<UnionObserver>> = const { std::cell::RefCell::new(None) };
     static CONTEXT_OBSERVER: std::cell::RefCell<Option<ContextObserver>> = const { std::cell::RefCell::new(None) };
-    // Watched allocation, original live-counter address, observed value and event count.
-    static DEALLOCATION: std::cell::Cell<(usize, usize, u64, usize)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
 }
+// The crate test allocator records the watched allocation, the original
+// live-counter address, the observed value and the event count.
+use crate::test_alloc::DEALLOCATION;
 pub(super) fn observe_source_context(ctx: &Ctx) {
     CONTEXT_OBSERVER.with(|observer| {
         if let Some(observer) = observer.borrow().as_ref() {
@@ -411,35 +412,6 @@ impl Drop for AllocationWatch {
         DEALLOCATION.with(|watch| watch.set((0, 0, 0, 0)));
     }
 }
-
-struct SourceAllocationObserver;
-// SAFETY: System receives exactly the original allocation layouts. Only the
-// selected test thread watches one actual backing allocation. Its Preparation stays
-// alive until the watch is cleared; the counter points into that retained Inner.
-// The allocator only reads an atomic and updates Copy TLS cells, never allocates,
-// invokes a callback or panics. Other unit-test allocations pass through unchanged.
-unsafe impl std::alloc::GlobalAlloc for SourceAllocationObserver {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        unsafe { std::alloc::System.alloc(layout) }
-    }
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
-        let _ = DEALLOCATION.try_with(|watch| {
-            let (watched, counter, _, count) = watch.get();
-            if watched != 0 && watched == pointer as usize {
-                let used = unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }
-                    .load(Ordering::Relaxed);
-                watch.set((0, counter, used, count + 1));
-            }
-        });
-        unsafe { std::alloc::System.dealloc(pointer, layout) };
-    }
-    unsafe fn realloc(&self, pointer: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
-        // A watched union vector is filled to its admitted capacity and never grows.
-        unsafe { std::alloc::System.realloc(pointer, layout, size) }
-    }
-}
-#[global_allocator]
-static SOURCE_ALLOCATION_OBSERVER: SourceAllocationObserver = SourceAllocationObserver;
 
 fn secret_policy() -> GraphAccess {
     use crate::access::{Caller, Limits, Protection, Rule, TripleRules};

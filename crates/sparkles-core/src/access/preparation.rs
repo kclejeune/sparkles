@@ -340,6 +340,22 @@ impl Preparation {
         Ok(view)
     }
 
+    /// A separate synchronous preparation with this one's request controls,
+    /// descendant query controls and wait policy but its own allowance. Charges
+    /// against it never reach this preparation's counter.
+    pub(crate) fn temporary_with_controls(&self, memory_bytes: u64) -> Result<Self> {
+        let mut temporary = Self::new(self.inner.control.clone(), memory_bytes)?;
+        temporary.no_wait = self.no_wait;
+        match &self.query {
+            Some(query) => temporary.with_query_controls(
+                query.cancel.clone(),
+                query.cancellation.clone(),
+                query.deadline,
+            ),
+            None => Ok(temporary),
+        }
+    }
+
     /// Options that carry this preparation's descendant query controls, if it has
     /// any, so that a query it runs over its own source reuses them unchanged.
     pub(crate) fn nested_query_options(&self) -> crate::sparql::QueryOptions {

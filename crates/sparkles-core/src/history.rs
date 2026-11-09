@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub(crate) mod capture;
 mod configuration;
 pub(crate) use configuration::{
     BranchConfigurationOrigin, ConfigurationSelector, PinnedConfiguration,
@@ -360,6 +361,9 @@ pub(crate) trait ReadControl: Send + Sync {
     fn no_wait(&self) -> bool {
         false
     }
+    /// A synchronous temporary preparation with this read's complete controls
+    /// and its own allowance, for a cold check that needs a Preparation.
+    fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation>;
 }
 
 impl ReadControl for HistoryOptions {
@@ -379,11 +383,30 @@ impl ReadControl for HistoryOptions {
         }
         Ok(())
     }
+
+    fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+        crate::access::Preparation::new(
+            crate::task::Control {
+                cancel: self
+                    .cancel
+                    .clone()
+                    .map(crate::task::Cancel::from_flag)
+                    .unwrap_or_default(),
+                deadline: self.deadline,
+                ..Default::default()
+            },
+            memory_bytes,
+        )
+    }
 }
 
 impl ReadControl for crate::access::Preparation {
     fn check_read(&self) -> Result<()> {
         self.check()
+    }
+
+    fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+        self.temporary_with_controls(memory_bytes)
     }
 
     fn no_wait(&self) -> bool {
@@ -518,26 +541,78 @@ pub(crate) struct HistoryConfig {
     pub catalog: CatalogHorizon,
 }
 
-/// Read and validate one history document without startup mutation.
-fn checked_file(
-    root: &Path,
-    identify: impl FnOnce() -> Result<Option<uuid::Uuid>>,
-) -> Result<Option<HistoryFile>> {
-    let bytes = match std::fs::read(root.join("history.json")) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(None);
-        }
-        Err(e) => return Err(e.into()),
+fn read_bytes(root: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(root.join("history.json")) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Pins, retention, schedules and the catalog horizon from `history.json` (none if the
+/// file is missing), checked against the selected store's actual identity.
+pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryConfig> {
+    let Some(bytes) = read_bytes(root)? else {
+        return Ok(HistoryConfig::default());
+    };
+    decode_file(&bytes, dataset_id, None)
+}
+
+/// Validate current history metadata without startup writers or recovery cleanup.
+/// A legacy directory without history needs no recorded identity. A present
+/// identity-bearing history requires its own dataset.json, never a fabricated ID.
+pub(crate) fn preflight_file(root: &Path) -> Result<()> {
+    let Some(bytes) = read_bytes(root)? else {
+        return Ok(());
     };
     let v: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
     crate::formats::check_settings("history.json", &v)?;
     let f: HistoryFile =
         serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
-    let dataset_id = identify()?.ok_or_else(|| {
+    let dataset_id = commit::read_dataset_file(root)?.ok_or_else(|| {
         Error::Corrupt("history.json requires its recorded dataset.json identity".into())
     })?;
+    checked_document(&f, &bytes, dataset_id, &|| Ok(()))
+}
+
+// The capture reader uses the same legacy semantics and format2 validation as
+// ordinary open. Its caller retains a real Preparation loan across all decoded
+// containers; no decoded metadata escapes that loan.
+fn decode_file(
+    bytes: &[u8],
+    dataset_id: uuid::Uuid,
+    budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
+) -> Result<HistoryConfig> {
+    if let Some(budget) = budget {
+        return decode_file_controlled(bytes, dataset_id, budget);
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
+    crate::formats::check_settings("history.json", &v)?;
+    let f: HistoryFile =
+        serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
+    checked_file(f, bytes, dataset_id, &|| Ok(()))
+}
+
+fn decode_file_controlled(
+    bytes: &[u8],
+    dataset_id: uuid::Uuid,
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+) -> Result<HistoryConfig> {
+    let raw: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
+    crate::formats::check_settings("history.json", &raw.value)?;
+    let f: HistoryFile = budget.value(raw.value)?;
+    checked_file(f, bytes, dataset_id, &|| budget.check())
+}
+
+fn checked_document(
+    f: &HistoryFile,
+    bytes: &[u8],
+    dataset_id: uuid::Uuid,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    check()?;
     if f.format == 1 && f.snapshots.iter().any(|pin| pin.configuration.is_some()) {
         return Err(Error::Corrupt(
             "legacy history cannot certify a configuration binding".into(),
@@ -555,6 +630,7 @@ fn checked_file(
         }
         let mut names = std::collections::BTreeSet::new();
         for pin in &f.snapshots {
+            check()?;
             let configuration = pin.configuration.as_ref().ok_or_else(|| {
                 Error::Corrupt("named snapshot configuration binding is missing".into())
             })?;
@@ -584,40 +660,33 @@ fn checked_file(
             f.dataset_id
         )));
     }
-    Ok(Some(f))
+    check()
 }
 
-/// Validate current history metadata without startup writers or recovery cleanup.
-/// A legacy directory without history needs no recorded identity. A present
-/// identity-bearing history requires its own dataset.json, never a fabricated ID.
-pub(crate) fn preflight_file(root: &Path) -> Result<()> {
-    checked_file(root, || commit::read_dataset_file(root)).map(|_| ())
-}
-
-/// Pins, retention, schedules and the catalog horizon from `history.json` (none if the
-/// file is missing), checked against the selected store's actual identity.
-pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryConfig> {
-    let Some(f) = checked_file(root, || Ok(Some(dataset_id)))? else {
-        return Ok(HistoryConfig::default());
-    };
-    let pins = f
-        .snapshots
-        .into_iter()
-        .map(|p| {
-            let created_ms = commit::parse_rfc3339_ms(&p.created).unwrap_or(0);
-            (
-                p.name,
-                Pin {
-                    seq: p.seq,
-                    created_ms,
-                    note: p.note,
-                    expires_ms: p.expires.as_deref().and_then(commit::parse_rfc3339_ms),
-                    warm: p.warm,
-                    configuration: p.configuration,
-                },
-            )
-        })
-        .collect();
+fn checked_file(
+    f: HistoryFile,
+    bytes: &[u8],
+    dataset_id: uuid::Uuid,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<HistoryConfig> {
+    checked_document(&f, bytes, dataset_id, check)?;
+    let mut pins = BTreeMap::new();
+    for p in f.snapshots {
+        check()?;
+        let created_ms = commit::parse_rfc3339_ms(&p.created).unwrap_or(0);
+        pins.insert(
+            p.name,
+            Pin {
+                seq: p.seq,
+                created_ms,
+                note: p.note,
+                expires_ms: p.expires.as_deref().and_then(commit::parse_rfc3339_ms),
+                warm: p.warm,
+                configuration: p.configuration,
+            },
+        );
+    }
+    check()?;
     Ok(HistoryConfig {
         pins,
         retention: f.retention,
@@ -1841,5 +1910,15 @@ mod tests {
             .err()
             .expect("refused");
         assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
+    }
+
+    #[test]
+    fn a_known_history_file_still_requires_its_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("history.json"), br#"{"format": 2}"#).unwrap();
+        let error = read_file(dir.path(), uuid::Uuid::nil())
+            .err()
+            .expect("refused");
+        assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
     }
 }

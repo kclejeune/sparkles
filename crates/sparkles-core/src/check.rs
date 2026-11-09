@@ -331,6 +331,18 @@ impl Run {
     }
 }
 
+/// Authenticate a copied configuration-history closure and every complete
+/// primary reference without opening, recovering or modifying the dataset.
+pub fn configuration_history(
+    root: &Path,
+    required: bool,
+    control: &crate::task::Control,
+) -> Result<()> {
+    let preparation =
+        crate::store::managed_history::administrative_preparation_with(control.clone())?;
+    crate::store::configuration_history::validate_copy(root, required, &preparation)
+}
+
 /// Check the database at `root` without modifying it. Fails only when `root` is not a
 /// readable directory; everything else is reported in the [`CheckReport`].
 pub fn check(root: &Path, opts: &CheckOptions) -> Result<CheckReport> {
@@ -396,6 +408,13 @@ pub fn check(root: &Path, opts: &CheckOptions) -> Result<CheckReport> {
     }
     c.reasoning();
     c.branches();
+    let mut configuration = Run::new("configuration-history");
+    if let Err(error) = configuration_history(root, false, &crate::task::Control::none()) {
+        configuration.add(Issue::error(error.to_string()));
+    }
+    c.checks.push(
+        configuration.done("published configuration closure and accepted primary references"),
+    );
     // a compaction while checking: the files read may belong to different generations
     if let Some(before) = &c.current {
         let now = std::fs::read_to_string(root.join("CURRENT")).map(|s| s.trim().to_string());

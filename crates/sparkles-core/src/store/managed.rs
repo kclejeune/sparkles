@@ -25,6 +25,26 @@ pub(super) fn load_dir(root: &Path) -> Option<ManagedState> {
             });
         }
     };
+    // format 3 is written only once configuration history is activated, so in a
+    // dataset without it the file is a newer release's registry
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let Some(format) = value.get("format").and_then(serde_json::Value::as_u64)
+        && format >= 3
+        && let Some(reader) = crate::commit::read_dataset_versions(root)
+            .ok()
+            .flatten()
+            .map(|versions| versions.minimum_reader)
+        && let Err(error) = crate::formats::admit_configuration_version(
+            reader,
+            crate::managed::FILE,
+            u32::try_from(format).unwrap_or(u32::MAX),
+        )
+    {
+        return Some(ManagedState::Unavailable {
+            reason: error.to_string(),
+            repairable: false,
+        });
+    }
     let mut state = crate::managed::decode(&bytes, |owner| {
         let path = root.join(owner.settings_file());
         match std::fs::metadata(&path) {
@@ -103,6 +123,24 @@ impl Store {
     /// The running registry state, shared and not copied, for controlled readers.
     pub(crate) fn managed_state_shared(&self) -> Option<Arc<ManagedState>> {
         self.managed_state()
+    }
+
+    /// Whether this store's family has activated configuration history, which
+    /// selects the newer versions of the files it writes from now on (see
+    /// [`super::managed_history::activated`]).
+    pub(crate) fn configuration_activated(&self) -> bool {
+        super::managed_history::activated(
+            self.managed_state().as_deref(),
+            self.managed_root().as_deref(),
+        )
+    }
+
+    pub(super) fn same_managed_state(&self, captured: &Option<Arc<ManagedState>>) -> bool {
+        match (self.managed_state(), captured) {
+            (None, None) => true,
+            (Some(current), Some(captured)) => Arc::ptr_eq(&current, captured),
+            _ => false,
+        }
     }
 
     /// The managed graphs of this store's dataset, `None` when no owner manages any.
@@ -755,7 +793,15 @@ impl Store {
     /// settings, as installed. An unavailable registry is copied from the directory as
     /// it is, so that the copy refuses writes too.
     pub(crate) fn managed_files(&self) -> Result<Vec<(&'static str, Vec<u8>)>> {
-        match self.managed_state().as_deref() {
+        let state = self.managed_state();
+        self.managed_files_at(state.as_deref())
+    }
+
+    pub(super) fn managed_files_at(
+        &self,
+        state: Option<&ManagedState>,
+    ) -> Result<Vec<(&'static str, Vec<u8>)>> {
+        match state {
             None => Ok(Vec::new()),
             Some(ManagedState::Installed(i)) => {
                 let mut out = vec![(crate::managed::FILE, i.file_bytes())];
@@ -787,6 +833,15 @@ impl Store {
                     }
                     Err(e) => return Err(e.into()),
                 };
+                // A registry of a newer format is refused as a copy, as any other
+                // registry whose dependencies this build cannot name.
+                match crate::managed::recorded_history(&bytes) {
+                    Ok(Some(_)) => {
+                        return refuse("its anchored configuration history is unavailable");
+                    }
+                    Ok(None) => {}
+                    Err(error) => return refuse(&error.to_string()),
+                }
                 let owners = match crate::managed::recorded_owners(&bytes) {
                     Ok(owners) => owners,
                     Err(why) => return refuse(&why),

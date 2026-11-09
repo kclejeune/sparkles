@@ -225,11 +225,16 @@ impl Store {
         current: u32,
         live: &Snapshot,
         limit: &ReadLimit<'_>,
+        through: u64,
     ) -> Result<Arc<Generation>> {
         limit.check(0)?;
         if owner == current {
             return Ok(live.generation.clone());
         }
+        let entry = history.gens.get(&owner).ok_or_else(|| {
+            Error::HistoryUnsupported("the selected generation is no longer retained".into())
+        })?;
+        branching::readonly::authenticate_retained_generation(self, entry, limit, through)?;
         if let Some(index) = history.open.iter().position(|(number, _)| *number == owner) {
             history.open[index].1.retained_bytes_limited(limit)?;
             let entry = history.open.remove(index);

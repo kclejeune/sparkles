@@ -1,5 +1,7 @@
 //! Read-only origin descriptors captured under the family's opening/table guards.
 //! Physical files describe lineage; they confer neither write nor receipt authority.
+mod configuration;
+
 use super::*;
 use crate::store::cold::{ColdBudget, Loaded};
 
@@ -210,6 +212,8 @@ fn prove_file_with(
     )?;
     let result = (|| {
         let annotations = crate::annotations::seqs_controlled(root, id, budget)?;
+        let mut primary = configuration::PrimaryReader::load(root, id, budget)?;
+        primary.generation(generation, budget)?;
         let path = generation.dir.join("wal.log");
         let loaded = match budget.buffered(&path) {
             Ok(loaded) => loaded,
@@ -234,7 +238,8 @@ fn prove_file_with(
         };
         let mut reader = loaded.value;
         let extent = reader.get_ref().metadata()?.len();
-        wal::probe::prove_prefix_with(
+        let mut configuration_error = None;
+        let proof = wal::probe::prove_prefix_with(
             &mut reader,
             extent,
             generation.base.seq,
@@ -245,12 +250,139 @@ fn prove_file_with(
             annotations.value.as_deref(),
             &path,
             budget,
-            visit,
-        )
+            &mut |observation| {
+                // Observations are provisional until the original complete
+                // framing/durable-bound proof succeeds. Never publish a prefix
+                // merely because a configuration target happened to validate.
+                if configuration_error.is_none()
+                    && let Err(error) = primary.observation(observation, budget)
+                {
+                    configuration_error = Some(error);
+                }
+                visit(observation)
+            },
+        )?;
+        if let Some(error) = configuration_error {
+            return Err(error);
+        }
+        Ok(proof)
     })();
     // These are temporary proof buffers and membership, never retained on a view.
     budget.release(budget.used() - start);
     result
+}
+
+/// A resident Store lends the same bounded physical proof to a retained
+/// generation before exposing its raw log through history/diff/change readers.
+/// The caller holds history exclusion; no parent Store is opened or recovered.
+pub(in crate::store) fn authenticate_retained_generation(
+    store: &Store,
+    entry: &crate::history::GenEntry,
+    limit: &crate::history::ReadLimit<'_>,
+    through: u64,
+) -> Result<()> {
+    let mut budget = ColdBudget::new(*limit)?;
+    budget.charge(
+        (entry.dir.as_os_str().len() as u64)
+            .saturating_mul(4)
+            .saturating_add(entry.name.len() as u64 * 4)
+            .saturating_add(2048),
+    )?;
+    let physical = commit::read_gen_commit_controlled(&entry.dir, &mut budget)?;
+    if physical.as_ref().is_some_and(|physical| {
+        physical.value.dataset_id != store.dataset_id || physical.value.commit.seq != entry.base.seq
+    }) {
+        return Err(Error::Corrupt(
+            "retained primary generation identity differs".into(),
+        ));
+    }
+    let generation = Current {
+        name: entry.name.clone(),
+        number: commit::generation_number(&entry.name),
+        dir: entry.dir.clone(),
+        base: entry.base,
+        folding: entry.fold_legacy,
+        strict_from: physical
+            .as_ref()
+            .and_then(|physical| physical.value.wal_strict_from),
+        configuration: physical.as_ref().map_or(
+            crate::history::ConfigurationBinding::LegacyUnbound,
+            |physical| physical.value.configuration,
+        ),
+    };
+    if let Some(physical) = physical {
+        drop(physical.value);
+        budget.release(physical.charge);
+    }
+    let mut primary = configuration::PrimaryReader::for_store(store, &mut budget)?;
+    primary.generation(&generation, &budget)?;
+    let vocabulary = cold::head_vocabulary_controlled(
+        &entry.dir,
+        store.root.as_deref().ok_or_else(|| {
+            Error::HistoryUnsupported("retained primary root is unavailable".into())
+        })?,
+        &mut budget,
+    )?;
+    let terms = vocabulary.value.len_limited(&budget.owned_limit()?)?;
+    let root = store.root.as_deref().expect("checked persistent root");
+    // This variant uses the actual resident family capture, including main.
+    let annotations = crate::annotations::seqs_controlled(root, store.dataset_id, &mut budget)?;
+    let path = entry.dir.join("wal.log");
+    let loaded = match budget.buffered(&path) {
+        Ok(loaded) => loaded,
+        Err(Error::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound && generation.strict_from.is_none() =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut reader = loaded.value;
+    let extent = reader.get_ref().metadata()?.len();
+    let mut configuration_error = None;
+    let mut observe = |observation| {
+        if configuration_error.is_none()
+            && let Err(error) = primary.observation(observation, &budget)
+        {
+            configuration_error = Some(error);
+        }
+        Ok(())
+    };
+    // A read of one commit needs that commit's prefix, as its replay reads it.
+    // Readers of the whole log pass `u64::MAX` and prove all of it.
+    if through == u64::MAX {
+        wal::probe::prove_prefix_with(
+            &mut reader,
+            extent,
+            entry.base.seq,
+            u64::MAX,
+            entry.fold_legacy,
+            generation.strict_from,
+            terms,
+            annotations.value.as_deref(),
+            &path,
+            &budget,
+            &mut observe,
+        )?;
+    } else {
+        wal::probe::prove_prefix_through(
+            &mut reader,
+            extent,
+            entry.base.seq,
+            through,
+            entry.fold_legacy,
+            generation.strict_from,
+            terms,
+            annotations.value.as_deref(),
+            &path,
+            &budget,
+            &mut observe,
+        )?;
+    }
+    if let Some(error) = configuration_error {
+        return Err(error);
+    }
+    budget.check()
 }
 
 fn head_controlled(
