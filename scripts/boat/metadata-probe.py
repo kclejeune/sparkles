@@ -1,6 +1,6 @@
 """Run inside the named 512-MiB qualification service."""
 from pathlib import Path
-import hashlib,json,os,stat,subprocess,sys,re,shutil,tomllib
+import hashlib,itertools,json,os,stat,subprocess,sys,re,shutil,tomllib
 
 class Refusal(Exception):pass
 def need(ok,why):
@@ -120,6 +120,76 @@ def stat_only_status(recorded,observed,status):
                and e.get('index_bytes')!=e.get('bytes') and e.get('link_matches_head') is True for (xy,_),e in zip(lines,entries))
 def public_status(status):
     return {k:v for k,v in status.items() if k!='_lines'}
+# Item 788. The helper hashes its own status listing, and the probe lists the status a
+# moment later. A stat-only line can clear in between, as in run 12, where the helper
+# hashed the ` M` line of the checkout's only symbolic link and the probe's listing was
+# empty. The helper's hash is then matched against the ` M` lines that tracked links
+# could produce, and only links whose index entry, HEAD entry and worktree target agree
+# can account for it. At most LINK_LISTING_MAX links are tried, every subset in git's order.
+LINK_LISTING_MAX=8
+def head_links(repo,env):
+    """The tracked symbolic links whose index blob is HEAD's and whose raw target matches it.
+
+    Returns None when the checkout has more than LINK_LISTING_MAX tracked links."""
+    data=command(['git','-C',str(repo),'-c','core.fsmonitor=false','--no-optional-locks','ls-files','--stage','-z'],15,env,repo)
+    links=[]
+    for item in data.split(b'\0'):
+        m=re.fullmatch(rb'120000 ([0-9a-f]{40,64}) 0\t(.+)',item,re.S)
+        if m:links.append((m[1],m[2]))
+    if len(links)>LINK_LISTING_MAX:return None
+    out=[]
+    for blob,raw in links:
+        full=os.path.join(os.fsencode(str(repo)),raw)
+        try:linked=stat.S_ISLNK(os.lstat(full).st_mode)
+        except FileNotFoundError:continue
+        if not linked:continue
+        tree=command(['git','-C',str(repo),'--literal-pathspecs','ls-tree','-z','HEAD','--',raw.decode('utf-8','surrogateescape')],15,env,repo)
+        if tree==b'120000 blob '+blob+b'\t'+raw+b'\0' and link_matches_head(repo,raw,full,env):out.append(raw)
+    return out
+def link_listing(status_sha256,links):
+    """The links whose ` M` lines alone, in git's order, hash to ``status_sha256``, or None."""
+    for n in range(1,len(links)+1):
+        for subset in itertools.combinations(links,n):
+            if hash_bytes(b''.join(b' M '+raw+b'\0' for raw in subset))==status_sha256:return list(subset)
+    return None
+def stat_only_lines(recorded,observed,repo,env):
+    """The link paths that alone account for a drifted status the probe could not list.
+
+    Every field but the status equals a clean recording, the tracked diff is empty, and
+    the helper's status hash is that of ` M` lines of tracked links that match HEAD."""
+    r,o=source_fields(recorded),source_fields(observed)
+    if any(r[k]!=o[k] for k in SOURCE_FIELDS if k!='status_sha256'):return None
+    if r['status_sha256']!=EMPTY_SHA256 or o['tracked_diff_sha256']!=EMPTY_SHA256 or o['status_sha256'] is None:return None
+    if set(recorded)!=set(observed) or recorded.get('inputs')!=observed.get('inputs'):return None
+    links=head_links(repo,env)
+    names=None if links is None else link_listing(o['status_sha256'],links)
+    # A credential-like path is never listed, so it never accounts for a status either.
+    return None if names is None or any(status_credential_like(raw.decode('utf-8','replace')) for raw in names) else names
+SOURCE_REREADS=3
+def startup_source(repo,expected,observe,env,pause=None):
+    """The checkout's first source observation and, when a stat-only status is accepted, its evidence.
+
+    ``observe`` runs the installed helper. A first observation equal to the recording
+    passes. A drift passes when the probe's own listing shows it is stat-only. When the
+    listing cannot show the hashed lines (item 788), the hash must belong to ` M` lines of
+    HEAD-matching links. Up to SOURCE_REREADS further observations, a second apart, then
+    look for one that equals the recording or is stat-only by a listing read right after
+    it. Anything else raises SourceDrift with the last pair read.
+    """
+    first=observe()
+    if first==expected:return first,None
+    status=status_record(repo,env)
+    if stat_only_status(expected,first,status):return first,dict(public_status(status),stat_only=True)
+    try:names=stat_only_lines(expected,first,repo,env)
+    except Exception:names=None
+    if names is None:raise SourceDrift('existing source drift',repo,expected,first,status)
+    again,now=first,status
+    for attempt in range(SOURCE_REREADS):
+        if attempt:(pause or __import__('time').sleep)(1)
+        again=observe();now=status_record(repo,env)
+        if again==expected or stat_only_status(expected,again,now):
+            return first,dict(public_status(now),stat_only=True,transient=True,attributed=[raw.decode('utf-8','replace') for raw in names])
+    raise SourceDrift('existing source drift',repo,expected,again,now)
 
 class SourceDrift(Refusal):
     """A checkout whose source identity differs, with every field recorded beside observed."""
@@ -217,12 +287,7 @@ def probe(payload):
     need(shutil.which('cargo',path=env['PATH'])==str(home/'.local/share/mbx/bin/cargo'),'Cargo resolution')
     helper=str(new/'toolchain-state.py');sources={};checks={}
     for repo,expected in [(Path(profile()['startup_repositories']['default']),s['default_source']),(Path(profile()['startup_repositories']['retained']),s['retained_source'])]:
-        first=json.loads(command(['/usr/bin/python3',helper,'source',str(repo)],30,env,repo))
-        stale=None
-        if first!=expected:
-            status=status_record(repo,env)
-            if not stat_only_status(expected,first,status):raise SourceDrift('existing source drift',repo,expected,first,status)
-            stale=dict(public_status(status),stat_only=True)
+        first,stale=startup_source(repo,expected,lambda:json.loads(command(['/usr/bin/python3',helper,'source',str(repo)],30,env,repo)),env)
         check=json.loads(command(['/bin/bash',str(new/'repository-start.sh'),str(repo)],55,env,repo))
         need(check['native_started'] is False and check['status']=='tools-ready-workload-admission-still-required' and check['uid']==uid,'checker outcome')
         last=json.loads(command(['/usr/bin/python3',helper,'source',str(repo)],30,env,repo))

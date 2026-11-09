@@ -1,14 +1,14 @@
 {
   "files": {
     "README.md": {
-      "bytes": 28883,
+      "bytes": 30622,
       "mode": 420,
-      "sha256": "b90b6f36d191ac75fb379fccdf4cad37354314310d38772e2f4a15698ea56e80"
+      "sha256": "78737197166b46fb185bc3c7d078dcb88037c9070daaa088307ab3c4187197ac"
     },
     "common.py": {
-      "bytes": 23345,
+      "bytes": 24734,
       "mode": 420,
-      "sha256": "85c60d32b6cc2a05dfbb242ad14f310a88282cfb486940fd3a7c5ec2ecf659da"
+      "sha256": "0ae5d919d4be37f11d8eabcf62eed12e585fdc4e6dad62ac9a26226aa020777e"
     },
     "config_schema.py": {
       "bytes": 3632,
@@ -16,14 +16,14 @@
       "sha256": "e25e6f2070a71461366145e3a4f126e5f46a7bfa97334ed56e074622eec18b08"
     },
     "controller.py": {
-      "bytes": 84992,
+      "bytes": 85703,
       "mode": 420,
-      "sha256": "841bdebcafb15257a4a0291c134a9bed1269048b9a8e3a37e48f81c8dac44a38"
+      "sha256": "4a4508d542094a518f3306cac7f473a2df3d4f51dcbd673558b48ffbbbe69268"
     },
     "controls.py": {
-      "bytes": 110930,
+      "bytes": 112114,
       "mode": 420,
-      "sha256": "8e6526be732ebe19f9ec23b41039ee4e88a4d0f6839f925a3a00759108396ff4"
+      "sha256": "4f39021b01aa3d556b0b3308a6dddbd06af3824e80b3a41c074f56af8f82bfdf"
     },
     "diagnostic-probe.py": {
       "bytes": 12703,
@@ -41,9 +41,9 @@
       "sha256": "8ce4e8aed1186d9660c477111ccdf92c5679437bd8afc393720341cdca3f4dbd"
     },
     "metadata-probe.py": {
-      "bytes": 20433,
+      "bytes": 24656,
       "mode": 420,
-      "sha256": "8ed37b04ea1b9cd64e67aa5eaec21e8c9643a791f2ee310983fac6f4caa785d2"
+      "sha256": "f3bb9abe4276e252386373fc4fc9951585b0f706cea754d884800421da22421e"
     },
     "owned_group.py": {
       "bytes": 9498,
