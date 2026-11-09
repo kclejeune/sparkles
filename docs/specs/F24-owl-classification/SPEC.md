@@ -897,7 +897,7 @@ successor term, so that the premises of one such literal are found without scann
 others of its term, and Pred checks that a new premise fits a place of a predecessor clause
 before it gathers the clause's other premises. The inferences are the same, and in
 interleaved runs on the laptop BioTop classifies in 0.59 of the time of the build before
-on one thread and 0.44 on four, 44 and 23 ms, which ties Konclude's 23 ms, item 712. The
+on one thread and 0.44 on four, 44 and 23 ms, about Konclude's 23 ms, item 712. The
 index holds one more id for each processed clause whose maximal literal is over a successor
 term, which raises the peak heap of a one-thread run by 9.6% on BioTop, from 17.7 to 19.4
 MiB, and by 3.3 to 3.5% on ore_ont_5438, ore_ont_13103 and ore_ont_16680. The speed costs
