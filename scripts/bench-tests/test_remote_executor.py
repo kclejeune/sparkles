@@ -145,6 +145,10 @@ class Admission(unittest.TestCase):
         controller.bind_release_profile(self.fixtures['release'])
         with patch.object(qwa,'current_boot_id',return_value=self.fixtures['boot_id']):
             receipt=controller.extend_operation(self.fixtures['release'],io,7200,fact,'lane two')
+        intent=json.loads((self.fixtures['operation']/'controller-intent.json').read_text())
+        # Until the running guard accepts the receipt, lane two still sees the original end.
+        with self.clocks(now+left+60,boot+left+60),self.assertRaises(ValueError):RX.admission('boat:bx_fixture')
+        controller.guard_deadlines(ExtendIO(self.fixtures,io.wall(),io.mono()),intent)
         lane_two=self.root/'lane-two-admission.json'
         expected=RX.boat_environment.expected_environment(self.fixtures['profile'],self.fixtures['qualified'])
         with self.clocks(now+left+60,boot+left+60),patch.object(RX.boat_environment.controller,'bounded',return_value={'exit':0,'body':expected}):

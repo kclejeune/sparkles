@@ -288,16 +288,19 @@ class LifetimeExtension(unittest.TestCase):
     def io(self,elapsed=0,wall_shift=0):
         return ExtendIO(self.f,self.f['now']+elapsed+wall_shift,self.f['boot_now']+elapsed)
 
-    def extend(self,io,seconds=10500,**fact):
+    def extend(self,io,seconds=10500,accept=True,**fact):
         path=environment_fact(self.f,self.root/'environment-fact.json',io.wall(),**fact)
         with patch.object(self.qwa,'current_boot_id',return_value=io.local_boot):
-            return controller.extend_operation(self.f['release'],io,seconds,path,'second lane on the warm worker')
+            receipt=controller.extend_operation(self.f['release'],io,seconds,path,'second lane on the warm worker')
+        # The running guard accepts the receipt on its next pass at the same instant.
+        if accept:controller.guard_deadlines(ExtendIO(self.f,io.wall(),io.mono()),self.intent)
+        return receipt
 
     def lifetime(self,boot_id=None):
         with patch.object(self.qwa,'current_boot_id',return_value=boot_id or self.f['boot_id']):
             return self.qwa.operation_lifetime(self.op,self.f['qualified'])
 
-    def receipts(self):return sorted(n for n in os.listdir(self.op) if n.startswith('lifetime-extension-0'))
+    def receipts(self):return sorted(n for n in os.listdir(self.op) if n.startswith('lifetime-extension-0') and not n.endswith('-accepted.json'))
 
     def test_extension_is_a_receipted_act_with_a_new_bounded_end(self):
         io=self.io(self.left-600)
@@ -455,6 +458,43 @@ class LifetimeExtension(unittest.TestCase):
         self.assertEqual(controller.guard_deadlines(io,self.intent),(boot,wall))
         bad=self.op/'lifetime-extension-0001.json';bad.write_text('{"schema":"sparkles.boat.lifetime-extension","version":2}');bad.chmod(0o600)
         self.assertEqual(controller.guard_deadlines(io,self.intent),(boot,wall))
+
+    def test_only_a_receipt_the_guard_accepts_in_time_grants_time(self):
+        # Published in time, but the guard first reads it after the previous end.
+        io=self.io(self.left-600);receipt=self.extend(io,3600,accept=False)
+        self.assertEqual(self.lifetime(),self.original)
+        late=ExtendIO(self.f,self.f['now']+self.left+1,self.f['boot_now']+self.left+1)
+        self.assertEqual(controller.guard_deadlines(late,self.intent),(self.original['boot_end'],self.original['wall_end']))
+        self.assertFalse((self.op/'lifetime-extension-0001-accepted.json').exists())
+        self.assertEqual(self.lifetime(),self.original)
+        # Another act refuses while a previous receipt is unaccepted.
+        with self.assertRaisesRegex(controller.Refusal,'not accepted'):self.extend(self.io(100))
+        # An edited acceptance or one for another receipt refuses the chain.
+        (self.op/'lifetime-extension-0001.json').unlink()
+        receipt=self.extend(self.io(self.left-600),3600)
+        path=self.op/'lifetime-extension-0001-accepted.json';good=json.loads(path.read_text())
+        for name,value in {'late':dict(good,accepted_boottime=self.original['boot_end']+1),'other receipt':dict(good,receipt_sha256='0'*64)}.items():
+            with self.subTest(name):
+                path.write_text(json.dumps(value));path.chmod(0o600)
+                with self.assertRaises(ValueError):self.lifetime()
+
+    def test_concurrent_stop_trigger_does_not_end_the_guard_before_reconciliation(self):
+        guard=controller.RealIO(self.f['release'],self.op);real=guard.exists
+        def racing(name):
+            if name=='stop-trigger.json' and not real(name):
+                # finish publishes its trigger between the guard's check and its write.
+                controller.RealIO(self.f['release'],self.op).record('stop-trigger.json',{'requested_wall':0});return False
+            return real(name)
+        guard.exists=racing;guard.trigger()
+        self.assertTrue((self.op/'stop-trigger.json').exists())
+
+    def test_the_conservative_base_survives_lost_handoff_receipts(self):
+        path=self.op/'guard-admission.json';guard=json.loads(path.read_text());guard['observed_wall']+=2000
+        path.write_text(json.dumps(guard));path.chmod(0o600)
+        io=self.io(0);first=controller.guard_deadlines(io,self.intent)
+        self.assertLess(first[0],self.intent['deadline_mono'])
+        path.unlink();self.assertEqual(controller.guard_deadlines(io,self.intent),first)
+        (self.op/'root-handoff.json').unlink();self.assertEqual(controller.guard_deadlines(io,self.intent),first)
 
     def test_the_guard_lock_excludes_an_extension_act(self):
         guard=controller.RealIO(self.f['release'],self.op)

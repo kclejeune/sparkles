@@ -49,12 +49,14 @@ def finite(value):return type(value)in(int,float)and value==value and abs(value)
 
 def extension_names(names):
     """Sorted receipt sequence numbers. Attempt records are evidence and confer nothing."""
-    numbers=[]
+    numbers=[];accepted=[]
     for name in names:
         if not name.startswith('lifetime-extension-')or re.fullmatch('lifetime-extension-attempt-[0-9a-f]{32}(-failed)?[.]json',name):continue
-        match=re.fullmatch('lifetime-extension-([0-9]{4})[.]json',name);require(match is not None,'malformed lifetime extension name')
-        numbers.append(int(match[1]))
-    numbers.sort();require(numbers==list(range(1,len(numbers)+1)),'lifetime extension sequence gap')
+        match=re.fullmatch('lifetime-extension-([0-9]{4})(-accepted)?[.]json',name);require(match is not None,'malformed lifetime extension name')
+        if match[2]:accepted.append(int(match[1]))
+        else:numbers.append(int(match[1]))
+    numbers.sort();accepted.sort();require(numbers==list(range(1,len(numbers)+1)),'lifetime extension sequence gap')
+    require(accepted==list(range(1,len(accepted)+1))and len(accepted)<=len(numbers),'lifetime extension acceptance without its receipt')
     return numbers
 
 def printable(text):return isinstance(text,str)and 0<len(text)<=200 and all(' '<=c<='~'for c in text)
@@ -64,13 +66,26 @@ def iso_unix(value):
     try:return datetime.fromisoformat(value.replace('Z','+00:00')).timestamp()
     except ValueError:raise ValueError('lifetime extension provider time')from None
 
-def apply_extensions(names,read,intent,wall,boot,identity):
-    """Return the end pair after every valid receipt, or refuse the whole chain.
+ACCEPTANCE_SCHEMA='sparkles.boat.lifetime-extension-acceptance'
+
+def receipt_digest(e):return hashlib.sha256(json.dumps(e,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+
+def acceptance_record(number,e,identity,now_wall,now_boot):
+    return {'schema':ACCEPTANCE_SCHEMA,'version':1,'sequence':number,'receipt_sha256':receipt_digest(e),
+            'guard':{'boot_id':identity['boot_id'],'invocation_id':identity['invocation_id']},
+            'accepted_wall':now_wall,'accepted_boottime':now_boot}
+
+def apply_extensions(names,read,intent,wall,boot,identity,accept=None):
+    """Return the end pair after the guard-accepted prefix of valid receipts.
 
     Each act is observed after the previous act was published and published
-    before the previous end with the closure reserve left on both clocks.
+    before the previous end with the closure reserve left on both clocks. A
+    receipt grants time only when the guard accepted it, by its own clocks,
+    before the previous end. The guard passes ``accept``, which records that
+    acceptance or returns None, and every other reader only checks the record.
+    A malformed receipt or acceptance refuses the whole chain.
     """
-    numbers=extension_names(names);after=identity['handoff_boottime']
+    numbers=extension_names(names);after=identity['handoff_boottime'];granted=0;open_chain=True
     for number in numbers:
         e=read('lifetime-extension-%04d.json'%number)
         require(isinstance(e,dict)and e.get('schema')==EXTENSION_SCHEMA and type(e.get('version'))is int and e['version']==1,'unknown lifetime extension schema')
@@ -91,8 +106,17 @@ def apply_extensions(names,read,intent,wall,boot,identity):
         require(isinstance(adoption,dict)and set(adoption)==ADOPTION_KEYS and identity['worker_boot_id']is not None and adoption['worker_boot_id']==identity['worker_boot_id'],'lifetime extension worker boot')
         require(adoption['local_boot_id']==identity['boot_id'] and type(adoption['guard_pid'])is int and adoption['guard_pid']==identity['guard_pid'],'lifetime extension local guard adoption')
         require(adoption['environment_version']==environment['version'] and adoption['environment_version_id']==environment['version_id'] and adoption['hook_sha256']==environment['hook_sha256'] and hexsha(adoption['environment_fact_sha256']),'lifetime extension environment adoption')
-        wall,boot,after=e['wall_end'],e['boot_end'],e['published_boottime']
-    return wall,boot,len(numbers)
+        if not open_chain:continue
+        name='lifetime-extension-%04d-accepted.json'%number
+        if name in names:
+            a=read(name)
+            require(isinstance(a,dict)and a.get('schema')==ACCEPTANCE_SCHEMA and type(a.get('version'))is int and a['version']==1,'unknown lifetime extension acceptance schema')
+            require(set(a)=={'schema','version','sequence','receipt_sha256','guard','accepted_wall','accepted_boottime'}and a['sequence']==number and a['receipt_sha256']==receipt_digest(e) and a['guard']==e['guard'],'lifetime extension acceptance identity')
+            require(finite(a['accepted_wall'])and finite(a['accepted_boottime'])and a['accepted_boottime']>=e['published_boottime'] and a['accepted_wall']<wall and a['accepted_boottime']<boot,'lifetime extension accepted after the previous end')
+        elif accept is None or accept(number,e,wall,boot) is None:
+            open_chain=False;continue
+        wall,boot,after=e['wall_end'],e['boot_end'],e['published_boottime'];granted+=1
+    return wall,boot,granted
 
 def operation_identity(intent,guard,qualification,operation_id,profile):
     worker_boot=qualification.get('worker_boot_id');env=profile['future_environment']

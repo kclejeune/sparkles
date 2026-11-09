@@ -188,7 +188,10 @@ class RealIO:
             self.wait(0.2)
         raise Refusal('guard readiness timeout')
     def trigger(self):
-        if not self.exists('stop-trigger.json'):self.record('stop-trigger.json',{'requested_wall':self.wall()})
+        # Finish, request-stop and the guard may race to publish the same trigger.
+        if not self.exists('stop-trigger.json'):
+            try:self.record('stop-trigger.json',{'requested_wall':self.wall()})
+            except FileExistsError:pass
     def metadata_closed(self):
         unit=self.r['guard_unit']+'-metadata.service'
         code="""from pathlib import Path
@@ -386,17 +389,28 @@ def guard_deadlines(io,intent):
     lost or damaged evidence can only end the lifetime sooner.
     """
     original=(intent['deadline_mono'],intent['deadline_wall'])
-    if not io.exists('root-handoff.json'):return original
-    try:
-        guard=io.read('guard-admission.json');handoff=io.read('root-handoff.json')
-        wall,boot=lifetime.original_ends(intent,guard,handoff)
-        base=(min(boot,original[0]),min(wall,original[1]))
-    except Exception:return original
+    # Once established, the conservative base is kept for the guard's life, so
+    # later loss of the handoff receipts cannot restore the intent's later end.
+    base=getattr(io,'guard_base',None)
+    if base is None:
+        if not io.exists('root-handoff.json'):return original
+        try:
+            guard=io.read('guard-admission.json');handoff=io.read('root-handoff.json')
+            wall,boot=lifetime.original_ends(intent,guard,handoff)
+            base=(min(boot,original[0]),min(wall,original[1]))
+        except Exception:return original
+        io.guard_base=base
     try:
         names=io.names()
         if not lifetime.extension_names(names):return base
+        guard=io.read('guard-admission.json')
         identity=lifetime.operation_identity(intent,guard,io.read('qualification.json'),io.r['guard_unit'],profile())
-        wall,boot,_=lifetime.apply_extensions(names,io.read,intent,base[1],base[0],identity)
+        def accept(number,e,wall,boot):
+            now_wall,now_boot=io.wall(),io.mono()
+            if not(now_wall<wall and now_boot<boot):return None
+            row=lifetime.acceptance_record(number,e,identity,now_wall,now_boot)
+            io.record('lifetime-extension-%04d-accepted.json'%number,row);return row
+        wall,boot,_=lifetime.apply_extensions(names,io.read,intent,base[1],base[0],identity,accept)
         return boot,wall
     except Exception:return base
 
@@ -459,6 +473,7 @@ def extend_operation(r,io,seconds,fact_path,reason):
     names=io.names();wall,boot=lifetime.original_ends(intent,guard,handoff)
     try:wall,boot,count=lifetime.apply_extensions(names,io.read,intent,wall,boot,identity)
     except ValueError as error:raise Refusal('existing extension receipts refused: '+str(error)) from None
+    need(count==len(lifetime.extension_names(names)),'a previous extension is not accepted by the guard')
     need(min(wall-io.wall(),boot-io.mono())>lifetime.CLOSURE_RESERVE,'lifetime already inside the closure reserve')
     # Adoption: the same local boot and guard invocation, and the same running worker boot and environment.
     need(io.local_boot_id()==guard['boot_id'],'local boot changed since qualification')
@@ -468,7 +483,7 @@ def extend_operation(r,io,seconds,fact_path,reason):
     env=profile()['future_environment']
     need(info['state'] in ('ready','idle','running') and info['environmentVersion']==env['version'],'worker not running the qualified environment')
     need(not info.get('setup_error_present') and info.get('setupStatus') not in ('failed','error'),'worker setup failed')
-    e=load(Path(fact_path).absolute());freshness(e,io.wall(),60)
+    fact_bytes=read_owned(Path(fact_path).absolute());e=json.loads(fact_bytes);freshness(e,io.wall(),60)
     need(e.get('id')==env['id'] and e.get('latestVersionNumber')==env['version'] and e.get('latestVersionId')==r['environment']['latest_version_id'] and e.get('hook_sha256')==hook_sha() and e.get('hook_bytes')==env['hook_bytes'] and e.get('setupBlocking') is True,'environment or hook drift since qualification')
     need(io.worker_boot_id()==identity['worker_boot_id'],'worker rebooted or replaced since qualification')
     observed_wall,observed_boot=io.wall(),io.mono()
@@ -500,7 +515,7 @@ def extend_operation(r,io,seconds,fact_path,reason):
                  'provider':{'ttl_seconds':ttl,'archive_after':after['archiveAfter'],'archive_after_unix':archive},
                  'adoption':{'worker_boot_id':identity['worker_boot_id'],'local_boot_id':guard['boot_id'],'guard_pid':guard['pid'],
                              'environment_version':env['version'],'environment_version_id':r['environment']['latest_version_id'],'hook_sha256':hook_sha(),
-                             'environment_fact_sha256':digest(read_owned(Path(fact_path).absolute()))},
+                             'environment_fact_sha256':digest(fact_bytes)},
                  'reason':reason}
         io.record('lifetime-extension-%04d.json'%(count+1),receipt)
         return receipt
@@ -514,8 +529,13 @@ def extend_entry(op,seconds,fact_path,reason):
     lock=os.open(op/EXTENSION_LOCK,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
     try:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        return extend_operation(r,RealIO(r,op),seconds,fact_path,reason)
+        io=RealIO(r,op);receipt=extend_operation(r,io,seconds,fact_path,reason)
     finally:os.close(lock)
+    # The receipt grants time only once the guard accepts it before the previous end.
+    name='lifetime-extension-%04d-accepted.json'%receipt['sequence'];end=io.mono()+15
+    while io.mono()<end and not io.exists(name):io.wait(0.2)
+    receipt['accepted_by_guard']=io.exists(name)
+    return receipt
 
 def verify_packet(expected):
     b=read_owned(ROOT/'runtime-sources.json');need(digest(b)==expected,'controller seal mismatch')
@@ -619,7 +639,7 @@ def main():
         if a.action=='extend':
             need(a.seconds is not None and a.environment_fact is not None and a.reason is not None,'extension seconds, environment fact and reason required')
             receipt=extend_entry(op,a.seconds,Path(a.environment_fact).absolute(),a.reason)
-            print(json.dumps({'extended':True,'worker':receipt['worker'],'sequence':receipt['sequence'],'wall_end':receipt['wall_end'],'boot_end':receipt['boot_end']}));return 0
+            print(json.dumps({'extended':receipt['accepted_by_guard'],'worker':receipt['worker'],'sequence':receipt['sequence'],'wall_end':receipt['wall_end'],'boot_end':receipt['boot_end']}));return 0 if receipt['accepted_by_guard'] else 1
         if a.action=='finish':
             result=finish_operation(op,None if a.job_closure is None else Path(a.job_closure).absolute());print(json.dumps(result));return 0
         r=bind_release_profile(load(op/'release.json'));verify_packet(r['controller_packet_manifest_sha256']);io=RealIO(r,op)
