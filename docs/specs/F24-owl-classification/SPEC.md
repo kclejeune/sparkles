@@ -970,10 +970,11 @@ and different individuals as equalities and inequalities of constants. The ABox 
 to the calculus once the root exists, since a nominal in a class axiom already gives the
 root ground clauses, such as `⊤ → B(o)` for `{o} ⊑ B`. The run also takes keys over object
 properties and the universal property, as below. Data properties wait on item 768, and self
-restrictions, reflexive properties and irreflexive properties stay refused. An irreflexive
-property is refused because a nominal or an equality of constants can close a loop, as
-`r(a, a)` does, and the rules above check irreflexivity only on simple properties without
-loops. The Nom rule with its generated nominals is not built. Nom fires only when a nominal,
+restrictions and reflexive properties stay refused. An irreflexive property is left out and
+reported, and the run takes the other axioms, as it does with a minimum above one when
+counting is off. The property is left out because a nominal or an equality of constants can
+close a loop, as `r(a, a)` does, and the rules above check irreflexivity only on simple
+properties without loops. The Nom rule with its generated nominals is not built. Nom fires only when a nominal,
 an inverse property and an at-most restriction meet, so the run refuses that interaction. A
 symmetric or inverse functional property counts as an inverse for this test, and so does
 the symmetric property that replaces the universal property.
@@ -1077,7 +1078,7 @@ The hand cases `nominal-inverse-max`, `nominal-bounded-count` and
 `nominal-predecessor-cases` need the Nom rule. Every case in the gate runs with counting
 off, on one and four threads, under both strategies, and must equal HermiT's taxonomy and
 consistency. Regressions with one disjunctive axiom added check that an irreflexive
-property beside a nominal is refused and that a stopped rooted run reports its consistency
+property beside a nominal is left out while the run takes the rest, and that a stopped rooted run reports its consistency
 as unknown.
 
 ### ROBOT-compatible commands

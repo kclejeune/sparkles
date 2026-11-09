@@ -317,20 +317,26 @@ fn minimum_fillers_are_not_coloured_across_individuals() {
     assert!(!out.taxonomy.is_unsatisfiable(&c("M")));
 }
 
-/// This one holds today, since every run with a nominal stays out of Tier D, and must still
-/// hold once the rooted run takes nominals.
+/// An irreflexive property beside a nominal is left out and reported, and the rooted run
+/// takes the rest, as it does with a minimum above one when counting is off.
 #[test]
-fn an_irreflexive_property_beside_a_nominal_is_refused() {
+#[ignore = "needs the rooted run of item 603 phase 6"]
+fn an_irreflexive_property_beside_a_nominal_is_left_out() {
     // r(a, a) closes a loop that the rules check only on simple properties without loops
     let ax = axioms(
         "IrreflexiveObjectProperty(:r)
-         SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:o)))",
+         SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:o)))
+         SubClassOf(ObjectOneOf(:o) :B)
+         SubClassOf(ObjectSomeValuesFrom(:r :B) :C)",
     );
     let mut k = Classifier::of(&ax);
     let out = k.classify(&Limits::default()).unwrap();
-    assert_eq!(out.stats.clauses, 0, "the rooted run refuses it");
+    let left: Vec<_> = k.excluded().into_iter().map(|e| e.axiom).collect();
     assert!(
-        !k.excluded().is_empty(),
-        "the disjunctive axiom is reported"
+        matches!(left[..], [AxiomKind::IrreflexiveObjectProperty(_)]),
+        "only the irreflexive axiom is left out: {left:#?}"
     );
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    assert!(out.stats.clauses > 0, "the rooted run takes the rest");
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("C")));
 }
