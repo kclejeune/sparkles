@@ -496,7 +496,7 @@ impl QueryBatch {
     }
 
     /// [`QueryBatch::term`] for a writer that has reserved [`QueryBatch::cell_bytes`] for
-    /// the cell, through [`QueryBatch::row_bytes`] or [`DecodedBatch::row_bytes`].
+    /// the cell, for example through [`DecodedBatch::row_bytes`].
     pub(super) fn reserved_term(&self, row: usize, column: usize) -> Result<Option<Term>> {
         if row >= self.len() || column >= self.width() {
             return Err(Error::invalid("query batch cell is out of bounds"));
@@ -519,12 +519,6 @@ impl QueryBatch {
         self.inner
             .ctx
             .covered_batch_term(self.id(row, column), cover)
-    }
-
-    pub(super) fn row_bytes(&self, row: usize) -> Result<u64> {
-        (0..self.width())
-            .map(|column| self.inner.ctx.decoded_bytes(self.id(row, column)))
-            .try_fold(128u64, |total, bytes| Ok(total.saturating_add(bytes?)))
     }
 
     pub(super) fn cell_bytes(&self, row: usize, column: usize) -> Result<u64> {

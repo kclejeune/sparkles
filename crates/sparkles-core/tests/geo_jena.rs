@@ -65,6 +65,10 @@ fn subjects(s: &Store, pattern: &str) -> Vec<String> {
         .unwrap_or_else(|e| panic!("{text}: {e}"));
     let mut v: Vec<String> = r
         .rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|row| match row.into_iter().next().flatten() {
             Some(Term::NamedNode(n)) => n.as_str().rsplit('/').next().unwrap().to_string(),
@@ -80,7 +84,15 @@ fn value(s: &Store, expr: &str) -> Option<Term> {
     let text = format!("{P}SELECT ?r {{ BIND({expr} AS ?r) }}");
     let r = query(s.snapshot(), &text, &QueryOptions::default())
         .unwrap_or_else(|e| panic!("{text}: {e}"));
-    r.rows().pop().unwrap().pop().unwrap()
+    r.rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>()
+        .pop()
+        .unwrap()
+        .pop()
+        .unwrap()
 }
 
 /// `expr` as a lexical form and datatype.
@@ -408,7 +420,14 @@ fn aggregates_over_features() {
          {{ ?f geo:hasGeometry/geo:asWKT ?w }}"
     );
     let r = query(s.snapshot(), &text, &QueryOptions::default()).unwrap();
-    let row = r.rows().pop().unwrap();
+    let row = r
+        .rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>()
+        .pop()
+        .unwrap();
     let Some(Term::Literal(b)) = &row[0] else {
         panic!("{row:?}")
     };

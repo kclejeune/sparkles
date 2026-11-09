@@ -70,6 +70,10 @@ fn rows(s: &Store, q: &str, o: &QueryOptions) -> Vec<String> {
     }
     let mut v: Vec<String> = r
         .rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|row| {
             row.into_iter()
@@ -155,7 +159,7 @@ fn explain_names_the_operator() {
         &opts(),
     )
     .unwrap();
-    let n = find(&r.plan, "SpatialRelate").expect("a SpatialRelate node");
+    let n = find(&r.plan(), "SpatialRelate").expect("a SpatialRelate node");
     assert_eq!(
         n.description,
         "?x geo:sfContains <http://example.org/g1> [asserted ∪ derived]"
@@ -169,7 +173,7 @@ fn explain_names_the_operator() {
         &opts(),
     )
     .unwrap();
-    let n = find(&r.plan, "SpatialRelate").unwrap();
+    let n = find(&r.plan(), "SpatialRelate").unwrap();
     assert!(n.description.ends_with("[derived]"), "{}", n.description);
 }
 

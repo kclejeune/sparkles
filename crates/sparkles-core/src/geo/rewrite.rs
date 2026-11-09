@@ -952,7 +952,7 @@ ex:A geo:sfTouches ex:p2 .
                 let mut rows: Vec<String> =
                     r.rows().into_iter().map(|r| format!("{r:?}")).collect();
                 rows.sort();
-                (rows, index(&r.plan).unwrap())
+                (rows, index(&r.plan()).unwrap())
             })
             .collect()
     }

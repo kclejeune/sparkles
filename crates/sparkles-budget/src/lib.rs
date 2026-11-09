@@ -255,6 +255,10 @@ struct Backend<R, G, H> {
 }
 // The callee's moved-out Box parameter is freed before its returned T can be
 // destroyed by the caller. Stable safe Rust, without Box::into_inner or unsafe.
+#[allow(
+    clippy::boxed_local,
+    reason = "the Box must be consumed here so its allocation is freed before the payload"
+)]
 fn unbox<T>(boxed: Box<T>) -> T {
     *boxed
 }

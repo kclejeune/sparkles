@@ -2633,31 +2633,6 @@ impl Ctx {
         self.local.read().get(id).map(f)
     }
 
-    /// Batch resolution is independent of a producer's sticky failure. Previously
-    /// returned IDs remain valid; each decode still reserves its transient bytes.
-    pub(super) fn batch_term(&self, id: Id) -> Result<Option<Term>> {
-        let decode = |key: &[u8]| -> Result<Option<Term>> {
-            let _charge = self.charge((key.len() as u64).saturating_mul(8).saturating_add(1024))?;
-            Ok(Some(id::key_to_term(key)))
-        };
-        match id.tag() {
-            Tag::Local => self.local.read().get(id.payload()).map_or(Ok(None), decode),
-            Tag::Vocab => self
-                .with_cursor_vocab_key(id.payload(), decode)?
-                .unwrap_or(Ok(None)),
-            Tag::Delta => self
-                .snap
-                .generation
-                .dvocab
-                .with(|v| v.get(id.payload()).map_or(Ok(None), decode)),
-            Tag::Undef | Tag::Special => Ok(None),
-            _ => {
-                let _charge = self.charge(128)?;
-                Ok(self.snap.term(id))
-            }
-        }
-    }
-
     /// The term of an id as eager execution decodes it, without charging the scratch of
     /// a vocabulary block or the term, for a caller that drops the term at once.
     pub(super) fn transient_batch_term(&self, id: Id) -> Option<Term> {
@@ -2668,8 +2643,10 @@ impl Ctx {
         }
     }
 
-    /// [`Ctx::batch_term`] for a caller that has already reserved
-    /// [`Ctx::decoded_bytes`] for the term, as the result writers do for a row's cells.
+    /// The term of an id as a cursor batch resolves it, for a caller that has already
+    /// reserved [`Ctx::decoded_bytes`] for the term, as the result writers do for a
+    /// row's cells. Batch resolution is independent of a producer's sticky failure, so
+    /// previously returned ids remain valid.
     /// It takes no reservation of its own, which cost an inline number one pass through
     /// the memory ledger per cell.
     pub(super) fn reserved_batch_term(&self, id: Id) -> Result<Option<Term>> {
@@ -2687,8 +2664,8 @@ impl Ctx {
         })
     }
 
-    /// [`Ctx::batch_term`] that asks `cover` for the [`Ctx::decoded_bytes`] of the term
-    /// before it builds it, so that a result writer can hold one reservation for its row
+    /// The term of an id as a cursor batch resolves it. It asks `cover` for the
+    /// [`Ctx::decoded_bytes`] of the term before it builds it, so that a result writer can hold one reservation for its row
     /// and decode each key once.
     pub(super) fn covered_batch_term(
         &self,

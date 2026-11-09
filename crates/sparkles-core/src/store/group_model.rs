@@ -198,7 +198,7 @@ fn text_subjects(snap: Arc<Snapshot>, word: &str) -> Option<BTreeSet<String>> {
     );
     match crate::sparql::query(snap, &q, &Default::default()) {
         Ok(r) => Some(
-            r.rows()
+            r.test_application_rows()
                 .into_iter()
                 .filter_map(|row| row[0].as_ref().map(|t| t.to_string()))
                 .collect(),
@@ -304,7 +304,7 @@ fn search_base(t: &WriteTxn<'_>, fault: Fault, mismatch: &mut Option<String>) ->
     match crate::sparql::query(view.clone(), q, &Default::default()) {
         Ok(r) => {
             let hits: BTreeSet<String> = r
-                .rows()
+                .test_application_rows()
                 .into_iter()
                 .filter_map(|row| row[0].as_ref().map(|t| t.to_string()))
                 .collect();

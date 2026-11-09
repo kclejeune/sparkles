@@ -1834,7 +1834,6 @@ fn incremental_groups_match_eager_for_empty_unbound_numeric_and_text_inputs() {
 
 #[test]
 fn construct_cursor_deduplicates_across_batches_and_retains_snapshot() {
-    use oxrdf::GraphName;
     use sparkles_core::sparql::graph_cursor;
     let s = store(40);
     let queries = [

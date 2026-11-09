@@ -1677,6 +1677,7 @@ impl PreparedView {
             .ok_or_else(|| Error::invalid("prepared backing headers overflow"))
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         access: Arc<GraphAccess>,
         snapshot: Arc<Snapshot>,

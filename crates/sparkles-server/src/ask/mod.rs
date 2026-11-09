@@ -662,7 +662,7 @@ impl Asking<'_, '_> {
             }
             m.insert("timeoutSeconds".into(), json!(secs));
         }
-        let mut call = Call {
+        let call = Call {
             arrived: Instant::now(),
             cancel: self.cancel.clone(),
             request_id: "ask".into(),
@@ -670,7 +670,6 @@ impl Asking<'_, '_> {
             headers: None,
             held: None,
             grant: self.o.grant.clone(),
-
             preparation: Some(self.preparation.clone()),
         };
         Ok((m, call))

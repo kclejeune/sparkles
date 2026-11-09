@@ -77,7 +77,7 @@ fn text_hits(snap: Arc<Snapshot>, word: &str) -> Result<BTreeSet<String>> {
         "PREFIX text:<http://jena.apache.org/text#> SELECT ?s {{ ?s text:query \"{word}\" }}"
     );
     let r = crate::sparql::query(snap, &q, &Default::default())?;
-    Ok(r.rows()
+    Ok(r.test_application_rows()
         .into_iter()
         .filter_map(|row| match &row[0] {
             Some(oxrdf::Term::NamedNode(n)) => Some(n.as_str().to_string()),

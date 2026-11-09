@@ -56,6 +56,10 @@ fn rows_at(snap: std::sync::Arc<sparkles_core::store::Snapshot>, q: &str) -> Vec
     let r = query(snap, &format!("{P}{q}"), &QueryOptions::default())
         .unwrap_or_else(|e| panic!("{q}: {e}"));
     r.rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|row| {
             row.into_iter()
@@ -173,8 +177,13 @@ fn retrieval_semantics() {
         &QueryOptions::default(),
     )
     .unwrap();
-    let rows_ = r.rows();
-    assert_eq!(rows_.len(), 1, "{:?} {:?}", r.vars, rows_);
+    let rows_ = r
+        .rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(rows_.len(), 1, "{:?} {:?}", r.variables(), rows_);
     let row = &rows_[0];
     let oxrdf::Term::Literal(sc) = row[0].as_ref().unwrap() else {
         panic!()
@@ -198,7 +207,7 @@ fn retrieval_semantics() {
     fn has(p: &sparkles_core::sparql::PlanInfo) -> bool {
         p.operator == "TextSearch" || p.children.iter().any(has)
     }
-    assert!(has(&r.plan));
+    assert!(has(&r.plan()));
 }
 
 #[test]
@@ -758,6 +767,10 @@ ex:c rdfs:comment "Foxes are not foxglove" .
         )
         .unwrap_or_else(|e| panic!("{q} {opts}: {e}"));
         r.rows()
+            .unwrap()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>()
             .into_iter()
             .map(|row| match row[0].as_ref().unwrap() {
                 oxrdf::Term::Literal(l) => {
@@ -851,7 +864,16 @@ fn limits_above_max_hits_are_refused_like_no_limit() {
             ),
             &QueryOptions::default(),
         )
-        .map(|r| r.rows()[0][0].as_ref().unwrap().to_string())
+        .map(|r| {
+            r.rows()
+                .unwrap()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>()[0][0]
+                .as_ref()
+                .unwrap()
+                .to_string()
+        })
     };
     for limit in ["", " 3", " 1000", " 100000000"] {
         let e = count(limit).expect_err(limit);
@@ -915,7 +937,7 @@ fn unused_outputs_are_left_out() {
             }
             p.children.iter().find_map(find)
         }
-        (r.len(), find(&r.plan).unwrap())
+        (r.len(), find(&r.plan()).unwrap())
     };
     let (n, d) = plan("SELECT (COUNT(*) AS ?n) { (?s ?sc ?lit) text:query \"brown\" }");
     assert_eq!(n, 1);
@@ -1418,6 +1440,10 @@ fn run(s: &Store, q: &str, o: &QueryOptions) -> sparkles_core::sparql::QueryResu
 fn texts(r: &sparkles_core::sparql::QueryResult) -> Vec<String> {
     let mut v: Vec<String> = r
         .rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|row| {
             row.into_iter()
@@ -1450,7 +1476,7 @@ fn joins_search_only_the_subjects_of_a_small_side() {
     ] {
         let (on, off) = (run(&s, q, &pushdown(true)), run(&s, q, &pushdown(false)));
         assert_eq!(texts(&on), texts(&off), "{q}");
-        assert!(!plan_has(&off.plan, "subjects of the join"), "{q}");
+        assert!(!plan_has(&off.plan(), "subjects of the join"), "{q}");
     }
     let r = run(
         &s,
@@ -1459,16 +1485,16 @@ fn joins_search_only_the_subjects_of_a_small_side() {
     );
     assert_eq!(texts(&r).len(), 3, "{:?}", texts(&r));
     assert!(
-        plan_has(&r.plan, "searched the 2 subjects of the join's left side"),
+        plan_has(&r.plan(), "searched the 2 subjects of the join's left side"),
         "{:#?}",
-        r.plan
+        r.plan()
     );
     let r = run(
         &s,
         "SELECT ?s { ?s a ex:Book . ?s text:query (\"brown OR fox\" 1) }",
         &pushdown(true),
     );
-    assert!(!plan_has(&r.plan, "subjects of the join"));
+    assert!(!plan_has(&r.plan(), "subjects of the join"));
 }
 
 #[test]
@@ -1491,7 +1517,7 @@ fn query_strings_bound_by_the_group() {
             "\"renard\"@fr <http://example.org/b3>",
         ]
     );
-    assert!(plan_has(&r.plan, "[4 searches"), "{:#?}", r.plan);
+    assert!(plan_has(&r.plan(), "[4 searches"), "{:#?}", r.plan());
     // bound by a triple pattern, with constant predicates, limit and other outputs
     sparkles_core::sparql::update::update(
         &s,
@@ -1522,7 +1548,7 @@ fn query_strings_bound_by_the_group() {
     let (on, off) = (run(&s, q, &pushdown(true)), run(&s, q, &pushdown(false)));
     assert_eq!(texts(&on), texts(&off));
     assert_eq!(texts(&on).len(), 3, "{:?}", texts(&on));
-    assert!(plan_has(&on.plan, "1 restricted"), "{:#?}", on.plan);
+    assert!(plan_has(&on.plan(), "1 restricted"), "{:#?}", on.plan());
     // errors: unbound, too many values, other arguments variables
     let e = err(&s, "SELECT ?s { ?s text:query (rdfs:label ?q) }");
     assert!(e.contains("not bound by the rest of the group"), "{e}");

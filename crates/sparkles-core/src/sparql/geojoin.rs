@@ -1183,28 +1183,28 @@ mod tests {
         // the join packs its own trees
         let fast = run(&snap, JOIN, true);
         assert_eq!(rows(&fast), rows(&run(&snap, JOIN, false)));
-        assert_eq!(fast.table.len(), 200);
-        let j = find(&fast.plan, "SpatialJoin").expect("joined");
+        assert_eq!(fast.table().len(), 200);
+        let j = find(&fast.plan(), "SpatialJoin").expect("joined");
         assert!(j.description.ends_with("[tree join]"), "{}", j.description);
         // the nearest-neighbour order waits for the index
         let q = nearest("3.2 3.2", 4, "uom:metre");
         let r = run(&snap, &q, true);
-        assert!(find(&r.plan, "SpatialKnn").is_none());
+        assert!(find(&r.plan(), "SpatialKnn").is_none());
         assert!(
-            r.plan
+            r.plan()
                 .warnings
                 .iter()
                 .any(|w| w.code == "geo-not-knn" && w.message.contains("building")),
             "{:?}",
-            r.plan.warnings
+            r.plan().warnings
         );
         s.pause_geo_build(false);
         s.wait_geo();
         let snap = s.snapshot();
         let fast = run(&snap, &q, true);
-        assert!(find(&fast.plan, "SpatialKnn").is_some());
+        assert!(find(&fast.plan(), "SpatialKnn").is_some());
         assert_eq!(rows(&fast), rows(&run(&snap, &q, false)));
         assert_eq!(rows(&fast), rows(&r));
-        assert_eq!(run(&snap, JOIN, true).table.len(), 200);
+        assert_eq!(run(&snap, JOIN, true).table().len(), 200);
     }
 }
