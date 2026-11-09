@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from boat_fixtures import fixture,ExtendIO,environment_fact,WORKER_BOOT_ID
+import controls
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'boat'))
 import controller
 import job_environment as env
@@ -83,7 +84,8 @@ class EnvironmentAdmission(unittest.TestCase):
              patch.object(qwa,'current_boot_id',return_value=self.f['boot_id'],create=True),\
              patch.object(controller,'bounded',return_value={'exit':0,'body':expected})as wire:
             env.prepare(self.f['profile_path'],self.f['operation'],self.f['profile']['worker'],out)
-        self.assertLessEqual(wire.call_args.args[1],10)
+        # The test's own 'left' comes from the microsecond-rounded expires_at.
+        self.assertLessEqual(wire.call_args.args[1],10+1e-3)
         self.assertEqual(self.f['qualified_path'].read_bytes(),original)
         with patch.object(env,'context',side_effect=context),patch.object(env.time,'time',return_value=self.f['now']-7200),\
              patch.object(qwa,'boottime',return_value=self.f['boot_now']+left-20,create=True),\
@@ -301,6 +303,12 @@ class LifetimeExtension(unittest.TestCase):
             return self.qwa.operation_lifetime(self.op,self.f['qualified'])
 
     def receipts(self):return sorted(n for n in os.listdir(self.op) if n.startswith('lifetime-extension-0') and not n.endswith('-accepted.json'))
+
+    def test_a_withdrawn_handoff_is_never_extended(self):
+        w=self.op/'root-handoff-withdrawn.json';w.write_text('{}\n');w.chmod(0o600)
+        io=self.io(self.left-600)
+        with self.assertRaises(Exception) as caught:self.extend(io,3600,accept=False)
+        self.assertIn('no qualified Root handoff to extend',str(caught.exception));self.assertEqual(io.calls,[])
 
     def test_extension_is_a_receipted_act_with_a_new_bounded_end(self):
         io=self.io(self.left-600)
@@ -596,7 +604,11 @@ class LifetimeExtension(unittest.TestCase):
 
     def test_guard_honours_only_valid_receipts(self):
         io=self.io(0)
-        self.assertEqual(controller.guard_deadlines(io,self.intent),(self.intent['deadline_mono'],self.intent['deadline_wall']))
+        # The conservative base may end a clock tick before the intent, never after it.
+        boot,wall=controller.guard_deadlines(io,self.intent)
+        self.assertLessEqual((boot,wall),(self.intent['deadline_mono'],self.intent['deadline_wall']))
+        self.assertLessEqual(boot,self.intent['deadline_mono']);self.assertLessEqual(wall,self.intent['deadline_wall'])
+        self.assertAlmostEqual(boot,self.intent['deadline_mono'],delta=1e-3);self.assertAlmostEqual(wall,self.intent['deadline_wall'],delta=1e-3)
         receipt=self.extend(self.io(self.left-600),3600)
         self.assertEqual(controller.guard_deadlines(io,self.intent),(receipt['boot_end'],receipt['wall_end']))
         # The guard loop stops at the extended end, not the original one.
@@ -617,9 +629,12 @@ class LifetimeExtension(unittest.TestCase):
             self.assertTrue(controller.guard_loop(self.f['release'],io,self.intent))
         self.assertGreaterEqual(seen[0],receipt_two['boot_end'])
         (self.op/'lifetime-extension-0002.json').unlink()
-        # A malformed receipt falls back to the original deadline.
+        # A malformed receipt falls back to the original deadline, or the conservative
+        # base a clock tick before it.
         path=self.op/'lifetime-extension-0001.json';path.write_text(json.dumps(dict(receipt,version=2)));path.chmod(0o600)
-        self.assertEqual(controller.guard_deadlines(io,self.intent),(self.intent['deadline_mono'],self.intent['deadline_wall']))
+        boot,wall=controller.guard_deadlines(io,self.intent)
+        self.assertLessEqual(boot,self.intent['deadline_mono']);self.assertLessEqual(wall,self.intent['deadline_wall'])
+        self.assertAlmostEqual(boot,self.intent['deadline_mono'],delta=1e-3);self.assertAlmostEqual(wall,self.intent['deadline_wall'],delta=1e-3)
 
 
 class RemoteTransport(unittest.TestCase):
@@ -756,6 +771,266 @@ class JobClosureProgram(unittest.TestCase):
         lock.unlink();env.release_job_locks()
 
 
+class BoundedCommand(unittest.TestCase):
+    """The launcher's command reader with real local children."""
+    def test_output_over_the_cap_is_refused_before_the_child_finishes(self):
+        import common,subprocess,time
+        with tempfile.TemporaryDirectory() as d:
+            done=Path(d)/'finished'
+            script="import os,sys\nfor _ in range(256):os.write(2,b'x'*65536)\nopen(%r,'w').close()"%str(done)
+            started=time.monotonic()
+            with self.assertRaises(common.Refusal) as caught:common.bounded_command([sys.executable,'-I','-c',script],30,True)
+            self.assertEqual(str(caught.exception),'output bound');self.assertLess(time.monotonic()-started,15)
+            time.sleep(0.2);self.assertFalse(done.exists())
+            with self.assertRaises(common.Refusal):common.bounded_command([sys.executable,'-I','-c',"import os\nfor _ in range(32):os.write(1,b'y'*65536)"],30)
+    def test_a_selector_failure_kills_and_reaps_the_child(self):
+        import common,subprocess
+        children=[];actual=subprocess.Popen
+        def launch(*a,**k):
+            child=actual(*a,**k);children.append(child);return child
+        with patch.object(common.subprocess,'Popen',side_effect=launch),patch.object(common.selectors,'DefaultSelector',side_effect=OSError(12,'no memory')):
+            with self.assertRaises(OSError):common.bounded_command([sys.executable,'-I','-c','import time;time.sleep(30)'],30,True)
+        self.assertEqual(len(children),1);self.assertIsNotNone(children[0].returncode)
+        self.assertTrue(children[0].stdout.closed and children[0].stderr.closed)
+    def test_a_failure_while_listing_the_pipes_kills_and_reaps_the_child(self):
+        import common,subprocess
+        children=[];actual=subprocess.Popen
+        class Child:
+            # The first read of stdout fails, as an allocation failure during setup would.
+            def __init__(self,child):self.child=child;self.reads=0
+            def __getattr__(self,name):return getattr(self.child,name)
+            @property
+            def stdout(self):
+                self.reads+=1
+                if self.reads==1:raise MemoryError()
+                return self.child.stdout
+        def launch(*a,**k):
+            child=Child(actual(*a,**k));children.append(child);return child
+        with patch.object(common.subprocess,'Popen',side_effect=launch):
+            with self.assertRaises(MemoryError):common.bounded_command([sys.executable,'-I','-c','import time;time.sleep(30)'],30,True)
+        self.assertEqual(len(children),1);self.assertIsNotNone(children[0].child.returncode)
+        self.assertTrue(children[0].child.stdout.closed and children[0].child.stderr.closed)
+    def test_each_cleanup_step_runs_when_another_fails(self):
+        import common,subprocess,selectors
+        children=[];actual=subprocess.Popen;real_selector=selectors.DefaultSelector
+        class Pipe:
+            def __init__(self,pipe):self.pipe=pipe
+            def __getattr__(self,name):return getattr(self.pipe,name)
+            def close(self):self.pipe.close();raise OSError(5,'close failed')
+        class Selector:
+            def __init__(self):self.inner=real_selector()
+            def __getattr__(self,name):return getattr(self.inner,name)
+            def close(self):self.inner.close();raise OSError(5,'close failed')
+        def launch(*a,**k):
+            child=actual(*a,**k);child.stdout=Pipe(child.stdout);children.append(child);return child
+        with patch.object(common.subprocess,'Popen',side_effect=launch),patch.object(common.selectors,'DefaultSelector',Selector):
+            with self.assertRaises(OSError):common.bounded_command([sys.executable,'-I','-c','import time;time.sleep(30)'],1,True)
+        self.assertIsNotNone(children[0].returncode);self.assertTrue(children[0].stdout.pipe.closed and children[0].stderr.closed)
+    def test_timeout_kills_the_child_and_output_is_returned(self):
+        import common,subprocess,time
+        started=time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):common.bounded_command([sys.executable,'-I','-c','import time;time.sleep(30)'],1,True)
+        self.assertLess(time.monotonic()-started,12)
+        r=common.bounded_command([sys.executable,'-I','-c',"import sys;sys.stdout.write('out');sys.stderr.write('Memory peak: 2.2M (swap: 0B)');raise SystemExit(3)"],30,True)
+        self.assertEqual((r.returncode,r.stdout,r.stderr),(3,b'out',b'Memory peak: 2.2M (swap: 0B)'))
+        r=common.bounded_command([sys.executable,'-I','-c',"import sys;sys.stderr.write('ignored')"],30);self.assertIsNone(r.stderr)
+
+
+from boat_fixtures import TickIO,OP5_CLOCKS
+
+
+def handoff_release():
+    r=controls.fixture()
+    r.update(useful_job_ready=True,separate_Root_handoff={'job_release_sha256':'a'*64,'different_job_review_sha256':'b'*64,'Root_owns_job_and_deadline_closure':True,'finite_job_and_closure_seconds':600})
+    return r
+
+
+def guard_row(io):
+    loaded={'Id':io.r['guard_unit']+'.service','ActiveState':'active','MainPID':'123','InvocationID':'a'*32}
+    row={'pid':123,'uid':os.getuid(),'observed_wall':io.wall(),'observed_boottime':io.mono(),'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'loaded':loaded}
+    io.record('guard-admission.json',row);return row
+
+
+class AdmissionClocks(unittest.TestCase):
+    """Admission against the clock receipts op-5 wrote on bx_gy2ytgh8, and clocks that move."""
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.f=fixture(Path(self.tmp.name))
+        self.op5=json.loads((Path(__file__).parent/'fixtures/boat-admission-clocks-op5.json').read_text())
+
+    def inputs(self):
+        op=self.f['operation'];read=lambda n:json.loads((op/n).read_text())
+        intent=read('controller-intent.json');guard=read('guard-admission.json');handoff=read('root-handoff.json')
+        intent.update(self.op5['intent']);guard.update(self.op5['guard']);handoff['deadline_wall']=self.op5['handoff_deadline_wall']
+        return self.f['release'],intent,read('qualification.json'),read('startup-closed.json'),guard,handoff
+
+    def test_admission_accepts_the_op5_clock_receipts(self):
+        r,intent,q,startup,guard,handoff=self.inputs()
+        row=controller.make_admission(r,intent,q,startup,guard,handoff,guard['observed_wall']+1)
+        wall,_=controller.lifetime.original_ends(intent,guard,handoff)
+        self.assertGreater(wall,intent['wall']+10500);self.assertLessEqual(wall,intent['deadline_wall'])
+        self.assertTrue(row['expires_at'].startswith('2026-11-09T11:57:00'))
+        # A deadline later than the reading by more than the clock skew still refuses.
+        intent['deadline_wall']=intent['wall']+10501;handoff['deadline_wall']=intent['deadline_wall']
+        with self.assertRaises(ValueError):controller.make_admission(r,intent,q,startup,guard,handoff,guard['observed_wall']+1)
+
+    def test_the_controller_reads_each_clock_once_for_its_deadlines(self):
+        r=handoff_release();io=TickIO(r);io.guard_for_admission=lambda:guard_row(io)
+        self.assertEqual(controller.drive(r,io),'QUALIFIED_ROOT_HANDOFF_GUARD_ACTIVE')
+        intent=io.read('controller-intent.json')
+        self.assertEqual((intent['deadline_wall'],intent['deadline_mono']),(intent['wall']+10500,intent['mono']+10500))
+        admission=io.read('qualified-worker-admission.json');self.assertEqual(admission['worker'],controller.worker_id())
+
+    def test_a_failed_admission_after_the_handoff_stops_the_worker_normally(self):
+        r=handoff_release();io=controls.InertIO(r)
+        def broken():raise ValueError('earlier effective deadline')
+        io.guard_for_admission=broken
+        io.diagnose=lambda seconds:{'schema':1,'processes':{'count':0,'rows':[]},'state':{'entries':[],'phases':{}}}
+        with self.assertRaises(ValueError):controller.drive(r,io)
+        # The handoff is published only after its admission, so none stands.
+        self.assertFalse(io.exists('root-handoff.json'));self.assertFalse(io.exists('qualified-worker-admission.json'))
+        self.assertTrue(io.exists('root-handoff-withdrawn.json'));self.assertTrue(io.exists('stop-trigger.json'))
+        self.assertTrue(io.exists('diagnostics.json'))
+        # Without the withdrawal the guard would wait for a job closure that can never
+        # exist, record unresolved.json and leave the worker to the provider TTL.
+        self.assertTrue(controller.guard_loop(r,io,io.read('controller-intent.json')))
+        self.assertTrue(io.exists('closed.json'));self.assertFalse(io.exists('unresolved.json'))
+        self.assertEqual([x[0] for x in io.calls],['resume','stop'])
+
+    def failing_writes(self,io,names):
+        record=io.record
+        def write(name,value):
+            if name in names:raise OSError('injected write failure: '+name)
+            return record(name,value)
+        io.record=write
+
+    def stops_normally(self,r,io):
+        self.assertTrue(io.exists('stop-trigger.json'));self.assertFalse(controller.handoff_active(io))
+        self.assertTrue(controller.guard_loop(r,io,io.read('controller-intent.json')))
+        self.assertTrue(io.exists('closed.json'));self.assertFalse(io.exists('unresolved.json'))
+        self.assertEqual([x[0] for x in io.calls],['resume','stop'])
+
+    def test_a_failed_withdrawal_write_still_stops_the_worker(self):
+        r=handoff_release();io=controls.InertIO(r)
+        def broken():raise ValueError('earlier effective deadline')
+        io.guard_for_admission=broken;io.diagnose=lambda seconds:{'schema':1,'processes':{'count':0,'rows':[]},'state':{'entries':[],'phases':{}}}
+        self.failing_writes(io,{'root-handoff-withdrawn.json'})
+        with self.assertRaises(ValueError):controller.drive(r,io)
+        self.assertFalse(io.exists('root-handoff-withdrawn.json'))
+        self.stops_normally(r,io)
+
+    def test_a_failed_handoff_write_after_the_admission_still_stops_the_worker(self):
+        r=handoff_release();io=controls.InertIO(r);io.guard_for_admission=lambda:guard_row(io)
+        io.diagnose=lambda seconds:{'schema':1,'processes':{'count':0,'rows':[]},'state':{'entries':[],'phases':{}}}
+        self.failing_writes(io,{'root-handoff.json','root-handoff-withdrawn.json'})
+        with self.assertRaises(OSError):controller.drive(r,io)
+        self.assertTrue(io.exists('qualified-worker-admission.json'));self.assertFalse(io.exists('root-handoff.json'))
+        self.stops_normally(r,io)
+
+    def failing_after_publication(self,io,name):
+        """The receipt becomes visible and the write then raises, as a failed directory fsync would."""
+        record=io.record;self.under_lock=[]
+        def write(n,value):
+            self.under_lock.append((n,getattr(io,'jobs_locked',None)));record(n,value)
+            if n==name:raise OSError('injected failure after publication: '+n)
+        io.record=write
+
+    def published_io(self):
+        r=handoff_release();io=controls.InertIO(r);io.guard_for_admission=lambda:guard_row(io)
+        io.diagnose=lambda seconds:self.fail('a published handoff never holds')
+        return r,io
+
+    def test_a_handoff_failing_after_publication_is_withdrawn_under_the_job_lock(self):
+        r,io=self.published_io();self.failing_after_publication(io,'root-handoff.json')
+        with self.assertRaises(OSError):controller.drive(r,io)
+        # Publication and withdrawal both ran under the exclusive job lock, so no job
+        # command was admitted between them and the stop needs no job closure.
+        locked=dict(self.under_lock)
+        for name in ('qualified-worker-admission.json','root-handoff.json','root-handoff-withdrawn.json'):self.assertIs(locked[name],True,name)
+        self.assertFalse(io.jobs_locked)
+        self.stops_normally(r,io)
+
+    def test_a_failed_withdrawal_after_publication_unpublishes_the_handoff(self):
+        r,io=self.published_io();self.failing_after_publication(io,'root-handoff.json')
+        record=io.record
+        def write(n,value):
+            if n=='root-handoff-withdrawn.json':raise OSError('injected withdrawal failure')
+            return record(n,value)
+        io.record=write
+        with self.assertRaises(OSError):controller.drive(r,io)
+        self.assertFalse(io.exists('root-handoff.json'));self.assertTrue(io.exists('unpublished-root-handoff.json'))
+        self.stops_normally(r,io)
+
+    def test_an_unrevocable_published_handoff_keeps_its_closure_requirement(self):
+        r,io=self.published_io();self.failing_after_publication(io,'root-handoff.json')
+        record=io.record;attempts=[]
+        def write(n,value):
+            if n=='root-handoff-withdrawn.json':attempts.append(io.jobs_locked);raise OSError('injected withdrawal failure')
+            return record(n,value)
+        io.record=write
+        def unpublish(name):attempts.append(io.jobs_locked);raise OSError('injected rename failure')
+        io.unpublish=unpublish
+        with self.assertRaises(OSError):controller.drive(r,io)
+        # Revocation is tried only under the job lock. Once the lock is released with
+        # the handoff standing, a job may have been admitted, so nothing withdraws it
+        # later and the stop keeps requiring the job closure.
+        self.assertEqual(attempts,[True,True]);self.assertTrue(controller.handoff_active(io))
+        self.assertFalse(io.exists('stop-trigger.json'))
+        io.trigger();self.assertFalse(controller.reconcile_stop(r,io));self.assertEqual([x[0] for x in io.calls],['resume'])
+
+    def test_a_held_job_lock_publishes_no_handoff(self):
+        r,io=self.published_io();io.diagnose=lambda seconds:{'schema':1,'processes':{'count':0,'rows':[]},'state':{'entries':[],'phases':{}}}
+        io.live_jobs=True
+        with self.assertRaises(Exception):controller.drive(r,io)
+        self.assertFalse(io.exists('qualified-worker-admission.json'));self.assertFalse(io.exists('root-handoff.json'))
+        self.stops_normally(r,io)
+
+    def test_an_admission_without_its_handoff_admits_nothing(self):
+        op=self.f['operation'];(op/'root-handoff.json').unlink()
+        with self.assertRaises(FileNotFoundError):controller.lifetime.export_operation(op,self.f['now'],self.f['profile']['worker'],self.f['profile'])
+        self.assertFalse(controller.handoff_active(controls.DiskIO(self.f['release'],op)))
+
+    def test_a_withdrawn_handoff_admits_nothing(self):
+        op=self.f['operation'];(op/'root-handoff-withdrawn.json').write_text('{}\n');(op/'root-handoff-withdrawn.json').chmod(0o600)
+        with self.assertRaises(ValueError) as caught:controller.lifetime.export_operation(op,self.f['now'],self.f['profile']['worker'],self.f['profile'])
+        self.assertEqual(str(caught.exception),'Root handoff withdrawn')
+        # A withdrawal cancels the handoff even after its admission receipt, since
+        # the controller writes one only when it did not return a standing handoff.
+        io=controls.DiskIO(self.f['release'],op);self.assertFalse(controller.handoff_active(io))
+
+
+class Op4PhaseReplay(unittest.TestCase):
+    """Each phase's own checks against what the worker reported in op-3 and op-4."""
+    def setUp(self):
+        import controls
+        self.O=controls.OBSERVER;self.O['bind_profile'](controls.synthetic_profile())
+        self.e=json.loads((Path(__file__).parent/'fixtures/boat-phase-evidence-op4.json').read_text())
+
+    def runtime(self,props,seconds):
+        cg='0::'+props['ControlGroup'];self.O['validate_runtime'](props['ControlGroup'].rsplit('/',1)[-1],int(props['MainPID']),cg,props['MemoryMax'],props['MemorySwapMax'],props,seconds)
+
+    def test_systemd_255_unit_properties_pass_every_phase_runtime_check(self):
+        self.runtime(self.e['startup']['loaded_properties'],32*60+56);self.runtime(self.e['stopcheck']['loaded_properties'],20)
+        # The metadata unit's 240 seconds, as systemd 255 formats them.
+        metadata=dict(self.e['stopcheck']['loaded_properties'],RuntimeMaxUSec='4min',ControlGroup=self.e['stopcheck']['loaded_properties']['ControlGroup'].replace('stopcheck','metadata'))
+        self.runtime(metadata,240)
+        with self.assertRaises(Exception):self.runtime(dict(metadata,RuntimeMaxUSec='4min 1s'),240)
+
+    def test_op4_startup_and_stopcheck_ends_are_healthy(self):
+        import common
+        for phase in ('startup','stopcheck'):
+            x=self.e[phase];result={'unit':x['unit'],'phase_memory':x['phase_memory']}
+            ok,code,evidence=common.terminal_health(result,x['terminal_properties'],True,0)
+            self.assertTrue(ok,(phase,code));self.assertEqual(evidence,x['terminal_evidence'])
+            self.O['validate_pressure'](x['memory_events'],'0')
+
+    def test_the_op3_tree_has_no_startup_or_job_work(self):
+        d=json.loads((Path(__file__).parent/'fixtures/boat-session-tree-op3.json').read_text())
+        rows={r['pid']:dict(r,group=r['pid']) for r in d['rows']};me=d['own_session'][-1]
+        manager=[(r['pid'],r['start']) for r in rows.values() if r['comm']=='systemd' and r['uid']==1000 and r['ppid']==1]
+        self.assertEqual(len(manager),1)
+        self.assertEqual(self.O['foreign_startup'](rows,{'pid':me,'start':rows[me]['start']},me,set(),manager[0]),[])
+
+
 class ProviderSessionTrees(unittest.TestCase):
     """The session allowance against the trees observed on bx_gy2ytgh8."""
     def setUp(self):
@@ -854,6 +1129,10 @@ class ClosureWatch(unittest.TestCase):
         return controller.closure_watch(self.f['release'],io,lead,local_units,observe=lambda r,x:self.observed.append(x.exists('stop-trigger.json')))
 
     def read(self,name):return json.loads((self.op/name).read_text())
+    def test_a_withdrawn_handoff_is_never_watched(self):
+        w=self.op/'root-handoff-withdrawn.json';w.write_text('{}\n');w.chmod(0o600)
+        with self.assertRaises(Exception) as caught:self.watch(ExtendIO(self.f))
+        self.assertIn('no qualified Root handoff to watch',str(caught.exception))
     def left(self,w,t,end=None):
         wall_end,boot_end,_=end or self.end;return min(wall_end-w,boot_end-t)
 
@@ -995,6 +1274,8 @@ class ClosureWatch(unittest.TestCase):
         self.assertEqual(self.watch(io),'GUARD_UNRESOLVED')
         self.setUp();io=WatchIO(self.f);io.trigger()
         self.assertEqual(self.watch(io),'UNRESOLVED_JOB_OPEN');self.assertEqual(self.read('closure-watch-unresolved.json')['reason_code'],'stop_triggered_without_job_closure')
+        # The closure phase keeps its refusal through the shared record.
+        q=self.read('closure-refused.json');self.assertEqual((q['phase'],q['reason_code']),('closure','closure_watch:stop_triggered_without_job_closure'))
         # A stop trigger that appears while the lock is awaited prevents publication.
         self.setUp();io=WatchIO(self.f);io.on_freeze=io.trigger
         self.assertEqual(self.watch(io),'UNRESOLVED_JOB_OPEN');self.assertFalse(io.exists('root-job-closed.json'))
@@ -1179,3 +1460,87 @@ class BoundedFinalizerInterrupt(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+
+
+def op5_fixture(root):
+    import boat_fixtures
+    return boat_fixtures.fixture(root,OP5_CLOCKS)
+
+
+class Op5Clocks:
+    """Run a test class again on an operation driven with moving clocks at op-5's times."""
+    def run(self,result=None):
+        with patch.object(sys.modules[__name__],'fixture',op5_fixture):return super().run(result)
+
+
+class Op5EnvironmentAdmission(Op5Clocks,EnvironmentAdmission):pass
+class Op5LifetimeExtension(Op5Clocks,LifetimeExtension):pass
+class Op5RemoteTransport(Op5Clocks,RemoteTransport):pass
+class Op5JobClosureProgram(Op5Clocks,JobClosureProgram):pass
+class Op5ClosureWatch(Op5Clocks,ClosureWatch):pass
+class Op5Finish(Op5Clocks,Finish):pass
+
+
+class SourceDriftRecord(unittest.TestCase):
+    """A metadata source drift names each recorded field next to the observed one."""
+    RECORDED={'head':'8'*40,'status_sha256':'e'*64,'tracked_diff_sha256':'e'*64,'inputs':{'mise.toml':'c'*64,'rust-toolchain.toml':'f'*64}}
+    def setUp(self):
+        self.O=controls.OBSERVER;self.O['bind_profile'](controls.synthetic_profile())
+
+    def observed(self,**change):
+        row=json.loads(json.dumps(self.RECORDED));row.update(change);return row
+
+    def test_a_drift_names_exactly_the_differing_fields(self):
+        error=self.O['SourceDrift']('existing source drift','/home/worker-fixture/sparkles',self.RECORDED,self.observed(status_sha256='1'*64,tracked_diff_sha256='2'*64))
+        d=error.source_drift;self.assertEqual(str(error),'existing source drift')
+        self.assertEqual(sorted(k for k,v in d['fields'].items() if v['differs']),['status_sha256','tracked_diff_sha256'])
+        self.assertEqual(d['fields']['status_sha256'],{'recorded':'e'*64,'observed':'1'*64,'differs':True})
+        self.assertEqual(d['fields']['head'],{'recorded':'8'*40,'observed':'8'*40,'differs':False})
+        self.assertFalse(d['other_fields_differ'])
+        # A row with a field outside the identity is flagged without its content.
+        extra=self.O['SourceDrift']('existing source drift','/home/worker-fixture/sparkles',self.RECORDED,dict(self.RECORDED,note='DO_NOT_COPY')).source_drift
+        self.assertTrue(extra['other_fields_differ']);self.assertNotIn('DO_NOT_COPY',json.dumps(extra))
+
+    def test_the_phase_result_keeps_the_drift(self):
+        def qualify(payload):raise self.O['SourceDrift']('existing source drift','/home/worker-fixture/sparkles',self.RECORDED,self.observed(head='9'*40))
+        result,closed=self.O['run_phase']({'phase':'metadata'},None,qualify)
+        self.assertFalse(closed);self.assertEqual(result['reason_code'],'refusal:existing source drift')
+        self.assertTrue(result['source_drift']['fields']['head']['differs'])
+
+    def test_the_metadata_refusal_records_the_drift_bounded(self):
+        r=controls.fixture();io=controls.InertIO(r);controller.bind_release_profile(r)
+        drift=self.O['SourceDrift']('existing source drift','/home/worker-fixture/sparkles',self.RECORDED,self.observed(head='9'*40)).source_drift
+        drift['fields']['head']['observed']='$(rm -rf /)';drift['secret']='DO_NOT_COPY';drift['repository']='DO NOT COPY; $(x)'
+        controller.record_refusal(io,'metadata',controller.Refusal('metadata refused: probe_not_qualified'),{'qualified':False,'reason_code':'refusal:existing source drift','source_drift':drift},failed=['probe_not_qualified'])
+        row=io.read('metadata-refused.json');self.assertNotIn('DO_NOT_COPY',json.dumps(row))
+        self.assertEqual(row['source_drift']['fields']['head'],{'recorded':'8'*40,'observed':None,'differs':True})
+        self.assertIsNone(row['source_drift']['repository']);self.assertEqual(set(row['source_drift']),{'repository','fields','other_fields_differ'})
+
+    def git(self,repo,*args):
+        import subprocess as sp;return sp.run(['git','-C',str(repo),*args],check=True,capture_output=True,timeout=30).stdout
+
+    def repository(self):
+        tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup);repo=Path(tmp.name)/'repo';repo.mkdir()
+        self.git(repo,'init','-q');(repo/'run.sh').write_text('true\n');(repo/'run.sh').chmod(0o755);(repo/'a.txt').write_text('a\n')
+        self.git(repo,'add','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','-c','commit.gpgsign=false','commit','-qm','x')
+        return repo
+
+    def test_new_inodes_and_mtimes_leave_the_content_identity_unchanged(self):
+        # Every resume so far gave the home filesystem a new device and new inodes. A
+        # copy with new inodes and mtimes leaves the checkout's content identity clean.
+        import shutil as sh;repo=self.repository();copy=repo.parent/'copy';sh.copytree(repo,copy,copy_function=sh.copy)
+        for path in copy.rglob('*'):
+            if '.git' not in path.parts and path.is_file():os.utime(path,(1577836800,1577836800))
+        self.assertNotEqual(os.stat(repo/'a.txt').st_ino,os.stat(copy/'a.txt').st_ino)
+        self.assertEqual(self.git(copy,'status','--porcelain=v1','-z'),b'')
+        self.assertEqual(self.git(repo,'status','--porcelain=v1','-z'),self.git(copy,'status','--porcelain=v1','-z'))
+        self.assertEqual(self.git(repo,'diff','HEAD','--binary'),self.git(copy,'diff','HEAD','--binary'))
+
+
+class SourceDriftBounds(SourceDriftRecord):
+    """The drift summary keeps its reason code, its time and output bounds, and git's formats."""
+    def test_both_drift_reason_codes_survive_into_the_receipt(self):
+        for reason in ('existing source drift','existing source changed during qualification'):
+            r=controls.fixture();io=controls.InertIO(r);controller.bind_release_profile(r)
+            controller.record_refusal(io,'metadata',controller.Refusal('metadata refused: probe_not_qualified'),{'qualified':False,'reason_code':'refusal:'+reason},failed=['probe_not_qualified'])
+            self.assertEqual(io.read('metadata-refused.json')['remote_reason_code'],'refusal:'+reason)

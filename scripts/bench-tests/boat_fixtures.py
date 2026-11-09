@@ -14,7 +14,24 @@ def write(path, value):
     path.write_text(json.dumps(value,indent=2)+'\n');path.chmod(0o600)
 
 
-def fixture(root):
+class TickIO(controls.InertIO):
+    """An inert operation whose clocks advance a microsecond on every reading, as real clocks do."""
+    def __init__(self,r,wall=None,boot=None):
+        super().__init__(r);self.ticks=0
+        if wall is not None:self.w=wall
+        if boot is not None:self.t=boot
+    def wall(self):self.ticks+=1;return self.w+self.ticks*1e-6
+    def mono(self):self.ticks+=1;return self.t+self.ticks*1e-6
+
+
+# The boot clock reading that op-5 started from on bx_gy2ytgh8's controller, and its
+# wall reading's fraction on the synthetic facts' epoch. Both epochs lie in the same
+# binary exponent range, so the floating-point spacing of every sum is the same.
+OP5_CLOCKS={'wall':1800000000.6173093,'boot':152177.296110792}
+
+
+def fixture(root,clocks=None):
+    """A qualified operation on disk, driven with fixed clocks or, given ``clocks``, moving ones."""
     release=controls.fixture();profile=controls.profile()
     profile['worker_uid']=os.getuid()
     raw=json.dumps(profile,sort_keys=True)
@@ -28,7 +45,7 @@ def fixture(root):
     release['boat'].update(path=str(cli),uid=os.getuid(),bytes=cli.stat().st_size,mode=0o755,
                            sha256=hashlib.sha256(cli.read_bytes()).hexdigest())
     release['controller_packet_manifest_sha256']=hashlib.sha256(controller.ROOT.joinpath('runtime-sources.json').read_bytes()).hexdigest()
-    io=controls.InertIO(release)
+    io=controls.InertIO(release) if clocks is None else TickIO(release,clocks['wall'],clocks['boot'])
     def guard():
         loaded={'Id':release['guard_unit']+'.service','ActiveState':'active','MainPID':'123','InvocationID':'a'*32}
         row={'pid':123,'uid':os.getuid(),'observed_wall':io.wall(),'observed_boottime':io.mono(),

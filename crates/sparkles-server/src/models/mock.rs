@@ -187,9 +187,14 @@ fn serve(mut c: impl Read + Write, log: &Mutex<Vec<Received>>, handler: &Handler
         l.len() - 1
     };
     let (status, out) = handler(&rec, n);
+    // a redirect's answer names its target as `{"location": …}`
+    let location = match (status, out["location"].as_str()) {
+        (300..=399, Some(l)) => format!("Location: {l}\r\n"),
+        _ => String::new(),
+    };
     let out = out.to_string();
     let resp = format!(
-        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 0\r\n{location}Connection: close\r\n\r\n",
         out.len()
     );
     let _ = c.write_all(resp.as_bytes());

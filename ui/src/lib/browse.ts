@@ -1667,6 +1667,41 @@ export function namesQuery(
   return `SELECT ?s ?d WHERE { VALUES ?s { ${values} } ${where} FILTER(isLiteral(?d)) }`;
 }
 
+/**
+ * The SPARQL of the names of a change set's subjects, as `changeIris` lists them. A subject is
+ * named by `rdfs:label` or `skos:prefLabel`, and by `sh:name` only when it has neither, so a
+ * SHACL shape without a label reads as its name. Without `graph` the names come from the
+ * default graph and every named graph the caller may read. `?k` carries the precedence, 0 for a label
+ * and 1 for `sh:name`, and `parseChangeNames` reads the rows. The other users of `namesQuery`
+ * read labels alone.
+ */
+export function changeNamesQuery(iris: readonly string[], graph: string | null) {
+  const values = iris.filter(queryableIri).map(sparqlIri).join(' ');
+  const labels = [RDFS + 'label', SKOS + 'prefLabel'].map((p) => `<${p}>`).join('|');
+  const body = `{ ?s ${labels} ?d BIND(0 AS ?k) } UNION { ?s <${WELL_KNOWN.sh}name> ?d BIND(1 AS ?k) }`;
+  // a change set may span graphs, and shapes usually sit in a named graph of their own, so
+  // without a graph the names are read from the default graph and every named graph
+  const where = graph == null ? `{ ${body} } UNION { GRAPH ?g { ${body} } }` : inGraph(graph, body);
+  return `SELECT ?s ?d ?k WHERE { VALUES ?s { ${values} } ${where} FILTER(isLiteral(?d)) }`;
+}
+
+/**
+ * The name of each subject in `changeNamesQuery`'s rows: a label before `sh:name` whatever
+ * their languages, then the caller's languages.
+ */
+export function parseChangeNames(rows: Row[], langs: readonly string[]): Map<string, string> {
+  const best = new Map<string, { text: string; k: number; rank: number }>();
+  for (const r of rows) {
+    if (!r.s || !r.d) continue;
+    const k = Number(r.k?.value ?? 0);
+    const rank = langRank(r.d['xml:lang'] ?? null, langs);
+    const was = best.get(r.s.value);
+    if (!was || k < was.k || (k === was.k && rank < was.rank))
+      best.set(r.s.value, { text: r.d.value, k, rank });
+  }
+  return new Map([...best].map(([s, v]) => [s, v.text]));
+}
+
 /** The best definition of each subject in `definitionsQuery`'s rows, in the caller's languages. */
 export function parseDefinitions(rows: Row[], langs: readonly string[]): Map<string, string> {
   const best = new Map<string, { text: string; rank: number }>();

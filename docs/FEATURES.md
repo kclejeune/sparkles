@@ -160,6 +160,11 @@ connected graph inspection and editing. The
 [ontology editor](visualization/README.md#ontology-editor) edits OWL classes, properties,
 individuals and annotations as previewed commits beside asserted trees, kept inferred
 class groups and strict materialization-backed property and individual views, and its DL Query tab answers Manchester class expressions with the reasoning used.
+Its entity frame lists the commits that changed an entity and holds
+[discussion threads](visualization/README.md#ontology-editor) on the entity and its
+axioms, with mentions, replies, resolve and reopen, which the editor's Discussions tab
+lists for the ontology. Threads are Web Annotation RDF in a named graph on the branch,
+so each comment is a commit.
 The [thesaurus editor](visualization/README.md#thesaurus-editor) edits SKOS concept
 schemes, concepts, collections and SKOS-XL labels in a concept tree, and checks them
 against the integrity conditions of the SKOS Reference. The
@@ -196,6 +201,8 @@ datasets and saved queries alone.
 ![The SHACL shape editor with the shape tree and the form of a property shape with a sequence path](images/shape-editor.png)
 
 ![The ontology editor's History view of Professor on a branch, with three commits and the opened one showing the annotation it added, its full diff link and its revert](images/entity-history.png)
+
+![The ontology editor's Discussion view of Professor with an open thread that mentions a colleague and has a reply, a thread on one of its axioms, and the composer](images/ontology-discussions.png)
 
 [Editing forms](visualization/README.md#nested-form-read-models) generated from SHACL
 shapes edit a resource with its nested blank-node children, ordered lists and value
@@ -305,7 +312,7 @@ answers and instruction counts, and the limits of attributing them to layout.
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Shared evidence and review records](ai/README.md#evidence-profile) | Partially complete. | Authenticated evidence proposals, reference resolution, review decisions with accepted projections, withdrawals, reviewed, reversible identity resolution maps, assessment inputs and the dependents of changed records are available through Rust, HTTP and caller-scoped MCP tools with protected records and retained source holds. Recall and Ask citations, ingestion into proposals, reports and maintained analyses are planned under items 650 to 652 and 340. |
+| [Shared evidence and review records](ai/README.md#evidence-profile) | Partially complete. | Authenticated evidence proposals, reference resolution, review decisions with accepted projections, withdrawals, reviewed, reversible identity resolution maps, assessment inputs and the dependents of changed records are available through Rust, HTTP and caller-scoped MCP tools with protected records and retained source holds. `recall` and Ask cite claim occurrences with their review state under a named policy. Ingestion into proposals, reports and maintained analyses are planned under items 651, 652 and 340. |
 | [Shared entity representation](ai/README.md#shared-entity-representation) | Partially complete. | Versioned resources, fixed fixtures and a bounded private offline resolver are available. Authenticated managed integration remains under item 396. |
 | [Durable jobs and delivery](specs/C26-durable-jobs-and-delivery.md) | Planned. | Item 339 specifies checkpointed jobs, fenced workers and a transactional outbox. Current tasks and notifications do not provide that recovery contract. |
 | [Maintained analysis results](specs/F22-analysis-lifecycle.md) | Planned. | Item 340 specifies reproducible runs, dependency checks, freshness and guarded publication. |

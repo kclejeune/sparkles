@@ -1,0 +1,97 @@
+{
+ "source": "bx_gy2ytgh8 op-4 startup-closed.json and stop-startup-closed.json",
+ "startup": {
+  "loaded_properties": {
+   "ControlGroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/boat-owned-warm-qual-762-4-startup.service",
+   "InvocationID": "745019632fab429682c364efca1f133c",
+   "KillMode": "control-group",
+   "MainPID": "8839",
+   "MemoryMax": "536870912",
+   "MemorySwapMax": "0",
+   "OOMPolicy": "continue",
+   "RuntimeMaxUSec": "32min 56s",
+   "TimeoutStopUSec": "10s"
+  },
+  "memory_events": {
+   "high": "0",
+   "low": "0",
+   "max": "0",
+   "oom": "0",
+   "oom_group_kill": "0",
+   "oom_kill": "0"
+  },
+  "phase_closed": true,
+  "phase_memory": {
+   "cgroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/boat-owned-warm-qual-762-4-startup.service",
+   "memory_peak": 14503936,
+   "source": "cgroup",
+   "swap_peak": 0
+  },
+  "startup_closed": true,
+  "terminal_evidence": {
+   "memory_peak": 14503936,
+   "source": "cgroup",
+   "swap_peak": 0,
+   "terminal_source": "systemd_run_exit"
+  },
+  "terminal_properties": {
+   "ActiveState": "inactive",
+   "ControlGroup": "",
+   "ExecMainStatus": "0",
+   "InvocationID": "",
+   "LoadState": "not-found",
+   "MainPID": "0",
+   "MemoryPeak": "[not set]",
+   "MemorySwapPeak": "[not set]",
+   "Result": "success"
+  },
+  "unit": "boat-owned-warm-qual-762-4-startup.service"
+ },
+ "stopcheck": {
+  "loaded_properties": {
+   "ControlGroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/boat-owned-warm-qual-762-4-stopcheck.service",
+   "InvocationID": "91817f70cf1d4525b8d96cf507c91626",
+   "KillMode": "control-group",
+   "MainPID": "11334",
+   "MemoryMax": "536870912",
+   "MemorySwapMax": "0",
+   "OOMPolicy": "continue",
+   "RuntimeMaxUSec": "20s",
+   "TimeoutStopUSec": "10s"
+  },
+  "memory_events": {
+   "high": "0",
+   "low": "0",
+   "max": "0",
+   "oom": "0",
+   "oom_group_kill": "0",
+   "oom_kill": "0"
+  },
+  "phase_closed": true,
+  "phase_memory": {
+   "cgroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/boat-owned-warm-qual-762-4-stopcheck.service",
+   "memory_peak": 14618624,
+   "source": "cgroup",
+   "swap_peak": 0
+  },
+  "startup_closed": true,
+  "terminal_evidence": {
+   "memory_peak": 14618624,
+   "source": "cgroup",
+   "swap_peak": 0,
+   "terminal_source": "systemd_run_exit"
+  },
+  "terminal_properties": {
+   "ActiveState": "inactive",
+   "ControlGroup": "",
+   "ExecMainStatus": "0",
+   "InvocationID": "",
+   "LoadState": "not-found",
+   "MainPID": "0",
+   "MemoryPeak": "[not set]",
+   "MemorySwapPeak": "[not set]",
+   "Result": "success"
+  },
+  "unit": "boat-owned-warm-qual-762-4-stopcheck.service"
+ }
+}

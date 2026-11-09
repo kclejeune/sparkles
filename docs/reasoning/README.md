@@ -731,11 +731,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   the bindings always take the Horn axioms. Roadmap item 694.
 * Axioms outside OWL 2 EL that need nominals, and axioms that need case analysis or
   counting in an ontology with individuals or data properties, are left out, and an
-  external DL reasoner bridge is planned. Roadmap item 603.
+  external DL reasoner bridge is planned. Roadmap item 603. The disjunctive rules need a
+  datatype checker with data cardinalities before they take data properties, and 10 of
+  the 97 disjunctive development files of the ORE 2015 DL sample wait on it. Roadmap item
+  768.
 * Counting is off by default. With it on, it passes its bound of derived conclusions on
   the five counting files of the ORE 2015 DL development set that the disjunctive rules
   take, so those files get the answer without counting. ore_ont_6485 spends 205 ms on the
-  attempt against 7 ms for the run without it, and Konclude takes 8 ms. Roadmap items
+  attempt against 7 ms for the run without it, and Konclude takes 18 ms on four threads. Roadmap items
   728 and 729.
 * BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies in 23 ms on four threads,
   the time Konclude takes, which is short of the classifier's aim of three times

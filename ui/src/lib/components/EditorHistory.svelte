@@ -4,7 +4,7 @@
   // set, with a link to the commit's full diff.
   import { resolve } from '$app/paths';
   import * as api from '$lib/api';
-  import { namesQuery, parseDefinitions } from '$lib/browse';
+  import { changeNamesQuery, parseChangeNames } from '$lib/browse';
   import { changeIris } from '$lib/changeset';
   import { commitKindLabel, fmtCommitTime, fmtDelta } from '$lib/commits';
   import { diffGraphHref } from '$lib/diff-graph';
@@ -112,8 +112,8 @@
     if (!todo.length) return;
     for (const i of todo) asked.add(i);
     try {
-      const rows = await api.select(target, namesQuery(todo, graph));
-      names = new Map([...names, ...parseDefinitions(rows as never, langs)]);
+      const rows = await api.select(target, changeNamesQuery(todo, graph));
+      names = new Map([...names, ...parseChangeNames(rows as never, langs)]);
     } catch {
       // the changes keep their short forms
     }

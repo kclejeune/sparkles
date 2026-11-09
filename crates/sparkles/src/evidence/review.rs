@@ -41,6 +41,8 @@ use uuid::Uuid;
 
 pub use sparkles_core::evidence::review::{POLICY_PREFIX, policy_iri};
 
+#[path = "claims.rs"]
+pub mod claims;
 #[path = "dependents.rs"]
 pub mod dependents;
 #[path = "identity.rs"]
@@ -563,6 +565,32 @@ impl PolicyGraphs {
             let n = NamedNode::new(iri).map_err(|e| Error::invalid(format!("graph: {e}")))?;
             let nonce = cap.protection(iri);
             Ok((n, nonce))
+        };
+        Ok(PolicyGraphs {
+            name: name.to_string(),
+            policy_iri: rv::policy_iri(name),
+            mode: policy.conflicts,
+            decisions: g(&policy.decisions)?,
+            supports: g(&policy.supports)?,
+            output: g(&policy.output)?,
+            boundary: policy
+                .boundary
+                .iter()
+                .map(|b| g(b))
+                .collect::<Result<_>>()?,
+        })
+    }
+
+    /// The graphs of `policy` with the nonces `nonce` gives, as an evidence view's
+    /// configuration records them.
+    fn with_nonces(
+        name: &str,
+        policy: &Policy,
+        nonce: &dyn Fn(&str) -> Option<Uuid>,
+    ) -> Result<Self> {
+        let g = |iri: &str| -> Result<G> {
+            let n = NamedNode::new(iri).map_err(|e| Error::invalid(format!("graph: {e}")))?;
+            Ok((n, nonce(iri)))
         };
         Ok(PolicyGraphs {
             name: name.to_string(),

@@ -19,6 +19,7 @@ import {
   logicalDefinitionOf,
   mentionGroups,
   mergePieces,
+  changeNamesQuery,
   namesQuery,
   neighbourhood,
   hierarchyOf,
@@ -34,6 +35,7 @@ import {
   xrefsByDatabase,
   oboIri,
   parseCounts,
+  parseChangeNames,
   parseDefinitions,
   parseHead,
   parseReuse,
@@ -1415,4 +1417,39 @@ describe('the time to check a long value from the data', () => {
     },
     120_000,
   );
+});
+
+describe('change-set names', () => {
+  const lit = (value: string, lang?: string) => ({
+    type: 'literal' as const,
+    value,
+    ...(lang ? { 'xml:lang': lang } : {}),
+  });
+  const row = (s: string, d: ReturnType<typeof lit>, k: number) => ({
+    s: { type: 'uri' as const, value: s },
+    d,
+    k: { type: 'literal' as const, value: String(k) },
+  });
+  it('asks for labels and sh:name with their precedence, in one graph or anywhere', () => {
+    const q = changeNamesQuery([EX + 'a'], 'urn:g');
+    expect(q).toContain('GRAPH <urn:g>');
+    expect(q).toContain('<http://www.w3.org/ns/shacl#name>');
+    expect(q).toMatch(/BIND\(0 AS \?k\)[\s\S]*BIND\(1 AS \?k\)/);
+    expect(changeNamesQuery([EX + 'a'], null)).toContain('GRAPH ?g');
+    // the plain names query keeps reading labels only
+    expect(namesQuery([EX + 'a'], null)).not.toContain('shacl#name');
+  });
+  it('names a subject by sh:name only when it has neither label', () => {
+    const rows = [
+      row(EX + 'shape', lit('Person shape'), 1),
+      row(EX + 'both', lit('Name shape', 'en'), 1),
+      row(EX + 'both', lit('Name', 'de'), 0),
+      row(EX + 'label', lit('Label'), 0),
+    ];
+    const names = parseChangeNames(rows as never, ['en']);
+    expect(names.get(EX + 'shape')).toBe('Person shape');
+    // a label in a less preferred language still wins over sh:name in the preferred one
+    expect(names.get(EX + 'both')).toBe('Name');
+    expect(names.get(EX + 'label')).toBe('Label');
+  });
 });

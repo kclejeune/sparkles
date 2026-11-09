@@ -16,6 +16,8 @@ mod ingest;
 #[cfg(all(feature = "auth", feature = "shacl"))]
 mod memory_acceptance;
 mod memory_writes;
+#[cfg(feature = "auth")]
+mod recall_claims;
 
 const FIXTURE: &str = r#"@prefix ex:   <http://ex.org/> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .

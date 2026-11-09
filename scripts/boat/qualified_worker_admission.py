@@ -22,6 +22,11 @@ CLOSURE_RESERVE=30
 def boottime():return time.clock_gettime(time.CLOCK_BOOTTIME)
 def current_boot_id():return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
 
+INTENT_SKEW=0.001
+# The controller withdraws a handoff whose admission failed before any admission
+# existed. A withdrawn handoff admits nothing and needs no job closure to stop.
+HANDOFF_WITHDRAWN='root-handoff-withdrawn.json'
+
 def original_ends(intent,guard,handoff):
     """Return the original (wall, BOOTTIME) end pair from the protected receipts.
 
@@ -172,7 +177,12 @@ def make_admission(release,intent,qualification,startup,guard,handoff,now,horizo
     require(re.fullmatch('[0-9a-f]{32}',loaded.get('InvocationID',''))is not None and re.fullmatch('[0-9a-f-]{36}',guard.get('boot_id',''))is not None,'local guard invocation/boot identity')
     require(type(guard.get('uid'))is int and guard['uid']>=0,'safe local owner')
     # expires_at stays the original end. A receipted extension moves only the horizon.
-    expires,_=original_ends(intent,guard,handoff);require(now<(expires if horizon is None else horizon) and expires<=intent['wall']+10500,'earlier effective deadline')
+    # The end is never later than the intent's own wall deadline, and that deadline is
+    # 10,500 seconds after the intent's wall reading. INTENT_SKEW admits the
+    # microseconds between the two readings in receipts written before both came
+    # from one clock reading.
+    expires,_=original_ends(intent,guard,handoff)
+    require(now<(expires if horizon is None else horizon) and expires<=intent['deadline_wall'] and intent['deadline_wall']<=intent['wall']+10500+INTENT_SKEW,'earlier effective deadline')
     manifest=qualification.get('actual_toolchain_manifest',{});require(manifest.get('path')==home+'/.local/state/sparkles-boat/toolchain.json' and manifest.get('sha256')==p['saved_toolchain_manifest_sha256'],'actual manifest pin')
     lock=qualification.get('bootstrap_lock',{});require(lock.get('path')==home+'/.local/state/sparkles-boat/bootstrap.lock' and lock.get('held_during_checkpoint')is True,'actual bootstrap checkpoint')
     require(qualification.get('runtime_env_file')is None,'no runtime env file created/adopted by this exporter')
@@ -198,6 +208,7 @@ def owned_json(path):
     finally:os.close(fd)
 def export_operation(operation,now,owned_worker,expected_profile):
     root=Path(operation).absolute();require(root.resolve()==root,'canonical operation')
+    require(not (root/HANDOFF_WITHDRAWN).exists(),'Root handoff withdrawn')
     names=['release.json','controller-intent.json','qualification.json','startup-closed.json','guard-admission.json','root-handoff.json']
     values=[owned_json(root/n)for n in names];p=release_profile(values[0]);require(p==validate_profile(expected_profile)and owned_worker==p['worker'],'explicit operation/profile/worker binding')
     horizon,_,_=extended_ends(root,values[1],values[4],values[5],values[0]['guard_unit'])

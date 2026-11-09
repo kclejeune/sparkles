@@ -758,7 +758,8 @@ existential restriction they imply, which keeps ALCHI's models. The rules run wh
 axiom needs case analysis and the ontology has no individuals, data properties, self
 restrictions, reflexive properties or top and bottom properties. Otherwise the Horn rules
 take what they can, and the axioms that need case analysis stay left out and reported, as
-do nominals and property hierarchies that are not regular. `Stats::tier` is `Disjunctive` for such a run, and
+do nominals and property hierarchies that are not regular. Data properties wait on a
+datatype checker with data cardinalities, item 768. `Stats::tier` is `Disjunctive` for such a run, and
 `Stats::clauses`, `dl_contexts`, `dl_stored`, `dl_tests` and `dl_testing` count its
 clauses, the contexts that held them, the clauses they stored, the candidate subsumers it
 tested and the time the tests took.
@@ -887,9 +888,25 @@ two answer as the existential restrictions they imply and that a functional prop
 answers as a maximum of one on every class. No development file of the ORE 2015 DL
 sample is taken whole with counting. Its counting files fall back when counting is on,
 ore_ont_6485 after 205 ms on one thread against 7 ms without counting, and ore_ont_6952
-and ore_ont_10140 after 1.4 and 1.7 s against 0.6 and 0.5 s. The cost is not counting alone, since the same ontologies
-with every exact cardinality read as an existential restriction do not finish on the base
-either, item 728. The normalization of a clause with a universal or a maximum
+and ore_ont_10140 after 1.4 and 1.7 s against 0.6 and 0.5 s. Bounds of 1, 4 and 16
+million conclusions do not finish ore_ont_6485 either, and the last stops after 63 s. Its
+20 clauses `⊤ → y ⊔ ≤(n-1) r.F ⊔ ≥(n+1) r.F`, one for each exact cardinality in a
+definition, are copied into all 156 of its contexts, which hold 173,476 clauses at the bound of 262,144
+conclusions. The copies are 3,120 of those clauses, and 12 contexts hold 6,190 to 7,199
+clauses each, so sharing the copies would not end the run. With the definitions absorbed,
+as in the experiment that PERFORMANCE-EXPERIMENTS.md records, the run stores 25,818
+clauses at the stop, and the hypothetical successor of `∃s.HeteroAtom` holds 10,295 of
+them. Their bodies combine the markers that each predecessor sends, such as
+`∃r1.H` and `∃r1.Alkyl`, and their heads are disjunctions of `Y` literals for the cases of
+the HeteroAtom union together with the qualified-role and successor literals of the at-most
+clauses. The symmetric bond properties make those clauses count the predecessor too, item
+731. The cost is not counting alone. A copy of ore_ont_6485 that replaces every exact and
+minimum cardinality `=n r.F` and `≥n r.F` by `∃r.F`, with `owl:Thing` for an unqualified
+filler, does not finish in 120 s on one thread on the build before counting, and takes
+105 s with the premise index and the Pred check below. A copy that replaces only the exact
+cardinalities classifies in 44 to 50 ms but leaves its four minimums of two out. Item 728
+holds the choice among the remedies.
+The normalization of a clause with a universal or a maximum
 beside a class or an existential restriction keeps the class in the clause's body, which
 classifies BioTop in 56 ms on one thread and 27 ms on four against 940 and 350 ms before.
 Each clause store then indexes its processed clauses by their maximal literal over a
