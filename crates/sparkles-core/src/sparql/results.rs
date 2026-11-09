@@ -2151,11 +2151,20 @@ mod application_value_tests {
         let value = sparkles_json_application_value(&r, None, 7).unwrap();
         let document = sparkles_json_with_commit(&r, None, 7).unwrap();
         let parsed: J = serde_json::from_str(document.as_str()).unwrap();
+        // Timings differ, and the document prints a float that the value keeps
+        // at full precision, so every timing member is left out.
+        fn untimed(v: &mut J) {
+            match v {
+                J::Object(map) => {
+                    map.retain(|key, _| key != "timing" && key != "elapsedMs" && key != "timeMs");
+                    map.values_mut().for_each(untimed);
+                }
+                J::Array(items) => items.iter_mut().for_each(untimed),
+                _ => {}
+            }
+        }
         let strip = |mut v: J| {
-            v["meta"]
-                .as_object_mut()
-                .unwrap()
-                .retain(|key, _| key != "timing" && key != "elapsedMs");
+            untimed(&mut v);
             v
         };
         assert_eq!(strip(value), strip(parsed));
