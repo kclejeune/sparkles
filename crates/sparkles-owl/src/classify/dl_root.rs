@@ -182,8 +182,7 @@ fn atom<S: Sink>(ix: &Index, out: &S, a: Ex, u: u32) -> Lit {
 /// the body `owl:Thing` give u.
 pub fn init<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
     st.init = true;
-    let x = ds(st);
-    x.root.get_or_insert_with(Box::default);
+    root_of(ds(st), out);
     let mut found = Found::default();
     for &(u, n) in &dix(ix).consts {
         found.push((Vec::new(), vec![atom(ix, out, n, u)]));
@@ -219,7 +218,7 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
         };
         let mut grown = x.store.take_grown();
         // the indexes by constant, before the rules, so that a clause meets itself
-        let r = x.root.get_or_insert_with(Box::default);
+        let r = root_of(x, out);
         for &l in &max {
             match out.dl().lits.view(l, inv) {
                 XLit::Atom(_, RTerm::C(u)) => grown += RootSt::push(&mut r.by_const, u, id),
@@ -261,7 +260,7 @@ fn process<S: Sink>(ix: &Index, st: &mut State, c: &Clause, max: &[Lit], out: &m
             root: true,
         };
         q.on_max(st, l, &prem, &mut found);
-        join_head(st, l, &prem, &mut found);
+        join_head(st, c, l, &prem, &mut found);
         let v = out.dl().lits.view(l, inv_of(ix, dx));
         if ground_trigger(v) {
             ground_out(ix, st, l, out);
@@ -566,10 +565,13 @@ fn is_marker(c: &Clause) -> bool {
     c.body().len() == 1 && c.body() == c.head()
 }
 
-/// Join on a new premise `prem` whose maximal literal is `l`: when l is a ground atom or an
-/// equality of constants, the processed clauses with l in the body. A marker is no premise,
-/// since its conclusion would be the other premise.
-pub(super) fn join_head(st: &State, l: Lit, prem: &Side, found: &mut Found) {
+/// Join on a new premise `prem` of the clause `c`, whose maximal literal is `l`: when l is a
+/// ground atom or an equality of constants, the processed clauses with l in the body. A
+/// marker is no premise on either side, since its conclusion would be the other premise.
+pub(super) fn join_head(st: &State, c: &Clause, l: Lit, prem: &Side, found: &mut Found) {
+    if is_marker(c) {
+        return;
+    }
     let Some(x) = dl(st) else { return };
     for &i in x.store.by_ground.get(&l).into_iter().flatten() {
         let s = &x.store.clauses[i as usize];
@@ -605,8 +607,12 @@ pub(super) fn join_body(
             c.body().iter().copied().filter(|&m| m != l).collect(),
             c.head().to_vec(),
         );
-        for p in partners(st, l) {
-            found.push(merge(&p, &rest));
+        let Some(x) = dl(st) else { return };
+        for &i in x.store.by_xl.get(&l).into_iter().flatten() {
+            let s = &x.store.clauses[i as usize];
+            if !s.dead && !is_marker(&s.c) {
+                found.push(merge(&side(&s.c, l), &rest));
+            }
         }
     }
 }
@@ -672,10 +678,12 @@ fn returns(v: XLit) -> bool {
 /// the context, whose maximal literal is the interned literal `l`: r-Succ sends the root the
 /// marker of a root successor trigger, Join resolves a ground l with the clauses that have
 /// it in the body, and r-Pred resolves l with the root's clauses that wait for it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn on_max<S: Sink>(
     ix: &Index,
     me: Ex,
     st: &mut State,
+    c: &Clause,
     l: Lit,
     prem: &Side,
     found: &mut Found,
@@ -688,10 +696,7 @@ pub(super) fn on_max<S: Sink>(
         && let Some(root) = dx.root
     {
         let mut grown = 0;
-        let r = ds(st).root.get_or_insert_with(|| {
-            grown += std::mem::size_of::<RootSt>();
-            Box::default()
-        });
+        let r = root_of(ds(st), out);
         if let Some(b) = RootSt::ins(&mut r.sent, m, 8) {
             out.send(root, Concl::RHyp(me, m.xid()));
             grown += b;
@@ -708,7 +713,7 @@ pub(super) fn on_max<S: Sink>(
     if ground_trigger(v) {
         ground_out(ix, st, l, out);
     }
-    join_head(st, l, prem, found);
+    join_head(st, c, l, prem, found);
     let Some(cids) = dl(st)
         .and_then(|x| x.root.as_deref())
         .and_then(|r| r.waiting.get(&l))
@@ -780,10 +785,7 @@ pub fn rpred_c<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bo
     }
     let inv = inv_of(ix, dix(ix));
     let mut grown = 0;
-    let r = ds(st).root.get_or_insert_with(|| {
-        grown += std::mem::size_of::<RootSt>();
-        Box::default()
-    });
+    let r = root_of(ds(st), out);
     match RootSt::ins(&mut r.seen, cid, 4) {
         Some(b) => grown += b,
         None => return false,
@@ -837,7 +839,7 @@ fn register<S: Sink>(
     us.dedup();
     let bottom = st.bottom;
     let x = ds(st);
-    let r = x.root.get_or_insert_with(Box::default);
+    let r = root_of(x, out);
     let mut grown = 0;
     let mut new = Vec::new();
     for &u in &us {
@@ -938,7 +940,7 @@ fn offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S) 
     keys.sort_unstable();
     keys.dedup();
     let x = ds(st);
-    let r = x.root.get_or_insert_with(Box::default);
+    let r = root_of(x, out);
     let mut grown = 0;
     for &u in &keys {
         grown += RootSt::push(&mut r.ready, u, id);
@@ -995,7 +997,11 @@ fn ground_trigger(v: XLit) -> bool {
 /// The context's state for the rules that involve the root, made with its first use and
 /// counted then.
 fn rst<'a, S: Sink>(st: &'a mut State, out: &S) -> &'a mut RootSt {
-    let x = ds(st);
+    root_of(ds(st), out)
+}
+
+/// [`rst`] for a context's state for Tier D.
+fn root_of<'a, S: Sink>(x: &'a mut super::dl_rules::DlSt, out: &S) -> &'a mut RootSt {
     if x.root.is_none() {
         out.dl().grow(std::mem::size_of::<RootSt>());
     }
@@ -2260,5 +2266,73 @@ mod tests {
         s.sub(ff, BOTTOM);
         let d = saturate_root(s);
         assert!(d.bottom());
+    }
+
+    /// The index and a probe over a signature whose root is made here.
+    fn probe_ix(mut s: Sig) -> (Index, Ex) {
+        let root = s.it.fresh_class();
+        s.dl.root = Some(root);
+        s.ax.dl = Some(Box::new(std::mem::take(&mut s.dl)));
+        (
+            Index::build(&s.ax, &mut s.it, None, &|| false).unwrap(),
+            root,
+        )
+    }
+
+    #[test]
+    fn a_marker_is_no_premise_of_join() {
+        // A(o) → A(o) and A(o) → B(o) in a context other than the root, in both orders:
+        // Join derives nothing
+        for marker_first in [true, false] {
+            let mut s = Sig::new();
+            let no = s.ind("o");
+            let [a, b] = ["A", "B"].map(|n| s.class(n));
+            let (ix, _) = probe_ix(s);
+            let run = DlRun::new(false, Default::default());
+            let mut out = Probe {
+                run: &run,
+                sent: Vec::new(),
+                mine: Vec::new(),
+            };
+            let o = c(no, &ix);
+            let inv = inv_of(&ix, dix(&ix));
+            let l = |v: XLit| match run.lits.lit(v, inv) {
+                Made::Lit(l) => l,
+                _ => panic!("a literal"),
+            };
+            let (ao, bo) = (l(XLit::Atom(a, o)), l(XLit::Atom(b, o)));
+            let mut st = State {
+                init: true,
+                ..State::default()
+            };
+            let mut cs = vec![
+                Clause::new(vec![ao], vec![ao]),
+                Clause::new(vec![ao], vec![bo]),
+            ];
+            if !marker_first {
+                cs.reverse();
+            }
+            for c in cs {
+                ds(&mut st).store.add(c);
+            }
+            super::super::dl_rules::flush(&ix, a, &mut st, &mut out, 100);
+            assert_eq!(run.work(), 0, "marker first {marker_first}");
+        }
+    }
+
+    #[test]
+    fn the_root_s_state_is_counted_when_made() {
+        let s = Sig::new();
+        let (ix, _) = probe_ix(s);
+        let run = DlRun::new(false, Default::default());
+        let mut out = Probe {
+            run: &run,
+            sent: Vec::new(),
+            mine: Vec::new(),
+        };
+        let mut st = State::default();
+        init(&ix, &mut st, &mut out);
+        assert!(dl(&st).unwrap().root.is_some());
+        assert!(run.bytes() >= std::mem::size_of::<RootSt>());
     }
 }

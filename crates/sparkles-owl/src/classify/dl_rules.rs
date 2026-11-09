@@ -2225,7 +2225,7 @@ fn process<S: Sink>(
                     }
                 }
             }
-            XL if rooted => super::dl_root::on_max(ix, me, st, l, &prem, &mut found, out),
+            XL if rooted => super::dl_root::on_max(ix, me, st, c, l, &prem, &mut found, out),
             _ => {}
         }
     }
