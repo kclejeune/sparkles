@@ -584,6 +584,38 @@ log are named at the end of the list, since the log cannot say what they changed
 that changed only the blank nodes of a restriction or an annotated axiom, without a triple
 that names the entity, is not listed.
 
+The entity frame's **Discussion** view holds comment threads on the entity and on its
+axioms, in the manner of WebProtégé's discussions
+([screenshot](../images/ontology-discussions.png)). A caller who can write the branch
+starts a thread on the entity or on one of the axioms its frame lists, replies to a
+thread, and resolves or reopens it. Writing `@name` in a comment mentions that principal,
+and the mention is highlighted and recorded with the comment. The view shows open
+threads, resolved threads or both, with each comment's author and time, and the
+ontology's **Discussions** tab lists every thread of the ontology graph with a link to
+its entity. A read lists at most 1,000 threads and replies, oldest first, and says when
+it stopped there.
+
+The threads are W3C Web Annotation RDF in an ordinary named graph beside the ontology
+graph on the branch. The graph of `http://example.org/uni` is
+`http://example.org/uni/discussions`, and the default graph's threads are in
+`urn:x-sparkles:discussions:default`. A thread is an `oa:Annotation` motivated by
+`oa:commenting` whose `oa:hasTarget` is the entity, or an `oa:SpecificResource` with the
+entity as `oa:hasSource` and the axiom's functional-style syntax as an
+`oa:TextQuoteSelector`. A reply is an `oa:replying` annotation that targets the thread.
+Each body is an `oa:TextualBody`, the author and time are `dcterms:creator` and
+`dcterms:created`, mentions are `schema:mentions`, and the resolved state is
+`urn:x-sparkles:discussion#resolved` with the resolver in `#resolvedBy`. Comments never
+use `rdfs:comment`, and the editor never reads the discussion graph as an ontology, so
+its frames, trees and graph list leave it out.
+
+Each comment, reply, resolve and reopen is one ordinary commit of the branch. Comments
+therefore appear in the branch's history and in exports of the dataset like any other
+graph, a protected branch refuses them as it refuses every write, and writing one needs
+`write` on the dataset. Readers and visitors of a protected branch see the threads with
+no composer, reply, resolve or reopen. A caller whose grants cover only some graphs needs
+a grant on the discussion graph, or the server refuses the comment. Item 768 covers an
+optional discussion store outside versioning.
+
 **Inferred** reveals the
 kept hierarchy beside the asserted class tree. It reads roots and expanded levels from
 an existing result, with the classifier's actual tier and outcome

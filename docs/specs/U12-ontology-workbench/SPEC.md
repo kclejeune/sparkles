@@ -169,6 +169,51 @@ revert and the phone layout against the mock, and the same flow against a real s
 A commit that changed only blank-node triples of a restriction or an annotated axiom is
 not found by the three lookups, and item 765 covers following those structures.
 
+### Discussions
+
+Item 618 adds a **Discussion** view to the entity frame, beside **Frame**, **Usage** and
+**History**, and a **Discussions** tab to the ontology editor. The view lists the threads
+on the entity and on its axioms with their replies, and a caller who can write the branch
+starts a thread, replies, and resolves or reopens a thread. The tab lists every thread of
+the ontology graph and opens a thread's entity in the Discussion view. Both read with one
+SELECT of at most 1,000 threads and replies, oldest first, and say when it stopped there.
+
+Threads are stored as the [C31](../C31-checks-and-protected-merges/SPEC.md#outcome)
+comments phase specifies, as W3C Web Annotation RDF. The maintainer chose the simple
+storage. The annotations live in an ordinary named graph per ontology graph on the
+branch, `<graph>/discussions` with a trailing `/` or `#` of the graph removed, or
+`urn:x-sparkles:discussions:default` for the default graph. A thread is an
+`oa:Annotation` motivated by `oa:commenting`. Its `oa:hasTarget` is the entity's IRI, or
+for an axiom an `oa:SpecificResource` whose `oa:hasSource` is the entity and whose
+`oa:TextQuoteSelector` holds the axiom in functional-style syntax as the frame shows it.
+A reply is an `oa:Annotation` motivated by `oa:replying` whose target is the thread. Each
+annotation has an `oa:TextualBody` with `rdf:value` and `dcterms:format`, a
+`dcterms:creator` IRI under `urn:x-sparkles:user:`, a `dcterms:created` time and one
+`schema:mentions` IRI for each `@name` in its text. A thread carries
+`urn:x-sparkles:discussion#resolved` as a boolean, and a resolve adds
+`urn:x-sparkles:discussion#resolvedBy` and `dcterms:modified`. Annotation IRIs are fresh
+`urn:uuid:` IRIs. No discussion triple uses `rdfs:comment`, and no U05 system graph or
+separate store is involved.
+
+Each comment, reply, resolve and reopen is one `POST /{ds}/update` on the branch with a
+commit message, so it is an ordinary commit. These consequences are accepted. Comments
+appear in the branch's history and in exports like any other graph, protected branches
+refuse them like any write, and writing needs `write` on the dataset, or a grant on the
+discussion graph for a caller whose grants cover only some graphs. Readers and protected
+branches see the threads without a composer or actions. The editor reads only the
+ontology graph and its imports for frames and trees, and leaves discussion graphs out of
+its graph list, so its axiom views never show the annotations. A comment's commit moves
+the branch head, and the editor reads its views again so the next edit names the new
+head. The session's undo stack does not take comments back.
+
+Unit tests run the writes and the SELECT against an in-memory store. Playwright covers a
+thread on the entity and one on an axiom, a mention, a reply, a resolve and a reopen as
+five commits, the ontology's tab, a reader and a protected branch against the mock, and a
+writer, a reader and a protected branch against a real server. Mentions are recorded but
+notify no one until the notifications of item 46 exist. Item 768 covers an optional
+discussion store outside versioning, with comments allowed on protected branches and
+kept out of exports.
+
 ### Ontology metrics and expressivity
 
 Item 621 adds an on-demand metrics panel to the ontology Header view and the ontology

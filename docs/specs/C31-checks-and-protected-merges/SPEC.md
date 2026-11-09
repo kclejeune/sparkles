@@ -73,4 +73,20 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ## Outcome
 
-Nothing is built. [Item 459](../../ROADMAP.md) tracks the work.
+The checks, workflow and badge phases are not built, and
+[item 459](../../ROADMAP.md) tracks them.
+
+The storage format of the comments phase is chosen, and the ontology editor's
+discussions of item 618 use it, as the
+[U12 Outcome](../U12-ontology-workbench/SPEC.md#discussions) describes. A thread is a
+W3C Web Annotation `oa:Annotation` motivated by `oa:commenting`, with an
+`oa:TextualBody`, `dcterms:creator` and `dcterms:created`, `schema:mentions` for each
+mentioned principal and `urn:x-sparkles:discussion#resolved` for its state. Its
+`oa:hasTarget` is the resource's IRI, or an `oa:SpecificResource` whose source is the
+resource and whose `oa:TextQuoteSelector` holds an axiom. A reply is an `oa:replying`
+annotation that targets the thread. The annotations are kept in an ordinary named graph
+beside the graph they discuss, `<graph>/discussions`, and each comment, resolve or reopen
+is an ordinary commit. They therefore appear in history and exports, protected branches
+refuse them and writing needs `write`. Item 768 covers an optional separate store that
+keeps comments outside versioning. Diff-line anchors, C21 notifications and the threads
+in Explore, forms and the review page remain open.
