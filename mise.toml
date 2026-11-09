@@ -1630,12 +1630,31 @@ systemd-run --user --wait --pipe --unit="$usage_unit" --property=Type=exec \
 '''
 
 [tasks."boat:job-env"]
-description = "Prepare deterministic PATH/token-FILE metadata for an actually qualified explicit worker; no lifecycle or source job"
+description = "Prepare the deterministic local-only job environment (PATH, Rust and mbx settings) for an actually qualified explicit worker; no lifecycle or source job"
 run = "python3 -I -B scripts/boat/job_environment.py"
 
 [tasks."boat:finish"]
 description = "Validate actual owned job closure, request the guard's normal stop and observe verified stop/guard closure"
 run = "python3 -I -B scripts/boat/controller.py finish"
+
+[tasks."boat:closure-watch"]
+description = "Check a warm qualified worker's job closure before its deadline and finish it, under a named local unit"
+usage = '''
+flag "--unit <name>" required=#true help="unused local unit name for the watch"
+flag "--operation <dir>" required=#true help="the qualified operation directory"
+flag "--lead <seconds>" default="900" help="check job closure and finish this many seconds before the guard's present end"
+flag "--local-unit <name>" var=#true help="a local job unit that must be inactive before the finish"
+'''
+run = '''
+set --
+# shellcheck disable=SC2154 # usage_local_unit is a list of unit names
+for unit in ${usage_local_unit:-}; do set -- "$@" --local-unit "$unit"; done
+systemd-run --user --unit="$usage_unit" --collect --property=Type=exec \
+  --property=MemoryMax=256M --property=MemorySwapMax=0 --property=RuntimeMaxSec=43500 \
+  --property=TimeoutStopSec=30 --property=KillMode=control-group --property=OOMPolicy=continue \
+  /usr/bin/python3 -I -B "$PWD/scripts/boat/controller.py" closure-watch \
+  --operation "$usage_operation" --lead "$usage_lead" "$@"
+'''
 
 [tasks."test:boat-controls"]
 description = "Inert maintained Boat lifecycle controls and source-seal validation; no provider, manager, child or network calls"

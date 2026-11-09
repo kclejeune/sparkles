@@ -499,12 +499,12 @@ class RequestTests(unittest.TestCase):
         original = ba.sorted_row_digest
 
         def slow_sort(*args):
-            time.sleep(0.3)
+            time.sleep(2.5)
             return original(*args)
 
         req = ba.urllib.request.Request(f"http://127.0.0.1:{self.server.server_address[1]}/tsv", data=b"query=SELECT")
         with unittest.mock.patch.object(ba, "sorted_row_digest", slow_sort):
-            record = ba.fetch(req, 0.2, lambda response, done: ba.streamed_tsv_record(response, "SELECT ?x {}", False, finish_response=done))
+            record = ba.fetch(req, 2.0, lambda response, done: ba.streamed_tsv_record(response, "SELECT ?x {}", False, finish_response=done))
         self.assertEqual(record["rows"], 2)
 
     def test_the_whole_request_has_a_deadline(self):

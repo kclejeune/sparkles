@@ -13,7 +13,7 @@
 //! reads more than its caps (C17 §7) allow, and every query runs under the call's
 //! deadline, memory budget and row limit.
 
-mod assert;
+pub(crate) mod assert;
 pub(crate) use assert::{date_time, now_ms, principal_iri};
 mod brief;
 pub(crate) mod check;
@@ -252,6 +252,19 @@ impl Tools<'_> {
         ctx: &ErrorContext,
     ) -> Result<Reader, ToolError> {
         let snap = self.snapshot(ds, at_commit, at, deadline)?;
+        self.reader_on(ds, snap, reasoning, deadline, ctx)
+    }
+
+    /// The reader of `snap`, such as the snapshot of an evidence view, with the
+    /// caller's query options as [`Self::reader`] gives them.
+    pub(crate) fn reader_on(
+        &self,
+        ds: &Arc<Dataset>,
+        snap: Arc<Snapshot>,
+        reasoning: Option<bool>,
+        deadline: Instant,
+        ctx: &ErrorContext,
+    ) -> Result<Reader, ToolError> {
         let reasoning = Self::reasoning(ds, reasoning);
         let mut opts = self
             .query_options(

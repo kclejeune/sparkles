@@ -66,9 +66,11 @@ sha1.workspace = true
 uuid.workspace = true
 # the UI's Content Security Policy (hashes of inline scripts); API token hashes
 sha2.workspace = true
-# native TLS (feature `tls`): rustls with the aws-lc-rs provider, already in the tree
-# through reqwest
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"], optional = true }
+# native TLS (feature `tls`) and the email channel of notifications: rustls with the
+# aws-lc-rs provider, already in the tree through reqwest, and the platform verifier
+# that reqwest's rustls client uses
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-platform-verifier = "0.7"
 tokio-rustls = { version = "0.26", default-features = false, optional = true }
 # authentication (feature `auth`)
 subtle = { version = "2.6", optional = true }
@@ -175,7 +177,7 @@ auth = [
     "dep:sparkles-client",
 ]
 # native TLS: `serve --tls-cert FILE --tls-key FILE`
-tls = ["dep:rustls", "dep:tokio-rustls"]
+tls = ["dep:tokio-rustls"]
 # Model Context Protocol server for LLM agents (`sparkles mcp` on stdio, `serve --mcp`)
 mcp = ["dep:rmcp", "dep:tokio-util", "dep:sparkles-memory-import"]
 # `sparkles memory`: import coding agents' memory and instruction files, sync them, and

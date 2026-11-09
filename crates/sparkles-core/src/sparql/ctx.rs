@@ -2439,8 +2439,7 @@ impl Ctx {
                     key,
                     |need| keys.reserve((need as u64).saturating_mul(2)),
                     |key| -> Result<()> {
-                        row.add(output_key_bytes(self, key, 0)?)?;
-                        out.push(Some(copied_output_key(key)));
+                        out.push(Some(output_key_term(self, key, row)?));
                         Ok(())
                     },
                 )?;
@@ -2972,6 +2971,29 @@ impl Ctx {
     pub fn local_len(&self) -> u64 {
         self.local.read().len()
     }
+}
+
+/// The term of one decoded vocabulary key, admitted on `row` before it is built.
+/// An IRI or literal key is split and its text checked once, and the term is built
+/// from the checked parts with the charge [`output_key_bytes`] gives for valid text.
+/// Sizing and building it in two passes repeated the separator scan and the UTF-8
+/// checks, a measurable share of the time to write a large answer.
+#[inline]
+fn output_key_term(ctx: &Ctx, key: &[u8], row: &RowCredit<'_>) -> Result<Term> {
+    if let Some(text) = id::TextKey::parse(key) {
+        let tag = match text {
+            id::TextKey::Lang(_, tag) => tag.len() as u64,
+            _ => 0,
+        };
+        row.add(
+            (key.len() as u64)
+                .checked_add(64 + tag)
+                .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?,
+        )?;
+        return Ok(text.into_term());
+    }
+    row.add(output_key_bytes(ctx, key, 0)?)?;
+    Ok(copied_output_key(key))
 }
 
 /// Heap and construction overlap of one decoded vocabulary key, excluding the
@@ -3682,6 +3704,98 @@ mod charge_tests {
         charge.adopt_charge(&mut empty).unwrap();
         assert!(empty.is_none());
         assert!(ctx.memory.get().is_none());
+    }
+
+    /// The one-pass output decode builds the same term as `key_to_term` and admits
+    /// the same bytes as `output_key_bytes`, for valid, damaged and special keys.
+    #[test]
+    fn one_pass_output_keys_match_the_two_pass_term_and_charge() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let sep = id::KEY_SEP;
+        let mut keys: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"<".to_vec(),
+            b"<http://example.org/a".to_vec(),
+            "<http://example.org/\u{e9}".as_bytes().to_vec(),
+            b"<http://example.org/\xff\xfe".to_vec(),
+            b"\"".to_vec(),
+            b"\"plain".to_vec(),
+            b"x-bare".to_vec(),
+            b"\xc3".to_vec(),
+            b"_short".to_vec(),
+        ];
+        for lex in [&b"lex"[..], b"", "caf\u{e9}".as_bytes(), b"bad\xc3("] {
+            let with = |suffix: &[u8]| {
+                let mut key = vec![b'"'];
+                key.extend_from_slice(lex);
+                key.push(sep);
+                key.extend_from_slice(suffix);
+                key
+            };
+            keys.push(with(b""));
+            keys.push(with(b"@en"));
+            keys.push(with(b"@en--ltr"));
+            keys.push(with(b"@ar--rtl"));
+            keys.push(with(b"@e\xffn"));
+            keys.push(with(b"^http://www.w3.org/2001/XMLSchema#integer"));
+            keys.push(with(b"^http://example.org/\xc3"));
+            keys.push(with("\u{e9}http://example.org/t".as_bytes()));
+            keys.push(with(b"\xe9x"));
+        }
+        let mut bnode = vec![b'_'];
+        bnode.extend_from_slice(&7u64.to_be_bytes());
+        keys.push(bnode);
+        let mut triple = vec![b'('];
+        for part in [
+            &b"<http://example.org/s"[..],
+            b"<http://example.org/p",
+            b"\"o",
+        ] {
+            triple.push(part.len() as u8);
+            triple.extend_from_slice(part);
+        }
+        keys.push(triple);
+        // The one-pass route takes every valid IRI and literal form, so that a fallback
+        // cannot hide a disabled fast path, and leaves the others to the two-pass route.
+        let one_pass = |key: &[u8]| id::TextKey::parse(key).is_some();
+        let lit = |suffix: &[u8]| [&b"\"lex"[..], &[sep], suffix].concat();
+        for key in [
+            &b""[..],
+            b"<http://example.org/a",
+            "<http://example.org/\u{e9}".as_bytes(),
+            b"x-bare",
+            b"\"plain",
+            &lit(b""),
+            &lit(b"@en"),
+            &lit(b"@ar--rtl"),
+            &lit(b"^http://www.w3.org/2001/XMLSchema#integer"),
+        ] {
+            assert!(one_pass(key), "{key:?}");
+        }
+        for key in [
+            &b"<http://example.org/\xff"[..],
+            b"\xc3",
+            b"_short",
+            &keys[keys.len() - 2],
+            &keys[keys.len() - 1],
+            &lit(b"@e\xffn"),
+            &lit(b"^http://example.org/\xc3"),
+            &lit("\u{e9}http://example.org/t".as_bytes()),
+            &[&b"\"bad\xc3("[..], &[sep]].concat(),
+        ] {
+            assert!(!one_pass(key), "{key:?}");
+        }
+        for key in &keys {
+            let row = RowCredit::new(&ctx);
+            let term = output_key_term(&ctx, key, &row).unwrap();
+            assert_eq!(term, id::key_to_term(key), "{key:?}");
+            assert_eq!(
+                row.used.get(),
+                output_key_bytes(&ctx, key, 0).unwrap(),
+                "{key:?}"
+            );
+        }
     }
 
     /// A decimal value gets the id of its canonical literal, inline or query-local.

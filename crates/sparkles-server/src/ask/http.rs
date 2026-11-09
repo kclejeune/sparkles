@@ -76,6 +76,10 @@ struct AskBody {
     thread: Option<String>,
     /// the resource on the page the question was asked from
     about: Option<assistant::AskAbout>,
+    /// cite claim occurrences under this review policy (C25)
+    review_policy: Option<String>,
+    /// resolve the linked entities through this matching policy's map (C25)
+    matching_policy: Option<String>,
 }
 
 fn bad(m: impl Into<String>) -> crate::http::ApiError {
@@ -83,7 +87,7 @@ fn bad(m: impl Into<String>) -> crate::http::ApiError {
 }
 
 /// The HTTP status of an error event's code, for the JSON form.
-fn status_of(code: &str) -> StatusCode {
+pub(super) fn status_of(code: &str) -> StatusCode {
     match code {
         "bad-argument" => StatusCode::BAD_REQUEST,
         "unknown-dataset" | "no-model" => StatusCode::NOT_FOUND,
@@ -92,7 +96,11 @@ fn status_of(code: &str) -> StatusCode {
         "timeout" => StatusCode::GATEWAY_TIMEOUT,
         "cancelled" => StatusCode::SERVICE_UNAVAILABLE,
         "no-later-pair" => StatusCode::CONFLICT,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
+        "forbidden" => StatusCode::FORBIDDEN,
+        // an evidence refusal from recall keeps recall's status (C25)
+        c => sparkles::managed::ManagedErrorKind::from_code(c)
+            .and_then(|k| StatusCode::from_u16(k.status()).ok())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -306,6 +314,8 @@ async fn ask_route(
         mode: b.mode,
         reviewed_only: b.reviewed_only,
         report_context,
+        review_policy: b.review_policy.clone(),
+        matching_policy: b.matching_policy.clone(),
         ..AskOptions::default()
     };
     repairs.apply(&mut o);

@@ -136,6 +136,186 @@ the controls and bounds. Text transfer explicitly replaces the saved Turtle draf
 does not install a guard or commit a shape graph. General classifier-backed entailments
 and justifications remain separate work under F24.
 
+### Entity history
+
+Item 620 adds a **History** view to the ontology editor's entity frame, beside **Frame**
+and **Usage**. It lists the commits of the branch that changed a triple naming the entity
+as subject, predicate or object in the editor's graph, newest first. The view asks
+`GET /{ds}/history` once for each position with `order=desc`, the graph, at most 200
+changes and the same `to`, which is the head the editor shows for the first page, so a
+commit that lands between the three lookups cannot be counted by only some of them. It keeps only the commits above the oldest commit at which a cut lookup
+stopped, so a commit is never shown with part of its changes. The next page reads up to
+that commit again. A single commit larger than one page is shown alone with its counts
+marked partial, and the next page starts below it. A triple that names the entity twice
+is counted once. Bulk loads, gaps and commits older than the change log are named at the
+end of the list.
+
+Opening a commit reads `GET /$/ontology/{ds}/diff` from its parent to it, without
+imports and with assertions, and the route's new `entity` parameter keeps only the
+axioms that mention the entity, as the usage view reads them. At most 100 axioms are
+listed on each side, with the full diff linked for the rest. A caller who can edit the
+branch reverts a commit through the editor's preview, which runs `POST /$/revert/{ds}`
+as a dry run against the head the page shows and commits it with the same expectation.
+The revert enters the session's undo stack. The server still requires write access to
+the whole branch for a revert. Readers, protected branches and callers whose grants cover
+only some graphs see no revert button. An opened commit's answer that arrives after the
+view moved to another entity, graph, branch or head is dropped, and unrecorded ranges
+are kept across pages.
+
+The mock backend answers the entity diff from its recorded states. Unit tests cover the
+page assembly and the lookups, the server test covers the entity filter, and Playwright
+covers the list, an opened commit, a revert, an empty history, a reader without the
+revert and the phone layout against the mock, and the same flow against a real server.
+A commit that changed only blank-node triples of a restriction or an annotated axiom is
+not found by the three lookups, and item 765 covers following those structures.
+
+### Discussions
+
+Item 618 adds a **Discussion** view to the entity frame, beside **Frame**, **Usage** and
+**History**, and a **Discussions** tab to the ontology editor. The view lists the threads
+on the entity and on its axioms with their replies, and a caller who can write the branch
+starts a thread, replies, and resolves or reopens a thread. The tab lists every thread of
+the ontology graph and opens a thread's entity in the Discussion view. Both read with one
+SELECT of at most 1,000 comments and replies, oldest first, and say when it stopped there.
+Later comments and replies are then not listed, and paging them is left open.
+
+Threads are stored as the [C31](../C31-checks-and-protected-merges/SPEC.md#outcome)
+comments phase specifies, as W3C Web Annotation RDF. The maintainer chose the simple
+storage. The annotations live in an ordinary named graph per ontology graph on the
+branch, whose IRI is the ontology graph's whole IRI under
+`urn:x-sparkles:discussions:` with `%`, `[` and `]` percent-encoded, since an IPv6 host's
+brackets may not stand in a URN, or `urn:x-sparkles:discussions:default` for the default
+graph. A name such as `<graph>/discussions` was set aside, because it either merges the
+threads of `onto`, `onto/` and `onto#` or can fall on a real ontology graph. The namespace
+keeps one discussion graph for each ontology graph and lets the editor recognize
+discussion graphs by their prefix. A thread is an
+`oa:Annotation` motivated by `oa:commenting`. Its `oa:hasTarget` is the entity's IRI, or
+for an axiom an `oa:SpecificResource` whose `oa:hasSource` is the entity and whose
+`oa:TextQuoteSelector` holds the axiom in functional-style syntax as the frame shows it.
+A reply is an `oa:Annotation` motivated by `oa:replying` whose target is the thread. Each
+annotation has an `oa:TextualBody` with `rdf:value` and `dcterms:format`, a
+`dcterms:creator` IRI under `urn:x-sparkles:user:`, a `dcterms:created` time and one
+`schema:mentions` IRI for each `@name` in its text. A thread carries
+`urn:x-sparkles:discussion#resolved` as a boolean, and a resolve adds
+`urn:x-sparkles:discussion#resolvedBy` and `dcterms:modified`. Annotation IRIs are fresh
+`urn:uuid:` IRIs. No discussion triple uses `rdfs:comment`, and no U05 system graph or
+separate store is involved.
+
+Each comment, reply, resolve and reopen is one `POST /{ds}/update` on the branch with a
+commit message, so it is an ordinary commit. These consequences are accepted. Comments
+appear in the branch's history and in exports like any other graph, protected branches
+refuse them like any write, and writing needs `write` on the dataset, or a grant on the
+discussion graph for a caller whose grants cover only some graphs. Readers and protected
+branches see the threads without a composer or actions. The editor reads only the
+ontology graph and its imports for frames and trees, and leaves discussion graphs out of
+its graph list, so its axiom views never show the annotations. A comment's commit moves
+the branch head, and the editor reads its views again so the next edit names the new
+head. The session's undo stack does not take comments back.
+
+Unit tests run the writes and the SELECT against an in-memory store. Playwright covers a
+thread on the entity and one on an axiom, a mention, a reply, a resolve and a reopen as
+five commits, the ontology's tab, a reader and a protected branch against the mock, and a
+writer, a reader and a protected branch against a real server. Mentions are recorded but
+notify no one until the notifications of item 46 exist. Item 769 covers an optional
+discussion store outside versioning, with comments allowed on protected branches and
+kept out of exports.
+
+### Bulk edits
+
+Item 626 adds a **Bulk edits** tab to the ontology editor, beside **Discussions**, for the
+bulk part of the "Patterns, imports, rendering and bulk edits" phase. It offers find and
+replace, setting and removing an annotation, and moving classes. Each builds one
+`POST /$/ontology/{ds}/axioms` edit from the axioms the editor read and hands it to the
+editor's preview, so the dry run, the shared change set, `If-Match` on the shown commit
+and the undo stack are the ones every other edit uses. No server route was added. The
+annotation edit declares an annotation property that the ontology does not declare yet, so
+its values read back as annotations, and the subjects of annotation assertions are not
+declared. Setting a property that the ontology or its imports type as another kind, such
+as a data property, is refused before the preview, since its declaration as an annotation
+property would change how the existing assertions read. A move declares nothing, and its new
+parent must be a class of the ontology or its imports, or `owl:Thing`. Each moved entity
+must be a class or an IRI the ontology does not know, since a `SubClassOf` would otherwise
+turn a property or an individual into a class. The kinds of the set
+property and of the new parent come from `GET /$/ontology/{ds}/entity` at the shown commit
+with imports, so they follow the ontology's lenient read. The kinds of the moved entities,
+up to 1,000, come from their `rdf:type` values in the graphs the ontology reads, through one
+SPARQL query for each 200 IRIs, since an entity report for each would map the ontology's
+axioms again for each IRI. A declaration type gives its kind, a property characteristic or
+`rdf:Property` a property, and any other type an individual. An entity that the lenient read
+knows only from its use, such as an untyped subject of a data property assertion, is not
+caught by this check, and item 771 covers a batched kinds read. A calculation that a new
+input or leaving the tab supersedes aborts its queries. It reads and writes the graph
+without its imports, as it was planned, so an imported copy of a new value does not stop the
+server from adding that value to the edited graph.
+
+Find and replace reads the graph's annotation assertions without its imports at the
+displayed commit through `GET /$/ontology/{ds}/axioms?type=AnnotationAssertion&at=`. It
+matches plain and language-tagged strings only, so IRIs and typed literals such as
+booleans and dates are never rewritten. Matching is literal or a JavaScript regular
+expression with the Unicode flag, with or without case. A regular expression's
+replacement may use groups, and a literal replacement is inserted as written. A pattern
+that matches empty text is refused, since it would insert the replacement between
+characters. This covers a pattern that matches only empty text and one, such as a lookahead
+or a word boundary, that matches empty text inside a value it is applied to. The property scope is the labels (`rdfs:label`, `skos:prefLabel`,
+`skos:altLabel` and `skos:hiddenLabel`), every annotation property or one property. The
+language filter is any language, untagged values, or one tag by the basic filtering of
+RFC 4647, so `en` matches `en-GB`. The entity scope is the whole graph or the entity list.
+Each change removes the stored annotation assertion with its axiom annotations and adds
+the new value with the same language and annotations. A value that the replacement would
+leave empty is left out and counted, because removal has its own form.
+
+Set annotation adds a value to every entity of the list. With replace, it also removes
+the property's other values in the new value's language, compared without case, or every
+other value when the new value is an IRI. Values compare as RDF terms, with language tags
+in any case and a plain literal equal to an `xsd:string`, so an entity that already holds
+the value is counted and left alone with its axiom annotations. Remove annotation removes
+every value of a property from the listed entities, the values in one language, or one
+value. A value given as an IRI removes only that IRI, and one given as text removes only
+literals of that text.
+
+Move classes reads the graph's `SubClassOf` axioms. Each listed class loses the axioms
+that state a named superclass other than the new parent, annotated ones included, and
+gains `SubClassOf(class, parent)` unless it is already stated. Superclass expressions such
+as restrictions stay. Keeping the old parents only adds the new one, and moving to the top
+removes the named superclasses and adds nothing. A parent that is one of the classes or
+below one of them through the graph's named `SubClassOf` axioms is refused before the
+preview, naming the class it is below. A new parent's annotations are not copied from the
+old axioms, because they described the old relation.
+
+The entity list takes an entity from the entity search, a class with its subclasses
+through the graph's named `SubClassOf` axioms, or pasted IRIs and prefixed names, and
+reports text that names neither. The panel lists every change with its entity, property
+and old and new value, showing the first 200 rows.
+
+Four bounds apply. An edit changes at most 1,000 annotation values or classes, and above
+that the panel names the count and the bound and offers no preview. The bound keeps the
+preview readable. A move also refuses to add and remove more than 10,000 axioms in all,
+which a few classes with many named parents could otherwise reach, so the edit's answer
+lists every axiom it changed. The entity list holds
+at most 1,000 entities. A read of more than 100,000 axioms of one type refuses the edit
+rather than editing from a partial read that could miss matches. The read holds the
+graph's axioms of that type in the browser for the tab's lifetime at one commit, which
+costs memory in proportion to the graph's annotations and is the price of matching in
+the browser without a new server route. A commit at another head, graph or branch clears
+the listed changes. Readers and protected branches list changes but get no preview, and
+the server still refuses their writes.
+
+A calculation still reading the graph is dropped when the operation, the commit, the graph
+or the branch changes, and every input of a plan is taken before the read, so a plan never
+mixes the fields of two operations.
+
+Unit tests cover matching, the filters, the replacements, empty matches, set, remove, value
+identity, the move plan, the cycle refusal, the bounds and the entity list. Playwright covers find and replace with its
+undo as one commit and its writes without imports, a regular expression that keeps a
+label's axiom annotation, an empty match and an invalid pattern, an operation switched while
+the graph is read, set and remove, moves with
+an annotated `SubClassOf` and a refused cycle, an edit above the bound, a reader at phone
+width and a protected branch against the mock, and against a real server a find and
+replace on a branch that keeps an annotated label's annotation, adds a value that an imported
+graph already holds, and leaves main and the imported graph alone, a move whose undo restores
+an annotated axiom's reification, the bound, a protected branch and a reader under
+authentication. Item 770 covers matching on the server and splitting larger edits.
+
 ### Ontology metrics and expressivity
 
 Item 621 adds an on-demand metrics panel to the ontology Header view and the ontology

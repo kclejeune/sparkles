@@ -833,6 +833,7 @@ pub(super) async fn remove_entity(
 /// (`to` is the head by default), read as the summary reads the ontology, with the
 /// assertions that the changed triples carry when `assertions=true`. `format=text`
 /// answers `+ axiom` and `- axiom` lines. `limit` caps each side (1,000 by default).
+/// `entity=` keeps the axioms that mention one IRI, as the entity frame's usage reads them.
 pub(super) async fn diff(
     State(st): St,
     Path(name): Path<String>,
@@ -849,6 +850,15 @@ pub(super) async fn diff(
         .ok_or_else(|| bad("from names the earlier commit"))?;
     let to = super::diff::selector(&params, "to")?.unwrap_or(sparkles::history::At::Head);
     let assertions = params.get("assertions").is_some_and(truthy);
+    let entity = match params.get("entity") {
+        None => None,
+        Some(v) => {
+            let iri = v.trim().trim_start_matches('<').trim_end_matches('>');
+            oxrdf::NamedNode::new(iri)
+                .map_err(|e| bad(format!("entity: invalid IRI {v:?}: {e}")))?;
+            Some(iri.to_string())
+        }
+    };
     let text = match params.get("format") {
         None | Some("json") => false,
         Some("text") => true,
@@ -864,11 +874,15 @@ pub(super) async fn diff(
     };
     let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Diff);
     blocking(move || {
-        let d = ds
+        let mut d = ds
             .dataset
             .ontology()
             .diff(&req, &from, &to, assertions, &opts)
             .map_err(ontology_error)?;
+        if let Some(iri) = &entity {
+            d.added.retain(|c| c.axiom.mentions(iri));
+            d.removed.retain(|c| c.axiom.mentions(iri));
+        }
         let r = renderer(&ds);
         let resp = if text {
             (
@@ -877,7 +891,11 @@ pub(super) async fn diff(
             )
                 .into_response()
         } else {
-            Json(diff_body(&ds.name, &d, &req, assertions, limit, &r)).into_response()
+            let mut j = diff_body(&ds.name, &d, &req, assertions, limit, &r);
+            if let Some(iri) = &entity {
+                j["entity"] = json!(iri);
+            }
+            Json(j).into_response()
         };
         Ok(with_commit(resp, &ds, d.to))
     })

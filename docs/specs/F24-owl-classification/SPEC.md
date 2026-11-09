@@ -758,7 +758,8 @@ existential restriction they imply, which keeps ALCHI's models. The rules run wh
 axiom needs case analysis and the ontology has no individuals, data properties, self
 restrictions, reflexive properties or top and bottom properties. Otherwise the Horn rules
 take what they can, and the axioms that need case analysis stay left out and reported, as
-do nominals and property hierarchies that are not regular. `Stats::tier` is `Disjunctive` for such a run, and
+do nominals and property hierarchies that are not regular. Data properties wait on a
+datatype checker with data cardinalities, item 768. `Stats::tier` is `Disjunctive` for such a run, and
 `Stats::clauses`, `dl_contexts`, `dl_stored`, `dl_tests` and `dl_testing` count its
 clauses, the contexts that held them, the clauses they stored, the candidate subsumers it
 tested and the time the tests took.
@@ -887,12 +888,37 @@ two answer as the existential restrictions they imply and that a functional prop
 answers as a maximum of one on every class. No development file of the ORE 2015 DL
 sample is taken whole with counting. Its counting files fall back when counting is on,
 ore_ont_6485 after 205 ms on one thread against 7 ms without counting, and ore_ont_6952
-and ore_ont_10140 after 1.4 and 1.7 s against 0.6 and 0.5 s. The cost is not counting alone, since the same ontologies
-with every exact cardinality read as an existential restriction do not finish on the base
-either, item 728. The normalization of a clause with a universal or a maximum
+and ore_ont_10140 after 1.4 and 1.7 s against 0.6 and 0.5 s. Bounds of 1, 4 and 16
+million conclusions do not finish ore_ont_6485 either, and the last stops after 63 s. Its
+20 clauses `⊤ → y ⊔ ≤(n-1) r.F ⊔ ≥(n+1) r.F`, one for each exact cardinality in a
+definition, are copied into all 156 of its contexts, which hold 173,476 clauses at the bound of 262,144
+conclusions. The copies are 3,120 of those clauses, and 12 contexts hold 6,190 to 7,199
+clauses each, so sharing the copies would not end the run. With the definitions absorbed,
+as in the experiment that PERFORMANCE-EXPERIMENTS.md records, the run stores 25,818
+clauses at the stop, and the hypothetical successor of `∃s.HeteroAtom` holds 10,295 of
+them. Their bodies combine the markers that each predecessor sends, such as
+`∃r1.H` and `∃r1.Alkyl`, and their heads are disjunctions of `Y` literals for the cases of
+the HeteroAtom union together with the qualified-role and successor literals of the at-most
+clauses. The symmetric bond properties make those clauses count the predecessor too, item
+731. The cost is not counting alone. A copy of ore_ont_6485 that replaces every exact and
+minimum cardinality `=n r.F` and `≥n r.F` by `∃r.F`, with `owl:Thing` for an unqualified
+filler, does not finish in 120 s on one thread on the build before counting, and takes
+105 s with the premise index and the Pred check below. A copy that replaces only the exact
+cardinalities classifies in 44 to 50 ms but leaves its four minimums of two out. Item 728
+holds the choice among the remedies.
+The normalization of a clause with a universal or a maximum
 beside a class or an existential restriction keeps the class in the clause's body, which
-classifies BioTop in 56 ms on one thread and 27 ms on four against 940 and 350 ms before,
-item 712.
+classifies BioTop in 56 ms on one thread and 27 ms on four against 940 and 350 ms before.
+Each clause store then indexes its processed clauses by their maximal literal over a
+successor term, so that the premises of one such literal are found without scanning the
+others of its term, and Pred checks that a new premise fits a place of a predecessor clause
+before it gathers the clause's other premises. The inferences are the same, and in
+interleaved runs on the laptop BioTop classifies in 0.59 of the time of the build before
+on one thread and 0.44 on four, 44 and 23 ms, about Konclude's 23 ms, item 712. The
+index holds one more id for each processed clause whose maximal literal is over a successor
+term, which raises the peak heap of a one-thread run by 9.6% on BioTop, from 17.7 to 19.4
+MiB, and by 3.3 to 3.5% on ore_ont_5438, ore_ont_13103 and ore_ont_16680. The speed costs
+that memory, and the estimate counts it.
 
 The classifier's answers equal HermiT 1.4.5.519's on the generated and hand-written
 `alc`, `alch` and `shi` fixtures that the rules take whole, and are the same on one and
@@ -907,7 +933,7 @@ their taxonomies equal the reference on all nine. Eight files of the strata have
 individuals or data properties and stay sound, and ore_ont_3215 passes the budget. Of the 13
 development files that classify slower than Konclude without them, the disjunctive rules
 take only ore_ont_5940, whose taxonomy is now complete and faster than Konclude's. ore_ont_12141, BioTop,
-classifies slower than Konclude, item 712. The taxonomies of the 298 ORE 2015 EL
+classifies in Konclude's time on four threads, item 712. The taxonomies of the 298 ORE 2015 EL
 ontologies, GO, ChEBI lite and every development file that the disjunctive rules do not
 take are byte for byte those of the Horn tier on one and eight threads. The saturation's
 arms for the disjunctive rules compile away in other runs. They first made the one worker's

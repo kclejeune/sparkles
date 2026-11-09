@@ -14,7 +14,24 @@ def write(path, value):
     path.write_text(json.dumps(value,indent=2)+'\n');path.chmod(0o600)
 
 
-def fixture(root):
+class TickIO(controls.InertIO):
+    """An inert operation whose clocks advance a microsecond on every reading, as real clocks do."""
+    def __init__(self,r,wall=None,boot=None):
+        super().__init__(r);self.ticks=0
+        if wall is not None:self.w=wall
+        if boot is not None:self.t=boot
+    def wall(self):self.ticks+=1;return self.w+self.ticks*1e-6
+    def mono(self):self.ticks+=1;return self.t+self.ticks*1e-6
+
+
+# The boot clock reading that op-5 started from on bx_gy2ytgh8's controller, and its
+# wall reading's fraction on the synthetic facts' epoch. Both epochs lie in the same
+# binary exponent range, so the floating-point spacing of every sum is the same.
+OP5_CLOCKS={'wall':1800000000.6173093,'boot':152177.296110792}
+
+
+def fixture(root,clocks=None):
+    """A qualified operation on disk, driven with fixed clocks or, given ``clocks``, moving ones."""
     release=controls.fixture();profile=controls.profile()
     profile['worker_uid']=os.getuid()
     raw=json.dumps(profile,sort_keys=True)
@@ -28,7 +45,7 @@ def fixture(root):
     release['boat'].update(path=str(cli),uid=os.getuid(),bytes=cli.stat().st_size,mode=0o755,
                            sha256=hashlib.sha256(cli.read_bytes()).hexdigest())
     release['controller_packet_manifest_sha256']=hashlib.sha256(controller.ROOT.joinpath('runtime-sources.json').read_bytes()).hexdigest()
-    io=controls.InertIO(release)
+    io=controls.InertIO(release) if clocks is None else TickIO(release,clocks['wall'],clocks['boot'])
     def guard():
         loaded={'Id':release['guard_unit']+'.service','ActiveState':'active','MainPID':'123','InvocationID':'a'*32}
         row={'pid':123,'uid':os.getuid(),'observed_wall':io.wall(),'observed_boottime':io.mono(),
@@ -49,3 +66,48 @@ def fixture(root):
             'release':release,'operation':operation,'job':job,'admission':admission,
             'guard':io.records['guard-admission.json']['loaded'],'now':io.wall(),'boot_now':io.mono(),
             'boot_id':io.records['guard-admission.json']['boot_id']}
+
+
+WORKER_BOOT_ID='87654321-4321-4321-4321-210987654321'
+
+
+class ExtendIO(controls.DiskIO):
+    """The fixture's operation on disk with an inert provider that only answers extend."""
+    names=controller.RealIO.names
+
+    def __init__(self,f,wall=None,boot=None):
+        super().__init__(f['release'],f['operation']);self.f=f;self.started=True
+        self.w=f['now'] if wall is None else wall;self.t=f['boot_now'] if boot is None else boot
+        self.archive=None;self.worker_boot=WORKER_BOOT_ID;self.extend_exit=0;self.archive_shortfall=0
+        self.live=dict(f['guard']);self.local_boot=f['boot_id']
+        self.env_version=None;self.shows=0;self.show_delay=0
+
+    def show(self,unit):
+        assert unit==self.r['guard_unit']+'.service';self.shows+=1
+        if self.show_delay and self.shows>1:self.t+=self.show_delay;self.w+=self.show_delay
+        return dict(self.live)
+
+    def boat(self,args,*a,**k):
+        self.calls.append(list(args))
+        if args[0]=='extend' and args[1]==controller.worker_id() and args[2]=='--ttl':
+            if self.extend_exit==0:self.archive=self.w+int(args[3])-self.archive_shortfall
+            return {'exit':self.extend_exit,'error':None,'body':{'id':controller.worker_id()}}
+        raise AssertionError('unexpected provider call')
+
+    def info(self):
+        row=controls.info(self.r,True)
+        if self.archive is not None:row['archiveAfter']=controls.iso(self.archive)
+        if self.env_version is not None:row['environmentVersion']=self.env_version
+        return row
+
+    def worker_boot_id(self):return self.worker_boot
+    def local_boot_id(self):return self.local_boot
+
+
+def environment_fact(f,path,observed,**changed):
+    """A Root-verified latest environment observation like the post-resume one."""
+    p=f['profile']['future_environment']
+    row={'observed_unix':observed,'verified_by_Root':True,'receipt_sha256':'c'*64,'id':p['id'],
+         'latestVersionNumber':p['version'],'latestVersionId':f['release']['environment']['latest_version_id'],
+         'hook_sha256':p['hook_sha256'],'hook_bytes':p['hook_bytes'],'setupBlocking':True}
+    row.update(changed);write(path,row);return path

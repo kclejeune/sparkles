@@ -3,6 +3,14 @@ const nf = new Intl.NumberFormat('en-US');
 export const fmtInt = (n: number | null | undefined) =>
   n == null || Number.isNaN(n) ? '—' : nf.format(Math.round(n));
 
+/**
+ * A count with its noun, singular for exactly one: `1 triple`, `2 triples`, `1,024 axioms`.
+ * `plural` names an irregular plural; the default adds an `s`.
+ */
+export function fmtCount(n: number, singular: string, plural = `${singular}s`): string {
+  return `${fmtInt(n)} ${n === 1 ? singular : plural}`;
+}
+
 export function fmtCompact(n: number): string {
   if (n < 0) return '—';
   if (n < 1000) return String(n);

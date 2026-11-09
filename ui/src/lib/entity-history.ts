@@ -1,7 +1,7 @@
 // An entity's history for Explore's time slider (docs/specs/U01-time-slider.md §2.3): the
 // commits that changed a resource's triples as subject or object, and the net change between
 // two of them. It reads the change log's answers of `GET /{ds}/history`.
-import type { Commit, HistoryChange } from './api';
+import type { Commit, HistoryChange, HistoryChanges, HistoryOptions } from './api';
 import type { Range } from './timeline';
 
 /** A change of the resource, in which direction it points, with the commit that made it. */
@@ -132,3 +132,141 @@ export function selectorSeq(selector: string, head: number): number | null {
 /** Whether `seq` lies inside one of the ranges a read can see. */
 export const isReadable = (seq: number, ranges: readonly Range[]) =>
   ranges.some((r) => seq >= r.from && seq <= r.to);
+
+// ---------------------------------------------------------------------------------------
+// The Workbench entity frame's History view (ROADMAP item 620): the commits of a branch
+// that changed triples naming an entity in the editor's graph, newest first, one bounded
+// page at a time.
+
+/** The positions a history lookup names the entity in. */
+export const ENTITY_POSITIONS = ['subject', 'predicate', 'object'] as const;
+
+/** One commit of the entity's history, with its counts of the entity's triples. */
+export type EntityCommit = {
+  seq: number;
+  timestamp: string;
+  kind: string;
+  author?: string;
+  message?: string;
+  /** The added and removed triples that name the entity, counted once each. */
+  added: number;
+  removed: number;
+  /** The page's lookups did not list all of this commit's triples, so the counts are low. */
+  partial: boolean;
+};
+
+/** One page of the entity's history. */
+export type EntityHistoryPage = {
+  commits: EntityCommit[];
+  /** The `to` of the next older page, or null at the end of the recorded history. */
+  next: number | null;
+  /** The commits of the range whose changes the change log does not hold. */
+  unrecorded: HistoryChanges['unrecorded'];
+};
+
+const changeKey = (c: HistoryChange) =>
+  `${c.commit}\u0000${c.op}\u0000${c.subject}\u0000${c.predicate}\u0000${c.object}\u0000${c.graph ?? ''}`;
+
+/**
+ * One page of the entity's history from its newest-first lookups as subject, predicate and
+ * object, each read up to the same commit and cut at the same number of changes. A cut
+ * lookup may stop inside a commit, so the page keeps only the commits newer than the
+ * oldest commit at which a cut lookup stopped, and the next page reads up to that commit
+ * again. When a single commit fills a lookup, the page holds that commit alone with its
+ * counts marked partial, and the next page starts below it. A triple that names the entity
+ * in two positions is counted once.
+ */
+export function entityHistoryPage(lookups: readonly HistoryChanges[]): EntityHistoryPage {
+  let bound: number | null = null;
+  for (const l of lookups) {
+    if (!l.truncated || !l.changes.length) continue;
+    const oldest = Math.min(...l.changes.map((c) => c.commit));
+    if (bound == null || oldest > bound) bound = oldest;
+  }
+  const seen = new Set<string>();
+  const by = new Map<number, EntityCommit>();
+  const keep = (seq: number) => bound == null || seq > bound;
+  const add = (c: HistoryChange, partial: boolean) => {
+    const k = changeKey(c);
+    if (seen.has(k)) return;
+    seen.add(k);
+    let e = by.get(c.commit);
+    if (!e) {
+      e = {
+        seq: c.commit,
+        timestamp: c.timestamp,
+        kind: c.kind,
+        ...(c.author ? { author: c.author } : {}),
+        ...(c.message ? { message: c.message } : {}),
+        added: 0,
+        removed: 0,
+        partial,
+      };
+      by.set(c.commit, e);
+    }
+    if (c.op === 'add') e.added++;
+    else e.removed++;
+  };
+  for (const l of lookups) for (const c of l.changes) if (keep(c.commit)) add(c, false);
+  let next: number | null = bound;
+  if (bound != null && !by.size) {
+    // one commit filled a lookup: show it, partly counted, and read below it next
+    for (const l of lookups) for (const c of l.changes) if (c.commit === bound) add(c, true);
+    next = bound > 0 ? bound - 1 : null;
+  }
+  const unrecorded: HistoryChanges['unrecorded'] = [];
+  for (const l of lookups)
+    for (const u of l.unrecorded)
+      if (!unrecorded.some((x) => x.from === u.from && x.to === u.to && x.reason === u.reason))
+        unrecorded.push(u);
+  unrecorded.sort((a, b) => b.from - a.from);
+  return { commits: [...by.values()].sort((a, b) => b.seq - a.seq), next, unrecorded };
+}
+
+/**
+ * The list so far with an older page appended: each commit once, the page's cursor, and the
+ * unrecorded ranges of every page read, newest first.
+ */
+export function appendEntityPage(
+  prev: EntityHistoryPage,
+  page: EntityHistoryPage,
+): EntityHistoryPage {
+  const commits = [...prev.commits];
+  for (const c of page.commits) if (!commits.some((h) => h.seq === c.seq)) commits.push(c);
+  const unrecorded = [...prev.unrecorded];
+  for (const u of page.unrecorded)
+    if (!unrecorded.some((x) => x.from === u.from && x.to === u.to && x.reason === u.reason))
+      unrecorded.push(u);
+  return {
+    commits: commits.sort((a, b) => b.seq - a.seq),
+    next: page.next,
+    unrecorded: unrecorded.sort((a, b) => b.from - a.from),
+  };
+}
+
+/**
+ * Read one page of the history of `iri` on `target` in `graph` (`default` for the default
+ * graph), up to commit `to`, with at most `limit` changes per lookup. Every lookup reads up
+ * to the same commit, so a commit that lands meanwhile cannot be counted by some lookups
+ * and not by others. The first page reads up to the head the editor shows.
+ */
+export async function readEntityHistory(
+  read: (o: HistoryOptions) => Promise<HistoryChanges>,
+  iri: string,
+  o: { graph: string; to: number; limit: number; signal?: AbortSignal },
+): Promise<EntityHistoryPage> {
+  const term = `<${iri}>`;
+  const lookups = await Promise.all(
+    ENTITY_POSITIONS.map((pos) =>
+      read({
+        [pos]: term,
+        graph: o.graph,
+        order: 'desc',
+        limit: o.limit,
+        to: String(o.to),
+        signal: o.signal,
+      }),
+    ),
+  );
+  return entityHistoryPage(lookups);
+}

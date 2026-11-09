@@ -75,6 +75,10 @@ struct Options {
     deadline_seconds: Option<f64>,
     /// extract from this registered source (its graph) instead of a document
     source: Option<String>,
+    /// claims mode: the evidence source-record graph
+    source_graph: Option<String>,
+    /// claims mode: the evidence proposal graph
+    proposal_graph: Option<String>,
 }
 
 impl Options {
@@ -99,6 +103,8 @@ impl Options {
             "base" => self.base = v_opt,
             "message" => self.message = v_opt,
             "source" => self.source = v_opt,
+            "sourceGraph" => self.source_graph = v_opt,
+            "proposalGraph" => self.proposal_graph = v_opt,
             "allowPartial" => self.allow_partial = Some(flag(&v)?),
             "extract" => self.extract = Some(flag(&v)?),
             "confirm" => self.confirm = Some(flag(&v)?),
@@ -209,8 +215,20 @@ async fn start(
     }
     let mode = match o.mode.as_deref() {
         None => Mode::Branch,
-        Some(m) => Mode::parse(m).ok_or_else(|| bad("mode is branch, preview, auto or memory"))?,
+        Some(m) => {
+            Mode::parse(m).ok_or_else(|| bad("mode is branch, preview, auto, memory or claims"))?
+        }
     };
+    if mode != Mode::Claims && (o.source_graph.is_some() || o.proposal_graph.is_some()) {
+        return Err(bad(
+            "sourceGraph and proposalGraph choose evidence graphs in claims mode",
+        ));
+    }
+    for g in [&o.source_graph, &o.proposal_graph].into_iter().flatten() {
+        if oxrdf::NamedNode::new(g.as_str()).is_err() {
+            return Err(bad("sourceGraph and proposalGraph are IRIs"));
+        }
+    }
     if let Some(s) = &o.source {
         if file.is_some() || o.text.is_some() || o.url.is_some() {
             return Err(bad("send a source, or a document: not both"));
@@ -307,6 +325,8 @@ async fn start(
         message: o.message.clone(),
         pairs: Vec::new(),
         source: o.source.clone(),
+        source_graph: o.source_graph.clone(),
+        proposal_graph: o.proposal_graph.clone(),
     };
     let task = Arc::new(Task::new(&ds, &p.id(), input));
     st.ingest

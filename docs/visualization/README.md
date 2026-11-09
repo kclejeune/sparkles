@@ -398,9 +398,10 @@ a little memory for the list of rows, about the size of the open nodes' ids, in 
 page whose size does not grow with the tree.
 
 A change set is drawn the same way wherever the pages show one, in the edit previews and in
-the history tabs. Each subject is a block named by its label, with every added or removed
-property and value on a line of its own and a sign beside it, and the plain N-Quads are one
-tab away.
+the history tabs. Each subject is a block named by its `rdfs:label` or `skos:prefLabel`,
+or by its `sh:name` when it has neither, so a shape in the shape editor's preview carries
+the name the form shows. Every added or removed property and value is on a line of its own
+with a sign beside it, and the plain N-Quads are one tab away.
 
 ### Rendering preferences
 
@@ -567,7 +568,94 @@ usage view lists every axiom that mentions the entity. The **History** tab lists
 branch's commits newest first in the manner of WebProtégé's changes. Each commit opens to
 what it changed in the graph as a change set, one block a subject named by its label with
 each added or removed property and value on a line, and links to the commit's full diff. Every other view of a commit's, a merge's or a preview's changes shows the same change
-set, with the signed N-Quads lines behind a **N-Quads** switch. **Inferred** reveals the
+set, with the signed N-Quads lines behind a **N-Quads** switch.
+
+The entity frame's **History** view lists the commits of the branch that changed a
+triple naming the entity as subject, predicate or object in the editor's graph, newest
+first, with each commit's message, author, time and counts of those triples
+([screenshot](../images/entity-history.png)). The list reads the change log 200 changes at
+a time for each position and offers older commits in further pages. A commit opens to the
+axioms and assertions that mention the entity which it added and removed, read through
+`GET /$/ontology/{ds}/diff?entity=`, and links to its full diff. A caller who can edit
+the branch, with grants that cover every graph, reverts a commit from there, and the revert is previewed and committed like an
+undo. A revert takes back everything the commit changed on the branch, and it needs
+write access to the whole branch. Commits from bulk loads and commits older than the change
+log are named at the end of the list, since the log cannot say what they changed. A commit
+that changed only the blank nodes of a restriction or an annotated axiom, without a triple
+that names the entity, is not listed.
+
+The entity frame's **Discussion** view holds comment threads on the entity and on its
+axioms, in the manner of WebProtégé's discussions
+([screenshot](../images/ontology-discussions.png)). A caller who can write the branch
+starts a thread on the entity or on one of the axioms its frame lists, replies to a
+thread, and resolves or reopens it. Writing `@name` in a comment mentions that principal,
+and the mention is highlighted and recorded with the comment. The view shows open
+threads, resolved threads or both, with each comment's author and time, and the
+ontology's **Discussions** tab lists every thread of the ontology graph with a link to
+its entity. A read lists at most 1,000 comments and replies, oldest first, and says when
+it stopped there, since later comments and replies are then not listed.
+
+The threads are W3C Web Annotation RDF in an ordinary named graph beside the ontology
+graph on the branch. Its IRI is the ontology graph's IRI under
+`urn:x-sparkles:discussions:`, with `%`, `[` and `]` percent-encoded, so the threads of `http://example.org/uni` are in
+`urn:x-sparkles:discussions:http://example.org/uni` and those of the default graph are in
+`urn:x-sparkles:discussions:default`. Each ontology graph has its own discussion graph,
+and none can be an ontology graph's own IRI. A thread is an `oa:Annotation` motivated by
+`oa:commenting` whose `oa:hasTarget` is the entity, or an `oa:SpecificResource` with the
+entity as `oa:hasSource` and the axiom's functional-style syntax as an
+`oa:TextQuoteSelector`. A reply is an `oa:replying` annotation that targets the thread.
+Each body is an `oa:TextualBody`, the author and time are `dcterms:creator` and
+`dcterms:created`, mentions are `schema:mentions`, and the resolved state is
+`urn:x-sparkles:discussion#resolved` with the resolver in `#resolvedBy`. Comments never
+use `rdfs:comment`, and the editor never reads the discussion graph as an ontology, so
+its frames, trees and graph list leave it out.
+
+Each comment, reply, resolve and reopen is one ordinary commit of the branch. Comments
+therefore appear in the branch's history and in exports of the dataset like any other
+graph, a protected branch refuses them as it refuses every write, and writing one needs
+`write` on the dataset. Readers and visitors of a protected branch see the threads with
+no composer, reply, resolve or reopen. A caller whose grants cover only some graphs needs
+a grant on the discussion graph, or the server refuses the comment. Item 769 covers an
+optional discussion store outside versioning.
+
+The **Bulk edits** tab changes many entities in one commit
+([screenshot](../images/ontology-bulk.png)). **Find and replace** searches the plain and
+language-tagged string values of the labels, of every annotation or of one annotation
+property, as literal text or as a JavaScript regular expression whose replacement may use
+groups such as `$1`, with or without matching case. A language filter keeps to untagged
+values or to one tag, and a tag such as `en` also matches `en-GB`. The scope is the whole
+graph or the entity list. A replacement keeps each value's language and its axiom
+annotations, and a value it would leave empty is left out and counted. **Set annotation**
+adds an annotation to every entity of the list and can replace the values the entities
+hold for that property in the same language, or every value when the new one is an IRI.
+**Remove annotation** removes a property's values from the entities of the list, every
+value, those in one language or one exact value. **Move classes** puts the classes of the
+list under a new parent or at the top. Each class loses the named superclasses that the
+graph's `SubClassOf` axioms state, with those axioms' annotations, unless **Keep the old
+parents** is checked, and its restrictions and other superclass expressions stay. A
+parent that is one of the classes or below one of them is refused, since the move would
+make a cycle.
+
+The entity list takes entities from the entity search, a class with its subclasses, or
+pasted IRIs and prefixed names, and holds at most 1,000 entities. Each edit reads the
+graph's own axioms without its imports at the commit the editor shows, lists every change
+with its old and new value, and opens the editor's preview of one `axioms` edit, so the
+dry run shows the changed triples and the commit is one entry of the undo stack. An edit
+of more than 1,000 changes is refused with its count, and so is a graph that holds more
+than 100,000 annotation assertions or `SubClassOf` axioms, since a partial read could miss
+matches. A move also refuses more than 10,000 changed axioms in all. A pattern that matches
+empty text, such as a lookahead, is refused. A value removed as an IRI removes only that IRI,
+and language tags compare without case, so setting a value an entity already holds leaves it
+and its axiom annotations alone. A commit that lands after the changes were listed clears
+them. Readers and
+protected branches can list changes but get no preview. An annotation property that the
+ontology does not declare is declared with the edit, and a property of another kind, such as a
+data property, is refused. A move's new parent must be a class of the ontology or its imports,
+each moved entity that the graphs type as something else is refused, and the move declares
+nothing. The cycle check follows only the graph's own named `SubClassOf` axioms.
+Item 770 covers bulk edits of larger ontologies.
+
+**Inferred** reveals the
 kept hierarchy beside the asserted class tree. It reads roots and expanded levels from
 an existing result, with the classifier's actual tier and outcome
 ([screenshot](../images/ontology-inferred.png)). **Classify tree** remains a deliberate
@@ -882,6 +970,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   read-only, 611. For the same reason the thesaurus editor's notes and members forms are
   read-only on branches other than main when authentication is on. Undo and redo revert commits, which needs write access to the
   whole branch, so a caller whose grants cover some graphs only can edit but not undo.
+  A revert from the entity frame's History view has the same requirement. The view reads
+  graph restrictions from the main branch's grants, so on another branch it offers a
+  revert that the preview's dry run refuses when that branch's grants cover only some
+  graphs, 611.
+* The entity frame's History view lists the commits that changed a triple naming the
+  entity, so a commit that changed only the blank nodes of a restriction or an annotated
+  axiom is not listed, 765. Each opened commit reads the editor's graph twice to compare
+  its axioms, so opening a commit of a large ontology takes as long as two reads of it.
 * The ontology browser's edit mode changes definitions, synonyms, annotations, parents,
   axioms and SKOS labels and links. SKOS-XL labels and collection members are edited in
   the thesaurus editor, and property assertions, keys and chains have no form of their

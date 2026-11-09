@@ -94,15 +94,19 @@ pub mod resolve;
 pub mod review;
 
 pub use propose::{
-    AuthorityFence, Options as ProposeOptions, Proposed, ProposedRecord, operation_recorded,
-    propose, reconcile_operation_holds,
+    AuthorityFence, Options as ProposeOptions, OrdinaryChanges, Proposed, ProposedRecord,
+    operation_id, operation_iri, operation_recorded, propose, reconcile_operation_holds,
+};
+pub use review::claims::{
+    self, ClaimOccurrence, ClaimOrigin, ClaimState, MAX_CLAIM_SCAN, MAX_CLAIMS, MEM_INSTRUCTIONS,
+    PolicyClaims, PolicyRef, check_matching_policy, claim_states, with_policy_claims,
 };
 pub use review::dependents::{
     self, Dependence, Dependent, Dependents, MAX_CHANGED, dependents as find_dependents,
 };
 pub use review::identity::{
     self, EntityResolution, MAX_MEMBERS, MAX_RESOLVE, RESOLVES_TO, ResolvedEntity,
-    resolve as resolve_entities,
+    resolve as resolve_entities, resolve_at as resolve_entities_at,
 };
 pub use review::{
     Changed, Decided, MapChange, Options as ReviewOptions, ProjectionChange, Reviewed, Withdrawn,
@@ -110,8 +114,8 @@ pub use review::{
 };
 pub use sparkles_core::evidence::review::{DecisionInput, Disposition, WithdrawalInput};
 pub use sparkles_core::evidence::{
-    ASSESSMENT_INPUT_KINDS, MAX_ASSESSMENT_INPUTS, MAX_IDENTITIES, MAX_IDENTITY_ENTITIES,
-    MIN_IDENTITY_ENTITIES,
+    ASSESSMENT_INPUT_KINDS, MAX_ASSESSMENT_INPUTS, MAX_CLAIMS as MAX_BATCH_CLAIMS, MAX_IDENTITIES,
+    MAX_IDENTITY_ENTITIES, MIN_IDENTITY_ENTITIES, prepare_input,
 };
 pub use sparkles_core::evidence::{
     AssessmentInput, ClaimInput, Confidence, ConfidenceFacets, EvidenceInput, EvidenceLinkInput,

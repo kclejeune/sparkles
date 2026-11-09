@@ -143,3 +143,15 @@ ex:edsger a ex:Person ;
  */
 export const BROWSE_EDIT_AUTH = 'browse-edit-auth';
 export const BROWSE_EDIT_OPEN_GRAPH = 'http://example.org/browse-edit/notes';
+
+/**
+ * The ontology of the discussions' tests under auth (item 618): `USER` writes it and
+ * `READER` only reads it. The spec creates and loads it.
+ */
+export const DISCUSSIONS_AUTH = 'discussions-auth';
+
+/**
+ * The ontology of the bulk edits' tests under auth (item 626): `USER` writes it and `READER`
+ * only reads it. The spec creates and loads it.
+ */
+export const BULK_AUTH = 'bulk-auth';

@@ -1495,7 +1495,7 @@ export interface paths {
         put?: never;
         /**
          * Ingest a document
-         * @description Starts an ingestion task: converts the document, registers it as a source on a review branch, and extracts its facts with the `extract` role into proposals there. A CSV or TSV file gets a C05 mapping draft instead, and nothing is written. Needs `read` on the dataset; every write runs as the caller, so it needs what `register_source` and `assert_facts` need. A PDF that needs OCR on a server without it fails with `needs-ocr` and its pages.
+         * @description Starts an ingestion task: converts the document, registers it as a source on a review branch, and extracts its facts with the `extract` role into proposals there. A CSV or TSV file gets a C05 mapping draft instead, and nothing is written. Needs `read` on the dataset; every write runs as the caller, so it needs what `register_source` and `assert_facts` need. A PDF that needs OCR on a server without it fails with `needs-ocr` and its pages. In `claims` mode the source is registered and its facts are proposed as claims of one evidence batch in a single commit, which needs what `POST /{ds}/claims` needs.
          */
         post: operations["startIngest"];
         delete?: never;
@@ -2195,7 +2195,7 @@ export interface paths {
         };
         /**
          * Diff the axioms of two commits
-         * @description The axioms that differ between the commits `from` and `to` (the head by default), with the graph of each. The terminology of each state is read as the summary reads it, and the two sets of axioms are compared. With `assertions=true`, the assertions that the triples changed between the two commits carry are added and removed too. When no triple of the graphs read changed, the diff is empty. `format=text` answers `+ axiom` and `- axiom` lines in functional-style syntax. A caller whose grants limit endpoints needs the `diff` endpoint.
+         * @description The axioms that differ between the commits `from` and `to` (the head by default), with the graph of each. The terminology of each state is read as the summary reads it, and the two sets of axioms are compared. With `assertions=true`, the assertions that the triples changed between the two commits carry are added and removed too. When no triple of the graphs read changed, the diff is empty. `format=text` answers `+ axiom` and `- axiom` lines in functional-style syntax. With `entity`, only the axioms that mention that IRI are kept, which is how the entity frame's history reads one commit. A caller whose grants limit endpoints needs the `diff` endpoint.
          */
         get: operations["diffOntology"];
         put?: never;
@@ -5030,6 +5030,8 @@ export interface components {
             drafts?: number;
             /** @description Explore the data once after a draft without a query or with an empty result. Over the dataset's `repairs.explore`. */
             explore?: boolean;
+            /** @description A matching policy of the dataset's evidence settings, which resolves the linked entities for the claims the summary reads. Not with `mode` `global`. */
+            matchingPolicy?: string;
             /** @description The rows returned in `result`, 1000 by default. */
             maxRows?: number;
             /**
@@ -5042,6 +5044,8 @@ export interface components {
             /** @description At most 2000 characters. */
             question: string;
             reasoning?: boolean;
+            /** @description A review policy of the dataset's evidence settings. The summary reads the claim occurrences about the linked entities with their state under the policy and may cite them in `claimCitations`. Not with `mode` `global`. */
+            reviewPolicy?: string;
             /** @description Hide the agent memory graphs of the dataset from the query, and use only reviewed community reports. */
             reviewedOnly?: boolean;
             /** @description Whether to run the checked query. `true` by default. */
@@ -5062,6 +5066,10 @@ export interface components {
             attempts?: {
                 [key: string]: unknown;
             }[];
+            /** @description With `reviewPolicy`, the claim occurrences the summary read, in the `claims` form of `recall`: `version` 1, `policy`, `occurrences` and `truncated`. */
+            claims?: {
+                [key: string]: unknown;
+            };
             /** @description `{id, question, choices: [{label, value}]}`. */
             clarify?: {
                 [key: string]: unknown;
@@ -5096,12 +5104,18 @@ export interface components {
             reports?: {
                 [key: string]: unknown;
             }[];
+            /** @description With `matchingPolicy`, the map revision read, in the `resolution` form of `recall`. */
+            resolution?: {
+                [key: string]: unknown;
+            };
             /** @description The checked query with `explanation`, `assumptions`, `terms`, `graph`, `commit`, `attempt`, `verdict` and `results` in the `application/x-sparkles+json` form. */
             result?: {
                 [key: string]: unknown;
             };
             summary?: {
                 citations: number[];
+                /** @description With `reviewPolicy`, the claim occurrences the text cites, such as `c1`. */
+                claimCitations?: string[];
                 model?: string;
                 provider?: string;
                 rowsSent?: number;
@@ -8304,7 +8318,7 @@ export interface components {
             allowPartial?: boolean;
             /** @description The namespace of a table's rows in its mapping draft. */
             base?: string;
-            /** @description The review branch (default `ingest.<slug>-<n>`). */
+            /** @description The review branch (default `ingest.<slug>-<n>`). In `claims` mode, an existing branch for the commit, `main` by default. */
             branch?: string;
             /** @description Confirm the estimate in advance. */
             confirm?: boolean;
@@ -8322,14 +8336,18 @@ export interface components {
             /** @description The commit message of the registration. */
             message?: string;
             /**
-             * @description `memory` extracts a registered `source` of agent memory and writes its facts on main into the source's graph, which `agentGraphs` must match.
+             * @description `memory` extracts a registered `source` of agent memory and writes its facts on main into the source's graph, which `agentGraphs` must match. `claims` registers the source and proposes its facts as claims of one evidence batch in the same commit, for a review policy to project; it needs enabled evidence settings, `write` on the update endpoint, update grants on the evidence graphs and `keepText`.
              * @enum {string}
              */
-            mode?: "branch" | "preview" | "auto" | "memory";
+            mode?: "branch" | "preview" | "auto" | "memory" | "claims";
             /** @description The file name, which may say the format. */
             name?: string;
             /** @description The ingest profile (default `default`). */
             profile?: string;
+            /** @description In `claims` mode, the evidence proposal graph when the settings name several. */
+            proposalGraph?: string;
+            /** @description In `claims` mode, the evidence source-record graph when the settings name several. */
+            sourceGraph?: string;
             title?: string;
             /** @description Where the document comes from; fetched through the outbound policy when there is no text or file, and the source's IRI by default. */
             url?: string;
@@ -8375,7 +8393,7 @@ export interface components {
             allowPartial?: boolean;
             /** @description The namespace of a table's rows in its mapping draft. */
             base?: string;
-            /** @description The review branch (default `ingest.<slug>-<n>`). */
+            /** @description The review branch (default `ingest.<slug>-<n>`). In `claims` mode, an existing branch for the commit, `main` by default. */
             branch?: string;
             /** @description Confirm the estimate in advance. */
             confirm?: boolean;
@@ -8392,16 +8410,20 @@ export interface components {
             /** @description The commit message of the registration. */
             message?: string;
             /**
-             * @description `memory` extracts a registered `source` of agent memory and writes its facts on main into the source's graph, which `agentGraphs` must match.
+             * @description `memory` extracts a registered `source` of agent memory and writes its facts on main into the source's graph, which `agentGraphs` must match. `claims` registers the source and proposes its facts as claims of one evidence batch in the same commit, for a review policy to project; it needs enabled evidence settings, `write` on the update endpoint, update grants on the evidence graphs and `keepText`.
              * @enum {string}
              */
-            mode?: "branch" | "preview" | "auto" | "memory";
+            mode?: "branch" | "preview" | "auto" | "memory" | "claims";
             /** @description The file name, which may say the format. */
             name?: string;
             /** @description The ingest profile (default `default`). */
             profile?: string;
+            /** @description In `claims` mode, the evidence proposal graph when the settings name several. */
+            proposalGraph?: string;
             /** @description The graph IRI of a registered source to extract from instead of a document: its current rendition goes through the estimate, the `extract` role and linking. Leave out text, url and the file. */
             source?: string;
+            /** @description In `claims` mode, the evidence source-record graph when the settings name several. */
+            sourceGraph?: string;
             /** @description The document's text. */
             text?: string;
             title?: string;
@@ -8437,7 +8459,7 @@ export interface components {
             message?: string;
             /** @description From 0 to 1. */
             progress: number;
-            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, a table's mapping draft and preview, or a workbook's drafts for each sheet. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted. */
+            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `already-proposed`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, a table's mapping draft and preview, or a workbook's drafts for each sheet. A `claims` ingestion reports the evidence operation, commit, first availability, revision, records and their counts by kind, the claims, failed facts, flagged entities and `factGuard` `not-run`. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted. */
             result?: {
                 [key: string]: unknown;
             };
@@ -9723,13 +9745,15 @@ export interface components {
             channels: {
                 /** @description Deliveries that failed, were refused or were dropped since the start. */
                 failed: number;
+                /** @description Whether the channel's thread is sending a delivery. */
+                inFlight: boolean;
                 lastFailure: {
                     at: string;
                     /** @description Why a delivery failed. It never holds a secret. */
                     error?: string;
                     event: string;
                     id?: string;
-                    /** @description The HTTP status of a delivery. */
+                    /** @description The HTTP status of a webhook or ntfy delivery, or the SMTP reply code of an email delivery. */
                     status?: number;
                 } | null;
                 lastSuccess: {
@@ -9738,10 +9762,14 @@ export interface components {
                     error?: string;
                     event: string;
                     id?: string;
-                    /** @description The HTTP status of a delivery. */
+                    /** @description The HTTP status of a webhook or ntfy delivery, or the SMTP reply code of an email delivery. */
                     status?: number;
                 } | null;
                 name: string;
+                /** @description The deliveries the channel's queue holds, the one in flight included. */
+                queueCapacity: number;
+                /** @description Deliveries waiting in the channel's queue. */
+                queued: number;
                 /** @description The secrets the channel names. */
                 secrets: string[];
                 /** @description Deliveries that succeeded since the start. */
@@ -9749,10 +9777,10 @@ export interface components {
                 /** @description Where the channel delivers, without credentials. */
                 target: string;
                 /** @enum {string} */
-                type: "webhook" | "ntfy";
+                type: "webhook" | "ntfy" | "email";
             }[];
             enabled: boolean;
-            /** @description Deliveries waiting in the queue. */
+            /** @description Deliveries waiting in every channel's queue. */
             queued: number;
             recent: {
                 [key: string]: unknown;
@@ -9770,10 +9798,10 @@ export interface components {
             latencyMs: number;
             /** @enum {string} */
             result: "ok";
-            /** @description The HTTP status the channel answered. */
+            /** @description The HTTP status the channel answered, or the SMTP reply code of an email channel. */
             status: number;
             /** @enum {string} */
-            type: "webhook" | "ntfy";
+            type: "webhook" | "ntfy" | "email";
         };
         OAuthError: {
             /**
@@ -10397,7 +10425,11 @@ export interface components {
             graphs?: string[];
             hops?: number;
             includeSuperseded?: boolean;
+            /** @description A matching policy of the dataset's evidence settings. Entities name their representative under its resolution map, and the other members of each seed's cluster are read too. */
+            matchingPolicy?: string;
             maxBytes?: number;
+            /** @description The claim occurrences listed at most, 1 to 200, 50 by default. Needs `reviewPolicy`. */
+            maxClaims?: number;
             maxTriples?: number;
             /** @description The question or the words to search for. Give query, seeds or both. */
             query?: string;
@@ -10405,6 +10437,8 @@ export interface components {
             reasoning?: boolean;
             /** @description A half-life such as `90d` (units s, m, h, d, w, y). Found seeds rank by the age of their newest fact and by how many graphs assert their facts. */
             recency?: string;
+            /** @description A review policy of the dataset's evidence settings. Accepted facts cite the claim occurrences of their supports, and `claims` lists the occurrences about the entities returned with their state under the policy. */
+            reviewPolicy?: string;
             seedLimit?: number;
             /** @description Entity IRIs to start from. */
             seeds?: string[];
@@ -10420,6 +10454,8 @@ export interface components {
             citations: {
                 at?: string;
                 by?: string;
+                /** @description With `reviewPolicy`, the identifiers of the claim occurrences of the facts' live supports. */
+                claims?: string[];
                 confidence?: string;
                 graph: string;
                 id: number;
@@ -10429,6 +10465,40 @@ export interface components {
                 /** @enum {string} */
                 status?: "reviewed" | "unreviewed";
             }[];
+            /** @description With `reviewPolicy`, the claim occurrences the result cites or that are about its entities. */
+            claims?: {
+                occurrences: {
+                    by?: string;
+                    claim: string;
+                    decision?: string;
+                    decisionVersion?: number;
+                    id: string;
+                    /** @enum {string} */
+                    kind: "reported" | "observation" | "hypothesis" | "preference";
+                    /**
+                     * @description `instructions` when the source is an instruction document. Every claim is source data either way.
+                     * @enum {string}
+                     */
+                    origin: "instructions" | "source";
+                    /** @enum {string} */
+                    polarity: "positive" | "negative" | "uncertain";
+                    proposition: {
+                        o: string;
+                        p: string;
+                        s: string;
+                    };
+                    source?: string;
+                    /** @enum {string} */
+                    state: "accepted" | "rejected" | "needs-evidence" | "unreviewed" | "withdrawn";
+                }[];
+                policy: {
+                    name: string;
+                    version: number;
+                };
+                truncated: boolean;
+                /** @description 1. A client must recognize the version before it reads the member. */
+                version: number;
+            };
             commit: number;
             /** @description With `communities`, the report of each seed's community. */
             communities?: {
@@ -10469,12 +10539,25 @@ export interface components {
                 hop: number;
                 iri: string;
                 label?: string;
+                /** @description With `matchingPolicy`, the entity's cluster when the map names it. */
+                resolution?: {
+                    members: string[];
+                    membersComplete: boolean;
+                    representative: string;
+                };
                 seed?: number;
                 types: string[];
             }[];
             /** @description The prefixes the compact terms use. */
             prefixes: {
                 [key: string]: unknown;
+            };
+            /** @description With `matchingPolicy`, the map revision read. */
+            resolution?: {
+                number: number;
+                policy: string;
+                revision: string | null;
+                version: number;
             };
             superseded?: {
                 at?: string;
@@ -18175,6 +18258,8 @@ export interface operations {
                 to?: string;
                 /** @description Also diff the assertions that the changed triples carry. */
                 assertions?: boolean;
+                /** @description An entity IRI. Only the axioms that mention it are listed and counted. */
+                entity?: string;
                 /** @description `json` (the default) or `text`. */
                 format?: "json" | "text";
                 /** @description The most axioms listed on each side, from 1 to 10,000 (1,000 by default). */

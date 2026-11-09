@@ -1,6 +1,6 @@
 """Narrow qualification primitives; imports perform no actions."""
 from pathlib import Path
-import hashlib,json,os,re,stat,time
+import hashlib,json,os,re,stat,time,selectors,subprocess
 
 _PROFILE=None
 def bind_profile(p):
@@ -21,6 +21,23 @@ MEMORY=536870912
 class Refusal(Exception): pass
 def need(ok,reason):
     if not ok: raise Refusal(reason)
+REASON_MAX=160
+def bounded_text(text,limit=REASON_MAX):
+    """Printable ASCII of at most ``limit`` characters, other characters as '?'."""
+    return ''.join(c if ' '<=c<='~' else '?' for c in str(text)[:limit])
+def reason_code(error):
+    """A bounded code for a refusal that never carries arbitrary error text.
+
+    A Refusal's message is one of this packet's own literal reasons and is kept.
+    Any other exception gives only its type and the function and line where it
+    was raised, so a path, provider response or credential cannot leak into a
+    receipt.
+    """
+    if isinstance(error,Refusal):return bounded_text('refusal:'+str(error))
+    tb=error.__traceback__;frame=None
+    while tb is not None:frame=tb;tb=tb.tb_next
+    where='' if frame is None else ':%s:%d'%(frame.tb_frame.f_code.co_name,frame.tb_lineno)
+    return bounded_text('unexpected:'+type(error).__name__+where)
 def digest(data): return hashlib.sha256(data).hexdigest()
 def sha(value):return isinstance(value,str) and re.fullmatch('[a-f0-9]{64}',value) is not None
 def read_owned(path,limit=1024*1024):
@@ -32,6 +49,14 @@ def read_owned(path,limit=1024*1024):
         need(len(data)==s.st_size and (a.st_dev,a.st_ino,a.st_mtime_ns,a.st_size)==(s.st_dev,s.st_ino,s.st_mtime_ns,s.st_size),'local receipt changed')
         return data
     finally:os.close(fd)
+def open_lock(path):
+    """Open or create a private lock file, refusing one of another owner, mode or link count."""
+    fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
+    try:
+        s=os.fstat(fd);need(stat.S_ISREG(s.st_mode) and s.st_uid==os.getuid() and s.st_nlink==1 and not s.st_mode&0o077,'unsafe lock file')
+    except BaseException:
+        os.close(fd);raise
+    return fd
 def load(path):return json.loads(read_owned(path))
 def write_new(root,name,data):
     # Linux/systemd qualification: renameat2(RENAME_NOREPLACE) publishes complete
@@ -87,6 +112,27 @@ def source_shape(row):
     need(re.fullmatch('[0-9a-f]{40}',row['head']) is not None,'source HEAD')
     need(sha(row['status_sha256']) and sha(row['tracked_diff_sha256']),'source status/diff')
     need(set(row['inputs'])=={'mise.toml','rust-toolchain.toml'} and all(sha(x) for x in row['inputs'].values()),'source inputs')
+# The fields of a checkout's source identity, which are all content: the commit, the
+# hashes of the porcelain status and of the tracked diff against it, and the hashes of
+# the two toolchain input files. A drift records each one, recorded beside observed.
+SOURCE_FIELDS=('head','status_sha256','tracked_diff_sha256','inputs.mise.toml','inputs.rust-toolchain.toml')
+def source_hex(value):
+    return value if isinstance(value,str) and re.fullmatch('[0-9a-f]{40}|[0-9a-f]{64}',value) is not None else None
+def source_fields(row):
+    row=row if isinstance(row,dict) else {};inputs=row.get('inputs') if isinstance(row.get('inputs'),dict) else {}
+    out={k:row.get(k) for k in SOURCE_FIELDS[:3]}
+    for name in ('mise.toml','rust-toolchain.toml'):out['inputs.'+name]=inputs.get(name)
+    return out
+def drift_evidence(x):
+    """A bounded copy of a source drift: fixed field names, hex values and flags only."""
+    if not isinstance(x,dict):return None
+    fields=x.get('fields') if isinstance(x.get('fields'),dict) else {}
+    out={'repository':x['repository'] if isinstance(x.get('repository'),str) and re.fullmatch('/[A-Za-z0-9._/-]{1,200}',x['repository']) else None,
+         'fields':{},'other_fields_differ':x.get('other_fields_differ') is True}
+    for name in SOURCE_FIELDS:
+        f=fields.get(name) if isinstance(fields.get(name),dict) else {}
+        out['fields'][name]={'recorded':source_hex(f.get('recorded')),'observed':source_hex(f.get('observed')),'differs':f.get('differs') is True}
+    return out
 def validate_release(r,now):
     need(r.get('schema')==1 and r.get('authorized_by_Root') is True,'release is false')
     need(r.get('worker')==worker_id(),'release worker')
@@ -101,7 +147,10 @@ def validate_release(r,now):
         freshness(r[key],now)
     book=r['start_ledger'];need(book.get('limit')==200 and type(book.get('starts_and_reservations')) is int and 0<=book['starts_and_reservations']<=200,'shared start bound')
     need(book.get('this_one_resume_reserved') is True and book.get('all_actors_included') is True and bool(book.get('window')) and bool(book.get('timezone')) and book.get('provider_rate_admitted') is True,'shared ledger incomplete')
-    need(r['local_first'].get('overflow_currently_needed') is True,'local capacity available or unknown')
+    # A qualification run needs no current overflow when the release binds the
+    # maintainer's recorded confirmation of that purpose by its hash.
+    lf=r['local_first']
+    need(lf.get('overflow_currently_needed') is True or (lf.get('overflow_currently_needed') is False and lf.get('purpose')=='qualification' and sha(lf.get('maintainer_confirmation_sha256'))),'local capacity available or unknown')
     e=r['environment'];freshness(e,now,30);need(e.get('version')==profile()['future_environment']['version'] and e.get('hook_sha256')==hook_sha() and e.get('name')==profile()['future_environment']['name'],'latest ENV drift')
     need(e.get('environment_id')==profile()['future_environment']['id'],'environment identity drift')
     need(e.get('assigned_editors_excluded') is True,'no environment edit exclusion')
@@ -158,3 +207,94 @@ def positive_resume_ack(result,contract):
     b=result.get('body');need(contract.get('verified_by_Root') is True and sha(contract.get('receipt_sha256')),'ack schema unbound')
     if not isinstance(b,dict):return False
     return contract.get('kind')=='cli_accepted_resuming' and b.get('event')=='accepted' and b.get('id')==worker_id() and b.get('status')=='resuming'
+
+UNITS={'B':1,'K':1024,'M':1024**2,'G':1024**3,'T':1024**4}
+SUMMARY_PEAK=re.compile(r'Memory peak: ([0-9]{1,6})(?:\.([0-9]))?([BKMGT]) \(swap: ([0-9]{1,6})(?:\.([0-9]))?([BKMGT])\)')
+def summary_bound(whole,tenth,unit):
+    """The largest byte count systemd's one-decimal size text can stand for."""
+    if unit=='B':
+        need(tenth is None,'phase memory summary');return int(whole)
+    return (int(whole)*10+int(tenth or 0)+1)*UNITS[unit]//10
+def summary_peaks(text):
+    """Upper bounds of the memory and swap peaks in a `systemd-run --wait` summary.
+
+    systemd truncates each size to one decimal place, so the bound is the next
+    tenth. The summary is the last matching line. The peaks are unknown when no
+    line names both values."""
+    if not isinstance(text,str):return None
+    rows=[SUMMARY_PEAK.fullmatch(line.strip()) for line in text.splitlines()[-64:]]
+    rows=[m for m in rows if m]
+    if not rows:return None
+    m=rows[-1]
+    try:return {'source':'systemd_run_summary','memory_peak':summary_bound(*m.group(1,2,3)),'swap_peak':summary_bound(*m.group(4,5,6))}
+    except Refusal:return None
+def cgroup_peaks(result,loaded):
+    """The peaks the phase read from its own cgroup, when they are bound to this unit."""
+    row=result.get('phase_memory') if isinstance(result,dict) else None
+    if not isinstance(row,dict) or row.get('source')!='cgroup':return None
+    if type(row.get('memory_peak'))is not int or type(row.get('swap_peak'))is not int or row['memory_peak']<0 or row['swap_peak']<0:return None
+    # The record names the phase unit's own cgroup, and a unit that is still loaded
+    # must report that same cgroup.
+    if not isinstance(row.get('cgroup'),str) or row['cgroup'].rsplit('/',1)[-1]!=result.get('unit'):return None
+    if loaded.get('LoadState')!='not-found' and loaded.get('ControlGroup')!=row['cgroup']:return None
+    return {'source':'cgroup','memory_peak':row['memory_peak'],'swap_peak':row['swap_peak']}
+def terminal_health(result,loaded,closed,run_exit=None,summary=None):
+    """Whether a finished phase unit ended healthy, with a bounded reason and its evidence.
+
+    The unit must have closed with status 0, a memory peak within the cap and no
+    swap. The memory peaks come from the phase's own cgroup read before it
+    exited, and otherwise from the `systemd-run --wait` summary. systemd unloads a
+    finished transient unit, and an unloaded unit reports default values: Result
+    success, status 0 and no peaks. Its status therefore comes only from
+    systemd-run's exit code, which is the unit's own. Peaks that the unit still
+    reports must also be within the cap."""
+    if not closed:return False,'unit_unhealthy:open',{}
+    unloaded=loaded.get('LoadState')=='not-found'
+    if unloaded:
+        if run_exit is None:return False,'unit_unhealthy:unloaded:status_unknown',{}
+        if run_exit!=0:return False,'unit_unhealthy:unloaded:exit-%d'%run_exit if type(run_exit)is int and 0<=run_exit<256 else 'unit_unhealthy:unloaded:exit-unknown',{}
+    elif loaded.get('Result')!='success' or loaded.get('ExecMainStatus')!='0':
+        return False,'unit_unhealthy:'+bounded_text(loaded.get('Result','unknown'),32)+':'+bounded_text(loaded.get('ExecMainStatus','unknown'),12),{}
+    peaks=cgroup_peaks(result,loaded) or summary_peaks(summary)
+    if peaks is None:return False,'unit_unhealthy:memory_peak_unavailable',{}
+    evidence=dict(peaks,terminal_source='systemd_run_exit' if unloaded else 'unit')
+    for key,value in (('MemoryPeak',peaks['memory_peak']),('MemorySwapPeak',peaks['swap_peak'])):
+        own=loaded.get(key,'')
+        if own.isdigit():evidence['unit_'+key]=int(own)
+    if max(peaks['memory_peak'],evidence.get('unit_MemoryPeak',0))>MEMORY:return False,'unit_unhealthy:memory_peak_over_cap',evidence
+    if max(peaks['swap_peak'],evidence.get('unit_MemorySwapPeak',0))!=0:return False,'unit_unhealthy:swap_used',evidence
+    return True,None,evidence
+
+def bounded_command(argv,limit,capture_stderr=False,cap=1024*1024):
+    """Run one command for at most ``limit`` seconds, reading at most ``cap`` bytes per pipe.
+
+    The bound holds while the pipes are read, so a child that writes more is killed
+    before its output is buffered. A refused or timed-out child is killed and
+    reaped within ten seconds."""
+    child=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL)
+    chooser=None
+    try:
+        pipes=[child.stdout]+([child.stderr] if capture_stderr else []);out={id(x):bytearray() for x in pipes};chooser=selectors.DefaultSelector()
+        for pipe in pipes:chooser.register(pipe,selectors.EVENT_READ)
+        end=time.monotonic()+limit
+        while chooser.get_map():
+            left=end-time.monotonic()
+            if left<=0:raise subprocess.TimeoutExpired(argv,limit)
+            for key,_ in chooser.select(left):
+                chunk=os.read(key.fd,65536)
+                if not chunk:chooser.unregister(key.fileobj);continue
+                need(len(out[id(key.fileobj)])+len(chunk)<=cap,'output bound');out[id(key.fileobj)]+=chunk
+        child.wait(max(0.001,end-time.monotonic()))
+    except BaseException:
+        child.kill();child.wait(10);raise
+    finally:
+        # Cleanup reads the pipes from the child itself, so it needs nothing the
+        # setup above may not have built, and each step runs even when another fails.
+        try:
+            if chooser is not None:chooser.close()
+        finally:
+            try:
+                if child.stdout is not None:child.stdout.close()
+            finally:
+                if child.stderr is not None:child.stderr.close()
+    return subprocess.CompletedProcess(argv,child.returncode,bytes(out[id(child.stdout)]),bytes(out[id(child.stderr)]) if capture_stderr else None)

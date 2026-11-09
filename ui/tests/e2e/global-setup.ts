@@ -33,6 +33,8 @@ import {
   BROWSE_EDIT_AUTH,
   BROWSE_EDIT_OPEN_GRAPH,
   DATASET,
+  DISCUSSIONS_AUTH,
+  BULK_AUTH,
   DATA,
   DECLARED_DATASET,
   DECLARED_KEY,
@@ -194,8 +196,24 @@ dataset = "${BROWSE_EDIT_AUTH}"
 level = "write"
 graphs = ["${BROWSE_EDIT_OPEN_GRAPH}"]
 
+[[roles.pattern-writer.grants]]
+dataset = "${DISCUSSIONS_AUTH}"
+level = "write"
+
+[[roles.pattern-writer.grants]]
+dataset = "${BULK_AUTH}"
+level = "write"
+
 [[roles.pattern-reader.grants]]
 dataset = "${PATTERN_DATASET}"
+level = "read"
+
+[[roles.pattern-reader.grants]]
+dataset = "${DISCUSSIONS_AUTH}"
+level = "read"
+
+[[roles.pattern-reader.grants]]
+dataset = "${BULK_AUTH}"
 level = "read"
 
 [[roles.pattern-reader.grants]]

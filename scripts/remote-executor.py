@@ -93,9 +93,74 @@ def command(host, text):
                    'file':data['_envfile'], 'body':boat_environment.environment_body(profile).decode(), 'check':True}
         check = shlex.join(['/usr/bin/python3','-I','-B','-c',boat_environment.REMOTE,json.dumps(payload)])+' >/dev/null'
         values = [key+'='+value for key,value in boat_environment.environment(profile).items()]
-        wrapped = 'set -e; '+check+'; cd '+shlex.quote(profile['worker_home'])+'; exec '+shlex.join(['env',*values,'/bin/bash','-c',text])
-        return [data['_cli']['path'], '--no-update', 'ssh', worker, '--', '/bin/bash', '-c', shlex.quote(wrapped)]
+        # Leave the provider's landing directory first, so nothing runs in a checkout.
+        # Bash started over ssh reads ~/.bashrc even for -c, and a worker's may put
+        # another cargo first on PATH, so neither shell reads a startup file, and an
+        # inherited BASH_ENV or ENV is cleared before each starts. Jobs build with mbx
+        # in local-only mode, so the job shell also drops any inherited mbx token setting.
+        quiet = ['-u', 'BASH_ENV', '-u', 'ENV']
+        local = ['-u', 'MBX_REMOTE_TOKEN_FILE', '-u', 'MBX_REMOTE_TOKEN']
+        wrapped = 'set -e; cd '+shlex.quote(profile['worker_home'])+'; '+check+'; exec '+shlex.join(['env',*quiet,*local,*values,'/bin/bash','--norc','--noprofile','-c',text])
+        # The provider passes each word to the worker as one argument, so the script
+        # goes to bash -c as it is, not as a quoted copy.
+        return [data['_cli']['path'], '--no-update', 'ssh', worker, '--', '/usr/bin/env', *quiet, '/bin/bash', '--norc', '--noprofile', '-c', wrapped]
     return [*SSH, host, text]
+
+
+def tool_check(profile):
+    """Resolve mbx and rustc through the job environment and refuse a pin mismatch by name.
+
+    Boat jobs build with MBX in local-only mode, so the check also asks the pinned mbx
+    for its effective remote URL and local budget and refuses a remote cache or token.
+    """
+    mbx,rust=profile['tool_versions']['mbx'],profile['tool_versions']['rust']
+    pinned=boat_environment.pinned_mbx(profile)
+    local=boat_environment.environment(profile)
+    return """refuse(){{ printf 'ADMIT-REFUSAL: %s\\n' "$1"; exit 86; }}
+physical=$(command -v mbx) || refuse 'mbx is not on the job PATH'
+test "$physical" = {pinned} || refuse "mbx resolves to $physical, pinned {pinned_text}"
+version=$("$physical" --version 2>/dev/null | awk '{{print $2}}') || true
+test "$version" = {mbx} || refuse "mbx reports $version, pinned {mbx}"
+test -z "${{MBX_REMOTE_TOKEN_FILE+x}}${{MBX_REMOTE_TOKEN+x}}" || refuse 'the job environment names an mbx remote token'
+url=$("$physical" settings get remote.url 2>/dev/null) || refuse 'mbx cannot read its settings'
+test -z "$url" || refuse 'mbx resolves a remote cache URL, not local-only mode'
+total=$("$physical" settings get gc.max_total_size 2>/dev/null) || true
+test "$total" = {total} || refuse "mbx local budget is $total, pinned {total}"
+floor=$("$physical" settings get gc.min_free_size 2>/dev/null) || true
+test "$floor" = {floor} || refuse "mbx free-space floor is $floor, pinned {floor}"
+command -v rustc >/dev/null || refuse 'rustc is not on the job PATH'
+version=$(rustc --version 2>/dev/null | awk '{{print $2}}') || true
+test "$version" = {rust} || refuse "rustc reports $version, pinned {rust} (RUSTUP_TOOLCHAIN=${{RUSTUP_TOOLCHAIN:-unset}})"
+""".format(pinned=shlex.quote(pinned),pinned_text=pinned.replace('"','?').replace('$','?').replace('`','?').replace('\\','?'),
+           mbx=shlex.quote(mbx),rust=shlex.quote(rust),
+           total=shlex.quote(local['MBX_GC_MAX_TOTAL_SIZE']),floor=shlex.quote(local['MBX_GC_MIN_FREE_SIZE']))
+
+
+# Commands the query, write and Jena screens and the remote build run on the worker,
+# including gzip for tar -z
+# and the dynamic loader that nsc-bench-remote.sh starts the server binary through.
+# Admission names the first missing one, so a job never stops partway through for a
+# tool the worker lacks. mbx and rustc are checked by tool_check, and test_remote_executor
+# derives the external commands of the worker scripts to keep this list complete.
+WORKER_TOOLS=('bash','sh','env','python3','git','systemd-run','systemctl','flock','timeout','mkfifo',
+              'tar','gzip','zstd','curl','taskset','chrt','cc','cargo','realpath','sha256sum',
+              'awk','sed','grep','tac','ls','cut','head','sort','seq','tr','wc','tee','cat','date','uname',
+              'free','du','df','tail','chmod','cp','ln','mkdir','mktemp','mv','rm','dirname','sleep',
+              '/lib64/ld-linux-x86-64.so.2')
+
+
+def worker_tools_check():
+    """Shell text that refuses, by name, the first command in WORKER_TOOLS the worker lacks."""
+    return 'for name in '+' '.join(WORKER_TOOLS)+'; do command -v "$name" >/dev/null || refuse "$name is not on the worker"; done\n'
+
+
+def refusal_reason(output):
+    """The worker's last refusal line, bounded and reduced to printable ASCII."""
+    reason=None
+    for line in output.decode('ascii','replace').splitlines():
+        if line.startswith('ADMIT-REFUSAL: '):
+            reason=''.join(c if ' '<=c<='~' else '?' for c in line.removeprefix('ADMIT-REFUSAL: '))[:200]
+    return reason
 
 
 def admit(host, minimum):
@@ -119,39 +184,31 @@ def admit(host, minimum):
     # setupStatus=null alone is no readiness evidence. The owner binds startup
     # quiescence and guard lifetime; these physical checks detect subsequent drift.
     probe = """set -euo pipefail
-test -f {envfile}
+""" + tool_check(data['_profile']) + ("""test -f {envfile}
 test "$(stat -c %a {envfile})" = 600
 test "$(sha256sum {envfile} | cut -d' ' -f1)" = {envhash}
 exec 8>{bootstrap}
 flock -n 8
 test "$(sha256sum {manifest} | cut -d' ' -f1)" = {digest}
-test "$(mbx --version | awk '{{print $2}}')" = 1.29.1
 shim=$(command -v cargo)
 test -f "$shim"
 test "$(sha256sum "$shim" | cut -d' ' -f1)" = 9cfafb636d06f397aa5c48a68ac7755865d424f7acafe075e6fce3bcaa723843
-physical=$(command -v mbx)
 target_record=$(dirname "$shim")/mbx-target
 test -f "$target_record" && test ! -L "$target_record"
 test "$(stat -c %s "$target_record")" -le 4096
 IFS= read -r child_mbx < "$target_record"
 test -f "$child_mbx"
 test "$(sha256sum "$child_mbx" | cut -d' ' -f1)" = 4b0c0fcfc9329a9d76fd6bdefc1ee34822580864f5f5ba2f0b47dcbbffce2eca
-test "$(rustc --version | awk '{{print $2}}')" = 1.99.1
-test -n "${{MBX_REMOTE_TOKEN_FILE:-}}"
-test -f "$MBX_REMOTE_TOKEN_FILE" && test ! -L "$MBX_REMOTE_TOKEN_FILE"
-test "$(stat -c %a "$MBX_REMOTE_TOKEN_FILE")" = 600
-test "$(stat -c %u "$MBX_REMOTE_TOKEN_FILE")" = "$(id -u)"
 test "$(sha256sum "$physical" | cut -d' ' -f1)" = 4b0c0fcfc9329a9d76fd6bdefc1ee34822580864f5f5ba2f0b47dcbbffce2eca
 for name in MBX_CACHE_DIR CARGO_TARGET_DIR CARGO_BUILD_TARGET RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER; do test -z "${{!name:-}}"; done
-command -v python3 >/dev/null
-command -v systemd-run >/dev/null
-""".format(envfile=shlex.quote(data['worker_env_path']), envhash=shlex.quote(data['worker_env_sha256']),
+""" + worker_tools_check()).format(envfile=shlex.quote(data['worker_env_path']), envhash=shlex.quote(data['worker_env_sha256']),
            bootstrap=shlex.quote(data['bootstrap_lock_path']), manifest=shlex.quote(data['toolchain_manifest_path']),
            digest=shlex.quote(data['toolchain_manifest_sha256']))
     with tempfile.TemporaryFile(buffering=0) as result:
         code=exchange(command(host,probe),result,limit=65536,deadline=deadline)
+        result.seek(0);reason=refusal_reason(result.read(65536))
     if code:
-        fail('worker guard or physical toolchain check failed')
+        fail('worker refused admission: '+reason if code==86 and reason else 'worker guard or physical toolchain check failed')
     # Retain only bounded non-secret identities, never arbitrary provider metadata.
     # Version 2 records the original end pair so that a later runtime is taken
     # from both clocks. expires_at is recomputed after the probes.

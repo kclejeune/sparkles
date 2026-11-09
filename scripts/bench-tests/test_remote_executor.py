@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import sys
 import subprocess
@@ -15,13 +16,83 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
-from boat_fixtures import fixture as boat_fixture
+from boat_fixtures import fixture as boat_fixture, ExtendIO, environment_fact
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('remote_executor', ROOT / 'scripts/remote-executor.py')
 RX = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RX)
 
+
+
+REMOTE_CALLS={'rx_exec','rsh','screen_exec'}
+WRAPPERS={'exec','timeout','nohup','env','setsid','taskset','chrt','nice','command','flock','systemd-run','xargs'}
+def shell_builtins():
+    import subprocess as sp
+    return set(sp.run(['bash','-c','compgen -b; compgen -k'],capture_output=True,text=True,check=True).stdout.split())
+
+def quoted_text(source,word):
+    """The shell text inside one quoted word, unescaped as the outer shell would."""
+    parts=word.get('Parts',[])
+    if len(parts)!=1 or parts[0].get('Type') not in ('DblQuoted','SglQuoted'):return None
+    raw=source.encode()[word['Pos']['Offset']+1:word['End']['Offset']-1].decode()
+    if parts[0]['Type']=='DblQuoted':
+        for a,b in (('\\"','"'),('\\$','$'),('\\`','`'),('\\\\','\\')):raw=raw.replace(a,b)
+    return raw
+
+def shell_commands(source,remote_only=False):
+    """The literal external command names that a shell text runs.
+
+    With remote_only, only the text passed to a remote call is read, recursively,
+    including bash -c and sh -c arguments inside it."""
+    import json as js,subprocess as sp
+    builtins=shell_builtins();found=set();funcs=set()
+    def parse(text):return js.loads(sp.run(['shfmt','--to-json'],input=text,capture_output=True,text=True,check=True).stdout)
+    def literal(arg):
+        parts=arg.get('Parts',[]);return parts[0].get('Value') if len(parts)==1 and parts[0].get('Type')=='Lit' else None
+    def walk(node,text,local):
+        if isinstance(node,dict):
+            if node.get('Type')=='FuncDecl':funcs.add(node['Name']['Value'])
+            # A heredoc fed to a shell, directly or through a wrapper such as
+            # mbx sparkles-task, runs as shell code on the same host.
+            cmd=node.get('Cmd')
+            staged=isinstance(cmd,dict) and cmd.get('Type')=='CallExpr' and [literal(a) for a in cmd.get('Args',[])]==['cat'] and any(
+                r.get('Op')=='>' and text.encode()[r['Word']['Pos']['Offset']:r['Word']['End']['Offset']].decode().rstrip('"').endswith('/remote.sh') for r in node.get('Redirs') or [])
+            if (local or staged) and isinstance(cmd,dict) and cmd.get('Type')=='CallExpr' and (staged or {'bash','sh'}&{literal(a) for a in cmd.get('Args',[])}):
+                for redirect in node.get('Redirs') or []:
+                    body=redirect.get('Hdoc')
+                    if redirect.get('Op') in ('<<','<<-') and body:
+                        # The body's span ends with the delimiter line, which is not code.
+                        lines=text.encode()[body['Pos']['Offset']:body['End']['Offset']].decode().splitlines()
+                        delimiter=text.encode()[redirect['Word']['Pos']['Offset']:redirect['Word']['End']['Offset']].decode().strip('\'"')
+                        if lines and lines[-1].strip()==delimiter:lines=lines[:-1]
+                        visit('\n'.join(lines)+'\n',True)
+            if node.get('Type')=='CallExpr' and node.get('Args'):
+                args=node['Args'];words=[literal(a) for a in args];first=words[0]
+                if first in REMOTE_CALLS:
+                    inner=quoted_text(text,args[-1])
+                    if inner is not None:visit(inner,True)
+                if local:
+                    i=0
+                    while i<len(words) and words[i] is not None:
+                        found.add(words[i])
+                        if words[i] in WRAPPERS:
+                            i+=1
+                            # Options, their values and assignments; a computed command ends the scan.
+                            while i<len(words) and (words[i] is None and words[i-1] is not None and words[i-1].startswith('-') or words[i] is not None and (words[i].startswith('-') or '=' in words[i] or words[i][:1].isdigit())):i+=1
+                            continue
+                        break
+                    if first in ('bash','sh') and '-c' in words:
+                        j=words.index('-c')
+                        if j+1<len(args):
+                            inner=quoted_text(text,args[j+1])
+                            if inner is not None:visit(inner,True)
+            for v in node.values():walk(v,text,local)
+        elif isinstance(node,list):
+            for v in node:walk(v,text,local)
+    def visit(text,local):walk(parse(text),text,local)
+    visit(source,not remote_only)
+    return {w for w in found if w not in builtins and w not in funcs and w not in REMOTE_CALLS}
 
 class Admission(unittest.TestCase):
     def setUp(self):
@@ -41,9 +112,28 @@ class Admission(unittest.TestCase):
     def test_exact_warm_identity_and_binary_safe_command(self):
         result=RX.command('boat:bx_fixture',"printf '%s' 'a;$(bad)' && cat")
         self.assertEqual(result[:4],[self.fixtures['release']['boat']['path'],'--no-update','ssh','bx_fixture'])
-        decoded=shlex.split(result[-1]);self.assertEqual(len(decoded),1)
-        self.assertIn("a;$(bad)",decoded[0]);self.assertNotIn('; . ',decoded[0])
+        # The provider passes each word after -- to the worker as one argument, quoting
+        # it there (observed on bx_gy2ytgh8: `-- echo 'a  b' '$HOME'` printed `a  b $HOME`).
+        # So bash -c receives the script itself, never a quoted copy of it.
+        # Bash run over ssh reads ~/.bashrc even with -c, and the worker's prepends
+        # /usr/local/cargo/bin to PATH (observed on bx_gy2ytgh8), so no shell reads it.
+        # An inherited BASH_ENV or ENV would still run startup code, so both are cleared.
+        words=result[result.index('--')+1:]
+        self.assertEqual(words[:9],['/usr/bin/env','-u','BASH_ENV','-u','ENV','/bin/bash','--norc','--noprofile','-c']);self.assertEqual(len(words),10)
+        script=words[9];self.assertFalse(script.startswith(("'",'"')),script[:20])
+        self.assertIn('exec env -u BASH_ENV -u ENV ',script);self.assertIn(' /bin/bash --norc --noprofile -c ',script)
+        import shutil as sh,subprocess,os,tempfile as tf
+        with tf.TemporaryDirectory() as t:
+            marker=Path(t)/'ran';startup=Path(t)/'startup';startup.write_text('touch '+shlex.quote(str(marker))+'\n')
+            local=[sh.which('env'),*words[1:5],sh.which('bash'),*words[6:9],'echo ok']
+            out=subprocess.run(local,env={'PATH':os.environ['PATH'],'BASH_ENV':str(startup),'ENV':str(startup)},capture_output=True,text=True,timeout=10)
+            self.assertEqual(out.stdout,'ok\n');self.assertFalse(marker.exists())
+        self.assertIn("a;$(bad)",script);self.assertNotIn('; . ',script)
+        import subprocess as sp
+        self.assertEqual(sp.run(['bash','-n','-c',script],capture_output=True,timeout=10).returncode,0)
         self.assertFalse(any(action in result for action in ('create','resume','stop','snapshot')))
+        # The session leaves the provider's landing directory before it runs anything.
+        self.assertTrue(script.startswith('set -e; cd '+shlex.quote(self.fixtures['profile']['worker_home'])+'; '),script[:80])
 
     def test_identity_expiry_unknown_schema_and_guard_replacement_refuse(self):
         for changed in (dict(worker='bx_other'),dict(version=2),dict(unexpected='NOT_A_SECRET')):
@@ -129,6 +219,43 @@ class Admission(unittest.TestCase):
             self.assertEqual(json.dumps(qwa.export_operation(self.fixtures['operation'],now-7000,'bx_fixture',self.fixtures['profile']),sort_keys=True),
                              json.dumps(json.loads(original),sort_keys=True))
 
+    def test_adopt_after_lane_boundary_through_a_receipted_extension(self):
+        """Lane one ends near the original end. Root extends the same running worker, and lane two adopts it."""
+        import qualified_worker_admission as qwa
+        controller=RX.boat_environment.controller
+        now,boot,left=self.fixtures['now'],self.fixtures['boot_now'],self.original_left()
+        original=self.fixtures['qualified_path'].read_bytes()
+        with self.clocks(now+left-900,boot+left-900):
+            RX.admission('boat:bx_fixture')
+        # Past the original end lane two cannot run on the worker without an extension.
+        with self.clocks(now+left+60,boot+left+60),self.assertRaises(ValueError):RX.admission('boat:bx_fixture')
+        io=ExtendIO(self.fixtures,now+left-600,boot+left-600)
+        fact=environment_fact(self.fixtures,self.root/'environment-fact.json',io.wall())
+        controller.bind_release_profile(self.fixtures['release'])
+        with patch.object(qwa,'current_boot_id',return_value=self.fixtures['boot_id']):
+            receipt=controller.extend_operation(self.fixtures['release'],io,7200,fact,'lane two')
+        intent=json.loads((self.fixtures['operation']/'controller-intent.json').read_text())
+        # Until the running guard accepts the receipt, lane two still sees the original end.
+        with self.clocks(now+left+60,boot+left+60),self.assertRaises(ValueError):RX.admission('boat:bx_fixture')
+        controller.guard_deadlines(ExtendIO(self.fixtures,io.wall(),io.mono()),intent)
+        lane_two=self.root/'lane-two-admission.json'
+        expected=RX.boat_environment.expected_environment(self.fixtures['profile'],self.fixtures['qualified'])
+        with self.clocks(now+left+60,boot+left+60),patch.object(RX.boat_environment.controller,'bounded',return_value={'exit':0,'body':expected}):
+            RX.boat_environment.prepare(self.fixtures['profile_path'],self.fixtures['operation'],self.fixtures['profile']['worker'],lane_two)
+        lane_two.chmod(0o600)
+        for elapsed in (60,1800,6500):
+            with self.subTest(elapsed=elapsed),self.clocks(now+left+elapsed,boot+left+elapsed),patch.dict(os.environ,SPARKLES_BOAT_ADMISSION=str(lane_two)):
+                data=RX.admission('boat:bx_fixture')
+                self.assertEqual(data['_lifetime']['boot_end'],receipt['boot_end'])
+                self.assertLessEqual(RX.remaining(RX.operation_deadline('boat:bx_fixture',seconds=10**6)),receipt['boot_end']-(boot+left+elapsed)-30)
+        # The extension ends too; nothing renews it silently.
+        with self.clocks(now+left+7200,boot+left+7200),patch.dict(os.environ,SPARKLES_BOAT_ADMISSION=str(lane_two)),self.assertRaises(ValueError):
+            RX.admission('boat:bx_fixture')
+        # A wall rollback after the extension cannot stretch it either.
+        with self.clocks(now,boot+left+7200),patch.dict(os.environ,SPARKLES_BOAT_ADMISSION=str(lane_two)),self.assertRaises(ValueError):
+            RX.admission('boat:bx_fixture')
+        self.assertEqual(self.fixtures['qualified_path'].read_bytes(),original)
+
     def test_forward_wall_suspend_reboot_and_exact_margin(self):
         now,boot,left=self.fixtures['now'],self.fixtures['boot_now'],self.original_left()
         # A forward wall jump shortens the remaining time through the wall bound.
@@ -191,6 +318,169 @@ class Admission(unittest.TestCase):
             text=(ROOT/name).read_text()
             with self.subTest(name=name):
                 self.assertNotIn('["expires_at"]-time.time()',text);self.assertIn('rx_runtime',text)
+
+    def fake_worker(self,mbx_version='1.29.1',rustc_version='1.99.1',install_mbx=True):
+        """A fake worker home whose tools are tiny scripts, with the job environment's PATH."""
+        profile=dict(self.fixtures['profile'],worker_home=str(self.root/'home'))
+        home=Path(profile['worker_home']);cargo=home/'.cargo/bin';cargo.mkdir(parents=True)
+        # rustup's proxy reports the pinned toolchain only when RUSTUP_TOOLCHAIN selects it.
+        (cargo/'rustc').write_text('#!/bin/sh\nif [ "$RUSTUP_TOOLCHAIN" = 1.99.1 ]; then echo "rustc '+rustc_version+' (fixture)"; else echo "rustc 1.97.1 (fixture default)"; fi\n')
+        (cargo/'rustc').chmod(0o755)
+        if install_mbx:
+            pinned=home/'.local/share/mise/installs/mr-boxington/1.29.1';pinned.mkdir(parents=True)
+            # The fake answers `settings get` the way mbx does: an environment variable
+            # wins over the worker's configuration, which names the read-only remote cache.
+            (pinned/'mbx').write_text('#!/bin/sh\nif [ "$1" = settings ] && [ "$2" = get ]; then\n case "$3" in\n'
+                                      '  remote.url) echo "${MBX_REMOTE_URL-https://cache.invalid}" ;;\n'
+                                      '  gc.max_total_size) echo "${MBX_GC_MAX_TOTAL_SIZE-}" ;;\n'
+                                      '  gc.min_free_size) echo "${MBX_GC_MIN_FREE_SIZE-}" ;;\n  *) exit 2 ;;\n esac\n exit 0\nfi\n'
+                                      'echo "mbx '+mbx_version+'"\n');(pinned/'mbx').chmod(0o755)
+        env=dict(RX.boat_environment.environment(profile),HOME=str(home))
+        # Keep the job's home entries and replace the system ones with awk alone,
+        # so a host-installed mbx or rustc cannot satisfy the check.
+        tools=self.root/'tools';tools.mkdir();(tools/'awk').symlink_to(shutil.which('awk'))
+        env['PATH']=':'.join([d for d in env['PATH'].split(':') if d.startswith(str(home))]+[str(tools)])
+        return profile,env
+
+    def run_tool_check(self,profile,env):
+        # Bash sources a startup file when its stdin is a socket, so the check reads /dev/null.
+        return subprocess.run(['/bin/bash','-c',RX.tool_check(profile)],env=env,stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=10,cwd=env['HOME'])
+
+    def test_job_environment_resolves_pinned_mbx_and_rust(self):
+        profile,env=self.fake_worker()
+        self.assertIn(profile['worker_home']+'/.local/share/mise/installs/mr-boxington/1.29.1',env['PATH'].split(':'))
+        self.assertEqual(env['RUSTUP_TOOLCHAIN'],'1.99.1')
+        result=self.run_tool_check(profile,env);self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+
+    def test_admit_tool_check_refuses_missing_mbx_and_wrong_rustc_clearly(self):
+        cases=[({'install_mbx':False},'mbx is not on the job PATH'),
+               ({'mbx_version':'1.28.0'},'mbx reports 1.28.0, pinned 1.29.1'),
+               ({'rustc_version':'1.97.1'},'rustc reports 1.97.1, pinned 1.99.1')]
+        for kwargs,reason in cases:
+            with self.subTest(reason=reason),tempfile.TemporaryDirectory()as tmp:
+                self.root=Path(tmp);profile,env=self.fake_worker(**kwargs)
+                result=self.run_tool_check(profile,env)
+                self.assertEqual(result.returncode,86,result.stdout+result.stderr)
+                self.assertIn('ADMIT-REFUSAL: '+reason,result.stdout,result.stderr)
+        # Without RUSTUP_TOOLCHAIN the rustup default is reported and refused, never used.
+        with tempfile.TemporaryDirectory()as tmp:
+            self.root=Path(tmp);profile,env=self.fake_worker();env.pop('RUSTUP_TOOLCHAIN')
+            result=self.run_tool_check(profile,env)
+            self.assertIn('ADMIT-REFUSAL: rustc reports 1.97.1, pinned 1.99.1',result.stdout,result.stderr)
+
+    def test_job_environment_is_local_only(self):
+        """Boat jobs build with mbx in local-only mode and a local budget, and name no token."""
+        profile=self.fixtures['profile'];values=RX.boat_environment.environment(profile)
+        self.assertEqual(values['MBX_REMOTE_URL'],'')
+        self.assertFalse([k for k in values if 'TOKEN' in k])
+        self.assertEqual(values['MBX_GC_MAX_TOTAL_SIZE'],'64GiB');self.assertEqual(values['MBX_GC_MIN_FREE_SIZE'],'45GiB')
+        self.assertNotIn('MBX_CACHE_DIR',values)
+        body=RX.boat_environment.environment_body(profile).decode()
+        self.assertIn("MBX_REMOTE_URL=''\n",body);self.assertNotIn('token',body.lower())
+        # Every Boat job shell drops an inherited token setting before it runs.
+        script=RX.command('boat:bx_fixture','true')[-1]
+        self.assertIn('exec env -u BASH_ENV -u ENV -u MBX_REMOTE_TOKEN_FILE -u MBX_REMOTE_TOKEN ',script)
+        self.assertIn(' MBX_REMOTE_URL= ',script)
+
+    def test_environment_preparation_needs_no_token_on_the_worker(self):
+        """The worker-side preparation writes the environment file in a home without a token."""
+        home=self.root/'prep-home';state=home/'.local/state/sparkles-boat';state.mkdir(parents=True,mode=0o700)
+        profile=dict(self.fixtures['profile'],worker_home=str(home),worker_uid=os.getuid())
+        q={'safe_owner':{'operation_id':'boat-owned-warm-qual-inert'},'local_guard':{'unit':'boat-owned-warm-qual-inert.service'}}
+        expected=RX.boat_environment.expected_environment(profile,q)
+        payload={'home':str(home),'uid':os.getuid(),'file':expected,'body':RX.boat_environment.environment_body(profile).decode(),'check':False}
+        self.assertFalse((home/'.config/mbx/remote-token').exists())
+        out=subprocess.run([sys.executable,'-I','-B','-c',RX.boat_environment.REMOTE,json.dumps(payload)],env={'HOME':str(home),'PATH':os.environ['PATH']},
+                           capture_output=True,text=True,timeout=20)
+        self.assertEqual(out.returncode,0,out.stderr);self.assertEqual(json.loads(out.stdout),expected)
+        self.assertEqual(Path(expected['path']).read_bytes(),RX.boat_environment.environment_body(profile))
+        out=subprocess.run([sys.executable,'-I','-B','-c',RX.boat_environment.REMOTE,json.dumps({**payload,'check':True})],env={'HOME':str(home),'PATH':os.environ['PATH']},
+                           capture_output=True,text=True,timeout=20)
+        self.assertEqual(out.returncode,0,out.stderr)
+
+    def test_admit_tool_check_refuses_a_remote_cache_or_token(self):
+        """Admission asks the pinned mbx for its effective settings and refuses anything but local-only."""
+        cases=[(lambda e:e.pop('MBX_REMOTE_URL'),'mbx resolves a remote cache URL, not local-only mode'),
+               (lambda e:e.update(MBX_REMOTE_URL='https://other.invalid'),'mbx resolves a remote cache URL, not local-only mode'),
+               (lambda e:e.update(MBX_REMOTE_TOKEN_FILE='/nonexistent'),'the job environment names an mbx remote token'),
+               (lambda e:e.update(MBX_GC_MAX_TOTAL_SIZE='5GiB'),'mbx local budget is 5GiB, pinned 64GiB'),
+               (lambda e:e.pop('MBX_GC_MIN_FREE_SIZE'),'mbx free-space floor is , pinned 45GiB')]
+        for change,reason in cases:
+            with self.subTest(reason=reason),tempfile.TemporaryDirectory()as tmp:
+                self.root=Path(tmp);profile,env=self.fake_worker();change(env)
+                result=self.run_tool_check(profile,env)
+                self.assertEqual(result.returncode,86,result.stdout+result.stderr)
+                self.assertIn('ADMIT-REFUSAL: '+reason,result.stdout,result.stderr)
+
+    def test_gate_unit_forwards_the_local_only_job_settings(self):
+        """A gate's service unit starts empty, so every job setting but PATH is forwarded when set."""
+        text=(ROOT/'scripts/gate/remote/gate-start.sh').read_text()
+        line=next(l for l in text.splitlines() if l.startswith('for n in MBX_REMOTE_URL'))
+        names=set(line.removeprefix('for n in ').removesuffix('; do').split())
+        self.assertEqual(set(RX.boat_environment.environment(self.fixtures['profile']))-{'PATH'},names)
+        self.assertIn('[ -z "${!n+x}" ] || forward+=("--setenv=$n=${!n}")',text)
+        self.assertIn('systemd-run --user --unit "$unit" --collect -q "${forward[@]}"',text)
+        build=(ROOT/'scripts/nsc-build-remote.sh').read_text()
+        self.assertNotIn('MBX_REMOTE_TOKEN_FILE=',build)
+        self.assertIn('MBX_REMOTE_URL MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE; do',build)
+
+    def test_admit_renders_its_probe_and_names_a_missing_worker_tool(self):
+        """The admit probe parses as shell, carries its formatted values, and checks every worker tool."""
+        import subprocess as sp
+        profile,env=self.fake_worker()
+        boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        data={'worker':'bx_fixture','environment':'fixture-environment','environment_version':3,'_cli':{'path':'/inert/boat'},'_profile':profile,
+              'worker_env_path':profile['worker_home']+'/.config/sparkles-boat/job.env','worker_env_sha256':'e'*64,
+              'bootstrap_lock_path':profile['worker_home']+'/.local/state/sparkles-boat/bootstrap.lock','toolchain_manifest_path':profile['worker_home']+'/.local/state/sparkles-boat/toolchain.json',
+              'toolchain_manifest_sha256':'f'*64,'_lifetime':{'wall_end':time.time()+7200,'boot_end':RX.boat_clock.boottime()+7200,'boot_id':boot}}
+        info={'sandbox':{'id':'bx_fixture','environment':'fixture-environment','environmentVersion':3,'type':'large','vcpu':8,'memoryGB':16,'state':'idle'}}
+        seen=[]
+        with patch.object(RX,'admission',return_value=data),patch.object(RX.boat_environment.controller,'bounded',return_value={'exit':0,'body':info}),\
+             patch.object(RX,'command',side_effect=lambda host,text:seen.append(text) or ['true']),patch.object(RX,'exchange',return_value=0),patch('builtins.print'):
+            RX.admit('boat:bx_fixture',1800)
+        probe=seen[0]
+        self.assertEqual(sp.run(['/bin/bash','-n','-c',probe],capture_output=True,timeout=10).returncode,0)
+        self.assertIn(shlex.quote(data['worker_env_path']),probe);self.assertNotIn('{envfile}',probe);self.assertIn('{print $2}',probe)
+        self.assertIn('for name in '+' '.join(RX.WORKER_TOOLS)+';',probe)
+        # A worker without zstd is refused by name before any job work.
+        tools=self.root/'some-tools';tools.mkdir()
+        for name in RX.WORKER_TOOLS:
+            if name!='zstd' and '/' not in name and shutil.which(name):(tools/name).symlink_to(shutil.which(name))
+        script="refuse(){ printf 'ADMIT-REFUSAL: %s\\n' \"$1\"; exit 86; }\n"+RX.worker_tools_check()
+        result=sp.run(['/bin/bash','-c',script],env={'PATH':str(tools)},stdin=sp.DEVNULL,capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,86);self.assertEqual(RX.refusal_reason(result.stdout.encode()),'zstd is not on the worker')
+        (tools/'zstd').symlink_to(shutil.which('true'))
+        missing=[n for n in RX.WORKER_TOOLS if not (shutil.which(n) if '/' in n else (tools/n).exists())]
+        result=sp.run(['/bin/bash','-c',script],env={'PATH':str(tools)},stdin=sp.DEVNULL,capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,86 if missing else 0,(missing,result.stdout))
+
+    def test_admission_checks_every_command_the_worker_scripts_run(self):
+        """Each external command of the worker-side scripts and remote strings is checked at admission."""
+        if not shutil.which('shfmt'):self.skipTest('shfmt is needed to parse the worker scripts')
+        found={}
+        scripts=Path(__file__).resolve().parents[1]
+        for name in ('nsc-bench-remote.sh','nsc-writes-remote.sh','nsc-build-remote.sh','nsc-build.sh','cargo-sparkles-task'):
+            for word in shell_commands((scripts/name).read_text()):found.setdefault(word,set()).add(name)
+        # nsc-jena.sh writes its worker script, remote.sh, from a heredoc.
+        for name in ('remote-screen.sh','nsc-build-host.sh','nsc-bench.sh','nsc-writes.sh','nsc-jena.sh'):
+            for word in shell_commands((scripts/name).read_text(),remote_only=True):found.setdefault(word,set()).add(name)
+        # The command strings remote-executor.py itself sends for put, get, sync and bundle.
+        for word in ('bash','env','python3','mkdir','mktemp','cat','sha256sum','cut','mv','tar','git','rm','dirname'):found.setdefault(word,set()).add('remote-executor.py')
+        # mbx and rustc are pinned by tool_check, c++ only feeds the build's info.txt, and
+        # remote-screen.sh runs nohup and setsid only on the nsc branch.
+        exempt={'mbx','rustc','c++','nohup','setsid'}
+        missing={w:f for w,f in found.items() if w not in RX.WORKER_TOOLS and w not in exempt}
+        self.assertEqual(missing,{})
+        self.assertIn('realpath',found);self.assertIn('tee',found);self.assertIn('gzip',RX.WORKER_TOOLS)
+        self.assertIn('/lib64/ld-linux-x86-64.so.2',found)
+        # The build body reaches bash -s through a heredoc of mbx sparkles-task.
+        self.assertIn('nsc-build.sh',found['cp'])
+        self.assertIn('nsc-writes-remote.sh',found['tac']);self.assertIn('nsc-jena.sh',found['ls'])
+
+    def test_admit_reports_the_worker_refusal_reason(self):
+        self.assertEqual(RX.refusal_reason(b'noise\nADMIT-REFUSAL: mbx is not on the job PATH\n'),'mbx is not on the job PATH')
+        self.assertEqual(RX.refusal_reason(b'ADMIT-REFUSAL: \x1b[31mbad\n'),'?[31mbad')
+        self.assertIsNone(RX.refusal_reason(b'nothing here'))
 
     def test_unsafe_selectors_refuse_before_execution(self):
         for host in ('boat:current','boat:bx_test;echo','-oProxyCommand=bad','h x','a:12'):

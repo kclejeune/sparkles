@@ -346,6 +346,13 @@ pub struct Store {
     pub by_x: FxHashMap<Ex, Vec<u32>>,
     /// the processed clauses whose maximal literal is over `f_e(x)`, by e
     pub by_f: FxHashMap<Ex, Vec<u32>>,
+    /// the processed clauses whose maximal literal is over a successor term, by that
+    /// literal, so that the premises of one literal are found without the others of its
+    /// term
+    by_succ: FxHashMap<Lit, Vec<u32>>,
+    /// the bytes that processing added to the indexes beyond what [`Store::add`]
+    /// answered, which [`Store::take_grown`] hands to the run's estimate
+    grown: usize,
     /// the processed clauses whose maximal literal is a role literal `s(x, f(x))`, by s
     pub by_rl: FxHashMap<u32, Vec<u32>>,
     /// the processed clauses whose maximal literal is an atom over a successor term that is
@@ -376,6 +383,7 @@ impl Store {
             + self.clauses.capacity() * std::mem::size_of::<Stored>()
             + table_bytes(self.by_x.capacity(), 32)
             + table_bytes(self.by_f.capacity(), 32)
+            + table_bytes(self.by_succ.capacity(), 32)
             + table_bytes(self.by_rl.capacity(), 32)
             + table_bytes(self.by_cert.capacity(), 32)
             + table_bytes(self.by_eq.capacity(), 32)
@@ -412,24 +420,31 @@ impl Store {
             return None;
         }
         // the clauses it subsumes have every literal of its head
-        let weaker: Vec<u32> = match c.head().first() {
+        let every: Vec<u32>;
+        let weaker: &[u32] = match c.head().first() {
             Some(l) => {
                 let pick = c
                     .head()
                     .iter()
                     .min_by_key(|l| self.by_lit.get(l).map_or(0, |v| v.len()))
                     .unwrap_or(l);
-                self.by_lit.get(pick).cloned().unwrap_or_default()
+                self.by_lit.get(pick).map_or(&[][..], |v| v.as_slice())
             }
-            None => (0..self.clauses.len() as u32).collect(),
+            None => {
+                every = (0..self.clauses.len() as u32).collect();
+                &every
+            }
         };
-        for i in weaker {
+        for &i in weaker {
             let s = &mut self.clauses[i as usize];
             if sig & !s.sig == 0 && !s.dead && c.subsumes(&s.c) {
                 s.dead = true;
             }
         }
         let id = self.clauses.len() as u32;
+        // the head's entries in the literal indexes, the queue's entry, and the entries in
+        // the maximal-literal indexes once processed; the index by successor literal counts
+        // its own growth as it is made
         let bytes = c.bytes() + 8 * (c.head().len() + 2) + 8;
         match c.head().last() {
             None => self.empty.push(id),
@@ -480,9 +495,13 @@ impl Store {
                     X => self.by_x.entry(l.atom()).or_default().push(id),
                     RL => {
                         self.by_f.entry(l.fun()).or_default().push(id);
+                        self.index_succ(l, id);
                         self.by_rl.entry(l.atom()).or_default().push(id);
                     }
-                    _ => self.by_f.entry(l.fun()).or_default().push(id),
+                    _ => {
+                        self.by_f.entry(l.fun()).or_default().push(id);
+                        self.index_succ(l, id);
+                    }
                 }
             }
             if let Some(l) = self.clauses[id as usize].max
@@ -494,6 +513,24 @@ impl Store {
             return Some(id);
         }
         None
+    }
+
+    /// Indexes a processed clause by its maximal literal over a successor term, and adds
+    /// what the table and the list grew by to the bytes the run's estimate has not seen,
+    /// since a store can hold as many keys as clauses.
+    fn index_succ(&mut self, l: Lit, id: u32) {
+        let table = table_bytes(self.by_succ.capacity(), 32);
+        let list = self.by_succ.entry(l).or_default();
+        let cap = list.capacity();
+        list.push(id);
+        let list = (list.capacity() - cap) * 4;
+        self.grown += table_bytes(self.by_succ.capacity(), 32).saturating_sub(table) + list;
+    }
+
+    /// The bytes processing added to the indexes since the last call, for the run's
+    /// estimate.
+    pub fn take_grown(&mut self) -> usize {
+        std::mem::take(&mut self.grown)
     }
 
     /// The clauses that are not dead with `l` in the head.
@@ -532,8 +569,8 @@ impl Store {
     /// The processed clauses that are not dead whose maximal literal is `l`, over a
     /// successor term.
     pub fn with_succ(&self, l: Lit) -> impl Iterator<Item = u32> + '_ {
-        self.by_f
-            .get(&l.fun())
+        self.by_succ
+            .get(&l)
             .into_iter()
             .flatten()
             .copied()
@@ -610,6 +647,37 @@ mod tests {
         assert!(g.succ_key() > e.succ_key());
         assert!(Lit::f(9, 1).succ_key() > g.succ_key());
         assert!(Lit::x(1) > Lit::ry(u32::MAX));
+    }
+
+    #[test]
+    fn the_index_by_successor_literal_is_counted() {
+        // what the run's estimate is handed covers what the index holds, from its first
+        // key on, with a key per clause and with many clauses under one key
+        let mut s = Store::default();
+        let mut counted = 0;
+        let held = |s: &Store| {
+            table_bytes(s.by_succ.capacity(), 32)
+                + s.by_succ.values().map(|v| v.capacity() * 4).sum::<usize>()
+        };
+        for i in 0..5000u32 {
+            s.index_succ(Lit::f(i % 97, i), i);
+            counted += s.take_grown();
+            assert!(
+                counted >= held(&s),
+                "{counted} counted for {} held",
+                held(&s)
+            );
+        }
+        for i in 0..5000u32 {
+            s.index_succ(Lit::f(1, 0), i);
+            counted += s.take_grown();
+            assert!(
+                counted >= held(&s),
+                "{counted} counted for {} held",
+                held(&s)
+            );
+        }
+        assert_eq!(s.take_grown(), 0, "the bytes are handed over once");
     }
 
     #[test]

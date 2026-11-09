@@ -38,7 +38,66 @@ The `expect` heads of `POST /$/merge/{ds}`, `POST /$/cherry-pick/{ds}` and
 branch UUID, or a null in their place, now returns `400` instead of being ignored.
 Omitted fields and an empty object keep their previous meaning.
 
+The `--mode` flag of `sparkles ingest` accepts `claims` (item 651). Every value it
+accepted before parses and behaves as before.
+
+The channel `type` of `GET /$/notifications` and of a test send's answer can be
+`email`. Clients that match the type against `webhook` and `ntfy` alone need a case for
+it.
+
 ### Added
+
+Roadmap item 651 adds a `claims` mode to `POST /$/ingest/{ds}` and `sparkles ingest`. It registers
+the document's source and chunks as the other modes do and proposes the extracted facts
+as claim occurrences of one evidence batch, with their passages and supporting evidence
+links, in the same commit, so that a review policy decides what is projected. It checks
+the caller's update grants, the evidence settings and `keepText` before any model call,
+answers `already-proposed` for a repeat of the same source, graph and text without a
+model call, and refuses an extraction over 1,000 claims as `too-large` with nothing
+written. New `sourceGraph` and `proposalGraph` options choose the evidence graphs.
+`sparkles::evidence::propose` takes ordinary changes outside every managed graph to
+publish in the batch's commit. The evidence rendition keeps its text, so a claims
+ingestion stores the text in its chunks and again in the evidence graph.
+
+The ontology editor has a Bulk edits tab (item 626). It finds and replaces text across
+labels, every annotation or one property, as literal text or a regular expression, with a
+language filter and a scope of the whole graph or an entity list. It sets or removes an
+annotation on the entities of a list and moves the listed classes under a new parent or to
+the top, refusing a cycle. Each edit is one previewed commit through the editor's preview
+and undo stack, and an edit of more than 1,000 changes is refused with its count.
+
+
+Failed background backup operations raise notifications (item 46). A backup started
+by hand that fails, a policy run that stops on an error, cannot start or fails its
+retention, a verification that fails or finds a damaged backup, and a GC that fails or
+cannot start now notify, as a failed policy run already did. The new event types
+`backup.verify.failed` and `backup.gc.failed` are keyed per repository, and
+`backup.overdue` fires when a policy has missed two scheduled runs since its last
+success.
+
+Notifications have an email channel (item 46, spec C21 Phase 2). It submits a message
+over STARTTLS on port 587 or over TLS on port 465, authenticates with SASL PLAIN with a
+password from a secret, and never sends in the clear, so a mail server without
+STARTTLS is refused. A `4xx` reply is retried and a `5xx` reply is not. The subject is
+the notification's title and the plain-text body holds its summary, link and data. The
+SMTP client is part of the server and adds no crate to the tree.
+
+The ontology editor's entity frame has a History view (item 620). It lists the branch's
+commits that changed a triple naming the entity in the editor's graph, newest first and
+in bounded pages, opens each to the axioms mentioning the entity that it added and
+removed, and reverts a commit as one previewed commit for a caller who can write the
+branch. `GET /$/ontology/{ds}/diff` takes `entity` to keep only the axioms that mention
+one IRI. A change set names a subject that has neither an `rdfs:label` nor a
+`skos:prefLabel` by its `sh:name`, so the shape editor's preview names a shape as its form
+does.
+
+The ontology editor's entity frame has a Discussion view (item 618) with comment threads
+on the entity and on its axioms, `@` mentions, replies, resolve and reopen, and a
+Discussions tab lists an ontology's threads. Threads are W3C Web Annotation RDF in a
+named graph beside the ontology graph on the branch, such as
+`urn:x-sparkles:discussions:http://example.org/uni`, and each comment, resolve or reopen is an ordinary
+commit. Comments therefore appear in history and exports, protected branches refuse
+them, and writing one needs `write`.
 
 The derived-table cache has a process-wide `--derived-table-cache-mb` budget and
 metrics-protected capacity, occupancy, hit and miss counters in the server statistics.
@@ -69,7 +128,10 @@ conclusions, which `Limits::dl_work` changes, and classifies again without count
 leaving those axioms out and reporting them, and `dl_counting_over` and `dl_over_budget`
 say so. A run that does not count has no such bound. The normalization keeps the class
 beside a universal or a maximum in a clause's body, which classifies BioTop in 27 ms on
-four threads where it took 350 ms.
+four threads where it took 350 ms. The clause stores find the premises of a literal over a
+successor term by that literal, and Pred passes over a predecessor clause that a new
+premise cannot enter, which takes BioTop to 23 ms on four threads and 44 ms on one with
+the same inferences.
 
 The web UI scales to large ontologies and graphs. The Workbench ontology and thesaurus trees
 draw only the rows in view, with the keyboard, sticky ancestors, **Show more** paging and
@@ -450,6 +512,14 @@ view's rows against its query and records a forge baseline.
 CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
+
+Notification channels deliver independently (item 46). Each channel has its own queue
+and delivery thread, so a webhook or ntfy server that hangs or fails delays only its own
+deliveries. A channel's queue holds its share of 1,000 deliveries, at least 50, and a
+delivery beyond it ends `dropped` for that channel alone. The `notifications` kind holds
+at most 32 channels. `GET /$/notifications` reports each channel's `queued`, `inFlight`
+and `queueCapacity`, and the gauges `sparkles_notifications_channel_queued` and
+`sparkles_notifications_channel_queue_capacity` show them per channel.
 
 The web UI's Browse term page has a new layout (roadmap item 734). A right rail of cards holds
 Metadata, with the cross-references as Identifiers by database above the downloads, and then

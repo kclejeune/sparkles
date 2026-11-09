@@ -2,6 +2,7 @@
 """Prepare only deterministic nonsecret job environment bytes after qualification."""
 from pathlib import Path
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -10,7 +11,7 @@ import stat
 import sys
 import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import read_owned, write_new
+from common import open_lock, read_owned, write_new
 from config_schema import validate_profile
 from qualified_worker_admission import CLOSURE_RESERVE, export_operation, lifetime_left, operation_lifetime, validate_admission
 import controller
@@ -27,11 +28,33 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def pinned_mbx(profile):
+    """The physical MBX that mise installs for the pinned version."""
+    return profile['worker_home']+'/.local/share/mise/installs/mr-boxington/'+profile['tool_versions']['mbx']+'/mbx'
+
+
+# Jobs build with MBX in local-only mode. The worker's own configuration names the
+# read-only remote cache, and an empty MBX_REMOTE_URL overrides it, so no job reads the
+# remote or its token. The local store stays in MBX's default cache directory in the
+# worker home, which the normal stop's snapshot keeps for the next resume. Its shared
+# budget for the store, managed targets and incremental state holds two release builds
+# and the workspace test builds. The free-space floor keeps the 40 GiB that the
+# metadata probe requires at the next qualification on the large worker's disk.
+LOCAL_STORE_TOTAL = '64GiB'
+LOCAL_STORE_MIN_FREE = '45GiB'
+
+
 def environment(profile):
+    # Jobs resolve the pinned MBX install directly and select the pinned Rust
+    # toolchain by name, so neither a missing shim nor the rustup default is used.
     home = profile['worker_home']
-    return {'PATH': ':'.join([home+'/.local/share/mbx/bin', home+'/.local/bin',
+    return {'PATH': ':'.join([home+'/.local/share/mbx/bin', pinned_mbx(profile).removesuffix('/mbx'), home+'/.local/bin',
                              home+'/.cargo/bin', '/usr/local/bin', '/usr/bin', '/bin']),
-            'MBX_REMOTE_TOKEN_FILE': home+'/.config/mbx/remote-token'}
+            'RUSTUP_TOOLCHAIN': profile['tool_versions']['rust'],
+            'RUSTUP_AUTO_INSTALL': '0',
+            'MBX_REMOTE_URL': '',
+            'MBX_GC_MAX_TOTAL_SIZE': LOCAL_STORE_TOTAL,
+            'MBX_GC_MIN_FREE_SIZE': LOCAL_STORE_MIN_FREE}
 
 
 def environment_body(profile):
@@ -56,6 +79,32 @@ def local_guard(unit):
     return result['body']
 
 
+JOB_LOCK_WAIT = 120
+JOB_LOCKS = []
+
+
+def hold_job_lock(operation, seconds=None):
+    """Hold the operation's job lock shared until this process exits.
+
+    The closure watch takes it exclusively for at most its decision bound, so a
+    command waits through that hold and then sees the stop trigger if the watch
+    closed the operation.
+    """
+    fd = open_lock(operation/controller.JOB_LOCK)
+    end = time.monotonic() + (JOB_LOCK_WAIT if seconds is None else seconds)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH|fcntl.LOCK_NB);JOB_LOCKS.append(fd);return
+        except BlockingIOError:
+            if time.monotonic() >= end:
+                os.close(fd);require(False, 'job lock held by the closure watch')
+            time.sleep(0.2)
+
+
+def release_job_locks():
+    while JOB_LOCKS:os.close(JOB_LOCKS.pop())
+
+
 def context(profile_path, qualification_path, worker, now, guard_reader=None):
     raw_profile = read_owned(Path(profile_path).absolute())
     profile = validate_profile(json.loads(raw_profile))
@@ -67,28 +116,34 @@ def context(profile_path, qualification_path, worker, now, guard_reader=None):
     require(qualification.get('profile_sha256')==digest(raw_profile), 'profile file changed')
     require(qualification==export_operation(path.parent, now, worker, profile), 'qualification operation changed')
     live = (local_guard if guard_reader is None else guard_reader)(qualification['local_guard']['unit'])
-    validate_admission(qualification, Path('/proc/sys/kernel/random/boot_id').read_text().strip(), live, now, profile)
+    # Held shared for this command's life, so the closure watch's exclusive hold
+    # proves that no command is running or launching. Checked before the stop receipts.
+    hold_job_lock(path.parent)
+    # A stopping or closed operation admits nothing, even with an extension receipt.
+    for name in ('stop-trigger.json', 'stop-intent.json', 'closed.json', 'unresolved.json', 'root-handoff-withdrawn.json'):
+        require(not (path.parent/name).exists(), 'operation is stopping or closed')
+    # The lifetime includes any receipted extension of this same operation.
+    lifetime = operation_lifetime(path.parent, qualification)
+    validate_admission(qualification, Path('/proc/sys/kernel/random/boot_id').read_text().strip(), live, now, profile, lifetime['wall_end'])
     require(qualification['safe_owner']['uid']==os.getuid(), 'qualification local owner mismatch')
     release = json.loads(read_owned(path.parent/'release.json'))
     require(Path(release['operation'])==path.parent, 'operation directory mismatch')
     require(release['controller_packet_manifest_sha256']==qualification['controller_packet_sha256'], 'source binding mismatch')
     controller.verify_packet(qualification['controller_packet_sha256'])
     controller.verify_cli(release)
-    lifetime = operation_lifetime(path.parent, qualification)
-    require(lifetime_left(lifetime, now) > 0, 'original lifetime expired')
+    require(lifetime_left(lifetime, now) > 0, 'lifetime expired')
     return profile, qualification, raw, release, lifetime
 
 
-# The only remote mutation is a private deterministic environment file. Token
-# content is never opened. An uncertain result may be reconciled with --check.
+# The only remote mutation is a private deterministic environment file. Jobs are
+# local-only, so the file names no token and preparation never looks at one. An
+# uncertain result may be reconciled with --check.
 REMOTE = r'''from pathlib import Path
 import hashlib,json,os,stat,sys,tempfile
 p=json.loads(sys.argv[1]);home=Path(p['home']);uid=p['uid'];expected=p['file'];body=p['body'].encode()
 assert os.getuid()==uid and Path.home()==home and home.resolve()==home
 assert hashlib.sha256(body).hexdigest()==expected['sha256'] and len(body)==expected['bytes']
 assert set(p)=={'home','uid','file','body','check'}
-token=home/'.config/mbx/remote-token';t=token.lstat()
-assert stat.S_ISREG(t.st_mode) and t.st_uid==uid and t.st_nlink==1 and stat.S_IMODE(t.st_mode)==0o600
 root=home/'.local/state/sparkles-boat';s=root.lstat()
 assert root.resolve()==root and stat.S_ISDIR(s.st_mode) and s.st_uid==uid and not s.st_mode&0o022
 directory=root/'job-environments'
@@ -104,7 +159,6 @@ if not path.exists():
   os.link(tmp,path,follow_symlinks=False)
  finally:os.unlink(tmp)
 s=path.lstat();assert stat.S_ISREG(s.st_mode) and s.st_uid==uid and s.st_nlink==1 and stat.S_IMODE(s.st_mode)==0o600 and s.st_size==len(body)
-assert (s.st_dev,s.st_ino)!=(t.st_dev,t.st_ino)
 fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
 try:
  a=os.fstat(fd);assert (a.st_dev,a.st_ino)==(s.st_dev,s.st_ino)
@@ -126,7 +180,7 @@ def prepare(profile_path, operation, worker, output, check=False):
     # Program and payload bytes never depend on provider argv shell joining.
     program=('import sys\nsys.argv=["job-environment",'+repr(json.dumps(payload))+']\n'+REMOTE).encode()
     result = controller.bounded([release['boat']['path'], '--no-update', 'ssh', worker, '--',
-                                 '/usr/bin/python3', '-I', '-B', '-'], seconds, program,
+                                 *controller.remote_entry(profile['worker_home'])], seconds, program,
                                limit=lambda: lifetime_left(lifetime, time.time())-CLOSURE_RESERVE)
     require(result['exit']==0 and result['body']==expected, 'job environment result uncertain; reconcile with --check')
     # Recheck the original guard, source/profile and deadline after transport, and

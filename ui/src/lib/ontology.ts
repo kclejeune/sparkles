@@ -267,6 +267,41 @@ export async function ontologyEntities(
   }
 }
 
+/** `GET /$/ontology/{ds}/diff?entity=`: the axioms mentioning one entity that a range changed. */
+export type EntityDiff = {
+  from: number;
+  to: number;
+  entity: string;
+  added: AxiomItem[];
+  removed: AxiomItem[];
+  addedCount: number;
+  removedCount: number;
+  truncated: boolean;
+};
+
+/**
+ * The axioms and assertions that mention `iri` and that commit `seq` added or removed in the
+ * selected graph, without its imports, at most `limit` on each side.
+ */
+export async function entityCommitDiff(
+  target: string,
+  sel: Selection,
+  iri: string,
+  seq: number,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<EntityDiff> {
+  const p = selParams(
+    { graph: sel.graph, imports: false },
+    { from: Math.max(seq - 1, 0), to: seq, entity: iri, assertions: true, limit },
+  );
+  const res = await request(`/$/ontology/${enc(target)}/diff?${p}`, {
+    headers: { Accept: 'application/json' },
+    signal,
+  });
+  return readJson<EntityDiff>(res);
+}
+
 /** Every axiom of `types` (or about `about`), read in pages. */
 export async function ontologyAxioms(
   target: string,

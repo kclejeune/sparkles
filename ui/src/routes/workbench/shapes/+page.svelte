@@ -7,6 +7,7 @@
   import { auth } from '$lib/auth.svelte';
   import { graphRestricted } from '$lib/auth';
   import { branchParam, MAIN, onBranch } from '$lib/branches';
+  import { fmtCount, fmtInt } from '$lib/format';
   import { EditSession, startSessionBranch } from '$lib/edit-session.svelte';
   import { type Op, type Selection } from '$lib/ontology';
   import { displayTerm, iri, WELL_KNOWN } from '$lib/rdf';
@@ -801,9 +802,10 @@
       </section>
       <footer class="draft-actions">
         <div>
-          <strong>{changes.added.length} triples added · {changes.removed.length} removed</strong
+          <strong
+            >{fmtCount(changes.added.length, 'triple')} added · {fmtInt(changes.removed.length)} removed</strong
           >{#if pending.size}<p>
-              Apply or discard {pending.size} field edit{pending.size === 1 ? '' : 's'} before previewing.
+              Apply or discard {fmtCount(pending.size, 'field edit')} before previewing.
             </p>{/if}
         </div>
         <button

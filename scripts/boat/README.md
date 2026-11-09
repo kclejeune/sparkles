@@ -2,15 +2,18 @@
 
 This package qualifies one explicitly owned warm Boat worker and keeps an independent
 local deadline guard through normal stop. It starts no source job and never creates,
-forks, extends, force-stops or silently replaces a worker. Build, screen, partition and
-gate adapters keep their own source, resource, test and lease requirements.
+forks, force-stops or silently replaces a worker. It extends a running worker only
+through the [receipted extension](#lifetime-extension) below. Build, screen, partition
+and gate adapters keep their own source, resource, test and lease requirements.
 
 The maintained defaults refuse. `profile.FALSE.json`, `release.FALSE.json` and
 `job-closure.FALSE.json` contain no actual worker, account, environment or credential.
 Private operator-reviewed copies provide those bindings. The release also requires
 current local-first need, the shared start reservation and live account limits, exact
 CLI/profile/source reviews, environment exclusion, snapshot continuity and previous
-native/lease closure. An owned ledger alone does not establish account-wide usage.
+native/lease closure. An owned ledger alone does not establish account-wide usage. A
+qualification run may set `overflow_currently_needed` to false only with the
+`qualification` purpose and the SHA-256 of the maintainer's recorded confirmation.
 
 ## Qualification and source binding
 
@@ -33,7 +36,9 @@ python3 -I -B scripts/boat/controls.py
 ```
 
 The lifecycle requests one 10,800-second resume and arms a local guard at the earlier
-10,500-second wall/BOOTTIME deadline. It checks the live guard's boot, invocation,
+10,500-second wall/BOOTTIME deadline. The guard unit's own runtime limit is 43,500
+seconds, which covers the 12-hour extension cap, the wait for a running extension act
+and the stop margin. The provider TTL stays the worker's backstop. It checks the live guard's boot, invocation,
 loaded command, PID, cgroup and limits. Null, malformed or lost acknowledgements retain
 the start reservation and never authorize another resume. Provider readiness alone does
 not qualify the worker. The pinned provisioning hook may run its reviewed normal setup,
@@ -41,8 +46,143 @@ including first bootstrap. Actual bootstrap-lock, descendant, tool, manifest, so
 capacity, token metadata and metadata-service closure checks must pass afterward. A
 different manifest is refused rather than adopted automatically.
 
+## Startup closure
+
+The startup observer treats a process of the worker's uid as startup work, apart from
+systemd, its PAM helper and dbus. It also treats any installer, shell or build tool as
+startup work, whatever its uid, and tracks every descendant of startup work by PID and
+start time. The provider's desktop session, which the first SSH connection starts, runs
+more than 30 such processes for the worker's whole life, so that rule alone never closes.
+`SESSION_CHAINS` in `startup-observer.py` allows those processes by their exact name and
+the full chain of their ancestors up to pid 1, as observed on an admitted worker. Each
+ancestor in a chain is pid 1 as root, the worker's user manager, or a name with the
+worker's uid or root's uid, and every ancestor of the worker's uid must itself be an
+allowed session process. The user manager is the main process that the system manager
+reports for `user@UID.service`, matched by pid and start time, and a name never stands in
+for pid 1 or the manager. The agent service's shell is allowed only while it has no
+children, and its sudo only while its children are the agent's root process logger. A
+process with any other chain, a name outside the table and any descendant of tracked
+startup work still count as startup work. Adding an entry needs the observed process
+tree and an independent review.
+
+The setup hook can still be restoring the state directory when the observer starts, and
+a file of a restored layer can get a new inode on its first open for writing. The hook
+writes no completion marker. A bootstrap lock or manifest replaced during an attempt,
+or a state directory whose entries change during it, therefore counts as startup still
+running. The observer then waits until the directory is present and its entries keep
+the same identity, size and times for five seconds, and observes again. The phase
+directories this package keeps there are left out of that comparison. An absent directory
+counts as a restore in progress. Every pause and the user-manager query are cut to the
+time left before the observation deadline, and a closure seen after it does not count. The observer
+refuses only when that deadline passes, with `startup_busy:bootstrap_lock_replaced` or
+`startup_busy:state_restore_in_progress` when that was the last thing it saw.
+
+## Phase unit health
+
+The startup, metadata and stop-check phases each run in a transient 512-MiB, zero-swap
+unit, and the launcher accepts a phase only when its unit ended with status 0 inside
+those limits. systemd unloads a transient unit as soon as it ends successfully, and an
+unloaded unit reports default values, which are result `success`, status 0 and no memory
+peaks. Each phase therefore reads its own cgroup's `memory.peak` and `memory.swap.peak`
+just before it writes its result, and records them with the cgroup path. The launcher
+takes the peaks from that record only when it names the phase unit's own cgroup and, for
+a unit that is still loaded, the cgroup that unit reports. When the phase could not read them, it takes them from
+the summary that `systemd-run --wait` prints, rounding each size up to the next tenth
+that systemd's truncated text can stand for. For an unloaded unit, the status comes only
+from the exit code of `systemd-run --wait`, which is the unit's own. A unit that is still
+loaded must also report success and status 0, and any peaks it reports must also be
+within the limits. A unit that reports no peaks and has neither source is refused with
+`unit_unhealthy:memory_peak_unavailable`. A recovered phase whose unit is already
+unloaded has no exit code and is refused with `unit_unhealthy:unloaded:status_unknown`.
+The kernel limits still bound the few writes that follow the cgroup read. The launcher
+reads at most 1 MiB from each output stream of a command as it reads it, and kills and
+reaps a command that writes more or outlives its time limit.
+
+## Refusal records and the diagnostic hold
+
+The startup, metadata, admission, stop-check and closure phases keep their first refusal
+in `startup-refused.json`, `metadata-refused.json`, `admission-refused.json`,
+`stopcheck-refused.json` and `closure-refused.json` through one shared function. Each
+record holds the local reason code, the remote phase's own reason code, the bounded
+terminal properties and memory evidence of the phase unit, and for startup the processes
+it counted. A refused metadata phase also names every check its result failed, from
+`metadata_not_closed`, `probe_not_qualified`, `startup_not_closed`,
+`engine_or_job_started`, `memory_cap`, `swap_cap`, `manifest_changed` and
+`worker_boot_id`, and its refusal names the first of them. Writing a record never masks
+the refusal it describes.
+
+A checkout's source identity is content only. It is the commit, the hashes of the
+porcelain status and of the tracked diff against that commit, and the hashes of
+`mise.toml` and `rust-toolchain.toml`. Git compares file content when a restore changes
+inodes, mtimes or the device, so those changes leave the identity unchanged, but it does
+track the executable bit. When the identity differs, the metadata refusal keeps a
+`source_drift` record with each field's recorded and observed value and whether it
+differs, and a flag for any field outside the identity. A changed status hash with an
+unchanged diff hash points to untracked files or a change in what is staged, and a
+changed diff hash to tracked content or modes. The probe runs no git command of its own for the record, so a
+repository's filters and hooks get no further chance to run.
+
+A refused qualification holds its stop trigger for at most 600 seconds when the resume
+was acknowledged and the worker was seen running. During the hold the controller runs
+`diagnostic-probe.py` on the worker and keeps its output in `diagnostics.json`. The
+program reads the process table, the package's state directory listing and every phase's
+`probe-result.json`, the host memory summary, free disk space and the package's user
+units, and whether each command that admission checks is on the worker's path. For each
+startup checkout it lists up to 200 untracked paths that git does not ignore, relative
+to the checkout, with each path's kind, size, mode and mtime from `lstat`. An untracked
+directory is one entry. A path with any component that looks like a credential is left
+out and only counted. A component looks like one when it contains a stem such as
+`token`, `secret`, `netrc`, `id_rsa`, `.pem`, `.env`, `.ssh` or `.aws` anywhere, which
+also catches backup and editor copies. Git's listing is read up to 4 MiB. It reads no
+other file, so the token and the content of the repository are never opened. It
+opens each directory by name under its parent and never through a symbolic link, accepts
+only private directories of the worker, and reads a result only when it is a private
+single-link regular file shaped as a phase result. Results, then process rows, then
+listings, then untracked paths are dropped until the output fits the transport bound and
+the receipt fits its 1 MiB bound.
+
+Every provider session the controller and `job_environment.py` open runs its program
+through `/usr/bin/env -C` from the worker's home, which always exists and lies outside
+the startup checkout, and `remote-executor.py`
+job commands change to the worker's home before they run anything. No session starts in
+the provider's landing directory, which may be a startup checkout. A failed read is kept in `diagnostics-failed-NNNN.json` and retried after 15
+seconds. The hold ends 300 seconds before the controller unit's 2,700-second runtime limit
+and 600 seconds before the guard's deadline. Each read ends 15 seconds before the hold, so
+the transport's own teardown fits inside it too. Any error ends the hold, so the
+controller always writes the stop trigger and the guard then stops the worker normally. The hold applies only to
+qualification, before a Root handoff, and never to a job, an extension, a closure watch
+or a finish.
+
+Every refusal records a bounded reason code. A refusal of this package keeps its literal
+reason, and any other exception records only its type and the function and line where it
+was raised, never its text. The controller keeps a remote code only in one of these
+forms, and a refusal code only when it names one of the packet's own refusal reasons.
+Any other value is recorded as `malformed`. A busy startup reports up to 32 of the processes it counted,
+each with its pid, name, uid and parent's name and uid, and never a command line or
+environment. The controller keeps the first refused startup in `startup-refused.json` and
+the code of a failed qualification in `qualification-failed.json`. An unresolved stop
+records its code in `unresolved.json`.
+
 Development credentials remain on the development worker. The token is qualified with
-lstat, and its content is never read by this package. The reviewed setup hook's own
+lstat, and its content is never read by this package. Jobs never use it.
+
+## Local-only MBX in jobs
+
+Boat jobs build with MBX in local-only mode. The worker's configuration names the
+read-only remote cache, and the job environment sets `MBX_REMOTE_URL` to an empty value,
+which overrides it, so no job reads the remote cache or its token. The job shell also
+drops any inherited `MBX_REMOTE_TOKEN_FILE` or `MBX_REMOTE_TOKEN`. The local store stays
+in MBX's default cache directory under the worker home, which the normal stop's snapshot
+keeps, so a later resume starts with the store warm. `MBX_GC_MAX_TOTAL_SIZE` is 64 GiB,
+which holds two release builds and the workspace test builds in one budget for the store,
+managed targets and incremental state. `MBX_GC_MIN_FREE_SIZE` is 45 GiB, which keeps the
+40 GiB of free disk that the metadata probe requires at the next qualification.
+`remote-executor.py admit` asks the pinned `mbx` for its effective `remote.url`,
+`gc.max_total_size` and `gc.min_free_size` through the job environment and refuses a
+remote URL, a token setting or another budget by name. A gate's service unit starts
+with an empty environment, so `gate-start.sh` forwards these settings when its caller
+set them. Qualification still checks the provisioned read-only configuration and the
+token metadata, since they describe the development environment rather than the job. The reviewed setup hook's own
 metadata-open behavior must remain within the release's provisioning scope. GitHub
 Actions retains separate OIDC authentication. This package exports no reusable snapshot
 or credential-bearing template.
@@ -59,6 +199,7 @@ mise run boat:qualify --unit "$LOCAL_CONTROLLER_UNIT" --worker "$OWNED_WORKER" -
 journalctl --user -u "$LOCAL_CONTROLLER_UNIT" --no-pager
 python3 -I -B scripts/boat/qualified_worker_admission.py --owned-worker "$OWNED_WORKER" --profile "$PRIVATE_PROFILE" --operation "$OWNED_OPERATION"
 mise run boat:job-env --owned-worker "$OWNED_WORKER" --profile "$PRIVATE_PROFILE" --operation "$OWNED_OPERATION" --out "$OWNED_OPERATION/job-admission.json"
+mise run boat:closure-watch --unit "$LOCAL_WATCH_UNIT" --operation "$OWNED_OPERATION"
 export SPARKLES_BOAT_PROFILE="$PRIVATE_PROFILE"
 export SPARKLES_BOAT_ADMISSION="$OWNED_OPERATION/job-admission.json"
 worker="boat:$OWNED_WORKER"
@@ -72,6 +213,30 @@ scripts/gate/gate.sh --host "$worker" --helper none HEAD
 mise run boat:finish --operation "$OWNED_OPERATION" --job-closure "$PRIVATE_JOB_CLOSURE"
 ```
 
+The controller reads the wall and boot clocks once for its intent, and both deadlines are
+exactly 10,500 seconds after those readings, so the admission end derived from the
+guard's paired observation never passes the intent's own wall deadline. Admission still
+accepts up to a millisecond of skew between the two in receipts of earlier controllers.
+The controller stages the handoff. It computes the admission from the handoff's
+values, publishes `qualified-worker-admission.json` first and `root-handoff.json` last,
+and a handoff stands only while both receipts exist. When any step fails, no handoff
+stands, so the controller holds for diagnostics and triggers a normal stop that needs
+no job closure. It also writes `root-handoff-withdrawn.json`, which job preparation,
+export, extension and the closure watch all refuse, and renames a published handoff
+receipt away when that write fails. Publication and withdrawal run under the
+operation's exclusive job lock, which every job command holds shared from before its
+stopping checks, so no job is admitted on a handoff the controller withdraws. The
+controller tries revocation only while it holds that lock. A published handoff that
+neither the withdrawal nor the rename could revoke keeps its job-closure requirement,
+since a job may have been admitted after the lock was released, and the provider TTL
+bounds that case.
+
+Before any job work, `remote-executor.py admit` refuses a worker that lacks one of the
+commands that the query, write and Jena screens and the remote build run there, and
+names it. A test derives those commands from the worker-side scripts, their heredocs
+and the remote command strings. The check does not cover the commands of Boat gates
+or partitioned test shares.
+
 Qualification runs in a named local 512-MiB, zero-swap controller unit with 2,700-second
 runtime and 30-second stop limits. The controller returns after qualification/handoff;
 its separate local guard remains active. Journal progress is observation rather than
@@ -82,7 +247,7 @@ The original `qualified-worker-admission.json` remains unchanged and has
 `runtime_env_file:null`. `job_environment.py` validates that receipt with the shared
 `validate_admission` consumer and its exact private profile, operation, source seal,
 job review and live guard. It creates one bounded mode-0600 nonsecret environment file
-containing literal PATH and token FILE path only. Its separate job-admission record
+containing only literal PATH, pinned Rust toolchain and local-only MBX values. Its separate job-admission record
 references the original qualification bytes and actual environment-file proof. It
 creates no extra authority or lifetime. Adapters pass the deterministic values
 literally and never source arbitrary shell values. An uncertain preparation is
@@ -95,6 +260,52 @@ guard stay bound to the same operation throughout. The transport's actual Boat q
 workload correctness, cache reuse and interruption behavior still require real
 acceptance under roadmap item 762. Namespace remains the required screen fallback.
 
+## Lifetime extension
+
+A worker can serve another lane without a stop and resume. The lifecycle owner records
+a fresh environment fact, as for the post-resume check, and extends the same operation.
+
+```sh
+python3 -I -B scripts/boat/controller.py extend --operation "$OWNED_OPERATION" --seconds 7200 --environment-fact "$PRIVATE_ENV_FACT" --reason "next lane"
+```
+
+The act refuses a stopping or closed operation and a lifetime already inside the
+30-second closure reserve. It adopts the worker only when the local boot and the live
+guard's invocation and PID match the guard receipt, the worker's current boot id matches
+the one the metadata probe recorded, the provider reports the qualified environment
+version and the fact matches the environment, version and hook. The new end is the
+act's own observation plus at most 10,500 seconds on the wall clock and
+`CLOCK_BOOTTIME`, never shorter than the current end and never more than 12 hours after
+the controller intent. The act sets the provider TTL 300 seconds past the new end with
+`boat extend --ttl`, confirms `archiveAfter` through info and then publishes
+`lifetime-extension-NNNN.json`. A failure leaves only an attempt record, which grants
+nothing, and the provider lifetime may then be longer than the guard's deadline.
+
+The act checks the previous end again after its last blocking call and publishes only
+while the 30-second closure reserve remains. The receipt records that publication time
+with the observation, provider confirmation and adoption facts. A receipt grants time
+only after the running guard accepts it. The guard reads new receipts on every pass and
+records `lifetime-extension-NNNN-accepted.json`, bound to the receipt's digest, only
+while its own clocks leave the closure reserve before the previous end. If that write
+finishes after the previous end, the guard records a veto, ignores the acceptance for
+its life and stops at the earlier end. Each act must follow the previous acceptance. The command waits up to 15
+seconds for that acceptance and exits nonzero without it. A later act refuses while an
+earlier receipt is unaccepted. One act runs at a time
+under the operation's extension lock. The guard takes the same lock before it stops,
+whether at its deadline or on an explicit stop trigger. At the deadline it reads the
+receipts again under the lock and, if no valid extension appeared, records the stop
+trigger before it stops. Admission and job preparation refuse an operation with a stop
+trigger, a stop request or a closure record, extended or not.
+
+Admission, job preparation and the guard accept only consecutive version-1 receipts
+whose every field matches the worker, operation, guard, worker boot and qualified
+environment, each observed after the previous act was published and published before
+the previous end. Without a valid chain the guard uses the conservative original end
+that admission uses, and it keeps that end for its life, so missing or damaged receipts
+can only end the lifetime sooner.
+Receipts carry the same owner-only file trust as the other operation receipts. A job
+admitted before an extension keeps the deadline it started with.
+
 ## Closure and normal stop
 
 Before finish, the operator verifies all owned native processes, cgroups and Boxington
@@ -103,6 +314,47 @@ leases are closed and records that evidence in a fresh private job-closure recei
 must bind the worker, operation, identical local guard tuple, exact job-release hash and
 actual closed state. `finish` validates and publishes that receipt without inventing
 closure observations. The guard alone submits the one normal stop request.
+
+## Scheduled closure
+
+A worker kept warm past its jobs would reach the guard's deadline without a job-closure
+receipt, and the guard would then leave it to the provider TTL. The closure watch runs
+beside the guard under its own named local unit and closes the operation in time.
+
+```sh
+mise run boat:closure-watch --unit "$LOCAL_WATCH_UNIT" --operation "$OWNED_OPERATION" --lead 900 --local-unit "$LOCAL_JOB_UNIT"
+```
+
+The watch reads the guard's present end, with the extensions the guard accepted, and
+waits until `--lead` seconds before it. It then checks over SSH that no
+`sparkles-screen-*`, `nsc-build-*` or `gate-*` unit is active on the worker and that the
+worker's boot is the qualified one. It also requires that no process remains that the
+startup observer would count, which is any process of the worker's uid outside systemd,
+dbus and the allowed provider session, any installer, shell or build tool and any
+descendant of those. Detached work, such as a partition share under `setsid`, is caught
+this way. An mbx lease lives only as long as its mbx process, so the process check
+covers the Boxington leases. Each named local job unit must also be inactive, and at
+most eight can be named, and a name without a unit suffix means a service. One bound
+covers the SSH check and the single local `systemctl` query, including the teardown of
+each call, and a check that ends after it counts as failed. Each check is kept as
+`closure-watch-check-NNNN.json`. An open job is checked again every 30 seconds.
+
+Every Boat command takes the operation's `jobs.lock` shared when its admission is
+loaded and holds it until the command exits. Commands and the watch open that lock, and
+the extension lock, only as a private regular file of the operation's owner with a
+single link. Once a check finds every job closed, the
+watch takes the extension lock and then `jobs.lock` exclusively. If a command holds the
+job lock, the watch tries again at the next check. While the watch holds it, a new
+command waits up to 120 seconds for it and then sees the stop trigger if the watch
+closed the operation. The watch finishes its decision within 90 seconds, inside the
+guard's 100-second wait for the extension lock. It waits up to 15 seconds for the guard
+to accept an extension published before it, checks the jobs once more and publishes
+`root-job-closed.json` from that check with the stop trigger. It publishes only if the
+end, the accepted extensions and the terminal receipts are unchanged since it took the
+locks and the decision bound has not passed. It then observes the guard's verified stop
+as `finish` does. If no check finds the jobs closed by 60 seconds before the end, the
+watch records `closure-watch-unresolved.json` with the last reason code and leaves the
+guard's own deadline stop in place. One watch runs per operation.
 
 `finish` waits up to 180 seconds for the same operation's verified completed/nonforced
 stop, current stopped/snapshot proof and clean local guard exit. A pending, submitted,

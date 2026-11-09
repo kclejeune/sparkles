@@ -1283,9 +1283,9 @@ about the assessments. F22's maintained analyses, roadmap item 340, consume it.
    assessment is left out, which follows the claims rule that a hidden record answers
    as a missing one.
 
-The rest of Phase 3 is planned as separate roadmap items. Recall and Ask citations of
-reviewed claims under their review state, identity resolution and access are
-650. Ingestion of extracted facts as claim proposals with their sources is
+The rest of Phase 3 is separate roadmap items. Recall and Ask citations of reviewed
+claims under their review state, identity resolution and access are item 650, which
+[Recall and Ask with claims](#recall-and-ask-with-claims) describes. Ingestion of extracted facts as claim proposals with their sources is
 651. Reports and community summaries that draw on accepted evidence are
 652. The bindings remain item 509.
 
@@ -1295,8 +1295,8 @@ Item 761 is the storage and restore prerequisite of item 650. A selected evidenc
 view must pair its retained RDF revision with a complete authenticated managed
 configuration, including owner settings and graph protection nonces. The current
 policy version, a projection or a caller-provided digest cannot establish that
-historical configuration. This work remains planned and does not change the
-available evidence operations described above.
+historical configuration. It does not change the available evidence operations
+described above.
 
 Head selects the configuration actually installed when its RDF snapshot is
 captured. An explicit commit selects the configuration that admitted that data
@@ -1371,7 +1371,10 @@ refuse. Later own publications use a genuine destination generation, while old
 explicit revisions remain unavailable as native historical evidence of the new
 identity. Repeated identity changes retain earlier imported origins and add only
 new imported suffixes, without duplicating large WAL files. Rebuild clones have no
-old WAL history and establish their own destination root explicitly.
+old WAL history and establish their own destination root explicitly. The public
+restore keeps the identity of a dataset whose configuration history is activated. It
+refuses a new identity for such a dataset as `unsupported`, and roadmap item 764 adds
+that path.
 
 A clone of a dataset whose configuration history is activated is refused with an
 `unsupported` error before anything is captured or written, because a clone copies
@@ -1386,7 +1389,7 @@ independent restrictions through Recall, Ask, queued responses and publication.
 Read, query and output owners retain the actual selected view through their last
 physical consumer. A borrowed cloneable snapshot or a separate metadata token
 does not establish that lifetime, and newly copied output needs its receiving
-budget. Item 650 additionally owns the named policy and matching-map consumer
+budget. Item 650 adds the named policy and matching-map consumer
 integration, reviewed claim-occurrence citations and A10 treatment of source
 instructions as untrusted data.
 
@@ -1431,6 +1434,524 @@ read-only and disable controls.
 
 Retained-reference resolution uses C29's bounded history and controlled permission
 preparation. Guarded Dataset queries and U02 readers still adopt them under item 395.
+
+### Recall and Ask with claims
+
+Roadmap item 650 delivers this contract in `recall`, `POST /{ds}/recall` and
+`POST /{ds}/ask`, with `sparkles::evidence::claim_states`, `with_policy_claims` and
+`resolve_entities_at` for Rust callers. Each decision states the adopted behaviour and
+the strongest alternative that was rejected. Every choice keeps the current output
+of `recall` and Ask unchanged unless the caller names a policy, and a state that cannot
+be represented faithfully is refused with a stable code rather than reported in a
+reduced form.
+
+#### Arguments
+
+`recall` and `POST /{ds}/recall` gain two optional string arguments. `reviewPolicy`
+names a review policy, and `matchingPolicy` names a matching policy. A call that names
+neither returns exactly what it returns today, in both formats. Claim citations and
+identity resolution therefore exist only for a caller that asks for them by policy name.
+
+The rejected alternative is a default policy declared in the evidence settings. It would
+change the output of existing callers when an administrator edits settings, and it would
+need a new settings member and format version.
+
+#### Which claims are cited
+
+With `reviewPolicy`, recall reports claim occurrences in two ways. A fact read from the
+policy's output graph cites the claim occurrences of its live acceptance supports. In
+addition, a claims section lists the occurrences in the policy's boundary proposal
+graphs whose reified triple has an entity of the result as its subject or object, of
+every kind, polarity and state. Claims never seed a search and never extend expansion.
+They are found only from the entities that the seeds and hops already selected. A claim's
+proposition is never shown as a fact, so an unaccepted proposition cannot read as
+asserted knowledge, as acceptance case A2 requires.
+
+The claims section is bounded by a new `maxClaims` argument, 50 by default and at most
+200, and its lines count toward `maxBytes`. Recall sets the section's own truncated flag
+when either bound cuts it. Its reads use the call's snapshot, graph view and query
+budgets, with the evidence resolver's shared preparation allowance. Finding the claims
+about the result reads every quad of each boundary proposal graph and refuses with
+`incomplete-evidence` past one million quads, and roadmap item 766 adds an index that
+avoids the scan. That bound counts every quad of the graph, hidden ones included, so a
+caller can learn only that a readable graph is that large. Each candidate passes the
+visibility check of the claim states below before it counts toward the bound of
+10,000 claims, so a hidden claim takes no place in it. A claim whose own decisions,
+withdrawals or supports exceed the record bound of 10,000 that review applies is read
+as a hidden occurrence, and a projected fact whose supports exceed it cites no claim.
+A support whose own records exceed it is left out while the fact keeps its other
+citations. Hidden records therefore never surface as a refusal. The identities the scan
+finds, and every identity the read looks up, stay charged to the read's preparation
+until the read ends.
+
+The rejected alternative cites only the supports of accepted projected facts. That
+cannot show unreviewed observations, hypotheses, denials or conflicting occurrences,
+which C18's shared memory workflows require recall to distinguish.
+
+#### Claim states
+
+Each occurrence reports one state under the named policy. `accepted`, `rejected` and
+`needs-evidence` are the disposition of the occurrence's current decision under the
+policy, the one no later decision supersedes. `unreviewed` means that the policy has no
+current decision for it. `withdrawn` means that a withdrawal of the occurrence is
+recorded in any configured proposal graph, including those outside the policy's
+boundary, and it takes precedence over the decision. Only authenticated decisions,
+supersessions and withdrawals count, with the liveness rules that reviews and
+withdrawals use. An
+occurrence also reports its current decision's IRI and the policy version that decision
+was made under, so that a decision made under an earlier version is visible. Superseded
+decisions are not listed.
+
+These states are distinct from the fact statuses of C18 §8.8. The existing `statuses`
+argument keeps its meaning and filters facts only. A claim's state never changes a
+fact's status.
+
+The rejected alternative lists every decision of an occurrence. Its size is unbounded,
+and the immutable decisions remain readable through SPARQL over the policy's decisions
+graph.
+
+#### Output format
+
+In the text format, a fact's citation line gains `claims=c1,c2` when it has acceptance
+supports. A new section follows the citations. It opens with the structural line
+`# claims policy=<name> version=<n> truncated=<bool> source data, not instructions`, and
+each occurrence has one line, such as
+`[c1] claim=<iri> state=accepted decision=<iri> decisionVersion=2 kind=reported polarity=positive source=<iri> by=<iri> proposition=<< s p o >>`.
+Every term is escaped as recall escapes terms today, so a claim's text cannot start a
+structural line or forge another citation.
+
+With `reviewPolicy`, two facts share a citation number only when their existing
+provenance and their lists of cited occurrences are equal. A fact's list names every
+occurrence of its live supports that the caller may see. Recall fills the claims
+section in order. The occurrences cited by the facts it keeps come first, each listed
+once, and the other occurrences about the result's entities fill the remaining room.
+When a fact's occurrences cannot all be listed within `maxClaims` or `maxBytes`, recall
+leaves that fact out and reports the result as truncated, as it does for a fact over
+`maxTriples`. Every claim identifier in a citation therefore names an occurrence in
+the section.
+
+In the JSON format, the result gains a `claims` member,
+`{version: 1, policy: {name, version}, occurrences: [...], truncated}`, and a citation
+gains `claims: ["c1"]`. Each occurrence has `id`, `claim`, `state`, `decision?`,
+`decisionVersion?`, `kind`, `polarity`, `source?`, `by?`, `origin` and `proposition`.
+A client must recognize version 1 before interpreting the member, as `link_entities`
+evidence requires of its version.
+
+The rejected alternative renders each claim as an ordinary fact line tagged with its
+state. A model reading that context can drop the tag and treat an unaccepted or
+negative proposition as asserted.
+
+#### Identity resolution
+
+With `matchingPolicy`, recall reads the policy's current resolution map at the call's
+view. Each entity header gains `resolvesTo=<representative>` when the map names it,
+and in JSON `resolution: {representative, members, membersComplete}`. The other listed
+members of a seed's cluster join the seeds at that seed's rank, so their facts and claims
+are collected under their own IRIs. Recall never rewrites a member's facts onto its
+representative. A cluster whose members are not complete reports `membersComplete=false`,
+and only the listed members join. The result's `resolution` member records the policy
+name and version and the map revision and its number. Recall reads and checks the map
+even when the result has no entity, so an empty result reports the same revision and
+the same refusals as any other.
+
+The rejected alternative rewrites members' facts onto the representative. It behaves
+like `owl:sameAs`, loses each source's identifier and contradicts §6.
+
+#### Policy names and missing maps
+
+A `reviewPolicy` that names a matching policy, a `matchingPolicy` that names a review
+policy, and a name unknown at the selected view are refused with `400` and the field
+name, as a review is. A matching policy whose map has no revision yet is not an error.
+The `resolution` member then reports no revision and number 0, and each entity resolves
+to itself. That is the policy's actual state rather than a fallback. A map that cannot be
+read because a protection of the policy's graphs changed is refused as the existing
+`projection-unavailable`.
+
+The rejected alternative refuses a policy with no map revision. An empty map is a valid
+state right after configuration, and refusing it would make a newly configured policy
+unusable until its first decision.
+
+#### Selected views and unactivated stores
+
+Claim states and resolution maps are read from the `BoundEvidenceView` that the call's
+selection gives, whether that is Head, `atCommit`, `at` or a named snapshot. The
+policies are read from that view's configuration, never from the current settings.
+A call that names a policy selects that one view from its original selector, before
+any reduction of a time or snapshot to a commit number, and reads its facts, claims and
+map from the view's snapshot. Identity resolution uses the same view rather than a
+fresh head of the branch. Head and an explicit commit can therefore select different
+configurations at the same sequence, as the historical-configuration rules above
+describe. A
+call that names a policy on a store whose configuration history is not activated is
+refused with `409` and the new code `configuration-history-inactive`, at Head as well.
+A selected commit outside the activation coverage is refused as `evidence-unavailable`,
+as the view selection already does. A call that names no policy is unaffected by
+activation.
+
+The rejected alternative reads current settings at Head on an unactivated store. Its
+answers would change meaning when the store is later activated, and the
+historical-configuration rules above state that current settings cannot establish the
+configuration of a view.
+
+#### Access
+
+A review policy needs read grants on its decisions, supports and output graphs. A
+matching policy needs read grants on its decisions, maps and output graphs and on the
+identity graphs of its boundary, as identity resolution does. A caller without them is
+refused before anything is read, with the same `400`, code and message as an unknown
+policy name. The refusal names the argument and neither the policy's graphs nor its
+version, so a caller cannot tell a hidden policy from a missing one.
+
+An occurrence's state is decided from the authenticated records of the unmasked view,
+and the occurrence is shown only when the caller's view holds every record that decides
+it. That means the claim itself, its current decision, any decision or withdrawal that
+supersedes or ends it, and the support that cites it. An occurrence that fails this
+check is left out without a count, as a hidden record answers as a missing one. An
+older decision never stands in for a hidden current one. Recall applies this filter
+before it orders, bounds or counts occurrences, so a hidden record takes no place in
+the section and does not change its truncated flag. A fact's citation lists only the
+occurrences that pass it. Recall reads with the caller's
+current grants and the source holds and protections in force, whatever configuration
+the view selects.
+
+#### Ask
+
+`POST /{ds}/ask` accepts the same two arguments and passes them to a new grounding
+stage, which calls `recall` with the policies for the linked entities at hop 0. MCP has
+no Ask tool, and an MCP client reads claims through `recall` itself. An ask that names
+a policy answers from the data, so `mode` `global` is refused with `400` and `auto`
+answers locally. Its policies and the store's configuration history are checked before
+any model call, with the refusals and HTTP statuses of `recall`. That check reads no
+entity and no claim. An ask with no linked entity, such as one that supplies its own
+query, carries an empty claims section.
+
+The claims section enters only the summary step's context, under the same structural
+label, and the summary may cite occurrences as `[c1]`. That step's system prompt lets
+the answer use the listed occurrences as reported claims that keep their state and
+polarity, and a summary without a policy keeps its prompt. The query drafting, repair and
+escalation steps never receive it. The summary step already uses only providers that
+may receive rows under C18 §3.5. When no such provider remains, the summary is left out
+as it is today, and the response still carries the claims for the caller. A cited
+occurrence must exist in the context, as a cited row or point must today, and a marker
+that names no listed occurrence is removed from the text. Ask does not
+rewrite its SPARQL query to read proposal graphs, so a result row cites claims only
+through that context.
+
+The summary's JSON keeps its numeric `citations` for rows and gains `claimCitations`, a
+list of occurrence identifiers such as `"c1"`. The `summary` event and the final JSON
+carry the `claims` member that recall's JSON format defines, with its version, policy
+and occurrences. No earlier event carries claim content.
+
+Before it emits the summary, Ask reads the claims section again with the same selector
+and the caller's current grants, protections and source holds, and compares it, with
+its commit and resolution, with the section in the context. Any difference withholds
+the answer with a `forbidden` error that does not say what changed, and the caller must
+ask again. A different occurrence, state, resolution or origin label counts, and so does
+a head that moved in between. A policy change after the first read changes the second
+read and withholds the answer too. The claims go to the provider and the answer is
+published only while the authority the caller's grants were read under still holds, so
+an access policy reload or a revoked or expired credential withholds the answer in the
+same way. Ask checks that authority before every attempt of the summary call, its
+retries and escalations included, and an attempt refused there is never sent. Such an
+attempt follows no redirect, since a redirect would send the claims again without that
+check, so a provider that redirects fails the attempt.
+
+A kept answer stores its `claimCitations` with its summary and the occurrences they
+cite under `claims`. Its footprint under C18 §6.4 already covers every graph the
+asker's view could read, the claims' graphs among them, so the list route withholds
+the answer from a reader whose view does not cover that footprint under the same
+protections.
+
+The rejected alternative maps each SPARQL result row to the acceptance supports of the
+triples that produced it. Ask has no row-to-triple provenance, and building it belongs
+to F18's explanations.
+
+#### Source instructions
+
+An occurrence reports `origin=instructions` when its source revision or that revision's
+source is typed `mem:Instructions` by a triple in the caller's view, and
+`origin=source` otherwise. The typing triple may be in any graph the caller can read,
+the default graph included, and a typing triple the caller cannot see is never
+consulted. Every claims section is labelled as source data whatever its origins, so a
+missing label never grants authority. Neither the label nor any claim's text changes the
+caller's tools, grants, outbound permissions or execution policy, which acceptance case
+A10 requires.
+
+The rejected alternative detects instruction-like text in quotes and propositions. Such
+detection is unreliable, an author can evade it, and a label that depends on the text
+can be forged by the text it labels.
+
+#### Library API and bindings
+
+Item 650 adds no recall API to the `sparkles` crate, and recall remains server code
+exposed through HTTP, OpenAPI and MCP. It adds one bounded library read,
+`sparkles::evidence::claim_states`, which reports the states, current decisions and
+origins of given claim occurrences under a review policy at a `BoundEvidenceView`, with
+the caller's access. The server uses it, and Rust callers can use it directly. Python,
+the JVM and Node.js gain it under item 509 with the other evidence reads.
+
+The rejected alternative moves recall into the `sparkles` crate. That is a large move of
+the MCP memory code that no current caller needs.
+
+#### Acceptance
+
+Router and library tests cover a caller without the policy's grants, a withdrawn
+occurrence beside a surviving accepted one, a rejected and a reversed decision, a
+decision made under an earlier policy version, a matching policy with no map revision,
+a review policy named as a matching policy, a merge and its reversal, an unactivated
+store, a historical commit with a changed configuration, a claim from an instruction
+document whose text imitates a citation and a structural line, and an Ask whose cited
+occurrence becomes unreadable before its answer is published. They also cover a hidden
+current decision behind a readable claim, two projected facts with different supports,
+more supporting occurrences than `maxClaims`, a hidden policy and an unknown one, a
+settings-only change at one sequence and a bound named snapshot. A call that names no
+policy matches today's output byte for byte in both formats.
+
+### Ingestion into claim proposals
+
+Roadmap item 651 delivers this contract in `POST /$/ingest/{ds}` and `sparkles ingest`,
+with `sparkles::evidence::OrdinaryChanges` for Rust callers of `propose`. C18 §7 defines
+ingestion only into asserted memory, and this specification did not say how an
+ingestion becomes an evidence batch, so each decision below states the adopted
+behaviour and the strongest alternative that was rejected. The current modes of C18 §7.7 keep their behaviour, and
+`branch` stays the default.
+
+#### Mode and arguments
+
+`POST /$/ingest/{ds}` and `sparkles ingest --mode` accept a fifth mode, `claims`. A
+claims ingestion converts and registers the document as the other modes do, extracts
+and links its facts, and publishes the registration and the evidence batch in one
+commit. The extracted facts become claim proposals instead of asserted memory. The
+mode creates no review branch and merges nothing, because the review policy decides
+what is projected. The `branch` option names an existing branch for the commit, and
+`main` is used when it is absent. The `source` option still extracts a registered
+source instead of a document.
+
+Two new options, `sourceGraph` and `proposalGraph`, choose the evidence graphs when
+the settings name several, as `POST /{ds}/claims` does. The `graph` option names the
+ordinary source graph of C18 §7.2, as in the other modes, and a graph that the
+managed-graph registry protects is refused with `profile-managed-graph`. The mode needs
+no `admin` grant, unlike `auto`, because it asserts no extracted fact.
+
+The rejected alternative is a `claims` flag that combines with `branch`, `preview` and
+`auto`. A review branch and its merge preview would review the batch a second time,
+and the confidence threshold of `auto` would decide admission in place of the policy.
+
+#### One commit for the source and the batch
+
+A claims ingestion still writes the C18 source graph of §7.2, with its source,
+rendition and chunks under the same `keepText` rules as asserted mode, so the document
+stays visible to `read_chunks`, full-text search and embeddings. Only the extracted
+facts change their form. The registration and the evidence batch publish in the same
+commit, so a reader sees either both or neither.
+
+The pipeline plans the registration at the branch head without writing it, which gives
+its inserted and deleted quads and the head they were read at. `propose` then takes
+those quads as ordinary changes of its own transaction, with `ifHead` set to that head,
+the caller's write view and the dataset's guard. It refuses ordinary changes in any
+graph that the managed-graph registry protects, for any owner, before it publishes, so
+the evidence owner's capability cannot carry a write into another owner's graph or into
+an evidence graph outside the typed records. When the head has moved, the registration
+is planned again at the new head, up to three times, and the run then answers
+`head-changed`. Planning reads no model, so a retry costs no tokens. An idempotent
+replay of the batch writes nothing, because its first publication carried the
+registration. When the same text is already registered, as after an asserted
+ingestion of the same document, the registration has no changes and the commit holds
+the batch alone.
+
+A `source` run reads a source that is already registered, so its commit holds the batch
+alone, and the source keeps its C18 records.
+
+The rejected alternative writes the registration and the batch in two commits, in either
+order. Between them a reader could see a registered source without its proposals or
+proposals whose source text is missing, and a crash or a refusal of the second commit
+would leave that state behind until a retry repaired it.
+
+#### Records of the batch
+
+The batch holds one source revision, one rendition, its passages and evidence
+references, the claims and one evidence link per claim.
+
+| Record | Content |
+|---|---|
+| Source revision | Its source is the IRI that the registration gives the C18 source, or for a `source` run the registered source's IRI. Its content is metadata only, with the content digest that the C18 registration records, and an http or https URL is a locator. |
+| Rendition | Its occurrence key is the C18 rendition IRI, and the conversion is a method named by the format and the server version. It retains the normalized text as `ev:normalizedText`. A `source` run uses the text of the source's current rendition. |
+| Passage and reference | One passage per distinct span of the extracted facts, quoting the exact selected text, and one evidence reference to it. |
+| Claim | One `ev:Reported`, `ev:Positive` occurrence per extracted fact, attributed to the source and derived from the revision. A reported confidence becomes `ev:extractionConfidence` on the zero-to-one scale, evaluated by the model whose answer gave the fact. |
+| Evidence link | `ev:Supports` from the fact's passage reference to its claim, attributed to the model whose answer gave the fact. |
+
+The C18 registration records the digest of the normalized text as the source's content
+digest when it keeps no other original bytes, which is the case for converted uploads.
+An upload and a later `source` run of the same registered source therefore describe the
+same revision. The passages are verified against the batch's own rendition text, which
+avoids the `incomplete-evidence` answer of proposal decision 1. A review verifies every
+cited passage again against the rendition's retained `ev:normalizedText` before it
+accepts a claim, so the evidence rendition must keep the text. The text is therefore
+stored twice, once in the C18 chunks and once in the evidence rendition. That costs up
+to 2 MiB of extra storage per source, and it keeps acceptance independent of the
+ordinary graph that the C18 chunks live in. A dataset with `keepText: false` cannot
+retain the text that acceptance needs, so it refuses claims mode with `409 no-text`
+before conversion. The extraction model and the converter remain attributed metadata,
+and the authenticated caller is the operation's principal, as §5 requires.
+
+The rejected alternative verifies the passages at publication and records the
+rendition without its text. The proposals would publish, but no review could accept
+them, because acceptance resolves each passage against retained text. Retaining the
+original bytes in the revision was rejected as well. The original bytes, the converted
+text and the other decoded content count together toward the 16 MiB bound of §8, so a
+large PDF could exceed it, and the C18 registration already records the content digest
+that identifies the revision.
+
+#### Entities
+
+Linking runs as in the other modes, as the caller and over the caller's view. An
+`exact` verdict uses the existing IRI. An `ambiguous` verdict uses the first candidate
+and is listed in the result's `flagged` member, as on a review branch. A new entity gets
+a name-based UUID of the dataset, the revision digest and the entity's normalized text
+and class, so that the same revision names the same entity again. Its class and label
+are proposed as two further claims, `rdf:type` and the profile's label predicate, cited
+by the first passage that mentions the entity and attributed to the model of that
+passage's fact. The candidates of a `candidates` verdict are reported in the result's
+`candidates` member and written nowhere.
+
+The rejected alternative asserts new entities' types and labels in an ordinary graph.
+That needs a second commit and asserts extracted content before any review.
+
+#### Checks before the write
+
+The profile's term checks and the span check of C18 §7.6 run as they do for asserted
+facts, and a fact that fails them is reported in `failed` and left out of the batch.
+The commit passes the dataset's guard as a registration does in the other modes. The
+guard dry run of the extracted facts in C18 §7.7 is not run, because no fact is
+asserted, and the result reports `factGuard: "not-run"`. The rejected alternative runs
+`assert_facts` as a dry run of the facts against the source graph. Its findings would
+describe triples that are never asserted, and a reader could take them for findings of
+a later projection.
+
+#### Grants and settings
+
+The pipeline checks the grants in two stages. Before conversion it checks from the
+grants alone that the caller has `write` on the update endpoint of the dataset or
+branch and update grants on the source-record and proposal graphs it will write, that
+the evidence settings are enabled and that the dataset keeps source text. A claims
+ingestion also needs a provider in the `extract` role, and without one it answers
+`no-model` at the same point. The C18 source graph of an upload without `iri` or
+`graph` is derived from the converted text, so it is known only after conversion. The
+registration plan derives it, and the pipeline then checks the caller's update grant on
+it and that no profile manages it, before any provider call. A caller
+without them is refused as `POST /{ds}/claims` refuses it, and no tokens are spent.
+`propose` checks again at publication.
+
+The rejected alternative lets `propose` alone refuse. Its answer would arrive only
+after the extraction's model calls had been spent.
+
+#### Idempotent re-ingestion
+
+Every claims ingestion carries the idempotency key `ingest-claims:1:<digest>`. The
+digest is the SHA-256 of a canonical JSON array of the version, the source IRI, the
+C18 source graph, the evidence source-record and proposal graphs, the revision and
+rendition digests and the profile name. The same text under another source or graph is
+therefore another ingestion with its own occurrences. The revision's source key frames
+the same source and graphs, so its record identities, and the identities derived from
+them, differ as well. The changing registration delta is not part of the key or of the
+payload digest. Before extraction the
+pipeline derives the operation IRI of that key for the caller with `operation_iri` and
+looks for it in the record graphs of the selected branch. When it is found, the result
+is `already-proposed` with the first operation, and nothing is extracted or written, so
+no model is called. The C18 chunks of that first ingestion are already present, since
+they published in its commit. A model's extraction is not
+deterministic, so without this check a second run would send another payload under the
+same key and answer `idempotency-conflict`. Two concurrent runs of the same revision can
+still both extract, and the second then answers `idempotency-conflict` and writes
+nothing.
+
+A document whose chunks exist because an asserted ingestion registered the same text
+has no such operation. Its claims ingestion extracts the facts and publishes the batch,
+and the registration contributes no change to that commit.
+
+The rejected alternative omits the key and relies on deterministic record identities
+and the writer's `existing` flag. A second extraction that differs would add new
+occurrences of the same revision, so re-ingestion would not be idempotent.
+
+#### Changed revisions
+
+A source ingested again with another digest gets a new revision of the same source and
+new claim occurrences. Earlier occurrences are neither withdrawn nor superseded, and the
+result names the previous C18 rendition when the registration replaced one. Withdrawal
+stays an explicit `claims/withdraw` call. Claim occurrences get no `prov:wasRevisionOf`
+link, because extraction does not establish which occurrence corresponds to which.
+
+The two source revisions do correspond, because the registration replaced the current
+rendition of the same source. Both revisions name the same source through
+`prov:specializationOf`, and the C18 renditions keep their `prov:wasRevisionOf` chain.
+The source revision input has no field for a link to a predecessor revision, and adding
+one changes the record digests of revisions, so roadmap item 780 tracks a
+`prov:wasRevisionOf` link between evidence source revisions.
+
+The rejected alternative applies the supersession of C18 §7.9 and withdraws the earlier
+occurrences that the new extraction does not repeat. A model omitting a fact is not
+evidence that the source no longer states it, and §6 makes withdrawal a recorded
+decision rather than an inference.
+
+#### Bounds
+
+The existing refusals of more than 10 MiB of input or 2 MiB of converted text answer
+`too-large` before extraction or any write. Linking follows the extraction chunk by
+chunk, so after each chunk that answers, the run knows the claims that the batch would
+hold so far. Those are the distinct fact claims together with the class and label
+claims of the new entities. Extraction stops calling the model as soon as that count
+exceeds the 1,000 claims of §8, and the run is refused with `too-large`, writing
+nothing. Each entity is linked once however many chunks name it. Before `propose`, the
+pipeline prepares the batch as the proposal will and refuses it the same way when its
+decoded size, including the rendition text, quotes and literals, exceeds the 16 MiB of
+§8. The HTTP route enforces that bound only through its body limit, so the pipeline
+must check it itself. A document is never split into several batches.
+
+The rejected alternative splits a large document into several batches. Each batch would
+publish separately, and a refusal partway through would leave the earlier batches
+behind.
+
+#### Source instructions
+
+A `source` run of a registered source typed `mem:Instructions` names that source in its
+revision, so the occurrences report `origin=instructions` under item 650's rule, and
+the claims section labels them as source data. An uploaded document is never typed as
+instructions by the ingestion. The extracted propositions and quotes are data, and they
+change no tool, grant, outbound permission or execution policy, as A10 requires. No
+vocabulary is added.
+
+The rejected alternative adds an instructions kind to the source revision input. That
+changes the profile's input model and record digests for a label that the existing
+typing triple already supplies.
+
+#### Result and surfaces
+
+The task result has `outcome` set to `proposed`, `already-proposed` or `no-facts`, and
+`mode` set to `claims`. A proposed result carries the operation, commit, branch, first
+availability and hold of the receipt, the revision and rendition IRIs, the counts of
+records by kind, the records of the receipt, and the `failed` and `flagged` lists, with
+the registration's members that the other modes report. A run that extracts no fact
+still publishes the registration with a batch of its revision and rendition alone, and
+answers `no-facts`, so that a repeat of it finds its operation. OpenAPI gains the mode, the
+two options and the result schema.
+
+MCP has no tool that starts an ingestion, since `register_converted` is internal and
+`register_source` registers without extraction, so MCP gains nothing. An agent that
+extracts facts itself proposes them with `propose_claims`. No binding exposes ingestion
+modes, so the bindings are unchanged.
+
+#### Acceptance
+
+Router and pipeline tests with a scripted extraction cover a refusal at each step that
+leaves no record, branch or source graph, a refusal of the batch at publication that
+also leaves the registration and chunks unwritten, a claims ingestion of a document
+whose chunks an asserted ingestion already wrote, a caller without `write` or without an update
+grant on either evidence graph that spends no model call, a repeated ingestion of the
+same revision that answers `already-proposed` without a model call, a changed revision
+that keeps the earlier occurrences, a `source` run of an instructions document whose
+occurrences report `origin=instructions`, and a document over each bound that is
+refused with nothing written. They also check that asserted modes are unchanged and
+that the written records conform to the shapes.
 
 ### Scope changes
 

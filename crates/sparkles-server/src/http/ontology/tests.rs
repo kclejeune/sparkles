@@ -426,6 +426,64 @@ async fn diffs_the_axioms_of_two_commits() {
 }
 
 #[tokio::test]
+async fn an_entity_diff_keeps_the_axioms_that_mention_it() {
+    let s = persistent();
+    let start = s._state.get("h").unwrap().store.head_commit().seq;
+    let r = post(
+        &s.app,
+        "/$/ontology/h/axioms",
+        json!({
+            "add": [sub("http://ex.org/Course", json!("http://www.w3.org/2002/07/owl#Thing"))],
+            "remove": [sub("http://ex.org/Professor", json!("http://ex.org/Person"))],
+        }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let diff = |entity: &str| format!("/$/ontology/h/diff?from={start}&entity={}", enc(entity));
+    let r = get(&s.app, &diff("http://ex.org/Course")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["entity"], "http://ex.org/Course", "{j}");
+    assert_eq!(j["addedCount"], 1, "{j}");
+    assert_eq!(j["removedCount"], 0, "{j}");
+    // the superclass is mentioned by the removed axiom, in angle brackets too
+    let r = get(&s.app, &diff("<http://ex.org/Person>")).await;
+    let j = r.json();
+    assert_eq!(
+        (j["addedCount"].as_u64(), j["removedCount"].as_u64()),
+        (Some(0), Some(1)),
+        "{j}"
+    );
+    assert!(
+        j["removed"][0]["ofn"]
+            .as_str()
+            .unwrap()
+            .contains("Professor"),
+        "{j}"
+    );
+    // an entity that no changed axiom mentions has an empty diff
+    let j = get(&s.app, &diff("http://ex.org/Nothing")).await.json();
+    assert_eq!(
+        (j["addedCount"].as_u64(), j["removedCount"].as_u64()),
+        (Some(0), Some(0)),
+        "{j}"
+    );
+    // as lines too
+    let t = get(
+        &s.app,
+        &format!("{}&format=text", diff("http://ex.org/Course")),
+    )
+    .await
+    .text();
+    assert_eq!(t.lines().count(), 1, "{t}");
+    assert!(t.starts_with("+ ") && t.contains("Course"), "{t}");
+    assert_eq!(
+        get(&s.app, &diff("not an iri")).await.status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
 async fn graph_store_writes_take_functional_syntax() {
     let s = server();
     let body = "Prefix(:=<http://ex.org/>)

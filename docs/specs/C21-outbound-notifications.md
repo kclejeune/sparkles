@@ -1,6 +1,6 @@
 # C21: Outbound notifications
 
-> **Status:** implemented in part (Phase 1)
+> **Status:** implemented in part (Phases 1 and 2)
 >
 > **Phases:** Phase 1 is the `notifications` settings kind, the webhook and ntfy
 > channels, delivery with retries, deduplication and repeats, a test send, delivery
@@ -75,6 +75,9 @@ Non-goals:
 | `backup.failed` | server | A run of a backup policy ends `failed` or `partial` | At most every `repeatEvery` of the kind for the same policy, until a run of the policy succeeds |
 | `models.budget.exceeded` | server | A provider's tokens counted today reach its `budget.tokensPerDay` | Once per provider and UTC day |
 | `notification.test` | server | A server administrator asks for a test | Never deduplicated |
+| `backup.verify.failed` | server | A verification fails or finds a damaged backup | At most every `repeatEvery` per repository, until the damaged backups and failed verifications are resolved (Outcome) |
+| `backup.gc.failed` | server | A GC fails or a policy cannot start one | At most every `repeatEvery` per repository, until a GC that deletes succeeds |
+| `backup.overdue` | server | An enabled policy missed two scheduled instants since its last success | At most every `repeatEvery` per policy, until it succeeds |
 
 An open review branch is a branch whose name the memory inbox treats as review work
 (`ingest.`, `review.`, `consolidation.` and `proposals.` branches) and that has commits
@@ -482,6 +485,13 @@ capabilities and remaining work are described by the spec status and Outcome.
   (2026-10-10). It adds no dependency. HMAC-SHA256 is written on the `sha2` crate the
   server already uses, and checked against the vectors of RFC 4231 and the example of
   the Standard Webhooks reference libraries.
+- **Implementation:** Phase 2, the email channel, from §4.3, RFC 5321, RFC 5322, RFC 3207,
+  RFC 4954, RFC 6409, RFC 8314, RFC 2045 and RFC 2047 (2026-11-09). It adds no crate to
+  the tree. The SMTP client is written in `notify/smtp.rs` on `rustls` and
+  `rustls-platform-verifier`, which reqwest already brought in. They became direct
+  dependencies of the server, and `rustls` is no longer behind the `tls` feature. The
+  `lettre` crate was not taken, since the channel needs only EHLO, STARTTLS, AUTH PLAIN,
+  MAIL, RCPT, DATA and QUIT.
 - **Rejected** (spec §13):
   - notifications through Alertmanager only;
   - a configuration file of its own;
@@ -493,7 +503,7 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
-Phase 1 landed on 2026-10-10. Phases 2 and 3 are not built.
+Phase 1 landed on 2026-10-10 and Phase 2 on 2026-11-09. Phase 3 is not built.
 
 The module `crates/sparkles-server/src/notify/` holds the settings type, the delivery
 queue and worker, the events, the routes and the HMAC signing. It is not behind a cargo
@@ -526,19 +536,109 @@ These points differ from the design or settle what it left open.
 - An open review branch is recognized by the prefixes the memory inbox uses. The
   notifier keeps its own copy of that rule instead of calling into the MCP module,
   which is behind the `mcp` feature. Its age is the time the branch was created.
-- The backup event covers the runs of backup policies. A backup started by hand and a
-  policy run that fails before it records a result send nothing.
+- The backup operations that run in the background raise an event when they fail
+  (item 46). A policy run that ends `failed` or `partial` sends `backup.failed` as
+  before, and so does a run that ends `ok` with a failed retention, whose
+  `retentionError` says why and which does not clear the policy's condition. A policy
+  run that stops on an error before it records a result, and a scheduled run that
+  cannot start for a reason other than a full task queue or a run still running, send
+  `backup.failed` with `stage` `run` or `start` under the same key as the policy's
+  runs. A backup started by hand that fails sends `backup.failed` with
+  `trigger: "manual"`, keyed by repository and dataset, and any later successful
+  backup of that dataset into that repository, by hand or by a policy, clears it. A
+  verification that fails or finds a backup with the status `error` sends
+  `backup.verify.failed`, keyed by repository. Each damaged backup and each failed
+  verification is also kept as a silent condition with its level in the key, and the
+  repository's condition clears when the last of them does. A damaged backup, and a
+  backup that a failed selected verification asked for, clears when a verification at
+  the same or a higher level finds it ok or when a whole verification no longer lists
+  it, whatever the level. A failed whole verification clears only when a whole one
+  succeeds at the same level, or at `data` for `restore`, which a whole verification
+  over HTTP does not offer. The update of these conditions is one step under the
+  notifier's lock, so two verifications cannot interleave between the check and the
+  clearing, and it saves the conditions file once. A verification that finds only orphan blobs is not a failure. A GC
+  that fails, and a GC after retention that a policy cannot start, send
+  `backup.gc.failed`, keyed by repository and cleared by a GC that deletes and
+  succeeds, since a dry run takes no exclusive lock and does not sweep. `backup.overdue` fires
+  for an enabled policy that has missed two scheduled instants since its last success
+  while no run of it is going on, which reads "twice its schedule's interval" as two
+  scheduled instants so that a weekday schedule is not overdue over a weekend. It
+  clears when the policy succeeds or is no longer overdue. The scheduler checks it at
+  each step, at least once a minute, and clears the conditions of policies that are
+  gone. A policy that has never succeeded is reported by its failures, not as overdue,
+  so a new policy whose scheduled runs are all skipped for a full task queue sends
+  nothing. A cancelled operation sends nothing. The new failure events are `critical`,
+  a retention failure in an `ok` run is a `warning` like a `partial` run, and
+  `backup.overdue` is a `warning`. Raising an event saves the conditions file
+  synchronously, on the task thread of the operation or on the scheduler's thread.
+- Some backup failures still send nothing. Requests that fail at once, such as a
+  refused registration, a disk reserve that cannot be met or a full task queue, answer
+  the caller instead. A failed restore sends nothing, since the person who asked for it
+  sees the failure. Startup recovery runs before the notifier, and the background
+  refresh of repository statistics, the saves of the policy state and run history, and
+  a failed SIGHUP reload are only logged. The CLI's offline `sparkles backup` commands
+  run outside the server and send nothing.
 - `partial` is a `warning` and `failed` is `critical`.
 - Secrets have no new flag. The declared source of a notification secret is
   `--model-secret`, and on NixOS `services.sparkles.models.secrets`. A dedicated
   `--secret` flag would be clearer and is left for later.
-- One worker thread sends the deliveries in turn, so a channel that times out delays
-  the others by up to `timeoutSecs` per attempt.
+- Each channel has its own queue and delivery thread (item 46). A channel's queue
+  holds its share of the 1,000 deliveries of §6.5, which is 1,000 divided by the number
+  of channels and at least 50, and the delivery in flight counts against it. A
+  delivery that does not fit ends `dropped`, as §6.5 says for the single queue, and
+  only the channel that is full drops. A retry waits in its channel's queue, so a
+  channel that times out or fails delays only its own deliveries, and raising an event
+  never waits for a delivery. The kind holds at most 32 channels. A channel that is
+  removed or renamed keeps its queue and thread until its waiting deliveries are done,
+  and at most 64 queues exist at once, so a delivery that would need one more ends
+  `dropped`. A channel's thread ends once its queue is empty and the settings no
+  longer have the channel, or after 30 seconds with an empty queue otherwise. The
+  delivery code reads the kind only when it passes the kind's checks, so a runtime
+  layer written with more than 32 channels leaves notifications off. The
+  gauges `sparkles_notifications_channel_queued{channel}` and
+  `sparkles_notifications_channel_queue_capacity{channel}` show each queue, and the
+  channel entries of `GET /$/notifications` gain `queued`, `inFlight` and
+  `queueCapacity`. With 32 channels the shares add up to 1,600 deliveries, since the
+  floor of 50 is kept. The tests hold one webhook that never answers while another
+  channel receives an event raised after the hung one's within a second, and fill a
+  hung channel's share of 50 while another channel still delivers.
 - A test send is counted in the metrics and the channel status with the event
   `notification.test`.
 - The OpenAPI description gained a shared `502` response, `BadGateway`.
 - The Notifications section of the UI is Phase 3. The server page's Models section
   was changing in parallel work, and the API and CLI cover the operations.
+- The email channel of Phase 2 is a small SMTP client in `notify/smtp.rs` on rustls,
+  without a mail crate. `tls` is `starttls` or `tls`, and a plain value is refused when
+  the kind is written. The port defaults to 587 or 465. A channel with `username` needs
+  `password`, a secret reference, and authenticates with AUTH PLAIN only when the server
+  lists it. The certificate is checked against the platform's roots through the
+  verifier reqwest uses, and an internal CA has to be in the system's trust store,
+  since the channel has no `caCert` of its own. Any `4xx` reply is retried and any
+  `5xx` reply ends the delivery, including a `5xx` to one recipient of several. A `251`
+  to RCPT, a recipient the server forwards, is accepted. A failed TLS handshake ends
+  the delivery without a retry. One deadline of `timeoutSecs` bounds the whole
+  attempt, since every read and write of the socket, those of the TLS handshake
+  included, gets only the time left, so a server that answers a byte at a time cannot
+  hold the channel. Credentials whose `AUTH PLAIN` command would pass the 512 octets of
+  an SMTP command are sent after the server's empty challenge instead of as an initial
+  response. A failed `AUTH` is reported as `authentication failed` with the reply code
+  and never with the server's text, which could echo the token, and every other error
+  has the password and the token replaced before it is cut to 200 characters. The
+  client also refuses a reply line without its line end, a line that is not an SMTP
+  reply line, and a multi-line reply whose lines change the code. The `To` header has
+  one recipient per line, and an encoded subject one encoded word per line, so no
+  line passes the limits of RFC 5322 and RFC 2047. The client refuses data that
+  a server sends after its STARTTLS reply and before the handshake, which would let a
+  man in the middle inject commands. The subject is the title, and the body is the
+  summary, the link, the event type, severity, server, dataset, time and id, and the
+  data as indented JSON. It is 7-bit when it is ASCII and quoted-printable otherwise,
+  and a subject outside ASCII is encoded words in Base64. The `Message-ID` is the
+  envelope's `id` at the domain of `from`. A delivery's `status` is the SMTP reply code
+  250. The tests run a mail server inside the test process with STARTTLS and with
+  implicit TLS on the test certificates of `tls/testdata`, check AUTH PLAIN and the
+  message, retry a `451` and not a `550`, refuse a server without STARTTLS and one
+  whose certificate is not trusted, refuse a loopback mail server without
+  `--outbound-allow-private`, and check that the password appears in no answer.
 - The NixOS module needed no new option. Its option descriptions and the user docs show
   `settings.server.notifications` with a secret from sops-nix, and no VM test was added.
 
@@ -547,16 +647,7 @@ These points differ from the design or settle what it left open.
 **Email, the UI section, backup coverage and independent delivery** (item 46, Tier 5,
 [ROADMAP](../ROADMAP.md)).
 
-* **The email channel (Phase 2).** §4.3 designs it: submission over STARTTLS or implicit
-  TLS, SASL PLAIN, a plain connection refused, the outbound policy's host check before
-  connecting, `4xx` retried and `5xx` not. It is built as written. The remaining choice
-  is the crate: `lettre` with its rustls back end and without its native-tls and
-  sendmail features, recorded in PROVENANCE with its dependency count, or a small SMTP
-  client in `notify/` if that tree is large, since the channel needs only EHLO,
-  STARTTLS, AUTH PLAIN, MAIL, RCPT and DATA. The tests run a local SMTP receiver as the
-  webhook tests run an HTTP one, and cover A-level cases for STARTTLS, a refused plain
-  server, a `451` retried and a `550` not, and a password from a secret that never
-  appears in the status.
+* **The email channel (Phase 2).** This part is built, as the Outcome above records.
 * **The administration UI (Phase 3).** §11 designs a Notifications section on the server
   page next to Models, showing `GET /$/notifications`, editing the kind with C19's
   settings components and a Send test button per channel. The Models section that
@@ -564,25 +655,11 @@ These points differ from the design or settle what it left open.
   section follows its layout. The mock server serves the notifications kind and the
   status, and a Playwright test adds a webhook channel, sends a test and sees its
   status.
-* **Broader backup-failure coverage.** `events::backup_run` fires only at the end of a
-  policy run in `crates/sparkles-server/src/backup/policies.rs`; a backup started by
-  hand, a policy run that fails before it records a result, a failed verification and
-  a failed GC send nothing (Outcome above). Each gets an event of its own kind with a
-  key per repository and operation: `backup.failed` gains the manual and early-failure
-  cases with `trigger: "manual"` or the failing stage, and `backup.verify.failed` and
-  `backup.gc.failed` are new kinds that operators can route separately. A policy run
-  that is cancelled sends nothing, as now. A policy whose last success is older than twice
-  its schedule's interval raises `backup.overdue`, which clears on the next success as
-  other conditions do.
-* **Delivery that a slow channel cannot delay.** One worker thread (`worker` in
-  `notify/mod.rs`) sends every delivery in turn, so a channel that times out delays
-  the others by up to `timeoutSecs` per attempt. The queue becomes one queue per
-  channel, each with its own worker thread and its share of the 1,000 entries (at
-  least 50), so a slow or failing channel holds only its own deliveries. Retries wait
-  in the channel's own queue. The settings have no cap on channels today, so the
-  kind gains one (32), which bounds the threads. Acceptance: with one webhook that never
-  answers and one that answers at once, a test send to the second arrives within a
-  second while the first is timing out.
+* **Broader backup-failure coverage.** This part is built, as the Outcome above
+  records.
+* **Delivery that a slow channel cannot delay.** This part is built, as the Outcome
+  above records. Each channel has its own queue and thread, and the kind holds at most
+  32 channels.
 
 
 ### Durable application delivery

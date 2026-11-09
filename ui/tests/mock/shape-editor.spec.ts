@@ -523,3 +523,47 @@ test('records a commit whose answer arrives after the change feed announced it',
   // committed values are checked by the real-server suite.
   await expect(page.getByText('by another writer', { exact: false })).toHaveCount(0);
 });
+
+test('counts one triple in the singular and keeps the raw patch collapsed below the change set', async ({
+  page,
+  request,
+}) => {
+  const ds = await setup(request);
+  await open(page, ds);
+  await changeCount(page, '2');
+  await expect(page.locator('.draft-actions')).toContainText('1 triple added · 1 removed');
+  await page.getByRole('button', { name: 'Preview commit', exact: true }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog.locator('[data-outcome]')).toHaveAttribute('data-outcome', 'commit');
+  await expect(dialog.locator('[data-outcome]')).not.toContainText(/\b1 triples\b/);
+  await expect(dialog.locator('[data-outcome]')).toContainText(/\d+ triples? added/);
+  // the rendered change set comes first, and the patch as sent waits behind its summary
+  const raw = dialog.locator('details.raw');
+  await expect(raw).toHaveCount(1);
+  await expect(raw).not.toHaveAttribute('open', '');
+  await expect(raw.locator('pre')).toBeHidden();
+  const order = await dialog.evaluate((d) => {
+    const diff = d.querySelector('.diff-view');
+    const details = d.querySelector('details.raw');
+    return (
+      !!diff &&
+      !!details &&
+      !!(diff.compareDocumentPosition(details) & Node.DOCUMENT_POSITION_FOLLOWING)
+    );
+  });
+  expect(order).toBe(true);
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+});
+
+test('names a shape in the preview change set by its sh:name', async ({ page, request }) => {
+  const ds = await setup(request);
+  await open(page, ds);
+  await pick(page, 'Other');
+  await page.getByRole('button', { name: 'Delete shape', exact: true }).click();
+  await page.getByRole('button', { name: 'Delete definition', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview commit', exact: true }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog.locator('[data-outcome]')).toHaveAttribute('data-outcome', 'commit');
+  await expect(dialog.locator('.cs-group .subject').first()).toHaveText('Other');
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+});

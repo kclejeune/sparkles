@@ -24,9 +24,10 @@
   import type { InferredKind } from '$lib/inferred-tree.svelte';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
+  import { graphRestricted } from '$lib/auth';
   import { branchParam, MAIN, onBranch } from '$lib/branches';
   import { EditSession, startSessionBranch } from '$lib/edit-session.svelte';
-  import { fmtInt } from '$lib/format';
+  import { fmtCount, fmtInt } from '$lib/format';
   import { fetchHierarchy, fetchIndividuals, type Name, type TreeKind } from '$lib/browse';
   import { searchEntities } from '$lib/entity-search';
   import { IndividualTree, isGroup, groupIri } from '$lib/individual-tree.svelte';
@@ -96,6 +97,10 @@
   import OntoPreview from '$components/OntoPreview.svelte';
   import OntoTree from '$components/OntoTree.svelte';
   import EditorHistory from '$components/EditorHistory.svelte';
+  import EntityHistory from '$components/EntityHistory.svelte';
+  import Discussions from '$components/Discussions.svelte';
+  import BulkEdit from '$components/BulkEdit.svelte';
+  import { isDiscussionGraph } from '$lib/discussions';
   import TreeCrumbs from '$components/TreeCrumbs.svelte';
 
   import { ONTOLOGY_TABS, routes, type OntologyTab } from '$lib/routes';
@@ -105,6 +110,8 @@
     ['dlquery', 'DL Query'],
     ['header', 'Header'],
     ['history', 'History'],
+    ['discussions', 'Discussions'],
+    ['bulk', 'Bulk edits'],
   ];
 
   type Tab = OntologyTab;
@@ -131,7 +138,9 @@
   /** The entity kind of the tree, when the page shows it. */
   const kindTab = $derived<EntityKind | null>(tab === 'tree' ? kind : null);
   const selected = $derived(q.get('iri'));
-  const view = $derived(q.get('view') === 'usage' ? 'usage' : 'frame');
+  const view = $derived(
+    (['usage', 'history', 'discussion'] as const).find((v) => v === q.get('view')) ?? 'frame',
+  );
   const inferredOn = $derived(q.get('inferred') === '1');
   const inferredKind = $derived<InferredKind | null>(
     kindTab && ['Class', 'ObjectProperty', 'DataProperty', 'NamedIndividual'].includes(kindTab)
@@ -331,7 +340,10 @@
     if (!ds) return;
     try {
       const rows = await api.select(onBranch(ds, branch), ONTOLOGY_GRAPHS, { nocache: true });
-      graphs = rows.map((r) => (r.g?.type === 'uri' ? r.g.value : '')).filter(Boolean);
+      // a discussion graph is not an ontology even if a comment's text were to declare one
+      graphs = rows
+        .map((r) => (r.g?.type === 'uri' ? r.g.value : ''))
+        .filter((g) => g && !isDiscussionGraph(g));
     } catch {
       graphs = [];
     }
@@ -649,7 +661,8 @@
   // header, the DL query or the create dialog needs them, and not when it opens
   let needKey = '';
   $effect(() => {
-    const need = !!selected || tab === 'header' || tab === 'dlquery' || createOpen;
+    const need =
+      !!selected || tab === 'header' || tab === 'dlquery' || tab === 'bulk' || createOpen;
     const key = `${selected ?? ''}\u0000${tab}\u0000${createOpen}`;
     const missing = PICKER_KINDS.some((k) => !listed.has(k));
     const failed = listFailed;
@@ -1016,6 +1029,8 @@
   const canWrite = $derived(auth.can(name, 'write'));
   const protectedBranch = $derived(!!currentBranch?.protected);
   const readonly = $derived(!canWrite || protectedBranch);
+  /** The name a comment records as its creator. */
+  const commenter = $derived(auth.who?.principal?.name ?? auth.who?.principal?.kind ?? 'anonymous');
   let sessionError = $state<string | null>(null);
   async function startSession() {
     sessionError = null;
@@ -1055,11 +1070,29 @@
     },
     staleText: 'Another commit landed since the editor read the ontology.',
   });
-  const edit = (op: Op, label: string, after?: () => void, fromFrame: string | null = null) => {
+  /**
+   * A comment, resolve or reopen committed `seq`: an ordinary commit of the branch, which
+   * moves the head the next edit names, so the views read it again. Undo leaves it alone.
+   */
+  const discussed = (seq: number | null) => {
+    if (seq != null) session.own.add(seq);
+    void loadAll();
+  };
+  /**
+   * Preview `op`. `selection` is the graphs the edit reads and writes, the page's own unless
+   * the edit was planned from another reading, as a bulk edit is from the graph alone.
+   */
+  const edit = (
+    op: Op,
+    label: string,
+    after?: () => void,
+    fromFrame: string | null = null,
+    selection: Selection = sel,
+  ) => {
     // an edit names the commit the summary read, which a large ontology's summary may still be reading
     if (readonly || !etag)
       return void toasts.push('info', 'The ontology is still being read', 'Try again in a moment.');
-    const origin = { target, sel: { ...sel }, etag, head: summary?.commit ?? null };
+    const origin = { target, sel: { ...selection }, etag, head: summary?.commit ?? null };
     session.edit(op, label, after);
     previewPin = { ...origin, op: session.previewOp!, frameContext: fromFrame };
   };
@@ -1209,7 +1242,7 @@
     const uses = frameFor === iri ? frameItems.length : null;
     edit(
       { kind: 'removeEntity', iri },
-      `Delete ${nameOf(iri)}${uses != null ? ` and the ${fmtInt(uses)} axioms that mention it` : ''}`,
+      `Delete ${nameOf(iri)}${uses != null ? ` and the ${fmtCount(uses, 'axiom')} that mention${uses === 1 ? 's' : ''} it` : ''}`,
       () => {
         if (selected === iri) void nav({ iri: null, view: null });
       },
@@ -1473,6 +1506,39 @@
             onedit={(op, label) => edit(op, label)}
             onrename={openRename}
           />
+        </div>
+      </section>
+    {:else if tab === 'bulk' && summary}
+      <section class="panel" aria-label="Bulk edits">
+        <div class="panel-body">
+          {#key `${target}|${graph}`}<BulkEdit
+              {target}
+              {graph}
+              commit={summary.commit ?? null}
+              {readonly}
+              {prefixes}
+              {annotationProperties}
+              graphs={summary.graphs}
+              name={nameOf}
+              onedit={(op, label) =>
+                // the plan was read without the imports, and its edit reads and writes the same
+                edit(op, label, undefined, null, { graph, imports: false })}
+            />{/key}
+        </div>
+      </section>
+    {:else if tab === 'discussions' && summary}
+      <section class="panel" aria-label="Discussions">
+        <div class="panel-body">
+          {#key `${target}|${graph}`}<Discussions
+              {target}
+              {sel}
+              {readonly}
+              user={commenter}
+              name={nameOf}
+              refreshKey={summary.commit ?? 0}
+              oncommitted={discussed}
+              onopen={(iri) => nav({ tab: null, iri, view: 'discussion' })}
+            />{/key}
         </div>
       </section>
     {:else if tab === 'history' && summary}
@@ -1789,6 +1855,13 @@
                     ? ` ${fmtInt(frameItems.length)}`
                     : ''}</button
                 >
+                <button aria-pressed={view === 'history'} onclick={() => nav({ view: 'history' })}
+                  >History</button
+                >
+                <button
+                  aria-pressed={view === 'discussion'}
+                  onclick={() => nav({ view: 'discussion' })}>Discussion</button
+                >
               </div>
             </div>
             <div class="panel-body">
@@ -1850,6 +1923,29 @@
                     />
                   {/if}
                 {/key}
+              {:else if view === 'discussion' && summary && selected}
+                {#key `${target}|${graph}|${selected}`}<Discussions
+                    {target}
+                    {sel}
+                    iri={selected}
+                    {readonly}
+                    user={commenter}
+                    axioms={frameFor === selected ? frameItems.map((it) => it.ofn) : []}
+                    name={nameOf}
+                    refreshKey={summary.commit ?? 0}
+                    oncommitted={discussed}
+                  />{/key}
+              {:else if view === 'history' && summary}
+                <EntityHistory
+                  {name}
+                  {target}
+                  {branch}
+                  {sel}
+                  iri={selected}
+                  readonly={readonly || graphRestricted(auth.who, name)}
+                  refreshKey={summary.commit}
+                  onrevert={(seq, label) => session.edit({ kind: 'revert', commit: seq }, label)}
+                />
               {:else if frameFor === selected && view === 'usage'}
                 {#if !usageGroups.length}<p class="empty">No axiom mentions this entity.</p>{/if}
                 {#each usageGroups as [type, items] (type)}

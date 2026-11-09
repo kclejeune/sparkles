@@ -1504,7 +1504,19 @@ test('shape-editor', async ({ page, request }) => {
   if (await expand.count()) await expand.click();
   await tree.getByRole('button', { name: 'Employer', exact: true }).first().click();
   await expect(page.locator('.definition h2')).toBeVisible();
+  // end the frame where the Description section starts, above the sticky draft footer, so
+  // the form shows whole sections only
+  await page.evaluate(() => window.scrollTo(0, 0));
+  const height = await page.evaluate(() => {
+    const next = document.querySelector('.definition section[aria-label="Description"]');
+    const footer = document.querySelector('.draft-actions');
+    if (!next || !footer) return null;
+    return Math.ceil(next.getBoundingClientRect().top + footer.getBoundingClientRect().height);
+  });
+  expect(height).not.toBeNull();
+  await page.setViewportSize({ width: 1440, height: Math.min(height!, 1400) });
   await shoot(page, 'shape-editor');
+  await page.setViewportSize({ width: 1440, height: 900 });
 });
 
 test('shape-editor-preview', async ({ page }) => {
@@ -1521,7 +1533,127 @@ test('shape-editor-preview', async ({ page }) => {
   await page.getByRole('button', { name: 'Preview commit', exact: true }).click();
   const preview = page.getByRole('dialog');
   await expect(preview.locator('[data-outcome]')).toHaveAttribute('data-outcome', 'commit');
-  await preview.getByText('RDF changes', { exact: true }).click();
+  // the raw patch stays collapsed below the rendered change set
+  await expect(preview.locator('details.raw')).not.toHaveAttribute('open', '');
   await shoot(page, 'shape-editor-preview');
   await preview.getByRole('button', { name: 'Cancel', exact: true }).click();
+});
+
+test('entity-history', async ({ page, request }) => {
+  // the history of Professor on a branch with three small commits, one of them opened
+  const branch = 'entity-history-shot';
+  const uni = 'http://example.org/uni#';
+  await request.post('/$/branches/uni', { data: { name: branch } });
+  for (const [message, body] of [
+    ['Comment on Professor', `uni:Professor rdfs:comment "Teaches at least one course."@en`],
+    ['Lecturer under Professor', 'uni:Lecturer rdfs:subClassOf uni:Professor'],
+    ['German label for Professor', 'uni:Professor rdfs:label "Professorin"@de'],
+  ]) {
+    const u = await request.post(`/uni@${branch}/update`, {
+      headers: { 'Content-Type': 'application/sparql-update', 'Sparkles-Commit-Message': message },
+      data: `PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> PREFIX uni: <${uni}>
+        INSERT DATA { ${body} }`,
+    });
+    expect(u.ok(), await u.text()).toBe(true);
+  }
+  await page.goto(
+    `/ui/workbench/ontology?${new URLSearchParams({ ds: 'uni', branch, iri: `${uni}Professor`, view: 'history' })}`,
+  );
+  const commits = page.getByRole('list', { name: 'Commits that changed the entity' });
+  await commits.getByRole('button', { name: /Comment on Professor/ }).click({ timeout: 30_000 });
+  await expect(page.getByRole('list', { name: /Axioms commit \d+ changed/ })).toBeVisible();
+  await shoot(page, 'entity-history');
+  await request.delete(`/$/branches/uni/${branch}?force=true`);
+});
+
+test('ontology-discussions', async ({ page, request }) => {
+  // Professor's Discussion view with a thread that mentions a colleague and has a reply,
+  // a thread on one of its axioms and a resolved one, written as the editor writes them
+  const branch = 'discussions-shot';
+  const uni = 'http://example.org/uni#';
+  const oa = 'http://www.w3.org/ns/oa#';
+  await request.post('/$/branches/uni', { data: { name: branch } });
+  const ago = (h: number) => new Date(Date.now() - h * 3_600_000).toISOString();
+  const note = (id: string, who: string, h: number, text: string, more: string) =>
+    `<urn:uuid:${id}> a oa:Annotation ; oa:hasBody <urn:uuid:${id}#body> ;
+       dcterms:creator <urn:x-sparkles:user:${who}> ;
+       dcterms:created "${ago(h)}"^^xsd:dateTime ; ${more} .
+     <urn:uuid:${id}#body> a oa:TextualBody ; rdf:value ${JSON.stringify(text)} .`;
+  const triples = [
+    note(
+      't1',
+      'ana',
+      26,
+      'Should a professor always teach? @bo, the restriction below says so.',
+      `oa:motivatedBy oa:commenting ; oa:hasTarget uni:Professor ; disc:resolved false ;
+       schema:mentions <urn:x-sparkles:user:bo>`,
+    ),
+    note(
+      'r1',
+      'bo',
+      20,
+      'Emeritus professors do not. Let us move it to a subclass.',
+      'oa:motivatedBy oa:replying ; oa:hasTarget <urn:uuid:t1>',
+    ),
+    note(
+      't2',
+      'bo',
+      3,
+      'Is Employee the right parent, or should this be Person?',
+      `oa:motivatedBy oa:commenting ; oa:hasTarget <urn:uuid:t2#target> ; disc:resolved false .
+       <urn:uuid:t2#target> a oa:SpecificResource ; oa:hasSource uni:Professor ;
+         oa:hasSelector <urn:uuid:t2#sel> .
+       <urn:uuid:t2#sel> a oa:TextQuoteSelector ;
+         oa:exact "SubClassOf(uni:Professor uni:Employee)"`,
+    ),
+    note(
+      't3',
+      'ana',
+      50,
+      'Add a German label.',
+      `oa:motivatedBy oa:commenting ; oa:hasTarget uni:Professor ; disc:resolved true ;
+       disc:resolvedBy <urn:x-sparkles:user:bo>`,
+    ),
+  ];
+  const u = await request.post(`/uni@${branch}/update`, {
+    headers: {
+      'Content-Type': 'application/sparql-update',
+      'Sparkles-Commit-Message': 'Discuss Professor',
+    },
+    data: `PREFIX oa: <${oa}> PREFIX dcterms: <http://purl.org/dc/terms/>
+      PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+      PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> PREFIX schema: <https://schema.org/>
+      PREFIX disc: <urn:x-sparkles:discussion#> PREFIX uni: <${uni}>
+      INSERT DATA { GRAPH <urn:x-sparkles:discussions:default> { ${triples.join('\n')} } }`,
+  });
+  expect(u.ok(), await u.text()).toBe(true);
+  await page.goto(
+    `/ui/workbench/ontology?${new URLSearchParams({ ds: 'uni', branch, iri: `${uni}Professor`, view: 'discussion' })}`,
+  );
+  const threads = page.getByRole('list', { name: 'Threads on the entity' });
+  await expect(threads.getByRole('article')).toHaveCount(2, { timeout: 30_000 });
+  await page
+    .getByRole('textbox', { name: 'Comment' })
+    .fill('@ana, I drafted the subclass on the session branch.');
+  await shoot(page, 'ontology-discussions');
+  await request.delete(`/$/branches/uni/${branch}?force=true`);
+});
+
+test('ontology-bulk', async ({ page, request }) => {
+  // the Bulk edits tab with a find and replace in the English labels and its listed changes
+  const branch = 'bulk-shot';
+  await request.post('/$/branches/uni', { data: { name: branch } });
+  await page.goto(
+    `/ui/workbench/ontology?${new URLSearchParams({ ds: 'uni', branch, tab: 'bulk' })}`,
+  );
+  const form = page.getByRole('form', { name: 'Find and replace' });
+  await expect(form).toBeVisible({ timeout: 30_000 });
+  await form.getByRole('textbox', { name: 'Find' }).fill('student');
+  await form.getByRole('textbox', { name: 'Replace with' }).fill('learner');
+  await form.getByRole('combobox', { name: 'Language' }).selectOption('tag');
+  await form.getByRole('textbox', { name: 'Tag' }).fill('en');
+  await form.getByRole('button', { name: 'Find' }).click();
+  await expect(page.getByRole('region', { name: 'Changes' }).locator('tbody tr')).toHaveCount(2);
+  await shoot(page, 'ontology-bulk');
+  await request.delete(`/$/branches/uni/${branch}?force=true`);
 });

@@ -18,10 +18,18 @@ const q = (params: Params) => {
 export type Editor = 'ontology' | 'thesaurus' | 'shapes';
 
 /**
- * The Ontology editor's tabs: the tree (no `tab`), DL Query, the header and the history.
+ * The Ontology editor's tabs: the tree (no `tab`), DL Query, the header, the history and the
+ * discussions.
  * The tree's entity kind is `kind` (no `kind`: classes).
  */
-export const ONTOLOGY_TABS = ['tree', 'dlquery', 'header', 'history'] as const;
+export const ONTOLOGY_TABS = [
+  'tree',
+  'dlquery',
+  'header',
+  'history',
+  'discussions',
+  'bulk',
+] as const;
 export type OntologyTab = (typeof ONTOLOGY_TABS)[number];
 /** The Thesaurus editor's tabs: the tree (no `tab`), the history and the validation report. */
 export const THESAURUS_TABS = ['tree', 'history', 'validation'] as const;

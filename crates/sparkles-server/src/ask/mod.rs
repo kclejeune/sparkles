@@ -18,6 +18,8 @@
 //! `POST /{ds}/ask` (`crate::ask::http`) streams the events of §5.2, and `sparkles ask`
 //! drives the same function from the command line for the evaluation of §11.4.
 
+#[cfg(test)]
+mod claims_tests;
 mod cli;
 pub mod complexity;
 mod entity_evidence;
@@ -60,6 +62,46 @@ pub const DEFAULT_COMPLEXITY_THRESHOLD: u32 = 8;
 pub const DEFAULT_EXAMPLE_SCORE: f64 = 0.8;
 /// The most communities a local question's grounding names (C22 §7.3).
 const MAX_COMMUNITIES: usize = 3;
+/// The admission code of a model call refused because the caller's authority changed.
+const AUTHORITY_CHANGED: &str = "authority-changed";
+
+/// Admits a model call only while the authority the caller's grants were read under
+/// still holds, checked before every HTTP attempt (C22 §6.3, C25).
+struct AuthorityFence<'a> {
+    state: &'a crate::state::AppState,
+    principal: &'a Principal,
+}
+
+impl crate::models::admission::Admission for AuthorityFence<'_> {
+    fn admit(
+        &self,
+        _: &crate::models::admission::Attempt<'_>,
+    ) -> Result<crate::models::admission::Ticket, crate::models::CallError> {
+        if !self.state.access_current(self.principal) {
+            return Err(crate::models::CallError::Admission(
+                AUTHORITY_CHANGED,
+                "the caller's access changed, so the claims are not sent".into(),
+                false,
+            ));
+        }
+        Ok(crate::models::admission::Ticket::new(Box::new(Unmetered)))
+    }
+
+    fn follows_redirects(&self) -> bool {
+        false
+    }
+}
+
+/// The settlement of an attempt that no budget meters.
+struct Unmetered;
+
+impl crate::models::admission::Settle for Unmetered {
+    fn reported(self: Box<Self>, _: crate::models::admission::Usage) {}
+    fn unknown(self: Box<Self>) {}
+}
+
+/// The linked entities whose claims an ask that names a review policy reads.
+const MAX_CLAIM_SEEDS: usize = 20;
 /// The linked entities and matched classes whose predicate use grounding reads.
 const MAX_USAGE_ENTITIES: usize = 3;
 const MAX_USAGE_CLASSES: usize = 2;
@@ -214,6 +256,10 @@ pub struct AskOptions {
     /// link each mention with the classes that the words around it name as type
     /// hints, and show how many triples name each candidate
     pub type_hints: bool,
+    /// cite claim occurrences under this review policy in the summary (C25)
+    pub review_policy: Option<String>,
+    /// resolve the linked entities through this matching policy's map (C25)
+    pub matching_policy: Option<String>,
 }
 
 impl Default for AskOptions {
@@ -249,6 +295,8 @@ impl Default for AskOptions {
             shape_check: false,
             drafts: 1,
             type_hints: false,
+            review_policy: None,
+            matching_policy: None,
         }
     }
 }
@@ -333,8 +381,44 @@ pub fn ask(
         reports: None,
         fallback: None,
         held: Vec::new(),
+        claim_seeds: Vec::new(),
+        claims: None,
+        withheld: false,
+        fenced: false,
     };
     let mut out = a.run();
+    // without a summary, the answer still carries the claims, read for the caller now
+    if (o.review_policy.is_some() || o.matching_policy.is_some())
+        && out["outcome"] == "answered"
+        && a.claims.is_none()
+        && !a.withheld
+    {
+        let seeds = a.claim_seeds.clone();
+        match a.claims_recall(&seeds) {
+            Ok(c) => a.claims = Some(c),
+            Err(_) => a.withheld = true,
+        }
+    }
+    if a.claims.is_some() && !a.authority_current() {
+        a.withheld = true;
+    }
+    if a.withheld {
+        // the evidence the summary read changed or became unreadable before it was
+        // published, so the answer is withheld without saying which (C25)
+        let e = json!({
+            "code": "forbidden",
+            "message": "the answer is withheld because the evidence it used is no longer the same for you; ask again",
+        });
+        (a.on)("error", &e);
+        out = json!({ "outcome": "error", "error": e });
+    } else if let Some(c) = a.claims.take()
+        && out["outcome"] == "answered"
+    {
+        out["claims"] = c["claims"].clone();
+        if !c["resolution"].is_null() {
+            out["resolution"] = c["resolution"].clone();
+        }
+    }
     // an event stream learns of the endings without their own event here
     match out["outcome"].as_str() {
         Some("unanswerable") => (a.on)(
@@ -410,6 +494,14 @@ struct Asking<'a, 'e> {
     fallback: Option<Answered>,
     /// the terminal events of that repair, which wait while `fallback` stands
     held: Vec<(String, Value)>,
+    /// the entities the question links exactly, which the claims grounding reads
+    claim_seeds: Vec<String>,
+    /// the `recall` result of the claims grounding, with `reviewPolicy`
+    claims: Option<Value>,
+    /// the claims changed for the caller before the summary was published
+    withheld: bool,
+    /// whether model calls are admitted only under the caller's current authority
+    fenced: bool,
 }
 
 /// What `run_query` returns: the compact result and, with `full_results`, the full one.
@@ -589,9 +681,17 @@ impl Asking<'_, '_> {
                     format!("no provider and model answers the {} role", role.as_str()),
                 ));
             };
+            // a summary that carries claims sends each attempt, retries and escalations
+            // included, only under the authority the claims were read with (C25)
+            let fence = AuthorityFence {
+                state: &self.server.state,
+                principal: self.principal,
+            };
+            let admission: Option<&dyn crate::models::admission::Admission> =
+                if self.fenced { Some(&fence) } else { None };
             match self
                 .models
-                .call_prompt(Some(role), &pair, prompt, out, self.deadline, None)
+                .call_prompt(Some(role), &pair, prompt, out, self.deadline, admission)
             {
                 Ok(a) => {
                     self.push_step(role, a.record);
@@ -602,6 +702,13 @@ impl Asking<'_, '_> {
                     let message = f.error.message();
                     match f.error {
                         StepError::Budget(_) => return Err(("budget-exceeded", message)),
+                        StepError::Call(crate::models::CallError::Admission(
+                            AUTHORITY_CHANGED,
+                            ..,
+                        )) => {
+                            self.withheld = true;
+                            return Err((AUTHORITY_CHANGED, message));
+                        }
                         StepError::Deadline => return Err(("timeout", message)),
                         _ => {
                             self.failed_calls += 1;
@@ -761,11 +868,28 @@ impl Asking<'_, '_> {
         if let Err(e) = self.server.dataset(self.principal, Some(&self.o.dataset)) {
             return self.error(&e.code, e.message);
         }
+        if self.o.review_policy.is_some() || self.o.matching_policy.is_some() {
+            if self.o.mode == AskMode::Global {
+                return self.error(
+                    "bad-argument",
+                    "reviewPolicy and matchingPolicy apply to answers from the data, not to mode global",
+                );
+            }
+            // the policies and the store's configuration history are checked before
+            // any model call, so a refused policy costs nothing
+            if let Err(e) = self.claims_recall(&[]) {
+                return self.error(&e.code, e.message);
+            }
+        }
         if let Some(q) = self.o.query.clone() {
             return self.given(&q);
         }
-        // C22 §7: the reports a global answer may use, and the explicit global mode
-        if self.o.mode != AskMode::Local {
+        // C22 §7: the reports a global answer may use, and the explicit global mode.
+        // An ask that cites claims answers from the data.
+        if self.o.mode != AskMode::Local
+            && self.o.review_policy.is_none()
+            && self.o.matching_policy.is_none()
+        {
             self.reports = self.report_selection();
             if self.o.mode == AskMode::Global
                 && let Some(sel) = self.reports.take()
@@ -1204,6 +1328,13 @@ impl Asking<'_, '_> {
             iris.extend(usage_entities);
             usage_entities = iris;
         }
+        // the entities the question links exactly, which the claims grounding reads
+        self.claim_seeds = entities
+            .iter()
+            .filter(|e| matches!(e["verdict"].as_str(), Some("exact")))
+            .filter_map(|e| e["candidates"][0]["iri"].as_str().map(str::to_string))
+            .take(MAX_CLAIM_SEEDS)
+            .collect();
         // C22 §7.3: the communities of the linked entities, at most three
         let linked: Vec<Value> = entities
             .iter()
@@ -2067,19 +2198,67 @@ impl Asking<'_, '_> {
         } else {
             format!("The result has {rows} rows, numbered from 1.")
         };
-        let user = prompts::summary_user(&self.o.question, query, &text, &total);
-        match self.call(
+        let mut user = prompts::summary_user(&self.o.question, query, &text, &total);
+        // the claims of the linked entities, read for the caller now (C25)
+        let claims = if self.o.review_policy.is_some() || self.o.matching_policy.is_some() {
+            let seeds = self.claim_seeds.clone();
+            match self.claims_recall(&seeds) {
+                // the claims go to a provider only under the caller's current authority
+                Ok(_) if !self.authority_current() => {
+                    self.withheld = true;
+                    return None;
+                }
+                Ok(c) => Some(c),
+                Err(e) => {
+                    self.notes
+                        .push(format!("the claims were not read: {}", e.message));
+                    self.withheld = true;
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        let listed: Vec<String> = claims
+            .as_ref()
+            .map(|c| prompts::claim_ids(&c["claims"]))
+            .unwrap_or_default();
+        if let Some(c) = &claims
+            && !c["claims"].is_null()
+        {
+            user.push_str(&prompts::claims_context(&c["claims"]));
+        }
+        let schema = if claims.is_some() {
+            prompts::summary_with_claims()
+        } else {
+            prompts::summary()
+        };
+        self.fenced = claims.is_some();
+        let called = self.call(
             Role::Summarize,
-            &Prompt::plain(prompts::SUMMARY_SYSTEM, &user),
-            &prompts::summary(),
-        ) {
+            &Prompt::plain(
+                if claims.is_some() {
+                    prompts::SUMMARY_WITH_CLAIMS_SYSTEM
+                } else {
+                    prompts::SUMMARY_SYSTEM
+                },
+                &user,
+            ),
+            &schema,
+        );
+        self.fenced = false;
+        match called {
             Err((_, message)) => {
                 self.notes.push(format!("the summary failed: {message}"));
                 None
             }
             Ok((value, _, pair)) => {
                 let raw = value["text"].as_str().unwrap_or("");
-                let text = prompts::drop_markers(raw, sent.max(1));
+                let mut text = prompts::drop_markers(raw, sent.max(1));
+                if claims.is_some() {
+                    // a claim marker names a listed occurrence or is removed
+                    text = prompts::drop_claim_markers(&text, &listed);
+                }
                 let mut citations: Vec<u64> = prompts::markers(&text);
                 for c in value["citations"].as_array().into_iter().flatten() {
                     if let Some(n) = c.as_u64()
@@ -2097,14 +2276,90 @@ impl Asking<'_, '_> {
                     "provider": pair.provider,
                     "model": pair.model,
                 });
+                if let Some(c) = &claims {
+                    let mut cited: Vec<String> = prompts::claim_markers(&text)
+                        .into_iter()
+                        .filter(|id| listed.contains(id))
+                        .collect();
+                    for id in value["claimCitations"].as_array().into_iter().flatten() {
+                        if let Some(id) = id.as_str()
+                            && listed.iter().any(|l| l == id)
+                            && !cited.iter().any(|x| x == id)
+                            && text.contains(&format!("[{id}]"))
+                        {
+                            cited.push(id.to_string());
+                        }
+                    }
+                    s["claimCitations"] = json!(cited);
+                    // the same view, read again with the caller's grants of now: any
+                    // difference withholds the answer before it is published
+                    let seeds = self.claim_seeds.clone();
+                    match self.claims_recall(&seeds) {
+                        Ok(again) if again == *c && self.authority_current() => {}
+                        _ => {
+                            self.withheld = true;
+                            return None;
+                        }
+                    }
+                    s["claims"] = c["claims"].clone();
+                    self.claims = Some(c.clone());
+                }
                 if citations.is_empty() {
                     s["uncited"] = true.into();
                     self.notes.push("the summary cites no row".into());
                 }
                 self.emit("summary", &s);
+                if claims.is_some()
+                    && let Some(m) = s.as_object_mut()
+                {
+                    m.remove("claims");
+                }
                 Some(s)
             }
         }
+    }
+
+    /// `recall` of `seeds` at hop 0 with the ask's policies, in JSON. A refused
+    /// policy keeps its code. Without seeds, the policies are still checked and the
+    /// claims are empty.
+    /// Whether the authority the caller's grants were read under still holds, so that
+    /// claims read with them may still be sent and published (C22 §6.3).
+    fn authority_current(&self) -> bool {
+        self.server.state.access_current(self.principal)
+    }
+
+    fn claims_recall(&self, seeds: &[String]) -> Result<Value, ToolError> {
+        let mut args = json!({ "hops": 0, "maxTriples": 50, "format": "json" });
+        if !seeds.is_empty() {
+            args["seeds"] = json!(seeds);
+        }
+        if let Some(p) = &self.o.review_policy {
+            args["reviewPolicy"] = p.clone().into();
+        }
+        if let Some(p) = &self.o.matching_policy {
+            args["matchingPolicy"] = p.clone().into();
+        }
+        let mut v = if seeds.is_empty() {
+            // no entity yet: the policies and the map are checked, and no claim is read
+            let (m, mut call) = self.tool_call("recall", args, true)?;
+            match self
+                .server
+                .run_now(crate::mcp::RECALL_PREFLIGHT, m, &mut call)?
+            {
+                Outcome::Structured(v) => v,
+                Outcome::Text(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)),
+            }
+        } else {
+            self.tool("recall", args, true)?
+        };
+        // the parts of the result that the summary's context and answer depend on
+        let mut kept = json!({ "commit": v["commit"].take() });
+        for k in ["claims", "resolution"] {
+            if !v[k].is_null() {
+                kept[k] = v[k].take();
+            }
+        }
+        Ok(kept)
     }
 
     fn usage(&self, started: Instant) -> Value {

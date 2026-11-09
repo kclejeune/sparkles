@@ -1,0 +1,1713 @@
+{
+"own_session": [
+1,
+1279,
+23200,
+23252,
+23292
+],
+"rows": [
+{
+"comm": "systemd",
+"pid": 1,
+"ppid": 0,
+"start": 8,
+"uid": 0
+},
+{
+"comm": "kthreadd",
+"pid": 2,
+"ppid": 0,
+"start": 8,
+"uid": 0
+},
+{
+"comm": "pool_workqueue_r",
+"pid": 3,
+"ppid": 2,
+"start": 8,
+"uid": 0
+},
+{
+"comm": "kworker/R-rcu_g",
+"pid": 4,
+"ppid": 2,
+"start": 8,
+"uid": 0
+},
+{
+"comm": "kworker/R-rcu_p",
+"pid": 5,
+"ppid": 2,
+"start": 8,
+"uid": 0
+},
+{
+"comm": "kworker/R-slub_",
+"pid": 6,
+"ppid": 2,
+"start": 8,
+"uid": 0
+},
+{
+"comm": "kworker/R-netns",
+"pid": 7,
+"ppid": 2,
+"start": 8,
+"uid": 0
+},
+{
+"comm": "kworker/0:0-cgro",
+"pid": 8,
+"ppid": 2,
+"start": 8,
+"uid": 0
+},
+{
+"comm": "kworker/0:0H-eve",
+"pid": 9,
+"ppid": 2,
+"start": 8,
+"uid": 0
+},
+{
+"comm": "kworker/0:1-cgro",
+"pid": 10,
+"ppid": 2,
+"start": 8,
+"uid": 0
+},
+{
+"comm": "kworker/u16:0-fl",
+"pid": 11,
+"ppid": 2,
+"start": 8,
+"uid": 0
+},
+{
+"comm": "kworker/R-mm_pe",
+"pid": 12,
+"ppid": 2,
+"start": 8,
+"uid": 0
+},
+{
+"comm": "rcu_tasks_kthrea",
+"pid": 13,
+"ppid": 2,
+"start": 8,
+"uid": 0
+},
+{
+"comm": "rcu_tasks_rude_k",
+"pid": 14,
+"ppid": 2,
+"start": 8,
+"uid": 0
+},
+{
+"comm": "rcu_tasks_trace_",
+"pid": 15,
+"ppid": 2,
+"start": 8,
+"uid": 0
+},
+{
+"comm": "ksoftirqd/0",
+"pid": 16,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "rcu_preempt",
+"pid": 17,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "migration/0",
+"pid": 18,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "idle_inject/0",
+"pid": 19,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "cpuhp/0",
+"pid": 20,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "cpuhp/1",
+"pid": 21,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "idle_inject/1",
+"pid": 22,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "migration/1",
+"pid": 23,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "ksoftirqd/1",
+"pid": 24,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "kworker/1:0-wg-c",
+"pid": 25,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "kworker/1:0H-eve",
+"pid": 26,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "cpuhp/2",
+"pid": 27,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "idle_inject/2",
+"pid": 28,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "migration/2",
+"pid": 29,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "ksoftirqd/2",
+"pid": 30,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "kworker/2:0-cgro",
+"pid": 31,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "kworker/2:0H-eve",
+"pid": 32,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "cpuhp/3",
+"pid": 33,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "idle_inject/3",
+"pid": 34,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "migration/3",
+"pid": 35,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "ksoftirqd/3",
+"pid": 36,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "kworker/3:0-wg-c",
+"pid": 37,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "kworker/3:0H-eve",
+"pid": 38,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "cpuhp/4",
+"pid": 39,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "idle_inject/4",
+"pid": 40,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "migration/4",
+"pid": 41,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "ksoftirqd/4",
+"pid": 42,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "kworker/4:0-even",
+"pid": 43,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "kworker/4:0H-eve",
+"pid": 44,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "cpuhp/5",
+"pid": 45,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "idle_inject/5",
+"pid": 46,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "migration/5",
+"pid": 47,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "ksoftirqd/5",
+"pid": 48,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "kworker/5:0H-eve",
+"pid": 50,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "cpuhp/6",
+"pid": 51,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "idle_inject/6",
+"pid": 52,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "migration/6",
+"pid": 53,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "ksoftirqd/6",
+"pid": 54,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "kworker/6:0H-eve",
+"pid": 56,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "cpuhp/7",
+"pid": 57,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "idle_inject/7",
+"pid": 58,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "migration/7",
+"pid": 59,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "ksoftirqd/7",
+"pid": 60,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "kworker/7:0-even",
+"pid": 61,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "kworker/7:0H-eve",
+"pid": 62,
+"ppid": 2,
+"start": 9,
+"uid": 0
+},
+{
+"comm": "kdevtmpfs",
+"pid": 63,
+"ppid": 2,
+"start": 10,
+"uid": 0
+},
+{
+"comm": "kworker/R-inet_",
+"pid": 64,
+"ppid": 2,
+"start": 10,
+"uid": 0
+},
+{
+"comm": "kauditd",
+"pid": 65,
+"ppid": 2,
+"start": 10,
+"uid": 0
+},
+{
+"comm": "khungtaskd",
+"pid": 66,
+"ppid": 2,
+"start": 11,
+"uid": 0
+},
+{
+"comm": "oom_reaper",
+"pid": 67,
+"ppid": 2,
+"start": 11,
+"uid": 0
+},
+{
+"comm": "kworker/u16:1-fl",
+"pid": 68,
+"ppid": 2,
+"start": 11,
+"uid": 0
+},
+{
+"comm": "kworker/R-write",
+"pid": 69,
+"ppid": 2,
+"start": 11,
+"uid": 0
+},
+{
+"comm": "kcompactd0",
+"pid": 71,
+"ppid": 2,
+"start": 11,
+"uid": 0
+},
+{
+"comm": "ksmd",
+"pid": 72,
+"ppid": 2,
+"start": 11,
+"uid": 0
+},
+{
+"comm": "khugepaged",
+"pid": 73,
+"ppid": 2,
+"start": 11,
+"uid": 0
+},
+{
+"comm": "kworker/R-kinte",
+"pid": 74,
+"ppid": 2,
+"start": 11,
+"uid": 0
+},
+{
+"comm": "kworker/R-kbloc",
+"pid": 75,
+"ppid": 2,
+"start": 11,
+"uid": 0
+},
+{
+"comm": "kworker/R-blkcg",
+"pid": 76,
+"ppid": 2,
+"start": 11,
+"uid": 0
+},
+{
+"comm": "kworker/2:1-even",
+"pid": 77,
+"ppid": 2,
+"start": 11,
+"uid": 0
+},
+{
+"comm": "kworker/1:1-wg-c",
+"pid": 78,
+"ppid": 2,
+"start": 13,
+"uid": 0
+},
+{
+"comm": "kworker/R-tpm_d",
+"pid": 79,
+"ppid": 2,
+"start": 17,
+"uid": 0
+},
+{
+"comm": "kworker/R-ata_s",
+"pid": 80,
+"ppid": 2,
+"start": 17,
+"uid": 0
+},
+{
+"comm": "kworker/R-md",
+"pid": 81,
+"ppid": 2,
+"start": 18,
+"uid": 0
+},
+{
+"comm": "kworker/R-md_bi",
+"pid": 82,
+"ppid": 2,
+"start": 18,
+"uid": 0
+},
+{
+"comm": "kworker/R-edac-",
+"pid": 83,
+"ppid": 2,
+"start": 18,
+"uid": 0
+},
+{
+"comm": "kworker/R-devfr",
+"pid": 84,
+"ppid": 2,
+"start": 18,
+"uid": 0
+},
+{
+"comm": "watchdogd",
+"pid": 85,
+"ppid": 2,
+"start": 18,
+"uid": 0
+},
+{
+"comm": "kworker/R-quota",
+"pid": 87,
+"ppid": 2,
+"start": 19,
+"uid": 0
+},
+{
+"comm": "kworker/0:1H-kbl",
+"pid": 88,
+"ppid": 2,
+"start": 20,
+"uid": 0
+},
+{
+"comm": "kswapd0",
+"pid": 89,
+"ppid": 2,
+"start": 27,
+"uid": 0
+},
+{
+"comm": "ecryptfs-kthread",
+"pid": 90,
+"ppid": 2,
+"start": 27,
+"uid": 0
+},
+{
+"comm": "kworker/R-kthro",
+"pid": 91,
+"ppid": 2,
+"start": 28,
+"uid": 0
+},
+{
+"comm": "irq/48-ACPI:Ged",
+"pid": 92,
+"ppid": 2,
+"start": 29,
+"uid": 0
+},
+{
+"comm": "kworker/R-acpi_",
+"pid": 93,
+"ppid": 2,
+"start": 29,
+"uid": 0
+},
+{
+"comm": "kworker/R-mld",
+"pid": 94,
+"ppid": 2,
+"start": 35,
+"uid": 0
+},
+{
+"comm": "kworker/R-ipv6_",
+"pid": 95,
+"ppid": 2,
+"start": 35,
+"uid": 0
+},
+{
+"comm": "kworker/R-kstrp",
+"pid": 102,
+"ppid": 2,
+"start": 35,
+"uid": 0
+},
+{
+"comm": "kworker/3:1-wg-c",
+"pid": 103,
+"ppid": 2,
+"start": 35,
+"uid": 0
+},
+{
+"comm": "kworker/6:1-cgro",
+"pid": 104,
+"ppid": 2,
+"start": 35,
+"uid": 0
+},
+{
+"comm": "kworker/5:1-wg-c",
+"pid": 105,
+"ppid": 2,
+"start": 35,
+"uid": 0
+},
+{
+"comm": "kworker/u17:0",
+"pid": 107,
+"ppid": 2,
+"start": 37,
+"uid": 0
+},
+{
+"comm": "kworker/R-crypt",
+"pid": 112,
+"ppid": 2,
+"start": 37,
+"uid": 0
+},
+{
+"comm": "kworker/R-charg",
+"pid": 122,
+"ppid": 2,
+"start": 39,
+"uid": 0
+},
+{
+"comm": "kworker/2:1H-kbl",
+"pid": 146,
+"ppid": 2,
+"start": 44,
+"uid": 0
+},
+{
+"comm": "kworker/3:1H-kbl",
+"pid": 150,
+"ppid": 2,
+"start": 45,
+"uid": 0
+},
+{
+"comm": "kworker/4:1H-kbl",
+"pid": 151,
+"ppid": 2,
+"start": 45,
+"uid": 0
+},
+{
+"comm": "kworker/7:1H-kbl",
+"pid": 163,
+"ppid": 2,
+"start": 46,
+"uid": 0
+},
+{
+"comm": "kworker/5:1H-kbl",
+"pid": 165,
+"ppid": 2,
+"start": 48,
+"uid": 0
+},
+{
+"comm": "kworker/1:1H-kbl",
+"pid": 166,
+"ppid": 2,
+"start": 48,
+"uid": 0
+},
+{
+"comm": "kworker/6:1H-kbl",
+"pid": 167,
+"ppid": 2,
+"start": 48,
+"uid": 0
+},
+{
+"comm": "hwrng",
+"pid": 190,
+"ppid": 2,
+"start": 49,
+"uid": 0
+},
+{
+"comm": "kworker/6:2-even",
+"pid": 204,
+"ppid": 2,
+"start": 49,
+"uid": 0
+},
+{
+"comm": "kworker/7:1-even",
+"pid": 215,
+"ppid": 2,
+"start": 51,
+"uid": 0
+},
+{
+"comm": "kworker/1:2-even",
+"pid": 236,
+"ppid": 2,
+"start": 157,
+"uid": 0
+},
+{
+"comm": "kworker/R-raid5",
+"pid": 239,
+"ppid": 2,
+"start": 170,
+"uid": 0
+},
+{
+"comm": "jbd2/vda1-8",
+"pid": 278,
+"ppid": 2,
+"start": 188,
+"uid": 0
+},
+{
+"comm": "kworker/R-ext4-",
+"pid": 279,
+"ppid": 2,
+"start": 188,
+"uid": 0
+},
+{
+"comm": "systemd-journal",
+"pid": 352,
+"ppid": 1,
+"start": 242,
+"uid": 0
+},
+{
+"comm": "kworker/u16:3-wr",
+"pid": 377,
+"ppid": 2,
+"start": 247,
+"uid": 0
+},
+{
+"comm": "kworker/3:3-even",
+"pid": 391,
+"ppid": 2,
+"start": 247,
+"uid": 0
+},
+{
+"comm": "kworker/R-kmpat",
+"pid": 402,
+"ppid": 2,
+"start": 250,
+"uid": 0
+},
+{
+"comm": "kworker/R-kmpat",
+"pid": 405,
+"ppid": 2,
+"start": 250,
+"uid": 0
+},
+{
+"comm": "multipathd",
+"pid": 407,
+"ppid": 1,
+"start": 250,
+"uid": 0
+},
+{
+"comm": "systemd-udevd",
+"pid": 435,
+"ppid": 1,
+"start": 260,
+"uid": 0
+},
+{
+"comm": "psimon",
+"pid": 436,
+"ppid": 2,
+"start": 268,
+"uid": 0
+},
+{
+"comm": "kworker/4:2-even",
+"pid": 515,
+"ppid": 2,
+"start": 285,
+"uid": 0
+},
+{
+"comm": "kworker/0:2-even",
+"pid": 530,
+"ppid": 2,
+"start": 287,
+"uid": 0
+},
+{
+"comm": "kworker/5:2-wg-c",
+"pid": 555,
+"ppid": 2,
+"start": 292,
+"uid": 0
+},
+{
+"comm": "systemd-timesyn",
+"pid": 603,
+"ppid": 1,
+"start": 296,
+"uid": 997
+},
+{
+"comm": "kworker/u16:4-fl",
+"pid": 611,
+"ppid": 2,
+"start": 297,
+"uid": 0
+},
+{
+"comm": "kworker/6:3-wg-c",
+"pid": 628,
+"ppid": 2,
+"start": 299,
+"uid": 0
+},
+{
+"comm": "kworker/4:3-wg-c",
+"pid": 714,
+"ppid": 2,
+"start": 316,
+"uid": 0
+},
+{
+"comm": "systemd-network",
+"pid": 806,
+"ppid": 1,
+"start": 432,
+"uid": 998
+},
+{
+"comm": "kworker/R-cfg80",
+"pid": 811,
+"ppid": 2,
+"start": 445,
+"uid": 0
+},
+{
+"comm": "kworker/u16:6-fl",
+"pid": 875,
+"ppid": 2,
+"start": 713,
+"uid": 0
+},
+{
+"comm": "accounts-daemon",
+"pid": 907,
+"ppid": 1,
+"start": 770,
+"uid": 0
+},
+{
+"comm": "avahi-daemon",
+"pid": 910,
+"ppid": 1,
+"start": 771,
+"uid": 114
+},
+{
+"comm": "dbus-daemon",
+"pid": 911,
+"ppid": 1,
+"start": 771,
+"uid": 101
+},
+{
+"comm": "gnome-remote-de",
+"pid": 916,
+"ppid": 1,
+"start": 772,
+"uid": 987
+},
+{
+"comm": "polkitd",
+"pid": 971,
+"ppid": 1,
+"start": 779,
+"uid": 991
+},
+{
+"comm": "power-profiles-",
+"pid": 981,
+"ppid": 1,
+"start": 780,
+"uid": 0
+},
+{
+"comm": "switcheroo-cont",
+"pid": 1008,
+"ppid": 1,
+"start": 783,
+"uid": 0
+},
+{
+"comm": "systemd-logind",
+"pid": 1011,
+"ppid": 1,
+"start": 784,
+"uid": 0
+},
+{
+"comm": "udisksd",
+"pid": 1013,
+"ppid": 1,
+"start": 785,
+"uid": 0
+},
+{
+"comm": "rsyslogd",
+"pid": 1037,
+"ppid": 1,
+"start": 791,
+"uid": 103
+},
+{
+"comm": "avahi-daemon",
+"pid": 1044,
+"ppid": 910,
+"start": 792,
+"uid": 114
+},
+{
+"comm": "NetworkManager",
+"pid": 1046,
+"ppid": 1,
+"start": 792,
+"uid": 0
+},
+{
+"comm": "wpa_supplicant",
+"pid": 1047,
+"ppid": 1,
+"start": 792,
+"uid": 0
+},
+{
+"comm": "ModemManager",
+"pid": 1100,
+"ppid": 1,
+"start": 808,
+"uid": 0
+},
+{
+"comm": "cupsd",
+"pid": 1243,
+"ppid": 1,
+"start": 859,
+"uid": 0
+},
+{
+"comm": "epmd",
+"pid": 1246,
+"ppid": 1,
+"start": 860,
+"uid": 111
+},
+{
+"comm": "cron",
+"pid": 1264,
+"ppid": 1,
+"start": 865,
+"uid": 0
+},
+{
+"comm": "containerd",
+"pid": 1270,
+"ppid": 1,
+"start": 867,
+"uid": 0
+},
+{
+"comm": "atd",
+"pid": 1271,
+"ppid": 1,
+"start": 867,
+"uid": 0
+},
+{
+"comm": "cups-browsed",
+"pid": 1275,
+"ppid": 1,
+"start": 869,
+"uid": 117
+},
+{
+"comm": "kworker/2:3-cgro",
+"pid": 1276,
+"ppid": 2,
+"start": 871,
+"uid": 0
+},
+{
+"comm": "sshd",
+"pid": 1279,
+"ppid": 1,
+"start": 871,
+"uid": 0
+},
+{
+"comm": "agetty",
+"pid": 1289,
+"ppid": 1,
+"start": 875,
+"uid": 0
+},
+{
+"comm": "agetty",
+"pid": 1297,
+"ppid": 1,
+"start": 877,
+"uid": 0
+},
+{
+"comm": "dockerd",
+"pid": 1377,
+"ppid": 1,
+"start": 939,
+"uid": 0
+},
+{
+"comm": "systemd",
+"pid": 1411,
+"ppid": 1,
+"start": 984,
+"uid": 1000
+},
+{
+"comm": "(sd-pam)",
+"pid": 1413,
+"ppid": 1411,
+"start": 985,
+"uid": 1000
+},
+{
+"comm": "pipewire",
+"pid": 1426,
+"ppid": 1411,
+"start": 996,
+"uid": 1000
+},
+{
+"comm": "pipewire",
+"pid": 1427,
+"ppid": 1411,
+"start": 996,
+"uid": 1000
+},
+{
+"comm": "wireplumber",
+"pid": 1428,
+"ppid": 1411,
+"start": 996,
+"uid": 1000
+},
+{
+"comm": "pipewire-pulse",
+"pid": 1429,
+"ppid": 1411,
+"start": 996,
+"uid": 1000
+},
+{
+"comm": "dbus-daemon",
+"pid": 1436,
+"ppid": 1411,
+"start": 1000,
+"uid": 1000
+},
+{
+"comm": "rtkit-daemon",
+"pid": 1514,
+"ppid": 1,
+"start": 1009,
+"uid": 110
+},
+{
+"comm": "kworker/R-tls-s",
+"pid": 1937,
+"ppid": 2,
+"start": 1059,
+"uid": 0
+},
+{
+"comm": "kworker/7:3-even",
+"pid": 2398,
+"ppid": 2,
+"start": 1114,
+"uid": 0
+},
+{
+"comm": "gvfsd",
+"pid": 2400,
+"ppid": 1411,
+"start": 1115,
+"uid": 1000
+},
+{
+"comm": "gvfsd-fuse",
+"pid": 2415,
+"ppid": 1411,
+"start": 1121,
+"uid": 1000
+},
+{
+"comm": "at-spi-bus-laun",
+"pid": 2423,
+"ppid": 1411,
+"start": 1123,
+"uid": 1000
+},
+{
+"comm": "dbus-daemon",
+"pid": 2474,
+"ppid": 2423,
+"start": 1126,
+"uid": 1000
+},
+{
+"comm": "kworker/R-wg-cr",
+"pid": 2563,
+"ppid": 2,
+"start": 1152,
+"uid": 0
+},
+{
+"comm": "napi/wg0-0",
+"pid": 2611,
+"ppid": 2,
+"start": 1153,
+"uid": 0
+},
+{
+"comm": "gnome-keyring-d",
+"pid": 2815,
+"ppid": 1411,
+"start": 1205,
+"uid": 1000
+},
+{
+"comm": "upowerd",
+"pid": 3028,
+"ppid": 1,
+"start": 1221,
+"uid": 0
+},
+{
+"comm": "dconf-service",
+"pid": 3038,
+"ppid": 1411,
+"start": 1225,
+"uid": 1000
+},
+{
+"comm": "colord",
+"pid": 3160,
+"ppid": 1,
+"start": 1269,
+"uid": 119
+},
+{
+"comm": "uuidd",
+"pid": 3224,
+"ppid": 1,
+"start": 1288,
+"uid": 104
+},
+{
+"comm": "obexd",
+"pid": 3346,
+"ppid": 1411,
+"start": 1318,
+"uid": 1000
+},
+{
+"comm": "gvfs-udisks2-vo",
+"pid": 3563,
+"ppid": 1411,
+"start": 1348,
+"uid": 1000
+},
+{
+"comm": "gvfs-gphoto2-vo",
+"pid": 3579,
+"ppid": 1411,
+"start": 1353,
+"uid": 1000
+},
+{
+"comm": "gvfs-afc-volume",
+"pid": 3607,
+"ppid": 1411,
+"start": 1358,
+"uid": 1000
+},
+{
+"comm": "gvfs-goa-volume",
+"pid": 3629,
+"ppid": 1411,
+"start": 1361,
+"uid": 1000
+},
+{
+"comm": "goa-daemon",
+"pid": 3635,
+"ppid": 1411,
+"start": 1364,
+"uid": 1000
+},
+{
+"comm": "evolution-sourc",
+"pid": 3638,
+"ppid": 1411,
+"start": 1366,
+"uid": 1000
+},
+{
+"comm": "goa-identity-se",
+"pid": 3653,
+"ppid": 1411,
+"start": 1370,
+"uid": 1000
+},
+{
+"comm": "gvfs-mtp-volume",
+"pid": 3655,
+"ppid": 1411,
+"start": 1372,
+"uid": 1000
+},
+{
+"comm": "gvfsd-trash",
+"pid": 3666,
+"ppid": 2400,
+"start": 1378,
+"uid": 1000
+},
+{
+"comm": "gvfsd-metadata",
+"pid": 3680,
+"ppid": 1411,
+"start": 1386,
+"uid": 1000
+},
+{
+"comm": "evolution-calen",
+"pid": 3683,
+"ppid": 1411,
+"start": 1388,
+"uid": 1000
+},
+{
+"comm": "evolution-addre",
+"pid": 3736,
+"ppid": 1411,
+"start": 1400,
+"uid": 1000
+},
+{
+"comm": "kworker/5:3-cgro",
+"pid": 5027,
+"ppid": 2,
+"start": 1704,
+"uid": 0
+},
+{
+"comm": "packagekitd",
+"pid": 5137,
+"ppid": 1,
+"start": 1772,
+"uid": 0
+},
+{
+"comm": "systemd-resolve",
+"pid": 12477,
+"ppid": 1,
+"start": 17451,
+"uid": 992
+},
+{
+"comm": "kworker/0:3-wg-c",
+"pid": 13387,
+"ppid": 2,
+"start": 17630,
+"uid": 0
+},
+{
+"comm": "pulseaudio",
+"pid": 13390,
+"ppid": 1,
+"start": 17632,
+"uid": 1000
+},
+{
+"comm": "xdg-desktop-por",
+"pid": 14073,
+"ppid": 1411,
+"start": 17761,
+"uid": 1000
+},
+{
+"comm": "xdg-document-po",
+"pid": 14086,
+"ppid": 1411,
+"start": 17763,
+"uid": 1000
+},
+{
+"comm": "xdg-permission-",
+"pid": 14090,
+"ppid": 1411,
+"start": 17764,
+"uid": 1000
+},
+{
+"comm": "fusermount3",
+"pid": 14101,
+"ppid": 14086,
+"start": 17766,
+"uid": 1000
+},
+{
+"comm": "socat",
+"pid": 15063,
+"ppid": 1,
+"start": 18093,
+"uid": 0
+},
+{
+"comm": "ariana-fswatch",
+"pid": 15139,
+"ppid": 1,
+"start": 18114,
+"uid": 0
+},
+{
+"comm": "ascii-agents-se",
+"pid": 16278,
+"ppid": 1,
+"start": 18350,
+"uid": 1000
+},
+{
+"comm": "sudo",
+"pid": 16315,
+"ppid": 16278,
+"start": 18369,
+"uid": 1000
+},
+{
+"comm": "ascii-proclog",
+"pid": 16321,
+"ppid": 16315,
+"start": 18369,
+"uid": 0
+},
+{
+"comm": "ariana-fswatch",
+"pid": 17121,
+"ppid": 1,
+"start": 18533,
+"uid": 0
+},
+{
+"comm": "psimon",
+"pid": 17508,
+"ppid": 2,
+"start": 19352,
+"uid": 0
+},
+{
+"comm": "ariana-fswatch",
+"pid": 17513,
+"ppid": 1,
+"start": 19356,
+"uid": 0
+},
+{
+"comm": "ascii-lazyfs",
+"pid": 18727,
+"ppid": 1,
+"start": 35837,
+"uid": 0
+},
+{
+"comm": "bash",
+"pid": 19827,
+"ppid": 16278,
+"start": 36223,
+"uid": 1000
+},
+{
+"comm": "kworker/1:3-wg-c",
+"pid": 20133,
+"ppid": 2,
+"start": 36462,
+"uid": 0
+},
+{
+"comm": "lightdm",
+"pid": 20136,
+"ppid": 1,
+"start": 36463,
+"uid": 0
+},
+{
+"comm": "Xorg",
+"pid": 20181,
+"ppid": 20136,
+"start": 36479,
+"uid": 0
+},
+{
+"comm": "lightdm",
+"pid": 20371,
+"ppid": 20136,
+"start": 36538,
+"uid": 0
+},
+{
+"comm": "kworker/0:4-cgro",
+"pid": 20386,
+"ppid": 2,
+"start": 36543,
+"uid": 0
+},
+{
+"comm": "dbus-run-sessio",
+"pid": 20391,
+"ppid": 20371,
+"start": 36545,
+"uid": 1000
+},
+{
+"comm": "sunshine",
+"pid": 20399,
+"ppid": 1,
+"start": 36546,
+"uid": 1000
+},
+{
+"comm": "dbus-launch",
+"pid": 20684,
+"ppid": 1,
+"start": 36607,
+"uid": 1000
+},
+{
+"comm": "ibus-daemon",
+"pid": 20695,
+"ppid": 1,
+"start": 36611,
+"uid": 1000
+},
+{
+"comm": "dbus-daemon",
+"pid": 20700,
+"ppid": 20391,
+"start": 36613,
+"uid": 1000
+},
+{
+"comm": "dbus-daemon",
+"pid": 20701,
+"ppid": 1,
+"start": 36613,
+"uid": 1000
+},
+{
+"comm": "at-spi-bus-laun",
+"pid": 20708,
+"ppid": 1,
+"start": 36614,
+"uid": 1000
+},
+{
+"comm": "ibus-memconf",
+"pid": 20710,
+"ppid": 20695,
+"start": 36615,
+"uid": 1000
+},
+{
+"comm": "ibus-ui-gtk3",
+"pid": 20711,
+"ppid": 20695,
+"start": 36616,
+"uid": 1000
+},
+{
+"comm": "ibus-extension-",
+"pid": 20712,
+"ppid": 20695,
+"start": 36616,
+"uid": 1000
+},
+{
+"comm": "ibus-x11",
+"pid": 20714,
+"ppid": 1,
+"start": 36616,
+"uid": 1000
+},
+{
+"comm": "ibus-portal",
+"pid": 20716,
+"ppid": 1411,
+"start": 36617,
+"uid": 1000
+},
+{
+"comm": "dbus-daemon",
+"pid": 20732,
+"ppid": 20708,
+"start": 36619,
+"uid": 1000
+},
+{
+"comm": "ascii-desktop",
+"pid": 20734,
+"ppid": 20391,
+"start": 36620,
+"uid": 1000
+},
+{
+"comm": "openbox",
+"pid": 20741,
+"ppid": 20734,
+"start": 36621,
+"uid": 1000
+},
+{
+"comm": "at-spi2-registr",
+"pid": 20756,
+"ppid": 1,
+"start": 36626,
+"uid": 1000
+},
+{
+"comm": "web-server",
+"pid": 20902,
+"ppid": 1,
+"start": 36687,
+"uid": 0
+},
+{
+"comm": "dbus-daemon",
+"pid": 20934,
+"ppid": 2474,
+"start": 36694,
+"uid": 1000
+},
+{
+"comm": "ibus-engine-sim",
+"pid": 20953,
+"ppid": 20695,
+"start": 36699,
+"uid": 1000
+},
+{
+"comm": "kworker/u16:2-fl",
+"pid": 21080,
+"ppid": 2,
+"start": 36804,
+"uid": 0
+},
+{
+"comm": "kworker/u16:5-ev",
+"pid": 21081,
+"ppid": 2,
+"start": 36805,
+"uid": 0
+},
+{
+"comm": "kworker/u16:7-fl",
+"pid": 21082,
+"ppid": 2,
+"start": 36805,
+"uid": 0
+},
+{
+"comm": "kworker/u16:8-fl",
+"pid": 21083,
+"ppid": 2,
+"start": 36805,
+"uid": 0
+},
+{
+"comm": "kworker/u16:9",
+"pid": 21084,
+"ppid": 2,
+"start": 36805,
+"uid": 0
+},
+{
+"comm": "kworker/u16:10",
+"pid": 21085,
+"ppid": 2,
+"start": 36805,
+"uid": 0
+},
+{
+"comm": "kworker/2:2-wg-c",
+"pid": 21426,
+"ppid": 2,
+"start": 37020,
+"uid": 0
+},
+{
+"comm": "cua-driver",
+"pid": 21432,
+"ppid": 1411,
+"start": 37022,
+"uid": 1000
+},
+{
+"comm": "sshd",
+"pid": 23200,
+"ppid": 1279,
+"start": 39542,
+"uid": 0
+},
+{
+"comm": "sshd",
+"pid": 23252,
+"ppid": 23200,
+"start": 39616,
+"uid": 1000
+},
+{
+"comm": "python3",
+"pid": 23292,
+"ppid": 23252,
+"start": 40325,
+"uid": 1000
+}
+],
+"source": "process tree of the admitted large worker bx_gy2ytgh8 (environment v8), captured over boat ssh during qualification operation op-2 after startup refused; pid, ppid, uid, start and comm only"
+}

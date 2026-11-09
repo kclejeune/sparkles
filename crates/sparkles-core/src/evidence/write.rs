@@ -50,7 +50,7 @@ use super::{
     IdentityNamespace, MethodRef, Polarity, RecordKey, RecordKind, RecordRef, RenditionContent,
     Settings, Sha256Digest, SourceContent,
 };
-use crate::access::Preparation;
+use crate::access::{Preparation, Reservation};
 use crate::id::Id;
 use crate::index::Perm;
 use crate::store::Snapshot;
@@ -59,7 +59,7 @@ use crate::{Error, Result};
 use base64::Engine as _;
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
 use sha1::{Digest as _, Sha1};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 const EV: &str = "urn:x-sparkles:evidence:";
@@ -1093,14 +1093,41 @@ pub struct Reads<'a> {
     preparation: &'a Preparation,
     snap: &'a Snapshot,
     ids: BTreeMap<String, Option<Id>>,
+    /// the storage of `ids`, charged to the preparation for the reads' lifetime
+    cached: Option<Reservation>,
 }
 
+/// The bytes a cached identity of [`Reads`] takes beside its IRI: the key's `String`,
+/// the value and the tree's per-entry share. A B-tree node is at least half full, which
+/// makes that share at most about 92 bytes on 64-bit targets, and the charge rounds up.
+const CACHE_ENTRY: u64 = 160;
+
+/// The bytes a returned claim identity takes beside its IRI: its place in the returned
+/// vector at up to twice the vector's length, and its entry in the caller's B-tree set.
+const IDENTITY_ENTRY: u64 = 160;
+
+/// The bytes a [`Reads`] cache takes once it holds an identity: its first B-tree node, a
+/// root leaf of 456 bytes on 64-bit targets, which can hold fewer entries than the
+/// half-full nodes [`CACHE_ENTRY`] covers. The charge rounds up.
+const CACHE_START: u64 = 1024;
+
+/// The bytes the first returned claim identity of a scan takes beside its entry: the
+/// vector's first allocation of four slots and the caller's set's first leaf, which
+/// coexist while the identities move into the set. The charge rounds up.
+const IDENTITY_START: u64 = 512;
+
 impl<'a> Reads<'a> {
+    /// The preparation the reads are charged to.
+    pub fn preparation(&self) -> &'a Preparation {
+        self.preparation
+    }
+
     pub fn new(preparation: &'a Preparation, snap: &'a Snapshot) -> Self {
         Reads {
             preparation,
             snap,
             ids: BTreeMap::new(),
+            cached: None,
         }
     }
 
@@ -1109,6 +1136,12 @@ impl<'a> Reads<'a> {
             return Ok(*id);
         }
         let id = self.preparation.lookup_iri(self.snap, iri)?;
+        // a cached identity stays charged until the reads end
+        let entry = iri.len() as u64 + CACHE_ENTRY;
+        match self.cached.as_mut() {
+            Some(r) => r.grow_by(entry)?,
+            None => self.cached = Some(self.preparation.reserve(CACHE_START + entry)?),
+        }
         self.ids.insert(iri.to_string(), id);
         Ok(id)
     }
@@ -1328,6 +1361,112 @@ impl<'a> Reads<'a> {
             return Ok(false);
         };
         Ok(self.is_operation(op, g)? && self.nonce_of(op, g)? == Some(nonce))
+    }
+
+    /// Whether some graph that holds `s p o` satisfies `accept`, which sees each graph's
+    /// id, the default graph's included. `o` is a ground term.
+    pub fn in_some_graph(
+        &mut self,
+        s: &str,
+        p: &str,
+        o: &Term,
+        mut accept: impl FnMut(&Snapshot, Id) -> bool,
+    ) -> Result<bool> {
+        let (Some(s), Some(p)) = (self.id(s)?, self.id(p)?) else {
+            return Ok(false);
+        };
+        let o = match o {
+            Term::NamedNode(n) => self.id(n.as_str())?,
+            t => self.preparation.lookup_term(self.snap, t)?,
+        };
+        let Some(o) = o else {
+            return Ok(false);
+        };
+        let snap = self.snap;
+        let mut found = false;
+        self.preparation
+            .scan(self.snap, Perm::Spo, &[s.0, p.0, o.0], |q| {
+                if accept(snap, q[3]) {
+                    found = true;
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+        Ok(found)
+    }
+
+    /// The IRI subjects in `g` that reify, through `p`, a triple term whose subject or
+    /// object is one of `entities`, in subject order. At most `scan` quads of `g` are
+    /// read. The rows read are charged to the preparation while the scan runs, and each
+    /// identity returned is charged to `held` before it is copied, with room for the
+    /// returned vector and one set the caller keeps it in, so the caller keeps it
+    /// charged for as long as it keeps `held`. Returns whether `g` holds more than
+    /// `scan` quads, in which case the list is incomplete.
+    pub fn reifiers_about(
+        &mut self,
+        p: &str,
+        g: &str,
+        entities: &BTreeSet<String>,
+        scan: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<NamedNode>, bool)> {
+        let (Some(p), Some(g)) = (self.id(p)?, self.id(g)?) else {
+            return Ok((Vec::new(), false));
+        };
+        const ROW: u64 = std::mem::size_of::<(Id, Id)>() as u64;
+        const CHUNK: usize = 4096;
+        let mut rows_held = self.preparation.reserve(0)?;
+        let mut rows: Vec<(Id, Id)> = Vec::new();
+        let mut read = 0usize;
+        let mut more = false;
+        self.preparation.scan(self.snap, Perm::Gspo, &[g.0], |q| {
+            if read == scan {
+                more = true;
+                return Ok(false);
+            }
+            read += 1;
+            if q[1] == p {
+                if rows.len() == rows.capacity() {
+                    rows_held.grow_by(CHUNK as u64 * ROW)?;
+                    rows.reserve_exact(CHUNK);
+                }
+                rows.push((q[0], q[2]));
+            }
+            Ok(true)
+        })?;
+        let mut out = Vec::new();
+        for (s, o) in rows {
+            let matches = self.preparation.with_term(self.snap, o, |t| {
+                let Some(Term::Triple(t)) = t else {
+                    return Ok(false);
+                };
+                let subject = match &t.subject {
+                    NamedOrBlankNode::NamedNode(n) => entities.contains(n.as_str()),
+                    _ => false,
+                };
+                let object = match &t.object {
+                    Term::NamedNode(n) => entities.contains(n.as_str()),
+                    _ => false,
+                };
+                Ok(subject || object)
+            })?;
+            if !matches {
+                continue;
+            }
+            if let Some(n) = self.preparation.with_term(self.snap, s, |t| {
+                Ok(match t {
+                    Some(Term::NamedNode(n)) => {
+                        let start = if out.is_empty() { IDENTITY_START } else { 0 };
+                        held.grow_by(start + n.as_str().len() as u64 + IDENTITY_ENTRY)?;
+                        Some(n.as_str().to_string())
+                    }
+                    _ => None,
+                })
+            })? {
+                out.push(NamedNode::new_unchecked(n));
+            }
+        }
+        Ok((out, more))
     }
 
     /// Whether `op` is described as an `ev:Operation` in any graph, whatever its marker.

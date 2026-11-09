@@ -1111,13 +1111,23 @@ impl Vocab {
         f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
         let _t = ioacct::timer(Phase::VocabRead);
-        let ahead = self.ahead_for(ids);
+        // One key needs no read-ahead or prefetch of its block.
+        let ahead = if ids.len() == 1 {
+            Ahead::default()
+        } else {
+            self.ahead_for(ids)
+        };
         if ahead.end == 0 && ids.len() > 1 {
             // scattered ids: ask for their blocks at once, so that a cold vocabulary
             // reads them in parallel instead of faulting on one after another
             self.prefetch_sorted(ids);
         }
-        self.get_sorted_checked_dispatch::<ROOM, E>(ids, key, reserve, f, ahead)
+        // Rebuild in a local buffer, which the decode loops can keep in registers, and
+        // return it, with its capacity, to the caller on every path.
+        let mut buf = std::mem::take(key);
+        let done = self.get_sorted_checked_dispatch::<ROOM, E>(ids, &mut buf, reserve, f, ahead);
+        *key = buf;
+        done
     }
 
     /// The bulk output owner admits hint metadata and reconstruction independently
@@ -1166,8 +1176,17 @@ impl Vocab {
         mut f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
         mut ahead: Ahead,
     ) -> std::result::Result<(), E> {
+        if let [id] = ids {
+            // One key needs no partition of its ids.
+            key.clear();
+            if *id < self.len {
+                let b = *id as usize / FC_BLOCK;
+                let mask = 1u32 << (*id as usize % FC_BLOCK);
+                self.checked_block::<F, ROOM, E>(b, mask, key, &mut reserve, &mut f)?;
+            }
+            return Ok(());
+        }
         key.clear();
-        let data = self.data.as_slice();
         let mut i = 0;
         while i < ids.len() && ids[i] < self.len {
             let b = ids[i] as usize / FC_BLOCK;
@@ -1180,75 +1199,91 @@ impl Vocab {
                 mask |= 1 << (x as usize % FC_BLOCK);
             }
             mask &= (1u32 << n) - 1;
-            let last = 31 - mask.leading_zeros() as usize;
-            let mut pos = self.block_offset(b);
-            ioacct::vocab_blocks_scanned(1);
-            self.touch_block(b);
-            key.clear();
-            if !F {
-                // front coding rebuilds every key up to the last wanted one, in one pass
-                for at in 0..=last {
-                    let id = (b * FC_BLOCK + at) as u64;
-                    let e = self.entry::<F>(data, &mut pos, at == 0);
-                    let total = key.len().min(e.shared).saturating_add(e.len);
-                    if total > key.capacity() {
-                        reserve(total)?;
-                        key.reserve_exact(total - key.len());
-                        #[cfg(any(test, feature = "failpoints"))]
-                        crate::algo::observe_projection(
-                            crate::algo::ProjectionEvent::Materialized(
-                                "checked-vocab-scratch-allocated",
-                                key.capacity(),
-                            ),
-                        );
-                    }
-                    key.truncate(e.shared);
-                    self.push_suffix::<F>(data, e, id, usize::MAX, key, true);
-                    if mask >> at & 1 == 1 {
-                        f(id, key)?;
-                    }
-                }
-                i = j;
-                continue;
-            }
-            let mut e = self.entry::<F>(data, &mut pos, true);
+            self.checked_block::<F, ROOM, E>(b, mask, key, &mut reserve, &mut f)?;
+            i = j;
+        }
+        Ok(())
+    }
+
+    /// The checked reconstruction of the keys of block `b` whose bits are set in the
+    /// nonempty `mask`, which holds only keys of the block.
+    #[inline(always)]
+    fn checked_block<const F: bool, const ROOM: bool, E>(
+        &self,
+        b: usize,
+        mask: u32,
+        key: &mut Vec<u8>,
+        reserve: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        f: &mut impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let data = self.data.as_slice();
+        let last = 31 - mask.leading_zeros() as usize;
+        let mut pos = self.block_offset(b);
+        ioacct::vocab_blocks_scanned(1);
+        self.touch_block(b);
+        key.clear();
+        // The steps below grow the buffer only through the reservations here, so its
+        // capacity is read once, rather than through `key` at every step.
+        let mut cap = key.capacity();
+        if !F {
+            // front coding rebuilds every key up to the last wanted one, in one pass
             for at in 0..=last {
                 let id = (b * FC_BLOCK + at) as u64;
-                let next = (at < last).then(|| self.entry::<F>(data, &mut pos, false));
-                let nd = lookahead(mask, at, next);
-                if nd > e.shared {
-                    // the whole key, or the bytes of it that later keys take
-                    let add = if nd == usize::MAX {
-                        self.suffix_len(data, e, id)
-                    } else {
-                        (nd - e.shared).min(e.most())
-                    };
-                    let total = key.len().min(e.shared).saturating_add(add);
-                    let room = if ROOM && e.coded { FSST_ROOM } else { 0 };
-                    if total.saturating_add(room) > key.capacity() {
-                        // an FSST suffix decodes fastest with room for eight symbols
-                        // past the key (`fsst::Table::decode_at`)
-                        let total = total.saturating_add(FSST_ROOM * usize::from(e.coded));
-                        reserve(total)?;
-                        key.reserve_exact(total - key.len());
-                        #[cfg(any(test, feature = "failpoints"))]
-                        crate::algo::observe_projection(
-                            crate::algo::ProjectionEvent::Materialized(
-                                "checked-vocab-scratch-allocated",
-                                key.capacity(),
-                            ),
-                        );
-                    }
+                let e = self.entry::<F>(data, &mut pos, at == 0);
+                let total = key.len().min(e.shared).saturating_add(e.len);
+                if total > cap {
+                    reserve(total)?;
+                    key.reserve_exact(total - key.len());
+                    cap = key.capacity();
+                    #[cfg(any(test, feature = "failpoints"))]
+                    crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
+                        "checked-vocab-scratch-allocated",
+                        key.capacity(),
+                    ));
                 }
-                self.step::<F>(data, e, id, nd, key, true);
+                key.truncate(e.shared);
+                self.push_suffix::<F>(data, e, id, usize::MAX, key, true);
                 if mask >> at & 1 == 1 {
                     f(id, key)?;
                 }
-                if let Some(n) = next {
-                    e = n;
+            }
+            return Ok(());
+        }
+        let mut e = self.entry::<F>(data, &mut pos, true);
+        for at in 0..=last {
+            let id = (b * FC_BLOCK + at) as u64;
+            let next = (at < last).then(|| self.entry::<F>(data, &mut pos, false));
+            let nd = lookahead(mask, at, next);
+            if nd > e.shared {
+                // the whole key, or the bytes of it that later keys take
+                let add = if nd == usize::MAX {
+                    self.suffix_len(data, e, id)
+                } else {
+                    (nd - e.shared).min(e.most())
+                };
+                let total = key.len().min(e.shared).saturating_add(add);
+                let room = if ROOM && e.coded { FSST_ROOM } else { 0 };
+                if total.saturating_add(room) > cap {
+                    // an FSST suffix decodes fastest with room for eight symbols
+                    // past the key (`fsst::Table::decode_at`)
+                    let total = total.saturating_add(FSST_ROOM * usize::from(e.coded));
+                    reserve(total)?;
+                    key.reserve_exact(total - key.len());
+                    cap = key.capacity();
+                    #[cfg(any(test, feature = "failpoints"))]
+                    crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
+                        "checked-vocab-scratch-allocated",
+                        key.capacity(),
+                    ));
                 }
             }
-            i = j;
+            self.step::<F>(data, e, id, nd, key, true);
+            if mask >> at & 1 == 1 {
+                f(id, key)?;
+            }
+            if let Some(n) = next {
+                e = n;
+            }
         }
         Ok(())
     }
@@ -3640,6 +3675,72 @@ mod tests {
             w.push(k).unwrap();
         }
         w.finish().unwrap();
+    }
+
+    /// The checked rebuild works in a buffer taken from its caller. The caller gets the
+    /// same allocation back after a reservation error, a callback error or success, and
+    /// can reuse it, for both codecs and with and without kept FSST room.
+    #[test]
+    fn checked_rebuild_returns_the_callers_buffer_on_every_path() {
+        let mut keys: Vec<Vec<u8>> = (0..3 * FC_BLOCK)
+            .map(|i| format!("<urn:buffer:{}:{i:04}", "long".repeat(i % 9)).into_bytes())
+            .collect();
+        keys.sort();
+        for fsst in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            write_codec(d.path(), &keys, fsst);
+            let v = Vocab::open(d.path()).unwrap();
+            assert_eq!(v.is_fsst(), fsst);
+            let id = FC_BLOCK as u64 + 20;
+            let want = &keys[id as usize];
+            for room in [false, true] {
+                let run = |key: &mut Vec<u8>, fail: Option<&'static str>| {
+                    let reserve = |_| {
+                        if fail == Some("reserve") {
+                            Err("reserve")
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    let f = |_, k: &[u8]| {
+                        assert_eq!(k, want);
+                        if fail == Some("callback") {
+                            Err("callback")
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    if room {
+                        v.get_sorted_checked_in::<true, _>(&[id], key, reserve, f)
+                    } else {
+                        v.get_sorted_checked_in::<false, _>(&[id], key, reserve, f)
+                    }
+                };
+                // A buffer with room for every key needs no reservation, so a failing
+                // reservation is never reached and the callback's error is returned.
+                let mut key = Vec::with_capacity(4096);
+                let (ptr, cap) = (key.as_ptr(), key.capacity());
+                for fail in [None, Some("callback"), Some("reserve")] {
+                    let expected = match fail {
+                        Some("callback") => Err("callback"),
+                        _ => Ok(()),
+                    };
+                    assert_eq!(run(&mut key, fail), expected);
+                    assert_eq!((key.as_ptr(), key.capacity()), (ptr, cap));
+                }
+                // A small buffer must reserve. The refusal still returns the same
+                // allocation, and the buffer then grows and rebuilds the key.
+                let mut key = Vec::with_capacity(4);
+                let (ptr, cap) = (key.as_ptr(), key.capacity());
+                assert_eq!(run(&mut key, Some("reserve")), Err("reserve"));
+                assert_eq!((key.as_ptr(), key.capacity()), (ptr, cap));
+                assert_eq!(run(&mut key, Some("callback")), Err("callback"));
+                let (ptr, cap) = (key.as_ptr(), key.capacity());
+                assert!(cap >= want.len());
+                assert_eq!(run(&mut key, None), Ok(()));
+                assert_eq!((key.as_ptr(), key.capacity()), (ptr, cap));
+            }
+        }
     }
 
     #[test]

@@ -1735,6 +1735,12 @@ fn pred(ix: &Index, st: &State, f: Ex, c: &Clause, fixed: Option<(Lit, &Side)>, 
         RL if dx.counting => p.kind() == RL && p.fun() == f && dx.sub(ix, p.atom(), n.atom()),
         _ => n == p,
     };
+    // a new premise that fits no place of the clause gives no inference
+    if let Some((p, _)) = fixed
+        && !need.iter().any(|&n| fits(n, p))
+    {
+        return;
+    }
     let mut head: Vec<Lit> = Vec::with_capacity(c.head().len());
     for l in c.head() {
         match l.kind() {
@@ -1786,6 +1792,10 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
         let Some(id) = x.store.next(ix, &mut max) else {
             break;
         };
+        let grown = x.store.take_grown();
+        if grown > 0 {
+            out.dl().grow(grown);
+        }
         n += 1;
         let c = x.store.clauses[id as usize].c.clone();
         process(ix, me, st, id, &c, &max, out);
@@ -1930,14 +1940,13 @@ fn process<S: Sink>(
                 if st.subs.contains(&e) && !es.contains(&ix.head(e).succ) {
                     es.push(ix.head(e).succ);
                 }
+                let table = &out.dl().table;
                 for &v in &es {
-                    let cids: Vec<u32> = dl(st)
+                    let cids = dl(st)
                         .and_then(|x| x.pred_in.get(&v))
-                        .cloned()
-                        .unwrap_or_default();
-                    for cid in cids {
-                        let pc = out.dl().table.get(cid).clone();
-                        pred(ix, st, e, &pc, Some((l, &prem)), &mut found);
+                        .map_or(&[][..], |v| v.as_slice());
+                    for &cid in cids {
+                        pred(ix, st, e, table.get(cid), Some((l, &prem)), &mut found);
                     }
                 }
             }

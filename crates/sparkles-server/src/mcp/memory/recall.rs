@@ -108,6 +108,12 @@ struct RecallArgs {
     communities: bool,
     /// the level of those communities, 0 being the coarsest (default: the finest)
     community_level: Option<u64>,
+    /// cite claim occurrences with their state under this review policy (C25)
+    review_policy: Option<String>,
+    /// resolve entities through this matching policy's map (C25)
+    matching_policy: Option<String>,
+    /// the claim occurrences listed at most, with `reviewPolicy`
+    max_claims: Option<u64>,
 }
 
 /// The community reports a recall adds after its facts (C22 §2.5).
@@ -311,6 +317,8 @@ struct Provenance {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Citation {
     graph: NamedNode,
+    /// the indexes of the claim occurrences of the fact's live supports
+    claims: Vec<usize>,
     source: Option<Term>,
     at: Option<Term>,
     by: Option<Term>,
@@ -331,7 +339,28 @@ struct Superseded {
 
 impl Tools<'_> {
     pub(crate) fn recall(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
+        self.recall_with(args, false)
+    }
+
+    /// `recall` without seeds or a query, for a caller that names a policy: the
+    /// policies and the map are checked at the selected view as `recall` checks them,
+    /// and the result holds their metadata with no facts and no claims. Ask uses it
+    /// before a question has entities, so no stand-in seed can bring in claims.
+    pub(crate) fn recall_preflight(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
+        self.recall_with(args, true)
+    }
+
+    fn recall_with(&self, args: Map<String, Value>, preflight: bool) -> Result<Outcome, ToolError> {
         let a: RecallArgs = parse(args)?;
+        if preflight
+            && (a.query.is_some()
+                || a.seeds.as_ref().is_some_and(|s| !s.is_empty())
+                || (a.review_policy.is_none() && a.matching_policy.is_none()))
+        {
+            return Err(ToolError::bad_argument(
+                "a preflight names a policy and no query or seeds",
+            ));
+        }
         let query = a.query.as_deref().map(str::trim).filter(|q| !q.is_empty());
         if a.query.as_ref().is_some_and(|q| q.chars().count() > 2000) {
             return Err(ToolError::bad_argument(
@@ -342,7 +371,7 @@ impl Tools<'_> {
         if seed_args.len() > 20 {
             return Err(ToolError::bad_argument("at most 20 seeds"));
         }
-        if query.is_none() && seed_args.is_empty() {
+        if query.is_none() && seed_args.is_empty() && !preflight {
             return Err(ToolError::bad_argument("give query, seeds or both"));
         }
         let type_args = a.types.clone().unwrap_or_default();
@@ -399,8 +428,44 @@ impl Tools<'_> {
         let names = prefixes.names();
         let ctx = self.ctx(&names, timeout.as_secs_f64());
         let deadline = self.call.arrived + timeout;
-        let r = self.reader(&ds, a.at_commit, a.at.as_ref(), a.reasoning, deadline, &ctx)?;
+        let max_claims = match (&a.review_policy, a.max_claims) {
+            (None, Some(_)) => {
+                return Err(ToolError::bad_argument("maxClaims needs reviewPolicy"));
+            }
+            (None, None) => 0,
+            (Some(_), m) => bounded("maxClaims", m, 50, 1, 200)? as usize,
+        };
+        let policies = a.review_policy.is_some() || a.matching_policy.is_some();
+        // A call that names a policy reads one evidence view, selected from its own
+        // selector, and its facts, claims and map all come from that view (C25).
+        let view = if policies {
+            Some(self.evidence_view(&ds, a.at_commit, a.at.as_ref(), deadline, &ctx)?)
+        } else {
+            None
+        };
+        let r = match &view {
+            Some(v) => self.reader_on(
+                &ds,
+                v.shared_snapshot().clone(),
+                a.reasoning,
+                deadline,
+                &ctx,
+            )?,
+            None => self.reader(&ds, a.at_commit, a.at.as_ref(), a.reasoning, deadline, &ctx)?,
+        };
         let eng = |e| ctx.engine(e);
+        let control = sparkles::task::Control {
+            deadline: Some(deadline),
+            ..sparkles::task::Control::with_cancel(self.call.cancel.clone())
+        };
+        let matching = match (&view, &a.matching_policy) {
+            (Some(v), Some(name)) => Some((
+                name.as_str(),
+                sparkles::evidence::check_matching_policy(v, name, r.opts.graphs.as_ref())
+                    .map_err(|e| policy_error("matchingPolicy", e, &ctx))?,
+            )),
+            _ => None,
+        };
 
         // the seeds: the given ones first, then the search's best subjects
         let mut seeds: Vec<(Term, Option<Fact>)> = seeds_given
@@ -428,6 +493,42 @@ impl Tools<'_> {
             }
         }
 
+        // a matching policy's cluster members join their seed at its rank
+        let mut ranks: Vec<usize> = (0..seeds.len()).collect();
+        let mut resolution: Option<ResolutionDoc> = None;
+        if let (Some(v), Some((name, version))) = (&view, &matching) {
+            let named: Vec<NamedNode> = seeds
+                .iter()
+                .filter_map(|(t, _)| match t {
+                    Term::NamedNode(n) => Some(n.clone()),
+                    _ => None,
+                })
+                .collect();
+            let mut doc = ResolutionDoc::new(name, *version);
+            doc.read(v, &named, &r, &control)
+                .map_err(|e| policy_error("matchingPolicy", e, &ctx))?;
+            let mut joined: Vec<(Term, Option<Fact>)> = Vec::new();
+            let mut joined_ranks: Vec<usize> = Vec::new();
+            let mut present: HashSet<String> = seeds.iter().map(|(t, _)| t.to_string()).collect();
+            for (rank, (seed, fact)) in seeds.iter().enumerate() {
+                joined.push((seed.clone(), fact.clone()));
+                joined_ranks.push(rank);
+                if let Term::NamedNode(n) = seed
+                    && let Some(e) = doc.entities.get(n.as_str())
+                {
+                    for m in &e.members {
+                        if present.insert(Term::NamedNode(m.clone()).to_string()) {
+                            joined.push((Term::NamedNode(m.clone()), None));
+                            joined_ranks.push(rank);
+                        }
+                    }
+                }
+            }
+            seeds = joined;
+            ranks = joined_ranks;
+            resolution = Some(doc);
+        }
+
         // the facts around each seed, breadth first, seed by seed
         let mut facts: Vec<Fact> = Vec::new();
         let mut keys: HashSet<String> = HashSet::new();
@@ -436,7 +537,8 @@ impl Tools<'_> {
         let mut complete = true;
         let status_kept: Option<Vec<Status>>;
         let budget = max_triples + 1;
-        'seeds: for (rank, (seed, fact)) in seeds.iter().enumerate() {
+        'seeds: for (i, (seed, fact)) in seeds.iter().enumerate() {
+            let rank = ranks[i];
             let mut queue: VecDeque<(Term, usize)> = VecDeque::from([(seed.clone(), 0)]);
             let mut first = fact.clone();
             while let Some((e, hop)) = queue.pop_front() {
@@ -549,6 +651,26 @@ impl Tools<'_> {
         }
         // the provenance of each fact
         let provenance = self.provenance(&r, &facts).map_err(eng)?;
+        // the entities of the result, resolved through the matching policy's map
+        if let (Some(v), Some(doc)) = (&view, resolution.as_mut()) {
+            let named: Vec<NamedNode> = entities
+                .iter()
+                .filter_map(|e| match &e.term {
+                    Term::NamedNode(n) => Some(n.clone()),
+                    _ => None,
+                })
+                .collect();
+            doc.read(v, &named, &r, &control)
+                .map_err(|e| policy_error("matchingPolicy", e, &ctx))?;
+        }
+        // the claim occurrences of the review policy
+        let claims = match (&view, &a.review_policy) {
+            (Some(v), Some(name)) => Some(
+                ClaimsDoc::read(v, name, &r, &facts, &entities, max_claims, &control)
+                    .map_err(|e| policy_error("reviewPolicy", e, &ctx))?,
+            ),
+            _ => None,
+        };
         let superseded = if a.include_superseded.unwrap_or(false) {
             let subjects: HashSet<String> = entities.iter().map(|e| e.term.to_string()).collect();
             self.superseded(&r, &subjects, &graphs, max_triples)
@@ -585,16 +707,46 @@ impl Tools<'_> {
             status: status_kept.as_deref(),
             agent: &agent,
             communities: a.communities.then_some(&communities),
+            claims: claims.as_ref(),
+            resolution: resolution.as_ref(),
         };
         // the most facts that fit in maxTriples and maxBytes
         let total = facts.len().min(max_triples);
-        let fits = |n: usize| {
+        let render = |n: usize, k: usize| {
             let truncated = n < facts.len() || !complete;
             let s = match format {
-                Format::Text => doc.text(n, truncated),
-                Format::Json => doc.json(n, truncated),
+                Format::Text => doc.text(n, k, truncated),
+                Format::Json => doc.json(n, k, truncated),
             };
             (s.len() <= max_bytes).then_some(s)
+        };
+        // the facts first: a fact whose cited claims do not all fit is left out, then
+        // the claims about the result that no kept fact cites fill the remaining room
+        let fits = |n: usize| -> Option<String> {
+            let Some(c) = &claims else {
+                return render(n, 0);
+            };
+            let (cited, extra) = c.section_parts(&doc, n);
+            if cited.len() > c.max {
+                return None;
+            }
+            let room = extra.len().min(c.max - cited.len());
+            if let Some(s) = render(n, room) {
+                return Some(s);
+            }
+            let mut best = render(n, 0)?;
+            let (mut lo, mut hi) = (0usize, room);
+            while lo + 1 < hi {
+                let mid = (lo + hi) / 2;
+                match render(n, mid) {
+                    Some(s) => {
+                        best = s;
+                        lo = mid;
+                    }
+                    None => hi = mid,
+                }
+            }
+            Some(best)
         };
         let best = match fits(total) {
             Some(s) => Some(s),
@@ -1534,6 +1686,10 @@ struct Doc<'a> {
     agent: &'a dyn Fn(&NamedNode) -> bool,
     /// the community reports, when the call asked for them
     communities: Option<&'a Communities>,
+    /// the claim occurrences, when the call names a review policy
+    claims: Option<&'a ClaimsDoc>,
+    /// the resolution map, when the call names a matching policy
+    resolution: Option<&'a ResolutionDoc>,
 }
 
 /// A time or number as it is when its lexical form is plain, else as a quoted term.
@@ -1574,10 +1730,14 @@ impl Doc<'_> {
         let mut ids: HashMap<Citation, usize> = HashMap::new();
         let mut list: Vec<(Citation, Option<Term>)> = Vec::new();
         let mut of = Vec::with_capacity(n);
-        for f in &self.facts[..n] {
+        for (fi, f) in self.facts[..n].iter().enumerate() {
             let p = self.provenance.get(&f.key()).cloned().unwrap_or_default();
             let c = Citation {
                 graph: f.g.clone(),
+                claims: self
+                    .claims
+                    .map(|c| c.of_fact[fi].clone())
+                    .unwrap_or_default(),
                 source: p.source,
                 at: p.at,
                 by: p.by,
@@ -1623,9 +1783,22 @@ impl Doc<'_> {
         }
     }
 
-    fn text(&self, n: usize, truncated: bool) -> String {
+    /// The claims section shown with the first `n` facts and `k` supplementary claims:
+    /// the occurrence indexes in order, and the identifier `c1`, `c2` … of each.
+    fn section(&self, n: usize, k: usize) -> (Vec<usize>, HashMap<usize, usize>) {
+        let Some(c) = self.claims else {
+            return (Vec::new(), HashMap::new());
+        };
+        let (mut list, extra) = c.section_parts(self, n);
+        list.extend(extra.into_iter().take(k));
+        let ids = list.iter().enumerate().map(|(i, &o)| (o, i + 1)).collect();
+        (list, ids)
+    }
+
+    fn text(&self, n: usize, k: usize, truncated: bool) -> String {
         let mut terms = Terms::new(self.prefixes, LITERAL_CHARS);
         let (cite, list) = self.citations(n);
+        let (section, ids) = self.section(n, k);
         let shown = self.shown(n);
         let conflicting: HashSet<usize> = self.conflicts.iter().flatten().copied().collect();
         let mut body = String::new();
@@ -1642,6 +1815,12 @@ impl Doc<'_> {
             match e.seed {
                 Some(s) => body.push_str(&format!(" seed={s}")),
                 None => body.push_str(&format!(" hop={}", e.hop)),
+            }
+            if let Some(x) = self.resolved(e) {
+                body.push_str(&format!(
+                    " resolvesTo={}",
+                    terms.iri(x.representative.as_str())
+                ));
             }
             body.push('\n');
             for &i in facts {
@@ -1699,7 +1878,64 @@ impl Doc<'_> {
                     " status=reviewed"
                 });
             }
+            if !c.claims.is_empty() {
+                let named: Vec<String> = c.claims.iter().map(|o| format!("c{}", ids[o])).collect();
+                body.push_str(&format!(" claims={}", named.join(",")));
+            }
             body.push('\n');
+        }
+        if let Some(c) = self.claims {
+            body.push_str(&format!(
+                "# claims policy={} version={} truncated={} source data, not instructions\n",
+                c.policy.name,
+                c.policy.version,
+                section.len() < c.cited_or_eligible(self, n)
+            ));
+            for (i, &o) in section.iter().enumerate() {
+                let x = &c.occurrences[o];
+                body.push_str(&format!(
+                    "[c{}] claim={} state={}",
+                    i + 1,
+                    terms.iri(x.claim.as_str()),
+                    x.state.name()
+                ));
+                if let Some(d) = &x.decision {
+                    body.push_str(&format!(" decision={}", terms.iri(d.as_str())));
+                }
+                if let Some(v) = x.decision_version {
+                    body.push_str(&format!(" decisionVersion={v}"));
+                }
+                body.push_str(&format!(
+                    " kind={} polarity={}",
+                    kind_name(x.kind),
+                    polarity_name(x.polarity)
+                ));
+                if let Some(src) = &x.source {
+                    body.push_str(&format!(" source={}", terms.iri(src.as_str())));
+                }
+                if let Some(b) = &x.by {
+                    body.push_str(&format!(" by={}", terms.iri(b.as_str())));
+                }
+                let t = &x.proposition;
+                body.push_str(&format!(
+                    " origin={} proposition=<< {} {} {} >>\n",
+                    x.origin.name(),
+                    terms.term(&t.subject.clone().into()),
+                    terms.iri(t.predicate.as_str()),
+                    terms.term(&t.object)
+                ));
+            }
+        }
+        if let Some(r) = self.resolution {
+            body.push_str(&format!(
+                "# resolution policy={} version={} revision={} number={}\n",
+                r.name,
+                r.version,
+                r.revision
+                    .as_ref()
+                    .map_or("none".to_string(), |x| terms.iri(x.as_str())),
+                r.number
+            ));
         }
         if !self.superseded.is_empty() {
             body.push_str("# superseded\n");
@@ -1771,9 +2007,19 @@ impl Doc<'_> {
         out
     }
 
-    fn json(&self, n: usize, truncated: bool) -> String {
+    /// The map's entry for `e` when the map names it.
+    fn resolved(&self, e: &Entity) -> Option<&ResolvedDoc> {
+        let r = self.resolution?;
+        match &e.term {
+            Term::NamedNode(n) => r.entities.get(n.as_str()).filter(|x| x.named),
+            _ => None,
+        }
+    }
+
+    fn json(&self, n: usize, k: usize, truncated: bool) -> String {
         let mut terms = Terms::new(self.prefixes, LITERAL_CHARS);
         let (cite, list) = self.citations(n);
+        let (section, ids) = self.section(n, k);
         let shown = self.shown(n);
         let entities: Vec<Value> = shown
             .iter()
@@ -1801,6 +2047,13 @@ impl Doc<'_> {
                 }
                 if let Some(s) = e.seed {
                     j["seed"] = s.into();
+                }
+                if let Some(x) = self.resolved(e) {
+                    j["resolution"] = json!({
+                        "representative": terms.iri(x.representative.as_str()),
+                        "members": x.members.iter().map(|m| terms.iri(m.as_str())).collect::<Vec<_>>(),
+                        "membersComplete": x.complete,
+                    });
                 }
                 j
             })
@@ -1835,6 +2088,14 @@ impl Doc<'_> {
                         "reviewed"
                     }
                     .into();
+                }
+                if !c.claims.is_empty() {
+                    j["claims"] = c
+                        .claims
+                        .iter()
+                        .map(|o| Value::from(format!("c{}", ids[o])))
+                        .collect::<Vec<_>>()
+                        .into();
                 }
                 j
             })
@@ -1899,6 +2160,56 @@ impl Doc<'_> {
                 .collect::<Vec<_>>()
                 .into();
         }
+        if let Some(c) = self.claims {
+            let occurrences: Vec<Value> = section
+                .iter()
+                .enumerate()
+                .map(|(i, &o)| {
+                    let x = &c.occurrences[o];
+                    let t = &x.proposition;
+                    let mut j = json!({
+                        "id": format!("c{}", i + 1),
+                        "claim": terms.iri(x.claim.as_str()),
+                        "state": x.state.name(),
+                        "kind": kind_name(x.kind),
+                        "polarity": polarity_name(x.polarity),
+                        "origin": x.origin.name(),
+                        "proposition": {
+                            "s": terms.term(&t.subject.clone().into()),
+                            "p": terms.iri(t.predicate.as_str()),
+                            "o": terms.term(&t.object),
+                        },
+                    });
+                    if let Some(d) = &x.decision {
+                        j["decision"] = terms.iri(d.as_str()).into();
+                    }
+                    if let Some(v) = x.decision_version {
+                        j["decisionVersion"] = v.into();
+                    }
+                    if let Some(src) = &x.source {
+                        j["source"] = terms.iri(src.as_str()).into();
+                    }
+                    if let Some(b) = &x.by {
+                        j["by"] = terms.iri(b.as_str()).into();
+                    }
+                    j
+                })
+                .collect();
+            out["claims"] = json!({
+                "version": 1,
+                "policy": { "name": c.policy.name, "version": c.policy.version },
+                "occurrences": occurrences,
+                "truncated": section.len() < c.cited_or_eligible(self, n),
+            });
+        }
+        if let Some(r) = self.resolution {
+            out["resolution"] = json!({
+                "policy": r.name,
+                "version": r.version,
+                "revision": r.revision.as_ref().map(|x| terms.iri(x.as_str())),
+                "number": r.number,
+            });
+        }
         if let Some(c) = self.communities {
             out["communities"] = match c.unavailable {
                 Some(why) => json!({ "unavailable": why, "reports": [] }),
@@ -1919,5 +2230,307 @@ impl Doc<'_> {
         }
         out["prefixes"] = json!(terms.used());
         out.to_string()
+    }
+}
+
+/// The memory an evidence view of a recall may hold while it selects its pair.
+const VIEW_BYTES: u64 = 64 << 20;
+
+impl Tools<'_> {
+    /// The evidence view a call that names a policy reads, selected from its own
+    /// selector: Head, `atCommit` or `at`, including a named snapshot.
+    fn evidence_view(
+        &self,
+        ds: &std::sync::Arc<crate::state::Dataset>,
+        at_commit: Option<u64>,
+        at: Option<&Value>,
+        deadline: std::time::Instant,
+        ctx: &ErrorContext,
+    ) -> Result<sparkles::store::BoundEvidenceView, ToolError> {
+        let sel =
+            crate::mcp::tools::selector(at_commit, at)?.unwrap_or(sparkles::history::At::Head);
+        let main = match &ds.branch {
+            Some(b) => b
+                .main
+                .upgrade()
+                .ok_or_else(|| ToolError::new("unknown-dataset", 404, "the dataset is gone"))?,
+            None => ds.clone(),
+        };
+        let control = sparkles::task::Control {
+            deadline: Some(deadline),
+            ..sparkles::task::Control::with_cancel(self.call.cancel.clone())
+        };
+        let preparation =
+            sparkles::access::Preparation::new(control, VIEW_BYTES).map_err(|e| ctx.engine(e))?;
+        main.dataset
+            .store()
+            .evidence_view_with_branch(ds.dataset.store(), &sel, &preparation)
+            .map_err(|e| match &e {
+                Error::Managed(m) if m.code == "configuration-history-inactive" => {
+                    ToolError::new(m.code, m.status(), m.message.clone()).hint(
+                        "claim citations and identity resolution need activated configuration history; leave out reviewPolicy and matchingPolicy to recall facts alone",
+                    )
+                }
+                _ => ctx.engine(e),
+            })
+    }
+}
+
+/// A refusal of a policy argument: a policy the caller cannot use is a bad argument
+/// that names the argument and not the policy's graphs. Other errors keep their codes.
+fn policy_error(argument: &str, e: Error, ctx: &ErrorContext) -> ToolError {
+    match e {
+        Error::Invalid(m) => ToolError::bad_argument(match m.strip_prefix("policy: ") {
+            Some(rest) => format!("{argument}: {rest}"),
+            None => m,
+        }),
+        e => ctx.engine(e),
+    }
+}
+
+fn kind_name(k: sparkles::evidence::ClaimKind) -> &'static str {
+    use sparkles::evidence::ClaimKind;
+    match k {
+        ClaimKind::Reported => "reported",
+        ClaimKind::Observation => "observation",
+        ClaimKind::Hypothesis => "hypothesis",
+        ClaimKind::Preference => "preference",
+    }
+}
+
+fn polarity_name(p: sparkles::evidence::Polarity) -> &'static str {
+    use sparkles::evidence::Polarity;
+    match p {
+        Polarity::Positive => "positive",
+        Polarity::Negative => "negative",
+        Polarity::Uncertain => "uncertain",
+    }
+}
+
+/// The claim occurrences of a call that names a review policy.
+struct ClaimsDoc {
+    policy: sparkles::evidence::PolicyRef,
+    /// every occurrence the caller may see, in claim order
+    occurrences: Vec<sparkles::evidence::ClaimOccurrence>,
+    /// for each fact, the occurrences of its live supports
+    of_fact: Vec<Vec<usize>>,
+    /// the occurrences about the result's entities, in claim order
+    extra: Vec<usize>,
+    max: usize,
+}
+
+impl ClaimsDoc {
+    fn read(
+        view: &sparkles::store::BoundEvidenceView,
+        name: &str,
+        r: &Reader,
+        facts: &[Fact],
+        entities: &[Entity],
+        max: usize,
+        control: &sparkles::task::Control,
+    ) -> Result<ClaimsDoc, Error> {
+        sparkles::evidence::with_policy_claims(view, name, r.opts.graphs.clone(), control, |pc| {
+            let policy = pc.policy();
+            let projected: Vec<usize> = facts
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.g == policy.output)
+                .map(|(i, _)| i)
+                .collect();
+            let triples: Vec<oxrdf::Triple> = projected
+                .iter()
+                .filter_map(|&i| {
+                    let f = &facts[i];
+                    let s = match &f.s {
+                        Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n.clone()),
+                        Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b.clone()),
+                        _ => return None,
+                    };
+                    Some(oxrdf::Triple::new(s, f.p.clone(), f.o.clone()))
+                })
+                .collect();
+            let supports = if triples.len() == projected.len() {
+                pc.supports(&triples)?
+            } else {
+                // a fact with a triple-term subject is never projected
+                let mut out = Vec::new();
+                for &i in &projected {
+                    let f = &facts[i];
+                    let Term::NamedNode(n) = &f.s else {
+                        out.push(Vec::new());
+                        continue;
+                    };
+                    let t = oxrdf::Triple::new(n.clone(), f.p.clone(), f.o.clone());
+                    out.extend(pc.supports(std::slice::from_ref(&t))?);
+                }
+                out
+            };
+            let named: Vec<NamedNode> = entities
+                .iter()
+                .filter_map(|e| match &e.term {
+                    Term::NamedNode(n) => Some(n.clone()),
+                    _ => None,
+                })
+                .collect();
+            let cited: Vec<NamedNode> = supports.iter().flatten().cloned().collect();
+            let mut occurrences = pc.visible(&cited)?;
+            let mut index: HashMap<String, usize> = HashMap::new();
+            for (i, o) in occurrences.iter().enumerate() {
+                index.insert(o.claim.as_str().to_string(), i);
+            }
+            let mut about = Vec::new();
+            for o in pc.about(&named)? {
+                let key = o.claim.as_str().to_string();
+                if !index.contains_key(&key) {
+                    index.insert(key.clone(), occurrences.len());
+                    occurrences.push(o);
+                }
+                about.push(key);
+            }
+            let mut of_fact = vec![Vec::new(); facts.len()];
+            for (k, &i) in projected.iter().enumerate() {
+                of_fact[i] = supports[k]
+                    .iter()
+                    .filter_map(|c| index.get(c.as_str()).copied())
+                    .collect();
+            }
+            let extra = about
+                .iter()
+                .filter_map(|c| index.get(c.as_str()).copied())
+                .collect();
+            Ok(ClaimsDoc {
+                policy,
+                occurrences,
+                of_fact,
+                extra,
+                max,
+            })
+        })
+    }
+
+    /// The occurrences the first `n` facts cite, in order of first use, and the
+    /// supplementary occurrences about the entities shown with them.
+    fn section_parts(&self, doc: &Doc<'_>, n: usize) -> (Vec<usize>, Vec<usize>) {
+        let mut seen = HashSet::new();
+        let mut cited = Vec::new();
+        for f in &self.of_fact[..n] {
+            for &o in f {
+                if seen.insert(o) {
+                    cited.push(o);
+                }
+            }
+        }
+        let shown: HashSet<String> = doc
+            .shown(n)
+            .iter()
+            .filter_map(|(e, _)| match &e.term {
+                Term::NamedNode(x) => Some(x.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        let about = |o: &sparkles::evidence::ClaimOccurrence| {
+            let s = match &o.proposition.subject {
+                oxrdf::NamedOrBlankNode::NamedNode(x) => shown.contains(x.as_str()),
+                _ => false,
+            };
+            let ob = match &o.proposition.object {
+                Term::NamedNode(x) => shown.contains(x.as_str()),
+                _ => false,
+            };
+            s || ob
+        };
+        let extra = self
+            .extra
+            .iter()
+            .copied()
+            .filter(|o| !seen.contains(o) && about(&self.occurrences[*o]))
+            .collect();
+        (cited, extra)
+    }
+
+    /// The occurrences the first `n` facts could show without the bound.
+    fn cited_or_eligible(&self, doc: &Doc<'_>, n: usize) -> usize {
+        let (cited, extra) = self.section_parts(doc, n);
+        cited.len() + extra.len()
+    }
+}
+
+/// One entity of the resolution map.
+struct ResolvedDoc {
+    representative: NamedNode,
+    members: Vec<NamedNode>,
+    complete: bool,
+    /// whether the map names the entity, rather than resolving it to itself
+    named: bool,
+}
+
+/// The resolution map of a call that names a matching policy.
+struct ResolutionDoc {
+    name: String,
+    version: u32,
+    revision: Option<NamedNode>,
+    number: u64,
+    entities: HashMap<String, ResolvedDoc>,
+    /// whether the map's header has been read
+    read: bool,
+}
+
+impl ResolutionDoc {
+    fn new(name: &str, version: u32) -> Self {
+        ResolutionDoc {
+            name: name.to_string(),
+            version,
+            revision: None,
+            number: 0,
+            entities: HashMap::new(),
+            read: false,
+        }
+    }
+
+    /// Resolve the entities of `named` not resolved yet, at `view`.
+    fn read(
+        &mut self,
+        view: &sparkles::store::BoundEvidenceView,
+        named: &[NamedNode],
+        r: &Reader,
+        control: &sparkles::task::Control,
+    ) -> Result<(), Error> {
+        let mut wanted: Vec<NamedNode> = Vec::new();
+        let mut seen = HashSet::new();
+        for n in named {
+            if !self.entities.contains_key(n.as_str()) && seen.insert(n.as_str().to_string()) {
+                wanted.push(n.clone());
+            }
+        }
+        // the map's header is read and checked once even when no entity is wanted
+        let header = (!self.read && wanted.is_empty()).then(Vec::new);
+        let chunks = wanted
+            .chunks(sparkles::evidence::MAX_RESOLVE)
+            .chain(header.as_deref());
+        for chunk in chunks {
+            self.read = true;
+            let got = sparkles::evidence::resolve_entities_at(
+                view,
+                &self.name,
+                chunk,
+                r.opts.graphs.clone(),
+                control,
+            )?;
+            self.revision = got.revision;
+            self.number = got.number;
+            for e in got.entities {
+                let named = e.members.len() > 1 || e.representative != e.entity;
+                self.entities.insert(
+                    e.entity.as_str().to_string(),
+                    ResolvedDoc {
+                        representative: e.representative,
+                        members: e.members,
+                        complete: e.members_complete,
+                        named,
+                    },
+                );
+            }
+        }
+        Ok(())
     }
 }

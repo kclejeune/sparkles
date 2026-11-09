@@ -35,7 +35,12 @@ pub fn run(
     // `branch` (C17 Phase 1c): the call runs on that branch, with the caller's grants
     // checked there
     let mut args = args;
-    let on_branch = super::branches::branch_call(server, name, &mut args, call)?;
+    let as_tool = if name == RECALL_PREFLIGHT {
+        "recall"
+    } else {
+        name
+    };
+    let on_branch = super::branches::branch_call(server, as_tool, &mut args, call)?;
     let call = on_branch.as_ref().unwrap_or(call);
     // C18 §8.8: an agent whose conversation facts wait for review writes on its branch
     let held = match name {
@@ -126,6 +131,10 @@ pub(crate) fn sparql_query_full(
 }
 
 /// The tools whose success may change a dataset's review inbox (C18 §8.9).
+/// The internal name of [`Tools::recall_preflight`]. It is no offered tool, so only
+/// the server's own callers such as Ask reach it, and its arguments are `recall`'s.
+pub(crate) const RECALL_PREFLIGHT: &str = "recall:preflight";
+
 const INBOX_TOOLS: &[&str] = &[
     "assert_facts",
     "sparql_update",
@@ -168,6 +177,7 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         "similar_queries" => t.similar_queries(args),
         "link_entities" => t.link_entities(args),
         "recall" => t.recall(args),
+        RECALL_PREFLIGHT => t.recall_preflight(args),
         "community_reports" => t.community_reports(args),
         "why_empty" => t.why_empty(args),
         #[cfg(feature = "reasoning")]
