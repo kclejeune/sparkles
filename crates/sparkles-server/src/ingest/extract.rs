@@ -69,7 +69,12 @@ fn strings(v: &Value) -> Vec<String> {
 impl Vocabulary {
     /// The profile `name` as the caller sees it.
     pub fn read(r: &Run, name: &str) -> Result<Vocabulary, Failed> {
-        let p = r.tool("ingest_profile", json!({ "name": name }), None)?;
+        Vocabulary::read_on(r, name, None)
+    }
+
+    /// The profile `name` as the caller sees it on `branch`, or on `main`.
+    pub fn read_on(r: &Run, name: &str, branch: Option<&str>) -> Result<Vocabulary, Failed> {
+        let p = r.tool("ingest_profile", json!({ "name": name }), branch)?;
         Vocabulary::from_profile(name, &p)
     }
 
@@ -342,6 +347,8 @@ pub struct Fact {
     pub end: usize,
     pub quote: String,
     pub confidence: Option<f64>,
+    /// the pair whose answer gave the fact
+    pub pair: Option<Pair>,
 }
 
 /// What the model answered for the whole rendition.
@@ -499,6 +506,9 @@ pub fn extract(
         *answered.entry(pos).or_default() += 1;
         let before = out.facts.len();
         read_answer(&value, ci, &chars, ctx_from, *b, v, &mut out);
+        for f in &mut out.facts[before..] {
+            f.pair = Some(pair.clone());
+        }
         r.usage.chunks.push(json!({
             "index": ci, "start": a, "end": b, "outcome": "ok",
             "provider": pair.provider, "model": pair.model,
@@ -655,6 +665,7 @@ fn read_answer(
             end: b,
             quote: chars[a..b].iter().collect(),
             confidence,
+            pair: None,
         });
     }
 }

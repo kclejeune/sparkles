@@ -43,6 +43,7 @@ fn api(e: crate::http::ApiError) -> Failed {
     let code = body["code"].as_str().unwrap_or(match status.as_u16() {
         400 => "bad-argument",
         403 => "forbidden",
+        413 => "too-large",
         404 => "not-found",
         409 => "conflict",
         _ => "error",
@@ -312,6 +313,25 @@ fn idempotency_key(
     Ok(format!("ingest-claims:1:{}", sha(framed.as_bytes())?))
 }
 
+/// The source key of the revision: the source IRI framed with the C18 graph and the
+/// evidence graphs, so that the same source and text ingested into other graphs gets
+/// other record identities instead of colliding with the first ones.
+fn source_key(t: &Target, source: &str, graph: &str) -> Result<String, Failed> {
+    let framed = json!([
+        "ingest-claims-source",
+        1,
+        source,
+        graph,
+        t.source_graph.as_str(),
+        t.proposal_graph.as_str(),
+    ])
+    .to_string();
+    Ok(format!(
+        "ingest-claims-source:1:{}",
+        sha(framed.as_bytes())?
+    ))
+}
+
 /// The revision digest: the content digest that the C18 registration records, which is
 /// the normalized text's unless the registration retained other original bytes.
 fn recorded_digest(v: &Value, text: &Sha256Digest) -> Sha256Digest {
@@ -349,6 +369,8 @@ struct Batch {
     /// the facts left out, with their code
     failed: Vec<Value>,
     flagged: Vec<Value>,
+    /// the possible duplicates of new entities, reported and written nowhere
+    candidates: Vec<Value>,
     entities: Value,
     claims: usize,
 }
@@ -371,7 +393,6 @@ fn batch(
     facts: &[Fact],
     linked: &Linked,
     src: &Source,
-    model: &NamedNode,
     mut failed_facts: Vec<Value>,
 ) -> Result<Batch, Failed> {
     let dataset_id = r
@@ -458,6 +479,7 @@ fn batch(
     };
     // the entities: existing IRIs, or a name-based UUID of the revision for a new one
     let mut flagged: Vec<Value> = Vec::new();
+    let mut candidates: Vec<Value> = Vec::new();
     let entity_iri: Vec<Option<NamedNode>> = linked
         .entities
         .iter()
@@ -468,7 +490,14 @@ fn batch(
                 flagged.push(json!({ "entity": text, "chosen": i, "candidates": c }));
                 named(i)
             }
-            Link::New(_) => {
+            Link::New(c) => {
+                if !c.is_empty() {
+                    let c: Vec<String> = c
+                        .iter()
+                        .filter_map(|i| named(i).map(|n| n.as_str().to_string()))
+                        .collect();
+                    candidates.push(json!({ "entity": text, "candidates": c }));
+                }
                 let norm = crate::mcp::memory::ingest::fold_ws(text).to_lowercase();
                 let id = crate::mcp::memory::assert::uuid_v5(
                     &dataset_id,
@@ -485,8 +514,9 @@ fn batch(
         })
         .collect();
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-    let mut claims: Vec<(Triple, usize, Option<f64>)> = Vec::new();
-    let mut first_span: HashMap<usize, (usize, usize)> = HashMap::new();
+    // each claim with its passage, confidence and the model whose answer gave it
+    let mut claims: Vec<(Triple, usize, Option<f64>, NamedNode)> = Vec::new();
+    let mut first_span: HashMap<usize, (usize, usize, NamedNode)> = HashMap::new();
     for f in facts {
         let term_of = |k: &str| linked.entity_of.get(k).and_then(|e| entity_iri[*e].clone());
         let Some(s) = term_of(&f.s) else {
@@ -537,9 +567,12 @@ fn batch(
             Obj::Key(k) => Some(k),
             Obj::Lit(_) => None,
         });
+        let model = model_iri(f.pair.as_ref());
         for k in entities_of {
             if let Some(e) = linked.entity_of.get(k) {
-                first_span.entry(*e).or_insert((f.start, f.end));
+                first_span
+                    .entry(*e)
+                    .or_insert((f.start, f.end, model.clone()));
             }
         }
         let i = passage(&mut input, f.start, f.end)?;
@@ -549,7 +582,7 @@ fn batch(
             continue;
         }
         seen.insert(id, claims.len());
-        claims.push((t, i, f.confidence));
+        claims.push((t, i, f.confidence, model));
     }
     // a new entity's class and label are claims too, cited by its first passage
     let label_p = v
@@ -562,13 +595,19 @@ fn batch(
         if !matches!(l, Link::New(_)) {
             continue;
         }
-        let (Some(iri), Some(&(a, b))) = (&entity_iri[e], first_span.get(&e)) else {
+        let (Some(iri), Some((a, b, model))) = (&entity_iri[e], first_span.get(&e)) else {
             continue;
         };
+        let (a, b) = (*a, *b);
         new_entities += 1;
         let i = passage(&mut input, a, b)?;
         if let Some(c) = named(class) {
-            claims.push((Triple::new(iri.clone(), rdf::TYPE, c), i, None));
+            claims.push((
+                Triple::new(iri.clone(), rdf::TYPE, c),
+                i,
+                None,
+                model.clone(),
+            ));
         }
         let label: Term = match &v.language {
             Some(lang) => Literal::new_language_tagged_literal(text.clone(), lang)
@@ -576,7 +615,12 @@ fn batch(
                 .unwrap_or_else(|_| Literal::new_simple_literal(text.clone()).into()),
             None => Literal::new_simple_literal(text.clone()).into(),
         };
-        claims.push((Triple::new(iri.clone(), label_p.clone(), label), i, None));
+        claims.push((
+            Triple::new(iri.clone(), label_p.clone(), label),
+            i,
+            None,
+            model.clone(),
+        ));
     }
     if claims.len() > sparkles::evidence::MAX_CLAIMS {
         return Err(too_large(format!(
@@ -585,8 +629,12 @@ fn batch(
             sparkles::evidence::MAX_CLAIMS
         )));
     }
-    for (n, (t, i, confidence)) in claims.iter().enumerate() {
-        decoded += t.to_string().len() * 2;
+    // every field a claim and its link frame: the proposition, the keys, the author,
+    // the evaluator and the methods, counted twice for their escaped forms
+    decoded += 2 * (src.source.as_str().len() + src.source_key.len() + 512);
+    for (n, (t, i, confidence, model)) in claims.iter().enumerate() {
+        decoded +=
+            2 * (t.to_string().len() + src.source.as_str().len() + 3 * model.as_str().len() + 512);
         let occurrence = format!(
             "{t} {}-{}",
             input.passages[*i].start, input.passages[*i].end
@@ -643,6 +691,7 @@ fn batch(
         input,
         failed: failed_facts,
         flagged,
+        candidates,
         entities,
     })
 }
@@ -790,8 +839,8 @@ fn models_and_pairs<'m>(
     }
 }
 
-fn model_iri(ex: &super::extract::Extraction) -> NamedNode {
-    match &ex.main_pair {
+fn model_iri(pair: Option<&crate::models::Pair>) -> NamedNode {
+    match pair {
         Some(p) => agent_iri(
             "urn:x-sparkles:model:",
             &format!("{}/{}", p.provider, p.model),
@@ -914,9 +963,9 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     }
     // 4. the estimate, the extraction and linking
     let chunks = crate::mcp::memory::ingest::chunk_bounds(&text, false);
-    let vocab = Vocabulary::read(r, &profile)?;
-    estimate(r, req, models, &pairs, &vocab, &text, &chunks, &t)?;
     let branch = (t.branch != sparkles::branch::MAIN).then_some(t.branch.as_str());
+    let vocab = Vocabulary::read_on(r, &profile, branch)?;
+    estimate(r, req, models, &pairs, &vocab, &text, &chunks, &t)?;
     let ex = super::extract::extract(
         r,
         models,
@@ -930,7 +979,7 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     ctx.progress.status(Status::Writing, 0.9, None);
     let src = Source {
         source: NamedNode::new(source.clone()).map_err(|e| failed("error", 500, e.to_string()))?,
-        source_key: source.clone(),
+        source_key: source_key(&t, &source, &graph)?,
         revision_digest,
         locator: req
             .url
@@ -942,16 +991,7 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         format: format.name(),
         text: &text,
     };
-    let model = model_iri(&ex);
-    let b = batch(
-        r,
-        &vocab,
-        &ex.facts,
-        &linked,
-        &src,
-        &model,
-        ex.failed.clone(),
-    )?;
+    let b = batch(r, &vocab, &ex.facts, &linked, &src, ex.failed.clone())?;
     let message = format!(
         "Ingest claims from {}",
         title.as_deref().unwrap_or(source.as_str())
@@ -982,6 +1022,9 @@ fn finish(
     out["entities"] = b.entities.clone();
     if !b.flagged.is_empty() {
         out["flagged"] = b.flagged.clone().into();
+    }
+    if !b.candidates.is_empty() {
+        out["candidates"] = b.candidates.clone().into();
     }
     if ex.chunks_failed > 0 {
         out["chunksFailed"] = ex.chunks_failed.into();
@@ -1032,7 +1075,8 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
     let t = target(r, req)?;
     let (models, pairs) = models_and_pairs(r, &t.main, req)?;
     let principal = crate::evidence::principal_iri(ctx.principal);
-    let read = super::pipeline::read_source(r, source)?;
+    let on = (t.branch != sparkles::branch::MAIN).then_some(t.branch.as_str());
+    let read = super::pipeline::read_source(r, source, on)?;
     let profile = req.profile.clone().unwrap_or_else(|| "default".into());
     let rendition_digest = sha(read.text.as_bytes())?;
     let revision_digest = recorded_digest(&read.found["digest"], &rendition_digest);
@@ -1063,9 +1107,9 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
         out["operation"] = op.as_str().into();
         return Ok(out);
     }
-    let vocab = Vocabulary::read(r, &profile)?;
-    estimate(r, req, models, &pairs, &vocab, &read.text, &read.chunks, &t)?;
     let branch = (t.branch != sparkles::branch::MAIN).then_some(t.branch.as_str());
+    let vocab = Vocabulary::read_on(r, &profile, branch)?;
+    estimate(r, req, models, &pairs, &vocab, &read.text, &read.chunks, &t)?;
     let ex = super::extract::extract(
         r,
         models,
@@ -1084,7 +1128,7 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
     let src = Source {
         source: NamedNode::new(source_iri.clone())
             .map_err(|e| failed("error", 500, e.to_string()))?,
-        source_key: source_iri.clone(),
+        source_key: source_key(&t, &source_iri, &read.graph)?,
         revision_digest,
         locator: None,
         rendition_key: read.rendition.clone(),
@@ -1092,16 +1136,7 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
         format: "registered",
         text: &read.text,
     };
-    let model = model_iri(&ex);
-    let b = batch(
-        r,
-        &vocab,
-        &ex.facts,
-        &linked,
-        &src,
-        &model,
-        ex.failed.clone(),
-    )?;
+    let b = batch(r, &vocab, &ex.facts, &linked, &src, ex.failed.clone())?;
     let message = format!("Ingest claims from {source_iri}");
     let (proposed, _) = publish(r, &t, &b.input, None, None, &key, message)?;
     finish(&mut out, &proposed, &b, &ex);

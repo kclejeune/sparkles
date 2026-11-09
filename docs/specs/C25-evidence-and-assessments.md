@@ -1502,8 +1502,8 @@ references, the claims and one evidence link per claim.
 | Source revision | Its source is the IRI that the registration gives the C18 source, or for a `source` run the registered source's IRI. Its content is metadata only, with the content digest that the C18 registration records, and an http or https URL is a locator. |
 | Rendition | Its occurrence key is the C18 rendition IRI, and the conversion is a method named by the format and the server version. It retains the normalized text as `ev:normalizedText`. A `source` run uses the text of the source's current rendition. |
 | Passage and reference | One passage per distinct span of the extracted facts, quoting the exact selected text, and one evidence reference to it. |
-| Claim | One `ev:Reported`, `ev:Positive` occurrence per extracted fact, attributed to the source and derived from the revision. A reported confidence becomes `ev:extractionConfidence` on the zero-to-one scale, evaluated by the extraction model. |
-| Evidence link | `ev:Supports` from the fact's passage reference to its claim, attributed to the extraction model. |
+| Claim | One `ev:Reported`, `ev:Positive` occurrence per extracted fact, attributed to the source and derived from the revision. A reported confidence becomes `ev:extractionConfidence` on the zero-to-one scale, evaluated by the model whose answer gave the fact. |
+| Evidence link | `ev:Supports` from the fact's passage reference to its claim, attributed to the model whose answer gave the fact. |
 
 The C18 registration records the digest of the normalized text as the source's content
 digest when it keeps no other original bytes, which is the case for converted uploads.
@@ -1535,8 +1535,9 @@ and is listed in the result's `flagged` member, as on a review branch. A new ent
 a name-based UUID of the dataset, the revision digest and the entity's normalized text
 and class, so that the same revision names the same entity again. Its class and label
 are proposed as two further claims, `rdf:type` and the profile's label predicate, cited
-by the first passage that mentions the entity. The candidates of a `candidates` verdict
-are reported in the result and written nowhere.
+by the first passage that mentions the entity and attributed to the model of that
+passage's fact. The candidates of a `candidates` verdict are reported in the result's
+`candidates` member and written nowhere.
 
 The rejected alternative asserts new entities' types and labels in an ordinary graph.
 That needs a second commit and asserts extracted content before any review.
@@ -1575,8 +1576,10 @@ Every claims ingestion carries the idempotency key `ingest-claims:1:<digest>`. T
 digest is the SHA-256 of a canonical JSON array of the version, the source IRI, the
 C18 source graph, the evidence source-record and proposal graphs, the revision and
 rendition digests and the profile name. The same text under another source or graph is
-therefore another ingestion with its own occurrences. The changing registration delta
-is not part of the key or of the payload digest. Before extraction the
+therefore another ingestion with its own occurrences. The revision's source key frames
+the same source and graphs, so its record identities, and the identities derived from
+them, differ as well. The changing registration delta is not part of the key or of the
+payload digest. Before extraction the
 pipeline derives the operation IRI of that key for the caller with `operation_iri` and
 looks for it in the record graphs of the selected branch. When it is found, the result
 is `already-proposed` with the first operation, and nothing is extracted or written, so
@@ -1618,9 +1621,12 @@ decision rather than an inference.
 #### Bounds
 
 The existing refusals of more than 10 MiB of input or 2 MiB of converted text answer
-`too-large` before extraction or any write. Extraction stops calling the model once the
-collected facts and entity claims exceed the 1,000 claims of §8, and the run is refused
-with `too-large`, writing nothing. Before `propose`, the pipeline charges the batch's
+`too-large` before extraction or any write. Every fact makes at least one claim, so
+extraction stops calling the model once the collected facts exceed the 1,000 claims of
+§8, and the run is refused with `too-large`, writing nothing. The class and label claims
+of new entities are known only after linking, and a batch that they take over the bound
+is refused the same way before anything is written. An upper bound that counted every
+mention as a new entity would refuse documents whose mentions link to existing entities. Before `propose`, the pipeline charges the batch's
 decoded size, including the rendition text, quotes and literals, against the 16 MiB of
 §8, and the same refusal applies when it is exceeded. The HTTP route enforces that
 bound only through its body limit, so the pipeline must check it itself. A document is

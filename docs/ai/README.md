@@ -293,7 +293,8 @@ before a branch expires and a way to keep one branch remain under item 435.
   `already-proposed` without a model call, and an extraction of more than 1,000 claims is
   refused as `too-large` with nothing written. The evidence rendition keeps the text that
   a review verifies, so the text is stored once in the chunks and once in the evidence
-  graph ([C25](../specs/C25-evidence-and-assessments.md#ingestion-into-claim-proposals)).
+  graph. [C25](../specs/C25-evidence-and-assessments.md#ingestion-into-claim-proposals)
+  records the contract.
 * PDF conversion uses pdf-inspector with the `pdf` cargo feature, on by default, and the
   `pdf-ocr` feature is included by default. Scanned pages use OCR models and native
   libraries that the operator provides. Office

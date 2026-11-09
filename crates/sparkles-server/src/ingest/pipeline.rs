@@ -748,7 +748,7 @@ fn run_existing(r: &mut Run, req: &Request, source: &str) -> Result<Value, Faile
         text,
         chunks,
         ..
-    } = read_source(r, source)?;
+    } = read_source(r, source, None)?;
     let title = req
         .title
         .clone()
@@ -857,15 +857,20 @@ pub(super) struct ReadSource {
     pub chunks: Vec<(usize, usize)>,
 }
 
-/// Read a registered source and its current rendition's text, chunk by chunk.
-pub(super) fn read_source(r: &Run, source: &str) -> Result<ReadSource, Failed> {
+/// Read a registered source and its current rendition's text, chunk by chunk, on
+/// `branch` or `main`.
+pub(super) fn read_source(
+    r: &Run,
+    source: &str,
+    branch: Option<&str>,
+) -> Result<ReadSource, Failed> {
     let ctx = r.ctx;
     ctx.progress
         .status(Status::Registering, 0.05, Some("reading the source".into()));
     let listed = r.tool(
         "list_sources",
         json!({ "graphs": [format!("<{source}>")], "limit": 50 }),
-        None,
+        branch,
     )?;
     let prefixes = listed["prefixes"].clone();
     let found = listed["sources"]
@@ -897,7 +902,7 @@ pub(super) fn read_source(r: &Run, source: &str) -> Result<ReadSource, Failed> {
         let page = r.tool(
             "read_chunks",
             json!({ "rendition": format!("<{rendition}>"), "from": from, "count": 20 }),
-            None,
+            branch,
         )?;
         for c in page["chunks"].as_array().into_iter().flatten() {
             let (Some(a), Some(b), Some(t)) =

@@ -1884,16 +1884,83 @@ async fn claims_reingestion_is_idempotent_and_reuses_existing_chunks() {
     assert_eq!(again["result"]["operation"], operation);
     assert_eq!(m.requests().len(), calls, "no model call");
     assert_eq!(head(&st), at, "nothing written");
-    // the same text under another source graph is another ingestion
+    // the same source and text in another source graph is another ingestion, with
+    // other record identities
+    let revision = v["result"]["revision"].clone();
     let other = "https://example.org/notes/copy";
     let v = ingest(
         &app,
-        claims(json!({ "text": NOTES, "format": "text/markdown", "graph": other, "iri": other })),
+        claims(json!({ "text": NOTES, "format": "text/markdown", "graph": other, "iri": g })),
     )
     .await;
     assert_eq!(v["result"]["outcome"], "proposed", "{v}");
     assert_ne!(v["result"]["operation"], operation);
+    assert_ne!(v["result"]["revision"], revision, "{v}");
+    assert!(
+        v["result"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["existing"] == false),
+        "{v}"
+    );
     assert!(m.requests().len() > calls);
+}
+
+#[tokio::test]
+async fn claims_on_a_branch_read_and_write_that_branch() {
+    let m = proposals_mock();
+    let (st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    evidence(&app).await;
+    // a branch-mode ingestion registers its source on the branch only
+    let g = "https://example.org/notes/branch-only";
+    let v = ingest(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({ "text": NOTES, "format": "text/markdown", "graph": g, "iri": g,
+                    "branch": "work", "extract": false }),
+        ),
+    )
+    .await;
+    assert_eq!(v["status"], "done", "{v}");
+    let main_head = head(&st);
+    let main = st.get("org").unwrap();
+    let work = || {
+        st.branch_dataset(&main, "work")
+            .unwrap()
+            .store
+            .head_commit()
+            .seq
+    };
+    let before = work();
+    let v = ingest(&app, claims(json!({ "source": g, "branch": "work" }))).await;
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(v["result"]["outcome"], "proposed", "{v}");
+    assert_eq!(v["result"]["branch"], "work");
+    assert_eq!(work(), before + 1);
+    assert_eq!(head(&st), main_head, "main is unchanged");
+    // on main the source is unknown
+    let v = ingest(&app, claims(json!({ "source": g }))).await;
+    assert_eq!(v["error"]["code"], "unknown-source", "{v}");
+    // an upload on the branch registers and proposes there
+    let before = work();
+    let v = ingest(
+        &app,
+        claims(
+            json!({ "text": "# Other\n\nKai Berg leads the platform team.\n",
+                       "format": "text/markdown", "branch": "work" }),
+        ),
+    )
+    .await;
+    assert_eq!(v["result"]["outcome"], "proposed", "{v}");
+    assert_eq!(work(), before + 1);
+    assert_eq!(head(&st), main_head);
+    // a branch that does not exist is refused
+    let v = ingest(&app, claims(json!({ "text": NOTES, "branch": "nope" }))).await;
+    assert_eq!(v["status"], "failed", "{v}");
 }
 
 /// A run of `body` on this thread, as the local principal.

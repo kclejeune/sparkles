@@ -29,7 +29,7 @@ Omitted fields and an empty object keep their previous meaning.
 
 ### Added
 
-`POST /$/ingest/{ds}` and `sparkles ingest` have a `claims` mode (item 651). It registers
+Roadmap item 651 adds a `claims` mode to `POST /$/ingest/{ds}` and `sparkles ingest`. It registers
 the document's source and chunks as the other modes do and proposes the extracted facts
 as claim occurrences of one evidence batch, with their passages and supporting evidence
 links, in the same commit, so that a review policy decides what is projected. It checks
