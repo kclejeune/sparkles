@@ -141,6 +141,8 @@
       files = [];
       await load();
       oncommitted?.(a.changed ? committed(a) : null);
+      // the map changed, also when no commit did
+      onchanged?.();
     });
   const fetchOne = (iri: string) =>
     act(`fetch ${iri}`, async () => {
@@ -150,6 +152,8 @@
         : `${name(iri)} is unchanged.`;
       await load();
       oncommitted?.(a.changed ? committed(a) : null);
+      // the map changed, also when no commit did
+      onchanged?.();
     });
   /** The commit a receipt-carrying answer names. */
   function committed(a: object): number | null {

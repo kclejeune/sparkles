@@ -40401,7 +40401,13 @@
             "$ref": "#/components/parameters/ds"
           },
           {
-            "$ref": "#/components/parameters/ifMatch"
+            "description": "The map's revision that the change starts from, as `GET` gives it. `*` is refused.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -40424,7 +40430,50 @@
                           "type": "string"
                         },
                         {
-                          "description": "An entry of the map, with or without its `iri`.",
+                          "additionalProperties": false,
+                          "description": "An entry of the map, with or without its `iri`, kept as given.",
+                          "properties": {
+                            "branch": {
+                              "type": "string"
+                            },
+                            "commit": {
+                              "type": "integer"
+                            },
+                            "digest": {
+                              "description": "`sha256:` and the hex digest of the bytes loaded.",
+                              "type": "string"
+                            },
+                            "etag": {
+                              "type": "string"
+                            },
+                            "fetched": {
+                              "format": "date-time",
+                              "type": "string"
+                            },
+                            "file": {
+                              "description": "The catalog's path of the file loaded into the graph.",
+                              "type": "string"
+                            },
+                            "graph": {
+                              "type": "string"
+                            },
+                            "iri": {
+                              "description": "The import IRI or version IRI.",
+                              "type": "string"
+                            },
+                            "location": {
+                              "description": "The URL fetched.",
+                              "type": "string"
+                            },
+                            "source": {
+                              "enum": [
+                                "manual",
+                                "catalog",
+                                "fetch"
+                              ],
+                              "type": "string"
+                            }
+                          },
                           "required": [
                             "graph",
                             "source"

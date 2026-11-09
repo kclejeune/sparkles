@@ -1206,6 +1206,12 @@ fn ontology(p: &mut Paths) {
         "digest": { "type": "string", "description": "`sha256:` and the hex digest of the bytes loaded." },
         "fetched": { "type": "string", "format": "date-time" }
     } });
+    // an entry as PATCH takes it whole: an entry of the map, with or without its `iri`
+    let mut set_entry = import_entry.clone();
+    set_entry["required"] = json!(["graph", "source"]);
+    set_entry["additionalProperties"] = json!(false);
+    set_entry["description"] =
+        json!("An entry of the map, with or without its `iri`, kept as given.");
     let import_map = json!({ "application/json": { "schema": { "type": "object", "properties": {
         "dataset": { "type": "string" },
         "revision": { "type": "string", "description": "The map's entity tag, which a PATCH's `If-Match` names." },
@@ -1224,7 +1230,11 @@ fn ontology(p: &mut Paths) {
         op(PATCH, "/$/ontology/{ds}/imports", "patchOntologyImportMap", "Ontology", "Change the import map")
             .doc("Sets and removes entries of the import map. A graph given as a string makes a manual entry, and an entry object, such as one that an `import-map-unwritten` answer lists, is kept as given. The map holds at most 4,096 entries, and each IRI and graph is at most 4 KiB. The `If-Match` header must name the map's revision. Without it, or with `*`, the change is `428`, and a stale revision is `412`.")
             .see("ontology")
-            .params(&["ifMatch"])
+            .header_req(
+                "If-Match",
+                json!({ "type": "string" }),
+                "The map's revision that the change starts from, as `GET` gives it. `*` is refused.",
+            )
             .body(
                 true,
                 "The change.",
@@ -1234,7 +1244,7 @@ fn ontology(p: &mut Paths) {
                     "properties": {
                         "set": { "type": "object", "additionalProperties": { "oneOf": [
                             { "type": "string", "description": "The graph, for a manual entry." },
-                            { "type": "object", "required": ["graph", "source"], "description": "An entry of the map, with or without its `iri`." }
+                            set_entry
                         ] }, "description": "Import IRI to graph or entry." },
                         "remove": { "type": "array", "items": { "type": "string" } }
                     }

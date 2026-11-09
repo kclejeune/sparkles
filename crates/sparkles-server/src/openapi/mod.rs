@@ -135,6 +135,15 @@ impl Op {
         self
     }
 
+    /// A required request header.
+    pub fn header_req(mut self, name: &str, schema: J, description: &str) -> Self {
+        self.params.push(json!({
+            "name": name, "in": "header", "required": true, "schema": schema,
+            "description": description,
+        }));
+        self
+    }
+
     /// The request body: `content` maps media types to media type objects.
     pub fn body(mut self, required: bool, description: &str, content: J) -> Self {
         self.obj.insert(

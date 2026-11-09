@@ -383,8 +383,8 @@
   // identities carry `importsRev` as well as the switch.
   let importsRev = $state(0);
   function rereadImports() {
-    summary = null;
-    shown = 0;
+    // the summary stays on screen until its next read lands, so the Imports tab keeps its
+    // form state; the reset below forgets what the views read
     loadedTarget = null;
     resetLazy();
     for (const lt of levelTrees.values()) lt.drop();
@@ -942,7 +942,12 @@
   const names = () => completionNames;
   /** Names of the kinds too long to list, found by the server's search as they are typed. */
   async function searchNames(word: string, signal: AbortSignal): Promise<NameOption[]> {
-    const r = await searchEntities(target, word, { limit: 20, graph, signal });
+    const r = await searchEntities(target, word, {
+      limit: 20,
+      graph,
+      imports: withImports,
+      signal,
+    });
     return r.results.map((h) => ({
       name: h.label ?? h.shortForm ?? iriName(h.iri, prefixes),
       iri: h.iri,

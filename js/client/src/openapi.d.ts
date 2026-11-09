@@ -18828,9 +18828,9 @@ export interface operations {
     patchOntologyImportMap: {
         parameters: {
             query?: never;
-            header?: {
-                /** @description Entity tags. A write needs a tag that names the current head. */
-                "If-Match"?: components["parameters"]["ifMatch"];
+            header: {
+                /** @description The map's revision that the change starts from, as `GET` gives it. `*` is refused. */
+                "If-Match": string;
             };
             path: {
                 /** @description The dataset name. */
@@ -18845,7 +18845,24 @@ export interface operations {
                     remove?: string[];
                     /** @description Import IRI to graph or entry. */
                     set?: {
-                        [key: string]: string | Record<string, never>;
+                        [key: string]: string | {
+                            branch?: string;
+                            commit?: number;
+                            /** @description `sha256:` and the hex digest of the bytes loaded. */
+                            digest?: string;
+                            etag?: string;
+                            /** Format: date-time */
+                            fetched?: string;
+                            /** @description The catalog's path of the file loaded into the graph. */
+                            file?: string;
+                            graph: string;
+                            /** @description The import IRI or version IRI. */
+                            iri?: string;
+                            /** @description The URL fetched. */
+                            location?: string;
+                            /** @enum {string} */
+                            source: "manual" | "catalog" | "fetch";
+                        };
                     };
                 };
             };

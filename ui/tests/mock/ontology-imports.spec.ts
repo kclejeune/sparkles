@@ -248,11 +248,36 @@ test('the switch and a map change read the tree and the frame again', async ({ p
       .getByRole('textbox', { name: 'Import IRI' })
       .fill('http://example.org/reread/missing');
     await page.getByRole('textbox', { name: 'Graph' }).fill('http://example.org/reread/lib2');
+    // a catalog chosen before the map change stays chosen, and the notice stays
+    const form = page.getByRole('form', { name: 'Load an XML catalog' });
+    const mapOnly = `<catalog xmlns="urn:oasis:names:tc:entity:xmlns:xml:catalog">
+  <uri name="http://example.org/reread/other" uri="http://example.org/reread/lib"/>
+</catalog>`;
+    await form.getByLabel('Catalog').setInputFiles({
+      name: 'map-only.xml',
+      mimeType: 'application/xml',
+      buffer: Buffer.from(mapOnly),
+    });
     await page.getByRole('button', { name: 'Add entry' }).click();
     await expect(mapTable(page)).toContainText('manual');
+    await expect(page.getByText('The entry was added.')).toBeVisible();
+    await expect(form.getByRole('button', { name: 'Load catalog' })).toBeEnabled();
     await page.getByRole('tab', { name: 'Tree' }).click();
     await expect(agent).toBeVisible();
     await expect.poll(() => reads.some((u) => u.includes('/hierarchy?'))).toBe(true);
+    await expect.poll(() => reads.some((u) => u.includes('/entity?'))).toBe(true);
+    // a catalog that only maps, and so makes no commit, reads them again too
+    await page.getByRole('tab', { name: 'Imports' }).click();
+    await form.getByLabel('Catalog').setInputFiles({
+      name: 'map-only.xml',
+      mimeType: 'application/xml',
+      buffer: Buffer.from(mapOnly),
+    });
+    await form.getByRole('button', { name: 'Load catalog' }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'mapped 1 import' })).toBeVisible();
+    reads.length = 0;
+    await page.getByRole('tab', { name: 'Tree' }).click();
+    await expect(agent).toBeVisible();
     await expect.poll(() => reads.some((u) => u.includes('/entity?'))).toBe(true);
   } finally {
     await request.delete(`/$/branches/uni/${branch}?force=true`);
