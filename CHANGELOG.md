@@ -27,7 +27,22 @@ The `expect` heads of `POST /$/merge/{ds}`, `POST /$/cherry-pick/{ds}` and
 branch UUID, or a null in their place, now returns `400` instead of being ignored.
 Omitted fields and an empty object keep their previous meaning.
 
+The `--mode` flag of `sparkles ingest` accepts `claims` (item 651). Every value it
+accepted before parses and behaves as before.
+
 ### Added
+
+Roadmap item 651 adds a `claims` mode to `POST /$/ingest/{ds}` and `sparkles ingest`. It registers
+the document's source and chunks as the other modes do and proposes the extracted facts
+as claim occurrences of one evidence batch, with their passages and supporting evidence
+links, in the same commit, so that a review policy decides what is projected. It checks
+the caller's update grants, the evidence settings and `keepText` before any model call,
+answers `already-proposed` for a repeat of the same source, graph and text without a
+model call, and refuses an extraction over 1,000 claims as `too-large` with nothing
+written. New `sourceGraph` and `proposalGraph` options choose the evidence graphs.
+`sparkles::evidence::propose` takes ordinary changes outside every managed graph to
+publish in the batch's commit. The evidence rendition keeps its text, so a claims
+ingestion stores the text in its chunks and again in the evidence graph.
 
 The ontology editor's entity frame has a History view (item 620). It lists the branch's
 commits that changed a triple naming the entity in the editor's graph, newest first and

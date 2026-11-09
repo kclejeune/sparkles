@@ -52,6 +52,10 @@ pub struct Vocabulary {
     /// the enumerations of `ingest_profile`'s JSON Schema
     pub class_enum: Vec<String>,
     pub predicate_enum: Vec<String>,
+    /// the prefixes of the profile's prefixed names
+    pub prefixes: Value,
+    /// the predicate that labels new entities
+    pub label_predicate: Option<String>,
 }
 
 fn strings(v: &Value) -> Vec<String> {
@@ -65,7 +69,12 @@ fn strings(v: &Value) -> Vec<String> {
 impl Vocabulary {
     /// The profile `name` as the caller sees it.
     pub fn read(r: &Run, name: &str) -> Result<Vocabulary, Failed> {
-        let p = r.tool("ingest_profile", json!({ "name": name }), None)?;
+        Vocabulary::read_on(r, name, None)
+    }
+
+    /// The profile `name` as the caller sees it on `branch`, or on `main`.
+    pub fn read_on(r: &Run, name: &str, branch: Option<&str>) -> Result<Vocabulary, Failed> {
+        let p = r.tool("ingest_profile", json!({ "name": name }), branch)?;
         Vocabulary::from_profile(name, &p)
     }
 
@@ -113,6 +122,8 @@ impl Vocabulary {
             language: p["language"].as_str().map(str::to_string),
             class_enum,
             predicate_enum,
+            prefixes: p["prefixes"].clone(),
+            label_predicate: p["labelPredicate"].as_str().map(str::to_string),
         })
     }
 
@@ -336,6 +347,8 @@ pub struct Fact {
     pub end: usize,
     pub quote: String,
     pub confidence: Option<f64>,
+    /// the pair whose answer gave the fact
+    pub pair: Option<Pair>,
 }
 
 /// What the model answered for the whole rendition.
@@ -391,7 +404,12 @@ pub fn locate(chars: &[char], from: usize, to: usize, quote: &str) -> Option<(us
     None
 }
 
-/// Run the extraction over every chunk.
+/// A check of the extraction so far, run after each chunk that answers. Its refusal
+/// stops the extraction before the next model call.
+pub(super) type Check<'c> = &'c mut dyn FnMut(&mut Run, &Extraction) -> Result<(), Failed>;
+
+/// Run the extraction over every chunk. With `check`, the extraction stops calling the
+/// model as soon as the check refuses what it has collected.
 pub fn extract(
     r: &mut Run,
     models: &Models,
@@ -399,6 +417,7 @@ pub fn extract(
     v: &Vocabulary,
     text: &str,
     chunks: &[(usize, usize)],
+    mut check: Option<Check<'_>>,
 ) -> Result<Extraction, Failed> {
     let chars: Vec<char> = text.chars().collect();
     let schema = OutputSchema {
@@ -491,11 +510,17 @@ pub fn extract(
         *answered.entry(pos).or_default() += 1;
         let before = out.facts.len();
         read_answer(&value, ci, &chars, ctx_from, *b, v, &mut out);
+        for f in &mut out.facts[before..] {
+            f.pair = Some(pair.clone());
+        }
         r.usage.chunks.push(json!({
             "index": ci, "start": a, "end": b, "outcome": "ok",
             "provider": pair.provider, "model": pair.model,
             "facts": out.facts.len() - before,
         }));
+        if let Some(check) = check.as_mut() {
+            check(r, &out)?;
+        }
     }
     if out.chunks_failed == chunks.len() && !chunks.is_empty() {
         return Err(Failed::new(
@@ -634,6 +659,7 @@ fn read_answer(
             end: b,
             quote: chars[a..b].iter().collect(),
             confidence,
+            pair: None,
         });
     }
 }
@@ -679,7 +705,7 @@ fn bare(s: &str) -> String {
 
 /// What linking decided for one entity (§7.5).
 #[derive(Clone, Debug)]
-enum Link {
+pub(super) enum Link {
     Existing(String),
     /// written with the first candidate and flagged
     Ambiguous(String, Vec<String>),
@@ -696,6 +722,177 @@ pub struct Proposals {
     pub min_confidence: f64,
 }
 
+/// The entities of an extraction and what linking decided for each (§7.5).
+pub(super) struct Linked {
+    /// (normalized name, class) of each entity
+    pub entities: Vec<(String, String)>,
+    /// the entity of each mention key that a fact uses
+    pub entity_of: HashMap<String, usize>,
+    pub links: Vec<Link>,
+    /// the prefixes of the candidates' prefixed names
+    pub prefixes: Value,
+}
+
+fn merge_prefixes(into: &mut Value, from: &Value) {
+    if let (Some(into), Some(from)) = (into.as_object_mut(), from.as_object()) {
+        for (k, v) in from {
+            into.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+}
+
+/// Links the entities of an extraction as it grows, so that each entity is linked once
+/// however often the extraction is linked again.
+pub(super) struct Linker {
+    by_name: HashMap<(String, String), usize>,
+    /// (name as first written, class) of each entity
+    entities: Vec<(String, String)>,
+    links: Vec<Link>,
+    prefixes: Value,
+}
+
+fn norm(s: &str) -> String {
+    fold_ws(s).to_lowercase()
+}
+
+impl Linker {
+    pub(super) fn new() -> Self {
+        Self {
+            by_name: HashMap::new(),
+            entities: Vec::new(),
+            links: Vec::new(),
+            prefixes: json!({}),
+        }
+    }
+
+    /// The entity of each mention key that a fact of `ex` uses.
+    fn entity_of(&self, ex: &Extraction) -> HashMap<String, usize> {
+        let mut entity_of = HashMap::new();
+        for k in used(ex) {
+            if let Some((text, class)) = ex.mentions.get(k)
+                && let Some(e) = self.by_name.get(&(norm(text), class.clone()))
+            {
+                entity_of.insert(k.clone(), *e);
+            }
+        }
+        entity_of
+    }
+
+    /// Link the entities of `ex` that are not linked yet with `link_entities`, as the
+    /// caller, on `branch`. Mentions with the same normalized name and class are one
+    /// entity (§7.5).
+    pub(super) fn update(
+        &mut self,
+        r: &mut Run,
+        ex: &Extraction,
+        branch: Option<&str>,
+    ) -> Result<(), Failed> {
+        let used = used(ex);
+        for (k, (text, class)) in &ex.mentions {
+            if !used.contains(k) {
+                continue;
+            }
+            let entities = &mut self.entities;
+            self.by_name
+                .entry((norm(text), class.clone()))
+                .or_insert_with(|| {
+                    entities.push((text.clone(), class.clone()));
+                    entities.len() - 1
+                });
+        }
+        let start = self.links.len();
+        if start == self.entities.len() {
+            return Ok(());
+        }
+        // a context for each entity: the first quote that names it
+        let entity_of = self.entity_of(ex);
+        let mut context: HashMap<usize, String> = HashMap::new();
+        for f in &ex.facts {
+            if let Some(e) = entity_of.get(&f.s)
+                && *e >= start
+            {
+                context.entry(*e).or_insert_with(|| f.quote.clone());
+            }
+        }
+        let pending: Vec<(String, String)> = self.entities[start..].to_vec();
+        for (bi, batch) in pending.chunks(20).enumerate() {
+            r.check()?;
+            let base = start + bi * 20;
+            let mentions: Vec<Value> = batch
+                .iter()
+                .enumerate()
+                .map(|(i, (text, class))| {
+                    let mut m = json!({ "text": text, "types": [class] });
+                    if let Some(c) = context.get(&(base + i)) {
+                        m["context"] = c.chars().take(500).collect::<String>().into();
+                    }
+                    m
+                })
+                .collect();
+            let out = r.tool(
+                "link_entities",
+                json!({ "mentions": mentions, "k": 3 }),
+                branch,
+            )?;
+            merge_prefixes(&mut self.prefixes, &out["prefixes"]);
+            for m in out["mentions"].as_array().into_iter().flatten() {
+                if self.links.len() >= base + batch.len() {
+                    break;
+                }
+                let cands: Vec<String> = m["candidates"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|c| c["iri"].as_str().map(str::to_string))
+                    .collect();
+                self.links.push(match m["verdict"].as_str() {
+                    Some("exact") if !cands.is_empty() => Link::Existing(cands[0].clone()),
+                    Some("ambiguous") if !cands.is_empty() => {
+                        Link::Ambiguous(cands[0].clone(), cands)
+                    }
+                    _ => Link::New(cands),
+                });
+            }
+            while self.links.len() < base + batch.len() {
+                self.links.push(Link::New(Vec::new()));
+            }
+        }
+        Ok(())
+    }
+
+    /// The entities linked so far and the entity of each mention of `ex`.
+    pub(super) fn linked(&self, ex: &Extraction) -> Linked {
+        Linked {
+            entities: self.entities.clone(),
+            entity_of: self.entity_of(ex),
+            links: self.links.clone(),
+            prefixes: self.prefixes.clone(),
+        }
+    }
+}
+
+/// The mention keys that the facts of `ex` use.
+fn used(ex: &Extraction) -> std::collections::BTreeSet<&String> {
+    ex.facts
+        .iter()
+        .flat_map(|f| {
+            let mut v = vec![&f.s];
+            if let Obj::Key(k) = &f.o {
+                v.push(k);
+            }
+            v
+        })
+        .collect()
+}
+
+/// Link the entities of `ex` with `link_entities`, as the caller, on `branch`.
+pub(super) fn link(r: &mut Run, ex: &Extraction, branch: Option<&str>) -> Result<Linked, Failed> {
+    r.ctx.progress.status(super::Status::Linking, 0.82, None);
+    let mut linker = Linker::new();
+    linker.update(r, ex, branch)?;
+    Ok(linker.linked(ex))
+}
+
 /// Link the extraction's entities and write its facts on `branch` (or, for a preview,
 /// check them with a dry run on `main` without writing).
 pub fn propose(
@@ -707,78 +904,12 @@ pub fn propose(
     preview: bool,
     converted: &super::convert::Converted,
 ) -> Result<Proposals, Failed> {
-    r.ctx.progress.status(super::Status::Linking, 0.82, None);
-    // the entities: mentions with the same normalized name and class are one (§7.5)
-    let norm = |s: &str| fold_ws(s).to_lowercase();
-    let mut entity_of: HashMap<String, usize> = HashMap::new();
-    let mut entities: Vec<(String, String)> = Vec::new();
-    let mut by_name: HashMap<(String, String), usize> = HashMap::new();
-    let used: std::collections::BTreeSet<&String> = ex
-        .facts
-        .iter()
-        .flat_map(|f| {
-            let mut v = vec![&f.s];
-            if let Obj::Key(k) = &f.o {
-                v.push(k);
-            }
-            v
-        })
-        .collect();
-    for (k, (text, class)) in &ex.mentions {
-        if !used.contains(k) {
-            continue;
-        }
-        let id = *by_name
-            .entry((norm(text), class.clone()))
-            .or_insert_with(|| {
-                entities.push((text.clone(), class.clone()));
-                entities.len() - 1
-            });
-        entity_of.insert(k.clone(), id);
-    }
-    // a context for each entity: the first quote that names it
-    let mut context: HashMap<usize, String> = HashMap::new();
-    for f in &ex.facts {
-        if let Some(e) = entity_of.get(&f.s) {
-            context.entry(*e).or_insert_with(|| f.quote.clone());
-        }
-    }
-    let mut links: Vec<Link> = Vec::with_capacity(entities.len());
-    for (bi, batch) in entities.chunks(20).enumerate() {
-        r.check()?;
-        let mentions: Vec<Value> = batch
-            .iter()
-            .enumerate()
-            .map(|(i, (text, class))| {
-                let mut m = json!({ "text": text, "types": [class] });
-                if let Some(c) = context.get(&(bi * 20 + i)) {
-                    m["context"] = c.chars().take(500).collect::<String>().into();
-                }
-                m
-            })
-            .collect();
-        let out = r.tool(
-            "link_entities",
-            json!({ "mentions": mentions, "k": 3 }),
-            if preview { None } else { branch },
-        )?;
-        for m in out["mentions"].as_array().into_iter().flatten() {
-            let cands: Vec<String> = m["candidates"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|c| c["iri"].as_str().map(str::to_string))
-                .collect();
-            links.push(match m["verdict"].as_str() {
-                Some("exact") if !cands.is_empty() => Link::Existing(cands[0].clone()),
-                Some("ambiguous") if !cands.is_empty() => Link::Ambiguous(cands[0].clone(), cands),
-                _ => Link::New(cands),
-            });
-        }
-        while links.len() < (bi + 1) * 20 && links.len() < entities.len() {
-            links.push(Link::New(Vec::new()));
-        }
-    }
+    let Linked {
+        entities,
+        entity_of,
+        links,
+        ..
+    } = link(r, ex, if preview { None } else { branch })?;
     r.ctx.progress.status(super::Status::Writing, 0.9, None);
     let rendition = bare(registered["rendition"].as_str().unwrap_or(""));
     let graph = registered["graph"].as_str().unwrap_or("").to_string();
@@ -1200,6 +1331,8 @@ mod estimate_tests {
             language: None,
             class_enum: vec!["ex:Person".into()],
             predicate_enum: Vec::new(),
+            prefixes: serde_json::Value::Null,
+            label_predicate: None,
         };
         let text = "x".repeat(4000);
         let chunks = [(0, 2000), (2000, 4000)];

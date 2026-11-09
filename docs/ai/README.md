@@ -282,6 +282,19 @@ before a branch expires and a way to keep one branch remain under item 435.
   profile's vocabulary, finds each quote to compute its span, links names to existing
   entities, and writes the facts on a review branch. `mode: "preview"` holds them for
   approval, and `mode: "auto"` merges them when every check passes.
+* `mode: "claims"` registers the document's source and chunks as the other modes do and
+  writes its extracted facts as claim proposals of one evidence batch in the same commit,
+  so that a review policy decides what is projected. It needs enabled evidence settings,
+  `write` on the update endpoint, update grants on the evidence graphs and `keepText`, and
+  it checks them before any model call. Each fact becomes a reported, positive claim
+  occurrence attributed to its source, with its passage, a supporting evidence link and
+  the extraction model's confidence. New entities get name-based IRIs, and their classes
+  and labels are claims too. A repeat of the same source, graph and text answers
+  `already-proposed` without a model call, and an extraction of more than 1,000 claims is
+  refused as `too-large` with nothing written. The evidence rendition keeps the text that
+  a review verifies, so the text is stored once in the chunks and once in the evidence
+  graph. [C25](../specs/C25-evidence-and-assessments.md#ingestion-into-claim-proposals)
+  records the contract.
 * PDF conversion uses pdf-inspector with the `pdf` cargo feature, on by default, and the
   `pdf-ocr` feature is included by default. Scanned pages use OCR models and native
   libraries that the operator provides. Office
@@ -512,7 +525,9 @@ graphs are protected from ordinary writes but remain unauthenticated RDF.
 These resources are ordinary caller-visible data under the existing access policy.
 Their shapes check structure, while the fixtures independently check source bytes and
 selectors. Loading a review decision or receipt does not authenticate it, admit facts
-or enable execution. Existing `assert_facts` and source registration keep their current
+or enable execution. A claims ingestion through `POST /$/ingest/{ds}` with
+`mode: "claims"` proposes extracted facts through the same typed writer, with its source
+registration in the same commit, as [document ingestion](#document-ingestion) describes. Existing `assert_facts` and source registration keep their current
 behavior. [C25](../specs/C25-evidence-and-assessments.md#outcome) records the exact phase
 boundary and remaining managed operations.
 
