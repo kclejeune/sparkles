@@ -180,7 +180,7 @@ editor of item 617 come these, in order:
 1. Inferred axioms in entity frames (622), with the inferred property and individual
    trees of item 609. Their explanation links wait for F24's justifications.
 2. Watches (619), after the notifications of item 46.
-3. Import resolution (624), bulk edits (626) and pattern-based axiom generation (623).
+3. Import resolution (624) and pattern-based axiom generation (623).
 4. Vocabulary governance and change requests (627), after item 459.
 
 Tagging documents with concepts (628) belongs to Wave B's ingest work, and real-time
@@ -854,7 +854,8 @@ Rows that need backend work name it first.
 | 751 | **Navigation after an entity is removed.** Handle an outstanding tree reveal's not-found response when the selected entity has been deleted. Preserve selection and revision pins, normal reveals and cancellation when the view changes. | [U12](specs/U12-ontology-workbench/SPEC.md#outcome) | S |
 | 623 | **Pattern-based axiom generation.** Generate axioms from spreadsheet rows through templates and design patterns, in the manner of Cellfie, ROBOT template and DOSDP, previewed as one commit. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | M |
 | 624 | **Import resolution.** Resolve `owl:imports` to local copies, catalog entries of C30 or XML catalogs, show the imports closure and let views include or exclude imported axioms. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | M |
-| 626 | **Bulk edits.** Find and replace across labels and annotations, set or remove an annotation on many entities and move many classes at once, each as one previewed commit. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | M |
+| 770 | **Bulk edits of large ontologies.** The Bulk edits tab reads every annotation assertion or `SubClassOf` axiom of the graph into the browser and refuses a graph with more than 100,000 of either, and one edit changes at most 1,000 values or classes. Find matches on the server, page the changes and split a larger edit into bounded commits that undo can take back together. | [U12](specs/U12-ontology-workbench/SPEC.md#bulk-edits) | M |
+| 771 | **Batched entity kinds.** A bulk move checks the kinds of up to 1,000 listed entities from their `rdf:type` values, so an entity that the ontology's lenient read types only by its use, such as an untyped individual or a data property known from its assertions, can be moved under a class. Add a route that answers the lenient kinds of many IRIs at one commit, with grants and a bound, and use it for the check. | [U12](specs/U12-ontology-workbench/SPEC.md#bulk-edits) | S |
 | 627 | **Vocabulary governance and change requests.** Editor, reviewer and approver roles per vocabulary, and change requests that collect edits on a branch for review and approval before they merge, on top of item 459's checks. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | L |
 | 628 | **Tagging documents with concepts.** Suggest a thesaurus's concepts for ingested documents from their labels and embeddings, with review, as EDG's tagger does, through the C18 ingest pipeline. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | M–L |
 | 629 | **Real-time co-editing.** Show other editors' presence and merge concurrent edits to one entity live, which U05 §1 leaves open. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | L |
@@ -977,6 +978,7 @@ for them.
 
 ## Completed
 
+- **626.** The ontology editor's Bulk edits tab finds and replaces text across labels and annotations with a scope, literal or regular-expression matching and a language filter, sets or removes an annotation on the entities of a list and moves many classes under a new parent. Each edit is one previewed commit on the undo stack, and an edit of more than 1,000 changes is refused. [U12](specs/U12-ontology-workbench/SPEC.md#bulk-edits)
 - **618.** The ontology editor's entity frame has a Discussion view with comment threads on the entity and its axioms, with `@` mentions, replies, resolve and reopen, and the editor's Discussions tab lists an ontology's threads. Threads are W3C Web Annotation RDF in an ordinary named graph beside the ontology graph on the branch, and each comment, resolve or reopen is a commit. [U12](specs/U12-ontology-workbench/SPEC.md#discussions)
 - **620.** The ontology editor's entity frame has a History view that lists, newest first and in bounded pages, the commits of the branch that changed a triple naming the entity in the editor's graph. Each commit opens to the axioms and assertions mentioning the entity that it added and removed, through `GET /$/ontology/{ds}/diff?entity=`, links to its full diff and can be reverted as one previewed commit by a caller with write access to the branch. [U12](specs/U12-ontology-workbench/SPEC.md#entity-history)
 

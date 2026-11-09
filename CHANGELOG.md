@@ -44,6 +44,13 @@ written. New `sourceGraph` and `proposalGraph` options choose the evidence graph
 publish in the batch's commit. The evidence rendition keeps its text, so a claims
 ingestion stores the text in its chunks and again in the evidence graph.
 
+The ontology editor has a Bulk edits tab (item 626). It finds and replaces text across
+labels, every annotation or one property, as literal text or a regular expression, with a
+language filter and a scope of the whole graph or an entity list. It sets or removes an
+annotation on the entities of a list and moves the listed classes under a new parent or to
+the top, refusing a cycle. Each edit is one previewed commit through the editor's preview
+and undo stack, and an edit of more than 1,000 changes is refused with its count.
+
 The ontology editor's entity frame has a History view (item 620). It lists the branch's
 commits that changed a triple naming the entity in the editor's graph, newest first and
 in bounded pages, opens each to the axioms mentioning the entity that it added and
