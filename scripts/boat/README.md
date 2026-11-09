@@ -46,6 +46,28 @@ including first bootstrap. Actual bootstrap-lock, descendant, tool, manifest, so
 capacity, token metadata and metadata-service closure checks must pass afterward. A
 different manifest is refused rather than adopted automatically.
 
+## Startup closure
+
+The startup observer treats a process of the worker's uid as startup work, apart from
+systemd, its PAM helper and dbus. It also treats any installer, shell or build tool as
+startup work, whatever its uid, and tracks every descendant of startup work by PID and
+start time. The provider's desktop session, which the first SSH connection starts, runs
+more than 30 such processes for the worker's whole life, so that rule alone never closes.
+`PROVIDER_SESSION` in `startup-observer.py` allows those processes by their exact name and
+parent, as observed on an admitted worker. An allowed process has the worker's uid and a
+parent that is pid 1 as root, the worker's own user manager under pid 1, or another
+allowed process of the worker's uid. A process under any other parent, a name outside the
+table and any descendant of tracked startup work still count as startup work. Adding an
+entry needs the observed listing and an independent review.
+
+Every refusal records a bounded reason code. A refusal of this package keeps its literal
+reason, and any other exception records only its type and the function and line where it
+was raised, never its text. A busy startup reports up to 32 of the processes it counted,
+each with its pid, name, uid and parent's name and uid, and never a command line or
+environment. The controller keeps the first refused startup in `startup-refused.json` and
+the code of a failed qualification in `qualification-failed.json`. An unresolved stop
+records its code in `unresolved.json`.
+
 Development credentials remain on the development worker. The token is qualified with
 lstat, and its content is never read by this package. The reviewed setup hook's own
 metadata-open behavior must remain within the release's provisioning scope. GitHub
@@ -64,6 +86,7 @@ mise run boat:qualify --unit "$LOCAL_CONTROLLER_UNIT" --worker "$OWNED_WORKER" -
 journalctl --user -u "$LOCAL_CONTROLLER_UNIT" --no-pager
 python3 -I -B scripts/boat/qualified_worker_admission.py --owned-worker "$OWNED_WORKER" --profile "$PRIVATE_PROFILE" --operation "$OWNED_OPERATION"
 mise run boat:job-env --owned-worker "$OWNED_WORKER" --profile "$PRIVATE_PROFILE" --operation "$OWNED_OPERATION" --out "$OWNED_OPERATION/job-admission.json"
+mise run boat:closure-watch --unit "$LOCAL_WATCH_UNIT" --operation "$OWNED_OPERATION"
 export SPARKLES_BOAT_PROFILE="$PRIVATE_PROFILE"
 export SPARKLES_BOAT_ADMISSION="$OWNED_OPERATION/job-admission.json"
 worker="boat:$OWNED_WORKER"
@@ -154,6 +177,32 @@ leases are closed and records that evidence in a fresh private job-closure recei
 must bind the worker, operation, identical local guard tuple, exact job-release hash and
 actual closed state. `finish` validates and publishes that receipt without inventing
 closure observations. The guard alone submits the one normal stop request.
+
+## Scheduled closure
+
+A worker kept warm past its jobs would reach the guard's deadline without a job-closure
+receipt, and the guard would then leave it to the provider TTL. The closure watch runs
+beside the guard under its own named local unit and closes the operation in time.
+
+```sh
+mise run boat:closure-watch --unit "$LOCAL_WATCH_UNIT" --operation "$OWNED_OPERATION" --lead 900 --local-unit "$LOCAL_JOB_UNIT"
+```
+
+The watch reads the guard's present end, with the extensions the guard accepted, and
+waits until `--lead` seconds before it. It then checks over SSH that no
+`sparkles-screen-*` or `nsc-build-*` unit is active on the worker, that no build, mbx or
+server process runs there, and that the worker's boot is the qualified one. Each named
+local job unit must also be inactive. An mbx lease lives only as long as its mbx
+process, so the process check covers the Boxington leases. Each check is kept as
+`closure-watch-check-NNNN.json`. An open job is checked again every 30 seconds.
+
+Once a check finds every job closed, the watch takes the extension lock and reads the
+end again. An extension the guard accepted in the meantime moves the check to the new
+end. Otherwise the watch publishes `root-job-closed.json` from that check and the stop
+trigger while it holds the lock, and then observes the guard's verified stop as `finish`
+does. If no check finds the jobs closed by 60 seconds before the end, the watch records
+`closure-watch-unresolved.json` with the last reason code and leaves the guard's own
+deadline stop in place. One watch runs per operation.
 
 `finish` waits up to 180 seconds for the same operation's verified completed/nonforced
 stop, current stopped/snapshot proof and clean local guard exit. A pending, submitted,
