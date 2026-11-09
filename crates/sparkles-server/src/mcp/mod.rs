@@ -48,7 +48,6 @@ mod pins;
 pub(crate) mod relevance;
 pub(crate) mod render;
 pub mod rest;
-mod retained;
 pub mod review_http;
 mod schema_history;
 mod schemas;

@@ -6,11 +6,6 @@
 //! value can never pass for a table row, a cell boundary or a status line. Long lexical
 //! forms and IRIs are cut, with a visible marker outside the quotes.
 
-mod bounded;
-mod bounded_page;
-
-pub(super) use bounded_page::{CompactPage, owned_page};
-
 use oxrdf::{Literal, NamedOrBlankNode, Term, Triple};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
