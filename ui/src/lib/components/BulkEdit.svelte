@@ -143,19 +143,28 @@
     const r = await searchEntities(target, text, { kind: ['class'], graph, limit: 10, signal });
     return r.results.map((h) => ({ iri: h.iri, label: h.label ?? h.shortForm ?? h.iri }));
   }
+  /** Bumped when a subtree read in flight no longer answers the list's question. */
+  let subtreeRun = 0;
   async function addSubtree() {
     const root = subtreeOf;
     if (!root || root.term.type !== 'uri') return;
+    const my = ++subtreeRun;
     listBusy = true;
     listError = null;
     try {
       const below = descendants(namedParents(await read('SubClassOf')), [root.term.value]);
+      // the commit, the graph, the root or the list changed while the subclasses were read
+      if (my !== subtreeRun) return;
       if (addEntities([root.term.value, ...below])) subtreeOf = null;
     } catch (e) {
-      listError = api.errorMessage(e);
+      if (my === subtreeRun) listError = api.errorMessage(e);
     } finally {
-      listBusy = false;
+      if (my === subtreeRun) listBusy = false;
     }
+  }
+  function dropSubtreeRead() {
+    subtreeRun++;
+    listBusy = false;
   }
 
   // --- the forms -------------------------------------------------------------------------------
@@ -216,12 +225,25 @@
     plan = null;
     error = null;
   }
-  // a new commit, graph, branch or operation makes the plan and its reads stale
+  // a new commit, graph or branch makes the plan and every read in flight stale
   $effect(() => {
     void target;
     void graph;
     void commit;
-    void mode;
+    untrack(() => {
+      invalidate();
+      dropSubtreeRead();
+    });
+  });
+  $effect(() => {
+    void subtreeOf;
+    untrack(dropSubtreeRead);
+  });
+  // so does any input the plan is built from, which a calculation in flight read before
+  $effect(() => {
+    void [mode, find, replace, regex, caseSensitive, propKind, propText, langKind, langTag];
+    void [scope, property, valueText, valueLang, valueType, valueIri, setMode, removeKind];
+    void [parent, toTop, keepParents, prefixes, entities];
     untrack(invalidate);
   });
 
@@ -471,6 +493,7 @@
             onclick={() => {
               entities = [];
               invalidate();
+              dropSubtreeRead();
             }}>Clear the list</button
           >
         {/if}

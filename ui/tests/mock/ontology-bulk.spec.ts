@@ -333,6 +333,52 @@ test('clearing the list while the graph is read drops the pending changes', asyn
   }
 });
 
+test('changing a field or the list while the graph is read drops the stale answer', async ({
+  page,
+  request,
+}) => {
+  const branch = 'bulk-race-field';
+  await newBranch(request, branch);
+  try {
+    let release!: () => void;
+    let held = new Promise<void>((done) => (release = done));
+    await page.route('**/axioms?**', async (route) => {
+      if (route.request().method() === 'GET') await held;
+      await route.continue().catch(() => {});
+    });
+    await openBulk(page, branch);
+    await pasteEntities(page, 'uni:Student');
+    await page
+      .getByRole('group', { name: 'Bulk edit' })
+      .getByRole('button', { name: 'Set annotation' })
+      .click();
+    const form = page.getByRole('form', { name: 'Set an annotation' });
+    await form.getByRole('textbox', { name: 'Value' }).fill('Reviewed');
+    await form.getByRole('button', { name: 'List the changes' }).click();
+    await expect(form.getByRole('button', { name: 'Reading…' })).toBeVisible();
+    await form.getByRole('textbox', { name: 'Value' }).fill('Different');
+    release();
+    await page.waitForTimeout(1000);
+    await expect(changes(page)).toHaveCount(0);
+
+    // a subtree read that the list's clearing overtakes adds nothing
+    await page.reload();
+    await expect(page.getByRole('group', { name: 'Bulk edit' })).toBeVisible({ timeout: 30_000 });
+    held = new Promise<void>((done) => (release = done));
+    await page.getByRole('combobox', { name: 'Add a class and its subclasses' }).fill('uni:Person');
+    await page.getByRole('option').first().click();
+    await page.getByRole('button', { name: 'Add subtree' }).click();
+    await expect(page.getByRole('button', { name: 'Reading…' })).toBeVisible();
+    await pasteEntities(page, 'uni:Course');
+    await page.getByRole('button', { name: 'Clear the list' }).click();
+    release();
+    await page.waitForTimeout(1000);
+    await expect(list(page)).toHaveCount(0);
+  } finally {
+    await request.delete(`/$/branches/uni/${branch}?force=true`);
+  }
+});
+
 test('an edit above the bound is refused with the reason', async ({ page, request }) => {
   const branch = 'bulk-bound';
   await newBranch(request, branch);
