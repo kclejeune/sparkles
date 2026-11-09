@@ -1736,7 +1736,8 @@ pub(super) fn pred_ready(ix: &Index, dx: &DlIx, lits: &Lits, c: &Clause) -> bool
             XLit::Eq(a, b) => [a, b]
                 .iter()
                 .all(|t| matches!(t, RTerm::X | RTerm::Y | RTerm::C(_))),
-            XLit::Ne(..) => false,
+            // a ground literal goes whatever its form, as Table 3 has it
+            XLit::Ne(a, b) => matches!((a, b), (RTerm::C(_), RTerm::C(_))),
         },
         _ => false,
     })
@@ -1805,7 +1806,8 @@ pub fn hyp<S: Sink>(st: &mut State, a: Ex, out: &mut S) -> bool {
 pub fn dedge<S: Sink>(ix: &Index, me: Ex, st: &mut State, u: Ex, e: Ex, out: &mut S) -> bool {
     let bottom = st.bottom;
     let props: Vec<(Role, Ex)> = st.props.clone();
-    let counting = dix(ix).counting;
+    // the root as predecessor finds the role premises itself, with every role over f(u)
+    let any = dix(ix).counting || dix(ix).is_root(u);
     let x = ds(st);
     if x.dpreds.contains(&(u, e)) {
         return false;
@@ -1820,13 +1822,13 @@ pub fn dedge<S: Sink>(ix: &Index, me: Ex, st: &mut State, u: Ex, e: Ex, out: &mu
     for k in 0..x.store.preds.len() {
         let i = x.store.preds[k];
         if let Some(cid) = pred_id(x, i, out)
-            && meets(ix, &x.store.clauses[i as usize].c, r)
+            && (any || meets(ix, &x.store.clauses[i as usize].c, r))
         {
             out.send(u, Concl::PredC(me, cid));
         }
     }
     for (s, c) in props {
-        if counting || ix.roles.sub(r, s) {
+        if any || ix.roles.sub(r, s) {
             let id = prop_id(x, s, c, out);
             out.send(u, Concl::PredC(me, id));
         }
@@ -2082,7 +2084,7 @@ fn process<S: Sink>(
             return;
         };
         for &(u, e) in &x.dpreds {
-            if role_of(ix, e).is_some_and(|r| meets(ix, c, r)) {
+            if dx.is_root(u) || role_of(ix, e).is_some_and(|r| meets(ix, c, r)) {
                 out.send(u, Concl::PredC(me, cid));
             }
         }

@@ -1286,10 +1286,19 @@ pub fn pred_c<S: Sink>(ix: &Index, st: &mut State, w: Ex, cid: u32, out: &mut S)
         return false;
     }
     let x = ds(st);
+    let (seen, table) = (x.pred_seen.capacity(), x.pred_in.capacity());
     if !x.pred_seen.insert((w, cid)) {
         return false;
     }
-    x.pred_in.entry(w).or_default().push(cid);
+    let list = x.pred_in.entry(w).or_default();
+    let cap = list.capacity();
+    list.push(cid);
+    let grown = (list.capacity() - cap) * 4
+        + table_bytes(x.pred_seen.capacity(), 8).saturating_sub(table_bytes(seen, 8))
+        + table_bytes(x.pred_in.capacity(), 32).saturating_sub(table_bytes(table, 32));
+    if grown > 0 {
+        out.dl().grow(grown);
+    }
     let pairs = x
         .root
         .as_deref()
@@ -1962,7 +1971,10 @@ mod tests {
         assert!(!ready(vec![XLit::Role(r, ua, RTerm::Y)]));
         assert!(!ready(vec![XLit::Role(r, RTerm::Y, RTerm::Y)]));
         assert!(!ready(vec![XLit::Ne(RTerm::Y, ua)]));
-        assert!(!ready(vec![XLit::Ne(ua, ub)]));
+        // a ground literal goes whatever its form
+        assert!(ready(vec![XLit::Ne(ua, ub)]));
+        // a role atom between x and a constant goes, and only the root takes it
+        assert!(ready(vec![XLit::Role(r, RTerm::X, ua)]));
         assert!(!ready(vec![XLit::Atom(bb, RTerm::X)]));
     }
 
@@ -2334,5 +2346,82 @@ mod tests {
         init(&ix, &mut st, &mut out);
         assert!(dl(&st).unwrap().root.is_some());
         assert!(run.bytes() >= std::mem::size_of::<RootSt>());
+    }
+
+    #[test]
+    fn the_root_takes_a_clause_over_any_role_of_its_successor() {
+        // a successor of the root by r, with r not below s, holds s(y, x) → K(y): the root
+        // gets it whether it registers before or after the clause, and another
+        // predecessor by r does not
+        for register_first in [true, false] {
+            let mut s = Sig::new();
+            let _ = s.ind("a");
+            let [a, b, k] = ["A", "B", "K"].map(|n| s.class(n));
+            let r = s.role("r");
+            let t = s.role("s");
+            let e = s.some(r, b);
+            let (ix, root) = probe_ix(s);
+            let run = DlRun::new(false, Default::default());
+            let mut out = Probe {
+                run: &run,
+                sent: Vec::new(),
+                mine: Vec::new(),
+            };
+            let mut st = State {
+                init: true,
+                ..State::default()
+            };
+            let add = |st: &mut State, out: &mut Probe| {
+                ds(st)
+                    .store
+                    .add(Clause::new(vec![Lit::ry(t)], vec![Lit::y(k)]));
+                super::super::dl_rules::flush(&ix, b, st, out, 100);
+            };
+            if !register_first {
+                add(&mut st, &mut out);
+            }
+            super::super::dl_rules::dedge(&ix, b, &mut st, root, e, &mut out);
+            super::super::dl_rules::dedge(&ix, b, &mut st, a, e, &mut out);
+            if register_first {
+                add(&mut st, &mut out);
+            }
+            let to = |v: Ex| {
+                out.sent
+                    .iter()
+                    .any(|&(w, c)| w == v && matches!(c, Concl::PredC(f, _) if f == b))
+            };
+            assert!(to(root), "the root, register first {register_first}");
+            assert!(
+                !to(a),
+                "another predecessor, register first {register_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_root_counts_the_clauses_its_successors_send() {
+        let mut s = Sig::new();
+        let _ = s.ind("a");
+        let b = s.class("B");
+        let (ix, _) = probe_ix(s);
+        let run = DlRun::new(false, Default::default());
+        let mut out = Probe {
+            run: &run,
+            sent: Vec::new(),
+            mine: Vec::new(),
+        };
+        let cid = run.table.push(Clause::new(Vec::new(), vec![Lit::y(b)]));
+        let mut st = State {
+            init: true,
+            ..State::default()
+        };
+        ds(&mut st);
+        let before = run.bytes();
+        assert!(pred_c(&ix, &mut st, b, cid, &mut out));
+        assert!(
+            !pred_c(&ix, &mut st, b, cid, &mut out),
+            "a clause is taken once"
+        );
+        assert!(run.bytes() > before);
     }
 }
