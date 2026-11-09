@@ -1209,10 +1209,10 @@ outputs to the 3 GiB of `MBX_GC_MAX_SIZE`. The link cache is off, since it would
 store.
 
 Pull requests, fork pull requests and runs on other branches restore both caches from
-`main` and save neither. The test build's target entry is about 0.8 GB and Clippy's about 0.5 GB,
-and each commit's two stores add about 0.3 and 0.2 GB. GitHub's 10 GB repository cache
-drops the least recently used entries first, so it keeps the stores of about the last
-fifteen main commits next to the other workflows' caches.
+`main` and save neither. The test build's target entry is about 0.8 GB and Clippy's about 0.6 GB.
+Each commit adds a test store of 0.3 to 0.6 GB and a Clippy store of 0.2 to 0.5 GB. GitHub's
+10 GB repository cache drops the least recently used entries first, so it keeps the
+stores of the last several main commits next to the other workflows' caches.
 
 The binding workflows and the server candidate build keep Boxington's remote cache. Main
 pushes, same-repository pull requests, release tags and manual runs use the remote cache
