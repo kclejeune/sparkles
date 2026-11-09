@@ -1434,10 +1434,11 @@ preparation. Guarded Dataset queries and U02 readers still adopt them under item
 
 ### Ingestion into claim proposals
 
-This section is the contract for roadmap item 651. C18 §7 defines ingestion only into
-asserted memory, and this specification did not say how an ingestion becomes an
-evidence batch, so each decision below states the adopted behaviour and the strongest
-alternative that was rejected. The current modes of C18 §7.7 keep their behaviour, and
+Roadmap item 651 delivers this contract in `POST /$/ingest/{ds}` and `sparkles ingest`,
+with `sparkles::evidence::OrdinaryChanges` for Rust callers of `propose`. C18 §7 defines
+ingestion only into asserted memory, and this specification did not say how an
+ingestion becomes an evidence batch, so each decision below states the adopted
+behaviour and the strongest alternative that was rejected. The current modes of C18 §7.7 keep their behaviour, and
 `branch` stays the default.
 
 #### Mode and arguments
@@ -1498,27 +1499,33 @@ references, the claims and one evidence link per claim.
 
 | Record | Content |
 |---|---|
-| Source revision | Its source is the IRI that the registration gives the C18 source, or for a `source` run the registered source's IRI. Its content is the digest of the original bytes, metadata only, and an http or https URL is a locator. |
-| Rendition | Its occurrence key is the C18 rendition IRI, and the conversion is a method named by the format and the server version. The batch carries the converted text so that the passages are verified, and the record keeps only the text's digest. A `source` run uses the text of the source's current rendition. |
+| Source revision | Its source is the IRI that the registration gives the C18 source, or for a `source` run the registered source's IRI. Its content is metadata only, with the content digest that the C18 registration records, and an http or https URL is a locator. |
+| Rendition | Its occurrence key is the C18 rendition IRI, and the conversion is a method named by the format and the server version. It retains the normalized text as `ev:normalizedText`. A `source` run uses the text of the source's current rendition. |
 | Passage and reference | One passage per distinct span of the extracted facts, quoting the exact selected text, and one evidence reference to it. |
 | Claim | One `ev:Reported`, `ev:Positive` occurrence per extracted fact, attributed to the source and derived from the revision. A reported confidence becomes `ev:extractionConfidence` on the zero-to-one scale, evaluated by the extraction model. |
 | Evidence link | `ev:Supports` from the fact's passage reference to its claim, attributed to the extraction model. |
 
-`sparkles_core::evidence::RenditionContent` gains a `VerifiedText` variant for this
-rendition. Preparation verifies the batch's passages against its text exactly as it does
-for normalized text, and the writer records it as a metadata-only rendition with the
-text's digest, so its record and its record digest equal those of a metadata-only
-rendition. The text therefore lives only in the C18 chunks, and only when `keepText`
-keeps it. A dataset with `keepText: false` still verifies every passage in the batch.
-Only a `source` run of such a dataset cannot read any text, and it answers `no-text` as
-the other modes do. The extraction model and the converter remain attributed metadata,
+The C18 registration records the digest of the normalized text as the source's content
+digest when it keeps no other original bytes, which is the case for converted uploads.
+An upload and a later `source` run of the same registered source therefore describe the
+same revision. The passages are verified against the batch's own rendition text, which
+avoids the `incomplete-evidence` answer of proposal decision 1. A review verifies every
+cited passage again against the rendition's retained `ev:normalizedText` before it
+accepts a claim, so the evidence rendition must keep the text. The text is therefore
+stored twice, once in the C18 chunks and once in the evidence rendition. That costs up
+to 2 MiB of extra storage per source, and it keeps acceptance independent of the
+ordinary graph that the C18 chunks live in. A dataset with `keepText: false` cannot
+retain the text that acceptance needs, so it refuses claims mode with `409 no-text`
+before conversion. The extraction model and the converter remain attributed metadata,
 and the authenticated caller is the operation's principal, as §5 requires.
 
-The rejected alternative records the rendition with `ev:normalizedText`. It would keep
-a second copy of up to 2 MiB of text beside the chunks, and with `keepText: false` it
-would retain the text that the dataset's setting excludes. Retaining the original bytes
-in the revision was rejected too. A 10 MiB PDF becomes about 13 MiB of base64, which
-would exceed the 16 MiB batch bound of §8.
+The rejected alternative verifies the passages at publication and records the
+rendition without its text. The proposals would publish, but no review could accept
+them, because acceptance resolves each passage against retained text. Retaining the
+original bytes in the revision was rejected as well. The original bytes, the converted
+text and the other decoded content count together toward the 16 MiB bound of §8, so a
+large PDF could exceed it, and the C18 registration already records the content digest
+that identifies the revision.
 
 #### Entities
 
@@ -1547,11 +1554,15 @@ a later projection.
 
 #### Grants and settings
 
-Before conversion or any model call, the pipeline checks from the grants alone that the
-caller has `write` on the dataset or branch and update grants on the C18 source graph
-and on the source-record and proposal graphs it will write, and that the evidence
-settings are enabled. A claims ingestion also needs a provider in the `extract` role,
-and without one it answers `no-model` before anything is converted. A caller
+The pipeline checks the grants in two stages. Before conversion it checks from the
+grants alone that the caller has `write` on the update endpoint of the dataset or
+branch and update grants on the source-record and proposal graphs it will write, that
+the evidence settings are enabled and that the dataset keeps source text. A claims
+ingestion also needs a provider in the `extract` role, and without one it answers
+`no-model` at the same point. The C18 source graph of an upload without `iri` or
+`graph` is derived from the converted text, so it is known only after conversion. The
+registration plan derives it, and the pipeline then checks the caller's update grant on
+it and that no profile manages it, before any provider call. A caller
 without them is refused as `POST /{ds}/claims` refuses it, and no tokens are spent.
 `propose` checks again at publication.
 
@@ -1560,8 +1571,12 @@ after the extraction's model calls had been spent.
 
 #### Idempotent re-ingestion
 
-Every claims ingestion carries the idempotency key
-`ingest-claims:<revision digest>:<rendition digest>:<profile>`. Before extraction the
+Every claims ingestion carries the idempotency key `ingest-claims:1:<digest>`. The
+digest is the SHA-256 of a canonical JSON array of the version, the source IRI, the
+C18 source graph, the evidence source-record and proposal graphs, the revision and
+rendition digests and the profile name. The same text under another source or graph is
+therefore another ingestion with its own occurrences. The changing registration delta
+is not part of the key or of the payload digest. Before extraction the
 pipeline derives the operation IRI of that key for the caller with `operation_iri` and
 looks for it in the record graphs of the selected branch. When it is found, the result
 is `already-proposed` with the first operation, and nothing is extracted or written, so
@@ -1584,9 +1599,16 @@ occurrences of the same revision, so re-ingestion would not be idempotent.
 
 A source ingested again with another digest gets a new revision of the same source and
 new claim occurrences. Earlier occurrences are neither withdrawn nor superseded, and the
-result names the earlier revisions of the source that the caller can read. Withdrawal
-stays an explicit `claims/withdraw` call. No `prov:wasRevisionOf` link is written,
-because extraction does not establish which occurrence corresponds to which.
+result names the previous C18 rendition when the registration replaced one. Withdrawal
+stays an explicit `claims/withdraw` call. Claim occurrences get no `prov:wasRevisionOf`
+link, because extraction does not establish which occurrence corresponds to which.
+
+The two source revisions do correspond, because the registration replaced the current
+rendition of the same source. Both revisions name the same source through
+`prov:specializationOf`, and the C18 renditions keep their `prov:wasRevisionOf` chain.
+The source revision input has no field for a link to a predecessor revision, and adding
+one changes the record digests of revisions, so roadmap item 780 tracks a
+`prov:wasRevisionOf` link between evidence source revisions.
 
 The rejected alternative applies the supersession of C18 §7.9 and withdraws the earlier
 occurrences that the new extraction does not repeat. A model omitting a fact is not
