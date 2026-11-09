@@ -42,9 +42,11 @@ def entry(name,parent):
 def owned_directory(name,parent,uid):
     """A directory of the worker opened by name under ``parent``, never through a symbolic link."""
     fd=os.open(name,DIRECTORY,dir_fd=parent)
-    s=os.fstat(fd)
-    if not stat.S_ISDIR(s.st_mode) or s.st_uid!=uid or s.st_mode&0o022:
-        os.close(fd);raise PermissionError('not an owned private directory')
+    try:
+        s=os.fstat(fd)
+        if not stat.S_ISDIR(s.st_mode) or s.st_uid!=uid or s.st_mode&0o022:raise PermissionError('not an owned private directory')
+    except BaseException:
+        os.close(fd);raise
     return fd
 
 def phase_result(parent,uid):

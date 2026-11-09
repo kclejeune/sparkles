@@ -21,14 +21,14 @@
       "sha256": "bef843219009df7ecf2f223c9f77f448f7096bc5be0ec3335e47eca73b9bf684"
     },
     "controls.py": {
-      "bytes": 108259,
+      "bytes": 109160,
       "mode": 420,
-      "sha256": "843691e3a88b4f7bf7b57a34d8a495e29c49adf6ff6948e40f87e47189681f10"
+      "sha256": "c91d301df08eb49a1b174229a122d72e5b212716ebb35a8359d796ceafaa6ca3"
     },
     "diagnostic-probe.py": {
-      "bytes": 7287,
+      "bytes": 7335,
       "mode": 420,
-      "sha256": "48cc2397acbb132dd3956315387847cf13fceef54f3cb304e762d36b692c438f"
+      "sha256": "714e0ebaeda33aa601be6a4654afe561400d37161cc6c9f05e4118916813921c"
     },
     "job-closure.FALSE.json": {
       "bytes": 269,

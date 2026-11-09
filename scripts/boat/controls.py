@@ -1191,6 +1191,19 @@ class Controls(unittest.TestCase):
             os.chmod(state,0o777)
             with patch.object(d,'units',return_value={'rows':[]}):out=d.collect(home,os.getuid())
             self.assertFalse(out['state']['present'])
+    def test_a_failed_directory_inspection_closes_its_descriptor(self):
+        spec=importlib.util.spec_from_file_location('diagnostic_probe',Path(__file__).with_name('diagnostic-probe.py'));d=importlib.util.module_from_spec(spec);spec.loader.exec_module(d)
+        with tempfile.TemporaryDirectory() as t:
+            (Path(t)/'x').mkdir();parent=os.open(t,os.O_RDONLY|os.O_DIRECTORY);opened=[];real_open=os.open
+            def tracked(*a,**k):
+                fd=real_open(*a,**k);opened.append(fd);return fd
+            try:
+                with patch.object(d.os,'open',side_effect=tracked),patch.object(d.os,'fstat',side_effect=OSError(5,'io')):
+                    with self.assertRaises(OSError):d.owned_directory('x',parent,os.getuid())
+                self.assertEqual(len(opened),1)
+                with self.assertRaises(OSError):os.fstat(opened[0])
+            finally:os.close(parent)
+
     def test_diagnostics_receipt_fits_its_bound_and_trimming_ends(self):
         result={'phase':'metadata','program_sha256':'a'*64,'directories':[{'path':'/home/user/x','uid':1000,'mode':448,'device':1,'inode':n} for n in range(8)]}
         body={'schema':1,'processes':{'count':0,'rows':[]},'state':{'entries':[],'phases':{'qualification-%04d'%n:{'entries':['probe-result.json'],'result':copy.deepcopy(result)} for n in range(1200)}}}
