@@ -250,6 +250,16 @@ jobs:
             crates/sparkles-py -> ../../target
             crates/sparkles-ffi -> ../../target
             crates/sparkles-node -> ../../target
+      # The server's build script writes ui/build/index.html when it is missing, and the
+      # write is newer than the build, so every later Cargo command in the job would build
+      # the server and relink its tests again. The same placeholder, written first, avoids
+      # that.
+      - name: UI placeholder
+        run: &ui-placeholder |
+          if [ ! -e ui/build/index.html ]; then
+            mkdir -p ui/build
+            printf '%s' '<!doctype html><title>Sparkles</title><p>The UI has not been built. Run <code>pnpm -C ui install &amp;&amp; pnpm -C ui build</code> and rebuild the server.</p>' > ui/build/index.html
+          fi
       # local mode: no remote cache, and no link cache, since the store is not kept
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
@@ -335,6 +345,8 @@ jobs:
         with:
           shared-key: tests
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
+      - name: UI placeholder
+        run: *ui-placeholder
       # local mode: no remote cache, and no link cache, since the store is not kept
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
@@ -565,6 +577,8 @@ jobs:
         with:
           shared-key: tests
           save-if: false
+      - name: UI placeholder
+        run: *ui-placeholder
       # local mode: no remote cache, and no link cache, since the store is not kept
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
@@ -649,6 +663,8 @@ jobs:
         with:
           shared-key: tests-${{ matrix.platform }}
           save-if: false
+      - name: UI placeholder
+        run: *ui-placeholder
       # local mode: no remote cache, and no link cache, since the store is not kept
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
