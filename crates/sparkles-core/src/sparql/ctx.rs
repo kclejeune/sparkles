@@ -2236,10 +2236,7 @@ impl Ctx {
                     id.payload(),
                     key,
                     |need| keys.reserve((need as u64).saturating_mul(2)),
-                    |key| -> Result<()> {
-                        out.push(Some(output_key_term(self, key, row)?));
-                        Ok(())
-                    },
+                    |key| -> Result<()> { output_key_term_into(self, key, row, out) },
                 )?;
                 match found {
                     Some(pushed) => pushed?,
@@ -2691,7 +2688,14 @@ impl Ctx {
 /// Sizing and building it in two passes repeated the separator scan and the UTF-8
 /// checks, a measurable share of the time to write a large answer.
 #[inline]
-fn output_key_term(ctx: &Ctx, key: &[u8], row: &OutputCredit<'_>) -> Result<Term> {
+fn output_key_term_into(
+    ctx: &Ctx,
+    key: &[u8],
+    row: &OutputCredit<'_>,
+    out: &mut Vec<Option<Term>>,
+) -> Result<()> {
+    // The term is pushed here rather than returned through a Result, whose copy of
+    // each 64-byte term showed among the writer's hottest instructions.
     if let Some(text) = id::TextKey::parse(key) {
         let tag = match text {
             id::TextKey::Lang(_, tag) => tag.len() as u64,
@@ -2702,10 +2706,12 @@ fn output_key_term(ctx: &Ctx, key: &[u8], row: &OutputCredit<'_>) -> Result<Term
                 .checked_add(64 + tag)
                 .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?,
         )?;
-        return Ok(text.into_term());
+        out.push(Some(text.into_term()));
+        return Ok(());
     }
     row.add(output_key_bytes(ctx, key, 0)?)?;
-    Ok(id::key_to_term(key))
+    out.push(Some(id::key_to_term(key)));
+    Ok(())
 }
 
 /// Heap and construction overlap of one decoded vocabulary key, excluding the
@@ -3158,8 +3164,9 @@ mod charge_tests {
         keys.push(triple);
         for key in &keys {
             let row = OutputCredit::new(&ctx);
-            let term = output_key_term(&ctx, key, &row).unwrap();
-            assert_eq!(term, id::key_to_term(key), "{key:?}");
+            let mut out = Vec::new();
+            output_key_term_into(&ctx, key, &row, &mut out).unwrap();
+            assert_eq!(out, [Some(id::key_to_term(key))], "{key:?}");
             assert_eq!(
                 row.used.get(),
                 output_key_bytes(&ctx, key, 0).unwrap(),
