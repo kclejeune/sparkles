@@ -2023,9 +2023,9 @@ current decision. A triple of the output graph with no such claim, because the v
 hides its supports, is left out of every input unless another graph of the projection
 also holds it, in which case it enters as an ordinary fact with no claim. It still links
 its ends when the hierarchy is computed, as every edge the principal can read does. A
-triple whose supports exceed the record bound of 10,000 refuses the run as
-`incomplete-evidence`, so a triple never leaves an input only because it gained
-supports.
+triple whose supports exceed the record bound of 10,000 has no claim either, as in
+recall, because that bound counts hidden supports and a refusal would reveal them. The
+refresh rules below rewrite a report whose triple leaves its input this way.
 
 The rejected alternative reads only the output graph. Ordinary data such as an
 organisation chart often links the entities of accepted claims into communities, and a
@@ -2053,7 +2053,10 @@ higher level reaches its children's claims through those child reports. A failed
 records no claim. A person's edit of a report keeps its citations, policy and
 configuration and has no activity, as C22 §4 says of edits. A child report that a kept
 parent's activity used stays in the reports graph, with its footprint, as a child that
-the parent cites does under C22's retention rule, so the parent's provenance resolves.
+the parent cites does under C22's retention rule, so the parent's provenance resolves. A
+report that a linked report written under a policy revises stays as well, with its
+activity, so an edit's provenance resolves through `prov:wasRevisionOf` to the
+activity and the children of the report it edits.
 
 The rejected alternative sends each fact's claims to the model and lets it cite them.
 The claims of a fact are a function of the fact under the policy, so the server
@@ -2079,13 +2082,13 @@ distinct occurrences in a run, or more than 1,000,000 links between the triples 
 inputs and their occurrences, refuse the run too. A report never records a partial list
 of its inputs, and nothing is truncated.
 
-These bounds also bound what a run writes and serves. A report names at most 10,000
-claims with their decisions in `prov:used`, besides its child reports, and a finding
-cites at most the occurrences of the facts it cites. A parent's recorded pairs include
-its children's, and a pair belongs to at most one community at each of the at most eight
-levels of C22, so the state's entries of reports and pairs number at most eight per
-distinct occurrence. The responses of C22 §2.3 read the stored citations and carry no
-more than the reports hold.
+The same allowance is charged, before anything is allocated, for every reference from
+a report to a pair, its own and those inherited from its children, for every claim and
+decision a finding cites, and for the quads and update text of each level's commit. A run
+that would pass it refuses before it commits that level, and keeps the reports of the
+levels it committed, as a run stopped by its budget does. A report names at most 10,000
+claims with their decisions in `prov:used`, besides its child reports, and the responses
+of C22 §2.3 read the stored citations and carry no more than the reports hold.
 
 #### Access
 
@@ -2114,17 +2117,18 @@ format becomes version 3. This build reads version 2 states, whose reports recor
 policy, and a release that reads only version 2 refuses version 3 as a newer file. A run
 saves the state after its last commit, so a crash between commits can leave a community
 whose report in the reports graph is not the one the state names. Such a report, and
-one for which the state records no pairs, is rewritten by the next refresh.
+one for which the state records no pairs, is rewritten by the next refresh, and the
+private check below finds it and starts that refresh.
 
 A report is rewritten, whatever the fraction, when it does not record the run's policy
 and version, or records a policy that the run does not have, and when one of its
 recorded pairs has ended. A pair has ended when its claim is not accepted under the
 policy at the run's view and the principal's access, when its decision is no longer the
-claim's current one, or when the claim's proposition is no longer in the output graph as
-the principal's view reads it. A claim whose current decision, withdrawal or support the
-principal can no longer see counts as ended, since its state can no longer be shown. A
-parent is
-rewritten whenever a child is rewritten for one of these reasons, whatever the share of
+claim's current one, or when the claim is no longer among the claims the run reads for
+its proposition, which covers a proposition gone from the principal's view of the output
+graph and one whose supports passed the record bound. A claim whose current decision,
+withdrawal or support the principal can no longer see counts as ended, since its state
+can no longer be shown. A parent is rewritten whenever a child is rewritten for one of these reasons, whatever the share of
 its children that changed. A withdrawal, a reversal or a superseding decision of
 anything a report read therefore rewrites that report and its ancestors, while a new
 acceptance follows the fraction. An edited report keeps the pairs of the report it
@@ -2136,17 +2140,24 @@ the settings' policy or the policy's version differs from the one the last build
 recorded, so enabling, switching or removing `reviewPolicy` takes effect on an idle
 dataset, and every report is then rewritten.
 
-A pair can end without any change that the principal's feed shows, through a decision,
-support or withdrawal hidden from the principal, a settings-only change of the evidence
-configuration or a reload of the access policy. The loop therefore checks the recorded
-pairs privately when a commit adds a record to the policy's decisions or supports graph
-or a withdrawal to a proposal graph, which it learns from the change feed read without
-the principal's view, when the selected configuration generation differs from the one
-it last checked, and when the access policy is reloaded or the server starts. The check
-reads the pairs under the rules above and decides only whether one has ended. When none
-has, it starts nothing and changes no status, state, task or report, so a reader cannot
-tell that it ran. When one has, the dataset is due and the refresh rewrites the reports
-that read it, as a manual refresh would.
+A report's input can change without any change that the principal's feed shows,
+through a decision, support or withdrawal hidden from the principal, a settings-only
+change of the evidence configuration, a reload of the access policy, or a crash that left
+the state behind the reports graph. For a dataset with a policy, the loop therefore runs
+a private check in place of a refresh when a commit adds a record to the policy's
+decisions or supports graph or a withdrawal to a proposal graph, which it learns from the
+change feed read without the principal's view, when the selected configuration
+generation differs from the one it last checked, when the access policy is reloaded,
+when the server starts, and when C22 §5 would start a refresh because the principal's
+feed cannot list the changes. The check is a refresh's preparation and plan, read as the
+principal at the Head view, with no estimate, model call, commit, state change or task.
+When its plan keeps every report and changes no community, it starts nothing and changes
+nothing a reader can see, so a reader cannot tell that it ran. When the plan rewrites a
+report, the dataset is due, and the refresh rewrites what the plan found, as a manual
+refresh would. A check that fails is retried privately after the backoff of C22 §5 and
+starts nothing. The check costs a refresh's reads and its Leiden run, without model
+calls, after each debounced change of the policy's evidence, which is the price of
+finding the changes that the principal's feed cannot show.
 
 A rewrite spends tokens within `tokensPerDay` like any other. When the budget stops a
 run, a report waiting for its rewrite keeps its earlier citations, which name what it
