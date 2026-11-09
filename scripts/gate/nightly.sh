@@ -4,7 +4,7 @@
 # finds idle. Batch gates choose their checks from the batch's diff, and this run covers
 # what that selection leaves out. Beside the full gate it runs the server artifact link
 # check (scripts/server-artifact-link-check.sh) with gate.sh --link-only on a gate host
-# that has podman, atlas first, since the GitHub workflow that builds the release archive
+# that has podman, since the GitHub workflow that builds the release archive
 # in the pinned manylinux_2_28 image does not run in any gate. GATE_LINK_HOST names the
 # host. The link check runs first and the full gate after it.
 #
@@ -36,6 +36,8 @@ self=$(readlink -f "${BASH_SOURCE[0]}")
 here=$(dirname "$self")
 # shellcheck source=scripts/gate/config.sh
 . "$here/config.sh"
+# shellcheck source=scripts/remote-executor.sh
+. "$here/../remote-executor.sh"
 root=$(cd "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)/.." && pwd)
 state=$root/.artifacts/gates/nightly
 unit=sparkles-gate-nightly
@@ -104,9 +106,9 @@ fi
 # The gate host for the server artifact link check, which runs it in a podman container.
 link_host=${GATE_LINK_HOST:-}
 if [ -z "$link_host" ]; then
-  for h in atlas "${gate_hosts[@]}"; do
+  for h in "${gate_hosts[@]}"; do
     is_bench "$h" && continue
-    if ssh -o BatchMode=yes -o ConnectTimeout=10 "$h" 'command -v podman' > /dev/null 2>&1; then
+    if rx_exec "$h" 'command -v podman' > /dev/null 2>&1; then
       link_host=$h
       break
     fi
@@ -126,7 +128,7 @@ link_log=${log%.log}-link.log
 code=0
 link_code=0
 # The link check runs first and the full gate after it, so that two gates never start
-# on one host's gate repository at once and the full gate finds atlas idle.
+# on one host's gate repository at once.
 if [ -n "$link_host" ]; then
   GATE_GITHUB_RUNS=0 "$here/gate.sh" --host "$link_host" --link-only --tag nightly-link "$rev" > "$link_log" 2>&1 || link_code=$?
 else

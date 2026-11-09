@@ -28,8 +28,9 @@ BH_SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BH_ROOT=$(cd "$BH_SELF_DIR/.." && pwd)
 # shellcheck source=scripts/gate/config.sh
 . "$BH_SELF_DIR/gate/config.sh"
+# shellcheck source=scripts/remote-executor.sh
+. "$BH_SELF_DIR/remote-executor.sh"
 BH_UI_PLACEHOLDER='<!doctype html><title>Sparkles</title><p>The UI was not built for this benchmark binary.</p>'
-bh_ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30)
 # The --build-host argument, the resolved choice (local or a host) and the remote state
 # that bh_cleanup removes.
 BH_ARG=
@@ -49,6 +50,7 @@ bh_ui_placeholder() {
 bh_check_arg() {
   case $BH_ARG in
     '' | local | auto) ;;
+    boat:bx_*) python3 "$RX_DIR/remote-executor.py" validate "$BH_ARG" > /dev/null || die 'invalid or expired Boat admission' ;;
     -* | *[!A-Za-z0-9._@-]*) die "--build-host is local, auto or a host name, not $BH_ARG" ;;
     *) if is_bench "$BH_ARG"; then die "$BH_ARG is the benchmark host (SPARKLES_BENCH_HOST) and never builds"; fi ;;
   esac
@@ -69,7 +71,7 @@ bh_load_config() {
 # bh_probe HOST: "<free|held> <gate units> <free GiB>", or "unreachable"
 bh_probe() {
   # shellcheck disable=SC2016
-  ssh "${bh_ssh_opts[@]}" "$1" '
+  rx_exec "$1" '
     if [ -e "$HOME/lanes/.heavy.lock" ] && ! flock -n "$HOME/lanes/.heavy.lock" true; then l=held; else l=free; fi
     u=$(systemctl --user list-units "gate-*" --state=active --plain --no-legend 2> /dev/null | wc -l)
     d=$(df -BG --output=avail "$HOME" | tail -n1 | tr -dc 0-9)
@@ -80,6 +82,7 @@ bh_probe() {
 bh_resolve() {
   [ -z "$BH_HOST" ] || return 0
   local want=$BH_ARG h p l u d min listed fallback='' hosts=()
+  case $want in boat:*) rx_admit "$want" --minimum "${SPARKLES_REMOTE_MIN_LIFETIME:-1800}" > /dev/null || die "Boat build admission failed" ;; esac
   bh_load_config
   min=${SPARKLES_NSC_BUILD_MIN_FREE_GB:-20}
   if [ -z "$want" ]; then
@@ -148,8 +151,13 @@ bh_resolve() {
 bh_cleanup() {
   [ -n "$BH_RDIR" ] || return 0
   # shellcheck disable=SC2029 # the unit and directory are this run's and expand here
-  ssh "${bh_ssh_opts[@]}" "$BH_RHOST" "systemctl --user stop $BH_RUNIT.scope > /dev/null 2>&1; rm -rf -- $BH_RDIR" < /dev/null ||
-    echo "could not remove $BH_RHOST:$BH_RDIR; remove it and stop the unit $BH_RUNIT.scope there" >&2
+  if ! rx_exec "$BH_RHOST" "systemctl --user stop $BH_RUNIT.scope > /dev/null 2>&1; ! systemctl --user is-active --quiet $BH_RUNIT.scope" < /dev/null; then
+    echo "could not confirm scope closure at $BH_RHOST:$BH_RDIR; keep its evidence and reconcile $BH_RUNIT.scope" >&2
+    return 97
+  fi
+  case $BH_RHOST in boat:*) echo "retained source/build evidence at $BH_RHOST:$BH_RDIR" ;;
+  *) rx_exec "$BH_RHOST" "rm -rf -- $BH_RDIR" < /dev/null ;;
+  esac
   BH_RDIR=
   BH_RUNIT=
 }
@@ -161,7 +169,9 @@ bh_cleanup() {
 bh_build() {
   local rc=0
   bh_build_steps "$@" || rc=$?
-  bh_cleanup
+  local cleanup_code=0
+  bh_cleanup || cleanup_code=$?
+  [ "$rc" != 0 ] || rc=$cleanup_code
   return "$rc"
 }
 
@@ -169,8 +179,13 @@ bh_build_steps() {
   local host=$1 sha=$2 out=$3 tmp args got want
   shift 3
   BH_RHOST=$host
+  case $host in boat:*)
+    mkdir -p "$out"
+    rx_admit "$host" --minimum "${SPARKLES_REMOTE_MIN_LIFETIME:-1800}" > "$out/admission.json" || return
+    ;;
+  esac
   # shellcheck disable=SC2029 # the commit expands here
-  BH_RDIR=$(ssh "${bh_ssh_opts[@]}" "$host" "mkdir -p \$HOME/lanes/nsc-build && mktemp -d \$HOME/lanes/nsc-build/$sha.XXXXXXXX" < /dev/null) || {
+  BH_RDIR=$(rx_exec "$host" "mkdir -p \$HOME/lanes/nsc-build && mktemp -d \$HOME/lanes/nsc-build/$sha.XXXXXXXX" < /dev/null) || {
     BH_RDIR=
     echo "could not create the scratch directory on $host" >&2
     return 1
@@ -188,7 +203,7 @@ bh_build_steps() {
   cp "$BH_SELF_DIR/nsc-build.sh" "$BH_SELF_DIR/nsc-build-remote.sh" "$BH_SELF_DIR/cargo-sparkles-task" "$tmp/"
   echo "$BH_UI_PLACEHOLDER" > "$tmp/ui-index.html"
   # shellcheck disable=SC2029
-  if ! tar -C "$tmp" -cf - . | ssh "${bh_ssh_opts[@]}" "$host" "mkdir $BH_RDIR/bin $BH_RDIR/src && tar -x -C $BH_RDIR/bin"; then
+  if ! tar -C "$tmp" -cf - . | rx_exec "$host" "mkdir $BH_RDIR/bin $BH_RDIR/src && tar -x -C $BH_RDIR/bin"; then
     rm -rf -- "$tmp"
     echo "copying the build scripts to $host failed" >&2
     return 1
@@ -196,20 +211,22 @@ bh_build_steps() {
   rm -rf -- "$tmp"
   # Source mtimes stay current, as in a local build.
   # shellcheck disable=SC2029
-  git -C "$BH_ROOT" archive "$sha" | ssh "${bh_ssh_opts[@]}" "$host" \
+  git -C "$BH_ROOT" archive "$sha" | rx_exec "$host" \
     "tar -x -m -C $BH_RDIR/src && mkdir -p $BH_RDIR/src/ui/build && mv $BH_RDIR/bin/ui-index.html $BH_RDIR/src/ui/build/index.html" || {
     echo "copying the source of $sha to $host failed" >&2
     return 1
   }
   args=$(printf '%q ' "$BH_RDIR" "$BH_RUNIT" "$@")
   # shellcheck disable=SC2029
-  ssh "${bh_ssh_opts[@]}" "$host" "bash $BH_RDIR/bin/nsc-build-remote.sh $args" < /dev/null || {
-    echo "the build on $host failed" >&2
-    return 1
-  }
+  local build_code=0
+  rx_exec "$host" "bash $BH_RDIR/bin/nsc-build-remote.sh $args" < /dev/null || build_code=$?
+  if [ "$build_code" != 0 ]; then
+    echo "the build on $host failed with exit $build_code" >&2
+    return "$build_code"
+  fi
   mkdir -p "$out"
   # shellcheck disable=SC2029
-  ssh "${bh_ssh_opts[@]}" "$host" "tar -C $BH_RDIR/out -cf - ." < /dev/null | tar -x -C "$out" || {
+  rx_exec "$host" "tar -C $BH_RDIR/out -cf - ." < /dev/null | python3 "$RX_DIR/remote-executor.py" unpack "$out" || {
     echo "copying the binary back from $host failed" >&2
     return 1
   }

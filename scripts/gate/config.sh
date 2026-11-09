@@ -3,8 +3,8 @@
 #
 # Settings come from the environment first and then from KEY=VALUE lines in
 # ${SPARKLES_GATE_CONFIG:-~/.config/sparkles/gate.env}. SPARKLES_BENCH_HOST (default forge)
-# names the benchmark host, which never runs gate work. GATE_HOSTS (default "wally atlas
-# forge") lists the hosts that may run gates, less the benchmark host.
+# names the benchmark host, which never runs gate work. GATE_HOSTS (default "wally")
+# lists the hosts that may run gates, less the benchmark host.
 
 gate_config=${SPARKLES_GATE_CONFIG:-$HOME/.config/sparkles/gate.env}
 if [ -f "$gate_config" ]; then
@@ -25,5 +25,5 @@ is_bench() {
 }
 
 gate_hosts=()
-for _h in ${GATE_HOSTS:-wally atlas forge}; do is_bench "$_h" || gate_hosts+=("$_h"); done
+for _h in ${GATE_HOSTS:-wally}; do is_bench "$_h" || gate_hosts+=("$_h"); done
 unset _h

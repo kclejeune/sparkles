@@ -1044,6 +1044,20 @@ thousands of instructions, which vary by a few percent. A few cases move by up t
 between processes with the addresses their data lands at, which is why the gate compares
 ranges over processes. The screen takes about half a minute on forge after its build.
 
+### Explicit remote executors
+
+`mise run bench:remote --executor boat:bx_ID A B` uses an admitted warm Boat worker.
+`bench:remote-writes` and `bench:jena-remote` expose the matching write and Jena commands.
+Their [admission and transport contract](REMOTE-EXECUTORS.md) keeps lifecycle ownership
+separate from workloads. Both arms and all flagged-query reruns stay on one isolated
+worker with matching binaries, compiler and runtime configuration. The query defaults,
+answer checks and 1.10 regression threshold match the Namespace command.
+
+Boat adapter contract tests do not qualify the performance screen. The required
+Namespace screen remains in force until item 762 has real lifecycle, workload and
+full-denominator comparison evidence. Small smoke workloads establish transport and
+correctness only. Published numbers still come from the benchmark host.
+
 ### Namespace query screens
 
 `scripts/nsc-bench.sh A B` (`mise run bench:nsc A B`) compares the query times of two
@@ -1164,7 +1178,7 @@ of a few percent, and [Choosing a host](#choosing-a-host) says where to measure 
 ### Namespace write screens
 
 `scripts/nsc-writes.sh` stages write workloads before creating a capped Namespace
-instance. Its revision builds use `SPARKLES_NSC_CACHE/writes-v1`, separately from the
+instance. Its revision builds use `SPARKLES_NSC_CACHE/writes-v2`, separately from the
 query harness. Each source commit and exact `--cargo-args` string has its own build key,
 target directory and cross-process lock. The lock covers publication, verification and
 compressed staging. Each staged revision binary has a `bin-<id>.build.json` recording its
