@@ -46,10 +46,11 @@ LIT = "urn:x-lit:"
 BNODE = "urn:x-bnode:"
 RL = "urn:x-rl:"
 
+# A blank node label may hold dots but does not end with one (N-Triples BLANK_NODE_LABEL).
 TERM = re.compile(
-    r'\s*(<[^>]*>|_:\S+|"(?:[^"\\]|\\.)*"(?:@[A-Za-z0-9-]+|\^\^<[^>]*>)?)'
+    r'\s*(<[^>]*>|_:[^\s.<>"#]+(?:\.+[^\s.<>"#]+)*|"(?:[^"\\]|\\.)*"(?:@[A-Za-z0-9-]+|\^\^<[^>]*>)?)'
 )
-QUAD_END = re.compile(r"\s*\.\s*$")
+QUAD_END = re.compile(r"\s*\.\s*(#.*)?$")
 
 
 def terms(line, n):
@@ -135,11 +136,18 @@ NAME_CHAR = NAME_START + r"\-.0-9·̀-ͯ‿-⁀"
 NAME = re.compile(f"[{NAME_START}][{NAME_CHAR}]*")
 NMTOKEN = re.compile(f"[{NAME_CHAR}]+")
 LANGUAGE = re.compile(r"[a-zA-Z]{1,8}(-[a-zA-Z0-9]{1,8})*")
-DECIMAL = re.compile(r"[+-]?(\d+(\.\d*)?|\.\d+)")
-INTEGER = re.compile(r"[+-]?\d+")
-FLOAT = re.compile(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?|[+-]?INF|NaN")
+DECIMAL = re.compile(r"[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)")
+INTEGER = re.compile(r"[+-]?[0-9]+")
+FLOAT = re.compile(r"[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?|[+-]?INF|NaN")
+HEX = re.compile(r"([0-9a-fA-F]{2})*")
+# XSD 1.1 base64Binary: groups of four, the last of which may end in = or ==, with single
+# spaces allowed between characters
+B64 = r"[A-Za-z0-9+/] ?"
+BASE64 = re.compile(
+    rf"(({B64}){{4}})*((({B64}){{3}}[A-Za-z0-9+/])|(({B64}){{2}}[AEIMQUYcgkosw048] ?=)|({B64}[AQgw] ?= ?=))?"
+)
 DATETIME = re.compile(
-    r"-?\d{4,}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?"
+    r"(-?[0-9]{4,})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2}(\.[0-9]+)?)(Z|[+-][0-9]{2}:[0-9]{2})?"
 )
 
 
@@ -194,12 +202,37 @@ def value(lex, lang, dt):
     if local in ("dateTime", "dateTimeStamp"):
         c = collapse_ws(lex)
         m = DATETIME.fullmatch(c)
-        if not m or (local == "dateTimeStamp" and not m.group(2)):
+        if not m or not valid_datetime(m) or (local == "dateTimeStamp" and not m.group(8)):
             return None
-        return ("dateTime", (c, bool(m.group(2))))
-    if local in ("hexBinary", "base64Binary", "anyURI"):
+        return ("dateTime", (c, bool(m.group(8))))
+    if local == "hexBinary":
+        c = collapse_ws(lex)
+        return (local, c.upper()) if HEX.fullmatch(c) else None
+    if local == "base64Binary":
+        c = collapse_ws(lex)
+        return (local, c.replace(" ", "")) if BASE64.fullmatch(c) else None
+    if local == "anyURI":
         return (local, collapse_ws(lex))
     return None
+
+
+def valid_datetime(m):
+    """The fields of a dateTime match within their ranges, with 24:00:00 for midnight."""
+    year, month, day, hour, minute = (int(m.group(i)) for i in range(1, 6))
+    second, tz = float(m.group(6)), m.group(8)
+    if not 1 <= month <= 12 or minute > 59 or second >= 60:
+        return False
+    leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    days = [31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+    if not 1 <= day <= days:
+        return False
+    if hour > 24 or (hour == 24 and (minute or second)):
+        return False
+    if tz and tz != "Z":
+        th, tm = int(tz[1:3]), int(tz[4:6])
+        if tm > 59 or th * 60 + tm > 14 * 60:
+            return False
+    return True
 
 
 def string_in(s, local):
@@ -266,6 +299,8 @@ def encode(src, out):
 
     def enc(term):
         if term[0] == "<":
+            if term.startswith(("<" + LIT, "<" + BNODE)):
+                raise ValueError(f"{src} holds the IRI {term}, which the encoding reserves")
             return term
         e = ids.get(term)
         if e is None:
@@ -283,6 +318,9 @@ def encode(src, out):
             b.write(f"{enc(s)} {enc(p)} {enc(o)} .\n")
             n += 1
     with open(f"{out}/literals.nt", "w", encoding="utf-8") as f:
+        for term, e in ids.items():
+            if term[0] == "_":
+                f.write(f"{e} <{RL}kind> <{RL}bnode> .\n")
         for e, term in lits:
             dts, one = datatypes(*literal(term))
             f.write(f"{e} <{RL}kind> <{RL}literal> .\n")

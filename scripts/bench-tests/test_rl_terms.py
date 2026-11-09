@@ -68,6 +68,22 @@ class Datatypes(unittest.TestCase):
         self.assertNotIn(XSD + "dateTimeStamp", dts(f'"2020-01-01T00:00:00"^^<{XSD}dateTime>'))
         self.assertEqual(dts('"x"^^<http://example.org/dt>'), {RDFS + "Literal"})
 
+    def test_invalid_lexical_forms_have_no_datatype(self):
+        for term in (
+            f'"2026-99-99T99:99:99+99:99"^^<{XSD}dateTime>',
+            f'"2023-02-29T00:00:00"^^<{XSD}dateTime>',
+            f'"2020-01-01T24:00:01Z"^^<{XSD}dateTime>',
+            f'"2020-01-01T00:00:00+14:01"^^<{XSD}dateTime>',
+            f'"0FB"^^<{XSD}hexBinary>',
+            f'"zz"^^<{XSD}hexBinary>',
+            f'"SGVsbG8"^^<{XSD}base64Binary>',
+            f'"\u0661\u0662"^^<{XSD}integer>',
+        ):
+            self.assertEqual(dts(term), set(), term)
+        self.assertIn(XSD + "dateTimeStamp", dts(f'"2024-02-29T24:00:00Z"^^<{XSD}dateTime>'))
+        self.assertIn(XSD + "hexBinary", dts(f'"0fb7"^^<{XSD}hexBinary>'))
+        self.assertIn(XSD + "base64Binary", dts(f'"SGVsbG8="^^<{XSD}base64Binary>'))
+
     def test_escapes(self):
         self.assertEqual(rl.literal(r'"a\"bé\n"')[0], 'a"bé\n')
 
@@ -97,6 +113,23 @@ class RoundTrip(unittest.TestCase):
             (d / "nemo.nt").write_text(f"{bnode} <urn:q> <urn:o> .\n{bnode} <urn:q> <urn:o> .\n")
             rl.decode(str(d / "enc"), str(d / "nemo.nt"), str(d / "ref.nt"))
             self.assertEqual((d / "ref.nt").read_text(), "_:b0 <urn:q> <urn:o> .\n")
+
+    def test_reader_takes_a_label_before_the_dot_and_a_comment(self):
+        self.assertEqual(rl.terms("<urn:s> <urn:p> _:b.c.", 3)[0][2], "_:b.c")
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "x.nt"
+            f.write_text("<urn:s> <urn:p> _:b. # a comment\n")
+            self.assertEqual(list(rl.triples(str(f))), [("<urn:s>", "<urn:p>", "_:b")])
+
+    def test_encode_marks_blank_nodes_and_refuses_reserved_iris(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "in.nt").write_text("_:x <urn:p> <urn:o> .\n")
+            rl.encode(str(d / "in.nt"), str(d))
+            self.assertIn(f"<{rl.RL}kind> <{rl.RL}bnode>", (d / "literals.nt").read_text())
+            (d / "bad.nt").write_text('<urn:x-lit:0> <urn:p> "x" .\n')
+            with self.assertRaises(ValueError):
+                rl.encode(str(d / "bad.nt"), str(d))
 
     def test_decode_refuses_an_unknown_encoded_term(self):
         with tempfile.TemporaryDirectory() as d:
