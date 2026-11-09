@@ -149,6 +149,12 @@ pub trait Admission: Send + Sync {
     /// Admit the attempt and reserve its tokens, or refuse it with
     /// [`CallError::Admission`].
     fn admit(&self, attempt: &Attempt<'_>) -> Result<Ticket, CallError>;
+
+    /// Whether an admitted attempt may follow redirects, which send its body again
+    /// without another admission. An admission that must see every send says no.
+    fn follows_redirects(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

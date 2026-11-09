@@ -400,6 +400,48 @@ or `sparkles::evidence::find_dependents` answers the authenticated assessments i
 proposal graphs the caller can read that depend on them, optionally transitively. The
 answer marks nothing stale by itself. Maintained analyses that act on it are item 340.
 
+`recall` and `POST /{ds}/recall` cite claims under a named policy. With `reviewPolicy`,
+a fact of the policy's output graph cites the claim occurrences of its live acceptance
+supports, and a claims section lists the occurrences in the policy's boundary whose
+proposition has an entity of the result as its subject or object. Each occurrence has
+its state under the policy, which is `accepted`, `rejected`, `needs-evidence`,
+`unreviewed` or `withdrawn`, with its current decision and the policy version that
+decision was made under. A claim's proposition is never shown as a fact, and the section
+is labelled as source data. An occurrence whose source is typed `mem:Instructions` in any
+graph of the caller's view, the default graph included, reports `origin=instructions`, and no label changes what the caller may
+do. `maxClaims`, 50 by default and at most 200, bounds the section, and a fact whose
+occurrences do not all fit is left out with the result marked truncated. The JSON
+`claims` member carries `version` 1. With `matchingPolicy`, entities name their
+representative under the policy's resolution map, and the other members of each seed's
+cluster join the seeds under their own IRIs. A call without either argument returns
+what it returned before.
+
+A call that names a policy reads one evidence view of the requested state, with the
+policies of that view's configuration. A store without activated configuration history
+refuses it with `409 configuration-history-inactive`, and the closed-store migration
+activates it. A caller needs read grants on the policy's decisions, supports and output
+graphs, or on a matching policy's decisions, maps, output and boundary identity graphs.
+Otherwise it gets the same `bad-argument` refusal as an unknown policy name. An
+occurrence is shown only when the caller's view holds its claim, its current decision,
+any withdrawal and the support that cites it, and a hidden one leaves no count. Finding
+the claims about the result reads each boundary proposal graph and refuses with
+`incomplete-evidence` past one million quads, a bound that counts the graph's hidden
+quads too. `sparkles::evidence::claim_states` and
+`sparkles::evidence::with_policy_claims` read the same states for Rust callers at a
+`BoundEvidenceView`, and `sparkles::evidence::resolve_entities_at` reads a map there.
+
+`POST /{ds}/ask` takes the same `reviewPolicy` and `matchingPolicy`. The summary step,
+and no other step, receives the claims of the entities the question links exactly, and
+it may cite them as `[c1]`, which the summary lists in `claimCitations`. The final JSON
+and the `summary` event carry the `claims` member. The policies are checked before any
+model call, and an ask with a policy answers from the data, so `mode` `global` is
+refused. A refused policy keeps the status `recall` gives it. An unlisted `[cN]` marker
+is removed from the summary's text. Ask reads the claims again before it publishes the
+summary, and any difference, including a moved head, withholds the answer with a
+`forbidden` error, as does an access policy reload or a credential that ends meanwhile. A kept answer
+stores the occurrences its summary cites and is shown again under its existing
+footprint rule. The CLI's `sparkles ask` does not take the policies.
+
 MCP exposes these same operations as the caller. Administrators first configure the
 dataset's evidence settings over HTTP or Rust. The tools take the corresponding
 [HTTP payloads](../API.md#evidence-proposals), with optional `dataset`, `branch` and
@@ -654,12 +696,15 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   exactly or after folding case and spacing. A value with several matches keeps a minted
   IRI until a person chooses, and the lookup reports only the first variant of an
   ambiguous group. Roadmap item 15.
-* The evidence resource profile does not supply authenticated typed writes, protected
-  availability metadata, retained-reference resolution, review state machines, accepted
-  projections or reversible identity operations. These remain in
-  [C25](../specs/C25-evidence-and-assessments.md), roadmap item 81, followed by recall,
-  ingestion, reporting and maintained-analysis integration. Ordinary RDF shape validation
-  does not establish these runtime guarantees.
+* Evidence ingestion into claim proposals, reports on accepted evidence and maintained
+  analyses remain planned under roadmap items 651, 652 and 340 of
+  [C25](../specs/C25-evidence-and-assessments.md). Ordinary RDF shape validation does not
+  establish the runtime guarantees of the typed evidence operations.
+* Recall finds the claims about its entities by reading each boundary proposal graph,
+  and refuses past one million quads, because no index maps a proposition's terms to its
+  claims. Roadmap item 766.
+* `sparkles ask` and the bindings do not take `reviewPolicy` or `matchingPolicy`. Roadmap
+  items 767 and 509.
 * Durable jobs, worker leases, collection checkpoints and a transactional delivery outbox
   are planned in [C26](../specs/C26-durable-jobs-and-delivery.md), roadmap item 339. Current
   server tasks and operator notifications do not provide the proposed recovery contract.
