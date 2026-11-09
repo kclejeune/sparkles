@@ -1,26 +1,31 @@
-# Temporary measurement for the CI cache choice: the test build with mbx's local object
-# store carried by rust-cache instead of the Cargo target. Removed after measurement (warm).
+# Temporary measurement for the CI cache choice: the test build with the dependency target
+# from rust-cache and, on top, mbx's object store saved per commit with actions/cache.
+# The "core change" job appends a comment to a sparkles-core source file first, which
+# stands for a commit that changes the engine. Removed after measurement (round 2).
 name: CI cache experiment
 on:
   push:
     branches: [lane/ci-speed-v2]
     paths: [.github/workflows/ci-cache-experiment.yml]
-  workflow_dispatch:
 permissions:
   contents: read
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
   NEXTEST_VERSION: "0.9.146"
+  MBX_TARGET_VIEWS: "0"
   HEAVY_1: binary_id(/^(sparkles-core::(spill_join|power_loss|w3c|geo_join)|sparkles-fmt::w3c_turtle)$/)
   HEAVY_2: binary_id(/^(sparkles-core::query_cursor|sparkles-reasoner::(explain_demand|demand)|sparkles-fmt::turtle_stream)$/)
   TIMING_BINARIES: binary_id(/^(sparkles::nesting|sparkles-fmt)$/)
-  # the store carried between runs has to fit GitHub's 10 GB cache entry limit
-  MBX_GC_MAX_SIZE: 8GiB
 jobs:
-  store:
-    name: Build tests (mbx store cache)
+  combined:
+    name: Build tests (target and store, ${{ matrix.change }})
     timeout-minutes: 60
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        change: [none, core]
     steps:
       - uses: actions/checkout@v5
       - name: Free disk space
@@ -35,11 +40,15 @@ jobs:
           sudo swapon /swapfile-ci
       - uses: Swatinem/rust-cache@v2.9.3
         with:
-          shared-key: exp-store
-          cache-targets: false
-          cache-directories: |
+          shared-key: tests
+          save-if: false
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
             ~/.cache/mbx
             !~/.cache/mbx/targets
+          key: exp-mbx-store-tests-${{ github.sha }}
+          restore-keys: exp-mbx-store-tests-
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
           backend: local
@@ -48,6 +57,14 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: UI placeholder and change
+        env:
+          CHANGE: ${{ matrix.change }}
+        run: |
+          mkdir -p ui/build
+          printf '%s' '<!doctype html><title>Sparkles</title><p>The UI has not been built.</p>' > ui/build/index.html
+          if [ "$CHANGE" = core ]; then echo '// a change for the cache experiment' >> crates/sparkles-core/src/branch.rs; fi
+          du -sh ~/.cache/mbx --exclude targets || true
       - name: Disk space before test archive
         run: scripts/ci-free-disk.sh wait
       - name: Build the test archives
@@ -60,11 +77,11 @@ jobs:
               --archive-file "$RUNNER_TEMP/heavy/tests.tar.zst"
           '
       - name: Store size
-        run: |
-          mbx cache dir
-          du -sh "$(mbx cache dir)" "$(mbx cache dir)"/* || true
-          mbx gc || true
-          du -sh "$(mbx cache dir)" --exclude targets || true
-      - name: Disk space after test archive
-        if: ${{ always() }}
-        run: scripts/ci-free-disk.sh report
+        run: du -sh ~/.cache/mbx --exclude targets || true
+      - if: matrix.change == 'none'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/mbx
+            !~/.cache/mbx/targets
+          key: exp-mbx-store-tests-${{ github.sha }}
