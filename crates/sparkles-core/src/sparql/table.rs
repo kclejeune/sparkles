@@ -308,6 +308,7 @@ impl<'ctx> Materialized<'ctx> {
 
     /// Only an explicitly raw application facade may detach this legacy table.
     /// Engine consumers keep this actual owner or make a prepaid receiving copy.
+    #[cfg(feature = "geo")]
     pub(crate) fn into_application_table(self) -> Table {
         self.table
     }
@@ -315,6 +316,7 @@ impl<'ctx> Materialized<'ctx> {
     /// Copy into an existing prepaid destination while the real source stays
     /// protected. Capacity growth is admitted before allocation; a failed copy
     /// restores row lengths and keeps all surviving capacity covered.
+    #[cfg(any(feature = "geo", test))]
     pub(crate) fn append_copy(
         &mut self,
         ctx: &super::ctx::Ctx,

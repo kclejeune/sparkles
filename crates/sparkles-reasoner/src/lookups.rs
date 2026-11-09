@@ -30,7 +30,7 @@
 //! limit, a shard of the run's table is emptied before it takes a new answer, and the
 //! answers of earlier runs are dropped when the run's answers join them.
 
-use crate::budget::{Budget, BudgetFailure, Held};
+use crate::budget::{Budget, Held};
 use crate::graph::Triple;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
@@ -390,7 +390,7 @@ impl Lookups {
 
     /// Charge the answers to `budget` from now on, or fail when they do not fit.
     #[cfg(test)]
-    pub fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), BudgetFailure> {
+    pub fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), crate::budget::BudgetFailure> {
         if Arc::ptr_eq(&self.budget, budget) {
             return Ok(());
         }
