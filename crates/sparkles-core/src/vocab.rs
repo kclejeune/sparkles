@@ -3460,6 +3460,71 @@ mod tests {
         w.finish().unwrap();
     }
 
+    /// The checked rebuild works in a buffer taken from its caller. The caller gets the
+    /// same allocation back after a reservation error, a callback error or success, and
+    /// can reuse it, for both codecs and with and without kept FSST room.
+    #[test]
+    fn checked_rebuild_returns_the_callers_buffer_on_every_path() {
+        let mut keys: Vec<Vec<u8>> = (0..3 * FC_BLOCK)
+            .map(|i| format!("<urn:buffer:{}:{i:04}", "long".repeat(i % 9)).into_bytes())
+            .collect();
+        keys.sort();
+        for fsst in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            write_codec(d.path(), &keys, fsst);
+            let v = Vocab::open(d.path()).unwrap();
+            assert_eq!(v.is_fsst(), fsst);
+            let id = FC_BLOCK as u64 + 20;
+            let want = &keys[id as usize];
+            for room in [false, true] {
+                let run = |key: &mut Vec<u8>, fail: Option<&'static str>| {
+                    let reserve = |_| {
+                        if fail == Some("reserve") {
+                            Err("reserve")
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    let f = |_, k: &[u8]| {
+                        assert_eq!(k, want);
+                        if fail == Some("callback") {
+                            Err("callback")
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    if room {
+                        v.get_sorted_checked_in::<true, _>(&[id], key, reserve, f)
+                    } else {
+                        v.get_sorted_checked_in::<false, _>(&[id], key, reserve, f)
+                    }
+                };
+                // A buffer with room for every key needs no reservation, so a failing
+                // reservation is never reached and the callback's error is returned.
+                let mut key = Vec::with_capacity(4096);
+                let (ptr, cap) = (key.as_ptr(), key.capacity());
+                for fail in [None, Some("callback"), Some("reserve")] {
+                    let expected = match fail {
+                        Some("callback") => Err("callback"),
+                        _ => Ok(()),
+                    };
+                    assert_eq!(run(&mut key, fail), expected);
+                    assert_eq!((key.as_ptr(), key.capacity()), (ptr, cap));
+                }
+                // An empty buffer must reserve. The refusal still returns the buffer,
+                // and the same buffer then rebuilds the key.
+                let mut key = Vec::new();
+                assert_eq!(run(&mut key, Some("reserve")), Err("reserve"));
+                assert_eq!(key.capacity(), 0);
+                assert_eq!(run(&mut key, Some("callback")), Err("callback"));
+                let (ptr, cap) = (key.as_ptr(), key.capacity());
+                assert!(cap >= want.len());
+                assert_eq!(run(&mut key, None), Ok(()));
+                assert_eq!((key.as_ptr(), key.capacity()), (ptr, cap));
+            }
+        }
+    }
+
     #[test]
     fn controlled_vocabulary_open_matches_both_codecs_and_type_boundaries() {
         use crate::{

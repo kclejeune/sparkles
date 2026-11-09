@@ -3156,6 +3156,36 @@ mod charge_tests {
             triple.extend_from_slice(part);
         }
         keys.push(triple);
+        // The one-pass route takes every valid IRI and literal form, so that a fallback
+        // cannot hide a disabled fast path, and leaves the others to the two-pass route.
+        let one_pass = |key: &[u8]| id::TextKey::parse(key).is_some();
+        let lit = |suffix: &[u8]| [&b"\"lex"[..], &[sep], suffix].concat();
+        for key in [
+            &b""[..],
+            b"<http://example.org/a",
+            "<http://example.org/\u{e9}".as_bytes(),
+            b"x-bare",
+            b"\"plain",
+            &lit(b""),
+            &lit(b"@en"),
+            &lit(b"@ar--rtl"),
+            &lit(b"^http://www.w3.org/2001/XMLSchema#integer"),
+        ] {
+            assert!(one_pass(key), "{key:?}");
+        }
+        for key in [
+            &b"<http://example.org/\xff"[..],
+            b"\xc3",
+            b"_short",
+            &keys[keys.len() - 2],
+            &keys[keys.len() - 1],
+            &lit(b"@e\xffn"),
+            &lit(b"^http://example.org/\xc3"),
+            &lit("\u{e9}http://example.org/t".as_bytes()),
+            &[&b"\"bad\xc3("[..], &[sep]].concat(),
+        ] {
+            assert!(!one_pass(key), "{key:?}");
+        }
         for key in &keys {
             let row = OutputCredit::new(&ctx);
             let term = output_key_term(&ctx, key, &row).unwrap();
