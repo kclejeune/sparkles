@@ -301,6 +301,38 @@ test('switching operation while the graph is read drops the pending changes', as
   }
 });
 
+test('clearing the list while the graph is read drops the pending changes', async ({
+  page,
+  request,
+}) => {
+  const branch = 'bulk-race-list';
+  await newBranch(request, branch);
+  try {
+    let release!: () => void;
+    const held = new Promise<void>((done) => (release = done));
+    await page.route('**/axioms?**', async (route) => {
+      if (route.request().method() === 'GET') await held;
+      await route.continue().catch(() => {});
+    });
+    await openBulk(page, branch);
+    await pasteEntities(page, 'uni:Student');
+    await page
+      .getByRole('group', { name: 'Bulk edit' })
+      .getByRole('button', { name: 'Set annotation' })
+      .click();
+    const form = page.getByRole('form', { name: 'Set an annotation' });
+    await form.getByRole('textbox', { name: 'Value' }).fill('Reviewed');
+    await form.getByRole('button', { name: 'List the changes' }).click();
+    await expect(form.getByRole('button', { name: 'Reading…' })).toBeVisible();
+    await page.getByRole('button', { name: 'Clear the list' }).click();
+    release();
+    await page.waitForTimeout(1000);
+    await expect(changes(page)).toHaveCount(0);
+  } finally {
+    await request.delete(`/$/branches/uni/${branch}?force=true`);
+  }
+});
+
 test('an edit above the bound is refused with the reason', async ({ page, request }) => {
   const branch = 'bulk-bound';
   await newBranch(request, branch);

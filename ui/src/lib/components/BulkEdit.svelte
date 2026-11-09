@@ -127,7 +127,7 @@
       return false;
     }
     entities = next;
-    plan = null;
+    invalidate();
     return true;
   }
   function addPasted() {
@@ -470,7 +470,7 @@
             class="btn ghost sm"
             onclick={() => {
               entities = [];
-              plan = null;
+              invalidate();
             }}>Clear the list</button
           >
         {/if}
@@ -494,7 +494,7 @@
               aria-label="Remove {name(e)} from the list"
               onclick={() => {
                 entities = entities.filter((x) => x !== e);
-                plan = null;
+                invalidate();
               }}><Icon name="x" size={12} /></button
             >
           </li>
