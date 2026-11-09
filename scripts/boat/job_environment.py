@@ -33,6 +33,17 @@ def pinned_mbx(profile):
     return profile['worker_home']+'/.local/share/mise/installs/mr-boxington/'+profile['tool_versions']['mbx']+'/mbx'
 
 
+# Jobs build with MBX in local-only mode. The worker's own configuration names the
+# read-only remote cache, and an empty MBX_REMOTE_URL overrides it, so no job reads the
+# remote or its token. The local store stays in MBX's default cache directory in the
+# worker home, which the normal stop's snapshot keeps for the next resume. Its shared
+# budget for the store, managed targets and incremental state holds two release builds
+# and the workspace test builds. The free-space floor keeps the 40 GiB that the
+# metadata probe requires at the next qualification on the large worker's disk.
+LOCAL_STORE_TOTAL = '64GiB'
+LOCAL_STORE_MIN_FREE = '45GiB'
+
+
 def environment(profile):
     # Jobs resolve the pinned MBX install directly and select the pinned Rust
     # toolchain by name, so neither a missing shim nor the rustup default is used.
@@ -41,7 +52,9 @@ def environment(profile):
                              home+'/.cargo/bin', '/usr/local/bin', '/usr/bin', '/bin']),
             'RUSTUP_TOOLCHAIN': profile['tool_versions']['rust'],
             'RUSTUP_AUTO_INSTALL': '0',
-            'MBX_REMOTE_TOKEN_FILE': home+'/.config/mbx/remote-token'}
+            'MBX_REMOTE_URL': '',
+            'MBX_GC_MAX_TOTAL_SIZE': LOCAL_STORE_TOTAL,
+            'MBX_GC_MIN_FREE_SIZE': LOCAL_STORE_MIN_FREE}
 
 
 def environment_body(profile):
@@ -122,16 +135,15 @@ def context(profile_path, qualification_path, worker, now, guard_reader=None):
     return profile, qualification, raw, release, lifetime
 
 
-# The only remote mutation is a private deterministic environment file. Token
-# content is never opened. An uncertain result may be reconciled with --check.
+# The only remote mutation is a private deterministic environment file. Jobs are
+# local-only, so the file names no token and preparation never looks at one. An
+# uncertain result may be reconciled with --check.
 REMOTE = r'''from pathlib import Path
 import hashlib,json,os,stat,sys,tempfile
 p=json.loads(sys.argv[1]);home=Path(p['home']);uid=p['uid'];expected=p['file'];body=p['body'].encode()
 assert os.getuid()==uid and Path.home()==home and home.resolve()==home
 assert hashlib.sha256(body).hexdigest()==expected['sha256'] and len(body)==expected['bytes']
 assert set(p)=={'home','uid','file','body','check'}
-token=home/'.config/mbx/remote-token';t=token.lstat()
-assert stat.S_ISREG(t.st_mode) and t.st_uid==uid and t.st_nlink==1 and stat.S_IMODE(t.st_mode)==0o600
 root=home/'.local/state/sparkles-boat';s=root.lstat()
 assert root.resolve()==root and stat.S_ISDIR(s.st_mode) and s.st_uid==uid and not s.st_mode&0o022
 directory=root/'job-environments'
@@ -147,7 +159,6 @@ if not path.exists():
   os.link(tmp,path,follow_symlinks=False)
  finally:os.unlink(tmp)
 s=path.lstat();assert stat.S_ISREG(s.st_mode) and s.st_uid==uid and s.st_nlink==1 and stat.S_IMODE(s.st_mode)==0o600 and s.st_size==len(body)
-assert (s.st_dev,s.st_ino)!=(t.st_dev,t.st_ino)
 fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
 try:
  a=os.fstat(fd);assert (a.st_dev,a.st_ino)==(s.st_dev,s.st_ino)

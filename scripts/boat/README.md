@@ -164,7 +164,25 @@ the code of a failed qualification in `qualification-failed.json`. An unresolved
 records its code in `unresolved.json`.
 
 Development credentials remain on the development worker. The token is qualified with
-lstat, and its content is never read by this package. The reviewed setup hook's own
+lstat, and its content is never read by this package. Jobs never use it.
+
+## Local-only MBX in jobs
+
+Boat jobs build with MBX in local-only mode. The worker's configuration names the
+read-only remote cache, and the job environment sets `MBX_REMOTE_URL` to an empty value,
+which overrides it, so no job reads the remote cache or its token. The job shell also
+drops any inherited `MBX_REMOTE_TOKEN_FILE` or `MBX_REMOTE_TOKEN`. The local store stays
+in MBX's default cache directory under the worker home, which the normal stop's snapshot
+keeps, so a later resume starts with the store warm. `MBX_GC_MAX_TOTAL_SIZE` is 64 GiB,
+which holds two release builds and the workspace test builds in one budget for the store,
+managed targets and incremental state. `MBX_GC_MIN_FREE_SIZE` is 45 GiB, which keeps the
+40 GiB of free disk that the metadata probe requires at the next qualification.
+`remote-executor.py admit` asks the pinned `mbx` for its effective `remote.url`,
+`gc.max_total_size` and `gc.min_free_size` through the job environment and refuses a
+remote URL, a token setting or another budget by name. A gate's service unit starts
+with an empty environment, so `gate-start.sh` forwards these settings when its caller
+set them. Qualification still checks the provisioned read-only configuration and the
+token metadata, since they describe the development environment rather than the job. The reviewed setup hook's own
 metadata-open behavior must remain within the release's provisioning scope. GitHub
 Actions retains separate OIDC authentication. This package exports no reusable snapshot
 or credential-bearing template.
@@ -229,7 +247,7 @@ The original `qualified-worker-admission.json` remains unchanged and has
 `runtime_env_file:null`. `job_environment.py` validates that receipt with the shared
 `validate_admission` consumer and its exact private profile, operation, source seal,
 job review and live guard. It creates one bounded mode-0600 nonsecret environment file
-containing only literal PATH, pinned Rust toolchain and token FILE path values. Its separate job-admission record
+containing only literal PATH, pinned Rust toolchain and local-only MBX values. Its separate job-admission record
 references the original qualification bytes and actual environment-file proof. It
 creates no extra authority or lifetime. Adapters pass the deterministic values
 literally and never source arbitrary shell values. An uncertain preparation is

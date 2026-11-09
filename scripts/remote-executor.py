@@ -96,9 +96,11 @@ def command(host, text):
         # Leave the provider's landing directory first, so nothing runs in a checkout.
         # Bash started over ssh reads ~/.bashrc even for -c, and a worker's may put
         # another cargo first on PATH, so neither shell reads a startup file, and an
-        # inherited BASH_ENV or ENV is cleared before each starts.
+        # inherited BASH_ENV or ENV is cleared before each starts. Jobs build with mbx
+        # in local-only mode, so the job shell also drops any inherited mbx token setting.
         quiet = ['-u', 'BASH_ENV', '-u', 'ENV']
-        wrapped = 'set -e; cd '+shlex.quote(profile['worker_home'])+'; '+check+'; exec '+shlex.join(['env',*quiet,*values,'/bin/bash','--norc','--noprofile','-c',text])
+        local = ['-u', 'MBX_REMOTE_TOKEN_FILE', '-u', 'MBX_REMOTE_TOKEN']
+        wrapped = 'set -e; cd '+shlex.quote(profile['worker_home'])+'; '+check+'; exec '+shlex.join(['env',*quiet,*local,*values,'/bin/bash','--norc','--noprofile','-c',text])
         # The provider passes each word to the worker as one argument, so the script
         # goes to bash -c as it is, not as a quoted copy.
         return [data['_cli']['path'], '--no-update', 'ssh', worker, '--', '/usr/bin/env', *quiet, '/bin/bash', '--norc', '--noprofile', '-c', wrapped]
@@ -106,19 +108,32 @@ def command(host, text):
 
 
 def tool_check(profile):
-    """Resolve mbx and rustc through the job environment and refuse a pin mismatch by name."""
+    """Resolve mbx and rustc through the job environment and refuse a pin mismatch by name.
+
+    Boat jobs build with MBX in local-only mode, so the check also asks the pinned mbx
+    for its effective remote URL and local budget and refuses a remote cache or token.
+    """
     mbx,rust=profile['tool_versions']['mbx'],profile['tool_versions']['rust']
     pinned=boat_environment.pinned_mbx(profile)
+    local=boat_environment.environment(profile)
     return """refuse(){{ printf 'ADMIT-REFUSAL: %s\\n' "$1"; exit 86; }}
 physical=$(command -v mbx) || refuse 'mbx is not on the job PATH'
 test "$physical" = {pinned} || refuse "mbx resolves to $physical, pinned {pinned_text}"
 version=$("$physical" --version 2>/dev/null | awk '{{print $2}}') || true
 test "$version" = {mbx} || refuse "mbx reports $version, pinned {mbx}"
+test -z "${{MBX_REMOTE_TOKEN_FILE+x}}${{MBX_REMOTE_TOKEN+x}}" || refuse 'the job environment names an mbx remote token'
+url=$("$physical" settings get remote.url 2>/dev/null) || refuse 'mbx cannot read its settings'
+test -z "$url" || refuse 'mbx resolves a remote cache URL, not local-only mode'
+total=$("$physical" settings get gc.max_total_size 2>/dev/null) || true
+test "$total" = {total} || refuse "mbx local budget is $total, pinned {total}"
+floor=$("$physical" settings get gc.min_free_size 2>/dev/null) || true
+test "$floor" = {floor} || refuse "mbx free-space floor is $floor, pinned {floor}"
 command -v rustc >/dev/null || refuse 'rustc is not on the job PATH'
 version=$(rustc --version 2>/dev/null | awk '{{print $2}}') || true
 test "$version" = {rust} || refuse "rustc reports $version, pinned {rust} (RUSTUP_TOOLCHAIN=${{RUSTUP_TOOLCHAIN:-unset}})"
 """.format(pinned=shlex.quote(pinned),pinned_text=pinned.replace('"','?').replace('$','?').replace('`','?').replace('\\','?'),
-           mbx=shlex.quote(mbx),rust=shlex.quote(rust))
+           mbx=shlex.quote(mbx),rust=shlex.quote(rust),
+           total=shlex.quote(local['MBX_GC_MAX_TOTAL_SIZE']),floor=shlex.quote(local['MBX_GC_MIN_FREE_SIZE']))
 
 
 # Commands the query, write and Jena screens and the remote build run on the worker,
@@ -184,10 +199,6 @@ test "$(stat -c %s "$target_record")" -le 4096
 IFS= read -r child_mbx < "$target_record"
 test -f "$child_mbx"
 test "$(sha256sum "$child_mbx" | cut -d' ' -f1)" = 4b0c0fcfc9329a9d76fd6bdefc1ee34822580864f5f5ba2f0b47dcbbffce2eca
-test -n "${{MBX_REMOTE_TOKEN_FILE:-}}"
-test -f "$MBX_REMOTE_TOKEN_FILE" && test ! -L "$MBX_REMOTE_TOKEN_FILE"
-test "$(stat -c %a "$MBX_REMOTE_TOKEN_FILE")" = 600
-test "$(stat -c %u "$MBX_REMOTE_TOKEN_FILE")" = "$(id -u)"
 test "$(sha256sum "$physical" | cut -d' ' -f1)" = 4b0c0fcfc9329a9d76fd6bdefc1ee34822580864f5f5ba2f0b47dcbbffce2eca
 for name in MBX_CACHE_DIR CARGO_TARGET_DIR CARGO_BUILD_TARGET RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER; do test -z "${{!name:-}}"; done
 """ + worker_tools_check()).format(envfile=shlex.quote(data['worker_env_path']), envhash=shlex.quote(data['worker_env_sha256']),
