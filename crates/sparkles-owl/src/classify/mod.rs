@@ -116,6 +116,11 @@ fn drawing_on(
     })
 }
 
+/// Whether Tier D takes ontologies with individuals and nominals through the root of a
+/// rooted run (F24, "Nominals in the disjunctive rules"). It stays off until the rooted
+/// rules are complete, so that such an ontology takes the paths it took before.
+const ROOTED_RUNS: bool = false;
+
 /// The most conclusions a run of Tier D with counting derives, kept or redundant, before
 /// it passes its bound and the run starts again without counting.
 /// Number restrictions can make a context derive millions of conclusions that subsumption
@@ -1227,9 +1232,9 @@ impl Saturation {
         if !candidates.is_empty()
             && !limits.el_only
             && !self.skip_dl
-            && self.horn_allowed(&ax)
+            && (self.horn_allowed(&ax) || ROOTED_RUNS && self.rooted_allowed(&ax))
             && candidates.iter().any(|k| !dl::shape(k).horn)
-            && dl_norm::eligible(&self.interner, &ax)
+            && dl_norm::eligible(&self.interner, &ax, ROOTED_RUNS)
         {
             self.dl_tried = true;
             if let Some((flags, d)) = dl_norm::normalize(
@@ -1239,6 +1244,7 @@ impl Saturation {
                 limits.max_memory,
                 &stop,
                 limits.counting && !self.no_counting,
+                ROOTED_RUNS,
             )
             .map_err(halt)?
             {
@@ -1314,6 +1320,20 @@ impl Saturation {
         self.excluded = excluded;
         outside_el.taken = taken.len();
         Ok((ax, ix, peak, outside_el))
+    }
+
+    /// Whether a rooted run of Tier D may take axioms outside OWL 2 EL with individuals:
+    /// when the EL part has no top properties or functional data roles. The universal
+    /// property waits on its replacement, as F24 describes.
+    fn rooted_allowed(&self, ax: &Axioms) -> bool {
+        let it = &self.interner;
+        ax.functional.is_empty()
+            && it
+                .role_id(&index::RoleName::Object(ObjectProperty::top()))
+                .is_none()
+            && it
+                .role_id(&index::RoleName::Data(DataProperty::top()))
+                .is_none()
     }
 
     /// Whether the Horn rules may take axioms outside OWL 2 EL: when the EL part has no
