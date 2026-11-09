@@ -11,9 +11,10 @@
 //! The functions here only build quads and the SPARQL that reads them back. The build
 //! writes them in commits of kind `graphrag`.
 
-use super::guard::{DISCLOSURE_GRAPH, gr};
+use super::guard::{DISCLOSURE_GRAPH, GR, gr};
 use super::report::{Checked, Item, Rendered};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
+use std::fmt::Write as _;
 
 pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 pub const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
@@ -374,22 +375,19 @@ pub fn delete_subjects(graph: &str, subjects: &[String]) -> Option<String> {
     Some(out)
 }
 
-/// Write [`delete_subjects`]'s update for a nonempty `subjects` into `out`.
-pub fn write_delete_subjects(out: &mut String, graph: &str, subjects: &[String]) {
-    out.push_str("DELETE { GRAPH <");
-    out.push_str(graph);
-    out.push_str("> { ?x ?p ?o } } WHERE { VALUES ?r { ");
+/// Write [`delete_subjects`]'s update for a nonempty `subjects` into `w`.
+pub fn write_delete_subjects(w: &mut impl std::fmt::Write, graph: &str, subjects: &[String]) {
+    let _ = write!(
+        w,
+        "DELETE {{ GRAPH <{graph}> {{ ?x ?p ?o }} }} WHERE {{ VALUES ?r {{ "
+    );
     for (i, s) in subjects.iter().enumerate() {
-        if i > 0 {
-            out.push(' ');
-        }
-        out.push('<');
-        out.push_str(s);
-        out.push('>');
+        let _ = write!(w, "{}<{s}>", if i > 0 { " " } else { "" });
     }
-    out.push_str(" } GRAPH <");
-    out.push_str(graph);
-    out.push_str("> { ?x ?p ?o } FILTER(?x = ?r || STRSTARTS(STR(?x), CONCAT(STR(?r), \"#\"))) }");
+    let _ = write!(
+        w,
+        " }} GRAPH <{graph}> {{ ?x ?p ?o }} FILTER(?x = ?r || STRSTARTS(STR(?x), CONCAT(STR(?r), \"#\"))) }}"
+    );
 }
 
 /// The SPARQL update that removes the reports of `graph` that no community links to and
@@ -402,26 +400,33 @@ pub fn write_delete_subjects(out: &mut String, graph: &str, subjects: &[String])
 /// parent is replaced, so its findings remain resolvable, and the history keeps every
 /// removed report.
 pub fn delete_unreachable_reports(graph: &str) -> String {
-    let step = format!(
-        "(<{cites}>|(<{PROV}wasGeneratedBy>/<{PROV}used>)|<{edit}>)",
-        cites = gr("citesReport"),
-        edit = gr("editOf"),
+    let mut out = String::new();
+    write_delete_unreachable_reports(&mut out, graph);
+    out
+}
+
+/// Write [`delete_unreachable_reports`]'s update into `w`.
+pub fn write_delete_unreachable_reports(w: &mut impl std::fmt::Write, graph: &str) {
+    let _ = write!(
+        w,
+        "DELETE {{ GRAPH <{graph}> {{ ?x ?p ?o }} }} WHERE {{ {{ SELECT DISTINCT ?r WHERE {{ GRAPH <{graph}> {{ ?r a <{GR}Report> FILTER NOT EXISTS {{ ?c <{GR}report> ?r }} FILTER NOT EXISTS {{ ?c2 <{GR}report> ?r2 . ?r2 (<{GR}citesReport>|(<{PROV}wasGeneratedBy>/<{PROV}used>)|<{GR}editOf>)+ ?r }} }} }} }} GRAPH <{graph}> {{ ?x ?p ?o }} FILTER(?x = ?r || STRSTARTS(STR(?x), CONCAT(STR(?r), \"#\"))) }}"
     );
-    format!(
-        "DELETE {{ GRAPH <{graph}> {{ ?x ?p ?o }} }} WHERE {{ {{ SELECT DISTINCT ?r WHERE {{ GRAPH <{graph}> {{ ?r a <{report_t}> FILTER NOT EXISTS {{ ?c <{report}> ?r }} FILTER NOT EXISTS {{ ?c2 <{report}> ?r2 . ?r2 {step}+ ?r }} }} }} }} GRAPH <{graph}> {{ ?x ?p ?o }} FILTER(?x = ?r || STRSTARTS(STR(?x), CONCAT(STR(?r), \"#\"))) }}",
-        report_t = gr("Report"),
-        report = gr("report"),
-    )
 }
 
 /// The SPARQL update that removes footprints of `graph` that no report or community
 /// links to.
 pub fn delete_unlinked_footprints(graph: &str) -> String {
-    format!(
-        "DELETE {{ GRAPH <{DISCLOSURE_GRAPH}> {{ ?f ?p ?o }} }} WHERE {{ GRAPH <{DISCLOSURE_GRAPH}> {{ ?f <{covers}> <{graph}> ; ?p ?o }} FILTER NOT EXISTS {{ GRAPH <{graph}> {{ ?r <{disclosure}> ?f }} }} }}",
-        covers = gr("covers"),
-        disclosure = gr("disclosure"),
-    )
+    let mut out = String::new();
+    write_delete_unlinked_footprints(&mut out, graph);
+    out
+}
+
+/// Write [`delete_unlinked_footprints`]'s update into `w`.
+pub fn write_delete_unlinked_footprints(w: &mut impl std::fmt::Write, graph: &str) {
+    let _ = write!(
+        w,
+        "DELETE {{ GRAPH <{DISCLOSURE_GRAPH}> {{ ?f ?p ?o }} }} WHERE {{ GRAPH <{DISCLOSURE_GRAPH}> {{ ?f <{GR}covers> <{graph}> ; ?p ?o }} FILTER NOT EXISTS {{ GRAPH <{graph}> {{ ?r <{GR}disclosure> ?f }} }} }}"
+    );
 }
 
 #[cfg(test)]

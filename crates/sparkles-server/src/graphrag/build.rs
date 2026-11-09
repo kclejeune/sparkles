@@ -37,6 +37,7 @@ use sparkles::commit::CommitKind;
 use sparkles::sparql::{self, QueryOptions};
 use sparkles::store::Snapshot;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -1380,60 +1381,82 @@ enum Stop {
     Cancelled,
 }
 
-/// The SPARQL Update text of a level's commit, written into one buffer of
+/// The SPARQL Update text of a level's commit, written into one buffer of exactly
 /// [`commit_bytes`] bytes, so that building it allocates nothing more.
 fn commit_text(graph: &str, delete: &[String], quads: &[oxrdf::Quad]) -> String {
-    use std::fmt::Write as _;
     let mut out = String::with_capacity(commit_bytes(graph, delete, quads) as usize);
-    if !delete.is_empty() {
-        store::write_delete_subjects(&mut out, graph, delete);
-        out.push_str(" ;\n");
-    }
-    if !quads.is_empty() {
-        // the quads of each graph go together, the graphs in the order of their names
-        let mut graphs: Vec<&oxrdf::GraphName> = Vec::new();
-        for q in quads {
-            if !graphs.contains(&&q.graph_name) {
-                graphs.push(&q.graph_name);
-            }
-        }
-        let mut graphs: Vec<(String, &oxrdf::GraphName)> =
-            graphs.into_iter().map(|g| (g.to_string(), g)).collect();
-        graphs.sort_by(|a, b| a.0.cmp(&b.0));
-        out.push_str("INSERT DATA {\n");
-        for (name, g) in &graphs {
-            let _ = write!(out, "GRAPH {name} {{\n");
-            let mut first = true;
-            for q in quads.iter().filter(|q| &q.graph_name == *g) {
-                if !first {
-                    out.push('\n');
-                }
-                first = false;
-                let _ = write!(out, "{} {} {} .", q.subject, q.predicate, q.object);
-            }
-            out.push_str("\n}\n");
-        }
-        out.push_str("} ;\n");
-    }
-    out.push_str(&store::delete_unreachable_reports(graph));
-    out.push_str(" ;\n");
-    out.push_str(&store::delete_unlinked_footprints(graph));
+    write_commit(&mut out, graph, delete, quads);
     out
 }
 
-/// An upper bound of the length of [`commit_text`], computed without building it.
+/// The length of [`commit_text`], counted by writing it to a sink that keeps nothing.
 fn commit_bytes(graph: &str, delete: &[String], quads: &[oxrdf::Quad]) -> u64 {
-    // the statements around the deletions and the quads, and their separators
-    const FIXED: u64 = 1024;
-    let deletes: u64 = delete.iter().map(|s| s.len() as u64 + 3).sum();
-    // each quad's bound holds its graph's name, which bounds the graph's header
-    let inserts: u64 = quads.iter().map(quad_bytes).sum();
-    FIXED
-        + 2 * graph.len() as u64
-        + deletes
-        + inserts
-        + store::delete_unreachable_reports(graph).len() as u64
-        + store::delete_unlinked_footprints(graph).len() as u64
+    struct Count(u64);
+    impl std::fmt::Write for Count {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0 += s.len() as u64;
+            Ok(())
+        }
+    }
+    let mut n = Count(0);
+    write_commit(&mut n, graph, delete, quads);
+    n.0
+}
+
+/// A graph name's text as `Display` writes it, in three parts.
+fn graph_parts(g: &oxrdf::GraphName) -> [&str; 3] {
+    match g {
+        oxrdf::GraphName::NamedNode(n) => ["<", n.as_str(), ">"],
+        oxrdf::GraphName::BlankNode(b) => ["_:", b.as_str(), ""],
+        oxrdf::GraphName::DefaultGraph => ["DEFAULT", "", ""],
+    }
+}
+
+/// The order of two graph names' texts, without building them.
+fn graph_order(a: &oxrdf::GraphName, b: &oxrdf::GraphName) -> std::cmp::Ordering {
+    let bytes = |g| graph_parts(g).into_iter().flat_map(str::bytes);
+    bytes(a).cmp(bytes(b))
+}
+
+/// Write a level's commit into `w`: the deleted subjects, the quads of each graph in the
+/// order of the graphs' names, and the cleanup of unreachable reports and footprints.
+fn write_commit(
+    w: &mut impl std::fmt::Write,
+    graph: &str,
+    delete: &[String],
+    quads: &[oxrdf::Quad],
+) {
+    if !delete.is_empty() {
+        store::write_delete_subjects(w, graph, delete);
+        let _ = w.write_str(" ;\n");
+    }
+    if !quads.is_empty() {
+        let _ = w.write_str("INSERT DATA {\n");
+        // each graph in turn, the least name after the last one written
+        let mut last: Option<&oxrdf::GraphName> = None;
+        while let Some(g) = quads
+            .iter()
+            .map(|q| &q.graph_name)
+            .filter(|g| last.is_none_or(|l| graph_order(g, l).is_gt()))
+            .min_by(|a, b| graph_order(a, b))
+        {
+            let _ = writeln!(w, "GRAPH {g} {{");
+            let mut first = true;
+            for q in quads.iter().filter(|q| &q.graph_name == g) {
+                if !first {
+                    let _ = w.write_char('\n');
+                }
+                first = false;
+                let _ = write!(w, "{} {} {} .", q.subject, q.predicate, q.object);
+            }
+            let _ = w.write_str("\n}\n");
+            last = Some(g);
+        }
+        let _ = w.write_str("} ;\n");
+    }
+    store::write_delete_unreachable_reports(w, graph);
+    let _ = w.write_str(" ;\n");
+    store::write_delete_unlinked_footprints(w, graph);
 }
 
 /// Run a build or a refresh. Returns the outcome; a run stopped by its budget or an
@@ -1522,46 +1545,6 @@ struct Read {
     all: Option<BTreeSet<u32>>,
 }
 
-/// The longest form that oxrdf's N-Triples escaping gives a string's characters: a
-/// control character becomes `\uXXXX`, six bytes for one.
-fn escaped_len(s: &str) -> usize {
-    s.chars()
-        .map(|c| match c {
-            '\u{8}' | '\t' | '\n' | '\u{C}' | '\r' | '"' | '\\' => 2,
-            '\0'..='\u{1F}' | '\u{7F}' | '\u{FFFE}' | '\u{FFFF}' => 6,
-            c => c.len_utf8(),
-        })
-        .sum()
-}
-
-/// An upper bound of the bytes of a quad in the update text, without building it.
-fn quad_bytes(q: &oxrdf::Quad) -> u64 {
-    let term = |t: &Term| -> usize {
-        match t {
-            Term::NamedNode(n) => n.as_str().len() + 2,
-            // the quoted value, then the datatype or the language tag
-            Term::Literal(l) => {
-                escaped_len(l.value())
-                    + l.language().map_or(0, str::len)
-                    + l.datatype().as_str().len()
-                    + 8
-            }
-            // blank nodes and triple terms do not occur in the quads a run writes, and
-            // are bounded by their own display
-            t => t.to_string().len(),
-        }
-    };
-    let s = match &q.subject {
-        oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len() + 2,
-        oxrdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len() + 2,
-    };
-    let g = match &q.graph_name {
-        oxrdf::GraphName::NamedNode(n) => n.as_str().len() + 2,
-        _ => 0,
-    };
-    (s + q.predicate.as_str().len() + 2 + term(&q.object) + g + 8) as u64
-}
-
 /// The quads `report_quads` writes for a written report besides its evidence, at most:
 /// the report's and its activity's own statements, and for each finding its link, order,
 /// text, entities, unmatched names and up to two quads for each citation, with a
@@ -1606,6 +1589,10 @@ fn report_bytes<'a>(
         + graph.len() as u64
         // the vectors of claims, decisions and children that are sorted before writing
         + 2 * reference;
+    // `store::parse_term` formats a document around a term, and the parser buffers the
+    // term while it decodes it, so a term that becomes a quad's object holds about three
+    // times its length while it is parsed, and its result once more
+    let parsed = |len: usize| 4 * len as u64 + 256;
     let mut quads = ordinary_quads(checked);
     let mut bytes = 0u64;
     let mut add = |n: u64| bytes = bytes.saturating_add(n);
@@ -1633,7 +1620,7 @@ fn report_bytes<'a>(
     add((checked.title.len() + checked.summary.len()) as u64);
     for f in &checked.findings {
         add(f.text.len() as u64);
-        add(f.entities.iter().map(|e| e.len() as u64).sum());
+        add(f.entities.iter().map(|e| parsed(e.len())).sum());
         add(f.unmatched.iter().map(|u| u.len() as u64).sum());
         for &n in &f.cites {
             for &p in read.items.get(n.wrapping_sub(1)).into_iter().flatten() {
@@ -1642,11 +1629,10 @@ fn report_bytes<'a>(
                 quads += 2;
             }
             match input.items.get(n.wrapping_sub(1)) {
-                Some(report::Item::Fact(x) | report::Item::Edge(x)) => add((x.s.len()
-                    + x.p.len()
-                    + x.o.len()
-                    + x.reifier.as_ref().map_or(0, String::len))
-                    as u64),
+                Some(report::Item::Fact(x) | report::Item::Edge(x)) => {
+                    let terms = [Some(&x.s), Some(&x.p), Some(&x.o), x.reifier.as_ref()];
+                    add(terms.into_iter().flatten().map(|t| parsed(t.len())).sum());
+                }
                 Some(report::Item::ChildFinding { report, .. }) => {
                     add(2 * report.len() as u64 + SUFFIX)
                 }

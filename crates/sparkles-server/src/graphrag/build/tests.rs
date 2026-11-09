@@ -1231,36 +1231,6 @@ fn long_quad(graph: &str, value: &str) -> oxrdf::Quad {
 }
 
 #[test]
-fn quad_charges_bound_the_update_text() {
-    let long = format!("urn:g:{}", "g".repeat(10_000));
-    let graph = oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked(&long));
-    let s = oxrdf::NamedNode::new_unchecked("urn:s");
-    let p = oxrdf::NamedNode::new_unchecked("urn:p");
-    let controls: String = (0u8..0x20)
-        .map(char::from)
-        .chain(['\u{7f}', '"', '\\'])
-        .collect();
-    for value in [controls.repeat(100), "plain".into(), "é\u{FFFF}".repeat(50)] {
-        for o in [
-            Term::from(oxrdf::Literal::new_simple_literal(&value)),
-            Term::from(oxrdf::Literal::new_language_tagged_literal_unchecked(
-                &value, "en",
-            )),
-            Term::from(oxrdf::NamedNode::new_unchecked(&long)),
-        ] {
-            let q = oxrdf::Quad::new(s.clone(), p.clone(), o, graph.clone());
-            let text = format!("{q} .\n");
-            assert!(
-                quad_bytes(&q) >= text.len() as u64,
-                "{} < {}",
-                quad_bytes(&q),
-                text.len()
-            );
-        }
-    }
-}
-
-#[test]
 fn commit_charges_bound_the_whole_update() {
     let reports = format!("urn:g:{}", "r".repeat(5_000));
     let controls: String = (0u8..0x20).map(char::from).collect();
@@ -1275,7 +1245,9 @@ fn commit_charges_bound_the_whole_update() {
             Vec::new(),
             vec![
                 long_quad(&reports, &controls.repeat(50)),
-                long_quad("urn:other", "x"),
+                long_quad("urn:a/b", "x"),
+                long_quad("urn:a", "y"),
+                long_quad(&reports, "z"),
             ],
         ),
         (Vec::new(), Vec::new()),
@@ -1283,9 +1255,29 @@ fn commit_charges_bound_the_whole_update() {
     for (delete, quads) in cases {
         let bound = commit_bytes(&reports, &delete, &quads);
         let text = commit_text(&reports, &delete, &quads);
-        assert!(bound >= text.len() as u64, "{bound} < {}", text.len());
+        assert_eq!(bound, text.len() as u64);
         // the buffer never grew past its first allocation
-        assert_eq!(text.capacity() as u64, bound);
+        assert_eq!(text.capacity(), text.len());
+        // the text is the one the statements build on their own
+        let mut parts: Vec<String> = Vec::new();
+        parts.extend(store::delete_subjects(&reports, &delete));
+        if !quads.is_empty() {
+            let mut by_graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for q in &quads {
+                by_graph
+                    .entry(q.graph_name.to_string())
+                    .or_default()
+                    .push(format!("{} {} {} .", q.subject, q.predicate, q.object));
+            }
+            let mut body = String::new();
+            for (g, ts) in by_graph {
+                body.push_str(&format!("GRAPH {g} {{\n{}\n}}\n", ts.join("\n")));
+            }
+            parts.push(format!("INSERT DATA {{\n{body}}}"));
+        }
+        parts.push(store::delete_unreachable_reports(&reports));
+        parts.push(store::delete_unlinked_footprints(&reports));
+        assert_eq!(text, parts.join(" ;\n"));
     }
 }
 
@@ -1309,7 +1301,9 @@ fn report_charges_bound_what_the_report_builds() {
             o: o.into(),
             reifier: None,
         };
-        let facts = vec![fact("a", "<http://ex/b>"), fact("b", "<http://ex/a>")];
+        // a cited literal of 1 MiB
+        let big = format!("\"{}\"", "v".repeat(1 << 20));
+        let facts = vec![fact("a", "<http://ex/b>"), fact("b", &big)];
         let input = render_leaf(&members, &facts, &HashMap::<String, EntityInfo>::new());
         let findings: Vec<Value> = (0..12)
             .map(|i| json!({"text": format!("Finding {i}."), "entities": [1], "cites": [1, 2]}))
