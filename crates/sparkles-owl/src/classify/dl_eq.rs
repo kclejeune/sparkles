@@ -154,6 +154,11 @@ impl Eqs<'_> {
         let mut ts = Vec::new();
         if let XLit::Eq(a, b) = v {
             for (s1, t1) in [(a, b), (b, a)] {
+                if Rooted::a_gt(t1, s1) {
+                    continue;
+                }
+                // Factor has no exclusions of x ≈ y and y ≈ u, which only Eq has
+                self.factor(prem, l, s1, t1, found);
                 if !Eqs::orients(s1, t1) {
                     continue;
                 }
@@ -166,7 +171,6 @@ impl Eqs<'_> {
                     self.rewrites(*v2, s1, t1, &mut made);
                     push(found, prem, c2, &made);
                 }
-                self.factor(prem, l, s1, t1, found);
             }
         }
         self.into(st, v, prem, found);

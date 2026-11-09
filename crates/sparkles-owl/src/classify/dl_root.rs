@@ -944,4 +944,50 @@ mod tests {
         assert!(!d.has(&[XLit::Eq(RTerm::Fx(e), o)]));
         assert!(!d.bottom());
     }
+
+    #[test]
+    fn factor_takes_two_equalities_of_y() {
+        // ⊤ → y ≈ a ∨ y ≈ b, b above a: a ≉ b ∨ y ≈ b
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let nb = s.ind("b");
+        let d = saturate_seeded(s, None, |ix, _| {
+            let (ua, ub) = (c(na, ix), c(nb, ix));
+            vec![(vec![], vec![XLit::Eq(RTerm::Y, ua), XLit::Eq(RTerm::Y, ub)])]
+        });
+        let (ua, ub) = (c(na, &d.ix), c(nb, &d.ix));
+        let (lo, hi) = (ua.min(ub), ua.max(ub));
+        assert!(d.has(&[XLit::Ne(lo, hi), XLit::Eq(RTerm::Y, hi)]));
+    }
+
+    #[test]
+    fn the_index_by_term_is_counted_from_its_first_allocation() {
+        let mut st = super::super::dl_clause::Store::default();
+        let mut s = Sig::new();
+        let _ = s.ind("a");
+        let ix = Index::build(&s.ax, &mut s.it, None, &|| false).unwrap();
+        let lits = super::super::dl_clause::Lits::default();
+        let inv = |_: Role| None;
+        let o = Rooted {
+            ix: &ix,
+            lits: &lits,
+            inv: &inv,
+        };
+        let Made::Lit(l) = lits.lit(XLit::Atom(TOP, RTerm::C(0)), inv) else {
+            unreachable!()
+        };
+        st.add(Clause::new(Vec::new(), vec![l]));
+        let before = st.bytes();
+        let added = st.take_grown();
+        let mut max = Vec::new();
+        st.next(&ix, Some(&o), &mut max);
+        let grown = st.take_grown();
+        assert!(added == 0);
+        assert!(grown >= std::mem::size_of::<super::super::dl_clause::ByTerm>());
+        assert!(
+            st.bytes() - before <= grown,
+            "growth {grown} covers {}",
+            st.bytes() - before
+        );
+    }
 }

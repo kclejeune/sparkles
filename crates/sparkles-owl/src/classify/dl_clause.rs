@@ -958,8 +958,8 @@ impl Store {
                 }
             }
             if let Some(o) = rooted {
+                let before = self.terms.as_ref().map_or(0, |t| t.bytes());
                 let t = self.terms.get_or_insert_with(Box::default);
-                let before = t.bytes();
                 for &l in max.iter() {
                     t.index(o.view(l), id);
                 }
@@ -1642,9 +1642,11 @@ mod tests {
         let Made::Lit(g) = lits.lit(XLit::Atom(a, C(0)), inv) else {
             panic!()
         };
+        // the index by interned literal, and the index by term beside it
         let held = |s: &Store| {
             table_bytes(s.by_xl.capacity(), 32)
                 + s.by_xl.values().map(|v| v.capacity() * 4).sum::<usize>()
+                + s.terms.as_ref().map_or(0, |t| t.bytes())
         };
         let mut s = Store::default();
         let mut max = Vec::new();
