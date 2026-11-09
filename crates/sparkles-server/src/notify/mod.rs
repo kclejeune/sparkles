@@ -492,7 +492,24 @@ pub fn raise(st: &Arc<AppState>, ev: Event, cond: Option<Condition>, now: DateTi
 
 /// The condition `key` cleared: the next event with it is notified at once.
 pub fn clear(st: &AppState, key: &str) {
-    clear_where(st, |k| k == key);
+    let mut g = st.notifier.shared.inner.lock();
+    if g.active(st).remove(key).is_some() {
+        g.save(st);
+    }
+}
+
+/// Change the conditions in one step under the notifier's lock, saving them once when
+/// `f` says it changed them.
+fn with_conditions<R>(
+    st: &AppState,
+    f: impl FnOnce(&mut BTreeMap<String, Active>) -> (R, bool),
+) -> R {
+    let mut g = st.notifier.shared.inner.lock();
+    let (r, changed) = f(g.active(st));
+    if changed {
+        g.save(st);
+    }
+    r
 }
 
 /// Clear every condition whose key `cleared` accepts.
@@ -504,38 +521,6 @@ pub fn clear_where(st: &AppState, cleared: impl Fn(&str) -> bool) {
     if active.len() != before {
         g.save(st);
     }
-}
-
-/// The keys of the active conditions that start with `prefix`.
-pub fn keys_with_prefix(st: &AppState, prefix: &str) -> Vec<String> {
-    let mut g = st.notifier.shared.inner.lock();
-    g.active(st)
-        .range(prefix.to_string()..)
-        .take_while(|(k, _)| k.starts_with(prefix))
-        .map(|(k, _)| k.clone())
-        .collect()
-}
-
-/// Record the condition `key` of event type `event` as present without sending
-/// anything, so that a later check can tell when it clears. Notifications are about
-/// the event that names the condition's group.
-pub fn mark(st: &AppState, key: &str, event: &str, now: DateTime<Utc>) {
-    let mut g = st.notifier.shared.inner.lock();
-    let active = g.active(st);
-    if active.contains_key(key) {
-        return;
-    }
-    active.insert(
-        key.to_string(),
-        Active {
-            event: event.into(),
-            dataset: None,
-            first: rfc3339(now),
-            last: rfc3339(now),
-            count: 0,
-        },
-    );
-    g.save(st);
 }
 
 /// Whether the condition `key` is active.

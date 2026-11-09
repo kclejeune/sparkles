@@ -549,13 +549,17 @@ These points differ from the design or settle what it left open.
   verification that fails or finds a backup with the status `error` sends
   `backup.verify.failed`, keyed by repository. Each damaged backup and each failed
   verification is also kept as a silent condition with its level in the key, and the
-  repository's condition clears when the last of them does: a damaged backup when a
-  verification at the same or a higher level finds it ok or a whole verification no
-  longer lists it, and a failed verification when a later one at the same or a higher
-  level succeeds. A verification that finds only orphan blobs is not a failure. A GC
+  repository's condition clears when the last of them does. A damaged backup, and a
+  backup that a failed selected verification asked for, clears when a verification at
+  the same or a higher level finds it ok or when a whole verification no longer lists
+  it, whatever the level. A failed whole verification clears only when a whole one
+  succeeds at the same level, or at `data` for `restore`, which a whole verification
+  over HTTP does not offer. The update of these conditions is one step under the
+  notifier's lock, so two verifications cannot interleave between the check and the
+  clearing, and it saves the conditions file once. A verification that finds only orphan blobs is not a failure. A GC
   that fails, and a GC after retention that a policy cannot start, send
   `backup.gc.failed`, keyed by repository and cleared by a GC that deletes and
-  succeeds, since a dry run neither takes the lock nor sweeps. `backup.overdue` fires
+  succeeds, since a dry run takes no exclusive lock and does not sweep. `backup.overdue` fires
   for an enabled policy that has missed two scheduled instants since its last success
   while no run of it is going on, which reads "twice its schedule's interval" as two
   scheduled instants so that a weekday schedule is not overdue over a weekend. It

@@ -415,17 +415,22 @@ fn verify_rank(level: &str) -> u8 {
     }
 }
 
-/// The end of a verification of `repository` at `level` (`whole`: of the whole
-/// repository, which lists every backup in `checked`): `backup.verify.failed`, keyed
+/// The end of a verification of `repository` at `level`: `backup.verify.failed`, keyed
 /// per repository, when it failed (`error`) or found backups in error (`broken`).
+/// `whole` is a verification of the whole repository, whose report lists every backup
+/// in `checked`, and `names` are the backups a selected one asked for.
 ///
-/// Each problem is also kept as a condition of its own that sends nothing,
-/// `backup.verify.failed/{repository}/{backup}@{level}`, or `…/*@{level}` for a
-/// verification that failed. A backup's problems clear when a verification at the
-/// same or a higher level finds it ok, and those of a backup that a whole verification
-/// no longer lists clear too, since it was deleted. A failed verification clears when
-/// a later one at the same or a higher level succeeds. The repository's condition
-/// clears once none of its problems is left.
+/// Each problem is also kept as a condition of its own that sends nothing: a damaged
+/// backup as `backup.verify.failed/{repository}/{backup}@{level}`, a selected
+/// verification that failed as `…/{backup}!@{level}` for each backup it asked for, and
+/// a whole verification that failed as `…/*@{level}`. A backup's problems clear when a
+/// verification at the same or a higher level finds it ok, or when a whole verification
+/// no longer lists it, since it was deleted. A failed whole verification clears only
+/// when a whole verification succeeds at the same level, or at `data` for one at
+/// `restore`, which a whole verification does not offer over HTTP. The repository's
+/// condition clears once none of its problems is left. The change is one step under
+/// the notifier's lock, so two verifications cannot interleave between the check and
+/// the clearing.
 #[cfg_attr(not(feature = "backup"), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub fn backup_verify(
@@ -433,6 +438,7 @@ pub fn backup_verify(
     repository: &str,
     whole: bool,
     level: &str,
+    names: &[String],
     checked: &[String],
     broken: &[String],
     error: Option<&str>,
@@ -441,45 +447,64 @@ pub fn backup_verify(
     let key = format!("backup.verify.failed/{repository}");
     let prefix = format!("{key}/");
     let rank = verify_rank(level);
-    if error.is_none() {
-        let ok: std::collections::HashSet<&str> = checked
+    let mut marks: Vec<String> = broken
+        .iter()
+        .map(|b| format!("{prefix}{b}@{level}"))
+        .collect();
+    if error.is_some() {
+        if whole {
+            marks.push(format!("{prefix}*@{level}"));
+        } else {
+            marks.extend(names.iter().map(|b| format!("{prefix}{b}!@{level}")));
+        }
+    }
+    let ok: std::collections::HashSet<&str> = if error.is_none() {
+        checked
             .iter()
             .map(String::as_str)
             .filter(|b| !broken.iter().any(|x| x == b))
-            .collect();
-        super::clear_where(st, |k| {
-            let Some(rest) = k.strip_prefix(&prefix) else {
-                return false;
-            };
-            let Some((backup, at)) = rest.rsplit_once('@') else {
-                return false;
-            };
-            if verify_rank(at) > rank {
-                return false;
-            }
-            backup == "*" || ok.contains(backup) || (whole && !checked.iter().any(|c| c == backup))
-        });
-    }
-    for b in broken {
-        super::mark(
-            st,
-            &format!("{prefix}{b}@{level}"),
-            "backup.verify.failed",
-            now,
-        );
-    }
-    if error.is_some() {
-        super::mark(
-            st,
-            &format!("{prefix}*@{level}"),
-            "backup.verify.failed",
-            now,
-        );
-    }
-    if error.is_none() && broken.is_empty() {
-        if super::keys_with_prefix(st, &prefix).is_empty() {
-            clear(st, &key);
+            .collect()
+    } else {
+        Default::default()
+    };
+    super::with_conditions(st, |active| {
+        let before = active.len();
+        if error.is_none() {
+            active.retain(|k, _| {
+                let Some(rest) = k.strip_prefix(&prefix) else {
+                    return true;
+                };
+                let Some((what, at)) = rest.rsplit_once('@') else {
+                    return true;
+                };
+                let at = verify_rank(at);
+                if what == "*" {
+                    return !(whole && rank >= at.min(1));
+                }
+                let backup = what.strip_suffix('!').unwrap_or(what);
+                let deleted = whole && !checked.iter().any(|c| c == backup);
+                let passed = ok.contains(backup) && rank >= at;
+                !(deleted || passed)
+            });
         }
+        for m in &marks {
+            active.entry(m.clone()).or_insert_with(|| super::Active {
+                event: "backup.verify.failed".into(),
+                dataset: None,
+                first: super::rfc3339(now),
+                last: super::rfc3339(now),
+                count: 0,
+            });
+        }
+        let left = active
+            .range(prefix.clone()..)
+            .next()
+            .is_some_and(|(k, _)| k.starts_with(&prefix));
+        let cleared = !left && active.remove(&key).is_some();
+        let changed = active.len() != before || cleared || !marks.is_empty();
+        ((), changed)
+    });
+    if marks.is_empty() {
         return None;
     }
     let summary = match error {
@@ -511,7 +536,8 @@ pub fn backup_verify(
 
 /// The end of a GC of `repository` (`dry_run`: one that deletes nothing), or a GC that
 /// a policy could not start: `backup.gc.failed` keyed per repository, cleared by a GC
-/// that deletes and succeeds, since a dry run does not take the lock or sweep.
+/// that deletes and succeeds, since a dry run takes no exclusive lock and does not
+/// sweep.
 #[cfg_attr(not(feature = "backup"), allow(dead_code))]
 pub fn backup_gc(
     st: &Arc<AppState>,

@@ -2643,3 +2643,84 @@ async fn a_failed_gc_notifies() {
     condition(&s.st, key, false).await;
     assert_eq!(notified(&s.st, "backup.gc.failed", 1).await.len(), 1);
 }
+
+/// A failed whole verification clears only on a whole one that succeeds, not on a
+/// selected one, and a backup's restore-level problem clears when the backup is
+/// deleted (spec C21).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn verification_conditions_follow_scope_and_deletion() {
+    use std::os::unix::fs::PermissionsExt;
+    let (s, repo) = with_local_opts(
+        false,
+        Opts {
+            notify: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    backup_ds(&s, "b1").await;
+    update(&s, "ds", "INSERT DATA { <urn:c> <urn:p> 3 }");
+    backup_ds(&s, "b2").await;
+    let key = "backup.verify.failed/local";
+    let listing = repo.path().join("backups");
+    let set = |mode: u32| {
+        std::fs::set_permissions(&listing, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    // the backups can be read but not listed
+    set(0o311);
+    let listable = std::fs::read_dir(&listing).is_ok();
+    if !listable {
+        let t = run(
+            &s,
+            "/$/repositories/local/verify",
+            json!({"level": "exists"}),
+        )
+        .await;
+        assert_eq!(t.state, "failed", "{:?}", t.detail);
+        condition(&s.st, key, true).await;
+        let _ = run(
+            &s,
+            "/$/backups/ds/local/b1/verify",
+            json!({"level": "exists"}),
+        )
+        .await;
+        assert!(
+            crate::notify::is_active(&s.st, key),
+            "a selected verification does not clear a failed whole one"
+        );
+    }
+    set(0o755);
+    let t = run(
+        &s,
+        "/$/repositories/local/verify",
+        json!({"level": "exists"}),
+    )
+    .await;
+    assert_ne!(t.detail.unwrap()["status"], "error");
+    condition(&s.st, key, false).await;
+    // a restore-level problem of b1, which no whole verification can check
+    let (_, file) = blob_file(&s, repo.path(), "b1", "gen-0001/spo.dat").await;
+    let saved = std::fs::read(&file).unwrap();
+    let mut bad = saved.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    std::fs::write(&file, &bad).unwrap();
+    let t = run(
+        &s,
+        "/$/backups/ds/local/b1/verify",
+        json!({"level": "restore"}),
+    )
+    .await;
+    assert_eq!(t.detail.unwrap()["status"], "error");
+    condition(&s.st, key, true).await;
+    std::fs::write(&file, &saved).unwrap();
+    delete_ds_backup(&s, "b1").await;
+    let t = run(&s, "/$/repositories/local/verify", json!({"level": "data"})).await;
+    assert_ne!(t.detail.unwrap()["status"], "error");
+    condition(&s.st, key, false).await;
+    if listable {
+        eprintln!(
+            "a directory without read permission is listable here (root?): the scope part was skipped"
+        );
+    }
+}
