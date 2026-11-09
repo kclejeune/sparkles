@@ -137,7 +137,11 @@ pub fn parse_term(nt: &str) -> Option<Term> {
     if let Some(iri) = nt.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
         return NamedNode::new(iri).ok().map(Term::NamedNode);
     }
-    let doc = format!("<urn:x> <urn:x> {nt} .");
+    // one allocation of the document's exact length, which the run's charges count on
+    let mut doc = String::with_capacity(nt.len() + 18);
+    doc.push_str("<urn:x> <urn:x> ");
+    doc.push_str(nt);
+    doc.push_str(" .");
     oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NTriples)
         .for_slice(doc.as_bytes())
         .next()

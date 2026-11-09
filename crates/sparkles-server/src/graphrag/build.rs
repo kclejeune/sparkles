@@ -1589,10 +1589,11 @@ fn report_bytes<'a>(
         + graph.len() as u64
         // the vectors of claims, decisions and children that are sorted before writing
         + 2 * reference;
-    // `store::parse_term` formats a document around a term, and the parser buffers the
-    // term while it decodes it, so a term that becomes a quad's object holds about three
-    // times its length while it is parsed, and its result once more
-    let parsed = |len: usize| 4 * len as u64 + 256;
+    // `store::parse_term` writes a document of the term's length around it, and the
+    // parser's buffer for the term grows by doubling while it decodes, holding the old
+    // buffer while it copies to the new one, so a term holds about six times its length
+    // while it is parsed and its result once more; eight times leaves a margin
+    let parsed = |len: usize| 8 * len as u64 + 256;
     let mut quads = ordinary_quads(checked);
     let mut bytes = 0u64;
     let mut add = |n: u64| bytes = bytes.saturating_add(n);

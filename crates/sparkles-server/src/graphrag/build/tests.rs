@@ -1301,8 +1301,8 @@ fn report_charges_bound_what_the_report_builds() {
             o: o.into(),
             reifier: None,
         };
-        // a cited literal of 1 MiB
-        let big = format!("\"{}\"", "v".repeat(1 << 20));
+        // a cited literal of 1 MiB, whose escaped quote makes the parser's buffer grow
+        let big = format!("\"{}\\\"\"", "v".repeat(1 << 20));
         let facts = vec![fact("a", "<http://ex/b>"), fact("b", &big)];
         let input = render_leaf(&members, &facts, &HashMap::<String, EntityInfo>::new());
         let findings: Vec<Value> = (0..12)
