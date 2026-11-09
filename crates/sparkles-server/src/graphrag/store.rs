@@ -377,26 +377,24 @@ pub fn delete_subjects(graph: &str, subjects: &[String]) -> Option<String> {
 }
 
 /// The SPARQL update that removes the reports of `graph` that no community links to and
-/// that no linked report reaches, with their findings and activities. A linked report
-/// reaches the reports it cites through `gr:citesReport` and the child reports its
-/// activity used. A linked report read under a review policy that a person edited, and
-/// so has no activity, also reaches the report it revises, back through earlier edits,
-/// and what that report reaches, so that the edit's provenance resolves (spec C25,
-/// "Reports on accepted evidence"). A report that a run wrote in place of another does
-/// not keep it. A report a kept parent still reaches stays until that parent is
-/// replaced, so its findings remain resolvable, and the history keeps every removed
-/// report.
+/// that no linked report reaches, with their findings and activities. A report reaches
+/// the reports it cites through `gr:citesReport`, the child reports its activity used,
+/// and, for a person's edit of a report read under a review policy, the report it edits
+/// through `gr:editOf`, so that the edit's provenance resolves wherever the edit is kept
+/// (spec C25, "Reports on accepted evidence"). A report that a run wrote in place of
+/// another does not keep it. A report a kept parent still reaches stays until that
+/// parent is replaced, so its findings remain resolvable, and the history keeps every
+/// removed report.
 pub fn delete_unreachable_reports(graph: &str) -> String {
     let step = format!(
-        "(<{cites}>|(<{PROV}wasGeneratedBy>/<{PROV}used>))",
-        cites = gr("citesReport")
+        "(<{cites}>|(<{PROV}wasGeneratedBy>/<{PROV}used>)|<{edit}>)",
+        cites = gr("citesReport"),
+        edit = gr("editOf"),
     );
     format!(
-        "DELETE {{ GRAPH <{graph}> {{ ?x ?p ?o }} }} WHERE {{ {{ SELECT DISTINCT ?r WHERE {{ GRAPH <{graph}> {{ ?r a <{report_t}> FILTER NOT EXISTS {{ ?c <{report}> ?r }} FILTER NOT EXISTS {{ ?c2 <{report}> ?r2 . ?r2 {step}+ ?r }} FILTER NOT EXISTS {{ ?c3 <{report}> ?l . ?l <{policy}> ?pol ; <{rev}>+ ?root . FILTER NOT EXISTS {{ ?l <{rev}>* ?m . ?m <{rev}>+ ?root ; <{PROV}wasGeneratedBy> ?act }} ?root {step}* ?r }} }} }} }} GRAPH <{graph}> {{ ?x ?p ?o }} FILTER(?x = ?r || STRSTARTS(STR(?x), CONCAT(STR(?r), \"#\"))) }}",
+        "DELETE {{ GRAPH <{graph}> {{ ?x ?p ?o }} }} WHERE {{ {{ SELECT DISTINCT ?r WHERE {{ GRAPH <{graph}> {{ ?r a <{report_t}> FILTER NOT EXISTS {{ ?c <{report}> ?r }} FILTER NOT EXISTS {{ ?c2 <{report}> ?r2 . ?r2 {step}+ ?r }} }} }} }} GRAPH <{graph}> {{ ?x ?p ?o }} FILTER(?x = ?r || STRSTARTS(STR(?x), CONCAT(STR(?r), \"#\"))) }}",
         report_t = gr("Report"),
         report = gr("report"),
-        policy = gr("reviewPolicy"),
-        rev = format!("{PROV}wasRevisionOf"),
     )
 }
 

@@ -373,8 +373,8 @@ old one with `prov:wasRevisionOf`, written by the person, with status `reviewed`
 `gr:reviewPolicy`, `gr:policyVersion` and `gr:evidenceConfiguration`, its findings cite
 `gr:citesClaim` and `gr:citesDecision`, and its activity names every claim, decision and
 child report it read with `prov:used`. A kept report keeps the child reports its activity
-used, and an edit of such a report keeps the report it revises with that report's
-activity. [C25](C25-evidence-and-assessments.md#reports-on-accepted-evidence) defines the
+used, and an edit of such a report names the report it edits with `gr:editOf` and keeps
+it with that report's activity. [C25](C25-evidence-and-assessments.md#reports-on-accepted-evidence) defines the
 reads, the bounds, the refresh rules and the footprint.
 
 **Search.** The summaries and findings are text, so the dataset's full-text index can

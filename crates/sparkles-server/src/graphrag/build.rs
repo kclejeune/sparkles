@@ -281,24 +281,48 @@ struct Prepared {
     entity_claims: HashMap<String, Vec<u32>>,
     /// the positions in the previous build's pairs of those that have ended
     ended: HashSet<u32>,
-    /// each report of the graph with the report it revises and whether a run wrote it
-    revisions: HashMap<String, (Option<String>, bool)>,
+    /// each report of the graph with what it revises, how it was written and its policy
+    revisions: HashMap<String, Revision>,
+}
+
+/// What the reports graph records about one report's origin.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Revision {
+    /// the report it revises
+    pub(crate) prev: Option<String>,
+    /// whether a run wrote it, rather than a person's edit
+    pub(crate) generated: bool,
+    /// the review policy's IRI and version it records
+    pub(crate) policy: Option<(String, u64)>,
+}
+
+/// Whether `report` is a person's edit of `of`, directly or through earlier edits. Every
+/// report of the chain but `of` is an edit, and a chain that returns to a report it
+/// passed is not one.
+pub(crate) fn edit_of(revisions: &HashMap<String, Revision>, report: &str, of: &str) -> bool {
+    let mut at = report;
+    let mut seen: HashSet<&str> = HashSet::new();
+    loop {
+        if at == of {
+            return true;
+        }
+        if !seen.insert(at) {
+            return false;
+        }
+        match revisions.get(at) {
+            Some(Revision {
+                prev: Some(prev),
+                generated: false,
+                ..
+            }) => at = prev,
+            _ => return false,
+        }
+    }
 }
 
 impl Prepared {
-    /// Whether `report` is a person's edit of `of`, directly or through earlier edits.
     fn edit_of(&self, report: &str, of: &str) -> bool {
-        let mut at = report;
-        for _ in 0..64 {
-            if at == of {
-                return true;
-            }
-            match self.revisions.get(at) {
-                Some((Some(prev), false)) => at = prev,
-                _ => return false,
-            }
-        }
-        false
+        edit_of(&self.revisions, report, of)
     }
 }
 
@@ -810,7 +834,9 @@ impl Run<'_> {
         // under the policy the previous build read under, which of its pairs have ended,
         // and how the reports of the graph revise each other
         let mut ended: HashSet<u32> = HashSet::new();
-        let mut revisions: HashMap<String, (Option<String>, bool)> = HashMap::new();
+        // read for every run, so that a run without a policy finds reports that record
+        // one even when the state does not say so, as after an interrupted run
+        let revisions = self.revisions(&snap)?;
         if let Some(e) = ev.as_mut() {
             if let Some(b) = &previous.last_build
                 && same_policy(b.policy.as_ref(), &e.policy)
@@ -829,7 +855,6 @@ impl Run<'_> {
                     }
                 }
             }
-            revisions = self.revisions(&snap)?;
         }
         Ok(Prepared {
             snap,
@@ -886,17 +911,16 @@ impl Run<'_> {
 
     /// Each report of the reports graph with the report it revises and whether a run
     /// generated it, which tells a person's edit from a run's replacement.
-    fn revisions(
-        &self,
-        snap: &Arc<Snapshot>,
-    ) -> Result<HashMap<String, (Option<String>, bool)>, RunError> {
+    fn revisions(&self, snap: &Arc<Snapshot>) -> Result<HashMap<String, Revision>, RunError> {
         let g = self.graph();
         let q = format!(
-            "SELECT ?r ?prev ?a WHERE {{ GRAPH <{g}> {{ ?r a <{}> OPTIONAL {{ ?r <{p}wasRevisionOf> ?prev }} OPTIONAL {{ ?r <{p}wasGeneratedBy> ?a }} }} }}",
+            "SELECT ?r ?prev ?a ?pol ?ver WHERE {{ GRAPH <{g}> {{ ?r a <{}> OPTIONAL {{ ?r <{p}wasRevisionOf> ?prev }} OPTIONAL {{ ?r <{p}wasGeneratedBy> ?a }} OPTIONAL {{ ?r <{}> ?pol OPTIONAL {{ ?r <{}> ?ver }} }} }} }}",
             super::guard::gr("Report"),
+            super::guard::gr("reviewPolicy"),
+            super::guard::gr("policyVersion"),
             p = store::PROV,
         );
-        let mut out: HashMap<String, (Option<String>, bool)> = HashMap::new();
+        let mut out: HashMap<String, Revision> = HashMap::new();
         for r in rows(snap, &q, &QueryOptions::default())? {
             let r = r.values();
             let Some(Term::NamedNode(rep)) = &r[0] else {
@@ -904,10 +928,17 @@ impl Run<'_> {
             };
             let e = out.entry(rep.as_str().to_string()).or_default();
             if let Some(Term::NamedNode(p)) = &r[1] {
-                e.0 = Some(p.as_str().to_string());
+                e.prev = Some(p.as_str().to_string());
             }
             if r[2].is_some() {
-                e.1 = true;
+                e.generated = true;
+            }
+            if let Some(Term::NamedNode(p)) = &r[3] {
+                let v = match &r[4] {
+                    Some(Term::Literal(l)) => l.value().parse().unwrap_or(u64::MAX),
+                    _ => u64::MAX,
+                };
+                e.policy = Some((p.as_str().to_string(), v));
             }
         }
         Ok(out)
@@ -1113,13 +1144,16 @@ impl Run<'_> {
             if o.members != n.members {
                 continue;
             }
+            // the policy the linked report records, whatever the state says
+            let recorded = prep.revisions.get(report).and_then(|r| r.policy.as_ref());
             let force = match policy {
                 // a report read under a policy the run does not have
-                None => o.policy,
-                Some(_) => {
+                None => o.policy || recorded.is_some(),
+                Some(p) => {
                     !same
                         || !o.policy
                         || o.pairs.is_none()
+                        || recorded.is_none_or(|(iri, v)| *iri != p.iri || *v != u64::from(p.version))
                         // a report other than the one the state names, unless a person
                         // edited it, which keeps the pairs of the report it revises
                         || o.report.as_deref().is_none_or(|r| !prep.edit_of(report, r))
@@ -1458,6 +1492,63 @@ struct Read {
     all: Option<BTreeSet<u32>>,
 }
 
+/// An upper bound of the bytes of a quad in the update text, without building it.
+fn quad_bytes(q: &oxrdf::Quad) -> u64 {
+    let term = |t: &Term| -> usize {
+        match t {
+            Term::NamedNode(n) => n.as_str().len() + 2,
+            Term::Literal(l) => {
+                // an escape doubles a byte at most, and the datatype or tag follows
+                2 * l.value().len()
+                    + l.language().map_or(0, str::len)
+                    + l.datatype().as_str().len()
+                    + 8
+            }
+            // blank nodes and triple terms do not occur in the quads a run writes, and
+            // are bounded by their own display
+            t => t.to_string().len(),
+        }
+    };
+    let s = match &q.subject {
+        oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len() + 2,
+        oxrdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len() + 2,
+    };
+    let g = match &q.graph_name {
+        oxrdf::GraphName::NamedNode(n) => n.as_str().len() + 2,
+        _ => 0,
+    };
+    (s + q.predicate.as_str().len() + 2 + term(&q.object) + g + 8) as u64
+}
+
+/// An upper bound of the bytes that a written report's evidence adds: the claim and
+/// decision strings of its items and of `prov:used`, and the quads of each finding's
+/// citations and of the activity's `prov:used`.
+fn citation_bytes(e: &Evidence, read: &Read, checked: &report::Checked, iri: &str) -> u64 {
+    const QUAD: u64 = 96;
+    let pair_len = |p: u32| {
+        let (c, d) = e.pair(p);
+        (c.len() + d.len()) as u64
+    };
+    let finding = iri.len() as u64 + 8;
+    let mut bytes = 0u64;
+    for ps in &read.items {
+        for &p in ps {
+            bytes = bytes.saturating_add(pair_len(p) + 16);
+        }
+    }
+    for f in &checked.findings {
+        for n in &f.cites {
+            for &p in read.items.get(n.wrapping_sub(1)).into_iter().flatten() {
+                bytes = bytes.saturating_add(pair_len(p) + 2 * (finding + QUAD));
+            }
+        }
+    }
+    for &p in &read.own {
+        bytes = bytes.saturating_add(2 * pair_len(p) + 2 * (finding + QUAD));
+    }
+    bytes.saturating_add(read.children.len() as u64 * (finding + QUAD))
+}
+
 pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
     let (models, pairs, principal) = r.admit()?;
     let previous = r.load_state()?;
@@ -1762,6 +1853,17 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                 outcome.written += 1;
             }
             *statuses.entry(status.as_str()).or_default() += 1;
+            // the citations and `prov:used` of a written report are charged before their
+            // strings and quads are built
+            let bytes = match (&ev, &read, &body) {
+                (Some(e), Some(read), Body::Written { checked, .. }) => {
+                    citation_bytes(e, read, checked, &iri)
+                }
+                _ => 0,
+            };
+            if let Some(e) = ev.as_mut() {
+                e.charge(bytes)?;
+            }
             // a failed report records its policy and no claim
             let evidence = match (&ev, read) {
                 (Some(e), Some(read)) => {
@@ -1832,11 +1934,11 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         if depth == 0 {
             delete.extend(prep.gone.iter().cloned());
         }
-        // under a policy, the level's quads and update text are charged before the
-        // text is built, and a level that would pass the allowance is not committed
+        // under a policy, the level's update text is charged before it is built, and a
+        // level that would pass the allowance is not committed
         if let Some(e) = ev.as_mut() {
-            let bytes: u64 = quads.iter().map(|q| q.to_string().len() as u64 + 4).sum();
-            e.charge(bytes.saturating_mul(2))?;
+            let bytes: u64 = quads.iter().map(quad_bytes).sum();
+            e.charge(bytes)?;
         }
         // builds and reviews of one dataset commit one at a time
         let lock = r.st.graphrag.lock(&r.ds.name);

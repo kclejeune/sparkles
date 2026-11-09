@@ -849,11 +849,15 @@ fn revision_text(
         gr("status"),
         format!("{}wasRevisionOf", store::PROV),
         format!("{}wasGeneratedBy", store::PROV),
+        gr("editOf"),
     ];
     let activity = store::activity_iri(old);
     let mut triples: Vec<Triple> = Vec::new();
     let mut old_title = None;
     let mut old_summary = None;
+    // an edit of a report read under a review policy keeps the report it edits, whose
+    // activity names what the copied citations read (spec C25)
+    let mut policy = false;
     for r in found {
         let (Some(Term::NamedNode(s)), Some(Term::NamedNode(p)), Some(o)) =
             (r[0].clone(), r[1].clone(), r[2].clone())
@@ -864,6 +868,7 @@ fn revision_text(
             continue;
         }
         if s.as_str() == old {
+            policy |= p.as_str() == gr("reviewPolicy");
             if p.as_str() == store::RDFS_LABEL {
                 old_title = lit(&Some(o.clone()));
             } else if p.as_str() == gr("summary") {
@@ -911,6 +916,13 @@ fn revision_text(
         pred(&format!("{}wasRevisionOf", store::PROV)),
         Term::NamedNode(NamedNode::new_unchecked(old)),
     ));
+    if policy {
+        triples.push(Triple::new(
+            id(),
+            pred(&gr("editOf")),
+            Term::NamedNode(NamedNode::new_unchecked(old)),
+        ));
+    }
     triples.push(Triple::new(
         NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(community)),
         pred(&gr("report")),

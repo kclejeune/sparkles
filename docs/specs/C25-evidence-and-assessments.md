@@ -2223,7 +2223,13 @@ retention rules and the reading routes ship as this section describes. The
 implementation is `crates/sparkles-server/src/graphrag/evidence.rs` with the build, store
 and refresh modules beside it, and the reports graph gains the predicates
 `gr:reviewPolicy`, `gr:policyVersion`, `gr:evidenceConfiguration`, `gr:citesClaim` and
-`gr:citesDecision`. The UI's GraphRAG settings take the policy name, and a report under a
+`gr:citesDecision`. A person's edit of a report read under a policy also records
+`gr:editOf` with the report it edits, beside `prov:wasRevisionOf`, so that retention
+follows an edit to the report it revises wherever the edit is kept, through a parent's
+`prov:used` as well as a community's link, and never follows a run's replacement. A run
+without a policy reads which reports record one from the reports graph, so a report
+written by an interrupted run under a policy is rewritten even when the state does not
+record it. The UI's GraphRAG settings take the policy name, and a report under a
 policy shows it with each finding's accepted claims and decisions.
 
 The private check of the automatic refresh is not built, and roadmap item 652 adds it.
@@ -2242,9 +2248,10 @@ known once the children are written. The bound of 10,000 occurrences is therefor
 before the estimate for every leaf and for a parent's own facts and their entities, and
 again for a parent's whole input before its model call. A parent that passes the bound
 only then refuses the run after the lower levels committed, and the next refresh, which
-finds no matching state for those levels, rewrites them. A level's quads are charged to
-the run allowance twice, once for the quads and once as an upper bound of the update
-text, before the text is built.
+finds no matching state for those levels, rewrites them. A written report's claim and
+decision strings and the quads of its citations and `prov:used` are charged to the run
+allowance before they are built, and a level's update text is charged from an upper bound
+of its quads before the text is built.
 
 The router tests in
 `crates/sparkles-server/src/http/router_tests/auth/graphrag_evidence.rs` cover a run

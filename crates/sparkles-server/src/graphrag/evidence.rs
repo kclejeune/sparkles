@@ -75,6 +75,9 @@ pub struct RunPolicy {
 /// A triple as canonical N-Triples terms.
 pub type TripleKey = (String, String, String);
 
+/// Which of some propositions the principal's view of the output graph holds.
+pub type Present<'a> = dyn Fn(&[oxrdf::Triple]) -> Result<Vec<bool>, RunError> + 'a;
+
 /// What a recheck compares: the dataset's current evidence settings against those the
 /// run's view recorded.
 #[derive(Clone)]
@@ -409,7 +412,7 @@ impl Evidence {
     pub fn ended(
         &mut self,
         old: &[(String, String)],
-        present: &dyn Fn(&[oxrdf::Triple]) -> Result<Vec<bool>, RunError>,
+        present: &Present<'_>,
     ) -> Result<Vec<bool>, RunError> {
         let mut out = vec![true; old.len()];
         for (chunk_at, chunk) in old.chunks(CHECK_CHUNK).enumerate() {

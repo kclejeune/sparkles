@@ -837,6 +837,12 @@ async fn edits_keep_their_pairs_and_mismatches_are_rewritten() {
         gr("citesClaim")
     )));
     assert_eq!(claims, vec![a.0.as_str().to_string()]);
+    // and names the report it edits, which retention follows
+    let of = column(e.rows(&format!(
+        "SELECT ?o WHERE {{ GRAPH <{REPORTS}> {{ <{edit}> <{}> ?o }} }}",
+        gr("editOf")
+    )));
+    assert_eq!(of, vec![first.clone()]);
     let (e2, s2) = (e.clone(), s.clone());
     let o = tokio::task::spawn_blocking(move || e2.run(s2, Mode::Refresh).unwrap())
         .await
@@ -1006,4 +1012,48 @@ async fn a_changed_evidence_configuration_stops_the_run() {
     })
     .await
     .unwrap();
+}
+
+/// A run under a policy that committed its reports and stopped before it saved the
+/// state leaves a state that says no report records a policy. A later run without the
+/// policy still rewrites those reports, because it reads their policy from the graph.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interrupted_policy_run_is_rewritten_without_the_policy() {
+    let e = Arc::new(env(true));
+    let ds = e.dataset();
+    let a = propose(&ds, "advisory", leads());
+    decide(&ds, &a, Disposition::Accepted, 1);
+    let plain = settings(
+        serde_json::json!({ "reviewPolicy": null, "refresh": { "minChangedFraction": 1.0 } }),
+    );
+    let (e2, s2) = (e.clone(), plain.clone());
+    tokio::task::spawn_blocking(move || e2.run(s2, Mode::Build).unwrap())
+        .await
+        .unwrap();
+    let before = e.s.state.graphrag.state("ev");
+    let e2 = e.clone();
+    tokio::task::spawn_blocking(move || {
+        e2.run(
+            settings(serde_json::json!({ "refresh": { "minChangedFraction": 1.0 } })),
+            Mode::Refresh,
+        )
+        .unwrap()
+    })
+    .await
+    .unwrap();
+    // the state as it was before the policy run saved its own
+    e.s.state.graphrag.set_state("ev", before);
+    let (e2, s2) = (e.clone(), plain.clone());
+    let o = tokio::task::spawn_blocking(move || e2.run(s2, Mode::Refresh).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(o.written, o.communities, "{o:?}");
+    assert!(
+        e.rows(&format!(
+            "SELECT ?r WHERE {{ GRAPH <{REPORTS}> {{ ?c <{}> ?r . ?r <{}> ?p }} }}",
+            gr("report"),
+            gr("reviewPolicy")
+        ))
+        .is_empty()
+    );
 }

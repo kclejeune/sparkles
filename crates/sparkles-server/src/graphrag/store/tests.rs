@@ -351,6 +351,11 @@ fn policy_reports_keep_what_their_provenance_names() {
     generated("urn:r:edited-child", None, &[]);
     generated("urn:r:replacement", Some("urn:r:old"), &[]);
     generated("urn:r:old", None, &[]);
+    // a parent whose activity used a person's edit of its child, whose community has a
+    // new report since: the edit stays through the parent, and so does what it edits
+    generated("urn:r:edit-parent", None, &["urn:r:used-edit"]);
+    generated("urn:r:edit-source", None, &[]);
+    generated("urn:r:edit-successor", Some("urn:r:used-edit"), &[]);
     // a report without a policy, which a person edits below
     quads.push(ins("urn:r:plain", t, &rep));
     let mut edit = |r: &str, of: &str, policy: bool| {
@@ -358,10 +363,12 @@ fn policy_reports_keep_what_their_provenance_names() {
         quads.push(ins(r, &rev, of));
         if policy {
             quads.push(ins(r, &pol, "urn:policy:main"));
+            quads.push(ins(r, &gr("editOf"), of));
         }
     };
     edit("urn:r:edit-1", "urn:r:edited", true);
     edit("urn:r:edit-2", "urn:r:edit-1", true);
+    edit("urn:r:used-edit", "urn:r:edit-source", true);
     edit("urn:r:plain-edit", "urn:r:plain", false);
     for (c, r) in [
         ("urn:c:parent", "urn:r:parent"),
@@ -369,6 +376,8 @@ fn policy_reports_keep_what_their_provenance_names() {
         ("urn:c:edited", "urn:r:edit-2"),
         ("urn:c:replaced", "urn:r:replacement"),
         ("urn:c:plain", "urn:r:plain-edit"),
+        ("urn:c:edit-parent", "urn:r:edit-parent"),
+        ("urn:c:edit-child", "urn:r:edit-successor"),
     ] {
         quads.push(ins(c, &gr("report"), r));
     }
@@ -391,6 +400,8 @@ fn policy_reports_keep_what_their_provenance_names() {
         "urn:r:edited-child",
         "urn:r:replacement",
         "urn:r:plain-edit",
+        "urn:r:used-edit",
+        "urn:r:edit-source",
     ] {
         assert!(left.contains(kept), "{kept} was removed: {left:?}");
     }

@@ -1156,3 +1156,51 @@ async fn branches_share_the_daily_ledger() {
     .await
     .unwrap();
 }
+
+/// A person's edit chain of any length leads back to the report it edits, and a chain
+/// through a generated report or around a loop does not (item 652).
+#[test]
+fn edit_chains_of_any_length_lead_back() {
+    let mut revs: HashMap<String, Revision> = HashMap::new();
+    revs.insert(
+        "urn:r:0".into(),
+        Revision {
+            prev: Some("urn:r:old".into()),
+            generated: true,
+            policy: None,
+        },
+    );
+    for i in 1..=100 {
+        revs.insert(
+            format!("urn:r:{i}"),
+            Revision {
+                prev: Some(format!("urn:r:{}", i - 1)),
+                generated: false,
+                policy: None,
+            },
+        );
+    }
+    assert!(edit_of(&revs, "urn:r:100", "urn:r:0"));
+    assert!(edit_of(&revs, "urn:r:64", "urn:r:0"));
+    assert!(edit_of(&revs, "urn:r:0", "urn:r:0"));
+    // a generated report does not lead back through what it replaced
+    assert!(!edit_of(&revs, "urn:r:100", "urn:r:old"));
+    // a loop ends
+    revs.insert(
+        "urn:r:a".into(),
+        Revision {
+            prev: Some("urn:r:b".into()),
+            generated: false,
+            policy: None,
+        },
+    );
+    revs.insert(
+        "urn:r:b".into(),
+        Revision {
+            prev: Some("urn:r:a".into()),
+            generated: false,
+            policy: None,
+        },
+    );
+    assert!(!edit_of(&revs, "urn:r:a", "urn:r:0"));
+}
