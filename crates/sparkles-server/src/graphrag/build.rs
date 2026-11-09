@@ -837,22 +837,21 @@ impl Run<'_> {
         // read for every run, so that a run without a policy finds reports that record
         // one even when the state does not say so, as after an interrupted run
         let revisions = self.revisions(&snap)?;
-        if let Some(e) = ev.as_mut() {
-            if let Some(b) = &previous.last_build
-                && same_policy(b.policy.as_ref(), &e.policy)
-                && !b.pairs.is_empty()
-            {
-                let old: Vec<(String, String)> = b
-                    .pairs
-                    .iter()
-                    .map(|[c, d]| (c.clone(), d.clone()))
-                    .collect();
-                let out = e.policy.output.clone();
-                let present = |ts: &[oxrdf::Triple]| self.present(&snap, &opts, &out, ts);
-                for (i, gone) in e.ended(&old, &present)?.into_iter().enumerate() {
-                    if gone {
-                        ended.insert(i as u32);
-                    }
+        if let Some(e) = ev.as_mut()
+            && let Some(b) = &previous.last_build
+            && same_policy(b.policy.as_ref(), &e.policy)
+            && !b.pairs.is_empty()
+        {
+            let old: Vec<(String, String)> = b
+                .pairs
+                .iter()
+                .map(|[c, d]| (c.clone(), d.clone()))
+                .collect();
+            let out = e.policy.output.clone();
+            let present = |ts: &[oxrdf::Triple]| self.present(&snap, &opts, &out, ts);
+            for (i, gone) in e.ended(&old, &present)?.into_iter().enumerate() {
+                if gone {
+                    ended.insert(i as u32);
                 }
             }
         }
@@ -1492,14 +1491,26 @@ struct Read {
     all: Option<BTreeSet<u32>>,
 }
 
+/// The longest form that oxrdf's N-Triples escaping gives a string's characters: a
+/// control character becomes `\uXXXX`, six bytes for one.
+fn escaped_len(s: &str) -> usize {
+    s.chars()
+        .map(|c| match c {
+            '\u{8}' | '\t' | '\n' | '\u{C}' | '\r' | '"' | '\\' => 2,
+            '\0'..='\u{1F}' | '\u{7F}' | '\u{FFFE}' | '\u{FFFF}' => 6,
+            c => c.len_utf8(),
+        })
+        .sum()
+}
+
 /// An upper bound of the bytes of a quad in the update text, without building it.
 fn quad_bytes(q: &oxrdf::Quad) -> u64 {
     let term = |t: &Term| -> usize {
         match t {
             Term::NamedNode(n) => n.as_str().len() + 2,
+            // the quoted value, then the datatype or the language tag
             Term::Literal(l) => {
-                // an escape doubles a byte at most, and the datatype or tag follows
-                2 * l.value().len()
+                escaped_len(l.value())
                     + l.language().map_or(0, str::len)
                     + l.datatype().as_str().len()
                     + 8
@@ -1520,33 +1531,54 @@ fn quad_bytes(q: &oxrdf::Quad) -> u64 {
     (s + q.predicate.as_str().len() + 2 + term(&q.object) + g + 8) as u64
 }
 
-/// An upper bound of the bytes that a written report's evidence adds: the claim and
-/// decision strings of its items and of `prov:used`, and the quads of each finding's
-/// citations and of the activity's `prov:used`.
-fn citation_bytes(e: &Evidence, read: &Read, checked: &report::Checked, iri: &str) -> u64 {
-    const QUAD: u64 = 96;
-    let pair_len = |p: u32| {
-        let (c, d) = e.pair(p);
-        (c.len() + d.len()) as u64
-    };
-    let finding = iri.len() as u64 + 8;
+/// An upper bound of the bytes that a written report's evidence adds before its update
+/// text: the claim, decision and child strings that `ReportEvidence` copies, and the
+/// quads of each finding's citations and of the activity's `prov:used`. Every quad owns
+/// its subject, predicate, object and a copy of the reports graph's name.
+fn citation_bytes<'a>(
+    pair: impl Fn(u32) -> &'a (String, String),
+    read: &Read,
+    checked: &report::Checked,
+    iri: &str,
+    graph: &str,
+    current: &HashMap<usize, String>,
+) -> u64 {
+    // the evidence predicates are shorter than this, and a finding's or the activity's
+    // IRI is the report's with a short suffix
+    const PREDICATE: u64 = 64;
+    const SUFFIX: u64 = 32;
+    let string = std::mem::size_of::<String>() as u64;
+    let reference = std::mem::size_of::<&str>() as u64;
+    let quad = std::mem::size_of::<oxrdf::Quad>() as u64;
+    let subject = iri.len() as u64 + SUFFIX;
+    let graph = graph.len() as u64;
+    let one = |object: u64| quad + subject + PREDICATE + object + graph + reference;
     let mut bytes = 0u64;
+    let mut add = |n: u64| bytes = bytes.saturating_add(n);
     for ps in &read.items {
         for &p in ps {
-            bytes = bytes.saturating_add(pair_len(p) + 16);
+            let (c, d) = pair(p);
+            add((c.len() + d.len()) as u64 + 2 * string);
         }
     }
     for f in &checked.findings {
         for n in &f.cites {
             for &p in read.items.get(n.wrapping_sub(1)).into_iter().flatten() {
-                bytes = bytes.saturating_add(pair_len(p) + 2 * (finding + QUAD));
+                let (c, d) = pair(p);
+                add(one(c.len() as u64) + one(d.len() as u64));
             }
         }
     }
     for &p in &read.own {
-        bytes = bytes.saturating_add(2 * pair_len(p) + 2 * (finding + QUAD));
+        let (c, d) = pair(p);
+        add((c.len() + d.len()) as u64 + 2 * string);
+        add(one(c.len() as u64) + one(d.len() as u64));
     }
-    bytes.saturating_add(read.children.len() as u64 * (finding + QUAD))
+    for c in &read.children {
+        let len = current.get(c).map_or(0, |s| s.len()) as u64;
+        add(len + string + one(len));
+    }
+    bytes
 }
 
 pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
@@ -1857,7 +1889,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
             // strings and quads are built
             let bytes = match (&ev, &read, &body) {
                 (Some(e), Some(read), Body::Written { checked, .. }) => {
-                    citation_bytes(e, read, checked, &iri)
+                    citation_bytes(|p| e.pair(p), read, checked, &iri, &graph, &current)
                 }
                 _ => 0,
             };

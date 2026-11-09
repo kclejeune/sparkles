@@ -1204,3 +1204,165 @@ fn edit_chains_of_any_length_lead_back() {
     );
     assert!(!edit_of(&revs, "urn:r:a", "urn:r:0"));
 }
+
+/// The heap bytes a quad owns, which the run's charges must bound.
+fn owned(q: &oxrdf::Quad) -> u64 {
+    let object = match &q.object {
+        Term::NamedNode(n) => n.as_str().len(),
+        Term::Literal(l) => l.value().len() + l.datatype().as_str().len(),
+        t => t.to_string().len(),
+    };
+    let graph = match &q.graph_name {
+        oxrdf::GraphName::NamedNode(n) => n.as_str().len(),
+        _ => 0,
+    };
+    (std::mem::size_of::<oxrdf::Quad>()
+        + q.subject.to_string().len()
+        + q.predicate.as_str().len()
+        + object
+        + graph) as u64
+}
+
+#[test]
+fn quad_charges_bound_the_update_text() {
+    let long = format!("urn:g:{}", "g".repeat(10_000));
+    let graph = oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked(&long));
+    let s = oxrdf::NamedNode::new_unchecked("urn:s");
+    let p = oxrdf::NamedNode::new_unchecked("urn:p");
+    let controls: String = (0u8..0x20)
+        .map(char::from)
+        .chain(['\u{7f}', '"', '\\'])
+        .collect();
+    for value in [controls.repeat(100), "plain".into(), "é\u{FFFF}".repeat(50)] {
+        for o in [
+            Term::from(oxrdf::Literal::new_simple_literal(&value)),
+            Term::from(oxrdf::Literal::new_language_tagged_literal_unchecked(
+                &value, "en",
+            )),
+            Term::from(oxrdf::NamedNode::new_unchecked(&long)),
+        ] {
+            let q = oxrdf::Quad::new(s.clone(), p.clone(), o, graph.clone());
+            let text = format!("{q} .\n");
+            assert!(
+                quad_bytes(&q) >= text.len() as u64,
+                "{} < {}",
+                quad_bytes(&q),
+                text.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn citation_charges_bound_the_evidence_quads() {
+    use super::super::report::{check, render_leaf};
+    use super::super::store::ReportEvidence;
+    let graph = format!("urn:g:{}", "r".repeat(10_000));
+    let members: BTreeSet<String> = ["<http://ex/a>", "<http://ex/b>"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let fact = |s: &str, o: &str| Fact {
+        s: format!("<http://ex/{s}>"),
+        p: "<http://ex/knows>".into(),
+        o: o.into(),
+        reifier: None,
+    };
+    let facts = vec![fact("a", "<http://ex/b>"), fact("b", "<http://ex/a>")];
+    let input = render_leaf(&members, &facts, &HashMap::<String, EntityInfo>::new());
+    let out = json!({
+        "title": "T",
+        "summary": "S",
+        "rating": 3,
+        "findings": [
+            {"text": "One.", "entities": [1], "cites": [1, 2]},
+            {"text": "Two.", "entities": [2], "cites": [2]}
+        ]
+    });
+    let checked = check(&out, &input, &|_| None).unwrap();
+    let pairs: Vec<(String, String)> = (0..3)
+        .map(|i| {
+            (
+                format!("urn:claim:{i}:{}", "c".repeat(500)),
+                format!("urn:decision:{i}:{}", "d".repeat(500)),
+            )
+        })
+        .collect();
+    let read = Read {
+        items: vec![vec![0, 1], vec![2]],
+        own: [0, 1, 2].into_iter().collect(),
+        children: vec![7],
+        all: None,
+    };
+    let child = format!("urn:child:{}", "x".repeat(1000));
+    let current: HashMap<usize, String> = [(7, child.clone())].into_iter().collect();
+    let iri = "urn:uuid:00000000-0000-0000-0000-000000000001";
+    let charged = citation_bytes(
+        |p| &pairs[p as usize],
+        &read,
+        &checked,
+        iri,
+        &graph,
+        &current,
+    );
+    let pair = |p: &u32| pairs[*p as usize].clone();
+    let evidence = ReportEvidence {
+        policy: "urn:policy".into(),
+        version: 1,
+        configuration: "l/1".into(),
+        items: read
+            .items
+            .iter()
+            .map(|x| x.iter().map(pair).collect())
+            .collect(),
+        used: read.own.iter().map(pair).collect(),
+        children: vec![child],
+    };
+    let strings: u64 = evidence
+        .items
+        .iter()
+        .flatten()
+        .chain(&evidence.used)
+        .map(|(c, d)| (c.len() + d.len() + 2 * std::mem::size_of::<String>()) as u64)
+        .sum::<u64>()
+        + evidence
+            .children
+            .iter()
+            .map(|c| (c.len() + std::mem::size_of::<String>()) as u64)
+            .sum::<u64>();
+    let quads = report_quads(
+        &NewReport {
+            iri: iri.into(),
+            community: "urn:c".into(),
+            status: Status::Unreviewed,
+            source_commit: 1,
+            footprint: "urn:fp".into(),
+            language: "en".into(),
+            activity: Some(Activity {
+                model: "p/m".into(),
+                input_tokens: 1,
+                output_tokens: 1,
+                started_at: "2026-11-09T00:00:00Z".into(),
+            }),
+            revision_of: None,
+            body: store::Body::Written { checked, input },
+            evidence: Some(evidence),
+        },
+        &graph,
+    );
+    let cites = [
+        super::super::guard::GR.to_string() + "citesClaim",
+        super::super::guard::GR.to_string() + "citesDecision",
+        format!("{}used", store::PROV),
+    ];
+    let built: u64 = quads
+        .iter()
+        .filter(|q| cites.iter().any(|c| c == q.predicate.as_str()))
+        .map(owned)
+        .sum();
+    assert!(built > 0);
+    assert!(
+        charged >= strings + built,
+        "{charged} < {strings} + {built}"
+    );
+}
