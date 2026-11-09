@@ -233,7 +233,7 @@ fn nested_blank_node_plan_runs_on_a_small_stack() {
             .find(|(shape, _)| *shape == "blank nodes")
             .unwrap();
         let result = ds.query(&query).unwrap();
-        assert_eq!(result.rows().len(), 2);
+        assert_eq!(result.len(), 2);
     });
 }
 
@@ -445,7 +445,9 @@ fn updates_cannot_grow_a_triple_term_past_the_limit() {
         );
         // the deepest one stored reads back
         let r = ds.query("SELECT ?o { <urn:s> <urn:q> ?o }").unwrap();
-        let o = r.rows()[0][0].clone().unwrap();
+        let o = r.rows().unwrap().row(0).unwrap().values()[0]
+            .clone()
+            .unwrap();
         assert!(o.to_string().starts_with("<<( <urn:s> <urn:p> <<("));
     });
 }

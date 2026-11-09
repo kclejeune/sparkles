@@ -1128,7 +1128,7 @@ mod tests {
             let bag = |snapshot| {
                 let mut rows = query(snapshot, QUERY, &Default::default())
                     .unwrap()
-                    .rows()
+                    .test_application_rows()
                     .into_iter()
                     .map(|row| format!("{row:?}"))
                     .collect::<Vec<_>>();

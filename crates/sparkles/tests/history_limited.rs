@@ -50,7 +50,6 @@ fn trusted_dataset_history_uses_real_caps_and_preserves_retained_origin() {
     assert_eq!(
         query(snapshot, "SELECT * { ?s ?p ?o }", &Default::default())
             .unwrap()
-            .rows()
             .len(),
         2
     );

@@ -85,9 +85,10 @@ fn answers(s: &Store) -> Vec<Vec<String>> {
             .unwrap();
             // blank node labels differ between the two stores
             r.rows()
-                .into_iter()
+                .unwrap()
+                .iter()
                 .map(|r| {
-                    let t = format!("{r:?}");
+                    let t = format!("{:?}", r.values());
                     if t.contains("BlankNode") {
                         "bnode".into()
                     } else {

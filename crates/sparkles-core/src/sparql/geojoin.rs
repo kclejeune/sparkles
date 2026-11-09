@@ -1086,7 +1086,11 @@ mod tests {
     }
 
     fn rows(r: &QueryResult) -> Vec<String> {
-        let mut v: Vec<String> = r.rows().into_iter().map(|r| format!("{r:?}")).collect();
+        let mut v: Vec<String> = r
+            .test_application_rows()
+            .into_iter()
+            .map(|r| format!("{r:?}"))
+            .collect();
         v.sort();
         v
     }

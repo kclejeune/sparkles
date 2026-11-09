@@ -136,17 +136,21 @@ fn main() {
                         }
                         rows = result.len();
                         if check && round == rounds && mode == "rows" {
-                            let table = &result.table;
+                            let table = result.table();
                             eager_digest = (0..table.len()).fold(0u64, |sum, i| {
-                                let row: Vec<_> =
-                                    table.cols.iter().map(|c| result.term(c[i])).collect();
+                                let row: Vec<_> = table
+                                    .columns()
+                                    .map(|c| {
+                                        result.term(c[i]).unwrap().map(|t| t.as_term().clone())
+                                    })
+                                    .collect();
                                 sum.wrapping_add(digest(std::iter::once(row.as_slice())))
                             });
                         }
                         if round == rounds && std::env::var_os("SPARKLES_PROBE_PLAN").is_some() {
                             eprintln!(
                                 "{name} eager plan: {}",
-                                serde_json::to_string(&result.plan).unwrap()
+                                serde_json::to_string(result.plan()).unwrap()
                             );
                         }
                         eager_mem = eager_mem.max(result.mem_peak_bytes);
