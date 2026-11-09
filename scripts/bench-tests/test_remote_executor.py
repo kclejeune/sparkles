@@ -319,6 +319,14 @@ class Admission(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertNotIn('["expires_at"]-time.time()',text);self.assertIn('rx_runtime',text)
 
+    def test_screen_units_end_before_the_closure_watch_checks(self):
+        """A Boat screen's lock and workload units end, stop included, ahead of the closure
+        watch's 900-second lead, so one that cleanup cannot reach is gone by then."""
+        text=(ROOT/'scripts/remote-screen.sh').read_text()
+        self.assertEqual(text.count('--reserve 990'),2)
+        self.assertNotIn('--reserve 60',text)
+        self.assertEqual(text.count('TimeoutStopSec=30'),2)
+
     def fake_worker(self,mbx_version='1.29.1',rustc_version='1.99.1',install_mbx=True):
         """A fake worker home whose tools are tiny scripts, with the job environment's PATH."""
         profile=dict(self.fixtures['profile'],worker_home=str(self.root/'home'))

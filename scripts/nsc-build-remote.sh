@@ -3,17 +3,18 @@
 # this file, scripts/nsc-build.sh and scripts/cargo-sparkles-task into DIR/bin and the
 # revision's `git archive` into DIR/src before it calls it over ssh.
 #
-#   nsc-build-remote.sh DIR UNIT RUNTIME [feature and dependency-resolution flags...]
+#   nsc-build-remote.sh DIR UNIT EXPIRY [feature and dependency-resolution flags...]
 #   nsc-build-remote.sh --status DIR UNIT OFFSET
 #   nsc-build-remote.sh --cancel DIR UNIT
-#   nsc-build-remote.sh --run DIR [flags...]
+#   nsc-build-remote.sh --run DIR UNIT EXPIRY [flags...]
 #
 # The first form checks the host and starts the build detached, and returns once the build
 # runs in the transient systemd user scope UNIT. The scope can be listed and stopped by name,
 # an out-of-memory kill ends the build alone, and a dropped ssh connection does not end it.
-# RUNTIME is the scope's RuntimeMaxSec. The scope has the gate's memory cap, the smaller of
-# 24G and the host's RAM less 2G, with 2G of swap (SPARKLES_NSC_BUILD_MEMORY_MAX overrides
-# it). Inside it the build holds ~/lanes/.heavy.lock, which gates and other heavy work on the
+# EXPIRY is the Unix time by which the scope has stopped, its stop included, read on this
+# host's clock, which must agree with the caller's. The scope has the gate's memory cap, the
+# smaller of 24G and the host's RAM less 2G, with 2G of swap (SPARKLES_NSC_BUILD_MEMORY_MAX
+# overrides it). Inside it the build holds ~/lanes/.heavy.lock, which gates and other heavy work on the
 # host share, and waits for it when another process holds it. CARGO_BUILD_JOBS defaults to
 # the gate's value for the cap. The host's own Boxington cache serves the build, with the
 # remote cache settings the caller's environment gives it. The detached process inherits
@@ -22,13 +23,15 @@
 # A start, a status query and a cancellation take DIR/launch.lock. A start claims the build
 # by creating DIR/launched, so a repeated start after a lost reply starts nothing, and a start
 # after a cancellation (DIR/cancelled) is refused. A refused start, including one whose
-# systemd-run fails, records its exit status in DIR/start.exit. RUNTIME counts from the
-# start's arrival, so the time the start waits for its lock and checks the host is taken
-# from the scope's RuntimeMaxSec, and a start with less than 300 seconds left is refused.
-# The start waits SPARKLES_NSC_BUILD_ACTIVATION_SECONDS (default 30) for the scope to hold
-# the build. When it does not, the start cancels the build itself, stops any scope that
-# appeared meanwhile and is refused with 75. The build checks DIR/cancelled when its scope
-# begins, so a scope that a delayed launcher creates after any cancellation builds nothing.
+# systemd-run fails, records its exit status in DIR/start.exit. The scope's RuntimeMaxSec
+# and TimeoutStopSec of 30 seconds are computed at the launch from EXPIRY, and a start with
+# less than 300 seconds left is refused. The start waits
+# SPARKLES_NSC_BUILD_ACTIVATION_SECONDS (default 30) of elapsed time, with each query
+# bounded, for the scope to hold the build. When it does not, the start cancels the build
+# itself, stops any scope that appeared meanwhile and is refused with 75. The build checks
+# DIR/cancelled and EXPIRY when its scope begins, so a scope that a delayed launcher
+# creates after a cancellation builds nothing, and a watchdog inside the scope stops the
+# scope at EXPIRY less the stop time however late it began.
 #
 # --status prints one state line and then the build log from byte OFFSET, at most 1 MiB.
 # The state is `running`, `exited N` with the build's exit status, `refused N` for a refused
@@ -88,14 +91,26 @@ if [ "${1:-}" = --cancel ]; then
 fi
 
 if [ "${1:-}" = --run ]; then
-  dir=$2
-  shift 2
+  dir=$2 unit=$3 expiry=$4
+  shift 4
   # A cancellation writes DIR/cancelled before it stops the scope, so a scope that begins
   # after the cancellation stops here and one that began before it is stopped.
   if [ -e "$dir/cancelled" ]; then
     echo "the build in $dir was cancelled before its scope began"
     exit 75
   fi
+  left=$((expiry - 30 - $(date +%s)))
+  if [ "$left" -le 0 ]; then
+    echo "the build in $dir began after its expiry"
+    exit 75
+  fi
+  # The scope's RuntimeMaxSec counts from its activation, so the watchdog holds the build
+  # to EXPIRY. It runs in the scope as a process group of its own, which the build's end
+  # kills, so that the scope ends with the build.
+  # shellcheck disable=SC2016 # the watchdog's shell expands its own arguments
+  setsid bash -c 'sleep "$1"; echo "the build reached its expiry; stopping $2.scope"; echo 124 > "$3/exit.tmp"; mv "$3/exit.tmp" "$3/exit"; systemctl --user stop --no-block "$2.scope"' \
+    watchdog "$left" "$unit" "$dir" < /dev/null &
+  watchdog=$!
   # One revision with one set of flags always builds at the same path, which the commit
   # and the flags name. mbx records each checkout's predictions of its compiler actions,
   # and a rebuild at the same path finds its own. A rebuild at a new path takes the latest
@@ -109,6 +124,7 @@ if [ "${1:-}" = --run ]; then
   # shellcheck disable=SC2329 # the EXIT trap calls it
   finish() {
     local code=$?
+    kill -- "-$watchdog" 2> /dev/null || true
     # The tree goes back to DIR, so each build keeps its own source as before.
     if [ -d "$work/src" ] && [ ! -e "$dir/src" ]; then mv -T "$work/src" "$dir/src" && rm -d -- "$work"; fi
     echo "$code" > "$dir/exit.tmp"
@@ -145,14 +161,13 @@ if [ "${1:-}" = --run ]; then
 fi
 
 if [ "$#" -lt 3 ]; then
-  echo 'usage: nsc-build-remote.sh DIR UNIT RUNTIME [cargo flags...]' >&2
+  echo 'usage: nsc-build-remote.sh DIR UNIT EXPIRY [cargo flags...]' >&2
   exit 2
 fi
 dir=$1
 unit=$2
-runtime=$3
+expiry=$3
 shift 3
-arrived=$(date +%s)
 [ -d "$dir/bin" ] || fail "$dir has no bin directory"
 exec 8>> "$dir/launch.lock"
 flock -w 60 8 || fail "another start in $dir holds its lock"
@@ -168,7 +183,7 @@ refused() {
 trap refused EXIT
 [ ! -e "$dir/cancelled" ] || fail "the build in $dir was cancelled"
 [ -d "$dir/src" ] || fail "$dir has no src directory"
-case $runtime in '' | *[!0-9]* | 0) fail "bad runtime $runtime" ;; esac
+case $expiry in '' | *[!0-9]*) fail "bad expiry $expiry" ;; esac
 activation=${SPARKLES_NSC_BUILD_ACTIVATION_SECONDS:-30}
 case $activation in '' | *[!0-9]* | 0) fail "bad SPARKLES_NSC_BUILD_ACTIVATION_SECONDS $activation" ;; esac
 cd "$dir/src"
@@ -192,7 +207,7 @@ jobs=${CARGO_BUILD_JOBS:-$(((mem_g - 1) / 2))}
 [ "$jobs" -le 8 ] || jobs=8
 
 mkdir -p "$HOME/lanes" "$dir/out"
-runtime=$((runtime - ($(date +%s) - arrived)))
+runtime=$((expiry - 30 - $(date +%s)))
 [ "$runtime" -ge 300 ] || fail "only $runtime seconds of runtime remain, too little to start the build"
 echo "building in scope $unit on $(uname -n): MemoryMax=$mem, CARGO_BUILD_JOBS=$jobs, RuntimeMaxSec=$runtime, mbx $have"
 : > "$dir/launched"
@@ -201,21 +216,22 @@ echo "building in scope $unit on $(uname -n): MemoryMax=$mem, CARGO_BUILD_JOBS=$
 # setsid runs in place, so its PID becomes the build's process inside the scope.
 setsid nohup systemd-run --user --scope -q --collect --unit "$unit" \
   -p MemoryMax="$mem" -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec="$runtime" -p TimeoutStopSec=30 -- \
-  env CARGO_BUILD_JOBS="$jobs" bash "$dir/bin/nsc-build-remote.sh" --run "$dir" "$@" \
+  env CARGO_BUILD_JOBS="$jobs" bash "$dir/bin/nsc-build-remote.sh" --run "$dir" "$unit" "$expiry" "$@" \
   > "$dir/build.log" 2>&1 < /dev/null 8>&- &
 launcher=$!
 # Return once the scope holds the build, so that the end of this connection's session can
 # no longer reach a process still on its way into the scope. A launcher that ends before
 # the scope is active, with no exit status of the build, is a refused start.
-for _ in $(seq 1 $((activation * 4))); do
-  if systemctl --user is-active --quiet "$unit.scope" || [ -f "$dir/exit" ]; then
+until_t=$(($(date +%s) + activation))
+while [ "$(date +%s)" -lt "$until_t" ]; do
+  if timeout 5 systemctl --user is-active --quiet "$unit.scope" || [ -f "$dir/exit" ]; then
     echo "started"
     exit 0
   fi
   if ! kill -0 "$launcher" 2> /dev/null; then
     code=0
     wait "$launcher" || code=$?
-    if [ "$code" != 0 ] && [ ! -f "$dir/exit" ] && ! systemctl --user is-active --quiet "$unit.scope"; then
+    if [ "$code" != 0 ] && [ ! -f "$dir/exit" ] && ! timeout 5 systemctl --user is-active --quiet "$unit.scope"; then
       echo "$code" > "$dir/start.exit"
       echo "systemd-run could not start the scope $unit (exit $code); see $dir/build.log" >&2
       exit "$code"
@@ -223,10 +239,8 @@ for _ in $(seq 1 $((activation * 4))); do
   fi
   sleep 0.25
 done
-# The scope's runtime counts from its activation, so a scope that begins later would end
-# later than RUNTIME allows. The build is cancelled instead, and a scope that began in the
-# meantime is stopped.
+# A scope that has not begun is cancelled, and one that began in the meantime is stopped.
 : > "$dir/cancelled"
-systemctl --user stop "$unit.scope" > /dev/null 2>&1 || true
+timeout 60 systemctl --user stop "$unit.scope" > /dev/null 2>&1 || true
 echo "the scope $unit did not start within $activation seconds, so the build was cancelled; see $dir/build.log" >&2
 exit 75

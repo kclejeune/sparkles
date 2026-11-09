@@ -23,10 +23,9 @@
 # side polls it every SPARKLES_NSC_BUILD_POLL_SECONDS (default 15) and copies its log. Each
 # remote step can be repeated, so a step whose connection drops is retried up to
 # SPARKLES_NSC_BUILD_RETRIES times (default 8), SPARKLES_NSC_BUILD_RETRY_SECONDS apart
-# (default 20), and a lost reply never starts a second build. The scope's RuntimeMaxSec is
-# SPARKLES_NSC_BUILD_RUNTIME (default 14400), less when SPARKLES_NSC_BUILD_DEADLINE or a
-# Boat worker's admitted lifetime leaves less, and a start with under 300 seconds is
-# refused. The binary and its build record come back over ssh and the SHA-256 is checked.
+# (default 20), and a lost reply never starts a second build. The scope must stop within
+# SPARKLES_NSC_BUILD_RUNTIME (default 14400) seconds, sooner when SPARKLES_NSC_BUILD_DEADLINE
+# or a Boat worker's admitted lifetime leaves less (bh_expiry), and the host enforces it. The binary and its build record come back over ssh and the SHA-256 is checked.
 # The scope is stopped and the scratch directory removed when the build ends in any way:
 # after a failure, and from the caller's EXIT trap (bh_cleanup) after an interrupt or lost
 # contact. A Boat worker keeps the directory as evidence. Cleanup touches only the
@@ -314,46 +313,42 @@ bh_fetch() {
   bh_rx 600 "$1" "tar -C $2/out -cf - ." < /dev/null | python3 "$RX_DIR/remote-executor.py" unpack "$3"
 }
 
-# BH_LAUNCH_ALLOWANCE: how much later than this side's clock reading a scope can end. The
-# start command arrives within bh_rx's 130 seconds or not at all, nsc-build-remote.sh counts
-# RUNTIME from its arrival and lets the scope begin within 30 seconds, and the scope's stop
-# takes at most its TimeoutStopSec of 30 seconds.
-BH_LAUNCH_ALLOWANCE=190
-
-# bh_runtime: the scope's RuntimeMaxSec for a start now. It is SPARKLES_NSC_BUILD_RUNTIME
-# (default 14400). When SPARKLES_NSC_BUILD_DEADLINE (a Unix time) is set, the scope ends,
-# stop included, by that deadline. For a Boat worker it ends by the admitted lifetime less
-# 960 seconds, the closure watch's 900-second lead and a minute, so a build ends before the
-# closure check whether or not its cleanup can reach the worker.
-bh_runtime() {
-  local runtime=${SPARKLES_NSC_BUILD_RUNTIME:-14400} left
-  if [ -n "${SPARKLES_NSC_BUILD_DEADLINE:-}" ]; then
-    left=$((SPARKLES_NSC_BUILD_DEADLINE - $(date +%s) - BH_LAUNCH_ALLOWANCE))
-    [ "$left" -ge "$runtime" ] || runtime=$left
+# bh_expiry: the Unix time by which the build's scope has stopped, its stop included. It is
+# SPARKLES_NSC_BUILD_RUNTIME (default 14400) seconds from now, no later than
+# SPARKLES_NSC_BUILD_DEADLINE (a Unix time) when that is set, and for a Boat worker no later
+# than the admitted lifetime less 960 seconds, the closure watch's 900-second lead and a
+# minute, so a build ends before the closure check whether or not its cleanup can reach the
+# worker. The host enforces it on its own clock, which must agree with this one.
+bh_expiry() {
+  local now expiry left
+  now=$(date +%s)
+  expiry=$((now + ${SPARKLES_NSC_BUILD_RUNTIME:-14400}))
+  if [ -n "${SPARKLES_NSC_BUILD_DEADLINE:-}" ] && [ "$SPARKLES_NSC_BUILD_DEADLINE" -lt "$expiry" ]; then
+    expiry=$SPARKLES_NSC_BUILD_DEADLINE
   fi
   if [ -n "$BH_ADMISSION" ]; then
     left=$(rx_runtime "$BH_ADMISSION" --reserve 960 2> /dev/null) || left=0
-    left=$((left - BH_LAUNCH_ALLOWANCE))
-    [ "$left" -ge "$runtime" ] || runtime=$left
+    [ $((now + left)) -ge "$expiry" ] || expiry=$((now + left))
   fi
-  echo "$runtime"
+  echo "$expiry"
 }
 
 # bh_start HOST DIR UNIT ARGS: start the detached build. When the reply is lost, the build's
 # state decides. A build that started, even one that already ended, counts as started, and a
 # start that the host refused sets BH_START_REFUSED to its exit status, so neither is
-# started again. A start with less than 300 seconds of runtime left is refused here.
+# started again. A start with less than 330 seconds before its expiry is refused here, and
+# the host refuses one with less than 300 seconds of runtime.
 bh_start() {
-  local code=0 state tmp runtime
-  runtime=$(bh_runtime)
-  if [ "$runtime" -lt 300 ]; then
-    echo "only $runtime seconds remain for the build, which is too little to start it" >&2
+  local code=0 state tmp expiry
+  expiry=$(bh_expiry)
+  if [ $((expiry - $(date +%s))) -lt 330 ]; then
+    echo "the build would have to stop by $(date -u -d "@$expiry" +%FT%TZ), which is too little time to start it" >&2
     BH_START_REFUSED=75
     return 0
   fi
-  echo "starting the build with RuntimeMaxSec=$runtime"
+  echo "starting the build to stop by $(date -u -d "@$expiry" +%FT%TZ)"
   # shellcheck disable=SC2029
-  bh_rx 120 "$1" "bash $2/bin/nsc-build-remote.sh $2 $3 $runtime $4" < /dev/null || code=$?
+  bh_rx 120 "$1" "bash $2/bin/nsc-build-remote.sh $2 $3 $expiry $4" < /dev/null || code=$?
   [ "$code" != 0 ] || return 0
   tmp=$(mktemp)
   # shellcheck disable=SC2029

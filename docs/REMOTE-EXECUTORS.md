@@ -224,10 +224,13 @@ attempt did, and a step whose connection drops is retried a bounded number of ti
 start whose reply was lost is resolved from the build's recorded state, and a start the
 host refuses fails at once. A cancellation takes the same lock as a start and fences any
 later one, and a scope that begins after a cancellation builds nothing. A start whose scope
-does not begin within 30 seconds cancels its own build. The scope's runtime limit counts
-from the start's arrival on the host. It is chosen so that the scope ends, its stop
-included, before the remaining admitted lifetime falls below the closure watch's lead and
-a minute, allowing for a late start command, a late scope and the stop. When contact cannot be restored
+does not begin within 30 seconds cancels its own build. The caller gives the start an
+absolute expiry, at which the remaining admitted lifetime falls to the closure watch's lead
+and a minute, and the host enforces it on its own clock, which must agree with the
+caller's. The scope's runtime limit is computed from the expiry at the launch, and a
+watchdog in the scope stops it at the expiry less its 30-second stop time however late it
+began. A Boat screen's lock and workload units end, their stop included, by the same point
+of the admitted lifetime. When contact cannot be restored
 within the retry bound, the build fails. Its cleanup then stops the scope, or names the
 scope for reconciliation when it cannot reach the host within its own shorter bound. The closure watch's unit check covers the detached scope. A gate receives a standard bounded Git bundle of the exact
 commit and comparison base. Temporary bundle refs live outside the caller's repository.

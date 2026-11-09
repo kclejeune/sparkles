@@ -467,6 +467,9 @@ class BuildHost(unittest.TestCase):
             shutil.copy(self.repo / "scripts" / name, d / "bin" / name)
         return d
 
+    def expiry(self, seconds=1000):
+        return str(int(time.time()) + seconds)
+
     def remote(self, *args, env=None):
         return subprocess.run(["bash", str(self.repo / "scripts/nsc-build-remote.sh"), *args],
                               env=dict(env or self.env, HOME=str(self.hosts / "h1")),
@@ -477,7 +480,7 @@ class BuildHost(unittest.TestCase):
         then stops the scope, and a start after the cancellation starts nothing."""
         d = self.remote_dir()
         env = dict(self.env, FAKE_SCOPE_DELAY="1.5", FAKE_BUILD_DELAY="60")
-        start = subprocess.Popen(["bash", str(self.repo / "scripts/nsc-build-remote.sh"), str(d), "u-fence", "600"],
+        start = subprocess.Popen(["bash", str(self.repo / "scripts/nsc-build-remote.sh"), str(d), "u-fence", self.expiry()],
                                  env=dict(env, HOME=str(self.hosts / "h1")), stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True, start_new_session=True)
         deadline = time.monotonic() + 10
@@ -499,7 +502,7 @@ class BuildHost(unittest.TestCase):
         self.assertEqual(self.remote("--status", str(d), "u-fence", "0").stdout.splitlines()[0], "gone")
         # A start whose earlier attempt was lost is refused once the build is cancelled.
         (d / "launched").unlink()
-        again = self.remote(str(d), "u-fence", "600", env=env)
+        again = self.remote(str(d), "u-fence", self.expiry(), env=env)
         self.assertEqual(again.returncode, 3)
         self.assertIn("was cancelled", again.stderr)
         self.assertEqual(self.remote("--status", str(d), "u-fence", "0").stdout.splitlines()[0], "refused 3")
@@ -507,7 +510,7 @@ class BuildHost(unittest.TestCase):
     def test_a_scope_that_systemd_refuses_is_a_refused_start(self):
         env = dict(self.env, FAKE_SCOPE_FAIL="1")
         d = self.remote_dir()
-        result = self.remote(str(d), "u-fail", "600", env=env)
+        result = self.remote(str(d), "u-fail", self.expiry(), env=env)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(self.remote("--status", str(d), "u-fail", "0").stdout.splitlines()[0], "refused 1")
         shutil.rmtree(d)
@@ -522,27 +525,27 @@ class BuildHost(unittest.TestCase):
         env = dict(self.env, SPARKLES_NSC_BUILD_DEADLINE=str(int(time.time()) + 200))
         result, out = self.bench("--build-host", "h1", env=env, ok_stop=False)
         log = (out / "logs" / "build-A.log").read_text()
-        self.assertIn("too little to start it", log)
+        self.assertIn("too little time to start it", log)
         self.assertIn("refused the build with exit 75", log)
         self.assertFalse((self.hosts / "units").exists())
         self.assertEqual(self.builds(), [])
         self.assertEqual(self.scratch("h1"), [])
-        # A deadline further away caps the scope's runtime, so that the scope ends, stop
-        # included, by the deadline even when its start arrives and begins late.
+        # A deadline further away caps the scope's runtime, so that the scope stops, its
+        # stop included, by the deadline.
         env = dict(self.env, SPARKLES_NSC_BUILD_DEADLINE=str(int(time.time()) + 1000))
         result, out = self.bench("--build-host", "h1", env=env)
         [unit] = list((self.hosts / "units").iterdir())
         runtime = int(unit.read_text().split("RuntimeMaxSec=")[1].split()[0])
-        self.assertTrue(700 <= runtime <= 810, runtime)
+        self.assertTrue(930 <= runtime <= 970, runtime)
         self.assertIn("TimeoutStopSec=30", unit.read_text())
 
-    def test_the_runtime_counts_from_the_start_s_arrival(self):
+    def test_the_runtime_is_read_from_the_expiry_at_the_launch(self):
         d = self.remote_dir()
         holder = subprocess.Popen(["flock", str(d / "launch.lock"), "sleep", "2"], start_new_session=True)
         self.holders.append(holder)
         while subprocess.run(["flock", "-n", str(d / "launch.lock"), "true"]).returncode == 0:
             time.sleep(0.02)
-        result = self.remote(str(d), "u-late", "301")
+        result = self.remote(str(d), "u-late", self.expiry(331))
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertIn("too little to start the build", result.stderr)
         self.assertFalse((self.hosts / "units" / "u-late.scope").exists())
@@ -553,7 +556,7 @@ class BuildHost(unittest.TestCase):
         the scope that the delayed launcher creates afterwards ends at once."""
         d = self.remote_dir()
         env = dict(self.env, SPARKLES_NSC_BUILD_ACTIVATION_SECONDS="1", FAKE_SCOPE_DELAY="2.5")
-        result = self.remote(str(d), "u-slow", "600", env=env)
+        result = self.remote(str(d), "u-slow", self.expiry(), env=env)
         self.assertEqual(result.returncode, 75, result.stderr)
         self.assertIn("did not start within 1 seconds", result.stderr)
         self.assertTrue((d / "cancelled").exists())
@@ -570,6 +573,26 @@ class BuildHost(unittest.TestCase):
         self.assertIn("was cancelled before its scope began", status)
         self.assertFalse((self.hosts / "build-started").exists())
         self.assertTrue((d / "src").is_dir())
+
+    def test_the_build_stops_at_its_expiry_however_late_its_scope_began(self):
+        d = self.remote_dir()
+        script = str(d / "bin" / "nsc-build-remote.sh")
+        env = dict(self.env, HOME=str(self.hosts / "h1"), FAKE_BUILD_DELAY="60")
+        # A scope that begins after the expiry builds nothing.
+        late = subprocess.run(["systemd-run", "--user", "--scope", "--unit", "u-past", "--", "bash", script, "--run",
+                               str(d), "u-past", self.expiry(20)], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(late.returncode, 75, late.stderr)
+        self.assertIn("began after its expiry", late.stdout)
+        self.assertFalse((self.hosts / "build-started").exists())
+        # A scope that began with 2 seconds left is stopped by its watchdog, which records 124.
+        started = time.monotonic()
+        run = subprocess.run(["systemd-run", "--user", "--scope", "--unit", "u-exp", "--", "bash", script, "--run",
+                              str(d), "u-exp", self.expiry(32)], env=env, capture_output=True, text=True, timeout=30)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertTrue((self.hosts / "build-started").exists())
+        self.assertIn("reached its expiry", run.stdout)
+        self.assertEqual((d / "exit").read_text().strip(), "124")
+        self.assertEqual(self.remote("--status", str(d), "u-exp", "0").stdout.splitlines()[0], "exited 124")
 
     def test_a_publication_cut_short_or_in_progress_is_finished_once(self):
         """A retried copy waits for a publication in progress and accepts a tree that an attempt
