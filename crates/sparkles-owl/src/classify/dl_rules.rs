@@ -688,7 +688,7 @@ fn partners_rf(ix: &Index, st: &State, t: Role) -> Vec<(Ex, Vec<Side>)> {
         let mut by: Vec<(Ex, u32, Lit)> = ids
             .into_iter()
             .filter_map(|i| {
-                let l = d.store.clauses[i as usize].max?;
+                let l = d.store.max_of(i, |l| l.kind() == RL)?;
                 (units.binary_search(&l.fun()).is_err()).then_some((l.fun(), i, l))
             })
             .collect();
@@ -1791,7 +1791,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
         let Some(x) = st.extra.as_mut().and_then(|x| x.dl.as_deref_mut()) else {
             break;
         };
-        let Some(id) = x.store.next(ix, &mut max) else {
+        let Some(id) = x.store.next(ix, None, &mut max) else {
             break;
         };
         let grown = x.store.take_grown();
