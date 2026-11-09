@@ -268,10 +268,9 @@ fn retained_eager_describe_is_charged_and_checks_both_memory_budgets() {
     .unwrap();
     assert_eq!(result.len(), 300);
     assert!(result.mem_peak_bytes >= 30_000_000);
-    // After the query the pool keeps what the result retains, its lexical payload,
-    // and returns the rest of the estimate.
-    assert!(pool.granted() >= 30_000_000);
-    assert!(pool.granted() < result.mem_peak_bytes);
+    // A graph result keeps its query's admitted high point on the pool until it is
+    // dropped (X14 stage 4).
+    assert!(pool.granted() >= result.mem_peak_bytes);
     drop(result);
     assert_eq!(pool.granted(), 0);
     for local in [false, true] {

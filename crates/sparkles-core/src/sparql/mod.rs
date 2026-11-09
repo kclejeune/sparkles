@@ -1741,18 +1741,17 @@ fn execute_prepared_parts(
     }
     // The operators' state goes with the plan, so the pool keeps only what the result
     // holds. The plan's retained charges, such as an EXISTS memo or key set, are
-    // released before the shrink, which they would otherwise keep. Graph payloads
-    // retain their original physical output credit rather than the query's peak.
+    // released before the shrink, which they would otherwise keep. A graph result
+    // keeps its query's admitted high point until it is dropped (X14 stage 4), so
+    // it is not shrunk to its graph credit.
     drop(node);
     ctx.release_work();
-    if (matches!(kind, QueryKind::Select | QueryKind::Ask) || result._graph_credit.is_some())
-        && let Err(error) = ctx.shrink_retained(
-            if result._table_credit.is_some() || result._graph_credit.is_some() {
-                0
-            } else {
-                result.table.capacity_bytes()
-            },
-        )
+    if matches!(kind, QueryKind::Select | QueryKind::Ask)
+        && let Err(error) = ctx.shrink_retained(if result._table_credit.is_some() {
+            0
+        } else {
+            result.table.capacity_bytes()
+        })
     {
         return Err(Box::new(Failed {
             error,

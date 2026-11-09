@@ -545,15 +545,15 @@ fn retained_eager_construct_graphs_cover_their_lexical_payload() {
         let result = query(s.snapshot(), q, &opts).unwrap();
         assert_eq!(result.len(), 300);
         assert!(result.mem_peak_bytes >= 30_000_000);
-        // The pool keeps what the result retains, its graph credit, and not the
-        // duplicate set that construction freed.
-        let retained = result.inner._graph_credit.as_ref().unwrap().bytes();
-        assert!(retained >= 30_000_000);
-        assert!(pool.granted() >= retained);
+        // A graph result keeps its query's admitted high point on the pool until the
+        // result is dropped (X14 stage 4).
+        let peak = result.mem_peak_bytes;
+        assert!(result.inner._graph_credit.as_ref().unwrap().bytes() >= 30_000_000);
+        assert!(pool.granted() >= peak);
         let kept = result.clone();
         assert!(std::sync::Arc::ptr_eq(&kept.inner, &result.inner));
         drop(result);
-        assert!(pool.granted() >= 30_000_000);
+        assert!(pool.granted() >= peak);
         assert_eq!(kept.triples().len() + kept.quads().len(), 300);
         let object = kept
             .triples()
@@ -589,9 +589,8 @@ fn retained_eager_graphs_add_on_one_grant_and_release_in_different_orders() {
     )
     .unwrap();
     let two = query(s.snapshot(), "DESCRIBE ?s WHERE {?s <urn:p> ?o}", &opts).unwrap();
-    // Each result keeps its own retained graph credit on the shared grant.
-    let credit = |r: &crate::sparql::QueryResult| r.inner._graph_credit.as_ref().unwrap().bytes();
-    let sum = credit(&one) + credit(&two);
+    // Each graph result keeps its query's admitted high point on the shared grant.
+    let sum = one.mem_peak_bytes + two.mem_peak_bytes;
     assert!(grant.used() >= sum);
     let context = two.clone();
     assert!(std::sync::Arc::ptr_eq(&context.inner, &two.inner));
@@ -602,7 +601,7 @@ fn retained_eager_graphs_add_on_one_grant_and_release_in_different_orders() {
         matches!(&context.triples()[0].object, oxrdf::Term::Literal(l) if l.value().len() == 100_000)
     );
     drop(context);
-    assert!(grant.used() >= credit(&one));
+    assert!(grant.used() >= one.mem_peak_bytes);
     assert_eq!(one.len(), 300);
     drop(one);
     assert_eq!(grant.used(), 0);
