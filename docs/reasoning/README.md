@@ -737,8 +737,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   take, so those files get the answer without counting. ore_ont_6485 spends 205 ms on the
   attempt against 7 ms for the run without it, and Konclude takes 8 ms. Roadmap items
   728 and 729.
-* BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies in 27 ms on four threads
-  against 23 ms for Konclude. Roadmap item 712.
+* BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies in 23 ms on four threads,
+  the time Konclude takes, which is short of the classifier's aim of three times
+  Konclude's speed. Roadmap item 712.
 * ore_ont_3215 of the ORE 2015 DL sample passes the disjunctive rules' memory budget and
   gets the Horn rules' answer without its 18,323 unions. Roadmap item 713.
 * `partial` applies only to runs of the disjunctive rules, and runs of the EL and Horn

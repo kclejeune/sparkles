@@ -65,7 +65,10 @@ conclusions, which `Limits::dl_work` changes, and classifies again without count
 leaving those axioms out and reporting them, and `dl_counting_over` and `dl_over_budget`
 say so. A run that does not count has no such bound. The normalization keeps the class
 beside a universal or a maximum in a clause's body, which classifies BioTop in 27 ms on
-four threads where it took 350 ms.
+four threads where it took 350 ms. The clause stores find the premises of a literal over a
+successor term by that literal, and Pred passes over a predecessor clause that a new
+premise cannot enter, which takes BioTop to 23 ms on four threads and 44 ms on one with
+the same inferences.
 
 The web UI scales to large ontologies and graphs. The Workbench ontology and thesaurus trees
 draw only the rows in view, with the keyboard, sticky ancestors, **Show more** paging and
