@@ -31,7 +31,8 @@
 # deadline. Nemo's own report adds its import, reasoning and export times. WORKDIR/results/rl-reference.json holds every run and summary.md the medians.
 #
 # Env: RUNS (default 3), THREADS (default all cores), DELTA_EVERY (default 100), MEM_MAX
-# (default 24G), RUN_TIMEOUT (default 3600), SCOPE, SPARKLES (default
+# (default 24G), RUN_TIMEOUT (default 3600), KILL_AFTER (seconds from TERM to KILL at the
+# deadline, default 30), SCOPE, SPARKLES (default
 # target/release/sparkles), NMO (default the flake's nemo package), PYTHON.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -45,7 +46,7 @@ RUN_TIMEOUT=${RUN_TIMEOUT:-3600}
 INFERRED=urn:x-sparkles:inferred
 
 [ $# -eq 3 ] || {
-  sed -n '2,33p' "$0" >&2
+  sed -n '2,36p' "$0" >&2
   exit 2
 }
 suite=$1 scale=$2
@@ -61,6 +62,87 @@ die() {
   exit 1
 }
 log() { echo "[$(date +%T)] $*" >&2; }
+
+# capped NAME [-t TIMEFILE] CMD...: CMD in a scope of its own with MemoryMax=MEM_MAX and
+# no swap, within RUN_TIMEOUT seconds, with its output in logs/NAME.log. With -t, GNU time
+# reports on the timeout supervisor and CMD to TIMEFILE, so that timeout signals CMD
+# itself and waits for it. It sets CAPPED_STATUS to ok, timeout, oom (the kernel killed a
+# process of the scope at its memory limit, which the scope's memory.events, copied to
+# logs/NAME.events, records), killed (another SIGKILL) or error (any other failure,
+# including a scope that did not start), and returns 0 only for ok. A small shell in the
+# scope runs CMD, copies memory.events when it ends and kills whatever is left in the
+# scope, so no process outlives the run.
+capped() {
+  local name=$1 rc=0 t0 t1 ooms=0
+  shift
+  local timer=()
+  if [ "${1:-}" = -t ]; then
+    timer=("$GTIME" -v -o "$2")
+    shift 2
+  fi
+  local scope=()
+  rm -f "logs/$name.events"
+  if [ "${SCOPE:-1}" != 0 ] && command -v systemd-run > /dev/null; then
+    # shellcheck disable=SC2016 # the inner shell expands these
+    scope=(systemd-run --user --scope -q --expand-environment=no -p "MemoryMax=$MEM_MAX" -p MemorySwapMax=0
+      -p OOMPolicy=continue sh -c 'cg=/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup); ev=$1; shift
+"$@"; rc=$?; cat "$cg/memory.events" > "$ev" 2> /dev/null
+while read -r p; do [ "$p" = $$ ] || kill -9 "$p" 2> /dev/null; done < "$cg/cgroup.procs"
+exit $rc' capped "logs/$name.events")
+  fi
+  t0=$(date +%s.%N)
+  "${scope[@]}" "${timer[@]}" timeout -k "${KILL_AFTER:-30}" "$RUN_TIMEOUT" "$@" > "logs/$name.log" 2>&1 || rc=$?
+  t1=$(date +%s.%N)
+  ooms=$(sed -n 's/^oom_kill \([0-9]*\)$/\1/p' "logs/$name.events" 2> /dev/null || true)
+  if [ "$rc" = 0 ]; then
+    CAPPED_STATUS=ok
+  elif [ "${ooms:-0}" -gt 0 ]; then
+    CAPPED_STATUS=oom
+  elif [ "$rc" = 124 ] || awk "BEGIN {exit !($t1 - $t0 >= $RUN_TIMEOUT)}"; then
+    CAPPED_STATUS=timeout
+  elif [ "$rc" = 137 ]; then
+    CAPPED_STATUS=killed
+  else
+    CAPPED_STATUS=error
+  fi
+  [ "$CAPPED_STATUS" = ok ]
+}
+
+# run NAME ROUND THREADS CMD...: one timed engine run, appended to the record. GNU time
+# inside the scope gives the wall time and the peak RSS of the run, whose largest process
+# is the engine.
+run() {
+  local name=$1 round=$2 threads=$3 rss wall
+  shift 3
+  rm -f "logs/$name.time"
+  capped "$name" -t "logs/$name.time" "$@" || true
+  LAST_STATUS=$CAPPED_STATUS
+  rss=$(sed -n 's/.*Maximum resident set size (kbytes): \([0-9]*\)/\1/p' "logs/$name.time" 2> /dev/null || true)
+  wall=$(sed -n 's/.*Elapsed (wall clock) time (h:mm:ss or m:ss): \(.*\)/\1/p' "logs/$name.time" 2> /dev/null || true)
+  "$PYTHON" -I - "$RECORD" "$name" "$round" "$threads" "$LAST_STATUS" "${wall:-}" "${rss:-}" "logs/$name.log" << 'EOF'
+import json, re, sys
+rec, name, rnd, threads, st, wall, rss, logf = sys.argv[1:]
+text = open(logf, errors="replace").read()
+secs = None
+if wall:
+    parts = [float(x) for x in wall.split(":")]
+    secs = sum(v * 60 ** i for i, v in enumerate(reversed(parts)))
+entry = {"run": re.sub(r"-t[0-9]+$", "", name.rsplit("-r", 1)[0]), "round": int(rnd), "threads": int(threads), "status": st,
+         "seconds": secs, "max_rss_kib": int(rss) if rss else None}
+# Nemo's short report: Data import, Reasoning and Data export, in milliseconds
+for key, label in (("import", "Data import"), ("reasoning", "Reasoning"), ("export", "Data export")):
+    m = re.search(rf"{label}:\s+([0-9]+)ms", text)
+    if m:
+        entry[f"nemo_{key}_seconds"] = int(m.group(1)) / 1000
+m = re.search(r"^([0-9]+) inferred triples", text, re.M)
+if m:
+    entry["derived_triples"] = int(m.group(1))
+with open(rec, "a") as f:
+    f.write(json.dumps(entry) + "\n")
+print(f"{entry['run']} round {rnd}, {threads} threads: {st}, {secs if secs is None else round(secs, 2)} s, peak RSS {int(rss) >> 10 if rss else '?'} MiB")
+EOF
+  return 0
+}
 
 # shellcheck source=scripts/bench-tools.sh
 . "$ROOT/scripts/bench-tools.sh"
@@ -95,77 +177,6 @@ grep -v '% reflexive-scm-eq$' "$HERE/owl2rl.rls" | cat - "$HERE/sparkles-extensi
 # ------------------------------------------------------------------------ correctness
 log "comparing the closures"
 capped compare "$HERE/compare.sh" base.nt compare || die "the closures differ or the comparison failed, see logs/compare.log"
-
-# capped NAME CMD...: CMD in a scope of its own with MemoryMax=MEM_MAX and no swap, within
-# RUN_TIMEOUT seconds, with its output in logs/NAME.log. It sets CAPPED_STATUS to ok,
-# timeout, oom (the kernel killed a process of the scope at its memory limit, which the
-# scope's memory.events, copied to logs/NAME.events, records), killed (another SIGKILL) or
-# error (any other failure, including a scope that did not start), and returns 0 only for
-# ok. A small shell in the scope runs CMD and copies memory.events when it ends, so the
-# record outlives the scope.
-capped() {
-  local name=$1 rc=0 t0 t1 ooms=0
-  shift
-  local scope=()
-  rm -f "logs/$name.events"
-  if [ "${SCOPE:-1}" != 0 ] && command -v systemd-run > /dev/null; then
-    # shellcheck disable=SC2016 # the inner shell expands these
-    scope=(systemd-run --user --scope -q --expand-environment=no -p "MemoryMax=$MEM_MAX" -p MemorySwapMax=0
-      -p OOMPolicy=continue sh -c 'cg=/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup); ev=$1; shift
-"$@"; rc=$?; cat "$cg/memory.events" > "$ev" 2> /dev/null; exit $rc' capped "logs/$name.events")
-  fi
-  t0=$(date +%s.%N)
-  "${scope[@]}" timeout -k 30 "$RUN_TIMEOUT" "$@" > "logs/$name.log" 2>&1 || rc=$?
-  t1=$(date +%s.%N)
-  ooms=$(sed -n 's/^oom_kill \([0-9]*\)$/\1/p' "logs/$name.events" 2> /dev/null || true)
-  if [ "$rc" = 0 ]; then
-    CAPPED_STATUS=ok
-  elif [ "${ooms:-0}" -gt 0 ]; then
-    CAPPED_STATUS=oom
-  elif [ "$rc" = 124 ] || awk "BEGIN {exit !($t1 - $t0 >= $RUN_TIMEOUT)}"; then
-    CAPPED_STATUS=timeout
-  elif [ "$rc" = 137 ]; then
-    CAPPED_STATUS=killed
-  else
-    CAPPED_STATUS=error
-  fi
-  [ "$CAPPED_STATUS" = ok ]
-}
-
-# run NAME ROUND THREADS CMD...: one timed engine run, appended to the record. GNU time
-# inside the scope gives the wall time and the peak RSS of the command alone.
-run() {
-  local name=$1 round=$2 threads=$3 rss wall
-  shift 3
-  rm -f "logs/$name.time"
-  capped "$name" "$GTIME" -v -o "logs/$name.time" "$@" || true
-  LAST_STATUS=$CAPPED_STATUS
-  rss=$(sed -n 's/.*Maximum resident set size (kbytes): \([0-9]*\)/\1/p' "logs/$name.time" 2> /dev/null || true)
-  wall=$(sed -n 's/.*Elapsed (wall clock) time (h:mm:ss or m:ss): \(.*\)/\1/p' "logs/$name.time" 2> /dev/null || true)
-  "$PYTHON" -I - "$RECORD" "$name" "$round" "$threads" "$LAST_STATUS" "${wall:-}" "${rss:-}" "logs/$name.log" << 'EOF'
-import json, re, sys
-rec, name, rnd, threads, st, wall, rss, logf = sys.argv[1:]
-text = open(logf, errors="replace").read()
-secs = None
-if wall:
-    parts = [float(x) for x in wall.split(":")]
-    secs = sum(v * 60 ** i for i, v in enumerate(reversed(parts)))
-entry = {"run": re.sub(r"-t[0-9]+$", "", name.rsplit("-r", 1)[0]), "round": int(rnd), "threads": int(threads), "status": st,
-         "seconds": secs, "max_rss_kib": int(rss) if rss else None}
-# Nemo's short report: Data import, Reasoning and Data export, in milliseconds
-for key, label in (("import", "Data import"), ("reasoning", "Reasoning"), ("export", "Data export")):
-    m = re.search(rf"{label}:\s+([0-9]+)ms", text)
-    if m:
-        entry[f"nemo_{key}_seconds"] = int(m.group(1)) / 1000
-m = re.search(r"^([0-9]+) inferred triples", text, re.M)
-if m:
-    entry["derived_triples"] = int(m.group(1))
-with open(rec, "a") as f:
-    f.write(json.dumps(entry) + "\n")
-print(f"{entry['run']} round {rnd}, {threads} threads: {st}, {secs if secs is None else round(secs, 2)} s, peak RSS {int(rss) >> 10 if rss else '?'} MiB")
-EOF
-  return 0
-}
 
 nemo_run() {
   local name=$1 round=$2 enc=$3
