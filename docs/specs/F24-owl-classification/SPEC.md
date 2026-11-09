@@ -948,7 +948,8 @@ the [code layout results](../../benchmarks/el-classification/RESULTS.md#code-lay
 This section is the design of item 603's sixth phase, which extends the disjunctive rules
 to nominals. The rules it describes are built, apart from keys and the universal property,
 which item 805 builds. They run only when the constant `ROOTED_RUNS` in `classify/mod.rs`
-is true, and it is false, because the rules do not finish on most of the phase's gate.
+is true, and it is false, because 19 of the 50 `shoi` fixtures of the phase's gate time
+out.
 The disjunctive rules therefore still refuse ontologies with individuals and nominals as
 the section above says, and every other run takes the paths it took before these rules
 existed. The measurements and the redesign that item 804 follows are at the end of this
@@ -1101,13 +1102,15 @@ taxonomy it finishes equals HermiT's. It times out at least once on 19 fixtures.
 smallest case, three axioms reduced from `shoi-000`, gives no answer within 200 s. Two
 causes are measured. The first is the fifth condition of Definition 7, which leaves ground
 atoms of different predicates incomparable, so the root's resolution over ground
-disjunctions is unordered and r-Pred copies those disjunctions into the contexts. An
-order of every ground atom by predicate, which Definition 7 does not admit, classifies the
-small case in 0.4 s, and 39 fixtures then finish in every configuration with HermiT's
+disjunctions is unordered and r-Pred copies those disjunctions into the contexts. The
+experiments on the order ran at commit 846dd24e with Eq blocked on `x ≈ u`, as the journal's
+Section 7.2.3 describes, in every context but the root. With that blocking, an order of
+every ground atom by predicate, which Definition 7 does not admit, classifies the small
+case in 0.4 s, and 39 fixtures then finish in every configuration with HermiT's
 taxonomies. Ordering only the unary atoms over one constant, which is what the nominal
 contexts of the journal's system Sequoia allow, classifies it in 5.2 s. The second cause
-remains with the order of every ground atom, with Eq blocked as the journal's Section 7.2.3 describes, with one
-query atom selected per clause as its Section 7.3.1 describes and without the ground
+remains with the order of every ground atom and that blocking, with one query atom
+selected per clause as its Section 7.3.1 describes and without the ground
 markers to successors. The root then spends its work on clauses whose bodies join up to
 five r-Succ markers, which is the calculus's own conditional reasoning. A read-only
 consult found that the growth follows Tables 2 and 3 rather than a wrong inference, and
