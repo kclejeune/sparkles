@@ -896,6 +896,10 @@ pub(crate) fn expand_in(
     let snap = &data.snap;
     let mut out = Vec::new();
     let mut warnings = Vec::new();
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "OwnedTerm hashes and compares its immutable term, not its owner"
+    )]
     let mut seen: FxHashSet<(OwnedTerm, ShapeLabel)> = FxHashSet::default();
     let mut push = |out: &mut Vec<FixedEntry>,
                     node: OwnedTerm,

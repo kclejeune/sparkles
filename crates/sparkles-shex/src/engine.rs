@@ -104,6 +104,10 @@ pub(crate) fn validate_typed_with_output(
 
     // nodes that are not in the store get local ids
     let mut absent = Vec::new();
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "OwnedTerm hashes and compares its immutable term, not its owner"
+    )]
     let mut absent_ids: FxHashMap<sparkles_core::sparql::output::OwnedTerm, Id> =
         FxHashMap::default();
     let nodes: Vec<Id> = entries

@@ -1330,7 +1330,7 @@ fn result_triples(r: &ResultMap) -> BTreeSet<(String, String, bool)> {
     r.results
         .iter()
         .map(|x| {
-            let node = match &x.node {
+            let node = match x.node.as_term() {
                 Term::NamedNode(n) => n.as_str().to_string(),
                 other => other.to_string(),
             };

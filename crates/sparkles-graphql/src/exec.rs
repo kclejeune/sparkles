@@ -63,6 +63,10 @@ fn is_node(t: &Term) -> bool {
 
 /// The distinct node ids of a group's records, in order.
 fn node_ids(d: &Data) -> Vec<OwnedTerm> {
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "OwnedTerm hashes and compares its immutable term, not its owner"
+    )]
     let mut seen = std::collections::HashSet::new();
     d.recs
         .iter()
@@ -129,6 +133,10 @@ fn decode_nodes(
     let nc = col(r, "n");
     let sc: Vec<Option<usize>> = b.singles.iter().map(|v| col(r, v.as_str())).collect();
     let fc: Vec<Option<usize>> = b.flags.iter().map(|v| col(r, v.as_str())).collect();
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "OwnedTerm hashes and compares its immutable term, not its owner"
+    )]
     let mut index: HashMap<(Option<OwnedTerm>, OwnedTerm), usize> = HashMap::new();
     for i in 0..r.table().len() {
         let Some(node) = cell(r, nc, i)? else {
