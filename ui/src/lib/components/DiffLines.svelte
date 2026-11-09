@@ -5,7 +5,7 @@
   // previews and the forms use it.
   import * as api from '$lib/api';
   import { app } from '$lib/app.svelte';
-  import { namesQuery, parseDefinitions } from '$lib/browse';
+  import { changeNamesQuery, parseChangeNames } from '$lib/browse';
   import { changeIris } from '$lib/changeset';
   import { fmtInt } from '$lib/format';
   import { diffLine } from '$lib/history';
@@ -42,9 +42,9 @@
     if (!t || !iris.length || raw) return;
     let live = true;
     api
-      .select(t, namesQuery(iris, null))
+      .select(t, changeNamesQuery(iris, null))
       .then((rows) => {
-        if (live) names = parseDefinitions(rows as never, langs);
+        if (live) names = parseChangeNames(rows as never, langs);
       })
       .catch(() => {});
     return () => {
