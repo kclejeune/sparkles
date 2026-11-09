@@ -147,11 +147,11 @@ jobs:
       - name: Build and assemble the default-feature candidate
         run: mise run server:artifact -- .artifacts/server-candidate
       - name: Collect the mbx store to its size limit
-        if: ${{ github.ref == 'refs/heads/lane/ci-packaging-773' }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           mbx gc
           du -sh "$(dirname "$(mbx cache dir)")"
-      - if: ${{ github.ref == 'refs/heads/lane/ci-packaging-773' }}
+      - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         uses: actions/cache/save@v4
         with:
           path: *mbx-store

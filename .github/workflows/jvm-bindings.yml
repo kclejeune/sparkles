@@ -72,7 +72,7 @@ env:
   # Pushes to main and pull requests build the bindings in the dev profile, which compiles
   # far faster than the release profile's thin LTO; tags and manual runs build what would
   # be published.
-  JVM_PROFILE: ${{ github.ref_type == 'branch' && 'dev' || 'release' }}
+  JVM_PROFILE: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'dev' || 'release' }}
 
 jobs:
   natives:
@@ -84,8 +84,8 @@ jobs:
       matrix:
         platform: [linux-x86_64, linux-aarch64, macos-aarch64]
         exclude:
-          - platform: ${{ github.ref_type == 'branch' && 'linux-aarch64' || 'none' }}
-          - platform: ${{ github.ref_type == 'branch' && 'macos-aarch64' || 'none' }}
+          - platform: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'linux-aarch64' || 'none' }}
+          - platform: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'macos-aarch64' || 'none' }}
     # Linux x86_64 uses SPARKLES_RUNNER_LARGE for same-repository branch events. Tags
     # (releases) and fork pull requests use GitHub's runners.
     runs-on: ${{ matrix.platform == 'macos-aarch64' && 'macos-15' || matrix.platform == 'linux-aarch64' && 'ubuntu-24.04-arm' || !inputs.github-hosted && github.ref_type != 'tag' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER_LARGE || 'ubuntu-24.04' }}
@@ -107,7 +107,7 @@ jobs:
           env-vars: &rust-cache-env CARGO CC CFLAGS CXX CMAKE RUST MBX
           workspaces: crates/sparkles-ffi -> ../../target
           shared-key: jvm-${{ matrix.platform }}-${{ env.JVM_PROFILE }}
-          save-if: ${{ github.ref == 'refs/heads/lane/ci-packaging-773' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       # mbx's object store keeps the crates' outputs by the hash of their inputs, so a crate
       # whose sources and dependencies did not change is not compiled again. Main pushes save
       # the store under the commit, and other runs restore the latest.
@@ -145,11 +145,11 @@ jobs:
           cd jvm
           ./gradlew --no-daemon --console=plain :sparkles-jena:test :sparkles-jena:testUniffi :sample-java:build
       - name: Collect the mbx store to its size limit
-        if: ${{ github.ref == 'refs/heads/lane/ci-packaging-773' }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           mbx gc
           du -sh "$(dirname "$(mbx cache dir)")"
-      - if: ${{ github.ref == 'refs/heads/lane/ci-packaging-773' }}
+      - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         uses: actions/cache/save@v4
         with:
           path: *mbx-store

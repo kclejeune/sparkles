@@ -76,7 +76,7 @@ env:
   # Pushes to main and pull requests build the wheels in the dev profile, which compiles
   # far faster than the release profile's thin LTO; tags and manual runs build what would
   # be published.
-  PROFILE_ARG: ${{ github.ref_type == 'branch' && '--profile dev' || '--release' }}
+  PROFILE_ARG: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && '--profile dev' || '--release' }}
 
 jobs:
   linux:
@@ -91,8 +91,8 @@ jobs:
         target: [x86_64, aarch64]
         libc: [manylinux, musllinux]
         exclude:
-          - target: ${{ github.ref_type == 'branch' && 'aarch64' || 'none' }}
-          - libc: ${{ github.ref_type == 'branch' && 'musllinux' || 'none' }}
+          - target: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'aarch64' || 'none' }}
+          - libc: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'musllinux' || 'none' }}
     env:
       CARGO_HOME: ${{ github.workspace }}/.cache/cargo
       MBX_CACHE_DIR: ${{ github.workspace }}/.cache/mbx
@@ -116,12 +116,12 @@ jobs:
           restore-keys: mbx-store-python-${{ matrix.libc }}-${{ matrix.target }}-${{ env.PROFILE_ARG == '--release' && 'release' || 'dev' }}-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
       # The host's Boxington collects that store before a save.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-        if: ${{ github.ref == 'refs/heads/lane/ci-packaging-773' }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         with: { cache: false, rustflags: "" }
       # local mode: no remote cache, and no link cache, which would add the wheel's
       # library to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
-        if: ${{ github.ref == 'refs/heads/lane/ci-packaging-773' }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         with:
           backend: local
           version: 1.29.1
@@ -155,11 +155,11 @@ jobs:
         run: |
           if [ -d .cache ]; then sudo chown -R "$(id -u):$(id -g)" .cache; fi
       - name: Collect the mbx store to its size limit
-        if: ${{ github.ref == 'refs/heads/lane/ci-packaging-773' }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           mbx gc
           du -sh .cache/mbx
-      - if: ${{ github.ref == 'refs/heads/lane/ci-packaging-773' }}
+      - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         uses: actions/cache/save@v4
         with:
           path: *mbx-store
@@ -189,7 +189,7 @@ jobs:
     timeout-minutes: 45
     name: macOS arm64
     # tags and manual runs only
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: macos-15
     env:
       # the oldest macOS the wheels support (spec P01, §2.4)
@@ -238,7 +238,7 @@ jobs:
     timeout-minutes: 45
     name: Source distribution
     # tags and manual runs only
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     # SPARKLES_RUNNER for same-repository branch events. Tags (releases) and fork pull
     # requests use GitHub's runner.
     runs-on: ${{ !inputs.github-hosted && github.ref_type != 'tag' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER || 'ubuntu-24.04' }}
