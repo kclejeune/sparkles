@@ -338,7 +338,7 @@ fn cloning_an_activated_store_refuses_before_writing() {
     std::fs::create_dir(&empty).unwrap();
     for destination in [&absent, &empty] {
         let refused = store.clone_to(destination, &Default::default());
-        let error = refused.err().expect("an activated store must not clone");
+        let error = refused.expect_err("an activated store must not clone");
         assert_eq!(error.code(), "unsupported", "{error}");
         assert!(
             error.to_string().contains("configuration history"),
