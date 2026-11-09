@@ -543,6 +543,8 @@ def exchange(argv, output, limit=MAX_ARCHIVE, timeout=300, deadline=None, source
                 code = process.wait(timeout=0.2);break
             except subprocess.TimeoutExpired:
                 pass
+        # A completion observed after the original end is not success.
+        remaining(deadline)
         return code
     except BaseException as error:
         failure = error

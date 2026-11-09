@@ -262,6 +262,20 @@ class LocalTransport(unittest.TestCase):
         deadline=RX.OperationDeadline(time.monotonic()+100,time.time()-1)
         with self.assertRaises(ValueError):RX.remaining(deadline)
 
+    def test_completion_after_the_original_end_is_not_success(self):
+        real_time=time.time;base=RX.boat_clock.boottime()
+        for clock in ('boot','wall'):
+            with self.subTest(clock=clock),tempfile.TemporaryDirectory()as tmp:
+                marker=Path(tmp)/'done'
+                # Output closes first, so the end passes during the final leader wait.
+                argv=['bash','-c','exec 1>&- 2>&-; sleep 0.3; : > '+shlex.quote(str(marker))]
+                jump=lambda:100 if marker.exists() else 0
+                boot=(lambda:base+jump())if clock=='boot' else (lambda:base)
+                wall=(lambda:real_time()+jump())if clock=='wall' else real_time
+                deadline=RX.OperationDeadline(time.monotonic()+5,real_time()+5,base+5)
+                with patch.object(RX.boat_clock,'boottime',side_effect=boot),patch.object(RX.time,'time',side_effect=wall):
+                    with self.assertRaises(ValueError):RX.exchange(argv,io.BytesIO(),deadline=deadline)
+
     def test_numeric_exit_and_receive_limit(self):
         with tempfile.TemporaryFile() as output:
             self.assertEqual(RX.receive('boat:bx_test', 'exit 17', output), 17)
