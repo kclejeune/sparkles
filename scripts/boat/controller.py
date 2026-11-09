@@ -56,9 +56,12 @@ def bounded(argv,seconds,input_bytes=None,limit=None):
             code=None
             while code is None:
                 cancel.check();rest=left()
-                try:code=child.wait(timeout=max(0.001,min(0.2,rest)))
+                if rest<=0:break
+                try:code=child.wait(timeout=min(0.2,rest))
                 except subprocess.TimeoutExpired:
                     if rest<=0.2:break
+            # A completion observed after the window or outer end is not success.
+            if code is not None and left()<=0:code=None
             if code is None:result={'exit':None,'error':'timeout','body':None}
             else:
                 try:body=json.loads(data)

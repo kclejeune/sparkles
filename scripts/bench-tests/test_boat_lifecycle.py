@@ -111,6 +111,21 @@ class EnvironmentAdmission(unittest.TestCase):
                 env.prepare(self.f['profile_path'],self.f['operation'],self.f['profile']['worker'],self.f['operation']/'suspended.json')
         self.assertLess(time.monotonic()-start,8)
 
+    def test_preparation_refuses_publication_inside_the_reserve(self):
+        import qualified_worker_admission as qwa
+        from datetime import datetime
+        left=datetime.fromisoformat(self.f['qualified']['expires_at'].replace('Z','+00:00')).timestamp()-self.f['now']
+        expected=env.expected_environment(self.f['profile'],self.f['qualified'])
+        real_context=env.context;boot=[self.f['boot_now']];out=self.f['operation']/'late-publication.json'
+        def context(*args,**kwargs):
+            kwargs['guard_reader']=lambda unit:self.f['guard'];return real_context(*args,**kwargs)
+        def transport(*args,**kwargs):
+            boot[0]=self.f['boot_now']+left-25;return {'exit':0,'error':None,'body':expected}
+        with patch.object(env,'context',side_effect=context),patch.object(env.time,'time',return_value=self.f['now']),\
+             patch.object(qwa,'boottime',side_effect=lambda:boot[0]),patch.object(controller,'bounded',side_effect=transport):
+            with self.assertRaises(ValueError):env.prepare(self.f['profile_path'],self.f['operation'],self.f['profile']['worker'],out)
+        self.assertFalse(out.exists())
+
     def test_reviewed_rollback_scenario_leaves_1570_seconds(self):
         import qualified_worker_admission as qwa
         intent={'deadline_wall':11500,'deadline_mono':10600};handoff={'deadline_wall':11500}
@@ -167,6 +182,17 @@ class ControllerTransportCleanup(unittest.TestCase):
                 if created:
                     try:os.killpg(created[0].pid,signal.SIGKILL)
                     except ProcessLookupError:pass
+
+    def test_limit_exhausted_by_completion_is_not_success(self):
+        import sys
+        with tempfile.TemporaryDirectory()as tmp:
+            marker=Path(tmp)/'done'
+            # Output closes first, so the outer end passes during the final leader wait.
+            child="import os,time,pathlib;os.close(1);time.sleep(0.3);pathlib.Path("+repr(str(marker))+").write_text('1')"
+            result=controller.bounded([sys.executable,'-c',child],5,None,limit=lambda:-1 if marker.exists() else 5)
+            self.assertEqual(result,{'exit':None,'error':'timeout','body':None})
+            result=controller.bounded([sys.executable,'-c','print(1)'],5,None,limit=lambda:-1)
+            self.assertEqual(result['error'],'timeout')
 
     def test_success_and_failure_retire_silent_descendants(self):
         import signal,sys

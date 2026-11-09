@@ -16,9 +16,9 @@
       "sha256": "e25e6f2070a71461366145e3a4f126e5f46a7bfa97334ed56e074622eec18b08"
     },
     "controller.py": {
-      "bytes": 36219,
+      "bytes": 36379,
       "mode": 420,
-      "sha256": "01a2cc68a75729a1aacac994b106e93d400d2b05d2c9245f47694b1bc2867dd8"
+      "sha256": "58ff7ff7e049dd2e1831d59b7980c6f9890108f2fa6357e00d84e9b5daff6a76"
     },
     "controls.py": {
       "bytes": 54649,
@@ -31,9 +31,9 @@
       "sha256": "b26f69930360afa4f7fd27f813684c7154efeed8c2507375c904f7d1677f0be8"
     },
     "job_environment.py": {
-      "bytes": 9228,
+      "bytes": 9444,
       "mode": 420,
-      "sha256": "a77d32d1adab04d6638f81be531842b8e736b7a5fdfd154856cc50f0ec6daac1"
+      "sha256": "9cd9998ef06e679adbfc459d0dcc897cc0a959c3256afc472b19e871bc61061e"
     },
     "metadata-probe.py": {
       "bytes": 11030,

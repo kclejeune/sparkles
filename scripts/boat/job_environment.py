@@ -129,8 +129,10 @@ def prepare(profile_path, operation, worker, output, check=False):
                                  '/usr/bin/python3', '-I', '-B', '-'], seconds, program,
                                limit=lambda: lifetime_left(lifetime, time.time())-CLOSURE_RESERVE)
     require(result['exit']==0 and result['body']==expected, 'job environment result uncertain; reconcile with --check')
-    # Recheck the original guard, source/profile and deadline after transport.
-    context(profile_path, path, worker, time.time())
+    # Recheck the original guard, source/profile and deadline after transport, and
+    # publish only while the closure reserve is still intact.
+    lifetime = context(profile_path, path, worker, time.time())[4]
+    require(lifetime_left(lifetime, time.time()) > CLOSURE_RESERVE, 'original lifetime reached the closure reserve during preparation')
     record = {'schema':SCHEMA, 'version':1, 'worker':worker,
               'qualification':{'path':str(path), 'sha256':digest(raw)}, 'runtime_env_file':expected}
     out = Path(output).absolute()
