@@ -861,14 +861,19 @@ exit "$code"
 
 
 class ScreenAcceptance(unittest.TestCase):
+    def setUp(self):
+        # Unit names of this test's own fixtures, unique to it.
+        self.owned = set()
+
     def tearDown(self):
         # A real unit's stop ends its watchdog with the rest of its cgroup. Here the
-        # watchdogs are process groups of their own and end with the test.
+        # watchdogs are process groups of their own, and only those of this test's own
+        # unit names end with it.
         for proc in Path('/proc').iterdir():
             if not proc.name.isdigit():continue
             try:args=(proc/'cmdline').read_bytes().split(b'\0')
             except OSError:continue
-            if b'watchdog' in args and any(b'sparkles-screen-' in a for a in args) and os.getpgid(int(proc.name))==int(proc.name):
+            if b'watchdog' in args and any(name.encode() in args for name in self.owned) and os.getpgid(int(proc.name))==int(proc.name):
                 try:os.killpg(int(proc.name),signal.SIGKILL)
                 except (ProcessLookupError,PermissionError):pass
 
@@ -941,8 +946,9 @@ screen_launch nsc-bench-remote.sh nohup.log
             fake = root/'bin'; fake.mkdir()
             (fake/'systemctl').write_text('#!/bin/sh\necho "$@" >> "$FAKE_LOG"\n'); (fake/'systemctl').chmod(0o755)
             env = dict(os.environ, PATH=str(fake)+os.pathsep+os.environ['PATH'], FAKE_LOG=str(root/'systemctl.log'))
-            guard = lambda e: subprocess.run(['bash', '-c', '. "$1"; screen_expiry_guard sparkles-screen-run-x-1 "$2"', 'bash',
-                                              str(ROOT/'scripts/remote-screen.sh'), str(e)], capture_output=True, text=True).stdout
+            name = 'sparkles-screen-run-test-' + os.urandom(6).hex(); self.owned.add(name)
+            guard = lambda e: subprocess.run(['bash', '-c', '. "$1"; screen_expiry_guard "$3" "$2"', 'bash',
+                                              str(ROOT/'scripts/remote-screen.sh'), str(e), name], capture_output=True, text=True).stdout
             late = subprocess.run(['bash', '-c', guard(int(time.time()) + 20) + ' echo began'], env=env, capture_output=True, text=True, timeout=10)
             self.assertEqual(late.returncode, 75)
             self.assertIn('began after its expiry', late.stderr)
@@ -953,7 +959,7 @@ screen_launch nsc-bench-remote.sh nohup.log
                 while not (root/'systemctl.log').exists() or 'stop' not in (root/'systemctl.log').read_text():
                     self.assertLess(time.monotonic(), deadline, 'the watchdog did not stop the unit')
                     time.sleep(0.05)
-                self.assertEqual((root/'systemctl.log').read_text().split(), ['--user', 'stop', '--no-block', 'sparkles-screen-run-x-1'])
+                self.assertEqual((root/'systemctl.log').read_text().split(), ['--user', 'stop', '--no-block', name])
             finally:
                 os.killpg(unit.pid, signal.SIGKILL); unit.wait()
 
@@ -978,6 +984,8 @@ screen_create test || true
             subprocess.run(['bash', '-c', program], env=dict(os.environ, SCRIPTS=str(ROOT/'scripts'), RESULTS=tmp),
                            capture_output=True, text=True, timeout=10)
             text = (root/'lock-command').read_text()
+            lock = 'sparkles-screen-lock-' + text.split('--unit=sparkles-screen-lock-')[1].split()[0]
+            self.owned.add(lock)
             expiry = int(text.rstrip().split('bash "$d" ')[1].split()[0])
             self.assertLessEqual(abs(expiry - (time.time() + 3600 - 960)), 5)
             env = dict(os.environ, PATH=str(fake)+os.pathsep+os.environ['PATH'], HOME=str(home))
@@ -995,7 +1003,6 @@ screen_create test || true
                 # With nobody reading its answer and a late start, the lock's watchdog, started
                 # before the FIFO is opened, still stops the lock before its expiry.
                 script = text.split("bash -c '", 1)[1].split("' bash \"$d\"", 1)[0]
-                lock = 'sparkles-screen-lock-' + text.split('--unit=sparkles-screen-lock-')[1].split()[0]
                 fifo = root/'unread'; fifo.mkdir(); os.mkfifo(fifo/'ready')
                 (fake/'systemctl').write_text('#!/bin/sh\necho "$@" >> "$HOME/systemctl.log"\n'); (fake/'systemctl').chmod(0o755)
                 unit = subprocess.Popen(['bash', '-c', script, 'bash', str(fifo), str(int(time.time()) + 33), lock],
