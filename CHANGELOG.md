@@ -29,6 +29,17 @@ Omitted fields and an empty object keep their previous meaning.
 
 ### Added
 
+Ontology reads resolve imports within the dataset (item 624). An `owl:imports` IRI
+resolves to the graph the dataset's import map names, then to the graph the IRI names, then
+to the graphs of a resource catalog vocabulary whose namespace matches it. The map is kept
+in `ontology-imports.json`, format 1, and `GET` and `PATCH /$/ontology/{ds}/imports` read
+and change it. `POST /$/ontology/{ds}/imports/catalog` loads an OASIS XML catalog with its
+files in one commit, and `POST /$/ontology/{ds}/imports/fetch` fetches an import into a
+graph through the outbound policy and records its ETag and digest. The summary lists the
+imports closure with its cycles, and its entity tag changes when the map does. The
+ontology editor's Imports tab shows the closure and the map with these actions, and a
+switch includes or excludes imported axioms in every view.
+
 The ontology editor has a Bulk edits tab (item 626). It finds and replaces text across
 labels, every annotation or one property, as literal text or a regular expression, with a
 language filter and a scope of the whole graph or an entity list. It sets or removes an

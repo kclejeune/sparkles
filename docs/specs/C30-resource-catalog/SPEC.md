@@ -280,6 +280,9 @@ for dataset administrators belongs to the dataset manager phase.
 
 The catalog is per server, as the non-goals require. A vocabulary resource names the
 dataset graphs that hold the vocabulary, and each dataset keeps its own term dictionary.
+An ontology read of that dataset resolves an `owl:imports` of one of the resource's
+namespaces to those graphs, as U12's
+[import resolution](../U12-ontology-workbench/SPEC.md#import-resolution) describes.
 A dictionary shared across datasets is not adopted, because it would couple the
 lifecycles of the datasets, force renumbering when one changes, reveal through shared
 ids which terms another dataset holds and widen the reach of every change to its format.

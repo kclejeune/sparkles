@@ -982,8 +982,12 @@ deadline. Roadmap item 540 adds the builder, the closure and the entity accessor
 describes.
 
 **Imports.** A read follows `owl:imports` only to graphs of the dataset that the caller
-can read. Fetching is refused, because a read route would otherwise make outbound
-requests. Roadmap item 559 adds fetching through the outbound policy.
+can read. The server's reads add the dataset's import map and the resource catalog's
+vocabularies as sources of those graphs, as U12's
+[import resolution](U12-ontology-workbench/SPEC.md#import-resolution) describes, and the
+summary lists the closure. Fetching is refused, because a read route would otherwise make
+outbound requests. The editor's explicit fetch stores a remote import as a graph, and
+roadmap item 559 adds fetching during a read through the outbound policy.
 
 **Caching.** The handle keeps the last four reads of up to two million triples each. An
 entry is keyed by commit, graphs, imports and mode, so any commit replaces it, and only

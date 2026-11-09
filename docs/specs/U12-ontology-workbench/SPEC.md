@@ -450,6 +450,47 @@ graph already holds, and leaves main and the imported graph alone, a move whose 
 an annotated axiom's reification, the bound, a protected branch and a reader under
 authentication. Item 770 covers matching on the server and splitting larger edits.
 
+### Import resolution
+
+Item 624 resolves imports within the dataset, as the
+[Import resolution](#import-resolution) design describes. The maintainer chose this design
+over a server-wide store of pinned source versions loaded on demand into a cached layer
+outside the branch's history. That store would keep imported copies out of exports and
+share them across datasets, but it needs the C30 source store, the durable jobs of item
+339 and a cache format of its own.
+
+`sparkles_reasoner::inputs::resolve_closure` resolves an ontology read's imports through
+`ImportTargets`, the map's entries and the vocabulary resources' graphs, and records one
+edge per `owl:imports` triple with its cycle flag. `resolve_readable` calls it without
+targets, so reasoning runs and reads without targets resolve as before. The ontology
+handle's cache key and the entity tags of the summary, the hierarchy, the individuals and
+the term reads carry a stable digest of the targets, and `If-Match` reads the format before
+the digest. The server keeps the map in the main dataset's `ontology-imports.json`, format
+1, in `crates/sparkles-server/src/http/ontology/imports.rs`, and reads the resource catalog
+on every ontology read, which costs one parse of `resources.json` per read while the file
+exists.
+
+The design's equal-document rule applies only to documents without blank nodes, since
+their blank nodes cannot be compared without canonical labelling. A catalog upload or a
+fetch of a document with blank nodes replaces the graph's triples and commits. A refresh
+always downloads again, because the recorded ETag belongs to one branch and one location.
+The catalog reader takes `uri` entries only. The editor offers file choice for a catalog's
+files, keyed by file name or by the path below a chosen folder.
+
+Unit tests cover the resolution order, readable and empty candidates, the resource union,
+the closure's cycles, the digest, the catalog reader's refusals of document types, entity
+references, deep nesting and leaving paths, the catalog plan and the map's bounds. Router
+tests cover the map with its revisions and the changed tags, a digest-bearing `If-Match`,
+a catalog that loads, maps, skips and then changes nothing, a refused catalog and file that
+change nothing, a protected branch, a fetch and an unchanged refresh, a refused file
+location, an outbound refusal that changes nothing, and under auth the admin requirement
+and the reader projection. Playwright covers the closure with a cycle and an unresolved
+import, a map entry, a catalog load, a fetch, the switch, a reader at phone width and a
+protected branch against the mock, and against a real server a map entry that makes no
+commit, a catalog on a branch that main does not see, a refused fetch, a protected branch
+and a writer who is not an administrator. Item 772 connects reasoning runs to the map, item
+782 covers more of the XML catalog standard, and item 783 covers per-branch maps.
+
 ### Ontology metrics and expressivity
 
 Item 621 adds an on-demand metrics panel to the ontology Header view and the ontology
