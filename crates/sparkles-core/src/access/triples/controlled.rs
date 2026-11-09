@@ -642,6 +642,106 @@ impl Pass {
     }
 }
 
+/// Write the query of [`pattern_query`] into charged text: the same prefixes, the
+/// same projection and the caller's values as escaped literals. `None` when the caller
+/// lacks an attribute the pattern uses, so the pattern matches nothing.
+fn pattern_text(
+    text: &mut Text,
+    protection: &Protection,
+    pattern: &str,
+    caller: &Caller,
+) -> Result<Option<[bool; 3]>> {
+    for (prefix, iri) in &protection.prefixes {
+        for part in ["PREFIX ", prefix, ": <", iri, ">\n"] {
+            text.push_str(part)?;
+        }
+    }
+    let subject = if uses(pattern, "this") { "this" } else { "s" };
+    let cols = [
+        uses(pattern, subject),
+        uses(pattern, "p"),
+        uses(pattern, "o"),
+    ];
+    text.push_str("SELECT DISTINCT")?;
+    for (on, var) in cols.iter().zip([subject, "p", "o"]) {
+        if *on {
+            text.push_str(" ?")?;
+            text.push_str(var)?;
+        }
+    }
+    if !cols.iter().any(|on| *on) {
+        text.push_str(" (1 AS ?any)")?;
+    }
+    text.push_str(" WHERE {\n")?;
+    let user = caller.user.as_slice();
+    for (var, values) in [
+        ("user", user),
+        ("role", caller.roles.as_slice()),
+        ("group", caller.groups.as_slice()),
+    ] {
+        if !uses(pattern, var) {
+            continue;
+        }
+        if values.is_empty() {
+            return Ok(None);
+        }
+        text.push_str("  VALUES ?")?;
+        text.push_str(var)?;
+        text.push_str(" { ")?;
+        for (at, value) in values.iter().enumerate() {
+            if at != 0 {
+                text.push_str(" ")?;
+            }
+            push_literal(text, value)?;
+        }
+        text.push_str(" }\n")?;
+    }
+    text.push_str("  { ")?;
+    text.push_str(pattern)?;
+    text.push_str("\n  }\n}")?;
+    Ok(Some(cols))
+}
+
+/// A simple literal in SPARQL syntax, with runs of plain characters copied whole.
+fn push_literal(text: &mut Text, value: &str) -> Result<()> {
+    text.push_str("\"")?;
+    let mut start = 0;
+    for (at, c) in value.char_indices() {
+        let escaped = match c {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            c if c.is_control() => "",
+            _ => continue,
+        };
+        text.push_str(&value[start..at])?;
+        if escaped.is_empty() {
+            let mut code = [0u8; 6];
+            let code = hex_escape(c, &mut code);
+            text.push_str(code)?;
+        } else {
+            text.push_str(escaped)?;
+        }
+        start = at + c.len_utf8();
+    }
+    text.push_str(&value[start..])?;
+    text.push_str("\"")
+}
+
+/// The `\uXXXX` escape of a control character, which is always below U+10000.
+fn hex_escape(c: char, out: &mut [u8; 6]) -> &str {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let code = c as u32;
+    out[0] = b'\\';
+    out[1] = b'u';
+    for (at, shift) in [12, 8, 4, 0].into_iter().enumerate() {
+        out[2 + at] = HEX[((code >> shift) & 0xF) as usize];
+    }
+    std::str::from_utf8(out).expect("ASCII escape")
+}
+
 /// Evaluate a protection's pattern as [`super::passes`] does, with every graph merged
 /// into the default graph and `GRAPH` for the named ones. The query text, the list of
 /// named graphs and the pattern's query are charged to `preparation`, and the query
@@ -655,45 +755,33 @@ fn passes(
     preparation: &Preparation,
 ) -> Result<Pass> {
     preparation.check()?;
-    // The text holds the prefixes, the caller's values as escaped literals and the
-    // pattern. Escaping at most doubles a value, and building it formats each piece once.
-    let inputs = protection
-        .prefixes
-        .iter()
-        .map(|(k, v)| k.len().saturating_add(v.len()).saturating_add(16))
-        .chain(caller.user.iter().map(String::len))
-        .chain(caller.roles.iter().map(String::len))
-        .chain(caller.groups.iter().map(String::len))
-        .fold(pattern.len(), usize::saturating_add);
-    let text_bytes = (inputs as u64).saturating_mul(4).saturating_add(1024);
-    let _text_held = preparation.reserve(text_bytes)?;
-    let Some((text, cols)) = pattern_query(protection, pattern, caller) else {
+    let mut text = Text::new(preparation)?;
+    let Some(cols) = pattern_text(&mut text, protection, pattern, caller)? else {
         return Ok(Pass::None);
     };
-    if text.capacity() as u64 > text_bytes {
-        return Err(preparation.exhausted());
-    }
-    let graphs = snap.graph_ids()?;
-    let mut named_held = preparation.reserve(
-        (graphs.capacity() as u64)
-            .saturating_mul(std::mem::size_of::<Id>() as u64)
-            .saturating_add(
-                (graphs.len() as u64).saturating_mul(std::mem::size_of::<String>() as u64),
-            ),
+    let (text, _text_held) = text.finish()?;
+    // The named graphs are merged into the default graph, as the legacy pattern reads
+    // them. Each name's storage is admitted before it is allocated.
+    let mut named = Buffer::new(preparation)?;
+    let mut names_held = preparation.reserve(0)?;
+    snap.for_each_graph_id_checked(
+        || preparation.check(),
+        |graph| {
+            preparation.with_term(snap, graph, |term| {
+                if let Some(Term::NamedNode(node)) = term {
+                    let iri = node.as_str();
+                    names_held.merge(preparation.reserve(iri.len() as u64)?);
+                    let mut name = String::new();
+                    name.try_reserve_exact(iri.len())
+                        .map_err(|_| preparation.exhausted())?;
+                    name.push_str(iri);
+                    named.push(name)?;
+                }
+                Ok(())
+            })
+        },
     )?;
-    let mut named: Vec<String> = Vec::new();
-    named
-        .try_reserve_exact(graphs.len())
-        .map_err(|_| preparation.exhausted())?;
-    for graph in graphs {
-        preparation.with_term(snap, graph, |term| {
-            if let Some(Term::NamedNode(node)) = term {
-                named_held.merge(preparation.reserve(node.as_str().len() as u64)?);
-                named.push(node.as_str().to_owned());
-            }
-            Ok(())
-        })?;
-    }
+    let (named, _named_held) = named.into_parts();
     let opts = crate::sparql::QueryOptions {
         default_graph_extra: named,
         max_rows: Some(usize::try_from(limits.max_pattern_rows).unwrap_or(usize::MAX)),
@@ -1372,27 +1460,29 @@ mod tests {
         let store = crate::store::Store::in_memory(Default::default());
         crate::sparql::update::update(
             &store,
-            "INSERT DATA { <urn:a> <urn:p> 1 . <urn:b> <urn:p> 2 . \
-             <urn:a> <urn:owner> \"alice\" . <urn:b> <urn:owner> \"bob\" . \
-             GRAPH <urn:g> { <urn:c> <urn:p> 3 . <urn:c> <urn:owner> \"alice\" } }",
+            r#"INSERT DATA { <urn:a> <urn:p> 1 . <urn:b> <urn:p> 2 .
+                <urn:a> <urn:owner> "alice" . <urn:b> <urn:owner> "bob" .
+                <urn:d> <urn:p> 4 . <urn:d> <urn:owner> "q\"\\\n\u0000\u007Fx" .
+                GRAPH <urn:g> { <urn:c> <urn:p> 3 . <urn:c> <urn:owner> "alice" } }"#,
             &Default::default(),
         )
         .unwrap();
         let snap = store.snapshot();
         let all = quads(&snap);
-        for user in ["alice", "bob", "carol"] {
+        // The last caller's value needs escaping in the pattern's query and still reads
+        // as itself, so it sees its one triple.
+        for (user, expected) in [
+            ("alice", 2),
+            ("bob", 3),
+            ("carol", 4),
+            ("q\"\\\n\u{0}\u{7f}x", 3),
+        ] {
             let access = owned_by(user);
             let legacy = quads(&access.masked(&snap).unwrap());
             let prep = Preparation::new(Control::none(), 8 << 20).unwrap();
             let view = access.masked_controlled(&snap, &prep).unwrap();
-            assert_eq!(quads(view.snapshot()), legacy, "{user}");
-            let hidden = all.len() - legacy.len();
-            let expected = match user {
-                "alice" => 1,
-                "bob" => 2,
-                _ => 3,
-            };
-            assert_eq!(hidden, expected, "{user}");
+            assert_eq!(quads(view.snapshot()), legacy, "{user:?}");
+            assert_eq!(all.len() - legacy.len(), expected, "{user:?}");
         }
         let prep = Preparation::new(Control::none(), 8 << 20).unwrap();
         let alice = owned_by("alice");
