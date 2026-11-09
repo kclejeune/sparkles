@@ -742,6 +742,9 @@ fn prefetch_answer(r: &QueryResult, n: usize) -> Result<()> {
         })
     };
     let ctx = &r.inner.ctx;
+    // The answer's writers check only memory failures, so this is where a cancelled or
+    // timed-out query is refused before it serializes.
+    ctx.check()?;
     let vocab = &ctx.snap.generation.vocab;
     if n < PREFETCH_BLOCKS_BELOW && vocab.prefetch_would_skip(ids()) {
         return Ok(());
@@ -750,7 +753,6 @@ fn prefetch_answer(r: &QueryResult, n: usize) -> Result<()> {
     if count == 0 {
         return Ok(());
     }
-    ctx.check()?;
     let scratch = ctx.charge(0)?;
     if n < PREFETCH_BLOCKS_BELOW {
         let held = ctx
@@ -2184,6 +2186,37 @@ mod application_value_tests {
 #[cfg(test)]
 mod buffered_tests {
     use super::*;
+
+    /// The writers of a small answer check only memory failures, so the prefetch entry
+    /// is where a query cancelled after it ran is refused before it serializes.
+    #[test]
+    fn small_answer_cancelled_after_execution_refuses_to_serialize() {
+        crate::index::set_io_hints(true);
+        let store = crate::store::Store::in_memory(Default::default());
+        for native in [false, true] {
+            let r = crate::sparql::query(
+                store.snapshot(),
+                "SELECT ?s WHERE { VALUES ?s { <urn:a> <urn:b> } }",
+                &Default::default(),
+            )
+            .unwrap();
+            assert_eq!(r.len(), 2);
+            r.inner
+                .ctx
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let mut out = Vec::new();
+            let result = if native {
+                write_native_json(&r, &mut out, None, None)
+            } else {
+                write_solutions(&r, SolutionsFormat::Tsv, &mut out, None)
+            };
+            assert!(
+                matches!(result, Err(Error::Cancelled)),
+                "native {native}: {result:?}"
+            );
+        }
+    }
 
     /// A writer that takes `room` bytes and refuses the write that would pass them, as
     /// the response writer does at the result-size budget.

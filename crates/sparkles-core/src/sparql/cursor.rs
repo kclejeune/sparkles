@@ -362,13 +362,19 @@ impl Variables {
                 super::select_star_columns_checked(query, &names, || ctx.check())?
         {
             let mut steps = 0usize;
+            let mut step = || {
+                steps += 1;
+                if steps.is_multiple_of(CHECK_EVERY) {
+                    ctx.check()
+                } else {
+                    Ok(())
+                }
+            };
             for first in 0..order.len() {
+                step()?;
                 let mut at = first;
                 while order[at] != at {
-                    steps += 1;
-                    if steps.is_multiple_of(CHECK_EVERY) {
-                        ctx.check()?;
-                    }
+                    step()?;
                     let next = order[at];
                     order[at] = at;
                     if next == first {

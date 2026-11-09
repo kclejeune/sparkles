@@ -429,9 +429,11 @@ struct ResultParts {
     _graph_credit: Option<ctx::OutputCredit>,
 }
 impl ResultParts {
-    /// Publish the parts as a shared result. Its work is constant apart from the plan
-    /// walk, so it is not timed, and its only check follows the header's admission.
+    /// Publish the parts as a shared result. Only a graph result's term scan grows with
+    /// the answer, so only a graph result times this into its execution, and the only
+    /// check follows the header's admission. A SELECT or ASK result reads no clock here.
     fn freeze(self) -> Result<QueryResult> {
+        let started = (!self.triples.is_empty() || !self.quads.is_empty()).then(Instant::now);
         fn levels(plan: &PlanInfo) -> usize {
             stacker::maybe_grow(exec::PLAN_RED_ZONE, exec::PLAN_STACK_SEGMENT, || {
                 1 + plan.children.iter().map(levels).max().unwrap_or(0)
@@ -458,7 +460,7 @@ impl ResultParts {
             .unwrap_or(0);
         let depth = levels(&self.plan).max(graph_depth);
         self.ctx.check()?;
-        let result = QueryResult {
+        let mut result = QueryResult {
             kind: self.kind,
             boolean: self.boolean,
             timing: self.timing,
@@ -478,6 +480,11 @@ impl ResultParts {
                 _header: header,
             }),
         };
+        if let Some(started) = started {
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            result.timing.exec_ms += elapsed;
+            result.timing.total_ms += elapsed;
+        }
         Ok(result)
     }
 }
