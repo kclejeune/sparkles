@@ -738,7 +738,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Counting is off by default. With it on, it passes its bound of derived conclusions on
   the five counting files of the ORE 2015 DL development set that the disjunctive rules
   take, so those files get the answer without counting. ore_ont_6485 spends 205 ms on the
-  attempt against 7 ms for the run without it, and Konclude takes 8 ms. Roadmap items
+  attempt against 7 ms for the run without it, and Konclude takes 18 ms on four threads. Roadmap items
   728 and 729.
 * BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies in 23 ms on four threads,
   the time Konclude takes, which is short of the classifier's aim of three times

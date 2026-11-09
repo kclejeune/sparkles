@@ -888,13 +888,15 @@ two answer as the existential restrictions they imply and that a functional prop
 answers as a maximum of one on every class. No development file of the ORE 2015 DL
 sample is taken whole with counting. Its counting files fall back when counting is on,
 ore_ont_6485 after 205 ms on one thread against 7 ms without counting, and ore_ont_6952
-and ore_ont_10140 after 1.4 and 1.7 s against 0.6 and 0.5 s.
-Bounds of 1, 4 and 16 million conclusions do not finish ore_ont_6485 either, and the last
-stops after 63 s. Its 20 clauses
-`⊤ → y ⊔ ≤(n-1) r.F ⊔ ≥(n+1) r.F`, one for each exact cardinality in a definition, are
-copied into all 156 of its contexts, but sharing them would not end the run, since the cost
-is in one context. At the stop the hypothetical successor of `∃s.HeteroAtom` holds about
-10,000 clauses. Their bodies combine the markers that each predecessor sends, such as
+and ore_ont_10140 after 1.4 and 1.7 s against 0.6 and 0.5 s. Bounds of 1, 4 and 16
+million conclusions do not finish ore_ont_6485 either, and the last stops after 63 s. Its
+20 clauses `⊤ → y ⊔ ≤(n-1) r.F ⊔ ≥(n+1) r.F`, one for each exact cardinality in a
+definition, are copied into all 156 of its contexts, which hold 173,476 clauses at the bound of 262,144
+conclusions. The copies are 3,120 of those clauses, and 12 contexts hold 6,190 to 7,199
+clauses each, so sharing the copies would not end the run. With the definitions absorbed,
+as in the experiment that PERFORMANCE-EXPERIMENTS.md records, the run stores 25,818
+clauses at the stop, and the hypothetical successor of `∃s.HeteroAtom` holds 10,295 of
+them. Their bodies combine the markers that each predecessor sends, such as
 `∃r1.H` and `∃r1.Alkyl`, and their heads are disjunctions of `Y` literals for the cases of
 the HeteroAtom union together with the qualified-role and successor literals of the at-most
 clauses. The symmetric bond properties make those clauses count the predecessor too, item
