@@ -537,7 +537,7 @@ pub fn backup_verify(
             repeat: Some(repeat),
         }),
         now,
-        update,
+        Some(update),
     )
 }
 

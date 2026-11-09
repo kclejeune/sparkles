@@ -435,26 +435,40 @@ fn spawn_worker(shared: &Arc<Shared>, st: &Arc<AppState>, channel: &str) -> std:
 /// Raise `ev` at `now`: route it, hold it back while `cond` was notified less than its
 /// interval ago, and queue a delivery per channel.
 pub fn raise(st: &Arc<AppState>, ev: Event, cond: Option<Condition>, now: DateTime<Utc>) -> Raised {
-    raise_with(st, ev, cond, now, |_| (true, false)).unwrap_or(Raised::Unrouted)
+    type Update = fn(&mut BTreeMap<String, Active>) -> (bool, bool);
+    raise_with(st, ev, cond, now, None::<Update>).unwrap_or(Raised::Unrouted)
 }
 
 /// [`raise`] after `first` has changed the conditions, in one step under the
 /// notifier's lock, so that no other change to the conditions comes between them.
 /// `first` answers whether to raise the event and whether it changed anything; it runs
-/// whether or not notifications are on. `None`: `first` said not to raise.
+/// whether or not notifications are on. Without `first`, a disabled or unrouted event
+/// returns before the lock and the conditions are not read. `None`: `first` said not to
+/// raise.
 fn raise_with(
     st: &Arc<AppState>,
     ev: Event,
     cond: Option<Condition>,
     now: DateTime<Utc>,
-    first: impl FnOnce(&mut BTreeMap<String, Active>) -> (bool, bool),
+    first: Option<impl FnOnce(&mut BTreeMap<String, Active>) -> (bool, bool)>,
 ) -> Option<Raised> {
     let cfg = settings(st);
     let channels = cfg.route(ev.kind);
+    if first.is_none() {
+        if !cfg.enabled {
+            return Some(Raised::Disabled);
+        }
+        if channels.is_empty() {
+            return Some(Raised::Unrouted);
+        }
+    }
     let n = &st.notifier;
     {
         let mut g = n.shared.inner.lock();
-        let (go, changed) = first(g.active(st));
+        let (go, changed) = match first {
+            Some(f) => f(g.active(st)),
+            None => (true, false),
+        };
         let outcome = if !go {
             Some(None)
         } else if !cfg.enabled {
