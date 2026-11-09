@@ -225,7 +225,8 @@ fn an_activated_store_without_its_registry_root_refuses_to_open() {
         assert_eq!(std::fs::read(root.join("dataset.json")).unwrap(), dataset);
         std::fs::write(root.join("managed.json"), &managed).unwrap();
     }
-    // the history directory alone also records activation
+    // with its reader lowered, the store still refuses: its version 2 files are not
+    // admitted, and its history directory records activation
     let mut versions = json(&root.join("dataset.json"));
     versions["minimumReader"] = PLAIN_READER.into();
     std::fs::write(
@@ -236,8 +237,11 @@ fn an_activated_store_without_its_registry_root_refuses_to_open() {
     std::fs::remove_file(root.join("managed.json")).unwrap();
     let error = Store::open(&root, StoreOptions::default())
         .err()
-        .expect("evidence-history records activation");
-    assert_eq!(error.code(), "evidence-unavailable", "{error}");
+        .expect("a lowered reader must not open the store as legacy");
+    assert!(
+        matches!(error.code(), "evidence-unavailable" | "unsupported"),
+        "{error}"
+    );
     std::fs::write(root.join("dataset.json"), &dataset).unwrap();
     std::fs::write(root.join("managed.json"), &managed).unwrap();
     drop(Store::open(&root, StoreOptions::default()).unwrap());

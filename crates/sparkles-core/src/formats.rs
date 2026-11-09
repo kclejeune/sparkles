@@ -835,6 +835,7 @@ pub(crate) fn branch_directories(root: &std::path::Path) -> Result<Vec<std::path
 pub(crate) fn check_dataset_tree(root: &std::path::Path) -> Result<()> {
     crate::commit::check_dataset_compatibility(root)?;
     check_dataset_dir(root)?;
+    check_configuration_versions(root)?;
     for branch in branch_directories(root)? {
         crate::commit::check_dataset_compatibility(&branch).map_err(|e| match e {
             Error::Unsupported(message) => {
@@ -843,6 +844,7 @@ pub(crate) fn check_dataset_tree(root: &std::path::Path) -> Result<()> {
             e => e,
         })?;
         check_dataset_dir(&branch)?;
+        check_configuration_versions(&branch)?;
     }
     Ok(())
 }
@@ -880,8 +882,11 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
             continue;
         };
         let checked = check_settings(s.name, &v).and_then(|found| {
-            if matches!(s.name, "history.json" | "branch.json") && found >= 2 {
-                admit_configuration_version(dir, s.name, found)?;
+            if matches!(s.name, "history.json" | "branch.json")
+                && found >= 2
+                && let Some(reader) = recorded_reader(dir)
+            {
+                admit_configuration_version(reader, s.name, found)?;
             }
             Ok(found)
         });
@@ -988,45 +993,108 @@ fn settings_stamp_format(s: &SettingsFile, v: &serde_json::Value) -> u32 {
 /// The version of a settings file's JSON object, from its member: absent is 1. A
 /// version newer than this build writes is refused, since the file may mean something
 /// this build would misread.
-/// Refuse `version` of `what` in the dataset at `root` unless the dataset records
-/// the reader of configuration history. Only activation writes the versions that
-/// need it (logs 2, generation `commit.json` 2, `managed.json` 3, `history.json` 2
-/// and `branch.json` 2), and it raises the dataset reader first. A dataset that
-/// records an older reader holds none of them, so one there is a newer file that
-/// this dataset does not admit, refused as a newer release's file is. A directory
-/// without `dataset.json`, such as a capture being assembled, gives no bound.
+/// Refuse `version` of `what` in a dataset that records `recorded_reader` unless
+/// that is the reader of configuration history. Only activation writes the
+/// versions that need it (logs 2, generation `commit.json` 2, `managed.json` 3,
+/// `history.json` 2 and `branch.json` 2), and it raises the dataset reader first.
+/// A dataset that records an older reader holds none of them, so one there is a
+/// newer file that this dataset does not admit, refused as a newer release's is.
+/// Callers pass the reader they already read, and bounded readers do not call it.
 pub(crate) fn admit_configuration_version(
-    root: &std::path::Path,
+    recorded_reader: u32,
     what: &str,
     version: u32,
 ) -> Result<()> {
-    // Bounded readers call this, so it reads a fixed amount and decodes one member.
-    // A real dataset.json is far smaller; a larger one gives no bound here, and
-    // the dataset checks that read it whole still apply.
-    const LIMIT: u64 = 64 << 10;
-    #[derive(serde::Deserialize)]
-    struct Versions {
-        #[serde(rename = "minimumReader")]
-        minimum_reader: Option<u64>,
+    let reader = crate::store::managed_history::READER;
+    if recorded_reader < reader {
+        return Err(Error::Unsupported(format!(
+            "{what} has version {version}, which a dataset records only with configuration \
+             history (reader {reader}); this dataset records reader {recorded_reader}"
+        )));
     }
-    let bytes = match read_bounded(&root.join("dataset.json"), LIMIT) {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => return Ok(()),
+    Ok(())
+}
+
+/// The reader that the dataset in `dir` records, when it has a `dataset.json`.
+fn recorded_reader(dir: &std::path::Path) -> Option<u32> {
+    crate::commit::read_dataset_versions(dir)
+        .ok()
+        .flatten()
+        .map(|versions| versions.minimum_reader)
+}
+
+/// Refuse the generations of the store in `dir` that hold a log or `commit.json`
+/// version that its recorded reader does not admit (see
+/// [`admit_configuration_version`]). Open and reidentification check this before
+/// they read or change a generation. Reading the version takes a log's first
+/// record and a generation's small `commit.json`, as open reads them.
+pub(crate) fn check_configuration_versions(dir: &std::path::Path) -> Result<()> {
+    use std::io::Read;
+    let Some(reader) = recorded_reader(dir) else {
+        return Ok(());
+    };
+    if reader >= crate::store::managed_history::READER {
+        return Ok(());
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    let recorded = serde_json::from_slice::<Versions>(&bytes)
-        .map_err(|error| {
-            Error::Corrupt(format!("{}: {error}", root.join("dataset.json").display()))
-        })?
-        .minimum_reader
-        .unwrap_or(1);
-    let reader = crate::store::managed_history::READER;
-    if recorded < u64::from(reader) {
-        return Err(Error::Unsupported(format!(
-            "{what} has version {version}, which a dataset records only with configuration \
-             history (reader {reader}); this dataset records reader {recorded}"
-        )));
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name
+            .strip_prefix("gen-")
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            || !entry.file_type()?.is_dir()
+        {
+            continue;
+        }
+        let generation = entry.path();
+        let wal = generation.join("wal.log");
+        let mut header = [0u8; 12];
+        match std::fs::File::open(&wal) {
+            Ok(file) => {
+                let mut read = 0;
+                let mut file = file.take(header.len() as u64);
+                loop {
+                    match file.read(&mut header[read..])? {
+                        0 => break,
+                        n => read += n,
+                    }
+                }
+                if read == header.len() && header[..8] == crate::store::wal::MAGIC {
+                    let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
+                    if version > crate::store::wal::PLAIN_VERSION {
+                        admit_configuration_version(reader, &wal.display().to_string(), version)?;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let commit = generation.join("commit.json");
+        match read_bounded(&commit, crate::store::managed_history::MAX_BYTES as u64) {
+            Ok(Some(bytes)) => {
+                if let Some(format) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .and_then(|value| value.get("format").and_then(serde_json::Value::as_u64))
+                    && format >= 2
+                {
+                    admit_configuration_version(
+                        reader,
+                        &commit.display().to_string(),
+                        u32::try_from(format).unwrap_or(u32::MAX),
+                    )?;
+                }
+            }
+            // its own reader reports a missing, oversized or unreadable file
+            Ok(None) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(())
 }
@@ -1132,27 +1200,14 @@ pub fn report() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn configuration_versions_are_bounded_by_the_recorded_reader_in_a_fixed_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let write = |value: serde_json::Value| {
-            std::fs::write(dir.path().join("dataset.json"), value.to_string()).unwrap()
-        };
-        // no dataset.json: a directory being assembled gives no bound
-        admit_configuration_version(dir.path(), "wal", 2).unwrap();
-        write(serde_json::json!({"format": 1, "minimumReader": 5}));
-        assert!(matches!(
-            admit_configuration_version(dir.path(), "wal", 2),
-            Err(Error::Unsupported(_))
-        ));
-        write(serde_json::json!({"format": 1, "minimumReader": 8}));
-        admit_configuration_version(dir.path(), "wal", 2).unwrap();
-        // the check reads a fixed amount: a larger file gives no bound here
-        write(serde_json::json!({
-            "format": 1,
-            "minimumReader": 5,
-            "extension": "x".repeat(128 << 10),
-        }));
-        admit_configuration_version(dir.path(), "wal", 2).unwrap();
+    fn configuration_versions_are_admitted_only_by_the_configuration_reader() {
+        for reader in [1, 5, 6, 7] {
+            assert!(matches!(
+                admit_configuration_version(reader, "wal", 2),
+                Err(Error::Unsupported(_))
+            ));
+        }
+        admit_configuration_version(8, "wal", 2).unwrap();
     }
 
     use super::*;

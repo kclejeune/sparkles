@@ -30,8 +30,12 @@ pub(super) fn load_dir(root: &Path) -> Option<ManagedState> {
     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
         && let Some(format) = value.get("format").and_then(serde_json::Value::as_u64)
         && format >= 3
+        && let Some(reader) = crate::commit::read_dataset_versions(root)
+            .ok()
+            .flatten()
+            .map(|versions| versions.minimum_reader)
         && let Err(error) = crate::formats::admit_configuration_version(
-            root,
+            reader,
             crate::managed::FILE,
             u32::try_from(format).unwrap_or(u32::MAX),
         )

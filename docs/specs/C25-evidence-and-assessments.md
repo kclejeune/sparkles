@@ -1334,8 +1334,11 @@ and publishes the registry root. From then on the family writes version 2 logs,
 `branch.json` format 2. Branches and captures of an activated family record reader 8
 before they write any of these. An older release refuses an activated dataset by its
 reader before it reads anything else. A dataset's recorded reader also bounds the
-versions this build accepts in it. One of these versions in a dataset that records an
-older reader is refused as a newer release's file.
+versions this build accepts in it. Open and reidentification check every generation's
+log and `commit.json` and the dataset's settings and registry against it, before they
+read or change them. One of these versions in a dataset that records an older reader
+is refused as a newer release's file. Bounded history readers do not repeat the check,
+so it adds no read to their allowance.
 
 A family root records activation when its dataset reader is at least 8 or when it
 holds an `evidence-history` directory. Activation runs on a migration copy that

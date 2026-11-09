@@ -702,6 +702,8 @@ pub struct RestoredFrom {
 ///
 /// Used by restores whose identity rule mints a new id; the directory must not be open.
 pub fn reidentify(root: &Path, new_id: uuid::Uuid, forked_from: ForkedFrom) -> Result<()> {
+    // a generation version that this dataset does not admit refuses before any rewrite
+    crate::formats::check_configuration_versions(root)?;
     let mut ds = read_dataset(root)?
         .ok_or_else(|| Error::Invalid(format!("{} has no dataset.json", root.display())))?;
     let old_id = ds.id;
@@ -1276,17 +1278,7 @@ fn check_gen_commit_value(path: &Path, value: &serde_json::Value) -> Result<()> 
             format
         )));
     }
-    // format 2 is written only once configuration history is activated
-    if format >= 2
-        && let Some(root) = path.parent().and_then(Path::parent)
-        && !root.as_os_str().is_empty()
-    {
-        crate::formats::admit_configuration_version(
-            root,
-            &path.display().to_string(),
-            format as u32,
-        )?;
-    }
+
     Ok(())
 }
 

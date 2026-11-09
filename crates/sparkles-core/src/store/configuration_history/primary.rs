@@ -144,7 +144,6 @@ impl Header {
             }
             None => (None, false),
         };
-        managed_history::check_activated_registry(root, state)?;
         Self::new(
             root,
             dataset,

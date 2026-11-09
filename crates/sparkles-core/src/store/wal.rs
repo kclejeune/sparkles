@@ -210,14 +210,6 @@ pub(crate) fn header_version(rec: &[u8], path: &Path) -> Result<u32> {
     let v = u32::from_le_bytes(rec[8..12].try_into().unwrap());
     // a newer version may define the bytes after its version, so check it first
     crate::formats::WAL.check(&path.display().to_string(), v, None)?;
-    // a version only activation writes is newer than a dataset without it admits,
-    // whatever the bytes after it hold (`gen-NNNN/wal.log` under the dataset root)
-    if v > PLAIN_VERSION
-        && let Some(root) = path.parent().and_then(Path::parent)
-        && !root.as_os_str().is_empty()
-    {
-        crate::formats::admit_configuration_version(root, &path.display().to_string(), v)?;
-    }
     // every version this build reads leaves them zero
     if rec[12..WAL_REC].iter().any(|&b| b != 0) {
         return Err(damaged());
