@@ -207,6 +207,9 @@ def observed_session_rows(unparented=True):
     return rows
 UNKNOWN_SESSION={8008,8096,8097,8101}
 
+def proc_fixture_reader():
+    return lambda:proc_fixture()
+
 class LoadedGuardIO(InertIO):
     # Exercise the actual RealIO.arm gate with entirely inert systemd methods.
     arm=c.RealIO.arm
@@ -511,7 +514,7 @@ class Controls(unittest.TestCase):
         for pid in UNKNOWN_SESSION:del rows[pid]
         with tempfile.TemporaryDirectory(prefix='boat-v2-session-') as d:
             root=Path(d);(root/'bootstrap.lock').touch(mode=0o600);m=root/'toolchain.json';m.write_text('ASCII');m.chmod(0o600);clock=Clock()
-            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause,lambda rows:(1220,5))
+            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause,lambda rows,left:(1220,5))
             self.assertTrue(q['startup_closed']);self.assertTrue(q['qualification_eligible'])
             # Without the system manager's own user-manager identity none of its children is allowed.
             q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause)
@@ -520,7 +523,7 @@ class Controls(unittest.TestCase):
         rows=observed_session_rows()
         with tempfile.TemporaryDirectory(prefix='boat-v2-session-') as d:
             root=Path(d);(root/'bootstrap.lock').touch(mode=0o600);m=root/'toolchain.json';m.write_text('ASCII');m.chmod(0o600);clock=Clock()
-            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause,lambda rows:(1220,5))
+            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause,lambda rows,left:(1220,5))
         self.assertFalse(q['startup_closed']);self.assertEqual(q['reason_code'],'startup_busy:unallowed_processes')
         self.assertEqual({x['pid'] for x in q['unallowed']},UNKNOWN_SESSION|set(UNPARENTED));self.assertEqual(q['unallowed_count'],7)
         row={x['pid']:x for x in q['unallowed']}[8008]
@@ -572,14 +575,108 @@ class Controls(unittest.TestCase):
             root=Path(d);(root/'bootstrap.lock').touch(mode=0o600);m=root/'toolchain.json';m.write_text('ASCII');m.chmod(0o600);rows=proc_fixture();rows[20]={'pid':20,'ppid':1,'uid':1000,'comm':'bash','start':1,'group':20};clock=Clock()
             q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause)
             self.assertFalse(q['startup_closed']);self.assertFalse(q['qualification_eligible'])
-    def test_manifest_replaced_during_checkpoint_refused(self):
-        with tempfile.TemporaryDirectory(prefix='boat-v2-manifest-race-') as d:
-            root=Path(d);(root/'bootstrap.lock').touch(mode=0o600);m=root/'toolchain.json';m.write_text('ASCII');m.chmod(0o600);clock=Clock();calls=[0]
+    def checkpoint_dir(self,d):
+        root=Path(d);(root/'bootstrap.lock').touch(mode=0o600);m=root/'toolchain.json';m.write_text('ASCII');m.chmod(0o600)
+        return root,m
+    def replace(self,path,text=''):
+        # A copy-up or restore gives the same name a new inode, possibly with the same bytes.
+        new=path.with_name('.restore-'+path.name);new.write_text(text);new.chmod(0o600);os.replace(new,path)
+    def test_manifest_replaced_during_checkpoint_settles_then_observes_again(self):
+        for text,eligible in [('ASCII',True),('CHANGED',False)]:
+            with tempfile.TemporaryDirectory(prefix='boat-v2-manifest-race-') as d:
+                root,m=self.checkpoint_dir(d);clock=Clock();calls=[0];expected=digest(m.read_bytes())
+                def rows():
+                    calls[0]+=1
+                    if calls[0]==2:self.replace(m,text)
+                    return proc_fixture()
+                q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,expected,30,rows,clock.now,clock.pause)
+                self.assertTrue(q['startup_closed'],q);self.assertEqual(q['qualification_eligible'],eligible)
+                self.assertGreaterEqual(clock.t,OBSERVER['SETTLE_SECONDS'])
+    def test_bootstrap_lock_replaced_during_observation_settles_then_observes_again(self):
+        with tempfile.TemporaryDirectory(prefix='boat-v2-lock-race-') as d:
+            root,m=self.checkpoint_dir(d);clock=Clock();calls=[0]
             def rows():
                 calls[0]+=1
-                if calls[0]==2:m.unlink();m.write_text('CHANGED');m.chmod(0o600)
+                if calls[0]==1:self.replace(root/'bootstrap.lock')
                 return proc_fixture()
-            with self.assertRaises(OBSERVER['Refusal']):OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,rows,clock.now,clock.pause)
+            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),30,rows,clock.now,clock.pause)
+            self.assertTrue(q['startup_closed'],q);self.assertTrue(q['qualification_eligible'])
+    def test_lock_copied_up_by_its_own_open_settles(self):
+        # The first open of a lower-layer file for writing gives it a new inode.
+        with tempfile.TemporaryDirectory(prefix='boat-v2-copy-up-') as d:
+            root,m=self.checkpoint_dir(d);clock=Clock();real=os.open;first=[True]
+            def copy_up(path,flags,*a):
+                if first[0] and str(path).endswith('bootstrap.lock') and flags&os.O_RDWR:
+                    first[0]=False;self.replace(Path(path))
+                return real(path,flags,*a)
+            with patch.dict(OBSERVER['os'].__dict__,{'open':copy_up}):
+                q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),30,proc_fixture_reader(),clock.now,clock.pause)
+            self.assertTrue(q['startup_closed'],q)
+    def test_settling_never_authorizes_startup_after_the_deadline(self):
+        for seconds in [5.5,6,6.5,7]:
+            with tempfile.TemporaryDirectory(prefix='boat-v2-late-') as d:
+                root,m=self.checkpoint_dir(d);clock=Clock();calls=[0]
+                def rows():
+                    calls[0]+=1
+                    if calls[0]==1:self.replace(root/'bootstrap.lock')
+                    return proc_fixture()
+                q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),seconds,rows,clock.now,clock.pause)
+                self.assertLessEqual(clock.t,seconds,seconds)
+                if q['startup_closed']:self.assertLess(clock.t,seconds)
+                else:self.assertEqual(q['reason_code'],'startup_busy:bootstrap_lock_replaced')
+    def test_a_state_directory_absent_during_settling_is_waited_for(self):
+        with tempfile.TemporaryDirectory(prefix='boat-v2-absent-') as d:
+            (Path(d)/'state').mkdir();root,m=self.checkpoint_dir(Path(d)/'state');clock=Clock();calls=[0];moved=Path(d)/'moved'
+            def rows():
+                calls[0]+=1
+                if calls[0]==1:self.replace(root/'bootstrap.lock')
+                return proc_fixture()
+            def pause(x):
+                clock.pause(x)
+                if 1<=clock.t<3 and root.exists():root.rename(moved)
+                if clock.t>=3 and moved.exists():moved.rename(root)
+            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),30,rows,clock.now,pause)
+            self.assertTrue(q['startup_closed'],q);self.assertGreater(clock.t,3+OBSERVER['SETTLE_SECONDS'])
+            moved=Path(d)/'gone';root.rename(moved)
+            self.assertIsNone(OBSERVER['state_snapshot'](root))
+            self.assertFalse(OBSERVER['settle'](root,clock.now,clock.pause,clock.t+10))
+    def test_an_absent_directory_at_both_snapshots_is_not_closure(self):
+        with tempfile.TemporaryDirectory(prefix='boat-v2-absent2-') as d:
+            root,m=self.checkpoint_dir(d);clock=Clock();real=OBSERVER['state_snapshot'];expected=digest(m.read_bytes())
+            # The directory is absent at both snapshot reads of every attempt.
+            with patch.dict(OBSERVER,{'state_snapshot':lambda state:None}):
+                q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,expected,10,proc_fixture_reader(),clock.now,clock.pause)
+            self.assertFalse(q['startup_closed']);self.assertEqual(q['reason_code'],'startup_busy:state_restore_in_progress')
+    def test_manager_and_slow_reads_stay_inside_the_deadline(self):
+        with tempfile.TemporaryDirectory(prefix='boat-v2-slow-') as d:
+            root,m=self.checkpoint_dir(d);clock=Clock();asked=[]
+            def manager(rows,left):
+                asked.append(left);clock.pause(min(10,left));return None
+            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),1,proc_fixture_reader(),clock.now,clock.pause,manager)
+            self.assertLessEqual(clock.t,1);self.assertTrue(all(0<x<=1 for x in asked),asked);self.assertFalse(q['startup_closed'])
+            calls=[]
+            with patch.dict(OBSERVER,{'command':lambda argv,seconds=15:(calls.append(seconds),b'MainPID=1\n')[1]}):
+                OBSERVER['user_manager'](observed_session_rows(),1000,3.5);OBSERVER['user_manager'](observed_session_rows(),1000,0)
+            self.assertEqual(calls,[3.5])
+    def test_retained_phase_directories_do_not_count_toward_the_bound(self):
+        with tempfile.TemporaryDirectory(prefix='boat-v2-retained-') as d:
+            root,m=self.checkpoint_dir(d)
+            for n in range(200):(root/('qualification-op-%d-startup'%n)).mkdir()
+            self.assertEqual(set(OBSERVER['state_snapshot'](root)),{'bootstrap.lock','toolchain.json'})
+            clock=Clock();q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),5,proc_fixture_reader(),clock.now,clock.pause)
+            self.assertTrue(q['startup_closed'])
+            for n in range(OBSERVER['STATE_ENTRIES']+1):(root/('entry-%d'%n)).touch()
+            with self.assertRaises(OBSERVER['Refusal']):OBSERVER['state_snapshot'](root)
+    def test_restore_that_never_settles_refuses_at_the_deadline_with_its_code(self):
+        for target,code in [('tools.toml','startup_busy:state_restore_in_progress'),('bootstrap.lock','startup_busy:bootstrap_lock_replaced')]:
+            with tempfile.TemporaryDirectory(prefix='boat-v2-restore-') as d:
+                root,m=self.checkpoint_dir(d);clock=Clock();(root/'tools.toml').write_text('x');(root/'tools.toml').chmod(0o600)
+                n=[0]
+                def pause(x):
+                    clock.pause(x);n[0]+=1;self.replace(root/target,str(n[0]))
+                q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),30,proc_fixture_reader(),clock.now,pause)
+                self.assertFalse(q['startup_closed']);self.assertEqual(q['reason_code'],code)
+                self.assertGreaterEqual(clock.t,30)
     def test_startup_phase_more_than900_and_finite1950(self):
         r=fixture();io=PhaseIO(r);intent={'mono':100,'wall':io.wall()};io.delay=1000
         self.assertTrue(io.startup(intent,True));self.assertGreater(io.mono(),1000);self.assertEqual(io.read('startup-closed.json')['bootstrap_occurrence'],'unknown')

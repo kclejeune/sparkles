@@ -756,6 +756,65 @@ class JobClosureProgram(unittest.TestCase):
         lock.unlink();env.release_job_locks()
 
 
+class ProviderSessionTrees(unittest.TestCase):
+    """The session allowance against the trees observed on bx_gy2ytgh8."""
+    def setUp(self):
+        import controls
+        self.O=controls.OBSERVER;self.controls=controls
+        self.O['bind_profile'](controls.synthetic_profile())
+        d=json.loads((Path(__file__).parent/'fixtures/boat-session-tree-op2.json').read_text())
+        self.rows={r['pid']:dict(r,group=r['pid']) for r in d['rows']};self.me=d['own_session'][-1]
+        self.manager=(1411,984)
+
+    def busy(self,rows=None,manager='default',tracked=None):
+        rows=self.rows if rows is None else rows;manager=self.manager if manager=='default' else manager
+        return {x['pid'] for x in self.O['foreign_startup'](rows,{'pid':self.me,'start':rows[self.me]['start']},self.me,set() if tracked is None else tracked,manager)}
+
+    def add(self,rows,pid,ppid,comm,uid=1000):
+        rows[pid]={'pid':pid,'ppid':ppid,'uid':uid,'comm':comm,'start':50,'group':pid};return rows
+
+    def test_the_op2_tree_is_all_provider_session(self):
+        self.assertEqual(self.rows[self.manager[0]]['comm'],'systemd')
+        self.assertEqual(self.busy(),set())
+
+    def test_the_run1_listing_still_refuses_its_unparented_processes(self):
+        rows=self.controls.observed_session_rows()
+        busy={x['pid'] for x in self.O['foreign_startup'](rows,{'pid':11,'start':1},12,set(),(1220,5))}
+        self.assertEqual(busy,self.controls.UNKNOWN_SESSION|set(self.controls.UNPARENTED))
+        for pid in self.controls.UNKNOWN_SESSION:del rows[pid]
+        for pid in self.controls.UNPARENTED:del rows[pid]
+        self.assertEqual({x['pid'] for x in self.O['foreign_startup'](rows,{'pid':11,'start':1},12,set(),(1220,5))},set())
+
+    def test_both_observed_parents_of_the_agent_service(self):
+        rows=copy.deepcopy(self.rows);rows[16278]['ppid']=self.add(rows,16000,1,'ascii-agent-sup')[16000]['pid']
+        self.assertEqual(self.busy(rows),set())
+        rows[16000]['comm']='ascii-agentsup2';self.assertEqual(self.busy(rows),{16000,16278,16315,16321,19827})
+
+    def test_the_agent_shell_and_sudo_are_bound_by_their_children(self):
+        rows=self.add(copy.deepcopy(self.rows),30000,19827,'cargo')
+        self.assertEqual(self.busy(rows),{19827,30000})
+        rows=self.add(copy.deepcopy(self.rows),30000,16315,'apt-get',0)
+        self.assertEqual(self.busy(rows),{16315,16321,30000})
+        rows=copy.deepcopy(self.rows);rows[16321]['uid']=1000
+        self.assertEqual(self.busy(rows),{16315,16321})
+        # A shell once tracked stays tracked after its child ends.
+        tracked=set();rows=self.add(copy.deepcopy(self.rows),30000,19827,'cargo')
+        self.assertEqual(self.busy(rows,tracked=tracked),{19827,30000})
+        del rows[30000];self.assertEqual(self.busy(rows,tracked=tracked),{19827})
+
+    def test_each_chain_is_bound_by_name_uid_and_every_ancestor(self):
+        cases=[('dbus-run-sessio under one lightdm',lambda r:r[20391].update(ppid=20136),{20391,20700,20734,20741}),
+               ('lightdm of the worker uid',lambda r:r[20371].update(uid=1000),{20371,20391,20700,20734,20741}),
+               ('fusermount3 under gvfsd',lambda r:r[14101].update(ppid=[p for p,x in r.items() if x['comm']=='gvfsd'][0]),{14101}),
+               ('agent service under a shell',lambda r:r[16278].update(ppid=self.add(r,16000,1,'bash')[16000]['pid']),{16000,16278,16315,16321,19827}),
+               ('sudo outside the agent service',lambda r:r[16315].update(ppid=1),{16315,16321}),
+               ('bash under the user manager',lambda r:r[19827].update(ppid=self.manager[0]),{19827})]
+        for name,change,expected in cases:
+            with self.subTest(name):
+                rows=copy.deepcopy(self.rows);change(rows);self.assertEqual(self.busy(rows),expected)
+        # Without the system manager's own identity, its children are not allowed.
+        self.assertIn(14086,self.busy(manager=None))
+
 class WatchIO(ExtendIO):
     """The fixture's warm operation with a scripted worker job-closure check."""
     def __init__(self,f,wall=None,boot=None,checks=None):

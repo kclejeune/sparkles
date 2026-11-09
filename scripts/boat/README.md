@@ -53,14 +53,29 @@ systemd, its PAM helper and dbus. It also treats any installer, shell or build t
 startup work, whatever its uid, and tracks every descendant of startup work by PID and
 start time. The provider's desktop session, which the first SSH connection starts, runs
 more than 30 such processes for the worker's whole life, so that rule alone never closes.
-The session tables in `startup-observer.py` allow those processes by their exact name
-and parent, as observed on an admitted worker. An allowed process has the worker's uid
-and a parent that is pid 1 as root, the worker's user manager or another allowed process
-of the worker's uid. The user manager is the main process that the system manager
-reports for `user@UID.service`, matched by pid and start time, and a parent's name never
-stands in for pid 1 or the manager. A process under any other parent, a name outside the
-table and any descendant of tracked startup work still count as startup work. Adding an
-entry needs the observed listing and an independent review.
+`SESSION_CHAINS` in `startup-observer.py` allows those processes by their exact name and
+the full chain of their ancestors up to pid 1, as observed on an admitted worker. Each
+ancestor in a chain is pid 1 as root, the worker's user manager, or a name with the
+worker's uid or root's uid, and every ancestor of the worker's uid must itself be an
+allowed session process. The user manager is the main process that the system manager
+reports for `user@UID.service`, matched by pid and start time, and a name never stands in
+for pid 1 or the manager. The agent service's shell is allowed only while it has no
+children, and its sudo only while its children are the agent's root process logger. A
+process with any other chain, a name outside the table and any descendant of tracked
+startup work still count as startup work. Adding an entry needs the observed process
+tree and an independent review.
+
+The setup hook can still be restoring the state directory when the observer starts, and
+a file of a restored layer can get a new inode on its first open for writing. The hook
+writes no completion marker. A bootstrap lock or manifest replaced during an attempt,
+or a state directory whose entries change during it, therefore counts as startup still
+running. The observer then waits until the directory is present and its entries keep
+the same identity, size and times for five seconds, and observes again. The phase
+directories this package keeps there are left out of that comparison. An absent directory
+counts as a restore in progress. Every pause and the user-manager query are cut to the
+time left before the observation deadline, and a closure seen after it does not count. The observer
+refuses only when that deadline passes, with `startup_busy:bootstrap_lock_replaced` or
+`startup_busy:state_restore_in_progress` when that was the last thing it saw.
 
 Every refusal records a bounded reason code. A refusal of this package keeps its literal
 reason, and any other exception records only its type and the function and line where it
