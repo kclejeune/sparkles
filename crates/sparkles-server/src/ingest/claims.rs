@@ -575,11 +575,11 @@ fn claims_of(
             model: model.clone(),
         });
     }
-    if claims.len() > sparkles::evidence::MAX_CLAIMS {
+    if claims.len() > sparkles::evidence::MAX_BATCH_CLAIMS {
         return Err(too_large(format!(
             "the extraction gives {} claims; one batch holds at most {}",
             claims.len(),
-            sparkles::evidence::MAX_CLAIMS
+            sparkles::evidence::MAX_BATCH_CLAIMS
         )));
     }
     let count = |f: fn(&Link) -> bool| linked.links.iter().filter(|l| f(l)).count();

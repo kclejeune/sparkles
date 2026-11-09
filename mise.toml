@@ -1630,7 +1630,7 @@ systemd-run --user --wait --pipe --unit="$usage_unit" --property=Type=exec \
 '''
 
 [tasks."boat:job-env"]
-description = "Prepare deterministic PATH/token-FILE metadata for an actually qualified explicit worker; no lifecycle or source job"
+description = "Prepare the deterministic local-only job environment (PATH, Rust and mbx settings) for an actually qualified explicit worker; no lifecycle or source job"
 run = "python3 -I -B scripts/boat/job_environment.py"
 
 [tasks."boat:finish"]
