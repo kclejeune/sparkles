@@ -346,6 +346,10 @@ pub struct Store {
     pub by_x: FxHashMap<Ex, Vec<u32>>,
     /// the processed clauses whose maximal literal is over `f_e(x)`, by e
     pub by_f: FxHashMap<Ex, Vec<u32>>,
+    /// the processed clauses whose maximal literal is over a successor term, by that
+    /// literal, so that the premises of one literal are found without the others of its
+    /// term
+    by_succ: FxHashMap<Lit, Vec<u32>>,
     /// the processed clauses whose maximal literal is a role literal `s(x, f(x))`, by s
     pub by_rl: FxHashMap<u32, Vec<u32>>,
     /// the processed clauses whose maximal literal is an atom over a successor term that is
@@ -376,6 +380,7 @@ impl Store {
             + self.clauses.capacity() * std::mem::size_of::<Stored>()
             + table_bytes(self.by_x.capacity(), 32)
             + table_bytes(self.by_f.capacity(), 32)
+            + table_bytes(self.by_succ.capacity(), 32)
             + table_bytes(self.by_rl.capacity(), 32)
             + table_bytes(self.by_cert.capacity(), 32)
             + table_bytes(self.by_eq.capacity(), 32)
@@ -412,25 +417,31 @@ impl Store {
             return None;
         }
         // the clauses it subsumes have every literal of its head
-        let weaker: Vec<u32> = match c.head().first() {
+        let every: Vec<u32>;
+        let weaker: &[u32] = match c.head().first() {
             Some(l) => {
                 let pick = c
                     .head()
                     .iter()
                     .min_by_key(|l| self.by_lit.get(l).map_or(0, |v| v.len()))
                     .unwrap_or(l);
-                self.by_lit.get(pick).cloned().unwrap_or_default()
+                self.by_lit.get(pick).map_or(&[][..], |v| v.as_slice())
             }
-            None => (0..self.clauses.len() as u32).collect(),
+            None => {
+                every = (0..self.clauses.len() as u32).collect();
+                &every
+            }
         };
-        for i in weaker {
+        for &i in weaker {
             let s = &mut self.clauses[i as usize];
             if sig & !s.sig == 0 && !s.dead && c.subsumes(&s.c) {
                 s.dead = true;
             }
         }
         let id = self.clauses.len() as u32;
-        let bytes = c.bytes() + 8 * (c.head().len() + 2) + 8;
+        // the head's entries in the literal indexes, the queue's entry, and the entries in
+        // the maximal-literal indexes once processed
+        let bytes = c.bytes() + 8 * (c.head().len() + 2) + 12;
         match c.head().last() {
             None => self.empty.push(id),
             Some(&l) => self.by_last.entry(l).or_default().push(id),
@@ -480,9 +491,13 @@ impl Store {
                     X => self.by_x.entry(l.atom()).or_default().push(id),
                     RL => {
                         self.by_f.entry(l.fun()).or_default().push(id);
+                        self.by_succ.entry(l).or_default().push(id);
                         self.by_rl.entry(l.atom()).or_default().push(id);
                     }
-                    _ => self.by_f.entry(l.fun()).or_default().push(id),
+                    _ => {
+                        self.by_f.entry(l.fun()).or_default().push(id);
+                        self.by_succ.entry(l).or_default().push(id);
+                    }
                 }
             }
             if let Some(l) = self.clauses[id as usize].max
@@ -532,8 +547,8 @@ impl Store {
     /// The processed clauses that are not dead whose maximal literal is `l`, over a
     /// successor term.
     pub fn with_succ(&self, l: Lit) -> impl Iterator<Item = u32> + '_ {
-        self.by_f
-            .get(&l.fun())
+        self.by_succ
+            .get(&l)
             .into_iter()
             .flatten()
             .copied()
