@@ -223,8 +223,11 @@ status. Each remote step is written so that repeating it does not change what an
 attempt did, and a step whose connection drops is retried a bounded number of times. A
 start whose reply was lost is resolved from the build's recorded state, and a start the
 host refuses fails at once. A cancellation takes the same lock as a start and fences any
-later one. The scope's runtime limit is set at the start from the remaining admitted
-lifetime, less the closure watch's lead and a minute. When contact cannot be restored
+later one, and a scope that begins after a cancellation builds nothing. A start whose scope
+does not begin within 30 seconds cancels its own build. The scope's runtime limit counts
+from the start's arrival on the host. It is chosen so that the scope ends, its stop
+included, before the remaining admitted lifetime falls below the closure watch's lead and
+a minute, allowing for a late start command, a late scope and the stop. When contact cannot be restored
 within the retry bound, the build fails. Its cleanup then stops the scope, or names the
 scope for reconciliation when it cannot reach the host within its own shorter bound. The closure watch's unit check covers the detached scope. A gate receives a standard bounded Git bundle of the exact
 commit and comparison base. Temporary bundle refs live outside the caller's repository.

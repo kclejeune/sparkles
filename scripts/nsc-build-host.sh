@@ -265,11 +265,26 @@ bh_scratch() {
   bh_rx 60 "$1" "mkdir -p \$HOME/lanes/nsc-build && mkdir -p \$HOME/$2 && cd \$HOME/$2 && pwd -P" < /dev/null
 }
 
-# bh_publish DIR NAME PART: shell text that renames the extracted PART to DIR/NAME unless an
-# earlier attempt did. DIR/NAME.claim records the publication under DIR/stage.lock and stays
-# when the build moves DIR/src away, so a late attempt never publishes a second tree.
+# bh_published DIR NAME: shell text that, holding DIR/stage.lock on fd 7, succeeds when an
+# attempt has published DIR/NAME. DIR/NAME.claim records a finished publication and stays
+# when the build moves DIR/src away. A tree renamed into place by an attempt that ended
+# before it wrote the claim is a finished publication too, and gets its claim here.
+bh_published() {
+  echo "{ [ -e $1/$2.claim ] || { [ -e $1/$2 ] && mkdir $1/$2.claim; }; }"
+}
+
+# bh_publish DIR NAME PART: shell text that renames the extracted PART to DIR/NAME and then
+# writes the claim, under DIR/stage.lock, unless an earlier attempt published it, in which
+# case PART is removed. A late attempt never publishes a second tree.
 bh_publish() {
-  echo "exec 7>> $1/stage.lock && flock 7 && if [ -e $1/$2.claim ]; then rm -rf -- $3; else mkdir $1/$2.claim && mv -T $3 $1/$2; fi"
+  echo "exec 7>> $1/stage.lock && flock 7 && if $(bh_published "$1" "$2"); then rm -rf -- $3; else mv -T $3 $1/$2 && mkdir $1/$2.claim; fi"
+}
+
+# bh_skip_published DIR NAME: shell text that ends an attempt at once, discarding its input,
+# when an earlier attempt published DIR/NAME. The check takes DIR/stage.lock, so it waits
+# for a publication in progress.
+bh_skip_published() {
+  echo "if (exec 7>> $1/stage.lock && flock 7 && $(bh_published "$1" "$2")); then cat > /dev/null; exit 0; fi"
 }
 
 # bh_send_scripts HOST DIR TMP: copy the build scripts into DIR/bin. Each attempt extracts into
@@ -279,7 +294,7 @@ bh_send_scripts() {
   BH_SEND_ATTEMPT=$((BH_SEND_ATTEMPT + 1))
   # shellcheck disable=SC2029
   tar -C "$3" -cf - . | bh_rx 120 "$1" \
-    "if [ -e $2/bin.claim ]; then cat > /dev/null; exit 0; fi; rm -rf -- $part && mkdir $part && tar -x -C $part && $(bh_publish "$2" bin "$part")"
+    "$(bh_skip_published "$2" bin); rm -rf -- $part && mkdir $part && tar -x -C $part && $(bh_publish "$2" bin "$part")"
 }
 
 # bh_send_source HOST DIR COMMIT: extract the commit's archive into DIR/src, in the same way.
@@ -289,7 +304,7 @@ bh_send_source() {
   # Source mtimes stay current, as in a local build.
   # shellcheck disable=SC2029
   git -C "$BH_ROOT" archive "$3" | bh_rx 900 "$1" \
-    "if [ -e $2/src.claim ]; then cat > /dev/null; exit 0; fi; rm -rf -- $part && mkdir $part && tar -x -m -C $part && mkdir -p $part/ui/build && cp $2/bin/ui-index.html $part/ui/build/index.html && $(bh_publish "$2" src "$part")"
+    "$(bh_skip_published "$2" src); rm -rf -- $part && mkdir $part && tar -x -m -C $part && mkdir -p $part/ui/build && cp $2/bin/ui-index.html $part/ui/build/index.html && $(bh_publish "$2" src "$part")"
 }
 
 # bh_fetch HOST DIR OUT: copy DIR/out back into OUT. The archive is extracted only when it
@@ -299,19 +314,26 @@ bh_fetch() {
   bh_rx 600 "$1" "tar -C $2/out -cf - ." < /dev/null | python3 "$RX_DIR/remote-executor.py" unpack "$3"
 }
 
+# BH_LAUNCH_ALLOWANCE: how much later than this side's clock reading a scope can end. The
+# start command arrives within bh_rx's 130 seconds or not at all, nsc-build-remote.sh counts
+# RUNTIME from its arrival and lets the scope begin within 30 seconds, and the scope's stop
+# takes at most its TimeoutStopSec of 30 seconds.
+BH_LAUNCH_ALLOWANCE=190
+
 # bh_runtime: the scope's RuntimeMaxSec for a start now. It is SPARKLES_NSC_BUILD_RUNTIME
-# (default 14400), no later than SPARKLES_NSC_BUILD_DEADLINE (a Unix time) when that is set,
-# and for a Boat worker no later than the admitted lifetime less 960 seconds, the closure
-# watch's 900-second lead and a minute, so a build ends before the closure check whether or
-# not its cleanup can reach the worker.
+# (default 14400). When SPARKLES_NSC_BUILD_DEADLINE (a Unix time) is set, the scope ends,
+# stop included, by that deadline. For a Boat worker it ends by the admitted lifetime less
+# 960 seconds, the closure watch's 900-second lead and a minute, so a build ends before the
+# closure check whether or not its cleanup can reach the worker.
 bh_runtime() {
   local runtime=${SPARKLES_NSC_BUILD_RUNTIME:-14400} left
   if [ -n "${SPARKLES_NSC_BUILD_DEADLINE:-}" ]; then
-    left=$((SPARKLES_NSC_BUILD_DEADLINE - $(date +%s)))
+    left=$((SPARKLES_NSC_BUILD_DEADLINE - $(date +%s) - BH_LAUNCH_ALLOWANCE))
     [ "$left" -ge "$runtime" ] || runtime=$left
   fi
   if [ -n "$BH_ADMISSION" ]; then
     left=$(rx_runtime "$BH_ADMISSION" --reserve 960 2> /dev/null) || left=0
+    left=$((left - BH_LAUNCH_ALLOWANCE))
     [ "$left" -ge "$runtime" ] || runtime=$left
   fi
   echo "$runtime"

@@ -333,7 +333,8 @@ class BuildHost(unittest.TestCase):
         self.assertEqual(self.builds(), [])
 
     def test_every_host_busy_waits_for_the_first_ones_lock(self):
-        self.hold_lock("h1", seconds=2)
+        # The lock outlasts the copies and the start, so the build finds it held.
+        self.hold_lock("h1", seconds=6)
         self.hold_lock("h2")
         env = dict(self.env, SPARKLES_NSC_BUILD_HOSTS="h1 h2")
         started = time.monotonic()
@@ -526,12 +527,81 @@ class BuildHost(unittest.TestCase):
         self.assertFalse((self.hosts / "units").exists())
         self.assertEqual(self.builds(), [])
         self.assertEqual(self.scratch("h1"), [])
-        # A deadline further away caps the scope's runtime.
+        # A deadline further away caps the scope's runtime, so that the scope ends, stop
+        # included, by the deadline even when its start arrives and begins late.
         env = dict(self.env, SPARKLES_NSC_BUILD_DEADLINE=str(int(time.time()) + 1000))
         result, out = self.bench("--build-host", "h1", env=env)
         [unit] = list((self.hosts / "units").iterdir())
         runtime = int(unit.read_text().split("RuntimeMaxSec=")[1].split()[0])
-        self.assertTrue(900 <= runtime <= 1000, runtime)
+        self.assertTrue(700 <= runtime <= 810, runtime)
+        self.assertIn("TimeoutStopSec=30", unit.read_text())
+
+    def test_the_runtime_counts_from_the_start_s_arrival(self):
+        d = self.remote_dir()
+        holder = subprocess.Popen(["flock", str(d / "launch.lock"), "sleep", "2"], start_new_session=True)
+        self.holders.append(holder)
+        while subprocess.run(["flock", "-n", str(d / "launch.lock"), "true"]).returncode == 0:
+            time.sleep(0.02)
+        result = self.remote(str(d), "u-late", "301")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("too little to start the build", result.stderr)
+        self.assertFalse((self.hosts / "units" / "u-late.scope").exists())
+        self.assertEqual(self.remote("--status", str(d), "u-late", "0").stdout.splitlines()[0], "refused 3")
+
+    def test_a_scope_that_begins_too_late_builds_nothing(self):
+        """A start whose scope does not begin within the activation limit cancels the build, so
+        the scope that the delayed launcher creates afterwards ends at once."""
+        d = self.remote_dir()
+        env = dict(self.env, SPARKLES_NSC_BUILD_ACTIVATION_SECONDS="1", FAKE_SCOPE_DELAY="2.5")
+        result = self.remote(str(d), "u-slow", "600", env=env)
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertIn("did not start within 1 seconds", result.stderr)
+        self.assertTrue((d / "cancelled").exists())
+        deadline = time.monotonic() + 10
+        while not (self.hosts / "units" / "u-slow.scope").exists():
+            self.assertLess(time.monotonic(), deadline, "the delayed launcher did not create its scope")
+            time.sleep(0.05)
+        deadline = time.monotonic() + 10
+        while self.remote("--status", str(d), "u-slow", "0").stdout.splitlines()[0] == "running":
+            self.assertLess(time.monotonic(), deadline, "the late scope kept running")
+            time.sleep(0.05)
+        status = self.remote("--status", str(d), "u-slow", "0").stdout
+        self.assertEqual(status.splitlines()[0], "refused 75")
+        self.assertIn("was cancelled before its scope began", status)
+        self.assertFalse((self.hosts / "build-started").exists())
+        self.assertTrue((d / "src").is_dir())
+
+    def test_a_publication_cut_short_or_in_progress_is_finished_once(self):
+        """A retried copy waits for a publication in progress and accepts a tree that an attempt
+        renamed into place before it could write its claim."""
+        d = self.remote_dir()
+        shutil.rmtree(d / "src")
+        (d / "bin" / "ui-index.html").write_text("<!doctype html>")
+        program = ('. "$1/scripts/nsc-build-host.sh"; BH_SEND_ATTEMPT=$4; bh_send_source h1 "$2" "$3"')
+        def send(attempt):
+            return subprocess.run(["bash", "-c", program, "bash", str(self.repo), str(d), self.sha, str(attempt)],
+                                  env=self.env, capture_output=True, text=True, timeout=30)
+        # An attempt that renamed its tree and ended before the claim.
+        (d / "src").mkdir()
+        (d / "src" / "first").write_text("first")
+        self.assertEqual(send(1).returncode, 0)
+        self.assertTrue((d / "src.claim").is_dir())
+        self.assertEqual(sorted(p.name for p in (d / "src").iterdir()), ["first"])
+        # A publication in progress holds the staging lock and finishes while the retry waits.
+        shutil.rmtree(d / "src"); (d / "src.claim").rmdir()
+        holder = subprocess.Popen(["flock", str(d / "stage.lock"), "sh", "-c",
+                                   f"sleep 1; mkdir {d}/src && touch {d}/src/held && mkdir {d}/src.claim"],
+                                  start_new_session=True)
+        self.holders.append(holder)
+        while subprocess.run(["flock", "-n", str(d / "stage.lock"), "true"]).returncode == 0:
+            time.sleep(0.02)
+        self.assertEqual(send(2).returncode, 0)
+        self.assertEqual(sorted(p.name for p in (d / "src").iterdir()), ["held"])
+        # Once the build has moved the tree away, the claim keeps a late attempt from publishing.
+        shutil.rmtree(d / "src")
+        self.assertEqual(send(3).returncode, 0)
+        self.assertFalse((d / "src").exists())
+        self.assertEqual(sorted(p.name for p in d.iterdir() if p.name.startswith("src")), ["src.claim"])
 
     def test_cleanup_of_an_unreachable_host_gives_up_within_its_budget(self):
         (self.hosts / "h1" / "unreachable").touch()
