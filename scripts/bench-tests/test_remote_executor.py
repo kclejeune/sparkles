@@ -273,6 +273,36 @@ class Admission(unittest.TestCase):
             result=self.run_tool_check(profile,env)
             self.assertIn('ADMIT-REFUSAL: rustc reports 1.97.1, pinned 1.99.1',result.stdout,result.stderr)
 
+    def test_admit_renders_its_probe_and_names_a_missing_worker_tool(self):
+        """The admit probe parses as shell, carries its formatted values, and checks every worker tool."""
+        import subprocess as sp
+        profile,env=self.fake_worker()
+        boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        data={'worker':'bx_fixture','environment':'fixture-environment','environment_version':3,'_cli':{'path':'/inert/boat'},'_profile':profile,
+              'worker_env_path':profile['worker_home']+'/.config/sparkles-boat/job.env','worker_env_sha256':'e'*64,
+              'bootstrap_lock_path':profile['worker_home']+'/.local/state/sparkles-boat/bootstrap.lock','toolchain_manifest_path':profile['worker_home']+'/.local/state/sparkles-boat/toolchain.json',
+              'toolchain_manifest_sha256':'f'*64,'_lifetime':{'wall_end':time.time()+7200,'boot_end':RX.boat_clock.boottime()+7200,'boot_id':boot}}
+        info={'sandbox':{'id':'bx_fixture','environment':'fixture-environment','environmentVersion':3,'type':'large','vcpu':8,'memoryGB':16,'state':'idle'}}
+        seen=[]
+        with patch.object(RX,'admission',return_value=data),patch.object(RX.boat_environment.controller,'bounded',return_value={'exit':0,'body':info}),\
+             patch.object(RX,'command',side_effect=lambda host,text:seen.append(text) or ['true']),patch.object(RX,'exchange',return_value=0),patch('builtins.print'):
+            RX.admit('boat:bx_fixture',1800)
+        probe=seen[0]
+        self.assertEqual(sp.run(['/bin/bash','-n','-c',probe],capture_output=True,timeout=10).returncode,0)
+        self.assertIn(shlex.quote(data['worker_env_path']),probe);self.assertNotIn('{envfile}',probe);self.assertIn('{print $2}',probe)
+        self.assertIn('for name in '+' '.join(RX.WORKER_TOOLS)+';',probe)
+        # A worker without zstd is refused by name before any job work.
+        tools=self.root/'some-tools';tools.mkdir()
+        for name in RX.WORKER_TOOLS:
+            if name!='zstd' and shutil.which(name):(tools/name).symlink_to(shutil.which(name))
+        script="refuse(){ printf 'ADMIT-REFUSAL: %s\\n' \"$1\"; exit 86; }\n"+RX.worker_tools_check()
+        result=sp.run(['/bin/bash','-c',script],env={'PATH':str(tools)},stdin=sp.DEVNULL,capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,86);self.assertEqual(RX.refusal_reason(result.stdout.encode()),'zstd is not on the worker')
+        (tools/'zstd').symlink_to(shutil.which('true'))
+        missing=[n for n in RX.WORKER_TOOLS if not (tools/n).exists()]
+        result=sp.run(['/bin/bash','-c',script],env={'PATH':str(tools)},stdin=sp.DEVNULL,capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,86 if missing else 0,(missing,result.stdout))
+
     def test_admit_reports_the_worker_refusal_reason(self):
         self.assertEqual(RX.refusal_reason(b'noise\nADMIT-REFUSAL: mbx is not on the job PATH\n'),'mbx is not on the job PATH')
         self.assertEqual(RX.refusal_reason(b'ADMIT-REFUSAL: \x1b[31mbad\n'),'?[31mbad')

@@ -114,6 +114,16 @@ test "$version" = {rust} || refuse "rustc reports $version, pinned {rust} (RUSTU
            mbx=shlex.quote(mbx),rust=shlex.quote(rust))
 
 
+# Commands the screen and build scripts run on the worker. Admission names the first
+# missing one, so a job never stops partway through for a tool the worker lacks.
+WORKER_TOOLS=('python3','systemd-run','flock','zstd','curl','taskset','chrt','awk','sed','sha256sum','timeout','tar','free','du','mkfifo')
+
+
+def worker_tools_check():
+    """Shell text that refuses, by name, the first command in WORKER_TOOLS the worker lacks."""
+    return 'for name in '+' '.join(WORKER_TOOLS)+'; do command -v "$name" >/dev/null || refuse "$name is not on the worker"; done\n'
+
+
 def refusal_reason(output):
     """The worker's last refusal line, bounded and reduced to printable ASCII."""
     reason=None
@@ -144,7 +154,7 @@ def admit(host, minimum):
     # setupStatus=null alone is no readiness evidence. The owner binds startup
     # quiescence and guard lifetime; these physical checks detect subsequent drift.
     probe = """set -euo pipefail
-""" + tool_check(data['_profile']) + """test -f {envfile}
+""" + tool_check(data['_profile']) + ("""test -f {envfile}
 test "$(stat -c %a {envfile})" = 600
 test "$(sha256sum {envfile} | cut -d' ' -f1)" = {envhash}
 exec 8>{bootstrap}
@@ -165,9 +175,7 @@ test "$(stat -c %a "$MBX_REMOTE_TOKEN_FILE")" = 600
 test "$(stat -c %u "$MBX_REMOTE_TOKEN_FILE")" = "$(id -u)"
 test "$(sha256sum "$physical" | cut -d' ' -f1)" = 4b0c0fcfc9329a9d76fd6bdefc1ee34822580864f5f5ba2f0b47dcbbffce2eca
 for name in MBX_CACHE_DIR CARGO_TARGET_DIR CARGO_BUILD_TARGET RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER; do test -z "${{!name:-}}"; done
-command -v python3 >/dev/null
-command -v systemd-run >/dev/null
-""".format(envfile=shlex.quote(data['worker_env_path']), envhash=shlex.quote(data['worker_env_sha256']),
+""" + worker_tools_check()).format(envfile=shlex.quote(data['worker_env_path']), envhash=shlex.quote(data['worker_env_sha256']),
            bootstrap=shlex.quote(data['bootstrap_lock_path']), manifest=shlex.quote(data['toolchain_manifest_path']),
            digest=shlex.quote(data['toolchain_manifest_sha256']))
     with tempfile.TemporaryFile(buffering=0) as result:

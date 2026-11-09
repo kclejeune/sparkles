@@ -84,7 +84,8 @@ class EnvironmentAdmission(unittest.TestCase):
              patch.object(qwa,'current_boot_id',return_value=self.f['boot_id'],create=True),\
              patch.object(controller,'bounded',return_value={'exit':0,'body':expected})as wire:
             env.prepare(self.f['profile_path'],self.f['operation'],self.f['profile']['worker'],out)
-        self.assertLessEqual(wire.call_args.args[1],10)
+        # The test's own 'left' comes from the microsecond-rounded expires_at.
+        self.assertLessEqual(wire.call_args.args[1],10+1e-3)
         self.assertEqual(self.f['qualified_path'].read_bytes(),original)
         with patch.object(env,'context',side_effect=context),patch.object(env.time,'time',return_value=self.f['now']-7200),\
              patch.object(qwa,'boottime',return_value=self.f['boot_now']+left-20,create=True),\
@@ -597,7 +598,11 @@ class LifetimeExtension(unittest.TestCase):
 
     def test_guard_honours_only_valid_receipts(self):
         io=self.io(0)
-        self.assertEqual(controller.guard_deadlines(io,self.intent),(self.intent['deadline_mono'],self.intent['deadline_wall']))
+        # The conservative base may end a clock tick before the intent, never after it.
+        boot,wall=controller.guard_deadlines(io,self.intent)
+        self.assertLessEqual((boot,wall),(self.intent['deadline_mono'],self.intent['deadline_wall']))
+        self.assertLessEqual(boot,self.intent['deadline_mono']);self.assertLessEqual(wall,self.intent['deadline_wall'])
+        self.assertAlmostEqual(boot,self.intent['deadline_mono'],delta=1e-3);self.assertAlmostEqual(wall,self.intent['deadline_wall'],delta=1e-3)
         receipt=self.extend(self.io(self.left-600),3600)
         self.assertEqual(controller.guard_deadlines(io,self.intent),(receipt['boot_end'],receipt['wall_end']))
         # The guard loop stops at the extended end, not the original one.
@@ -618,9 +623,12 @@ class LifetimeExtension(unittest.TestCase):
             self.assertTrue(controller.guard_loop(self.f['release'],io,self.intent))
         self.assertGreaterEqual(seen[0],receipt_two['boot_end'])
         (self.op/'lifetime-extension-0002.json').unlink()
-        # A malformed receipt falls back to the original deadline.
+        # A malformed receipt falls back to the original deadline, or the conservative
+        # base a clock tick before it.
         path=self.op/'lifetime-extension-0001.json';path.write_text(json.dumps(dict(receipt,version=2)));path.chmod(0o600)
-        self.assertEqual(controller.guard_deadlines(io,self.intent),(self.intent['deadline_mono'],self.intent['deadline_wall']))
+        boot,wall=controller.guard_deadlines(io,self.intent)
+        self.assertLessEqual(boot,self.intent['deadline_mono']);self.assertLessEqual(wall,self.intent['deadline_wall'])
+        self.assertAlmostEqual(boot,self.intent['deadline_mono'],delta=1e-3);self.assertAlmostEqual(wall,self.intent['deadline_wall'],delta=1e-3)
 
 
 class RemoteTransport(unittest.TestCase):
@@ -822,11 +830,7 @@ class BoundedCommand(unittest.TestCase):
         r=common.bounded_command([sys.executable,'-I','-c',"import sys;sys.stderr.write('ignored')"],30);self.assertIsNone(r.stderr)
 
 
-class TickIO(controls.InertIO):
-    """An inert operation whose clocks advance a microsecond on every reading, as real clocks do."""
-    def __init__(self,r):super().__init__(r);self.ticks=0
-    def wall(self):self.ticks+=1;return self.w+self.ticks*1e-6
-    def mono(self):self.ticks+=1;return self.t+self.ticks*1e-6
+from boat_fixtures import TickIO,OP5_CLOCKS
 
 
 def handoff_release():
@@ -1351,3 +1355,22 @@ class BoundedFinalizerInterrupt(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+
+
+def op5_fixture(root):
+    import boat_fixtures
+    return boat_fixtures.fixture(root,OP5_CLOCKS)
+
+
+class Op5Clocks:
+    """Run a test class again on an operation driven with moving clocks at op-5's times."""
+    def run(self,result=None):
+        with patch.object(sys.modules[__name__],'fixture',op5_fixture):return super().run(result)
+
+
+class Op5EnvironmentAdmission(Op5Clocks,EnvironmentAdmission):pass
+class Op5LifetimeExtension(Op5Clocks,LifetimeExtension):pass
+class Op5RemoteTransport(Op5Clocks,RemoteTransport):pass
+class Op5JobClosureProgram(Op5Clocks,JobClosureProgram):pass
+class Op5ClosureWatch(Op5Clocks,ClosureWatch):pass
+class Op5Finish(Op5Clocks,Finish):pass

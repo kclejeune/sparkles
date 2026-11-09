@@ -116,7 +116,7 @@ was acknowledged and the worker was seen running. During the hold the controller
 `diagnostic-probe.py` on the worker and keeps its output in `diagnostics.json`. The
 program reads the process table, the package's state directory listing and every phase's
 `probe-result.json`, the host memory summary, free disk space and the package's user
-units. It reads no other file, so the token and the repository are never opened. It
+units, and whether each command that admission checks is on the worker's path. It reads no other file, so the token and the repository are never opened. It
 opens each directory by name under its parent and never through a symbolic link, accepts
 only private directories of the worker, and reads a result only when it is a private
 single-link regular file shaped as a phase result. Results, then process rows, then
@@ -170,6 +170,17 @@ scripts/gate/setup-host.sh "$worker" wally
 scripts/gate/gate.sh --host "$worker" --helper none HEAD
 mise run boat:finish --operation "$OWNED_OPERATION" --job-closure "$PRIVATE_JOB_CLOSURE"
 ```
+
+The controller reads the wall and boot clocks once for its intent, and both deadlines are
+exactly 10,500 seconds after those readings, so the admission end derived from the
+guard's paired observation never passes the intent's own wall deadline. Admission still
+accepts up to a millisecond of skew between the two in receipts of earlier controllers.
+The controller writes `root-handoff.json` before it computes the admission. When that
+computation fails, no `qualified-worker-admission.json` exists and no job can be
+admitted, so the controller withdraws the handoff in `root-handoff-withdrawn.json`, holds
+for diagnostics and triggers a normal stop that needs no job closure. A withdrawn
+handoff admits nothing. Before any job work, `remote-executor.py admit` refuses a worker
+that lacks one of the commands the screen and build scripts run there, and names it.
 
 Qualification runs in a named local 512-MiB, zero-swap controller unit with 2,700-second
 runtime and 30-second stop limits. The controller returns after qualification/handoff;

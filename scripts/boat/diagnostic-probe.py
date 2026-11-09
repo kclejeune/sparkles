@@ -6,7 +6,7 @@ never reads the token or any repository or tool file, starts no unit and writes
 nothing. Every value is bounded, and its output stays below the transport bound.
 """
 from pathlib import Path
-import json,os,re,stat,subprocess,sys
+import json,os,re,shutil,stat,subprocess,sys
 
 OUTPUT_MAX=900*1024
 RESULT_MAX=64*1024
@@ -135,10 +135,15 @@ def units():
         return {'exit':r.returncode,'rows':rows}
     except (OSError,subprocess.TimeoutExpired) as error:return {'unread':type(error).__name__}
 
+# The commands the screen and build scripts need on the worker, as admission checks them.
+TOOLS=('python3','systemd-run','flock','zstd','curl','taskset','chrt','awk','sed','sha256sum','timeout','tar','free','du','mkfifo')
+def commands():
+    return {name:shutil.which(name) is not None for name in TOOLS}
+
 def collect(home=None,uid=None):
     home=Path.home() if home is None else home;uid=os.getuid() if uid is None else uid
     body={'schema':1,'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'uptime_seconds':float(Path('/proc/uptime').read_text().split()[0]),
-          'uid':uid,'processes':processes(),'state':state(home,uid),'memory_bytes':memory(),'disk':disk(home),'units':units()}
+          'uid':uid,'processes':processes(),'state':state(home,uid),'memory_bytes':memory(),'disk':disk(home),'units':units(),'commands':commands()}
     return fit(body,OUTPUT_MAX,lambda x:len(json.dumps(x)))
 
 if __name__=='__main__':

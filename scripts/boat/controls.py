@@ -1168,6 +1168,11 @@ class Controls(unittest.TestCase):
             self.assertEqual(phases['qualification-a-startup']['unread'],'not a private regular file');self.assertEqual(phases['qualification-b-startup']['unread'],'over the result bound')
             self.assertEqual(phases['qualification-c-stopcheck'],{'entries':[]})
             self.assertIn('toolchain.json',[e['name'] for e in body['state']['entries']]);self.assertIn('MemTotal',body['memory_bytes'])
+            self.assertEqual(set(body['commands']),set(d.TOOLS));self.assertTrue(body['commands']['python3'])
+            # The same tools that admission checks, read from its source without importing it.
+            source=(Path(__file__).parents[1]/'remote-executor.py').read_text()
+            node=[n for n in ast.parse(source).body if isinstance(n,ast.Assign) and getattr(n.targets[0],'id',None)=='WORKER_TOOLS'][0]
+            self.assertEqual(ast.literal_eval(node.value),d.TOOLS)
             self.assertTrue(any(r['pid']==os.getpid() for r in body['processes']['rows']))
             # Results are dropped, largest first, until the output fits.
             for n in range(20):phase('qualification-z%02d-metadata'%n,{'x':'y'*60000})
