@@ -34,9 +34,13 @@ impl WorkingKey {
     /// intern operation or is backed by Terms' own prepared permanent credit.
     pub fn intern(self, terms: &super::Terms, strict: bool) -> Result<u64, BudgetFailure> {
         let Self { bytes, _held } = self;
-        let result = terms.local_keyed(bytes, super::LocalTerm::Key(Vec::new()), strict);
-        drop(_held);
-        result
+        // The key's own credit pays for the buffer the map keeps.
+        terms.local_keyed(
+            bytes,
+            super::LocalTerm::Key(Vec::new()),
+            strict,
+            Some(_held),
+        )
     }
 }
 

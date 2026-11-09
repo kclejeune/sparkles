@@ -121,25 +121,30 @@ impl Shape {
             errors: plus(self.errors, other.errors)?,
         })
     }
-    fn compilation_bytes(self, head: Self, name: usize) -> Result<usize, BudgetFailure> {
+    /// The bytes one compiled rule keeps, which accumulate over the rules, and the
+    /// scratch its compilation frees again before the next rule compiles.
+    fn compilation_bytes(self, head: Self, name: usize) -> Result<(usize, usize), BudgetFailure> {
         let all_vars = plus(self.vars, head.vars)?;
+        // Kept in the CRule and its RuleInfo, as rule_bytes and info_bytes count them.
+        let mut kept = Bytes::default();
+        kept.raw(name)?; // returned CRule name
+        kept.vector(self.atoms, size_of::<Atom>())?;
+        kept.vector(self.builtins, size_of::<CBuiltin>())?;
+        kept.vector(head.clauses, size_of::<CHead>())?;
+        kept.vector(self.args, size_of::<Slot>())?;
+        kept.vector(self.args, size_of::<usize>())?; // returned inputs
+        kept.vector(self.args, size_of::<usize>())?; // returned outputs
+        kept.vector(head.args, size_of::<Slot>())?;
+        kept.vector(all_vars, size_of::<String>())?; // returned variable names
+        kept.raw(plus(self.var_bytes, head.var_bytes)?)?;
+        kept.vector(self.builtins, size_of::<String>())?;
+        kept.raw(self.builtin_bytes)?;
+        // Freed when the rule's compilation ends.
         let mut b = Bytes::default();
-        b.raw(name)?; // returned CRule name
         b.table(all_vars, size_of::<(&str, usize)>())?; // variable interning
         b.table(self.vars, size_of::<&str>())?; // borrowed textual-bound set
-        b.vector(self.atoms, size_of::<Atom>())?;
-        b.vector(self.builtins, size_of::<CBuiltin>())?;
-        b.vector(head.clauses, size_of::<CHead>())?;
-        b.vector(self.args, size_of::<Slot>())?;
-        b.vector(self.args, size_of::<usize>())?; // returned inputs
-        b.vector(self.args, size_of::<usize>())?; // returned outputs
         b.vector(self.args, size_of::<usize>())?; // temporary input positions
         b.vector(self.args, size_of::<usize>())?; // temporary output positions
-        b.vector(head.args, size_of::<Slot>())?;
-        b.vector(all_vars, size_of::<String>())?; // returned variable names
-        b.raw(plus(self.var_bytes, head.var_bytes)?)?;
-        b.vector(self.builtins, size_of::<String>())?;
-        b.raw(self.builtin_bytes)?;
         b.vector(all_vars, size_of::<bool>())?; // head binding check
         b.vector(all_vars, size_of::<bool>())?; // plan binding scratch
         b.vector(self.atoms, size_of::<(u32, u32)>())?;
@@ -147,7 +152,6 @@ impl Shape {
         b.vector(self.atoms, size_of::<usize>())?; // remaining atoms
         b.vector(self.builtins, size_of::<usize>())?; // remaining calls
         b.raw(plus(self.errors, head.errors)?)?;
-        // The unbound-head error overlaps its copied variable name.
         b.raw(plus(self.var_bytes, head.var_bytes)?)?;
         b.raw(plus(
             "head variable ? is not bound by the body".len(),
@@ -159,7 +163,7 @@ impl Shape {
         ] {
             b.raw(literal.len())?;
         }
-        Ok(b.0)
+        Ok((kept.0, b.0))
     }
 }
 #[derive(Default)]
@@ -207,6 +211,7 @@ pub(super) fn prewalk(rules: &[Rule], backward: bool) -> Result<(usize, usize), 
         name: usize,
         bytes: &mut Bytes,
         emitted: &mut usize,
+        scratch: &mut usize,
     ) -> Result<(), BudgetFailure> {
         let body = prefix.merge(Shape::clauses(&r.body)?)?;
         let head = Shape::clauses(&r.head)?;
@@ -221,17 +226,21 @@ pub(super) fn prewalk(rules: &[Rule], backward: bool) -> Result<(usize, usize), 
                     .name
                     .as_ref()
                     .map_or_else(|| plus(name, plus(1, digits(nested))?), |n| Ok(n.len()))?;
-                walk(inner, body, inner_name, bytes, emitted)?;
+                walk(inner, body, inner_name, bytes, emitted, scratch)?;
             }
         }
         if head.clauses != 0 || nested == 0 {
             *emitted = plus(*emitted, 1)?;
-            bytes.raw(body.compilation_bytes(head, name)?)?;
+            let (kept, freed) = body.compilation_bytes(head, name)?;
+            bytes.raw(kept)?;
+            *scratch = (*scratch).max(freed);
         }
         Ok(())
     }
     let mut bytes = Bytes::default();
     let mut emitted = 0;
+    // Rules compile one at a time, so only the largest scratch is live at once.
+    let mut scratch = 0;
     for rule in rules {
         let label = label_len(rule)?;
         if (rule.direction == Direction::Backward && !backward)
@@ -240,8 +249,16 @@ pub(super) fn prewalk(rules: &[Rule], backward: bool) -> Result<(usize, usize), 
             bytes.raw(label)?;
             continue;
         }
-        walk(rule, Shape::default(), label, &mut bytes, &mut emitted)?;
+        walk(
+            rule,
+            Shape::default(),
+            label,
+            &mut bytes,
+            &mut emitted,
+            &mut scratch,
+        )?;
     }
+    bytes.raw(scratch)?;
     bytes.vector(emitted, size_of::<FlatRule<'_>>())?;
     bytes.vector(emitted, size_of::<CRule>())?;
     bytes.vector(emitted, size_of::<RuleInfo>())?;

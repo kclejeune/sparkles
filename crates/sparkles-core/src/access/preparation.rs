@@ -210,29 +210,23 @@ impl Preparation {
         if deadline.is_some_and(|end| std::time::Instant::now() >= end) {
             return Err(Error::Timeout);
         }
-        // Charge the actual layouts of Inner and its control, the optional new
-        // grant and the cancel flag, with their Arc headers and alignment.
-        let layouts = [
-            (std::mem::size_of::<Inner>(), std::mem::align_of::<Inner>()),
-            (
-                std::mem::size_of::<crate::sparql::pool::PoolGrant>(),
-                std::mem::align_of::<crate::sparql::pool::PoolGrant>(),
-            ),
-            (
-                std::mem::size_of::<std::sync::atomic::AtomicBool>(),
-                std::mem::align_of::<std::sync::atomic::AtomicBool>(),
-            ),
-        ];
-        let fixed = layouts
-            .into_iter()
-            .try_fold(0usize, |sum, (size, align)| {
-                sum.checked_add(size)?
-                    .checked_add(2 * std::mem::size_of::<usize>())?
-                    .checked_add(2 * align)
-            })
-            .ok_or_else(|| Error::invalid("receiving root header size overflow"))?;
-        let bytes = u64::try_from(fixed)
-            .map_err(|_| Error::invalid("receiving root header size overflow"))?;
+        // Charge the Arc allocations this root makes: its Inner, which holds the
+        // control inline, and a new grant only when it creates one. The cancel
+        // flag and an existing grant are shared, not allocated here.
+        fn arc_bytes<T>() -> Result<u64> {
+            let counters = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>();
+            let (layout, _) = counters
+                .extend(std::alloc::Layout::new::<T>())
+                .map_err(|_| Error::invalid("receiving root header size overflow"))?;
+            u64::try_from(layout.pad_to_align().size())
+                .map_err(|_| Error::invalid("receiving root header size overflow"))
+        }
+        let mut bytes = arc_bytes::<Inner>()?;
+        if opts.grant.is_none() && opts.pool.is_some() {
+            bytes = bytes
+                .checked_add(arc_bytes::<crate::sparql::pool::PoolGrant>()?)
+                .ok_or_else(|| Error::invalid("receiving root header size overflow"))?;
+        }
         let limit = opts.max_memory_bytes.unwrap_or(u64::MAX);
         if bytes > limit {
             return Err(Error::BudgetExceeded(Budget {

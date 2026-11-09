@@ -346,7 +346,7 @@ impl Terms {
             return Ok(id.0);
         }
         let temporary = Held::try_new_exact(&self.budget(), key.len())?;
-        let id = self.local_keyed(key.to_vec(), LocalTerm::Key(Vec::new()), true)?;
+        let id = self.local_keyed(key.to_vec(), LocalTerm::Key(Vec::new()), true, None)?;
         drop(temporary);
         Ok(id)
     }
@@ -437,17 +437,21 @@ impl Terms {
         let mut key = Vec::with_capacity(bytes);
         key.extend_from_slice(b"\0bn");
         key.extend_from_slice(node.as_str().as_bytes());
-        self.local_keyed(key, LocalTerm::RuleBNode(Vec::new()), strict)
+        self.local_keyed(key, LocalTerm::RuleBNode(Vec::new()), strict, None)
     }
 
     /// The local id of `key`, made with `term` (a key term gets a copy of `key`) when
     /// it is new: its bytes, its entry, the map's growth and a new segment of the table
     /// are charged first.
+    /// Intern `key`. A `carried` credit that already pays for the key buffer on
+    /// the same budget moves into the permanent credit, so the moved buffer is
+    /// not charged twice while it is interned.
     fn local_keyed(
         &self,
         key: Vec<u8>,
         term: LocalTerm,
         strict: bool,
+        mut carried: Option<Held>,
     ) -> Result<u64, BudgetFailure> {
         loop {
             let (n, cap, len, grow, bytes) = {
@@ -473,7 +477,11 @@ impl Terms {
                 (l.len, cap, len, grow, bytes)
             };
             let budget = self.budget();
-            let prepared = Held::new_exact_mode(&budget, bytes, strict)?;
+            let reuse = carried
+                .as_ref()
+                .filter(|held| Arc::ptr_eq(held.budget(), &budget))
+                .map_or(0, |held| held.bytes().min(key.len()));
+            let mut prepared = Held::new_exact_mode(&budget, bytes - reuse, strict)?;
             let current = self.credit.budget.read().unwrap();
             let mut l = self.locals.write().unwrap();
             if !Arc::ptr_eq(&current, &budget)
@@ -495,7 +503,14 @@ impl Terms {
             l.len += 1;
             let id = Id::local(n).0;
             l.map.insert(key, id);
-            self.credit.charged.fetch_add(bytes, Ordering::Relaxed);
+            if reuse > 0
+                && let Some(held) = carried.take()
+            {
+                prepared.absorb(held);
+            }
+            self.credit
+                .charged
+                .fetch_add(prepared.bytes(), Ordering::Relaxed);
             drop(l);
             drop(current);
             let _ = prepared.into_bytes();
@@ -545,7 +560,7 @@ impl Terms {
         for a in args {
             key.extend_from_slice(&a.to_le_bytes());
         }
-        self.local_keyed(key, LocalTerm::BNode, true)
+        self.local_keyed(key, LocalTerm::BNode, true, None)
     }
 
     /// A program-local blank constant cannot be recreated by inserting an RDF blank.

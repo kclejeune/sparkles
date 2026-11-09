@@ -1966,8 +1966,21 @@ fn graph_set_room<T: std::hash::Hash + Eq>(
     if values.capacity() > slots {
         return Err(Error::invalid("graph set exceeds admission"));
     }
-    held.resize(held.bytes() - *storage)?;
-    *storage = bytes;
+    // The old and new tables coexisted during the reserve, which the bound covered.
+    // Keep only the new table's actual buckets: capacity is 7/8 of a power-of-two
+    // bucket count, with one control byte per bucket and a group of slack.
+    let buckets = (values.capacity().saturating_mul(8) / 7)
+        .saturating_add(1)
+        .checked_next_power_of_two()
+        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+    let actual = buckets
+        .checked_mul(std::mem::size_of::<T>() + 1)
+        .and_then(|n| n.checked_add(16 + std::mem::align_of::<T>()))
+        .and_then(|n| u64::try_from(n).ok())
+        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?
+        .min(bytes);
+    held.resize(held.bytes() - *storage - (bytes - actual))?;
+    *storage = actual;
     Ok(())
 }
 
