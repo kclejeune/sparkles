@@ -591,8 +591,20 @@ These points differ from the design or settle what it left open.
   lists it. The certificate is checked against the platform's roots through the
   verifier reqwest uses, and an internal CA has to be in the system's trust store,
   since the channel has no `caCert` of its own. Any `4xx` reply is retried and any
-  `5xx` reply ends the delivery, including a `5xx` to one recipient of several. A
-  failed TLS handshake ends the delivery without a retry. The client refuses data that
+  `5xx` reply ends the delivery, including a `5xx` to one recipient of several. A `251`
+  to RCPT, a recipient the server forwards, is accepted. A failed TLS handshake ends
+  the delivery without a retry. One deadline of `timeoutSecs` bounds the whole
+  attempt, since every read and write of the socket, those of the TLS handshake
+  included, gets only the time left, so a server that answers a byte at a time cannot
+  hold the channel. Credentials whose `AUTH PLAIN` command would pass the 512 octets of
+  an SMTP command are sent after the server's empty challenge instead of as an initial
+  response. A failed `AUTH` is reported as `authentication failed` with the reply code
+  and never with the server's text, which could echo the token, and every other error
+  has the password and the token replaced before it is cut to 200 characters. The
+  client also refuses a reply line without its line end, a line that is not an SMTP
+  reply line, and a multi-line reply whose lines change the code. The `To` header has
+  one recipient per line, and an encoded subject one encoded word per line, so no
+  line passes the limits of RFC 5322 and RFC 2047. The client refuses data that
   a server sends after its STARTTLS reply and before the handshake, which would let a
   man in the middle inject commands. The subject is the title, and the body is the
   summary, the link, the event type, severity, server, dataset, time and id, and the

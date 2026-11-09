@@ -14340,7 +14340,8 @@ PLAIN, and `password` names the secret that holds the password. `from` and `to` 
 ASCII mail addresses, with 1 to 20 recipients. The outbound policy checks the host
 before the server connects. A `4xx` reply is retried like a transient failure, and a
 `5xx` reply ends the delivery. A recipient that the server refuses fails the whole
-delivery.
+delivery, and one that it forwards with `251` is accepted. One `timeoutSecs` bounds the
+whole submission. A failed login is reported without the server's reply text.
 
 The message has the notification's title as its subject and a plain-text body with
 the summary, the link, the event type, the severity, the server, the dataset, the time,

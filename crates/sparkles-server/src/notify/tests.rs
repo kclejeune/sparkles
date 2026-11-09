@@ -994,11 +994,25 @@ struct Mail {
     commands: Vec<String>,
 }
 
-/// A local mail server inside the test process that answers RCPT with `rcpt` in turn
-/// and then 250.
+/// How the fake mail server answers, beyond the plain success.
+#[derive(Clone, Default)]
+struct Script {
+    /// the replies to RCPT in turn, then 250
+    rcpt: Vec<u16>,
+    /// answer AUTH with a 535 that quotes the credentials and the token
+    auth_echo: bool,
+    /// send the greeting one byte at a time, 300 ms apart
+    trickle: bool,
+    /// answer 500 to a command line longer than this, CRLF included
+    max_command: Option<usize>,
+}
+
+/// A local mail server inside the test process. It stops when it is dropped.
 struct FakeSmtp {
     port: u16,
     got: Arc<Mutex<Vec<Mail>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 fn server_tls() -> Arc<rustls::ServerConfig> {
@@ -1046,13 +1060,32 @@ fn smtp_session(
     mode: SmtpMode,
     secure: bool,
     greet: bool,
+    script: &Script,
     rcpt: &Mutex<std::vec::IntoIter<u16>>,
     mail: &mut Mail,
 ) -> Next {
+    use base64::Engine as _;
     if greet {
-        let _ = s.write_all(b"220 fake.example ESMTP\r\n");
+        let g = b"220 fake.example ESMTP\r\n";
+        if script.trickle {
+            for b in g {
+                if s.write_all(&[*b]).is_err() {
+                    return Next::Done;
+                }
+                let _ = s.flush();
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        } else {
+            let _ = s.write_all(g);
+        }
     }
     mail.secure = secure;
+    let decode = |t: &str| {
+        let d = base64::engine::general_purpose::STANDARD
+            .decode(t.trim())
+            .unwrap_or_default();
+        String::from_utf8_lossy(&d).into_owned()
+    };
     loop {
         let Some(line) = read_line(s) else {
             return Next::Done;
@@ -1064,6 +1097,10 @@ fn smtp_session(
         } else {
             cmd.clone()
         });
+        if script.max_command.is_some_and(|m| line.len() > m) {
+            let _ = s.write_all(b"500 line too long\r\n");
+            continue;
+        }
         let reply: String = if upper.starts_with("EHLO") {
             let tls = if mode == SmtpMode::Starttls && !secure {
                 "250-STARTTLS\r\n"
@@ -1074,25 +1111,35 @@ fn smtp_session(
         } else if upper == "STARTTLS" {
             let _ = s.write_all(b"220 ready\r\n");
             return Next::Upgrade;
-        } else if let Some(t) = cmd.strip_prefix("AUTH PLAIN ") {
-            use base64::Engine as _;
-            let d = base64::engine::general_purpose::STANDARD
-                .decode(t.trim())
-                .unwrap_or_default();
-            mail.auth = Some(String::from_utf8_lossy(&d).into_owned());
-            "235 ok\r\n".into()
-        } else if let Some(f) = upper.strip_prefix("MAIL FROM:") {
-            let _ = f;
+        } else if upper.starts_with("AUTH PLAIN") {
+            let token = match cmd.strip_prefix("AUTH PLAIN ") {
+                Some(t) => t.trim().to_string(),
+                None => {
+                    // no initial response: the empty challenge, then the token
+                    let _ = s.write_all(b"334 \r\n");
+                    match read_line(s) {
+                        Some(t) => t.trim().to_string(),
+                        None => return Next::Done,
+                    }
+                }
+            };
+            mail.auth = Some(decode(&token));
+            if script.auth_echo {
+                format!("535 bad credentials {:?} in {token}\r\n", decode(&token))
+            } else {
+                "235 ok\r\n".into()
+            }
+        } else if upper.starts_with("MAIL FROM:") {
             mail.from = cmd["MAIL FROM:".len()..]
                 .trim_matches(['<', '>'])
                 .to_string();
             "250 ok\r\n".into()
         } else if upper.starts_with("RCPT TO:") {
             let code = rcpt.lock().next().unwrap_or(250);
-            if code == 250 {
+            if code == 250 || code == 251 {
                 mail.to
                     .push(cmd["RCPT TO:".len()..].trim_matches(['<', '>']).to_string());
-                "250 ok\r\n".into()
+                format!("{code} ok\r\n")
             } else {
                 format!("{code} not now\r\n")
             }
@@ -1120,16 +1167,30 @@ fn smtp_session(
 
 impl FakeSmtp {
     fn start(mode: SmtpMode, rcpt: Vec<u16>) -> FakeSmtp {
+        FakeSmtp::start_with(
+            mode,
+            Script {
+                rcpt,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn start_with(mode: SmtpMode, script: Script) -> FakeSmtp {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         let got: Arc<Mutex<Vec<Mail>>> = Arc::default();
-        let g = got.clone();
+        let stop: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let (g, halt) = (got.clone(), stop.clone());
         let config = server_tls();
-        std::thread::spawn(move || {
-            let rcpt = Mutex::new(rcpt.into_iter());
+        let thread = std::thread::spawn(move || {
+            let rcpt = Mutex::new(script.rcpt.clone().into_iter());
             for c in l.incoming() {
+                if halt.load(Ordering::SeqCst) {
+                    return;
+                }
                 let Ok(tcp) = c else { continue };
-                let _ = tcp.set_read_timeout(Some(Duration::from_secs(10)));
+                let _ = tcp.set_read_timeout(Some(Duration::from_secs(5)));
                 let mut mail = Mail::default();
                 let tls_stream = |tcp: std::net::TcpStream| {
                     rustls::StreamOwned::new(
@@ -1140,22 +1201,27 @@ impl FakeSmtp {
                 match mode {
                     SmtpMode::Tls => {
                         let mut s = tls_stream(tcp);
-                        smtp_session(&mut s, mode, true, true, &rcpt, &mut mail);
+                        smtp_session(&mut s, mode, true, true, &script, &rcpt, &mut mail);
                     }
                     SmtpMode::Starttls | SmtpMode::Plain => {
                         let mut tcp = tcp;
                         if let Next::Upgrade =
-                            smtp_session(&mut tcp, mode, false, true, &rcpt, &mut mail)
+                            smtp_session(&mut tcp, mode, false, true, &script, &rcpt, &mut mail)
                         {
                             let mut s = tls_stream(tcp);
-                            smtp_session(&mut s, mode, true, false, &rcpt, &mut mail);
+                            smtp_session(&mut s, mode, true, false, &script, &rcpt, &mut mail);
                         }
                     }
                 }
                 g.lock().push(mail);
             }
         });
-        FakeSmtp { port, got }
+        FakeSmtp {
+            port,
+            got,
+            stop,
+            thread: Some(thread),
+        }
     }
 
     fn got(&self) -> Vec<Mail> {
@@ -1172,6 +1238,16 @@ impl FakeSmtp {
             std::thread::sleep(Duration::from_millis(10));
         }
         self.got()
+    }
+}
+
+impl Drop for FakeSmtp {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 }
 
@@ -1224,7 +1300,7 @@ async fn email_is_submitted_over_starttls() {
     assert!(m.data.contains("Subject: Title\r\n"), "{}", m.data);
     assert!(
         m.data
-            .contains("To: ops@example.org, oncall@example.org\r\n")
+            .contains("To: ops@example.org,\r\n oncall@example.org\r\n")
     );
     assert!(
         m.data
@@ -1444,4 +1520,123 @@ fn the_email_message_is_rfc_5322() {
     assert_eq!(smtp::quoted_printable("a=b \n"), "a=3Db=20\r\n");
     let long = "x".repeat(200);
     assert!(smtp::quoted_printable(&long).lines().all(|l| l.len() <= 76));
+}
+
+/// A server that quotes the credentials in its AUTH reply gets them into no answer,
+/// however short the password.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_email_login_quotes_nothing_secret() {
+    use base64::Engine as _;
+    let smtp = FakeSmtp::start_with(
+        SmtpMode::Tls,
+        Script {
+            auth_echo: true,
+            ..Default::default()
+        },
+    );
+    let f = fixture_with(None, true, Some(TEST_CA));
+    f.secret("smtp", "pw");
+    f.patch(json!({"channels": {"mail": email_channel(smtp.port, "tls")}}))
+        .await;
+    let (s, v) = f.send("POST", "/$/notifications/test/mail", None).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    let token = base64::engine::general_purpose::STANDARD.encode("\0sparkles\0pw");
+    let text = v.to_string();
+    assert!(text.contains("SMTP 535: authentication failed"), "{text}");
+    assert!(!text.contains(&token), "{text}");
+    let (_, v) = f.send("GET", "/$/notifications", None).await;
+    assert!(!v.to_string().contains(&token), "{v}");
+    assert!(!v.to_string().contains("\\u0000pw"), "{v}");
+    assert_eq!(
+        smtp::scrub("a pw and a token".into(), &["pw", "token"]),
+        "a [redacted] and a [redacted]"
+    );
+}
+
+/// One deadline bounds the attempt: a server that sends its greeting a byte at a time
+/// cannot hold the channel past `timeoutSecs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trickling_mail_server_times_out() {
+    let smtp = FakeSmtp::start_with(
+        SmtpMode::Starttls,
+        Script {
+            trickle: true,
+            ..Default::default()
+        },
+    );
+    let f = fixture_with(None, true, Some(TEST_CA));
+    f.secret("smtp", "s3cret-smtp-pass");
+    f.patch(json!({
+        "channels": {"mail": email_channel(smtp.port, "starttls")},
+        "delivery": {"attempts": 1, "backoffSecs": 1, "maxBackoffSecs": 1, "timeoutSecs": 1},
+    }))
+    .await;
+    let t = Instant::now();
+    let (s, v) = f.send("POST", "/$/notifications/test/mail", None).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    assert!(v.to_string().contains("in time"), "{v}");
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+}
+
+/// A recipient that the server forwards (251) is accepted, and credentials too long for
+/// an initial response go after the server's challenge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn email_accepts_forwarding_and_long_credentials() {
+    let smtp = FakeSmtp::start_with(
+        SmtpMode::Tls,
+        Script {
+            rcpt: vec![251],
+            max_command: Some(512),
+            ..Default::default()
+        },
+    );
+    let f = fixture_with(None, true, Some(TEST_CA));
+    let password = "p".repeat(140);
+    f.secret("smtp", &password);
+    let mut c = email_channel(smtp.port, "tls");
+    let user = "u".repeat(240);
+    c["username"] = user.clone().into();
+    let (s, v) = f.patch(json!({"channels": {"mail": c}})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = f.send("POST", "/$/notifications/test/mail", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let m = &smtp.wait(1)[0];
+    assert_eq!(
+        m.auth.as_deref(),
+        Some(format!("\0{user}\0{password}").as_str())
+    );
+    assert_eq!(m.to, ["ops@example.org", "oncall@example.org"]);
+}
+
+/// No line of a message passes 998 characters, and no line of an encoded subject 76.
+#[test]
+fn email_header_lines_stay_within_the_limits() {
+    let to: Vec<String> = (0..20)
+        .map(|i| format!("{}{i:02}@example.org", "r".repeat(48)))
+        .collect();
+    let e: config::Email = serde_json::from_value(json!({
+        "host": "smtp.example.org", "from": "s@example.org", "to": to
+    }))
+    .unwrap();
+    let env = json!({
+        "id": "abc", "type": "backup.failed", "time": "2026-10-10T09:00:00Z",
+        "server": "s", "severity": "critical", "title": "é".repeat(120),
+        "summary": "s", "data": {}
+    });
+    let m = String::from_utf8(smtp::message(&e, &env)).unwrap();
+    assert!(m.split("\r\n").all(|l| l.len() <= 998), "{m}");
+    let header = &m[..m.find("\r\n\r\n").unwrap()];
+    let mut in_subject = false;
+    for l in header.split("\r\n") {
+        if l.starts_with("Subject:") {
+            in_subject = true;
+        } else if !l.starts_with(' ') {
+            in_subject = false;
+        }
+        if in_subject {
+            assert!(l.len() <= 76, "{l:?}");
+        }
+    }
+    assert!(header.contains("To: rrr"), "{header}");
+    assert_eq!(header.matches("@example.org,\r\n ").count(), 19, "{header}");
 }

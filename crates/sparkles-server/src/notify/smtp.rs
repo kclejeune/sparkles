@@ -11,7 +11,9 @@
 //!
 //! TLS is rustls with the platform's roots, the verifier reqwest already uses, and the
 //! extra roots of the server's outbound policy. The SMTP host passes the outbound
-//! policy's host check, and the client connects only to the addresses it checked.
+//! policy's host check, and the client connects only to the addresses it checked. One
+//! deadline bounds the whole attempt: every read and write of the socket, the TLS
+//! handshake included, gets only the time that is left.
 
 use super::Attempt;
 use super::config::{Email, EmailTls};
@@ -28,21 +30,55 @@ use std::time::{Duration, Instant};
 const MAX_LINE: usize = 4096;
 /// The most lines of one reply.
 const MAX_LINES: usize = 200;
+/// The longest command line, CRLF included (RFC 5321 §4.5.3.1.4).
+const MAX_COMMAND: usize = 512;
+/// The most characters of a server's reply that an error quotes.
+const QUOTED: usize = 200;
+
+/// The socket, with the attempt's deadline applied to each read and write.
+struct Deadlined {
+    tcp: TcpStream,
+    deadline: Instant,
+}
+
+impl Deadlined {
+    fn left(&self) -> io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "deadline"))
+    }
+}
+
+impl Read for Deadlined {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.left()?;
+        self.tcp.set_read_timeout(Some(left))?;
+        self.tcp.read(buf)
+    }
+}
+
+impl Write for Deadlined {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let left = self.left()?;
+        self.tcp.set_write_timeout(Some(left))?;
+        self.tcp.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
+type TlsStream = rustls::StreamOwned<rustls::ClientConnection, Deadlined>;
 
 /// The connection, before or after TLS.
 enum Conn {
-    Plain(BufReader<TcpStream>),
-    Tls(Box<BufReader<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>>),
+    Plain(BufReader<Deadlined>),
+    Tls(Box<BufReader<TlsStream>>),
 }
 
 impl Conn {
-    fn tcp(&self) -> &TcpStream {
-        match self {
-            Conn::Plain(r) => r.get_ref(),
-            Conn::Tls(r) => &r.get_ref().sock,
-        }
-    }
-
     fn reader(&mut self) -> &mut dyn BufRead {
         match self {
             Conn::Plain(r) => r,
@@ -92,27 +128,15 @@ impl From<io::Error> for Stop {
 
 struct Session {
     conn: Conn,
-    deadline: Instant,
 }
 
 impl Session {
-    /// Arm the socket's timeouts with the time left before the deadline.
-    fn arm(&self) -> Result<(), Stop> {
-        let left = self
-            .deadline
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
-            .ok_or_else(|| Stop::Io("the mail server did not answer in time".into()))?;
-        let t = self.conn.tcp();
-        t.set_read_timeout(Some(left))?;
-        t.set_write_timeout(Some(left))?;
-        Ok(())
-    }
-
-    /// Read one reply: its code and the text of each line.
+    /// Read one reply: its code and the text of each line. A line without its line
+    /// end within [`MAX_LINE`], a line that is not a reply line, and a multi-line reply
+    /// whose lines change the code are refused.
     fn reply(&mut self) -> Result<(u16, Vec<String>), Stop> {
-        self.arm()?;
         let mut text = Vec::new();
+        let mut first: Option<u16> = None;
         for _ in 0..MAX_LINES {
             let mut line = Vec::new();
             let r = self.conn.reader();
@@ -120,14 +144,32 @@ impl Session {
             if n == 0 {
                 return Err(Stop::Io("the mail server closed the connection".into()));
             }
+            if line.last() != Some(&b'\n') {
+                return Err(Stop::Fatal(
+                    "the mail server's reply line is too long".into(),
+                ));
+            }
             let l = String::from_utf8_lossy(&line);
             let l = l.trim_end_matches(['\r', '\n']);
             let code = l
                 .get(..3)
+                .filter(|c| c.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|c| c.parse::<u16>().ok())
                 .filter(|c| (200..600).contains(c))
                 .ok_or_else(|| Stop::Fatal("the mail server's reply is not SMTP".into()))?;
-            let more = l.as_bytes().get(3) == Some(&b'-');
+            let more = match l.as_bytes().get(3) {
+                None | Some(b' ') => false,
+                Some(b'-') => true,
+                Some(_) => {
+                    return Err(Stop::Fatal("the mail server's reply is not SMTP".into()));
+                }
+            };
+            if first.is_some_and(|f| f != code) {
+                return Err(Stop::Fatal(
+                    "the lines of the mail server's reply have different codes".into(),
+                ));
+            }
+            first = Some(code);
             text.push(l.get(4..).unwrap_or("").to_string());
             if !more {
                 return Ok((code, text));
@@ -138,22 +180,15 @@ impl Session {
         ))
     }
 
-    /// Send `line` (without CRLF) and read the reply, which must have code `want`, or a
-    /// code in `want..want + 100` when `want` is a multiple of 100.
-    fn command(&mut self, line: &str, want: u16) -> Result<Vec<String>, Stop> {
-        self.arm()?;
+    /// Send `line` (without CRLF) and read the reply, whose code must be one of `want`.
+    fn command(&mut self, line: &str, want: &[u16]) -> Result<Vec<String>, Stop> {
         self.conn.write_all(format!("{line}\r\n").as_bytes())?;
         self.expect(want)
     }
 
-    fn expect(&mut self, want: u16) -> Result<Vec<String>, Stop> {
+    fn expect(&mut self, want: &[u16]) -> Result<Vec<String>, Stop> {
         let (code, text) = self.reply()?;
-        let ok = if want % 100 == 0 {
-            code / 100 == want / 100
-        } else {
-            code == want
-        };
-        if ok {
+        if want.contains(&code) {
             Ok(text)
         } else {
             Err(Stop::Reply(code, text.join(" ")))
@@ -163,7 +198,7 @@ impl Session {
     /// EHLO: the extensions the server lists, each as its upper-cased words. The
     /// first line is the greeting.
     fn ehlo(&mut self, name: &str) -> Result<Vec<Vec<String>>, Stop> {
-        let lines = self.command(&format!("EHLO {name}"), 250)?;
+        let lines = self.command(&format!("EHLO {name}"), &[250])?;
         Ok(lines
             .iter()
             .skip(1)
@@ -181,15 +216,32 @@ impl Session {
                 "the mail server sent data before the TLS handshake".into(),
             ));
         }
-        let tcp = r.into_inner();
         Ok(Session {
-            conn: tls(tcp, host, config)?,
-            deadline: self.deadline,
+            conn: tls(r.into_inner(), host, config)?,
         })
+    }
+
+    /// AUTH PLAIN with `token`, the Base64 of the credentials: as an initial response
+    /// when the command fits in [`MAX_COMMAND`], and otherwise after the server's empty
+    /// challenge (RFC 4954 §4). A failure never quotes the server, which could echo the
+    /// token.
+    fn auth_plain(&mut self, token: &str) -> Result<(), Stop> {
+        let quiet = |e: Stop| match e {
+            Stop::Reply(code, _) => Stop::Reply(code, "authentication failed".into()),
+            other => other,
+        };
+        if "AUTH PLAIN ".len() + token.len() + 2 <= MAX_COMMAND {
+            self.command(&format!("AUTH PLAIN {token}"), &[235])
+                .map_err(quiet)?;
+        } else {
+            self.command("AUTH PLAIN", &[334]).map_err(quiet)?;
+            self.command(token, &[235]).map_err(quiet)?;
+        }
+        Ok(())
     }
 }
 
-fn tls(tcp: TcpStream, host: &str, config: Arc<rustls::ClientConfig>) -> Result<Conn, Stop> {
+fn tls(tcp: Deadlined, host: &str, config: Arc<rustls::ClientConfig>) -> Result<Conn, Stop> {
     let name = match host.parse::<IpAddr>() {
         Ok(ip) => ServerName::IpAddress(ip.into()),
         Err(_) => ServerName::try_from(host.to_string())
@@ -198,7 +250,8 @@ fn tls(tcp: TcpStream, host: &str, config: Arc<rustls::ClientConfig>) -> Result<
     let c = rustls::ClientConnection::new(config, name)
         .map_err(|e| Stop::Fatal(format!("TLS: {e}")))?;
     let mut s = rustls::StreamOwned::new(c, tcp);
-    // the handshake runs now, so that its failure is reported as such
+    // the handshake runs now, so that its failure is reported as such; each of its
+    // reads and writes is bounded by the deadline
     while s.conn.is_handshaking() {
         s.conn.complete_io(&mut s.sock)?;
     }
@@ -244,23 +297,46 @@ fn ehlo_name() -> String {
     if ok { h } else { "[127.0.0.1]".into() }
 }
 
-/// Connect to the first of `addrs` that answers, within `connect` each.
-fn connect(addrs: &[IpAddr], port: u16, connect: Duration) -> Result<TcpStream, Stop> {
+/// Connect to the first of `addrs` that answers, each try within `connect` and all of
+/// them before `deadline`.
+fn connect(
+    addrs: &[IpAddr],
+    port: u16,
+    connect: Duration,
+    deadline: Instant,
+) -> Result<TcpStream, Stop> {
     let mut last = None;
     for ip in addrs {
-        match TcpStream::connect_timeout(&SocketAddr::new(*ip, port), connect) {
+        let Some(left) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+        else {
+            break;
+        };
+        match TcpStream::connect_timeout(&SocketAddr::new(*ip, port), connect.min(left)) {
             Ok(s) => return Ok(s),
             Err(e) => last = Some(e),
         }
     }
     Err(match last {
         Some(e) => Stop::from(e),
-        None => Stop::Io("the mail server has no address".into()),
+        None => Stop::Io("the mail server did not answer in time".into()),
     })
 }
 
+/// `s` with each of `secrets` replaced, whatever their length.
+pub(super) fn scrub(mut s: String, secrets: &[&str]) -> String {
+    for k in secrets {
+        if !k.is_empty() {
+            s = s.replace(k, "[redacted]");
+        }
+    }
+    s
+}
+
 /// One attempt to submit the message of `env` through channel `name`. `password` is
-/// the value of the channel's password secret.
+/// the value of the channel's password secret. No message it returns holds the
+/// password or the AUTH token.
 pub(super) fn send(
     policy: &sparkles::outbound::OutboundPolicy,
     name: &str,
@@ -278,19 +354,20 @@ pub(super) fn send(
         Ok(c) => c,
         Err(m) => return Attempt::Failed(format!("channel {name}: {m}")),
     };
+    let token = e.username.as_ref().map(|user| {
+        base64::engine::general_purpose::STANDARD
+            .encode(format!("\0{user}\0{}", password.unwrap_or("")))
+    });
     let deadline = Instant::now() + timeout;
-    let started = (|| -> Result<(), Stop> {
-        let tcp = connect(&addrs, e.port(), policy.connect_timeout.min(timeout))?;
+    let outcome = (|| -> Result<(), Stop> {
+        let tcp = connect(&addrs, e.port(), policy.connect_timeout, deadline)?;
+        let sock = Deadlined { tcp, deadline };
         let conn = match e.tls {
-            EmailTls::Tls => {
-                tcp.set_read_timeout(Some(timeout))?;
-                tcp.set_write_timeout(Some(timeout))?;
-                tls(tcp, &e.host, config.clone())?
-            }
-            EmailTls::Starttls => Conn::Plain(BufReader::new(tcp)),
+            EmailTls::Tls => tls(sock, &e.host, config.clone())?,
+            EmailTls::Starttls => Conn::Plain(BufReader::new(sock)),
         };
-        let mut s = Session { conn, deadline };
-        s.expect(220)?;
+        let mut s = Session { conn };
+        s.expect(&[220])?;
         let me = ehlo_name();
         let mut ext = s.ehlo(&me)?;
         if e.tls == EmailTls::Starttls {
@@ -302,12 +379,11 @@ pub(super) fn send(
                     "the mail server does not offer STARTTLS, and the channel never sends in the clear".into(),
                 ));
             }
-            s.command("STARTTLS", 220)?;
+            s.command("STARTTLS", &[220])?;
             s = s.start_tls(&e.host, config.clone())?;
             ext = s.ehlo(&me)?;
         }
-        if let Some(user) = &e.username {
-            let pw = password.unwrap_or("");
+        if let Some(token) = &token {
             let plain = ext.iter().any(|x| {
                 x.first().is_some_and(|k| k == "AUTH") && x.iter().skip(1).any(|m| m == "PLAIN")
             });
@@ -316,29 +392,35 @@ pub(super) fn send(
                     "the mail server does not offer AUTH PLAIN".into(),
                 ));
             }
-            let token = base64::engine::general_purpose::STANDARD.encode(format!("\0{user}\0{pw}"));
-            // the reply to AUTH never quotes the token, and the token is not logged
-            s.command(&format!("AUTH PLAIN {token}"), 235)?;
+            s.auth_plain(token)?;
         }
-        s.command(&format!("MAIL FROM:<{}>", e.from), 250)?;
+        s.command(&format!("MAIL FROM:<{}>", e.from), &[250])?;
         for to in &e.to {
-            s.command(&format!("RCPT TO:<{to}>"), 250)?;
+            // 251: the server forwards the message (RFC 5321 §3.4)
+            s.command(&format!("RCPT TO:<{to}>"), &[250, 251])?;
         }
-        s.command("DATA", 354)?;
-        let msg = message(e, env);
-        s.arm()?;
-        s.conn.write_all(&msg)?;
-        s.expect(250)?;
-        let _ = s.command("QUIT", 221);
+        s.command("DATA", &[354])?;
+        s.conn.write_all(&message(e, env))?;
+        s.expect(&[250])?;
+        let _ = s.command("QUIT", &[221]);
         Ok(())
     })();
-    match started {
+    let secrets: Vec<&str> = [password, token.as_deref()].into_iter().flatten().collect();
+    // the secrets are replaced before the text is cut, so no prefix of one is left
+    let clean = |m: String| -> String {
+        let m = scrub(m, &secrets);
+        let mut out: String = m.chars().take(QUOTED).collect();
+        if m.chars().count() > QUOTED {
+            out.push('…');
+        }
+        out
+    };
+    match outcome {
         Ok(()) => Attempt::Ok(250),
-        Err(Stop::Io(m)) => Attempt::Retry(format!("channel {name}: {m}"), None),
-        Err(Stop::Fatal(m)) => Attempt::Failed(format!("channel {name}: {m}")),
+        Err(Stop::Io(m)) => Attempt::Retry(format!("channel {name}: {}", clean(m)), None),
+        Err(Stop::Fatal(m)) => Attempt::Failed(format!("channel {name}: {}", clean(m))),
         Err(Stop::Reply(code, text)) => {
-            let text: String = text.chars().take(200).collect();
-            let m = format!("SMTP {code}: {text}");
+            let m = format!("SMTP {code}: {}", clean(text));
             if code / 100 == 4 {
                 Attempt::Retry(m, None)
             } else {
@@ -383,7 +465,8 @@ pub(super) fn message(e: &Email, env: &Value) -> Vec<u8> {
     let mut h = String::new();
     h.push_str(&format!("Date: {time}\r\n"));
     h.push_str(&format!("From: {}\r\n", e.from));
-    h.push_str(&format!("To: {}\r\n", e.to.join(", ")));
+    // one recipient per line, so that no line passes the limit of RFC 5322 §2.1.1
+    h.push_str(&format!("To: {}\r\n", e.to.join(",\r\n ")));
     h.push_str(&format!("Subject: {}\r\n", subject(&s("title"))));
     h.push_str(&format!("Message-ID: <{}@{domain}>\r\n", s("id")));
     h.push_str("MIME-Version: 1.0\r\n");
@@ -414,8 +497,9 @@ pub(super) fn message(e: &Email, env: &Value) -> Vec<u8> {
     out
 }
 
-/// A header value that is printable ASCII as is, and otherwise encoded words of RFC
-/// 2047 in Base64, folded so that no line passes 78 characters.
+/// A `Subject` value that is printable ASCII as is, and otherwise encoded words of RFC
+/// 2047 in Base64, one per line, so that no line of the field, `Subject: ` included,
+/// passes 76 characters.
 pub(super) fn subject(t: &str) -> String {
     let t: String = t
         .chars()
@@ -424,11 +508,12 @@ pub(super) fn subject(t: &str) -> String {
     if t.is_ascii() && t.len() <= 900 {
         return t;
     }
-    // at most 45 bytes of UTF-8 per word, which Base64 makes 60 characters
+    // at most 36 bytes of UTF-8 per word, which Base64 makes 48 characters and the
+    // word 60; with `Subject: ` the first line has 69
     let mut words = Vec::new();
     let mut cur = String::new();
     for c in t.chars() {
-        if cur.len() + c.len_utf8() > 45 {
+        if cur.len() + c.len_utf8() > 36 {
             words.push(std::mem::take(&mut cur));
         }
         cur.push(c);
