@@ -107,7 +107,7 @@ def context(profile_path, qualification_path, worker, now, guard_reader=None):
     # proves that no command is running or launching. Checked before the stop receipts.
     hold_job_lock(path.parent)
     # A stopping or closed operation admits nothing, even with an extension receipt.
-    for name in ('stop-trigger.json', 'stop-intent.json', 'closed.json', 'unresolved.json'):
+    for name in ('stop-trigger.json', 'stop-intent.json', 'closed.json', 'unresolved.json', 'root-handoff-withdrawn.json'):
         require(not (path.parent/name).exists(), 'operation is stopping or closed')
     # The lifetime includes any receipted extension of this same operation.
     lifetime = operation_lifetime(path.parent, qualification)

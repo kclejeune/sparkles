@@ -77,6 +77,58 @@ time left before the observation deadline, and a closure seen after it does not 
 refuses only when that deadline passes, with `startup_busy:bootstrap_lock_replaced` or
 `startup_busy:state_restore_in_progress` when that was the last thing it saw.
 
+## Phase unit health
+
+The startup, metadata and stop-check phases each run in a transient 512-MiB, zero-swap
+unit, and the launcher accepts a phase only when its unit ended with status 0 inside
+those limits. systemd unloads a transient unit as soon as it ends successfully, and an
+unloaded unit reports default values, which are result `success`, status 0 and no memory
+peaks. Each phase therefore reads its own cgroup's `memory.peak` and `memory.swap.peak`
+just before it writes its result, and records them with the cgroup path. The launcher
+takes the peaks from that record only when it names the phase unit's own cgroup and, for
+a unit that is still loaded, the cgroup that unit reports. When the phase could not read them, it takes them from
+the summary that `systemd-run --wait` prints, rounding each size up to the next tenth
+that systemd's truncated text can stand for. For an unloaded unit, the status comes only
+from the exit code of `systemd-run --wait`, which is the unit's own. A unit that is still
+loaded must also report success and status 0, and any peaks it reports must also be
+within the limits. A unit that reports no peaks and has neither source is refused with
+`unit_unhealthy:memory_peak_unavailable`. A recovered phase whose unit is already
+unloaded has no exit code and is refused with `unit_unhealthy:unloaded:status_unknown`.
+The kernel limits still bound the few writes that follow the cgroup read. The launcher
+reads at most 1 MiB from each output stream of a command as it reads it, and kills and
+reaps a command that writes more or outlives its time limit.
+
+## Refusal records and the diagnostic hold
+
+The startup, metadata, admission, stop-check and closure phases keep their first refusal
+in `startup-refused.json`, `metadata-refused.json`, `admission-refused.json`,
+`stopcheck-refused.json` and `closure-refused.json` through one shared function. Each
+record holds the local reason code, the remote phase's own reason code, the bounded
+terminal properties and memory evidence of the phase unit, and for startup the processes
+it counted. A refused metadata phase also names every check its result failed, from
+`metadata_not_closed`, `probe_not_qualified`, `startup_not_closed`,
+`engine_or_job_started`, `memory_cap`, `swap_cap`, `manifest_changed` and
+`worker_boot_id`, and its refusal names the first of them. Writing a record never masks
+the refusal it describes.
+
+A refused qualification holds its stop trigger for at most 600 seconds when the resume
+was acknowledged and the worker was seen running. During the hold the controller runs
+`diagnostic-probe.py` on the worker and keeps its output in `diagnostics.json`. The
+program reads the process table, the package's state directory listing and every phase's
+`probe-result.json`, the host memory summary, free disk space and the package's user
+units, and whether each command that admission checks is on the worker's path. It reads no other file, so the token and the repository are never opened. It
+opens each directory by name under its parent and never through a symbolic link, accepts
+only private directories of the worker, and reads a result only when it is a private
+single-link regular file shaped as a phase result. Results, then process rows, then
+listings are dropped until the output fits the transport bound and the receipt fits its
+1 MiB bound. A failed read is kept in `diagnostics-failed-NNNN.json` and retried after 15
+seconds. The hold ends 300 seconds before the controller unit's 2,700-second runtime limit
+and 600 seconds before the guard's deadline. Each read ends 15 seconds before the hold, so
+the transport's own teardown fits inside it too. Any error ends the hold, so the
+controller always writes the stop trigger and the guard then stops the worker normally. The hold applies only to
+qualification, before a Root handoff, and never to a job, an extension, a closure watch
+or a finish.
+
 Every refusal records a bounded reason code. A refusal of this package keeps its literal
 reason, and any other exception records only its type and the function and line where it
 was raised, never its text. The controller keeps a remote code only in one of these
@@ -118,6 +170,30 @@ scripts/gate/setup-host.sh "$worker" wally
 scripts/gate/gate.sh --host "$worker" --helper none HEAD
 mise run boat:finish --operation "$OWNED_OPERATION" --job-closure "$PRIVATE_JOB_CLOSURE"
 ```
+
+The controller reads the wall and boot clocks once for its intent, and both deadlines are
+exactly 10,500 seconds after those readings, so the admission end derived from the
+guard's paired observation never passes the intent's own wall deadline. Admission still
+accepts up to a millisecond of skew between the two in receipts of earlier controllers.
+The controller stages the handoff. It computes the admission from the handoff's
+values, publishes `qualified-worker-admission.json` first and `root-handoff.json` last,
+and a handoff stands only while both receipts exist. When any step fails, no handoff
+stands, so the controller holds for diagnostics and triggers a normal stop that needs
+no job closure. It also writes `root-handoff-withdrawn.json`, which job preparation,
+export, extension and the closure watch all refuse, and renames a published handoff
+receipt away when that write fails. Publication and withdrawal run under the
+operation's exclusive job lock, which every job command holds shared from before its
+stopping checks, so no job is admitted on a handoff the controller withdraws. The
+controller tries revocation only while it holds that lock. A published handoff that
+neither the withdrawal nor the rename could revoke keeps its job-closure requirement,
+since a job may have been admitted after the lock was released, and the provider TTL
+bounds that case.
+
+Before any job work, `remote-executor.py admit` refuses a worker that lacks one of the
+commands that the query, write and Jena screens and the remote build run there, and
+names it. A test derives those commands from the worker-side scripts, their heredocs
+and the remote command strings. The check does not cover the commands of Boat gates
+or partitioned test shares.
 
 Qualification runs in a named local 512-MiB, zero-swap controller unit with 2,700-second
 runtime and 30-second stop limits. The controller returns after qualification/handoff;
