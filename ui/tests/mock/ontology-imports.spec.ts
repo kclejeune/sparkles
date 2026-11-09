@@ -5,6 +5,9 @@
 // closure and the map without the actions; and the phone layout. Each test works on its own
 // branch. The mock shares the map across branches, so each test uses its own import IRIs.
 
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import { expectNoSidewaysScroll } from '../phone';
 
@@ -157,6 +160,100 @@ test('excluding imported axioms reads the views without the imports', async ({ p
     await expect.poll(() => reads.some((u) => u.includes('imports=false'))).toBe(true);
     await page.getByRole('checkbox', { name: 'Imported axioms' }).check();
     await expect(closure(page)).toBeVisible();
+  } finally {
+    await request.delete(`/$/branches/uni/${branch}?force=true`);
+  }
+});
+
+test('a catalog folder keeps the paths of the files in its subfolders', async ({
+  page,
+  request,
+}) => {
+  const branch = 'imports-folder';
+  await newBranch(request, branch);
+  const dir = mkdtempSync(join(tmpdir(), 'onto-catalog-'));
+  try {
+    await update(
+      request,
+      branch,
+      `INSERT DATA { <http://example.org/uni> <${OWL}imports> <http://example.org/f/lib> }`,
+    );
+    const catalog = `<?xml version="1.0"?>
+<catalog xmlns="urn:oasis:names:tc:entity:xmlns:xml:catalog">
+  <uri name="http://example.org/f/lib" uri="sub/lib.ttl"/>
+</catalog>`;
+    mkdirSync(join(dir, 'onto', 'sub'), { recursive: true });
+    writeFileSync(join(dir, 'onto', 'catalog-v001.xml'), catalog);
+    writeFileSync(
+      join(dir, 'onto', 'sub', 'lib.ttl'),
+      `<http://example.org/f/Lib> a <${OWL}Class> .`,
+    );
+    await openImports(page, branch);
+    await expect(unresolved(page).locator('li')).toHaveCount(1);
+    const form = page.getByRole('form', { name: 'Load an XML catalog' });
+    await form.getByLabel('Catalog').setInputFiles(join(dir, 'onto', 'catalog-v001.xml'));
+    await form.getByLabel('Folder').setInputFiles(join(dir, 'onto'));
+    await form.getByRole('button', { name: 'Load catalog' }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'Loaded 1 file' })).not.toContainText(
+      'skipped',
+    );
+    await expect(unresolved(page)).toHaveCount(0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await request.delete(`/$/branches/uni/${branch}?force=true`);
+  }
+});
+
+test('the switch and a map change read the tree and the frame again', async ({ page, request }) => {
+  const branch = 'imports-reread';
+  await newBranch(request, branch);
+  try {
+    await seed(request, branch, 'reread');
+    await page.goto(`/ui/workbench/ontology?${new URLSearchParams({ ds: 'uni', branch })}`);
+    const classes = page.getByRole('tree', { name: 'Classes (asserted)' });
+    const agent = classes.getByRole('button', { name: 'Agent', exact: true });
+    await expect(agent).toBeVisible({ timeout: 30_000 });
+    // toggling the switch, with no class selected, reads the roots again each time
+    const toggle = page.getByRole('checkbox', { name: 'Imported axioms' });
+    await toggle.uncheck();
+    await expect(page).toHaveURL(/imports=0/);
+    await expect(agent).toBeVisible();
+    await toggle.check();
+    await expect(page).not.toHaveURL(/imports=0/);
+    await expect(agent).toBeVisible();
+    // a filter searches and reads ancestors with the switch's selection
+    await toggle.uncheck();
+    await expect(page).toHaveURL(/imports=0/);
+    const filtered: string[] = [];
+    page.on('request', (r) => {
+      if (/\/\$\/ontology\/uni\/(search|hierarchy)\?/.test(r.url())) filtered.push(r.url());
+    });
+    await page.getByRole('searchbox', { name: 'Filter' }).fill('Agent');
+    await expect.poll(() => filtered.some((u) => u.includes('/hierarchy?'))).toBe(true);
+    expect(filtered.filter((u) => u.includes('/search?')).length).toBeGreaterThan(0);
+    for (const u of filtered) expect(u, u).toContain('imports=false');
+    await page.getByRole('searchbox', { name: 'Filter' }).fill('');
+    await toggle.check();
+    await expect(page).not.toHaveURL(/imports=0/);
+    // a map change keeps the commit, and the tree and the frame are read again
+    await agent.click();
+    await expect(page).toHaveURL(/iri=/);
+    await page.getByRole('tab', { name: 'Imports' }).click();
+    await expect(page.getByRole('region', { name: 'Imports' })).toBeVisible();
+    const reads: string[] = [];
+    page.on('request', (r) => {
+      if (/\/\$\/ontology\/uni\/(hierarchy|entity)\?/.test(r.url())) reads.push(r.url());
+    });
+    await page
+      .getByRole('textbox', { name: 'Import IRI' })
+      .fill('http://example.org/reread/missing');
+    await page.getByRole('textbox', { name: 'Graph' }).fill('http://example.org/reread/lib2');
+    await page.getByRole('button', { name: 'Add entry' }).click();
+    await expect(mapTable(page)).toContainText('manual');
+    await page.getByRole('tab', { name: 'Tree' }).click();
+    await expect(agent).toBeVisible();
+    await expect.poll(() => reads.some((u) => u.includes('/hierarchy?'))).toBe(true);
+    await expect.poll(() => reads.some((u) => u.includes('/entity?'))).toBe(true);
   } finally {
     await request.delete(`/$/branches/uni/${branch}?force=true`);
   }

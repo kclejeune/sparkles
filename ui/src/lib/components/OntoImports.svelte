@@ -310,12 +310,21 @@
             onchange={(e) => (files = [...(e.currentTarget.files ?? [])])}
           /></label
         >
+        <!-- a folder keeps each file's path below it, which a catalog's sub/lib.ttl names -->
+        <label class="form-row"
+          >Folder <input
+            type="file"
+            webkitdirectory
+            onchange={(e) => (files = [...(e.currentTarget.files ?? [])])}
+          /></label
+        >
         <button class="btn sm" disabled={!catalogFile || busy != null}
           >{#if busy === 'catalog'}<span class="spinner"></span>{/if} Load catalog</button
         >
       </form>
       <p class="faint small">
-        Each file replaces the graph of the import its catalog entry names, in one commit.
+        Each file replaces the graph of the import its catalog entry names, in one commit. Choose
+        the catalog's folder when its entries name files in subfolders.
       </p>
     {/if}
   {:else if !error}

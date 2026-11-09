@@ -378,21 +378,25 @@
     });
   });
 
-  // including or excluding the imported axioms reads every view again, and keeps the undo stack
-  let importsShown: boolean | null = null;
+  // Including or excluding the imported axioms, or a change of the import map, reads every
+  // view again and keeps the undo stack. A map change keeps the commit, so the views'
+  // identities carry `importsRev` as well as the switch.
+  let importsRev = $state(0);
+  function rereadImports() {
+    summary = null;
+    shown = 0;
+    loadedTarget = null;
+    resetLazy();
+    for (const lt of levelTrees.values()) lt.drop();
+    individualLevel.drop();
+    classification = null;
+    void loadAll();
+  }
+  let importsShown: string | null = null;
   $effect(() => {
-    const w = withImports;
+    const w = `${withImports}\u0000${importsRev}`;
     untrack(() => {
-      if (importsShown !== null && importsShown !== w) {
-        summary = null;
-        shown = 0;
-        loadedTarget = null;
-        resetLazy();
-        for (const lt of levelTrees.values()) lt.drop();
-        individualLevel.drop();
-        classification = null;
-        void loadAll();
-      }
+      if (importsShown !== null && importsShown !== w) rereadImports();
       importsShown = w;
     });
   });
@@ -493,7 +497,7 @@
   let levelCommit: number | null = null;
   $effect(() => {
     const context = `${target}\u0000${graph ?? ''}`;
-    const scope = `${context}\u0000${langs.join(',')}`;
+    const scope = `${context}\u0000${langs.join(',')}\u0000${withImports}\u0000${importsRev}`;
     const commit = summary?.commit ?? null;
     untrack(() => {
       if (scope !== levelScope) {
@@ -555,8 +559,10 @@
     // the scope is read here, where the effect tracks it, not in the timer below
     const scopeTarget = target;
     const scopeGraph = graph;
+    const scopeImports = withImports;
+    void importsRev;
     const individualCommit = k === 'NamedIndividual' ? (summary?.commit ?? null) : null;
-    const scope = `${scopeTarget}\u0000${scopeGraph ?? ''}\u0000${langs.join(',')}\u0000${individualCommit ?? ''}`;
+    const scope = `${scopeTarget}\u0000${scopeGraph ?? ''}\u0000${scopeImports}\u0000${importsRev}\u0000${langs.join(',')}\u0000${individualCommit ?? ''}`;
     if (scope !== filteredIn) {
       // another dataset, branch or graph must not keep showing the last scope's hits
       filteredIn = scope;
@@ -575,6 +581,7 @@
           kind: [kind],
           limit: 20,
           graph: scopeGraph,
+          imports: scopeImports,
           signal: ctl.signal,
         });
         if (kind === 'individual') {
@@ -582,7 +589,7 @@
             r.results.map((h) =>
               fetchIndividuals(
                 scopeTarget,
-                { graph: scopeGraph, imports: true },
+                { graph: scopeGraph, imports: scopeImports },
                 {
                   iri: h.iri,
                   at: `commit:${individualCommit}`,
@@ -635,7 +642,7 @@
           r.results.map((h) =>
             fetchHierarchy(
               scopeTarget,
-              { graph: scopeGraph, imports: true },
+              { graph: scopeGraph, imports: scopeImports },
               { kind, iri: h.iri, ancestors: true, limit: 1 },
               ctl.signal,
             ),
@@ -821,7 +828,7 @@
     const t = target;
     const commit = summary?.commit;
     const selection = { ...sel };
-    const scope = JSON.stringify([t, selection.graph, selection.imports]);
+    const scope = JSON.stringify([t, selection.graph, selection.imports, importsRev]);
     if (!iri || commit == null) {
       frameSeq++;
       frameAbort?.abort();
@@ -885,6 +892,8 @@
     void selected;
     void target;
     void graph;
+    void withImports;
+    void importsRev;
     void summary?.commit;
     untrack(() => void loadFrame());
   });
@@ -1081,10 +1090,10 @@
     frameContext: string | null;
   } | null>(null);
   const frameContext = $derived(
-    JSON.stringify([target, sel.graph, sel.imports, selected, frameKind]),
+    JSON.stringify([target, sel.graph, sel.imports, importsRev, selected, frameKind]),
   );
   const frameSource = $derived(
-    JSON.stringify([target, sel.graph, sel.imports, selected, frameKind, frameCommit]),
+    JSON.stringify([target, sel.graph, sel.imports, importsRev, selected, frameKind, frameCommit]),
   );
   const session = new EditSession({
     reload: async () => {
@@ -1569,7 +1578,7 @@
               imports={withImports}
               name={(i) => (i === 'default' ? 'default graph' : iriName(i, prefixes))}
               oncommitted={discussed}
-              onchanged={() => void loadAll()}
+              onchanged={() => importsRev++}
             />{/key}
         </div>
       </section>
@@ -1760,16 +1769,18 @@
               {#if inferredKind && inferredOn}
                 <div class="tree-col">
                   <div class="tree-scroll">
-                    <InferredTreeView
-                      {target}
-                      {graph}
-                      imports={sel.imports}
-                      commit={summary?.commit ?? null}
-                      kind={inferredKind}
-                      {selected}
-                      pins={inferredPins}
-                      onopen={(iri) => nav({ iri })}
-                    />
+                    {#key importsRev}
+                      <InferredTreeView
+                        {target}
+                        {graph}
+                        imports={sel.imports}
+                        commit={summary?.commit ?? null}
+                        kind={inferredKind}
+                        {selected}
+                        pins={inferredPins}
+                        onopen={(iri) => nav({ iri })}
+                      />
+                    {/key}
                   </div>
                   {#if kindTab === 'Class'}
                     <h2 class="col-title">
@@ -1948,26 +1959,30 @@
                     onopen={(iri) => nav({ iri, view: null })}
                   />
                   {#if frameKind === 'Class'}
-                    <ClassificationFrame
-                      {target}
-                      {graph}
-                      imports={sel.imports}
-                      iri={selected}
-                      commit={frameCommit}
-                      items={frameItems}
-                      pins={frameCommit === summary?.commit ? inferredPins : undefined}
-                      onopen={(iri) => nav({ iri, view: null })}
-                    />
+                    {#key importsRev}
+                      <ClassificationFrame
+                        {target}
+                        {graph}
+                        imports={sel.imports}
+                        iri={selected}
+                        commit={frameCommit}
+                        items={frameItems}
+                        pins={frameCommit === summary?.commit ? inferredPins : undefined}
+                        onopen={(iri) => nav({ iri, view: null })}
+                      />
+                    {/key}
                   {:else if ['ObjectProperty', 'DataProperty', 'NamedIndividual'].includes(frameKind)}
-                    <MaterializedFrame
-                      {target}
-                      {graph}
-                      imports={sel.imports}
-                      iri={selected}
-                      commit={frameCommit}
-                      items={frameItems}
-                      pins={frameCommit === summary?.commit ? inferredPins : undefined}
-                    />
+                    {#key importsRev}
+                      <MaterializedFrame
+                        {target}
+                        {graph}
+                        imports={sel.imports}
+                        iri={selected}
+                        commit={frameCommit}
+                        items={frameItems}
+                        pins={frameCommit === summary?.commit ? inferredPins : undefined}
+                      />
+                    {/key}
                   {/if}
                 {/key}
               {:else if view === 'discussion' && summary && selected}
