@@ -1566,7 +1566,7 @@ class UntrackedDiagnostics(unittest.TestCase):
     def repository(self):
         tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup);repo=Path(tmp.name)/'repo';repo.mkdir()
         self.git(repo,'init','-q');(repo/'.gitignore').write_text('target/\n*.log\n');(repo/'a.txt').write_text('a\n')
-        self.git(repo,'add','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','commit','-qm','x')
+        self.git(repo,'add','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','-c','commit.gpgsign=false','commit','-qm','x')
         return repo
 
     def test_untracked_paths_are_listed_with_sizes_and_mtimes(self):
@@ -1632,7 +1632,7 @@ class UntrackedRoundOne(UntrackedDiagnostics):
         d=diagnostic_module();repo=self.repository()
         for parent in ('.ssh','secrets','config/tokens'):
             (repo/parent).mkdir(parents=True);(repo/parent/'tracked').write_text('t')
-        self.git(repo,'add','-f','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','commit','-qm','y')
+        self.git(repo,'add','-f','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','-c','commit.gpgsign=false','commit','-qm','y')
         for parent in ('.ssh','secrets','config/tokens'):(repo/parent/'DO_NOT_COPY_child').write_text('x')
         (repo/'plain.txt').write_text('p')
         row=d.untracked([str(repo)])[str(repo)]
