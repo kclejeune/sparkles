@@ -111,7 +111,7 @@ pub use review::{
 pub use sparkles_core::evidence::review::{DecisionInput, Disposition, WithdrawalInput};
 pub use sparkles_core::evidence::{
     ASSESSMENT_INPUT_KINDS, MAX_ASSESSMENT_INPUTS, MAX_CLAIMS, MAX_IDENTITIES,
-    MAX_IDENTITY_ENTITIES, MIN_IDENTITY_ENTITIES,
+    MAX_IDENTITY_ENTITIES, MIN_IDENTITY_ENTITIES, prepare_input,
 };
 pub use sparkles_core::evidence::{
     AssessmentInput, ClaimInput, Confidence, ConfidenceFacets, EvidenceInput, EvidenceLinkInput,

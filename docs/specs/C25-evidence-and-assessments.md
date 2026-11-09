@@ -1621,16 +1621,16 @@ decision rather than an inference.
 #### Bounds
 
 The existing refusals of more than 10 MiB of input or 2 MiB of converted text answer
-`too-large` before extraction or any write. Every fact makes at least one claim, so
-extraction stops calling the model once the collected facts exceed the 1,000 claims of
-§8, and the run is refused with `too-large`, writing nothing. The class and label claims
-of new entities are known only after linking, and a batch that they take over the bound
-is refused the same way before anything is written. An upper bound that counted every
-mention as a new entity would refuse documents whose mentions link to existing entities. Before `propose`, the pipeline charges the batch's
-decoded size, including the rendition text, quotes and literals, against the 16 MiB of
-§8, and the same refusal applies when it is exceeded. The HTTP route enforces that
-bound only through its body limit, so the pipeline must check it itself. A document is
-never split into several batches.
+`too-large` before extraction or any write. Linking follows the extraction chunk by
+chunk, so after each chunk that answers, the run knows the claims that the batch would
+hold so far. Those are the distinct fact claims together with the class and label
+claims of the new entities. Extraction stops calling the model as soon as that count
+exceeds the 1,000 claims of §8, and the run is refused with `too-large`, writing
+nothing. Each entity is linked once however many chunks name it. Before `propose`, the
+pipeline prepares the batch as the proposal will and refuses it the same way when its
+decoded size, including the rendition text, quotes and literals, exceeds the 16 MiB of
+§8. The HTTP route enforces that bound only through its body limit, so the pipeline
+must check it itself. A document is never split into several batches.
 
 The rejected alternative splits a large document into several batches. Each batch would
 publish separately, and a refusal partway through would leave the earlier batches

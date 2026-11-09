@@ -28,8 +28,6 @@ use sparkles::task::Control;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-/// The decoded size one batch may hold (spec C25 §8).
-const MAX_DECODED: usize = 16 << 20;
 /// How many times a moved head is planned again.
 const REPLANS: usize = 3;
 const ZERO_TO_ONE: &str = "urn:x-sparkles:evidence:ZeroToOne";
@@ -386,15 +384,36 @@ struct Source<'a> {
     text: &'a str,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn batch(
+/// One claim of an extraction with its span, confidence and the model whose answer
+/// gave it.
+struct Proposition {
+    triple: Triple,
+    span: (usize, usize),
+    confidence: Option<f64>,
+    model: NamedNode,
+}
+
+/// The claims that an extraction makes once its entities are linked.
+struct Claims {
+    claims: Vec<Proposition>,
+    /// the facts left out, with their code
+    failed: Vec<Value>,
+    flagged: Vec<Value>,
+    candidates: Vec<Value>,
+    entities: Value,
+}
+
+/// The claims of `facts` with the entities of `linked`, refused with `too-large` when
+/// they are more than one batch holds. A new entity's IRI is a name-based UUID of the
+/// revision.
+fn claims_of(
     r: &Run,
     v: &Vocabulary,
     facts: &[Fact],
     linked: &Linked,
-    src: &Source,
+    revision_digest: &Sha256Digest,
     mut failed_facts: Vec<Value>,
-) -> Result<Batch, Failed> {
+) -> Result<Claims, Failed> {
     let dataset_id = r
         .ctx
         .server
@@ -402,72 +421,6 @@ fn batch(
         .get(&r.dataset)
         .map(|d| d.store.dataset_id())
         .unwrap_or_default();
-    let mut input = EvidenceInput::default();
-    input.revisions.push(SourceRevisionInput {
-        version: RecordVersion::V1,
-        key: key("rev"),
-        source: src.source.clone(),
-        source_key: key(src.source_key.clone()),
-        upstream_version: None,
-        content: SourceContent::MetadataOnly {
-            digest: src.revision_digest,
-        },
-        metadata: sparkles::evidence::SourceMetadata {
-            locators: src.locator.iter().cloned().collect(),
-            reported_rights: Vec::new(),
-        },
-        times: Default::default(),
-        lineage: Default::default(),
-    });
-    input.renditions.push(RenditionInput {
-        version: RecordVersion::V1,
-        key: key("text"),
-        revision: RecordRef::Local(key("rev")),
-        occurrence_key: key(src.rendition_key.clone()),
-        conversion: MethodRef {
-            method: agent_iri("urn:x-sparkles:ingest:convert:", src.format),
-            version: key(env!("CARGO_PKG_VERSION")),
-        },
-        media_type: src.media_type.to_string(),
-        language: None,
-        content: RenditionContent::NormalizedText(src.text.to_string()),
-        expected_digest: None,
-    });
-    let chars: Vec<char> = src.text.chars().collect();
-    let mut decoded = src.text.len();
-    // one passage and one reference per distinct span
-    let mut spans: BTreeMap<(usize, usize), usize> = BTreeMap::new();
-    let mut passage = |input: &mut EvidenceInput, a: usize, b: usize| -> Result<usize, Failed> {
-        if let Some(i) = spans.get(&(a, b)) {
-            return Ok(*i);
-        }
-        let i = spans.len();
-        let quote: String = chars[a..b].iter().collect();
-        decoded += quote.len() * 2;
-        input.passages.push(PassageInput {
-            version: RecordVersion::V1,
-            key: key(format!("p{i}")),
-            revision: RecordRef::Local(key("rev")),
-            rendition: RecordRef::Local(key("text")),
-            occurrence_key: key(format!("{a}-{b}")),
-            start: a as u64,
-            end: b as u64,
-            text_digest: sha(quote.as_bytes())?,
-            quote: Some(quote),
-        });
-        input.references.push(EvidenceRefInput {
-            version: RecordVersion::V1,
-            key: key(format!("r{i}")),
-            occurrence_key: key(format!("{a}-{b}")),
-            target: EvidenceRefTarget::Passage {
-                revision: RecordRef::Local(key("rev")),
-                rendition: RecordRef::Local(key("text")),
-                passage: RecordRef::Local(key(format!("p{i}"))),
-            },
-        });
-        spans.insert((a, b), i);
-        Ok(i)
-    };
     let prefixes = merged(&v.prefixes, &linked.prefixes);
     let named = |s: &str| -> Option<NamedNode> {
         let s = s.trim();
@@ -501,10 +454,7 @@ fn batch(
                 let norm = crate::mcp::memory::ingest::fold_ws(text).to_lowercase();
                 let id = crate::mcp::memory::assert::uuid_v5(
                     &dataset_id,
-                    &format!(
-                        "ingest-claims-entity\0{}\0{norm}\0{class}",
-                        src.revision_digest
-                    ),
+                    &format!("ingest-claims-entity\0{}\0{norm}\0{class}", revision_digest),
                 );
                 Some(NamedNode::new_unchecked(format!(
                     "urn:uuid:{}",
@@ -514,8 +464,7 @@ fn batch(
         })
         .collect();
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-    // each claim with its passage, confidence and the model whose answer gave it
-    let mut claims: Vec<(Triple, usize, Option<f64>, NamedNode)> = Vec::new();
+    let mut claims: Vec<Proposition> = Vec::new();
     let mut first_span: HashMap<usize, (usize, usize, NamedNode)> = HashMap::new();
     for f in facts {
         let term_of = |k: &str| linked.entity_of.get(k).and_then(|e| entity_iri[*e].clone());
@@ -575,14 +524,18 @@ fn batch(
                     .or_insert((f.start, f.end, model.clone()));
             }
         }
-        let i = passage(&mut input, f.start, f.end)?;
-        let t = Triple::new(s, p, o);
-        let id = format!("{t} {i}");
+        let triple = Triple::new(s, p, o);
+        let id = format!("{triple} {}-{}", f.start, f.end);
         if seen.contains_key(&id) {
             continue;
         }
         seen.insert(id, claims.len());
-        claims.push((t, i, f.confidence, model));
+        claims.push(Proposition {
+            triple,
+            span: (f.start, f.end),
+            confidence: f.confidence,
+            model,
+        });
     }
     // a new entity's class and label are claims too, cited by its first passage
     let label_p = v
@@ -600,14 +553,14 @@ fn batch(
         };
         let (a, b) = (*a, *b);
         new_entities += 1;
-        let i = passage(&mut input, a, b)?;
+        let span = (a, b);
         if let Some(c) = named(class) {
-            claims.push((
-                Triple::new(iri.clone(), rdf::TYPE, c),
-                i,
-                None,
-                model.clone(),
-            ));
+            claims.push(Proposition {
+                triple: Triple::new(iri.clone(), rdf::TYPE, c),
+                span,
+                confidence: None,
+                model: model.clone(),
+            });
         }
         let label: Term = match &v.language {
             Some(lang) => Literal::new_language_tagged_literal(text.clone(), lang)
@@ -615,12 +568,12 @@ fn batch(
                 .unwrap_or_else(|_| Literal::new_simple_literal(text.clone()).into()),
             None => Literal::new_simple_literal(text.clone()).into(),
         };
-        claims.push((
-            Triple::new(iri.clone(), label_p.clone(), label),
-            i,
-            None,
-            model.clone(),
-        ));
+        claims.push(Proposition {
+            triple: Triple::new(iri.clone(), label_p.clone(), label),
+            span,
+            confidence: None,
+            model: model.clone(),
+        });
     }
     if claims.len() > sparkles::evidence::MAX_CLAIMS {
         return Err(too_large(format!(
@@ -629,21 +582,96 @@ fn batch(
             sparkles::evidence::MAX_CLAIMS
         )));
     }
-    // every field a claim and its link frame: the proposition, the keys, the author,
-    // the evaluator and the methods, counted twice for their escaped forms
-    decoded += 2 * (src.source.as_str().len() + src.source_key.len() + 512);
-    for (n, (t, i, confidence, model)) in claims.iter().enumerate() {
-        decoded +=
-            2 * (t.to_string().len() + src.source.as_str().len() + 3 * model.as_str().len() + 512);
-        let occurrence = format!(
-            "{t} {}-{}",
-            input.passages[*i].start, input.passages[*i].end
-        );
-        let digest = sha(occurrence.as_bytes())?;
-        let confidence = confidence.map(|c| Confidence {
+    let count = |f: fn(&Link) -> bool| linked.links.iter().filter(|l| f(l)).count();
+    let entities = json!({
+        "linked": count(|l| matches!(l, Link::Existing(_))),
+        "new": new_entities,
+        "ambiguous": count(|l| matches!(l, Link::Ambiguous(..))),
+    });
+    flagged.dedup();
+    Ok(Claims {
+        claims,
+        failed: failed_facts,
+        flagged,
+        candidates,
+        entities,
+    })
+}
+
+/// The claims of an extraction as one evidence batch, refused with `too-large` when its
+/// preparation exceeds the decoded bound of spec C25 §8.
+fn batch(src: &Source, c: Claims, control: &Control) -> Result<Batch, Failed> {
+    let mut input = EvidenceInput::default();
+    input.revisions.push(SourceRevisionInput {
+        version: RecordVersion::V1,
+        key: key("rev"),
+        source: src.source.clone(),
+        source_key: key(src.source_key.clone()),
+        upstream_version: None,
+        content: SourceContent::MetadataOnly {
+            digest: src.revision_digest,
+        },
+        metadata: sparkles::evidence::SourceMetadata {
+            locators: src.locator.iter().cloned().collect(),
+            reported_rights: Vec::new(),
+        },
+        times: Default::default(),
+        lineage: Default::default(),
+    });
+    input.renditions.push(RenditionInput {
+        version: RecordVersion::V1,
+        key: key("text"),
+        revision: RecordRef::Local(key("rev")),
+        occurrence_key: key(src.rendition_key.clone()),
+        conversion: MethodRef {
+            method: agent_iri("urn:x-sparkles:ingest:convert:", src.format),
+            version: key(env!("CARGO_PKG_VERSION")),
+        },
+        media_type: src.media_type.to_string(),
+        language: None,
+        content: RenditionContent::NormalizedText(src.text.to_string()),
+        expected_digest: None,
+    });
+    let chars: Vec<char> = src.text.chars().collect();
+    // one passage and one reference per distinct span, in the order the claims cite them
+    let mut spans: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+    for (n, claim) in c.claims.iter().enumerate() {
+        let (a, b) = claim.span;
+        let i = match spans.get(&(a, b)) {
+            Some(i) => *i,
+            None => {
+                let i = spans.len();
+                let quote: String = chars[a..b].iter().collect();
+                input.passages.push(PassageInput {
+                    version: RecordVersion::V1,
+                    key: key(format!("p{i}")),
+                    revision: RecordRef::Local(key("rev")),
+                    rendition: RecordRef::Local(key("text")),
+                    occurrence_key: key(format!("{a}-{b}")),
+                    start: a as u64,
+                    end: b as u64,
+                    text_digest: sha(quote.as_bytes())?,
+                    quote: Some(quote),
+                });
+                input.references.push(EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key(format!("r{i}")),
+                    occurrence_key: key(format!("{a}-{b}")),
+                    target: EvidenceRefTarget::Passage {
+                        revision: RecordRef::Local(key("rev")),
+                        rendition: RecordRef::Local(key("text")),
+                        passage: RecordRef::Local(key(format!("p{i}"))),
+                    },
+                });
+                spans.insert((a, b), i);
+                i
+            }
+        };
+        let digest = sha(format!("{} {a}-{b}", claim.triple).as_bytes())?;
+        let confidence = claim.confidence.map(|v| Confidence {
             scale: NamedNode::new_unchecked(ZERO_TO_ONE),
-            value: Literal::new_typed_literal(decimal(c), xsd::DECIMAL),
-            evaluator: model.clone(),
+            value: Literal::new_typed_literal(decimal(v), xsd::DECIMAL),
+            evaluator: claim.model.clone(),
             method: Some(MethodRef {
                 method: NamedNode::new_unchecked("urn:x-sparkles:ingest:extract"),
                 version: key(env!("CARGO_PKG_VERSION")),
@@ -654,7 +682,7 @@ fn batch(
             key: key(format!("c{n}")),
             occurrence_key: key(digest.to_string()),
             revision: RecordRef::Local(key("rev")),
-            proposition: t.clone(),
+            proposition: claim.triple.clone(),
             kind: ClaimKind::Reported,
             polarity: Polarity::Positive,
             attributed_author: src.source.clone(),
@@ -671,28 +699,29 @@ fn batch(
             target: RecordRef::Local(key(format!("c{n}"))),
             evidence: RecordRef::Local(key(format!("r{i}"))),
             relation: EvidenceRelation::Supports,
-            attributed_author: model.clone(),
+            attributed_author: claim.model.clone(),
         });
     }
-    if decoded > MAX_DECODED {
-        return Err(too_large(format!(
-            "the batch would decode to about {decoded} bytes; one batch holds at most {MAX_DECODED}"
-        )));
+    // the decoded bound is the one the proposal's preparation charges
+    match sparkles::evidence::prepare_input(&input, control) {
+        Ok(_) => {}
+        Err(sparkles::Error::BudgetExceeded(b))
+            if matches!(b.kind, sparkles::BudgetKind::DecompressedBytes) =>
+        {
+            return Err(too_large(format!(
+                "the batch decodes to at least {} bytes; one batch holds at most {}",
+                b.requested, b.limit
+            )));
+        }
+        Err(e) => return Err(api(e.into())),
     }
-    let count = |f: fn(&Link) -> bool| linked.links.iter().filter(|l| f(l)).count();
-    let entities = json!({
-        "linked": count(|l| matches!(l, Link::Existing(_))),
-        "new": new_entities,
-        "ambiguous": count(|l| matches!(l, Link::Ambiguous(..))),
-    });
-    flagged.dedup();
     Ok(Batch {
         claims: input.claims.len(),
         input,
-        failed: failed_facts,
-        flagged,
-        candidates,
-        entities,
+        failed: c.failed,
+        flagged: c.flagged,
+        candidates: c.candidates,
+        entities: c.entities,
     })
 }
 
@@ -737,10 +766,7 @@ fn publish(
 ) -> Result<(sparkles::evidence::Proposed, Option<Value>), Failed> {
     let st = r.ctx.server.state.clone();
     let p = r.ctx.principal.clone();
-    let control = Control {
-        deadline: Some(r.ctx.deadline),
-        ..Control::with_cancel(r.ctx.cancel.clone())
-    };
+    let control = control_of(r);
     let mut attempt = 0;
     loop {
         r.check()?;
@@ -762,6 +788,7 @@ fn publish(
             options.if_head = Some(pl.head);
             options.ordinary = Some(pl.changes.clone());
         }
+        t.main.store.failpoint("ingest-claims-before-publish");
         match crate::evidence::propose_ingested(
             &st,
             (&t.main, &t.logical),
@@ -850,6 +877,46 @@ fn model_iri(pair: Option<&crate::models::Pair>) -> NamedNode {
 }
 
 /// Run a claims ingestion of a document.
+/// The run's deadline and cancellation as a task control.
+fn control_of(r: &Run) -> Control {
+    Control {
+        deadline: Some(r.ctx.deadline),
+        ..Control::with_cancel(r.ctx.cancel.clone())
+    }
+}
+
+/// Extract the facts of `text` and link their entities on `branch`. Linking follows the
+/// extraction chunk by chunk, so the extraction stops calling the model as soon as the
+/// claims collected, with the class and label claims of new entities, pass the bound of
+/// one batch.
+fn extract_and_link(
+    r: &mut Run,
+    (models, pairs): (&crate::models::Models, &[crate::models::Pair]),
+    vocab: &Vocabulary,
+    (text, chunks): (&str, &[(usize, usize)]),
+    branch: Option<&str>,
+    revision_digest: &Sha256Digest,
+) -> Result<(super::extract::Extraction, Linked), Failed> {
+    let mut linker = super::extract::Linker::new();
+    let mut check = |r: &mut Run, ex: &super::extract::Extraction| -> Result<(), Failed> {
+        linker.update(r, ex, branch)?;
+        claims_of(
+            r,
+            vocab,
+            &ex.facts,
+            &linker.linked(ex),
+            revision_digest,
+            Vec::new(),
+        )
+        .map(|_| ())
+    };
+    let ex = super::extract::extract(r, models, pairs, vocab, text, chunks, Some(&mut check))?;
+    r.ctx.progress.status(Status::Linking, 0.82, None);
+    linker.update(r, &ex, branch)?;
+    let linked = linker.linked(&ex);
+    Ok((ex, linked))
+}
+
 pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     let ctx = r.ctx;
     let t = target(r, req)?;
@@ -966,16 +1033,14 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     let branch = (t.branch != sparkles::branch::MAIN).then_some(t.branch.as_str());
     let vocab = Vocabulary::read_on(r, &profile, branch)?;
     estimate(r, req, models, &pairs, &vocab, &text, &chunks, &t)?;
-    let ex = super::extract::extract(
+    let (ex, linked) = extract_and_link(
         r,
-        models,
-        &pairs,
+        (models, &pairs),
         &vocab,
-        &text,
-        &chunks,
-        Some(sparkles::evidence::MAX_CLAIMS),
+        (&text, &chunks),
+        branch,
+        &revision_digest,
     )?;
-    let linked = super::extract::link(r, &ex, branch)?;
     ctx.progress.status(Status::Writing, 0.9, None);
     let src = Source {
         source: NamedNode::new(source.clone()).map_err(|e| failed("error", 500, e.to_string()))?,
@@ -991,7 +1056,15 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         format: format.name(),
         text: &text,
     };
-    let b = batch(r, &vocab, &ex.facts, &linked, &src, ex.failed.clone())?;
+    let c = claims_of(
+        r,
+        &vocab,
+        &ex.facts,
+        &linked,
+        &revision_digest,
+        ex.failed.clone(),
+    )?;
+    let b = batch(&src, c, &control_of(r))?;
     let message = format!(
         "Ingest claims from {}",
         title.as_deref().unwrap_or(source.as_str())
@@ -1110,16 +1183,14 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
     let branch = (t.branch != sparkles::branch::MAIN).then_some(t.branch.as_str());
     let vocab = Vocabulary::read_on(r, &profile, branch)?;
     estimate(r, req, models, &pairs, &vocab, &read.text, &read.chunks, &t)?;
-    let ex = super::extract::extract(
+    let (ex, linked) = extract_and_link(
         r,
-        models,
-        &pairs,
+        (models, &pairs),
         &vocab,
-        &read.text,
-        &read.chunks,
-        Some(sparkles::evidence::MAX_CLAIMS),
+        (&read.text, &read.chunks),
+        branch,
+        &revision_digest,
     )?;
-    let linked = super::extract::link(r, &ex, branch)?;
     ctx.progress.status(Status::Writing, 0.9, None);
     let media_type = read.found["format"]
         .as_str()
@@ -1136,7 +1207,15 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
         format: "registered",
         text: &read.text,
     };
-    let b = batch(r, &vocab, &ex.facts, &linked, &src, ex.failed.clone())?;
+    let c = claims_of(
+        r,
+        &vocab,
+        &ex.facts,
+        &linked,
+        &revision_digest,
+        ex.failed.clone(),
+    )?;
+    let b = batch(&src, c, &control_of(r))?;
     let message = format!("Ingest claims from {source_iri}");
     let (proposed, _) = publish(r, &t, &b.input, None, None, &key, message)?;
     finish(&mut out, &proposed, &b, &ex);
@@ -1163,5 +1242,49 @@ mod tests {
         assert_eq!(c.delete.len(), 1);
         assert_eq!(c.insert.len(), 1);
         assert_eq!(c.insert[0].graph_name.to_string(), "<urn:g>");
+    }
+
+    /// One claim whose literal object holds `bytes` bytes, as a batch.
+    fn one_claim(bytes: usize) -> Result<super::Batch, super::Failed> {
+        use oxrdf::{Literal, NamedNode, Triple};
+        let text = "Ana Lima moved to the payments team this week.";
+        let src = super::Source {
+            source: NamedNode::new_unchecked("urn:source"),
+            source_key: "k".into(),
+            revision_digest: super::sha(text.as_bytes()).ok().unwrap(),
+            locator: None,
+            rendition_key: "urn:rendition".into(),
+            media_type: "text/markdown",
+            format: "markdown",
+            text,
+        };
+        let c = super::Claims {
+            claims: vec![super::Proposition {
+                triple: Triple::new(
+                    NamedNode::new_unchecked("urn:s"),
+                    NamedNode::new_unchecked("urn:p"),
+                    Literal::new_simple_literal("x".repeat(bytes)),
+                ),
+                span: (0, 8),
+                confidence: Some(0.9),
+                model: NamedNode::new_unchecked("urn:x-sparkles:model:m"),
+            }],
+            failed: Vec::new(),
+            flagged: Vec::new(),
+            candidates: Vec::new(),
+            entities: serde_json::json!({}),
+        };
+        super::batch(&src, c, &sparkles::task::Control::default())
+    }
+
+    #[test]
+    fn the_decoded_bound_is_the_one_the_proposal_charges() {
+        // a batch whose content is most of the 16 MiB is admitted, though an estimate
+        // that counted its fields twice would refuse it
+        let b = one_claim(15 << 20).ok().unwrap();
+        assert_eq!(b.claims, 1);
+        let e = one_claim(16 << 20).err().unwrap();
+        assert_eq!(e.0["code"], "too-large", "{}", e.0);
+        assert_eq!(e.0["status"], 413);
     }
 }
