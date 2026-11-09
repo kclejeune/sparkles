@@ -112,11 +112,20 @@ class Admission(unittest.TestCase):
     def test_exact_warm_identity_and_binary_safe_command(self):
         result=RX.command('boat:bx_fixture',"printf '%s' 'a;$(bad)' && cat")
         self.assertEqual(result[:4],[self.fixtures['release']['boat']['path'],'--no-update','ssh','bx_fixture'])
-        decoded=shlex.split(result[-1]);self.assertEqual(len(decoded),1)
-        self.assertIn("a;$(bad)",decoded[0]);self.assertNotIn('; . ',decoded[0])
+        # The provider passes each word after -- to the worker as one argument, quoting
+        # it there (observed on bx_gy2ytgh8: `-- echo 'a  b' '$HOME'` printed `a  b $HOME`).
+        # So bash -c receives the script itself, never a quoted copy of it.
+        # Bash run over ssh reads ~/.bashrc even with -c, and the worker's prepends
+        # /usr/local/cargo/bin to PATH (observed on bx_gy2ytgh8), so no shell reads it.
+        words=result[result.index('--')+1:];self.assertEqual(words[:4],['/bin/bash','--norc','--noprofile','-c']);self.assertEqual(len(words),5)
+        script=words[4];self.assertFalse(script.startswith(("'",'"')),script[:20])
+        self.assertIn("'/bin/bash' --norc --noprofile -c ",script.replace("/bin/bash --norc","'/bin/bash' --norc"))
+        self.assertIn("a;$(bad)",script);self.assertNotIn('; . ',script)
+        import subprocess as sp
+        self.assertEqual(sp.run(['bash','-n','-c',script],capture_output=True,timeout=10).returncode,0)
         self.assertFalse(any(action in result for action in ('create','resume','stop','snapshot')))
         # The session leaves the provider's landing directory before it runs anything.
-        self.assertTrue(decoded[0].startswith('set -e; cd '+shlex.quote(self.fixtures['profile']['worker_home'])+'; '),decoded[0][:80])
+        self.assertTrue(script.startswith('set -e; cd '+shlex.quote(self.fixtures['profile']['worker_home'])+'; '),script[:80])
 
     def test_identity_expiry_unknown_schema_and_guard_replacement_refuse(self):
         for changed in (dict(worker='bx_other'),dict(version=2),dict(unexpected='NOT_A_SECRET')):

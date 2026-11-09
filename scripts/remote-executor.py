@@ -94,8 +94,12 @@ def command(host, text):
         check = shlex.join(['/usr/bin/python3','-I','-B','-c',boat_environment.REMOTE,json.dumps(payload)])+' >/dev/null'
         values = [key+'='+value for key,value in boat_environment.environment(profile).items()]
         # Leave the provider's landing directory first, so nothing runs in a checkout.
-        wrapped = 'set -e; cd '+shlex.quote(profile['worker_home'])+'; '+check+'; exec '+shlex.join(['env',*values,'/bin/bash','-c',text])
-        return [data['_cli']['path'], '--no-update', 'ssh', worker, '--', '/bin/bash', '-c', shlex.quote(wrapped)]
+        # Bash started over ssh reads ~/.bashrc even for -c, and a worker's may put
+        # another cargo first on PATH, so neither shell reads startup files.
+        wrapped = 'set -e; cd '+shlex.quote(profile['worker_home'])+'; '+check+'; exec '+shlex.join(['env',*values,'/bin/bash','--norc','--noprofile','-c',text])
+        # The provider passes each word to the worker as one argument, so the script
+        # goes to bash -c as it is, not as a quoted copy.
+        return [data['_cli']['path'], '--no-update', 'ssh', worker, '--', '/bin/bash', '--norc', '--noprofile', '-c', wrapped]
     return [*SSH, host, text]
 
 

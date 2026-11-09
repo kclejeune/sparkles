@@ -638,7 +638,7 @@ class LifetimeExtension(unittest.TestCase):
 
 
 class RemoteTransport(unittest.TestCase):
-    """The provider joins the words after ``--`` into one remote shell command."""
+    """Remote programs run whether the provider passes the words after ``--`` as arguments, as observed, or joins them."""
     def run_remote(self,method,*args):
         import shlex,subprocess
         root=Path(tempfile.mkdtemp(dir=self.tmp.name));f=fixture(root);controller.bind_release_profile(f['release'])
