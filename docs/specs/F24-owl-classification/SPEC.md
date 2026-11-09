@@ -1041,10 +1041,10 @@ the completeness of each named class's context, and Theorem 5 for termination wi
 admissible expansion strategy. The hypothetical successors of the cautious strategy are
 admissible under Definitions 5 and 9 once one edge covers every ground trigger as above. A
 run that stops at its bound is not saturated. The dependency record of the rules above
-follows edges from `owl:Thing` and cannot see work that waits in the root, on an edge out
-of the root, on a propagation to or from the root or on a key. A stopped rooted run
-therefore reports its consistency as unknown and leaves every class open unless none of
-that work waits. Constants that the run creates for its own encoding, such as h, never
+follows edges from `owl:Thing` and cannot see work in the root, in the contexts that the
+root reaches through its successors, on a propagation to or from the root or on a key.
+A stopped rooted run therefore always reports its consistency as unknown and leaves every
+class open. Constants that the run creates for its own encoding, such as h, never
 reach the answer.
 
 The phase's gate is the `dl-o` stratum of the ORE 2015 DL development set, the nominal
