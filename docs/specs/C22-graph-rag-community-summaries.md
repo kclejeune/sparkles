@@ -101,6 +101,7 @@ A dataset's GraphRAG settings are a settings kind of C19, `graphrag`, stored in
 | `minCommunitySize` | Smaller communities get no report and are merged into their parent's report. |
 | `maxFactsPerCommunity` | The facts sent for a leaf community's report, chosen as §3.2 says. |
 | `refresh` | `manual`, or `auto` with a debounce and the share of a community's facts that must change before its report is rewritten (§5). |
+| `reviewPolicy` | A review policy of the dataset's evidence settings whose accepted projection the reports read, with citations of the claims and decisions behind their facts ([C25](C25-evidence-and-assessments.md#reports-on-accepted-evidence)). Optional. With it, `projection.graphs` may be empty. |
 | `budget` | Tokens a full build and a day of refreshes may use. `providerCounting` allows the provider's token counting endpoint and defaults to `true`. `byteBound` sets the byte bound's allowances per provider kind (§3.5). The provider's own budget of C19 applies as well. |
 
 ### 2.2 Building
@@ -367,6 +368,14 @@ level cites the child reports it used with `gr:citesReport`.
 as C18 §8.8 decided for agent facts, and Ask's `reviewedOnly` uses only reviewed ones.
 A person can edit a report's text in the UI. The edit is a new report that supersedes the
 old one with `prov:wasRevisionOf`, written by the person, with status `reviewed`.
+
+**Reports on accepted evidence.** A report read under `reviewPolicy` also records
+`gr:reviewPolicy`, `gr:policyVersion` and `gr:evidenceConfiguration`, its findings cite
+`gr:citesClaim` and `gr:citesDecision`, and its activity names every claim, decision and
+child report it read with `prov:used`. A kept report keeps the child reports its activity
+used, and an edit of such a report keeps the report it revises with that report's
+activity. [C25](C25-evidence-and-assessments.md#reports-on-accepted-evidence) defines the
+reads, the bounds, the refresh rules and the footprint.
 
 **Search.** The summaries and findings are text, so the dataset's full-text index can
 cover `gr:summary` and `gr:text`, and an F08 embedding index on `gr:summary` gives vector
@@ -1059,3 +1068,12 @@ deferred and does not block the existing community-summary phases. When adopted,
 profile must let a report cite the same assertion and source identities used by recall
 and personal notes. A generated report retains its provenance and review status, and
 does not itself establish the truth or independent corroboration of its inputs.
+
+### Reports on accepted evidence
+
+Roadmap item 652 lets the reports read a review policy's accepted projection through the
+settings member `reviewPolicy`, as
+[C25](C25-evidence-and-assessments.md#reports-on-accepted-evidence) specifies and records.
+The GraphRAG state moves to format version 3, which records the build's policy and the
+claim and decision pairs each report read. This build reads version 2 states as states
+without a policy and refuses newer versions.

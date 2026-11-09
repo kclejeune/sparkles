@@ -627,6 +627,11 @@ count examples define no operational health policy or connector.
   every request against per-build and daily budgets. A refresh rewrites only the reports
   of communities that changed, and `refresh.mode: auto` starts one when enough facts
   change.
+* With `reviewPolicy` in the settings, the reports read a review policy's accepted
+  projection. A finding cites the accepted claims and current decisions behind its facts,
+  the report's activity names every claim, decision and child report it read with
+  `prov:used`, and a withdrawn, reversed or superseded claim rewrites the reports that
+  read it ([C25](../specs/C25-evidence-and-assessments.md#reports-on-accepted-evidence)).
 * Ask answers questions about the whole dataset from the reports by map-reduce, and falls
   back to a query for callers who may not read them. The MCP tool `community_reports`,
   `recall` with `communities`, the brief, `sparkles graphrag` and the UI's Communities tab
@@ -717,10 +722,21 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   exactly or after folding case and spacing. A value with several matches keeps a minted
   IRI until a person chooses, and the lookup reports only the first variant of an
   ambiguous group. Roadmap item 15.
-* Evidence ingestion into claim proposals, reports on accepted evidence and maintained
-  analyses remain planned in [C25](../specs/C25-evidence-and-assessments.md). Ordinary RDF
-  shape validation does not establish the runtime guarantees of the typed evidence
-  operations. Roadmap items 651, 652 and 340.
+* Maintained analyses remain planned in [C25](../specs/C25-evidence-and-assessments.md).
+  Ordinary RDF shape validation does not establish the runtime guarantees of the typed
+  evidence operations. Roadmap item 340.
+* The automatic refresh of reports read under a review policy notices only the changes
+  of the policy's evidence that the principal's change feed lists. A hidden decision,
+  support or withdrawal, a settings-only change of the evidence configuration, a reload
+  of the access policy and a state left behind by a crash wait for the next visible
+  change or a manual refresh. Roadmap item 652.
+* A report waiting for a rewrite after its claim was withdrawn keeps its earlier
+  citations while the daily budget holds the rewrite back, without a `stale` mark.
+  Roadmap item 809.
+* No search lists the reports whose activity used a changed claim or decision, as
+  `claims/dependents` does for assessments. Roadmap item 810.
+* A global answer refuses `reviewPolicy`, and reports do not resolve identities through
+  a matching policy. Roadmap item 811.
 * Recall finds the claims about its entities by reading each boundary proposal graph,
   and refuses past one million quads, because no index maps a proposition's terms to its
   claims. Roadmap item 766.

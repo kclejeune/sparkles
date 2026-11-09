@@ -36,6 +36,23 @@ it.
 
 ### Added
 
+Community reports can read a review policy's accepted projection (item 652). The
+`graphrag` settings member `reviewPolicy` names a review policy of the dataset's evidence
+settings, and a build or refresh then reads the policy's output graph with the projection's
+graphs, never another evidence graph, and admits an accepted fact only with a claim the
+principal may see. A run is refused before any model call on a store without activated
+configuration history and for a policy the principal cannot use. Each finding records
+`gr:citesClaim` and `gr:citesDecision`, a report records `gr:reviewPolicy`,
+`gr:policyVersion` and `gr:evidenceConfiguration`, and its activity names every claim,
+decision and child report it read with `prov:used`. The footprint lists the policy's
+decisions and supports graphs and the readable proposal graphs. A withdrawal, reversal or
+superseding decision rewrites the reports that read it and their ancestors at the next
+refresh, and a new policy version rewrites every report. `GET /$/graphrag/{ds}/community`,
+`community_reports` and a global answer's `reports` carry `reviewPolicy` and each
+finding's `claims` and `decisions`. The automatic refresh notices only the evidence
+changes that the principal's change feed lists, and roadmap item 652 adds a private check
+for the others.
+
 Roadmap item 791 adds Nemo 0.10.1 as the reference for the `owl-rl` materialization. The
 flake builds it from its checksum-pinned release binaries as `.#nemo`, and
 `scripts/rl-reference/owl2rl.rls` writes the OWL 2 RL/RDF rules of OWL 2 Profiles for it.
@@ -1986,6 +2003,11 @@ frequent predicate gains the least. Planning observes the request's timeout and 
 throughout.
 
 ### Format
+
+The GraphRAG state `graphrag/state.json` moves to format version 3, which records the
+review policy of the last build and the claim and decision pairs each report read under
+it. This release reads version 2 states as states without a policy and writes version 3.
+An older release refuses a version 3 state as a newer format.
 
 The planner statistics in `gen-*/stats.json` gain the member `correlations`, which
 carries its own version, 1, and is registered as the derived kind `planner-statistics`.

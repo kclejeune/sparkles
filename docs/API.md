@@ -13962,6 +13962,27 @@ community with its members, its children and its report with findings and citati
 Both read through the caller's view, and a community the caller may not read is a
 `404`.
 
+The settings member `reviewPolicy` names a review policy of the dataset's
+[evidence settings](#evidence-settings), and every build and refresh then reads under it.
+The store's configuration history must be active, or the run is refused with
+`configuration-history-inactive`. A policy that the Head view's configuration does not
+name as a review policy, or whose decisions, supports and output graphs the principal may
+not read, is refused with recall's message for an unknown policy, before any model call.
+The run reads the projection's graphs and the policy's output graph, which
+`projection.graphs` need not name, and never a graph with another evidence role. A triple
+of the output graph enters a report's input only with an accepted claim that the
+principal may see, unless another graph of the projection also holds it. Each finding of
+such a report gains `claims` and `decisions`, the IRIs of the claims behind its cited
+facts and of their current decisions, and the report gains `reviewPolicy` with the
+policy's `iri`, `version` and `configuration`. The report's activity records every claim,
+decision and child report its input read as `prov:used`, and its footprint also lists the
+policy's decisions and supports graphs and the proposal graphs the principal may read, so
+a reader who may not read them is not admitted. A refresh rewrites a report whose
+recorded claim was withdrawn, reversed or superseded, and that report's ancestors,
+whatever the fraction. The automatic refresh also starts after a new policy version, a
+change of `reviewPolicy`, or a change of the policy's decisions or supports that the
+principal's change feed lists. A report without a policy has none of these members.
+
 `POST /$/graphrag/{ds}/memberships` takes `{"nodes": ["<iri>", …], "level": 0}` with at
 most 20,000 IRIs and answers which communities hold each node, at the given level or at
 every level when `level` is left out. Each row of `memberships` names a node, its

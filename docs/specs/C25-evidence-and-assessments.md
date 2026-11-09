@@ -2215,6 +2215,52 @@ private check after an unrelated hidden decision that leaves every response, sta
 state unchanged. Router tests read the new members through `/community`,
 `community_reports` and a global answer.
 
+#### Delivered scope
+
+The settings member, admission, the reads, citations, `prov:used`, the footprint, the
+bounds, the fact digest, the forced rewrites, version 3 of the GraphRAG state, the
+retention rules and the reading routes ship as this section describes. The
+implementation is `crates/sparkles-server/src/graphrag/evidence.rs` with the build, store
+and refresh modules beside it, and the reports graph gains the predicates
+`gr:reviewPolicy`, `gr:policyVersion`, `gr:evidenceConfiguration`, `gr:citesClaim` and
+`gr:citesDecision`. The UI's GraphRAG settings take the policy name, and a report under a
+policy shows it with each finding's accepted claims and decisions.
+
+The private check of the automatic refresh is not built, and roadmap item 652 adds it.
+The loop counts the changes of the output graph that the principal's feed lists, as it
+counts those of the projection's graphs. It starts a refresh for any change of the
+policy's decisions or supports graph and any withdrawal in a proposal graph that the feed
+lists, and it compares the settings' policy and the Head view's policy version with the
+last build's once a debounce period, without waiting for a commit. A decision, support
+or withdrawal hidden from the principal, a settings-only change of the evidence
+configuration, a reload of the access policy and a state left behind by a crash wait for
+the next change that the feed lists or for a manual refresh, which then rewrites what
+they changed.
+
+The claims behind a parent's entity lines that only its children's findings name are
+known once the children are written. The bound of 10,000 occurrences is therefore checked
+before the estimate for every leaf and for a parent's own facts and their entities, and
+again for a parent's whole input before its model call. A parent that passes the bound
+only then refuses the run after the lower levels committed, and the next refresh, which
+finds no matching state for those levels, rewrites them. A level's quads are charged to
+the run allowance twice, once for the quads and once as an upper bound of the update
+text, before the text is built.
+
+The router tests in
+`crates/sparkles-server/src/http/router_tests/auth/graphrag_evidence.rs` cover a run
+without a policy, the four admission refusals, the evidence graphs that the projection
+never reads, an ordinary graph that asserts a rejected proposition, a cited claim with its
+decision, `prov:used` for an uncited label claim, the footprint, a reader without the
+proposal graph, a change of evidence settings during a run, the run bounds, a fact with
+two supports where one is withdrawn below the fraction, a new acceptance that follows the
+fraction, a policy version change found without a data write, a person's edit that keeps
+its pairs, a state that names another report than the graph links, `/community` and
+`community_reports`. A store test covers the retention of used children, of edited
+reports through earlier edits and of generated replacements. A hidden support under a
+triple protection, supports past the record bound that are all hidden, a label shared by
+many communities, an edited parent whose consumed child is replaced across a refresh and
+a global answer through the router have no test.
+
 ### Scope changes
 
 **Probabilistic reasoning through external engines.** The scope statement in §1 excluded probabilistic reasoning. Probabilistic reasoning through external engines, as integration only, is now planned under [ROADMAP](../ROADMAP.md) item 463 and [F28](F28-ml-and-probabilistic-integration/README.md). Sparkles still defines no probabilistic reasoner of its own.
