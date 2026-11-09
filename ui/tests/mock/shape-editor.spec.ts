@@ -560,6 +560,7 @@ test('names a shape in the preview change set by its sh:name', async ({ page, re
   await open(page, ds);
   await pick(page, 'Other');
   await page.getByRole('button', { name: 'Delete shape', exact: true }).click();
+  await page.getByRole('button', { name: 'Delete definition', exact: true }).click();
   await page.getByRole('button', { name: 'Preview commit', exact: true }).click();
   const dialog = page.getByRole('dialog');
   await expect(dialog.locator('[data-outcome]')).toHaveAttribute('data-outcome', 'commit');
