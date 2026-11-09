@@ -1,5 +1,5 @@
 # Temporary measurement for the CI cache choice: the test build with mbx's local object
-# store carried by rust-cache instead of the Cargo target. Removed after measurement.
+# store carried by rust-cache instead of the Cargo target. Removed after measurement (warm).
 name: CI cache experiment
 on:
   push:
