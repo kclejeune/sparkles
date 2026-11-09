@@ -187,6 +187,14 @@ class Controls(unittest.TestCase):
                 r=fixture();r[section][key]=value;io=InertIO(r)
                 with self.assertRaises(Refusal):c.drive(r,io)
                 self.assertEqual(io.calls,[])
+    def test_qualification_without_current_overflow_needs_a_bound_maintainer_confirmation(self):
+        for changed in ({'purpose':'qualification'},{'purpose':'other','maintainer_confirmation_sha256':'9'*64},{'maintainer_confirmation_sha256':'9'*64},{'purpose':'qualification','maintainer_confirmation_sha256':'short'}):
+            with self.subTest(changed=changed):
+                r=fixture();r['local_first'].update(overflow_currently_needed=False,**changed);io=InertIO(r)
+                with self.assertRaises(Refusal):c.drive(r,io)
+                self.assertEqual(io.calls,[])
+        r=fixture();r['local_first'].update(overflow_currently_needed=False,purpose='qualification',maintainer_confirmation_sha256='9'*64)
+        self.assertIs(c.validate_release(r,1800000000),r)
     def test_stale_fact_refused(self):
         r=fixture();r['environment']['observed_unix']-=301
         with self.assertRaises(Refusal):c.drive(r,InertIO(r))

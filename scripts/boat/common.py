@@ -101,7 +101,10 @@ def validate_release(r,now):
         freshness(r[key],now)
     book=r['start_ledger'];need(book.get('limit')==200 and type(book.get('starts_and_reservations')) is int and 0<=book['starts_and_reservations']<=200,'shared start bound')
     need(book.get('this_one_resume_reserved') is True and book.get('all_actors_included') is True and bool(book.get('window')) and bool(book.get('timezone')) and book.get('provider_rate_admitted') is True,'shared ledger incomplete')
-    need(r['local_first'].get('overflow_currently_needed') is True,'local capacity available or unknown')
+    # A qualification run needs no current overflow when the release binds the
+    # maintainer's recorded confirmation of that purpose by its hash.
+    lf=r['local_first']
+    need(lf.get('overflow_currently_needed') is True or (lf.get('overflow_currently_needed') is False and lf.get('purpose')=='qualification' and sha(lf.get('maintainer_confirmation_sha256'))),'local capacity available or unknown')
     e=r['environment'];freshness(e,now,30);need(e.get('version')==profile()['future_environment']['version'] and e.get('hook_sha256')==hook_sha() and e.get('name')==profile()['future_environment']['name'],'latest ENV drift')
     need(e.get('environment_id')==profile()['future_environment']['id'],'environment identity drift')
     need(e.get('assigned_editors_excluded') is True,'no environment edit exclusion')
