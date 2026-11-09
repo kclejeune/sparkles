@@ -533,8 +533,28 @@ These points differ from the design or settle what it left open.
 - An open review branch is recognized by the prefixes the memory inbox uses. The
   notifier keeps its own copy of that rule instead of calling into the MCP module,
   which is behind the `mcp` feature. Its age is the time the branch was created.
-- The backup event covers the runs of backup policies. A backup started by hand and a
-  policy run that fails before it records a result send nothing.
+- Every backup failure path of the server raises an event (item 46). A policy run that
+  ends `failed` or `partial` sends `backup.failed` as before. A policy run that stops
+  on an error before it records a result, and a scheduled run that cannot start for a
+  reason other than a full task queue or a run still running, send `backup.failed`
+  with `stage` `run` or `start` under the same key as the policy's runs. A backup
+  started by hand that fails sends `backup.failed` with `trigger: "manual"`, keyed by
+  repository and dataset and cleared by the next successful backup of that dataset
+  into that repository. A verification that fails or finds a backup with the status
+  `error` sends `backup.verify.failed`, keyed by repository, and only a verification of
+  the whole repository without errors clears it, since another backup may still be
+  damaged. A verification that finds only orphan blobs is not a failure. A GC that
+  fails, and a GC after retention that a policy cannot start, send `backup.gc.failed`,
+  keyed by repository and cleared by a GC that succeeds. `backup.overdue` fires for an
+  enabled policy whose last success is older than twice the longest gap between its
+  next eight scheduled instants, so that a weekday schedule is not overdue over a
+  weekend, and it clears when the policy succeeds or is no longer overdue. The
+  scheduler checks it at each step, at least once a minute. A policy that has never
+  succeeded is reported by its failures, not as overdue. A cancelled operation sends
+  nothing. All of them are `critical` except `backup.overdue`, which is a `warning`.
+  The CLI's offline `sparkles backup` commands run outside the server and send
+  nothing. A failed restore sends nothing either, since the person who asked
+  for it sees the failure.
 - `partial` is a `warning` and `failed` is `critical`.
 - Secrets have no new flag. The declared source of a notification secret is
   `--model-secret`, and on NixOS `services.sparkles.models.secrets`. A dedicated
@@ -600,16 +620,8 @@ These points differ from the design or settle what it left open.
   section follows its layout. The mock server serves the notifications kind and the
   status, and a Playwright test adds a webhook channel, sends a test and sees its
   status.
-* **Broader backup-failure coverage.** `events::backup_run` fires only at the end of a
-  policy run in `crates/sparkles-server/src/backup/policies.rs`; a backup started by
-  hand, a policy run that fails before it records a result, a failed verification and
-  a failed GC send nothing (Outcome above). Each gets an event of its own kind with a
-  key per repository and operation: `backup.failed` gains the manual and early-failure
-  cases with `trigger: "manual"` or the failing stage, and `backup.verify.failed` and
-  `backup.gc.failed` are new kinds that operators can route separately. A policy run
-  that is cancelled sends nothing, as now. A policy whose last success is older than twice
-  its schedule's interval raises `backup.overdue`, which clears on the next success as
-  other conditions do.
+* **Broader backup-failure coverage.** This part is built, as the Outcome above
+  records.
 * **Delivery that a slow channel cannot delay.** This part is built, as the Outcome
   above records. Each channel has its own queue and thread, and the kind holds at most
   32 channels.

@@ -2545,7 +2545,11 @@ sparkles settings set org memory.review.notifyAfter=2d memory.review.repeatEvery
 ```
 
 A backup policy that fails notifies once, then at most once per the kind's
-`repeatEvery` (one day by default) until a run of the policy succeeds. A spent model
+`repeatEvery` (one day by default) until a run of the policy succeeds. A backup started
+by hand that fails, a verification that finds a damaged backup and a GC that fails
+notify the same way, with the types `backup.failed`, `backup.verify.failed` and
+`backup.gc.failed`, and a policy whose last success is older than twice its schedule's
+interval sends `backup.overdue`. The route `backup.*` sends all of them. A spent model
 budget notifies once per provider and day. Requests to the channels go through the
 outbound policy, so a channel on a private address needs `--outbound-allow-private`.
 A failed delivery is retried with backoff, five attempts by default.

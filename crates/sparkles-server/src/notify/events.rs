@@ -3,7 +3,9 @@
 //! [`spawn`] checks the lasting conditions once a minute: the review branches of agent
 //! memory that wait longer than a dataset's `memory.review.notifyAfter`, and the model
 //! providers whose daily token budget is spent. [`backup_run`] reports the end of a
-//! backup policy run.
+//! backup policy run, and the other `backup_*` functions the other backup failures: a
+//! backup started by hand, a policy run that stops or cannot start, a verification, a
+//! GC and a policy that is overdue.
 
 use super::{Condition, Event, Raised, Severity, clear, raise, settings};
 use crate::state::AppState;
@@ -208,6 +210,7 @@ pub fn backup_run(
     match result {
         "ok" => {
             clear(st, &key);
+            clear(st, &format!("backup.overdue/{policy}"));
             return None;
         }
         "failed" | "partial" => {}
@@ -255,6 +258,243 @@ pub fn backup_run(
             "repository": repository,
             "failedDatasets": failed,
             "consecutiveFailures": consecutive_failures,
+        }),
+    };
+    let repeat = settings(st).repeat();
+    Some(raise(
+        st,
+        ev,
+        Some(Condition {
+            key,
+            repeat: Some(repeat),
+        }),
+        now,
+    ))
+}
+
+/// One backup failure that is not the end of a policy run: its event type, the key of
+/// its condition and what the event says.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub struct BackupFailure<'a> {
+    /// `backup.failed`, `backup.verify.failed` or `backup.gc.failed`
+    pub kind: &'static str,
+    pub key: String,
+    pub title: String,
+    pub summary: String,
+    pub repository: &'a str,
+    /// the event's other `data` members
+    pub data: Value,
+}
+
+/// Raise a backup failure, held back for `repeatEvery` per key until it clears.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub fn backup_failure(st: &Arc<AppState>, f: BackupFailure, now: DateTime<Utc>) -> Raised {
+    let mut data = f.data;
+    data["repository"] = f.repository.into();
+    let ev = Event {
+        kind: f.kind,
+        dataset: None,
+        severity: Severity::Critical,
+        title: f.title,
+        summary: f.summary,
+        link: Some("/ui/backups".into()),
+        data,
+    };
+    let repeat = settings(st).repeat();
+    raise(
+        st,
+        ev,
+        Some(Condition {
+            key: f.key,
+            repeat: Some(repeat),
+        }),
+        now,
+    )
+}
+
+/// The condition key of a backup started by hand of `dataset` into `repository`.
+pub fn manual_backup_key(repository: &str, dataset: &str) -> String {
+    format!("backup.failed/manual/{repository}/{dataset}")
+}
+
+/// The end of a backup started by hand: `backup.failed` with `trigger: "manual"` when
+/// it failed, and the condition cleared when it succeeded. A cancelled backup sends
+/// nothing.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub fn backup_manual(
+    st: &Arc<AppState>,
+    dataset: &str,
+    repository: &str,
+    error: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<Raised> {
+    let key = manual_backup_key(repository, dataset);
+    let Some(e) = error else {
+        clear(st, &key);
+        return None;
+    };
+    Some(backup_failure(
+        st,
+        BackupFailure {
+            kind: "backup.failed",
+            key,
+            title: format!("Backup of {dataset} failed"),
+            summary: format!(
+                "The backup of {dataset} into {repository} that was started by hand failed: {e}"
+            ),
+            repository,
+            data: json!({ "trigger": "manual", "dataset": dataset, "error": e }),
+        },
+        now,
+    ))
+}
+
+/// A backup policy run that failed before it recorded a result: `backup.failed` with
+/// the failing `stage`, `start` for a scheduled run that could not start and `run` for
+/// a run that stopped on an error. It shares the key of the policy's runs, so the next
+/// successful run clears it.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub fn backup_policy_error(
+    st: &Arc<AppState>,
+    policy: &str,
+    repository: &str,
+    stage: &str,
+    error: &str,
+    now: DateTime<Utc>,
+) -> Raised {
+    let what = if stage == "start" {
+        "could not start"
+    } else {
+        "stopped on an error"
+    };
+    backup_failure(
+        st,
+        BackupFailure {
+            kind: "backup.failed",
+            key: format!("backup.failed/{policy}"),
+            title: format!("Backup policy {policy} failed"),
+            summary: format!("A run of backup policy {policy} {what}: {error}"),
+            repository,
+            data: json!({ "policy": policy, "stage": stage, "error": error }),
+        },
+        now,
+    )
+}
+
+/// The end of a verification of `repository`: `backup.verify.failed` when it failed or
+/// found a backup in error, keyed per repository. A verification of the whole
+/// repository without errors clears the condition, and one of chosen backups does not,
+/// since other backups may still be in error.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub fn backup_verify(
+    st: &Arc<AppState>,
+    repository: &str,
+    whole: bool,
+    level: &str,
+    broken: &[String],
+    error: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<Raised> {
+    let key = format!("backup.verify.failed/{repository}");
+    if error.is_none() && broken.is_empty() {
+        if whole {
+            clear(st, &key);
+        }
+        return None;
+    }
+    let summary = match error {
+        Some(e) => format!("A verification of repository {repository} failed: {e}"),
+        None => format!(
+            "A verification of repository {repository} found {} backup{} in error: {}.",
+            broken.len(),
+            if broken.len() == 1 { "" } else { "s" },
+            broken.join(", ")
+        ),
+    };
+    let mut data = json!({ "level": level, "backups": broken });
+    if let Some(e) = error {
+        data["error"] = e.into();
+    }
+    Some(backup_failure(
+        st,
+        BackupFailure {
+            kind: "backup.verify.failed",
+            key,
+            title: format!("Backup verification failed in {repository}"),
+            summary,
+            repository,
+            data,
+        },
+        now,
+    ))
+}
+
+/// The end of a GC of `repository`, or a GC that a policy could not start:
+/// `backup.gc.failed` keyed per repository, cleared by a GC that succeeds.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub fn backup_gc(
+    st: &Arc<AppState>,
+    repository: &str,
+    stage: &str,
+    error: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<Raised> {
+    let key = format!("backup.gc.failed/{repository}");
+    let Some(e) = error else {
+        clear(st, &key);
+        return None;
+    };
+    Some(backup_failure(
+        st,
+        BackupFailure {
+            kind: "backup.gc.failed",
+            key,
+            title: format!("Backup GC failed in {repository}"),
+            summary: format!("A GC of repository {repository} failed: {e}"),
+            repository,
+            data: json!({ "stage": stage, "error": e }),
+        },
+        now,
+    ))
+}
+
+/// `backup.overdue` for an enabled policy whose last success is older than twice the
+/// interval of its schedule, held back for `repeatEvery` and cleared once the policy
+/// is not overdue. A policy without a success yet is told about by its failures.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub fn backup_overdue(
+    st: &Arc<AppState>,
+    policy: &str,
+    repository: &str,
+    last_success: Option<DateTime<Utc>>,
+    interval: Option<TimeDelta>,
+    now: DateTime<Utc>,
+) -> Option<Raised> {
+    let key = format!("backup.overdue/{policy}");
+    let (Some(last), Some(interval)) = (last_success, interval) else {
+        clear(st, &key);
+        return None;
+    };
+    if interval <= TimeDelta::zero() || now - last <= interval * 2 {
+        clear(st, &key);
+        return None;
+    }
+    let ev = Event {
+        kind: "backup.overdue",
+        dataset: None,
+        severity: Severity::Warning,
+        title: format!("Backup policy {policy} is overdue"),
+        summary: format!(
+            "Backup policy {policy} last succeeded {} ago, more than twice its schedule's interval of {}.",
+            days_text(now - last),
+            days_text(interval)
+        ),
+        link: Some("/ui/backups".into()),
+        data: json!({
+            "policy": policy,
+            "repository": repository,
+            "lastSuccess": super::rfc3339(last),
+            "intervalSecs": interval.num_seconds(),
         }),
     };
     let repeat = settings(st).repeat();

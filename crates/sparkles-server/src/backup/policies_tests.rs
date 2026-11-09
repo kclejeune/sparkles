@@ -85,6 +85,8 @@ struct Fake {
     failing: Mutex<HashSet<String>>,
     busy: Mutex<HashSet<String>>,
     gcs: Mutex<Vec<String>>,
+    /// whether a GC cannot start
+    gc_fails: Mutex<bool>,
     /// while true, backups wait
     hold: Mutex<bool>,
     released: parking_lot::Condvar,
@@ -114,6 +116,7 @@ impl Fake {
             failing: Mutex::default(),
             busy: Mutex::default(),
             gcs: Mutex::default(),
+            gc_fails: Mutex::new(false),
             hold: Mutex::new(false),
             released: parking_lot::Condvar::new(),
             entered: Mutex::new(0),
@@ -255,6 +258,12 @@ impl Engine for Fake {
     }
 
     fn start_gc(&self, _: &Arc<AppState>, repo: &str) -> Result<String, BackupError> {
+        if *self.gc_fails.lock() {
+            return Err(BackupError::new(
+                Code::RepositoryUnavailable,
+                "the GC lock is held elsewhere",
+            ));
+        }
         let mut g = self.gcs.lock();
         g.push(repo.to_string());
         Ok(format!("gc-{}", g.len()))
@@ -349,9 +358,16 @@ impl T {
 /// fake engine and a fake clock at `now`. Files under `<dir>/backup` written before
 /// (`files`) are loaded as at a restart.
 fn setup_with(now: &str, dir: tempfile::TempDir, read_only: bool) -> T {
+    setup_full(now, dir, read_only, false)
+}
+
+fn setup_full(now: &str, dir: tempfile::TempDir, read_only: bool, notify: bool) -> T {
     let mut state =
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
     state.read_only = read_only;
+    if notify {
+        crate::notify::enable_for_tests(&mut state, dir.path());
+    }
     let b = BackupState::new(dir.path(), None, 2).unwrap();
     for (name, readonly) in [("local", false), ("archive", true)] {
         b.registry.repos.write().insert(
@@ -1476,4 +1492,112 @@ fn a_newer_policy_file_is_refused_and_written_files_carry_the_member() {
     assert!(read_json::<PolicyRunList>(&dir.path().join("runs.json")).is_ok());
     std::fs::write(dir.path().join("policies.json"), r#"{"policies": []}"#).unwrap();
     assert!(read_api_policies(dir.path()).unwrap().is_empty());
+}
+
+/// A GC that a policy run cannot start raises `backup.gc.failed` for the repository
+/// (spec C21).
+#[tokio::test]
+async fn a_gc_that_cannot_start_notifies() {
+    let s = setup_full(
+        "2026-09-30T12:00:00Z",
+        tempfile::tempdir().unwrap(),
+        false,
+        true,
+    );
+    s.call(
+        "POST",
+        "/$/backup-policies",
+        Some(
+            json!({"name": "p", "repository": "local", "schedule": "0 3 * * *",
+                    "datasets": ["d*"], "retention": {"minCount": 1, "maxCount": 1},
+                    "gcAfterRetention": true}),
+        ),
+    )
+    .await;
+    *s.fake.gc_fails.lock() = true;
+    for at in ["2026-09-30T12:00:00Z", "2026-09-30T13:00:00Z"] {
+        s.clock.set(at);
+        let task = start_run(&s.st, "p".into(), RunTrigger::Manual, None)
+            .ok()
+            .unwrap();
+        s.wait(&task.id);
+    }
+    let run = s.runs("p").remove(0);
+    assert!(
+        run.retention
+            .clone()
+            .unwrap()
+            .error
+            .unwrap()
+            .contains("gc after retention failed"),
+        "{run:?}"
+    );
+    assert!(crate::notify::is_active(&s.st, "backup.gc.failed/local"));
+    let recent = crate::notify::status_json(&s.st)["recent"].clone();
+    let gc: Vec<&J> = recent
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["event"] == "backup.gc.failed")
+        .collect();
+    assert_eq!(gc.len(), 1, "{recent}");
+}
+
+/// An enabled policy whose last success is older than twice its schedule's interval
+/// raises `backup.overdue`, and a success clears it (spec C21).
+#[tokio::test]
+async fn an_overdue_policy_notifies_until_it_succeeds() {
+    let s = setup_full(
+        "2026-09-30T12:05:00Z",
+        tempfile::tempdir().unwrap(),
+        false,
+        true,
+    );
+    s.call(
+        "POST",
+        "/$/backup-policies",
+        Some(json!({"name": "p", "repository": "local", "schedule": "*/10 * * * *"})),
+    )
+    .await;
+    let key = "backup.overdue/p";
+    let manual = |s: &T| {
+        let task = start_run(&s.st, "p".into(), RunTrigger::Manual, None)
+            .ok()
+            .unwrap();
+        s.wait(&task.id);
+    };
+    let mut sched = Scheduler::default();
+    // never succeeded: its failures tell, not an overdue event
+    sched.step(&s.st, s.clock.now());
+    assert!(!crate::notify::is_active(&s.st, key));
+    manual(&s);
+    assert_eq!(s.runs("p")[0].result, RunResult::Ok);
+    // from now on every backup fails
+    s.fake
+        .failing
+        .lock()
+        .extend(["ds".to_string(), "mem1".to_string()]);
+    s.clock.set("2026-09-30T12:20:00Z");
+    sched.step(&s.st, s.clock.now());
+    s.wait_policy("p");
+    assert!(
+        !crate::notify::is_active(&s.st, key),
+        "15 minutes is within twice the interval"
+    );
+    assert!(crate::notify::is_active(&s.st, "backup.failed/p"));
+    s.clock.set("2026-09-30T12:30:00Z");
+    sched.step(&s.st, s.clock.now());
+    s.wait_policy("p");
+    assert!(
+        crate::notify::is_active(&s.st, key),
+        "{:?}",
+        crate::notify::active_keys(&s.st)
+    );
+    s.fake.failing.lock().clear();
+    s.clock.set("2026-09-30T12:31:00Z");
+    manual(&s);
+    assert!(!crate::notify::is_active(&s.st, key));
+    assert!(!crate::notify::is_active(&s.st, "backup.failed/p"));
+    sched.step(&s.st, s.clock.now());
+    assert!(!crate::notify::is_active(&s.st, key));
 }

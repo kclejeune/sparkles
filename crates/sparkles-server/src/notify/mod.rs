@@ -504,6 +504,39 @@ pub fn is_active(st: &AppState, key: &str) -> bool {
     st.notifier.shared.inner.lock().active(st).contains_key(key)
 }
 
+/// The keys of the active conditions.
+#[cfg(test)]
+pub fn active_keys(st: &AppState) -> Vec<String> {
+    st.notifier
+        .shared
+        .inner
+        .lock()
+        .active(st)
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// Turn notifications on for the tests of other modules: a settings file in `dir`
+/// routes every event to a webhook on loopback, which the outbound policy refuses, so
+/// an event is raised and recorded without any network traffic.
+#[cfg(test)]
+pub fn enable_for_tests(st: &mut AppState, dir: &std::path::Path) {
+    st.outbound.allow_private = false;
+    let f = dir.join("notify-settings.json");
+    std::fs::write(
+        &f,
+        json!({"server": {"notifications": {
+            "enabled": true,
+            "channels": {"hook": {"type": "webhook", "url": "http://127.0.0.1:9/x"}},
+            "routes": {"*": ["hook"]}
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    crate::settings::server::start(st, Some(&f), &Default::default()).unwrap();
+}
+
 // --------------------------------------------------------------------- delivery ------
 
 /// The outcome of one attempt.

@@ -33,6 +33,13 @@ it.
 
 ### Added
 
+Every backup failure path raises a notification (item 46). A backup started by hand
+that fails, a policy run that stops on an error or cannot start, a verification that
+fails or finds a damaged backup, and a GC that fails or cannot start now notify, as a
+failed policy run already did. The new event types `backup.verify.failed` and
+`backup.gc.failed` are keyed per repository, and `backup.overdue` fires when a policy's
+last success is older than twice its schedule's interval.
+
 Notifications have an email channel (item 46, spec C21 Phase 2). It submits a message
 over STARTTLS on port 587 or over TLS on port 465, authenticates with SASL PLAIN with a
 password from a secret, and never sends in the clear, so a mail server without

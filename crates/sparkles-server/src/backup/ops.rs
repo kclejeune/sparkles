@@ -103,9 +103,26 @@ pub fn create(
     h: &TaskHandle,
     started: Option<Started>,
 ) -> Result<BackupSummary, BackupError> {
-    let b = backup_state(st)?;
-    let _slot = b.slots.acquire(h, started)?;
-    create_now(st, &b, ds, repo, a, ctl(h, 0.0, 1.0))
+    let r = (|| {
+        let b = backup_state(st)?;
+        let _slot = b.slots.acquire(h, started)?;
+        create_now(st, &b, ds, repo, a, ctl(h, 0.0, 1.0))
+    })();
+    // a backup started by hand tells the operator's channels (spec C21)
+    match &r {
+        Err(e) if e.is_cancelled() => {}
+        r => {
+            let msg = r.as_ref().err().map(|e| e.message().to_string());
+            crate::notify::events::backup_manual(
+                st,
+                &ds.name,
+                repo,
+                msg.as_deref(),
+                chrono::Utc::now(),
+            );
+        }
+    }
+    r
 }
 
 /// Back up dataset `dataset` into repository `repo` for a policy run, inside its
@@ -382,6 +399,42 @@ pub fn verify(
     let r = verify_in(st, &b, repo, &names, level, h);
     count(st, &b, repo, Operation::Verify, &r, t0);
     log_end(&what, &r, t0);
+    // a failed verification tells the operator's channels (spec C21)
+    let level_name = serde_json::to_value(level)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    match &r {
+        Err(e) if e.is_cancelled() => {}
+        Err(e) => {
+            crate::notify::events::backup_verify(
+                st,
+                repo,
+                names.is_empty(),
+                &level_name,
+                &[],
+                Some(e.message()),
+                chrono::Utc::now(),
+            );
+        }
+        Ok((v, _)) => {
+            let broken: Vec<String> = v
+                .backups
+                .iter()
+                .filter(|b| b.status == sparkles_backup::VerifyStatus::Error)
+                .map(|b| b.name.clone())
+                .collect();
+            crate::notify::events::backup_verify(
+                st,
+                repo,
+                names.is_empty(),
+                &level_name,
+                &broken,
+                None,
+                chrono::Utc::now(),
+            );
+        }
+    }
     r.map(|(v, _)| v)
 }
 
@@ -457,6 +510,14 @@ pub fn gc(
     })();
     count(st, &b, repo, Operation::Gc, &r, t0);
     log_end(&what, &r, t0);
+    // a failed GC tells the operator's channels (spec C21)
+    match &r {
+        Err(e) if e.is_cancelled() => {}
+        r => {
+            let msg = r.as_ref().err().map(|e| e.message().to_string());
+            crate::notify::events::backup_gc(st, repo, "run", msg.as_deref(), chrono::Utc::now());
+        }
+    }
     if let Ok((report, _)) = &r
         && !dry_run
     {
