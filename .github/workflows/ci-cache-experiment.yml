@@ -1,7 +1,7 @@
 # Temporary measurement for the CI cache choice: the test build with the dependency target
 # from rust-cache and, on top, mbx's object store saved per commit with actions/cache.
 # The "core change" job appends a comment to a sparkles-core source file first, which
-# stands for a commit that changes the engine. Removed after measurement (round 2).
+# stands for a commit that changes the engine. Removed after measurement (round 3).
 name: CI cache experiment
 on:
   push:
