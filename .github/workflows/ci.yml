@@ -250,7 +250,7 @@ jobs:
           cache-bin: false
           env-vars: &rust-cache-env CARGO CC CFLAGS CXX CMAKE RUST MBX
           shared-key: clippy-${{ matrix.platform }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
       # The server's build script writes ui/build/index.html when it is missing, and the
       # write is newer than the build, so every later Cargo command in the job would build
       # the server and relink its tests again. The same placeholder, written first, avoids
@@ -310,11 +310,11 @@ jobs:
             done
           done
       - name: Collect the mbx store to its size limit
-        if: ${{ github.ref == 'refs/heads/main' }}
+        if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
         run: |
           mbx gc
           du -sh "$(mbx cache dir)"
-      - if: ${{ github.ref == 'refs/heads/main' }}
+      - if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
         uses: actions/cache/save@v4
         with:
           path: *mbx-store
@@ -371,7 +371,7 @@ jobs:
           cache-bin: false
           env-vars: *rust-cache-env
           shared-key: tests
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
       - name: UI placeholder
         run: *ui-placeholder
       - uses: actions/cache/restore@v4
@@ -420,11 +420,11 @@ jobs:
           cp "$RUNNER_TEMP/archive/build-workspace" "$RUNNER_TEMP/heavy/"
           ls -l "$RUNNER_TEMP"/archive/* "$RUNNER_TEMP"/heavy/* "$RUNNER_TEMP"/server/*
       - name: Collect the mbx store to its size limit
-        if: ${{ github.ref == 'refs/heads/main' }}
+        if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
         run: |
           mbx gc
           du -sh "$(mbx cache dir)"
-      - if: ${{ github.ref == 'refs/heads/main' }}
+      - if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
         uses: actions/cache/save@v4
         with:
           path: *mbx-store
@@ -725,7 +725,7 @@ jobs:
           cache-bin: false
           env-vars: *rust-cache-env
           shared-key: tests-${{ matrix.platform }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
       - name: UI placeholder
         run: *ui-placeholder
       # local mode: no remote cache, and no link cache, which would add every test binary
