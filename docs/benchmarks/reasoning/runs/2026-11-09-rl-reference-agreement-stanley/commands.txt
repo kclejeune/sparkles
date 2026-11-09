@@ -34,3 +34,4 @@ systemd-run --user --scope -q -p MemoryMax=16G -p MemorySwapMax=0 timeout 600 \
 # workload.txt gives the counts of the workloads, the OWL2Bench(1) change and its clique
 # and the W3C cases. lubm-1-record-2.json and owl2bench-1-record-2.json are the second
 # round's complete runner records, and the *-summary.md files its summaries.
+# item-798-test.txt is the outcome of roadmap item 798's ignored regression test.
