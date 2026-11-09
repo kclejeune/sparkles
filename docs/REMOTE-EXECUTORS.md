@@ -56,8 +56,11 @@ environment file by digest.
 
 Boat jobs build with MBX in local-only mode. The empty `MBX_REMOTE_URL` overrides the
 worker's configured remote cache, and the job shell drops any inherited token setting.
-The local store stays in MBX's default cache directory in the worker home, which the
-normal stop's snapshot keeps for the next resume. Its 64 GiB budget holds two release
+The local store stays in MBX's default cache directory in the worker home. The normal
+stop's snapshot keeps the worker's checkouts and build directories but not that cache
+directory, so each resume starts with an empty store and its first build of a revision
+is a cold one. Roadmap item 812 covers a store location that the snapshot keeps. Within
+one lifetime the store keeps every build warm. Its 64 GiB budget holds two release
 builds and the workspace test builds, and its 45 GiB free-space floor keeps the disk
 headroom that qualification requires. `admit` asks the pinned `mbx` for these effective
 settings and refuses a remote URL, a token setting or another budget. Laptops, gate
