@@ -355,6 +355,10 @@ fn fill_solutions(st: &mut SolState) -> sparkles::Result<()> {
         && let Some(r) = &st.result
     {
         let end = (st.row + BATCH).min(r.table().len());
+        // An exhausted iterator stays exhausted, even after cancellation.
+        if st.row == end {
+            return Ok(());
+        }
         let rows = r.rows_range(st.row..end)?;
         for i in 0..rows.len() {
             st.buf.push_back(rows.row(i)?.values().to_vec());
