@@ -1127,6 +1127,16 @@ impl Vocab {
         mut f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
         let _t = ioacct::timer(Phase::VocabRead);
+        if let [id] = ids {
+            // One key needs no read-ahead, prefetch or partition of its ids.
+            key.clear();
+            if *id < self.len {
+                let b = *id as usize / FC_BLOCK;
+                let mask = 1u32 << (*id as usize % FC_BLOCK);
+                self.checked_block::<F, ROOM, E>(b, mask, key, &mut reserve, &mut f)?;
+            }
+            return Ok(());
+        }
         let mut ahead = self.ahead_for(ids);
         if ahead.end == 0 && ids.len() > 1 {
             // scattered ids: ask for their blocks at once, so that a cold vocabulary
@@ -1134,7 +1144,6 @@ impl Vocab {
             self.prefetch_sorted(ids);
         }
         key.clear();
-        let data = self.data.as_slice();
         let mut i = 0;
         while i < ids.len() && ids[i] < self.len {
             let b = ids[i] as usize / FC_BLOCK;
@@ -1147,75 +1156,86 @@ impl Vocab {
                 mask |= 1 << (x as usize % FC_BLOCK);
             }
             mask &= (1u32 << n) - 1;
-            let last = 31 - mask.leading_zeros() as usize;
-            let mut pos = self.block_offset(b);
-            ioacct::vocab_blocks_scanned(1);
-            self.touch_block(b);
-            key.clear();
-            if !F {
-                // front coding rebuilds every key up to the last wanted one, in one pass
-                for at in 0..=last {
-                    let id = (b * FC_BLOCK + at) as u64;
-                    let e = self.entry::<F>(data, &mut pos, at == 0);
-                    let total = key.len().min(e.shared).saturating_add(e.len);
-                    if total > key.capacity() {
-                        reserve(total)?;
-                        key.reserve_exact(total - key.len());
-                        #[cfg(any(test, feature = "failpoints"))]
-                        crate::algo::observe_projection(
-                            crate::algo::ProjectionEvent::Materialized(
-                                "checked-vocab-scratch-allocated",
-                                key.capacity(),
-                            ),
-                        );
-                    }
-                    key.truncate(e.shared);
-                    self.push_suffix::<F>(data, e, id, usize::MAX, key, true);
-                    if mask >> at & 1 == 1 {
-                        f(id, key)?;
-                    }
-                }
-                i = j;
-                continue;
-            }
-            let mut e = self.entry::<F>(data, &mut pos, true);
+            self.checked_block::<F, ROOM, E>(b, mask, key, &mut reserve, &mut f)?;
+            i = j;
+        }
+        Ok(())
+    }
+
+    /// The checked reconstruction of the keys of block `b` whose bits are set in the
+    /// nonempty `mask`, which holds only keys of the block.
+    #[inline(always)]
+    fn checked_block<const F: bool, const ROOM: bool, E>(
+        &self,
+        b: usize,
+        mask: u32,
+        key: &mut Vec<u8>,
+        reserve: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        f: &mut impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let data = self.data.as_slice();
+        let last = 31 - mask.leading_zeros() as usize;
+        let mut pos = self.block_offset(b);
+        ioacct::vocab_blocks_scanned(1);
+        self.touch_block(b);
+        key.clear();
+        if !F {
+            // front coding rebuilds every key up to the last wanted one, in one pass
             for at in 0..=last {
                 let id = (b * FC_BLOCK + at) as u64;
-                let next = (at < last).then(|| self.entry::<F>(data, &mut pos, false));
-                let nd = lookahead(mask, at, next);
-                if nd > e.shared {
-                    // the whole key, or the bytes of it that later keys take
-                    let add = if nd == usize::MAX {
-                        self.suffix_len(data, e, id)
-                    } else {
-                        (nd - e.shared).min(e.most())
-                    };
-                    let total = key.len().min(e.shared).saturating_add(add);
-                    let room = if ROOM && e.coded { FSST_ROOM } else { 0 };
-                    if total.saturating_add(room) > key.capacity() {
-                        // an FSST suffix decodes fastest with room for eight symbols
-                        // past the key (`fsst::Table::decode_at`)
-                        let total = total.saturating_add(FSST_ROOM * usize::from(e.coded));
-                        reserve(total)?;
-                        key.reserve_exact(total - key.len());
-                        #[cfg(any(test, feature = "failpoints"))]
-                        crate::algo::observe_projection(
-                            crate::algo::ProjectionEvent::Materialized(
-                                "checked-vocab-scratch-allocated",
-                                key.capacity(),
-                            ),
-                        );
-                    }
+                let e = self.entry::<F>(data, &mut pos, at == 0);
+                let total = key.len().min(e.shared).saturating_add(e.len);
+                if total > key.capacity() {
+                    reserve(total)?;
+                    key.reserve_exact(total - key.len());
+                    #[cfg(any(test, feature = "failpoints"))]
+                    crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
+                        "checked-vocab-scratch-allocated",
+                        key.capacity(),
+                    ));
                 }
-                self.step::<F>(data, e, id, nd, key, true);
+                key.truncate(e.shared);
+                self.push_suffix::<F>(data, e, id, usize::MAX, key, true);
                 if mask >> at & 1 == 1 {
                     f(id, key)?;
                 }
-                if let Some(n) = next {
-                    e = n;
+            }
+            return Ok(());
+        }
+        let mut e = self.entry::<F>(data, &mut pos, true);
+        for at in 0..=last {
+            let id = (b * FC_BLOCK + at) as u64;
+            let next = (at < last).then(|| self.entry::<F>(data, &mut pos, false));
+            let nd = lookahead(mask, at, next);
+            if nd > e.shared {
+                // the whole key, or the bytes of it that later keys take
+                let add = if nd == usize::MAX {
+                    self.suffix_len(data, e, id)
+                } else {
+                    (nd - e.shared).min(e.most())
+                };
+                let total = key.len().min(e.shared).saturating_add(add);
+                let room = if ROOM && e.coded { FSST_ROOM } else { 0 };
+                if total.saturating_add(room) > key.capacity() {
+                    // an FSST suffix decodes fastest with room for eight symbols
+                    // past the key (`fsst::Table::decode_at`)
+                    let total = total.saturating_add(FSST_ROOM * usize::from(e.coded));
+                    reserve(total)?;
+                    key.reserve_exact(total - key.len());
+                    #[cfg(any(test, feature = "failpoints"))]
+                    crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
+                        "checked-vocab-scratch-allocated",
+                        key.capacity(),
+                    ));
                 }
             }
-            i = j;
+            self.step::<F>(data, e, id, nd, key, true);
+            if mask >> at & 1 == 1 {
+                f(id, key)?;
+            }
+            if let Some(n) = next {
+                e = n;
+            }
         }
         Ok(())
     }
