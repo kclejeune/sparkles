@@ -127,12 +127,25 @@ was acknowledged and the worker was seen running. During the hold the controller
 `diagnostic-probe.py` on the worker and keeps its output in `diagnostics.json`. The
 program reads the process table, the package's state directory listing and every phase's
 `probe-result.json`, the host memory summary, free disk space and the package's user
-units, and whether each command that admission checks is on the worker's path. It reads no other file, so the token and the repository are never opened. It
+units, and whether each command that admission checks is on the worker's path. For each
+startup checkout it lists up to 200 untracked paths that git does not ignore, relative
+to the checkout, with each path's kind, size, mode and mtime from `lstat`. An untracked
+directory is one entry. A path with any component that looks like a credential is left
+out and only counted. A component looks like one when it contains a stem such as
+`token`, `secret`, `netrc`, `id_rsa`, `.pem`, `.env`, `.ssh` or `.aws` anywhere, which
+also catches backup and editor copies. Git's listing is read up to 4 MiB. It reads no
+other file, so the token and the content of the repository are never opened. It
 opens each directory by name under its parent and never through a symbolic link, accepts
 only private directories of the worker, and reads a result only when it is a private
 single-link regular file shaped as a phase result. Results, then process rows, then
-listings are dropped until the output fits the transport bound and the receipt fits its
-1 MiB bound. A failed read is kept in `diagnostics-failed-NNNN.json` and retried after 15
+listings, then untracked paths are dropped until the output fits the transport bound and
+the receipt fits its 1 MiB bound.
+
+Every provider session the controller and `job_environment.py` open runs its program
+through `/usr/bin/env -C` from the worker's home, which always exists and lies outside
+the startup checkout, and `remote-executor.py`
+job commands change to the worker's home before they run anything. No session starts in
+the provider's landing directory, which may be a startup checkout. A failed read is kept in `diagnostics-failed-NNNN.json` and retried after 15
 seconds. The hold ends 300 seconds before the controller unit's 2,700-second runtime limit
 and 600 seconds before the guard's deadline. Each read ends 15 seconds before the hold, so
 the transport's own teardown fits inside it too. Any error ends the hold, so the
@@ -151,7 +164,25 @@ the code of a failed qualification in `qualification-failed.json`. An unresolved
 records its code in `unresolved.json`.
 
 Development credentials remain on the development worker. The token is qualified with
-lstat, and its content is never read by this package. The reviewed setup hook's own
+lstat, and its content is never read by this package. Jobs never use it.
+
+## Local-only MBX in jobs
+
+Boat jobs build with MBX in local-only mode. The worker's configuration names the
+read-only remote cache, and the job environment sets `MBX_REMOTE_URL` to an empty value,
+which overrides it, so no job reads the remote cache or its token. The job shell also
+drops any inherited `MBX_REMOTE_TOKEN_FILE` or `MBX_REMOTE_TOKEN`. The local store stays
+in MBX's default cache directory under the worker home, which the normal stop's snapshot
+keeps, so a later resume starts with the store warm. `MBX_GC_MAX_TOTAL_SIZE` is 64 GiB,
+which holds two release builds and the workspace test builds in one budget for the store,
+managed targets and incremental state. `MBX_GC_MIN_FREE_SIZE` is 45 GiB, which keeps the
+40 GiB of free disk that the metadata probe requires at the next qualification.
+`remote-executor.py admit` asks the pinned `mbx` for its effective `remote.url`,
+`gc.max_total_size` and `gc.min_free_size` through the job environment and refuses a
+remote URL, a token setting or another budget by name. A gate's service unit starts
+with an empty environment, so `gate-start.sh` forwards these settings when its caller
+set them. Qualification still checks the provisioned read-only configuration and the
+token metadata, since they describe the development environment rather than the job. The reviewed setup hook's own
 metadata-open behavior must remain within the release's provisioning scope. GitHub
 Actions retains separate OIDC authentication. This package exports no reusable snapshot
 or credential-bearing template.
@@ -216,7 +247,7 @@ The original `qualified-worker-admission.json` remains unchanged and has
 `runtime_env_file:null`. `job_environment.py` validates that receipt with the shared
 `validate_admission` consumer and its exact private profile, operation, source seal,
 job review and live guard. It creates one bounded mode-0600 nonsecret environment file
-containing only literal PATH, pinned Rust toolchain and token FILE path values. Its separate job-admission record
+containing only literal PATH, pinned Rust toolchain and local-only MBX values. Its separate job-admission record
 references the original qualification bytes and actual environment-file proof. It
 creates no extra authority or lifetime. Adapters pass the deterministic values
 literally and never source arbitrary shell values. An uncertain preparation is

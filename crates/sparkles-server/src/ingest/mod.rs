@@ -17,6 +17,7 @@
 //! ingestion can write nothing that the caller could not write with `register_source` and
 //! `assert_facts` itself.
 
+mod claims;
 pub mod cli;
 pub mod convert;
 mod csv;

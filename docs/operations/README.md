@@ -69,11 +69,12 @@ callers and records the selected numeric user in its receipt.
   The settings file declares and locks them, and a dataset admin changes them through the
   settings API, the Settings tab or Fuseki's `/{ds}/prefixes`. Loaded data never replaces
   a declared prefix.
-* The server pushes signed Standard Webhooks and ntfy notifications when memory review
-  waits too long, a backup policy run fails, or a provider's daily token budget is used
-  up ([C21](../specs/C21-outbound-notifications.md), [API.md](../API.md#notifications),
+* The server pushes signed Standard Webhooks, ntfy and email notifications when memory review
+  waits too long, a backup, policy run, verification or GC fails, a policy is overdue,
+  or a provider's daily token budget is used up ([C21](../specs/C21-outbound-notifications.md), [API.md](../API.md#notifications),
   [USAGE.md](../USAGE.md#sending-notifications)). Channels and routes are a server settings
-  kind, failures are retried with backoff, and `sparkles notify status` and
+  kind, failures are retried with backoff, each channel delivers from its own queue so
+  that a slow channel delays no other, and `sparkles notify status` and
   `sparkles notify test` show and test channels.
 
 ### Memory and resource limits

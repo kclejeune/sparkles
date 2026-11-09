@@ -618,6 +618,43 @@ no composer, reply, resolve or reopen. A caller whose grants cover only some gra
 a grant on the discussion graph, or the server refuses the comment. Item 769 covers an
 optional discussion store outside versioning.
 
+The **Bulk edits** tab changes many entities in one commit
+([screenshot](../images/ontology-bulk.png)). **Find and replace** searches the plain and
+language-tagged string values of the labels, of every annotation or of one annotation
+property, as literal text or as a JavaScript regular expression whose replacement may use
+groups such as `$1`, with or without matching case. A language filter keeps to untagged
+values or to one tag, and a tag such as `en` also matches `en-GB`. The scope is the whole
+graph or the entity list. A replacement keeps each value's language and its axiom
+annotations, and a value it would leave empty is left out and counted. **Set annotation**
+adds an annotation to every entity of the list and can replace the values the entities
+hold for that property in the same language, or every value when the new one is an IRI.
+**Remove annotation** removes a property's values from the entities of the list, every
+value, those in one language or one exact value. **Move classes** puts the classes of the
+list under a new parent or at the top. Each class loses the named superclasses that the
+graph's `SubClassOf` axioms state, with those axioms' annotations, unless **Keep the old
+parents** is checked, and its restrictions and other superclass expressions stay. A
+parent that is one of the classes or below one of them is refused, since the move would
+make a cycle.
+
+The entity list takes entities from the entity search, a class with its subclasses, or
+pasted IRIs and prefixed names, and holds at most 1,000 entities. Each edit reads the
+graph's own axioms without its imports at the commit the editor shows, lists every change
+with its old and new value, and opens the editor's preview of one `axioms` edit, so the
+dry run shows the changed triples and the commit is one entry of the undo stack. An edit
+of more than 1,000 changes is refused with its count, and so is a graph that holds more
+than 100,000 annotation assertions or `SubClassOf` axioms, since a partial read could miss
+matches. A move also refuses more than 10,000 changed axioms in all. A pattern that matches
+empty text, such as a lookahead, is refused. A value removed as an IRI removes only that IRI,
+and language tags compare without case, so setting a value an entity already holds leaves it
+and its axiom annotations alone. A commit that lands after the changes were listed clears
+them. Readers and
+protected branches can list changes but get no preview. An annotation property that the
+ontology does not declare is declared with the edit, and a property of another kind, such as a
+data property, is refused. A move's new parent must be a class of the ontology or its imports,
+each moved entity that the graphs type as something else is refused, and the move declares
+nothing. The cycle check follows only the graph's own named `SubClassOf` axioms.
+Item 770 covers bulk edits of larger ontologies.
+
 **Inferred** reveals the
 kept hierarchy beside the asserted class tree. It reads roots and expanded levels from
 an existing result, with the classifier's actual tier and outcome

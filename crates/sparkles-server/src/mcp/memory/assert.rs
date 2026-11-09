@@ -295,7 +295,7 @@ pub(crate) fn principal_iri(name: &str) -> NamedNode {
 }
 
 /// A version 5 UUID (RFC 9562 §5.5) in the namespace `ns`.
-pub(super) fn uuid_v5(ns: &uuid::Uuid, name: &str) -> uuid::Uuid {
+pub(crate) fn uuid_v5(ns: &uuid::Uuid, name: &str) -> uuid::Uuid {
     use sha1::{Digest, Sha1};
     let mut h = Sha1::new();
     h.update(ns.as_bytes());

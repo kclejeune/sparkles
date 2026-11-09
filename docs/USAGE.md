@@ -2468,7 +2468,7 @@ and the request shapes are in [API.md](API.md#service-options-loop-bulk-and-cach
 ## Sending notifications
 
 The server can tell a person when something needs them. It sends a notification to a
-webhook or an ntfy topic when agent memory has waited for review too long, when a
+webhook, an ntfy topic or mail addresses when agent memory has waited for review too long, when a
 backup policy run fails, and when a model provider's daily token budget is used up.
 Notifications are off until the configuration turns them on.
 
@@ -2524,6 +2524,18 @@ with `"urlSecret": {"secret": NAME}` in place of `url`. An ntfy channel publishe
 server can be read by anyone who guesses its name, so use an access token with a
 reserved topic, or a server of your own.
 
+An email channel submits a message to a mail server with STARTTLS on port 587, or with
+TLS on port 465 when `tls` is `tls`. It never sends in the clear, so a server that does
+not offer STARTTLS is refused. The password goes into a secret like any other
+credential:
+
+```json
+{ "type": "email", "host": "smtp.example.org", "username": "sparkles", "password": { "secret": "smtp" }, "from": "sparkles@example.org", "to": ["ops@example.org"] }
+```
+
+The subject is the notification's title, and the body holds the summary, the link and
+the event's data.
+
 Each dataset decides how long its memory review may wait. The event fires when the
 oldest open review branch, such as a scheduled consolidation's, is older than
 `notifyAfter`, and then at most once per `repeatEvery` until no review branch is open:
@@ -2533,7 +2545,11 @@ sparkles settings set org memory.review.notifyAfter=2d memory.review.repeatEvery
 ```
 
 A backup policy that fails notifies once, then at most once per the kind's
-`repeatEvery` (one day by default) until a run of the policy succeeds. A spent model
+`repeatEvery` (one day by default) until a run of the policy succeeds. A backup started
+by hand that fails, a verification that finds a damaged backup and a GC that fails
+notify the same way, with the types `backup.failed`, `backup.verify.failed` and
+`backup.gc.failed`, and a policy that has missed two scheduled runs since its last
+success sends `backup.overdue`. The route `backup.*` sends all of them. A spent model
 budget notifies once per provider and day. Requests to the channels go through the
 outbound policy, so a channel on a private address needs `--outbound-allow-private`.
 A failed delivery is retried with backoff, five attempts by default.

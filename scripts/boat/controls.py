@@ -917,10 +917,10 @@ class Controls(unittest.TestCase):
     def test_job_environment_is_only_literal_nonsecret_paths(self):
         from job_environment import environment,environment_body,expected_environment
         p=synthetic_profile();values=environment(p)
-        self.assertEqual(set(values),{'PATH','RUSTUP_TOOLCHAIN','RUSTUP_AUTO_INSTALL','MBX_REMOTE_TOKEN_FILE'})
+        self.assertEqual(set(values),{'PATH','RUSTUP_TOOLCHAIN','RUSTUP_AUTO_INSTALL','MBX_REMOTE_URL','MBX_GC_MAX_TOTAL_SIZE','MBX_GC_MIN_FREE_SIZE'})
         self.assertEqual(values['RUSTUP_TOOLCHAIN'],p['tool_versions']['rust']);self.assertEqual(values['RUSTUP_AUTO_INSTALL'],'0')
         self.assertIn(p['worker_home']+'/.local/share/mise/installs/mr-boxington/'+p['tool_versions']['mbx'],values['PATH'].split(':'))
-        self.assertEqual(values['MBX_REMOTE_TOKEN_FILE'],p['worker_home']+'/.config/mbx/remote-token')
+        self.assertEqual(values['MBX_REMOTE_URL'],'');self.assertNotIn('MBX_REMOTE_TOKEN_FILE',values)
         q={'safe_owner':{'operation_id':'boat-owned-warm-qual-inert'},'local_guard':{'unit':'boat-owned-warm-qual-inert.service'}}
         row=expected_environment(p,q)
         self.assertEqual(row['sha256'],digest(environment_body(p)));self.assertEqual(row['mode'],0o600)
