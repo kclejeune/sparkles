@@ -1590,3 +1590,44 @@ class SourceDriftBounds(SourceDriftRecord):
         (repo/'run.sh').write_text('false\n');(repo/'run.sh').chmod(0o644)
         got=self.O['worktree_summary'](repo)
         self.assertEqual((got['mode_changes'],got['content_changes']),(0,3))
+
+
+class SourceDriftCleanup(SourceDriftRecord):
+    """A summary command's whole process group ends with it, whatever fails."""
+    def started(self):
+        import subprocess as sp;made=[];real=sp.Popen
+        def popen(*a,**k):
+            child=real(*a,**k);made.append(child);return child
+        return made,patch.object(sp,'Popen',popen)
+
+    def gone(self,pid):
+        import time as t
+        end=t.monotonic()+3
+        while t.monotonic()<end:
+            try:
+                os.kill(pid,0)
+                status=Path('/proc/%d/stat'%pid).read_text().rsplit(')',1)[1].split()[0]
+                if status=='Z':return True
+            except (ProcessLookupError,FileNotFoundError):return True
+            t.sleep(0.05)
+        return False
+
+    def test_a_descendant_that_outlives_its_command_is_ended(self):
+        import time as t,shutil as sh
+        tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup);pidfile=Path(tmp.name)/'pid'
+        script='sleep 30 & echo $! > "$1"; wait'
+        with self.assertRaises(self.O['Refusal']):self.O['bounded_output']([sh.which('sh'),'-c',script,'sh',str(pidfile)],t.monotonic()+0.7)
+        self.assertTrue(self.gone(int(pidfile.read_text())))
+
+    def test_a_selector_failure_still_ends_the_child_and_closes_its_pipe(self):
+        import time as t,shutil as sh,selectors
+        made,popen=self.started()
+        with popen,patch.object(selectors,'DefaultSelector',side_effect=OSError('selector')):
+            with self.assertRaises(OSError):self.O['bounded_output']([sh.which('sleep'),'30'],t.monotonic()+5)
+        self.assertEqual(len(made),1);self.assertTrue(self.gone(made[0].pid));self.assertTrue(made[0].stdout.closed)
+
+    def test_the_summary_disables_repository_hooks(self):
+        import time as t;seen=[]
+        def fake(argv,deadline,env=None,cwd=None,**k):seen.append(argv);return b''
+        with patch.dict(self.O,{'bounded_output':fake}):self.O['worktree_summary']('/repo',deadline=t.monotonic()+5)
+        for argv in seen:self.assertIn('core.fsmonitor=false',argv)

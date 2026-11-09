@@ -48,26 +48,35 @@ class SourceDrift(Refusal):
 SUMMARY_SECONDS=12
 SUMMARY_RESERVE=45
 SUMMARY_BYTES=4*1024*1024
+CLEANUP_SECONDS=2
 PROBE_STARTED=[]
 def bounded_output(argv,deadline,env=None,cwd=None,limit=SUMMARY_BYTES,clock=None):
-    """A command's stdout, refused past its byte limit or the deadline; the child never outlives it."""
-    import selectors,time as t
+    """A command's stdout, refused past its byte limit or the deadline.
+
+    The command runs in its own process group, which is killed whatever happens, so no
+    descendant outlives it, and the cleanup waits at most CLEANUP_SECONDS."""
+    import selectors,signal,time as t
     clock=clock or t.monotonic
-    child=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env,cwd=cwd)
-    chunks=[];size=0;sel=selectors.DefaultSelector();sel.register(child.stdout,selectors.EVENT_READ)
+    child=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env,cwd=cwd,start_new_session=True)
+    sel=None
     try:
+        sel=selectors.DefaultSelector();sel.register(child.stdout,selectors.EVENT_READ)
+        chunks=[];size=0
         while True:
             left=deadline-clock();need(left>0,'worktree summary deadline')
             if not sel.select(min(left,1.0)):continue
             data=os.read(child.stdout.fileno(),65536)
             if not data:break
             size+=len(data);need(size<=limit,'worktree summary output bound');chunks.append(data)
-        need(child.wait(max(0.1,deadline-clock()))==0,'worktree summary command failed')
+        while child.poll() is None:
+            need(deadline-clock()>0,'worktree summary deadline');t.sleep(0.01)
+        need(child.returncode==0,'worktree summary command failed')
         return b''.join(chunks)
     finally:
-        sel.close()
-        if child.poll() is None:child.kill();child.wait()
-        child.stdout.close()
+        for step in (lambda:sel is not None and sel.close(),lambda:os.killpg(child.pid,signal.SIGKILL),
+                     lambda:child.wait(CLEANUP_SECONDS),lambda:child.stdout.close()):
+            try:step()
+            except Exception:pass
 def summary_deadline(clock=None,runtime=240):
     """The summary's end, or None when the metadata unit has too little time left."""
     import time as t
@@ -82,7 +91,8 @@ def worktree_summary(repo,env=None,deadline=None):
     try:
         deadline=summary_deadline() if deadline is None else deadline
         if deadline is None:return None
-        git=lambda *a:bounded_output(['git','-C',str(repo),*a],deadline,env,repo)
+        # No repository hook or helper runs, so nothing the checkout configures starts.
+        git=lambda *a:bounded_output(['git','-C',str(repo),'-c','core.fsmonitor=false','-c','core.untrackedCache=false','-c','diff.external=','--no-optional-locks',*a],deadline,env,repo)
         tokens=git('status','--porcelain=v1','-z').split(b'\0');counts=dict.fromkeys(WORKTREE_COUNTS,0);i=0
         while i<len(tokens):
             entry=tokens[i];i+=1
