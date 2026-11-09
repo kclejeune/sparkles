@@ -1792,6 +1792,10 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
         let Some(id) = x.store.next(ix, &mut max) else {
             break;
         };
+        let grown = x.store.take_grown();
+        if grown > 0 {
+            out.dl().grow(grown);
+        }
         n += 1;
         let c = x.store.clauses[id as usize].c.clone();
         process(ix, me, st, id, &c, &max, out);
