@@ -1346,10 +1346,13 @@ class Finish(unittest.TestCase):
                   'stop':{'id':'stop_fixture','status':'completed','error':None,'forced':False,'endedAt':iso(now+2)}}
             closed={'worker':worker,'stop_operation':'stop_fixture','safe_info':safe,'stopped_confirmed':True,'owned_metadata_closed':True,'guard_may_exit':True}
             gone=str(Path(tmp)/'collected-guard-cgroup')
-            def io_with(live):
+            boot=f['qualified']['local_guard']['boot_id'];receipt={'invocation_id':'a'*32,'boot_id':boot,'pid':7,'exit':0}
+            def io_with(live,exited=receipt):
                 class IO:
-                    def __init__(self):self.t=0;self.records={'closed.json':closed,'stop-intent.json':{'requested_wall':now+1},
-                                                              'guard-loaded.json':{'boot_id':f['qualified']['local_guard']['boot_id'],'loaded':{'InvocationID':'a'*32,'ControlGroup':gone}}}
+                    def __init__(self):
+                        self.t=0;self.records={'closed.json':closed,'stop-intent.json':{'requested_wall':now+1},
+                                               'guard-loaded.json':{'boot_id':boot,'loaded':{'InvocationID':'a'*32,'ControlGroup':gone}}}
+                        if exited is not None:self.records['guard-exited.json']=exited
                     def mono(self):return self.t
                     def read(self,n):return self.records[n]
                     def exists(self,n):return n in self.records
@@ -1364,6 +1367,21 @@ class Finish(unittest.TestCase):
                 for live in (dict(collected,LoadState='loaded',InvocationID='b'*32),dict(collected,LoadState='loaded',ActiveState='active',SubState='running',MainPID='7',InvocationID='b'*32),
                              dict(collected,LoadState='not-found',ActiveState='active'),dict(collected,InvocationID='b'*32)):
                     with self.assertRaisesRegex(controller.Refusal,'guard replaced during finish|verified stop not observed'):controller.await_stop(r,io_with(live),seconds=2)
+                # Absence alone is no exit status: a collected unit needs the original guard's own
+                # receipt, so a signalled, reset-failed or replaced guard that was unloaded refuses.
+                for exited in (None,dict(receipt,invocation_id='b'*32),dict(receipt,boot_id='other-boot'),dict(receipt,exit=1)):
+                    with self.assertRaisesRegex(controller.Refusal,'collected guard without its own exit receipt'):controller.await_stop(r,io_with(collected,exited),seconds=2)
+
+    def test_the_guard_records_its_exit_only_after_a_closure(self):
+        class IO:
+            def __init__(self,closed):self.records={'closed.json':{}} if closed else {}
+            def exists(self,n):return n in self.records
+            def record(self,n,v):assert n not in self.records;self.records[n]=v
+        io=IO(True)
+        with patch.dict(os.environ,{'INVOCATION_ID':'c'*32}):controller.record_guard_exit(io)
+        row=io.records['guard-exited.json'];self.assertEqual((row['invocation_id'],row['exit'],row['pid']),('c'*32,0,os.getpid()))
+        self.assertEqual(row['boot_id'],Path('/proc/sys/kernel/random/boot_id').read_text().strip())
+        io=IO(False);controller.record_guard_exit(io);self.assertNotIn('guard-exited.json',io.records)
 
 class BoundedFinalizerInterrupt(unittest.TestCase):
     def test_real_interrupts_finish_owned_closure_before_propagating(self):
@@ -1608,7 +1626,7 @@ class StatOnlyStatus(SourceDriftRecord):
         self.assertNotEqual(observed['status_sha256'],clean['status_sha256']);self.assertEqual(observed['tracked_diff_sha256'],clean['tracked_diff_sha256'])
         status=self.O['status_record'](repo,None)
         self.assertEqual(status['sha256'],observed['status_sha256'])
-        self.assertEqual(self.O['public_status'](status)['entries'],[{'xy':' M','path':'crates/LICENSE','kind':'link','bytes':8,'mode':0o120777,'index_mode':0o120000,'index_bytes':99}])
+        self.assertEqual(self.O['public_status'](status)['entries'],[{'xy':' M','path':'crates/LICENSE','kind':'link','bytes':8,'mode':0o120777,'index_mode':0o120000,'index_bytes':99,'link_matches_head':True}])
         self.assertTrue(self.O['stat_only_status'](clean,observed,status))
         # The drift record keeps the lines bounded when the probe refuses.
         drift=self.O['SourceDrift']('existing source drift',repo,clean,observed,status).source_drift
@@ -1627,6 +1645,17 @@ class StatOnlyStatus(SourceDriftRecord):
             with self.subTest(name):
                 observed=self.source(repo);status=self.O['status_record'](repo,None)
                 self.assertNotEqual(observed,clean);self.assertFalse(self.O['stat_only_status'](clean,observed,status))
+        # A regular file whose change a line-ending conversion or a clean filter hides from
+        # the diff shows as ` M` by its size alone, and stays drift.
+        for name,attrs,config in (('crlf','*.txt text eol=lf\n',()),('filter','*.txt filter=strip\n',('filter.strip.clean','sed -e s/^x//'))):
+            with self.subTest(name):
+                repo=self.linked();(repo/'.gitattributes').write_text(attrs)
+                for k in config[::2]:self.git(repo,'config',k,config[config.index(k)+1])
+                self.git(repo,'add','.gitattributes');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','-c','commit.gpgsign=false','commit','-qm','attrs')
+                clean=self.source(repo);(repo/'a.txt').write_bytes(b'a\r\n' if name=='crlf' else b'xa\n')
+                observed=self.source(repo);status=self.O['status_record'](repo,None)
+                self.assertEqual(observed['tracked_diff_sha256'],clean['tracked_diff_sha256']);self.assertNotEqual(observed['status_sha256'],clean['status_sha256'])
+                self.assertFalse(self.O['stat_only_status'](clean,observed,status))
         repo,clean=cases['credential-like'];status=self.O['public_status'](self.O['status_record'](repo,None))
         self.assertEqual((status['omitted_credential_like'],status['entries']),(1,[]))
         # A stat-only status against a recording that was not clean, or a listing other than the hashed one, is still drift.
@@ -1807,14 +1836,18 @@ class ResumeReply(unittest.TestCase):
     def test_a_reply_summary_keeps_shape_and_enumerated_fields_only(self):
         s=controller.reply_summary
         good=json.dumps({'event':'accepted','id':'bx_gy2ytgh8','status':'resuming'}).encode()
-        self.assertEqual(s(good),{'bytes':len(good),'lines':1,'parsed':'json','objects':[{'keys':['event','id','status'],'fields':{'event':'accepted','id':'bx_gy2ytgh8','status':'resuming'}}]})
+        self.assertEqual(s(good),{'bytes':len(good),'lines':1,'parsed':'json','objects':[{'keys':['event','id','status'],'unknown_keys':0,'fields':{'event':'accepted','id':'bx_gy2ytgh8','status':'resuming'}}]})
         # Two JSON lines do not parse as one document, and the summary still shows both.
         stream=b'{"event":"accepted","id":"bx_gy2ytgh8"}\n{"event":"resuming","status":"resuming","url":"https://x/?token=DO_NOT_COPY"}\n'
         row=s(stream);self.assertEqual(row['parsed'],'json_lines');self.assertEqual(row['lines'],2)
-        self.assertEqual(row['objects'][1]['fields'],{'event':'resuming','status':'resuming'});self.assertIn('url',row['objects'][1]['keys'])
+        self.assertEqual(row['objects'][1]['fields'],{'event':'resuming','status':'resuming'});self.assertNotIn('url',row['objects'][1]['keys']);self.assertEqual(row['objects'][1]['unknown_keys'],1)
         secret={'ok':False,'code':'quota','error':{'code':'rate_limited','message':'DO_NOT_COPY'},'token':'DO_NOT_COPY','status':'Bearer DO_NOT_COPY','id':'DO_NOT_COPY'}
         row=s(json.dumps(secret).encode());self.assertNotIn('DO_NOT_COPY',json.dumps(row))
-        self.assertEqual(row['objects'][0]['fields'],{'ok':False,'code':'quota','error_code':'rate_limited','status':None,'id':None})
+        self.assertEqual(row['objects'][0]['fields'],{'ok':False,'code':'other','error_code':'rate_limited','status':'other','id':None})
+        # Lowercase identifier-shaped secrets in values or key names are not kept either.
+        row=s(json.dumps({'status':'mysecret123','event':'mysecret123','mysecret123':True,'code':'ghp_mysecret123'}).encode())
+        self.assertNotIn('mysecret123',json.dumps(row));self.assertEqual(row['objects'][0]['unknown_keys'],1)
+        self.assertEqual(row['objects'][0]['fields'],{'event':'other','status':'other','code':'other'})
         self.assertEqual(s(b'not json DO_NOT_COPY'),{'bytes':20,'lines':1,'parsed':'unparsed','objects':[]})
         self.assertEqual(s(b''),{'bytes':0,'lines':0,'parsed':'empty','objects':[]})
         big=b'\n'.join(json.dumps({'k%d'%i:i for i in range(80)}).encode() for _ in range(20))
@@ -1835,6 +1868,12 @@ class ResumeReply(unittest.TestCase):
         io.boat=lambda args,*a,**k:dict(original(args,*a,**k),body={'event':'queued'}) if args[0]=='resume' else original(args,*a,**k)
         with self.assertRaises(controller.Refusal):controller.drive(r,io)
         self.assertEqual(io.read('resume-outcome.json')['reply']['objects'][0]['fields'],{'event':'queued'})
+
+    def test_a_timed_out_resume_keeps_the_reply_it_printed(self):
+        code='import sys,time;print(\'{"event":"accepted","id":"bx_a1","status":"resuming"}\',flush=True);time.sleep(30)'
+        result=controller.bounded([sys.executable,'-I','-c',code],2,reply=True)
+        self.assertEqual(result['error'],'timeout');self.assertEqual(result['reply']['parsed'],'json')
+        self.assertEqual(result['reply']['objects'][0]['fields']['event'],'accepted')
 
     def test_the_real_adapter_summarizes_only_the_resume_reply(self):
         code='print(\'{"event":"accepted","id":"bx_a1"}\');print(\'{"event":"resuming","status":"resuming"}\')'

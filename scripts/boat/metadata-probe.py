@@ -61,6 +61,14 @@ def index_records(repo,paths,env):
         size=re.search(rb'size: ([0-9]+)',m[3])
         out[m[2]]={'index_mode':int(m[1],8),'index_bytes':int(size[1]) if size else None}
     return out
+def link_matches_head(repo,raw,full,env):
+    """Whether a symbolic link's raw target is the blob HEAD records for it, as a link."""
+    tree=command(['git','-C',str(repo),'--literal-pathspecs','ls-tree','-z','HEAD','--',raw.decode('utf-8','surrogateescape')],15,env,repo)
+    m=re.fullmatch(rb'120000 blob ([0-9a-f]{40,64})\t'+re.escape(raw)+rb'\0',tree)
+    if m is None:return False
+    target=os.readlink(full)
+    r=subprocess.run(['git','-C',str(repo),'hash-object','--no-filters','--stdin'],input=target,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=15,env=env,cwd=repo)
+    return r.returncode==0 and r.stdout.strip()==m[1]
 def status_record(repo,env):
     """The checkout's status lines, bounded and credential-free, with the hash of the raw listing."""
     row={'sha256':None,'total':0,'omitted_credential_like':0,'truncated':False,'stat_only':False,'entries':[]}
@@ -77,11 +85,13 @@ def status_record(repo,env):
         index=index_records(repo,tracked,env)
         for xy,raw,name in kept:
             entry={'xy':xy,'path':name}
+            full=os.path.join(os.fsencode(str(repo)),raw)
             try:
-                st=os.lstat(os.path.join(os.fsencode(str(repo)),raw))
+                st=os.lstat(full)
                 entry.update(kind='directory' if stat.S_ISDIR(st.st_mode) else ('file' if stat.S_ISREG(st.st_mode) else ('link' if stat.S_ISLNK(st.st_mode) else 'other')),bytes=st.st_size,mode=st.st_mode)
             except FileNotFoundError:entry['kind']='absent'
             entry.update(index.get(raw,{}))
+            if entry.get('kind')=='link' and raw in index:entry['link_matches_head']=link_matches_head(repo,raw,full,env)
             row['entries'].append(entry)
         row['_lines']=lines
     except Exception as error:row['unread']=reason_code(error)
@@ -90,11 +100,13 @@ def stat_only_status(recorded,observed,status):
     """Whether a status that differs from a clean recording shows only stale index stat data.
 
     Git reports ` M` without reading content when a path's size differs from the size its
-    index entry records, as a restored symbolic link can, and no refresh clears it. The
-    identity still holds when the recording was clean, every other field is unchanged,
-    the tracked diff against HEAD is empty, the probe's own listing is the one the helper
-    hashed, and every line is a worktree-only modification of a tracked path, so tracked
-    content and modes equal HEAD and no path is untracked or staged.
+    index entry records, as a restored symbolic link can, and no refresh clears it. Only
+    that case is accepted. The recording was clean, every other field is unchanged, the
+    tracked diff against HEAD is empty, the probe's own listing is the one the helper
+    hashed, and every line is a worktree-only ` M` of a path that is a symbolic link in
+    the worktree, the index and HEAD, whose lstat size differs from its index size and
+    whose raw target is the blob HEAD records. A regular file is never accepted, since a
+    clean filter or line-ending conversion can hide a content change from the diff.
     """
     r,o=source_fields(recorded),source_fields(observed)
     if any(r[k]!=o[k] for k in SOURCE_FIELDS if k!='status_sha256'):return False
@@ -102,7 +114,10 @@ def stat_only_status(recorded,observed,status):
     if set(recorded)!=set(observed) or recorded.get('inputs')!=observed.get('inputs'):return False
     lines=status.get('_lines')
     if status.get('sha256')!=o['status_sha256'] or not lines or status.get('truncated') or status.get('omitted_credential_like'):return False
-    return all(xy==' M' for xy,_ in lines)
+    entries=status.get('entries') or []
+    if len(entries)!=len(lines):return False
+    return all(xy==' M' and e.get('xy')==' M' and e.get('kind')=='link' and e.get('index_mode')==0o120000 and isinstance(e.get('index_bytes'),int)
+               and e.get('index_bytes')!=e.get('bytes') and e.get('link_matches_head') is True for (xy,_),e in zip(lines,entries))
 def public_status(status):
     return {k:v for k,v in status.items() if k!='_lines'}
 

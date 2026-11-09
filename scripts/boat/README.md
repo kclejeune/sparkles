@@ -43,9 +43,11 @@ loaded command, PID, cgroup and limits. Null, malformed or lost acknowledgements
 the start reservation and never authorize another resume. `resume-outcome.json` keeps a
 bounded summary of the reply beside the acceptance, with its byte and line counts,
 whether it parsed as one JSON document or as JSON lines, and for at most four objects
-their key names and the `event`, `status`, `state`, `code`, `ok` and error code fields.
-A field value is kept only when it is a short lowercase word, and the worker ID only in
-its `bx_` form, so messages, URLs and other provider text never reach the record. Provider readiness alone does
+the `event`, `status`, `state`, `code`, `ok` and error code fields. A field value is
+kept only when it is one of the provider's known words, and any other string reads as
+`other`. Key names are kept only from the reply's known schema, and other keys are only
+counted. The worker ID is kept only in its `bx_` form. The summary covers whatever was
+read, so a resume that prints and then times out keeps it too. Provider readiness alone does
 not qualify the worker. The pinned provisioning hook may run its reviewed normal setup,
 including first bootstrap. Actual bootstrap-lock, descendant, tool, manifest, source,
 capacity, token metadata and metadata-service closure checks must pass afterward. A
@@ -135,15 +137,20 @@ records. Paths follow the credential-like rule of the untracked list below. Git 
 records, and no refresh clears it, which a restored symbolic link can cause. The
 startup checkout has one symbolic link, `crates/sparkles-py/LICENSE`, and the ` M` line
 of that path is the status change this produces.
-The probe therefore accepts a status that differs only in such lines. It requires a
-clean recorded status, every other identity field unchanged, an empty tracked diff
-against HEAD, its own listing hashing to the status the helper observed, and every line
-a worktree-only ` M` of a tracked path. Tracked content and modes then equal HEAD, and
-no path is untracked, staged or hidden as credential-like. The qualification keeps the
-lines as `stat_only_status` beside the checkout's source observations. Any other status
-change remains a refusal, and so does a stat-only status whose content later changes
-during the checker. The repository's filters run only for git's own status and diff,
-and no hook runs.
+The probe therefore accepts a status that differs only in such lines of symbolic links.
+It requires a clean recorded status, every other identity field unchanged, an empty
+tracked diff against HEAD and its own listing hashing to the status the helper observed.
+Every line must be a worktree-only ` M` of a path that is a symbolic link in the
+worktree, the index and HEAD, whose `lstat` size differs from its index size and whose
+raw target hashes to the blob HEAD records. A regular file is never accepted this way,
+because a clean filter or a line-ending conversion can hide a content change from the
+diff while its new size still marks it. The qualification keeps the lines as
+`stat_only_status` beside the checkout's source observations. Any other status change
+remains a refusal, and so does a stat-only status whose content changes during the
+checker. The identity has the limits of git's own view. A path marked assume-unchanged
+or skip-worktree, a mode change under `core.fileMode=false` and ignored files do not
+appear in it. The repository's filters run only for git's own status and diff, and no
+hook runs.
 
 A refused qualification holds its stop trigger for at most 600 seconds when the resume
 was acknowledged and the worker was seen running. During the hold the controller runs
@@ -380,12 +387,13 @@ watch records `closure-watch-unresolved.json` with the last reason code and leav
 guard's own deadline stop in place. One watch runs per operation.
 
 `finish` waits up to 180 seconds for the same operation's verified completed/nonforced
-stop, current stopped/snapshot proof and clean local guard exit. The guard is a transient
-unit started without `--collect`, so systemd unloads it after a clean exit and keeps a
-failed guard loaded as failed. A guard unit that is no longer loaded, with no invocation
-and no main process, is therefore the original guard after its clean exit, and its
-recorded cgroup must be gone or empty. A loaded unit with another invocation is still a
-replaced guard. A pending, submitted,
+stop, current stopped/snapshot proof and clean local guard exit. systemd unloads the guard's
+transient unit once it is inactive without a failure, so a finish can find it already
+collected, and an absent unit proves no exit status. The guard's last act after a
+verified closure therefore writes `guard-exited.json` with its own invocation ID, boot
+and PID. A collected guard counts as closed only with that receipt for the original
+invocation and boot, and its recorded cgroup must be gone or empty. A loaded unit with
+another invocation, or a collected one without the receipt, still refuses. A pending, submitted,
 unknown or unresolved stop fails and retains reconciliation ownership. It never forces,
 resumes, retries stop or selects another worker. `request-stop --operation OPERATION`
 remains available to submit the trigger without claiming completion. Recovery uses the

@@ -152,6 +152,7 @@ def status_evidence(x):
         row={'xy':e['xy'] if isinstance(e.get('xy'),str) and STATUS_XY.fullmatch(e['xy']) else None,'path':status_text(e.get('path'))}
         for k in ('kind',):row[k]=e[k] if e.get(k) in ('file','directory','link','other','absent') else None
         for k in ('bytes','mode','index_bytes','index_mode'):row[k]=status_count(e.get(k))
+        if 'link_matches_head' in e:row['link_matches_head']=e['link_matches_head'] is True
         out['entries'].append(row)
     return out
 def validate_release(r,now):
