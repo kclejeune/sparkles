@@ -18,6 +18,8 @@ EXTEND_ACT_MAX=90
 FREEZE_WAIT=100
 GUARD_RUNTIME=lifetime.MAX_LIFETIME+lifetime.STOP_MARGIN+FREEZE_WAIT
 EXTENSION_LOCK='lifetime-extension.lock'
+# Every Boat command holds this lock shared from its admission until it exits.
+JOB_LOCK='jobs.lock'
 
 ROOT=Path(__file__).resolve().parent
 
@@ -29,7 +31,8 @@ WATCH_POLL=30
 WATCH_FLOOR=60
 WATCH_CHECKS=400
 WATCH_ACCEPT=15
-WATCH_SETTLE=60
+WATCH_DECISION=90
+WATCH_LOCAL=20
 # Job work on the worker: the screen and build units the remote executor and the
 # build host start, and the processes that build or serve a revision. An mbx
 # lease lives only as long as its mbx process, so the process check covers it.
@@ -213,9 +216,19 @@ class RealIO:
         need(safe['day']['used']<self.r['start_ledger']['starts_and_reservations'],'start ledger stale or missing this reservation')
         self.record('account-starts-before-resume.json',{'observed_wall':self.wall(),'account_wide':True,'starts':safe,'large_available':True,'no_wallet_or_plan_changes':True})
         return safe
-    def job_closure(self,local_units):
+    def lock_jobs(self):
+        """Take the operation's job lock exclusively without waiting, or report that a command holds it."""
+        fd=os.open(self.op/JOB_LOCK,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+        try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd);return False
+        self._jobs=fd;return True
+    def unlock_jobs(self):
+        fd=getattr(self,'_jobs',None);self._jobs=None
+        if fd is not None:os.close(fd)
+    def job_closure(self,local_units,seconds=60):
         """One bounded check of the worker's job units and processes and the local job units."""
-        r=self.remote_python(JOB_CLOSURE_PROGRAM,[json.dumps(list(JOB_UNIT_PREFIXES)),json.dumps(sorted(JOB_PROCESSES))],60)
+        r=self.remote_python(JOB_CLOSURE_PROGRAM,[json.dumps(list(JOB_UNIT_PREFIXES)),json.dumps(sorted(JOB_PROCESSES))],seconds)
         need(r['exit']==0 and isinstance(r['body'],dict),'worker job closure check failed')
         b=r['body']
         local={}
@@ -787,29 +800,32 @@ def closure_watch(r,io,lead=WATCH_LEAD,local_units=(),poll=WATCH_POLL,observe=aw
     A worker kept warm past its jobs would otherwise reach the guard's deadline
     with no job-closure record, and the guard would leave it to the provider TTL.
     ``lead`` seconds before the present end, extensions included, the watch
-    records a fence for that end, which job admission refuses, and waits
-    WATCH_SETTLE seconds for jobs admitted just before to start. It then checks
-    that no job unit or job process remains on the worker and that the named
-    local job units are inactive. When a check finds them closed, it takes the
-    extension lock, waits out a pending acceptance, reads the end again and, if
-    no extension moved it, checks the jobs once more and publishes the
-    job-closure record from that check with the stop trigger while it holds the
-    lock. It then observes the guard's verified stop. An open job is checked
-    again every ``poll`` seconds. If none closes by WATCH_FLOOR seconds before
-    the end, the watch records that and leaves the guard's stop path unchanged.
+    checks that no job unit or job process remains on the worker and that the
+    named local job units are inactive. When a check finds them closed, it takes
+    the extension lock and then the operation's job lock exclusively. Every Boat
+    command holds that job lock shared for its whole life from admission, so the
+    exclusive lock proves that no command is running or launching, and new
+    commands wait while the watch holds it. Within WATCH_DECISION seconds the
+    watch waits out a pending acceptance, checks the jobs again, and publishes
+    the job-closure record from that check with the stop trigger only if the
+    end, the accepted extensions and the terminal receipts are unchanged. It then
+    observes the guard's verified stop. An open job is checked again every
+    ``poll`` seconds. If none closes by WATCH_FLOOR seconds before the end, the
+    watch records that and leaves the guard's stop path unchanged.
     """
     need(type(lead)is int and 300<=lead<=3600,'closure watch lead out of range')
-    need(all(isinstance(u,str) and re.fullmatch(r'[A-Za-z0-9@_.:-]{1,200}',u) for u in local_units),'local job unit name')
+    need(len(local_units)<=8 and all(isinstance(u,str) and re.fullmatch(r'[A-Za-z0-9@_.:-]{1,200}',u) for u in local_units),'local job unit name')
     need(io.exists('root-handoff.json') and io.exists('qualified-worker-admission.json') and io.exists('guard-admission.json'),'no qualified Root handoff to watch')
     io.record('closure-watch.json',{'worker':worker_id(),'operation_id':r['guard_unit'],'lead_seconds':lead,'poll_seconds':poll,'local_units':list(local_units),'started_wall':io.wall(),'started_boottime':io.mono()})
-    checks=0;last='not_checked';fences=0;fenced=None
+    checks=0;last='not_checked'
+    terminal=('stop-trigger.json','closed.json','unresolved.json','root-job-closed.json')
     def unresolved(code):
         io.record('closure-watch-unresolved.json',{'worker':worker_id(),'reason_code':code,'checks':checks,'observed_wall':io.wall(),'action':'the guard keeps its own deadline stop; Root must establish job closure or reconcile the worker'})
         return 'UNRESOLVED_JOB_OPEN'
-    def check_jobs():
+    def check_jobs(seconds):
         nonlocal checks,last
         checks+=1
-        try:check=io.job_closure(local_units)
+        try:check=io.job_closure(local_units,seconds)
         except Exception as error:last=reason_code(error);return None
         check['observed_unix']=io.wall();check['closed']=job_closed(r,io,check)
         io.record('closure-watch-check-%04d.json'%checks,check)
@@ -826,38 +842,39 @@ def closure_watch(r,io,lead=WATCH_LEAD,local_units=(),poll=WATCH_POLL,observe=aw
         if left>lead:pause(io,min(poll,left-lead));continue
         if io.exists('stop-trigger.json'):return unresolved('stop_triggered_without_job_closure')
         if checks>=WATCH_CHECKS:return unresolved('closure_check_bound')
-        if fenced!=(wall,boot):
-            # Job admission refuses from here until an extension moves this end.
-            # Jobs admitted just before get WATCH_SETTLE seconds to start their units.
-            fences+=1;fenced=(wall,boot)
-            io.record('closure-watch-fence-%04d.json'%fences,{'worker':worker_id(),'wall_end':wall,'boot_end':boot,'accepted_extensions':io.watch_granted,'observed_wall':io.wall(),'observed_boottime':io.mono()})
-            pause(io,WATCH_SETTLE);continue
-        check=check_jobs()
+        check=check_jobs(60)
         if check is None or not check['closed']:pause(io,poll);continue
         if not io.freeze_extensions():
             last='extension_act_running';pause(io,1);continue
         published=False
         try:
-            # An act published before the lock may still await the guard's
-            # acceptance, which the guard gives within a second of its next pass.
-            # One it has not accepted after WATCH_ACCEPT seconds grants nothing to
-            # this decision, and a stop now only ends the lifetime sooner.
-            wall,boot,pending=watch_ends(r,io);end=io.mono()+WATCH_ACCEPT
-            while pending and io.mono()<end:
-                io.wait(1);wall,boot,pending=watch_ends(r,io)
-            wall,boot,pending=watch_ends(r,io)
-            left=min(wall-io.wall(),boot-io.mono())
-            if left<=lead and left>WATCH_FLOOR and fenced==(wall,boot) and not any(io.exists(n) for n in ('stop-trigger.json','closed.json','unresolved.json')):
-                # The record is published only from a check made under this lock,
-                # after the fence and any extension wait.
-                check=check_jobs()
-                if check is not None and check['closed']:
-                    admission=io.read('qualified-worker-admission.json');handoff=io.read('root-handoff.json')
-                    row={'observed_unix':check['observed_unix'],'verified_by_Root':True,'receipt_sha256':lifetime.receipt_digest(check),'worker':worker_id(),
-                         'operation_id':r['guard_unit'],'local_guard':admission['local_guard'],'job_release_sha256':handoff['separate_job_release']['job_release_sha256'],
-                         'all_native_and_leases_closed':True,'closure_check':'closure-watch-check-%04d.json'%checks}
-                    need(io.wall()-check['observed_unix']<=WATCH_ACCEPT,'closure check went stale before publication')
-                    matching_root_job_closed(r,io,row);io.record('root-job-closed.json',row);io.trigger();published=True
+            # The whole decision ends within WATCH_DECISION, inside the guard's
+            # FREEZE_WAIT for this lock.
+            decision_end=io.mono()+WATCH_DECISION
+            if not io.lock_jobs():last='job_command_live'
+            else:
+                try:
+                    # An act published before the lock may still await the guard's
+                    # acceptance, which it gives within a second of its next pass.
+                    # One it has not accepted after WATCH_ACCEPT seconds grants
+                    # nothing to this decision, and a stop now ends the lifetime sooner.
+                    wall,boot,pending=watch_ends(r,io);accept_end=io.mono()+WATCH_ACCEPT
+                    while pending and io.mono()<accept_end:
+                        io.wait(1);wall,boot,pending=watch_ends(r,io)
+                    granted=io.watch_granted;left=min(wall-io.wall(),boot-io.mono())
+                    if left<=lead and left>WATCH_FLOOR and not any(io.exists(n) for n in terminal):
+                        check=check_jobs(max(1,min(60,decision_end-io.mono()-WATCH_LOCAL)))
+                        if check is not None and check['closed']:
+                            after_wall,after_boot,_=watch_ends(r,io);left=min(after_wall-io.wall(),after_boot-io.mono())
+                            if (io.mono()<decision_end and (after_wall,after_boot)==(wall,boot) and io.watch_granted==granted and WATCH_FLOOR<left<=lead
+                                    and io.wall()-check['observed_unix']<=WATCH_DECISION and not any(io.exists(n) for n in terminal)):
+                                admission=io.read('qualified-worker-admission.json');handoff=io.read('root-handoff.json')
+                                row={'observed_unix':check['observed_unix'],'verified_by_Root':True,'receipt_sha256':lifetime.receipt_digest(check),'worker':worker_id(),
+                                     'operation_id':r['guard_unit'],'local_guard':admission['local_guard'],'job_release_sha256':handoff['separate_job_release']['job_release_sha256'],
+                                     'all_native_and_leases_closed':True,'closure_check':'closure-watch-check-%04d.json'%checks}
+                                matching_root_job_closed(r,io,row);io.record('root-job-closed.json',row);io.trigger();published=True
+                            else:last='closure_decision_changed'
+                finally:io.unlock_jobs()
         finally:io.thaw_extensions()
         if not published:pause(io,poll);continue
         observe(r,io);return 'FINISHED'

@@ -193,24 +193,28 @@ mise run boat:closure-watch --unit "$LOCAL_WATCH_UNIT" --operation "$OWNED_OPERA
 ```
 
 The watch reads the guard's present end, with the extensions the guard accepted, and
-waits until `--lead` seconds before it. It then records `closure-watch-fence-NNNN.json`
-for that end, and job admission refuses the operation from then on until the guard
-accepts a further extension. After 60 seconds, which lets a job admitted just before the
-fence start its units, it checks over SSH that no
+waits until `--lead` seconds before it. It then checks over SSH that no
 `sparkles-screen-*` or `nsc-build-*` unit is active on the worker, that no build, mbx or
 server process runs there, and that the worker's boot is the qualified one. Each named
-local job unit must also be inactive. An mbx lease lives only as long as its mbx
-process, so the process check covers the Boxington leases. Each check is kept as
-`closure-watch-check-NNNN.json`. An open job is checked again every 30 seconds.
+local job unit must also be inactive, and at most eight can be named. An mbx lease lives
+only as long as its mbx process, so the process check covers the Boxington leases. Each
+check is kept as `closure-watch-check-NNNN.json`. An open job is checked again every 30
+seconds.
 
-Once a check finds every job closed, the watch takes the extension lock, waits up to 15
-seconds for the guard to accept an extension published before it, and reads the end
-again. An extension the guard accepted in the meantime moves the check to the new end.
-Otherwise the watch checks the jobs once more and, if they are still closed, publishes
-`root-job-closed.json` from that check and the stop trigger while it holds the lock. It
-then observes the guard's verified stop as `finish` does. If no check finds the jobs closed by 60 seconds before the end, the watch records
-`closure-watch-unresolved.json` with the last reason code and leaves the guard's own
-deadline stop in place. One watch runs per operation.
+Every Boat command takes the operation's `jobs.lock` shared when its admission is
+loaded and holds it until the command exits. Once a check finds every job closed, the
+watch takes the extension lock and then `jobs.lock` exclusively. If a command holds the
+job lock, the watch tries again at the next check. While the watch holds it, a new
+command waits up to 120 seconds for it and then sees the stop trigger if the watch
+closed the operation. The watch finishes its decision within 90 seconds, inside the
+guard's 100-second wait for the extension lock. It waits up to 15 seconds for the guard
+to accept an extension published before it, checks the jobs once more and publishes
+`root-job-closed.json` from that check with the stop trigger. It publishes only if the
+end, the accepted extensions and the terminal receipts are unchanged since it took the
+locks and the decision bound has not passed. It then observes the guard's verified stop
+as `finish` does. If no check finds the jobs closed by 60 seconds before the end, the
+watch records `closure-watch-unresolved.json` with the last reason code and leaves the
+guard's own deadline stop in place. One watch runs per operation.
 
 `finish` waits up to 180 seconds for the same operation's verified completed/nonforced
 stop, current stopped/snapshot proof and clean local guard exit. A pending, submitted,
