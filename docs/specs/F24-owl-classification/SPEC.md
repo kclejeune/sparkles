@@ -1022,11 +1022,14 @@ its head is greater.
 | r-Succ | A maximal literal `Aσ` in a context other than the root, with A a root successor trigger and σ mapping `y` to `x`, adds an edge to the root labelled by A's constant and the marker `A → A` there. So `S(x, u)` gives the root the marker `S(y, u) → S(y, u)`, and the root never gets `A` as a fact. |
 | r-Pred | A root clause whose body atoms are root successor triggers returns to each context with edges to the root for their constants. That context resolves every body atom `C` as `Cσ` against its own maximal premises and receives the head with `y` read as `x`. The conjunction `A_i` that the journal's typeset rule adds to the conclusion is not introduced by its premises and is read as empty. |
 
-A root clause without a body goes to the contexts that hold one of its constants in a
-maximal literal or in a body, which the journal's r-Pred sends it to every context for.
-Every inference with such a clause in a context has a second premise there that mentions
-one of the clause's constants, so no inference is lost, and the journal's system Sequoia
-holds the ABox's facts back from a context in the same way.
+The journal's r-Pred sends a root clause without a body to every context. The rooted run
+sends it only to the contexts that hold one of its constants in a maximal literal or in a
+body. A context that resolves such a clause with one of its own clauses has a premise that
+mentions one of the clause's constants, so it already holds the clause. Some inferences
+are still left out, such as the marker that Succ would pass on to a successor of a context
+that never mentions the constant. Their conclusions matter only to a context that mentions
+the constant, and that context takes the clause itself once it does. The journal's system
+Sequoia holds back asserted ground facts from a context in a similar way.
 
 A minimum restriction above one in a positive position is not weakened to an existential
 restriction in a rooted run with counting off, since `A ⊑ ≥2 r.{o}` makes `A`

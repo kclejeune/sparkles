@@ -31,13 +31,16 @@
 //! journal's r-Pred has a clause without a body reach every context. Here a context also
 //! registers for the constants of every other maximal literal, such as `x ≈ u`, and of the
 //! ground literals in its bodies, and a clause without a body reaches the contexts
-//! registered for one of its constants. That loses no inference: in a context, every
-//! inference with such a clause has a second premise of the context that mentions one of
-//! the clause's constants in a maximal literal or in its body, since a rule's premises
-//! meet at a shared literal or a term an ontology clause's role atom binds, and an
-//! inference between two root clauses happens in the root, whose conclusion follows the
-//! same routing. The journal's system Sequoia holds the ABox's facts back from a context
-//! in the same way until the context mentions their constant (its Section 7.3.2).
+//! registered for one of its constants. A rule that resolves such a clause with a clause
+//! of the context has a premise of the context that mentions one of the clause's
+//! constants in a maximal literal or in its body, since the premises meet at a shared
+//! literal or at a term that an ontology clause's role atom binds, so the context holds
+//! the clause. An inference between two root clauses happens in the root, whose conclusion
+//! is routed the same way. What the restriction leaves out, such as the marker that Succ
+//! would pass to a successor of a context that never mentions the constant, matters only
+//! to a context that mentions the constant, which then registers and takes the clause.
+//! The journal's system Sequoia holds back asserted ground facts in a similar way (its
+//! Section 7.3.2).
 //!
 //! A maximal literal over `f_e(u)` in the root takes Succ: the root registers with e's
 //! hypothetical successor, which has the empty core, records the constant u for the edge and
