@@ -229,8 +229,10 @@ absolute expiry, at which the remaining admitted lifetime falls to the closure w
 and a minute, and the host enforces it on its own clock, which must agree with the
 caller's. The scope's runtime limit is computed from the expiry at the launch, and a
 watchdog in the scope stops it at the expiry less its 30-second stop time however late it
-began. A Boat screen's lock and workload units end, their stop included, by the same point
-of the admitted lifetime. When contact cannot be restored
+began. A Boat screen's lock and workload units get an absolute expiry at the same point of
+the admitted lifetime. The worker refuses a unit that begins too close to it, the lock's
+sleep ends before it, and a watchdog in each workload unit stops the unit 30 seconds
+before it. When contact cannot be restored
 within the retry bound, the build fails. Its cleanup then stops the scope, or names the
 scope for reconciliation when it cannot reach the host within its own shorter bound. The closure watch's unit check covers the detached scope. A gate receives a standard bounded Git bundle of the exact
 commit and comparison base. Temporary bundle refs live outside the caller's repository.
