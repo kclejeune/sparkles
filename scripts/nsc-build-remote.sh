@@ -95,6 +95,7 @@ if [ -e "$dir/launched" ]; then
   echo "the build in scope $unit was already started"
   exit 0
 fi
+# shellcheck disable=SC2329 # the EXIT trap calls it
 refused() {
   local code=$?
   [ -e "$dir/launched" ] || echo "$code" > "$dir/start.exit"
@@ -130,4 +131,14 @@ setsid nohup systemd-run --user --scope -q --collect --unit "$unit" \
   -p MemoryMax="$mem" -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec="$runtime" -- \
   env CARGO_BUILD_JOBS="$jobs" bash "$dir/bin/nsc-build-remote.sh" --run "$dir" "$@" \
   > "$dir/build.log" 2>&1 < /dev/null &
-echo "started"
+# Return once the scope holds the build, so that the end of this connection's session can
+# no longer reach a process still on its way into the scope.
+for _ in $(seq 1 40); do
+  if systemctl --user is-active --quiet "$unit.scope" || [ -f "$dir/exit" ]; then
+    echo "started"
+    exit 0
+  fi
+  sleep 0.25
+done
+echo "the scope $unit did not start within 10 seconds; see $dir/build.log" >&2
+exit 0
