@@ -18,6 +18,8 @@
 //! `POST /{ds}/ask` (`crate::ask::http`) streams the events of §5.2, and `sparkles ask`
 //! drives the same function from the command line for the evaluation of §11.4.
 
+#[cfg(test)]
+mod claims_tests;
 mod cli;
 pub mod complexity;
 mod entity_evidence;
@@ -60,6 +62,10 @@ pub const DEFAULT_COMPLEXITY_THRESHOLD: u32 = 8;
 pub const DEFAULT_EXAMPLE_SCORE: f64 = 0.8;
 /// The most communities a local question's grounding names (C22 §7.3).
 const MAX_COMMUNITIES: usize = 3;
+/// The linked entities whose claims an ask that names a review policy reads.
+const MAX_CLAIM_SEEDS: usize = 20;
+/// An entity no dataset describes, which checks an ask's policies before it starts.
+const PREFLIGHT_SEED: &str = "urn:x-sparkles:evidence:ask-preflight";
 /// The linked entities and matched classes whose predicate use grounding reads.
 const MAX_USAGE_ENTITIES: usize = 3;
 const MAX_USAGE_CLASSES: usize = 2;
@@ -214,6 +220,10 @@ pub struct AskOptions {
     /// link each mention with the classes that the words around it name as type
     /// hints, and show how many triples name each candidate
     pub type_hints: bool,
+    /// cite claim occurrences under this review policy in the summary (C25)
+    pub review_policy: Option<String>,
+    /// resolve the linked entities through this matching policy's map (C25)
+    pub matching_policy: Option<String>,
 }
 
 impl Default for AskOptions {
@@ -249,6 +259,8 @@ impl Default for AskOptions {
             shape_check: false,
             drafts: 1,
             type_hints: false,
+            review_policy: None,
+            matching_policy: None,
         }
     }
 }
@@ -305,8 +317,40 @@ pub fn ask(
         reports: None,
         fallback: None,
         held: Vec::new(),
+        claim_seeds: Vec::new(),
+        claims: None,
+        withheld: false,
     };
     let mut out = a.run();
+    // without a summary, the answer still carries the claims, read for the caller now
+    if (o.review_policy.is_some() || o.matching_policy.is_some())
+        && out["outcome"] == "answered"
+        && a.claims.is_none()
+        && !a.withheld
+    {
+        let seeds = a.claim_seeds.clone();
+        match a.claims_recall(&seeds) {
+            Ok(c) => a.claims = Some(c),
+            Err(_) => a.withheld = true,
+        }
+    }
+    if a.withheld {
+        // the evidence the summary read changed or became unreadable before it was
+        // published, so the answer is withheld without saying which (C25)
+        let e = json!({
+            "code": "forbidden",
+            "message": "the answer is withheld because the evidence it used is no longer the same for you; ask again",
+        });
+        (a.on)("error", &e);
+        out = json!({ "outcome": "error", "error": e });
+    } else if let Some(c) = a.claims.take()
+        && out["outcome"] == "answered"
+    {
+        out["claims"] = c["claims"].clone();
+        if !c["resolution"].is_null() {
+            out["resolution"] = c["resolution"].clone();
+        }
+    }
     // an event stream learns of the endings without their own event here
     match out["outcome"].as_str() {
         Some("unanswerable") => (a.on)(
@@ -380,6 +424,12 @@ struct Asking<'a, 'e> {
     fallback: Option<Answered>,
     /// the terminal events of that repair, which wait while `fallback` stands
     held: Vec<(String, Value)>,
+    /// the entities the question links exactly, which the claims grounding reads
+    claim_seeds: Vec<String>,
+    /// the `recall` result of the claims grounding, with `reviewPolicy`
+    claims: Option<Value>,
+    /// the claims changed for the caller before the summary was published
+    withheld: bool,
 }
 
 /// What `run_query` returns: the compact result and, with `full_results`, the full one.
@@ -727,11 +777,28 @@ impl Asking<'_, '_> {
         if let Err(e) = self.server.dataset(self.principal, Some(&self.o.dataset)) {
             return self.error(&e.code, e.message);
         }
+        if self.o.review_policy.is_some() || self.o.matching_policy.is_some() {
+            if self.o.mode == AskMode::Global {
+                return self.error(
+                    "bad-argument",
+                    "reviewPolicy and matchingPolicy apply to answers from the data, not to mode global",
+                );
+            }
+            // the policies and the store's configuration history are checked before
+            // any model call, so a refused policy costs nothing
+            if let Err(e) = self.claims_recall(&[PREFLIGHT_SEED.to_string()]) {
+                return self.error(&e.code, e.message);
+            }
+        }
         if let Some(q) = self.o.query.clone() {
             return self.given(&q);
         }
-        // C22 §7: the reports a global answer may use, and the explicit global mode
-        if self.o.mode != AskMode::Local {
+        // C22 §7: the reports a global answer may use, and the explicit global mode.
+        // An ask that cites claims answers from the data.
+        if self.o.mode != AskMode::Local
+            && self.o.review_policy.is_none()
+            && self.o.matching_policy.is_none()
+        {
             self.reports = self.report_selection();
             if self.o.mode == AskMode::Global
                 && let Some(sel) = self.reports.take()
@@ -1170,6 +1237,13 @@ impl Asking<'_, '_> {
             iris.extend(usage_entities);
             usage_entities = iris;
         }
+        // the entities the question links exactly, which the claims grounding reads
+        self.claim_seeds = entities
+            .iter()
+            .filter(|e| matches!(e["verdict"].as_str(), Some("exact")))
+            .filter_map(|e| e["candidates"][0]["iri"].as_str().map(str::to_string))
+            .take(MAX_CLAIM_SEEDS)
+            .collect();
         // C22 §7.3: the communities of the linked entities, at most three
         let linked: Vec<Value> = entities
             .iter()
@@ -2033,11 +2107,40 @@ impl Asking<'_, '_> {
         } else {
             format!("The result has {rows} rows, numbered from 1.")
         };
-        let user = prompts::summary_user(&self.o.question, query, &text, &total);
+        let mut user = prompts::summary_user(&self.o.question, query, &text, &total);
+        // the claims of the linked entities, read for the caller now (C25)
+        let claims = if self.o.review_policy.is_some() || self.o.matching_policy.is_some() {
+            let seeds = self.claim_seeds.clone();
+            match self.claims_recall(&seeds) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    self.notes
+                        .push(format!("the claims were not read: {}", e.message));
+                    self.withheld = true;
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        let listed: Vec<String> = claims
+            .as_ref()
+            .map(|c| prompts::claim_ids(&c["claims"]))
+            .unwrap_or_default();
+        if let Some(c) = &claims
+            && !c["claims"].is_null()
+        {
+            user.push_str(&prompts::claims_context(&c["claims"]));
+        }
+        let schema = if claims.is_some() {
+            prompts::summary_with_claims()
+        } else {
+            prompts::summary()
+        };
         match self.call(
             Role::Summarize,
             &Prompt::plain(prompts::SUMMARY_SYSTEM, &user),
-            &prompts::summary(),
+            &schema,
         ) {
             Err((_, message)) => {
                 self.notes.push(format!("the summary failed: {message}"));
@@ -2063,14 +2166,74 @@ impl Asking<'_, '_> {
                     "provider": pair.provider,
                     "model": pair.model,
                 });
+                if let Some(c) = &claims {
+                    let mut cited: Vec<String> = prompts::claim_markers(&text)
+                        .into_iter()
+                        .filter(|id| listed.contains(id))
+                        .collect();
+                    for id in value["claimCitations"].as_array().into_iter().flatten() {
+                        if let Some(id) = id.as_str()
+                            && listed.iter().any(|l| l == id)
+                            && !cited.iter().any(|x| x == id)
+                            && text.contains(&format!("[{id}]"))
+                        {
+                            cited.push(id.to_string());
+                        }
+                    }
+                    s["claimCitations"] = json!(cited);
+                    // the same view, read again with the caller's grants of now: any
+                    // difference withholds the answer before it is published
+                    let seeds = self.claim_seeds.clone();
+                    match self.claims_recall(&seeds) {
+                        Ok(again) if again == *c => {}
+                        _ => {
+                            self.withheld = true;
+                            return None;
+                        }
+                    }
+                    s["claims"] = c["claims"].clone();
+                    self.claims = Some(c.clone());
+                }
                 if citations.is_empty() {
                     s["uncited"] = true.into();
                     self.notes.push("the summary cites no row".into());
                 }
                 self.emit("summary", &s);
+                if claims.is_some()
+                    && let Some(m) = s.as_object_mut()
+                {
+                    m.remove("claims");
+                }
                 Some(s)
             }
         }
+    }
+
+    /// `recall` of `seeds` at hop 0 with the ask's policies, in JSON. A refused
+    /// policy keeps its code. Without seeds, the policies are still checked and the
+    /// claims are empty.
+    fn claims_recall(&self, seeds: &[String]) -> Result<Value, ToolError> {
+        let seeds: Vec<String> = if seeds.is_empty() {
+            vec![PREFLIGHT_SEED.to_string()]
+        } else {
+            seeds.to_vec()
+        };
+        let mut args = json!({ "seeds": seeds, "hops": 0, "maxTriples": 50, "format": "json" });
+        if let Some(p) = &self.o.review_policy {
+            args["reviewPolicy"] = p.clone().into();
+        }
+        if let Some(p) = &self.o.matching_policy {
+            args["matchingPolicy"] = p.clone().into();
+        }
+        let mut v = self.tool("recall", args, true)?;
+        // the parts of the result that the summary's context and answer depend on
+        let mut kept = json!({ "commit": v["commit"].take() });
+        for k in ["claims", "resolution"] {
+            if !v[k].is_null() {
+                kept[k] = v[k].take();
+            }
+        }
+        Ok(kept)
     }
 
     fn usage(&self, started: Instant) -> Value {

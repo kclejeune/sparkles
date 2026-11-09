@@ -76,6 +76,10 @@ struct AskBody {
     thread: Option<String>,
     /// the resource on the page the question was asked from
     about: Option<assistant::AskAbout>,
+    /// cite claim occurrences under this review policy (C25)
+    review_policy: Option<String>,
+    /// resolve the linked entities through this matching policy's map (C25)
+    matching_policy: Option<String>,
 }
 
 fn bad(m: impl Into<String>) -> crate::http::ApiError {
@@ -91,7 +95,8 @@ fn status_of(code: &str) -> StatusCode {
         "provider-unavailable" => StatusCode::BAD_GATEWAY,
         "timeout" => StatusCode::GATEWAY_TIMEOUT,
         "cancelled" => StatusCode::SERVICE_UNAVAILABLE,
-        "no-later-pair" => StatusCode::CONFLICT,
+        "no-later-pair" | "configuration-history-inactive" => StatusCode::CONFLICT,
+        "forbidden" => StatusCode::FORBIDDEN,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -306,6 +311,8 @@ async fn ask_route(
         mode: b.mode,
         reviewed_only: b.reviewed_only,
         report_context,
+        review_policy: b.review_policy.clone(),
+        matching_policy: b.matching_policy.clone(),
         ..AskOptions::default()
     };
     repairs.apply(&mut o);
