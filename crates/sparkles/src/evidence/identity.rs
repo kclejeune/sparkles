@@ -1179,7 +1179,8 @@ fn resolve_bounded(
 
 /// What the resolution map of the matching policy `policy` selects for each of
 /// `entities` in an evidence view, with the policy, its graphs and their protections
-/// as the view's configuration records them. Refusals are those of [`resolve`].
+/// as the view's configuration records them. Refusals are those of [`resolve`], except
+/// that an empty `entities` is allowed and reads and checks only the map's revision.
 pub fn resolve_at(
     view: &sparkles_core::store::BoundEvidenceView,
     policy: &str,
@@ -1238,7 +1239,7 @@ fn resolve_in(
     control: &Control,
     decision_limit: usize,
 ) -> Result<EntityResolution> {
-    if entities.is_empty() || entities.len() > MAX_RESOLVE {
+    if entities.len() > MAX_RESOLVE {
         return Err(Error::invalid(format!(
             "entities: a resolution names 1 to {MAX_RESOLVE} entities"
         )));

@@ -261,6 +261,12 @@ async fn the_summary_reads_and_cites_claims() {
         .collect();
     assert_eq!(summaries.len(), 1);
     assert!(summaries[0].contains("Claim occurrences") && summaries[0].contains("lisbon"));
+    // the system prompt lets the answer use the listed occurrences
+    assert!(summaries[0].contains("claim occurrences listed with them"));
+    // an unlisted marker leaves the text, and every marker left names a listed claim
+    let text = out["summary"]["text"].as_str().unwrap();
+    assert!(!text.contains("[c7]"), "{text}");
+    assert_eq!(super::prompts::claim_markers(text), vec!["c1".to_string()]);
     assert!(
         reqs.iter()
             .filter(|r| !is_summary(r))
@@ -268,6 +274,13 @@ async fn the_summary_reads_and_cites_claims() {
     );
     let plain = ask(&app, json!({ "question": question })).await;
     assert_eq!(plain["outcome"], "answered", "{plain}");
+    let last = m.requests().into_iter().rev().find(is_summary).unwrap();
+    assert!(
+        !last
+            .body
+            .to_string()
+            .contains("claim occurrences listed with them")
+    );
     assert!(plain.get("claims").is_none() && plain["summary"].get("claimCitations").is_none());
 }
 
@@ -369,4 +382,82 @@ fn a_kept_answer_stores_its_cited_claims() {
     )
     .unwrap();
     assert!(plain.get("claims").is_none());
+}
+
+/// A supplied query has no linked entities, so no claim reaches the summary, whatever
+/// the claims name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_supplied_query_reads_no_claims() {
+    let m = mock(Arc::new(OnceLock::new()));
+    let (st, app) = app(&m.url()).await;
+    let ds = dataset(&st);
+    claim(&ds);
+    // a claim about the IRI an earlier preflight used as a stand-in seed
+    let key = |k: &str| RecordKey::new(k).unwrap();
+    let mut o = ProposeOptions::new(iri("urn:principal:importer"));
+    o.proposal_graph = Some(iri("urn:ev:claims"));
+    evidence::propose(
+        None,
+        &ds,
+        &ds,
+        &EvidenceInput {
+            revisions: vec![SourceRevisionInput {
+                version: RecordVersion::V1,
+                key: key("rev"),
+                source: iri("urn:source:other"),
+                source_key: key("other"),
+                upstream_version: None,
+                content: SourceContent::MetadataOnly {
+                    digest: Sha256Digest::of_bytes(b"other", &Control::none()).unwrap(),
+                },
+                metadata: Default::default(),
+                times: Default::default(),
+                lineage: Default::default(),
+            }],
+            claims: vec![ClaimInput {
+                version: RecordVersion::V1,
+                key: key("claim"),
+                occurrence_key: key("c"),
+                revision: RecordRef::Local(key("rev")),
+                proposition: Triple::new(
+                    iri("urn:x-sparkles:evidence:ask-preflight"),
+                    iri("urn:says"),
+                    iri("urn:anything"),
+                ),
+                kind: ClaimKind::Reported,
+                polarity: Polarity::Positive,
+                attributed_author: iri("urn:other"),
+                scope: Default::default(),
+                confidence: Default::default(),
+            }],
+            ..Default::default()
+        },
+        &o,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let out = ask(
+        &app,
+        json!({ "question": "Which teams does Acme have?", "query": EASY, "reviewPolicy": "main" }),
+    )
+    .await;
+    assert_eq!(out["outcome"], "answered", "{out}");
+    assert_eq!(out["claims"]["occurrences"], json!([]), "{out}");
+    assert_eq!(out["claims"]["policy"]["name"], "main", "{out}");
+    let summary = m.requests().into_iter().find(is_summary).unwrap();
+    assert!(!summary.body.to_string().contains("anything"));
+}
+
+/// An evidence refusal from recall keeps recall's status in the JSON form.
+#[test]
+fn evidence_refusals_keep_their_status() {
+    use axum::http::StatusCode as S;
+    let status = super::http::status_of;
+    assert_eq!(status("evidence-unavailable"), S::UNPROCESSABLE_ENTITY);
+    assert_eq!(status("incomplete-evidence"), S::UNPROCESSABLE_ENTITY);
+    assert_eq!(status("projection-unavailable"), S::SERVICE_UNAVAILABLE);
+    assert_eq!(status("configuration-history-inactive"), S::CONFLICT);
+    assert_eq!(status("forbidden"), S::FORBIDDEN);
+    assert_eq!(status("something-else"), S::INTERNAL_SERVER_ERROR);
 }

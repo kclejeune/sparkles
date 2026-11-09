@@ -64,8 +64,6 @@ pub const DEFAULT_EXAMPLE_SCORE: f64 = 0.8;
 const MAX_COMMUNITIES: usize = 3;
 /// The linked entities whose claims an ask that names a review policy reads.
 const MAX_CLAIM_SEEDS: usize = 20;
-/// An entity no dataset describes, which checks an ask's policies before it starts.
-const PREFLIGHT_SEED: &str = "urn:x-sparkles:evidence:ask-preflight";
 /// The linked entities and matched classes whose predicate use grounding reads.
 const MAX_USAGE_ENTITIES: usize = 3;
 const MAX_USAGE_CLASSES: usize = 2;
@@ -333,6 +331,9 @@ pub fn ask(
             Ok(c) => a.claims = Some(c),
             Err(_) => a.withheld = true,
         }
+    }
+    if a.claims.is_some() && !a.authority_current() {
+        a.withheld = true;
     }
     if a.withheld {
         // the evidence the summary read changed or became unreadable before it was
@@ -786,7 +787,7 @@ impl Asking<'_, '_> {
             }
             // the policies and the store's configuration history are checked before
             // any model call, so a refused policy costs nothing
-            if let Err(e) = self.claims_recall(&[PREFLIGHT_SEED.to_string()]) {
+            if let Err(e) = self.claims_recall(&[]) {
                 return self.error(&e.code, e.message);
             }
         }
@@ -2112,6 +2113,11 @@ impl Asking<'_, '_> {
         let claims = if self.o.review_policy.is_some() || self.o.matching_policy.is_some() {
             let seeds = self.claim_seeds.clone();
             match self.claims_recall(&seeds) {
+                // the claims go to a provider only under the caller's current authority
+                Ok(_) if !self.authority_current() => {
+                    self.withheld = true;
+                    return None;
+                }
                 Ok(c) => Some(c),
                 Err(e) => {
                     self.notes
@@ -2139,7 +2145,14 @@ impl Asking<'_, '_> {
         };
         match self.call(
             Role::Summarize,
-            &Prompt::plain(prompts::SUMMARY_SYSTEM, &user),
+            &Prompt::plain(
+                if claims.is_some() {
+                    prompts::SUMMARY_WITH_CLAIMS_SYSTEM
+                } else {
+                    prompts::SUMMARY_SYSTEM
+                },
+                &user,
+            ),
             &schema,
         ) {
             Err((_, message)) => {
@@ -2148,7 +2161,11 @@ impl Asking<'_, '_> {
             }
             Ok((value, _, pair)) => {
                 let raw = value["text"].as_str().unwrap_or("");
-                let text = prompts::drop_markers(raw, sent.max(1));
+                let mut text = prompts::drop_markers(raw, sent.max(1));
+                if claims.is_some() {
+                    // a claim marker names a listed occurrence or is removed
+                    text = prompts::drop_claim_markers(&text, &listed);
+                }
                 let mut citations: Vec<u64> = prompts::markers(&text);
                 for c in value["citations"].as_array().into_iter().flatten() {
                     if let Some(n) = c.as_u64()
@@ -2185,7 +2202,7 @@ impl Asking<'_, '_> {
                     // difference withholds the answer before it is published
                     let seeds = self.claim_seeds.clone();
                     match self.claims_recall(&seeds) {
-                        Ok(again) if again == *c => {}
+                        Ok(again) if again == *c && self.authority_current() => {}
                         _ => {
                             self.withheld = true;
                             return None;
@@ -2212,20 +2229,36 @@ impl Asking<'_, '_> {
     /// `recall` of `seeds` at hop 0 with the ask's policies, in JSON. A refused
     /// policy keeps its code. Without seeds, the policies are still checked and the
     /// claims are empty.
+    /// Whether the authority the caller's grants were read under still holds, so that
+    /// claims read with them may still be sent and published (C22 §6.3).
+    fn authority_current(&self) -> bool {
+        self.server.state.access_current(self.principal)
+    }
+
     fn claims_recall(&self, seeds: &[String]) -> Result<Value, ToolError> {
-        let seeds: Vec<String> = if seeds.is_empty() {
-            vec![PREFLIGHT_SEED.to_string()]
-        } else {
-            seeds.to_vec()
-        };
-        let mut args = json!({ "seeds": seeds, "hops": 0, "maxTriples": 50, "format": "json" });
+        let mut args = json!({ "hops": 0, "maxTriples": 50, "format": "json" });
+        if !seeds.is_empty() {
+            args["seeds"] = json!(seeds);
+        }
         if let Some(p) = &self.o.review_policy {
             args["reviewPolicy"] = p.clone().into();
         }
         if let Some(p) = &self.o.matching_policy {
             args["matchingPolicy"] = p.clone().into();
         }
-        let mut v = self.tool("recall", args, true)?;
+        let mut v = if seeds.is_empty() {
+            // no entity yet: the policies and the map are checked, and no claim is read
+            let (m, call) = self.tool_call("recall", args, true)?;
+            match self
+                .server
+                .run_now(crate::mcp::RECALL_PREFLIGHT, m, &call)?
+            {
+                Outcome::Structured(v) => v,
+                Outcome::Text(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)),
+            }
+        } else {
+            self.tool("recall", args, true)?
+        };
         // the parts of the result that the summary's context and answer depend on
         let mut kept = json!({ "commit": v["commit"].take() });
         for k in ["claims", "resolution"] {

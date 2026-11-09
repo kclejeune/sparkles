@@ -1330,63 +1330,56 @@ impl<'a> Reads<'a> {
         Ok(self.is_operation(op, g)? && self.nonce_of(op, g)? == Some(nonce))
     }
 
-    /// The graphs that hold `s p o`, at most `limit` of them, and whether more exist.
-    /// `o` is a ground term.
-    pub fn graphs_of(
+    /// Whether some graph that holds `s p o` satisfies `accept`, which sees each graph's
+    /// id, the default graph's included. `o` is a ground term.
+    pub fn in_some_graph(
         &mut self,
         s: &str,
         p: &str,
         o: &Term,
-        limit: usize,
-    ) -> Result<(Vec<NamedNode>, bool)> {
+        mut accept: impl FnMut(&Snapshot, Id) -> bool,
+    ) -> Result<bool> {
         let (Some(s), Some(p)) = (self.id(s)?, self.id(p)?) else {
-            return Ok((Vec::new(), false));
+            return Ok(false);
         };
         let o = match o {
             Term::NamedNode(n) => self.id(n.as_str())?,
             t => self.preparation.lookup_term(self.snap, t)?,
         };
         let Some(o) = o else {
-            return Ok((Vec::new(), false));
+            return Ok(false);
         };
-        let mut ids = Vec::new();
-        let mut more = false;
+        let snap = self.snap;
+        let mut found = false;
         self.preparation
             .scan(self.snap, Perm::Spo, &[s.0, p.0, o.0], |q| {
-                if ids.len() == limit {
-                    more = true;
+                if accept(snap, q[3]) {
+                    found = true;
                     return Ok(false);
                 }
-                ids.push(q[3]);
                 Ok(true)
             })?;
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(Term::NamedNode(n)) = self
-                .preparation
-                .with_term(self.snap, id, |t| Ok(t.cloned()))?
-            {
-                out.push(n);
-            }
-        }
-        Ok((out, more))
+        Ok(found)
     }
 
     /// The IRI subjects in `g` that reify, through `p`, a triple term whose subject or
-    /// object is one of `entities`, with that triple, in subject order. At most `scan`
-    /// quads of `g` are read. Returns whether `g` holds more than that, in which case the
-    /// list is incomplete.
+    /// object is one of `entities`, in subject order. At most `scan` quads of `g` are
+    /// read, and the rows and identities kept are charged to the preparation. Returns
+    /// whether `g` holds more than `scan` quads, in which case the list is incomplete.
     pub fn reifiers_about(
         &mut self,
         p: &str,
         g: &str,
         entities: &BTreeSet<String>,
         scan: usize,
-    ) -> Result<(Vec<(NamedNode, Triple)>, bool)> {
+    ) -> Result<(Vec<NamedNode>, bool)> {
         let (Some(p), Some(g)) = (self.id(p)?, self.id(g)?) else {
             return Ok((Vec::new(), false));
         };
-        let mut rows = Vec::new();
+        const ROW: u64 = std::mem::size_of::<(Id, Id)>() as u64;
+        const CHUNK: usize = 4096;
+        let mut held = self.preparation.reserve(0)?;
+        let mut rows: Vec<(Id, Id)> = Vec::new();
         let mut read = 0usize;
         let mut more = false;
         self.preparation.scan(self.snap, Perm::Gspo, &[g.0], |q| {
@@ -1396,36 +1389,41 @@ impl<'a> Reads<'a> {
             }
             read += 1;
             if q[1] == p {
+                if rows.len() == rows.capacity() {
+                    held.grow_by(CHUNK as u64 * ROW)?;
+                    rows.reserve_exact(CHUNK);
+                }
                 rows.push((q[0], q[2]));
             }
             Ok(true)
         })?;
         let mut out = Vec::new();
         for (s, o) in rows {
-            let Some(Term::Triple(t)) = self
-                .preparation
-                .with_term(self.snap, o, |t| Ok(t.cloned()))?
-            else {
-                continue;
-            };
-            let subject = match &t.subject {
-                NamedOrBlankNode::NamedNode(n) => Some(n.as_str()),
-                _ => None,
-            };
-            let object = match &t.object {
-                Term::NamedNode(n) => Some(n.as_str()),
-                _ => None,
-            };
-            if !subject.is_some_and(|x| entities.contains(x))
-                && !object.is_some_and(|x| entities.contains(x))
-            {
+            let matches = self.preparation.with_term(self.snap, o, |t| {
+                let Some(Term::Triple(t)) = t else {
+                    return Ok(false);
+                };
+                let subject = match &t.subject {
+                    NamedOrBlankNode::NamedNode(n) => entities.contains(n.as_str()),
+                    _ => false,
+                };
+                let object = match &t.object {
+                    Term::NamedNode(n) => entities.contains(n.as_str()),
+                    _ => false,
+                };
+                Ok(subject || object)
+            })?;
+            if !matches {
                 continue;
             }
-            if let Some(Term::NamedNode(n)) = self
-                .preparation
-                .with_term(self.snap, s, |t| Ok(t.cloned()))?
-            {
-                out.push((n, *t));
+            if let Some(n) = self.preparation.with_term(self.snap, s, |t| {
+                Ok(match t {
+                    Some(Term::NamedNode(n)) => Some(n.as_str().to_string()),
+                    _ => None,
+                })
+            })? {
+                held.grow_by(n.len() as u64 + std::mem::size_of::<NamedNode>() as u64)?;
+                out.push(NamedNode::new_unchecked(n));
             }
         }
         Ok((out, more))

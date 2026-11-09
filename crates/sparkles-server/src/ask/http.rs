@@ -87,7 +87,7 @@ fn bad(m: impl Into<String>) -> crate::http::ApiError {
 }
 
 /// The HTTP status of an error event's code, for the JSON form.
-fn status_of(code: &str) -> StatusCode {
+pub(super) fn status_of(code: &str) -> StatusCode {
     match code {
         "bad-argument" => StatusCode::BAD_REQUEST,
         "unknown-dataset" | "no-model" => StatusCode::NOT_FOUND,
@@ -95,9 +95,12 @@ fn status_of(code: &str) -> StatusCode {
         "provider-unavailable" => StatusCode::BAD_GATEWAY,
         "timeout" => StatusCode::GATEWAY_TIMEOUT,
         "cancelled" => StatusCode::SERVICE_UNAVAILABLE,
-        "no-later-pair" | "configuration-history-inactive" => StatusCode::CONFLICT,
+        "no-later-pair" => StatusCode::CONFLICT,
         "forbidden" => StatusCode::FORBIDDEN,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
+        // an evidence refusal from recall keeps recall's status (C25)
+        c => sparkles::managed::ManagedErrorKind::from_code(c)
+            .and_then(|k| StatusCode::from_u16(k.status()).ok())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 

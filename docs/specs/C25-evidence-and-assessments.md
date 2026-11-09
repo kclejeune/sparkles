@@ -1473,7 +1473,12 @@ when either bound cuts it. Its reads use the call's snapshot, graph view and que
 budgets, with the evidence resolver's shared preparation allowance. Finding the claims
 about the result reads every quad of each boundary proposal graph and refuses with
 `incomplete-evidence` past one million quads, and roadmap item 766 adds an index that
-avoids the scan.
+avoids the scan. That bound counts every quad of the graph, hidden ones included, so a
+caller can learn only that a readable graph is that large. Each candidate passes the
+visibility check of the claim states below before it counts toward the bound of
+10,000 claims, so a hidden claim takes no place in it. The records of one claim or one
+supported triple, such as its decisions and supports, keep the record bound of 10,000
+that review applies, which counts hidden records as review does.
 
 The rejected alternative cites only the supports of accepted projected facts. That
 cannot show unreviewed observations, hypotheses, denials or conflicting occurrences,
@@ -1541,7 +1546,9 @@ members of a seed's cluster join the seeds at that seed's rank, so their facts a
 are collected under their own IRIs. Recall never rewrites a member's facts onto its
 representative. A cluster whose members are not complete reports `membersComplete=false`,
 and only the listed members join. The result's `resolution` member records the policy
-name and version and the map revision and its number.
+name and version and the map revision and its number. Recall reads and checks the map
+even when the result has no entity, so an empty result reports the same revision and
+the same refusals as any other.
 
 The rejected alternative rewrites members' facts onto the representative. It behaves
 like `owl:sameAs`, loses each source's identifier and contradicts §6.
@@ -1610,14 +1617,19 @@ stage, which calls `recall` with the policies for the linked entities at hop 0. 
 no Ask tool, and an MCP client reads claims through `recall` itself. An ask that names
 a policy answers from the data, so `mode` `global` is refused with `400` and `auto`
 answers locally. Its policies and the store's configuration history are checked before
-any model call, with the refusals of `recall`.
+any model call, with the refusals and HTTP statuses of `recall`. That check reads no
+entity and no claim. An ask with no linked entity, such as one that supplies its own
+query, carries an empty claims section.
 
 The claims section enters only the summary step's context, under the same structural
-label, and the summary may cite occurrences as `[c1]`. The query drafting, repair and
+label, and the summary may cite occurrences as `[c1]`. That step's system prompt lets
+the answer use the listed occurrences as reported claims that keep their state and
+polarity, and a summary without a policy keeps its prompt. The query drafting, repair and
 escalation steps never receive it. The summary step already uses only providers that
 may receive rows under C18 §3.5. When no such provider remains, the summary is left out
 as it is today, and the response still carries the claims for the caller. A cited
-occurrence must exist in the context, as a cited row or point must today. Ask does not
+occurrence must exist in the context, as a cited row or point must today, and a marker
+that names no listed occurrence is removed from the text. Ask does not
 rewrite its SPARQL query to read proposal graphs, so a result row cites claims only
 through that context.
 
@@ -1632,7 +1644,10 @@ its commit and resolution, with the section in the context. Any difference withh
 the answer with a `forbidden` error that does not say what changed, and the caller must
 ask again. A different occurrence, state, resolution or origin label counts, and so does
 a head that moved in between. A policy change after the first read changes the second
-read and withholds the answer too.
+read and withholds the answer too. The claims go to the provider and the answer is
+published only while the authority the caller's grants were read under still holds, so
+an access policy reload or a revoked or expired credential withholds the answer in the
+same way.
 
 A kept answer stores its `claimCitations` with its summary and the occurrences they
 cite under `claims`. Its footprint under C18 §6.4 already covers every graph the
@@ -1648,7 +1663,9 @@ to F18's explanations.
 
 An occurrence reports `origin=instructions` when its source revision or that revision's
 source is typed `mem:Instructions` by a triple in the caller's view, and
-`origin=source` otherwise. Every claims section is labelled as source data whatever its origins, so a
+`origin=source` otherwise. The typing triple may be in any graph the caller can read,
+the default graph included, and a typing triple the caller cannot see is never
+consulted. Every claims section is labelled as source data whatever its origins, so a
 missing label never grants authority. Neither the label nor any claim's text changes the
 caller's tools, grants, outbound permissions or execution policy, which acceptance case
 A10 requires.

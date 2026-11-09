@@ -234,7 +234,7 @@ impl Store {
         let history = installed
             .configuration_history
             .as_ref()
-            .ok_or_else(|| inactive())?;
+            .ok_or_else(inactive)?;
         let document = if let Some(root) = self.managed_root() {
             managed_history::resolve(
                 &root,
@@ -291,7 +291,7 @@ impl Store {
             return Err(Error::invalid("invalid evidence snapshot name"));
         }
         let metadata = preparation.reserve(1024)?;
-        let before = self.managed_state_shared().ok_or_else(|| inactive())?;
+        let before = self.managed_state_shared().ok_or_else(inactive)?;
         let installed = match before.as_ref() {
             ManagedState::Installed(installed) => installed,
             ManagedState::Unavailable { reason, .. } => {
@@ -301,7 +301,7 @@ impl Store {
         let current = installed
             .configuration_history
             .as_ref()
-            .ok_or_else(|| inactive())?
+            .ok_or_else(inactive)?
             .identity(self.owner_dataset_id());
         let allowance = preparation.room();
         let mut held = preparation.reserve(allowance)?;

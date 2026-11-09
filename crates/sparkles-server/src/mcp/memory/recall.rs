@@ -339,7 +339,28 @@ struct Superseded {
 
 impl Tools<'_> {
     pub(crate) fn recall(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
+        self.recall_with(args, false)
+    }
+
+    /// `recall` without seeds or a query, for a caller that names a policy: the
+    /// policies and the map are checked at the selected view as `recall` checks them,
+    /// and the result holds their metadata with no facts and no claims. Ask uses it
+    /// before a question has entities, so no stand-in seed can bring in claims.
+    pub(crate) fn recall_preflight(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
+        self.recall_with(args, true)
+    }
+
+    fn recall_with(&self, args: Map<String, Value>, preflight: bool) -> Result<Outcome, ToolError> {
         let a: RecallArgs = parse(args)?;
+        if preflight
+            && (a.query.is_some()
+                || a.seeds.as_ref().is_some_and(|s| !s.is_empty())
+                || (a.review_policy.is_none() && a.matching_policy.is_none()))
+        {
+            return Err(ToolError::bad_argument(
+                "a preflight names a policy and no query or seeds",
+            ));
+        }
         let query = a.query.as_deref().map(str::trim).filter(|q| !q.is_empty());
         if a.query.as_ref().is_some_and(|q| q.chars().count() > 2000) {
             return Err(ToolError::bad_argument(
@@ -350,7 +371,7 @@ impl Tools<'_> {
         if seed_args.len() > 20 {
             return Err(ToolError::bad_argument("at most 20 seeds"));
         }
-        if query.is_none() && seed_args.is_empty() {
+        if query.is_none() && seed_args.is_empty() && !preflight {
             return Err(ToolError::bad_argument("give query, seeds or both"));
         }
         let type_args = a.types.clone().unwrap_or_default();
@@ -2349,20 +2370,20 @@ impl ClaimsDoc {
                     _ => None,
                 })
                 .collect();
-            let about = pc.about(&named)?;
-            let candidates: BTreeSet<NamedNode> = supports
-                .iter()
-                .flatten()
-                .cloned()
-                .chain(about.iter().cloned())
-                .collect();
-            let candidates: Vec<NamedNode> = candidates.into_iter().collect();
-            let states = pc.states(&candidates)?;
-            let mut occurrences = Vec::new();
+            let cited: Vec<NamedNode> = supports.iter().flatten().cloned().collect();
+            let mut occurrences = pc.visible(&cited)?;
             let mut index: HashMap<String, usize> = HashMap::new();
-            for o in states.into_iter().flatten() {
-                index.insert(o.claim.as_str().to_string(), occurrences.len());
-                occurrences.push(o);
+            for (i, o) in occurrences.iter().enumerate() {
+                index.insert(o.claim.as_str().to_string(), i);
+            }
+            let mut about = Vec::new();
+            for o in pc.about(&named)? {
+                let key = o.claim.as_str().to_string();
+                if !index.contains_key(&key) {
+                    index.insert(key.clone(), occurrences.len());
+                    occurrences.push(o);
+                }
+                about.push(key);
             }
             let mut of_fact = vec![Vec::new(); facts.len()];
             for (k, &i) in projected.iter().enumerate() {
@@ -2448,6 +2469,8 @@ struct ResolutionDoc {
     revision: Option<NamedNode>,
     number: u64,
     entities: HashMap<String, ResolvedDoc>,
+    /// whether the map's header has been read
+    read: bool,
 }
 
 impl ResolutionDoc {
@@ -2458,6 +2481,7 @@ impl ResolutionDoc {
             revision: None,
             number: 0,
             entities: HashMap::new(),
+            read: false,
         }
     }
 
@@ -2476,7 +2500,13 @@ impl ResolutionDoc {
                 wanted.push(n.clone());
             }
         }
-        for chunk in wanted.chunks(sparkles::evidence::MAX_RESOLVE) {
+        // the map's header is read and checked once even when no entity is wanted
+        let header = (!self.read && wanted.is_empty()).then(Vec::new);
+        let chunks = wanted
+            .chunks(sparkles::evidence::MAX_RESOLVE)
+            .chain(header.as_deref());
+        for chunk in chunks {
+            self.read = true;
             let got = sparkles::evidence::resolve_entities_at(
                 view,
                 &self.name,

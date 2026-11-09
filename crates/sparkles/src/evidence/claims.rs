@@ -343,6 +343,9 @@ impl PolicyClaims<'_> {
                 .text(d, &ev("policyVersion"), &decisions)?
                 .and_then(|v| v.parse().ok());
         }
+        if !self.supports_seen(claim)? {
+            return Ok(None);
+        }
         let state = match (withdrawn, disposition) {
             (true, _) => ClaimState::Withdrawn,
             (false, Some(Disposition::Accepted)) => ClaimState::Accepted,
@@ -405,15 +408,39 @@ impl PolicyClaims<'_> {
         }))
     }
 
-    /// Whether a triple in the caller's view types `x` as `mem:Instructions`.
+    /// Whether a triple in the caller's view types `x` as `mem:Instructions`, in any
+    /// graph the caller may read, the default graph included. A hidden or unreadable
+    /// typing triple is not consulted and takes no part of any bound.
     fn typed_instructions(&mut self, x: &NamedNode) -> Result<bool> {
         let class = Term::NamedNode(NamedNode::new_unchecked(MEM_INSTRUCTIONS));
+        let access = self.access.clone();
         let reads = match self.state.seen.as_mut() {
             Some(seen) => seen,
             None => &mut self.state.reads,
         };
-        let (graphs, _) = reads.graphs_of(x.as_str(), RDF_TYPE, &class, 64)?;
-        Ok(graphs.iter().any(|g| self.readable(g)))
+        reads.in_some_graph(x.as_str(), RDF_TYPE, &class, |snap, g| {
+            access.as_ref().is_none_or(|a| a.readable_id(snap, g))
+        })
+    }
+
+    /// Whether the caller sees every live acceptance support of the policy that cites
+    /// `claim`. An occurrence whose citing support is hidden is itself hidden.
+    fn supports_seen(&mut self, claim: &NamedNode) -> Result<bool> {
+        let supports = self.graphs.supports.clone();
+        for s in self.state.subjects(
+            &ev("claim"),
+            &Term::NamedNode(claim.clone()),
+            &supports,
+            "supports",
+        )? {
+            if !self.state.live(&s, &self.graphs)? {
+                continue;
+            }
+            if !self.sees(&s, &supports.0)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// For each of `triples`, the claims of the policy's live acceptance supports that
@@ -446,13 +473,14 @@ impl PolicyClaims<'_> {
         Ok(out)
     }
 
-    /// The claims in the readable proposal graphs of the policy's boundary whose
-    /// proposition has one of `entities` as its subject or object, sorted, before any
-    /// visibility check. Refuses as `incomplete-evidence` when a graph holds more than
-    /// [`MAX_CLAIM_SCAN`] quads or the claims exceed [`MAX_CLAIMS`].
-    pub fn about(&mut self, entities: &[NamedNode]) -> Result<Vec<NamedNode>> {
+    /// The occurrences the caller may see in the readable proposal graphs of the
+    /// policy's boundary whose proposition has one of `entities` as its subject or
+    /// object, in claim order. Each candidate passes [`Self::states`]' visibility check
+    /// before it is counted, so a hidden claim takes no place in the bound. Refuses as
+    /// `incomplete-evidence` when a graph holds more than [`MAX_CLAIM_SCAN`] quads or the
+    /// visible occurrences exceed [`MAX_CLAIMS`].
+    pub fn about(&mut self, entities: &[NamedNode]) -> Result<Vec<ClaimOccurrence>> {
         let wanted: BTreeSet<String> = entities.iter().map(|e| e.as_str().to_string()).collect();
-        let mut found = BTreeSet::new();
         if wanted.is_empty() {
             return Ok(Vec::new());
         }
@@ -463,6 +491,7 @@ impl PolicyClaims<'_> {
             .filter(|(g, _)| self.settings.proposals.iter().any(|p| p == g.as_str()))
             .cloned()
             .collect();
+        let mut found = BTreeSet::new();
         for (g, _) in boundary {
             self.control.check()?;
             if !self.readable(&g) {
@@ -482,13 +511,39 @@ impl PolicyClaims<'_> {
                     ),
                 ));
             }
-            for (c, _) in rows {
-                found.insert(c);
-                if found.len() > MAX_CLAIMS {
+            found.extend(rows);
+        }
+        let mut out = Vec::new();
+        for c in found {
+            self.control.check()?;
+            if let Some(o) = self.state_of(&c)? {
+                if out.len() == MAX_CLAIMS {
                     return Err(super::incomplete("claims"));
                 }
+                out.push(o);
             }
         }
-        Ok(found.into_iter().collect())
+        Ok(out)
+    }
+
+    /// The occurrences among `claims` the caller may see, in the order given, with a
+    /// claim named twice listed once. Unlike [`Self::states`], only visible occurrences
+    /// count toward [`MAX_CLAIMS`].
+    pub fn visible(&mut self, claims: &[NamedNode]) -> Result<Vec<ClaimOccurrence>> {
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        for c in claims {
+            self.control.check()?;
+            if !seen.insert(c.as_str()) {
+                continue;
+            }
+            if let Some(o) = self.state_of(c)? {
+                if out.len() == MAX_CLAIMS {
+                    return Err(super::incomplete("claims"));
+                }
+                out.push(o);
+            }
+        }
+        Ok(out)
     }
 }

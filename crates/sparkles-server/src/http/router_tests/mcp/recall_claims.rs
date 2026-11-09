@@ -571,3 +571,96 @@ async fn claim_bounds_never_leave_dangling_citations() {
     }
     assert!(listed.len() <= 1);
 }
+
+/// R1: claims read for an Ask summary are published only under the authority they
+/// were read with. A policy reload while the summary is written withholds the answer.
+#[cfg(feature = "mcp")]
+#[tokio::test(flavor = "multi_thread")]
+async fn ask_withholds_claims_when_authority_changes() {
+    use crate::models::mock::{self, MockModel};
+    use crate::models::{Models, ModelsConfig};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let s = server(true);
+    let ds = dataset(&s);
+    ds.update("INSERT DATA { <urn:release> a <urn:Release> }")
+        .unwrap();
+    let c = propose(&ds, "advisory", affected(), Polarity::Positive);
+    accept(&ds, &c);
+    let reload = Arc::new(AtomicBool::new(false));
+    let auth = s.auth();
+    let flag = reload.clone();
+    let draft = json!({
+        "query": "SELECT ?r WHERE { ?r a <urn:Release> }",
+        "explanation": "It lists the releases.",
+        "assumptions": [],
+        "clarify": { "question": "", "choices": [] },
+        "graph": { "subject": "", "predicate": "", "object": "" }
+    })
+    .to_string();
+    let m = MockModel::start(move |r, _| {
+        if r.body.to_string().contains("rows of a query result") {
+            if flag.swap(false, Ordering::SeqCst) {
+                auth.reload().unwrap();
+            }
+            return (
+                200,
+                mock::openai(
+                    &json!({ "text": "One release [1].", "citations": [1], "claimCitations": [] })
+                        .to_string(),
+                ),
+            );
+        }
+        (200, mock::openai(&draft))
+    });
+    let pair = json!({ "provider": "p", "model": "m" });
+    let cfg = json!({
+        "providers": { "p": { "kind": "openai", "endpoint": m.url(), "requestTimeoutSecs": 5, "allowedModels": ["m"] } },
+        "roles": { "draft": [pair], "summarize": [pair] },
+    });
+    let models = Models::new(
+        ModelsConfig::parse(&cfg.to_string()).unwrap(),
+        Default::default(),
+        sparkles::outbound::OutboundPolicy {
+            allow_private: true,
+            ..Default::default()
+        },
+    );
+    s.state.models.store(Some(Arc::new(models)));
+    let alice = b("alice");
+    let r = call(
+        &s.app,
+        "PUT",
+        "/$/assistant/ev",
+        &[
+            ("authorization", &alice),
+            ("content-type", "application/json"),
+        ],
+        r#"{"enabled": true, "send": "rows"}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let evr = b("evr");
+    let headers = [
+        ("authorization", evr.as_str()),
+        ("content-type", "application/json"),
+        ("accept", "application/json"),
+    ];
+    let ask = || {
+        call(
+            &s.app,
+            "POST",
+            "/ev/ask",
+            &headers,
+            r#"{"question": "Which releases are there?", "reviewPolicy": "main"}"#,
+        )
+    };
+    let r = ask().await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    reload.store(true, Ordering::SeqCst);
+    let r = ask().await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    let out = r.json();
+    assert_eq!(out["error"]["code"], "forbidden", "{out}");
+    assert!(out.get("summary").is_none() && out.get("claims").is_none());
+}

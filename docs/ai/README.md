@@ -407,8 +407,8 @@ proposition has an entity of the result as its subject or object. Each occurrenc
 its state under the policy, which is `accepted`, `rejected`, `needs-evidence`,
 `unreviewed` or `withdrawn`, with its current decision and the policy version that
 decision was made under. A claim's proposition is never shown as a fact, and the section
-is labelled as source data. An occurrence whose source is typed `mem:Instructions` in the
-caller's view reports `origin=instructions`, and no label changes what the caller may
+is labelled as source data. An occurrence whose source is typed `mem:Instructions` in any
+graph of the caller's view, the default graph included, reports `origin=instructions`, and no label changes what the caller may
 do. `maxClaims`, 50 by default and at most 200, bounds the section, and a fact whose
 occurrences do not all fit is left out with the result marked truncated. The JSON
 `claims` member carries `version` 1. With `matchingPolicy`, entities name their
@@ -422,10 +422,11 @@ refuses it with `409 configuration-history-inactive`, and the closed-store migra
 activates it. A caller needs read grants on the policy's decisions, supports and output
 graphs, or on a matching policy's decisions, maps, output and boundary identity graphs.
 Otherwise it gets the same `bad-argument` refusal as an unknown policy name. An
-occurrence is shown only when the caller's view holds its claim, its current decision
-and any withdrawal, and a hidden one leaves no count. Finding the claims about the
-result reads each boundary proposal graph and refuses with `incomplete-evidence` past
-one million quads. `sparkles::evidence::claim_states` and
+occurrence is shown only when the caller's view holds its claim, its current decision,
+any withdrawal and the support that cites it, and a hidden one leaves no count. Finding
+the claims about the result reads each boundary proposal graph and refuses with
+`incomplete-evidence` past one million quads, a bound that counts the graph's hidden
+quads too. `sparkles::evidence::claim_states` and
 `sparkles::evidence::with_policy_claims` read the same states for Rust callers at a
 `BoundEvidenceView`, and `sparkles::evidence::resolve_entities_at` reads a map there.
 
@@ -434,8 +435,10 @@ and no other step, receives the claims of the entities the question links exactl
 it may cite them as `[c1]`, which the summary lists in `claimCitations`. The final JSON
 and the `summary` event carry the `claims` member. The policies are checked before any
 model call, and an ask with a policy answers from the data, so `mode` `global` is
-refused. Ask reads the claims again before it publishes the summary, and any difference,
-including a moved head, withholds the answer with a `forbidden` error. A kept answer
+refused. A refused policy keeps the status `recall` gives it. An unlisted `[cN]` marker
+is removed from the summary's text. Ask reads the claims again before it publishes the
+summary, and any difference, including a moved head, withholds the answer with a
+`forbidden` error, as does an access policy reload or a credential that ends meanwhile. A kept answer
 stores the occurrences its summary cites and is shown again under its existing
 footprint rule. The CLI's `sparkles ask` does not take the policies.
 

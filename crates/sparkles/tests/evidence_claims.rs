@@ -332,6 +332,9 @@ fn claims_about_entities_match_subject_or_object() {
         let e: Vec<NamedNode> = entities.iter().map(|e| iri(e)).collect();
         evidence::with_policy_claims(&head(&ds), "main", all(), &Control::none(), |c| c.about(&e))
             .unwrap()
+            .into_iter()
+            .map(|o| o.claim)
+            .collect::<Vec<_>>()
     };
     assert_eq!(about(&["urn:release"]), vec![a.0.clone()]);
     assert_eq!(about(&["urn:cve"]), vec![a.0.clone()]);
@@ -525,4 +528,199 @@ fn identity_resolution_reads_the_view() {
     assert_eq!(r.revision, None);
     assert_eq!(r.number, 0);
     assert_eq!(r.entities[0].representative, iri("urn:ana"));
+}
+
+/// A hidden support hides the occurrence it cites, as a state and as a claim about an
+/// entity, so the occurrence never returns as a supplementary claim.
+#[test]
+fn a_hidden_support_hides_its_occurrence() {
+    let ds = configured();
+    let a = claim(&ds, "advisory");
+    review(&ds, &a, Disposition::Accepted, None);
+    let b = claim(&ds, "mirror");
+    let hidden = masking("urn:x-sparkles:evidence:claim", SUPPORTS);
+    assert_eq!(
+        states(&head(&ds), &[&a.0, &b.0], hidden.clone()),
+        vec![None, Some(ClaimState::Unreviewed)]
+    );
+    let about = evidence::with_policy_claims(&head(&ds), "main", hidden, &Control::none(), |c| {
+        c.about(&[iri("urn:release")])
+    })
+    .unwrap();
+    assert_eq!(
+        about.into_iter().map(|o| o.claim).collect::<Vec<_>>(),
+        vec![b.0.clone()]
+    );
+}
+
+/// Hidden claims take no place in the bound on claims about an entity.
+#[test]
+fn hidden_claims_do_not_count_toward_the_bound() {
+    let ds = configured();
+    let per = 1_000;
+    for batch in 0..=(evidence::MAX_CLAIMS / per) {
+        let mut input = occurrence(&format!("bulk{batch}"), Polarity::Positive, affected());
+        let template = input.claims.pop().unwrap();
+        for i in 0..per {
+            let mut c = template.clone();
+            c.key = key(&format!("claim{i}"));
+            c.occurrence_key = key(&format!("c{i}"));
+            c.proposition = Triple::new(
+                iri("urn:release"),
+                iri("urn:affectedBy"),
+                iri(&format!("urn:cve:{batch}:{i}")),
+            );
+            input.claims.push(c);
+        }
+        let mut o = ProposeOptions::new(iri("urn:principal:importer"));
+        o.proposal_graph = Some(iri(CLAIMS));
+        evidence::propose(
+            None,
+            &ds,
+            &ds,
+            &input,
+            &o,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+    }
+    // a compacted store reads a masked view without materializing it
+    ds.compact().unwrap();
+    let big = Preparation::new(Control::none(), 1 << 30).unwrap();
+    let v = ds.store().evidence_view(&At::Head, &big).unwrap();
+    let hidden = masking("http://www.w3.org/ns/prov#wasAttributedTo", CLAIMS);
+    let about = evidence::with_policy_claims(&v, "main", hidden, &Control::none(), |c| {
+        c.about(&[iri("urn:release")])
+    })
+    .unwrap();
+    assert!(about.is_empty());
+    let all_about = evidence::with_policy_claims(&v, "main", all(), &Control::none(), |c| {
+        c.about(&[iri("urn:release")])
+    });
+    assert!(all_about.is_err());
+}
+
+/// A visible typing triple in the default graph labels an instruction document, and
+/// unreadable typing triples in many other graphs neither hide nor stand in for it.
+#[test]
+fn instruction_typing_is_read_from_every_readable_graph() {
+    let ds = configured();
+    let a = propose(
+        &ds,
+        &occurrence(
+            "agents",
+            Polarity::Positive,
+            Triple::new(iri("urn:release"), iri("urn:note"), iri("urn:x")),
+        ),
+    );
+    let class = evidence::MEM_INSTRUCTIONS;
+    let mut update = String::from("INSERT DATA {");
+    for i in 0..80 {
+        update.push_str(&format!(
+            " GRAPH <urn:hidden:{i}> {{ <urn:source:agents> a <{class}> }}"
+        ));
+    }
+    update.push_str(&format!(
+        " GRAPH <urn:docs:late> {{ <urn:source:agents> a <{class}> }} }}"
+    ));
+    ds.update(&update).unwrap();
+    let origin = |access: Option<Arc<GraphAccess>>| {
+        evidence::claim_states(&head(&ds), "main", &[a.0.clone()], access, &Control::none())
+            .unwrap()[0]
+            .clone()
+            .unwrap()
+            .origin
+    };
+    let base = [SOURCES, CLAIMS, DECISIONS, SUPPORTS, OUTPUT];
+    assert_eq!(origin(reading(&base)), ClaimOrigin::Source);
+    let late: Vec<&str> = base.iter().copied().chain(["urn:docs:late"]).collect();
+    assert_eq!(origin(reading(&late)), ClaimOrigin::Instructions);
+
+    let ds = configured();
+    let a = propose(
+        &ds,
+        &occurrence(
+            "agents",
+            Polarity::Positive,
+            Triple::new(iri("urn:release"), iri("urn:note"), iri("urn:x")),
+        ),
+    );
+    ds.update(&format!(
+        "INSERT DATA {{ <urn:source:agents> a <{class}> }}"
+    ))
+    .unwrap();
+    let read = evidence::claim_states(&head(&ds), "main", &[a.0.clone()], all(), &Control::none())
+        .unwrap();
+    assert_eq!(read[0].as_ref().unwrap().origin, ClaimOrigin::Instructions);
+}
+
+/// With no entities, identity resolution at a view still reads and checks the map.
+#[test]
+fn identity_resolution_of_no_entities_reads_the_map() {
+    let ds = configured();
+    let r =
+        evidence::resolve_entities_at(&head(&ds), "people", &[], all(), &Control::none()).unwrap();
+    assert_eq!(r.revision, None);
+    assert!(r.entities.is_empty());
+    let hidden = reading(&[SOURCES, CLAIMS, DECISIONS, SUPPORTS, OUTPUT]);
+    assert!(
+        evidence::resolve_entities_at(&head(&ds), "people", &[], hidden, &Control::none()).is_err()
+    );
+    // a published map reports its revision without any entity
+    publish_map(&ds);
+    let r =
+        evidence::resolve_entities_at(&head(&ds), "people", &[], all(), &Control::none()).unwrap();
+    assert!(r.revision.is_some());
+    assert_eq!(r.number, 1);
+}
+
+/// Accept a match of `urn:ana` and `urn:anna` under `people`, which publishes the
+/// first map revision.
+fn publish_map(ds: &Dataset) {
+    let mut o = ProposeOptions::new(iri("urn:principal:matcher"));
+    o.identity_graph = Some(iri(IDENTITIES));
+    let p = evidence::propose(
+        None,
+        ds,
+        ds,
+        &EvidenceInput {
+            identities: vec![evidence::IdentityInput {
+                version: RecordVersion::V1,
+                key: key("p"),
+                occurrence_key: key("ana"),
+                entities: vec![iri("urn:ana"), iri("urn:anna")],
+                relation: evidence::IdentityRelation::PossibleMatch,
+                preferred: None,
+                attributed_author: iri("urn:matcher"),
+                method: None,
+            }],
+            ..Default::default()
+        },
+        &o,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let r = p.records.iter().find(|r| r.key == "p").unwrap();
+    let mut ro = ReviewOptions::new(iri("urn:principal:reviewer"));
+    ro.if_head = Some(ds.store().head_commit().seq);
+    evidence::review(
+        None,
+        ds,
+        ds,
+        "people",
+        1,
+        &[DecisionInput {
+            key: "d".into(),
+            target: r.iri.clone(),
+            target_digest: r.digest,
+            disposition: Disposition::Accepted,
+            supersedes: None,
+        }],
+        &ro,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
 }
