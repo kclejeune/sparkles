@@ -227,12 +227,17 @@ pub enum XLit {
 )]
 impl XLit {
     /// The canonical form: an equality's terms and a role atom's in order, the role atom
-    /// read by the inverse role when it swaps them, which `inv` gives.
+    /// read by the inverse role when it swaps them, which `inv` gives, and a loop by the
+    /// smaller of the role and its inverse.
     pub fn canon(self, inv: impl Fn(Role) -> Option<Role>) -> XLit {
         match self {
             XLit::Role(s, a, b) if a > b => match inv(s) {
                 Some(i) => XLit::Role(i, b, a),
                 None => self,
+            },
+            XLit::Role(s, a, b) if a == b => match inv(s) {
+                Some(i) if i < s => XLit::Role(i, a, b),
+                _ => self,
             },
             XLit::Eq(a, b) if a > b => XLit::Eq(b, a),
             XLit::Ne(a, b) if a > b => XLit::Ne(b, a),
@@ -296,7 +301,8 @@ impl Lits {
             let _ = self.recs.slot(id, &self.bytes).set(l);
             id
         });
-        let grown = table_bytes(ids.capacity(), 24).saturating_sub(table_bytes(cap, 24));
+        let entry = std::mem::size_of::<(XLit, u32)>();
+        let grown = table_bytes(ids.capacity(), entry).saturating_sub(table_bytes(cap, entry));
         self.bytes.fetch_add(grown, Ordering::Relaxed);
         Made::Lit(Lit::xl(id))
     }
@@ -951,6 +957,37 @@ mod tests {
         );
         assert_eq!(lits.view(a, inv), XLit::Atom(5, C(1)));
         assert!(lits.bytes() > 0);
+    }
+
+    #[test]
+    fn a_loop_by_a_role_or_its_inverse_is_one_literal() {
+        use RTerm::*;
+        let lits = Lits::default();
+        for t in [X, C(0)] {
+            assert_eq!(
+                lits.lit(XLit::Role(4, t, t), inv),
+                lits.lit(XLit::Role(5, t, t), inv)
+            );
+        }
+    }
+
+    #[test]
+    fn the_interned_literals_map_is_counted_by_its_entries() {
+        let lits = Lits::default();
+        for i in 0..5000 {
+            lits.lit(XLit::Atom(i, RTerm::C(1)), inv);
+        }
+        let map = table_bytes(
+            lits.ids.lock().capacity(),
+            std::mem::size_of::<(XLit, u32)>(),
+        )
+            // the segments of 1,024, 2,048 and 4,096 records that 5,000 fill
+            + 7168 * std::mem::size_of::<OnceLock<XLit>>();
+        assert!(
+            lits.bytes() >= map,
+            "{} counted for a map of {map}",
+            lits.bytes()
+        );
     }
 
     #[test]
