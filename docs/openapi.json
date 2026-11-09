@@ -17531,6 +17531,10 @@
                   "description": "Deliveries that failed, were refused or were dropped since the start.",
                   "type": "integer"
                 },
+                "inFlight": {
+                  "description": "Whether the channel's thread is sending a delivery.",
+                  "type": "boolean"
+                },
                 "lastFailure": {
                   "oneOf": [
                     {
@@ -17549,7 +17553,7 @@
                           "type": "string"
                         },
                         "status": {
-                          "description": "The HTTP status of a delivery.",
+                          "description": "The HTTP status of a webhook or ntfy delivery, or the SMTP reply code of an email delivery.",
                           "type": "integer"
                         }
                       },
@@ -17582,7 +17586,7 @@
                           "type": "string"
                         },
                         "status": {
-                          "description": "The HTTP status of a delivery.",
+                          "description": "The HTTP status of a webhook or ntfy delivery, or the SMTP reply code of an email delivery.",
                           "type": "integer"
                         }
                       },
@@ -17599,6 +17603,14 @@
                 },
                 "name": {
                   "type": "string"
+                },
+                "queueCapacity": {
+                  "description": "The deliveries the channel's queue holds, the one in flight included.",
+                  "type": "integer"
+                },
+                "queued": {
+                  "description": "Deliveries waiting in the channel's queue.",
+                  "type": "integer"
                 },
                 "secrets": {
                   "description": "The secrets the channel names.",
@@ -17618,7 +17630,8 @@
                 "type": {
                   "enum": [
                     "webhook",
-                    "ntfy"
+                    "ntfy",
+                    "email"
                   ],
                   "type": "string"
                 }
@@ -17631,7 +17644,10 @@
                 "lastSuccess",
                 "lastFailure",
                 "sent",
-                "failed"
+                "failed",
+                "queued",
+                "inFlight",
+                "queueCapacity"
               ],
               "type": "object"
             },
@@ -17641,7 +17657,7 @@
             "type": "boolean"
           },
           "queued": {
-            "description": "Deliveries waiting in the queue.",
+            "description": "Deliveries waiting in every channel's queue.",
             "type": "integer"
           },
           "recent": {
@@ -17691,13 +17707,14 @@
             "type": "string"
           },
           "status": {
-            "description": "The HTTP status the channel answered.",
+            "description": "The HTTP status the channel answered, or the SMTP reply code of an email channel.",
             "type": "integer"
           },
           "type": {
             "enum": [
               "webhook",
-              "ntfy"
+              "ntfy",
+              "email"
             ],
             "type": "string"
           }

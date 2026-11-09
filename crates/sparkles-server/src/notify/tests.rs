@@ -9,6 +9,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::Ordering;
 use tower::ServiceExt;
 
 /// One request the receiver got.
@@ -96,6 +97,11 @@ struct Fixture {
 /// A server with the settings file `settings` and the outbound policy's
 /// `allow_private`.
 fn fixture(settings: Option<Value>, allow_private: bool) -> Fixture {
+    fixture_with(settings, allow_private, None)
+}
+
+/// [`fixture`] with an outbound policy that also trusts the PEM roots `roots`.
+fn fixture_with(settings: Option<Value>, allow_private: bool, roots: Option<&[u8]>) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let mut st = AppState::new(
         &dir.path().join("data"),
@@ -104,6 +110,7 @@ fn fixture(settings: Option<Value>, allow_private: bool) -> Fixture {
     )
     .unwrap();
     st.outbound.allow_private = allow_private;
+    st.outbound.tls.extra_roots_pem = roots.map(<[u8]>::to_vec);
     let file = settings.map(|s| {
         let f = dir.path().join("settings.json");
         std::fs::write(&f, s.to_string()).unwrap();
@@ -655,4 +662,1114 @@ fn a_newer_state_file_is_refused() {
     assert!(parse_state(br#"{"active": {}}"#).unwrap().is_empty());
     let saved = sparkles::formats::settings_to_vec(STATE_FILE, &StateFile::default()).unwrap();
     assert!(parse_state(&saved).is_ok());
+}
+
+/// A local server that accepts connections and never answers, as a hung webhook does.
+struct Stalled {
+    port: u16,
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Stalled {
+    fn start() -> Stalled {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let accepted: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+        let stop: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let (a, s) = (accepted.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for c in l.incoming() {
+                if s.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(c) = c else { continue };
+                a.fetch_add(1, Ordering::SeqCst);
+                held.push(c);
+            }
+        });
+        Stalled {
+            port,
+            accepted,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}/hook", self.port)
+    }
+}
+
+impl Drop for Stalled {
+    /// Stop accepting and close the held connections.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The channel's entry in `GET /$/notifications`.
+fn channel_of(v: &Value, name: &str) -> Value {
+    v["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == name)
+        .cloned()
+        .unwrap()
+}
+
+/// A hung channel holds only its own deliveries: an event for another channel, raised
+/// after the hung one's, arrives at once while the hung channel waits for its timeout,
+/// and raising events never waits for a delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hung_channel_does_not_delay_the_others() {
+    let slow = Stalled::start();
+    let rx = Receiver::start(vec![]);
+    let f = fixture(None, true);
+    let (s, v) = f
+        .patch(json!({
+            "enabled": true,
+            "channels": {
+                "slow": {"type": "webhook", "url": slow.url()},
+                "fast": {"type": "webhook", "url": rx.url()}
+            },
+            "routes": {"backup.*": ["slow"], "memory.*": ["fast"]},
+            "delivery": {"attempts": 1, "backoffSecs": 1, "maxBackoffSecs": 1, "timeoutSecs": 20},
+        }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    for _ in 0..3 {
+        let t = Instant::now();
+        raise(&f.st, event("backup.failed"), None, Utc::now());
+        assert!(
+            t.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+    // the hung channel has started its first attempt
+    for _ in 0..200 {
+        if slow.accepted.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(slow.accepted.load(Ordering::SeqCst), 1);
+    let t = Instant::now();
+    raise(&f.st, event("memory.review.pending"), None, Utc::now());
+    let v = settled(&f.st, "fast", 1).await;
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert_eq!(rx.got().len(), 1);
+    assert_eq!(channel_of(&v, "fast")["sent"], 1);
+    let s = channel_of(&v, "slow");
+    assert_eq!(s["sent"], 0);
+    assert_eq!(s["failed"], 0);
+    assert_eq!(s["queued"], 2, "{v}");
+    assert_eq!(v["queued"], 2, "{v}");
+    let m = f.metrics().await;
+    assert!(
+        m.contains(r#"sparkles_notifications_channel_queued{channel="slow"} 2"#),
+        "{m}"
+    );
+    assert!(m.contains("sparkles_notifications_queued 2"), "{m}");
+}
+
+/// Each channel has its share of the queue, at least 50 deliveries: a hung channel
+/// that fills its share drops its own new deliveries with the result `dropped`, and
+/// another channel still queues and delivers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_channel_queue_drops_only_its_own_deliveries() {
+    let slow = Stalled::start();
+    let rx = Receiver::start(vec![]);
+    let f = fixture(None, true);
+    let mut channels = serde_json::Map::new();
+    channels.insert("slow".into(), json!({"type": "webhook", "url": slow.url()}));
+    channels.insert("fast".into(), json!({"type": "webhook", "url": rx.url()}));
+    // 30 channels: a share of 1000 / 30 = 33, raised to the floor of 50
+    for i in 0..28 {
+        channels.insert(
+            format!("idle{i}"),
+            json!({"type": "webhook", "url": "https://hooks.example.org/x"}),
+        );
+    }
+    let (s, v) = f
+        .patch(json!({
+            "enabled": true,
+            "channels": channels,
+            "routes": {"backup.*": ["slow"], "memory.*": ["fast"]},
+            "delivery": {"attempts": 1, "backoffSecs": 1, "maxBackoffSecs": 1, "timeoutSecs": 20},
+        }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    for _ in 0..60 {
+        raise(&f.st, event("backup.failed"), None, Utc::now());
+    }
+    raise(&f.st, event("memory.review.pending"), None, Utc::now());
+    for _ in 0..200 {
+        if slow.accepted.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let v = settled(&f.st, "fast", 1).await;
+    assert_eq!(channel_of(&v, "fast")["sent"], 1);
+    let s = channel_of(&v, "slow");
+    // one in flight and 49 waiting fill the share of 50, and the other 10 are dropped
+    assert_eq!(s["queueCapacity"], 50, "{v}");
+    assert_eq!(s["queued"], 49, "{v}");
+    assert_eq!(s["failed"], 10, "{v}");
+    assert_eq!(s["lastFailure"]["error"], "the channel's queue is full");
+    let m = f.metrics().await;
+    assert!(m.contains(r#"sparkles_notifications_sent_total{channel="slow",event="backup.failed",result="dropped"} 10"#), "{m}");
+    assert!(
+        m.contains(r#"sparkles_notifications_channel_queue_capacity{channel="slow"} 50"#),
+        "{m}"
+    );
+}
+
+/// The kind has at most 32 channels, which bounds the delivery threads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_kind_has_at_most_32_channels() {
+    let f = fixture(None, true);
+    let channels: serde_json::Map<String, Value> = (0..33)
+        .map(|i| {
+            (
+                format!("c{i}"),
+                json!({"type": "webhook", "url": "https://hooks.example.org/x"}),
+            )
+        })
+        .collect();
+    let (s, v) = f.patch(json!({ "channels": channels })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v.to_string().contains("at most 32"), "{v}");
+}
+
+/// Channels that were renamed while their deliveries wait still have queues, but the
+/// queues of all channels, current and removed, are at most 64, so the threads stay
+/// bounded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn renamed_channels_do_not_add_threads_without_bound() {
+    let slow = Stalled::start();
+    let f = fixture(None, true);
+    let set = |prefix: &str| {
+        let channels: serde_json::Map<String, Value> = (0..32)
+            .map(|i| {
+                (
+                    format!("{prefix}{i}"),
+                    json!({"type": "webhook", "url": slow.url()}),
+                )
+            })
+            .collect();
+        let names: Vec<String> = channels.keys().cloned().collect();
+        json!({
+            "enabled": true,
+            "channels": channels,
+            "routes": {"*": names},
+            "delivery": {"attempts": 1, "backoffSecs": 1, "maxBackoffSecs": 1, "timeoutSecs": 20},
+        })
+    };
+    let lanes = |st: &AppState| st.notifier.shared.inner.lock().lanes.len();
+    let mut previous: Option<&str> = None;
+    for prefix in ["a", "b", "c"] {
+        let mut body = set(prefix);
+        if let Some(p) = previous {
+            for n in 0..32 {
+                body["channels"][format!("{p}{n}")] = Value::Null;
+            }
+        }
+        let (s, v) = f.patch(body).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        raise(&f.st, event("backup.failed"), None, Utc::now());
+        previous = Some(prefix);
+    }
+    assert_eq!(lanes(&f.st), MAX_LANES, "{}", status_json(&f.st));
+    let m = f.metrics().await;
+    assert!(m.contains(r#"sparkles_notifications_sent_total{channel="c0",event="backup.failed",result="dropped"} 1"#), "{m}");
+}
+
+/// The queue of a channel that was removed ends once it is empty, without waiting for
+/// the idle time of a current channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removed_channel_gives_back_its_queue() {
+    let rx = Receiver::start(vec![]);
+    let f = fixture(None, true);
+    f.patch(json!({
+        "enabled": true,
+        "channels": {"hook": {"type": "webhook", "url": rx.url()}},
+        "routes": {"*": ["hook"]},
+    }))
+    .await;
+    raise(&f.st, event("backup.failed"), None, Utc::now());
+    settled(&f.st, "hook", 1).await;
+    assert!(f.st.notifier.shared.inner.lock().lanes.contains_key("hook"));
+    let (s, v) = f
+        .patch(json!({"channels": {"hook": null}, "routes": {"*": null}}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let mut gone = false;
+    for _ in 0..100 {
+        if !f.st.notifier.shared.inner.lock().lanes.contains_key("hook") {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(gone, "the removed channel's queue is still there");
+}
+
+/// A runtime layer written before the cap, with 33 channels, is not delivered to past
+/// the cap of threads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runtime_layer_past_the_cap_is_refused_on_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let channels: serde_json::Map<String, Value> = (0..33)
+        .map(|i| {
+            (
+                format!("c{i}"),
+                json!({"type": "webhook", "url": "https://hooks.example.org/x"}),
+            )
+        })
+        .collect();
+    std::fs::write(
+        data.join(config::NOTIFICATIONS_FILE),
+        json!({"enabled": true, "channels": channels, "routes": {"*": ["c0"]}}).to_string(),
+    )
+    .unwrap();
+    let mut st = AppState::new(
+        &data,
+        sparkles::store::StoreOptions::default(),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    crate::settings::server::start(&mut st, None, &Default::default()).unwrap();
+    let st = Arc::new(st);
+    let cfg = settings(&st);
+    assert!(!cfg.enabled);
+    assert!(cfg.channels.is_empty());
+    assert_eq!(
+        raise(&st, event("backup.failed"), None, Utc::now()),
+        Raised::Disabled
+    );
+}
+// ------------------------------------------------------------------ email (§4.3) ------
+
+const TEST_CA: &[u8] = include_bytes!("../tls/testdata/ca.pem");
+const TEST_CERT: &[u8] = include_bytes!("../tls/testdata/cert-a.pem");
+const TEST_KEY: &[u8] = include_bytes!("../tls/testdata/key-a.pem");
+
+trait Rw: Read + Write {}
+impl<T: Read + Write> Rw for T {}
+
+/// How the fake mail server offers TLS.
+#[derive(Clone, Copy, PartialEq)]
+enum SmtpMode {
+    /// STARTTLS on a plain connection
+    Starttls,
+    /// TLS from the first byte
+    Tls,
+    /// a plain server without STARTTLS
+    Plain,
+}
+
+/// One message the fake mail server took, or the commands of a session that ended
+/// before DATA.
+#[derive(Clone, Debug, Default)]
+struct Mail {
+    /// whether the commands after the greeting ran over TLS
+    secure: bool,
+    /// `\0user\0password` decoded from AUTH PLAIN
+    auth: Option<String>,
+    from: String,
+    to: Vec<String>,
+    data: String,
+    commands: Vec<String>,
+}
+
+/// How the fake mail server answers, beyond the plain success.
+#[derive(Clone, Default)]
+struct Script {
+    /// the replies to RCPT in turn, then 250
+    rcpt: Vec<u16>,
+    /// answer AUTH with a 535 that quotes the credentials and the token
+    auth_echo: bool,
+    /// send the greeting one byte at a time, 300 ms apart
+    trickle: bool,
+    /// answer 500 to a command line longer than this, CRLF included
+    max_command: Option<usize>,
+}
+
+/// A local mail server inside the test process. It stops when it is dropped.
+struct FakeSmtp {
+    port: u16,
+    got: Arc<Mutex<Vec<Mail>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+fn server_tls() -> Arc<rustls::ServerConfig> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(TEST_CERT)
+        .map(Result::unwrap)
+        .collect();
+    let key = PrivateKeyDer::from_pem_slice(TEST_KEY).unwrap();
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    Arc::new(
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap(),
+    )
+}
+
+fn read_line(s: &mut dyn Rw) -> Option<String> {
+    let mut out = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        match s.read(&mut b) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {
+                out.push(b[0]);
+                if b[0] == b'\n' {
+                    return Some(String::from_utf8_lossy(&out).into_owned());
+                }
+            }
+        }
+    }
+}
+
+enum Next {
+    Done,
+    Upgrade,
+}
+
+/// One SMTP session on `s` until QUIT, a closed connection or STARTTLS.
+fn smtp_session(
+    s: &mut dyn Rw,
+    mode: SmtpMode,
+    secure: bool,
+    greet: bool,
+    script: &Script,
+    rcpt: &Mutex<std::vec::IntoIter<u16>>,
+    mail: &mut Mail,
+) -> Next {
+    use base64::Engine as _;
+    if greet {
+        let g = b"220 fake.example ESMTP\r\n";
+        if script.trickle {
+            for b in g {
+                if s.write_all(&[*b]).is_err() {
+                    return Next::Done;
+                }
+                let _ = s.flush();
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        } else {
+            let _ = s.write_all(g);
+        }
+    }
+    mail.secure = secure;
+    let decode = |t: &str| {
+        let d = base64::engine::general_purpose::STANDARD
+            .decode(t.trim())
+            .unwrap_or_default();
+        String::from_utf8_lossy(&d).into_owned()
+    };
+    loop {
+        let Some(line) = read_line(s) else {
+            return Next::Done;
+        };
+        let cmd = line.trim_end().to_string();
+        let upper = cmd.to_ascii_uppercase();
+        mail.commands.push(if upper.starts_with("AUTH") {
+            "AUTH PLAIN [token]".into()
+        } else {
+            cmd.clone()
+        });
+        if script.max_command.is_some_and(|m| line.len() > m) {
+            let _ = s.write_all(b"500 line too long\r\n");
+            continue;
+        }
+        let reply: String = if upper.starts_with("EHLO") {
+            let tls = if mode == SmtpMode::Starttls && !secure {
+                "250-STARTTLS\r\n"
+            } else {
+                ""
+            };
+            format!("250-fake.example greets you\r\n{tls}250-AUTH LOGIN PLAIN\r\n250 8BITMIME\r\n")
+        } else if upper == "STARTTLS" {
+            let _ = s.write_all(b"220 ready\r\n");
+            return Next::Upgrade;
+        } else if upper.starts_with("AUTH PLAIN") {
+            let token = match cmd.strip_prefix("AUTH PLAIN ") {
+                Some(t) => t.trim().to_string(),
+                None => {
+                    // no initial response: the empty challenge, then the token
+                    let _ = s.write_all(b"334 \r\n");
+                    match read_line(s) {
+                        Some(t) => t.trim().to_string(),
+                        None => return Next::Done,
+                    }
+                }
+            };
+            mail.auth = Some(decode(&token));
+            if script.auth_echo {
+                format!("535 bad credentials {:?} in {token}\r\n", decode(&token))
+            } else {
+                "235 ok\r\n".into()
+            }
+        } else if upper.starts_with("MAIL FROM:") {
+            mail.from = cmd["MAIL FROM:".len()..]
+                .trim_matches(['<', '>'])
+                .to_string();
+            "250 ok\r\n".into()
+        } else if upper.starts_with("RCPT TO:") {
+            let code = rcpt.lock().next().unwrap_or(250);
+            if code == 250 || code == 251 {
+                mail.to
+                    .push(cmd["RCPT TO:".len()..].trim_matches(['<', '>']).to_string());
+                format!("{code} ok\r\n")
+            } else {
+                format!("{code} not now\r\n")
+            }
+        } else if upper == "DATA" {
+            let _ = s.write_all(b"354 go on\r\n");
+            let mut data = String::new();
+            while let Some(l) = read_line(s) {
+                if l == ".\r\n" {
+                    break;
+                }
+                data.push_str(&l);
+            }
+            mail.data = data;
+            "250 queued\r\n".into()
+        } else if upper == "QUIT" {
+            let _ = s.write_all(b"221 bye\r\n");
+            return Next::Done;
+        } else {
+            "500 what\r\n".into()
+        };
+        let _ = s.write_all(reply.as_bytes());
+        let _ = s.flush();
+    }
+}
+
+impl FakeSmtp {
+    fn start(mode: SmtpMode, rcpt: Vec<u16>) -> FakeSmtp {
+        FakeSmtp::start_with(
+            mode,
+            Script {
+                rcpt,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn start_with(mode: SmtpMode, script: Script) -> FakeSmtp {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let got: Arc<Mutex<Vec<Mail>>> = Arc::default();
+        let stop: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let (g, halt) = (got.clone(), stop.clone());
+        let config = server_tls();
+        let thread = std::thread::spawn(move || {
+            let rcpt = Mutex::new(script.rcpt.clone().into_iter());
+            for c in l.incoming() {
+                if halt.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(tcp) = c else { continue };
+                let _ = tcp.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut mail = Mail::default();
+                let tls_stream = |tcp: std::net::TcpStream| {
+                    rustls::StreamOwned::new(
+                        rustls::ServerConnection::new(config.clone()).unwrap(),
+                        tcp,
+                    )
+                };
+                match mode {
+                    SmtpMode::Tls => {
+                        let mut s = tls_stream(tcp);
+                        smtp_session(&mut s, mode, true, true, &script, &rcpt, &mut mail);
+                    }
+                    SmtpMode::Starttls | SmtpMode::Plain => {
+                        let mut tcp = tcp;
+                        if let Next::Upgrade =
+                            smtp_session(&mut tcp, mode, false, true, &script, &rcpt, &mut mail)
+                        {
+                            let mut s = tls_stream(tcp);
+                            smtp_session(&mut s, mode, true, false, &script, &rcpt, &mut mail);
+                        }
+                    }
+                }
+                g.lock().push(mail);
+            }
+        });
+        FakeSmtp {
+            port,
+            got,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn got(&self) -> Vec<Mail> {
+        self.got.lock().clone()
+    }
+
+    /// The sessions once `n` have ended, since a session ends after the client has its
+    /// last reply.
+    fn wait(&self, n: usize) -> Vec<Mail> {
+        for _ in 0..200 {
+            if self.got.lock().len() >= n {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.got()
+    }
+}
+
+impl Drop for FakeSmtp {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn email_channel(port: u16, tls: &str) -> Value {
+    json!({
+        "type": "email", "host": "127.0.0.1", "port": port, "tls": tls,
+        "username": "sparkles", "password": {"secret": "smtp"},
+        "from": "sparkles@example.org", "to": ["ops@example.org", "oncall@example.org"]
+    })
+}
+
+/// §4.3: a message submitted over STARTTLS with AUTH PLAIN, whose password comes from
+/// a secret and appears in no answer, and whose subject is the title.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn email_is_submitted_over_starttls() {
+    let smtp = FakeSmtp::start(SmtpMode::Starttls, vec![]);
+    let f = fixture_with(None, true, Some(TEST_CA));
+    f.secret("smtp", "s3cret-smtp-pass");
+    let (s, v) = f
+        .patch(json!({
+            "enabled": true,
+            "baseUrl": "https://sparkles.example.org",
+            "channels": {"mail": email_channel(smtp.port, "starttls")},
+            "routes": {"backup.*": ["mail"]},
+            "delivery": fast(),
+        }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    raise(&f.st, event("backup.failed"), None, Utc::now());
+    let v = settled(&f.st, "mail", 1).await;
+    let c = channel_of(&v, "mail");
+    assert_eq!(c["sent"], 1, "{v}");
+    assert_eq!(c["lastSuccess"]["status"], 250);
+    assert_eq!(c["type"], "email");
+    assert_eq!(c["secrets"], json!(["smtp"]));
+    let got = smtp.wait(1);
+    assert_eq!(got.len(), 1);
+    let m = &got[0];
+    assert!(m.secure, "{m:?}");
+    assert_eq!(m.auth.as_deref(), Some("\0sparkles\0s3cret-smtp-pass"));
+    assert_eq!(m.from, "sparkles@example.org");
+    assert_eq!(m.to, ["ops@example.org", "oncall@example.org"]);
+    // STARTTLS comes before AUTH and MAIL, and EHLO is sent again over TLS
+    let at = |p: &str| m.commands.iter().position(|c| c.starts_with(p)).unwrap();
+    assert!(at("STARTTLS") < at("AUTH"), "{:?}", m.commands);
+    assert_eq!(
+        m.commands.iter().filter(|c| c.starts_with("EHLO")).count(),
+        2
+    );
+    assert!(m.data.contains("Subject: Title\r\n"), "{}", m.data);
+    assert!(
+        m.data
+            .contains("To: ops@example.org,\r\n oncall@example.org\r\n")
+    );
+    assert!(
+        m.data
+            .contains("Content-Type: text/plain; charset=utf-8\r\n")
+    );
+    assert!(
+        m.data
+            .contains("\r\n\r\nSummary\r\n\r\nhttps://sparkles.example.org/ui/server\r\n"),
+        "{}",
+        m.data
+    );
+    assert!(m.data.contains("Event: backup.failed\r\n"));
+    assert!(m.data.contains("\"x\": 1"), "{}", m.data);
+    let (_, v) = f.send("GET", "/$/notifications", None).await;
+    assert!(!v.to_string().contains("s3cret-smtp-pass"), "{v}");
+    let (_, v) = f
+        .send("GET", "/$/server/settings/notifications", None)
+        .await;
+    assert!(!v.to_string().contains("s3cret-smtp-pass"), "{v}");
+}
+
+/// Implicit TLS on its own port, through a test send, and a 451 that is retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn email_over_implicit_tls_retries_a_4xx() {
+    let smtp = FakeSmtp::start(SmtpMode::Tls, vec![451]);
+    let f = fixture_with(None, true, Some(TEST_CA));
+    f.secret("smtp", "s3cret-smtp-pass");
+    let (s, v) = f
+        .patch(json!({
+            "enabled": true,
+            "channels": {"mail": email_channel(smtp.port, "tls")},
+            "routes": {"*": ["mail"]},
+            "delivery": fast(),
+        }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // the test send has one attempt, so the 451 fails it
+    let (s, v) = f.send("POST", "/$/notifications/test/mail", None).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    assert!(v.to_string().contains("SMTP 451"), "{v}");
+    let (s, v) = f.send("POST", "/$/notifications/test/mail", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["result"], "ok");
+    assert_eq!(v["status"], 250);
+    assert!(smtp.wait(2)[1].secure);
+    assert!(
+        smtp.got()[1]
+            .data
+            .contains("Subject: Test notification\r\n")
+    );
+    // a delivery retries a 451 and succeeds on the second attempt
+    let smtp2 = FakeSmtp::start(SmtpMode::Tls, vec![451]);
+    let (s, v) = f
+        .patch(json!({"channels": {"mail": email_channel(smtp2.port, "tls")}}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    raise(&f.st, event("backup.failed"), None, Utc::now());
+    let v = settled(&f.st, "mail", 3).await;
+    assert_eq!(
+        channel_of(&v, "mail")["lastSuccess"]["event"],
+        "backup.failed",
+        "{v}"
+    );
+    assert_eq!(smtp2.wait(2).len(), 2);
+    assert!(
+        f.metrics()
+            .await
+            .contains(r#"sparkles_notifications_retries_total{channel="mail"} 1"#)
+    );
+}
+
+/// A 550 ends the delivery after one attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn email_does_not_retry_a_5xx() {
+    let smtp = FakeSmtp::start(SmtpMode::Starttls, vec![550]);
+    let f = fixture_with(None, true, Some(TEST_CA));
+    f.secret("smtp", "s3cret-smtp-pass");
+    f.patch(json!({
+        "enabled": true,
+        "channels": {"mail": email_channel(smtp.port, "starttls")},
+        "routes": {"*": ["mail"]},
+        "delivery": fast(),
+    }))
+    .await;
+    raise(&f.st, event("backup.failed"), None, Utc::now());
+    let v = settled(&f.st, "mail", 1).await;
+    let c = channel_of(&v, "mail");
+    assert_eq!(c["failed"], 1);
+    assert!(
+        c["lastFailure"]["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("SMTP 550"),
+        "{v}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(smtp.wait(1).len(), 1);
+    assert!(
+        !f.metrics()
+            .await
+            .contains(r#"sparkles_notifications_retries_total{channel="mail"}"#)
+    );
+}
+
+/// A server without STARTTLS gets neither the password nor the message, and one whose
+/// certificate the server does not trust gets nothing past the handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn email_never_goes_out_in_the_clear() {
+    let plain = FakeSmtp::start(SmtpMode::Plain, vec![]);
+    let f = fixture_with(None, true, Some(TEST_CA));
+    f.secret("smtp", "s3cret-smtp-pass");
+    f.patch(json!({"channels": {"mail": email_channel(plain.port, "starttls")}}))
+        .await;
+    let (s, v) = f.send("POST", "/$/notifications/test/mail", None).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    assert!(v.to_string().contains("does not offer STARTTLS"), "{v}");
+    let got = plain.wait(1);
+    assert_eq!(got.len(), 1);
+    assert!(got[0].auth.is_none());
+    assert!(
+        !got[0].commands.iter().any(|c| c.starts_with("MAIL")),
+        "{:?}",
+        got[0].commands
+    );
+    // without the test CA the certificate is not trusted
+    let tls = FakeSmtp::start(SmtpMode::Starttls, vec![]);
+    let f = fixture(None, true);
+    f.secret("smtp", "s3cret-smtp-pass");
+    f.patch(json!({"channels": {"mail": email_channel(tls.port, "starttls")}}))
+        .await;
+    let (s, v) = f.send("POST", "/$/notifications/test/mail", None).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    assert!(v.to_string().contains("TLS"), "{v}");
+    assert!(
+        tls.wait(1)
+            .iter()
+            .all(|m| m.auth.is_none() && m.data.is_empty())
+    );
+}
+
+/// The outbound policy checks the mail host before any connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_outbound_policy_refuses_a_private_mail_server() {
+    let smtp = FakeSmtp::start(SmtpMode::Starttls, vec![]);
+    let f = fixture_with(None, false, Some(TEST_CA));
+    f.secret("smtp", "s3cret-smtp-pass");
+    f.patch(json!({"channels": {"mail": email_channel(smtp.port, "starttls")}}))
+        .await;
+    let (s, v) = f.send("POST", "/$/notifications/test/mail", None).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    assert_eq!(v["code"], "outbound-refused");
+    assert!(smtp.got().is_empty());
+}
+
+/// The email channel's settings: no plain mode, secret passwords and checked addresses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_email_channel_settings_are_checked() {
+    let f = fixture(None, true);
+    let base = email_channel(587, "starttls");
+    let with = |k: &str, v: Value| {
+        let mut c = base.clone();
+        c[k] = v;
+        json!({"channels": {"mail": c}})
+    };
+    for (body, what) in [
+        (with("tls", json!("none")), "tls"),
+        (with("password", json!("inline-pass-value")), "password"),
+        (with("from", json!("not an address")), "from"),
+        (with("to", json!([])), "to"),
+        (with("to", json!(["a@example.org>, evil@x.org"])), "to"),
+        (with("host", json!("bad host")), "host"),
+    ] {
+        let (s, v) = f.patch(body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{what}: {v}");
+        assert!(v.to_string().contains(what), "{what}: {v}");
+        assert!(!v.to_string().contains("inline-pass-value"), "{v}");
+    }
+    let mut c = base.clone();
+    c.as_object_mut().unwrap().remove("password");
+    let (s, v) = f.patch(json!({"channels": {"mail": c}})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let (s, v) = f.patch(json!({"channels": {"mail": base}})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (_, v) = f.send("GET", "/$/notifications", None).await;
+    assert_eq!(
+        channel_of(&v, "mail")["target"],
+        "127.0.0.1 port 587 (starttls) to ops@example.org, oncall@example.org"
+    );
+}
+
+/// The message: an encoded subject outside ASCII, quoted-printable text, and a body line
+/// that starts with a dot.
+#[test]
+fn the_email_message_is_rfc_5322() {
+    let e: config::Email = serde_json::from_value(json!({
+        "host": "smtp.example.org", "from": "s@example.org", "to": ["o@example.org"]
+    }))
+    .unwrap();
+    assert_eq!(e.port(), 587);
+    let env = json!({
+        "id": "abc", "type": "backup.failed", "time": "2026-10-10T09:00:00Z",
+        "server": "s", "severity": "critical", "title": "Sauvegarde échouée",
+        "summary": ".leading dot and caf\u{e9}", "data": {}
+    });
+    let m = String::from_utf8(smtp::message(&e, &env)).unwrap();
+    assert!(m.contains("Subject: =?utf-8?B?"), "{m}");
+    assert!(m.contains("Content-Transfer-Encoding: quoted-printable\r\n"));
+    assert!(m.contains("\r\n..leading dot and caf=C3=A9\r\n"), "{m}");
+    assert!(
+        m.contains("Date: Sat, 10 Oct 2026 09:00:00 +0000\r\n"),
+        "{m}"
+    );
+    assert!(m.contains("Message-ID: <abc@example.org>\r\n"));
+    assert!(m.ends_with("\r\n.\r\n"));
+    assert!(!m.contains("Data:"));
+    assert_eq!(smtp::subject("plain"), "plain");
+    assert_eq!(smtp::quoted_printable("a=b \n"), "a=3Db=20\r\n");
+    let long = "x".repeat(200);
+    assert!(smtp::quoted_printable(&long).lines().all(|l| l.len() <= 76));
+}
+
+/// A server that quotes the credentials in its AUTH reply gets them into no answer,
+/// however short the password.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_email_login_quotes_nothing_secret() {
+    use base64::Engine as _;
+    let smtp = FakeSmtp::start_with(
+        SmtpMode::Tls,
+        Script {
+            auth_echo: true,
+            ..Default::default()
+        },
+    );
+    let f = fixture_with(None, true, Some(TEST_CA));
+    f.secret("smtp", "pw");
+    f.patch(json!({"channels": {"mail": email_channel(smtp.port, "tls")}}))
+        .await;
+    let (s, v) = f.send("POST", "/$/notifications/test/mail", None).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    let token = base64::engine::general_purpose::STANDARD.encode("\0sparkles\0pw");
+    let text = v.to_string();
+    assert!(text.contains("SMTP 535: authentication failed"), "{text}");
+    assert!(!text.contains(&token), "{text}");
+    let (_, v) = f.send("GET", "/$/notifications", None).await;
+    assert!(!v.to_string().contains(&token), "{v}");
+    assert!(!v.to_string().contains("\\u0000pw"), "{v}");
+    assert_eq!(
+        smtp::scrub("a pw and a token".into(), &["pw", "token"]),
+        "a [redacted] and a [redacted]"
+    );
+}
+
+/// One deadline bounds the attempt: a server that sends its greeting a byte at a time
+/// cannot hold the channel past `timeoutSecs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trickling_mail_server_times_out() {
+    let smtp = FakeSmtp::start_with(
+        SmtpMode::Starttls,
+        Script {
+            trickle: true,
+            ..Default::default()
+        },
+    );
+    let f = fixture_with(None, true, Some(TEST_CA));
+    f.secret("smtp", "s3cret-smtp-pass");
+    f.patch(json!({
+        "channels": {"mail": email_channel(smtp.port, "starttls")},
+        "delivery": {"attempts": 1, "backoffSecs": 1, "maxBackoffSecs": 1, "timeoutSecs": 1},
+    }))
+    .await;
+    let t = Instant::now();
+    let (s, v) = f.send("POST", "/$/notifications/test/mail", None).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    assert!(v.to_string().contains("in time"), "{v}");
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+}
+
+/// A recipient that the server forwards (251) is accepted, and credentials too long for
+/// an initial response go after the server's challenge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn email_accepts_forwarding_and_long_credentials() {
+    let smtp = FakeSmtp::start_with(
+        SmtpMode::Tls,
+        Script {
+            rcpt: vec![251],
+            max_command: Some(512),
+            ..Default::default()
+        },
+    );
+    let f = fixture_with(None, true, Some(TEST_CA));
+    let password = "p".repeat(140);
+    f.secret("smtp", &password);
+    let mut c = email_channel(smtp.port, "tls");
+    let user = "u".repeat(240);
+    c["username"] = user.clone().into();
+    let (s, v) = f.patch(json!({"channels": {"mail": c}})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = f.send("POST", "/$/notifications/test/mail", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let m = &smtp.wait(1)[0];
+    assert_eq!(
+        m.auth.as_deref(),
+        Some(format!("\0{user}\0{password}").as_str())
+    );
+    assert_eq!(m.to, ["ops@example.org", "oncall@example.org"]);
+}
+
+/// No line of a message passes 998 characters, and no line of an encoded subject 76.
+#[test]
+fn email_header_lines_stay_within_the_limits() {
+    let to: Vec<String> = (0..20)
+        .map(|i| format!("{}{i:02}@example.org", "r".repeat(48)))
+        .collect();
+    let e: config::Email = serde_json::from_value(json!({
+        "host": "smtp.example.org", "from": "s@example.org", "to": to
+    }))
+    .unwrap();
+    let env = json!({
+        "id": "abc", "type": "backup.failed", "time": "2026-10-10T09:00:00Z",
+        "server": "s", "severity": "critical", "title": "é".repeat(120),
+        "summary": "s", "data": {}
+    });
+    let m = String::from_utf8(smtp::message(&e, &env)).unwrap();
+    assert!(m.split("\r\n").all(|l| l.len() <= 998), "{m}");
+    let header = &m[..m.find("\r\n\r\n").unwrap()];
+    let mut in_subject = false;
+    for l in header.split("\r\n") {
+        if l.starts_with("Subject:") {
+            in_subject = true;
+        } else if !l.starts_with(' ') {
+            in_subject = false;
+        }
+        if in_subject {
+            assert!(l.len() <= 76, "{l:?}");
+        }
+    }
+    assert!(header.contains("To: rrr"), "{header}");
+    assert_eq!(header.matches("@example.org,\r\n ").count(), 19, "{header}");
+}
+
+/// A mail server on loopback that writes `greeting` to each of `n` connections and
+/// closes it, and then ends; the connections it took.
+fn one_line_server(
+    greeting: &'static [u8],
+    n: usize,
+) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let taken: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+    let counter = taken.clone();
+    std::thread::spawn(move || {
+        for c in l.incoming().take(n) {
+            let Ok(mut c) = c else { continue };
+            counter.fetch_add(1, Ordering::SeqCst);
+            let _ = c.write_all(greeting);
+        }
+    });
+    (port, taken)
+}
+
+/// A connection that ends within a line is a transient failure, which is retried, and
+/// a line without its CRLF is not SMTP, which is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn email_reply_framing() {
+    let f = fixture_with(None, true, Some(TEST_CA));
+    f.secret("smtp", "s3cret-smtp-pass");
+    let (cut, cuts) = one_line_server(b"220 ready", 2);
+    let (bare, bares) = one_line_server(b"220 ready\n", 1);
+    f.patch(json!({
+        "enabled": true,
+        "channels": {
+            "cut": email_channel(cut, "starttls"),
+            "bare": email_channel(bare, "starttls"),
+        },
+        "routes": {"*": ["bare", "cut"]},
+        "delivery": {"attempts": 2, "backoffSecs": 0.05, "maxBackoffSecs": 1, "timeoutSecs": 5},
+    }))
+    .await;
+    raise(&f.st, event("backup.failed"), None, Utc::now());
+    let v = settled(&f.st, "cut", 1).await;
+    let v = if channel_of(&v, "bare")["failed"] == 0 {
+        settled(&f.st, "bare", 1).await
+    } else {
+        v
+    };
+    assert_eq!(cuts.load(Ordering::SeqCst), 2, "{v}");
+    assert_eq!(bares.load(Ordering::SeqCst), 1, "{v}");
+    assert!(
+        channel_of(&v, "bare")["lastFailure"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not SMTP"),
+        "{v}"
+    );
+}
+
+/// A password inside the AUTH token does not leave part of the token readable.
+#[test]
+fn overlapping_secrets_are_scrubbed_whole() {
+    use base64::Engine as _;
+    let token = base64::engine::general_purpose::STANDARD.encode("\0aasparkles\0c3Bhcmts");
+    assert_eq!(token, "AGFhc3BhcmtsZXMAYzNCaGNtdHM=");
+    let out = smtp::scrub(
+        format!("554 rejected {token} for c3Bhcmts"),
+        &["c3Bhcmts", &token],
+    );
+    assert_eq!(out, "554 rejected [redacted] for [redacted]");
+}
+
+/// Verifications that fail and succeed at once from several threads always leave the
+/// repository's condition exactly when one of its problems is left, since each one
+/// changes the problems and the condition in one step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_verifications_keep_the_repository_condition_consistent() {
+    let f = fixture(None, false);
+    let (s, v) = f
+        .patch(json!({
+            "enabled": true,
+            "repeatEvery": "1m",
+            "channels": {"hook": {"type": "webhook", "url": "http://127.0.0.1:9/x"}},
+            "routes": {"*": ["hook"]},
+        }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let key = "backup.verify.failed/r";
+    let consistent = |st: &AppState| {
+        let keys = active_keys(st);
+        let problems = keys.iter().any(|k| k.starts_with(&format!("{key}/")));
+        keys.iter().any(|k| k == key) == problems
+    };
+    let threads: Vec<_> = (0..4)
+        .map(|t| {
+            let st = f.st.clone();
+            std::thread::spawn(move || {
+                let names = vec!["b1".to_string()];
+                for i in 0..200 {
+                    let fail = (i + t) % 2 == 0;
+                    let broken: &[String] = if fail { &names } else { &[] };
+                    events::backup_verify(
+                        &st,
+                        "r",
+                        false,
+                        "data",
+                        &names,
+                        &names,
+                        broken,
+                        None,
+                        Utc::now(),
+                    );
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert!(consistent(&f.st), "{:?}", active_keys(&f.st));
+    // a last success leaves nothing
+    let names = vec!["b1".to_string()];
+    events::backup_verify(
+        &f.st,
+        "r",
+        false,
+        "data",
+        &names,
+        &names,
+        &[],
+        None,
+        Utc::now(),
+    );
+    assert!(active_keys(&f.st).iter().all(|k| !k.starts_with(key)));
 }

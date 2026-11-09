@@ -30,6 +30,10 @@ Omitted fields and an empty object keep their previous meaning.
 The `--mode` flag of `sparkles ingest` accepts `claims` (item 651). Every value it
 accepted before parses and behaves as before.
 
+The channel `type` of `GET /$/notifications` and of a test send's answer can be
+`email`. Clients that match the type against `webhook` and `ntfy` alone need a case for
+it.
+
 ### Added
 
 Roadmap item 651 adds a `claims` mode to `POST /$/ingest/{ds}` and `sparkles ingest`. It registers
@@ -50,6 +54,22 @@ language filter and a scope of the whole graph or an entity list. It sets or rem
 annotation on the entities of a list and moves the listed classes under a new parent or to
 the top, refusing a cycle. Each edit is one previewed commit through the editor's preview
 and undo stack, and an edit of more than 1,000 changes is refused with its count.
+
+
+Failed background backup operations raise notifications (item 46). A backup started
+by hand that fails, a policy run that stops on an error, cannot start or fails its
+retention, a verification that fails or finds a damaged backup, and a GC that fails or
+cannot start now notify, as a failed policy run already did. The new event types
+`backup.verify.failed` and `backup.gc.failed` are keyed per repository, and
+`backup.overdue` fires when a policy has missed two scheduled runs since its last
+success.
+
+Notifications have an email channel (item 46, spec C21 Phase 2). It submits a message
+over STARTTLS on port 587 or over TLS on port 465, authenticates with SASL PLAIN with a
+password from a secret, and never sends in the clear, so a mail server without
+STARTTLS is refused. A `4xx` reply is retried and a `5xx` reply is not. The subject is
+the notification's title and the plain-text body holds its summary, link and data. The
+SMTP client is part of the server and adds no crate to the tree.
 
 The ontology editor's entity frame has a History view (item 620). It lists the branch's
 commits that changed a triple naming the entity in the editor's graph, newest first and
@@ -481,6 +501,14 @@ view's rows against its query and records a forge baseline.
 CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
+
+Notification channels deliver independently (item 46). Each channel has its own queue
+and delivery thread, so a webhook or ntfy server that hangs or fails delays only its own
+deliveries. A channel's queue holds its share of 1,000 deliveries, at least 50, and a
+delivery beyond it ends `dropped` for that channel alone. The `notifications` kind holds
+at most 32 channels. `GET /$/notifications` reports each channel's `queued`, `inFlight`
+and `queueCapacity`, and the gauges `sparkles_notifications_channel_queued` and
+`sparkles_notifications_channel_queue_capacity` show them per channel.
 
 The web UI's Browse term page has a new layout (roadmap item 734). A right rail of cards holds
 Metadata, with the cross-references as Identifiers by database above the downloads, and then

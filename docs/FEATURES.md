@@ -311,7 +311,7 @@ answers and instruction counts, and the limits of attributing them to layout.
 | [App shell and design system](visualization/README.md#app-shell) | Complete. | Every page shares a top bar whose command palette searches entities, datasets, saved queries and pages and runs each page's commands, and a rail that narrows to icons and becomes a drawer on a phone. Light and dark tokens and shared components set one layout at large, medium and phone widths, with toolbars that keep one row and dialogs that dock as sheets on a phone. |
 | [Rust, Python, JVM and Node.js APIs](integrations/README.md#libraries-and-bindings) | Partially complete. | All four embed the engine, and the JVM binding integrates with Jena. Administration, callback and platform coverage differ by binding. |
 | [Formatting, linting and command-line tools](querying/README.md#formatter-and-editor-support) | Complete within the documented scope. | Formatting, linting, completion and CLI tools are available. The [querying guide](querying/README.md#sparql-and-formats) lists embedded-query limits and remaining linter work. |
-| [Backups and operations](operations/README.md#operations) | Partially complete. | Dataset backups, integrity checks, format migration and degraded startup are available. Whole-server recovery and published release artifacts remain open. |
+| [Backups and operations](operations/README.md#operations) | Partially complete. | Dataset backups, integrity checks, format migration and degraded startup are available, and webhook, ntfy and email notifications report failed backups, verifications and GCs. Whole-server recovery, published release artifacts and a notifications UI remain open. |
 
 ### Evidence and planned extensions
 
