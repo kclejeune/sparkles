@@ -448,14 +448,6 @@ impl Graph {
         }
     }
 
-    /// Construct directly under the receiving owner before allocating shard vectors.
-    pub fn with_base_in(base: Arc<Base>, budget: &Arc<Budget>) -> Result<Graph, BudgetFailure> {
-        let held = Held::try_new_exact(budget, Self::fixed_heap_bytes())?;
-        let mut graph = Self::with_base(base);
-        graph.held = held;
-        Ok(graph)
-    }
-
     fn fixed_heap_bytes() -> usize {
         SHARDS
             * (size_of::<HashTable<u32>>()

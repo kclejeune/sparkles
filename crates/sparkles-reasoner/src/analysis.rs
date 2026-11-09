@@ -10,7 +10,7 @@ use oxrdf::{Literal, Term};
 use sparkles_core::id::Id;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 #[derive(Debug)]
@@ -69,7 +69,6 @@ pub struct AnalysisContext {
     program: Arc<str>,
     typings: Mutex<Option<LiteralTypings>>,
     typing_budget: Arc<Budget>,
-    failed: OnceLock<BudgetFailure>,
 }
 
 impl AnalysisContext {
@@ -95,14 +94,10 @@ impl AnalysisContext {
             witnesses,
             typings: Mutex::new(None),
             typing_budget: Budget::new(max_typing_memory),
-            failed: OnceLock::new(),
         }))
     }
 
     pub(crate) fn check(&self) -> Result<(), BudgetFailure> {
-        if let Some(error) = self.failed.get() {
-            return Err(error.clone());
-        }
         self.witnesses.budget.check_peak()?;
         if self.witnesses.cancel.load(Ordering::Relaxed)
             || self
@@ -116,10 +111,6 @@ impl AnalysisContext {
             ));
         }
         Ok(())
-    }
-
-    pub(crate) fn fail(&self, error: BudgetFailure) {
-        let _ = self.failed.set(error);
     }
 
     pub(crate) fn witness(&self, key: Vec<String>) -> Result<u64, BudgetFailure> {

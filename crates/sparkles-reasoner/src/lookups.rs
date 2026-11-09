@@ -389,6 +389,7 @@ impl Lookups {
     }
 
     /// Charge the answers to `budget` from now on, or fail when they do not fit.
+    #[cfg(test)]
     pub fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), BudgetFailure> {
         if Arc::ptr_eq(&self.budget, budget) {
             return Ok(());

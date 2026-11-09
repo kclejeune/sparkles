@@ -45,14 +45,9 @@ impl WorkingWarnings {
     pub fn as_slice(&self) -> &[String] {
         &self.values
     }
-    pub fn len(&self) -> usize {
-        self.values.len()
-    }
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
-    }
-    pub fn iter(&self) -> std::slice::Iter<'_, String> {
-        self.values.iter()
     }
 
     pub fn push_fmt(&mut self, args: fmt::Arguments<'_>) -> Result<(), BudgetFailure> {

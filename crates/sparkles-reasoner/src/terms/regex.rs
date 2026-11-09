@@ -39,6 +39,7 @@ impl BudgetRegex {
         Ok(regex.map(|regex| Arc::new(Self { regex, _held: held })))
     }
 
+    #[cfg(test)]
     pub fn is_match(&self, text: &str) -> bool {
         self.regex.is_match(text)
     }
