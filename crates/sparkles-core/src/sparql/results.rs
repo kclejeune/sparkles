@@ -704,7 +704,7 @@ fn solutions_to(
             let completed = next.and_then(|handle| match handle.join() {
                 Ok(cells) => cells,
                 Err(panic) => {
-                    tracing::warn!("query output prefetch worker panicked");
+                    tracing::warn!(target: "sparkles::sparql::results", "query output prefetch worker panicked");
                     failure.record(Error::invalid("query output prefetch worker panicked"));
                     // Do not destroy an arbitrary panic payload under a failure lock.
                     drop(panic);
@@ -983,7 +983,7 @@ impl Decoded {
             }));
             drop(task_headers);
             if let Err(panic) = sorted {
-                tracing::warn!("query output sort worker panicked");
+                tracing::warn!(target: "sparkles::sparql::results", "query output sort worker panicked");
                 drop(panic);
                 return Err(Error::invalid("query output sort worker panicked"));
             }
@@ -1167,7 +1167,7 @@ impl Decoded {
                     });
             }));
             if let Err(panic) = joined {
-                tracing::warn!("query output decode worker panicked");
+                tracing::warn!(target: "sparkles::sparql::results", "query output decode worker panicked");
                 failure.record(Error::invalid("query output decode worker panicked"));
                 drop(panic);
             }
