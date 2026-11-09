@@ -255,7 +255,9 @@ class BuildHost(unittest.TestCase):
         self.assertIn("build host: h2", result.stdout)
         [build] = self.builds()
         self.assertEqual(Path(build["home"]), self.hosts / "h2")
-        self.assertTrue(build["cwd"].startswith(str(self.hosts / "h2" / "lanes" / "nsc-build" / self.sha)))
+        # The build runs at the stable path of its commit, and its tree returns to the scratch.
+        self.assertEqual(build["cwd"], str(self.hosts / "h2" / "lanes" / "nsc-build-work" / self.sha / "src"))
+        self.assertEqual(list((self.hosts / "h2" / "lanes" / "nsc-build-work").iterdir()), [])
         self.assertEqual(build["args"], ["build", "--release", "-p", "sparkles-server"])
         self.assertEqual((self.entry() / "sparkles").read_text(), f"built in {self.hosts / 'h2'} with ")
         record = (self.entry() / "build.txt").read_text()

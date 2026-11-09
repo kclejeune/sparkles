@@ -24,7 +24,9 @@
 # The state is `running`, `exited N` with the build's exit status, `refused N` for a refused
 # start, `gone` when the scope ended without an exit status, or `unlaunched`.
 #
-# --run is the build inside the scope. The binary goes to DIR/out/sparkles with its SHA-256
+# --run is the build inside the scope. Holding the lock, it moves DIR/src to the stable path
+# ~/lanes/nsc-build-work/<commit>[-<hash of the flags>]/src, builds there and moves the tree
+# back when it ends. The binary goes to DIR/out/sparkles with its SHA-256
 # in DIR/out/sha256. DIR/out/info.txt gets the host's cc, c++ and rustc versions in the form
 # of build.txt, DIR/out/rustc.txt and cargo.txt the verbose versions, and DIR/out/env.txt the
 # build variables that were set. Its exit status goes to DIR/exit. The caller removes DIR.
@@ -60,13 +62,41 @@ fi
 if [ "${1:-}" = --run ]; then
   dir=$2
   shift 2
-  trap 'echo "$?" > "$dir/exit.tmp"; mv "$dir/exit.tmp" "$dir/exit"' EXIT
-  cd "$dir/src"
+  # One revision with one set of flags always builds at the same path, which the commit
+  # and the flags name. mbx records each checkout's predictions of its compiler actions,
+  # and a rebuild at the same path finds its own, so it restores every crate from the
+  # store. A rebuild at a new path takes the latest predictions of the same command, which
+  # name another revision's crates when revisions alternate, and the crates it then
+  # compiles embed the new path, so their dependents miss as well.
+  key=$(basename "$dir")
+  key=${key%.*}
+  [ "$#" = 0 ] || key=$key-$(printf '%s
+' "$@" | sha256sum | cut -c1-16)
+  work=$HOME/lanes/nsc-build-work/$key
+  # shellcheck disable=SC2329 # the EXIT trap calls it
+  finish() {
+    local code=$?
+    # The tree goes back to DIR, so each build keeps its own source as before.
+    if [ -d "$work/src" ] && [ ! -e "$dir/src" ]; then mv -T "$work/src" "$dir/src" && rmdir "$work" 2> /dev/null; fi
+    echo "$code" > "$dir/exit.tmp"
+    mv "$dir/exit.tmp" "$dir/exit"
+  }
+  trap finish EXIT
   export PATH="$dir/bin:$PATH"
-  if ! flock -n "$lock" true; then
+  exec 9> "$lock"
+  if ! flock -n 9; then
     echo "waiting for $lock on $(uname -n), which another process holds"
+    flock 9
   fi
-  flock "$lock" bash "$dir/bin/nsc-build.sh" "$dir/out/sparkles" "$@"
+  # Holding the lock, no other build uses the path. A tree left there by a build that was
+  # stopped before it could move its tree back is removed.
+  rm -rf -- "$work"
+  mkdir -p "$work"
+  mv -T "$dir/src" "$work/src"
+  echo "building in $work/src"
+  cd "$work/src"
+  # This shell alone holds the lock, so no process the build leaves behind keeps it.
+  bash "$dir/bin/nsc-build.sh" "$dir/out/sparkles" "$@" 9>&-
   {
     echo "cc: $(cc --version 2> /dev/null | head -1)"
     echo "c++: $(c++ --version 2> /dev/null | head -1)"
