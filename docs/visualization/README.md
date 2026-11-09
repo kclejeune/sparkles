@@ -567,7 +567,23 @@ usage view lists every axiom that mentions the entity. The **History** tab lists
 branch's commits newest first in the manner of WebProtégé's changes. Each commit opens to
 what it changed in the graph as a change set, one block a subject named by its label with
 each added or removed property and value on a line, and links to the commit's full diff. Every other view of a commit's, a merge's or a preview's changes shows the same change
-set, with the signed N-Quads lines behind a **N-Quads** switch. **Inferred** reveals the
+set, with the signed N-Quads lines behind a **N-Quads** switch.
+
+The entity frame's **History** view lists the commits of the branch that changed a
+triple naming the entity as subject, predicate or object in the editor's graph, newest
+first, with each commit's message, author, time and counts of those triples
+([screenshot](../images/entity-history.png)). The list reads the change log 200 changes at
+a time for each position and offers older commits in further pages. A commit opens to the
+axioms and assertions that mention the entity which it added and removed, read through
+`GET /$/ontology/{ds}/diff?entity=`, and links to its full diff. A caller who can edit
+the branch reverts a commit from there, and the revert is previewed and committed like an
+undo. A revert takes back everything the commit changed on the branch, and it needs
+write access to the whole branch. Commits from bulk loads and commits older than the change
+log are named at the end of the list, since the log cannot say what they changed. A commit
+that changed only the blank nodes of a restriction or an annotated axiom, without a triple
+that names the entity, is not listed.
+
+**Inferred** reveals the
 kept hierarchy beside the asserted class tree. It reads roots and expanded levels from
 an existing result, with the classifier's actual tier and outcome
 ([screenshot](../images/ontology-inferred.png)). **Classify tree** remains a deliberate
@@ -882,6 +898,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   read-only, 611. For the same reason the thesaurus editor's notes and members forms are
   read-only on branches other than main when authentication is on. Undo and redo revert commits, which needs write access to the
   whole branch, so a caller whose grants cover some graphs only can edit but not undo.
+  A revert from the entity frame's History view has the same requirement.
+* The entity frame's History view lists the commits that changed a triple naming the
+  entity, so a commit that changed only the blank nodes of a restriction or an annotated
+  axiom is not listed, 765. Each opened commit reads the editor's graph twice to compare
+  its axioms, so opening a commit of a large ontology takes as long as two reads of it.
 * The ontology browser's edit mode changes definitions, synonyms, annotations, parents,
   axioms and SKOS labels and links. SKOS-XL labels and collection members are edited in
   the thesaurus editor, and property assertions, keys and chains have no form of their

@@ -89,7 +89,7 @@ export const PRIVATE_GRAPH = 'http://example.org/private';
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 
 /** The state after commit `seq` of `ds` as a store (the head is the live store), or null. */
-function storeAt(ds, seq) {
+export function storeAt(ds, seq) {
   const list = allCommits(ds);
   const head = list.at(-1)?.seq ?? 0;
   if (seq === head) return ds.store;
