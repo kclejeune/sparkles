@@ -2522,7 +2522,7 @@ Below it, the recent deliveries and the conditions that were notified are listed
 the configuration panel edits every field with its source and lock, as the Models
 section does for the model configuration.
 
-![The Notifications section of the server page with two channels, their routes and recent deliveries](images/notifications-settings.png)
+![The Notifications section of the server page with three channels, their routes and recent deliveries](images/notifications-settings.png)
 
 A webhook receives the notification as a JSON body. With `signingSecret`, the request
 carries the `webhook-id`, `webhook-timestamp` and `webhook-signature` headers of

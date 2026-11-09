@@ -616,14 +616,21 @@ These points differ from the design or settle what it left open.
   out of the routes that name it, so that the write is not refused. A runtime route left
   without channels is removed, and a declared route keeps an empty list, since the
   layers do not remove a declared route. Declared routes cannot be removed from the
-  section, and a channel that the settings file locks cannot be removed either. The
-  section lists the active conditions and the recent deliveries, newest first, and polls
-  the status every 10 seconds while the page is visible. The kind itself is edited with
+  section, and a channel that the settings file locks, or that a locked route names,
+  cannot be removed either. No route can be added while the settings file locks the
+  routes. The section lists the active conditions and the recent deliveries, newest
+  first. It polls the status every 10 seconds while a delivery is queued or sending and
+  backs off to once a minute while nothing is, and it polls only while the page is
+  visible. The kind itself is edited with
   C19's settings panel, whose form is built from the new `NotificationsSettings` and
   `NotificationChannelSettings` schemas of the OpenAPI description. Each channel gets
   the members of its type, each route is a list of channels checked against the
   channels before a save, and a secret member shows whether its secret has a value and
-  sets one write-only. A channel's type is not a field, since changing it would leave
+  sets one write-only. A save that switches a webhook from a URL that the settings file
+  declares to a URL secret, or back, sends the whole configuration with a `PUT`, since a
+  merge patch that empties the declared member only drops its runtime value. A reload, or
+  a write from the section's own forms, starts the panel again so that it shows the
+  version the section read. A channel's type is not a field, since changing it would leave
   the members of the old type. `GET /$/server/secrets` already named the channels of
   each secret, and the Models section's API keys now list them as users. An
   OpenAPI test checks that the schemas name every member the kind and each channel type
