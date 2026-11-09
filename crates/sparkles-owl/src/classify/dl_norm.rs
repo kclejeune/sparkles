@@ -48,6 +48,9 @@ pub struct DlAx {
     pub rdis: Vec<(Role, Role)>,
     /// whether the run takes a number restriction, so that successors can be equal
     pub counting: bool,
+    /// in a run with individuals, nominals or the universal property, the fresh class
+    /// whose context is the root, where the constants' facts meet
+    pub root: Option<Ex>,
 }
 
 impl DlAx {

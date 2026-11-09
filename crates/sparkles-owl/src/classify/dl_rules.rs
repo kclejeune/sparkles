@@ -83,11 +83,15 @@ pub struct DlIx {
     /// the holders, bounds and roles of the at-most restrictions
     atmosts: Vec<(Ex, u32, Role)>,
     /// the pairs of disjoint roles, closed under inverses and order
-    rdis: Vec<(Role, Role)>,
+    pub(super) rdis: Vec<(Role, Role)>,
     /// with counting, for each role and qualified role t, whether a role literal below t
     /// can hold over a successor term: the roles of the existential restrictions, the
     /// qualified roles they give, and their inverses once a predecessor can be counted
     carry: Vec<bool>,
+    /// in a rooted run, the context of the root, which has the empty core
+    pub root: Option<Ex>,
+    /// in a rooted run, each constant with its singleton class `N_u`, by constant
+    pub consts: Vec<(u32, Ex)>,
 }
 
 impl DlIx {
@@ -97,6 +101,7 @@ impl DlIx {
             hyp: dl.hyp.clone(),
             of_hyp: dl.hyp.iter().map(|(&e, &h)| (h, e)).collect(),
             counting: dl.counting,
+            root: dl.root,
             ..DlIx::default()
         };
         for (b, h) in &dl.clauses {
@@ -138,6 +143,11 @@ impl DlIx {
         }
         for e in 0..nodes as Ex {
             let h = ix.head(e);
+            if d.root.is_some()
+                && let Node::Nominal(k) = h.node
+            {
+                d.consts.push((k, e));
+            }
             if let Node::Exist(r, _) = h.node {
                 let mut core = Vec::new();
                 flatten(ix, h.succ, &mut core);
@@ -308,6 +318,13 @@ impl DlIx {
             + self.atmosts.capacity() * 12
             + self.rdis.capacity() * 8
             + self.carry.capacity()
+            + self.consts.capacity() * 8
+    }
+
+    /// Whether `me` is the root of a rooted run.
+    #[inline]
+    pub fn is_root(&self, me: Ex) -> bool {
+        self.root == Some(me)
     }
 
     /// Whether a universal on `t` can meet a successor.
@@ -329,7 +346,7 @@ impl DlIx {
     /// Whether r is below s: through the index's hierarchy, and a qualified role only below
     /// itself.
     #[inline]
-    fn sub(&self, ix: &Index, r: Role, s: Role) -> bool {
+    pub(super) fn sub(&self, ix: &Index, r: Role, s: Role) -> bool {
         if r >= self.base || s >= self.base {
             r == s
         } else {
@@ -339,7 +356,7 @@ impl DlIx {
 
     /// The inverse of a role.
     #[inline]
-    fn inv(&self, ix: &Index, r: Role) -> Option<Role> {
+    pub(super) fn inv(&self, ix: &Index, r: Role) -> Option<Role> {
         if r >= self.base {
             Some(r ^ 1)
         } else {
@@ -362,7 +379,7 @@ pub struct DlRun {
     empty: OnceLock<u32>,
     /// the conclusions derived, kept or not, and the most the run may derive before it
     /// passes its budget, zero for no bound
-    work: AtomicUsize,
+    pub(super) work: AtomicUsize,
     work_limit: AtomicUsize,
     /// set once the run passes its bound on derived conclusions
     worked: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -379,7 +396,7 @@ impl DlRun {
     pub fn bytes(&self) -> usize {
         self.table.bytes() + self.lits.bytes() + self.stores.load(Ordering::Relaxed)
     }
-    fn grow(&self, bytes: usize) {
+    pub(super) fn grow(&self, bytes: usize) {
         self.stores.fetch_add(bytes, Ordering::Relaxed);
     }
     /// Bounds the conclusions the run derives, which bounds its time where redundant
@@ -436,6 +453,8 @@ pub struct DlSt {
     pub neg: Vec<Ex>,
     /// the choices of products derived since the last check of the run's bounds
     choices: u32,
+    /// in the root of a rooted run, its indexes by constant
+    pub root: Option<Box<super::dl_root::RootSt>>,
 }
 
 impl DlSt {
@@ -453,6 +472,7 @@ impl DlSt {
             + table_bytes(self.hyps.capacity(), 4)
             + table_bytes(self.sent.capacity(), 8)
             + table_bytes(self.props.capacity(), 12)
+            + self.root.as_ref().map_or(0, |r| r.bytes())
     }
 
     /// Whether the context has no clause waiting for the rules.
@@ -550,16 +570,16 @@ pub fn candidates(
     out
 }
 
-fn ds(st: &mut State) -> &mut DlSt {
+pub(super) fn ds(st: &mut State) -> &mut DlSt {
     st.extra().dl.get_or_insert_with(Box::default)
 }
 
-fn dl(st: &State) -> Option<&DlSt> {
+pub(super) fn dl(st: &State) -> Option<&DlSt> {
     st.extra.as_ref().and_then(|x| x.dl.as_deref())
 }
 
 #[inline]
-fn dix(ix: &Index) -> &DlIx {
+pub(super) fn dix(ix: &Index) -> &DlIx {
     ix.dl.as_deref().expect("a run with Tier D")
 }
 
@@ -573,9 +593,9 @@ fn role_of(ix: &Index, e: Ex) -> Option<Role> {
 }
 
 /// A premise's side: its body, and its head without the literal resolved on.
-type Side = (Vec<Lit>, Vec<Lit>);
+pub(super) type Side = (Vec<Lit>, Vec<Lit>);
 
-fn side(c: &Clause, without: Lit) -> Side {
+pub(super) fn side(c: &Clause, without: Lit) -> Side {
     (
         c.body().to_vec(),
         c.head().iter().copied().filter(|&l| l != without).collect(),
@@ -584,7 +604,7 @@ fn side(c: &Clause, without: Lit) -> Side {
 
 /// The premise of a unit.
 #[inline]
-fn unit() -> Side {
+pub(super) fn unit() -> Side {
     (Vec::new(), Vec::new())
 }
 
@@ -709,7 +729,7 @@ fn partners_rf(ix: &Index, st: &State, t: Role) -> Vec<(Ex, Vec<Side>)> {
 /// premise from every list of a product, which [`drain`] derives one at a time so that a
 /// wide case analysis is never held whole.
 #[derive(Default)]
-struct Found {
+pub(super) struct Found {
     one: Vec<Side>,
     prods: Vec<(Vec<Vec<Side>>, Side)>,
     /// set when an inference has more choices than a context enumerates, which passes the
@@ -718,11 +738,11 @@ struct Found {
 }
 
 impl Found {
-    fn push(&mut self, s: Side) {
+    pub(super) fn push(&mut self, s: Side) {
         self.one.push(s);
     }
     /// Each choice of one premise from every list, merged with `base`.
-    fn products(&mut self, mut lists: Vec<Vec<Side>>, base: Side) {
+    pub(super) fn products(&mut self, mut lists: Vec<Vec<Side>>, base: Side) {
         if lists.iter().any(|l| l.is_empty()) {
             return;
         }
@@ -762,6 +782,19 @@ const PRODUCT_POLL: usize = 256;
 /// and marks the context's store interrupted, a store made for the mark if the context has
 /// none, so that the dependency record of a partial answer counts the context as open.
 fn drain<S: Sink>(ix: &Index, st: &mut State, found: Found, out: &mut S) {
+    drain_with(ix, st, found, out, derive);
+}
+
+/// [`drain`], with `derive` adding each conclusion, which the root of a rooted run gives
+/// its own.
+#[inline(always)]
+pub(super) fn drain_with<S: Sink>(
+    ix: &Index,
+    st: &mut State,
+    found: Found,
+    out: &mut S,
+    derive: impl Fn(&Index, &mut State, Side, &mut S),
+) {
     if found.over {
         out.dl().exhaust();
         ds(st).store.interrupted = true;
@@ -820,7 +853,7 @@ fn drain<S: Sink>(ix: &Index, st: &mut State, found: Found, out: &mut S) {
 }
 
 /// Two premises merged.
-fn merge(a: &Side, b: &Side) -> Side {
+pub(super) fn merge(a: &Side, b: &Side) -> Side {
     let mut s = a.clone();
     s.0.extend_from_slice(&b.0);
     s.1.extend_from_slice(&b.1);
@@ -828,7 +861,7 @@ fn merge(a: &Side, b: &Side) -> Side {
 }
 
 /// A premise with one more head literal.
-fn with(a: &Side, l: Lit) -> Side {
+pub(super) fn with(a: &Side, l: Lit) -> Side {
     let mut s = a.clone();
     s.1.push(l);
     s
@@ -837,7 +870,7 @@ fn with(a: &Side, l: Lit) -> Side {
 /// The universal restrictions that a holder `d` stands for, as `(t, c)` for `d ⊑ ∀t.c`:
 /// from a universal node, and from the negative existential restrictions `∃s.d ⊑ c`,
 /// which are `d ⊑ ∀s⁻.c`.
-fn alls(ix: &Index, d: Ex, out: &mut Vec<(Role, Ex)>) {
+pub(super) fn alls(ix: &Index, d: Ex, out: &mut Vec<(Role, Ex)>) {
     out.clear();
     let h = ix.head(d);
     if let Node::Forall(t, c) = h.node {

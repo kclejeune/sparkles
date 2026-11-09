@@ -60,6 +60,7 @@ mod data;
 mod dl;
 mod dl_clause;
 mod dl_norm;
+mod dl_root;
 mod dl_rules;
 mod horn;
 mod horn_rules;

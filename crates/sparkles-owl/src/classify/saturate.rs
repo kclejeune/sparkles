@@ -22,6 +22,7 @@
 //! an instance; [`super::world`] classifies the classes that reach such a context.
 
 use super::data::DataVal;
+use super::dl_root;
 use super::dl_rules;
 use super::horn::HornIx;
 use super::horn_rules;
@@ -1322,6 +1323,8 @@ impl<'a> Run<'a> {
                 for &r in &self.ix.roles.reflexive {
                     out.me(Concl::Loop(r));
                 }
+            } else if R::DISJ && self.ix.dl.as_deref().is_some_and(|d| d.is_root(me)) {
+                dl_root::init(self.ix, &mut st, &mut out);
             } else {
                 init(self.ix, me, &mut st, self.universal, &mut out);
             }
@@ -1363,7 +1366,11 @@ impl<'a> Run<'a> {
                 }
                 // Tier D's clauses wait for the units, which the EL rules take first
                 if R::DISJ {
-                    let n = dl_rules::flush(self.ix, me, &mut st, &mut out, DL_CLAUSES);
+                    let n = if self.ix.dl.as_deref().is_some_and(|d| d.is_root(me)) {
+                        dl_root::flush(self.ix, &mut st, &mut out, DL_CLAUSES)
+                    } else {
+                        dl_rules::flush(self.ix, me, &mut st, &mut out, DL_CLAUSES)
+                    };
                     if n > 0 {
                         tally.applied += n;
                         tally.queued += out.sent as isize;

@@ -169,10 +169,6 @@ impl Lit {
         (self.fun(), k, self.atom())
     }
     /// The literal of a rooted run with id `id` in the run's [`Lits`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the rooted rules of item 603 phase 6 make it")
-    )]
     #[inline]
     fn xl(id: u32) -> Lit {
         Lit((XL << KIND_SHIFT) | id as u64)
@@ -189,10 +185,6 @@ impl Lit {
 /// `f_e(x)`, a constant, or a successor term `f_e(u)` of a constant in the root context.
 /// Constants are numbered by the index's individuals and then those the run makes for its
 /// own encoding. The derived order is only the canonical order of a literal's terms.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the rooted rules of item 603 phase 6 make it")
-)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum RTerm {
     X,
@@ -237,10 +229,6 @@ impl XLit {
 /// The literals of a rooted run that the packed forms cannot hold, interned: a literal of
 /// kind [`XL`] holds its id here. Entries never move, so a worker reads one without a lock,
 /// and only a new literal takes the lock of the map.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the rooted rules of item 603 phase 6 make it")
-)]
 #[derive(Default)]
 pub struct Lits {
     ids: parking_lot::Mutex<FxHashMap<XLit, u32>>,
@@ -335,10 +323,6 @@ impl Lits {
 
 /// The packed form of an equality or inequality of two terms when both are y or successor
 /// terms over x and they differ.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the rooted rules of item 603 phase 6 make it")
-)]
 fn packed_pair(kind: u64, a: RTerm, b: RTerm) -> Option<Lit> {
     let t = |r: RTerm| match r {
         RTerm::Y => Some(Term::Y),
@@ -993,10 +977,6 @@ impl Store {
     }
 
     /// The maximal literals of a processed clause.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the rooted rules of item 603 phase 6 read it")
-    )]
     pub fn maxima(&self, i: u32) -> &[Lit] {
         match self.multi.get(&i) {
             Some(m) => m,
