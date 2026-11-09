@@ -93,7 +93,8 @@ def command(host, text):
                    'file':data['_envfile'], 'body':boat_environment.environment_body(profile).decode(), 'check':True}
         check = shlex.join(['/usr/bin/python3','-I','-B','-c',boat_environment.REMOTE,json.dumps(payload)])+' >/dev/null'
         values = [key+'='+value for key,value in boat_environment.environment(profile).items()]
-        wrapped = 'set -e; '+check+'; cd '+shlex.quote(profile['worker_home'])+'; exec '+shlex.join(['env',*values,'/bin/bash','-c',text])
+        # Leave the provider's landing directory first, so nothing runs in a checkout.
+        wrapped = 'set -e; cd '+shlex.quote(profile['worker_home'])+'; '+check+'; exec '+shlex.join(['env',*values,'/bin/bash','-c',text])
         return [data['_cli']['path'], '--no-update', 'ssh', worker, '--', '/bin/bash', '-c', shlex.quote(wrapped)]
     return [*SSH, host, text]
 

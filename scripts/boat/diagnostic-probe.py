@@ -1,9 +1,11 @@
 """Read-only refusal diagnostics, run on the worker over SSH during the diagnostic hold.
 
 It reads process metadata, the package's own state directory listing and phase
-results, the host memory summary and free disk space. It opens no other file,
-never reads the token or any repository or tool file, starts no unit and writes
-nothing. Every value is bounded, and its output stays below the transport bound.
+results, the host memory summary and free disk space. For each startup checkout it
+names, it lists the untracked paths that git does not ignore, with their sizes and
+mtimes from lstat and without their content. It opens no other file, never reads the
+token or any tool file, starts no unit and writes nothing. Every value is bounded, and
+its output stays below the transport bound.
 """
 from pathlib import Path
 import json,os,re,shutil,stat,subprocess,sys
@@ -106,6 +108,10 @@ def fit(body,limit,size):
             body['processes']['rows']=body['processes']['rows'][:len(body['processes']['rows'])//2];continue
         if body['state']['entries']:
             body['state']['entries']=body['state']['entries'][:len(body['state']['entries'])//2];continue
+        rows=[v for v in body.get('untracked',{}).values() if v.get('paths')]
+        if rows:
+            for v in rows:v['paths']=v['paths'][:len(v['paths'])//2];v['truncated']=True
+            continue
         if phases:
             body['state']['phases']={};continue
         break
@@ -144,11 +150,46 @@ TOOLS=('bash','sh','env','python3','git','systemd-run','systemctl','flock','time
 def commands():
     return {name:shutil.which(name) is not None for name in TOOLS}
 
-def collect(home=None,uid=None):
+# At most UNTRACKED_MAX untracked paths per checkout. A path that looks like a credential
+# is left out and only counted. Ignored paths never appear, and an untracked directory
+# is one entry, so the listing stays small.
+UNTRACKED_MAX=200
+UNTRACKED_REPOS_MAX=4
+UNTRACKED_BYTES=4*1024*1024
+CREDENTIAL=re.compile(r'(^|/)(\.env(\.[^/]*)?|\.netrc|\.npmrc|\.pypirc|\.pgpass|\.git-credentials|\.ssh|\.gnupg|id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*\.(pem|key|p12|pfx|jks|keystore|kdbx|gpg|asc|ovpn)|[^/]*(credential|secret|token|passw|apikey|api-key|api_key)[^/]*)/?$',re.I)
+def untracked(repos):
+    out={}
+    for repo in [r for r in repos if isinstance(r,str) and r.startswith('/')][:UNTRACKED_REPOS_MAX]:
+        row={'paths':[],'total':0,'omitted_credential_like':0,'truncated':False}
+        try:
+            # No fsmonitor hook, untracked cache or lock; ls-files compares no tracked content.
+            r=subprocess.run(['git','-C',repo,'-c','core.fsmonitor=false','-c','core.untrackedCache=false','--no-optional-locks',
+                              'ls-files','--others','--exclude-standard','--directory','-z'],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=20)
+            if r.returncode:row['unread']='git exit %d'%r.returncode;out[text(repo,200)]=row;continue
+            data=r.stdout[:UNTRACKED_BYTES];row['truncated']=len(r.stdout)>UNTRACKED_BYTES
+            names=[n for n in data.split(b'\0') if n]
+            if row['truncated']:names=names[:-1]
+            row['total']=len(names)
+            for raw in names:
+                name=raw.decode('utf-8','replace')
+                if CREDENTIAL.search(name):row['omitted_credential_like']+=1;continue
+                if len(row['paths'])>=UNTRACKED_MAX:row['truncated']=True;continue
+                entry={'path':text(name,300)}
+                try:
+                    s=os.lstat(os.path.join(os.fsencode(repo),raw))
+                    entry.update(kind='directory' if stat.S_ISDIR(s.st_mode) else ('file' if stat.S_ISREG(s.st_mode) else ('link' if stat.S_ISLNK(s.st_mode) else 'other')),
+                                 bytes=s.st_size if stat.S_ISREG(s.st_mode) else None,mtime_ns=s.st_mtime_ns,mode=stat.S_IMODE(s.st_mode))
+                except OSError as error:entry['unread']=type(error).__name__
+                row['paths'].append(entry)
+        except (OSError,subprocess.TimeoutExpired) as error:row['unread']=type(error).__name__
+        out[text(repo,200)]=row
+    return out
+
+def collect(home=None,uid=None,repos=()):
     home=Path.home() if home is None else home;uid=os.getuid() if uid is None else uid
     body={'schema':1,'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'uptime_seconds':float(Path('/proc/uptime').read_text().split()[0]),
-          'uid':uid,'processes':processes(),'state':state(home,uid),'memory_bytes':memory(),'disk':disk(home),'units':units(),'commands':commands()}
+          'uid':uid,'processes':processes(),'state':state(home,uid),'memory_bytes':memory(),'disk':disk(home),'units':units(),'commands':commands(),'untracked':untracked(list(repos))}
     return fit(body,OUTPUT_MAX,lambda x:len(json.dumps(x)))
 
 if __name__=='__main__':
-    print(json.dumps(collect()))
+    print(json.dumps(collect(repos=sys.argv[1:])))

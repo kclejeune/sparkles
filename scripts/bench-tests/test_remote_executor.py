@@ -115,6 +115,8 @@ class Admission(unittest.TestCase):
         decoded=shlex.split(result[-1]);self.assertEqual(len(decoded),1)
         self.assertIn("a;$(bad)",decoded[0]);self.assertNotIn('; . ',decoded[0])
         self.assertFalse(any(action in result for action in ('create','resume','stop','snapshot')))
+        # The session leaves the provider's landing directory before it runs anything.
+        self.assertTrue(decoded[0].startswith('set -e; cd '+shlex.quote(self.fixtures['profile']['worker_home'])+'; '),decoded[0][:80])
 
     def test_identity_expiry_unknown_schema_and_guard_replacement_refuse(self):
         for changed in (dict(worker='bx_other'),dict(version=2),dict(unexpected='NOT_A_SECRET')):
