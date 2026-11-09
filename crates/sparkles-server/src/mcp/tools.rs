@@ -1282,7 +1282,10 @@ impl Tools<'_> {
             .checked_for_query(&opts)
             .map_err(|e| ctx.engine(e))?;
         let all = sparkles::access::GraphAccess::all();
-        let access = opts.graphs.as_deref().unwrap_or(&all);
+        // The prepared source carries the caller's bound policy, so the query runs
+        // without a second policy; a different one would be a replacement it refuses.
+        let policy = opts.graphs.take();
+        let access = policy.as_deref().unwrap_or(&all);
         let physical = access
             .masked_controlled(&snap, &controlled)
             .map_err(|e| ctx.engine(e))?;

@@ -2051,7 +2051,12 @@ pub(crate) async fn run_query(
     // the rows the last attempt wrote whole, for the report of a body it stopped partway
     let sent_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let rows_written = sent_rows.clone();
+    // The retained answer decodes under the query's own cancel flag, so the request's
+    // cancel guard lives as long as the writer does, as a cursor's guard does. A
+    // client that leaves still cancels it, when the aborted body drops the writer.
+    let cancel_guard = _cancel_on_drop;
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
+        let _guard = &cancel_guard;
         let ts = std::time::Instant::now();
         let sent = std::cell::Cell::new(0);
         let written = if thrift {
