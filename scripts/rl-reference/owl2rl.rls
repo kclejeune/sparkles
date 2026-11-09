@@ -2,8 +2,9 @@
 % (https://www.w3.org/TR/owl2-profiles/#Reasoning_in_OWL_2_RL_and_RDF_Graphs_using_Rules),
 % written for Nemo (https://github.com/knowsys/nemo) as the reference materialization of
 % docs/benchmarks/reasoning. The rules are transcribed from the recommendation's tables 4
-% to 9 and use the recommendation's rule names. scripts/rl-reference/README.md describes
-% the conventions below, and scripts/rl-reference/run.sh runs the program.
+% to 9 and use the recommendation's rule names. docs/benchmarks/reasoning/README.md
+% describes the conventions below, and scripts/rl-reference/compare.sh and bench.sh run
+% the program.
 %
 % Input. base.nt holds the graph with every literal replaced by an IRI <urn:x-lit:N> and
 % every blank node by an IRI <urn:x-bnode:N> (scripts/rl-reference/rl_terms.py encode),
@@ -16,7 +17,7 @@
 %
 % Output. derived.nt holds the triples of the closure that base.nt does not hold.
 %
-% Conventions, which scripts/rl-reference/README.md explains:
+% Conventions, which docs/benchmarks/reasoning/README.md explains:
 % * The closure is an RDF graph. A rule is not applied when its conclusion would have a
 %   literal as subject or predicate, so no generalized triple is derived. dt-type2 is
 %   kept as the relation inDatatype and used by cls-svf1 for data values.

@@ -4,7 +4,7 @@
 % entailment rules of RDFS. owl-rl.rules in crates/sparkles-reasoner/rules adds those below,
 % and this file restates them for Nemo, so that the closures can be compared whole. The
 % OWL 2 RL rules themselves stay those of owl2rl.rls, written from the recommendation.
-% scripts/rl-reference/README.md lists each addition. The file is appended to owl2rl.rls,
+% docs/benchmarks/reasoning/README.md lists them. The file is appended to owl2rl.rls,
 % whose relations it uses.
 
 % ---------------------------------------------------------------- axiomatic triples

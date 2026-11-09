@@ -17,6 +17,12 @@ split QUADS.nq BASE.nt DERIVED.nt GRAPH
     Splits one N-Quads dump into the triples of the default graph and those of GRAPH,
     so that both come from one dump and share its blank node labels.
 
+delta IN.nt EVERY DELTA.nt REST.nt INSERT.ru DELETE.ru
+    Takes every EVERY-th triple of IN.nt whose property is outside the RDF, RDFS and OWL
+    vocabularies and that has no blank node as the change of the incremental
+    measurements of bench.sh. DELTA.nt gets those triples, REST.nt the others, and
+    INSERT.ru and DELETE.ru the SPARQL updates that insert and delete them.
+
 diff SPARKLES.nt REFERENCE.nt REPORT.json [--known KNOWN.tsv] [--subset]
     Compares two derived graphs triple for triple. Every difference must match a line of
     KNOWN.tsv, whose rows name a side (sparkles or reference), a regular expression over
@@ -337,6 +343,33 @@ def split(src, base, derived, graph):
     print(f"split {nb} base and {nd} derived triples", file=sys.stderr)
 
 
+def delta(src, every, delta_out, rest_out, insert_ru, delete_ru):
+    """Every EVERY-th triple of SRC whose property is outside the RDF, RDFS and OWL
+    vocabularies and that has no blank node, as the change of the incremental
+    measurements, with the rest of SRC and the SPARQL updates that insert and delete it."""
+    every = int(every)
+    vocab = ("<" + RDF, "<" + RDFS, "<http://www.w3.org/2002/07/owl#")
+    n = 0
+    chosen = []
+    with open(rest_out, "w", encoding="utf-8") as rest:
+        for s, p, o in triples(src):
+            line = f"{s} {p} {o} ."
+            if not p.startswith(vocab) and not s.startswith("_:") and not o.startswith("_:"):
+                n += 1
+                if n % every == 0:
+                    chosen.append(line)
+                    continue
+            rest.write(line + "\n")
+    with open(delta_out, "w", encoding="utf-8") as f:
+        f.writelines(line + "\n" for line in chosen)
+    for path, op in ((insert_ru, "INSERT"), (delete_ru, "DELETE")):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"{op} DATA {{\n")
+            f.writelines(line + "\n" for line in chosen)
+            f.write("}\n")
+    print(f"chose {len(chosen)} of {n} eligible triples", file=sys.stderr)
+
+
 def diff(sparkles, reference, report, known_path=None, subset=False):
     known = []
     if known_path:
@@ -394,6 +427,8 @@ def main(argv):
         decode(*args)
     elif cmd == "split":
         split(*args)
+    elif cmd == "delta":
+        delta(*args)
     elif cmd == "diff":
         known = None
         subset = "--subset" in args

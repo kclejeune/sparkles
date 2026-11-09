@@ -2,15 +2,18 @@
 """Runs compare.sh on the premise ontology of every OWL 2 RL case of the W3C OWL 2 test
 cases (the approved export of https://www.w3.org/2009/11/owl-test/).
 
-    scripts/rl-reference/w3c.py ALL_NT WORKDIR
+    scripts/rl-reference/w3c.py ALL WORKDIR
 
-ALL_NT is the suite's all.rdf converted to N-Triples (run.sh prepares it). A case takes
-part when it lists the RL profile and has an RDF/XML premise ontology and no imports.
+ALL is the suite's all.rdf, which scripts/fetch-test-suites.sh downloads, and which
+`sparkles convert` turns into WORKDIR/all.nt, or that file already converted (a name that
+ends in .nt). A case takes part when it lists the RL profile and has an RDF/XML premise
+ontology and no imports.
 WORKDIR/<identifier>/ gets the premise and the comparison of that case, and
 WORKDIR/summary.json lists every case with its outcome and the counts of compare.sh. The
 exit status is 1 when a comparison has an unexplained difference or fails.
 
-Env: COMPARE (default compare.sh beside this file), and the variables of compare.sh.
+Env: COMPARE (default compare.sh beside this file), SPARKLES (default
+target/release/sparkles), and the variables of compare.sh.
 """
 
 import json
@@ -34,7 +37,17 @@ def fix_entities(data):
     )
 
 
-def main(all_nt, work):
+def main(src, work):
+    os.makedirs(work, exist_ok=True)
+    all_nt = src
+    if not src.endswith(".nt"):
+        fixed = os.path.join(work, "all.rdf")
+        with open(src, encoding="utf-8") as f, open(fixed, "w", encoding="utf-8") as g:
+            g.write(fix_entities(f.read()))
+        all_nt = os.path.join(work, "all.nt")
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        sparkles = os.environ.get("SPARKLES") or os.path.join(root, "target", "release", "sparkles")
+        subprocess.run([sparkles, "convert", fixed, "-o", all_nt], check=True)
     by_s = defaultdict(lambda: defaultdict(list))
     for s, p, o in rl_terms.triples(all_nt):
         by_s[s][p].append(o)
@@ -51,7 +64,6 @@ def main(all_nt, work):
         cases.append((name, rl_terms.literal(premise[0])[0], bool(imports)))
     cases.sort()
     compare = os.environ.get("COMPARE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "compare.sh")
-    os.makedirs(work, exist_ok=True)
     summary, failed = [], 0
     for name, premise, imports in cases:
         safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
