@@ -768,6 +768,15 @@ class BoundedCommand(unittest.TestCase):
             self.assertEqual(str(caught.exception),'output bound');self.assertLess(time.monotonic()-started,15)
             time.sleep(0.2);self.assertFalse(done.exists())
             with self.assertRaises(common.Refusal):common.bounded_command([sys.executable,'-I','-c',"import os\nfor _ in range(32):os.write(1,b'y'*65536)"],30)
+    def test_a_selector_failure_kills_and_reaps_the_child(self):
+        import common,subprocess
+        children=[];actual=subprocess.Popen
+        def launch(*a,**k):
+            child=actual(*a,**k);children.append(child);return child
+        with patch.object(common.subprocess,'Popen',side_effect=launch),patch.object(common.selectors,'DefaultSelector',side_effect=OSError(12,'no memory')):
+            with self.assertRaises(OSError):common.bounded_command([sys.executable,'-I','-c','import time;time.sleep(30)'],30,True)
+        self.assertEqual(len(children),1);self.assertIsNotNone(children[0].returncode)
+        self.assertTrue(children[0].stdout.closed and children[0].stderr.closed)
     def test_timeout_kills_the_child_and_output_is_returned(self):
         import common,subprocess,time
         started=time.monotonic()
