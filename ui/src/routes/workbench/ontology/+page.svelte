@@ -99,6 +99,7 @@
   import EditorHistory from '$components/EditorHistory.svelte';
   import EntityHistory from '$components/EntityHistory.svelte';
   import Discussions from '$components/Discussions.svelte';
+  import WatchButton from '$components/WatchButton.svelte';
   import BulkEdit from '$components/BulkEdit.svelte';
   import OntoImports from '$components/OntoImports.svelte';
   import { isDiscussionGraph } from '$lib/discussions';
@@ -1905,6 +1906,7 @@
                 title="Open this entity's page in Browse"
                 ><Icon name="book" size={13} /> Open page</a
               >
+              <WatchButton dataset={name} branch={branch ?? MAIN} {graph} entity={selected!} />
               {#if !readonly && frameKinds.length}
                 <button class="btn sm" onclick={() => openRename(selected!)}
                   ><Icon name="pencil" size={13} /> Rename</button
