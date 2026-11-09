@@ -2058,8 +2058,9 @@ report that a linked report written under a policy revises stays as well, with i
 activity, so an edit's provenance resolves through `prov:wasRevisionOf` to the
 activity and the children of the report it edits. Only an edit, which has no activity,
 keeps the report it revises. A report that a run writes in place of another does not
-keep it, so a replaced report and its wider footprint leave the graph once nothing else
-holds them, and a principal that lost a grant gets reports it can be proven for.
+keep it, so a replaced report and its footprint leave the graph once nothing else holds
+them, and an older and wider footprint never keeps the reports graph unproven for a
+reader after a refresh has replaced the reports it covered.
 
 The rejected alternative sends each fact's claims to the model and lets it cite them.
 The claims of a fact are a function of the fact under the policy, so the server
