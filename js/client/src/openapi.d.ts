@@ -8840,10 +8840,12 @@ export interface components {
             entailments?: boolean;
             /** @description Predicate IRIs whose cells never conflict in this merge, besides the dataset's. */
             exempt?: string[];
-            /** @description The heads the caller saw: `409 head-moved` when either moved. */
+            /** @description The heads the caller saw: `409 head-moved` when either moved. Optional targetId pins the target branch incarnation and returns 412 when it changed. Supplied heads must be unsigned 64-bit integers. A malformed expect object, head or UUID returns 400 invalid-merge; null is invalid. Omitted fields and an empty object are allowed. */
             expect?: {
                 source?: number;
                 target?: number;
+                /** Format: uuid */
+                targetId?: string;
             };
             /** @enum {string} */
             ff?: "auto" | "only" | "replay";
@@ -9872,9 +9874,11 @@ export interface components {
             /** @description Include complete candidate entailment changes. Requires dryRun=true. */
             entailments?: boolean;
             exempt?: string[];
-            /** @description The head of the branch written to that the caller saw: `409 head-moved` when it moved. */
+            /** @description The head of the branch written to that the caller saw: `409 head-moved` when it moved. Optional targetId pins the target branch incarnation and returns 412 when it changed. Supplied heads must be unsigned 64-bit integers. A malformed expect object, head or UUID returns 400 invalid-merge; null is invalid. Omitted fields and an empty object are allowed. */
             expect?: {
                 target?: number;
+                /** Format: uuid */
+                targetId?: string;
             };
             geoDefaultGeometry?: boolean;
             /** @enum {string} */
@@ -14528,6 +14532,7 @@ export interface operations {
                 };
             };
             410: components["responses"]["Gone"];
+            412: components["responses"]["PreconditionFailed"];
             422: components["responses"]["Unprocessable"];
             507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
@@ -17540,6 +17545,7 @@ export interface operations {
                 };
             };
             410: components["responses"]["Gone"];
+            412: components["responses"]["PreconditionFailed"];
             422: components["responses"]["Unprocessable"];
             507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
@@ -20748,6 +20754,7 @@ export interface operations {
                 };
             };
             410: components["responses"]["Gone"];
+            412: components["responses"]["PreconditionFailed"];
             422: components["responses"]["Unprocessable"];
             507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
@@ -24965,6 +24972,8 @@ export interface operations {
     patchPost: {
         parameters: {
             query?: {
+                /** @description Strict authoring precondition urn:uuid:UUID#commit:N. Both source UUID and head must match under the writer lock or the response is 412. Unlike a foreign body prev, a foreign expectation is never ignored. */
+                expect?: string;
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
@@ -25054,6 +25063,8 @@ export interface operations {
     patch: {
         parameters: {
             query?: {
+                /** @description Strict authoring precondition urn:uuid:UUID#commit:N. Both source UUID and head must match under the writer lock or the response is 412. Unlike a foreign body prev, a foreign expectation is never ignored. */
+                expect?: string;
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
@@ -25615,6 +25626,8 @@ export interface operations {
                 target?: string[];
                 /** @description `guard` for the write-time guard's shapes on its data graph, or the IRI of a shapes graph of the dataset. */
                 shapes?: string;
+                /** @description For an inline RDF draft, resolve existing stored blank-node labels at the selected revision. New labels remain local. The default keeps all inline blank nodes local. Does not combine with shapes= or SHACLC, and does not bind $shapesGraph for the inline draft. */
+                storedBlankNodes?: boolean;
                 /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */

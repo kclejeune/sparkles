@@ -7,6 +7,7 @@
 //   MOCK_LATENCY=300 node mock/...  # add artificial latency (ms) to every request
 
 import { randomUUID } from 'node:crypto';
+import { handleShapePatch } from './shape-patch.mjs';
 import http from 'node:http';
 import { performance } from 'node:perf_hooks';
 import ox from 'oxigraph';
@@ -1267,7 +1268,7 @@ function handleSearchQuery(req, res, ds, p, query) {
           ...(call.counters ? { counters: call.counters } : {}),
         },
         commit: headCommit(ds).seq,
-        datasetId: ds.id,
+        datasetId: ds.branchId ?? ds.id,
       },
     },
     'application/x-sparkles+json',
@@ -1333,7 +1334,7 @@ function handlePathSearch(req, res, ds, query, seq, headers) {
           counters: r.counters,
         },
         commit: seq,
-        datasetId: ds.id,
+        datasetId: ds.branchId ?? ds.id,
       },
     },
     'application/x-sparkles+json',
@@ -1502,7 +1503,7 @@ async function handleQuery(req, res, ds, p) {
         },
         plan: plan(query, total, execMs, true),
         commit: readSeq,
-        datasetId: ds.id,
+        datasetId: ds.branchId ?? ds.id,
       },
     },
     'application/x-sparkles+json',
@@ -1548,7 +1549,7 @@ function sparklesResult(ds, query, cap = Infinity) {
       },
       plan: plan(query, total, execMs, true),
       commit: headCommit(ds).seq,
-      datasetId: ds.id,
+      datasetId: ds.branchId ?? ds.id,
     },
   };
 }
@@ -3155,6 +3156,7 @@ const server = http.createServer(async (req, res) => {
     if (!ds) return fail(res, 404, `No such dataset: ${seg[0] ?? ''}`);
     const op = seg[1] ?? '';
     const writes =
+      op === 'patch' ||
       (op === 'upload' && req.method === 'POST') ||
       op === 'update' ||
       (['data', 'get'].includes(op) && !['GET', 'HEAD'].includes(req.method ?? ''));
@@ -3165,6 +3167,16 @@ const server = http.createServer(async (req, res) => {
       return fail(res, 403, `branch ${ds.branchName} is protected`, { code: 'branch-protected' });
     if (op === 'upload' && req.method === 'POST') return handleUpload(req, res, ds, url);
     const p = await params(req, url);
+    if (op === 'patch')
+      return handleShapePatch(req, res, ds, p, {
+        send,
+        fail,
+        headCommit,
+        commitWrite,
+        quadSet,
+        overlaySummary,
+        commitMessageOf,
+      });
     if (['', 'sparql', 'query'].includes(op)) {
       if (p.has('update')) return handleUpdate(req, res, ds, p);
       return handleQuery(req, res, ds, p);

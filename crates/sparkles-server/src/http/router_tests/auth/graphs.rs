@@ -390,6 +390,59 @@ async fn patches_write_only_the_write_graphs() {
 }
 
 #[tokio::test]
+async fn strict_authoring_patch_keeps_graph_and_endpoint_grants() {
+    let s = server();
+    let source_id = s.state.get("graphs").unwrap().store.dataset_id();
+    for dry in [false, true] {
+        for (user, body, allowed) in [
+            (
+                "grad",
+                "A <http://ex/strict> <http://ex/p> 1 <http://ex/a/1> .",
+                true,
+            ),
+            (
+                "grad",
+                "A <http://ex/strict> <http://ex/p> 1 <http://ex/b/1> .",
+                false,
+            ),
+            (
+                "gupd",
+                "A <http://ex/strict> <http://ex/p> 1 <http://ex/a/1> .",
+                false,
+            ),
+        ] {
+            let before = head(&s.state, "graphs");
+            let uri =
+                format!("/graphs/patch?expect=urn:uuid:{source_id}%23commit:{before}&dryRun={dry}");
+            let r = call(
+                &s.app,
+                "POST",
+                &uri,
+                &[
+                    ("authorization", &b(user)),
+                    ("content-type", "application/rdf-patch"),
+                ],
+                body,
+            )
+            .await;
+            assert_eq!(
+                r.status,
+                if allowed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::FORBIDDEN
+                },
+                "{user}: {}",
+                r.text()
+            );
+            if dry || !allowed {
+                assert_eq!(head(&s.state, "graphs"), before);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn graph_store_writes_check_the_target_first() {
     let s = server();
     let send = |method: &'static str, uri: &'static str, ct: &'static str, body: &'static str| {
@@ -496,6 +549,7 @@ async fn routes_that_cover_every_graph_refuse_a_limited_view() {
         "/graphs/shacl?shapes=guard&target=http%3A%2F%2Fex%2Fa",
         "/graphs/shacl?target=http%3A%2F%2Fex%2Fa&target=http%3A%2F%2Fex%2Fb",
         "/graphs/shacl?shapes=http%3A%2F%2Fex%2Fa%2Fshapes",
+        "/graphs/shacl?storedBlankNodes=true&target=_:b1",
         "/graphs/shex?schema=guard&node=%3Chttp%3A%2F%2Fex%2Fa%3E",
     ] {
         let r = call(

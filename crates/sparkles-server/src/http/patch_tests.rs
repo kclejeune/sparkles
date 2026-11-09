@@ -179,6 +179,76 @@ async fn p4_prev_mismatch_is_412() {
 }
 
 #[tokio::test]
+async fn authoring_expectation_never_ignores_a_foreign_source() {
+    let s = server();
+    let foreign = "00000000-0000-0000-0000-000000000000";
+    let patch = format!("H prev <urn:uuid:{foreign}#commit:0> .\nA <urn:foreign> <urn:p> 1 .\n");
+    for dry in ["", "&dryRun=true&changes=50"] {
+        let uri = format!("/ds/patch?expect=urn:uuid:{foreign}%23commit:0{dry}");
+        let r = call(
+            &s.app,
+            "POST",
+            &uri,
+            &[("content-type", TEXT)],
+            patch.as_str(),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.text());
+        assert_eq!(s.head(), 0);
+    }
+    assert!(!s.ask("ASK { <urn:foreign> <urn:p> 1 }").await);
+    // Default F10 cross-dataset replication remains compatible.
+    let r = s.patch(&patch).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["prevChecked"], false);
+    let id = s.ds().store.dataset_id();
+    let next = format!("H prev <urn:uuid:{id}#commit:1> .\nA <urn:own> <urn:p> 2 .\n");
+    let uri = format!("/ds/patch?expect=urn:uuid:{id}%23commit:1");
+    let preview = call(
+        &s.app,
+        "POST",
+        &format!("{uri}&dryRun=true&changes=50"),
+        &[("content-type", TEXT)],
+        next.as_str(),
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK, "{}", preview.text());
+    assert_eq!(preview.json()["outcome"], "commit");
+    assert_eq!(s.head(), 1);
+    let r = call(
+        &s.app,
+        "POST",
+        &uri,
+        &[("content-type", TEXT)],
+        next.as_str(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["prevChecked"], true);
+    for dry in ["", "&dryRun=true"] {
+        let r = call(
+            &s.app,
+            "POST",
+            &format!("{uri}{dry}"),
+            &[("content-type", TEXT)],
+            next.as_str(),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.text());
+        assert_eq!(s.head(), 2);
+    }
+    let r = call(
+        &s.app,
+        "POST",
+        "/ds/patch?expect=invalid",
+        &[("content-type", TEXT)],
+        next.as_str(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}
+
+#[tokio::test]
 async fn leading_prev_dry_run_preserves_precondition_preview() {
     let s = server();
     let id = s.ds().store.dataset_id();

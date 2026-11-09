@@ -22,6 +22,11 @@ fails set `--ready-ignore-failed` and use `/$/ready/{ds}` for the datasets they 
 monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move to
 `/$/ready`. The Helm chart's startup probe now asks for `/$/ping`.
 
+The `expect` heads of `POST /$/merge/{ds}`, `POST /$/cherry-pick/{ds}` and
+`POST /$/revert/{ds}` are unsigned 64-bit integers. A malformed `expect` object, head or
+branch UUID, or a null in their place, now returns `400` instead of being ignored.
+Omitted fields and an empty object keep their previous meaning.
+
 ### Added
 
 The derived-table cache has a process-wide `--derived-table-cache-mb` budget and

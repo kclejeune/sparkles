@@ -15,7 +15,7 @@ const q = (params: Params) => {
 };
 
 /** The Workbench's editors. */
-export type Editor = 'ontology' | 'thesaurus';
+export type Editor = 'ontology' | 'thesaurus' | 'shapes';
 
 /**
  * The Ontology editor's tabs: the tree (no `tab`), DL Query, the header and the history.
@@ -64,6 +64,7 @@ export const routes = {
   ontology: (ds: string, params: Params = {}) => workbenchPath(base, 'ontology', ds, params),
   /** The Workbench's Thesaurus editor. */
   thesaurus: (ds: string, params: Params = {}) => workbenchPath(base, 'thesaurus', ds, params),
+  shapes: (ds: string, params: Params = {}) => workbenchPath(base, 'shapes', ds, params),
   workbench: (editor: Editor, ds: string, params: Params = {}) =>
     workbenchPath(base, editor, ds, params),
 };

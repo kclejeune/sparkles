@@ -245,6 +245,8 @@ pub struct Interner {
     /// the data ranges, as lattice elements
     pub vals: Vec<DataVal>,
     val_ids: FxHashMap<DataVal, u32>,
+    /// Actual opaque-array capacities owned by both vals and the map's keys.
+    val_opaque_bytes: usize,
     /// the opaque data atoms and the datatype definitions of the run
     pub ranges: Ranges,
     pub roles: Vec<RoleName>,
@@ -261,6 +263,20 @@ pub struct Interner {
     and_ids: FxHashMap<(Vec<Ex>, bool), u32>,
     /// the operands of [`Interner::ands`], counted twice, once for the table's key
     and_ops: usize,
+}
+
+struct ValueInsertionPlan {
+    vector_capacity: usize,
+    bytes: usize,
+}
+
+fn next_value_capacity(len: usize, capacity: usize) -> Option<usize> {
+    if len < capacity {
+        Some(capacity)
+    } else {
+        let needed = len.checked_add(1)?;
+        Some(capacity.checked_mul(2)?.max(4).max(needed))
+    }
 }
 
 impl Interner {
@@ -280,10 +296,32 @@ impl Interner {
         i
     }
 
+    /// Retained inline data containers and their independently owned opaque arrays.
+    pub fn data_bytes(&self) -> usize {
+        self.checked_data_bytes().unwrap_or(usize::MAX)
+    }
+
+    fn checked_data_bytes(&self) -> Option<usize> {
+        let vector = self
+            .vals
+            .capacity()
+            .checked_mul(std::mem::size_of::<DataVal>())?;
+        let table = self
+            .val_ids
+            .capacity()
+            .checked_mul(std::mem::size_of::<(DataVal, u32)>().checked_add(1)?)?
+            .checked_mul(8)?
+            / 7;
+        vector
+            .checked_add(table)?
+            .checked_add(self.val_opaque_bytes)
+    }
+
     /// The bytes the interner takes, roughly: each expression with its entry in the
     /// table, the names with their IRIs, and a chunk's intersections.
     pub fn bytes(&self) -> usize {
-        self.nodes.capacity() * 40
+        self.data_bytes()
+            + self.nodes.capacity() * 40
             + self.classes.bytes()
             + self.classes.name_bytes()
             + self.met.capacity()
@@ -545,12 +583,100 @@ impl Interner {
         match self.val_ids.get(&v) {
             Some(&id) => id,
             None => {
+                let before = self.checked_data_bytes();
+                let plan = self.value_insertion_plan(&v);
+                let Ok(reservation) = self
+                    .ranges
+                    .reserve_storage(before.and_then(|_| plan.as_ref().map(|p| p.bytes)))
+                else {
+                    return 0;
+                };
+                // A successful reservation proves both checked computations succeeded.
+                let (before, plan) = (before.unwrap(), plan.unwrap());
+                if plan.vector_capacity > self.vals.capacity() {
+                    self.vals
+                        .reserve_exact(plan.vector_capacity - self.vals.len());
+                }
+                self.val_ids.reserve(1);
                 let id = self.vals.len() as u32;
-                self.vals.push(v.clone());
+                let copy = v.clone();
+                #[cfg(test)]
+                a1_record_accounting_visit();
+                let copied = copy.owned_bytes();
+                #[cfg(test)]
+                a1_record_accounting_visit();
+                let moved = v.owned_bytes();
+                // Both capacities were bounded in the plan before either allocation.
+                // Retain a terminal overflow sentinel if an allocator breaks that bound.
+                self.val_opaque_bytes = self
+                    .val_opaque_bytes
+                    .checked_add(copied)
+                    .and_then(|n| n.checked_add(moved))
+                    .unwrap_or(usize::MAX);
+                self.vals.push(copy);
                 self.val_ids.insert(v, id);
+                let retained = self
+                    .checked_data_bytes()
+                    .and_then(|n| n.checked_sub(before));
+                if !self
+                    .ranges
+                    .retain_storage(reservation, retained, plan.bytes)
+                {
+                    return 0;
+                }
                 id
             }
         }
+    }
+
+    fn value_insertion_plan(&self, v: &DataVal) -> Option<ValueInsertionPlan> {
+        let vector_capacity = next_value_capacity(self.vals.len(), self.vals.capacity())?;
+        // The entire replacement buffer overlaps the old buffer, already in base.
+        let vector = if vector_capacity > self.vals.capacity() {
+            std::alloc::Layout::array::<DataVal>(vector_capacity)
+                .ok()?
+                .size()
+        } else {
+            0
+        };
+        // Keep the conservative allowance for a geometric map rehash, including
+        // the compiled tuple and control-byte sizes. No rehash needs new credit
+        // after allocation; its actual retained capacity is transferred below.
+        let map = if self.val_ids.len() == self.val_ids.capacity() {
+            self.val_ids
+                .capacity()
+                .checked_add(4)?
+                .checked_mul(4)?
+                .checked_mul(std::mem::size_of::<(DataVal, u32)>().checked_add(1)?)?
+        } else {
+            0
+        };
+        let opaque = v
+            .opaque
+            .capacity()
+            .checked_add(v.opaque.len())?
+            .checked_mul(std::mem::size_of::<u32>())?;
+        self.val_opaque_bytes.checked_add(opaque)?;
+        Some(ValueInsertionPlan {
+            vector_capacity,
+            bytes: vector.checked_add(map)?.checked_add(opaque)?,
+        })
+    }
+
+    fn copy_values(&mut self) -> Result<Vec<DataVal>, Halt> {
+        self.ranges.check_halt()?;
+        #[cfg(test)]
+        if let Some(b) = &self.ranges.budget {
+            b.at(super::numeric::Point::IndexCopy)
+                .map_err(|e| match e {
+                    super::Error::Memory { used, .. } => Halt::Memory(used),
+                    _ => Halt::Stopped,
+                })?;
+        }
+        if !self.ranges.admit_copies(&self.vals) {
+            self.ranges.check_halt()?;
+        }
+        Ok(self.vals.clone())
     }
 
     /// The expressions of the individuals.
@@ -855,7 +981,13 @@ impl Axioms {
 /// Every class of the axiom's signature is interned, and so met for the run: those the
 /// normalization does not reach are interned from the signature.
 pub fn normalize(ax: &AxiomKind, it: &mut Interner, out: &mut Axioms) -> Option<&'static str> {
-    let (partial, whole) = match normalize_axiom(ax, it, out) {
+    let normalized = normalize_axiom(ax, it, out);
+    // A guarded resource stop is propagated by the caller, never interned/reported
+    // as an unsupported literal or a successful stand-in.
+    if it.ranges.check().is_err() {
+        return None;
+    }
+    let (partial, whole) = match normalized {
         Ok((partial, whole)) => (partial, whole),
         Err(why) => (Some(why), false),
     };
@@ -1039,16 +1171,19 @@ fn normalize_axiom(
             let c = ce(c, it, &mut partial)?;
             let r = it.role(RoleName::Data(d.clone()));
             let top = it.val(DataVal::TOP);
+            it.ranges.check().map_err(|_| NUMERIC_HALTED)?;
             let e = it.node(Node::DataSome(r, top));
             out.subs.push((e, c));
         }
         K::DataPropertyRange(d, range) => {
             let r = it.role(RoleName::Data(d.clone()));
             let (v, opaque) = it.ranges.range(range);
+            it.ranges.check().map_err(|_| NUMERIC_HALTED)?;
             if opaque {
                 partial = Some(OPAQUE);
             }
             let v = it.val(v);
+            it.ranges.check().map_err(|_| NUMERIC_HALTED)?;
             out.data_ranges.push((r, v));
         }
         K::FunctionalDataProperty(d) => {
@@ -1061,6 +1196,7 @@ fn normalize_axiom(
             if it.ranges.range(range).1 {
                 partial = Some(OPAQUE);
             }
+            it.ranges.check().map_err(|_| NUMERIC_HALTED)?;
         }
         K::HasKey(c, ops, dps) => {
             let class = ce(c, it, &mut partial)?;
@@ -1114,10 +1250,12 @@ fn normalize_axiom(
             let r = it.role(RoleName::Data(d.clone()));
             let a = it.nominal(a);
             let (v, opaque) = it.ranges.literal(v);
+            it.ranges.check().map_err(|_| NUMERIC_HALTED)?;
             if opaque {
                 partial = Some(OPAQUE);
             }
             let v = it.val(v);
+            it.ranges.check().map_err(|_| NUMERIC_HALTED)?;
             let e = it.node(Node::DataSome(r, v));
             out.individuals.push(a);
             out.subs.push((a, e));
@@ -1126,10 +1264,12 @@ fn normalize_axiom(
             let r = it.role(RoleName::Data(d.clone()));
             let a = it.nominal(a);
             let (v, opaque) = it.ranges.literal(v);
+            it.ranges.check().map_err(|_| NUMERIC_HALTED)?;
             if opaque {
                 partial = Some(OPAQUE);
             }
             let v = it.val(v);
+            it.ranges.check().map_err(|_| NUMERIC_HALTED)?;
             let e = it.node(Node::DataSome(r, v));
             let both = it.conj(a, e);
             out.individuals.push(a);
@@ -1195,6 +1335,7 @@ fn object_role(p: &ObjectPropertyExpression, it: &mut Interner) -> Option<Role> 
 /// The deepest nesting of class expressions that normalization follows, as the reverse
 /// mapping bounds it.
 const MAX_DEPTH: usize = 256;
+const NUMERIC_HALTED: &str = "numeric construction halted";
 
 /// The interned form of a class expression and, when the classifier may miss some of
 /// its consequences, why. An expression the classifier cannot represent is an error
@@ -1276,13 +1417,17 @@ pub fn class_expression(
         C::DataSomeValuesFrom(ps, r) if ps.len() == 1 => {
             let role = it.role(RoleName::Data(ps[0].clone()));
             let (v, opaque) = it.ranges.range(r);
+            it.ranges.check().map_err(|_| NUMERIC_HALTED)?;
             let v = it.val(v);
+            it.ranges.check().map_err(|_| NUMERIC_HALTED)?;
             (it.node(Node::DataSome(role, v)), opaque.then_some(OPAQUE))
         }
         C::DataHasValue(d, l) => {
             let role = it.role(RoleName::Data(d.clone()));
             let (v, opaque) = it.ranges.literal(l);
+            it.ranges.check().map_err(|_| NUMERIC_HALTED)?;
             let v = it.val(v);
+            it.ranges.check().map_err(|_| NUMERIC_HALTED)?;
             (it.node(Node::DataSome(role, v)), opaque.then_some(OPAQUE))
         }
         // outside OWL 2 EL: the profile check has already left the axiom out
@@ -1323,6 +1468,8 @@ pub struct Head {
 /// The rules each expression triggers.
 #[derive(Default)]
 pub struct Index {
+    /// Keeps the numeric accounting root alive without billing each alias.
+    pub(super) numeric_ledger: Option<std::sync::Arc<super::numeric::NumericLedger>>,
     /// by expression
     heads: Vec<Head>,
     /// told superexpressions
@@ -1361,6 +1508,172 @@ impl Index {
     /// Whether `r` is above a top role, so that it relates every pair of elements.
     pub fn is_universal(&self, r: Role) -> bool {
         self.tops.iter().flatten().any(|&t| self.roles.sub(t, r))
+    }
+}
+
+#[cfg(test)]
+impl Index {
+    /// The fixture may replace only key records after a production index build.
+    pub(super) fn assert_key_fixture_equivalent(&self, expected: &Index) {
+        let Index {
+            numeric_ledger: a_ledger,
+            heads: a_heads,
+            told: a_told,
+            conj: a_conj,
+            exist: a_exist,
+            disjoint: a_disjoint,
+            selfs: a_selfs,
+            roles: a_roles,
+            vals: a_vals,
+            neg_data: a_neg_data,
+            universal: a_universal,
+            keys: a_keys,
+            nominals: a_nominals,
+            nominal_selfs: a_nominal_selfs,
+            tops: a_tops,
+            horn: a_horn,
+            dl: a_dl,
+        } = self;
+        let Index {
+            numeric_ledger: b_ledger,
+            heads: b_heads,
+            told: b_told,
+            conj: b_conj,
+            exist: b_exist,
+            disjoint: b_disjoint,
+            selfs: b_selfs,
+            roles: b_roles,
+            vals: b_vals,
+            neg_data: b_neg_data,
+            universal: b_universal,
+            keys: b_keys,
+            nominals: b_nominals,
+            nominal_selfs: b_nominal_selfs,
+            tops: b_tops,
+            horn: b_horn,
+            dl: b_dl,
+        } = expected;
+        match (a_ledger, b_ledger) {
+            (None, None) => {}
+            (Some(a), Some(b)) => {
+                assert!(
+                    std::sync::Arc::ptr_eq(a, b),
+                    "fixture Index ledger roots differ"
+                );
+                assert!(
+                    std::sync::Arc::downgrade(a).upgrade().is_some(),
+                    "fixture Index ledger is not live"
+                );
+            }
+            _ => panic!("fixture Index ledger presence differs from production reference"),
+        }
+        assert_eq!(a_heads.len(), b_heads.len(), "fixture heads");
+        let span = |s: &Span| {
+            let Span { start, len } = s;
+            (*start, *len)
+        };
+        for (a, b) in a_heads.iter().zip(b_heads) {
+            let Head {
+                node: an,
+                succ: asucc,
+                told: at,
+                conj: ac,
+                exist: ae,
+                disj: ad,
+            } = a;
+            let Head {
+                node: bn,
+                succ: bsucc,
+                told: bt,
+                conj: bc,
+                exist: be,
+                disj: bd,
+            } = b;
+            assert_eq!(
+                (an, asucc, span(at), span(ac), span(ae), span(ad)),
+                (bn, bsucc, span(bt), span(bc), span(be), span(bd)),
+                "fixture head content"
+            );
+        }
+        assert_eq!(a_told, b_told, "fixture told");
+        assert_eq!(a_conj, b_conj, "fixture conjunctions");
+        assert_eq!(a_exist, b_exist, "fixture existentials");
+        assert_eq!(a_disjoint, b_disjoint, "fixture disjoint sets");
+        assert_eq!(a_selfs, b_selfs, "fixture selfs");
+        let Roles {
+            sup: a_sup,
+            comp: a_comp,
+            right: a_right,
+            left: a_left,
+            reflexive: a_reflexive,
+            range: a_range,
+            data_range: a_data_range,
+            functional: a_functional,
+            empty: a_empty,
+            any_empty: a_any_empty,
+            inv: a_inv,
+            clash: a_clash,
+        } = a_roles;
+        let Roles {
+            sup: b_sup,
+            comp: b_comp,
+            right: b_right,
+            left: b_left,
+            reflexive: b_reflexive,
+            range: b_range,
+            data_range: b_data_range,
+            functional: b_functional,
+            empty: b_empty,
+            any_empty: b_any_empty,
+            inv: b_inv,
+            clash: b_clash,
+        } = b_roles;
+        assert_eq!(
+            (
+                a_sup,
+                a_comp,
+                a_right,
+                a_left,
+                a_reflexive,
+                a_range,
+                a_data_range,
+                a_functional,
+                a_empty,
+                a_any_empty,
+                a_inv,
+                a_clash
+            ),
+            (
+                b_sup,
+                b_comp,
+                b_right,
+                b_left,
+                b_reflexive,
+                b_range,
+                b_data_range,
+                b_functional,
+                b_empty,
+                b_any_empty,
+                b_inv,
+                b_clash
+            ),
+            "fixture role content"
+        );
+        assert_eq!(a_vals, b_vals, "fixture values");
+        assert_eq!(a_neg_data, b_neg_data, "fixture negative data");
+        assert_eq!(a_universal, b_universal, "fixture universal facts");
+        assert_eq!(a_keys, b_keys, "fixture original keys including duplicates");
+        assert_eq!(a_nominals, b_nominals, "fixture nominals");
+        assert_eq!(a_nominal_selfs, b_nominal_selfs, "fixture nominal selfs");
+        assert_eq!(a_tops, b_tops, "fixture top roles");
+        assert!(
+            a_horn.is_none() && b_horn.is_none(),
+            "fixture requires no Horn index"
+        );
+        assert!(
+            a_dl.is_none() && b_dl.is_none(),
+            "fixture requires no DL index"
+        );
     }
 }
 
@@ -1464,6 +1777,7 @@ impl Index {
             + self.disjoint.capacity() * 4
             + self.selfs.capacity() * 8
             + self.vals.capacity() * std::mem::size_of::<DataVal>()
+            + self.vals.iter().map(DataVal::owned_bytes).sum::<usize>()
             + self
                 .neg_data
                 .values()
@@ -1524,7 +1838,8 @@ impl Index {
         for &(r, w, x) in &b.neg_data {
             ix.neg_data.entry(r).or_default().push((w, x));
         }
-        ix.vals = it.vals.clone();
+        ix.vals = it.copy_values()?;
+        ix.numeric_ledger = it.ranges.ledger.clone();
         for &(a, c) in &ax.subs {
             b.positive(c, it, &mut ix);
             if a != c {
@@ -1598,6 +1913,7 @@ impl Index {
                 v = v.meet(&it.vals[d as usize]);
             }
             data_succ.push((e, it.val(v)));
+            it.ranges.check_halt()?;
         }
         // every individual is linked to every literal by a universal data role
         if let Some(td) = top_data {
@@ -1663,7 +1979,8 @@ impl Index {
         ix.selfs = b.selfs;
         ix.keys = ax.keys.clone();
         ix.nominals = it.nominals().collect();
-        ix.vals = it.vals.clone();
+        ix.vals = it.copy_values()?;
+        ix.numeric_ledger = it.ranges.ledger.clone();
         if let Some(d) = &ax.dl {
             let dx = super::dl_rules::DlIx::new(d, &ax.disjoint, &ix, it.nodes.len());
             ix.dl = Some(Box::new(dx));
@@ -2297,6 +2614,7 @@ fn roles(
         }
         if let Some(v) = acc {
             data_range[r] = Some(it.val(v));
+            it.ranges.check_halt()?;
         }
     }
     // a role under the bottom property relates nothing
@@ -2353,3 +2671,27 @@ fn roles(
     roles.any_empty = roles.empty.contains(&true);
     Ok(roles)
 }
+
+// Count real opaque ownership reads. K needs no such accounting and never calls record.
+#[cfg(test)]
+thread_local! {
+    static A1_ACCOUNTING_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+fn a1_record_accounting_visit() {
+    A1_ACCOUNTING_VISITS.with(|n| n.set(n.get() + 1));
+}
+#[cfg(test)]
+fn a1_reset_accounting_visits() {
+    A1_ACCOUNTING_VISITS.with(|n| n.set(0));
+}
+#[cfg(test)]
+fn a1_accounting_visits() -> usize {
+    A1_ACCOUNTING_VISITS.with(std::cell::Cell::get)
+}
+#[cfg(test)]
+#[path = "a1_regression_probes.rs"]
+mod a1_regression_probes;
+#[cfg(test)]
+#[path = "a1_repair_accounting_tests.rs"]
+mod a1_repair_accounting_tests;

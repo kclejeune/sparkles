@@ -1,0 +1,12 @@
+Prefix(:=<urn:precision663:>)
+Prefix(xsd:=<http://www.w3.org/2001/XMLSchema#>)
+Prefix(owl:=<http://www.w3.org/2002/07/owl#>)
+Ontology(
+Declaration(Class(:A))
+Declaration(Class(:B))
+Declaration(DataProperty(:d))
+FunctionalDataProperty(:d)
+DataPropertyAssertion(:d :a "170141183460469231731687303715884105728"^^xsd:integer)
+DataPropertyAssertion(:d :b "170141183460469231731687303715884105729"^^xsd:integer)
+DifferentIndividuals(:a :b)
+)

@@ -843,10 +843,12 @@ export const headUrl = (target: string, graph: string | null) =>
 export async function readHead(
   target: string,
   graph: string | null,
+  signal?: AbortSignal,
 ): Promise<{ etag: string | null; commit: number }> {
   const res = await request(headUrl(target, graph), {
     method: 'HEAD',
     cache: 'no-store',
+    signal,
   });
   return {
     etag: res.headers.get('ETag'),

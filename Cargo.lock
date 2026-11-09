@@ -6046,6 +6046,9 @@ name = "sparkles-owl"
 version = "0.1.0"
 dependencies = [
  "hashbrown 0.16.1",
+ "num-bigint 0.4.8",
+ "num-integer",
+ "num-traits",
  "oxiri",
  "oxrdf",
  "oxrdfio",

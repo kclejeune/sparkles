@@ -569,6 +569,10 @@ impl OutboundPolicy {
         timeout: Duration,
         build: impl FnOnce(&reqwest::blocking::Client, Url) -> reqwest::blocking::RequestBuilder,
     ) -> Result<Response, Failure> {
+        #[cfg(any(test, feature = "failpoints"))]
+        if probe::intercept(url) {
+            return Err(Failure::Failed("owned test refused outbound send".into()));
+        }
         let u = self.check_url(url)?;
         let own = timeout.min(self.timeout);
         let left = budget.remaining_time();
@@ -1024,10 +1028,77 @@ fn apply(rb: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBui
     headers.into_iter().fold(rb, |rb, (k, v)| rb.header(k, v))
 }
 
+/// URL-scoped outbound observers, available only with the existing test failpoints.
+/// Matching sends are counted and refused before URL resolution or network access.
+#[cfg(any(test, feature = "failpoints"))]
+#[doc(hidden)]
+pub mod probe {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    static SENDS: OnceLock<Mutex<BTreeMap<String, Arc<AtomicU64>>>> = OnceLock::new();
+
+    pub struct SendProbe {
+        url: String,
+        entries: Arc<AtomicU64>,
+    }
+
+    impl SendProbe {
+        pub fn install(url: String) -> Self {
+            let entries = Arc::new(AtomicU64::new(0));
+            let mut sends = SENDS.get_or_init(Default::default).lock();
+            assert!(!sends.contains_key(&url), "duplicate outbound probe URL");
+            sends.insert(url.clone(), entries.clone());
+            Self { url, entries }
+        }
+
+        pub fn entries(&self) -> u64 {
+            self.entries.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for SendProbe {
+        fn drop(&mut self) {
+            if let Some(sends) = SENDS.get() {
+                sends.lock().remove(&self.url);
+            }
+        }
+    }
+
+    pub(super) fn intercept(url: &str) -> bool {
+        let Some(sends) = SENDS.get() else {
+            return false;
+        };
+        let sends = sends.lock();
+        let Some(entries) = sends.get(url) else {
+            return false;
+        };
+        entries.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn authoring_consult_outbound_probe_counts_send_before_network() {
+        let url = "http://127.0.0.1:1/authoring-consult-probe-control";
+        let probe = probe::SendProbe::install(url.into());
+        let policy = OutboundPolicy::default();
+        let result = policy.send(
+            &RequestBudget::new(&policy),
+            url,
+            Duration::from_secs(1),
+            |client, url| client.get(url),
+        );
+        assert!(
+            matches!(result, Err(Failure::Failed(ref e)) if e == "owned test refused outbound send")
+        );
+        assert_eq!(probe.entries(), 1);
+    }
 
     /// A resolver answering from a table.
     struct Fake(HashMap<&'static str, Vec<IpAddr>>);

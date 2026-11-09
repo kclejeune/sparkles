@@ -670,6 +670,9 @@ export type WriteOpts = {
   message?: string;
   /** The head commit the editor shows, which a revert expects the branch to be at. */
   head?: number | null;
+  /** Immutable identity of the captured authoring source. */
+  sourceId?: string;
+  signal?: AbortSignal;
 };
 
 /** The preview of a dry run, which a `412`, `422` or `507` carries as its body. */
@@ -727,6 +730,7 @@ export async function editAxioms(
         method: 'POST',
         headers: writeHeaders(o, true),
         body: JSON.stringify(body),
+        signal: o.signal,
       }),
     !!o.dryRun,
   );
@@ -746,6 +750,7 @@ export async function removeEntity(
       request(`/$/ontology/${enc(target)}/entity?${p}&${writeQuery(o)}`, {
         method: 'DELETE',
         headers: writeHeaders(o, false),
+        signal: o.signal,
       }),
     !!o.dryRun,
   );
@@ -769,7 +774,14 @@ export async function revertCommit(
   const p = new URLSearchParams({ branch, commit: String(commit) });
   const body = {
     ...(o.dryRun ? { dryRun: true, changes: 50 } : {}),
-    ...(o.head != null ? { expect: { target: o.head } } : {}),
+    ...(o.head != null || o.sourceId
+      ? {
+          expect: {
+            ...(o.head != null ? { target: o.head } : {}),
+            ...(o.sourceId ? { targetId: o.sourceId } : {}),
+          },
+        }
+      : {}),
     ...(o.message ? { message: o.message } : {}),
   };
   const r = await previewOr<Record<string, unknown>>(
@@ -778,6 +790,7 @@ export async function revertCommit(
         method: 'POST',
         headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        signal: o.signal,
       }),
     !!o.dryRun,
   );
@@ -815,12 +828,40 @@ export async function runUpdate(
           'Content-Type': 'application/sparql-update',
         },
         body: sparql,
+        signal: o.signal,
       }),
     !!o.dryRun,
   );
   if (isPreview(r)) return r;
   const receipt = receiptOf(r);
   return { inserted: Number(r.inserted ?? 0), deleted: Number(r.deleted ?? 0), receipt };
+}
+
+/** An authoring delta with a strict source identity and head; patch ignores If-Match. */
+export async function runPatch(
+  target: string,
+  patch: string,
+  o: WriteOpts = {},
+): Promise<UpdateAnswer | WritePreview> {
+  const prev = /^H prev <(urn:uuid:[0-9a-f-]+#commit:\d+)> \.$/im.exec(patch)?.[1];
+  if (!prev) throw new Error('An authoring patch requires an exact source identity and head.');
+  const expect = new URLSearchParams({ expect: prev });
+  const r = await previewOr<UpdateAnswer & Record<string, unknown>>(
+    () =>
+      request(`/${enc(target)}/patch?${writeQuery(o)}&${expect}`, {
+        method: 'POST',
+        headers: { ...writeHeaders(o, false), 'Content-Type': 'application/rdf-patch' },
+        body: patch,
+        signal: o.signal,
+      }),
+    !!o.dryRun,
+  );
+  if (isPreview(r)) return r;
+  return {
+    inserted: Number(r.inserted ?? 0),
+    deleted: Number(r.deleted ?? 0),
+    receipt: receiptOf(r),
+  };
 }
 
 export function isPreview(x: unknown): x is WritePreview {
@@ -1558,6 +1599,7 @@ export type Op =
   | { kind: 'axioms'; add: AxiomInput[]; remove: AxiomInput[]; declare?: boolean }
   | { kind: 'removeEntity'; iri: string }
   | { kind: 'update'; sparql: string }
+  | { kind: 'patch'; patch: string }
   | { kind: 'revert'; commit: number };
 
 /** An entry of the session's undo stack: a commit and what it did. */
@@ -2038,6 +2080,8 @@ export function runOp(
       return removeEntity(target, sel, op.iri, o);
     case 'update':
       return runUpdate(target, op.sparql, o);
+    case 'patch':
+      return runPatch(target, op.patch, o);
     case 'revert':
       return revertCommit(target, op.commit, o);
   }
