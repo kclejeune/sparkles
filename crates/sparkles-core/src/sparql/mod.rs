@@ -2026,7 +2026,16 @@ fn graph_set_charge_is_its_table_allocation() {
             let actual = set_buckets_of(set.capacity())
                 .and_then(set_table_bytes::<u64>)
                 .unwrap();
-            assert_eq!(actual, largest as u64, "capacity {}", set.capacity());
+            // SSE2 groups are 16 bytes and the size is exact. Other groups are 8
+            // bytes, and the size is an upper bound.
+            if cfg!(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                target_feature = "sse2"
+            )) {
+                assert_eq!(actual, largest as u64, "capacity {}", set.capacity());
+            } else {
+                assert!(actual >= largest as u64, "capacity {}", set.capacity());
+            }
             assert_eq!(bound, actual, "capacity {}", set.capacity());
         }
         set.insert(n);
