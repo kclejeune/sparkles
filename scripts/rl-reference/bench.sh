@@ -24,9 +24,11 @@
 #
 # Every engine run is timed by GNU time for its wall time and peak RSS, in its own systemd
 # scope with MemoryMax=MEM_MAX and no swap where systemd-run exists (SCOPE=0 runs it
-# directly), and within RUN_TIMEOUT seconds. A run that fails, runs out of memory or times
-# out is recorded with that status. Nemo's own report adds its import, reasoning and export
-# times. WORKDIR/results/rl-reference.json holds every run and summary.md the medians.
+# directly), and within RUN_TIMEOUT seconds. A run is recorded as ok, timeout, oom when the
+# kernel killed a process of its scope at the memory limit, killed for another SIGKILL, or
+# error. The correctness check
+# and the materializations that prepare the incremental runs share the cap and the
+# deadline. Nemo's own report adds its import, reasoning and export times. WORKDIR/results/rl-reference.json holds every run and summary.md the medians.
 #
 # Env: RUNS (default 3), THREADS (default all cores), DELTA_EVERY (default 100), MEM_MAX
 # (default 24G), RUN_TIMEOUT (default 3600), SCOPE, SPARKLES (default
@@ -92,35 +94,64 @@ grep -v '% reflexive-scm-eq$' "$HERE/owl2rl.rls" | cat - "$HERE/sparkles-extensi
 
 # ------------------------------------------------------------------------ correctness
 log "comparing the closures"
-"$HERE/compare.sh" base.nt compare > logs/compare.log 2>&1 || die "the closures differ or the comparison failed, see logs/compare.log"
+capped compare "$HERE/compare.sh" base.nt compare || die "the closures differ or the comparison failed, see logs/compare.log"
 
-# run NAME ROUND THREADS CMD...: one timed engine run, appended to the record
-run() {
-  local name=$1 round=$2 threads=$3 st=ok rc=0 t0 t1 rss
-  shift 3
+# capped NAME CMD...: CMD in a scope of its own with MemoryMax=MEM_MAX and no swap, within
+# RUN_TIMEOUT seconds, with its output in logs/NAME.log. It sets CAPPED_STATUS to ok,
+# timeout, oom (the kernel killed a process of the scope at its memory limit, which the
+# scope's memory.events, copied to logs/NAME.events, records), killed (another SIGKILL) or
+# error (any other failure, including a scope that did not start), and returns 0 only for
+# ok. A small shell in the scope runs CMD and copies memory.events when it ends, so the
+# record outlives the scope.
+capped() {
+  local name=$1 rc=0 t0 t1 ooms=0
+  shift
   local scope=()
+  rm -f "logs/$name.events"
   if [ "${SCOPE:-1}" != 0 ] && command -v systemd-run > /dev/null; then
-    scope=(systemd-run --user --scope -q -p "MemoryMax=$MEM_MAX" -p MemorySwapMax=0)
+    # shellcheck disable=SC2016 # the inner shell expands these
+    scope=(systemd-run --user --scope -q --expand-environment=no -p "MemoryMax=$MEM_MAX" -p MemorySwapMax=0
+      -p OOMPolicy=continue sh -c 'cg=/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup); ev=$1; shift
+"$@"; rc=$?; cat "$cg/memory.events" > "$ev" 2> /dev/null; exit $rc' capped "logs/$name.events")
   fi
   t0=$(date +%s.%N)
-  rm -f "logs/$name.time"
-  "${scope[@]}" "$GTIME" -v -o "logs/$name.time" timeout -k 30 "$RUN_TIMEOUT" "$@" > "logs/$name.log" 2>&1 || rc=$?
+  "${scope[@]}" timeout -k 30 "$RUN_TIMEOUT" "$@" > "logs/$name.log" 2>&1 || rc=$?
   t1=$(date +%s.%N)
-  if [ "$rc" = 124 ]; then
-    st=timeout
-  elif [ "$rc" = 137 ] || [ ! -s "logs/$name.time" ] || grep -q "signal 9" "logs/$name.time"; then
-    st=oom
-  elif [ "$rc" != 0 ]; then
-    st=error
+  ooms=$(sed -n 's/^oom_kill \([0-9]*\)$/\1/p' "logs/$name.events" 2> /dev/null || true)
+  if [ "$rc" = 0 ]; then
+    CAPPED_STATUS=ok
+  elif [ "${ooms:-0}" -gt 0 ]; then
+    CAPPED_STATUS=oom
+  elif [ "$rc" = 124 ] || awk "BEGIN {exit !($t1 - $t0 >= $RUN_TIMEOUT)}"; then
+    CAPPED_STATUS=timeout
+  elif [ "$rc" = 137 ]; then
+    CAPPED_STATUS=killed
+  else
+    CAPPED_STATUS=error
   fi
-  LAST_STATUS=$st
+  [ "$CAPPED_STATUS" = ok ]
+}
+
+# run NAME ROUND THREADS CMD...: one timed engine run, appended to the record. GNU time
+# inside the scope gives the wall time and the peak RSS of the command alone.
+run() {
+  local name=$1 round=$2 threads=$3 rss wall
+  shift 3
+  rm -f "logs/$name.time"
+  capped "$name" "$GTIME" -v -o "logs/$name.time" "$@" || true
+  LAST_STATUS=$CAPPED_STATUS
   rss=$(sed -n 's/.*Maximum resident set size (kbytes): \([0-9]*\)/\1/p' "logs/$name.time" 2> /dev/null || true)
-  "$PYTHON" -I - "$RECORD" "$name" "$round" "$threads" "$st" "$(awk "BEGIN {print $t1 - $t0}")" "${rss:-}" "logs/$name.log" << 'EOF'
+  wall=$(sed -n 's/.*Elapsed (wall clock) time (h:mm:ss or m:ss): \(.*\)/\1/p' "logs/$name.time" 2> /dev/null || true)
+  "$PYTHON" -I - "$RECORD" "$name" "$round" "$threads" "$LAST_STATUS" "${wall:-}" "${rss:-}" "logs/$name.log" << 'EOF'
 import json, re, sys
-rec, name, rnd, threads, st, secs, rss, logf = sys.argv[1:]
+rec, name, rnd, threads, st, wall, rss, logf = sys.argv[1:]
 text = open(logf, errors="replace").read()
+secs = None
+if wall:
+    parts = [float(x) for x in wall.split(":")]
+    secs = sum(v * 60 ** i for i, v in enumerate(reversed(parts)))
 entry = {"run": re.sub(r"-t[0-9]+$", "", name.rsplit("-r", 1)[0]), "round": int(rnd), "threads": int(threads), "status": st,
-         "seconds": float(secs), "max_rss_kib": int(rss) if rss else None}
+         "seconds": secs, "max_rss_kib": int(rss) if rss else None}
 # Nemo's short report: Data import, Reasoning and Data export, in milliseconds
 for key, label in (("import", "Data import"), ("reasoning", "Reasoning"), ("export", "Data export")):
     m = re.search(rf"{label}:\s+([0-9]+)ms", text)
@@ -131,7 +162,7 @@ if m:
     entry["derived_triples"] = int(m.group(1))
 with open(rec, "a") as f:
     f.write(json.dumps(entry) + "\n")
-print(f"{entry['run']} round {rnd}, {threads} threads: {st}, {float(secs):.2f} s, peak RSS {int(rss) >> 10 if rss else '?'} MiB")
+print(f"{entry['run']} round {rnd}, {threads} threads: {st}, {secs if secs is None else round(secs, 2)} s, peak RSS {int(rss) >> 10 if rss else '?'} MiB")
 EOF
   return 0
 }
@@ -168,10 +199,10 @@ rm -f "$RECORD"
 log "materializing the databases for the incremental runs"
 rm -rf full.db minus.db
 cp -a --reflink=auto base.db full.db
-"$SPARKLES" infer --loc full.db --profile owl-rl --full > logs/prepare-full.log 2>&1 || die "materializing full.db failed"
+capped prepare-full "$SPARKLES" infer --loc full.db --profile owl-rl --full || die "materializing full.db ended with $CAPPED_STATUS, see logs/prepare-full.log"
 cp -a --reflink=auto base.db minus.db
-"$SPARKLES" update --loc minus.db --update delete.ru > logs/prepare-minus.log 2>&1 || die "deleting the change failed"
-"$SPARKLES" infer --loc minus.db --profile owl-rl --full >> logs/prepare-minus.log 2>&1 || die "materializing minus.db failed"
+"$SPARKLES" update --loc minus.db --update delete.ru > logs/prepare-minus-update.log 2>&1 || die "deleting the change failed"
+capped prepare-minus "$SPARKLES" infer --loc minus.db --profile owl-rl --full || die "materializing minus.db ended with $CAPPED_STATUS, see logs/prepare-minus.log"
 
 # ------------------------------------------------------------------------------ rounds
 for round in $(seq 1 "$RUNS"); do
