@@ -76,6 +76,12 @@ pub enum Concl {
     /// Tier D in a rooted run: the root sent a clause, by its id in the run's table
     /// (r-Pred)
     RPred(u32),
+    /// Tier D in a rooted run: the marker of a ground literal that a predecessor holds as
+    /// a maximal literal, by its id in the run's literals (Succ)
+    HypL(u32),
+    /// Tier D in a rooted run: the source context registers with the root for the
+    /// constant, which a ground literal in one of its bodies mentions
+    REdge(Ex, u32),
 }
 
 // a conclusion takes three words, so that the to-do lists and outboxes keep their size
@@ -387,7 +393,9 @@ impl State {
             | Concl::DEdge(..)
             | Concl::PredC(..)
             | Concl::RHyp(..)
-            | Concl::RPred(..) => false,
+            | Concl::RPred(..)
+            | Concl::HypL(..)
+            | Concl::REdge(..) => false,
         }
     }
 
@@ -1684,14 +1692,24 @@ fn apply_rules<S: Sink, R: Rules>(
         }
         Concl::Hyp(a) if R::DISJ => dl_rules::hyp(st, a, out),
         Concl::DEdge(u, e) if R::DISJ => dl_rules::dedge(ix, me, st, u, e, out),
-        Concl::PredC(v, c) if R::DISJ => dl_rules::pred_c(ix, st, v, c, out),
+        Concl::PredC(v, c) if R::DISJ => {
+            if ix.dl.as_deref().is_some_and(|d| d.is_root(me)) {
+                dl_root::pred_c(ix, st, v, c, out)
+            } else {
+                dl_rules::pred_c(ix, st, v, c, out)
+            }
+        }
         Concl::RHyp(v, l) if R::DISJ => dl_root::rhyp(ix, st, v, l, out),
         Concl::RPred(c) if R::DISJ => dl_root::rpred_c(ix, st, c, out),
+        Concl::HypL(l) if R::DISJ => dl_root::hyp_l(st, l, out),
+        Concl::REdge(v, u) if R::DISJ => dl_root::redge(ix, st, v, u, out),
         Concl::Hyp(_)
         | Concl::DEdge(..)
         | Concl::PredC(..)
         | Concl::RHyp(..)
-        | Concl::RPred(..) => {
+        | Concl::RPred(..)
+        | Concl::HypL(..)
+        | Concl::REdge(..) => {
             unreachable!("a conclusion of Tier D in a saturation without it")
         }
     }

@@ -447,7 +447,7 @@ pub struct DlSt {
     pub store: Store,
     /// the clauses over the predecessor that successors sent, by successor
     pub pred_in: FxHashMap<Ex, Vec<u32>>,
-    pred_seen: FxHashSet<(Ex, u32)>,
+    pub(super) pred_seen: FxHashSet<(Ex, u32)>,
     /// the predecessors that registered, with the existential restriction they reach this
     /// context by
     pub dpreds: Vec<(Ex, Ex)>,
@@ -1565,6 +1565,10 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
     }
     if dx.root.is_some() {
         rooted_unit(ix, st, d, &mut found, &out.dl().lits);
+        // the EL successor of a unit existential restriction takes the ground markers
+        if let Node::Exist(..) = h.node {
+            super::dl_root::new_succ(st, h.succ, out);
+        }
     }
     drain(ix, st, found, out);
 }
@@ -1711,7 +1715,8 @@ fn is_ground(v: super::dl_clause::XLit) -> bool {
 /// role atoms `s(y, x)` and ground literals, and every head literal is a predecessor
 /// trigger of the journal's Definition 4: an atom over y or a constant, a role atom between
 /// x and y or between two constants, or an equality of x, y and constants. An inequality is
-/// none.
+/// none. A role atom between x and a constant goes too, which Table 3 admits for the root
+/// as predecessor and [`pred`] refuses for another.
 pub(super) fn pred_ready(ix: &Index, dx: &DlIx, lits: &Lits, c: &Clause) -> bool {
     use super::dl_clause::XLit;
     let inv = |r: Role| dx.inv(ix, r);
@@ -1724,7 +1729,10 @@ pub(super) fn pred_ready(ix: &Index, dx: &DlIx, lits: &Lits, c: &Clause) -> bool
         Y | RY => true,
         XL => match lits.view(l, inv) {
             XLit::Atom(_, t) => matches!(t, RTerm::C(_)),
-            XLit::Role(_, a, b) => matches!((a, b), (RTerm::C(_), RTerm::C(_))),
+            XLit::Role(_, a, b) => matches!(
+                (a, b),
+                (RTerm::C(_), RTerm::C(_)) | (RTerm::X, RTerm::C(_)) | (RTerm::C(_), RTerm::X)
+            ),
             XLit::Eq(a, b) => [a, b]
                 .iter()
                 .all(|t| matches!(t, RTerm::X | RTerm::Y | RTerm::C(_))),
@@ -1905,6 +1913,12 @@ fn pred(
                 up.push(l);
                 continue;
             }
+            // a role atom between x and a constant goes only to the root
+            if let XLit::Role(_, a, b) = v
+                && matches!((a, b), (RTerm::X, RTerm::C(_)) | (RTerm::C(_), RTerm::X))
+            {
+                return;
+            }
             let t = |t: RTerm| match t {
                 RTerm::Y => Some(RTerm::X),
                 RTerm::X => Some(RTerm::Fx(f)),
@@ -2054,6 +2068,7 @@ fn process<S: Sink>(
     let mut found = Found::default();
     if rooted {
         super::dl_root::join_body(ix, st, c, &mut found, &out.dl().lits);
+        super::dl_root::register_body(ix, me, st, c, out);
     }
     if if rooted {
         pred_ready(ix, dx, &out.dl().lits, c)
@@ -2218,7 +2233,7 @@ fn process<S: Sink>(
 }
 
 /// Sends the successor `v` the marker of `a`, unless the successor's core has it.
-fn send_hyp<S: Sink>(ix: &Index, st: &mut State, v: Ex, a: Ex, out: &mut S) {
+pub(super) fn send_hyp<S: Sink>(ix: &Index, st: &mut State, v: Ex, a: Ex, out: &mut S) {
     if a == TOP || ds(st).sent.contains(&(v, a)) {
         return;
     }
@@ -2281,6 +2296,9 @@ fn target<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -> Ex
     };
     ds(st).edges.push((e, v));
     out.send(v, Concl::DEdge(me, e));
+    if dx.root.is_some() {
+        super::dl_root::new_succ(st, v, out);
+    }
     if let Some(core) = dx.cores.get(&e) {
         for &a in core.iter() {
             send_hyp(ix, st, v, a, out);
