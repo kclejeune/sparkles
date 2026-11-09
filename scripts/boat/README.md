@@ -217,6 +217,13 @@ metadata-open behavior must remain within the release's provisioning scope. GitH
 Actions retains separate OIDC authentication. This package exports no reusable snapshot
 or credential-bearing template.
 
+A remote build on the worker runs detached in its named `nsc-build-*` scope, which the
+closure watch's unit check covers, and survives a dropped job connection. It builds each
+revision at the stable path `~/lanes/nsc-build-work/<commit>`, so a rebuild of a commit
+finds mbx's predictions for that path and restores its crates from the local store. The
+[remote executors](../../docs/REMOTE-EXECUTORS.md#source-results-and-cleanup) guide
+describes both.
+
 ## One warm-worker sequence
 
 The variables below name operator-owned private files and an unused controller unit.
