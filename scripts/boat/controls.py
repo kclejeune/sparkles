@@ -61,6 +61,9 @@ class InertIO:
         assert name not in self.records,name
         self.records[name]=copy.deepcopy(value)
     def exists(self,n):return n in self.records
+    def names(self):return sorted(self.records)
+    def freeze_extensions(self):self.frozen=True;return True
+    def thaw_extensions(self):self.frozen=False
     def read(self,n):
         if n not in self.records:raise FileNotFoundError(n)
         return copy.deepcopy(self.records[n])
@@ -116,7 +119,7 @@ class InertIO:
         self.record('metadata-started.json',{})
         if self.closure:self.record('qualification-closed.json',{'metadata_closed':True})
         if self.qual_bad:raise Refusal('inert wrong caps/source')
-        self.record('qualification.json',{'qualified':True,'metadata_closed':True,'startup_closed':True,'engine_or_job_started':False,'actual_toolchain_manifest':{'path':profile()['worker_home']+'/.local/state/sparkles-boat/toolchain.json','sha256':manifest_sha()},'bootstrap_lock':{'path':profile()['worker_home']+'/.local/state/sparkles-boat/bootstrap.lock','held_during_checkpoint':True},'runtime_env_file':None});return {}
+        self.record('qualification.json',{'qualified':True,'metadata_closed':True,'startup_closed':True,'engine_or_job_started':False,'actual_toolchain_manifest':{'path':profile()['worker_home']+'/.local/state/sparkles-boat/toolchain.json','sha256':manifest_sha()},'bootstrap_lock':{'path':profile()['worker_home']+'/.local/state/sparkles-boat/bootstrap.lock','held_during_checkpoint':True},'runtime_env_file':None,'worker_boot_id':'87654321-4321-4321-4321-210987654321'});return {}
     def metadata_closed(self):
         if self.closure:self.record('qualification-closed.json',{'metadata_closed':True});return True
         return False
@@ -158,7 +161,7 @@ class LoadedGuardIO(InertIO):
         if not self.launched:return {'LoadState':'not-found','ActiveState':'inactive','MainPID':'0','InvocationID':''}
         expected=[str(Path(sys.executable).resolve()),'-I','-B',str(c.ROOT/'controller.py'),'guard','--operation','/tmp/boat-inert-qualification']
         if self.exec_wrong:expected[-1]='/tmp/other-operation'
-        row={'LoadState':'loaded','ActiveState':'active','InvocationID':'a'*32,'ControlGroup':'/inert/boat-owned-warm-qual-inert.service','MainPID':'123','MemoryMax':'536870912','MemorySwapMax':'0','KillMode':'control-group','RuntimeMaxUSec':'2h 58min 20s','OOMPolicy':'continue','ExecStart':'{ path='+expected[0]+' ; argv[]='+' '.join(expected)+' ; ignore_errors=no ; }'}
+        row={'LoadState':'loaded','ActiveState':'active','InvocationID':'a'*32,'ControlGroup':'/inert/boat-owned-warm-qual-inert.service','MainPID':'123','MemoryMax':'536870912','MemorySwapMax':'0','KillMode':'control-group','RuntimeMaxUSec':'12h 5min','OOMPolicy':'continue','ExecStart':'{ path='+expected[0]+' ; argv[]='+' '.join(expected)+' ; ignore_errors=no ; }'}
         row.update(self.loaded_override);return row
     @property
     def op(self):return Path('/tmp/boat-inert-qualification')

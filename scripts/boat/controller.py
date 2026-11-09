@@ -4,9 +4,20 @@ from pathlib import Path
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from common import *
+identity_check=identity
+import qualified_worker_admission as lifetime
 from qualified_worker_admission import make_admission
 import owned_group
-import argparse,fcntl,selectors,signal,subprocess,time,shlex,base64
+import argparse,fcntl,math,secrets,selectors,signal,subprocess,time,shlex,base64
+
+# An extension act publishes within EXTEND_ACT_MAX seconds of its start, and the
+# guard waits up to FREEZE_WAIT for it before it stops at its deadline. The guard
+# unit outlives the longest permitted lifetime, extensions included, by that wait
+# and the stop margin. The provider TTL remains the worker's own backstop.
+EXTEND_ACT_MAX=90
+FREEZE_WAIT=100
+GUARD_RUNTIME=lifetime.MAX_LIFETIME+lifetime.STOP_MARGIN+FREEZE_WAIT
+EXTENSION_LOCK='lifetime-extension.lock'
 
 ROOT=Path(__file__).resolve().parent
 
@@ -89,6 +100,25 @@ class RealIO:
     def record(self,name,value):write_new(self.op,name,value)
     def exists(self,name):return (self.op/name).exists()
     def read(self,name):return load(self.op/name)
+    def names(self):return sorted(os.listdir(self.op))
+    def local_boot_id(self):return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    def freeze_extensions(self):
+        """Hold the operation's extension lock, waiting out a running act within FREEZE_WAIT."""
+        if getattr(self,'_frozen',None) is not None:return True
+        fd=os.open(self.op/EXTENSION_LOCK,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600);end=self.mono()+FREEZE_WAIT
+        while True:
+            try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);self._frozen=fd;return True
+            except BlockingIOError:
+                if self.mono()>=end:os.close(fd);return False
+                time.sleep(0.2)
+    def thaw_extensions(self):
+        fd=getattr(self,'_frozen',None);self._frozen=None
+        if fd is not None:os.close(fd)
+    def worker_boot_id(self):
+        code="import json;print(json.dumps({'boot_id':open('/proc/sys/kernel/random/boot_id').read().strip()}))"
+        r=self.boat(['ssh',worker_id(),'--','/usr/bin/python3','-I','-B','-c',code],20,json_mode=False)
+        need(r['exit']==0 and isinstance(r['body'],dict) and isinstance(r['body'].get('boot_id'),str),'worker boot identity unavailable')
+        return r['body']['boot_id']
     def boat(self,args,seconds=20,input_bytes=None,json_mode=True):
         prefix=[self.boat_path,'--no-update']+(['--json'] if json_mode else [])
         return bounded(prefix+args,seconds,input_bytes)
@@ -143,14 +173,14 @@ class RealIO:
         unit=self.r['guard_unit']+'.service'
         absent=self.show(unit);need(absent.get('ActiveState')=='inactive' and absent.get('MainPID')=='0' and absent.get('LoadState')=='not-found' and not absent.get('InvocationID'),'guard unit not unused')
         argv=[str(Path(sys.executable).resolve()),'-I','-B',str(ROOT/'controller.py'),'guard','--operation',str(self.op)]
-        self.system(['systemd-run','--user','--unit='+self.r['guard_unit'],'--property=Type=exec','--property=MemoryMax=512M','--property=MemorySwapMax=0','--property=RuntimeMaxSec=10700','--property=TimeoutStopSec=10','--property=KillMode=control-group','--property=OOMPolicy=continue']+argv)
+        self.system(['systemd-run','--user','--unit='+self.r['guard_unit'],'--property=Type=exec','--property=MemoryMax=512M','--property=MemorySwapMax=0','--property=RuntimeMaxSec='+str(GUARD_RUNTIME),'--property=TimeoutStopSec=10','--property=KillMode=control-group','--property=OOMPolicy=continue']+argv)
         end=self.mono()+15
         while self.mono()<end:
             if self.exists('guard-ready.json'):
                 ready=self.read('guard-ready.json');p=self.show(unit)
                 actual=re.search(r'argv\[\]=(.*?) ;',p.get('ExecStart',''))
                 need(actual is not None and shlex.split(actual[1])==argv,'guard loaded ExecStart mismatch')
-                need(p.get('ActiveState')=='active' and int(p.get('MainPID','0'))==ready['pid'] and p.get('MemoryMax')==str(MEMORY) and p.get('MemorySwapMax')=='0' and p.get('KillMode')=='control-group' and p.get('OOMPolicy')=='continue' and systemd_seconds(p.get('RuntimeMaxUSec',''))==10700,'guard loaded limits/PID/clock mismatch')
+                need(p.get('ActiveState')=='active' and int(p.get('MainPID','0'))==ready['pid'] and p.get('MemoryMax')==str(MEMORY) and p.get('MemorySwapMax')=='0' and p.get('KillMode')=='control-group' and p.get('OOMPolicy')=='continue' and systemd_seconds(p.get('RuntimeMaxUSec',''))==GUARD_RUNTIME,'guard loaded limits/PID/clock mismatch')
                 need(p.get('ControlGroup')==ready['cgroup'].removeprefix('/sys/fs/cgroup') and re.fullmatch('[0-9a-f]{32}',p.get('InvocationID','')),'guard loaded cgroup/invocation mismatch')
                 need(ready['deadline_mono']==intent['deadline_mono'] and ready['memory_max']==str(MEMORY) and ready['swap_max']=='0','guard runtime mismatch')
                 ready['loaded']={k:p[k] for k in p if k!='ExecStart'}
@@ -229,6 +259,7 @@ if __name__=='__main__':
         if q.get('metadata_closed')is True:self.record('qualification-closed.json',{'metadata_closed':True,'unit':self.r['guard_unit']+'-metadata.service'})
         need(q.get('qualified')is True and q.get('startup_closed')is True and q.get('metadata_closed')is True and q.get('engine_or_job_started')is False,'metadata/startup closure refused')
         need(q.get('memory_max')==str(MEMORY) and q.get('swap_max')=='0' and q.get('manifest_unchanged')is True,'metadata cap/pins refused')
+        need(isinstance(q.get('worker_boot_id'),str) and re.fullmatch(lifetime.UUID,q['worker_boot_id']) is not None,'worker boot identity missing')
         self.record('qualification.json',q);return q
 
 
@@ -346,8 +377,34 @@ def reconcile_stop(r,io):
     io.record('unresolved.json',{'worker':worker_id(),'stop_operation':operation,'resume_retried':False,'stop_retried_or_forced':False,'ownership_retained_by_Root':True,'action':'Root must reconcile exact worker/operation; retain failed guard unit, do not declare shutdown/disarm/clean.'})
     return False
 
+def guard_deadlines(io,intent):
+    """The guard's (BOOTTIME, wall) deadline, moved only by valid extension receipts.
+
+    Without receipts this is the intent's own pair. Any unreadable or malformed
+    receipt chain falls back to that original pair, so it can only end sooner.
+    """
+    original=(intent['deadline_mono'],intent['deadline_wall'])
+    try:
+        names=io.names()
+        if not lifetime.extension_names(names):return original
+        guard=io.read('guard-admission.json');handoff=io.read('root-handoff.json')
+        wall,boot=lifetime.original_ends(intent,guard,handoff)
+        identity=lifetime.operation_identity(intent,guard,io.read('qualification.json'),io.r['guard_unit'])
+        wall,boot,_=lifetime.apply_extensions(names,io.read,intent,wall,boot,identity)
+        return boot,wall
+    except Exception:return original
+
 def guard_loop(r,io,intent):
-    while io.mono()<intent['deadline_mono'] and io.wall()<intent['deadline_wall']:
+    while True:
+        deadline_mono,deadline_wall=guard_deadlines(io,intent)
+        if not(io.mono()<deadline_mono and io.wall()<deadline_wall):
+            # Stop only while holding the extension lock, after reading the receipts
+            # once more, so that no act publishes an extension after this decision.
+            if io.freeze_extensions():
+                deadline_mono,deadline_wall=guard_deadlines(io,intent)
+                if io.mono()<deadline_mono and io.wall()<deadline_wall:
+                    io.thaw_extensions();continue
+            break
         if io.exists('no-ready-confirmed.json'):
             check=io.read('no-ready-confirmed.json');stopped(check['safe_info'])
             io.record('closed-no-start.json',{'worker':worker_id(),'no_ready_confirmed':True,'guard_may_exit':True});return True
@@ -355,7 +412,7 @@ def guard_loop(r,io,intent):
             io.record('closed-no-resume.json',{'no_resume_intent':True,'guard_may_exit':True});return True
         if io.exists('stop-trigger.json'):
             if not io.exists('startup-closed.json'):
-                if min(intent['deadline_mono']-io.mono(),intent['deadline_wall']-io.wall())<=200:break
+                if min(deadline_mono-io.mono(),deadline_wall-io.wall())<=200:break
                 try:
                     if not io.startup(intent,allow_qualification=False):io.wait(5);continue
                 except Exception:io.wait(1);continue
@@ -371,6 +428,81 @@ def guard_loop(r,io,intent):
         io.record('closed-no-resume.json',{'no_resume_intent':True,'guard_may_exit':True});return True
     return reconcile_stop(r,io)
 
+
+def extend_operation(r,io,seconds,fact_path,reason):
+    """Root's explicit extension of the running qualified worker, recorded as a receipt.
+
+    It adopts the worker only when the local boot, the live guard invocation, the
+    worker's own boot, the provider environment and a fresh Root environment fact
+    all match the qualification. The new end is this observation plus ``seconds``
+    on both clocks, within the total cap. The provider lifetime is set first and
+    confirmed through info before the receipt is published. Any uncertainty
+    leaves only a failed attempt record, which grants nothing.
+    """
+    need(type(seconds) is int and 0<seconds<=lifetime.EXTENSION_MAX,'extension seconds out of range')
+    need(isinstance(reason,str) and 0<len(reason)<=200 and all(' '<=c<='~' for c in reason),'extension reason must be short printable text')
+    need(io.exists('root-handoff.json') and io.exists('qualified-worker-admission.json') and io.exists('guard-admission.json'),'no qualified Root handoff to extend')
+    for name in ('stop-trigger.json','stop-intent.json','closed.json','unresolved.json'):need(not io.exists(name),'operation is stopping or closed')
+    intent=io.read('controller-intent.json');guard=io.read('guard-admission.json');handoff=io.read('root-handoff.json');q=io.read('qualification.json')
+    identity=lifetime.operation_identity(intent,guard,q,r['guard_unit'])
+    need(identity['worker_boot_id'] is not None,'qualification lacks the worker boot identity')
+    names=io.names();wall,boot=lifetime.original_ends(intent,guard,handoff)
+    try:wall,boot,count=lifetime.apply_extensions(names,io.read,intent,wall,boot,identity)
+    except ValueError as error:raise Refusal('existing extension receipts refused: '+str(error)) from None
+    need(min(wall-io.wall(),boot-io.mono())>lifetime.CLOSURE_RESERVE,'lifetime already inside the closure reserve')
+    # Adoption: the same local boot and guard invocation, and the same running worker boot and environment.
+    need(io.local_boot_id()==guard['boot_id'],'local boot changed since qualification')
+    unit=r['guard_unit']+'.service';live=io.show(unit)
+    need(live.get('Id')==unit and live.get('ActiveState')=='active' and live.get('InvocationID')==identity['invocation_id'] and str(live.get('MainPID'))==str(guard['pid']),'guard not live or replaced')
+    info=io.info();identity_check(info)
+    env=profile()['future_environment']
+    need(info['state'] in ('ready','idle','running') and info['environmentVersion']==env['version'],'worker not running the qualified environment')
+    need(not info.get('setup_error_present') and info.get('setupStatus') not in ('failed','error'),'worker setup failed')
+    e=load(Path(fact_path).absolute());freshness(e,io.wall(),60)
+    need(e.get('id')==env['id'] and e.get('latestVersionNumber')==env['version'] and e.get('latestVersionId')==r['environment']['latest_version_id'] and e.get('hook_sha256')==hook_sha() and e.get('hook_bytes')==env['hook_bytes'] and e.get('setupBlocking') is True,'environment or hook drift since qualification')
+    need(io.worker_boot_id()==identity['worker_boot_id'],'worker rebooted or replaced since qualification')
+    observed_wall,observed_boot=io.wall(),io.mono()
+    new_wall,new_boot=observed_wall+seconds,observed_boot+seconds
+    need(observed_wall+lifetime.CLOSURE_RESERVE<wall and observed_boot+lifetime.CLOSURE_RESERVE<boot,'lifetime already inside the closure reserve')
+    need(new_wall>=wall and new_boot>=boot,'extension would shorten the lifetime')
+    need(new_wall<=intent['wall']+lifetime.MAX_LIFETIME and new_boot<=intent['mono']+lifetime.MAX_LIFETIME,'extension beyond the total lifetime cap')
+    started=io.mono();ttl=seconds+lifetime.PROVIDER_MARGIN;attempt='lifetime-extension-attempt-'+secrets.token_hex(16)
+    io.record(attempt+'.json',{'worker':worker_id(),'sequence':count+1,'observed_wall':observed_wall,'observed_boottime':observed_boot,'seconds':seconds,'ttl_seconds':ttl,'reason':reason})
+    try:
+        result=io.boat(['extend',worker_id(),'--ttl',str(ttl)],20)
+        need(result['exit']==0,'provider extension uncertain')
+        after=io.info();identity_check(after)
+        need(after['state'] in ('ready','idle','running') and after['environmentVersion']==env['version'],'provider extension left the worker in another state')
+        archive=timestamp(after.get('archiveAfter'))
+        need(archive>=new_wall+lifetime.STOP_MARGIN,'provider lifetime not confirmed past the new end')
+        # The act's bound, the previous end, the stop path and the guard are checked
+        # again just before publication. The guard holds the lock before it stops.
+        need(io.mono()-started<=EXTEND_ACT_MAX,'extension act exceeded its bound')
+        need(min(wall-io.wall(),boot-io.mono())>0,'previous end passed during the extension act')
+        for name in ('stop-trigger.json','stop-intent.json','closed.json','unresolved.json'):need(not io.exists(name),'operation is stopping or closed')
+        live=io.show(unit);need(live.get('ActiveState')=='active' and live.get('InvocationID')==identity['invocation_id'],'guard not live or replaced')
+        receipt={'schema':lifetime.EXTENSION_SCHEMA,'version':1,'sequence':count+1,'worker':worker_id(),'operation_id':r['guard_unit'],
+                 'guard':{'boot_id':identity['boot_id'],'invocation_id':identity['invocation_id']},
+                 'observed_wall':observed_wall,'observed_boottime':observed_boot,'seconds':seconds,'wall_end':new_wall,'boot_end':new_boot,
+                 'provider':{'ttl_seconds':ttl,'archive_after':after['archiveAfter'],'archive_after_unix':archive},
+                 'adoption':{'worker_boot_id':identity['worker_boot_id'],'local_boot_id':guard['boot_id'],'guard_pid':guard['pid'],
+                             'environment_version':env['version'],'environment_version_id':r['environment']['latest_version_id'],'hook_sha256':hook_sha(),
+                             'environment_fact_sha256':digest(read_owned(Path(fact_path).absolute()))},
+                 'reason':reason}
+        io.record('lifetime-extension-%04d.json'%(count+1),receipt)
+        return receipt
+    except Exception as error:
+        io.record(attempt+'-failed.json',{'extended':False,'reason':str(error) if isinstance(error,Refusal) else 'uncertain','provider_lifetime_may_be_longer':True})
+        raise
+
+def extend_entry(op,seconds,fact_path,reason):
+    r=bind_release_profile(load(op/'release.json'));verify_packet(r['controller_packet_manifest_sha256']);verify_cli(r)
+    # One extension at a time per operation, so a provider TTL cannot be set by a racing act.
+    lock=os.open(op/EXTENSION_LOCK,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+    try:
+        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        return extend_operation(r,RealIO(r,op),seconds,fact_path,reason)
+    finally:os.close(lock)
 
 def verify_packet(expected):
     b=read_owned(ROOT/'runtime-sources.json');need(digest(b)==expected,'controller seal mismatch')
@@ -464,13 +596,17 @@ def finish_operation(op,job_closure=None,seconds=180):
 
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('action',choices=['run','guard','request-stop','finish']);parser.add_argument('--release');parser.add_argument('--operation');parser.add_argument('--profile');parser.add_argument('--owned-worker');parser.add_argument('--job-closure');a=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('action',choices=['run','guard','request-stop','finish','extend']);parser.add_argument('--release');parser.add_argument('--operation');parser.add_argument('--profile');parser.add_argument('--owned-worker');parser.add_argument('--job-closure');parser.add_argument('--seconds',type=int);parser.add_argument('--environment-fact');parser.add_argument('--reason');a=parser.parse_args()
     try:
         if a.action=='run':
             need(a.release is not None and a.profile is not None and a.owned_worker is not None,'explicit owned worker/profile/release required')
             return run_entry(Path(a.release).absolute(),Path(a.profile).absolute(),a.owned_worker)
         need(a.operation is not None,'operation required');op=Path(a.operation).absolute()
         if a.action=='guard':return guard_entry(op)
+        if a.action=='extend':
+            need(a.seconds is not None and a.environment_fact is not None and a.reason is not None,'extension seconds, environment fact and reason required')
+            receipt=extend_entry(op,a.seconds,Path(a.environment_fact).absolute(),a.reason)
+            print(json.dumps({'extended':True,'worker':receipt['worker'],'sequence':receipt['sequence'],'wall_end':receipt['wall_end'],'boot_end':receipt['boot_end']}));return 0
         if a.action=='finish':
             result=finish_operation(op,None if a.job_closure is None else Path(a.job_closure).absolute());print(json.dumps(result));return 0
         r=bind_release_profile(load(op/'release.json'));verify_packet(r['controller_packet_manifest_sha256']);io=RealIO(r,op)

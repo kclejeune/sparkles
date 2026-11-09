@@ -76,15 +76,16 @@ def context(profile_path, qualification_path, worker, now, guard_reader=None):
     require(qualification.get('profile_sha256')==digest(raw_profile), 'profile file changed')
     require(qualification==export_operation(path.parent, now, worker, profile), 'qualification operation changed')
     live = (local_guard if guard_reader is None else guard_reader)(qualification['local_guard']['unit'])
-    validate_admission(qualification, Path('/proc/sys/kernel/random/boot_id').read_text().strip(), live, now, profile)
+    # The lifetime includes any receipted extension of this same operation.
+    lifetime = operation_lifetime(path.parent, qualification)
+    validate_admission(qualification, Path('/proc/sys/kernel/random/boot_id').read_text().strip(), live, now, profile, lifetime['wall_end'])
     require(qualification['safe_owner']['uid']==os.getuid(), 'qualification local owner mismatch')
     release = json.loads(read_owned(path.parent/'release.json'))
     require(Path(release['operation'])==path.parent, 'operation directory mismatch')
     require(release['controller_packet_manifest_sha256']==qualification['controller_packet_sha256'], 'source binding mismatch')
     controller.verify_packet(qualification['controller_packet_sha256'])
     controller.verify_cli(release)
-    lifetime = operation_lifetime(path.parent, qualification)
-    require(lifetime_left(lifetime, now) > 0, 'original lifetime expired')
+    require(lifetime_left(lifetime, now) > 0, 'lifetime expired')
     return profile, qualification, raw, release, lifetime
 
 

@@ -49,3 +49,46 @@ def fixture(root):
             'release':release,'operation':operation,'job':job,'admission':admission,
             'guard':io.records['guard-admission.json']['loaded'],'now':io.wall(),'boot_now':io.mono(),
             'boot_id':io.records['guard-admission.json']['boot_id']}
+
+
+WORKER_BOOT_ID='87654321-4321-4321-4321-210987654321'
+
+
+class ExtendIO(controls.DiskIO):
+    """The fixture's operation on disk with an inert provider that only answers extend."""
+    names=controller.RealIO.names
+
+    def __init__(self,f,wall=None,boot=None):
+        super().__init__(f['release'],f['operation']);self.f=f;self.started=True
+        self.w=f['now'] if wall is None else wall;self.t=f['boot_now'] if boot is None else boot
+        self.archive=None;self.worker_boot=WORKER_BOOT_ID;self.extend_exit=0;self.archive_shortfall=0
+        self.live=dict(f['guard']);self.local_boot=f['boot_id']
+        self.env_version=None
+
+    def show(self,unit):
+        assert unit==self.r['guard_unit']+'.service';return dict(self.live)
+
+    def boat(self,args,*a,**k):
+        self.calls.append(list(args))
+        if args[0]=='extend' and args[1]==controller.worker_id() and args[2]=='--ttl':
+            if self.extend_exit==0:self.archive=self.w+int(args[3])-self.archive_shortfall
+            return {'exit':self.extend_exit,'error':None,'body':{'id':controller.worker_id()}}
+        raise AssertionError('unexpected provider call')
+
+    def info(self):
+        row=controls.info(self.r,True)
+        if self.archive is not None:row['archiveAfter']=controls.iso(self.archive)
+        if self.env_version is not None:row['environmentVersion']=self.env_version
+        return row
+
+    def worker_boot_id(self):return self.worker_boot
+    def local_boot_id(self):return self.local_boot
+
+
+def environment_fact(f,path,observed,**changed):
+    """A Root-verified latest environment observation like the post-resume one."""
+    p=f['profile']['future_environment']
+    row={'observed_unix':observed,'verified_by_Root':True,'receipt_sha256':'c'*64,'id':p['id'],
+         'latestVersionNumber':p['version'],'latestVersionId':f['release']['environment']['latest_version_id'],
+         'hook_sha256':p['hook_sha256'],'hook_bytes':p['hook_bytes'],'setupBlocking':True}
+    row.update(changed);write(path,row);return path

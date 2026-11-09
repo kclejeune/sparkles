@@ -16,7 +16,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
-from boat_fixtures import fixture as boat_fixture
+from boat_fixtures import fixture as boat_fixture, ExtendIO, environment_fact
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('remote_executor', ROOT / 'scripts/remote-executor.py')
@@ -129,6 +129,39 @@ class Admission(unittest.TestCase):
         with self.clocks(now-7000,boot+elapsed):
             self.assertEqual(json.dumps(qwa.export_operation(self.fixtures['operation'],now-7000,'bx_fixture',self.fixtures['profile']),sort_keys=True),
                              json.dumps(json.loads(original),sort_keys=True))
+
+    def test_adopt_after_lane_boundary_through_a_receipted_extension(self):
+        """Lane one ends near the original end. Root extends the same running worker, and lane two adopts it."""
+        import qualified_worker_admission as qwa
+        controller=RX.boat_environment.controller
+        now,boot,left=self.fixtures['now'],self.fixtures['boot_now'],self.original_left()
+        original=self.fixtures['qualified_path'].read_bytes()
+        with self.clocks(now+left-900,boot+left-900):
+            RX.admission('boat:bx_fixture')
+        # Past the original end lane two cannot run on the worker without an extension.
+        with self.clocks(now+left+60,boot+left+60),self.assertRaises(ValueError):RX.admission('boat:bx_fixture')
+        io=ExtendIO(self.fixtures,now+left-600,boot+left-600)
+        fact=environment_fact(self.fixtures,self.root/'environment-fact.json',io.wall())
+        controller.bind_release_profile(self.fixtures['release'])
+        with patch.object(qwa,'current_boot_id',return_value=self.fixtures['boot_id']):
+            receipt=controller.extend_operation(self.fixtures['release'],io,7200,fact,'lane two')
+        lane_two=self.root/'lane-two-admission.json'
+        expected=RX.boat_environment.expected_environment(self.fixtures['profile'],self.fixtures['qualified'])
+        with self.clocks(now+left+60,boot+left+60),patch.object(RX.boat_environment.controller,'bounded',return_value={'exit':0,'body':expected}):
+            RX.boat_environment.prepare(self.fixtures['profile_path'],self.fixtures['operation'],self.fixtures['profile']['worker'],lane_two)
+        lane_two.chmod(0o600)
+        for elapsed in (60,1800,6500):
+            with self.subTest(elapsed=elapsed),self.clocks(now+left+elapsed,boot+left+elapsed),patch.dict(os.environ,SPARKLES_BOAT_ADMISSION=str(lane_two)):
+                data=RX.admission('boat:bx_fixture')
+                self.assertEqual(data['_lifetime']['boot_end'],receipt['boot_end'])
+                self.assertLessEqual(RX.remaining(RX.operation_deadline('boat:bx_fixture',seconds=10**6)),receipt['boot_end']-(boot+left+elapsed)-30)
+        # The extension ends too; nothing renews it silently.
+        with self.clocks(now+left+7200,boot+left+7200),patch.dict(os.environ,SPARKLES_BOAT_ADMISSION=str(lane_two)),self.assertRaises(ValueError):
+            RX.admission('boat:bx_fixture')
+        # A wall rollback after the extension cannot stretch it either.
+        with self.clocks(now,boot+left+7200),patch.dict(os.environ,SPARKLES_BOAT_ADMISSION=str(lane_two)),self.assertRaises(ValueError):
+            RX.admission('boat:bx_fixture')
+        self.assertEqual(self.fixtures['qualified_path'].read_bytes(),original)
 
     def test_forward_wall_suspend_reboot_and_exact_margin(self):
         now,boot,left=self.fixtures['now'],self.fixtures['boot_now'],self.original_left()

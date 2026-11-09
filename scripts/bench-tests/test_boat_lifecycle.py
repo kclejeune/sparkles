@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
-from boat_fixtures import fixture
+from boat_fixtures import fixture,ExtendIO,environment_fact,WORKER_BOOT_ID
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'boat'))
 import controller
 import job_environment as env
@@ -273,6 +273,171 @@ class MemoryAdmission(unittest.TestCase):
     def test_missing_stat_on_a_limited_ancestor_refuses(self):
         mp=metadata_probe();rows=self.ancestors();rows[2].pop('memory.stat')
         with self.assertRaises(mp.Refusal):mp.memory_admission(meminfo_text(OBSERVED_MEMINFO),rows)
+
+
+class LifetimeExtension(unittest.TestCase):
+    """An explicit, receipted extension of one running qualified worker."""
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.root=Path(self.tmp.name);self.f=fixture(self.root);controller.bind_release_profile(self.f['release'])
+        import qualified_worker_admission as qwa;self.qwa=qwa
+        self.op=self.f['operation'];self.intent=json.loads((self.op/'controller-intent.json').read_text())
+        self.original=qwa.operation_lifetime(self.op,self.f['qualified'])
+        self.left=self.original['wall_end']-self.f['now']
+
+    def io(self,elapsed=0,wall_shift=0):
+        return ExtendIO(self.f,self.f['now']+elapsed+wall_shift,self.f['boot_now']+elapsed)
+
+    def extend(self,io,seconds=10500,**fact):
+        path=environment_fact(self.f,self.root/'environment-fact.json',io.wall(),**fact)
+        with patch.object(self.qwa,'current_boot_id',return_value=io.local_boot):
+            return controller.extend_operation(self.f['release'],io,seconds,path,'second lane on the warm worker')
+
+    def lifetime(self,boot_id=None):
+        with patch.object(self.qwa,'current_boot_id',return_value=boot_id or self.f['boot_id']):
+            return self.qwa.operation_lifetime(self.op,self.f['qualified'])
+
+    def receipts(self):return sorted(n for n in os.listdir(self.op) if n.startswith('lifetime-extension-0'))
+
+    def test_extension_is_a_receipted_act_with_a_new_bounded_end(self):
+        io=self.io(self.left-600)
+        receipt=self.extend(io,3600)
+        self.assertEqual(io.calls,[['extend',self.f['profile']['worker'],'--ttl','3900']])
+        self.assertEqual(self.receipts(),['lifetime-extension-0001.json'])
+        self.assertEqual((receipt['schema'],receipt['version'],receipt['sequence']),('sparkles.boat.lifetime-extension',1,1))
+        self.assertEqual(receipt['wall_end'],io.wall()+3600);self.assertEqual(receipt['boot_end'],io.mono()+3600)
+        self.assertEqual(receipt['adoption']['worker_boot_id'],WORKER_BOOT_ID)
+        life=self.lifetime()
+        self.assertEqual((life['wall_end'],life['boot_end']),(receipt['wall_end'],receipt['boot_end']))
+        # The extended end is the act's own observation plus its seconds, not the old end plus them.
+        self.assertLess(life['boot_end'],self.original['boot_end']+3600)
+        # Re-export after the original end reproduces the original admission bytes.
+        later=self.f['now']+self.left+100
+        with patch.object(self.qwa,'boottime',return_value=self.f['boot_now']+self.left+100):
+            data=self.qwa.export_operation(self.op,later,self.f['profile']['worker'],self.f['profile'])
+        self.assertEqual(data,self.f['qualified'])
+        with patch.object(self.qwa,'boottime',return_value=self.f['boot_now']+self.left+100):
+            loaded=env.load_job_admission(self.f['admission'],self.f['profile_path'],self.f['profile']['worker'],later,lambda unit:self.f['guard'])
+        self.assertEqual(loaded[4]['boot_end'],receipt['boot_end'])
+
+    def test_a_second_extension_chains_and_the_total_is_capped(self):
+        first=self.extend(self.io(self.left-600),10500)
+        second=self.extend(self.io(self.left+9000),10500)
+        self.assertEqual(second['sequence'],2);self.assertEqual(self.receipts(),['lifetime-extension-0001.json','lifetime-extension-0002.json'])
+        self.assertEqual(self.lifetime()['boot_end'],second['boot_end'])
+        third=self.extend(self.io(self.left+18000),10500)
+        # The cap on the total lifetime refuses an extension past 12 hours after the intent.
+        io=self.io(self.left+27000)
+        with self.assertRaisesRegex(controller.Refusal,'total lifetime cap'):self.extend(io,10500)
+        self.assertEqual(io.calls,[]);self.assertEqual(len(self.receipts()),3)
+        self.assertLessEqual(third['boot_end'],self.intent['mono']+43200)
+        self.assertEqual(self.lifetime()['boot_end'],third['boot_end'])
+
+    def test_unreceipted_or_malformed_extensions_are_not_honoured(self):
+        # A provider TTL change made outside the act leaves the original end.
+        self.assertEqual(self.lifetime(),self.original)
+        io=self.io(self.left-600);receipt=self.extend(io,3600)
+        good=(self.op/'lifetime-extension-0001.json').read_text()
+        cases={'unknown version':dict(receipt,version=2),'edited end':dict(receipt,wall_end=receipt['wall_end']+1000),
+               'other guard':dict(receipt,guard=dict(receipt['guard'],invocation_id='d'*32)),
+               'missing provider confirmation':{k:v for k,v in receipt.items() if k!='provider'},
+               'provider short':dict(receipt,provider=dict(receipt['provider'],archive_after_unix=receipt['wall_end'])),
+               'other worker boot':dict(receipt,adoption=dict(receipt['adoption'],worker_boot_id='0'*8+'-0000-0000-0000-'+'0'*12)),
+               'recorded after the end':dict(receipt,observed_boottime=self.original['boot_end']+1,boot_end=self.original['boot_end']+3601)}
+        for name,value in cases.items():
+            with self.subTest(name):
+                path=self.op/'lifetime-extension-0001.json';path.write_text(json.dumps(value));path.chmod(0o600)
+                with self.assertRaises(ValueError):self.lifetime()
+        path=self.op/'lifetime-extension-0001.json';path.write_text(good);path.chmod(0o600)
+        for name in ('lifetime-extension-0003.json','lifetime-extension-1.json'):
+            with self.subTest(name):
+                (self.op/name).write_text(good);(self.op/name).chmod(0o600)
+                with self.assertRaises(ValueError):self.lifetime()
+                (self.op/name).unlink()
+        self.assertEqual(self.lifetime()['boot_end'],receipt['boot_end'])
+
+    def test_adoption_refuses_another_boot_environment_guard_or_a_stopping_operation(self):
+        changes={'worker rebooted':lambda io:setattr(io,'worker_boot','11111111-1111-1111-1111-111111111111'),
+                 'local boot':lambda io:setattr(io,'local_boot','22222222-2222-2222-2222-222222222222'),
+                 'guard replaced':lambda io:io.live.update(InvocationID='d'*32),
+                 'guard pid':lambda io:io.live.update(MainPID='999'),
+                 'guard inactive':lambda io:io.live.update(ActiveState='failed'),
+                 'environment version':lambda io:setattr(io,'env_version',9)}
+        for name,change in changes.items():
+            with self.subTest(name):
+                io=self.io(100);change(io)
+                with self.assertRaises((controller.Refusal,ValueError)):self.extend(io)
+                self.assertEqual(io.calls,[]);self.assertEqual(self.receipts(),[])
+        for name,fact in {'hook':dict(hook_sha256='e'*64),'version':dict(latestVersionNumber=9),'stale':dict(observed_unix=self.f['now']-1000),'unverified':dict(verified_by_Root=False)}.items():
+            with self.subTest(name):
+                io=self.io(100)
+                with self.assertRaises(controller.Refusal):self.extend(io,**fact)
+                self.assertEqual(io.calls,[]);self.assertEqual(self.receipts(),[])
+        io=self.io(100);io.record('stop-trigger.json',{'requested_wall':io.wall()})
+        with self.assertRaisesRegex(controller.Refusal,'stopping or closed'):self.extend(io)
+        self.assertEqual(io.calls,[])
+
+    def test_bounds_expiry_and_provider_uncertainty_refuse_without_a_receipt(self):
+        for seconds in (0,-1,10501,3600.5,True):
+            with self.subTest(seconds=seconds):
+                io=self.io(100)
+                with self.assertRaises(controller.Refusal):self.extend(io,seconds)
+                self.assertEqual(io.calls,[])
+        io=self.io(self.left-10)
+        with self.assertRaisesRegex(controller.Refusal,'closure reserve'):self.extend(io)
+        self.assertEqual(io.calls,[])
+        io=self.io(100);io.extend_exit=1
+        with self.assertRaisesRegex(controller.Refusal,'provider'):self.extend(io)
+        io=self.io(100);io.archive_shortfall=150
+        with self.assertRaisesRegex(controller.Refusal,'provider'):self.extend(io)
+        self.assertEqual(self.receipts(),[])
+        attempts=[n for n in os.listdir(self.op) if n.startswith('lifetime-extension-attempt-')]
+        self.assertEqual(len([n for n in attempts if n.endswith('-failed.json')]),2)
+        self.assertEqual(self.lifetime(),self.original)
+
+    def test_the_guard_lock_excludes_an_extension_act(self):
+        guard=controller.RealIO(self.f['release'],self.op)
+        self.assertTrue(guard.freeze_extensions())
+        try:
+            with self.assertRaises(BlockingIOError):
+                controller.extend_entry(self.op,3600,self.root/'environment-fact.json','blocked by the stopping guard')
+        finally:guard.thaw_extensions()
+        self.assertEqual(self.receipts(),[])
+
+    def test_wall_changes_at_the_act_are_bounded_by_boottime(self):
+        # A forward wall jump makes a later wall end, but BOOTTIME still bounds the lifetime.
+        io=self.io(100,wall_shift=3000);receipt=self.extend(io,10500)
+        life=self.lifetime();self.assertEqual(life['wall_end']-(io.wall()-3000),13500)
+        self.assertEqual(self.qwa.lifetime_left(life,io.wall()-3000,io.mono(),self.f['boot_id']),10500)
+        # A wall rollback that would end earlier than the current end is refused, not stretched.
+        io=self.io(200,wall_shift=-9000)
+        with self.assertRaisesRegex(controller.Refusal,'shorten'):self.extend(io,3600)
+        self.assertEqual(io.calls,[]);self.assertEqual(self.receipts(),['lifetime-extension-0001.json'])
+
+    def test_guard_honours_only_valid_receipts(self):
+        io=self.io(0)
+        self.assertEqual(controller.guard_deadlines(io,self.intent),(self.intent['deadline_mono'],self.intent['deadline_wall']))
+        receipt=self.extend(self.io(self.left-600),3600)
+        self.assertEqual(controller.guard_deadlines(io,self.intent),(receipt['boot_end'],receipt['wall_end']))
+        # The guard loop stops at the extended end, not the original one.
+        seen=[]
+        io=self.io(self.left+60)
+        with patch.object(controller,'reconcile_stop',side_effect=lambda r,io:seen.append((io.mono(),io.wall())) or True):
+            self.assertTrue(controller.guard_loop(self.f['release'],io,self.intent))
+        self.assertGreaterEqual(seen[0][0],receipt['boot_end']);self.assertLess(seen[0][0],receipt['boot_end']+2)
+        # An act that publishes while the guard waits for the lock keeps the worker.
+        receipt_two={}
+        io=self.io(self.left+3000-30);later=self.io(self.left+3000-60)
+        def freeze():
+            receipt_two.update(self.extend(later,10500));return True
+        io.freeze_extensions=freeze;seen.clear()
+        with patch.object(controller,'reconcile_stop',side_effect=lambda r,io:seen.append(io.mono()) or True):
+            self.assertTrue(controller.guard_loop(self.f['release'],io,self.intent))
+        self.assertGreaterEqual(seen[0],receipt_two['boot_end'])
+        (self.op/'lifetime-extension-0002.json').unlink()
+        # A malformed receipt falls back to the original deadline.
+        path=self.op/'lifetime-extension-0001.json';path.write_text(json.dumps(dict(receipt,version=2)));path.chmod(0o600)
+        self.assertEqual(controller.guard_deadlines(io,self.intent),(self.intent['deadline_mono'],self.intent['deadline_wall']))
 
 
 class Finish(unittest.TestCase):
