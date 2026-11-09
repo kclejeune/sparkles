@@ -118,8 +118,8 @@ inodes, mtimes or the device, so those changes leave the identity unchanged, but
 track the executable bit. When the identity differs, the metadata refusal keeps a
 `source_drift` record with each field's recorded and observed value and whether it
 differs, and a flag for any field outside the identity. A changed status hash with an
-unchanged diff hash points to untracked files, and a changed diff hash to tracked
-content or modes. The probe runs no git command of its own for the record, so a
+unchanged diff hash points to untracked files or a change in what is staged, and a
+changed diff hash to tracked content or modes. The probe runs no git command of its own for the record, so a
 repository's filters and hooks get no further chance to run.
 
 A refused qualification holds its stop trigger for at most 600 seconds when the resume
