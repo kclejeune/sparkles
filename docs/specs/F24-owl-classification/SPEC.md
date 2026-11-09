@@ -926,6 +926,127 @@ its activation, and with `sparkles-owl` in one codegen unit GO classifies on one
 0.99 of the time of the build before and ChEBI lite in 0.98, with the same taxonomies, as
 the [code layout results](../../benchmarks/el-classification/RESULTS.md#code-layout) give.
 
+### Nominals in the disjunctive rules
+
+This section is the design of item 603's sixth phase, which extends the disjunctive rules
+to nominals. Until that phase lands, the disjunctive rules refuse ontologies with
+individuals and nominals as the section above says.
+
+**The calculus.** A run of the disjunctive rules with nominals uses the general rooted
+calculus of Tena Cucala, Cuenca Grau and Horrocks, in the journal version *Pay-As-You-Go
+Consequence-Based Reasoning for the Description Logic SROIQ* (Artificial Intelligence,
+2021). Its Tables 2 and 3 and its Algorithm 1 are the reference, and the conference
+version of IJCAI 2018 explains the design but is not mixed into the rules. The journal's
+Horn variant, Algorithm 2, is not used. Its soundness holds for one query body under the
+eager strategy, so it cannot answer the conditional clauses that a classification run
+shares between its contexts. Algorithm 1 is exponential on ELHO in the worst case, which
+is why OWL 2 EL runs with nominals keep the worlds of the EL classifier and Horn runs with
+individuals stay with item 692. A rooted run never enters a world, so no run mixes the two
+mechanisms. The EL rules still serve as the calculus's inferences on units in every
+context other than the root, as they do in the rules above.
+
+**What the phase takes.** The rooted run takes `ObjectOneOf` and `ObjectHasValue` in class
+axioms and the object assertions of the ABox, which are class assertions, object property
+assertions, negative object property assertions and same and different individuals. A
+class assertion `C(a)` is read as `{a} ⊑ C`, `r(a, b)` as `{a} ⊑ ∃r.{b}`, `¬r(a, b)` as
+`{a} ⊑ ∀r.¬{b}`, and same and different individuals as equalities and inequalities of
+constants. The ABox adds little to the calculus once the root exists, since a nominal in a
+class axiom already gives the root ground clauses, such as `⊤ → B(o)` for `{o} ⊑ B`. It
+also takes keys over object properties and the universal property, as below. Data
+properties wait on item 768, self restrictions and reflexive properties stay refused, and
+the Nom rule with its generated nominals is not built. Nom fires only when a nominal, an
+inverse property and an at-most restriction meet, so the run refuses that interaction, and
+a symmetric or inverse functional property counts as an inverse for this test.
+
+**Terms and literals.** The terms are `x`, `y`, `f(x)`, the constants `u` of the named
+individuals, and `f(u)` in the root. Besides the literals over `x`, `y` and successor
+terms of the rules above, the run needs the ground atoms `B(u)` and `S(u, v)`, the role
+atoms `S(x, u)`, `S(u, x)`, `S(y, u)` and `S(u, y)`, the atoms over `f(u)` in the root, and
+the equalities and inequalities `x ≈ u`, `y ≈ u`, `u ≈ v` and `f(x) ≈ u`. Clause bodies
+may hold ground atoms and equalities of constants. The packed literal has one free kind,
+which marks an interned literal whose record holds the predicate, the terms and the
+polarity, so that the seven present kinds keep their encoding and a literal stays eight
+bytes. Every test of a literal's kind treats the new kind by its record.
+
+**The root context.** One root context has the empty core. Its clauses hold no `x`, may
+hold `y`, and are the place where facts about named individuals meet. A singleton class
+`{u}` is a proxy class `N_u` with the clauses `N_u(x) → x ≈ u` and `⊤ → N_u(u)`, so every
+named individual exists, including one that only a class axiom names. A clause `⊤ → ⊥` in
+the root makes the ontology inconsistent.
+
+**The order.** Every context of a rooted run uses an order that is admissible in the sense
+of the journal's Definition 7, built as its Appendix A builds it from one total order on
+function symbols and constants. Named classes over `x` are incomparable with one another
+and with every ground atom, and a function-free atom that mentions `y` or a constant is
+above only what Definition 7's fifth condition allows. Each context of a named class is
+then a query context that meets condition C2 of the journal's Theorem 2, and its unit
+subsumers are complete without the candidate tests of the rules above, whose model
+construction ignores ground atoms. A clause can have several incomparable maximal
+literals, so the clause store indexes every one of them. A clause keeps a canonical
+literal order for hashing, apart from the order that selects its premises.
+
+**The rules.** The rules are those of the journal's Tables 2 and 3, in Tier D's literals.
+A premise is a clause whose selected literal is maximal, that is, no other literal of its
+head is greater.
+
+| Rule | In the rooted run |
+|---|---|
+| Core | A context's core atoms are units, as now. The root's core is empty, and a hypothetical successor's id is not a core atom. |
+| Hyper | Outside the root the ontology clause's `x` is `x`. In the root it is a constant, so the rule matches ground atoms. |
+| Eq, Ineq and Factor | They run whenever the run has nominals, with counting on or off, and rewrite constants as well as successor terms. Eq keeps the journal's conditions, that the rewriting equality is not `x ≈ y` or `y ≈ u`, that a rewritten `x` sits in a term without a function symbol or `y`, and that the root rewrites every occurrence of a constant. |
+| Elim | Subsumption and tautology elimination as now. A marker `A → A` stays. |
+| Join | It resolves a maximal ground atom or equality of constants in one clause's head with the same literal in another clause's body, in any context. It is indexed by ground body literal so that either premise can arrive first. |
+| Succ | It creates or reuses a successor for a maximal literal over `f(x)`, or over `f(u)` in the root, where the edge also records the constant. One edge must cover every successor trigger of the journal's Definition 4, the ground atoms and constant equalities included. |
+| Pred | A successor's clause carries its ground body atoms and its ground head literals to the predecessor unchanged and resolves its other body atoms there. A predecessor that is the root also resolves the successor's core atoms against its own maximal premises, since an edge out of the root holds only for its constant. |
+| r-Succ | A context whose maximal literal is a root successor trigger, such as `B(u)` or `S(y, u)`, adds an edge to the root labelled by the constant and the marker `A → A` there. It never adds `A` to the root as a fact. |
+| r-Pred | A root clause whose body atoms are all root successor triggers returns to a context with an edge to the root, which resolves each body atom against its own maximal premises. The journal's typeset rule writes a conjunction of atoms `A_i` in the conclusion that its premises do not introduce, and it is read as empty. |
+
+**Normalization.** `ObjectHasValue(r, u)` is `∃r.{u}`, and an enumeration of several
+individuals in a positive position is a disjunction of their proxies. With nominals, a
+minimum restriction above one in a positive position is not weakened to an existential
+restriction when counting is off, since `A ⊑ ≥2 r.{o}` makes `A` unsatisfiable. Such an
+axiom is reported as left out instead. With counting on, a minimum restriction gets
+inequalities between its successor terms, `M(x) → f_i(x) ≉ f_j(x)`, in place of the
+globally disjoint fresh fillers of the rules above, which a nominal can make unsound. Three
+individuals with `M ⊑ ≥2 r.⊤` and `∀r` over two of three shared constants each show it,
+since fillers disjoint everywhere would ask for two colours on a triangle.
+
+**Keys.** A key `HasKey(C (r_1 … r_m) ())` over object properties holds only of named
+individuals, as the OWL 2 Direct Semantics says. The run adds its ground instances
+`C(a) ∧ C(b) ∧ r_1(a, c_1) ∧ r_1(b, c_1) ∧ … → a ≈ b` over the original named
+individuals, generated as their premises appear, and resolves them in the root with Join
+and the equality rules. Keys over data properties wait on item 768. The journal's theorems
+do not cover keys, so their completeness rests on a separate argument that a finite set of
+ground clauses added to the ontology is another ontology of the calculus.
+
+**The universal property.** An occurrence of `owl:topObjectProperty` becomes a fresh
+property U′ that is symmetric and transitive, with `⊤ ⊑ ∃U′.{h}` for a fresh internal
+individual h. Every element then reaches h and back, so U′ relates every pair of elements.
+The transitive property goes through the automata of the rules above, and h is no named
+individual for keys or for the taxonomy.
+
+**Soundness and completeness.** The run relies on the journal's Theorem 1 for soundness,
+Theorem 2 with condition C2 for the completeness of each named class's context, and
+Theorem 5 for termination with an admissible expansion strategy. The hypothetical
+successors of the cautious strategy are admissible under Definitions 5 and 9 once one edge
+covers every ground trigger as above. A run that stops at its bound is not saturated and
+answers as the rules above do, with the classes it leaves open. Constants that the run
+creates for its own encoding, such as h, never reach the answer.
+
+**The gate.** The phase's gate is the `dl-o` stratum of the ORE 2015 DL development set,
+the nominal fixtures that need no counting and the hand cases. Of the six development
+files in `dl-o`, ore_ont_15803 and ore_ont_14924 have no data properties and both name the
+top object property. The other four use data properties and join the gate with item 768.
+The `dl-oiq` stratum needs counting and the Nom rule and joins the gate after item 728. The
+fixtures in the gate are the 50 `shoi` cases, `sroiq-048` and the hand cases
+`nominal-disjunction`, `nominal-ripple`, `nominal-ripple-conditional`, `key-disjunction`,
+`top-forall` and `top-forall-conditional`, each on the rules that take it. Those hand
+cases that are Horn or EL also get a copy with one disjunctive axiom added, so that the
+rooted run takes them. The hand cases
+`nominal-inverse-max`, `nominal-bounded-count` and `nominal-predecessor-cases` need the
+Nom rule. Every case in the gate runs with counting off, on one and four threads, under
+both strategies, and must equal HermiT's taxonomy and consistency.
+
 ### ROBOT-compatible commands
 
 **The commands.** `sparkles ontology reason`, `reduce` and `relax` (items 634 and 635)
