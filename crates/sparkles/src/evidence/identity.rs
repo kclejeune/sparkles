@@ -1153,11 +1153,6 @@ fn resolve_bounded(
         )));
     }
     let (settings, _) = settings_of(main)?;
-    let Some(p) = settings.matching_policies.get(policy) else {
-        return Err(Error::invalid(format!(
-            "policy: the evidence settings name no matching policy {policy}"
-        )));
-    };
     let registry = main.store().managed_snapshot()?;
     let nonce = |g: &str| -> Option<Uuid> {
         registry.as_ref().and_then(|s| {
@@ -1168,7 +1163,92 @@ fn resolve_bounded(
                 .and_then(|e| e.protections.get(g).copied())
         })
     };
-    let m = MapGraphs::new(policy, p, &settings, &nonce)?;
+    let head = logical.store().snapshot();
+    resolve_in(
+        &settings,
+        &nonce,
+        main.dataset_id(),
+        &head,
+        policy,
+        entities,
+        access,
+        control,
+        decision_limit,
+    )
+}
+
+/// What the resolution map of the matching policy `policy` selects for each of
+/// `entities` in an evidence view, with the policy, its graphs and their protections
+/// as the view's configuration records them. Refusals are those of [`resolve`].
+pub fn resolve_at(
+    view: &sparkles_core::store::BoundEvidenceView,
+    policy: &str,
+    entities: &[NamedNode],
+    access: Option<Arc<GraphAccess>>,
+    control: &Control,
+) -> Result<EntityResolution> {
+    control.check()?;
+    let settings = super::claims::view_settings(view)?;
+    let owner = view.owner(crate::managed::OwnerKind::Evidence);
+    let nonce = |g: &str| -> Option<Uuid> {
+        owner
+            .filter(|e| e.graphs.iter().any(|x| x == g))
+            .and_then(|e| e.protections.get(g).copied())
+    };
+    resolve_in(
+        &settings,
+        &nonce,
+        view.dataset_id(),
+        view.shared_snapshot(),
+        policy,
+        entities,
+        access,
+        control,
+        MAX_EVIDENCE,
+    )
+}
+
+/// The graphs a caller must be able to read to resolve entities under `policy`: its
+/// decisions, maps and output graphs and the identity graphs of its boundary.
+pub(super) fn required_graphs(settings: &Settings, policy: &MatchingPolicy) -> Vec<String> {
+    let mut out = vec![
+        policy.decisions.clone(),
+        policy.maps.clone(),
+        policy.output.clone(),
+    ];
+    out.extend(
+        policy
+            .boundary
+            .iter()
+            .filter(|b| settings.identity.iter().any(|i| i == *b))
+            .cloned(),
+    );
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_in(
+    settings: &Settings,
+    nonce: &dyn Fn(&str) -> Option<Uuid>,
+    dataset_id: Uuid,
+    head: &Arc<crate::store::Snapshot>,
+    policy: &str,
+    entities: &[NamedNode],
+    access: Option<Arc<GraphAccess>>,
+    control: &Control,
+    decision_limit: usize,
+) -> Result<EntityResolution> {
+    if entities.is_empty() || entities.len() > MAX_RESOLVE {
+        return Err(Error::invalid(format!(
+            "entities: a resolution names 1 to {MAX_RESOLVE} entities"
+        )));
+    }
+    let Some(p) = settings.matching_policies.get(policy) else {
+        return Err(Error::invalid(format!(
+            "policy: the evidence settings name no matching policy {policy}"
+        )));
+    };
+    let m = MapGraphs::new(policy, p, settings, nonce)?;
     let all = Some(Arc::new(GraphAccess::all()));
     let access = access.or(all);
     for (g, _) in [&m.decisions, &m.maps, &m.output]
@@ -1177,16 +1257,15 @@ fn resolve_bounded(
     {
         readable(access.as_ref(), g)?;
     }
-    let head = logical.store().snapshot();
     let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
-    let view = caller_view(access.as_ref(), &head, &preparation)?;
+    let view = caller_view(access.as_ref(), head, &preparation)?;
     // Records are read at the unmasked head with the caller's view beside it. The map's
     // consistency is checked there, so that a mask cannot hide the metadata that would
     // refuse it, and a revision the caller's view masks is refused rather than read. A
     // proposal or decision the view hides any triple of takes no part in a cluster, and
     // the output graph is read in the caller's view.
     let mut state = State {
-        reads: Reads::new(&preparation, &head),
+        reads: Reads::new(&preparation, head),
         seen: view
             .as_ref()
             .map(|v| Reads::new(&preparation, v.snapshot())),
@@ -1194,7 +1273,7 @@ fn resolve_bounded(
         superseded: BTreeSet::new(),
         withdrawn: BTreeSet::new(),
     };
-    let latest = latest(&mut state, main.dataset_id(), &m, control)?;
+    let latest = latest(&mut state, dataset_id, &m, control)?;
     if let Some(l) = &latest
         && state.masked(&l.iri, &m.maps.0)?
     {

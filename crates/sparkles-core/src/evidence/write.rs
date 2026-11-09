@@ -59,7 +59,7 @@ use crate::{Error, Result};
 use base64::Engine as _;
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
 use sha1::{Digest as _, Sha1};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 const EV: &str = "urn:x-sparkles:evidence:";
@@ -1328,6 +1328,107 @@ impl<'a> Reads<'a> {
             return Ok(false);
         };
         Ok(self.is_operation(op, g)? && self.nonce_of(op, g)? == Some(nonce))
+    }
+
+    /// The graphs that hold `s p o`, at most `limit` of them, and whether more exist.
+    /// `o` is a ground term.
+    pub fn graphs_of(
+        &mut self,
+        s: &str,
+        p: &str,
+        o: &Term,
+        limit: usize,
+    ) -> Result<(Vec<NamedNode>, bool)> {
+        let (Some(s), Some(p)) = (self.id(s)?, self.id(p)?) else {
+            return Ok((Vec::new(), false));
+        };
+        let o = match o {
+            Term::NamedNode(n) => self.id(n.as_str())?,
+            t => self.preparation.lookup_term(self.snap, t)?,
+        };
+        let Some(o) = o else {
+            return Ok((Vec::new(), false));
+        };
+        let mut ids = Vec::new();
+        let mut more = false;
+        self.preparation
+            .scan(self.snap, Perm::Spo, &[s.0, p.0, o.0], |q| {
+                if ids.len() == limit {
+                    more = true;
+                    return Ok(false);
+                }
+                ids.push(q[3]);
+                Ok(true)
+            })?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(Term::NamedNode(n)) = self
+                .preparation
+                .with_term(self.snap, id, |t| Ok(t.cloned()))?
+            {
+                out.push(n);
+            }
+        }
+        Ok((out, more))
+    }
+
+    /// The IRI subjects in `g` that reify, through `p`, a triple term whose subject or
+    /// object is one of `entities`, with that triple, in subject order. At most `scan`
+    /// quads of `g` are read. Returns whether `g` holds more than that, in which case the
+    /// list is incomplete.
+    pub fn reifiers_about(
+        &mut self,
+        p: &str,
+        g: &str,
+        entities: &BTreeSet<String>,
+        scan: usize,
+    ) -> Result<(Vec<(NamedNode, Triple)>, bool)> {
+        let (Some(p), Some(g)) = (self.id(p)?, self.id(g)?) else {
+            return Ok((Vec::new(), false));
+        };
+        let mut rows = Vec::new();
+        let mut read = 0usize;
+        let mut more = false;
+        self.preparation.scan(self.snap, Perm::Gspo, &[g.0], |q| {
+            if read == scan {
+                more = true;
+                return Ok(false);
+            }
+            read += 1;
+            if q[1] == p {
+                rows.push((q[0], q[2]));
+            }
+            Ok(true)
+        })?;
+        let mut out = Vec::new();
+        for (s, o) in rows {
+            let Some(Term::Triple(t)) = self
+                .preparation
+                .with_term(self.snap, o, |t| Ok(t.cloned()))?
+            else {
+                continue;
+            };
+            let subject = match &t.subject {
+                NamedOrBlankNode::NamedNode(n) => Some(n.as_str()),
+                _ => None,
+            };
+            let object = match &t.object {
+                Term::NamedNode(n) => Some(n.as_str()),
+                _ => None,
+            };
+            if !subject.is_some_and(|x| entities.contains(x))
+                && !object.is_some_and(|x| entities.contains(x))
+            {
+                continue;
+            }
+            if let Some(Term::NamedNode(n)) = self
+                .preparation
+                .with_term(self.snap, s, |t| Ok(t.cloned()))?
+            {
+                out.push((n, *t));
+            }
+        }
+        Ok((out, more))
     }
 
     /// Whether `op` is described as an `ev:Operation` in any graph, whatever its marker.

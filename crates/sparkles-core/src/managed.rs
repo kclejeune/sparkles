@@ -336,6 +336,9 @@ pub enum ManagedErrorKind {
     /// A review of identity proposals would put two entities that an accepted
     /// separation keeps apart into one cluster of its resolution map.
     IdentityConflict,
+    /// A read that needs historical evidence configuration found a store whose
+    /// configuration history is not activated.
+    ConfigurationHistoryInactive,
 }
 
 /// An error of the managed-graph boundary, with its stable code. Nothing was written.
@@ -349,7 +352,9 @@ pub struct ManagedError {
     /// `immutable-record-conflict`, and the typed-write codes `head-changed`,
     /// `idempotency-conflict` and `authority-changed`, and the review codes
     /// `policy-changed`, `target-changed`, `decision-superseded`, `target-withdrawn`,
-    /// `evidence-conflict`, `projection-unavailable` and `identity-conflict`
+    /// `evidence-conflict`, `projection-unavailable` and `identity-conflict`, and
+    /// `configuration-history-inactive` for a historical evidence read of a store
+    /// without activated configuration history
     pub code: &'static str,
     pub message: String,
 }
@@ -380,6 +385,7 @@ impl ManagedError {
             ManagedErrorKind::EvidenceConflict => "evidence-conflict",
             ManagedErrorKind::ProjectionUnavailable => "projection-unavailable",
             ManagedErrorKind::IdentityConflict => "identity-conflict",
+            ManagedErrorKind::ConfigurationHistoryInactive => "configuration-history-inactive",
         };
         Error::Managed(Box::new(ManagedError {
             kind,
@@ -410,7 +416,8 @@ impl ManagedError {
             | ManagedErrorKind::DecisionSuperseded
             | ManagedErrorKind::TargetWithdrawn
             | ManagedErrorKind::EvidenceConflict
-            | ManagedErrorKind::IdentityConflict => 409,
+            | ManagedErrorKind::IdentityConflict
+            | ManagedErrorKind::ConfigurationHistoryInactive => 409,
             ManagedErrorKind::AuthorityChanged | ManagedErrorKind::ProjectionUnavailable => 503,
         }
     }

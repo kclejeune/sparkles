@@ -84,6 +84,14 @@ impl BoundEvidenceView {
         &self.inner.snapshot
     }
 
+    /// The shared physical snapshot, for preparing the caller's mask and running
+    /// reads while this view is alive. Cloning it gives no authority to construct
+    /// another view, and a reader that keeps it past this view needs its own
+    /// accounting, as [`Self::snapshot`] says.
+    pub fn shared_snapshot(&self) -> &Arc<Snapshot> {
+        &self.inner.snapshot
+    }
+
     /// Exact original owner bytes. These describe history and grant no access.
     pub fn owner_settings(&self, owner: OwnerKind) -> Option<&[u8]> {
         self.inner
@@ -111,6 +119,15 @@ impl BoundEvidenceView {
         }
         Ok(())
     }
+}
+
+/// The refusal of a historical evidence read on a store without activated
+/// configuration history.
+fn inactive() -> Error {
+    crate::managed::ManagedError::error(
+        crate::managed::ManagedErrorKind::ConfigurationHistoryInactive,
+        "configuration history is not activated, so evidence views cannot select their configuration; activate it with the closed-store migration",
+    )
 }
 
 /// Private selection also represents a genuinely unbound historical fork. Only
@@ -214,9 +231,10 @@ impl Store {
             ManagedState::Installed(installed) => installed,
             ManagedState::Unavailable { .. } => unreachable!("selection checked installation"),
         };
-        let history = installed.configuration_history.as_ref().ok_or_else(|| {
-            managed_history::unavailable("configuration history is not activated")
-        })?;
+        let history = installed
+            .configuration_history
+            .as_ref()
+            .ok_or_else(|| inactive())?;
         let document = if let Some(root) = self.managed_root() {
             managed_history::resolve(
                 &root,
@@ -273,9 +291,7 @@ impl Store {
             return Err(Error::invalid("invalid evidence snapshot name"));
         }
         let metadata = preparation.reserve(1024)?;
-        let before = self.managed_state_shared().ok_or_else(|| {
-            managed_history::unavailable("configuration history is not activated")
-        })?;
+        let before = self.managed_state_shared().ok_or_else(|| inactive())?;
         let installed = match before.as_ref() {
             ManagedState::Installed(installed) => installed,
             ManagedState::Unavailable { reason, .. } => {
@@ -285,7 +301,7 @@ impl Store {
         let current = installed
             .configuration_history
             .as_ref()
-            .ok_or_else(|| managed_history::unavailable("configuration history is not activated"))?
+            .ok_or_else(|| inactive())?
             .identity(self.owner_dataset_id());
         let allowance = preparation.room();
         let mut held = preparation.reserve(allowance)?;
