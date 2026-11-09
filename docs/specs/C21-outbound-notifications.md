@@ -731,7 +731,7 @@ address header is missing or malformed, an identity older than the bound, groups
 away by a request to another route, a revocation that cannot be saved, and the refused
 route keys. Cloudflare Access
 assertions give no address, and an OIDC provider that sends `email` only from UserInfo
-gives one only when the server reads UserInfo for the name or groups claim. Item 809
+gives one only when the server reads UserInfo for the name or groups claim. Item 821
 covers both.
 
 ### Durable application delivery
