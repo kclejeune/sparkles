@@ -180,8 +180,14 @@ test('sets and removes an annotation on the entities of the list', async ({ page
       .getByRole('button', { name: 'Set annotation' })
       .click();
     const form = page.getByRole('form', { name: 'Set an annotation' });
-    await form.getByRole('combobox', { name: 'Annotation property' }).fill('skos:editorialNote');
     await form.getByRole('textbox', { name: 'Value' }).fill('Reviewed');
+    // a data property is not an annotation property, and setting one is refused
+    await form.getByRole('combobox', { name: 'Annotation property' }).fill('uni:name');
+    await form.getByRole('button', { name: 'List the changes' }).click();
+    await expect(changes(page).getByRole('alert')).toContainText(
+      'is a data property in this ontology, not an annotation property',
+    );
+    await form.getByRole('combobox', { name: 'Annotation property' }).fill('skos:editorialNote');
     await form.getByRole('button', { name: 'List the changes' }).click();
     await expect(changes(page)).toContainText('Set skos:editorialNote on 2 entities');
     await changes(page).getByRole('button', { name: 'Preview the edit' }).click();
@@ -242,6 +248,12 @@ test('moves classes under a new parent and refuses a cycle', async ({ page, requ
       'Student is below Person, so the move would make a cycle.',
     );
     await expect(changes(page).getByRole('button', { name: 'Preview the edit' })).toHaveCount(0);
+
+    // a property is not a parent class
+    await form.getByRole('combobox', { name: 'New parent class' }).fill('uni:teaches');
+    await page.getByRole('listbox').getByRole('option').first().click();
+    await form.getByRole('button', { name: 'List the changes' }).click();
+    await expect(changes(page).getByRole('alert')).toContainText('not a class');
 
     // two classes, one with an annotated SubClassOf, move under Agent
     await page.getByRole('button', { name: 'Clear the list' }).click();

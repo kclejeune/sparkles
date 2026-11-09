@@ -300,7 +300,11 @@ export function removeAnnotation(
   return out;
 }
 
-/** The one operation of a set of annotation changes. */
+/**
+ * The one operation of a set of annotation changes. The server declares an annotation
+ * property the ontology does not declare yet, so its values read back as annotations; the
+ * caller refuses a property that the ontology declares as another kind first.
+ */
 export function changesOp(changes: readonly Change[]): Op {
   const remove: AxiomJson[] = [];
   const add: AxiomJson[] = [];
@@ -364,7 +368,8 @@ export type MovePlan =
   | { ok: false; reason: string };
 
 /**
- * Move `classes` under `parent`, or to the top of the hierarchy when `parent` is null. Each
+ * Move `classes` under `parent`, or to the top of the hierarchy when `parent` is null. The
+ * edit declares nothing, so a listed IRI is never declared a class by the move. Each
  * class loses the named superclasses its `SubClassOf` axioms in the graph state, with those
  * axioms' annotations, unless `keep`, and gains `SubClassOf(class, parent)`. Superclass
  * expressions such as restrictions stay. A parent that is one of the classes or below one is
@@ -420,7 +425,7 @@ export function planMove(
       ok: false,
       reason: `The move would change ${fmt(add.length + remove.length)} SubClassOf axioms, more than the ${fmt(BULK_AXIOM_LIMIT)} that one bulk edit may change. Move fewer classes at once.`,
     };
-  return { ok: true, op: { kind: 'axioms', add, remove }, moved, unchanged };
+  return { ok: true, op: { kind: 'axioms', add, remove, declare: false }, moved, unchanged };
 }
 
 // --- the entity list ----------------------------------------------------------------------

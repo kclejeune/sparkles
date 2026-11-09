@@ -303,6 +303,7 @@ describe('moving classes', () => {
       kind: 'axioms',
       remove: [HIER[4], HIER[2]],
       add: [sub('Professor', 'Agent'), sub('GraduateStudent', 'Agent')],
+      declare: false,
     });
   });
 
@@ -312,12 +313,14 @@ describe('moving classes', () => {
       kind: 'axioms',
       remove: [],
       add: [sub('Professor', 'Agent')],
+      declare: false,
     });
     const top = planMove([EX + 'Professor', EX + 'Agent'], null, HIER, false);
     expect(top.ok && top.op).toEqual({
       kind: 'axioms',
       remove: [HIER[4]],
       add: [],
+      declare: false,
     });
     expect(top.ok && top.unchanged).toEqual([EX + 'Agent']);
     const there = planMove([EX + 'Student'], EX + 'Person', HIER, false);

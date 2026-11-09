@@ -32,8 +32,11 @@
   import {
     COMMON_ANNOTATION_PROPERTIES,
     isLit,
+    KIND_SINGULAR,
     LITERAL_TYPES,
     ontologyAxioms,
+    ontologyEntity,
+    type EntityKind,
     resolveInput,
     type AnnValue,
     type AxiomItem,
@@ -109,6 +112,25 @@
     }
     return p;
   }
+
+  /** The kinds the ontology and its imports give `iri` at the shown commit. */
+  async function kindsOf(iri: string): Promise<EntityKind[]> {
+    const r = await ontologyEntity(
+      target,
+      { graph, imports: true },
+      iri,
+      ctl.signal,
+      commit != null ? `commit:${commit}` : undefined,
+    );
+    return r?.kinds ?? [];
+  }
+  const OWL_THING = 'http://www.w3.org/2002/07/owl#Thing';
+  /** Kinds as a phrase: `a data property and an individual`. */
+  const kindWords = (kinds: EntityKind[]) =>
+    kinds
+      .map((k) => KIND_SINGULAR[k] ?? k)
+      .map((w) => `${/^[aeiou]/i.test(w) ? 'an' : 'a'} ${w}`)
+      .join(' and ');
 
   // --- the entity list -----------------------------------------------------------------------
   let entities = $state<string[]>([]);
@@ -355,6 +377,11 @@
             valueIri ? 'Name the value as a prefixed name or an IRI.' : 'Type the value to set.',
           );
         const how = setMode;
+        const kinds = await kindsOf(p);
+        if (kinds.length && !kinds.includes('AnnotationProperty'))
+          return refuse(
+            `${name(p)} is ${kindWords(kinds)} in this ontology, not an annotation property, so its values cannot be set as annotations.`,
+          );
         const r = setAnnotation(ents, p, v, how, await read('AnnotationAssertion'));
         const notes = r.unchanged
           ? [
@@ -393,6 +420,15 @@
     const to = toTop ? null : parent?.term.type === 'uri' ? parent.term.value : undefined;
     if (to === undefined) return refuse('Pick the new parent class, or move to the top.');
     const keep = keepParents && !toTop;
+    if (to !== null && to !== OWL_THING) {
+      const kinds = await kindsOf(to);
+      if (!kinds.includes('Class'))
+        return refuse(
+          kinds.length
+            ? `${name(to)} is ${kindWords(kinds)} in this ontology, not a class.`
+            : `${name(to)} is not a class of this ontology or its imports.`,
+        );
+    }
     const mv = planMove(ents, to, await read('SubClassOf'), keep, name);
     if (!mv.ok) return { ...refuse(mv.reason), count: ents.length };
     const op = mv.op.kind === 'axioms' ? mv.op : null;

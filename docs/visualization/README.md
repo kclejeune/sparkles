@@ -648,8 +648,10 @@ empty text, such as a lookahead, is refused. A value removed as an IRI removes o
 and language tags compare without case, so setting a value an entity already holds leaves it
 and its axiom annotations alone. A commit that lands after the changes were listed clears
 them. Readers and
-protected branches can list changes but get no preview. An annotation property or parent
-class that the ontology does not declare is declared with the edit, and the cycle check follows only the graph's own named `SubClassOf` axioms.
+protected branches can list changes but get no preview. An annotation property that the
+ontology does not declare is declared with the edit, and a property of another kind, such as a
+data property, is refused. A move's new parent must be a class of the ontology or its imports,
+and the move declares nothing. The cycle check follows only the graph's own named `SubClassOf` axioms.
 Item 770 covers bulk edits of larger ontologies.
 
 **Inferred** reveals the

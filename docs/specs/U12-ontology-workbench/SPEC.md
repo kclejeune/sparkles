@@ -228,8 +228,12 @@ replace, setting and removing an annotation, and moving classes. Each builds one
 `POST /$/ontology/{ds}/axioms` edit from the axioms the editor read and hands it to the
 editor's preview, so the dry run, the shared change set, `If-Match` on the shown commit
 and the undo stack are the ones every other edit uses. No server route was added. The
-edit declares an annotation property or a class that the ontology does not declare yet,
-as other edits do, and the subjects of annotation assertions are not declared. It reads and writes the graph
+annotation edit declares an annotation property that the ontology does not declare yet, so
+its values read back as annotations, and the subjects of annotation assertions are not
+declared. Setting a property that the ontology or its imports declare as another kind, such
+as a data property, is refused before the preview, since its declaration as an annotation
+property would change how the existing assertions read. A move declares nothing, and its new
+parent must be a class of the ontology or its imports, or `owl:Thing`. It reads and writes the graph
 without its imports, as it was planned, so an imported copy of a new value does not stop the
 server from adding that value to the edited graph.
 
