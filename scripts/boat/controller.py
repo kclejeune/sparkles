@@ -8,7 +8,7 @@ identity_check=identity
 import qualified_worker_admission as lifetime
 from qualified_worker_admission import make_admission
 import owned_group
-import argparse,fcntl,math,secrets,selectors,signal,subprocess,time,shlex,base64
+import argparse,ast,fcntl,math,secrets,selectors,signal,subprocess,time,shlex,base64
 
 # An extension act publishes within EXTEND_ACT_MAX seconds of its start, and the
 # guard waits up to FREEZE_WAIT for it before it stops at its deadline. The guard
@@ -18,8 +18,62 @@ EXTEND_ACT_MAX=90
 FREEZE_WAIT=100
 GUARD_RUNTIME=lifetime.MAX_LIFETIME+lifetime.STOP_MARGIN+FREEZE_WAIT
 EXTENSION_LOCK='lifetime-extension.lock'
+# Every Boat command holds this lock shared from its admission until it exits.
+JOB_LOCK='jobs.lock'
 
 ROOT=Path(__file__).resolve().parent
+
+# The closure watch checks a warm worker's jobs WATCH_LEAD seconds before the
+# guard's present end, retries every WATCH_POLL seconds and gives up WATCH_FLOOR
+# seconds before that end, which leaves the guard's own stop path in place.
+WATCH_LEAD=900
+WATCH_POLL=30
+WATCH_FLOOR=60
+WATCH_CHECKS=400
+WATCH_ACCEPT=15
+WATCH_DECISION=90
+# A remote phase's reason code is kept only in one of these forms. A refusal
+# code must name one of the packet's own literal refusal reasons.
+FIXED_REASONS=frozenset({'startup_unobserved','startup_busy:unallowed_processes','startup_busy:bootstrap_lock_held','startup_busy:lock_or_manifest_absent','existing_phase_pending','unreported'})
+def packet_refusals():
+    found=set()
+    for name in ('common.py','config_schema.py','metadata-probe.py','startup-observer.py','remote-launcher.py'):
+        for node in ast.walk(ast.parse((ROOT/name).read_text())):
+            if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id in ('need','require','Refusal'):
+                for arg in node.args:
+                    if isinstance(arg,ast.Constant) and isinstance(arg.value,str):found.add(arg.value)
+    return frozenset(found)
+def remote_reason(code):
+    """The code itself when it has a known form, otherwise 'malformed'."""
+    if not isinstance(code,str):return 'unreported' if code is None else 'malformed'
+    if code in FIXED_REASONS:return code
+    if re.fullmatch(r'(launcher:)?unexpected:[A-Za-z_][A-Za-z0-9_]{0,63}(:[A-Za-z_<>][A-Za-z0-9_<>]{0,63}:[0-9]{1,7})?',code):return code
+    if re.fullmatch(r'unit_unhealthy:(open|[a-z-]{1,32}:[0-9a-z]{1,12})',code):return code
+    m=re.fullmatch(r'(launcher:)?refusal:(.{1,150})',code)
+    if m and m[2] in {bounded_text('refusal:'+x)[len('refusal:'):] for x in packet_refusals()}:return code
+    return 'malformed'
+def remote_name(value):
+    return value if isinstance(value,str) and re.fullmatch(r'[ -~]{1,16}',value) else None
+
+# Job work on the worker. A unit named for a screen, build or gate is job work,
+# and so is any process the startup observer would count, which is every process
+# of the worker's uid outside the systemd and dbus infrastructure and the allowed
+# provider session, every installer, shell or build tool and every descendant of
+# those. That covers detached work such as a partition share under setsid. An mbx
+# lease lives only as long as its mbx process, so the process check covers it.
+JOB_UNIT_PREFIXES=('sparkles-screen-','nsc-build-','gate-')
+JOB_CLOSURE_ENTRY='''
+if __name__=='__main__':
+    bind_profile(json.loads(sys.argv[1]));prefixes=tuple(json.loads(sys.argv[2]));uid=os.getuid()
+    need(uid==profile()['worker_uid'],'job closure worker user')
+    r=subprocess.run(['systemctl','--user','list-units','--all','--plain','--no-legend','--state=active,activating,deactivating,reloading'],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=10)
+    need(len(r.stdout)<=1048576,'unit listing bound')
+    units=sorted(x.split()[0] for x in r.stdout.decode(errors='replace').splitlines() if x.split() and x.split()[0].startswith(prefixes))
+    rows=process_rows();me=os.getpid()
+    busy=foreign_startup(rows,{'pid':me,'start':rows[me]['start']},me,set(),user_manager(rows,uid))
+    print(json.dumps({'list_exit':r.returncode,'units':[bounded_text(u,64) for u in units[:32]],'unit_count':len(units),
+                      'processes':unallowed_inventory(rows,busy),'process_count':len(busy),'boot_id':open('/proc/sys/kernel/random/boot_id').read().strip()}))
+'''
 
 def bounded(argv,seconds,input_bytes=None,limit=None):
     """Only Root's real adapter calls this. Kill only this new process group.
@@ -89,6 +143,17 @@ def bounded(argv,seconds,input_bytes=None,limit=None):
     return result
 
 
+UNIT_SUFFIXES=('service','scope','socket','timer','target','slice','mount','automount','path','swap','device')
+def unit_name(unit):
+    """The full unit name systemctl resolves, with .service added when no unit suffix is given."""
+    return unit if unit.rsplit('.',1)[-1] in UNIT_SUFFIXES and '.' in unit else unit+'.service'
+
+def observer_sources():
+    """The maintained sources that every remote observer program is composed from."""
+    common=(ROOT/'config_schema.py').read_text()+'\n'+(ROOT/'common.py').read_text()
+    definitions=(ROOT/'metadata-probe.py').read_text().split("\nif __name__=='__main__':",1)[0]
+    return common,definitions,(ROOT/'startup-observer.py').read_text()
+
 def props(text):
     return dict(line.split('=',1) for line in text.splitlines() if '=' in line)
 
@@ -105,7 +170,7 @@ class RealIO:
     def freeze_extensions(self):
         """Hold the operation's extension lock, waiting out a running act within FREEZE_WAIT."""
         if getattr(self,'_frozen',None) is not None:return True
-        fd=os.open(self.op/EXTENSION_LOCK,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600);end=self.mono()+FREEZE_WAIT
+        fd=open_lock(self.op/EXTENSION_LOCK);end=self.mono()+FREEZE_WAIT
         while True:
             try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);self._frozen=fd;return True
             except BlockingIOError:
@@ -114,9 +179,18 @@ class RealIO:
     def thaw_extensions(self):
         fd=getattr(self,'_frozen',None);self._frozen=None
         if fd is not None:os.close(fd)
+    def remote_python(self,program,args,seconds):
+        """Run a maintained program on the worker through stdin.
+
+        The provider joins the words after ``--`` into one remote shell command,
+        so a program or argument given as argv would be split by that shell. The
+        program and its arguments travel as stdin bytes, as the phase launcher's do.
+        """
+        source=('import sys\nsys.argv=[\'remote\']+'+repr([str(a) for a in args])+'\n'+program).encode()
+        return self.boat(['ssh',worker_id(),'--','/usr/bin/python3','-I','-B','-'],seconds,source,json_mode=False)
     def worker_boot_id(self):
         code="import json;print(json.dumps({'boot_id':open('/proc/sys/kernel/random/boot_id').read().strip()}))"
-        r=self.boat(['ssh',worker_id(),'--','/usr/bin/python3','-I','-B','-c',code],20,json_mode=False)
+        r=self.remote_python(code,[],20)
         need(r['exit']==0 and isinstance(r['body'],dict) and isinstance(r['body'].get('boot_id'),str),'worker boot identity unavailable')
         return r['body']['boot_id']
     def boat(self,args,seconds=20,input_bytes=None,json_mode=True):
@@ -153,6 +227,42 @@ class RealIO:
         need(safe['day']['used']<self.r['start_ledger']['starts_and_reservations'],'start ledger stale or missing this reservation')
         self.record('account-starts-before-resume.json',{'observed_wall':self.wall(),'account_wide':True,'starts':safe,'large_available':True,'no_wallet_or_plan_changes':True})
         return safe
+    def lock_jobs(self):
+        """Take the operation's job lock exclusively without waiting, or report that a command holds it."""
+        fd=open_lock(self.op/JOB_LOCK)
+        try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd);return False
+        self._jobs=fd;return True
+    def unlock_jobs(self):
+        fd=getattr(self,'_jobs',None);self._jobs=None
+        if fd is not None:os.close(fd)
+    def job_closure(self,local_units,seconds=60):
+        """One check of the worker's job units and processes and the local job units.
+
+        Each bounded call may spend owned_group.WINDOW seconds in teardown after its
+        own timeout, so the timeouts leave that much, and the whole check with its
+        teardown ends within ``seconds``.
+        """
+        end=self.mono()+seconds;teardown=owned_group.WINDOW+1
+        common,definitions,observer=observer_sources()
+        program=common+'\n'+definitions+'\n'+observer+'\n'+JOB_CLOSURE_ENTRY
+        remote=end-self.mono()-teardown-((10+teardown) if local_units else 0);need(remote>=5,'job closure bound exhausted')
+        r=self.remote_python(program,[json.dumps(profile()),json.dumps(list(JOB_UNIT_PREFIXES))],remote)
+        need(r['exit']==0 and isinstance(r['body'],dict),'worker job closure check failed')
+        b=r['body'];local={}
+        if local_units:
+            names={unit:unit_name(unit) for unit in local_units}
+            left=end-self.mono()-teardown;need(left>=1,'job closure bound exhausted')
+            # One systemctl call for every named unit, bounded by what is left.
+            text=self.system(['systemctl','--user','show',*names.values(),'--property=Id,ActiveState,MainPID'],int(left))
+            blocks=[props(x) for x in text.strip().split('\n\n')] if text.strip() else []
+            seen={x.get('Id'):x for x in blocks}
+            for unit,name in names.items():
+                x=seen.get(name,{})
+                local[unit]=x.get('ActiveState') in ('inactive','failed') and x.get('MainPID')=='0'
+        need(self.mono()<=end,'job closure bound exhausted')
+        return {'list_exit':b.get('list_exit'),'units':b.get('units'),'unit_count':b.get('unit_count'),'processes':b.get('processes'),'process_count':b.get('process_count'),'boot_id':b.get('boot_id'),'local_units_closed':local}
     def stop_status(self,operation):
         r=self.boat(['stop',worker_id(),'--status',operation],15)
         need(r['exit']==0 and isinstance(r['body'],dict) and r['body'].get('id')==worker_id(),'stop status unavailable')
@@ -204,25 +314,22 @@ if c:
  if root.exists():closed=closed and all(not f.read_text().strip()for f in root.rglob('cgroup.procs'))
 print(json.dumps({'closed':closed,'unit':u,'properties':p}))
 """
-        r=self.boat(['ssh',worker_id(),'--','/usr/bin/python3','-I','-B','-c',code,unit],20,json_mode=False)
+        r=self.remote_python(code,[unit],20)
         need(r['exit']==0 and isinstance(r['body'],dict) and r['body'].get('closed')is True and r['body'].get('unit')==unit,'metadata closure query failed')
         self.record('qualification-closed.json',r['body']);return True
     def phase(self,phase,observation_seconds=0):
         payload={'pins':profile(),'release':{'snapshot_continuity':self.r['snapshot_continuity']},'operation_tag':self.r['guard_unit'],'phase':phase,'observation_seconds':observation_seconds}
-        common=(ROOT/'config_schema.py').read_text()+'\n'+(ROOT/'common.py').read_text()
-        definitions=(ROOT/'metadata-probe.py').read_text().split("\nif __name__=='__main__':",1)[0]
-        observer=(ROOT/'startup-observer.py').read_text()
+        common,definitions,observer=observer_sources()
         entry="""
 if __name__=='__main__':
-    payload=json.loads(sys.argv[1]);bind_profile(payload['pins'])
-    try:
-        result=observe_startup(payload) if payload['phase']!='metadata' else qualify_with_startup_lock(payload)
-    except Exception:
-        result={'qualified':False,'startup_closed':False,'engine_or_job_started':False,'failure':'bounded phase refused; no arbitrary error content'}
+    payload=json.loads(sys.argv[1])
+    def bound(x):
+        bind_profile(x['pins']);return observe_startup(x) if x['phase']!='metadata' else qualify_with_startup_lock(x)
+    result,closed=run_phase(payload,bound,bound)
     result.update({'program_sha256':payload['program_sha256'],'phase':payload['phase'],'unit':payload['operation_tag']+'-'+payload['phase']+'.service'})
     write_new(Path(payload['result_directory']),'probe-result.json',result)
     print(json.dumps(result))
-    raise SystemExit(0 if (result.get('startup_closed')is True if payload['phase']!='metadata' else result.get('qualified')is True) else 1)
+    raise SystemExit(0 if closed else 1)
 """
         program=(common+'\n'+definitions+'\n'+observer+'\n'+entry).encode()
         source=(ROOT/'remote-launcher.py').read_text().replace('COMMON_SOURCE_LITERAL',repr(common)).replace('PAYLOAD_JSON_LITERAL',repr(json.dumps(payload))).replace('PROBE_BASE64_LITERAL',repr(base64.b64encode(program).decode())).encode()
@@ -243,10 +350,28 @@ if __name__=='__main__':
         # Existing remote operation only reads its atomic receipt/unit; no second
         # observer/installer invocation, even after foreground disconnect.
         result=self.phase('startup',seconds)
-        if result.get('startup_closed')is not True or result.get('phase_closed')is not True:return False
+        if result.get('startup_closed')is not True or result.get('phase_closed')is not True:
+            self.startup_refused(result);return False
         self.record('startup-closed.json',result)
         if allow_qualification:need(result.get('qualification_eligible')is True,'allowed startup produced unadopted manifest')
         return True
+    def startup_refused(self,result):
+        """Keep the first refused startup's bounded reason, never its free text."""
+        if self.exists('startup-refused.json'):return
+        rows=result.get('unallowed')
+        terminal=result.get('terminal_properties') if isinstance(result.get('terminal_properties'),dict) else {}
+        def row(x):
+            return {'pid':x.get('pid') if type(x.get('pid'))is int else None,'comm':remote_name(x.get('comm')),'uid':x.get('uid') if type(x.get('uid'))is int else None,
+                    'ppid':x.get('ppid') if type(x.get('ppid'))is int else None,'parent_comm':remote_name(x.get('parent_comm')),
+                    'parent_uid':x.get('parent_uid') if type(x.get('parent_uid'))is int else None}
+        safe={'reason_code':remote_reason(result.get('reason_code')),
+              'phase_closed':result.get('phase_closed') is True,'existing_phase_pending':result.get('existing_phase_pending') is True,
+              'unallowed':[row(x) for x in rows[:32] if isinstance(x,dict)] if isinstance(rows,list) else [],
+              'unallowed_count':result.get('unallowed_count') if type(result.get('unallowed_count'))is int else None,
+              'elapsed_seconds':result.get('elapsed_seconds') if type(result.get('elapsed_seconds'))in(int,float) else None,
+              'terminal':{k:terminal[k] for k in ('ExecMainStatus','Result') if isinstance(terminal.get(k),str) and re.fullmatch(r'[a-z0-9-]{1,32}',terminal[k])},'observed_wall':self.wall()}
+        try:self.record('startup-refused.json',safe)
+        except FileExistsError:pass
     def stop_quiescent(self):
         if self.exists('stop-startup-closed.json'):return True
         result=self.phase('stopcheck',5)
@@ -322,8 +447,8 @@ def drive(r,io):
             io.record('qualified-worker-admission.json',admission)
             return 'QUALIFIED_ROOT_HANDOFF_GUARD_ACTIVE'
         return 'QUALIFIED_STOP_REQUESTED'
-    except Exception:
-        io.record('qualification-failed.json',{'qualification':False,'resume_not_retried':True,'Root_must_reconcile_if_guard_unresolved':True})
+    except Exception as error:
+        io.record('qualification-failed.json',{'qualification':False,'resume_not_retried':True,'Root_must_reconcile_if_guard_unresolved':True,'reason_code':reason_code(error)})
         raise
     finally:
         if not io.exists('no-ready-confirmed.json') and not io.exists('root-handoff.json'):io.trigger()
@@ -346,12 +471,12 @@ def reconcile_stop(r,io):
             need(io.metadata_closed(), 'owned metadata closure unavailable')
         if io.exists('root-handoff.json'):
             closed=io.read('root-job-closed.json');matching_root_job_closed(r,io,closed)
-    except Exception:
-        io.record('unresolved.json',{'worker':worker_id(),'stop_submitted':False,'ownership_retained_by_Root':True,'action':'Root must establish owned metadata/job/lease closure before normal stop; providerTTL remains finite; retain guard evidence.'})
+    except Exception as error:
+        io.record('unresolved.json',{'worker':worker_id(),'stop_submitted':False,'ownership_retained_by_Root':True,'reason_code':reason_code(error),'action':'Root must establish owned metadata/job/lease closure before normal stop; providerTTL remains finite; retain guard evidence.'})
         return False
     try:need(io.stop_quiescent(),'startup not currently quiescent')
-    except Exception:
-        io.record('unresolved.json',{'worker':worker_id(),'stop_submitted':False,'ownership_retained_by_Root':True,'action':'current bootstrap-lock/installer closure unavailable; no clean stop claim'})
+    except Exception as error:
+        io.record('unresolved.json',{'worker':worker_id(),'stop_submitted':False,'ownership_retained_by_Root':True,'reason_code':reason_code(error),'action':'current bootstrap-lock/installer closure unavailable; no clean stop claim'})
         return False
     request=io.wall();stop_end=io.mono()+120;io.record('stop-intent.json',{'worker':worker_id(),'requested_wall':request,'force':False,'single_request':True})
     result=io.boat(['stop',worker_id()],20);operation=None
@@ -360,7 +485,7 @@ def reconcile_stop(r,io):
         s=b.get('operation') or b.get('stop')
         if isinstance(s,dict) and isinstance(s.get('id'),str) and s['id'].startswith('stop_'):operation=s['id']
     io.record('stop-submission.json',{'exit':result['exit'],'transport_error':result['error'],'operation_id':operation,'completed':False})
-    end=stop_end;count=0
+    end=stop_end;count=0;last='stop_not_observed'
     while io.mono()+50<end:
         try:
             info=io.info();count+=1;io.record(f'stop-info-{count:04d}.json',info)
@@ -376,8 +501,8 @@ def reconcile_stop(r,io):
                 matching_root_job_closed(r,io,closed)
             io.record('closed.json',{'worker':worker_id(),'stop_operation':op,'safe_info':info,'stopped_confirmed':True,'snapshot_available':True,'owned_metadata_closed':True,'private_credential_snapshot':True,'guard_may_exit':True})
             return True
-        except (Refusal,FileNotFoundError):io.wait(1)
-    io.record('unresolved.json',{'worker':worker_id(),'stop_operation':operation,'resume_retried':False,'stop_retried_or_forced':False,'ownership_retained_by_Root':True,'action':'Root must reconcile exact worker/operation; retain failed guard unit, do not declare shutdown/disarm/clean.'})
+        except (Refusal,FileNotFoundError) as error:last=reason_code(error);io.wait(1)
+    io.record('unresolved.json',{'worker':worker_id(),'stop_operation':operation,'reason_code':last,'resume_retried':False,'stop_retried_or_forced':False,'ownership_retained_by_Root':True,'action':'Root must reconcile exact worker/operation; retain failed guard unit, do not declare shutdown/disarm/clean.'})
     return False
 
 def guard_deadlines(io,intent):
@@ -557,7 +682,7 @@ def extend_operation(r,io,seconds,fact_path,reason):
 def extend_entry(op,seconds,fact_path,reason):
     r=bind_release_profile(load(op/'release.json'));verify_packet(r['controller_packet_manifest_sha256']);verify_cli(r)
     # One extension at a time per operation, so a provider TTL cannot be set by a racing act.
-    lock=os.open(op/EXTENSION_LOCK,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+    lock=open_lock(op/EXTENSION_LOCK)
     try:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         io=RealIO(r,op);receipt=extend_operation(r,io,seconds,fact_path,reason)
@@ -639,6 +764,10 @@ def finish_operation(op,job_closure=None,seconds=180):
             else:io.record('root-job-closed.json',closed)
         matching_root_job_closed(r,io,io.read('root-job-closed.json'))
     if not io.exists('closed.json'):io.trigger()
+    return await_stop(r,io,seconds)
+
+def await_stop(r,io,seconds=180):
+    """Observe the guard's verified stop and its own clean exit, within ``seconds``."""
     end=io.mono()+seconds
     while io.mono()<end:
         if io.exists('unresolved.json'):raise Refusal('stop unresolved; owner retains reconciliation')
@@ -659,8 +788,134 @@ def finish_operation(op,job_closure=None,seconds=180):
     raise Refusal('verified stop not observed within finish bound; do not retry lifecycle')
 
 
+def watch_ends(r,io):
+    """The guard's present end pair and whether an extension awaits its acceptance.
+
+    The watch only reads. It starts from the guard's conservative base, applies
+    the extensions the guard accepted, and falls back to the base on any damaged
+    chain, so a reading error can only move its check earlier.
+    """
+    intent=io.read('controller-intent.json');guard=io.read('guard-admission.json');handoff=io.read('root-handoff.json')
+    wall,boot=lifetime.original_ends(intent,guard,handoff)
+    wall,boot=min(wall,intent['deadline_wall']),min(boot,intent['deadline_mono'])
+    names=io.names();numbers=lifetime.extension_names(names)
+    io.watch_granted=0
+    if not numbers:return wall,boot,False
+    try:
+        identity=lifetime.operation_identity(intent,guard,io.read('qualification.json'),r['guard_unit'],profile())
+        ext_wall,ext_boot,granted=lifetime.apply_extensions(names,io.read,intent,wall,boot,identity)
+    except Exception:return wall,boot,False
+    io.watch_granted=granted
+    following=granted+1
+    pending=following in numbers and 'lifetime-extension-%04d-accepted.json'%following not in names and 'lifetime-extension-%04d-vetoed.json'%following not in names
+    return ext_wall,ext_boot,pending
+
+def pause(io,seconds):
+    """Wait ``seconds`` on the boot clock, whatever step the IO's own wait takes."""
+    end=io.mono()+seconds
+    while io.mono()<end:io.wait(end-io.mono())
+
+def job_closed(r,io,check):
+    q=io.read('qualification.json')
+    return (check.get('list_exit')==0 and check.get('units')==[] and check.get('unit_count')==0 and check.get('processes')==[] and check.get('process_count')==0
+            and isinstance(check.get('boot_id'),str) and check['boot_id']==q.get('worker_boot_id') and all(v is True for v in check['local_units_closed'].values()))
+
+def closure_watch(r,io,lead=WATCH_LEAD,local_units=(),poll=WATCH_POLL,observe=await_stop):
+    """Close a warm worker's operation before its deadline, once its jobs have ended.
+
+    A worker kept warm past its jobs would otherwise reach the guard's deadline
+    with no job-closure record, and the guard would leave it to the provider TTL.
+    ``lead`` seconds before the present end, extensions included, the watch
+    checks that no job unit or job process remains on the worker and that the
+    named local job units are inactive. When a check finds them closed, it takes
+    the extension lock and then the operation's job lock exclusively. Every Boat
+    command holds that job lock shared for its whole life from admission, so the
+    exclusive lock proves that no command is running or launching, and new
+    commands wait while the watch holds it. Within WATCH_DECISION seconds the
+    watch waits out a pending acceptance, checks the jobs again, and publishes
+    the job-closure record from that check with the stop trigger only if the
+    end, the accepted extensions and the terminal receipts are unchanged. It then
+    observes the guard's verified stop. An open job is checked again every
+    ``poll`` seconds. If none closes by WATCH_FLOOR seconds before the end, the
+    watch records that and leaves the guard's stop path unchanged.
+    """
+    need(type(lead)is int and 300<=lead<=3600,'closure watch lead out of range')
+    need(len(local_units)<=8 and all(isinstance(u,str) and re.fullmatch(r'[A-Za-z0-9@_.:-]{1,200}',u) for u in local_units),'local job unit name')
+    need(io.exists('root-handoff.json') and io.exists('qualified-worker-admission.json') and io.exists('guard-admission.json'),'no qualified Root handoff to watch')
+    io.record('closure-watch.json',{'worker':worker_id(),'operation_id':r['guard_unit'],'lead_seconds':lead,'poll_seconds':poll,'local_units':list(local_units),'started_wall':io.wall(),'started_boottime':io.mono()})
+    checks=0;last='not_checked'
+    terminal=('stop-trigger.json','closed.json','unresolved.json','root-job-closed.json')
+    def unresolved(code):
+        io.record('closure-watch-unresolved.json',{'worker':worker_id(),'reason_code':code,'checks':checks,'observed_wall':io.wall(),'action':'the guard keeps its own deadline stop; Root must establish job closure or reconcile the worker'})
+        return 'UNRESOLVED_JOB_OPEN'
+    def check_jobs(seconds):
+        nonlocal checks,last
+        checks+=1
+        try:check=io.job_closure(local_units,seconds)
+        except Exception as error:last=reason_code(error);return None
+        check['observed_unix']=io.wall();check['closed']=job_closed(r,io,check)
+        io.record('closure-watch-check-%04d.json'%checks,check)
+        if not check['closed']:last='job_open'
+        return check
+    while True:
+        if io.exists('closed.json'):return 'CLOSED'
+        if io.exists('unresolved.json'):return 'GUARD_UNRESOLVED'
+        if io.exists('root-job-closed.json'):
+            observe(r,io);return 'FINISHED'
+        wall,boot,pending=watch_ends(r,io)
+        left=min(wall-io.wall(),boot-io.mono())
+        if left<=WATCH_FLOOR:return unresolved(last)
+        if left>lead:pause(io,min(poll,left-lead));continue
+        if io.exists('stop-trigger.json'):return unresolved('stop_triggered_without_job_closure')
+        if checks>=WATCH_CHECKS:return unresolved('closure_check_bound')
+        check=check_jobs(60)
+        if check is None or not check['closed']:pause(io,poll);continue
+        if not io.freeze_extensions():
+            last='extension_act_running';pause(io,1);continue
+        published=False
+        try:
+            # The whole decision ends within WATCH_DECISION, inside the guard's
+            # FREEZE_WAIT for this lock.
+            decision_end=io.mono()+WATCH_DECISION
+            if not io.lock_jobs():last='job_command_live'
+            else:
+                try:
+                    # An act published before the lock may still await the guard's
+                    # acceptance, which it gives within a second of its next pass.
+                    # One it has not accepted after WATCH_ACCEPT seconds grants
+                    # nothing to this decision, and a stop now ends the lifetime sooner.
+                    wall,boot,pending=watch_ends(r,io);accept_end=io.mono()+WATCH_ACCEPT
+                    while pending and io.mono()<accept_end:
+                        io.wait(1);wall,boot,pending=watch_ends(r,io)
+                    granted=io.watch_granted;left=min(wall-io.wall(),boot-io.mono())
+                    if left<=lead and left>WATCH_FLOOR and not any(io.exists(n) for n in terminal):
+                        check=check_jobs(decision_end-io.mono()) if decision_end-io.mono()>=15 else None
+                        if check is not None and check['closed']:
+                            after_wall,after_boot,_=watch_ends(r,io);left=min(after_wall-io.wall(),after_boot-io.mono())
+                            if (io.mono()<decision_end and (after_wall,after_boot)==(wall,boot) and io.watch_granted==granted and WATCH_FLOOR<left<=lead
+                                    and io.wall()-check['observed_unix']<=WATCH_DECISION and not any(io.exists(n) for n in terminal)):
+                                admission=io.read('qualified-worker-admission.json');handoff=io.read('root-handoff.json')
+                                row={'observed_unix':check['observed_unix'],'verified_by_Root':True,'receipt_sha256':lifetime.receipt_digest(check),'worker':worker_id(),
+                                     'operation_id':r['guard_unit'],'local_guard':admission['local_guard'],'job_release_sha256':handoff['separate_job_release']['job_release_sha256'],
+                                     'all_native_and_leases_closed':True,'closure_check':'closure-watch-check-%04d.json'%checks}
+                                matching_root_job_closed(r,io,row);io.record('root-job-closed.json',row);io.trigger();published=True
+                            else:last='closure_decision_changed'
+                finally:io.unlock_jobs()
+        finally:io.thaw_extensions()
+        if not published:pause(io,poll);continue
+        observe(r,io);return 'FINISHED'
+
+def closure_watch_entry(op,lead,local_units):
+    r=bind_release_profile(load(op/'release.json'));verify_packet(r['controller_packet_manifest_sha256']);verify_cli(r)
+    io=RealIO(r,op)
+    try:return closure_watch(r,io,lead,tuple(local_units))
+    except Exception as error:
+        try:io.record('closure-watch-unresolved.json',{'worker':worker_id(),'reason_code':reason_code(error),'observed_wall':io.wall(),'action':'the guard keeps its own deadline stop; Root must establish job closure or reconcile the worker'})
+        except Exception:pass
+        raise
+
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('action',choices=['run','guard','request-stop','finish','extend']);parser.add_argument('--release');parser.add_argument('--operation');parser.add_argument('--profile');parser.add_argument('--owned-worker');parser.add_argument('--job-closure');parser.add_argument('--seconds',type=int);parser.add_argument('--environment-fact');parser.add_argument('--reason');a=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('action',choices=['run','guard','request-stop','finish','extend','closure-watch']);parser.add_argument('--release');parser.add_argument('--operation');parser.add_argument('--profile');parser.add_argument('--owned-worker');parser.add_argument('--job-closure');parser.add_argument('--seconds',type=int);parser.add_argument('--environment-fact');parser.add_argument('--reason');parser.add_argument('--lead',type=int,default=WATCH_LEAD);parser.add_argument('--local-unit',action='append',default=[]);a=parser.parse_args()
     try:
         if a.action=='run':
             need(a.release is not None and a.profile is not None and a.owned_worker is not None,'explicit owned worker/profile/release required')
@@ -671,6 +926,8 @@ def main():
             need(a.seconds is not None and a.environment_fact is not None and a.reason is not None,'extension seconds, environment fact and reason required')
             receipt=extend_entry(op,a.seconds,Path(a.environment_fact).absolute(),a.reason)
             print(json.dumps({'extended':receipt['accepted_by_guard'],'worker':receipt['worker'],'sequence':receipt['sequence'],'wall_end':receipt['wall_end'],'boot_end':receipt['boot_end']}));return 0 if receipt['accepted_by_guard'] else 1
+        if a.action=='closure-watch':
+            status=closure_watch_entry(op,a.lead,a.local_unit);print(json.dumps({'status':status,'worker':worker_id()}));return 0 if status in ('FINISHED','CLOSED') else 2
         if a.action=='finish':
             result=finish_operation(op,None if a.job_closure is None else Path(a.job_closure).absolute());print(json.dumps(result));return 0
         r=bind_release_profile(load(op/'release.json'));verify_packet(r['controller_packet_manifest_sha256']);io=RealIO(r,op)
@@ -678,7 +935,7 @@ def main():
         if io.exists('root-handoff.json'):
             closed=io.read('root-job-closed.json');matching_root_job_closed(r,io,closed)
         io.trigger();return 0
-    except Exception:
+    except Exception as error:
         # Never print arbitrary subprocess/provider exception text or environment.
-        print(json.dumps({'status':'REFUSED_OR_UNCERTAIN','worker':worker_id(),'resume_retry':False,'Root_reconcile_owned_guard_and_receipts':True}));return 1
+        print(json.dumps({'status':'REFUSED_OR_UNCERTAIN','worker':worker_id(),'resume_retry':False,'Root_reconcile_owned_guard_and_receipts':True,'reason_code':reason_code(error)}));return 1
 if __name__=='__main__':raise SystemExit(main())

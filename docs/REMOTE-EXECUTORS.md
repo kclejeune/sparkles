@@ -26,7 +26,10 @@ A lifecycle owner must establish startup quiescence, actual tool and source iden
 cache authentication, available memory and disk, worker exclusivity and a finite
 lifetime before handing over a worker. A ready provider state or `setupStatus: null`
 does not establish tool readiness. The worker's bootstrap lock must be idle and its
-current toolchain manifest must match the handoff. MBX 1.29.1 and the matching child
+current toolchain manifest must match the handoff. The provider's own desktop-session
+processes are allowed by exact name and parent, and any other process of the worker's
+user still holds startup open. Every refusal records a bounded reason code, as the
+[startup closure](../scripts/boat/README.md#startup-closure) section describes. MBX 1.29.1 and the matching child
 Cargo shim use the shared host cache and each source directory's managed target.
 
 The memory check counts only memory that the kernel cannot reclaim. On the host this is
@@ -140,6 +143,24 @@ and gates at least 7200 through `SPARKLES_REMOTE_MIN_LIFETIME`. Partitions reque
 `TEST_PARTITION_TIMEOUT` and check again after archive transfer. Boat caps follow the
 original qualification deadline. The legacy `--duration` screen option controls
 Namespace instance lifetime.
+
+A worker kept warm past its jobs runs `boat:closure-watch`, which checks the jobs'
+closure shortly before the guard's present end and finishes the operation, so the
+guard's stop does not depend on the provider TTL. The
+[scheduled closure](../scripts/boat/README.md#scheduled-closure) section describes it.
+
+A Boat screen builds both revisions on the worker with mbx, because binaries built on a
+host with a newer glibc do not run there. The executor does not choose the build host,
+so the screen names the worker as its build host and passes two revisions rather than
+binary paths.
+
+```sh
+mise run bench:remote --executor "$worker" --build-host "$worker" origin/main HEAD
+```
+
+A Boat screen and a Namespace screen of the same revisions therefore run different
+binaries, and the Boat screen is judged by its ratios and noise against Namespace rather
+than by identical binaries.
 
 The operator establishes actual native/cgroup/lease closure before supplying the fresh
 job-closure receipt. `boat:finish` validates that evidence and observes the guard's

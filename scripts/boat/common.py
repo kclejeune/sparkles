@@ -21,6 +21,23 @@ MEMORY=536870912
 class Refusal(Exception): pass
 def need(ok,reason):
     if not ok: raise Refusal(reason)
+REASON_MAX=160
+def bounded_text(text,limit=REASON_MAX):
+    """Printable ASCII of at most ``limit`` characters, other characters as '?'."""
+    return ''.join(c if ' '<=c<='~' else '?' for c in str(text)[:limit])
+def reason_code(error):
+    """A bounded code for a refusal that never carries arbitrary error text.
+
+    A Refusal's message is one of this packet's own literal reasons and is kept.
+    Any other exception gives only its type and the function and line where it
+    was raised, so a path, provider response or credential cannot leak into a
+    receipt.
+    """
+    if isinstance(error,Refusal):return bounded_text('refusal:'+str(error))
+    tb=error.__traceback__;frame=None
+    while tb is not None:frame=tb;tb=tb.tb_next
+    where='' if frame is None else ':%s:%d'%(frame.tb_frame.f_code.co_name,frame.tb_lineno)
+    return bounded_text('unexpected:'+type(error).__name__+where)
 def digest(data): return hashlib.sha256(data).hexdigest()
 def sha(value):return isinstance(value,str) and re.fullmatch('[a-f0-9]{64}',value) is not None
 def read_owned(path,limit=1024*1024):
@@ -32,6 +49,14 @@ def read_owned(path,limit=1024*1024):
         need(len(data)==s.st_size and (a.st_dev,a.st_ino,a.st_mtime_ns,a.st_size)==(s.st_dev,s.st_ino,s.st_mtime_ns,s.st_size),'local receipt changed')
         return data
     finally:os.close(fd)
+def open_lock(path):
+    """Open or create a private lock file, refusing one of another owner, mode or link count."""
+    fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
+    try:
+        s=os.fstat(fd);need(stat.S_ISREG(s.st_mode) and s.st_uid==os.getuid() and s.st_nlink==1 and not s.st_mode&0o077,'unsafe lock file')
+    except BaseException:
+        os.close(fd);raise
+    return fd
 def load(path):return json.loads(read_owned(path))
 def write_new(root,name,data):
     # Linux/systemd qualification: renameat2(RENAME_NOREPLACE) publishes complete

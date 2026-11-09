@@ -2,6 +2,7 @@
 """Prepare only deterministic nonsecret job environment bytes after qualification."""
 from pathlib import Path
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -10,7 +11,7 @@ import stat
 import sys
 import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import read_owned, write_new
+from common import open_lock, read_owned, write_new
 from config_schema import validate_profile
 from qualified_worker_admission import CLOSURE_RESERVE, export_operation, lifetime_left, operation_lifetime, validate_admission
 import controller
@@ -65,6 +66,32 @@ def local_guard(unit):
     return result['body']
 
 
+JOB_LOCK_WAIT = 120
+JOB_LOCKS = []
+
+
+def hold_job_lock(operation, seconds=None):
+    """Hold the operation's job lock shared until this process exits.
+
+    The closure watch takes it exclusively for at most its decision bound, so a
+    command waits through that hold and then sees the stop trigger if the watch
+    closed the operation.
+    """
+    fd = open_lock(operation/controller.JOB_LOCK)
+    end = time.monotonic() + (JOB_LOCK_WAIT if seconds is None else seconds)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH|fcntl.LOCK_NB);JOB_LOCKS.append(fd);return
+        except BlockingIOError:
+            if time.monotonic() >= end:
+                os.close(fd);require(False, 'job lock held by the closure watch')
+            time.sleep(0.2)
+
+
+def release_job_locks():
+    while JOB_LOCKS:os.close(JOB_LOCKS.pop())
+
+
 def context(profile_path, qualification_path, worker, now, guard_reader=None):
     raw_profile = read_owned(Path(profile_path).absolute())
     profile = validate_profile(json.loads(raw_profile))
@@ -76,6 +103,9 @@ def context(profile_path, qualification_path, worker, now, guard_reader=None):
     require(qualification.get('profile_sha256')==digest(raw_profile), 'profile file changed')
     require(qualification==export_operation(path.parent, now, worker, profile), 'qualification operation changed')
     live = (local_guard if guard_reader is None else guard_reader)(qualification['local_guard']['unit'])
+    # Held shared for this command's life, so the closure watch's exclusive hold
+    # proves that no command is running or launching. Checked before the stop receipts.
+    hold_job_lock(path.parent)
     # A stopping or closed operation admits nothing, even with an extension receipt.
     for name in ('stop-trigger.json', 'stop-intent.json', 'closed.json', 'unresolved.json'):
         require(not (path.parent/name).exists(), 'operation is stopping or closed')

@@ -1,14 +1,14 @@
 {
   "files": {
     "README.md": {
-      "bytes": 10780,
+      "bytes": 15579,
       "mode": 420,
-      "sha256": "b221a7e6e4c9f58f700074fcac3573c3a45a646b67798388fc5dd1ef2ba1a35d"
+      "sha256": "7fc8408cc449db8447793234bbdbcf97262325a5c48f2b8702db73ae84aa9263"
     },
     "common.py": {
-      "bytes": 13002,
+      "bytes": 14305,
       "mode": 420,
-      "sha256": "6753b4016c3a2fcc5b12efb862f99c19d0e38f13711d7e030d2cc35365f54133"
+      "sha256": "acb0af489a20e4b9316e9cf335b4e8e61ed4836130c73aa65d5f20231bbb6f59"
     },
     "config_schema.py": {
       "bytes": 3632,
@@ -16,14 +16,14 @@
       "sha256": "e25e6f2070a71461366145e3a4f126e5f46a7bfa97334ed56e074622eec18b08"
     },
     "controller.py": {
-      "bytes": 50900,
+      "bytes": 68496,
       "mode": 420,
-      "sha256": "292a5705de9482a088fdceab5e94d1d6efaa08d4fd7899ee06b9ff6af3658090"
+      "sha256": "15788dccb04b9b4a2f0872ad8675b6b26126dbf04042d083f2a9738614bc3fa6"
     },
     "controls.py": {
-      "bytes": 55951,
+      "bytes": 71723,
       "mode": 420,
-      "sha256": "5e0c895d572650b36400a4ab3383c8f28e96874513b0089e25f04196187ba233"
+      "sha256": "532aea18736f79b49e7526a219f9483c6c684731b0f0e79187211d6890483f3b"
     },
     "job-closure.FALSE.json": {
       "bytes": 269,
@@ -31,9 +31,9 @@
       "sha256": "b26f69930360afa4f7fd27f813684c7154efeed8c2507375c904f7d1677f0be8"
     },
     "job_environment.py": {
-      "bytes": 10318,
+      "bytes": 11386,
       "mode": 420,
-      "sha256": "f83cc45e42e3176e706c26f8c0fa2beb077843dd71d559a912eaa5725aaa9a07"
+      "sha256": "28dffcb32f17d65f2445dba2d716d74cece0bad706fc880692e2c168330a41b2"
     },
     "metadata-probe.py": {
       "bytes": 12985,
@@ -61,14 +61,14 @@
       "sha256": "6fb62c219ef554409e319fe061bf1bf4deef683f4b14e9b331cf4500c4777385"
     },
     "remote-launcher.py": {
-      "bytes": 4360,
+      "bytes": 4785,
       "mode": 420,
-      "sha256": "ee924799502b46c6563d68842e44de96958fcbb53300d3e8a1aa94caa0d41440"
+      "sha256": "4c22463e1a40b3c18dab8e9bd16fe31e19532e853f1d5770b4a7f123fbf60072"
     },
     "startup-observer.py": {
-      "bytes": 8235,
+      "bytes": 13009,
       "mode": 420,
-      "sha256": "063b5a1ddf2b93e292cfe481e054f65c3d6a0b4c31999d3750ee8eb8f2be8250"
+      "sha256": "e42382b86ae5b0545ad000b76b4fc37a6e174b0d15c613e9d07f73fa10d0e985"
     },
     "update_sources.py": {
       "bytes": 1367,
