@@ -22,6 +22,7 @@
 //! an instance; [`super::world`] classifies the classes that reach such a context.
 
 use super::data::DataVal;
+use super::dl_root;
 use super::dl_rules;
 use super::horn::HornIx;
 use super::horn_rules;
@@ -68,6 +69,19 @@ pub enum Concl {
     /// Tier D: the successor sent a clause over its predecessor, by its id in the run's
     /// table
     PredC(Ex, u32),
+    /// Tier D in a rooted run: the source context sends the root the marker of a root
+    /// successor trigger, by its id in the run's literals, and registers with the root for
+    /// each of its constants (r-Succ)
+    RHyp(Ex, u32),
+    /// Tier D in a rooted run: the root sent a clause, by its id in the run's table
+    /// (r-Pred)
+    RPred(u32),
+    /// Tier D in a rooted run: the marker of a ground literal that a predecessor holds as
+    /// a maximal literal, by its id in the run's literals (Succ)
+    HypL(u32),
+    /// Tier D in a rooted run: the source context registers with the root for the
+    /// constant, which a ground literal in one of its bodies mentions
+    REdge(Ex, u32),
 }
 
 // a conclusion takes three words, so that the to-do lists and outboxes keep their size
@@ -377,7 +391,11 @@ impl State {
             | Concl::PredIn(..)
             | Concl::Succ(..)
             | Concl::DEdge(..)
-            | Concl::PredC(..) => false,
+            | Concl::PredC(..)
+            | Concl::RHyp(..)
+            | Concl::RPred(..)
+            | Concl::HypL(..)
+            | Concl::REdge(..) => false,
         }
     }
 
@@ -1322,6 +1340,8 @@ impl<'a> Run<'a> {
                 for &r in &self.ix.roles.reflexive {
                     out.me(Concl::Loop(r));
                 }
+            } else if R::DISJ && self.ix.dl.as_deref().is_some_and(|d| d.is_root(me)) {
+                dl_root::init(self.ix, &mut st, &mut out);
             } else {
                 init(self.ix, me, &mut st, self.universal, &mut out);
             }
@@ -1363,7 +1383,11 @@ impl<'a> Run<'a> {
                 }
                 // Tier D's clauses wait for the units, which the EL rules take first
                 if R::DISJ {
-                    let n = dl_rules::flush(self.ix, me, &mut st, &mut out, DL_CLAUSES);
+                    let n = if self.ix.dl.as_deref().is_some_and(|d| d.is_root(me)) {
+                        dl_root::flush(self.ix, &mut st, &mut out, DL_CLAUSES)
+                    } else {
+                        dl_rules::flush(self.ix, me, &mut st, &mut out, DL_CLAUSES)
+                    };
                     if n > 0 {
                         tally.applied += n;
                         tally.queued += out.sent as isize;
@@ -1668,8 +1692,24 @@ fn apply_rules<S: Sink, R: Rules>(
         }
         Concl::Hyp(a) if R::DISJ => dl_rules::hyp(st, a, out),
         Concl::DEdge(u, e) if R::DISJ => dl_rules::dedge(ix, me, st, u, e, out),
-        Concl::PredC(v, c) if R::DISJ => dl_rules::pred_c(ix, st, v, c, out),
-        Concl::Hyp(_) | Concl::DEdge(..) | Concl::PredC(..) => {
+        Concl::PredC(v, c) if R::DISJ => {
+            if ix.dl.as_deref().is_some_and(|d| d.is_root(me)) {
+                dl_root::pred_c(ix, st, v, c, out)
+            } else {
+                dl_rules::pred_c(ix, st, v, c, out)
+            }
+        }
+        Concl::RHyp(v, l) if R::DISJ => dl_root::rhyp(ix, st, v, l, out),
+        Concl::RPred(c) if R::DISJ => dl_root::rpred_c(ix, st, c, out),
+        Concl::HypL(l) if R::DISJ => dl_root::hyp_l(st, l, out),
+        Concl::REdge(v, u) if R::DISJ => dl_root::redge(ix, st, v, u, out),
+        Concl::Hyp(_)
+        | Concl::DEdge(..)
+        | Concl::PredC(..)
+        | Concl::RHyp(..)
+        | Concl::RPred(..)
+        | Concl::HypL(..)
+        | Concl::REdge(..) => {
             unreachable!("a conclusion of Tier D in a saturation without it")
         }
     }
