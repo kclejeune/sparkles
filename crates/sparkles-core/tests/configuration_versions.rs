@@ -321,3 +321,48 @@ fn a_symlinked_generation_is_checked_as_the_generation_it_names() {
         refused.map(|_| ())
     );
 }
+
+/// A clone copies the registry, whose history root names an `evidence-history`
+/// closure that the clone does not carry. Cloning an activated store therefore
+/// refuses before it writes anything (roadmap item 764).
+#[test]
+fn cloning_an_activated_store_refuses_before_writing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("db");
+    drop(ordinary(&root));
+    activate(&root);
+    let store = Store::open(&root, StoreOptions::default()).unwrap();
+    let before = std::fs::read(root.join("managed.json")).unwrap();
+    let absent = temporary.path().join("absent");
+    let empty = temporary.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    for destination in [&absent, &empty] {
+        let refused = store.clone_to(destination, &Default::default());
+        let error = refused.err().expect("an activated store must not clone");
+        assert_eq!(error.code(), "unsupported", "{error}");
+        assert!(
+            error.to_string().contains("configuration history"),
+            "{error}"
+        );
+    }
+    assert!(!absent.exists());
+    assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
+    let memory = store.clone_to_memory(&Default::default(), StoreOptions::default());
+    assert_eq!(
+        memory.err().expect("nor clone into memory").code(),
+        "unsupported"
+    );
+    // the source is unchanged and still writable
+    assert_eq!(std::fs::read(root.join("managed.json")).unwrap(), before);
+    insert(&store, 9);
+}
+
+#[test]
+fn cloning_an_ordinary_store_still_works() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("db");
+    let store = ordinary(&root);
+    let destination = temporary.path().join("clone");
+    store.clone_to(&destination, &Default::default()).unwrap();
+    drop(Store::open(&destination, StoreOptions::default()).unwrap());
+}
