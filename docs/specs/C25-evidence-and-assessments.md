@@ -2197,9 +2197,13 @@ recorded after a settings-only change at one sequence, the run bounds, a withdra
 a reversal that rewrite a cited report below the fraction, a withdrawal behind one of
 twenty children that rewrites their parent, a hidden superseding decision beside a
 surviving second support, a new acceptance that follows the fraction, a policy version
-change without a data write, and an automatic refresh started by a decision. Router
-tests read the new members through `/community`, `community_reports` and a global
-answer.
+change without a data write, and an automatic refresh started by a decision. They
+cover supports past the record bound that are all hidden, a label shared by many
+communities, an edited parent whose consumed child is replaced, a crash between two
+level commits followed by a withdrawal, a grant that reveals more accepted facts, and a
+private check after an unrelated hidden decision that leaves every response, status and
+state unchanged. Router tests read the new members through `/community`,
+`community_reports` and a global answer.
 
 ### Scope changes
 
