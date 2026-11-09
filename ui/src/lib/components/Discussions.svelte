@@ -207,6 +207,7 @@
         placeholder="Start a thread. Mention someone with @name."
         rows="3"
         maxlength={MAX_TEXT}
+        disabled={busy != null}
         bind:value={draft}></textarea>
       <div class="row">
         {#if axioms.length}

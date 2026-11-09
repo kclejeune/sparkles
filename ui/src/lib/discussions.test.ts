@@ -40,6 +40,31 @@ describe('discussion graphs', () => {
     expect(isDiscussionGraph(null)).toBe(false);
   });
 
+  it('names a valid graph for IPv6 hosts and percent-encoded names, one for each', () => {
+    const store = new ox.Store();
+    const graphs = [
+      'http://[::1]/onto',
+      'http://example.org/a%20b',
+      'http://example.org/a b'.replace(' ', '%2520'),
+    ];
+    graphs.forEach((g, i) =>
+      store.update(
+        newThreadUpdate(g, {
+          id: `urn:uuid:${i}`,
+          text: 'Hi',
+          user: 'bo',
+          now: '2026-11-01T10:00:00Z',
+          entity: EX + 'A',
+        }),
+      ),
+    );
+    graphs.forEach((g, i) => {
+      expect(isDiscussionGraph(discussionGraph(g))).toBe(true);
+      expect(read(store, null, g).threads.map((t) => t.id)).toEqual([`urn:uuid:${i}`]);
+    });
+    expect(new Set(graphs.map(discussionGraph)).size).toBe(graphs.length);
+  });
+
   it('keeps the threads of graphs that differ only in a trailing / apart', () => {
     const store = new ox.Store();
     const c = { text: 'Hi', user: 'bo', now: '2026-11-01T10:00:00Z', entity: EX + 'A' };

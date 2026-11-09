@@ -597,7 +597,7 @@ it stopped there, since later comments and replies are then not listed.
 
 The threads are W3C Web Annotation RDF in an ordinary named graph beside the ontology
 graph on the branch. Its IRI is the ontology graph's IRI under
-`urn:x-sparkles:discussions:`, so the threads of `http://example.org/uni` are in
+`urn:x-sparkles:discussions:`, with `%`, `[` and `]` percent-encoded, so the threads of `http://example.org/uni` are in
 `urn:x-sparkles:discussions:http://example.org/uni` and those of the default graph are in
 `urn:x-sparkles:discussions:default`. Each ontology graph has its own discussion graph,
 and none can be an ontology graph's own IRI. A thread is an `oa:Annotation` motivated by

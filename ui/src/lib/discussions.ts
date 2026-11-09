@@ -29,12 +29,20 @@ export const MAX_TEXT = 10_000;
 
 /**
  * The graph that holds the discussions of the ontology in `graph` (null: the default graph):
- * the ontology graph's whole IRI under `urn:x-sparkles:discussions:`. The name is distinct for
- * every ontology graph, `onto`, `onto/` and `onto#` included, and cannot be an ontology
- * graph's own IRI.
+ * the ontology graph's whole IRI under `urn:x-sparkles:discussions:`, with `%`, `[` and `]`
+ * percent-encoded, since an IPv6 host's brackets may not stand in a URN. The encoding can be
+ * undone, so the name is distinct for every ontology graph, `onto`, `onto/` and `onto#`
+ * included, and it cannot be an ontology graph's own IRI.
  */
 export function discussionGraph(graph: string | null): string {
-  return graph ? DISCUSSIONS + graph : DEFAULT_DISCUSSIONS;
+  if (!graph) return DEFAULT_DISCUSSIONS;
+  return (
+    DISCUSSIONS +
+    graph.replace(
+      /[%[\]]/g,
+      (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'),
+    )
+  );
 }
 
 /** Whether a graph IRI names a discussion graph, which the editor never reads as an ontology. */

@@ -150,6 +150,41 @@ test("another entity starts with an empty composer, not the last entity's draft"
   }
 });
 
+test('a write in flight locks the composer and keeps a later draft for another entity', async ({
+  page,
+  request,
+}) => {
+  const branch = 'disc-flight';
+  await newBranch(request, branch);
+  try {
+    let release!: () => void;
+    const held = new Promise<void>((done) => (release = done));
+    await page.route(`**/uni@${branch}/update**`, async (route) => {
+      await held;
+      await route.continue().catch(() => {});
+    });
+    await openDiscussion(page, branch);
+    const compose = page.getByRole('form', { name: 'New thread' });
+    const text = compose.getByRole('textbox', { name: 'Comment' });
+    await text.fill('Sent from Professor.');
+    await compose.getByRole('button', { name: 'Comment' }).click();
+    await expect(text).toBeDisabled();
+    await page.locator('.crumbs').getByRole('button', { name: 'Employee', exact: true }).click();
+    await expect(page).toHaveURL(/Employee/);
+    await text.fill('A draft for Employee.');
+    release();
+    // the commit lands, and Professor's completion leaves Employee's draft alone
+    await expect
+      .poll(async () => (await messages(request, branch))[0], { timeout: 15_000 })
+      .toBe('Comment on Professor');
+    await page.waitForTimeout(500);
+    await expect(text).toHaveValue('A draft for Employee.');
+    await expect(text).toBeEnabled();
+  } finally {
+    await request.delete(`/$/branches/uni/${branch}?force=true`);
+  }
+});
+
 test("the Discussions tab lists the ontology's threads and opens their entity", async ({
   page,
   request,

@@ -183,7 +183,8 @@ Threads are stored as the [C31](../C31-checks-and-protected-merges/SPEC.md#outco
 comments phase specifies, as W3C Web Annotation RDF. The maintainer chose the simple
 storage. The annotations live in an ordinary named graph per ontology graph on the
 branch, whose IRI is the ontology graph's whole IRI under
-`urn:x-sparkles:discussions:`, or `urn:x-sparkles:discussions:default` for the default
+`urn:x-sparkles:discussions:` with `%`, `[` and `]` percent-encoded, since an IPv6 host's
+brackets may not stand in a URN, or `urn:x-sparkles:discussions:default` for the default
 graph. A name such as `<graph>/discussions` was set aside, because it either merges the
 threads of `onto`, `onto/` and `onto#` or can fall on a real ontology graph. The namespace
 keeps one discussion graph for each ontology graph and lets the editor recognize
