@@ -49,8 +49,10 @@ screen_create() {
   fi
   rx_admit "$EXECUTOR" --minimum "${SPARKLES_REMOTE_MIN_LIFETIME:-1800}" > "$OUT/admission.json" || return
   # The lock ends by the screen's expiry (screen_expiry). Its RuntimeMaxSec bounds it from
-  # its activation, and the lock's sleep, read from the expiry when the lock begins, ends it
-  # in time however late it began.
+  # its activation. When it begins, the lock refuses within 30 seconds of the expiry and
+  # otherwise starts a watchdog that stops it 30 seconds before the expiry, before it opens
+  # the readiness FIFO, whose writes are bounded, so it ends in time however late it began
+  # and whether or not anyone reads its answer.
   expiry=$(screen_expiry) || return
   ttl=$((expiry - 30 - $(date +%s)))
   [ "$ttl" -gt 0 ] || return
@@ -67,7 +69,7 @@ screen_create() {
     d=\$(mktemp -d \"\$HOME/lanes/remote-screens/$token.XXXXXXXX\")
     mkfifo \"\$d/ready\"
     systemd-run --user --unit=$SCREEN_LOCK --collect -q -p RuntimeMaxSec=$ttl -p TimeoutStopSec=30 \
-      bash -c 'left=\$((\$2 - 30 - \$(date +%s))); if [ \$left -le 0 ]; then echo expired > \"\$1/ready\"; exit 75; fi; exec 9>\"\$HOME/lanes/.heavy.lock\"; if ! flock -n 9; then echo busy > \"\$1/ready\"; exit 75; fi; echo ready > \"\$1/ready\"; exec sleep \$left' bash \"\$d\" $expiry
+      bash -c 'left=\$((\$2 - 30 - \$(date +%s))); [ \$left -gt 0 ] || exit 75; setsid bash -c \"sleep \\\$1; systemctl --user stop --no-block \\\$2\" watchdog \$left \$3 < /dev/null > /dev/null 2>&1 & exec 9>\"\$HOME/lanes/.heavy.lock\"; if ! flock -n 9; then timeout 15 tee \"\$1/ready\" > /dev/null <<< busy; exit 75; fi; timeout 15 tee \"\$1/ready\" > /dev/null <<< ready || exit 75; exec sleep \$left' bash \"\$d\" $expiry $SCREEN_LOCK
     test \"\$(timeout 15 cat \"\$d/ready\")\" = ready
     rm \"\$d/ready\"
     printf '%s\\n' \"\$d\"") || return

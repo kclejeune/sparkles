@@ -861,6 +861,17 @@ exit "$code"
 
 
 class ScreenAcceptance(unittest.TestCase):
+    def tearDown(self):
+        # A real unit's stop ends its watchdog with the rest of its cgroup. Here the
+        # watchdogs are process groups of their own and end with the test.
+        for proc in Path('/proc').iterdir():
+            if not proc.name.isdigit():continue
+            try:args=(proc/'cmdline').read_bytes().split(b'\0')
+            except OSError:continue
+            if b'watchdog' in args and any(b'sparkles-screen-' in a for a in args) and os.getpgid(int(proc.name))==int(proc.name):
+                try:os.killpg(int(proc.name),signal.SIGKILL)
+                except (ProcessLookupError,PermissionError):pass
+
     def test_unknown_launch_is_recorded_once_and_cleanup_retains_lock_on_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -981,6 +992,24 @@ screen_create test || true
                             # The refused lock wrote its answer and ended without the heavy lock.
                             time.sleep(0.2)
                             self.assertEqual(subprocess.run(['flock', '-n', str(home/'lanes/.heavy.lock'), 'true']).returncode, 0)
+                # With nobody reading its answer and a late start, the lock's watchdog, started
+                # before the FIFO is opened, still stops the lock before its expiry.
+                script = text.split("bash -c '", 1)[1].split("' bash \"$d\"", 1)[0]
+                lock = 'sparkles-screen-lock-' + text.split('--unit=sparkles-screen-lock-')[1].split()[0]
+                fifo = root/'unread'; fifo.mkdir(); os.mkfifo(fifo/'ready')
+                (fake/'systemctl').write_text('#!/bin/sh\necho "$@" >> "$HOME/systemctl.log"\n'); (fake/'systemctl').chmod(0o755)
+                unit = subprocess.Popen(['bash', '-c', script, 'bash', str(fifo), str(int(time.time()) + 33), lock],
+                                        env=env, start_new_session=True)
+                try:
+                    deadline = time.monotonic() + 8
+                    log = home/'systemctl.log'
+                    while not log.exists() or 'stop' not in log.read_text():
+                        self.assertLess(time.monotonic(), deadline, 'the lock watchdog did not stop the unit')
+                        time.sleep(0.05)
+                    self.assertEqual(log.read_text().split(), ['--user', 'stop', '--no-block', lock])
+                    self.assertIsNone(unit.poll(), 'the lock waits on its unread answer')
+                finally:
+                    os.killpg(unit.pid, signal.SIGKILL); unit.wait()
             finally:
                 for pid in (home/'units').read_text().split() if (home/'units').exists() else []:
                     try:os.killpg(int(pid), signal.SIGKILL)

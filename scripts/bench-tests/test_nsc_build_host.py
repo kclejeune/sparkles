@@ -205,6 +205,15 @@ class BuildHost(unittest.TestCase):
                 except ProcessLookupError:break
                 self.assertLess(time.monotonic(),end,'owned lock fixture did not close')
                 time.sleep(0.01)
+        # A real scope's stop ends its build's watchdog with the rest of its cgroup. The fake
+        # scopes are process groups, so the watchdogs, groups of their own, end here.
+        for proc in Path('/proc').iterdir():
+            if not proc.name.isdigit():continue
+            try:args=(proc/'cmdline').read_bytes().split(b'\0')
+            except OSError:continue
+            if b'watchdog' in args and any(str(self.root).encode() in a for a in args):
+                try:os.killpg(int(proc.name),signal.SIGKILL)
+                except (ProcessLookupError,PermissionError):pass
         self.reaper_stop.set();self.fixture_reaper.join(timeout=1)
         self.fixture_libc.prctl(36,self.fixture_previous.value,0,0,0)
 
