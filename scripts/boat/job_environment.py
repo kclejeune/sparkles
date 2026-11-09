@@ -11,7 +11,7 @@ import stat
 import sys
 import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import read_owned, write_new
+from common import open_lock, read_owned, write_new
 from config_schema import validate_profile
 from qualified_worker_admission import CLOSURE_RESERVE, export_operation, lifetime_left, operation_lifetime, validate_admission
 import controller
@@ -77,10 +77,7 @@ def hold_job_lock(operation, seconds=None):
     command waits through that hold and then sees the stop trigger if the watch
     closed the operation.
     """
-    fd = os.open(operation/controller.JOB_LOCK, os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW, 0o600)
-    s = os.fstat(fd)
-    if not (stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and s.st_nlink == 1 and not s.st_mode & 0o077):
-        os.close(fd);require(False, 'unsafe job lock')
+    fd = open_lock(operation/controller.JOB_LOCK)
     end = time.monotonic() + (JOB_LOCK_WAIT if seconds is None else seconds)
     while True:
         try:

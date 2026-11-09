@@ -194,15 +194,21 @@ mise run boat:closure-watch --unit "$LOCAL_WATCH_UNIT" --operation "$OWNED_OPERA
 
 The watch reads the guard's present end, with the extensions the guard accepted, and
 waits until `--lead` seconds before it. It then checks over SSH that no
-`sparkles-screen-*` or `nsc-build-*` unit is active on the worker, that no build, mbx or
-server process runs there, and that the worker's boot is the qualified one. Each named
-local job unit must also be inactive, and at most eight can be named. An mbx lease lives
-only as long as its mbx process, so the process check covers the Boxington leases. Each
-check is kept as `closure-watch-check-NNNN.json`. An open job is checked again every 30
-seconds.
+`sparkles-screen-*`, `nsc-build-*` or `gate-*` unit is active on the worker and that the
+worker's boot is the qualified one. It also requires that no process remains that the
+startup observer would count, which is any process of the worker's uid outside systemd,
+dbus and the allowed provider session, any installer, shell or build tool and any
+descendant of those. Detached work, such as a partition share under `setsid`, is caught
+this way. An mbx lease lives only as long as its mbx process, so the process check
+covers the Boxington leases. Each named local job unit must also be inactive, and at
+most eight can be named. One bound covers the SSH check and the single local `systemctl`
+query, and a check that ends after it counts as failed. Each check is kept as
+`closure-watch-check-NNNN.json`. An open job is checked again every 30 seconds.
 
 Every Boat command takes the operation's `jobs.lock` shared when its admission is
-loaded and holds it until the command exits. Once a check finds every job closed, the
+loaded and holds it until the command exits. Commands and the watch open that lock, and
+the extension lock, only as a private regular file of the operation's owner with a
+single link. Once a check finds every job closed, the
 watch takes the extension lock and then `jobs.lock` exclusively. If a command holds the
 job lock, the watch tries again at the next check. While the watch holds it, a new
 command waits up to 120 seconds for it and then sees the stop trigger if the watch

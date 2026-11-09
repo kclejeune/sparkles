@@ -32,10 +32,6 @@ WATCH_FLOOR=60
 WATCH_CHECKS=400
 WATCH_ACCEPT=15
 WATCH_DECISION=90
-WATCH_LOCAL=20
-# Job work on the worker: the screen and build units the remote executor and the
-# build host start, and the processes that build or serve a revision. An mbx
-# lease lives only as long as its mbx process, so the process check covers it.
 # A remote phase's reason code is kept only in one of these forms. A refusal
 # code must name one of the packet's own literal refusal reasons.
 FIXED_REASONS=frozenset({'startup_unobserved','startup_busy:unallowed_processes','startup_busy:bootstrap_lock_held','startup_busy:lock_or_manifest_absent','existing_phase_pending','unreported'})
@@ -59,20 +55,24 @@ def remote_reason(code):
 def remote_name(value):
     return value if isinstance(value,str) and re.fullmatch(r'[ -~]{1,16}',value) else None
 
-JOB_UNIT_PREFIXES=('sparkles-screen-','nsc-build-')
-JOB_PROCESSES=frozenset({'cargo','rustc','mbx','sparkles','sparkles-server','cc','cc1','cc1plus','ld','ld.lld','mold','clang','hyperfine'})
-JOB_CLOSURE_PROGRAM='''import json,os,subprocess,sys
-prefixes=tuple(json.loads(sys.argv[1]));names=set(json.loads(sys.argv[2]))
-r=subprocess.run(['systemctl','--user','list-units','--all','--plain','--no-legend','--state=active,activating,deactivating,reloading'],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=10)
-assert len(r.stdout)<=1048576
-units=sorted(x.split()[0] for x in r.stdout.decode(errors='replace').splitlines() if x.split() and x.split()[0].startswith(prefixes))
-procs=[]
-for p in os.listdir('/proc'):
-    if not p.isdigit():continue
-    try:c=open('/proc/%s/comm'%p).read().strip()
-    except OSError:continue
-    if c in names:procs.append([int(p),c])
-print(json.dumps({'list_exit':r.returncode,'units':units[:32],'unit_count':len(units),'processes':sorted(procs)[:32],'process_count':len(procs),'boot_id':open('/proc/sys/kernel/random/boot_id').read().strip()}))
+# Job work on the worker. A unit named for a screen, build or gate is job work,
+# and so is any process the startup observer would count, which is every process
+# of the worker's uid outside the systemd and dbus infrastructure and the allowed
+# provider session, every installer, shell or build tool and every descendant of
+# those. That covers detached work such as a partition share under setsid. An mbx
+# lease lives only as long as its mbx process, so the process check covers it.
+JOB_UNIT_PREFIXES=('sparkles-screen-','nsc-build-','gate-')
+JOB_CLOSURE_ENTRY='''
+if __name__=='__main__':
+    bind_profile(json.loads(sys.argv[1]));prefixes=tuple(json.loads(sys.argv[2]));uid=os.getuid()
+    need(uid==profile()['worker_uid'],'job closure worker user')
+    r=subprocess.run(['systemctl','--user','list-units','--all','--plain','--no-legend','--state=active,activating,deactivating,reloading'],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=10)
+    need(len(r.stdout)<=1048576,'unit listing bound')
+    units=sorted(x.split()[0] for x in r.stdout.decode(errors='replace').splitlines() if x.split() and x.split()[0].startswith(prefixes))
+    rows=process_rows();me=os.getpid()
+    busy=foreign_startup(rows,{'pid':me,'start':rows[me]['start']},me,set(),user_manager(rows,uid))
+    print(json.dumps({'list_exit':r.returncode,'units':[bounded_text(u,64) for u in units[:32]],'unit_count':len(units),
+                      'processes':unallowed_inventory(rows,busy),'process_count':len(busy),'boot_id':open('/proc/sys/kernel/random/boot_id').read().strip()}))
 '''
 
 def bounded(argv,seconds,input_bytes=None,limit=None):
@@ -143,6 +143,12 @@ def bounded(argv,seconds,input_bytes=None,limit=None):
     return result
 
 
+def observer_sources():
+    """The maintained sources that every remote observer program is composed from."""
+    common=(ROOT/'config_schema.py').read_text()+'\n'+(ROOT/'common.py').read_text()
+    definitions=(ROOT/'metadata-probe.py').read_text().split("\nif __name__=='__main__':",1)[0]
+    return common,definitions,(ROOT/'startup-observer.py').read_text()
+
 def props(text):
     return dict(line.split('=',1) for line in text.splitlines() if '=' in line)
 
@@ -159,7 +165,7 @@ class RealIO:
     def freeze_extensions(self):
         """Hold the operation's extension lock, waiting out a running act within FREEZE_WAIT."""
         if getattr(self,'_frozen',None) is not None:return True
-        fd=os.open(self.op/EXTENSION_LOCK,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600);end=self.mono()+FREEZE_WAIT
+        fd=open_lock(self.op/EXTENSION_LOCK);end=self.mono()+FREEZE_WAIT
         while True:
             try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);self._frozen=fd;return True
             except BlockingIOError:
@@ -218,7 +224,7 @@ class RealIO:
         return safe
     def lock_jobs(self):
         """Take the operation's job lock exclusively without waiting, or report that a command holds it."""
-        fd=os.open(self.op/JOB_LOCK,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+        fd=open_lock(self.op/JOB_LOCK)
         try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(fd);return False
@@ -227,13 +233,24 @@ class RealIO:
         fd=getattr(self,'_jobs',None);self._jobs=None
         if fd is not None:os.close(fd)
     def job_closure(self,local_units,seconds=60):
-        """One bounded check of the worker's job units and processes and the local job units."""
-        r=self.remote_python(JOB_CLOSURE_PROGRAM,[json.dumps(list(JOB_UNIT_PREFIXES)),json.dumps(sorted(JOB_PROCESSES))],seconds)
+        """One check of the worker's job units and processes and the local job units, all within ``seconds``."""
+        end=self.mono()+seconds
+        common,definitions,observer=observer_sources()
+        program=common+'\n'+definitions+'\n'+observer+'\n'+JOB_CLOSURE_ENTRY
+        remote=end-self.mono()-(10 if local_units else 0);need(remote>=5,'job closure bound exhausted')
+        r=self.remote_python(program,[json.dumps(profile()),json.dumps(list(JOB_UNIT_PREFIXES))],remote)
         need(r['exit']==0 and isinstance(r['body'],dict),'worker job closure check failed')
-        b=r['body']
-        local={}
-        for unit in local_units:
-            p=self.show(unit);local[unit]=p.get('ActiveState') in ('inactive','failed') and p.get('MainPID')=='0'
+        b=r['body'];local={}
+        if local_units:
+            left=end-self.mono();need(left>=1,'job closure bound exhausted')
+            # One systemctl call for every named unit, bounded by what is left.
+            text=self.system(['systemctl','--user','show',*local_units,'--property=Id,ActiveState,MainPID'],max(1,int(left)))
+            blocks=[props(x) for x in text.strip().split('\n\n')] if text.strip() else []
+            seen={x.get('Id'):x for x in blocks}
+            for unit in local_units:
+                x=seen.get(unit if '.' in unit else unit+'.service',{})
+                local[unit]=x.get('ActiveState') in ('inactive','failed') and x.get('MainPID')=='0'
+        need(self.mono()<=end,'job closure bound exhausted')
         return {'list_exit':b.get('list_exit'),'units':b.get('units'),'unit_count':b.get('unit_count'),'processes':b.get('processes'),'process_count':b.get('process_count'),'boot_id':b.get('boot_id'),'local_units_closed':local}
     def stop_status(self,operation):
         r=self.boat(['stop',worker_id(),'--status',operation],15)
@@ -291,9 +308,7 @@ print(json.dumps({'closed':closed,'unit':u,'properties':p}))
         self.record('qualification-closed.json',r['body']);return True
     def phase(self,phase,observation_seconds=0):
         payload={'pins':profile(),'release':{'snapshot_continuity':self.r['snapshot_continuity']},'operation_tag':self.r['guard_unit'],'phase':phase,'observation_seconds':observation_seconds}
-        common=(ROOT/'config_schema.py').read_text()+'\n'+(ROOT/'common.py').read_text()
-        definitions=(ROOT/'metadata-probe.py').read_text().split("\nif __name__=='__main__':",1)[0]
-        observer=(ROOT/'startup-observer.py').read_text()
+        common,definitions,observer=observer_sources()
         entry="""
 if __name__=='__main__':
     payload=json.loads(sys.argv[1])
@@ -656,7 +671,7 @@ def extend_operation(r,io,seconds,fact_path,reason):
 def extend_entry(op,seconds,fact_path,reason):
     r=bind_release_profile(load(op/'release.json'));verify_packet(r['controller_packet_manifest_sha256']);verify_cli(r)
     # One extension at a time per operation, so a provider TTL cannot be set by a racing act.
-    lock=os.open(op/EXTENSION_LOCK,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+    lock=open_lock(op/EXTENSION_LOCK)
     try:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         io=RealIO(r,op);receipt=extend_operation(r,io,seconds,fact_path,reason)
@@ -863,7 +878,7 @@ def closure_watch(r,io,lead=WATCH_LEAD,local_units=(),poll=WATCH_POLL,observe=aw
                         io.wait(1);wall,boot,pending=watch_ends(r,io)
                     granted=io.watch_granted;left=min(wall-io.wall(),boot-io.mono())
                     if left<=lead and left>WATCH_FLOOR and not any(io.exists(n) for n in terminal):
-                        check=check_jobs(max(1,min(60,decision_end-io.mono()-WATCH_LOCAL)))
+                        check=check_jobs(decision_end-io.mono()) if decision_end-io.mono()>=15 else None
                         if check is not None and check['closed']:
                             after_wall,after_boot,_=watch_ends(r,io);left=min(after_wall-io.wall(),after_boot-io.mono())
                             if (io.mono()<decision_end and (after_wall,after_boot)==(wall,boot) and io.watch_granted==granted and WATCH_FLOOR<left<=lead

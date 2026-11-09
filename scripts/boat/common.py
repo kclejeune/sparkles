@@ -49,6 +49,14 @@ def read_owned(path,limit=1024*1024):
         need(len(data)==s.st_size and (a.st_dev,a.st_ino,a.st_mtime_ns,a.st_size)==(s.st_dev,s.st_ino,s.st_mtime_ns,s.st_size),'local receipt changed')
         return data
     finally:os.close(fd)
+def open_lock(path):
+    """Open or create a private lock file, refusing one of another owner, mode or link count."""
+    fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
+    try:
+        s=os.fstat(fd);need(stat.S_ISREG(s.st_mode) and s.st_uid==os.getuid() and s.st_nlink==1 and not s.st_mode&0o077,'unsafe lock file')
+    except BaseException:
+        os.close(fd);raise
+    return fd
 def load(path):return json.loads(read_owned(path))
 def write_new(root,name,data):
     # Linux/systemd qualification: renameat2(RENAME_NOREPLACE) publishes complete

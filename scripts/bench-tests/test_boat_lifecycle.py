@@ -654,6 +654,79 @@ class RemoteTransport(unittest.TestCase):
         with self.assertRaises(controller.Refusal):self.run_remote('metadata_closed')
 
 
+class JobClosureProgram(unittest.TestCase):
+    """The maintained worker job-closure program and its bounds, without a worker."""
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.f=fixture(Path(self.tmp.name));controller.bind_release_profile(self.f['release'])
+
+    def run_program(self,rows,units):
+        import io as stdio,contextlib,types
+        common,definitions,observer=controller.observer_sources()
+        ns={'__name__':'job-closure-definitions'}
+        exec(compile(common+'\n'+definitions+'\n'+observer,'job-closure','exec'),ns)
+        me=os.getpid();rows=dict(rows);rows[me]={'pid':me,'ppid':1,'uid':os.getuid(),'comm':'python3','start':7,'group':me}
+        listing=''.join(u+' loaded active running x\n' for u in units).encode()
+        fake=types.SimpleNamespace(run=lambda *a,**k:types.SimpleNamespace(returncode=0,stdout=listing),DEVNULL=-3,PIPE=-1)
+        ns.update(process_rows=lambda:rows,subprocess=fake,command=lambda argv,seconds=15:b'MainPID=1220\n')
+        ns['sys']=types.SimpleNamespace(argv=['remote',json.dumps(controller.profile()),json.dumps(list(controller.JOB_UNIT_PREFIXES))])
+        ns['__name__']='__main__';out=stdio.StringIO()
+        with contextlib.redirect_stdout(out):exec(compile(controller.JOB_CLOSURE_ENTRY,'job-closure-entry','exec'),ns)
+        return json.loads(out.getvalue())
+
+    def session(self):
+        uid=os.getuid()
+        return {1:{'pid':1,'ppid':0,'uid':0,'comm':'systemd','start':1,'group':1},
+                1220:{'pid':1220,'ppid':1,'uid':uid,'comm':'systemd','start':5,'group':1220},
+                1264:{'pid':1264,'ppid':1220,'uid':uid,'comm':'pipewire','start':5,'group':1264},
+                976:{'pid':976,'ppid':1,'uid':uid,'comm':'pulseaudio','start':5,'group':976}}
+
+    def test_a_quiet_worker_is_closed_and_detached_work_is_not(self):
+        q=self.run_program(self.session(),['dbus.service'])
+        self.assertEqual((q['units'],q['unit_count'],q['processes'],q['process_count']),([],0,[],0))
+        uid=os.getuid();rows=self.session()
+        # A partition share under setsid, a gate unit and a timeout wrapper.
+        rows.update({40:{'pid':40,'ppid':1,'uid':uid,'comm':'bash','start':9,'group':40},41:{'pid':41,'ppid':40,'uid':uid,'comm':'cargo-nextest','start':9,'group':40},
+                     42:{'pid':42,'ppid':41,'uid':uid,'comm':'store_tests-1a','start':9,'group':40},50:{'pid':50,'ppid':1,'uid':uid,'comm':'timeout','start':9,'group':50}})
+        q=self.run_program(rows,['gate-batch.service','sparkles-screen-run-a.service','nsc-build-b.scope','dbus.service'])
+        self.assertEqual(q['unit_count'],3);self.assertEqual({x['pid'] for x in q['processes']},{40,41,42,50})
+        self.assertNotIn('python3',[x['comm'] for x in q['processes']])
+
+    def test_one_bound_covers_the_worker_and_local_checks(self):
+        class Timed(controller.RealIO):
+            def __init__(self,r,op):super().__init__(r,op);self.t=1000.0;self.spent=[]
+            def mono(self):return self.t
+            def remote_python(self,program,args,seconds):
+                # A call that runs to its timeout and then spends two seconds in teardown.
+                self.spent.append(('remote',seconds));self.t+=seconds+2
+                return {'exit':0,'error':None,'body':{'list_exit':0,'units':[],'unit_count':0,'processes':[],'process_count':0,'boot_id':WORKER_BOOT_ID}}
+            def system(self,args,seconds=15):
+                self.spent.append(('local',seconds));self.t+=seconds+1
+                return '\n\n'.join('Id=%s\nActiveState=inactive\nMainPID=0'%u for u in args[3:-1])
+        io=Timed(self.f['release'],self.f['operation'])
+        units=tuple('lane-%d.service'%n for n in range(8))
+        with self.assertRaises(controller.Refusal):io.job_closure(units,60)
+        self.assertEqual(io.spent,[('remote',50),('local',8)])
+        io=Timed(self.f['release'],self.f['operation']);io.remote_python=lambda p,a,s:(setattr(io,'t',io.t+s-12),{'exit':0,'error':None,'body':{}})[1]
+        io.system=lambda args,seconds=15:(setattr(io,'t',io.t+1),'\n\n'.join('Id=%s\nActiveState=inactive\nMainPID=0'%u for u in args[3:-1]))[1]
+        self.assertEqual(io.job_closure(units,60)['local_units_closed'],{u:True for u in units})
+        with self.assertRaises(controller.Refusal):io.job_closure(units,14)
+
+    def test_lock_files_of_another_mode_link_or_kind_refuse(self):
+        op=self.f['operation'];io=controller.RealIO(self.f['release'],op);lock=op/controller.JOB_LOCK
+        self.assertTrue(io.lock_jobs());io.unlock_jobs()
+        for change in ['mode','hardlink','symlink']:
+            with self.subTest(change=change):
+                lock.unlink(missing_ok=True);other=op.parent/('other-'+change)
+                if change=='mode':lock.touch();lock.chmod(0o666)
+                if change=='hardlink':other.touch();other.chmod(0o600);os.link(other,lock)
+                if change=='symlink':other.touch();other.chmod(0o600);lock.symlink_to(other)
+                with self.assertRaises((controller.Refusal,OSError)):io.lock_jobs()
+                with self.assertRaises((controller.Refusal,OSError)):env.hold_job_lock(op,0.1)
+                self.assertIsNone(getattr(io,'_jobs',None))
+        lock.unlink();env.release_job_locks()
+
+
 class WatchIO(ExtendIO):
     """The fixture's warm operation with a scripted worker job-closure check."""
     def __init__(self,f,wall=None,boot=None,checks=None):
@@ -714,7 +787,7 @@ class ClosureWatch(unittest.TestCase):
         # A check outside the locks and the publishing check under them.
         self.assertEqual(len(io.check_times),2);w,t,_=io.check_times[0]
         self.assertLessEqual(self.left(w,t),900);self.assertGreater(self.left(w,t),900-31)
-        self.assertEqual([x[2] for x in io.check_times],[False,True]);self.assertLessEqual(io.check_seconds[1],controller.WATCH_DECISION-controller.WATCH_LOCAL)
+        self.assertEqual([x[2] for x in io.check_times],[False,True]);self.assertLessEqual(io.check_seconds[1],controller.WATCH_DECISION)
         closed=self.read('root-job-closed.json')
         self.assertEqual(closed['closure_check'],'closure-watch-check-0002.json');self.assertTrue(closed['all_native_and_leases_closed'])
         self.assertEqual(closed['receipt_sha256'],self.qwa.receipt_digest(self.read('closure-watch-check-0002.json')))
