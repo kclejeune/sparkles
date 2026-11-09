@@ -1110,11 +1110,16 @@ impl Vocab {
         reserve: impl FnMut(usize) -> std::result::Result<(), E>,
         f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
-        if self.fsst.is_some() {
-            self.get_sorted_checked_as::<true, ROOM, E>(ids, key, reserve, f)
+        // Rebuild in a local buffer, which the decode loops can keep in registers, and
+        // return it, with its capacity, to the caller on every path.
+        let mut buf = std::mem::take(key);
+        let done = if self.fsst.is_some() {
+            self.get_sorted_checked_as::<true, ROOM, E>(ids, &mut buf, reserve, f)
         } else {
-            self.get_sorted_checked_as::<false, ROOM, E>(ids, key, reserve, f)
-        }
+            self.get_sorted_checked_as::<false, ROOM, E>(ids, &mut buf, reserve, f)
+        };
+        *key = buf;
+        done
     }
 
     /// [`Vocab::get_sorted_checked`] for an FSST-coded vocabulary when `F`.
@@ -1179,15 +1184,19 @@ impl Vocab {
         ioacct::vocab_blocks_scanned(1);
         self.touch_block(b);
         key.clear();
+        // The steps below grow the buffer only through the reservations here, so its
+        // capacity is read once, rather than through `key` at every step.
+        let mut cap = key.capacity();
         if !F {
             // front coding rebuilds every key up to the last wanted one, in one pass
             for at in 0..=last {
                 let id = (b * FC_BLOCK + at) as u64;
                 let e = self.entry::<F>(data, &mut pos, at == 0);
                 let total = key.len().min(e.shared).saturating_add(e.len);
-                if total > key.capacity() {
+                if total > cap {
                     reserve(total)?;
                     key.reserve_exact(total - key.len());
+                    cap = key.capacity();
                     #[cfg(any(test, feature = "failpoints"))]
                     crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
                         "checked-vocab-scratch-allocated",
@@ -1216,12 +1225,13 @@ impl Vocab {
                 };
                 let total = key.len().min(e.shared).saturating_add(add);
                 let room = if ROOM && e.coded { FSST_ROOM } else { 0 };
-                if total.saturating_add(room) > key.capacity() {
+                if total.saturating_add(room) > cap {
                     // an FSST suffix decodes fastest with room for eight symbols
                     // past the key (`fsst::Table::decode_at`)
                     let total = total.saturating_add(FSST_ROOM * usize::from(e.coded));
                     reserve(total)?;
                     key.reserve_exact(total - key.len());
+                    cap = key.capacity();
                     #[cfg(any(test, feature = "failpoints"))]
                     crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
                         "checked-vocab-scratch-allocated",
