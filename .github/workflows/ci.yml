@@ -6,9 +6,10 @@
 # name another runner label. Fork pull requests always use GitHub's runners.
 #
 # mbx builds in local mode with no remote cache. Swatinem/rust-cache carries the Cargo
-# registry and the dependencies' part of the target directory between runs. Clippy keeps
-# one cache and the test build another, which the doctests and the feature jobs restore.
-# Main pushes save a cache when its key is new, and other runs only restore.
+# registry and the dependencies' part of the target directory between runs, and
+# actions/cache carries mbx's object store for each commit. Clippy keeps one pair and the
+# test build another, which the doctests and the feature jobs restore. Runs on main save,
+# and runs on other branches and pull requests only restore.
 #
 #   checks       formatting of Rust, UI, JavaScript and shell, shellcheck, cited doc
 #                paths, the benchmark scripts' tests, the UI's type check, unit tests and
@@ -313,7 +314,7 @@ jobs:
         if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
         run: |
           mbx gc
-          du -sh "$(mbx cache dir)"
+          du -sh "$(dirname "$(mbx cache dir)")"
       - if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
         uses: actions/cache/save@v4
         with:
@@ -423,7 +424,7 @@ jobs:
         if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
         run: |
           mbx gc
-          du -sh "$(mbx cache dir)"
+          du -sh "$(dirname "$(mbx cache dir)")"
       - if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
         uses: actions/cache/save@v4
         with:

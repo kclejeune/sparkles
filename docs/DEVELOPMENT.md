@@ -1204,8 +1204,8 @@ of its inputs, so a workspace crate whose sources and dependencies did not chang
 restored instead of compiled. Clippy and Build tests each save their store under the
 commit on `main`, and every run restores the latest store saved for its job kind, its
 platform, the Boxington version and the toolchain. The doctests and the feature jobs
-restore the test build's store. Before a save, `mbx gc` trims the store to the 3 GiB of
-`MBX_GC_MAX_SIZE`. The link cache is off, since it would add every test binary to the
+restore the test build's store. Before a save, `mbx gc` trims the store's compiled
+outputs to the 3 GiB of `MBX_GC_MAX_SIZE`. The link cache is off, since it would add every test binary to the
 store.
 
 Pull requests, fork pull requests and runs on other branches restore both caches from
