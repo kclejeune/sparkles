@@ -153,7 +153,7 @@ test('a late answer for the entity the view left is not shown for the next one',
         'Sparkles-Commit-Message': 'Both entities',
       },
       data: `${PREFIXES}
-INSERT DATA { uni:Lecturer rdfs:subClassOf uni:Professor . uni:Professor rdfs:comment "late"@en }`,
+INSERT DATA { uni:Employee rdfs:comment "staff"@en . uni:Professor rdfs:comment "late"@en }`,
     });
     expect(r.ok(), await r.text()).toBe(true);
     let release!: () => void;
@@ -162,31 +162,26 @@ INSERT DATA { uni:Lecturer rdfs:subClassOf uni:Professor . uni:Professor rdfs:co
       (u) => u.pathname.endsWith('/diff') && u.searchParams.get('entity') === `${UNI}Professor`,
       async (route) => {
         await held;
-        await route.continue();
+        await route.continue().catch(() => {});
       },
     );
     await openHistory(page, branch, `${UNI}Professor`);
     await historyOf(page)
       .getByRole('button', { name: /Both entities/ })
       .click();
-    // Professor's answer is held while the view moves to Lecturer
-    await page.getByRole('button', { name: 'Expand Professor' }).first().click();
-    await page
-      .getByRole('tree', { name: 'Classes (asserted)' })
-      .getByRole('button', { name: 'Lecturer', exact: true })
-      .click();
-    await expect(page).toHaveURL(/Lecturer/);
+    // Professor's answer is held while the view moves to Employee through the breadcrumb,
+    // which keeps the History view
+    await page.locator('.crumbs').getByRole('button', { name: 'Employee', exact: true }).click();
+    await expect(page).toHaveURL(/Employee/);
     await historyOf(page)
       .getByRole('button', { name: /Both entities/ })
       .click();
     const changed = page.getByRole('list', { name: /Axioms commit \d+ changed/ });
-    await expect(changed).toContainText('SubClassOf(uni:Lecturer uni:Professor)');
+    await expect(changed).toContainText('"staff"@en');
     release();
-    // give the held answer time to arrive, then check it did not replace Lecturer's
-    await page
-      .waitForResponse((res) => res.url().includes('/diff') && res.url().includes('Professor'))
-      .catch(() => {});
-    await page.waitForTimeout(300);
+    // the held answer, if it still arrives, must not replace Employee's
+    await page.waitForTimeout(1000);
+    await expect(changed).toContainText('"staff"@en');
     await expect(changed).not.toContainText('late');
   } finally {
     await request.delete(`/$/branches/uni/${branch}?force=true`);
