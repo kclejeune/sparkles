@@ -59,6 +59,21 @@ written. New `sourceGraph` and `proposalGraph` options choose the evidence graph
 publish in the batch's commit. The evidence rendition keeps its text, so a claims
 ingestion stores the text in its chunks and again in the evidence graph.
 
+Users can watch an entity or its asserted subtree (item 619, spec U12). The server keeps
+watches in `<dataDir>/watches.json`, format 1, and a follower thread matches each watched
+branch's commits in order, walking upward from each changed IRI through the hierarchy
+before and after the commit. The routes are `/$/watches`, and every answer is filtered by
+the caller's current access. The ontology editor's entity frame has a Watch button, the
+new Watches page lists the matched commits with links to each member's History view, and
+the top bar shows the unread count. An email channel with `"watchers": true` mails each
+owner's matches in a dataset, gathered over `watches.batchSecs`, to the owner's verified
+address as the event `entity.changed`, which no route carries. The address comes from the
+new `email` member of `[[users]]`, the OIDC `email` claim with `email_verified`, or the
+header that the new `[proxy] verified_email_header` names. Each attempt rebuilds the
+message from the watches and the owner's access at that moment. The `notifications` kind
+gains the `watches` member with `maxAncestors`, `largeCommit`, `identityMaxAgeDays` and
+`batchSecs`, and `GET /$/notifications` gains the count of watches per dataset.
+
 Ontology reads resolve imports within the dataset (item 624). An `owl:imports` IRI
 resolves to the graph the dataset's import map names, then to the graph the IRI names, then
 to the graphs of a resource catalog vocabulary whose namespace matches it. The map is kept

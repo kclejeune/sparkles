@@ -618,6 +618,30 @@ no composer, reply, resolve or reopen. A caller whose grants cover only some gra
 a grant on the discussion graph, or the server refuses the comment. Item 769 covers an
 optional discussion store outside versioning.
 
+The **Watch** button in the entity frame's head watches the entity on the frame's branch
+and graph, alone or with its asserted subtree, and a subtree watch can stop a number of
+levels below the entity ([screenshot](../images/watches.png)). The subtree follows
+`rdfs:subClassOf`, `rdfs:subPropertyOf`, `skos:broader` and `skos:narrower` as the graph
+states them, before and after each commit, so a class moved into or out of the subtree
+counts. The button's dialog lists the caller's watches on the entity, each with its unread
+count and a way to stop it. The **Watches** page lists every watch of the caller with its
+dataset, branch, scope and unread count. Opening a watch lists its matched commits, newest
+first, with the time, the author and the members each commit changed, and each member
+links to its History view. **Mark read** marks a watch's commits as read and **Remove**
+ends the watch. The top bar shows the unread count, read at most once a minute while the
+page is visible, and links to the page. A caller who signs in anonymously or with a static
+token cannot watch, and the button is hidden for them.
+
+The page also says whether matches are mailed. A server administrator marks an email
+channel of the [notifications](../operations/README.md#operations) with `watchers`, and
+each owner's matches in a dataset are then gathered for five minutes and mailed to the
+owner's verified address. That address is the `email` of a configured user in the auth
+configuration, the verified `email` claim of an OIDC sign-in, or the header that
+`[proxy] verified_email_header` names. The owner's own commits are not mailed. The server
+reads the watches and the owner's access again before each attempt, so a change it can no
+longer read is never mailed. [API: Watches](../API.md#watches) describes the routes and
+the bounds.
+
 The **Bulk edits** tab changes many entities in one commit
 ([screenshot](../images/ontology-bulk.png)). **Find and replace** searches the plain and
 language-tagged string values of the labels, of every annotation or of one annotation

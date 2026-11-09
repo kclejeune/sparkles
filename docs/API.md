@@ -11436,6 +11436,7 @@ name = "bob"
 password = "$argon2id$v=19$m=19456,t=2,p=1$…"  # sparkles auth hash
 roles = ["wiki-editors"]
 datasets = { "team-*" = "read" }
+# email = "bob@example.org"                  # where watches on entities are mailed
 
 [[tokens]]                                   # static machine token
 name = "prometheus"
@@ -11486,6 +11487,7 @@ trusted = ["127.0.0.1/32", "unix"]
 groups_separator = ","
 name_from = "user"                           # or "email"
 logout_url = "https://auth.example.org/logout"
+# verified_email_header = "Remote-Email"     # an address the proxy verified, for watches
 
 # [cloudflare_access]                        # instead of the cloudflare-access preset
 # team_domain = "https://example.cloudflareaccess.com"
@@ -14508,7 +14510,7 @@ limited to one dataset therefore sees nothing of another.
 
 | Method | Path | Effect |
 |---|---|---|
-| GET | `/$/watches` | The caller's watches with `unread` for each and in all. `dataset`, `entity` and `graph` (`default` for the default graph) filter them. |
+| GET | `/$/watches` | The caller's watches with `unread` for each and in all, and `mail`, which says whether matches are also mailed to the caller and where. `dataset`, `entity` and `graph` (`default` for the default graph) filter them. |
 | POST | `/$/watches` | `{dataset, branch?, graph?, entity, scope?, depth?}` makes a watch, `201`, or answers the same watch with `200`. `scope` is `entity` or `subtree`, and `depth` limits a subtree to that many levels below the entity. |
 | DELETE | `/$/watches/{id}` | Removes the watch, `204`. |
 | GET | `/$/watches/{id}/matches` | The matched commits, newest first, with `after`, `before` and `limit` (at most 200). |
@@ -14536,6 +14538,33 @@ show `truncated` and match only the entity.
 The bounds are the `watches` member of the `notifications` kind: `maxAncestors`
 (default 10,000), `largeCommit` (default 1,000), `identityMaxAgeDays` (default 30) and
 `batchSecs` (default 300).
+
+Matches are also mailed when notifications are on and a server administrator sets
+`"watchers": true` on an email channel. Such a channel may have an empty `to`, and the
+routes cannot then name it. The routes never carry a watch, and `entity.changed` and
+`entity.*` are refused as route keys. The first match of an owner in a dataset opens a
+window of `batchSecs`, and at its close one `entity.changed` message per channel goes to
+the owner's verified address, listing each watch with its entity, scope, branch, graph
+and up to 20 commits with their time, author, message and members. The owner's own
+commits are listed in the UI but not mailed.
+
+The address of a configured user is the `email` member of its `[[users]]` entry. The
+address of an OIDC account is the `email` claim of its sign-in when `email_verified` is
+true. The address of a proxy account is the value of the header that `[proxy]
+verified_email_header` names, which only the administrator sets. An account name is
+never used as an address, and a minted token's watches go to its owner's address. An OIDC
+or proxy owner is mailed only while its provider or proxy vouched for it within
+`identityMaxAgeDays`, by a sign-in, an access token or a proxied request, and the groups
+of that vouching are recorded on the owner's watches at once, whichever route the
+request took.
+
+A delivery holds only the owner, the dataset and the matched watches and commits. Its
+message is built again at each attempt from the watches as they are then, so a watch
+that was removed, a match that was dropped, a graph the owner can no longer read, an
+owner who is gone or out of date, and an address that is no longer verified each shrink
+or end the delivery. A delivery that ends this way counts as `dropped` in the
+notification metrics. It uses the channel's queue share, retries and timeout, and a
+restart loses a window that has not closed, while the matches stay in the UI.
 
 A watch is refused with `403` when the caller cannot read the graph, with `409` and
 `watch-unsupported-protections` while triple protections limit what the caller reads in

@@ -82,6 +82,7 @@ Non-goals:
 | `backup.verify.failed` | server | A verification fails or finds a damaged backup | At most every `repeatEvery` per repository, until the damaged backups and failed verifications are resolved (Outcome) |
 | `backup.gc.failed` | server | A GC fails or a policy cannot start one | At most every `repeatEvery` per repository, until a GC that deletes succeeds |
 | `backup.overdue` | server | An enabled policy missed two scheduled instants since its last success | At most every `repeatEvery` per policy, until it succeeds |
+| `entity.changed` | dataset | A batch window of a watch owner's matches in a dataset closes ([U12](U12-ontology-workbench/SPEC.md#watches)) | Never deduplicated. It goes only to the owner, through email channels with `watchers`, and no route carries it |
 
 An open review branch is a branch whose name the memory inbox treats as review work
 (`ingest.`, `review.`, `consolidation.` and `proposals.` branches) and that has commits
@@ -693,6 +694,39 @@ These points differ from the design or settle what it left open.
   above records. Each channel has its own queue and thread, and the kind holds at most
   32 channels.
 
+
+### Mail to the owners of watches (item 619)
+
+The event `entity.changed` tells the owner of a watch on an entity about the commits
+that changed it, as §2's exception allows. An email channel takes `watchers: true`, and
+such a channel may have an empty `to`, which the routes then cannot name. The route keys
+`entity.changed` and `entity.*` are refused, so no route, `*` included, carries the
+event. The watch follower hands each new match that the owner did not make to a batch per
+owner and dataset, and the window of `watches.batchSecs` closes the batch. A closed
+batch is queued once on each email channel with `watchers`, in that channel's queue and
+share and with the kind's `delivery`, next to the envelope deliveries of the routes. The
+job holds only the owner, the dataset and the matched watch and commit references. Each
+attempt reads the settings and the watches again, and it builds the envelope from what
+the owner can still read, with the owner's current address in `to`. An attempt that has
+nothing left to send, because notifications are off, the channel no longer carries
+watches, the owner is gone, out of date or without a verified address, or nothing in the
+batch is still readable, ends the delivery as `dropped`. The envelope's `data` holds the
+watches with their entity, scope, branch, graph, `truncated`, up to 20 commits each and a
+count of the rest. The `link` is `/ui/watches`.
+
+The address is the `email` of a configured user, the OIDC `email` claim with
+`email_verified`, or the header that `[proxy] verified_email_header` names. The auth
+layer tells the watches each time a provider or proxy vouches for an OIDC or proxy
+identity, so a group taken away on any route reaches the follower's authorization and the
+next attempt at once, and the time of that vouching is checked against
+`watches.identityMaxAgeDays`. The tests in `crates/sparkles-server/src/watches/tests.rs`
+send a batch through the test mail server to the owner alone while `*` routes to the same
+channel, and cover a removed watch, a user without an address, a proxy account whose
+address header is missing or malformed, an identity older than the bound, groups taken
+away by a request to another route, and the refused route keys. Cloudflare Access
+assertions give no address, and an OIDC provider that sends `email` only from UserInfo
+gives one only when the server reads UserInfo for the name or groups claim. Item 809
+covers both.
 
 ### Durable application delivery
 
