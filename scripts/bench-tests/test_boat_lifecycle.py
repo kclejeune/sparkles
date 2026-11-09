@@ -1522,7 +1522,7 @@ class SourceDriftRecord(unittest.TestCase):
     def repository(self):
         tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup);repo=Path(tmp.name)/'repo';repo.mkdir()
         self.git(repo,'init','-q');(repo/'run.sh').write_text('true\n');(repo/'run.sh').chmod(0o755);(repo/'a.txt').write_text('a\n')
-        self.git(repo,'add','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','commit','-qm','x')
+        self.git(repo,'add','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','-c','commit.gpgsign=false','commit','-qm','x')
         return repo
 
     def test_new_inodes_and_mtimes_leave_the_content_identity_unchanged(self):
