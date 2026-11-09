@@ -230,10 +230,10 @@ The test cases are those of the approved W3C OWL 2 test cases that list the RL p
 have an RDF/XML premise and no imports, 66 of 70. The closures that incremental
 maintenance left after inserting and after deleting a change of 1% of LUBM(1)'s data
 triples equal the reference's closures of the same data, and so does the closure after
-inserting the change into OWL2Bench(1). Deleting the change from OWL2Bench(1) ran out of
-16 GiB, against 566 MiB for a full run, and [roadmap](../../ROADMAP.md) item 798 covers
-it. Those two memory figures come from the development laptop and are not benchmark
-measurements.
+inserting the change into OWL2Bench(1). Deleting the change from OWL2Bench(1) grew to
+14.1 GiB in 136 s until the out-of-memory killer ended it, against less than 800 MiB for a
+full run, and [roadmap](../../ROADMAP.md) item 798 covers it. Those memory figures come
+from the development laptop and are not benchmark measurements.
 
 ## Query-time reasoning latency
 

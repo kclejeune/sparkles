@@ -29,9 +29,12 @@ as a Nemo program, transcribed from the recommendation's tables with their rule 
 The program follows these conventions, which Sparkles' rule set shares.
 
 - The closure is an RDF graph. A rule is not applied when its conclusion would have a
-  literal as subject or predicate, so no generalized triple is derived.
-- The rules eq-ref, dt-eq and dt-diff are left out, and no reflexive `owl:sameAs` triple
-  is derived. The rules whose conclusion is false check consistency and derive no
+  literal as subject or a literal or blank node as predicate, so no generalized triple is
+  derived. Each conclusion of a rule with several conclusions is checked on its own.
+- The rules eq-ref, dt-eq and dt-diff are left out, and no rule derives a reflexive
+  `owl:sameAs` triple, including the rules whose conclusion has a variable property.
+- A list is read only when it ends at `rdf:nil`, as the LIST expansion of the
+  recommendation requires. The rules whose conclusion is false check consistency and derive no
   triple, so they are left out too.
 - The rule dt-type2 is kept as a relation that the rule cls-svf1 reads for data values.
   The relation gives each literal the datatypes of OWL 2 RL whose value space holds its
@@ -66,7 +69,9 @@ also leaves out the cases of scm-eqc2 and scm-eqp2 whose two classes or properti
 same. The aligned closure must equal Sparkles' closure. The core comparison runs the W3C
 program alone, and each of its triples must be in Sparkles' closure. A difference that is
 understood is listed in `scripts/rl-reference/known.tsv` with its explanation, and any
-other difference fails the comparison.
+other difference fails the comparison. The encoding refuses input whose IRIs use the
+encoded namespaces, and it gives a literal a datatype only when its lexical form is valid
+for that datatype, with calendar and time zone bounds for dates.
 
 `mise run test:rl-reference` compares the closures of the premise ontologies of the W3C
 OWL 2 test cases that list the RL profile. `mise run bench:rl-reference lubm 1` or
@@ -83,7 +88,11 @@ then times both engines for `--runs` rounds.
   data after the update. The first round compares each maintained closure with Nemo's
   closure of the same data.
 - GNU time gives each run's wall time and peak resident memory, and each run has its own
-  memory-limited systemd scope. Sparkles' time starts from a loaded store and includes
+  memory-limited systemd scope and a deadline. A run is recorded as out of memory only
+  when the scope's `memory.events` counts a kill at its limit, and the closure check and
+  the materializations that prepare the incremental runs have the same limit and
+  deadline. At the deadline the engine gets SIGTERM and, 30 seconds later, SIGKILL, and
+  no process of a run outlives it. Sparkles' time starts from a loaded store and includes
   writing the derived graph to it. Nemo's time includes reading the encoded N-Triples and
   writing the derived triples, and its own report gives the reasoning time apart.
 

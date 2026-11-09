@@ -885,8 +885,8 @@ fn analysis_cancellation_interrupts_geometry_during_its_input_scan() {
 /// whether the run maintains the closure or falls back to a full run. The full run of 600
 /// people fits in 256 MiB, and the run after deleting 24 of the 1,200 edges exceeds it.
 /// OWL2Bench(1) shows the case at scale. Its `hasSameHomeTownWith` closure is a clique of
-/// about 1,100 people, a full run needs 566 MiB, and deleting 1% of the data triples ran
-/// out of 16 GiB.
+/// about 1,100 people, a full run needs less than 800 MiB, and deleting 1% of the data triples grew
+/// to 14.1 GiB before the out-of-memory killer ended it.
 #[test]
 #[ignore = "roadmap item 798: maintenance after a deletion in a clique exceeds a full run's memory"]
 fn deleting_edges_of_a_clique_stays_within_a_full_runs_memory() {

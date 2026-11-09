@@ -44,7 +44,8 @@ test cases, and `mise run bench:rl-reference` does so on LUBM or OWL2Bench befor
 times full materialization and incremental insertion and deletion. The closures are equal
 on LUBM(1), OWL2Bench(1) and 66 test cases. RDFox is not a reference, because its
 evaluation agreement restricts publishing benchmark results. Deleting 1% of OWL2Bench(1)'s
-data triples ran out of 16 GiB in incremental maintenance, and roadmap item 798 covers it.
+data triples grew to 14.1 GiB in incremental maintenance before the out-of-memory killer
+ended it, and roadmap item 798 covers it.
 
 Roadmap item 651 adds a `claims` mode to `POST /$/ingest/{ds}` and `sparkles ingest`. It registers
 the document's source and chunks as the other modes do and proposes the extracted facts
