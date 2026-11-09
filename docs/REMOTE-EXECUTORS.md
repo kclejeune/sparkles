@@ -70,6 +70,10 @@ same instant on `CLOCK_BOOTTIME` for the guard's boot and invocation. Each check
 takes the earlier of the two remaining times and subtracts the 30-second closure
 reserve, so a wall clock moved backward cannot lengthen the lifetime and a suspend
 counts even when the wall clock misses it. A different boot refuses the admission.
+A warm worker reused across many jobs and lanes keeps that one original end, since
+every job-admission record references the same qualification and receipts. No call,
+job environment or lane renews it. Only a new qualification by the lifecycle owner,
+with its own recorded intent, guard and handoff receipts, gives a worker more time.
 `admit --minimum` uses this measure. Environment preparation and each operation
 also check both ends while they run, so a suspend during a transfer is counted.
 `admit` prints a version-2 `sparkles.boat.adapter-observation` that records the

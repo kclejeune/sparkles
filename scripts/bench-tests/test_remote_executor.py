@@ -97,6 +97,38 @@ class Admission(unittest.TestCase):
             self.assertEqual(RX.main(),0)
         self.assertEqual(len(seen),1);self.assertLessEqual(seen[0],left-30)
 
+    def test_one_warm_worker_across_many_calls_and_a_lane_boundary(self):
+        """Successive invocations and a later lane share one original end that never grows."""
+        import qualified_worker_admission as qwa
+        now,boot,left=self.fixtures['now'],self.fixtures['boot_now'],self.original_left()
+        original=self.fixtures['qualified_path'].read_bytes()
+        expected=RX.boat_environment.expected_environment(self.fixtures['profile'],self.fixtures['qualified'])
+        # Lane two prepares its own job-admission record from the same qualification.
+        lane_two=self.root/'lane-two-admission.json'
+        with self.clocks(now-3600,boot+100),patch.object(RX.boat_environment,'local_guard',return_value=self.fixtures['guard']),\
+             patch.object(RX.boat_environment.controller,'bounded',return_value={'exit':0,'body':expected}):
+            RX.boat_environment.prepare(self.fixtures['profile_path'],self.fixtures['operation'],self.fixtures['profile']['worker'],lane_two)
+        lane_two.chmod(0o600)
+        elapsed=0
+        for index in range(24):
+            elapsed+=37
+            # The wall clock wanders backward and forward between calls.
+            wall=now+elapsed+(-5000 if index%3==0 else 2000 if index%3==1 else 0)
+            record=self.path if index<12 else lane_two
+            with self.subTest(index=index),self.clocks(wall,boot+elapsed),patch.dict(os.environ,SPARKLES_BOAT_ADMISSION=str(record)):
+                data=RX.admission('boat:bx_fixture')
+                deadline=RX.operation_deadline('boat:bx_fixture',seconds=10**6)
+                # Never more than the original end on BOOTTIME, whatever the wall says.
+                self.assertLessEqual(RX.remaining(deadline),left-elapsed-30)
+                self.assertLessEqual(data['expires_at']-wall,left-elapsed)
+                self.assertEqual(data['_lifetime']['boot_end'],boot+left)
+        self.assertEqual(self.fixtures['qualified_path'].read_bytes(),original)
+        self.assertEqual(json.loads(lane_two.read_text())['qualification']['sha256'],hashlib.sha256(original).hexdigest())
+        # Re-exporting after a rollback reproduces the same bytes, so it renews nothing.
+        with self.clocks(now-7000,boot+elapsed):
+            self.assertEqual(json.dumps(qwa.export_operation(self.fixtures['operation'],now-7000,'bx_fixture',self.fixtures['profile']),sort_keys=True),
+                             json.dumps(json.loads(original),sort_keys=True))
+
     def test_forward_wall_suspend_reboot_and_exact_margin(self):
         now,boot,left=self.fixtures['now'],self.fixtures['boot_now'],self.original_left()
         # A forward wall jump shortens the remaining time through the wall bound.
