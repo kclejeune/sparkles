@@ -1638,3 +1638,22 @@ test('ontology-discussions', async ({ page, request }) => {
   await shoot(page, 'ontology-discussions');
   await request.delete(`/$/branches/uni/${branch}?force=true`);
 });
+
+test('ontology-bulk', async ({ page, request }) => {
+  // the Bulk edits tab with a find and replace in the English labels and its listed changes
+  const branch = 'bulk-shot';
+  await request.post('/$/branches/uni', { data: { name: branch } });
+  await page.goto(
+    `/ui/workbench/ontology?${new URLSearchParams({ ds: 'uni', branch, tab: 'bulk' })}`,
+  );
+  const form = page.getByRole('form', { name: 'Find and replace' });
+  await expect(form).toBeVisible({ timeout: 30_000 });
+  await form.getByRole('textbox', { name: 'Find' }).fill('student');
+  await form.getByRole('textbox', { name: 'Replace with' }).fill('learner');
+  await form.getByRole('combobox', { name: 'Language' }).selectOption('tag');
+  await form.getByRole('textbox', { name: 'Tag' }).fill('en');
+  await form.getByRole('button', { name: 'Find' }).click();
+  await expect(page.getByRole('region', { name: 'Changes' }).locator('tbody tr')).toHaveCount(2);
+  await shoot(page, 'ontology-bulk');
+  await request.delete(`/$/branches/uni/${branch}?force=true`);
+});

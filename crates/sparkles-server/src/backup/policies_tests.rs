@@ -85,6 +85,10 @@ struct Fake {
     failing: Mutex<HashSet<String>>,
     busy: Mutex<HashSet<String>>,
     gcs: Mutex<Vec<String>>,
+    /// whether a GC cannot start
+    gc_fails: Mutex<bool>,
+    /// whether deletions fail
+    delete_fails: Mutex<bool>,
     /// while true, backups wait
     hold: Mutex<bool>,
     released: parking_lot::Condvar,
@@ -114,6 +118,8 @@ impl Fake {
             failing: Mutex::default(),
             busy: Mutex::default(),
             gcs: Mutex::default(),
+            gc_fails: Mutex::new(false),
+            delete_fails: Mutex::new(false),
             hold: Mutex::new(false),
             released: parking_lot::Condvar::new(),
             entered: Mutex::new(0),
@@ -244,6 +250,12 @@ impl Engine for Fake {
     }
 
     fn delete(&self, _: &Arc<AppState>, _: &str, name: &str) -> Result<bool, BackupError> {
+        if *self.delete_fails.lock() {
+            return Err(BackupError::new(
+                Code::RepositoryUnavailable,
+                "the bucket refuses deletions",
+            ));
+        }
         let mut b = self.backups.lock();
         let n = b.len();
         b.retain(|x| x.name != name);
@@ -255,6 +267,12 @@ impl Engine for Fake {
     }
 
     fn start_gc(&self, _: &Arc<AppState>, repo: &str) -> Result<String, BackupError> {
+        if *self.gc_fails.lock() {
+            return Err(BackupError::new(
+                Code::RepositoryUnavailable,
+                "the GC lock is held elsewhere",
+            ));
+        }
         let mut g = self.gcs.lock();
         g.push(repo.to_string());
         Ok(format!("gc-{}", g.len()))
@@ -349,9 +367,16 @@ impl T {
 /// fake engine and a fake clock at `now`. Files under `<dir>/backup` written before
 /// (`files`) are loaded as at a restart.
 fn setup_with(now: &str, dir: tempfile::TempDir, read_only: bool) -> T {
+    setup_full(now, dir, read_only, false)
+}
+
+fn setup_full(now: &str, dir: tempfile::TempDir, read_only: bool, notify: bool) -> T {
     let mut state =
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
     state.read_only = read_only;
+    if notify {
+        crate::notify::enable_for_tests(&mut state, dir.path());
+    }
     let b = BackupState::new(dir.path(), None, 2).unwrap();
     for (name, readonly) in [("local", false), ("archive", true)] {
         b.registry.repos.write().insert(
@@ -1476,4 +1501,214 @@ fn a_newer_policy_file_is_refused_and_written_files_carry_the_member() {
     assert!(read_json::<PolicyRunList>(&dir.path().join("runs.json")).is_ok());
     std::fs::write(dir.path().join("policies.json"), r#"{"policies": []}"#).unwrap();
     assert!(read_api_policies(dir.path()).unwrap().is_empty());
+}
+
+/// A GC that a policy run cannot start raises `backup.gc.failed` for the repository
+/// (spec C21).
+#[tokio::test]
+async fn a_gc_that_cannot_start_notifies() {
+    let s = setup_full(
+        "2026-09-30T12:00:00Z",
+        tempfile::tempdir().unwrap(),
+        false,
+        true,
+    );
+    s.call(
+        "POST",
+        "/$/backup-policies",
+        Some(
+            json!({"name": "p", "repository": "local", "schedule": "0 3 * * *",
+                    "datasets": ["d*"], "retention": {"minCount": 1, "maxCount": 1},
+                    "gcAfterRetention": true}),
+        ),
+    )
+    .await;
+    *s.fake.gc_fails.lock() = true;
+    for at in ["2026-09-30T12:00:00Z", "2026-09-30T13:00:00Z"] {
+        s.clock.set(at);
+        let task = start_run(&s.st, "p".into(), RunTrigger::Manual, None)
+            .ok()
+            .unwrap();
+        s.wait(&task.id);
+    }
+    let run = s.runs("p").remove(0);
+    assert!(
+        run.retention
+            .clone()
+            .unwrap()
+            .error
+            .unwrap()
+            .contains("gc after retention failed"),
+        "{run:?}"
+    );
+    assert!(crate::notify::is_active(&s.st, "backup.gc.failed/local"));
+    // the delivery is recorded once the channel's thread has tried it
+    let mut gc = 0;
+    for _ in 0..200 {
+        gc = crate::notify::status_json(&s.st)["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["event"] == "backup.gc.failed")
+            .count();
+        if gc > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(gc, 1);
+}
+
+/// A policy that has missed two scheduled instants since its last success raises
+/// `backup.overdue`, which a success clears, and so does removing the policy (spec
+/// C21).
+#[tokio::test]
+async fn an_overdue_policy_notifies_until_it_succeeds() {
+    let s = setup_full(
+        "2026-09-30T12:05:00Z",
+        tempfile::tempdir().unwrap(),
+        false,
+        true,
+    );
+    s.call(
+        "POST",
+        "/$/backup-policies",
+        Some(json!({"name": "p", "repository": "local", "schedule": "*/10 * * * *"})),
+    )
+    .await;
+    let key = "backup.overdue/p";
+    let active = |s: &T, k: &str| crate::notify::is_active(&s.st, k);
+    let manual = |s: &T| {
+        let task = start_run(&s.st, "p".into(), RunTrigger::Manual, None)
+            .ok()
+            .unwrap();
+        s.wait(&task.id);
+    };
+    let mut sched = Scheduler::default();
+    // never succeeded: its failures tell, not an overdue event
+    sched.step(&s.st, s.clock.now());
+    assert!(!active(&s, key));
+    manual(&s);
+    assert_eq!(s.runs("p")[0].result, RunResult::Ok);
+    // from now on every backup fails
+    s.fake
+        .failing
+        .lock()
+        .extend(["ds".to_string(), "mem1".to_string()]);
+    s.clock.set("2026-09-30T12:10:00Z");
+    sched.step(&s.st, s.clock.now());
+    s.wait_policy("p");
+    assert!(active(&s, "backup.failed/p"));
+    s.clock.set("2026-09-30T12:15:00Z");
+    sched.step(&s.st, s.clock.now());
+    assert!(!active(&s, key), "one instant missed");
+    s.clock.set("2026-09-30T12:20:00Z");
+    sched.step(&s.st, s.clock.now());
+    s.wait_policy("p");
+    s.clock.set("2026-09-30T12:21:00Z");
+    sched.step(&s.st, s.clock.now());
+    assert!(active(&s, key), "{:?}", crate::notify::active_keys(&s.st));
+    s.fake.failing.lock().clear();
+    s.clock.set("2026-09-30T12:22:00Z");
+    manual(&s);
+    assert!(!active(&s, key));
+    assert!(!active(&s, "backup.failed/p"));
+    sched.step(&s.st, s.clock.now());
+    assert!(!active(&s, key));
+    // a removed policy's conditions go with it
+    s.fake.failing.lock().insert("ds".to_string());
+    manual(&s);
+    assert!(active(&s, "backup.failed/p"));
+    let (st, _) = s.call("DELETE", "/$/backup-policies/p", None).await;
+    assert!(st.is_success(), "{st}");
+    sched.step(&s.st, s.clock.now());
+    assert!(
+        !active(&s, "backup.failed/p"),
+        "{:?}",
+        crate::notify::active_keys(&s.st)
+    );
+}
+
+/// Overdue counts scheduled instants, so a weekday schedule is not overdue over the
+/// weekend (spec C21).
+#[tokio::test]
+async fn a_weekday_policy_is_not_overdue_over_the_weekend() {
+    let s = setup_full(
+        "2026-10-02T23:00:00Z",
+        tempfile::tempdir().unwrap(),
+        false,
+        true,
+    );
+    s.call(
+        "POST",
+        "/$/backup-policies",
+        Some(json!({"name": "w", "repository": "local", "schedule": "0 * * * 1-5", "timezone": "UTC"})),
+    )
+    .await;
+    // the last success was on Friday 2 October at 23:00
+    s.b()
+        .policies
+        .inner
+        .lock()
+        .state
+        .policies
+        .entry("w".into())
+        .or_default()
+        .last_success = Some("2026-10-02T23:00:00.000Z".into());
+    let check = |at: &str| {
+        let policies: Vec<PolicyConfig> = s
+            .b()
+            .registry
+            .policies
+            .read()
+            .values()
+            .map(|e| e.config.clone())
+            .collect();
+        s.b().policies.check_overdue(&s.st, &policies, t(at));
+        crate::notify::is_active(&s.st, "backup.overdue/w")
+    };
+    assert!(!check("2026-10-03T02:01:00Z"), "Saturday");
+    assert!(
+        !check("2026-10-05T00:30:00Z"),
+        "one instant missed on Monday"
+    );
+    assert!(check("2026-10-05T01:30:00Z"), "two instants missed");
+}
+
+/// A run whose backups succeed but whose retention fails still notifies, and does not
+/// clear the policy's condition (spec C21).
+#[tokio::test]
+async fn a_failed_retention_notifies() {
+    let s = setup_full(
+        "2026-09-30T12:00:00Z",
+        tempfile::tempdir().unwrap(),
+        false,
+        true,
+    );
+    s.call(
+        "POST",
+        "/$/backup-policies",
+        Some(
+            json!({"name": "p", "repository": "local", "schedule": "0 3 * * *",
+                    "datasets": ["d*"], "retention": {"minCount": 1, "maxCount": 1}}),
+        ),
+    )
+    .await;
+    let run = |s: &T, at: &str| {
+        s.clock.set(at);
+        let task = start_run(&s.st, "p".into(), RunTrigger::Manual, None)
+            .ok()
+            .unwrap();
+        s.wait(&task.id);
+        s.runs("p").remove(0)
+    };
+    run(&s, "2026-09-30T12:00:00Z");
+    *s.fake.delete_fails.lock() = true;
+    let r = run(&s, "2026-09-30T13:00:00Z");
+    assert_eq!(r.result, RunResult::Ok);
+    assert!(r.retention.unwrap().error.is_some());
+    assert!(crate::notify::is_active(&s.st, "backup.failed/p"));
+    *s.fake.delete_fails.lock() = false;
+    run(&s, "2026-09-30T14:00:00Z");
+    assert!(!crate::notify::is_active(&s.st, "backup.failed/p"));
 }

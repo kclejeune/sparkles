@@ -134,8 +134,10 @@ if __name__=='__main__':
                       'processes':unallowed_inventory(rows,busy),'process_count':len(busy),'boot_id':open('/proc/sys/kernel/random/boot_id').read().strip()}))
 '''
 
-def bounded(argv,seconds,input_bytes=None,limit=None):
+def bounded(argv,seconds,input_bytes=None,limit=None,reply=False):
     """Only Root's real adapter calls this. Kill only this new process group.
+
+    ``reply`` adds a bounded summary of the raw reply, as ``reply_summary`` keeps it.
 
     ``limit``, when given, returns the seconds left before an outer end, such as
     the original wall and BOOTTIME lifetime. It is checked with the monotonic
@@ -198,7 +200,9 @@ def bounded(argv,seconds,input_bytes=None,limit=None):
         problems,_=owned_group.finish(child,(getattr(child,'stdin',None),getattr(child,'stdout',None)),prelude,subprocess.TimeoutExpired,cancel)
         if failure is not None and problems:failure.cleanup_errors=problems
         owned_group.conclude(cancel,failure,**({'cleanup_errors':problems} if problems else {}))
-    if problems:return {'exit':getattr(child,'returncode',None),'error':'owned_invocation_closure_unknown','body':None}
+    if problems:result={'exit':getattr(child,'returncode',None),'error':'owned_invocation_closure_unknown','body':None}
+    # Every returned outcome keeps the summary of what was read, a timeout included.
+    if reply:result['reply']=reply_summary(bytes(data))
     return result
 
 
@@ -215,6 +219,16 @@ def observer_sources():
 
 def props(text):
     return dict(line.split('=',1) for line in text.splitlines() if '=' in line)
+
+def remote_entry(home=None):
+    """The remote command of every provider session: Python on stdin, started from the
+    worker's home, so nothing a session runs lands in a startup checkout.
+
+    The home always exists, unlike the state directory before provisioning, so a
+    diagnostic can still report an absent state directory."""
+    home=profile()['worker_home'] if home is None else home
+    need(isinstance(home,str) and re.fullmatch('/[A-Za-z0-9_./+-]+',home) is not None,'remote working directory')
+    return ['/usr/bin/env','-C',home,'/usr/bin/python3','-I','-B','-']
 
 class RealIO:
     def __init__(self,r,op):self.r=r;self.op=Path(op);self.boat_path=r['boat']['path']
@@ -246,10 +260,10 @@ class RealIO:
         program and its arguments travel as stdin bytes, as the phase launcher's do.
         """
         source=('import sys\nsys.argv=[\'remote\']+'+repr([str(a) for a in args])+'\n'+program).encode()
-        return self.boat(['ssh',worker_id(),'--','/usr/bin/python3','-I','-B','-'],seconds,source,json_mode=False)
+        return self.boat(['ssh',worker_id(),'--',*remote_entry()],seconds,source,json_mode=False)
     def diagnose(self,seconds):
         """Run the maintained read-only diagnostic program on the worker."""
-        r=self.remote_python((ROOT/'diagnostic-probe.py').read_text(),[],seconds)
+        r=self.remote_python((ROOT/'diagnostic-probe.py').read_text(),sorted(set(profile()['startup_repositories'].values())),seconds)
         need(r['exit']==0 and isinstance(r['body'],dict),'diagnostics unavailable')
         return r['body']
     def worker_boot_id(self):
@@ -259,7 +273,8 @@ class RealIO:
         return r['body']['boot_id']
     def boat(self,args,seconds=20,input_bytes=None,json_mode=True):
         prefix=[self.boat_path,'--no-update']+(['--json'] if json_mode else [])
-        return bounded(prefix+args,seconds,input_bytes)
+        # Only the resume keeps a summary of its reply, for an unacknowledged resume.
+        return bounded(prefix+args,seconds,input_bytes,reply=args[:1]==['resume'])
     def info(self):
         r=self.boat(['info',worker_id()]);need(r['exit']==0 and r['body'] is not None,'info unavailable')
         return safe_info(r['body'])
@@ -403,7 +418,7 @@ if __name__=='__main__':
         source=(ROOT/'remote-launcher.py').read_text().replace('COMMON_SOURCE_LITERAL',repr(common)).replace('PAYLOAD_JSON_LITERAL',repr(json.dumps(payload))).replace('PROBE_BASE64_LITERAL',repr(base64.b64encode(program).decode())).encode()
         need(len(source)<262144,'remote phase stdin bound')
         seconds=330 if phase=='metadata' else (45 if phase=='stopcheck' else observation_seconds+85)
-        r=self.boat(['ssh',worker_id(),'--','/usr/bin/python3','-I','-B','-'],seconds,source,False)
+        r=self.boat(['ssh',worker_id(),'--',*remote_entry()],seconds,source,False)
         need(r['exit']==0 and isinstance(r['body'],dict),'remote phase invocation failed')
         return r['body']
     def startup(self,intent,allow_qualification):
@@ -457,6 +472,50 @@ if __name__=='__main__':
         self.record('qualification.json',q);return q
 
 
+# The resume reply keeps its shape and a few fields, never free text. A field value is
+# kept only when it is one of the provider's known words below, and any other value reads
+# as "other". Key names are kept only when they belong to the reply's known schema, and
+# the rest are only counted. The worker ID is kept only in its provider form.
+REPLY_WORDS={
+    'event':{'accepted','resuming','ready','queued','started','resumed','error','failed'},
+    'status':{'resuming','running','ready','idle','starting','stopping','stopped','queued','pending','failed','error','archived'},
+    'code':{'no_ready_machine','rate_limited','quota_exceeded','limit_exceeded','not_found','conflict','unauthorized','forbidden',
+            'timeout','internal_error','invalid_request','already_running','busy'}}
+REPLY_WORDS['state']=REPLY_WORDS['status'];REPLY_WORDS['error_code']=REPLY_WORDS['code']
+REPLY_KEYS_KNOWN=('event','id','status','state','ok','code','error','message','sandbox','data','type','warning','warnings','request_id','requestId')
+REPLY_OBJECTS=4
+def reply_object(x):
+    if not isinstance(x,dict):return {'keys':[],'unknown_keys':0,'fields':{},'kind':type(x).__name__ if x is None or isinstance(x,(list,str,int,float,bool)) else 'other'}
+    def word(name,v):
+        if not isinstance(v,str):return None
+        return v if v in REPLY_WORDS[name] else 'other'
+    fields={}
+    for k in ('event','status','state','code'):
+        if k in x:fields[k]=word(k,x[k])
+    if 'ok' in x:fields['ok']=x['ok'] if isinstance(x['ok'],bool) else None
+    if isinstance(x.get('error'),dict) and 'code' in x['error']:fields['error_code']=word('error_code',x['error']['code'])
+    if 'id' in x:fields['id']=x['id'] if isinstance(x['id'],str) and re.fullmatch(r'bx_[a-z0-9]{1,32}',x['id']) else None
+    return {'keys':[k for k in REPLY_KEYS_KNOWN if k in x],'unknown_keys':sum(1 for k in x if k not in REPLY_KEYS_KNOWN),'fields':fields}
+def reply_summary(data):
+    """A bounded, credential-free summary of a provider reply's raw bytes."""
+    lines=[l for l in data.split(b'\n') if l.strip()]
+    row={'bytes':len(data),'lines':len(lines),'parsed':'empty' if not lines else 'unparsed','objects':[]}
+    if not lines:return row
+    try:
+        body=json.loads(data);row['parsed']='json'
+        row['objects']=[reply_object(x) for x in (body if isinstance(body,list) else [body])[:REPLY_OBJECTS]]
+        return row
+    except (ValueError,UnicodeError):pass
+    try:docs=[json.loads(l) for l in lines[:64]]
+    except (ValueError,UnicodeError):return row
+    row['parsed']='json_lines';row['objects']=[reply_object(x) for x in docs[:REPLY_OBJECTS]]
+    return row
+def recorded_reply(result):
+    """The reply summary of a result, from its raw bytes when the adapter kept them."""
+    if isinstance(result.get('reply'),dict):return result['reply']
+    body=result.get('body')
+    return {'bytes':None,'lines':None,'parsed':'body' if body is not None else 'none','objects':[] if body is None else [reply_object(x) for x in (body if isinstance(body,list) else [body])[:REPLY_OBJECTS]]}
+
 def no_ready(result):
     b=result.get('body')
     return result.get('exit') not in (0,None) and isinstance(b,dict) and b.get('ok') is False and b.get('code')=='no_ready_machine' and isinstance(b.get('error'),dict) and b['error'].get('code')=='no_ready_machine'
@@ -477,7 +536,7 @@ def drive(r,io):
     io.record('resume-intent.json',{'worker':worker_id(),'wall':io.wall(),'mono':io.mono(),'argv':['resume',worker_id(),'--environment',profile()['future_environment']['name'],'--type','large','--ttl','10800','--fail-fast','--no-wait']})
     try:
         result=io.boat(['resume',worker_id(),'--environment',profile()['future_environment']['name'],'--type','large','--ttl','10800','--fail-fast','--no-wait'])
-        io.record('resume-outcome.json',{'exit':result['exit'],'transport_error':result['error'],'no_ready_machine':no_ready(result),'acceptance':'positive' if positive_resume_ack(result,r['provider_contract']['resume_ack']) else ('no_ready_candidate' if no_ready(result) else 'uncertain'),'uncertain_acceptance':not positive_resume_ack(result,r['provider_contract']['resume_ack']) and not no_ready(result)})
+        io.record('resume-outcome.json',{'exit':result['exit'],'transport_error':result['error'],'no_ready_machine':no_ready(result),'acceptance':'positive' if positive_resume_ack(result,r['provider_contract']['resume_ack']) else ('no_ready_candidate' if no_ready(result) else 'uncertain'),'uncertain_acceptance':not positive_resume_ack(result,r['provider_contract']['resume_ack']) and not no_ready(result),'reply':recorded_reply(result)})
         if no_ready(result):
             after=io.info();stopped(after)
             need(after['environmentVersion'] in (r['snapshot_continuity']['pre_resume_environment_version'],profile()['future_environment']['version']) and after['snapshotCompletedAt']==before['snapshotCompletedAt'] and after['stoppedAt']==before['stoppedAt'],'no-ready state drift')
@@ -882,7 +941,16 @@ def guard_entry(op):
     cg=Path('/sys/fs/cgroup')/line[3:].lstrip('/')
     need(cg.name==r['guard_unit']+'.service','guard cgroup identity')
     io.record('guard-ready.json',{'pid':os.getpid(),'uid':os.getuid(),'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'deadline_mono':intent['deadline_mono'],'memory_max':(cg/'memory.max').read_text().strip(),'swap_max':(cg/'memory.swap.max').read_text().strip(),'cgroup':str(cg)})
-    return 0 if guard_loop(r,io,intent) else 1
+    if not guard_loop(r,io,intent):return 1
+    # The guard's last act names its own invocation, so a finish that finds the unit
+    # already collected can tell this clean exit from a replaced, signalled or failed one.
+    record_guard_exit(io)
+    return 0
+
+def record_guard_exit(io):
+    """The guard's last receipt after a verified closure: its invocation, boot and PID."""
+    if io.exists('closed.json'):
+        io.record('guard-exited.json',{'invocation_id':os.environ.get('INVOCATION_ID'),'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'pid':os.getpid(),'exit':0})
 
 def startup_scope_gate(pins,mode):
     need(mode=='normal_pinned_provisioning','check-only prebootstrap mode unavailable')
@@ -947,7 +1015,19 @@ def await_stop(r,io,seconds=180):
             request=io.read('stop-intent.json');stop_complete(closed['safe_info'],closed['stop_operation'],request['requested_wall'],r['snapshot_continuity']['snapshot_completed_at'],r['provider_contract']['snapshot_policy'])
             loaded=io.show(r['guard_unit']+'.service');original=io.read('guard-loaded.json')
             need(Path('/proc/sys/kernel/random/boot_id').read_text().strip()==original['boot_id'],'guard boot changed during finish')
-            need(loaded.get('Id')==r['guard_unit']+'.service'and loaded.get('InvocationID')==original['loaded']['InvocationID'],'guard replaced during finish')
+            need(loaded.get('Id')==r['guard_unit']+'.service','guard replaced during finish')
+            # systemd unloads the guard's transient unit once it is inactive without a failure,
+            # so a finish can find it collected. Absence alone proves no exit status, so the
+            # collected branch also needs the guard's own last receipt, which names the
+            # original invocation and boot and is written only after a verified closure.
+            if loaded.get('LoadState')=='not-found' and loaded.get('InvocationID')=='' and loaded.get('ActiveState')=='inactive' and loaded.get('MainPID')=='0':
+                exited=io.read('guard-exited.json') if io.exists('guard-exited.json') else {}
+                need(exited.get('invocation_id')==original['loaded']['InvocationID'] and exited.get('boot_id')==original['boot_id'] and exited.get('exit')==0,'collected guard without its own exit receipt')
+                cg=original['loaded'].get('ControlGroup','')
+                root=Path('/sys/fs/cgroup')/cg.lstrip('/') if cg else None
+                need(root is None or not root.exists() or all(not f.read_text().strip() for f in root.rglob('cgroup.procs')),'guard cgroup not empty')
+                return {'worker':worker_id(),'stopped_confirmed':True,'guard_closed':True,'stop_operation':closed['stop_operation']}
+            need(loaded.get('InvocationID')==original['loaded']['InvocationID'],'guard replaced during finish')
             if loaded.get('ActiveState')in('inactive','failed')and loaded.get('MainPID')=='0':
                 need(loaded.get('ExecMainStatus')=='0','guard did not exit cleanly')
                 cg=loaded.get('ControlGroup','')

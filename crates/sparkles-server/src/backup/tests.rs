@@ -33,6 +33,8 @@ struct Opts {
     max_tasks: usize,
     /// `--min-free-disk-mb` (default: the server's default)
     min_free_disk: Option<u64>,
+    /// notifications on, every event routed to a refused channel (spec C21)
+    notify: bool,
 }
 
 struct Srv {
@@ -93,6 +95,9 @@ fn server(o: Opts) -> Srv {
     st.read_only = o.read_only;
     if let Some(m) = o.min_free_disk {
         st.limits.min_free_disk_bytes = Some(m);
+    }
+    if o.notify {
+        crate::notify::enable_for_tests(&mut st, dir.path());
     }
     #[cfg(feature = "auth")]
     if o.auth {
@@ -1000,7 +1005,11 @@ async fn permissions_follow_the_route_table_and_the_handlers() {
 /// A server whose `ds` has commits 1–3 of the acceptance setup, and repository `local`
 /// registered at a fresh directory.
 async fn with_local(read_only_repo: bool) -> (Srv, tempfile::TempDir) {
-    let s = server(Opts::default());
+    with_local_opts(read_only_repo, Opts::default()).await
+}
+
+async fn with_local_opts(read_only_repo: bool, o: Opts) -> (Srv, tempfile::TempDir) {
+    let s = server(o);
     // a fresh `ds` (the fixture's has a commit already) with three commits, holding
     // `<urn:b> <urn:p> 2` at head 3
     assert!(s.st.delete("ds").unwrap());
@@ -2388,4 +2397,330 @@ fn a_newer_restore_record_is_ignored() {
     assert!(restored_from(dir.path()).is_none());
     std::fs::write(&path, record(writes).to_string()).unwrap();
     assert_eq!(restored_from(dir.path()).unwrap()["backup"], "b1");
+}
+
+// ---------------------------------------------------- notifications (spec C21) ------
+
+/// Wait until the notifier has the condition `key` (or, with `false`, does not).
+async fn condition(st: &AppState, key: &str, active: bool) {
+    for _ in 0..200 {
+        if crate::notify::is_active(st, key) == active {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "condition {key} is not {}: {:?}",
+        if active { "active" } else { "clear" },
+        crate::notify::active_keys(st)
+    );
+}
+
+/// The recent deliveries of event type `event`, once there are `n` of them or after a
+/// while.
+async fn notified(st: &AppState, event: &str, n: usize) -> Vec<J> {
+    let read = || -> Vec<J> {
+        crate::notify::status_json(st)["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["event"] == event)
+            .cloned()
+            .collect()
+    };
+    for _ in 0..200 {
+        if read().len() >= n {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    read()
+}
+
+/// Make every directory under `root` read-only (`read_only`) or writable again. With
+/// `true` it answers whether writes now fail, which they do not for root.
+fn freeze(root: &std::path::Path, read_only: bool) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let mut dirs = vec![root.to_path_buf()];
+    let mut all = Vec::new();
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                dirs.push(e.path());
+            }
+        }
+        all.push(d);
+    }
+    for d in &all {
+        let mode = if read_only { 0o555 } else { 0o755 };
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    read_only && std::fs::write(root.join(".probe"), b"x").is_err()
+}
+
+/// A backup started by hand that fails raises `backup.failed` with `trigger: manual`,
+/// and the next one that succeeds clears it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_manual_backup_notifies() {
+    let (s, repo) = with_local_opts(
+        false,
+        Opts {
+            notify: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    backup_ds(&s, "b1").await;
+    let key = crate::notify::events::manual_backup_key("local", "ds");
+    assert!(!crate::notify::is_active(&s.st, &key));
+    // the repository cannot be written, so the task fails
+    update(&s, "ds", "INSERT DATA { <urn:c> <urn:p> 3 }");
+    if !freeze(repo.path(), true) {
+        freeze(repo.path(), false);
+        eprintln!("writes to a read-only directory succeed here (root?): skipped");
+        return;
+    }
+    let t = run(
+        &s,
+        "/$/backups/ds",
+        json!({"repository": "local", "name": "b2"}),
+    )
+    .await;
+    freeze(repo.path(), false);
+    assert_eq!(t.state, "failed", "{:?}", t.message);
+    condition(&s.st, &key, true).await;
+    let sent = notified(&s.st, "backup.failed", 1).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        crate::notify::status_json(&s.st)["active"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a["key"] == key.as_str())
+            .count(),
+        1
+    );
+    // a backup of another dataset does not clear it, and one by a policy of the same
+    // dataset into the same repository does
+    let policy_backup = |ds: &'static str, name: &'static str| {
+        let st = s.st.clone();
+        let o = sparkles_backup::CreateOptions {
+            name: name.into(),
+            ..Default::default()
+        };
+        tokio::task::spawn_blocking(move || ops::create_for_policy(&st, ds, "local", o))
+    };
+    policy_backup("wiki", "w1").await.unwrap().unwrap();
+    assert!(crate::notify::is_active(&s.st, &key));
+    policy_backup("ds", "b3").await.unwrap().unwrap();
+    condition(&s.st, &key, false).await;
+}
+
+/// A verification that finds a backup in error raises `backup.verify.failed` for the
+/// repository. A clean verification at a lower level does not clear it, one at the
+/// same level of the damaged backup does, and so does deleting the backup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_verification_notifies() {
+    let (s, repo) = with_local_opts(
+        false,
+        Opts {
+            notify: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    backup_ds(&s, "b1").await;
+    update(&s, "ds", "INSERT DATA { <urn:c> <urn:p> 3 }");
+    backup_ds(&s, "b2").await;
+    let key = "backup.verify.failed/local";
+    let (_, file) = blob_file(&s, repo.path(), "b1", "gen-0001/spo.dat").await;
+    let saved = std::fs::read(&file).unwrap();
+    // a flipped byte keeps the length, so only the data level sees it
+    let mut bad = saved.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    std::fs::write(&file, &bad).unwrap();
+    let t = run(
+        &s,
+        "/$/backups/ds/local/b1/verify",
+        json!({"level": "data"}),
+    )
+    .await;
+    assert_eq!(t.detail.unwrap()["status"], "error");
+    condition(&s.st, key, true).await;
+    let t = run(
+        &s,
+        "/$/repositories/local/verify",
+        json!({"level": "exists"}),
+    )
+    .await;
+    assert_ne!(t.detail.unwrap()["status"], "error");
+    assert!(
+        crate::notify::is_active(&s.st, key),
+        "a lower level clears nothing"
+    );
+    std::fs::write(&file, &saved).unwrap();
+    let t = run(
+        &s,
+        "/$/backups/ds/local/b1/verify",
+        json!({"level": "data"}),
+    )
+    .await;
+    assert_eq!(t.detail.unwrap()["status"], "ok");
+    condition(&s.st, key, false).await;
+    assert_eq!(notified(&s.st, "backup.verify.failed", 1).await.len(), 1);
+    // damaged again, then deleted: a whole verification no longer lists it
+    std::fs::remove_file(&file).unwrap();
+    let t = run(
+        &s,
+        "/$/backups/ds/local/b1/verify",
+        json!({"level": "exists"}),
+    )
+    .await;
+    assert_eq!(t.detail.unwrap()["status"], "error");
+    condition(&s.st, key, true).await;
+    delete_ds_backup(&s, "b1").await;
+    let t = run(
+        &s,
+        "/$/repositories/local/verify",
+        json!({"level": "exists"}),
+    )
+    .await;
+    let d = t.detail.unwrap();
+    let still: Vec<&J> = d["backups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|b| b["status"] == "error")
+        .collect();
+    if still.is_empty() {
+        condition(&s.st, key, false).await;
+    }
+}
+
+/// A GC that fails raises `backup.gc.failed` for the repository, and one that succeeds
+/// clears it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_gc_notifies() {
+    let (s, repo) = with_local_opts(
+        false,
+        Opts {
+            notify: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    // blobs that no backup needs, as in the GC test above
+    backup_ds(&s, "b1").await;
+    update(&s, "ds", "INSERT DATA { <urn:c> <urn:p> 3 }");
+    backup_ds(&s, "b2").await;
+    delete_ds_backup(&s, "b1").await;
+    s.st.get("ds").unwrap().store.compact().unwrap();
+    backup_ds(&s, "b4").await;
+    delete_ds_backup(&s, "b2").await;
+    let key = "backup.gc.failed/local";
+    if !freeze(repo.path(), true) {
+        freeze(repo.path(), false);
+        eprintln!("writes to a read-only directory succeed here (root?): skipped");
+        return;
+    }
+    let t = run(&s, "/$/repositories/local/gc", json!({"graceHours": 0})).await;
+    freeze(repo.path(), false);
+    assert_eq!(t.state, "failed", "{:?}", t.message);
+    condition(&s.st, key, true).await;
+    // a dry run does not sweep, so it clears nothing
+    let t = run(
+        &s,
+        "/$/repositories/local/gc",
+        json!({"graceHours": 0, "dryRun": true}),
+    )
+    .await;
+    assert_eq!(t.state, "done", "{:?}", t.message);
+    assert!(crate::notify::is_active(&s.st, key));
+    let t = run(&s, "/$/repositories/local/gc", json!({"graceHours": 0})).await;
+    assert_eq!(t.state, "done", "{:?}", t.message);
+    condition(&s.st, key, false).await;
+    assert_eq!(notified(&s.st, "backup.gc.failed", 1).await.len(), 1);
+}
+
+/// A failed whole verification clears only on a whole one that succeeds, not on a
+/// selected one, and a backup's restore-level problem clears when the backup is
+/// deleted (spec C21).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn verification_conditions_follow_scope_and_deletion() {
+    use std::os::unix::fs::PermissionsExt;
+    let (s, repo) = with_local_opts(
+        false,
+        Opts {
+            notify: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    backup_ds(&s, "b1").await;
+    update(&s, "ds", "INSERT DATA { <urn:c> <urn:p> 3 }");
+    backup_ds(&s, "b2").await;
+    let key = "backup.verify.failed/local";
+    let listing = repo.path().join("backups");
+    let set = |mode: u32| {
+        std::fs::set_permissions(&listing, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    // the backups can be read but not listed
+    set(0o311);
+    let listable = std::fs::read_dir(&listing).is_ok();
+    if !listable {
+        let t = run(
+            &s,
+            "/$/repositories/local/verify",
+            json!({"level": "exists"}),
+        )
+        .await;
+        assert_eq!(t.state, "failed", "{:?}", t.detail);
+        condition(&s.st, key, true).await;
+        let _ = run(
+            &s,
+            "/$/backups/ds/local/b1/verify",
+            json!({"level": "exists"}),
+        )
+        .await;
+        assert!(
+            crate::notify::is_active(&s.st, key),
+            "a selected verification does not clear a failed whole one"
+        );
+    }
+    set(0o755);
+    let t = run(
+        &s,
+        "/$/repositories/local/verify",
+        json!({"level": "exists"}),
+    )
+    .await;
+    assert_ne!(t.detail.unwrap()["status"], "error");
+    condition(&s.st, key, false).await;
+    // a restore-level problem of b1, which no whole verification can check
+    let (_, file) = blob_file(&s, repo.path(), "b1", "gen-0001/spo.dat").await;
+    let saved = std::fs::read(&file).unwrap();
+    let mut bad = saved.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    std::fs::write(&file, &bad).unwrap();
+    let t = run(
+        &s,
+        "/$/backups/ds/local/b1/verify",
+        json!({"level": "restore"}),
+    )
+    .await;
+    assert_eq!(t.detail.unwrap()["status"], "error");
+    condition(&s.st, key, true).await;
+    std::fs::write(&file, &saved).unwrap();
+    delete_ds_backup(&s, "b1").await;
+    let t = run(&s, "/$/repositories/local/verify", json!({"level": "data"})).await;
+    assert_ne!(t.detail.unwrap()["status"], "error");
+    condition(&s.st, key, false).await;
+    if listable {
+        eprintln!(
+            "a directory without read permission is listable here (root?): the scope part was skipped"
+        );
+    }
 }

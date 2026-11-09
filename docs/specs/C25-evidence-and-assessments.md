@@ -1707,6 +1707,252 @@ more supporting occurrences than `maxClaims`, a hidden policy and an unknown one
 settings-only change at one sequence and a bound named snapshot. A call that names no
 policy matches today's output byte for byte in both formats.
 
+### Ingestion into claim proposals
+
+Roadmap item 651 delivers this contract in `POST /$/ingest/{ds}` and `sparkles ingest`,
+with `sparkles::evidence::OrdinaryChanges` for Rust callers of `propose`. C18 §7 defines
+ingestion only into asserted memory, and this specification did not say how an
+ingestion becomes an evidence batch, so each decision below states the adopted
+behaviour and the strongest alternative that was rejected. The current modes of C18 §7.7 keep their behaviour, and
+`branch` stays the default.
+
+#### Mode and arguments
+
+`POST /$/ingest/{ds}` and `sparkles ingest --mode` accept a fifth mode, `claims`. A
+claims ingestion converts and registers the document as the other modes do, extracts
+and links its facts, and publishes the registration and the evidence batch in one
+commit. The extracted facts become claim proposals instead of asserted memory. The
+mode creates no review branch and merges nothing, because the review policy decides
+what is projected. The `branch` option names an existing branch for the commit, and
+`main` is used when it is absent. The `source` option still extracts a registered
+source instead of a document.
+
+Two new options, `sourceGraph` and `proposalGraph`, choose the evidence graphs when
+the settings name several, as `POST /{ds}/claims` does. The `graph` option names the
+ordinary source graph of C18 §7.2, as in the other modes, and a graph that the
+managed-graph registry protects is refused with `profile-managed-graph`. The mode needs
+no `admin` grant, unlike `auto`, because it asserts no extracted fact.
+
+The rejected alternative is a `claims` flag that combines with `branch`, `preview` and
+`auto`. A review branch and its merge preview would review the batch a second time,
+and the confidence threshold of `auto` would decide admission in place of the policy.
+
+#### One commit for the source and the batch
+
+A claims ingestion still writes the C18 source graph of §7.2, with its source,
+rendition and chunks under the same `keepText` rules as asserted mode, so the document
+stays visible to `read_chunks`, full-text search and embeddings. Only the extracted
+facts change their form. The registration and the evidence batch publish in the same
+commit, so a reader sees either both or neither.
+
+The pipeline plans the registration at the branch head without writing it, which gives
+its inserted and deleted quads and the head they were read at. `propose` then takes
+those quads as ordinary changes of its own transaction, with `ifHead` set to that head,
+the caller's write view and the dataset's guard. It refuses ordinary changes in any
+graph that the managed-graph registry protects, for any owner, before it publishes, so
+the evidence owner's capability cannot carry a write into another owner's graph or into
+an evidence graph outside the typed records. When the head has moved, the registration
+is planned again at the new head, up to three times, and the run then answers
+`head-changed`. Planning reads no model, so a retry costs no tokens. An idempotent
+replay of the batch writes nothing, because its first publication carried the
+registration. When the same text is already registered, as after an asserted
+ingestion of the same document, the registration has no changes and the commit holds
+the batch alone.
+
+A `source` run reads a source that is already registered, so its commit holds the batch
+alone, and the source keeps its C18 records.
+
+The rejected alternative writes the registration and the batch in two commits, in either
+order. Between them a reader could see a registered source without its proposals or
+proposals whose source text is missing, and a crash or a refusal of the second commit
+would leave that state behind until a retry repaired it.
+
+#### Records of the batch
+
+The batch holds one source revision, one rendition, its passages and evidence
+references, the claims and one evidence link per claim.
+
+| Record | Content |
+|---|---|
+| Source revision | Its source is the IRI that the registration gives the C18 source, or for a `source` run the registered source's IRI. Its content is metadata only, with the content digest that the C18 registration records, and an http or https URL is a locator. |
+| Rendition | Its occurrence key is the C18 rendition IRI, and the conversion is a method named by the format and the server version. It retains the normalized text as `ev:normalizedText`. A `source` run uses the text of the source's current rendition. |
+| Passage and reference | One passage per distinct span of the extracted facts, quoting the exact selected text, and one evidence reference to it. |
+| Claim | One `ev:Reported`, `ev:Positive` occurrence per extracted fact, attributed to the source and derived from the revision. A reported confidence becomes `ev:extractionConfidence` on the zero-to-one scale, evaluated by the model whose answer gave the fact. |
+| Evidence link | `ev:Supports` from the fact's passage reference to its claim, attributed to the model whose answer gave the fact. |
+
+The C18 registration records the digest of the normalized text as the source's content
+digest when it keeps no other original bytes, which is the case for converted uploads.
+An upload and a later `source` run of the same registered source therefore describe the
+same revision. The passages are verified against the batch's own rendition text, which
+avoids the `incomplete-evidence` answer of proposal decision 1. A review verifies every
+cited passage again against the rendition's retained `ev:normalizedText` before it
+accepts a claim, so the evidence rendition must keep the text. The text is therefore
+stored twice, once in the C18 chunks and once in the evidence rendition. That costs up
+to 2 MiB of extra storage per source, and it keeps acceptance independent of the
+ordinary graph that the C18 chunks live in. A dataset with `keepText: false` cannot
+retain the text that acceptance needs, so it refuses claims mode with `409 no-text`
+before conversion. The extraction model and the converter remain attributed metadata,
+and the authenticated caller is the operation's principal, as §5 requires.
+
+The rejected alternative verifies the passages at publication and records the
+rendition without its text. The proposals would publish, but no review could accept
+them, because acceptance resolves each passage against retained text. Retaining the
+original bytes in the revision was rejected as well. The original bytes, the converted
+text and the other decoded content count together toward the 16 MiB bound of §8, so a
+large PDF could exceed it, and the C18 registration already records the content digest
+that identifies the revision.
+
+#### Entities
+
+Linking runs as in the other modes, as the caller and over the caller's view. An
+`exact` verdict uses the existing IRI. An `ambiguous` verdict uses the first candidate
+and is listed in the result's `flagged` member, as on a review branch. A new entity gets
+a name-based UUID of the dataset, the revision digest and the entity's normalized text
+and class, so that the same revision names the same entity again. Its class and label
+are proposed as two further claims, `rdf:type` and the profile's label predicate, cited
+by the first passage that mentions the entity and attributed to the model of that
+passage's fact. The candidates of a `candidates` verdict are reported in the result's
+`candidates` member and written nowhere.
+
+The rejected alternative asserts new entities' types and labels in an ordinary graph.
+That needs a second commit and asserts extracted content before any review.
+
+#### Checks before the write
+
+The profile's term checks and the span check of C18 §7.6 run as they do for asserted
+facts, and a fact that fails them is reported in `failed` and left out of the batch.
+The commit passes the dataset's guard as a registration does in the other modes. The
+guard dry run of the extracted facts in C18 §7.7 is not run, because no fact is
+asserted, and the result reports `factGuard: "not-run"`. The rejected alternative runs
+`assert_facts` as a dry run of the facts against the source graph. Its findings would
+describe triples that are never asserted, and a reader could take them for findings of
+a later projection.
+
+#### Grants and settings
+
+The pipeline checks the grants in two stages. Before conversion it checks from the
+grants alone that the caller has `write` on the update endpoint of the dataset or
+branch and update grants on the source-record and proposal graphs it will write, that
+the evidence settings are enabled and that the dataset keeps source text. A claims
+ingestion also needs a provider in the `extract` role, and without one it answers
+`no-model` at the same point. The C18 source graph of an upload without `iri` or
+`graph` is derived from the converted text, so it is known only after conversion. The
+registration plan derives it, and the pipeline then checks the caller's update grant on
+it and that no profile manages it, before any provider call. A caller
+without them is refused as `POST /{ds}/claims` refuses it, and no tokens are spent.
+`propose` checks again at publication.
+
+The rejected alternative lets `propose` alone refuse. Its answer would arrive only
+after the extraction's model calls had been spent.
+
+#### Idempotent re-ingestion
+
+Every claims ingestion carries the idempotency key `ingest-claims:1:<digest>`. The
+digest is the SHA-256 of a canonical JSON array of the version, the source IRI, the
+C18 source graph, the evidence source-record and proposal graphs, the revision and
+rendition digests and the profile name. The same text under another source or graph is
+therefore another ingestion with its own occurrences. The revision's source key frames
+the same source and graphs, so its record identities, and the identities derived from
+them, differ as well. The changing registration delta is not part of the key or of the
+payload digest. Before extraction the
+pipeline derives the operation IRI of that key for the caller with `operation_iri` and
+looks for it in the record graphs of the selected branch. When it is found, the result
+is `already-proposed` with the first operation, and nothing is extracted or written, so
+no model is called. The C18 chunks of that first ingestion are already present, since
+they published in its commit. A model's extraction is not
+deterministic, so without this check a second run would send another payload under the
+same key and answer `idempotency-conflict`. Two concurrent runs of the same revision can
+still both extract, and the second then answers `idempotency-conflict` and writes
+nothing.
+
+A document whose chunks exist because an asserted ingestion registered the same text
+has no such operation. Its claims ingestion extracts the facts and publishes the batch,
+and the registration contributes no change to that commit.
+
+The rejected alternative omits the key and relies on deterministic record identities
+and the writer's `existing` flag. A second extraction that differs would add new
+occurrences of the same revision, so re-ingestion would not be idempotent.
+
+#### Changed revisions
+
+A source ingested again with another digest gets a new revision of the same source and
+new claim occurrences. Earlier occurrences are neither withdrawn nor superseded, and the
+result names the previous C18 rendition when the registration replaced one. Withdrawal
+stays an explicit `claims/withdraw` call. Claim occurrences get no `prov:wasRevisionOf`
+link, because extraction does not establish which occurrence corresponds to which.
+
+The two source revisions do correspond, because the registration replaced the current
+rendition of the same source. Both revisions name the same source through
+`prov:specializationOf`, and the C18 renditions keep their `prov:wasRevisionOf` chain.
+The source revision input has no field for a link to a predecessor revision, and adding
+one changes the record digests of revisions, so roadmap item 780 tracks a
+`prov:wasRevisionOf` link between evidence source revisions.
+
+The rejected alternative applies the supersession of C18 §7.9 and withdraws the earlier
+occurrences that the new extraction does not repeat. A model omitting a fact is not
+evidence that the source no longer states it, and §6 makes withdrawal a recorded
+decision rather than an inference.
+
+#### Bounds
+
+The existing refusals of more than 10 MiB of input or 2 MiB of converted text answer
+`too-large` before extraction or any write. Linking follows the extraction chunk by
+chunk, so after each chunk that answers, the run knows the claims that the batch would
+hold so far. Those are the distinct fact claims together with the class and label
+claims of the new entities. Extraction stops calling the model as soon as that count
+exceeds the 1,000 claims of §8, and the run is refused with `too-large`, writing
+nothing. Each entity is linked once however many chunks name it. Before `propose`, the
+pipeline prepares the batch as the proposal will and refuses it the same way when its
+decoded size, including the rendition text, quotes and literals, exceeds the 16 MiB of
+§8. The HTTP route enforces that bound only through its body limit, so the pipeline
+must check it itself. A document is never split into several batches.
+
+The rejected alternative splits a large document into several batches. Each batch would
+publish separately, and a refusal partway through would leave the earlier batches
+behind.
+
+#### Source instructions
+
+A `source` run of a registered source typed `mem:Instructions` names that source in its
+revision, so the occurrences report `origin=instructions` under item 650's rule, and
+the claims section labels them as source data. An uploaded document is never typed as
+instructions by the ingestion. The extracted propositions and quotes are data, and they
+change no tool, grant, outbound permission or execution policy, as A10 requires. No
+vocabulary is added.
+
+The rejected alternative adds an instructions kind to the source revision input. That
+changes the profile's input model and record digests for a label that the existing
+typing triple already supplies.
+
+#### Result and surfaces
+
+The task result has `outcome` set to `proposed`, `already-proposed` or `no-facts`, and
+`mode` set to `claims`. A proposed result carries the operation, commit, branch, first
+availability and hold of the receipt, the revision and rendition IRIs, the counts of
+records by kind, the records of the receipt, and the `failed` and `flagged` lists, with
+the registration's members that the other modes report. A run that extracts no fact
+still publishes the registration with a batch of its revision and rendition alone, and
+answers `no-facts`, so that a repeat of it finds its operation. OpenAPI gains the mode, the
+two options and the result schema.
+
+MCP has no tool that starts an ingestion, since `register_converted` is internal and
+`register_source` registers without extraction, so MCP gains nothing. An agent that
+extracts facts itself proposes them with `propose_claims`. No binding exposes ingestion
+modes, so the bindings are unchanged.
+
+#### Acceptance
+
+Router and pipeline tests with a scripted extraction cover a refusal at each step that
+leaves no record, branch or source graph, a refusal of the batch at publication that
+also leaves the registration and chunks unwritten, a claims ingestion of a document
+whose chunks an asserted ingestion already wrote, a caller without `write` or without an update
+grant on either evidence graph that spends no model call, a repeated ingestion of the
+same revision that answers `already-proposed` without a model call, a changed revision
+that keeps the earlier occurrences, a `source` run of an instructions document whose
+occurrences report `origin=instructions`, and a document over each bound that is
+refused with nothing written. They also check that asserted modes are unchanged and
+that the written records conform to the shapes.
+
 ### Scope changes
 
 **Probabilistic reasoning through external engines.** The scope statement in §1 excluded probabilistic reasoning. Probabilistic reasoning through external engines, as integration only, is now planned under [ROADMAP](../ROADMAP.md) item 463 and [F28](F28-ml-and-probabilistic-integration/README.md). Sparkles still defines no probabilistic reasoner of its own.

@@ -14276,8 +14276,8 @@ Notification channels name their credentials with the same secrets, and the answ
 
 ### Notifications
 
-The server can push notifications to a webhook or an ntfy topic when something needs a
-person. The design is in [C21](specs/C21-outbound-notifications.md). The configuration
+The server can push notifications to a webhook, an ntfy topic or mail addresses when
+something needs a person. The design is in [C21](specs/C21-outbound-notifications.md). The configuration
 is the server-wide settings kind `notifications`, at `/$/server/settings/notifications`
 with the routes of [Server settings](#server-settings). Its layers are the built-in
 defaults, the settings file's `server.notifications` object and the runtime layer in
@@ -14309,7 +14309,7 @@ defaults, the settings file's `server.notifications` object and the runtime laye
 | `server` | The server's name in each notification. The host name by default. |
 | `baseUrl` | The URL of the server, which makes the links of notifications absolute. Without it a link is a path under `/ui`. |
 | `repeatEvery` | The shortest time between two notifications about one lasting condition, at least `1m`. `1d` by default. |
-| `channels` | Channels by name. A name has the form of a secret's name. |
+| `channels` | Channels by name, at most 32. A name has the form of a secret's name. |
 | `routes` | Event types to channel names. A key is an event type, a prefix such as `backup.*`, or `*`. An event goes to the union of the channels of every key that matches it. |
 | `delivery` | `attempts` from 1 to 10 with the first included, `backoffSecs` before the second attempt and doubled for each later one, `maxBackoffSecs`, and `timeoutSecs` per attempt, at most the outbound policy's timeout. |
 
@@ -14324,6 +14324,32 @@ An `ntfy` channel has `server` (`https://ntfy.sh` by default), `topic`, an optio
 `token` secret sent as a bearer token, `priority` from 1 to 5 and `tags`. The server
 publishes `{topic, title, message, priority, tags, click}` to the root of `server`.
 Without `priority`, the event's severity gives 3, 4 or 5.
+
+An `email` channel has `host`, `port`, `tls`, `username`, `password`, `from` and `to`.
+
+```json
+{ "type": "email", "host": "smtp.example.org", "port": 587, "tls": "starttls", "username": "sparkles", "password": { "secret": "smtp" }, "from": "sparkles@example.org", "to": ["ops@example.org"] }
+```
+
+`tls` is `starttls`, the default, for STARTTLS on the submission port, or `tls` for
+TLS from the first byte. The port defaults to 587 with `starttls` and 465 with `tls`.
+There is no plain mode, and a server that does not offer STARTTLS is refused before
+the server sends a password or a message. The server checks the mail server's
+certificate against the system's roots. With `username`, it authenticates with SASL
+PLAIN, and `password` names the secret that holds the password. `from` and `to` are
+ASCII mail addresses, with 1 to 20 recipients. The outbound policy checks the host
+before the server connects. A `4xx` reply is retried like a transient failure, and a
+`5xx` reply ends the delivery. A recipient that the server refuses fails the whole
+delivery, and one that it forwards with `251` is accepted. One `timeoutSecs` bounds the
+whole submission. A failed login is reported without the server's reply text.
+
+The message has the notification's title as its subject and a plain-text body with
+the summary, the link, the event type, the severity, the server, the dataset, the time,
+the id and the data as indented JSON. The body is UTF-8, sent as 7-bit text when it is
+ASCII and as quoted-printable otherwise, and a subject outside ASCII is sent as encoded
+words. The `Message-ID` is the notification's `id` at the domain of `from`, so the
+retries of one delivery carry the same one, and an `X-Sparkles-Event` header holds the
+event type.
 
 A credential is always a secret reference. A channel member such as `token` that holds a
 string is a `400`, and the error does not quote it. A route that names an unknown
@@ -14356,7 +14382,10 @@ server-wide events, and new members may appear in later versions.
 | Event | Fires when | `data` |
 |---|---|---|
 | `memory.review.pending` | The oldest open review branch of a dataset is older than the dataset's `memory.review.notifyAfter`. Repeats at most every `memory.review.repeatEvery`, or the kind's `repeatEvery`, until no review branch is open. | `open`, `oldest` with `branch`, `kind` and `created`, `branches` (at most 10), `notifyAfter`, `repeatEvery` |
-| `backup.failed` | A backup policy run ends `failed` or `partial`. Repeats at most every `repeatEvery` per policy, until a run of the policy succeeds. | `policy`, `run`, `result`, `repository`, `failedDatasets` with `dataset` and `reason`, `consecutiveFailures` |
+| `backup.failed` | A backup policy run ends `failed` or `partial`, ends `ok` with a failed retention, stops on an error, or cannot start when it is due, or a backup started by hand fails. Repeats at most every `repeatEvery` per policy, or per repository and dataset for a backup started by hand. A policy's condition clears when a run of it succeeds in full, and a backup started by hand clears when any backup of the dataset into the repository succeeds. | For a policy run, `policy`, `run`, `result`, `repository`, `failedDatasets` with `dataset` and `reason`, `consecutiveFailures`, and `retentionError` when retention failed. For a run that stopped or did not start, `policy`, `repository`, `stage` (`run` or `start`) and `error`. For a backup started by hand, `trigger: "manual"`, `dataset`, `repository` and `error`. |
+| `backup.verify.failed` | A verification fails or finds a backup in error. Repeats at most every `repeatEvery` per repository. It clears once every damaged backup has passed a verification at the same or a higher level or has been deleted, and every failed verification has been followed by one of the same scope that succeeded at the same or a higher level. | `repository`, `level`, `backups` in error, and `error` when the verification itself failed |
+| `backup.gc.failed` | A GC of a repository fails, or a policy cannot start its GC after retention. Repeats at most every `repeatEvery` per repository, until a GC of the repository that deletes succeeds. A dry run clears nothing. | `repository`, `stage` (`run` or `start`) and `error` |
+| `backup.overdue` | An enabled policy has missed two scheduled instants since its last success and no run of it is going on. Repeats at most every `repeatEvery` per policy, until the policy succeeds. A policy that has never succeeded is reported by its failures instead. | `policy`, `repository`, `lastSuccess`, `missedSince` |
 | `models.budget.exceeded` | A provider's tokens counted today reach its `budget.tokensPerDay`. Once per provider and day. | `provider`, `tokensPerDay`, `usedToday` |
 | `notification.test` | A test send. | `channel` |
 
@@ -14369,7 +14398,13 @@ with commits that `main` does not have. A dataset sends no memory review event w
 ```
 
 Both durations are at least `1h`. The server checks the memory review and budget
-conditions once a minute, and sends a backup event when the run ends. When a condition
+conditions once a minute, sends a backup event when a backup, a policy run, a
+verification or a GC ends, and checks for overdue policies each time the backup
+scheduler runs. A cancelled backup, policy run, verification or GC sends nothing. The
+conditions of a policy that is removed are cleared. A damaged backup and a failed
+verification are also listed in `active` as conditions of their own, with keys such as
+`backup.verify.failed/local/b1@data`, which send nothing and let the repository's
+condition clear when the last of them does. When a condition
 was notified less than its repeat interval ago, the event is held back and counted. The
 conditions that were notified are kept in `<dataDir>/notifications-state.json`, so a
 restart does not repeat them.
@@ -14378,18 +14413,30 @@ Every request goes through the outbound policy. A channel on a loopback or priva
 address needs `--outbound-allow-private`, and a refused delivery is not retried. A
 connection error, a timeout, `408`, `429` and `5xx` are retried with backoff, honoring
 `Retry-After` up to `maxBackoffSecs`. Other answers and a missing secret end the
-delivery. Deliveries wait in a queue in the process of at most 1,000 entries, which a
-restart loses.
+delivery. Each channel has a queue and a delivery thread of its own, so a channel that
+hangs or fails delays only its own deliveries, and raising an event never waits for one.
+A channel's queue holds its share of 1,000 deliveries, which is 1,000 divided by the
+number of channels and at least 50, counting the delivery in flight. A retry waits in
+its channel's queue. A delivery that does not fit is dropped with the result `dropped`
+and a warning in the log. A channel that is removed or renamed keeps its queue until
+its waiting deliveries are done, and the server keeps at most 64 queues, so a delivery
+that would need another queue past that is dropped too. The queues live in the
+process, and a restart loses them. Settings that fail the kind's checks, such as a
+runtime layer with more than 32 channels, leave notifications off with a warning in
+the log.
 
 | Method | Path | Needs | Effect |
 |---|---|---|---|
-| GET | `/$/notifications` | `server-admin` | `{enabled, channels, routes, queued, active, recent}`. Each channel has its `name`, `type`, `target` without credentials, `secrets`, `lastSuccess`, `lastFailure`, `sent` and `failed`. `active` lists the conditions that were notified, and `recent` the last 50 deliveries with their `result` (`ok`, `failed`, `refused` or `dropped`) and `attempts`. |
-| POST | `/$/notifications/test/{channel}` | `server-admin` | Sends a `notification.test` now, in one attempt. `200` with `{channel, type, result, status, id, latencyMs}`, `404` with `unknown-channel`, or `502` with `delivery-failed` or `outbound-refused` and the error. |
+| GET | `/$/notifications` | `server-admin` | `{enabled, channels, routes, queued, active, recent}`. Each channel has its `name`, `type`, `target` without credentials, `secrets`, `lastSuccess`, `lastFailure`, `sent`, `failed`, `queued`, `inFlight` and `queueCapacity`. `active` lists the conditions that were notified, and `recent` the last 50 deliveries with their `result` (`ok`, `failed`, `refused` or `dropped`) and `attempts`. |
+| POST | `/$/notifications/test/{channel}` | `server-admin` | Sends a `notification.test` now, in one attempt. `200` with `{channel, type, result, status, id, latencyMs}`, where `status` is the HTTP status or, for email, the SMTP reply code. `404` with `unknown-channel`, or `502` with `delivery-failed` or `outbound-refused` and the error. |
 
 The metrics are `sparkles_notifications_sent_total{channel,event,result}`,
 `sparkles_notifications_retries_total{channel}`,
-`sparkles_notifications_suppressed_total{event}` and the gauge
-`sparkles_notifications_queued`. A test send is logged under `sparkles::audit` as
+`sparkles_notifications_suppressed_total{event}`, the gauge
+`sparkles_notifications_queued` of every channel's waiting deliveries, and the gauges
+`sparkles_notifications_channel_queued{channel}` and
+`sparkles_notifications_channel_queue_capacity{channel}`. A dropped delivery counts in
+`sparkles_notifications_sent_total` with `result="dropped"`. A test send is logged under `sparkles::audit` as
 `notification_test` with the channel, the result and the `principal`, and each failed
 delivery is logged under `sparkles::notify` with an error that never holds a secret.
 `sparkles notify status` and `sparkles notify test CHANNEL` use these routes.

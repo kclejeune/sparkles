@@ -854,6 +854,124 @@ fn a_release_waits_for_a_publication_that_passed_its_hold_check() {
     );
 }
 
+const ORDINARY: &str = "urn:source-graph";
+
+fn ordinary() -> evidence::OrdinaryChanges {
+    evidence::OrdinaryChanges {
+        delete: Vec::new(),
+        insert: vec![oxrdf::Quad::new(
+            iri("urn:doc"),
+            iri("urn:x-sparkles:text"),
+            Literal::new_simple_literal(TEXT),
+            iri(ORDINARY),
+        )],
+    }
+}
+
+fn has_ordinary(ds: &Dataset) -> bool {
+    ds.ask(&format!("ASK {{ GRAPH <{ORDINARY}> {{ ?s ?p ?o }} }}"))
+        .unwrap()
+}
+
+#[test]
+fn ordinary_changes_publish_in_the_batchs_commit() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    let before = ds.store().head_commit().seq;
+    let mut o = options();
+    o.ordinary = Some(ordinary());
+    o.idempotency_key = Some("k".into());
+    let p = propose(&ds, &small("c1", proposition()), &o).unwrap();
+    assert!(p.committed);
+    assert_eq!(
+        p.commit,
+        before + 1,
+        "the source and the batch share one commit"
+    );
+    assert!(has_ordinary(&ds));
+    // a replay writes nothing again, the ordinary changes included
+    ds.update(&format!("DROP GRAPH <{ORDINARY}>")).unwrap();
+    let head = ds.store().head_commit().seq;
+    let again = propose(&ds, &small("c1", proposition()), &o).unwrap();
+    assert!(again.replayed);
+    assert_eq!(ds.store().head_commit().seq, head);
+    assert!(!has_ordinary(&ds));
+}
+
+#[test]
+fn a_refused_batch_leaves_its_ordinary_changes_unwritten() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    let head = ds.store().head_commit().seq;
+    // refused at publication by the authority fence
+    let mut o = options();
+    o.ordinary = Some(ordinary());
+    o.authority = Some(Arc::new(Revocable(Arc::new(AtomicBool::new(true)))));
+    assert_eq!(
+        code(propose(&ds, &small("c1", proposition()), &o)),
+        "authority-changed"
+    );
+    // refused by a stale head
+    let mut o = options();
+    o.ordinary = Some(ordinary());
+    o.if_head = Some(head + 7);
+    assert_eq!(
+        code(propose(&ds, &small("c1", proposition()), &o)),
+        "head-changed"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+    assert!(!has_ordinary(&ds));
+    assert!(
+        !ds.ask(&format!("ASK {{ GRAPH <{CLAIMS}> {{ ?s ?p ?o }} }}"))
+            .unwrap()
+    );
+}
+
+#[test]
+fn ordinary_changes_cannot_write_a_managed_graph() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    let head = ds.store().head_commit().seq;
+    for g in [SOURCES, CLAIMS] {
+        let mut o = options();
+        o.ordinary = Some(evidence::OrdinaryChanges {
+            delete: Vec::new(),
+            insert: vec![oxrdf::Quad::new(
+                iri("urn:x"),
+                iri("urn:y"),
+                iri("urn:z"),
+                iri(g),
+            )],
+        });
+        assert_eq!(
+            code(propose(&ds, &small("c1", proposition()), &o)),
+            "profile-managed-graph"
+        );
+    }
+    // the default graph is not a source graph
+    let mut o = options();
+    o.ordinary = Some(evidence::OrdinaryChanges {
+        delete: Vec::new(),
+        insert: vec![oxrdf::Quad::new(
+            iri("urn:x"),
+            iri("urn:y"),
+            iri("urn:z"),
+            oxrdf::GraphName::DefaultGraph,
+        )],
+    });
+    assert!(propose(&ds, &small("c1", proposition()), &o).is_err());
+    // grants decide the ordinary graph too
+    let mut o = options();
+    o.ordinary = Some(ordinary());
+    o.write = Some(Arc::new(GraphAccess::graphs(
+        Graphs::All,
+        Graphs::Only(GraphRule::new([SOURCES, CLAIMS], &[])),
+    )));
+    let e = propose(&ds, &small("c1", proposition()), &o).unwrap_err();
+    assert!(matches!(e, sparkles::Error::NotPermitted(_)), "{e:?}");
+    assert_eq!(ds.store().head_commit().seq, head);
+}
+
 #[cfg(feature = "failpoints")]
 mod crashes {
     use super::*;

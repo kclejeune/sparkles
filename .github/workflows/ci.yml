@@ -5,6 +5,11 @@
 # compile-heavy jobs) and SPARKLES_RUNNER (the test shards, the doctests and the checks)
 # name another runner label. Fork pull requests always use GitHub's runners.
 #
+# mbx builds in local mode with no remote cache. Swatinem/rust-cache carries the Cargo
+# registry and the dependencies' part of the target directory between runs, and
+# actions/cache carries mbx's object store for each commit. Clippy keeps one pair and the
+# test build another, which the doctests and the feature jobs restore. Runs on main save,
+# and runs on other branches and pull requests only restore.
 #
 #   checks       formatting of Rust, UI, JavaScript and shell, shellcheck, cited doc
 #                paths, the benchmark scripts' tests, the UI's type check, unit tests and
@@ -70,10 +75,14 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  MBX_HTTP_TIMEOUT: 5m
-  MBX_GC_MAX_SIZE: 10GiB
-  # Only same-repository PRs may publish to the remote cache.
-  MBX_REMOTE_TRUST_WRITES: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && 'true' || 'false' }}
+  # The target is a plain directory in the checkout, which rust-cache saves and restores,
+  # rather than a view into mbx's store.
+  MBX_TARGET_VIEWS: "0"
+  # mbx would replace each build script with a launcher whose binary lives in the target's
+  # profile directory, which rust-cache's cleanup removes, so build scripts run directly.
+  MBX_BUILD_SCRIPT_EXECUTION: "0"
+  # The saved mbx stores stay small enough for GitHub's 10 GB repository cache.
+  MBX_GC_MAX_SIZE: 3GiB
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
   NEXTEST_VERSION: "0.9.146"
@@ -223,9 +232,6 @@ jobs:
   # The binding crates are their own workspaces and share the target directory, so they
   # reuse most of the workspace's checked dependencies.
   clippy:
-    permissions:
-      contents: read
-      id-token: write
     name: Clippy (${{ matrix.platform }})
     needs: changes
     if: needs.changes.outputs.rust == 'true'
@@ -236,25 +242,45 @@ jobs:
         platform: ${{ fromJSON(inputs.all-platforms && '["linux-amd64", "linux-arm64", "macos-arm64"]' || '["linux-amd64"]') }}
     # Linux amd64 uses SPARKLES_RUNNER_LARGE for same-repository events.
     runs-on: ${{ matrix.platform == 'macos-arm64' && 'macos-15' || matrix.platform == 'linux-arm64' && 'ubuntu-24.04-arm' || !inputs.github-hosted && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER_LARGE || 'ubuntu-24.04' }}
-    env:
-      # Workspace and binding checks exceed the shared 10 GiB download allowance.
-      MBX_GC_MAX_SIZE: 30GiB
     steps:
       - uses: actions/checkout@v5
-        with: { fetch-depth: 2 }
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          cache-bin: false
+          env-vars: &rust-cache-env CARGO CC CFLAGS CXX CMAKE RUST MBX
+          shared-key: clippy-${{ matrix.platform }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The server's build script writes ui/build/index.html when it is missing, and the
+      # write is newer than the build, so every later Cargo command in the job would build
+      # the server and relink its tests again. The same placeholder, written first, avoids
+      # that.
+      - name: UI placeholder
+        run: &ui-placeholder |
+          if [ ! -e ui/build/index.html ]; then
+            mkdir -p ui/build
+            printf '%s' '<!doctype html><title>Sparkles</title><p>The UI has not been built. Run <code>pnpm -C ui install &amp;&amp; pnpm -C ui build</code> and rebuild the server.</p>' > ui/build/index.html
+          fi
+      # mbx's object store keeps the workspace crates' outputs by the hash of their inputs,
+      # so a crate whose sources and dependencies did not change is not compiled again,
+      # while Cargo's fingerprints in the restored target cover only the dependencies.
+      # Main runs save the store under the commit, and other runs restore the latest.
+      - uses: actions/cache/restore@v4
+        id: mbx-store
+        with:
+          path: &mbx-store |
+            ${{ runner.os == 'macOS' && '~/Library/Caches/mbx' || '~/.cache/mbx' }}
+            !${{ runner.os == 'macOS' && '~/Library/Caches/mbx' || '~/.cache/mbx' }}/targets
+          key: mbx-store-clippy-${{ matrix.platform }}-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-clippy-${{ matrix.platform }}-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
+      # local mode: no remote cache, and no link cache, which would add every test binary
+      # to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          # Fork pull requests use GitHub cache because they cannot request an OIDC token.
-          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
-          remote-url: https://mbx.kclj.dev
-          namespace: kclejeune/sparkles
-          oidc-audience: https://mbx.kclj.dev
+          backend: local
           version: 1.29.1
-          github-cache-mode: objects
-          cache-generation: sparkles-${{ matrix.platform }}-v1
-          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+          cache-links: false
       - name: Disk space before Clippy
         run: df -h "$GITHUB_WORKSPACE"
       - name: Workspace
@@ -284,6 +310,16 @@ jobs:
               echo "::endgroup::"
             done
           done
+      - name: Collect the mbx store to its size limit
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          mbx gc
+          du -sh "$(dirname "$(mbx cache dir)")"
+      - if: ${{ github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@v4
+        with:
+          path: *mbx-store
+          key: ${{ steps.mbx-store.outputs.cache-primary-key }}
       - name: Disk space after Clippy
         if: ${{ always() }}
         run: df -h "$GITHUB_WORKSPACE"
@@ -293,27 +329,20 @@ jobs:
   # of the download and extraction. The doctests run in a job of their own, so the shards
   # do not wait for them.
   build:
-    permissions:
-      contents: read
-      id-token: write
     name: Build tests
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     timeout-minutes: 45
     # SPARKLES_RUNNER_LARGE for same-repository events, GitHub's runner otherwise
     runs-on: ${{ !inputs.github-hosted && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER_LARGE || 'ubuntu-24.04' }}
-    env:
-      # Keep the archive build's remote download allowance above the shared 10 GiB.
-      MBX_GC_MAX_SIZE: 30GiB
-      MBX_GC_MIN_FREE_SIZE: 5GiB
     steps:
       - uses: actions/checkout@v5
-        with: { fetch-depth: 2 }
-      # The build's target, the uncompressed archive, the final archives, the cache and
-      # the swap file outgrow the free disk of GitHub's runner image. The removal of
-      # unused preinstalled toolchains runs in the background during the setup steps.
+      # The build's target, the uncompressed archive, the final archives and the swap file
+      # take about 40 GB. When the runner has less than 60 GiB free, unused preinstalled
+      # toolchains are removed in the background during the setup steps. The test shards
+      # use about 30 GB and the doctests about 15 GB.
       - name: Free disk space
-        run: &free-disk scripts/ci-free-disk.sh start
+        run: &free-disk scripts/ci-free-disk.sh start 60
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
       # The test build can exceed the physical memory of a 16 GB runner. A larger runner
@@ -338,16 +367,27 @@ jobs:
           else
             echo "CI_SWAPFILE=$swapfile" >> "$GITHUB_ENV"
           fi
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          cache-bin: false
+          env-vars: *rust-cache-env
+          shared-key: tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: UI placeholder
+        run: *ui-placeholder
+      - uses: actions/cache/restore@v4
+        id: mbx-store
+        with:
+          path: *mbx-store
+          key: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
+      # local mode: no remote cache, and no link cache, which would add every test binary
+      # to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          # Fork pull requests use GitHub cache because they cannot request an OIDC token.
-          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
-          remote-url: https://mbx.kclj.dev
-          namespace: kclejeune/sparkles
-          oidc-audience: https://mbx.kclj.dev
+          backend: local
           version: 1.29.1
-          cache-generation: sparkles-tests-v1
-          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+          cache-links: false
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
@@ -380,6 +420,16 @@ jobs:
           echo "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/archive/build-workspace"
           cp "$RUNNER_TEMP/archive/build-workspace" "$RUNNER_TEMP/heavy/"
           ls -l "$RUNNER_TEMP"/archive/* "$RUNNER_TEMP"/heavy/* "$RUNNER_TEMP"/server/*
+      - name: Collect the mbx store to its size limit
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          mbx gc
+          du -sh "$(dirname "$(mbx cache dir)")"
+      - if: ${{ github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@v4
+        with:
+          path: *mbx-store
+          key: ${{ steps.mbx-store.outputs.cache-primary-key }}
       - name: Disk space after test archive
         if: ${{ always() }}
         run: &free-disk-report scripts/ci-free-disk.sh report
@@ -410,24 +460,16 @@ jobs:
           compression-level: 0
 
   # nextest does not run doctests. They build the workspace's libraries again, from the
-  # same remote cache, in parallel with the test build.
+  # test build's dependency cache, in parallel with the test build.
   doctests:
-    permissions:
-      contents: read
-      id-token: write
     name: Doctests
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     timeout-minutes: 45
     runs-on: *runner
-    env:
-      MBX_GC_MAX_SIZE: 30GiB
-      MBX_GC_MIN_FREE_SIZE: 5GiB
     steps:
       - uses: actions/checkout@v5
-        with: { fetch-depth: 2 }
-      # The doctest build of the workspace's libraries and the swap file outgrow the free
-      # disk of GitHub's runner image, as the test build does.
+      # The same removal as in the test build, when the runner has less than 60 GiB free
       - name: Free disk space
         run: *free-disk
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -436,16 +478,25 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: *add-swap
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          cache-bin: false
+          env-vars: *rust-cache-env
+          shared-key: tests
+          save-if: false
+      - uses: actions/cache/restore@v4
+        id: mbx-store
+        with:
+          path: *mbx-store
+          key: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
+      # local mode: no remote cache, and no link cache, which would add every test binary
+      # to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          # Fork pull requests use GitHub cache because they cannot request an OIDC token.
-          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
-          remote-url: https://mbx.kclj.dev
-          namespace: kclejeune/sparkles
-          oidc-audience: https://mbx.kclj.dev
+          backend: local
           version: 1.29.1
-          cache-generation: sparkles-doctests-v1
-          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+          cache-links: false
       - name: Disk space before doctests
         run: *free-disk-wait
       - name: Doctests
@@ -479,7 +530,7 @@ jobs:
     runs-on: *runner
     steps:
       - uses: actions/checkout@v5
-      # The extracted archive and the tests' own files need more than the image leaves.
+      # The same removal as in the test build, when the runner has less than 60 GiB free
       - name: Free disk space
         run: *free-disk
       - uses: taiki-e/install-action@v2
@@ -545,13 +596,10 @@ jobs:
   # set on (scripts/test-features.sh, mise run test:features). The archive above builds
   # the default features only, so a test that assumes a feature's routes, or their absence,
   # would pass there and fail here. Each set compiles the whole server crate again, so the
-  # sets are separate manual compatibility jobs with a cache each. Ordinary pushes and
+  # sets are separate manual compatibility jobs that restore the test build's cache. Ordinary pushes and
   # pull requests validate the default server. A new set goes in the script's default
   # list and in this matrix.
   features:
-    permissions:
-      contents: read
-      id-token: write
     name: Features (${{ matrix.set }})
     needs: changes
     if: github.event_name == 'workflow_dispatch' && inputs.compatibility-features && needs.changes.outputs.rust == 'true'
@@ -563,7 +611,6 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-        with: { fetch-depth: 2 }
       # The server's test build and the swap file take much of the free disk of GitHub's
       # runner image.
       - name: Free disk space
@@ -579,16 +626,27 @@ jobs:
           sudo chmod 600 /swapfile-ci
           sudo mkswap /swapfile-ci > /dev/null
           sudo swapon /swapfile-ci
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          cache-bin: false
+          env-vars: *rust-cache-env
+          shared-key: tests
+          save-if: false
+      - name: UI placeholder
+        run: *ui-placeholder
+      - uses: actions/cache/restore@v4
+        id: mbx-store
+        with:
+          path: *mbx-store
+          key: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-tests-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
+      # local mode: no remote cache, and no link cache, which would add every test binary
+      # to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          # Fork pull requests use GitHub cache because they cannot request an OIDC token.
-          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
-          remote-url: https://mbx.kclj.dev
-          namespace: kclejeune/sparkles
-          oidc-audience: https://mbx.kclj.dev
+          backend: local
           version: 1.29.1
-          cache-generation: sparkles-features-${{ matrix.set }}-v1
-          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+          cache-links: false
       # the script runs the tests under nextest when it is installed, which stops a test
       # that hangs
       - uses: taiki-e/install-action@v2
@@ -642,9 +700,6 @@ jobs:
   # Linux arm64 and macOS on Apple silicon, for a manual run with all-platforms checked:
   # one job per platform that builds and runs the tests, with the conformance suites.
   other-platforms:
-    permissions:
-      contents: read
-      id-token: write
     name: Test (${{ matrix.platform }})
     if: inputs.all-platforms
     timeout-minutes: 75
@@ -655,7 +710,6 @@ jobs:
     runs-on: ${{ matrix.platform == 'macos-arm64' && 'macos-15' || 'ubuntu-24.04-arm' }}
     steps:
       - uses: actions/checkout@v5
-        with: { fetch-depth: 2 }
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
       # The test build can exceed the runner's physical memory.
@@ -667,13 +721,21 @@ jobs:
           sudo chmod 600 /swapfile-ci
           sudo mkswap /swapfile-ci > /dev/null
           sudo swapon /swapfile-ci
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          cache-bin: false
+          env-vars: *rust-cache-env
+          shared-key: tests-${{ matrix.platform }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: UI placeholder
+        run: *ui-placeholder
+      # local mode: no remote cache, and no link cache, which would add every test binary
+      # to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          backend: remote
-          remote-url: https://mbx.kclj.dev
-          namespace: kclejeune/sparkles
-          oidc-audience: https://mbx.kclj.dev
+          backend: local
           version: 1.29.1
+          cache-links: false
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}

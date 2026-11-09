@@ -3,6 +3,12 @@
 # `jvm-v*` tag with publishing switched on, the release to Maven Central
 # (docs/DEVELOPMENT.md, "Releases"). The jobs run on standard GitHub-hosted runners
 # with Cargo and Gradle dependencies cached in GitHub Actions.
+#
+# mbx builds in local mode with no remote cache. Swatinem/rust-cache carries the Cargo
+# registry and the dependencies' part of the target directory between runs, and
+# actions/cache carries mbx's object store for each commit. Pushes to main save, and other
+# runs only restore. The jars and the compatibility matrix restore the Linux x86_64 dev
+# natives' caches, since they build the dev bindings generator on that platform.
 # Branch builds of the Linux x86_64 native use the runner that SPARKLES_RUNNER_LARGE
 # names and the other Linux x86_64 jobs the one SPARKLES_RUNNER names, when they are set.
 # Tags, publishing and fork pull requests always use GitHub's runners.
@@ -55,10 +61,14 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref_type != 'tag' }}
 
 env:
-  MBX_HTTP_TIMEOUT: 5m
-  MBX_GC_MAX_SIZE: 10GiB
-  # Permit same-repository PRs and this workflow's release tags to publish.
-  MBX_REMOTE_TRUST_WRITES: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push' && startsWith(github.ref, 'refs/tags/jvm-v')) && 'true' || 'false' }}
+  # The target is a plain directory in the checkout, which rust-cache saves and restores,
+  # rather than a view into mbx's store.
+  MBX_TARGET_VIEWS: "0"
+  # mbx would replace each build script with a launcher whose binary lives in the target's
+  # profile directory, which rust-cache's cleanup removes, so build scripts run directly.
+  MBX_BUILD_SCRIPT_EXECUTION: "0"
+  # The saved mbx stores stay small enough for GitHub's 10 GB repository cache.
+  MBX_GC_MAX_SIZE: 2GiB
   # Pushes to main and pull requests build the bindings in the dev profile, which compiles
   # far faster than the release profile's thin LTO; tags and manual runs build what would
   # be published.
@@ -66,9 +76,6 @@ env:
 
 jobs:
   natives:
-    permissions:
-      contents: read
-      id-token: write
     timeout-minutes: 45
     # Pushes to main and pull requests build and test linux-x86_64 only. Tags and manual
     # runs build every platform, which the release jars need.
@@ -86,24 +93,39 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v5
-        with: { fetch-depth: 2 }
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
       # saves Gradle's caches from main only, by default
       - uses: gradle/actions/setup-gradle@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
+      # The library's workspace shares the root target directory. The cleanup before a save
+      # keeps that workspace's dependencies.
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          cache-bin: false
+          env-vars: &rust-cache-env CARGO CC CFLAGS CXX CMAKE RUST MBX
+          workspaces: crates/sparkles-ffi -> ../../target
+          shared-key: jvm-${{ matrix.platform }}-${{ env.JVM_PROFILE }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      # mbx's object store keeps the crates' outputs by the hash of their inputs, so a crate
+      # whose sources and dependencies did not change is not compiled again. Main pushes save
+      # the store under the commit, and other runs restore the latest.
+      - uses: actions/cache/restore@v4
+        id: mbx-store
+        with:
+          path: &mbx-store |
+            ${{ runner.os == 'macOS' && '~/Library/Caches/mbx' || '~/.cache/mbx' }}
+            !${{ runner.os == 'macOS' && '~/Library/Caches/mbx' || '~/.cache/mbx' }}/targets
+          key: mbx-store-jvm-${{ matrix.platform }}-${{ env.JVM_PROFILE }}-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-jvm-${{ matrix.platform }}-${{ env.JVM_PROFILE }}-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
+      # local mode: no remote cache, and no link cache, which would add the native
+      # libraries to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          # Fork pull requests use GitHub cache because they cannot request an OIDC token.
-          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
-          remote-url: https://mbx.kclj.dev
-          namespace: kclejeune/sparkles
-          oidc-audience: https://mbx.kclj.dev
+          backend: local
           version: 1.29.1
-          github-cache-mode: objects
-          cache-generation: sparkles-jvm-natives-${{ matrix.platform }}-${{ env.JVM_PROFILE }}-v1
-          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+          cache-links: false
       - name: Disk space before build
         run: df -h "$GITHUB_WORKSPACE"
       - name: Build native library and generate matching bindings
@@ -122,6 +144,16 @@ jobs:
           mbx test --locked --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --lib
           cd jvm
           ./gradlew --no-daemon --console=plain :sparkles-jena:test :sparkles-jena:testUniffi :sample-java:build
+      - name: Collect the mbx store to its size limit
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: |
+          mbx gc
+          du -sh "$(dirname "$(mbx cache dir)")"
+      - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@v4
+        with:
+          path: *mbx-store
+          key: ${{ steps.mbx-store.outputs.cache-primary-key }}
       - name: Stage platform resources
         shell: bash
         run: |
@@ -140,9 +172,6 @@ jobs:
   # The all-platform jars and the Java and Jena version matrix: pull requests, tags and
   # manual runs. A push to main stops after the natives job's tests.
   jars:
-    permissions:
-      contents: read
-      id-token: write
     timeout-minutes: 30
     needs: natives
     if: github.event_name != 'push' || github.ref_type == 'tag'
@@ -151,24 +180,32 @@ jobs:
     runs-on: ${{ !inputs.github-hosted && github.ref_type != 'tag' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
-        with: { fetch-depth: 2 }
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
       # saves Gradle's caches from main only, by default
       - uses: gradle/actions/setup-gradle@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
+      # the Linux x86_64 dev natives' caches, which hold the dev bindings generator
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          cache-bin: false
+          env-vars: *rust-cache-env
+          workspaces: crates/sparkles-ffi -> ../../target
+          shared-key: jvm-linux-x86_64-dev
+          save-if: false
+      - uses: actions/cache/restore@v4
+        with:
+          path: *mbx-store
+          key: mbx-store-jvm-linux-x86_64-dev-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-jvm-linux-x86_64-dev-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
+      # local mode: no remote cache, and no link cache, which would add the native
+      # libraries to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          # Fork pull requests use GitHub cache because they cannot request an OIDC token.
-          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
-          remote-url: https://mbx.kclj.dev
-          namespace: kclejeune/sparkles
-          oidc-audience: https://mbx.kclj.dev
+          backend: local
           version: 1.29.1
-          github-cache-mode: objects
-          cache-generation: sparkles-jvm-bindgen-v1
-          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+          cache-links: false
       - uses: actions/download-artifact@v4
         with: { pattern: "jvm-native-*", path: target/jvm/natives, merge-multiple: true }
       - name: Generate bindings and assemble all-platform artifacts
@@ -184,9 +221,6 @@ jobs:
           if-no-files-found: error
 
   compatibility:
-    permissions:
-      contents: read
-      id-token: write
     timeout-minutes: 30
     needs: natives
     if: github.event_name != 'push' || github.ref_type == 'tag'
@@ -201,24 +235,32 @@ jobs:
           - { java: "21", jena: "6.2.0" }
     steps:
       - uses: actions/checkout@v5
-        with: { fetch-depth: 2 }
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "${{ matrix.java }}" }
       # saves Gradle's caches from main only, by default
       - uses: gradle/actions/setup-gradle@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
+      # the Linux x86_64 dev natives' caches, which hold the dev bindings generator
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          cache-bin: false
+          env-vars: *rust-cache-env
+          workspaces: crates/sparkles-ffi -> ../../target
+          shared-key: jvm-linux-x86_64-dev
+          save-if: false
+      - uses: actions/cache/restore@v4
+        with:
+          path: *mbx-store
+          key: mbx-store-jvm-linux-x86_64-dev-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-jvm-linux-x86_64-dev-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
+      # local mode: no remote cache, and no link cache, which would add the native
+      # libraries to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          # Fork pull requests use GitHub cache because they cannot request an OIDC token.
-          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
-          remote-url: https://mbx.kclj.dev
-          namespace: kclejeune/sparkles
-          oidc-audience: https://mbx.kclj.dev
+          backend: local
           version: 1.29.1
-          github-cache-mode: objects
-          cache-generation: sparkles-jvm-bindgen-v1
-          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+          cache-links: false
       - uses: actions/download-artifact@v4
         with: { name: jvm-native-linux-x86_64, path: target/jvm/natives }
       - run: |
@@ -228,9 +270,6 @@ jobs:
           ./gradlew --no-daemon --console=plain -Psparkles.nativeDir=../target/jvm/natives -Psparkles.javaVersion=${{ matrix.java }} -Psparkles.jenaVersion=${{ matrix.jena }} :sparkles-jena:test :sample-java:build
 
   publish:
-    permissions:
-      contents: read
-      id-token: write
     timeout-minutes: 30
     if: startsWith(github.ref, 'refs/tags/jvm-v') && vars.MAVEN_PUBLISH == 'true'
     needs: [jars, compatibility]
@@ -238,20 +277,32 @@ jobs:
     environment: maven
     steps:
       - uses: actions/checkout@v5
-        with: { fetch-depth: 2 }
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
       # saves Gradle's caches from main only, by default
       - uses: gradle/actions/setup-gradle@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
+      # the Linux x86_64 dev natives' caches, which hold the dev bindings generator
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          cache-bin: false
+          env-vars: *rust-cache-env
+          workspaces: crates/sparkles-ffi -> ../../target
+          shared-key: jvm-linux-x86_64-dev
+          save-if: false
+      - uses: actions/cache/restore@v4
+        with:
+          path: *mbx-store
+          key: mbx-store-jvm-linux-x86_64-dev-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-jvm-linux-x86_64-dev-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
+      # local mode: no remote cache, and no link cache, which would add the native
+      # libraries to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          backend: remote
-          remote-url: https://mbx.kclj.dev
-          namespace: kclejeune/sparkles
-          oidc-audience: https://mbx.kclj.dev
+          backend: local
           version: 1.29.1
+          cache-links: false
       - uses: actions/download-artifact@v4
         with: { pattern: "jvm-native-*", path: target/jvm/natives, merge-multiple: true }
       # Maven Central through the Central Portal's OSSRH Staging API: Gradle deploys the

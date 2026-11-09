@@ -99,6 +99,7 @@
   import EditorHistory from '$components/EditorHistory.svelte';
   import EntityHistory from '$components/EntityHistory.svelte';
   import Discussions from '$components/Discussions.svelte';
+  import BulkEdit from '$components/BulkEdit.svelte';
   import { isDiscussionGraph } from '$lib/discussions';
   import TreeCrumbs from '$components/TreeCrumbs.svelte';
 
@@ -110,6 +111,7 @@
     ['header', 'Header'],
     ['history', 'History'],
     ['discussions', 'Discussions'],
+    ['bulk', 'Bulk edits'],
   ];
 
   type Tab = OntologyTab;
@@ -659,7 +661,8 @@
   // header, the DL query or the create dialog needs them, and not when it opens
   let needKey = '';
   $effect(() => {
-    const need = !!selected || tab === 'header' || tab === 'dlquery' || createOpen;
+    const need =
+      !!selected || tab === 'header' || tab === 'dlquery' || tab === 'bulk' || createOpen;
     const key = `${selected ?? ''}\u0000${tab}\u0000${createOpen}`;
     const missing = PICKER_KINDS.some((k) => !listed.has(k));
     const failed = listFailed;
@@ -1075,11 +1078,21 @@
     if (seq != null) session.own.add(seq);
     void loadAll();
   };
-  const edit = (op: Op, label: string, after?: () => void, fromFrame: string | null = null) => {
+  /**
+   * Preview `op`. `selection` is the graphs the edit reads and writes, the page's own unless
+   * the edit was planned from another reading, as a bulk edit is from the graph alone.
+   */
+  const edit = (
+    op: Op,
+    label: string,
+    after?: () => void,
+    fromFrame: string | null = null,
+    selection: Selection = sel,
+  ) => {
     // an edit names the commit the summary read, which a large ontology's summary may still be reading
     if (readonly || !etag)
       return void toasts.push('info', 'The ontology is still being read', 'Try again in a moment.');
-    const origin = { target, sel: { ...sel }, etag, head: summary?.commit ?? null };
+    const origin = { target, sel: { ...selection }, etag, head: summary?.commit ?? null };
     session.edit(op, label, after);
     previewPin = { ...origin, op: session.previewOp!, frameContext: fromFrame };
   };
@@ -1493,6 +1506,24 @@
             onedit={(op, label) => edit(op, label)}
             onrename={openRename}
           />
+        </div>
+      </section>
+    {:else if tab === 'bulk' && summary}
+      <section class="panel" aria-label="Bulk edits">
+        <div class="panel-body">
+          {#key `${target}|${graph}`}<BulkEdit
+              {target}
+              {graph}
+              commit={summary.commit ?? null}
+              {readonly}
+              {prefixes}
+              {annotationProperties}
+              graphs={summary.graphs}
+              name={nameOf}
+              onedit={(op, label) =>
+                // the plan was read without the imports, and its edit reads and writes the same
+                edit(op, label, undefined, null, { graph, imports: false })}
+            />{/key}
         </div>
       </section>
     {:else if tab === 'discussions' && summary}

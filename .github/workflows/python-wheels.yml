@@ -12,6 +12,11 @@
 # Branch builds of the Linux x86_64 native use the runner that SPARKLES_RUNNER_LARGE
 # names and the other Linux x86_64 jobs the one SPARKLES_RUNNER names, when they are set.
 # Tags, publishing and fork pull requests always use GitHub's runners.
+#
+# mbx builds in local mode with no remote cache. The Linux wheels build in maturin's
+# container with mbx's object store in the checkout, and actions/cache carries that store
+# for each commit. Pushes to main save, and other runs only restore. The macOS wheel and
+# the source distribution, which tags and manual runs build, start from an empty store.
 name: Python wheels
 
 # Pushes to main and pull requests run when the Python bindings or a crate they build on
@@ -64,10 +69,8 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref_type != 'tag' }}
 
 env:
-  MBX_HTTP_TIMEOUT: 5m
-  MBX_GC_MAX_SIZE: 10GiB
-  # Permit same-repository PRs and this workflow's release tags to publish.
-  MBX_REMOTE_TRUST_WRITES: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push' && startsWith(github.ref, 'refs/tags/py-v')) && 'true' || 'false' }}
+  # The saved mbx stores stay small enough for GitHub's 10 GB repository cache.
+  MBX_GC_MAX_SIZE: 2GiB
   MATURIN_VERSION: "1.15.0"
   MANIFEST: crates/sparkles-py/Cargo.toml
   # Pushes to main and pull requests build the wheels in the dev profile, which compiles
@@ -77,9 +80,6 @@ env:
 
 jobs:
   linux:
-    permissions:
-      contents: read
-      id-token: write
     timeout-minutes: 45
     name: Linux ${{ matrix.libc }} ${{ matrix.target }}
     # arm64 builds and tests natively on arm64 runners
@@ -102,22 +102,30 @@ jobs:
     runs-on: ${{ matrix.target == 'aarch64' && 'ubuntu-24.04-arm' || !inputs.github-hosted && github.ref_type != 'tag' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER_LARGE || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
-        with: { fetch-depth: 2 }
-      # The container and host action share one job store. Its object payload
-      # includes every binding compilation, independently of target placement.
+      # The container builds with its own Boxington into the store under .cache/mbx, which
+      # keeps the crates' outputs by the hash of their inputs, so a crate whose sources and
+      # dependencies did not change is not compiled again. Main pushes save the store under
+      # the commit, and other runs restore the latest.
+      - uses: actions/cache/restore@v4
+        id: mbx-store
+        with:
+          path: &mbx-store |
+            .cache/mbx
+            !.cache/mbx/targets
+          key: mbx-store-python-${{ matrix.libc }}-${{ matrix.target }}-${{ env.PROFILE_ARG == '--release' && 'release' || 'dev' }}-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-python-${{ matrix.libc }}-${{ matrix.target }}-${{ env.PROFILE_ARG == '--release' && 'release' || 'dev' }}-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
+      # The host's Boxington collects that store before a save. The toolchain step runs on
+      # every event, since maturin forwards the Cargo settings it exports into the
+      # container, and pull requests and main then build the same wheel.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
+      # local mode: no remote cache, and no link cache, which would add the wheel's
+      # library to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          # Fork pull requests use GitHub cache because they cannot request an OIDC token.
-          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
-          remote-url: https://mbx.kclj.dev
-          namespace: kclejeune/sparkles
-          oidc-audience: https://mbx.kclj.dev
+          backend: local
           version: 1.29.1
-          github-cache-mode: objects
-          cache-generation: sparkles-python-linux-${{ matrix.libc }}-${{ env.PROFILE_ARG }}-v1
-          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+          cache-links: false
       - name: Disk space before build
         run: df -h "$GITHUB_WORKSPACE"
       - name: Build the wheel
@@ -126,11 +134,9 @@ jobs:
           maturin-version: ${{ env.MATURIN_VERSION }}
           target: ${{ matrix.target }}
           manylinux: ${{ env.COMPAT }}
+          # The container's Boxington builds in local mode, without the link cache.
           docker-options: >-
-            -e MBX_CACHE_EXPORT_GROUP
-            -e MBX_REMOTE_URL -e MBX_REMOTE_NAMESPACE -e MBX_REMOTE_OIDC_AUDIENCE
-            -e MBX_REMOTE_TRUST_WRITES -e MBX_HTTP_TIMEOUT -e MBX_GC_MAX_SIZE
-            -e ACTIONS_ID_TOKEN_REQUEST_URL -e ACTIONS_ID_TOKEN_REQUEST_TOKEN
+            -e MBX_CACHE_LINKS=0
             -e GITHUB_ACTIONS -e GITHUB_EVENT_NAME -e GITHUB_REF -e GITHUB_REF_TYPE -e GITHUB_REF_PROTECTED
             -e MBX_CACHE_DIR=${{ github.workspace }}/.cache/mbx
             -e MBX_SHIMS_DIR=${{ github.workspace }}/.cache/container-shims
@@ -148,6 +154,16 @@ jobs:
         if: always()
         run: |
           if [ -d .cache ]; then sudo chown -R "$(id -u):$(id -g)" .cache; fi
+      - name: Collect the mbx store to its size limit
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: |
+          mbx gc
+          du -sh .cache/mbx
+      - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@v4
+        with:
+          path: *mbx-store
+          key: ${{ steps.mbx-store.outputs.cache-primary-key }}
       - name: Set up CPython 3.10 and 3.14
         if: matrix.libc == 'manylinux'
         uses: actions/setup-python@v6
@@ -170,9 +186,6 @@ jobs:
           if-no-files-found: error
 
   macos:
-    permissions:
-      contents: read
-      id-token: write
     timeout-minutes: 45
     name: macOS arm64
     # tags and manual runs only
@@ -184,16 +197,14 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v5
-        with: { fetch-depth: 2 }
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
+      # local mode: no remote cache, and no link cache
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          backend: remote
-          remote-url: https://mbx.kclj.dev
-          namespace: kclejeune/sparkles
-          oidc-audience: https://mbx.kclj.dev
+          backend: local
           version: 1.29.1
+          cache-links: false
       # This build tool invokes Cargo itself.
       - name: Route build-tool Cargo calls through Boxington
         shell: bash
@@ -224,9 +235,6 @@ jobs:
           if-no-files-found: error
 
   sdist:
-    permissions:
-      contents: read
-      id-token: write
     timeout-minutes: 45
     name: Source distribution
     # tags and manual runs only
@@ -238,16 +246,14 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v5
-        with: { fetch-depth: 2 }
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
+      # local mode: no remote cache, and no link cache
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          backend: remote
-          remote-url: https://mbx.kclj.dev
-          namespace: kclejeune/sparkles
-          oidc-audience: https://mbx.kclj.dev
+          backend: local
           version: 1.29.1
+          cache-links: false
       # This build tool invokes Cargo itself.
       - name: Route build-tool Cargo calls through Boxington
         shell: bash

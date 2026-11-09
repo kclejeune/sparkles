@@ -2,10 +2,15 @@
 #
 # Addons are built for Linux on x64 and arm64 (glibc and musl) and for macOS on Apple
 # silicon. The jobs run on standard GitHub-hosted runners with Cargo and pnpm
-# dependencies cached in GitHub Actions or the remote mbx server.
+# dependencies cached in GitHub Actions.
 # Branch builds of the Linux x86_64 native use the runner that SPARKLES_RUNNER_LARGE
 # names and the other Linux x86_64 jobs the one SPARKLES_RUNNER names, when they are set.
 # Tags, publishing and fork pull requests always use GitHub's runners.
+#
+# mbx builds in local mode with no remote cache. In the native job, Swatinem/rust-cache
+# carries the Cargo registry and the dependencies' part of the target directory between
+# runs, and actions/cache carries mbx's object store for each commit. Pushes to main save,
+# and other runs only restore. The Alpine release builds start from an empty store.
 name: Node packages
 # Pushes to main and pull requests run when the Node packages or a crate the addon builds
 # on changes, or when the server used by the remote client tests changes. Tests, benches
@@ -61,19 +66,20 @@ concurrency:
   group: node-packages-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.run_id || 'latest' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref_type != 'tag' }}
 env:
-  MBX_HTTP_TIMEOUT: 5m
-  MBX_GC_MAX_SIZE: 10GiB
-  # Permit same-repository PRs and this workflow's release tags to publish.
-  MBX_REMOTE_TRUST_WRITES: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push' && startsWith(github.ref, 'refs/tags/node-v')) && 'true' || 'false' }}
+  # The target is a plain directory in the checkout, which rust-cache saves and restores,
+  # rather than a view into mbx's store.
+  MBX_TARGET_VIEWS: "0"
+  # mbx would replace each build script with a launcher whose binary lives in the target's
+  # profile directory, which rust-cache's cleanup removes, so build scripts run directly.
+  MBX_BUILD_SCRIPT_EXECUTION: "0"
+  # The saved mbx stores stay small enough for GitHub's 10 GB repository cache.
+  MBX_GC_MAX_SIZE: 2GiB
   # Pushes to main and pull requests build the bindings in the dev profile, which compiles
   # far faster than the release profile's thin LTO; tags and manual runs build what would
   # be published.
   NODE_PROFILE: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'dev' || 'release' }}
 jobs:
   native:
-    permissions:
-      contents: read
-      id-token: write
     timeout-minutes: 45
     # Pushes to main and pull requests build and test linux-x64 only. Tags and manual runs
     # build every platform.
@@ -91,7 +97,6 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v5
-        with: { fetch-depth: 2 }
       - uses: pnpm/action-setup@v4
         with: {version: '10.34.5'}
       - uses: actions/setup-node@v5
@@ -104,17 +109,33 @@ jobs:
         run: node js/scripts/check-version.mjs "${{ github.ref_name }}"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
+      # The addon's workspace shares the root target directory. The cleanup before a save
+      # keeps that workspace's dependencies, and the server's own come from the store.
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          cache-bin: false
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST MBX
+          workspaces: crates/sparkles-node -> ../../target
+          shared-key: node-${{ matrix.platform }}-${{ env.NODE_PROFILE }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      # mbx's object store keeps the crates' outputs by the hash of their inputs, so a crate
+      # whose sources and dependencies did not change is not compiled again. Main pushes save
+      # the store under the commit, and other runs restore the latest.
+      - uses: actions/cache/restore@v4
+        id: mbx-store
+        with:
+          path: &mbx-store |
+            ${{ runner.os == 'macOS' && '~/Library/Caches/mbx' || '~/.cache/mbx' }}
+            !${{ runner.os == 'macOS' && '~/Library/Caches/mbx' || '~/.cache/mbx' }}/targets
+          key: mbx-store-node-${{ matrix.platform }}-${{ env.NODE_PROFILE }}-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-node-${{ matrix.platform }}-${{ env.NODE_PROFILE }}-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
+      # local mode: no remote cache, and no link cache, which would add the addon and the
+      # server to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          # Fork pull requests use GitHub cache because they cannot request an OIDC token.
-          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
-          remote-url: https://mbx.kclj.dev
-          namespace: kclejeune/sparkles
-          oidc-audience: https://mbx.kclj.dev
+          backend: local
           version: 1.29.1
-          github-cache-mode: objects
-          cache-generation: sparkles-node-${{ matrix.platform }}-${{ env.NODE_PROFILE }}-v1
-          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+          cache-links: false
       # This build tool invokes Cargo itself.
       - name: Route build-tool Cargo calls through Boxington
         shell: bash
@@ -142,6 +163,16 @@ jobs:
       - name: Build the server for the remote client test
         if: matrix.platform == 'linux-x64'
         run: mbx build --locked -p sparkles-server --bin sparkles
+      - name: Collect the mbx store to its size limit
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: |
+          mbx gc
+          du -sh "$(dirname "$(mbx cache dir)")"
+      - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@v4
+        with:
+          path: *mbx-store
+          key: ${{ steps.mbx-store.outputs.cache-primary-key }}
       - name: Test Node 22, 24 and 26
         shell: bash
         env:
@@ -174,9 +205,6 @@ jobs:
           name: node-${{ matrix.platform }}
           path: packed/sparkles-rdf-*.tgz
   musl:
-    permissions:
-      contents: read
-      id-token: write
     timeout-minutes: 60
     # tags and manual runs only
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
@@ -187,21 +215,10 @@ jobs:
     # amd64 uses SPARKLES_RUNNER_LARGE for same-repository branch events. Tags
     # (releases) and fork pull requests use GitHub's runners.
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || !inputs.github-hosted && github.ref_type != 'tag' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER_LARGE || 'ubuntu-24.04' }}
-    env:
-      MBX_CACHE_DIR: ${{ github.workspace }}/.cache/mbx
     steps:
       - uses: actions/checkout@v5
-        with: { fetch-depth: 2 }
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with: { cache: false, rustflags: "" }
-      - uses: jdx/mr-boxington-action@v1.7.3
-        with:
-          backend: remote
-          remote-url: https://mbx.kclj.dev
-          namespace: kclejeune/sparkles
-          oidc-audience: https://mbx.kclj.dev
-          version: 1.29.1
-      # Rustup and pnpm remain tool caches; compiler outputs use the remote cache.
+      # Rustup and pnpm remain tool caches. The container installs its own toolchain, and its
+      # Boxington builds in local mode into a store in the checkout, which starts empty.
       - uses: actions/cache/restore@v4
         id: musl-tools
         with:
@@ -213,9 +230,7 @@ jobs:
           restore-keys: node-musl-tools-${{ runner.os }}-${{ runner.arch }}-
       - name: Build and test the addon on Alpine
         run: |
-          docker run --rm -e CI=true -e NODE_PROFILE -e MBX_CACHE_EXPORT_GROUP -e MBX_GC_MAX_SIZE \
-            -e MBX_REMOTE_URL -e MBX_REMOTE_NAMESPACE -e MBX_REMOTE_OIDC_AUDIENCE -e MBX_REMOTE_TRUST_WRITES -e MBX_HTTP_TIMEOUT \
-            -e ACTIONS_ID_TOKEN_REQUEST_URL -e ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+          docker run --rm -e CI=true -e NODE_PROFILE -e MBX_CACHE_LINKS=0 \
             -e GITHUB_ACTIONS -e GITHUB_EVENT_NAME -e GITHUB_REF -e GITHUB_REF_TYPE -e GITHUB_REF_PROTECTED \
             -e MBX_CACHE_DIR=/work/.cache/mbx -e MBX_SHIMS_DIR=/work/.cache/container-shims \
             -v "$PWD:/work" -w /work node:24-alpine \

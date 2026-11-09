@@ -11,7 +11,9 @@
 # (SPARKLES_NSC_BUILD_MEMORY_MAX overrides it). Inside it the build holds
 # ~/lanes/.heavy.lock, which gates and other heavy work on the host share, and waits for it
 # when another process holds it. CARGO_BUILD_JOBS defaults to the gate's value for the cap.
-# The host's own Boxington cache serves the build.
+# The host's own Boxington cache serves the build, with the remote cache settings the
+# caller's environment gives it. The scope inherits that environment, so a Boat job's
+# local-only mbx settings reach the build unchanged.
 #
 # The binary goes to DIR/out/sparkles with its SHA-256 in DIR/out/sha256. DIR/out/info.txt
 # gets the host's cc, c++ and rustc versions in the form of build.txt, DIR/out/rustc.txt and
@@ -59,7 +61,7 @@ fi
 echo "building in scope $unit on $(uname -n): MemoryMax=$mem, CARGO_BUILD_JOBS=$jobs, mbx $have"
 systemd-run --user --scope -q --collect --unit "$unit" \
   -p MemoryMax="$mem" -p MemorySwapMax=2G -p OOMPolicy=continue -- \
-  env MBX_REMOTE_TOKEN_FILE="${MBX_REMOTE_TOKEN_FILE:-}" CARGO_BUILD_JOBS="$jobs" flock "$lock" bash "$dir/bin/nsc-build.sh" "$dir/out/sparkles" "$@"
+  env CARGO_BUILD_JOBS="$jobs" flock "$lock" bash "$dir/bin/nsc-build.sh" "$dir/out/sparkles" "$@"
 
 {
   echo "cc: $(cc --version 2> /dev/null | head -1)"
@@ -68,7 +70,8 @@ systemd-run --user --scope -q --collect --unit "$unit" \
 } > "$dir/out/info.txt"
 rustc -vV > "$dir/out/rustc.txt"
 cargo -V > "$dir/out/cargo.txt"
-for n in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTUP_TOOLCHAIN CARGO_BUILD_TARGET RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER; do
+for n in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTUP_TOOLCHAIN CARGO_BUILD_TARGET RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER \
+  MBX_REMOTE_URL MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE; do
   [ -z "${!n+x}" ] || printf '%s=%s\n' "$n" "${!n}"
 done > "$dir/out/env.txt"
 sha256sum "$dir/out/sparkles" | cut -d' ' -f1 > "$dir/out/sha256"

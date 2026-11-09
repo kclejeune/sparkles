@@ -3,7 +3,9 @@
 //! [`spawn`] checks the lasting conditions once a minute: the review branches of agent
 //! memory that wait longer than a dataset's `memory.review.notifyAfter`, and the model
 //! providers whose daily token budget is spent. [`backup_run`] reports the end of a
-//! backup policy run.
+//! backup policy run, and the other `backup_*` functions the other backup failures: a
+//! backup started by hand, a policy run that stops or cannot start, a verification, a
+//! GC and a policy that is overdue.
 
 use super::{Condition, Event, Raised, Severity, clear, raise, settings};
 use crate::state::AppState;
@@ -192,8 +194,8 @@ pub fn model_budgets(st: &Arc<AppState>, now: DateTime<Utc>) {
 }
 
 /// The end of a backup policy run (§3.1): `backup.failed` for a failed or partial run,
-/// held back for `repeatEvery` per policy, and the condition cleared by a successful
-/// run.
+/// or for a run whose backups succeeded but whose retention failed, held back for
+/// `repeatEvery` per policy, and the condition cleared by a run that succeeded in full.
 #[cfg_attr(not(feature = "backup"), allow(dead_code))]
 pub fn backup_run(
     st: &Arc<AppState>,
@@ -205,12 +207,16 @@ pub fn backup_run(
     now: DateTime<Utc>,
 ) -> Option<Raised> {
     let key = format!("backup.failed/{policy}");
-    match result {
-        "ok" => {
+    let retention_error = run["retention"]["error"].as_str().filter(|e| !e.is_empty());
+    match (result, retention_error) {
+        ("ok", None) => {
             clear(st, &key);
+            clear(st, &format!("backup.overdue/{policy}"));
             return None;
         }
-        "failed" | "partial" => {}
+        // the backups are there, so the policy is not overdue
+        ("ok", Some(_)) => clear(st, &format!("backup.overdue/{policy}")),
+        ("failed" | "partial", _) => {}
         _ => return None,
     }
     let failed: Vec<Value> = run["datasets"]
@@ -238,14 +244,24 @@ pub fn backup_run(
         } else {
             Severity::Warning
         },
-        title: format!("Backup policy {policy} {result}"),
-        summary: if names.is_empty() {
-            format!("The run of backup policy {policy} ended {result}.")
+        title: if result == "ok" {
+            format!("Backup policy {policy}: retention failed")
         } else {
-            format!(
-                "The run of backup policy {policy} ended {result}. It did not back up {}.",
-                names.join(", ")
-            )
+            format!("Backup policy {policy} {result}")
+        },
+        summary: {
+            let mut t = if names.is_empty() {
+                format!("The run of backup policy {policy} ended {result}.")
+            } else {
+                format!(
+                    "The run of backup policy {policy} ended {result}. It did not back up {}.",
+                    names.join(", ")
+                )
+            };
+            if let Some(e) = retention_error {
+                t.push_str(&format!(" Its retention failed: {e}"));
+            }
+            t
         },
         link: Some("/ui/backups".into()),
         data: json!({
@@ -255,6 +271,353 @@ pub fn backup_run(
             "repository": repository,
             "failedDatasets": failed,
             "consecutiveFailures": consecutive_failures,
+        }),
+    };
+    let mut ev = ev;
+    if let Some(e) = retention_error {
+        ev.data["retentionError"] = e.into();
+    }
+    let repeat = settings(st).repeat();
+    Some(raise(
+        st,
+        ev,
+        Some(Condition {
+            key,
+            repeat: Some(repeat),
+        }),
+        now,
+    ))
+}
+
+/// One backup failure that is not the end of a policy run: its event type, the key of
+/// its condition and what the event says.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub struct BackupFailure<'a> {
+    /// `backup.failed`, `backup.verify.failed` or `backup.gc.failed`
+    pub kind: &'static str,
+    pub key: String,
+    pub title: String,
+    pub summary: String,
+    pub repository: &'a str,
+    /// the event's other `data` members
+    pub data: Value,
+}
+
+/// Raise a backup failure, held back for `repeatEvery` per key until it clears.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub fn backup_failure(st: &Arc<AppState>, f: BackupFailure, now: DateTime<Utc>) -> Raised {
+    let mut data = f.data;
+    data["repository"] = f.repository.into();
+    let ev = Event {
+        kind: f.kind,
+        dataset: None,
+        severity: Severity::Critical,
+        title: f.title,
+        summary: f.summary,
+        link: Some("/ui/backups".into()),
+        data,
+    };
+    let repeat = settings(st).repeat();
+    raise(
+        st,
+        ev,
+        Some(Condition {
+            key: f.key,
+            repeat: Some(repeat),
+        }),
+        now,
+    )
+}
+
+/// The condition key of a backup started by hand of `dataset` into `repository`.
+pub fn manual_backup_key(repository: &str, dataset: &str) -> String {
+    format!("backup.failed/manual/{repository}/{dataset}")
+}
+
+/// A backup of `dataset` into `repository` succeeded, whether started by hand or by a
+/// policy: the condition of a failed backup of it started by hand clears.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub fn backup_created(st: &AppState, dataset: &str, repository: &str) {
+    clear(st, &manual_backup_key(repository, dataset));
+}
+
+/// The end of a backup started by hand: `backup.failed` with `trigger: "manual"` when
+/// it failed, and the condition cleared when it succeeded. A cancelled backup sends
+/// nothing.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub fn backup_manual(
+    st: &Arc<AppState>,
+    dataset: &str,
+    repository: &str,
+    error: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<Raised> {
+    let key = manual_backup_key(repository, dataset);
+    let Some(e) = error else {
+        clear(st, &key);
+        return None;
+    };
+    Some(backup_failure(
+        st,
+        BackupFailure {
+            kind: "backup.failed",
+            key,
+            title: format!("Backup of {dataset} failed"),
+            summary: format!(
+                "The backup of {dataset} into {repository} that was started by hand failed: {e}"
+            ),
+            repository,
+            data: json!({ "trigger": "manual", "dataset": dataset, "error": e }),
+        },
+        now,
+    ))
+}
+
+/// A backup policy run that failed before it recorded a result: `backup.failed` with
+/// the failing `stage`, `start` for a scheduled run that could not start and `run` for
+/// a run that stopped on an error. It shares the key of the policy's runs, so the next
+/// successful run clears it.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub fn backup_policy_error(
+    st: &Arc<AppState>,
+    policy: &str,
+    repository: &str,
+    stage: &str,
+    error: &str,
+    now: DateTime<Utc>,
+) -> Raised {
+    let what = if stage == "start" {
+        "could not start"
+    } else {
+        "stopped on an error"
+    };
+    backup_failure(
+        st,
+        BackupFailure {
+            kind: "backup.failed",
+            key: format!("backup.failed/{policy}"),
+            title: format!("Backup policy {policy} failed"),
+            summary: format!("A run of backup policy {policy} {what}: {error}"),
+            repository,
+            data: json!({ "policy": policy, "stage": stage, "error": error }),
+        },
+        now,
+    )
+}
+
+/// The order of verification levels: a check at a level also checks what the lower
+/// ones do.
+fn verify_rank(level: &str) -> u8 {
+    match level {
+        "exists" => 0,
+        "data" => 1,
+        _ => 2,
+    }
+}
+
+/// The end of a verification of `repository` at `level`: `backup.verify.failed`, keyed
+/// per repository, when it failed (`error`) or found backups in error (`broken`).
+/// `whole` is a verification of the whole repository, whose report lists every backup
+/// in `checked`, and `names` are the backups a selected one asked for.
+///
+/// Each problem is also kept as a condition of its own that sends nothing: a damaged
+/// backup as `backup.verify.failed/{repository}/{backup}@{level}`, a selected
+/// verification that failed as `…/{backup}!@{level}` for each backup it asked for, and
+/// a whole verification that failed as `…/*@{level}`. A backup's problems clear when a
+/// verification at the same or a higher level finds it ok, or when a whole verification
+/// no longer lists it, since it was deleted. A failed whole verification clears only
+/// when a whole verification succeeds at the same level, or at `data` for one at
+/// `restore`, which a whole verification does not offer over HTTP. The repository's
+/// condition clears once none of its problems is left. The change is one step under
+/// the notifier's lock, so two verifications cannot interleave between the check and
+/// the clearing.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub fn backup_verify(
+    st: &Arc<AppState>,
+    repository: &str,
+    whole: bool,
+    level: &str,
+    names: &[String],
+    checked: &[String],
+    broken: &[String],
+    error: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<Raised> {
+    let key = format!("backup.verify.failed/{repository}");
+    let prefix = format!("{key}/");
+    let rank = verify_rank(level);
+    let mut marks: Vec<String> = broken
+        .iter()
+        .map(|b| format!("{prefix}{b}@{level}"))
+        .collect();
+    if error.is_some() {
+        if whole {
+            marks.push(format!("{prefix}*@{level}"));
+        } else {
+            marks.extend(names.iter().map(|b| format!("{prefix}{b}!@{level}")));
+        }
+    }
+    let ok: std::collections::HashSet<&str> = if error.is_none() {
+        checked
+            .iter()
+            .map(String::as_str)
+            .filter(|b| !broken.iter().any(|x| x == b))
+            .collect()
+    } else {
+        Default::default()
+    };
+    let update = |active: &mut std::collections::BTreeMap<String, super::Active>| {
+        let before = active.len();
+        if error.is_none() {
+            active.retain(|k, _| {
+                let Some(rest) = k.strip_prefix(&prefix) else {
+                    return true;
+                };
+                let Some((what, at)) = rest.rsplit_once('@') else {
+                    return true;
+                };
+                let at = verify_rank(at);
+                if what == "*" {
+                    return !(whole && rank >= at.min(1));
+                }
+                let backup = what.strip_suffix('!').unwrap_or(what);
+                let deleted = whole && !checked.iter().any(|c| c == backup);
+                let passed = ok.contains(backup) && rank >= at;
+                !(deleted || passed)
+            });
+        }
+        for m in &marks {
+            active.entry(m.clone()).or_insert_with(|| super::Active {
+                event: "backup.verify.failed".into(),
+                dataset: None,
+                first: super::rfc3339(now),
+                last: super::rfc3339(now),
+                count: 0,
+            });
+        }
+        let left = active
+            .range(prefix.clone()..)
+            .next()
+            .is_some_and(|(k, _)| k.starts_with(&prefix));
+        let cleared = !left && active.remove(&key).is_some();
+        let changed = active.len() != before || cleared || !marks.is_empty();
+        (!marks.is_empty(), changed)
+    };
+    let summary = match error {
+        Some(e) => format!("A verification of repository {repository} failed: {e}"),
+        None => format!(
+            "A verification of repository {repository} found {} backup{} in error: {}.",
+            broken.len(),
+            if broken.len() == 1 { "" } else { "s" },
+            broken.join(", ")
+        ),
+    };
+    let mut data = json!({ "level": level, "backups": broken, "repository": repository });
+    if let Some(e) = error {
+        data["error"] = e.into();
+    }
+    let ev = Event {
+        kind: "backup.verify.failed",
+        dataset: None,
+        severity: Severity::Critical,
+        title: format!("Backup verification failed in {repository}"),
+        summary,
+        link: Some("/ui/backups".into()),
+        data,
+    };
+    let repeat = settings(st).repeat();
+    // the problems, the repository's condition and its repeat are one step, so that a
+    // verification that clears cannot come between another's problems and its event
+    super::raise_with(
+        st,
+        ev,
+        Some(Condition {
+            key: key.clone(),
+            repeat: Some(repeat),
+        }),
+        now,
+        Some(update),
+    )
+}
+
+/// The end of a GC of `repository` (`dry_run`: one that deletes nothing), or a GC that
+/// a policy could not start: `backup.gc.failed` keyed per repository, cleared by a GC
+/// that deletes and succeeds, since a dry run takes no exclusive lock and does not
+/// sweep.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub fn backup_gc(
+    st: &Arc<AppState>,
+    repository: &str,
+    stage: &str,
+    dry_run: bool,
+    error: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<Raised> {
+    let key = format!("backup.gc.failed/{repository}");
+    let Some(e) = error else {
+        if !dry_run {
+            clear(st, &key);
+        }
+        return None;
+    };
+    Some(backup_failure(
+        st,
+        BackupFailure {
+            kind: "backup.gc.failed",
+            key,
+            title: format!("Backup GC failed in {repository}"),
+            summary: format!("A GC of repository {repository} failed: {e}"),
+            repository,
+            data: json!({ "stage": stage, "error": e }),
+        },
+        now,
+    ))
+}
+
+/// `backup.overdue` for an enabled policy that has missed two scheduled instants since
+/// its last success: `second` is the second instant of its schedule after the last
+/// success, and the policy is overdue once `now` is past it while no run of the policy
+/// is going on. Held back for `repeatEvery` and cleared once the policy is not overdue.
+/// A policy without a success yet (`second` is `None`) is told about by its failures.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub fn backup_overdue(
+    st: &Arc<AppState>,
+    policy: &str,
+    repository: &str,
+    last_success: Option<DateTime<Utc>>,
+    second: Option<DateTime<Utc>>,
+    running: bool,
+    now: DateTime<Utc>,
+) -> Option<Raised> {
+    let key = format!("backup.overdue/{policy}");
+    if running {
+        // the run may be the one that succeeds
+        return None;
+    }
+    let (Some(last), Some(second)) = (last_success, second) else {
+        clear(st, &key);
+        return None;
+    };
+    if now <= second {
+        clear(st, &key);
+        return None;
+    }
+    let ev = Event {
+        kind: "backup.overdue",
+        dataset: None,
+        severity: Severity::Warning,
+        title: format!("Backup policy {policy} is overdue"),
+        summary: format!(
+            "Backup policy {policy} last succeeded {} ago and has missed at least two scheduled runs since.",
+            days_text(now - last)
+        ),
+        link: Some("/ui/backups".into()),
+        data: json!({
+            "policy": policy,
+            "repository": repository,
+            "lastSuccess": super::rfc3339(last),
+            "missedSince": super::rfc3339(second),
         }),
     };
     let repeat = settings(st).repeat();
@@ -267,4 +630,15 @@ pub fn backup_run(
         }),
         now,
     ))
+}
+
+/// The conditions of policies that are gone, which no later run can clear.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub fn backup_policies_present(st: &AppState, policies: &[&str]) {
+    super::clear_where(st, |k| {
+        ["backup.overdue/", "backup.failed/"].iter().any(|p| {
+            k.strip_prefix(p)
+                .is_some_and(|name| !name.starts_with("manual/") && !policies.contains(&name))
+        })
+    });
 }

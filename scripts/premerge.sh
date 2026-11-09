@@ -13,6 +13,9 @@
 #   py-parity     every `planned:` Python entry of crates/sparkles/bindings.toml is in the
 #                 DEFERRED set of crates/sparkles-py/tests/test_parity.py, every `skip:` entry
 #                 is one the test allows, and no DEFERRED key is stale
+#   nix-pins      the Nix packages evaluate against Cargo.lock, which fails when a lock
+#                 refresh moves a crate that a Nix file pins, such as wasm-bindgen in
+#                 nix/fmt-wasm.nix
 #   doc-paths     cited source paths and documentation entry-page links (lint:doc-paths)
 #   licenses      the third-party licence files match the Cargo locks (licenses:check)
 #   bench-scripts the script unit tests, which include the CI task-profile test, and the
@@ -29,7 +32,7 @@ set -euo pipefail
 
 main() {
   cd "$(dirname "$0")/.."
-  all=(client-ts client-rust lock-py lock-node lock-ffi py-parity doc-paths licenses bench-scripts)
+  all=(client-ts client-rust lock-py lock-node lock-ffi nix-pins py-parity doc-paths licenses bench-scripts)
   fix=
   checks=()
   while [ $# -gt 0 ]; do
@@ -121,10 +124,23 @@ hint() {
     lock-node) echo "run 'mise run node:lock' (or premerge.sh --fix) and commit crates/sparkles-node/Cargo.lock" ;;
     lock-ffi) echo "run 'mise run jvm:lock' (or premerge.sh --fix) and commit crates/sparkles-ffi/Cargo.lock" ;;
     py-parity) echo "add the Python binding, or the key to DEFERRED in crates/sparkles-py/tests/test_parity.py with the reason in bindings.toml, or drop a stale DEFERRED key" ;;
+    nix-pins) echo "update the version and hashes in the Nix file that the log names to match Cargo.lock" ;;
     doc-paths) echo "fix the cited paths or links that the log names" ;;
     licenses) echo "run 'mise run licenses' (or premerge.sh --fix) and commit the THIRD_PARTY_LICENSES.md files it changes" ;;
     bench-scripts) echo "fix the failing script test that the log names (scripts/bench-tests)" ;;
   esac
+}
+
+# Evaluating a package checks the pins its Nix file asserts against Cargo.lock without
+# building anything. A host without Nix skips the check.
+check_nix_pins() {
+  if ! command -v nix > /dev/null; then
+    echo "nix not found, skipping"
+    return 0
+  fi
+  local sys
+  sys=$(nix eval --raw --impure --expr builtins.currentSystem) || return 1
+  nix eval --raw ".#packages.$sys.sparkles-fmt-wasm.drvPath"
 }
 
 check_client_ts() { mise run node:client:check; }

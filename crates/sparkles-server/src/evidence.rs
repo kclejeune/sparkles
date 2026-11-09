@@ -51,6 +51,8 @@ pub fn routes() -> Router<Arc<AppState>> {
 mod claims;
 mod review;
 
+pub(crate) use claims::{caller_fence, principal_iri, propose_ingested, record_json};
+
 /// The response body: the canonical settings, their digest, the registry revision and
 /// the role graphs that are protected or detached.
 fn body(status: SettingsStatus) -> ApiResult<Json<J>> {
@@ -429,7 +431,7 @@ fn record_kind(name: &str) -> Option<RecordKind> {
     })
 }
 
-fn kind_name(kind: RecordKind) -> &'static str {
+pub(crate) fn kind_name(kind: RecordKind) -> &'static str {
     let iri = sparkles::evidence::resolve::kind_iri(kind);
     iri.strip_prefix("urn:x-sparkles:evidence:").unwrap_or(iri)
 }

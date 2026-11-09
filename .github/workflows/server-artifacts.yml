@@ -1,4 +1,8 @@
 # Unpublished GNU x86_64 candidates. No registry/release/tag operations.
+#
+# mbx builds in local mode with no remote cache. actions/cache carries mbx's object store
+# for each commit, without the managed targets. Pushes to main save, and other runs only
+# restore.
 name: Server artifact candidates
 
 on:
@@ -38,18 +42,14 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  MBX_HTTP_TIMEOUT: 5m
-  MBX_GC_MAX_SIZE: 10GiB
-  MBX_REMOTE_TRUST_WRITES: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && 'true' || 'false' }}
+  # The saved mbx store stays small enough for GitHub's 10 GB repository cache.
+  MBX_GC_MAX_SIZE: 3GiB
 
 jobs:
   build:
     # SPARKLES_RUNNER_LARGE for same-repository events, GitHub's runner otherwise
     runs-on: ${{ !inputs.github-hosted && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER_LARGE || 'ubuntu-24.04' }}
     timeout-minutes: 90
-    permissions:
-      contents: read
-      id-token: write
     # UI, Wasm and Rust use one workspace and one managed target in this container. On
     # GitHub's runner the container is held to 4 CPUs and 14 GB with two compiler jobs.
     # A larger runner lends the container all of its CPUs and memory.
@@ -124,20 +124,38 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           install_args: node pnpm mr-boxington
+      # mbx's object store keeps the crates' outputs by the hash of their inputs, so a crate
+      # whose sources and dependencies did not change is not compiled again. The managed
+      # targets stay out of the saved store.
+      - uses: actions/cache/restore@v4
+        id: mbx-store
+        with:
+          path: &mbx-store |
+            ~/.cache/mbx
+            !~/.cache/mbx/targets
+          key: mbx-store-server-manylinux228-release-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: mbx-store-server-manylinux228-release-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
+      # local mode: no remote cache, and no link cache, which would add the server binary
+      # to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
-          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
-          remote-url: https://mbx.kclj.dev
-          namespace: kclejeune/sparkles
-          oidc-audience: https://mbx.kclj.dev
+          backend: local
           version: 1.29.1
-          github-cache-mode: objects
-          cache-generation: sparkles-server-manylinux228-release-v1
-          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
+          cache-links: false
       - name: Packaging regressions and tiny ELF fixture
         run: python3 -m unittest discover -s scripts/bench-tests -p test_server_artifact.py
       - name: Build and assemble the default-feature candidate
         run: mise run server:artifact -- .artifacts/server-candidate
+      - name: Collect the mbx store to its size limit
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: |
+          mbx gc
+          du -sh "$(dirname "$(mbx cache dir)")"
+      - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@v4
+        with:
+          path: *mbx-store
+          key: ${{ steps.mbx-store.outputs.cache-primary-key }}
       - uses: actions/upload-artifact@v4
         with:
           name: server-candidate-x86_64-unknown-linux-gnu
