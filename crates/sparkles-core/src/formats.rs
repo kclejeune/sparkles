@@ -851,19 +851,17 @@ pub(crate) fn check_dataset_tree(root: &std::path::Path) -> Result<()> {
 
 /// Every reason this build refuses the dataset directory `dir` because of a settings
 /// file (the registered files of [`Scope::Dataset`] other than the informational ones).
-/// A file that does not exist is skipped. History uses its full typed reader so that
-/// supported corruption refuses before startup writers. Other files that are not JSON
-/// are left to their own readers. An unreadable version names the directory and keeps
-/// its error variant.
+/// A file that does not exist is skipped. History also uses its full typed reader so
+/// that supported corruption refuses before startup writers. Other files that are not
+/// JSON are left to their own readers. An unreadable version names the directory and
+/// keeps its error variant.
 pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
     let mut out = Vec::new();
+    let mut history_refused = false;
     for s in SETTINGS.iter().filter(|s| {
         s.scope == Scope::Dataset
             && !informational(s.name)
             && !WRITE_FENCED_SETTINGS.contains(&s.name)
-            // History shares the full pure typed reader below. A version-only
-            // check would allow current corruption to fail after startup writers.
-            && s.name != "history.json"
     }) {
         let fenced = RETENTION_FENCED_SETTINGS.contains(&s.name);
         // a fenced file's own reader bounds its size, and so does this check
@@ -885,6 +883,7 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             continue;
         };
+        let refused = out.len();
         let checked = check_settings(s.name, &v).and_then(|found| {
             if matches!(s.name, "history.json" | "branch.json")
                 && found >= 2
@@ -906,8 +905,13 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
             Err(Error::Corrupt(m)) => out.push(Error::Corrupt(format!("{}: {m}", dir.display()))),
             Err(e) => out.push(e),
         }
+        history_refused |= s.name == "history.json" && out.len() > refused;
     }
-    if let Err(error) = crate::history::preflight_file(dir) {
+    // History also goes through its full pure typed reader, so that supported
+    // corruption refuses before startup writers. The version and its admission
+    // against the recorded reader are checked above first, and a refusal there
+    // stands alone.
+    if !history_refused && let Err(error) = crate::history::preflight_file(dir) {
         out.push(match error {
             Error::Unsupported(message) => {
                 Error::Unsupported(format!("{}: {message}", dir.display()))
@@ -1489,39 +1493,73 @@ mod history_refusal_nonmutation_tests {
         files
     }
 
+    /// Activate configuration history on a closed persistent store. Only an
+    /// activated dataset admits `history.json` format 2 (C25, "The newer file
+    /// versions are written only after activation").
+    fn activate(root: &Path) {
+        let preparation =
+            crate::access::Preparation::new(crate::task::Control::none(), 64 << 20).unwrap();
+        crate::migrate::activate_configuration_history(root, false, &preparation).unwrap();
+    }
+
+    /// Remove `writtenBy`, so that a write-open by this build would rewrite
+    /// `dataset.json` and a refusal can show that nothing was written.
+    fn unstamp_writer(root: &Path) {
+        let path = root.join("dataset.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("writtenBy");
+        std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
+    fn refused_without_writes(root: &Path) -> Error {
+        let before = metadata_files(root);
+        let error = match Store::open(root, StoreOptions::default()) {
+            Err(error) => error,
+            Ok(_) => panic!("the open must refuse"),
+        };
+        assert_eq!(
+            metadata_files(root),
+            before,
+            "a refused open must not mutate any metadata file"
+        );
+        error
+    }
+
     #[test]
     fn supported_corrupt_history_refuses_before_any_metadata_writer() {
+        assert_eq!(super::settings_file("history.json").unwrap().writes, 2);
+        // An activated dataset admits format 2, so a malformed one is corruption.
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("db");
         drop(Store::open(&root, StoreOptions::default()).unwrap());
-        let path = root.join("dataset.json");
-        let mut dataset: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        activate(&root);
         let original_id = crate::commit::read_dataset_file(&root).unwrap().unwrap();
-        dataset["minimumReader"] = 1.into();
-        dataset.as_object_mut().unwrap().remove("writtenBy");
-        std::fs::write(&path, serde_json::to_vec_pretty(&dataset).unwrap()).unwrap();
+        unstamp_writer(&root);
+        std::fs::write(root.join("history.json"), br#"{"format":2}"#).unwrap();
+        let error = refused_without_writes(&root);
+        assert!(
+            matches!(error, Error::Corrupt(_)),
+            "current malformed history is corruption: {error}"
+        );
         assert_eq!(
             crate::commit::read_dataset_file(&root).unwrap(),
             Some(original_id),
             "real dataset identity is unchanged"
         );
-        assert_eq!(super::settings_file("history.json").unwrap().writes, 2);
+    }
+
+    #[test]
+    fn format_two_history_in_an_older_reader_dataset_is_a_newer_file() {
+        // C25: "One of these versions in a dataset that records an older reader
+        // is refused as a newer release's file."
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("db");
+        drop(Store::open(&root, StoreOptions::default()).unwrap());
+        old_stamp(&root);
         std::fs::write(root.join("history.json"), br#"{"format":2}"#).unwrap();
-        let before = metadata_files(&root);
-        let error = match Store::open(&root, StoreOptions::default()) {
-            Err(error) => error,
-            Ok(_) => panic!("supported malformed history must refuse"),
-        };
-        assert!(
-            matches!(error, Error::Corrupt(_)),
-            "current malformed history is corruption: {error}"
-        );
-        let after = metadata_files(&root);
-        assert_eq!(
-            after, before,
-            "a refused open must not mutate any metadata file"
-        );
+        let error = refused_without_writes(&root);
+        assert!(matches!(error, Error::Unsupported(_)), "{error}");
     }
 
     fn write_valid_history(root: &Path, identity: uuid::Uuid, current: bool) {
@@ -1598,6 +1636,7 @@ mod history_refusal_nonmutation_tests {
                     target.is_dir(),
                     "real active/retained physical branch must survive"
                 );
+                activate(&root);
                 let identity = crate::commit::read_dataset_file(&target).unwrap().unwrap();
                 write_valid_history(
                     &target,
@@ -1614,7 +1653,7 @@ mod history_refusal_nonmutation_tests {
                     bytes.push(b' ');
                     std::fs::write(path, bytes).unwrap();
                 }
-                old_stamp(&root);
+                unstamp_writer(&root);
                 let before = metadata_files(&root);
                 let plan = crate::migrate::plan(&root).unwrap();
                 assert!(
@@ -1689,6 +1728,7 @@ mod history_refusal_nonmutation_tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("db");
         drop(Store::open(&root, StoreOptions::default()).unwrap());
+        activate(&root);
         let identity = crate::commit::read_dataset_file(&root).unwrap().unwrap();
         write_valid_history(&root, identity, true);
         let before = metadata_files(&root);
