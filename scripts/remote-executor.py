@@ -22,6 +22,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'boat'))
 import job_environment as boat_environment
+import qualified_worker_admission as boat_clock
 import owned_group
 
 SSH = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
@@ -56,15 +57,22 @@ def admission(host, minimum=0):
     if minimum < 0:fail('minimum lifetime cannot be negative')
     worker = boat_id(host)
     if not worker:return None
-    profile, qualified, envfile, cli = boat_environment.load_job_admission(
+    profile, qualified, envfile, cli, lifetime = boat_environment.load_job_admission(
         selection_path('SPARKLES_BOAT_ADMISSION', worker),
         selection_path('SPARKLES_BOAT_PROFILE', worker), worker, time.time())
-    expiry = datetime.fromisoformat(qualified['expires_at'].replace('Z','+00:00')).timestamp()
-    if not math.isfinite(expiry) or expiry <= time.time()+minimum:
+    # Every call measures the original lifetime on both clocks, so neither a wall
+    # rollback nor a missed suspend can lengthen it, and keeps the closure reserve.
+    wall = time.time()
+    left = boat_clock.lifetime_left(lifetime, wall)
+    if not math.isfinite(left) or left - boat_clock.CLOSURE_RESERVE <= minimum:
         fail('admission expired or has insufficient remaining lifetime')
+    # expires_at is the effective wall end at this observation, never later than
+    # the original. Callers that subtract the current wall time get the earlier end.
+    expiry = min(lifetime['wall_end'], wall + left)
     guard = qualified['local_guard']
     return {'worker':worker, 'environment':qualified['environment']['name'],
             'environment_version':qualified['environment']['version'], 'expires_at':expiry,
+            'remaining_seconds':left, 'boot_end':lifetime['boot_end'],
             'owner':qualified['safe_owner']['operation_id'], 'guard_unit':guard['unit'],
             'guard_boot_id':guard['boot_id'], 'guard_invocation_id':guard['invocation_id'],
             'toolchain_manifest_path':qualified['toolchain_manifest']['path'],
@@ -73,7 +81,8 @@ def admission(host, minimum=0):
             'worker_env_path':envfile['path'], 'worker_env_sha256':envfile['sha256'],
             'job_release_sha256':qualified['job_release_sha256'],
             'controller_packet_sha256':qualified['controller_packet_sha256'],
-            '_profile':profile, '_qualified':qualified, '_cli':cli, '_envfile':envfile}
+            '_profile':profile, '_qualified':qualified, '_cli':cli, '_envfile':envfile,
+            '_lifetime':lifetime}
 
 
 def command(host, text):
@@ -94,7 +103,7 @@ def admit(host, minimum):
     data = admission(host, minimum)
     if data is None:
         return
-    deadline=min(time.monotonic()+30,time.monotonic()+data['expires_at']-time.time()-30)
+    deadline=admission_deadline(data,30)
     result=boat_environment.controller.bounded([data['_cli']['path'],'--no-update','--json','info',data['worker']],remaining(deadline))
     if result['exit']!=0 or not isinstance(result['body'],dict) or not isinstance(result['body'].get('sandbox'),dict):
         fail('bounded worker metadata unavailable')
@@ -198,23 +207,30 @@ def remote_path(spec):
 
 
 class OperationDeadline(float):
-    def __new__(cls, monotonic_end, wall_end):
-        value=float.__new__(cls,monotonic_end);value.wall_end=wall_end;return value
+    """A monotonic end with the original wall end and, for Boat, BOOTTIME end."""
+    def __new__(cls, monotonic_end, wall_end, boot_end=None):
+        value=float.__new__(cls,monotonic_end);value.wall_end=wall_end;value.boot_end=boot_end;return value
+
+
+def admission_deadline(data, seconds):
+    """Freeze one operation's end from an admission, minus the closure reserve."""
+    reserve=boat_clock.CLOSURE_RESERVE
+    left=boat_clock.lifetime_left(data['_lifetime'],time.time())-reserve
+    return OperationDeadline(time.monotonic()+min(seconds,left),data['_lifetime']['wall_end']-reserve,
+                             data['_lifetime']['boot_end']-reserve)
 
 
 def operation_deadline(host, seconds=300):
     """Freeze the original admission end once for all phases of one operation."""
-    now = time.monotonic()
     if boat_id(host):
-        data = admission(host)
-        end=data['expires_at']-30
-        return OperationDeadline(min(now+seconds,now+end-time.time()),end)
-    return now + seconds
+        return admission_deadline(admission(host), seconds)
+    return time.monotonic() + seconds
 
 
 def remaining(deadline):
     left = deadline - time.monotonic()
     if hasattr(deadline,'wall_end'):left=min(left,deadline.wall_end-time.time())
+    if getattr(deadline,'boot_end',None) is not None:left=min(left,deadline.boot_end-boat_clock.boottime())
     if left <= 0:
         fail('transfer deadline exceeded before dispatch')
     return left
@@ -421,7 +437,7 @@ def exchange(argv, output, limit=MAX_ARCHIVE, timeout=300, deadline=None, source
              input_limit=None, stderr_output=None, stderr_limit=1024*1024):
     input_limit=MAX_ARCHIVE if input_limit is None else input_limit
     if deadline is None:deadline=time.monotonic()+timeout
-    elif hasattr(deadline,'wall_end'):deadline=OperationDeadline(min(deadline,time.monotonic()+timeout),deadline.wall_end)
+    elif hasattr(deadline,'wall_end'):deadline=OperationDeadline(min(deadline,time.monotonic()+timeout),deadline.wall_end,getattr(deadline,'boot_end',None))
     else:deadline=min(deadline,time.monotonic()+timeout)
     remaining(deadline)
     # From here until teardown ends SIGINT is only recorded. The transfer loop
@@ -667,8 +683,7 @@ def main():
         print(shlex.join(['python3', '-I', '-c', EXTRACT, args.destination, str(args.max_bytes), str(MAX_MEMBERS)])); return 0
     if args.action == 'exec':
         if boat_id(args.host):
-            data=admission(args.host);end=data['expires_at']-30
-            deadline=OperationDeadline(time.monotonic()+end-time.time(),end)
+            deadline=admission_deadline(admission(args.host),float('inf'))
             return exchange(command(args.host,args.command),sys.stdout.buffer,timeout=10800,
                             deadline=deadline,source=None if sys.stdin.isatty() else sys.stdin.buffer,
                             input_limit=64*1024**3,stderr_output=sys.stderr.buffer,stderr_limit=64*1024**2)

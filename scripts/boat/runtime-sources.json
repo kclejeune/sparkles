@@ -1,9 +1,9 @@
 {
   "files": {
     "README.md": {
-      "bytes": 7074,
+      "bytes": 7155,
       "mode": 420,
-      "sha256": "daa4bb10303eec1a1a9ca3dfe41fcca4dfc26c3009decfb4e187872a3ec531fe"
+      "sha256": "6dc050996439a8508a15f8fa4926938995644be027eba8f72120df1234c7da07"
     },
     "common.py": {
       "bytes": 12704,
@@ -31,9 +31,9 @@
       "sha256": "b26f69930360afa4f7fd27f813684c7154efeed8c2507375c904f7d1677f0be8"
     },
     "job_environment.py": {
-      "bytes": 8983,
+      "bytes": 9129,
       "mode": 420,
-      "sha256": "cbbb94b5a7c896bc60ff17fb00456fea8678c322719384a61b3913f9bef5a2a3"
+      "sha256": "14c6068273c86f64a1e96f6bb046c8bf2a5df0a82ec15462311a77335110d42d"
     },
     "metadata-probe.py": {
       "bytes": 11030,
@@ -51,9 +51,9 @@
       "sha256": "52545934cada5c517218506cdc9f6ac743649d47f9d9f278d3fce4204e5968ae"
     },
     "qualified_worker_admission.py": {
-      "bytes": 7834,
+      "bytes": 10077,
       "mode": 420,
-      "sha256": "4c2cb77666d55448ddd6498ec5b7d68fd51b6e57b55d6d79aeb7a88e6358d428"
+      "sha256": "a81c1bb70f017f568128f18cf9df144096cea9c3e5099ba3ea0579cd1311103b"
     },
     "release.FALSE.json": {
       "bytes": 2781,

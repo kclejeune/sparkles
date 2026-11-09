@@ -64,6 +64,16 @@ name a directory of exact-worker `bx_ID.json` files. Unknown schemas, changed or
 qualification bytes, profile/source drift, a replaced local guard and insufficient
 remaining lifetime are refused.
 
+Remaining lifetime comes from the original operation receipts on every call. The
+controller intent, guard observation and handoff give an original wall end and the
+same instant on `CLOCK_BOOTTIME` for the guard's boot and invocation. Each check
+takes the earlier of the two remaining times and subtracts the 30-second closure
+reserve, so a wall clock moved backward cannot lengthen the lifetime and a suspend
+counts even when the wall clock misses it. A different boot refuses the admission.
+`admit --minimum` and environment preparation use this measure, and each operation
+freezes a deadline bounded by both ends. The `expires_at` that `admit` reports is
+the effective wall end at that observation and is never later than the original.
+
 ## Warm worker commands
 
 The [complete sequence](../scripts/boat/README.md#one-warm-worker-sequence) runs

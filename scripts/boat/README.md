@@ -89,7 +89,8 @@ literally and never source arbitrary shell values. An uncertain preparation is
 reconciled with the same command and `--check`, which creates no worker files.
 
 Several jobs reuse the same worker without lifecycle starts. Each checks the original
-deadline and refuses inadequate remaining time. The qualification receipt and local
+deadline on both the wall clock and `CLOCK_BOOTTIME`, keeps the 30-second closure
+reserve and refuses inadequate remaining time. The qualification receipt and local
 guard stay bound to the same operation throughout. The transport's actual Boat quoting,
 workload correctness, cache reuse and interruption behavior still require real
 acceptance under roadmap item 762. Namespace remains the required screen fallback.

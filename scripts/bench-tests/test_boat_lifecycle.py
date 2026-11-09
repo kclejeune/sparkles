@@ -20,14 +20,18 @@ class EnvironmentAdmission(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name);self.f=fixture(self.root)
+        import qualified_worker_admission as qwa
+        # The fixture's BOOTTIME observation stands for the current boot clock.
+        boot=patch.object(qwa,'boottime',return_value=self.f['boot_now']);boot.start();self.addCleanup(boot.stop)
 
     def load(self):
         return env.load_job_admission(self.f['admission'],self.f['profile_path'],self.f['profile']['worker'],self.f['now'],lambda unit:self.f['guard'])
 
     def test_exact_original_qualification_profile_source_job_and_environment(self):
-        p,q,file,cli=self.load()
+        p,q,file,cli,life=self.load()
         self.assertEqual(q,self.f['qualified']);self.assertEqual(file,env.expected_environment(p,q))
         self.assertEqual(cli,self.f['release']['boat'])
+        self.assertEqual(life['boot_id'],self.f['boot_id']);self.assertEqual(life['invocation_id'],self.f['qualified']['local_guard']['invocation_id'])
         original=self.f['qualified_path'].read_bytes()
         self.assertEqual(hashlib.sha256(original).hexdigest(),self.f['job']['qualification']['sha256'])
         self.assertIsNone(json.loads(original)['runtime_env_file'])
@@ -63,6 +67,40 @@ class EnvironmentAdmission(unittest.TestCase):
         self.assertEqual(self.f['qualified_path'].read_bytes(),original)
         record=json.loads(out.read_bytes());self.assertEqual(record['qualification']['sha256'],hashlib.sha256(original).hexdigest())
         self.assertEqual(out.stat().st_mode&0o777,0o600)
+
+    def test_prepare_window_uses_original_boottime_after_wall_rollback(self):
+        import qualified_worker_admission as qwa
+        from datetime import datetime
+        out=self.f['operation']/'prepared-rollback.json';original=self.f['qualified_path'].read_bytes()
+        left=datetime.fromisoformat(self.f['qualified']['expires_at'].replace('Z','+00:00')).timestamp()-self.f['now']
+        expected=env.expected_environment(self.f['profile'],self.f['qualified'])
+        real_context=env.context
+        def context(*args,**kwargs):
+            kwargs['guard_reader']=lambda unit:self.f['guard'];return real_context(*args,**kwargs)
+        # Forty original seconds remain by BOOTTIME although wall time moved back.
+        with patch.object(env,'context',side_effect=context),patch.object(env.time,'time',return_value=self.f['now']-7200),\
+             patch.object(qwa,'boottime',return_value=self.f['boot_now']+left-40,create=True),\
+             patch.object(qwa,'current_boot_id',return_value=self.f['boot_id'],create=True),\
+             patch.object(controller,'bounded',return_value={'exit':0,'body':expected})as wire:
+            env.prepare(self.f['profile_path'],self.f['operation'],self.f['profile']['worker'],out)
+        self.assertLessEqual(wire.call_args.args[1],10)
+        self.assertEqual(self.f['qualified_path'].read_bytes(),original)
+        with patch.object(env,'context',side_effect=context),patch.object(env.time,'time',return_value=self.f['now']-7200),\
+             patch.object(qwa,'boottime',return_value=self.f['boot_now']+left-20,create=True),\
+             patch.object(qwa,'current_boot_id',return_value=self.f['boot_id'],create=True),\
+             patch.object(controller,'bounded',side_effect=AssertionError('no transport')):
+            with self.assertRaises(ValueError):
+                env.prepare(self.f['profile_path'],self.f['operation'],self.f['profile']['worker'],self.f['operation']/'late.json')
+
+    def test_reviewed_rollback_scenario_leaves_1570_seconds(self):
+        import qualified_worker_admission as qwa
+        intent={'deadline_wall':11500,'deadline_mono':10600};handoff={'deadline_wall':11500}
+        guard={'observed_wall':1100,'observed_boottime':200}
+        wall,boot=qwa.original_ends(intent,guard,handoff);self.assertEqual((wall,boot),(11500,10600))
+        life={'wall_end':wall,'boot_end':boot,'boot_id':'b','invocation_id':'a'*32}
+        self.assertEqual(qwa.lifetime_left(life,2700,9000,'b')-qwa.CLOSURE_RESERVE,1570)
+        self.assertEqual(qwa.lifetime_left(life,9900,9000,'b')-qwa.CLOSURE_RESERVE,1570)
+        with self.assertRaises(ValueError):qwa.lifetime_left(life,2700,9000,'other boot')
 
     def test_remote_environment_creation_and_check_never_open_token_content(self):
         home=self.root/'worker';state=home/'.local/state/sparkles-boat';state.mkdir(parents=True)

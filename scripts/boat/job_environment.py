@@ -12,7 +12,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import read_owned, write_new
 from config_schema import validate_profile
-from qualified_worker_admission import export_operation, validate_admission
+from qualified_worker_admission import CLOSURE_RESERVE, export_operation, lifetime_left, operation_lifetime, validate_admission
 import controller
 
 SCHEMA = 'sparkles.boat.job-admission'
@@ -74,7 +74,9 @@ def context(profile_path, qualification_path, worker, now, guard_reader=None):
     require(release['controller_packet_manifest_sha256']==qualification['controller_packet_sha256'], 'source binding mismatch')
     controller.verify_packet(qualification['controller_packet_sha256'])
     controller.verify_cli(release)
-    return profile, qualification, raw, release
+    lifetime = operation_lifetime(path.parent, qualification)
+    require(lifetime_left(lifetime, now) > 0, 'original lifetime expired')
+    return profile, qualification, raw, release, lifetime
 
 
 # The only remote mutation is a private deterministic environment file. Token
@@ -114,12 +116,11 @@ print(json.dumps(expected))
 
 def prepare(profile_path, operation, worker, output, check=False):
     path = Path(operation).absolute()/'qualified-worker-admission.json'
-    profile, qualification, raw, release = context(profile_path, path, worker, time.time())
+    profile, qualification, raw, release, lifetime = context(profile_path, path, worker, time.time())
     expected = expected_environment(profile, qualification)
     payload = {'home':profile['worker_home'], 'uid':profile['worker_uid'], 'file':expected,
                'body':environment_body(profile).decode(), 'check':check}
-    from datetime import datetime
-    seconds=min(30,datetime.fromisoformat(qualification['expires_at'].replace('Z','+00:00')).timestamp()-time.time()-30)
+    seconds=min(30,lifetime_left(lifetime,time.time())-CLOSURE_RESERVE)
     require(seconds>0,'insufficient original lifetime for environment preparation')
     # Use the maintained qualification launcher's stdin transport convention.
     # Program and payload bytes never depend on provider argv shell joining.
@@ -144,10 +145,10 @@ def load_job_admission(path, profile_path, worker, now, guard_reader=None):
     require(set(record)=={'schema','version','worker','qualification','runtime_env_file'} and record['schema']==SCHEMA and type(record['version'])is int and record['version']==1, 'unknown job admission schema')
     require(record['worker']==worker and set(record['qualification'])=={'path','sha256'}, 'job admission worker/qualification')
     reference=record['qualification']
-    profile, qualification, raw, release = context(profile_path, reference['path'], worker, now, guard_reader)
+    profile, qualification, raw, release, lifetime = context(profile_path, reference['path'], worker, now, guard_reader)
     require(digest(raw)==reference['sha256'], 'original qualification bytes changed')
     require(record['runtime_env_file']==expected_environment(profile,qualification), 'job environment identity changed')
-    return profile, qualification, record['runtime_env_file'], release['boat']
+    return profile, qualification, record['runtime_env_file'], release['boat'], lifetime
 
 
 def main():
