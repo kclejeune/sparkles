@@ -969,6 +969,16 @@ fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: 
     {
         return;
     }
+    // a rooted run's bodies also hold ground literals, and its equalities and inequalities
+    // are tautologies with counting on or off
+    if dx.root.is_some()
+        && (head
+            .iter()
+            .any(|l| l.kind() == XL && body.binary_search(l).is_ok())
+            || out.dl().lits.complementary(&head, |r| dx.inv(ix, r)))
+    {
+        return;
+    }
     if dx.counting && equality_tautology(&head) {
         return;
     }

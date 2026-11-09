@@ -289,6 +289,18 @@ impl Lits {
         Made::Lit(Lit::xl(id))
     }
 
+    /// Whether a head holds an equality and the inequality of the same terms, in any
+    /// encoding, which makes its clause a tautology.
+    pub fn complementary(&self, head: &[Lit], inv: impl Fn(Role) -> Option<Role> + Copy) -> bool {
+        head.iter().any(|&l| {
+            matches!(l.kind(), EQ | XL)
+                && matches!(self.view(l, inv), XLit::Eq(s, t)
+                if head.iter().any(|&m| {
+                    matches!(m.kind(), NE | XL) && self.view(m, inv) == XLit::Ne(s, t)
+                }))
+        })
+    }
+
     /// The general form of any literal, canonical as [`XLit::canon`] makes it.
     pub fn view(&self, l: Lit, inv: impl Fn(Role) -> Option<Role>) -> XLit {
         use RTerm::Fx;

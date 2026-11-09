@@ -547,8 +547,8 @@ fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: 
     body.dedup();
     head.sort_unstable();
     head.dedup();
-    // Γ ∧ A → Δ ∨ A
-    if head.iter().any(|l| body.binary_search(l).is_ok()) {
+    // Γ ∧ A → Δ ∨ A and Γ → Δ ∨ s ≈ t ∨ s ≉ t
+    if head.iter().any(|l| body.binary_search(l).is_ok()) || lits.complementary(&head, inv) {
         return;
     }
     if body.is_empty() && head.is_empty() {
@@ -2469,6 +2469,97 @@ mod tests {
                 !to(a),
                 "another predecessor, register first {register_first}"
             );
+        }
+    }
+
+    /// A context of the class `at`, or the root, seeded with `seeds` and flushed, with its
+    /// live clauses in general form. o is the greater constant of o and p.
+    fn flushed_tautologies(at_root: bool) -> Vec<(Vec<XLit>, Vec<XLit>)> {
+        let mut s = Sig::new();
+        let np = s.ind("p");
+        let no = s.ind("o");
+        let [a, cc, g, z] = ["A", "C", "G", "Z"].map(|n| s.class(n));
+        let root = s.it.fresh_class();
+        s.dl.root = Some(root);
+        s.ax.dl = Some(Box::new(std::mem::take(&mut s.dl)));
+        let ix = Index::build(&s.ax, &mut s.it, None, &|| false).unwrap();
+        let run = DlRun::new(false, Default::default());
+        let mut out = Probe {
+            run: &run,
+            sent: Vec::new(),
+            mine: Vec::new(),
+        };
+        let (o, p) = (c(no, &ix), c(np, &ix));
+        assert!(Rooted::a_gt(o, p));
+        let inv = inv_of(&ix, dix(&ix));
+        let l = |v: XLit| match run.lits.lit(v, inv) {
+            Made::Lit(l) => l,
+            _ => panic!("a literal"),
+        };
+        let mut st = State {
+            init: true,
+            ..State::default()
+        };
+        if at_root {
+            ds(&mut st).root.get_or_insert_with(Box::default);
+        }
+        let seeds = [
+            // Join on A(o) gives ⊤ → o ≈ p ∨ o ≉ p
+            (vec![], vec![XLit::Atom(a, o), XLit::Eq(o, p)]),
+            (vec![XLit::Atom(a, o)], vec![XLit::Ne(o, p)]),
+            // Join on A(o) gives G(p) → C(o) ∨ G(p)
+            (
+                vec![XLit::Atom(g, p)],
+                vec![XLit::Atom(a, o), XLit::Atom(cc, o)],
+            ),
+            (vec![XLit::Atom(a, o)], vec![XLit::Atom(g, p)]),
+        ];
+        for (b, h) in seeds {
+            ds(&mut st).store.add(Clause::new(
+                b.into_iter().map(l).collect(),
+                h.into_iter().map(l).collect(),
+            ));
+        }
+        if at_root {
+            flush(&ix, &mut st, &mut out, 1000);
+        } else {
+            super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 1000);
+        }
+        let x = dl(&st).unwrap();
+        x.store
+            .clauses
+            .iter()
+            .filter(|s| !s.dead)
+            .map(|s| {
+                let v = |ls: &[Lit]| ls.iter().map(|&l| run.lits.view(l, inv)).collect();
+                (v(s.c.body()), v(s.c.head()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_ground_tautology_is_no_clause() {
+        // Elim drops Γ ∧ A → Δ ∨ A and Γ → Δ ∨ s ≈ t ∨ s ≉ t whatever their literals, in
+        // the root and in every other context, with counting off
+        for at_root in [true, false] {
+            let kept = flushed_tautologies(at_root);
+            assert!(
+                kept.iter().any(|(b, _)| b.is_empty()),
+                "the seeds are kept, root {at_root}"
+            );
+            for (b, h) in &kept {
+                assert!(
+                    !h.iter().any(|l| b.contains(l)),
+                    "{b:?} → {h:?} is a tautology, root {at_root}"
+                );
+            }
+            for (b, h) in &kept {
+                assert!(
+                    !h.iter()
+                        .any(|&e| matches!(e, XLit::Eq(s, t) if h.contains(&XLit::Ne(s, t)))),
+                    "{b:?} → {h:?} is a tautology, root {at_root}"
+                );
+            }
         }
     }
 }
