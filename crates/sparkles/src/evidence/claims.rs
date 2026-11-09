@@ -134,14 +134,15 @@ fn can_read(access: Option<&Arc<GraphAccess>>, g: &str) -> bool {
     access.is_none_or(|a| a.readable(Some(&term)))
 }
 
-/// Refuse with [`unknown_matching_policy`] unless the view's configuration names the
-/// matching policy `name` and the caller may read its decisions, maps and output graphs
-/// and the identity graphs of its boundary.
+/// The version of the matching policy `name` at `view`. Refuses with
+/// [`unknown_matching_policy`] unless the view's configuration names that matching
+/// policy and the caller may read its decisions, maps and output graphs and the
+/// identity graphs of its boundary.
 pub fn check_matching_policy(
     view: &BoundEvidenceView,
     name: &str,
     access: Option<&Arc<GraphAccess>>,
-) -> Result<()> {
+) -> Result<u32> {
     let settings = view_settings(view)?;
     let Some(p) = settings
         .matching_policies
@@ -156,7 +157,7 @@ pub fn check_matching_policy(
     {
         return Err(unknown_matching_policy(name));
     }
-    Ok(())
+    Ok(p.version)
 }
 
 /// The claims of one review policy at one evidence view, as one caller may see them.
@@ -175,6 +176,8 @@ pub struct PolicyRef {
     pub name: String,
     pub iri: NamedNode,
     pub version: u32,
+    /// The output graph of its accepted projection.
+    pub output: NamedNode,
 }
 
 /// Read the claims of the review policy `policy` at `view` with the caller's `access`,
@@ -257,6 +260,7 @@ impl PolicyClaims<'_> {
             name: self.graphs.name.clone(),
             iri: self.graphs.policy_iri.clone(),
             version: self.version,
+            output: self.graphs.output.0.clone(),
         }
     }
 
