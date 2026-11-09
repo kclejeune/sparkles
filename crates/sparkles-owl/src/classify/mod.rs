@@ -1324,11 +1324,13 @@ impl Saturation {
     }
 
     /// Whether a rooted run of Tier D may take axioms outside OWL 2 EL with individuals:
-    /// when the EL part has no top properties or functional data roles. The universal
-    /// property waits on its replacement, as F24 describes.
+    /// when the EL part has no keys, top properties or functional data roles. Keys wait on
+    /// their reduction to class axioms and the universal property on its replacement, as
+    /// F24 describes.
     fn rooted_allowed(&self, ax: &Axioms) -> bool {
         let it = &self.interner;
         ax.functional.is_empty()
+            && ax.keys.is_empty()
             && it
                 .role_id(&index::RoleName::Object(ObjectProperty::top()))
                 .is_none()
@@ -1482,6 +1484,9 @@ impl Saturation {
         // names it
         roots.extend(ax.individuals.iter().copied());
         roots.extend(ix.nominals.iter().copied());
+        // a rooted run's root context, where the facts of the individuals meet
+        let rooted = ix.dl.as_deref().and_then(|d| d.root);
+        roots.extend(rooted);
         roots.sort_unstable();
         roots.dedup();
         stats.index = start.elapsed();
@@ -1567,8 +1572,11 @@ impl Saturation {
         // Tier D orders the atoms totally, which leaves the subsumers that only a case
         // analysis gives as clauses: each named class that the canonical model of a
         // class's context makes true is tested in a context of its own, and those that
-        // hold join the class's subsumers, until no class has a new candidate.
-        if disj && halted.is_none() {
+        // hold join the class's subsumers, until no class has a new candidate. A rooted
+        // run's order leaves named classes over x incomparable, so each named class's
+        // context is complete for its subsumers without the tests (F24, condition C2 of
+        // Theorem 2 of the journal's calculus).
+        if disj && halted.is_none() && rooted.is_none() {
             let tests_start = Instant::now();
             let d = dynamic
                 .as_ref()
@@ -1656,6 +1664,13 @@ impl Saturation {
         // the dependency record of a partial answer: the classes it leaves open and the
         // consistency
         let open = halted.as_ref().map(|_| {
+            // The dependency record cannot see the work in the root, in what the root
+            // reaches or on a propagation to or from it, so a stopped rooted run leaves
+            // every class open and its consistency unknown.
+            if rooted.is_some() {
+                let incomplete: Vec<Ex> = roots.iter().copied().filter(|&r| r != TOP).collect();
+                return (incomplete, Consistency::Unknown);
+            }
             let (complete, known) =
                 dl_rules::record(&ix, &self.ctx, dynamic.as_ref(), &roots, &refuted);
             let incomplete: Vec<Ex> = roots
@@ -1858,7 +1873,7 @@ impl Saturation {
         let t = Instant::now();
         let consistent = match &open {
             Some((_, c)) => *c != Consistency::Inconsistent,
-            None => self.consistent(&ax, &ix_nominals),
+            None => self.consistent(&ax, &ix_nominals, rooted),
         };
         if open.is_none() {
             self.consistent = consistent;
@@ -1945,7 +1960,9 @@ impl Saturation {
             + self.dynamic.as_ref().map_or(0, |d| d.len())
     }
 
-    fn consistent(&self, ax: &Axioms, nominals: &[Ex]) -> bool {
+    /// Whether the saturated contexts show a model: owl:Thing, the individuals and a rooted
+    /// run's root are satisfiable.
+    fn consistent(&self, ax: &Axioms, nominals: &[Ex], root: Option<Ex>) -> bool {
         let bottom = |e: Ex| {
             self.ctx
                 .get(e as usize)
@@ -1955,6 +1972,7 @@ impl Saturation {
         !bottom(TOP)
             && !ax.individuals.iter().any(|&i| bottom(i))
             && !nominals.iter().any(|&i| bottom(i))
+            && !root.is_some_and(bottom)
     }
 
     fn index_bytes(&self, ix: &Index) -> usize {
