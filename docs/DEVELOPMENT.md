@@ -353,7 +353,7 @@ the account's shared daily and rate limits.
 
 Development environments and CI runners have separate setup and authentication. Inject
 development credentials into owned development sandboxes, and keep Actions OIDC authentication
-for CI. Reusable dev and CI seeds are separate and contain no credentials or live leases.
+for the workflows that use the remote cache. Reusable dev and CI seeds are separate and contain no credentials or live leases.
 Verify snapshot and credential behavior before treating a seed as reusable. Tool setup
 alone does not qualify a compiler workload or snapshot lifecycle.
 
@@ -1066,11 +1066,11 @@ manual **compatibility-features** input.
 |---|---|
 | Checks | Formatting of the Rust, UI, JavaScript and shell sources, shellcheck, the cited doc paths, the benchmark scripts' tests, the license notices, the generated TypeScript client against `docs/openapi.json`, the API compatibility inventory and checker fixtures, and the UI's build, type check and unit tests. It compiles small tooling fixtures and leaves the workspace crates unbuilt. |
 | Clippy | Clippy with warnings as errors on the workspace, on the formatter's wasm32 build and on the three binding crates with and without their default features. |
-| Build tests | `mbx nextest archive` builds every test binary once and uploads three artifacts. These are the whole archive, a small archive of the binaries in `HEAVY_1` and `HEAVY_2`, and the debug server binary. `scripts/ci-free-disk.sh` first removes unused preinstalled toolchains from GitHub's runner and reports the least free disk the job reached. |
+| Build tests | `mbx nextest archive` builds every test binary once and uploads three artifacts. These are the whole archive, a small archive of the binaries in `HEAVY_1` and `HEAVY_2`, and the debug server binary. `scripts/ci-free-disk.sh` removes unused preinstalled toolchains from GitHub's runner when it has less than 60 GiB free and reports the least free disk the job reached. |
 | Doctests | The workspace's doctests, which nextest does not run. They build in parallel with the test archive, so the test jobs do not wait for them. |
 | Test | Two heavy shards run the binaries with the slowest tests from the small archive. The `timing` shard runs the `timing` group of `.config/nextest.toml`, which needs a machine to itself. Four more shards split the other tests by count, and the `SPARKLES_TEST_SLICES` variable changes how many. |
 | Jena clients | Jena's own HTTP clients against the debug server binary (`mise run test:jena-clients`). |
-| Features | A manual run with **compatibility-features** checked runs six jobs through `scripts/test-features.sh`, with the default features off and one feature set each. They build apart from the archive and have a cache each. |
+| Features | A manual run with **compatibility-features** checked runs six jobs through `scripts/test-features.sh`, with the default features off and one feature set each. They build apart from the archive and restore the test build's cache. |
 
 The transcript import integration test reserves all test slots while it runs in its
 shard. It sends a 5 MiB transcript through the real server, whose query deadline stays
@@ -1137,7 +1137,8 @@ system refuses one, the job warns and continues. On a large runner the server ca
 container keeps its process limit and drops its 4 CPU and 14 GB limits, and Cargo runs one
 compiler job for each CPU instead of two in total.
 
-The remote mbx cache authenticates with the GitHub OIDC token of the job. GitHub issues
+The binding workflows and the server candidate build authenticate to the remote mbx cache
+with the GitHub OIDC token of the job, and `ci.yml` uses no remote cache. GitHub issues
 that token to jobs on self-hosted runners as it does on its own, and neither provider below
 documents a restriction. Both providers bill per second of runner time, while GitHub's
 standard runners are free for this public repository.
@@ -1178,14 +1179,50 @@ to `ubuntu-24.04` unless the pull request's head repository is this one.
 ### Caches
 
 GitHub Actions installs the pinned `jdx/mr-boxington-action` after the toolchain from
-`rust-toolchain.toml`. Main pushes, same-repository pull requests, release tags and manual
-runs use the remote cache in the `kclejeune/sparkles` namespace. The cache server uses
-GitHub OIDC and grants writes to main pushes, same-repository pull requests and tag pushes.
-The binding workflows enable tag writes only for their release-tag prefixes. The server
-matches claims exactly, so its tag grant covers every tag push in the repository. Manual
-runs read the remote cache without publishing. Fork pull requests use GitHub Actions
-cache instead, since they cannot request the OIDC token. This is a backend selection at
-job start, not automatic failover if the remote cache becomes unavailable.
+`rust-toolchain.toml`.
+
+`ci.yml` runs Boxington in the action's local mode, with no remote cache and no OIDC
+token. `MBX_TARGET_VIEWS` is 0, so the target is a plain directory in the checkout. Two
+caches carry the build between runs, and each covers what the other cannot.
+
+`Swatinem/rust-cache` saves the Cargo registry and the target directory without the
+workspace crates' own outputs. Cargo's fingerprints then find every dependency fresh, but
+a fresh checkout makes every workspace source newer than its fingerprint, so Cargo
+compiles every workspace crate again. The rust-cache key holds the job kind, the compiler
+version, the root workspace's lock file and manifests and the Cargo, Rust and Boxington
+environment variables. The cleanup before a save keeps the root workspace's dependencies,
+so the binding crates' own dependencies come from the object store below instead. Clippy
+keeps one cache for each platform. Build tests keeps another, which the doctests and the
+manual feature jobs restore without saving. The manual arm64 and macOS test jobs keep a
+cache for their own platform. A run saves only on `main` and only when no entry has its
+exact key, so a new entry appears when the lock file, the manifests or the toolchain
+change. `MBX_BUILD_SCRIPT_EXECUTION` is 0, because Boxington's build-script launchers
+name a binary in the target's profile directory that the cleanup removes.
+
+`actions/cache` saves Boxington's object store, which finds a compiled crate by the hash
+of its inputs, so a workspace crate whose sources and dependencies did not change is
+restored instead of compiled. Clippy and Build tests each save their store under the
+commit on `main`, and every run restores the latest store saved for its job kind, its
+platform, the Boxington version and the toolchain. The doctests and the feature jobs
+restore the test build's store. Before a save, `mbx gc` trims the store's compiled
+outputs to the 3 GiB of `MBX_GC_MAX_SIZE`. The link cache is off, since it would add every test binary to the
+store.
+
+Pull requests, fork pull requests and runs on other branches restore both caches from
+`main` and save neither. The test build's target entry is about 0.8 GB and Clippy's about 0.6 GB.
+Each commit adds a test store of 0.3 to 0.6 GB and a Clippy store of 0.2 to 0.5 GB. GitHub's
+10 GB repository cache drops the least recently used entries first, so it keeps the
+stores of the last several main commits next to the other workflows' caches.
+
+The binding workflows and the server candidate build keep Boxington's remote cache. Main
+pushes, same-repository pull requests, release tags and manual runs use the remote cache
+in the `kclejeune/sparkles` namespace. The cache server uses GitHub OIDC and grants writes
+to main pushes, same-repository pull requests and tag pushes. The binding workflows enable
+tag writes only for their release-tag prefixes. The server matches claims exactly, so its
+tag grant covers every tag push in the repository. Manual runs read the remote cache
+without publishing. Fork pull requests use GitHub Actions cache instead, since they cannot
+request the OIDC token. This is a backend selection at job start, not automatic failover
+if the remote cache becomes unavailable.
 
 Cache-backed checkouts fetch two commits so Boxington can borrow predictions from the base
 commit of a pull request when the lockfile changes. Native build commands and shell build
@@ -1201,11 +1238,10 @@ including checksum-verified container downloads. When changing it, verify remote
 access and use matching local compiler shims and agents. Other client versions may miss
 cache entries or lack features used by these build scripts.
 
-The hosted **Build tests** job uses mbx remote caching and managed target views.
-Boxington holds the target lease while `mbx nextest archive` builds and writes its
-archive under `RUNNER_TEMP`. Recompression and artifact upload read that archive
-outside the managed target directory, so collection after the command cannot remove
-the upload. The job uses the mbx action's GitHub cache backend for fork pull requests.
+The **Build tests** job holds the target lease while `mbx nextest archive` builds and
+writes its archive under `RUNNER_TEMP`. Recompression and artifact upload read that
+archive outside the target directory, so collection after the command cannot remove the
+upload.
 
 The Linux wheel and Alpine addon containers install the pinned Boxington version from
 checksum-verified portable binaries. They mount their host job's store and use a separate

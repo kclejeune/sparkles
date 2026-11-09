@@ -261,7 +261,8 @@ and fixed forward in a follow-up commit, and a check that the batch selection sh
 chosen gets a rule in `scripts/gate/select-checks.py`.
 
 Benchmark-host measurements do not hold up a feature lane or a push. A lane whose goal
-is performance measures on the benchmark host before it reports, and every other lane
-reports once its review and tests pass. Pinned benchmark-host checks of the screen's
-flags, including queries under 0.3 ms, run after the push. A regression they confirm is
+is performance measures on a designated benchmark worker with the benchmark host's
+hardware before it reports, and every other lane reports once its review and tests pass.
+The benchmark host itself runs published measurements and the pinned checks of the
+screen's flags, including queries under 0.3 ms, after the push. A regression they confirm is
 bisected across the batch's merges and fixed forward in a follow-up commit.
