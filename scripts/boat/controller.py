@@ -39,7 +39,7 @@ def packet_refusals():
     found=set()
     for name in ('common.py','config_schema.py','metadata-probe.py','startup-observer.py','remote-launcher.py','diagnostic-probe.py'):
         for node in ast.walk(ast.parse((ROOT/name).read_text())):
-            if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id in ('need','require','Refusal'):
+            if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id in ('need','require','Refusal','SourceDrift'):
                 for arg in node.args:
                     if isinstance(arg,ast.Constant) and isinstance(arg.value,str):found.add(arg.value)
     return frozenset(found)

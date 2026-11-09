@@ -1538,3 +1538,55 @@ class SourceDriftRecord(unittest.TestCase):
         self.assertEqual(self.O['worktree_summary'](copy)['entries'],0)
         self.assertEqual(self.git(repo,'status','--porcelain=v1','-z'),self.git(copy,'status','--porcelain=v1','-z'))
         self.assertEqual(self.git(repo,'diff','HEAD','--binary'),self.git(copy,'diff','HEAD','--binary'))
+
+
+class SourceDriftBounds(SourceDriftRecord):
+    """The drift summary keeps its reason code, its time and output bounds, and git's formats."""
+    def test_both_drift_reason_codes_survive_into_the_receipt(self):
+        for reason in ('existing source drift','existing source changed during qualification'):
+            r=controls.fixture();io=controls.InertIO(r);controller.bind_release_profile(r)
+            controller.record_refusal(io,'metadata',controller.Refusal('metadata refused: probe_not_qualified'),{'qualified':False,'reason_code':'refusal:'+reason},failed=['probe_not_qualified'])
+            self.assertEqual(io.read('metadata-refused.json')['remote_reason_code'],'refusal:'+reason)
+
+    def test_a_late_drift_skips_the_summary_and_keeps_the_refusal(self):
+        import time as t
+        self.O['PROBE_STARTED'][:]=[t.monotonic()-200];self.addCleanup(self.O['PROBE_STARTED'].clear)
+        self.assertIsNone(self.O['summary_deadline']())
+        repo=self.repository();started=t.monotonic()
+        self.assertIsNone(self.O['worktree_summary'](repo));self.assertLess(t.monotonic()-started,1)
+
+    def test_the_summary_commands_stop_at_their_deadline_and_byte_bound(self):
+        import time as t,shutil as sh
+        started=t.monotonic()
+        with self.assertRaises(self.O['Refusal']):self.O['bounded_output']([sh.which('sleep'),'5'],t.monotonic()+0.5)
+        self.assertLess(t.monotonic()-started,3)
+        with self.assertRaises(self.O['Refusal']):self.O['bounded_output']([sh.which('head'),'-c','8000000','/dev/zero'],t.monotonic()+10,limit=1024*1024)
+
+    def outputs(self,status,raw,numstat):
+        def fake(argv,deadline,env=None,cwd=None,**k):
+            return status if 'status' in argv else (raw if '--raw' in argv else numstat)
+        return patch.dict(self.O,{'bounded_output':fake})
+
+    def test_a_rename_in_either_column_consumes_its_original_path(self):
+        import time as t
+        with self.outputs(b' R new\0long-old-name\0R  b\0a\0',b'',b''):
+            got=self.O['worktree_summary']('/repo',deadline=t.monotonic()+5)
+        self.assertEqual((got['entries'],got['staged'],got['unstaged']),(2,1,1))
+
+    def test_paths_that_look_like_headers_and_mode_cases(self):
+        import time as t
+        raw=(b':100644 100644 '+b'0'*40+b' '+b'0'*40+b' M\0:secret file\0'
+             b':000000 100644 '+b'0'*40+b' '+b'0'*40+b' A\0added\0'
+             b':100755 100644 '+b'0'*40+b' '+b'0'*40+b' M\0both\0'
+             b':100755 100644 '+b'0'*40+b' '+b'0'*40+b' M\0modeonly\0')
+        numstat=b'1\t0\t:secret file\0001\t0\tadded\0002\t1\tboth\0000\t0\tmodeonly\0'
+        with self.outputs(b' M :secret file\0A  added\0 M both\0 M modeonly\0',raw,numstat):
+            got=self.O['worktree_summary']('/repo',deadline=t.monotonic()+5)
+        self.assertEqual((got['content_changes'],got['mode_changes']),(3,1))
+
+    def test_real_git_mode_cases(self):
+        repo=self.repository()
+        (repo/'new.txt').write_text('n\n');self.git(repo,'add','new.txt');(repo/'a.txt').unlink()
+        (repo/'run.sh').write_text('false\n');(repo/'run.sh').chmod(0o644)
+        got=self.O['worktree_summary'](repo)
+        self.assertEqual((got['mode_changes'],got['content_changes']),(0,3))

@@ -42,22 +42,71 @@ class SourceDrift(Refusal):
         inputs=lambda row:{k:v for k,v in row.get('inputs',{}).items() if k not in ('mise.toml','rust-toolchain.toml')} if isinstance(row,dict) and isinstance(row.get('inputs'),dict) else None
         self.source_drift=drift_evidence({'repository':str(repo),'fields':{k:{'recorded':r[k],'observed':o[k],'differs':r[k]!=o[k]} for k in SOURCE_FIELDS},
                                           'other_fields_differ':other(recorded)!=other(observed) or inputs(recorded)!=inputs(observed),'worktree':worktree})
-def worktree_summary(repo,env=None):
-    """Counts of a checkout's porcelain entries, separating mode-only changes from content."""
+# The worktree summary only runs on a drift, within SUMMARY_SECONDS in all, and ends
+# SUMMARY_RESERVE seconds before the metadata unit's runtime, so the refusal is always
+# published. Each git output is read in chunks and abandoned past SUMMARY_BYTES.
+SUMMARY_SECONDS=12
+SUMMARY_RESERVE=45
+SUMMARY_BYTES=4*1024*1024
+PROBE_STARTED=[]
+def bounded_output(argv,deadline,env=None,cwd=None,limit=SUMMARY_BYTES,clock=None):
+    """A command's stdout, refused past its byte limit or the deadline; the child never outlives it."""
+    import selectors,time as t
+    clock=clock or t.monotonic
+    child=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env,cwd=cwd)
+    chunks=[];size=0;sel=selectors.DefaultSelector();sel.register(child.stdout,selectors.EVENT_READ)
     try:
-        git=lambda *a:command(['git','-C',str(repo),*a],30,env,repo)
+        while True:
+            left=deadline-clock();need(left>0,'worktree summary deadline')
+            if not sel.select(min(left,1.0)):continue
+            data=os.read(child.stdout.fileno(),65536)
+            if not data:break
+            size+=len(data);need(size<=limit,'worktree summary output bound');chunks.append(data)
+        need(child.wait(max(0.1,deadline-clock()))==0,'worktree summary command failed')
+        return b''.join(chunks)
+    finally:
+        sel.close()
+        if child.poll() is None:child.kill();child.wait()
+        child.stdout.close()
+def summary_deadline(clock=None,runtime=240):
+    """The summary's end, or None when the metadata unit has too little time left."""
+    import time as t
+    now=(clock or t.monotonic)();started=PROBE_STARTED[0] if PROBE_STARTED else now
+    end=min(now+SUMMARY_SECONDS,started+runtime-SUMMARY_RESERVE)
+    return end if end-now>=3 else None
+def worktree_summary(repo,env=None,deadline=None):
+    """Counts of a checkout's porcelain entries, separating mode-only changes from content.
+
+    It runs within one deadline and returns None on any failure, so it never masks the
+    drift it describes. Paths are compared in memory and never kept."""
+    try:
+        deadline=summary_deadline() if deadline is None else deadline
+        if deadline is None:return None
+        git=lambda *a:bounded_output(['git','-C',str(repo),*a],deadline,env,repo)
         tokens=git('status','--porcelain=v1','-z').split(b'\0');counts=dict.fromkeys(WORKTREE_COUNTS,0);i=0
         while i<len(tokens):
             entry=tokens[i];i+=1
             if len(entry)<4:continue
             x,y=chr(entry[0]),chr(entry[1]);counts['entries']+=1
+            # A rename or copy in either column is followed by its original path.
+            if x in 'RC' or y in 'RC':i+=1
             if x+y=='??':counts['untracked']+=1;continue
-            if x in 'RC':i+=1
-            counts['staged']+=x!=' ';counts['unstaged']+=y!=' '
-        raw=git('diff','HEAD','--raw','-z','--no-renames').split(b'\0')
-        counts['mode_changes']=sum(1 for t in raw if t.startswith(b':') and t[1:].split()[0]!=t.split()[1])
-        rows=[t.split(b'\t') for t in git('diff','HEAD','--numstat','-z','--no-renames').split(b'\0') if t.count(b'\t')>=2]
-        counts['content_changes']=sum(1 for t in rows if (t[0],t[1])!=(b'0',b'0'))
+            counts['staged']+=x not in ' ?';counts['unstaged']+=y not in ' ?'
+        # --raw -z is a header then one path per record without rename detection.
+        raw=git('diff','HEAD','--raw','-z','--no-renames').split(b'\0');modes={};i=0
+        while i+1<len(raw):
+            header,path=raw[i],raw[i+1];i+=2
+            fields=header[1:].split()
+            need(header.startswith(b':') and len(fields)==5,'raw diff record')
+            modes[path]=(fields[0],fields[1])
+        # --numstat -z is added, deleted and the path in one record.
+        changed=set()
+        for record in git('diff','HEAD','--numstat','-z','--no-renames').split(b'\0'):
+            if not record:continue
+            added,deleted,path=record.split(b'\t',2)
+            if (added,deleted)!=(b'0',b'0'):changed.add(path)
+        counts['content_changes']=len(changed)
+        counts['mode_changes']=sum(1 for path,(old,new) in modes.items() if old!=new and b'000000' not in (old,new) and path not in changed)
         return counts
     except Exception:return None
 def validate_runtime(unit,pid,cgline,maxmem,maxswap,properties,runtime_seconds=240):
@@ -114,6 +163,7 @@ def memory_admission(meminfo,ancestors):
     return memory
 
 def probe(payload):
+    import time as t;PROBE_STARTED[:]=[t.monotonic()]
     uid=os.getuid();home=Path.home();need(uid==profile()['worker_uid'] and home==Path(profile()['worker_home']),'worker user')
     pins=payload['pins'];s=payload['release']['snapshot_continuity'];tag=payload['operation_tag'];unit=tag+'-metadata.service'
     need(os.uname().machine=='x86_64','architecture')
