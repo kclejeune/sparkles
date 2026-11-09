@@ -735,6 +735,18 @@ pub fn send_admitted(
         )
     };
     let has_counter = count_request(p, req).is_some();
+    // an admission that must see every send gets no redirects, each of which would
+    // send the body again unadmitted
+    let unredirected;
+    let outbound = if admission.is_some_and(|a| !a.follows_redirects()) {
+        unredirected = sparkles::outbound::OutboundPolicy {
+            max_redirects: 0,
+            ..t.outbound.clone()
+        };
+        &unredirected
+    } else {
+        t.outbound
+    };
     let mut attempt = 0;
     loop {
         let timed_out = || {
@@ -775,7 +787,7 @@ pub fn send_admitted(
         }
         // a ticket dropped on any path below leaves its usage unknown
         let posted =
-            match sparkles::outbound::post_json(t.outbound, &url, &hrefs, bytes.clone(), left) {
+            match sparkles::outbound::post_json(outbound, &url, &hrefs, bytes.clone(), left) {
                 Ok(posted) => posted,
                 Err(sparkles::outbound::Failure::Refused(m)) => {
                     // a refusal can come from a redirect after the request was sent, so

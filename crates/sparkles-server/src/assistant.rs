@@ -1046,6 +1046,7 @@ fn cut_list(v: &Value, each: impl Fn(&Value) -> Option<Value>) -> Option<Value> 
 /// `ground` event: never the rows.
 pub fn stored_answer(out: &Value, ground: &Value) -> Option<Value> {
     let mut a = serde_json::Map::new();
+    let mut claims_kept: Option<Value> = None;
     let r = &out["result"];
     let mut put = |k: &str, v: Option<Value>| {
         if let Some(v) = v {
@@ -1075,6 +1076,29 @@ pub fn stored_answer(out: &Value, ground: &Value) -> Option<Value> {
                 sum[k] = s[k].clone();
             }
         }
+        // the claim occurrences the summary cites, with the policy they were read
+        // under (C25); the answer's footprint covers the graphs they came from
+        if let Some(cited) = cut_list(&s["claimCitations"], |c| c.as_str().map(Value::from)) {
+            let ids: Vec<&str> = cited
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let occurrences: Vec<Value> = out["claims"]["occurrences"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|o| o["id"].as_str().is_some_and(|id| ids.contains(&id)))
+                .cloned()
+                .collect();
+            sum["claimCitations"] = cited.clone();
+            claims_kept = Some(json!({
+                "version": out["claims"]["version"],
+                "policy": out["claims"]["policy"],
+                "occurrences": occurrences,
+            }));
+        }
         put("summary", Some(sum));
     }
     // a global answer's points and reports sit beside its `global` selection
@@ -1097,6 +1121,7 @@ pub fn stored_answer(out: &Value, ground: &Value) -> Option<Value> {
         }
         put("global", Some(gl));
     }
+    put("claims", claims_kept.take());
     put("verdict", cut(&r["verdict"]));
     let diag = out["attempts"]
         .as_array()

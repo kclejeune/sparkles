@@ -554,3 +554,16 @@ test('counts one triple in the singular and keeps the raw patch collapsed below 
   expect(order).toBe(true);
   await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
 });
+
+test('names a shape in the preview change set by its sh:name', async ({ page, request }) => {
+  const ds = await setup(request);
+  await open(page, ds);
+  await pick(page, 'Other');
+  await page.getByRole('button', { name: 'Delete shape', exact: true }).click();
+  await page.getByRole('button', { name: 'Delete definition', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview commit', exact: true }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog.locator('[data-outcome]')).toHaveAttribute('data-outcome', 'commit');
+  await expect(dialog.locator('.cs-group .subject').first()).toHaveText('Other');
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+});

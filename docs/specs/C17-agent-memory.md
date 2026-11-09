@@ -1487,9 +1487,10 @@ a retrieval-quality or latency evaluation.
 
 [Roadmap](../ROADMAP.md) item 81 extends the existing memory model with the shared
 profile specified by [C25](C25-evidence-and-assessments.md). It connects evidence,
-claims, authored records and review decisions. Static profile resources and bounded
-preparation helpers are available. Managed runtime operations and memory integration
-remain planned, and current asserting behavior remains as recorded above. The workflow
+claims, authored records and review decisions. Its managed operations are available,
+and `recall` cites claim occurrences with their review state when a call names a review
+policy, as [C25](C25-evidence-and-assessments.md#recall-and-ask-with-claims) describes.
+Current asserting behavior remains as recorded above. The workflow
 requirements are in [C18](C18-natural-language-questions-and-ingest/OUTCOME.md#shared-memory-workflows).
 
 The profile will connect sources and document renditions, cited assertions, shared

@@ -1565,3 +1565,76 @@ test('entity-history', async ({ page, request }) => {
   await shoot(page, 'entity-history');
   await request.delete(`/$/branches/uni/${branch}?force=true`);
 });
+
+test('ontology-discussions', async ({ page, request }) => {
+  // Professor's Discussion view with a thread that mentions a colleague and has a reply,
+  // a thread on one of its axioms and a resolved one, written as the editor writes them
+  const branch = 'discussions-shot';
+  const uni = 'http://example.org/uni#';
+  const oa = 'http://www.w3.org/ns/oa#';
+  await request.post('/$/branches/uni', { data: { name: branch } });
+  const ago = (h: number) => new Date(Date.now() - h * 3_600_000).toISOString();
+  const note = (id: string, who: string, h: number, text: string, more: string) =>
+    `<urn:uuid:${id}> a oa:Annotation ; oa:hasBody <urn:uuid:${id}#body> ;
+       dcterms:creator <urn:x-sparkles:user:${who}> ;
+       dcterms:created "${ago(h)}"^^xsd:dateTime ; ${more} .
+     <urn:uuid:${id}#body> a oa:TextualBody ; rdf:value ${JSON.stringify(text)} .`;
+  const triples = [
+    note(
+      't1',
+      'ana',
+      26,
+      'Should a professor always teach? @bo, the restriction below says so.',
+      `oa:motivatedBy oa:commenting ; oa:hasTarget uni:Professor ; disc:resolved false ;
+       schema:mentions <urn:x-sparkles:user:bo>`,
+    ),
+    note(
+      'r1',
+      'bo',
+      20,
+      'Emeritus professors do not. Let us move it to a subclass.',
+      'oa:motivatedBy oa:replying ; oa:hasTarget <urn:uuid:t1>',
+    ),
+    note(
+      't2',
+      'bo',
+      3,
+      'Is Employee the right parent, or should this be Person?',
+      `oa:motivatedBy oa:commenting ; oa:hasTarget <urn:uuid:t2#target> ; disc:resolved false .
+       <urn:uuid:t2#target> a oa:SpecificResource ; oa:hasSource uni:Professor ;
+         oa:hasSelector <urn:uuid:t2#sel> .
+       <urn:uuid:t2#sel> a oa:TextQuoteSelector ;
+         oa:exact "SubClassOf(uni:Professor uni:Employee)"`,
+    ),
+    note(
+      't3',
+      'ana',
+      50,
+      'Add a German label.',
+      `oa:motivatedBy oa:commenting ; oa:hasTarget uni:Professor ; disc:resolved true ;
+       disc:resolvedBy <urn:x-sparkles:user:bo>`,
+    ),
+  ];
+  const u = await request.post(`/uni@${branch}/update`, {
+    headers: {
+      'Content-Type': 'application/sparql-update',
+      'Sparkles-Commit-Message': 'Discuss Professor',
+    },
+    data: `PREFIX oa: <${oa}> PREFIX dcterms: <http://purl.org/dc/terms/>
+      PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+      PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> PREFIX schema: <https://schema.org/>
+      PREFIX disc: <urn:x-sparkles:discussion#> PREFIX uni: <${uni}>
+      INSERT DATA { GRAPH <urn:x-sparkles:discussions:default> { ${triples.join('\n')} } }`,
+  });
+  expect(u.ok(), await u.text()).toBe(true);
+  await page.goto(
+    `/ui/workbench/ontology?${new URLSearchParams({ ds: 'uni', branch, iri: `${uni}Professor`, view: 'discussion' })}`,
+  );
+  const threads = page.getByRole('list', { name: 'Threads on the entity' });
+  await expect(threads.getByRole('article')).toHaveCount(2, { timeout: 30_000 });
+  await page
+    .getByRole('textbox', { name: 'Comment' })
+    .fill('@ana, I drafted the subclass on the session branch.');
+  await shoot(page, 'ontology-discussions');
+  await request.delete(`/$/branches/uni/${branch}?force=true`);
+});

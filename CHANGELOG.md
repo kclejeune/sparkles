@@ -53,7 +53,17 @@ commits that changed a triple naming the entity in the editor's graph, newest fi
 in bounded pages, opens each to the axioms mentioning the entity that it added and
 removed, and reverts a commit as one previewed commit for a caller who can write the
 branch. `GET /$/ontology/{ds}/diff` takes `entity` to keep only the axioms that mention
-one IRI.
+one IRI. A change set names a subject that has neither an `rdfs:label` nor a
+`skos:prefLabel` by its `sh:name`, so the shape editor's preview names a shape as its form
+does.
+
+The ontology editor's entity frame has a Discussion view (item 618) with comment threads
+on the entity and on its axioms, `@` mentions, replies, resolve and reopen, and a
+Discussions tab lists an ontology's threads. Threads are W3C Web Annotation RDF in a
+named graph beside the ontology graph on the branch, such as
+`urn:x-sparkles:discussions:http://example.org/uni`, and each comment, resolve or reopen is an ordinary
+commit. Comments therefore appear in history and exports, protected branches refuse
+them, and writing one needs `write`.
 
 The derived-table cache has a process-wide `--derived-table-cache-mb` budget and
 metrics-protected capacity, occupancy, hit and miss counters in the server statistics.

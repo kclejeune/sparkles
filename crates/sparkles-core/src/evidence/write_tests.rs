@@ -262,3 +262,125 @@ fn identity_proposals_go_to_an_identity_graph_as_a_set_of_entities() {
     let after = plan_of(&input("o", "urn:o"), &t, Some("k")).unwrap();
     assert_eq!(before.payload_digest, after.payload_digest);
 }
+
+/// The claim identities a proposal-graph scan returns stay charged to the caller's
+/// reservation after the scan returns, so scans of several graphs share one bound.
+#[test]
+fn reifiers_about_charges_the_identities_it_returns() {
+    use crate::store::{Store, StoreOptions};
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("INSERT DATA { GRAPH <urn:g> {");
+    for i in 0..200 {
+        data.push_str(&format!(
+            " <urn:claim:{i}:{}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <urn:e> <urn:p> <urn:o{i}> )>> .",
+            "x".repeat(200)
+        ));
+    }
+    data.push_str(" } }");
+    crate::sparql::update::update(&s, &data, &crate::sparql::QueryOptions::default()).unwrap();
+    let snap = s.snapshot();
+    let wanted: BTreeSet<String> = ["urn:e".to_string()].into();
+    let scan = |limit: u64| -> Result<Vec<NamedNode>> {
+        let preparation = Preparation::new(crate::task::Control::none(), limit)?;
+        let mut reads = Reads::new(&preparation, &snap);
+        let mut held = preparation.reserve(0)?;
+        let mut out = Vec::new();
+        // the same graph twice stands for two graphs that each fit alone
+        for _ in 0..2 {
+            let (rows, more) = reads.reifiers_about(
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies",
+                "urn:g",
+                &wanted,
+                1_000,
+                &mut held,
+            )?;
+            assert!(!more);
+            out.extend(rows);
+        }
+        Ok(out)
+    };
+    assert_eq!(scan(16 << 20).unwrap().len(), 400);
+    // one scan keeps about 75 KiB of identities beside 64 KiB of rows, so it fits in
+    // 176 KiB, and two scans that keep the first one's identities do not
+    let one = Preparation::new(crate::task::Control::none(), 176 << 10).unwrap();
+    let mut reads = Reads::new(&one, &snap);
+    let mut held = one.reserve(0).unwrap();
+    assert!(
+        reads
+            .reifiers_about(
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies",
+                "urn:g",
+                &wanted,
+                1_000,
+                &mut held,
+            )
+            .is_ok()
+    );
+    drop(held);
+    assert!(matches!(scan(176 << 10), Err(Error::BudgetExceeded(_))));
+}
+
+/// Each identity a `Reads` caches, found or not, is charged to its preparation.
+#[test]
+fn reads_charge_their_identity_cache() {
+    use crate::store::{Store, StoreOptions};
+    let s = Store::in_memory(StoreOptions::default());
+    let snap = s.snapshot();
+    let preparation = Preparation::new(crate::task::Control::none(), 1 << 20).unwrap();
+    let mut reads = Reads::new(&preparation, &snap);
+    let mut refused = false;
+    for i in 0..20_000 {
+        match reads.subject_triples(&format!("urn:c:{i:06}"), "urn:g", 1) {
+            Ok(n) => assert_eq!(n, 0),
+            Err(Error::BudgetExceeded(_)) => {
+                refused = true;
+                break;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert!(refused, "20,000 cached identities fit in 1 MiB uncharged");
+}
+
+/// A cache and a scan that hold a single identity charge their containers' first
+/// allocations, which are larger than any one entry's share.
+#[test]
+fn single_identities_charge_their_first_allocations() {
+    use crate::store::{Store, StoreOptions};
+    const LIMIT: u64 = 96 << 10;
+    let s = Store::in_memory(StoreOptions::default());
+    crate::sparql::update::update(
+        &s,
+        "INSERT DATA { GRAPH <urn:g> { <urn:c> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <urn:e> <urn:p> <urn:o> )>> } }",
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    let snap = s.snapshot();
+    // one cached identity keeps at least a root leaf charged
+    let preparation = Preparation::new(crate::task::Control::none(), LIMIT).unwrap();
+    let mut reads = Reads::new(&preparation, &snap);
+    assert_eq!(reads.subject_triples("urn:missing", "urn:g", 1).unwrap(), 0);
+    assert!(preparation.reserve(LIMIT - 1000).is_err());
+    drop(reads);
+    assert!(preparation.reserve(LIMIT - 1000).is_ok());
+    // one returned identity keeps the vector's and the set's first allocations charged
+    let preparation = Preparation::new(crate::task::Control::none(), LIMIT).unwrap();
+    let mut reads = Reads::new(&preparation, &snap);
+    let mut held = preparation.reserve(0).unwrap();
+    let wanted: BTreeSet<String> = ["urn:e".to_string()].into();
+    let (rows, _) = reads
+        .reifiers_about(
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies",
+            "urn:g",
+            &wanted,
+            10,
+            &mut held,
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    // the cache holds about 1.3 KiB, so a reservation that leaves 2 KiB fits only
+    // when the identity is charged at less than about 700 bytes
+    assert!(preparation.reserve(LIMIT - 2048).is_err());
+    drop(held);
+    assert!(preparation.reserve(LIMIT - 2048).is_ok());
+}

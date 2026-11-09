@@ -1,0 +1,14 @@
+{
+ "guard": {
+  "observed_boottime": 152219.60917697,
+  "observed_wall": 1794214962.9303756
+ },
+ "handoff_deadline_wall": 1794225420.6173115,
+ "intent": {
+  "deadline_mono": 162677.296111217,
+  "deadline_wall": 1794225420.6173115,
+  "mono": 152177.296110792,
+  "wall": 1794214920.6173093
+ },
+ "source": "bx_gy2ytgh8 op-5 controller-intent.json, guard-admission.json and root-handoff.json clock values"
+}

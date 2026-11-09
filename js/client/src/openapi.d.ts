@@ -5030,6 +5030,8 @@ export interface components {
             drafts?: number;
             /** @description Explore the data once after a draft without a query or with an empty result. Over the dataset's `repairs.explore`. */
             explore?: boolean;
+            /** @description A matching policy of the dataset's evidence settings, which resolves the linked entities for the claims the summary reads. Not with `mode` `global`. */
+            matchingPolicy?: string;
             /** @description The rows returned in `result`, 1000 by default. */
             maxRows?: number;
             /**
@@ -5042,6 +5044,8 @@ export interface components {
             /** @description At most 2000 characters. */
             question: string;
             reasoning?: boolean;
+            /** @description A review policy of the dataset's evidence settings. The summary reads the claim occurrences about the linked entities with their state under the policy and may cite them in `claimCitations`. Not with `mode` `global`. */
+            reviewPolicy?: string;
             /** @description Hide the agent memory graphs of the dataset from the query, and use only reviewed community reports. */
             reviewedOnly?: boolean;
             /** @description Whether to run the checked query. `true` by default. */
@@ -5062,6 +5066,10 @@ export interface components {
             attempts?: {
                 [key: string]: unknown;
             }[];
+            /** @description With `reviewPolicy`, the claim occurrences the summary read, in the `claims` form of `recall`: `version` 1, `policy`, `occurrences` and `truncated`. */
+            claims?: {
+                [key: string]: unknown;
+            };
             /** @description `{id, question, choices: [{label, value}]}`. */
             clarify?: {
                 [key: string]: unknown;
@@ -5096,12 +5104,18 @@ export interface components {
             reports?: {
                 [key: string]: unknown;
             }[];
+            /** @description With `matchingPolicy`, the map revision read, in the `resolution` form of `recall`. */
+            resolution?: {
+                [key: string]: unknown;
+            };
             /** @description The checked query with `explanation`, `assumptions`, `terms`, `graph`, `commit`, `attempt`, `verdict` and `results` in the `application/x-sparkles+json` form. */
             result?: {
                 [key: string]: unknown;
             };
             summary?: {
                 citations: number[];
+                /** @description With `reviewPolicy`, the claim occurrences the text cites, such as `c1`. */
+                claimCitations?: string[];
                 model?: string;
                 provider?: string;
                 rowsSent?: number;
@@ -10403,7 +10417,11 @@ export interface components {
             graphs?: string[];
             hops?: number;
             includeSuperseded?: boolean;
+            /** @description A matching policy of the dataset's evidence settings. Entities name their representative under its resolution map, and the other members of each seed's cluster are read too. */
+            matchingPolicy?: string;
             maxBytes?: number;
+            /** @description The claim occurrences listed at most, 1 to 200, 50 by default. Needs `reviewPolicy`. */
+            maxClaims?: number;
             maxTriples?: number;
             /** @description The question or the words to search for. Give query, seeds or both. */
             query?: string;
@@ -10411,6 +10429,8 @@ export interface components {
             reasoning?: boolean;
             /** @description A half-life such as `90d` (units s, m, h, d, w, y). Found seeds rank by the age of their newest fact and by how many graphs assert their facts. */
             recency?: string;
+            /** @description A review policy of the dataset's evidence settings. Accepted facts cite the claim occurrences of their supports, and `claims` lists the occurrences about the entities returned with their state under the policy. */
+            reviewPolicy?: string;
             seedLimit?: number;
             /** @description Entity IRIs to start from. */
             seeds?: string[];
@@ -10426,6 +10446,8 @@ export interface components {
             citations: {
                 at?: string;
                 by?: string;
+                /** @description With `reviewPolicy`, the identifiers of the claim occurrences of the facts' live supports. */
+                claims?: string[];
                 confidence?: string;
                 graph: string;
                 id: number;
@@ -10435,6 +10457,40 @@ export interface components {
                 /** @enum {string} */
                 status?: "reviewed" | "unreviewed";
             }[];
+            /** @description With `reviewPolicy`, the claim occurrences the result cites or that are about its entities. */
+            claims?: {
+                occurrences: {
+                    by?: string;
+                    claim: string;
+                    decision?: string;
+                    decisionVersion?: number;
+                    id: string;
+                    /** @enum {string} */
+                    kind: "reported" | "observation" | "hypothesis" | "preference";
+                    /**
+                     * @description `instructions` when the source is an instruction document. Every claim is source data either way.
+                     * @enum {string}
+                     */
+                    origin: "instructions" | "source";
+                    /** @enum {string} */
+                    polarity: "positive" | "negative" | "uncertain";
+                    proposition: {
+                        o: string;
+                        p: string;
+                        s: string;
+                    };
+                    source?: string;
+                    /** @enum {string} */
+                    state: "accepted" | "rejected" | "needs-evidence" | "unreviewed" | "withdrawn";
+                }[];
+                policy: {
+                    name: string;
+                    version: number;
+                };
+                truncated: boolean;
+                /** @description 1. A client must recognize the version before it reads the member. */
+                version: number;
+            };
             commit: number;
             /** @description With `communities`, the report of each seed's community. */
             communities?: {
@@ -10475,12 +10531,25 @@ export interface components {
                 hop: number;
                 iri: string;
                 label?: string;
+                /** @description With `matchingPolicy`, the entity's cluster when the map names it. */
+                resolution?: {
+                    members: string[];
+                    membersComplete: boolean;
+                    representative: string;
+                };
                 seed?: number;
                 types: string[];
             }[];
             /** @description The prefixes the compact terms use. */
             prefixes: {
                 [key: string]: unknown;
+            };
+            /** @description With `matchingPolicy`, the map revision read. */
+            resolution?: {
+                number: number;
+                policy: string;
+                revision: string | null;
+                version: number;
             };
             superseded?: {
                 at?: string;

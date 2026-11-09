@@ -398,9 +398,10 @@ a little memory for the list of rows, about the size of the open nodes' ids, in 
 page whose size does not grow with the tree.
 
 A change set is drawn the same way wherever the pages show one, in the edit previews and in
-the history tabs. Each subject is a block named by its label, with every added or removed
-property and value on a line of its own and a sign beside it, and the plain N-Quads are one
-tab away.
+the history tabs. Each subject is a block named by its `rdfs:label` or `skos:prefLabel`,
+or by its `sh:name` when it has neither, so a shape in the shape editor's preview carries
+the name the form shows. Every added or removed property and value is on a line of its own
+with a sign beside it, and the plain N-Quads are one tab away.
 
 ### Rendering preferences
 
@@ -582,6 +583,40 @@ write access to the whole branch. Commits from bulk loads and commits older than
 log are named at the end of the list, since the log cannot say what they changed. A commit
 that changed only the blank nodes of a restriction or an annotated axiom, without a triple
 that names the entity, is not listed.
+
+The entity frame's **Discussion** view holds comment threads on the entity and on its
+axioms, in the manner of WebProtégé's discussions
+([screenshot](../images/ontology-discussions.png)). A caller who can write the branch
+starts a thread on the entity or on one of the axioms its frame lists, replies to a
+thread, and resolves or reopens it. Writing `@name` in a comment mentions that principal,
+and the mention is highlighted and recorded with the comment. The view shows open
+threads, resolved threads or both, with each comment's author and time, and the
+ontology's **Discussions** tab lists every thread of the ontology graph with a link to
+its entity. A read lists at most 1,000 comments and replies, oldest first, and says when
+it stopped there, since later comments and replies are then not listed.
+
+The threads are W3C Web Annotation RDF in an ordinary named graph beside the ontology
+graph on the branch. Its IRI is the ontology graph's IRI under
+`urn:x-sparkles:discussions:`, with `%`, `[` and `]` percent-encoded, so the threads of `http://example.org/uni` are in
+`urn:x-sparkles:discussions:http://example.org/uni` and those of the default graph are in
+`urn:x-sparkles:discussions:default`. Each ontology graph has its own discussion graph,
+and none can be an ontology graph's own IRI. A thread is an `oa:Annotation` motivated by
+`oa:commenting` whose `oa:hasTarget` is the entity, or an `oa:SpecificResource` with the
+entity as `oa:hasSource` and the axiom's functional-style syntax as an
+`oa:TextQuoteSelector`. A reply is an `oa:replying` annotation that targets the thread.
+Each body is an `oa:TextualBody`, the author and time are `dcterms:creator` and
+`dcterms:created`, mentions are `schema:mentions`, and the resolved state is
+`urn:x-sparkles:discussion#resolved` with the resolver in `#resolvedBy`. Comments never
+use `rdfs:comment`, and the editor never reads the discussion graph as an ontology, so
+its frames, trees and graph list leave it out.
+
+Each comment, reply, resolve and reopen is one ordinary commit of the branch. Comments
+therefore appear in the branch's history and in exports of the dataset like any other
+graph, a protected branch refuses them as it refuses every write, and writing one needs
+`write` on the dataset. Readers and visitors of a protected branch see the threads with
+no composer, reply, resolve or reopen. A caller whose grants cover only some graphs needs
+a grant on the discussion graph, or the server refuses the comment. Item 769 covers an
+optional discussion store outside versioning.
 
 **Inferred** reveals the
 kept hierarchy beside the asserted class tree. It reads roots and expanded levels from
