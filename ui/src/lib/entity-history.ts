@@ -224,13 +224,36 @@ export function entityHistoryPage(lookups: readonly HistoryChanges[]): EntityHis
 }
 
 /**
+ * The list so far with an older page appended: each commit once, the page's cursor, and the
+ * unrecorded ranges of every page read, newest first.
+ */
+export function appendEntityPage(
+  prev: EntityHistoryPage,
+  page: EntityHistoryPage,
+): EntityHistoryPage {
+  const commits = [...prev.commits];
+  for (const c of page.commits) if (!commits.some((h) => h.seq === c.seq)) commits.push(c);
+  const unrecorded = [...prev.unrecorded];
+  for (const u of page.unrecorded)
+    if (!unrecorded.some((x) => x.from === u.from && x.to === u.to && x.reason === u.reason))
+      unrecorded.push(u);
+  return {
+    commits: commits.sort((a, b) => b.seq - a.seq),
+    next: page.next,
+    unrecorded: unrecorded.sort((a, b) => b.from - a.from),
+  };
+}
+
+/**
  * Read one page of the history of `iri` on `target` in `graph` (`default` for the default
- * graph), up to commit `to` (the head when null), with at most `limit` changes per lookup.
+ * graph), up to commit `to`, with at most `limit` changes per lookup. Every lookup reads up
+ * to the same commit, so a commit that lands meanwhile cannot be counted by some lookups
+ * and not by others. The first page reads up to the head the editor shows.
  */
 export async function readEntityHistory(
   read: (o: HistoryOptions) => Promise<HistoryChanges>,
   iri: string,
-  o: { graph: string; to: number | null; limit: number; signal?: AbortSignal },
+  o: { graph: string; to: number; limit: number; signal?: AbortSignal },
 ): Promise<EntityHistoryPage> {
   const term = `<${iri}>`;
   const lookups = await Promise.all(
@@ -240,7 +263,7 @@ export async function readEntityHistory(
         graph: o.graph,
         order: 'desc',
         limit: o.limit,
-        ...(o.to != null ? { to: String(o.to) } : {}),
+        to: String(o.to),
         signal: o.signal,
       }),
     ),

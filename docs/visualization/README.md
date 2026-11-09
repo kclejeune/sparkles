@@ -576,7 +576,7 @@ first, with each commit's message, author, time and counts of those triples
 a time for each position and offers older commits in further pages. A commit opens to the
 axioms and assertions that mention the entity which it added and removed, read through
 `GET /$/ontology/{ds}/diff?entity=`, and links to its full diff. A caller who can edit
-the branch reverts a commit from there, and the revert is previewed and committed like an
+the branch, with grants that cover every graph, reverts a commit from there, and the revert is previewed and committed like an
 undo. A revert takes back everything the commit changed on the branch, and it needs
 write access to the whole branch. Commits from bulk loads and commits older than the change
 log are named at the end of the list, since the log cannot say what they changed. A commit

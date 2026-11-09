@@ -131,8 +131,92 @@ test('a reader sees the history without a revert, and it fits a phone', async ({
       'rdfs:comment',
     );
     await expect(page.getByRole('link', { name: /Full diff of commit/ })).toBeVisible();
-    await expect(page.getByRole('button', { name: /^Revert commit/ })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /^Revert commit \d+$/ })).toHaveCount(0);
     await expectNoSidewaysScroll(page, 'the entity history at phone width');
+  } finally {
+    await request.delete(`/$/branches/uni/${branch}?force=true`);
+  }
+});
+
+test('a late answer for the entity the view left is not shown for the next one', async ({
+  page,
+  request,
+}) => {
+  const branch = 'eh-late';
+  const made = await request.post('/$/branches/uni', { data: { name: branch } });
+  expect(made.status()).toBe(201);
+  try {
+    // one commit that changes both entities, with an axiom only Professor's diff lists
+    const r = await request.post(`/uni@${branch}/update`, {
+      headers: {
+        'Content-Type': 'application/sparql-update',
+        'Sparkles-Commit-Message': 'Both entities',
+      },
+      data: `${PREFIXES}
+INSERT DATA { uni:Lecturer rdfs:subClassOf uni:Professor . uni:Professor rdfs:comment "late"@en }`,
+    });
+    expect(r.ok(), await r.text()).toBe(true);
+    let release!: () => void;
+    const held = new Promise<void>((done) => (release = done));
+    await page.route(
+      (u) => u.pathname.endsWith('/diff') && u.searchParams.get('entity') === `${UNI}Professor`,
+      async (route) => {
+        await held;
+        await route.continue();
+      },
+    );
+    await openHistory(page, branch, `${UNI}Professor`);
+    await historyOf(page)
+      .getByRole('button', { name: /Both entities/ })
+      .click();
+    // Professor's answer is held while the view moves to Lecturer
+    await page.getByRole('button', { name: 'Expand Professor' }).first().click();
+    await page
+      .getByRole('tree', { name: 'Classes (asserted)' })
+      .getByRole('button', { name: 'Lecturer', exact: true })
+      .click();
+    await expect(page).toHaveURL(/Lecturer/);
+    await historyOf(page)
+      .getByRole('button', { name: /Both entities/ })
+      .click();
+    const changed = page.getByRole('list', { name: /Axioms commit \d+ changed/ });
+    await expect(changed).toContainText('SubClassOf(uni:Lecturer uni:Professor)');
+    release();
+    // give the held answer time to arrive, then check it did not replace Lecturer's
+    await page
+      .waitForResponse((res) => res.url().includes('/diff') && res.url().includes('Professor'))
+      .catch(() => {});
+    await page.waitForTimeout(300);
+    await expect(changed).not.toContainText('late');
+  } finally {
+    await request.delete(`/$/branches/uni/${branch}?force=true`);
+  }
+});
+
+test('a writer whose grants cover only some graphs gets no revert', async ({ page, request }) => {
+  const branch = 'eh-limited';
+  await branchWithEdits(request, branch);
+  try {
+    await page.route('**/$/whoami', (route) =>
+      route.fulfill({
+        json: {
+          authEnabled: true,
+          principal: { kind: 'token', name: 'limited' },
+          method: 'bearer',
+          server: [],
+          datasets: { uni: 'write' },
+          restricted: { uni: { graphs: true } },
+          canMintTokens: false,
+          logout: false,
+        },
+      }),
+    );
+    await openHistory(page, branch, `${UNI}Professor`);
+    await historyOf(page)
+      .getByRole('button', { name: /Comment on Professor/ })
+      .click();
+    await expect(page.getByRole('link', { name: /Full diff of commit/ })).toBeVisible();
+    await expect(page.getByRole('button', { name: /^Revert commit \d+$/ })).toHaveCount(0);
   } finally {
     await request.delete(`/$/branches/uni/${branch}?force=true`);
   }

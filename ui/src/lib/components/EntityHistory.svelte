@@ -10,6 +10,7 @@
   import { commitKindLabel, fmtCommitTime } from '$lib/commits';
   import { diffGraphHref } from '$lib/diff-graph';
   import {
+    appendEntityPage,
     readEntityHistory,
     type EntityCommit,
     type EntityHistoryPage,
@@ -38,7 +39,7 @@
     sel: Selection;
     /** The entity. */
     iri: string;
-    /** No revert is offered. */
+    /** No revert is offered: the caller cannot write the branch, or its grants cover only some graphs. */
     readonly?: boolean;
     /** The head the editor shows. A new head reads the newest page again. */
     refreshKey?: number;
@@ -62,7 +63,11 @@
   const runs = new LatestRun();
   onDestroy(() => runs.abortAll());
 
-  async function load(to: number | null) {
+  /** Bumped when the entity, graph, branch or head changes, which orphans every pending read. */
+  let epoch = 0;
+
+  /** Read the page up to `to`, replacing the list for the first page. */
+  async function load(to: number, replace: boolean) {
     const owns = runs.claim('page');
     loading = true;
     try {
@@ -73,10 +78,13 @@
         signal: runs.signal('page'),
       });
       if (!owns()) return;
-      const have = to == null ? [] : commits;
-      commits = [...have, ...p.commits.filter((c) => !have.some((h) => h.seq === c.seq))];
-      next = p.next;
-      unrecorded = p.unrecorded;
+      const all = appendEntityPage(
+        replace ? { commits: [], next: null, unrecorded: [] } : { commits, next, unrecorded },
+        p,
+      );
+      commits = all.commits;
+      next = all.next;
+      unrecorded = all.unrecorded;
       error = null;
       now = Date.now();
     } catch (e) {
@@ -87,15 +95,18 @@
   }
 
   $effect(() => {
-    void refreshKey;
+    const head = refreshKey;
     void target;
     void iri;
     void sel.graph;
+    epoch++;
+    runs.abortAll();
     diffs = {};
     open = null;
     commits = [];
     next = null;
-    void load(null);
+    unrecorded = [];
+    void load(head, true);
   });
 
   async function toggle(c: EntityCommit) {
@@ -105,12 +116,18 @@
     }
     open = c.seq;
     if (diffs[c.seq]) return;
+    const mine = epoch;
+    const key = `diff:${c.seq}`;
+    const owns = runs.claim(key);
+    let d: EntityDiff | Error;
     try {
-      const d = await entityCommitDiff(target, sel, iri, c.seq, AXIOMS);
-      diffs = { ...diffs, [c.seq]: d };
+      d = await entityCommitDiff(target, sel, iri, c.seq, AXIOMS, runs.signal(key));
     } catch (e) {
-      diffs = { ...diffs, [c.seq]: e as Error };
+      d = e as Error;
     }
+    // an answer for an entity, graph, branch or head the view has left is dropped
+    if (mine !== epoch || !owns()) return;
+    diffs = { ...diffs, [c.seq]: d };
   }
 
   const title = (c: EntityCommit) => c.message || commitKindLabel(c.kind);
@@ -202,7 +219,7 @@
     {/each}
   </ol>
   {#if next != null}
-    <button class="btn ghost sm" disabled={loading} onclick={() => load(next)}
+    <button class="btn ghost sm" disabled={loading} onclick={() => load(next!, false)}
       >{#if loading}<span class="spinner"></span>{/if} Older commits</button
     >
   {:else if loading}<p class="faint small"><span class="spinner"></span> Reading the history…</p>

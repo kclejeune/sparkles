@@ -4,6 +4,7 @@ import {
   authorsOf,
   entityChanges,
   entityCommits,
+  appendEntityPage,
   entityHistoryPage,
   isReadable,
   netChanges,
@@ -240,5 +241,61 @@ describe('readEntityHistory', () => {
         (o) => o.graph === 'default' && o.order === 'desc' && o.to === '7' && o.limit === 50,
       ),
     ).toBe(true);
+  });
+});
+
+describe('appendEntityPage', () => {
+  const commit = (seq: number) => ({
+    seq,
+    timestamp: '2026-10-01T00:00:00Z',
+    kind: 'update',
+    added: 1,
+    removed: 0,
+    partial: false,
+  });
+  it('keeps the unrecorded ranges of earlier pages and adds each commit once', () => {
+    const first = {
+      commits: [commit(9)],
+      next: 7,
+      unrecorded: [{ from: 8, to: 8, reason: 'bulk' as const }],
+    };
+    const second = {
+      commits: [commit(7), commit(5)],
+      next: null,
+      unrecorded: [{ from: 1, to: 1, reason: 'before-log' as const }],
+    };
+    const all = appendEntityPage(first, second);
+    expect(all.commits.map((c) => c.seq)).toEqual([9, 7, 5]);
+    expect(all.next).toBeNull();
+    expect(all.unrecorded).toEqual([
+      { from: 8, to: 8, reason: 'bulk' },
+      { from: 1, to: 1, reason: 'before-log' },
+    ]);
+    // a page read again does not repeat its commits or ranges
+    expect(appendEntityPage(all, second)).toEqual(all);
+  });
+});
+
+describe('readEntityHistory pins its lookups', () => {
+  it('reads every lookup up to the same commit, the head shown for the first page', async () => {
+    const asked: (string | undefined)[] = [];
+    await readEntityHistory(
+      async (o) => {
+        asked.push(o.to);
+        return {
+          dataset: 'd',
+          datasetId: 'x',
+          head: 12,
+          from: 0,
+          to: 9,
+          truncated: false,
+          changes: [],
+          unrecorded: [],
+        };
+      },
+      'urn:A',
+      { graph: 'default', to: 9, limit: 50 },
+    );
+    expect(asked).toEqual(['9', '9', '9']);
   });
 });

@@ -24,6 +24,7 @@
   import type { InferredKind } from '$lib/inferred-tree.svelte';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
+  import { graphRestricted } from '$lib/auth';
   import { branchParam, MAIN, onBranch } from '$lib/branches';
   import { EditSession, startSessionBranch } from '$lib/edit-session.svelte';
   import { fmtInt } from '$lib/format';
@@ -1863,7 +1864,7 @@
                   {branch}
                   {sel}
                   iri={selected}
-                  {readonly}
+                  readonly={readonly || graphRestricted(auth.who, name)}
                   refreshKey={summary.commit}
                   onrevert={(seq, label) => session.edit({ kind: 'revert', commit: seq }, label)}
                 />
