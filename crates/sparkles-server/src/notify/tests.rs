@@ -1641,15 +1641,18 @@ fn email_header_lines_stay_within_the_limits() {
     assert_eq!(header.matches("@example.org,\r\n ").count(), 19, "{header}");
 }
 
-/// A mail server on loopback that writes `greeting` to each connection and closes it;
-/// the connections it took.
-fn one_line_server(greeting: &'static [u8]) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+/// A mail server on loopback that writes `greeting` to each of `n` connections and
+/// closes it, and then ends; the connections it took.
+fn one_line_server(
+    greeting: &'static [u8],
+    n: usize,
+) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     let n: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
     let n2 = n.clone();
     std::thread::spawn(move || {
-        for c in l.incoming().take(4) {
+        for c in l.incoming().take(n) {
             let Ok(mut c) = c else { continue };
             n2.fetch_add(1, Ordering::SeqCst);
             let _ = c.write_all(greeting);
@@ -1664,8 +1667,8 @@ fn one_line_server(greeting: &'static [u8]) -> (u16, Arc<std::sync::atomic::Atom
 async fn email_reply_framing() {
     let f = fixture_with(None, true, Some(TEST_CA));
     f.secret("smtp", "s3cret-smtp-pass");
-    let (cut, cuts) = one_line_server(b"220 ready");
-    let (bare, bares) = one_line_server(b"220 ready\n");
+    let (cut, cuts) = one_line_server(b"220 ready", 2);
+    let (bare, bares) = one_line_server(b"220 ready\n", 1);
     f.patch(json!({
         "enabled": true,
         "channels": {
