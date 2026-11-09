@@ -1675,3 +1675,13 @@ class UntrackedRoundTwo(unittest.TestCase):
         self.assertEqual(d.listed_names(b'a\0b\0',True),[b'a',b'b'])
         self.assertEqual(d.listed_names(b'a\0bc',True),[b'a'])
         self.assertEqual(d.listed_names(b'a\0b',False),[b'a',b'b'])
+
+
+class UntrackedRoundThree(unittest.TestCase):
+    """Backup and editor copies of credential names are omitted too."""
+    def test_backup_suffixes_and_prefixes_are_matched(self):
+        d=diagnostic_module()
+        for name in ('.netrc.bak','.npmrc~','deploy.pem.bak','#.env#','.env.swp','old/.ssh.orig/x','id_ed25519.pub','server.key.old','.aws-backup/config','my-token-copy','secrets.tar.gz','.git-credentials~'):
+            self.assertTrue(d.credential_like(name),repr(name))
+        for name in ('plain.txt','.mise/state','src/main.rs','.venv/','__pycache__/','environment.md'):
+            self.assertFalse(d.credential_like(name),repr(name))
