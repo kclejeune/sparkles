@@ -366,6 +366,7 @@ struct PageDoc<'a> {
     prefixes: PrefixMap<'a>,
     elapsed_ms: f64,
 }
+#[allow(clippy::too_many_arguments)]
 fn document<'a>(
     page: &'a QueryPage<'a>,
     prefixes: &'a Prefixes,

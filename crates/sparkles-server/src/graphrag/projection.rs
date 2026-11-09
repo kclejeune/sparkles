@@ -119,7 +119,7 @@ pub fn read(
         for r in q(&text)? {
             let r = r.values();
             ctl.check().map_err(|e| e.to_string())?;
-            if let [Some(s), Some(o)] = &r[..] {
+            if let [Some(s), Some(o)] = r {
                 let (s, o) = (s.to_string(), o.to_string());
                 terms.insert(s.clone());
                 terms.insert(o.clone());

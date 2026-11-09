@@ -105,13 +105,12 @@ impl RetainedToolBody for Body {
         if let RetainedFraming::Sse {
             event_id: Some(id), ..
         } = framing
+            && id.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
         {
-            if id.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "invalid SSE event ID",
-                ));
-            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid SSE event ID",
+            ));
         }
         let bytes =
             self.receiver

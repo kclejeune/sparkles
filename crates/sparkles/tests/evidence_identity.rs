@@ -965,6 +965,7 @@ fn written_records_conform_to_the_profile_shapes() {
                 "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }}"
             ))
             .unwrap()
+            .iter()
         {
             nt.push_str(&format!("{t} .\n"));
         }
