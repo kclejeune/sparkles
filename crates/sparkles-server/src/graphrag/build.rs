@@ -1380,29 +1380,60 @@ enum Stop {
     Cancelled,
 }
 
-/// The SPARQL Update text of a level's commit.
+/// The SPARQL Update text of a level's commit, written into one buffer of
+/// [`commit_bytes`] bytes, so that building it allocates nothing more.
 fn commit_text(graph: &str, delete: &[String], quads: &[oxrdf::Quad]) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(d) = store::delete_subjects(graph, delete) {
-        parts.push(d);
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(commit_bytes(graph, delete, quads) as usize);
+    if !delete.is_empty() {
+        store::write_delete_subjects(&mut out, graph, delete);
+        out.push_str(" ;\n");
     }
     if !quads.is_empty() {
-        let mut by_graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        // the quads of each graph go together, the graphs in the order of their names
+        let mut graphs: Vec<&oxrdf::GraphName> = Vec::new();
         for q in quads {
-            by_graph
-                .entry(q.graph_name.to_string())
-                .or_default()
-                .push(format!("{} {} {} .", q.subject, q.predicate, q.object));
+            if !graphs.contains(&&q.graph_name) {
+                graphs.push(&q.graph_name);
+            }
         }
-        let mut body = String::new();
-        for (g, ts) in by_graph {
-            body.push_str(&format!("GRAPH {g} {{\n{}\n}}\n", ts.join("\n")));
+        let mut graphs: Vec<(String, &oxrdf::GraphName)> =
+            graphs.into_iter().map(|g| (g.to_string(), g)).collect();
+        graphs.sort_by(|a, b| a.0.cmp(&b.0));
+        out.push_str("INSERT DATA {\n");
+        for (name, g) in &graphs {
+            let _ = write!(out, "GRAPH {name} {{\n");
+            let mut first = true;
+            for q in quads.iter().filter(|q| &q.graph_name == *g) {
+                if !first {
+                    out.push('\n');
+                }
+                first = false;
+                let _ = write!(out, "{} {} {} .", q.subject, q.predicate, q.object);
+            }
+            out.push_str("\n}\n");
         }
-        parts.push(format!("INSERT DATA {{\n{body}}}"));
+        out.push_str("} ;\n");
     }
-    parts.push(store::delete_unreachable_reports(graph));
-    parts.push(store::delete_unlinked_footprints(graph));
-    parts.join(" ;\n")
+    out.push_str(&store::delete_unreachable_reports(graph));
+    out.push_str(" ;\n");
+    out.push_str(&store::delete_unlinked_footprints(graph));
+    out
+}
+
+/// An upper bound of the length of [`commit_text`], computed without building it.
+fn commit_bytes(graph: &str, delete: &[String], quads: &[oxrdf::Quad]) -> u64 {
+    // the statements around the deletions and the quads, and their separators
+    const FIXED: u64 = 1024;
+    let deletes: u64 = delete.iter().map(|s| s.len() as u64 + 3).sum();
+    // each quad's bound holds its graph's name, which bounds the graph's header
+    let inserts: u64 = quads.iter().map(quad_bytes).sum();
+    FIXED
+        + 2 * graph.len() as u64
+        + deletes
+        + inserts
+        + store::delete_unreachable_reports(graph).len() as u64
+        + store::delete_unlinked_footprints(graph).len() as u64
 }
 
 /// Run a build or a refresh. Returns the outcome; a run stopped by its budget or an
@@ -1531,54 +1562,99 @@ fn quad_bytes(q: &oxrdf::Quad) -> u64 {
     (s + q.predicate.as_str().len() + 2 + term(&q.object) + g + 8) as u64
 }
 
-/// An upper bound of the bytes that a written report's evidence adds before its update
-/// text: the claim, decision and child strings that `ReportEvidence` copies, and the
-/// quads of each finding's citations and of the activity's `prov:used`. Every quad owns
-/// its subject, predicate, object and a copy of the reports graph's name.
-fn citation_bytes<'a>(
+/// The quads `report_quads` writes for a written report besides its evidence, at most:
+/// the report's and its activity's own statements, and for each finding its link, order,
+/// text, entities, unmatched names and up to two quads for each citation, with a
+/// `gr:citesReport` for each cited child.
+fn ordinary_quads(checked: &report::Checked) -> u64 {
+    32 + checked
+        .findings
+        .iter()
+        .map(|f| (4 + f.entities.len() + 3 * f.cites.len() + f.unmatched.len()) as u64)
+        .sum::<u64>()
+}
+
+/// An upper bound of the bytes that a written report adds before the level's update
+/// text is charged: the claim, decision and child strings that `ReportEvidence` copies
+/// with their vectors, and every quad `report_quads` builds, each owning its subject,
+/// predicate, object and a copy of the reports graph's name. A quad's slot is charged
+/// five times, for the report's vector and the level's, each up to twice its length,
+/// and the old buffer of the level's while it grows.
+fn report_bytes<'a>(
     pair: impl Fn(u32) -> &'a (String, String),
     read: &Read,
     checked: &report::Checked,
+    input: &Rendered,
     iri: &str,
     graph: &str,
     current: &HashMap<usize, String>,
 ) -> u64 {
-    // the evidence predicates are shorter than this, and a finding's or the activity's
-    // IRI is the report's with a short suffix
+    // the predicates are shorter than this, and so are a literal's datatype or language
+    // tag; a finding's or the activity's IRI is the report's with a short suffix
     const PREDICATE: u64 = 64;
+    const TAG: u64 = 64;
     const SUFFIX: u64 = 32;
+    const SLOTS: u64 = 5;
     let string = std::mem::size_of::<String>() as u64;
+    let vec = std::mem::size_of::<Vec<(String, String)>>() as u64;
     let reference = std::mem::size_of::<&str>() as u64;
-    let quad = std::mem::size_of::<oxrdf::Quad>() as u64;
-    let subject = iri.len() as u64 + SUFFIX;
-    let graph = graph.len() as u64;
-    let one = |object: u64| quad + subject + PREDICATE + object + graph + reference;
+    let slot = SLOTS * std::mem::size_of::<oxrdf::Quad>() as u64
+        + iri.len() as u64
+        + SUFFIX
+        + PREDICATE
+        + TAG
+        + graph.len() as u64
+        // the vectors of claims, decisions and children that are sorted before writing
+        + 2 * reference;
+    let mut quads = ordinary_quads(checked);
     let mut bytes = 0u64;
     let mut add = |n: u64| bytes = bytes.saturating_add(n);
+    // the copies in `ReportEvidence`
     for ps in &read.items {
+        add(vec);
         for &p in ps {
             let (c, d) = pair(p);
             add((c.len() + d.len()) as u64 + 2 * string);
         }
     }
-    for f in &checked.findings {
-        for n in &f.cites {
-            for &p in read.items.get(n.wrapping_sub(1)).into_iter().flatten() {
-                let (c, d) = pair(p);
-                add(one(c.len() as u64) + one(d.len() as u64));
-            }
-        }
-    }
     for &p in &read.own {
         let (c, d) = pair(p);
         add((c.len() + d.len()) as u64 + 2 * string);
-        add(one(c.len() as u64) + one(d.len() as u64));
+        // and the activity's `prov:used` of each
+        add((c.len() + d.len()) as u64);
+        quads += 2;
     }
     for c in &read.children {
         let len = current.get(c).map_or(0, |s| s.len()) as u64;
-        add(len + string + one(len));
+        add(2 * (len + string));
+        quads += 1;
     }
-    bytes
+    // the objects of the findings' quads
+    add((checked.title.len() + checked.summary.len()) as u64);
+    for f in &checked.findings {
+        add(f.text.len() as u64);
+        add(f.entities.iter().map(|e| e.len() as u64).sum());
+        add(f.unmatched.iter().map(|u| u.len() as u64).sum());
+        for &n in &f.cites {
+            for &p in read.items.get(n.wrapping_sub(1)).into_iter().flatten() {
+                let (c, d) = pair(p);
+                add((c.len() + d.len()) as u64);
+                quads += 2;
+            }
+            match input.items.get(n.wrapping_sub(1)) {
+                Some(report::Item::Fact(x) | report::Item::Edge(x)) => add((x.s.len()
+                    + x.p.len()
+                    + x.o.len()
+                    + x.reifier.as_ref().map_or(0, String::len))
+                    as u64),
+                Some(report::Item::ChildFinding { report, .. }) => {
+                    add(2 * report.len() as u64 + SUFFIX)
+                }
+                None => {}
+            }
+        }
+    }
+    bytes.saturating_add(quads.saturating_mul(slot))
 }
 
 pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
@@ -1888,8 +1964,8 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
             // the citations and `prov:used` of a written report are charged before their
             // strings and quads are built
             let bytes = match (&ev, &read, &body) {
-                (Some(e), Some(read), Body::Written { checked, .. }) => {
-                    citation_bytes(|p| e.pair(p), read, checked, &iri, &graph, &current)
+                (Some(e), Some(read), Body::Written { checked, input }) => {
+                    report_bytes(|p| e.pair(p), read, checked, input, &iri, &graph, &current)
                 }
                 _ => 0,
             };
@@ -1969,8 +2045,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         // under a policy, the level's update text is charged before it is built, and a
         // level that would pass the allowance is not committed
         if let Some(e) = ev.as_mut() {
-            let bytes: u64 = quads.iter().map(quad_bytes).sum();
-            e.charge(bytes)?;
+            e.charge(commit_bytes(&graph, &delete, &quads))?;
         }
         // builds and reviews of one dataset commit one at a time
         let lock = r.st.graphrag.lock(&r.ds.name);

@@ -369,11 +369,27 @@ pub fn delete_subjects(graph: &str, subjects: &[String]) -> Option<String> {
     if subjects.is_empty() {
         return None;
     }
-    let values: Vec<String> = subjects.iter().map(|s| format!("<{s}>")).collect();
-    Some(format!(
-        "DELETE {{ GRAPH <{graph}> {{ ?x ?p ?o }} }} WHERE {{ VALUES ?r {{ {} }} GRAPH <{graph}> {{ ?x ?p ?o }} FILTER(?x = ?r || STRSTARTS(STR(?x), CONCAT(STR(?r), \"#\"))) }}",
-        values.join(" ")
-    ))
+    let mut out = String::new();
+    write_delete_subjects(&mut out, graph, subjects);
+    Some(out)
+}
+
+/// Write [`delete_subjects`]'s update for a nonempty `subjects` into `out`.
+pub fn write_delete_subjects(out: &mut String, graph: &str, subjects: &[String]) {
+    out.push_str("DELETE { GRAPH <");
+    out.push_str(graph);
+    out.push_str("> { ?x ?p ?o } } WHERE { VALUES ?r { ");
+    for (i, s) in subjects.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push('<');
+        out.push_str(s);
+        out.push('>');
+    }
+    out.push_str(" } GRAPH <");
+    out.push_str(graph);
+    out.push_str("> { ?x ?p ?o } FILTER(?x = ?r || STRSTARTS(STR(?x), CONCAT(STR(?r), \"#\"))) }");
 }
 
 /// The SPARQL update that removes the reports of `graph` that no community links to and

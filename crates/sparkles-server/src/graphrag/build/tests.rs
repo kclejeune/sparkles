@@ -1205,22 +1205,29 @@ fn edit_chains_of_any_length_lead_back() {
     assert!(!edit_of(&revs, "urn:r:a", "urn:r:0"));
 }
 
-/// The heap bytes a quad owns, which the run's charges must bound.
+/// The heap bytes a quad owns besides its slot, which the run's charges must bound.
 fn owned(q: &oxrdf::Quad) -> u64 {
     let object = match &q.object {
         Term::NamedNode(n) => n.as_str().len(),
-        Term::Literal(l) => l.value().len() + l.datatype().as_str().len(),
+        Term::Literal(l) => {
+            l.value().len() + l.datatype().as_str().len() + l.language().map_or(0, str::len)
+        }
         t => t.to_string().len(),
     };
     let graph = match &q.graph_name {
         oxrdf::GraphName::NamedNode(n) => n.as_str().len(),
         _ => 0,
     };
-    (std::mem::size_of::<oxrdf::Quad>()
-        + q.subject.to_string().len()
-        + q.predicate.as_str().len()
-        + object
-        + graph) as u64
+    (q.subject.to_string().len() + q.predicate.as_str().len() + object + graph) as u64
+}
+
+fn long_quad(graph: &str, value: &str) -> oxrdf::Quad {
+    oxrdf::Quad::new(
+        oxrdf::NamedNode::new_unchecked("urn:s"),
+        oxrdf::NamedNode::new_unchecked("urn:p"),
+        oxrdf::Literal::new_simple_literal(value),
+        oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked(graph)),
+    )
 }
 
 #[test]
@@ -1254,115 +1261,148 @@ fn quad_charges_bound_the_update_text() {
 }
 
 #[test]
-fn citation_charges_bound_the_evidence_quads() {
+fn commit_charges_bound_the_whole_update() {
+    let reports = format!("urn:g:{}", "r".repeat(5_000));
+    let controls: String = (0u8..0x20).map(char::from).collect();
+    let deleted: Vec<String> = (0..1000)
+        .map(|i| format!("urn:uuid:00000000-0000-0000-0000-{i:012}"))
+        .collect();
+    let cases: Vec<(Vec<String>, Vec<oxrdf::Quad>)> = vec![
+        // an empty hierarchy deletes many communities and writes almost nothing
+        (deleted.clone(), Vec::new()),
+        (deleted, vec![long_quad(&reports, &controls)]),
+        (
+            Vec::new(),
+            vec![
+                long_quad(&reports, &controls.repeat(50)),
+                long_quad("urn:other", "x"),
+            ],
+        ),
+        (Vec::new(), Vec::new()),
+    ];
+    for (delete, quads) in cases {
+        let bound = commit_bytes(&reports, &delete, &quads);
+        let text = commit_text(&reports, &delete, &quads);
+        assert!(bound >= text.len() as u64, "{bound} < {}", text.len());
+        // the buffer never grew past its first allocation
+        assert_eq!(text.capacity() as u64, bound);
+    }
+}
+
+#[test]
+fn report_charges_bound_what_the_report_builds() {
     use super::super::report::{check, render_leaf};
     use super::super::store::ReportEvidence;
     let graph = format!("urn:g:{}", "r".repeat(10_000));
-    let members: BTreeSet<String> = ["<http://ex/a>", "<http://ex/b>"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let fact = |s: &str, o: &str| Fact {
-        s: format!("<http://ex/{s}>"),
-        p: "<http://ex/knows>".into(),
-        o: o.into(),
-        reifier: None,
-    };
-    let facts = vec![fact("a", "<http://ex/b>"), fact("b", "<http://ex/a>")];
-    let input = render_leaf(&members, &facts, &HashMap::<String, EntityInfo>::new());
-    let out = json!({
-        "title": "T",
-        "summary": "S",
-        "rating": 3,
-        "findings": [
-            {"text": "One.", "entities": [1], "cites": [1, 2]},
-            {"text": "Two.", "entities": [2], "cites": [2]}
-        ]
-    });
-    let checked = check(&out, &input, &|_| None).unwrap();
-    let pairs: Vec<(String, String)> = (0..3)
-        .map(|i| {
-            (
-                format!("urn:claim:{i}:{}", "c".repeat(500)),
-                format!("urn:decision:{i}:{}", "d".repeat(500)),
-            )
-        })
-        .collect();
-    let read = Read {
-        items: vec![vec![0, 1], vec![2]],
-        own: [0, 1, 2].into_iter().collect(),
-        children: vec![7],
-        all: None,
-    };
-    let child = format!("urn:child:{}", "x".repeat(1000));
-    let current: HashMap<usize, String> = [(7, child.clone())].into_iter().collect();
-    let iri = "urn:uuid:00000000-0000-0000-0000-000000000001";
-    let charged = citation_bytes(
-        |p| &pairs[p as usize],
-        &read,
-        &checked,
-        iri,
-        &graph,
-        &current,
-    );
-    let pair = |p: &u32| pairs[*p as usize].clone();
-    let evidence = ReportEvidence {
-        policy: "urn:policy".into(),
-        version: 1,
-        configuration: "l/1".into(),
-        items: read
-            .items
+    let slot = std::mem::size_of::<oxrdf::Quad>() as u64;
+    let string = std::mem::size_of::<String>() as u64;
+    let vec = std::mem::size_of::<Vec<(String, String)>>() as u64;
+    // enough pairs that the report's vector of quads crosses capacity boundaries
+    for n in [1usize, 3, 37, 400, 1300] {
+        let members: BTreeSet<String> = ["<http://ex/a>", "<http://ex/b>"]
             .iter()
-            .map(|x| x.iter().map(pair).collect())
-            .collect(),
-        used: read.own.iter().map(pair).collect(),
-        children: vec![child],
-    };
-    let strings: u64 = evidence
-        .items
-        .iter()
-        .flatten()
-        .chain(&evidence.used)
-        .map(|(c, d)| (c.len() + d.len() + 2 * std::mem::size_of::<String>()) as u64)
-        .sum::<u64>()
-        + evidence
-            .children
-            .iter()
-            .map(|c| (c.len() + std::mem::size_of::<String>()) as u64)
-            .sum::<u64>();
-    let quads = report_quads(
-        &NewReport {
-            iri: iri.into(),
-            community: "urn:c".into(),
-            status: Status::Unreviewed,
-            source_commit: 1,
-            footprint: "urn:fp".into(),
-            language: "en".into(),
-            activity: Some(Activity {
-                model: "p/m".into(),
-                input_tokens: 1,
-                output_tokens: 1,
-                started_at: "2026-11-09T00:00:00Z".into(),
-            }),
-            revision_of: None,
-            body: store::Body::Written { checked, input },
-            evidence: Some(evidence),
-        },
-        &graph,
-    );
-    let cites = [
-        super::super::guard::GR.to_string() + "citesClaim",
-        super::super::guard::GR.to_string() + "citesDecision",
-        format!("{}used", store::PROV),
-    ];
-    let built: u64 = quads
-        .iter()
-        .filter(|q| cites.iter().any(|c| c == q.predicate.as_str()))
-        .map(owned)
-        .sum();
-    assert!(built > 0);
-    assert!(
-        charged >= strings + built,
-        "{charged} < {strings} + {built}"
-    );
+            .map(|s| s.to_string())
+            .collect();
+        let fact = |s: &str, o: &str| Fact {
+            s: format!("<http://ex/{s}>"),
+            p: "<http://ex/knows>".into(),
+            o: o.into(),
+            reifier: None,
+        };
+        let facts = vec![fact("a", "<http://ex/b>"), fact("b", "<http://ex/a>")];
+        let input = render_leaf(&members, &facts, &HashMap::<String, EntityInfo>::new());
+        let findings: Vec<Value> = (0..12)
+            .map(|i| json!({"text": format!("Finding {i}."), "entities": [1], "cites": [1, 2]}))
+            .collect();
+        let out = json!({"title": "T", "summary": "S", "rating": 3, "findings": findings});
+        let checked = check(&out, &input, &|_| None).unwrap();
+        let pairs: Vec<(String, String)> = (0..n)
+            .map(|i| {
+                (
+                    format!("urn:claim:{i}:{}", "c".repeat(100)),
+                    format!("urn:decision:{i}:{}", "d".repeat(100)),
+                )
+            })
+            .collect();
+        let half = (n / 2) as u32;
+        // two items with pairs, and two child items with none
+        let read = Read {
+            items: vec![
+                (0..half).collect(),
+                (half..n as u32).collect(),
+                Vec::new(),
+                Vec::new(),
+            ],
+            own: (0..n as u32).collect(),
+            children: vec![7],
+            all: None,
+        };
+        let child = format!("urn:child:{}", "x".repeat(1000));
+        let current: HashMap<usize, String> = [(7, child.clone())].into_iter().collect();
+        let iri = "urn:uuid:00000000-0000-0000-0000-000000000001";
+        let charged = report_bytes(
+            |p| &pairs[p as usize],
+            &read,
+            &checked,
+            &input,
+            iri,
+            &graph,
+            &current,
+        );
+        let pair = |p: &u32| pairs[*p as usize].clone();
+        let evidence = ReportEvidence {
+            policy: "urn:policy".into(),
+            version: 1,
+            configuration: "l/1".into(),
+            items: read
+                .items
+                .iter()
+                .map(|x| x.iter().map(pair).collect())
+                .collect(),
+            used: read.own.iter().map(pair).collect(),
+            children: vec![child],
+        };
+        let strings: u64 = evidence.items.len() as u64 * vec
+            + evidence
+                .items
+                .iter()
+                .flatten()
+                .chain(&evidence.used)
+                .map(|(c, d)| (c.len() + d.len()) as u64 + 2 * string)
+                .sum::<u64>()
+            + evidence
+                .children
+                .iter()
+                .map(|c| c.len() as u64 + string)
+                .sum::<u64>();
+        let quads = report_quads(
+            &NewReport {
+                iri: iri.into(),
+                community: "urn:c".into(),
+                status: Status::Unreviewed,
+                source_commit: 1,
+                footprint: "urn:fp".into(),
+                language: "en".into(),
+                activity: Some(Activity {
+                    model: "p/m".into(),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    started_at: "2026-11-09T00:00:00Z".into(),
+                }),
+                revision_of: None,
+                body: store::Body::Written { checked, input },
+                evidence: Some(evidence),
+            },
+            &graph,
+        );
+        // the report's vector with its spare capacity, and the level's at twice the
+        // report's length with the buffer it grew from
+        let built: u64 = quads.capacity() as u64 * slot
+            + 3 * quads.len() as u64 * slot
+            + quads.iter().map(owned).sum::<u64>();
+        assert!(
+            charged >= strings + built,
+            "{n}: {charged} < {strings} + {built}"
+        );
+    }
 }
