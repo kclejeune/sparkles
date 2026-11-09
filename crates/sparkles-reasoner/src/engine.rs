@@ -259,8 +259,11 @@ fn compile_with(
                 infos.push(info);
             }
             Ok(None) => {}
-            Err(CompileFailure::Unsupported(msg)) => {
-                warnings.push_fmt(format_args!("rule '{}': {msg}; skipped", f.name))?
+            Err(CompileFailure::Unsupported(msg, held)) => {
+                let pushed = warnings.push_fmt(format_args!("rule '{}': {msg}; skipped", f.name));
+                drop(msg);
+                drop(held);
+                pushed?
             }
             Err(CompileFailure::Memory(error)) => return Err(error),
         }
@@ -304,18 +307,25 @@ fn compile_with(
 }
 
 enum CompileFailure {
-    Unsupported(String),
+    /// A rule the compiler skips, with the credit for its message. A rule fails on
+    /// its first error, so its message is charged only on that path.
+    Unsupported(String, Held),
     Memory(BudgetFailure),
 }
-impl From<String> for CompileFailure {
-    fn from(value: String) -> Self {
-        Self::Unsupported(value)
-    }
-}
-impl From<&str> for CompileFailure {
-    fn from(value: &str) -> Self {
-        Self::Unsupported(value.into())
-    }
+/// The skip message for a rule, charged to `budget` before it is formatted.
+fn unsupported(budget: &Arc<Budget>, args: std::fmt::Arguments<'_>) -> CompileFailure {
+    use std::fmt::Write;
+    let len = match crate::budget::format_len(args) {
+        Ok(len) => len,
+        Err(error) => return CompileFailure::Memory(error),
+    };
+    let held = match Held::try_new_exact(budget, len) {
+        Ok(held) => held,
+        Err(error) => return CompileFailure::Memory(error),
+    };
+    let mut message = String::with_capacity(len);
+    message.write_fmt(args).expect("private String formatting");
+    CompileFailure::Unsupported(message, held)
 }
 impl From<BudgetFailure> for CompileFailure {
     fn from(value: BudgetFailure) -> Self {
@@ -345,10 +355,12 @@ fn compile_one<'a>(
                 Node::Const(t) => Slot::Const(terms.id_for_rule(t)?),
                 Node::Any => Slot::Any,
                 Node::Functor(name, _) => {
-                    return Err(compiler_message(format_args!(
-                        "functor term '{name}(…)' is not supported by forward materialization"
-                    ))?
-                    .into());
+                    return Err(unsupported(
+                        budget,
+                        format_args!(
+                            "functor term '{name}(…)' is not supported by forward materialization"
+                        ),
+                    ));
                 }
             })
         };
@@ -373,26 +385,23 @@ fn compile_one<'a>(
             }
             Clause::Builtin(b) => {
                 let Some(kind) = BuiltinKind::from_name(&b.name) else {
-                    if let Some(always) = static_bound_test(b, &bound)? {
+                    if let Some(always) = static_bound_test(b, &bound) {
                         if !always {
                             // e.g. `unbound(?x)` after ?x was bound: the rule can never fire
                             return Ok(None);
                         }
                         continue;
                     }
-                    return Err(compiler_message(format_args!(
-                        "unknown or unsupported builtin '{}'",
-                        b.name
-                    ))?
-                    .into());
+                    return Err(unsupported(
+                        budget,
+                        format_args!("unknown or unsupported builtin '{}'", b.name),
+                    ));
                 };
                 if !kind.accepts_arity(b.args.len()) {
-                    return Err(compiler_message(format_args!(
-                        "{}: wrong number of arguments ({})",
-                        b.name,
-                        b.args.len()
-                    ))?
-                    .into());
+                    return Err(unsupported(
+                        budget,
+                        format_args!("{}: wrong number of arguments ({})", b.name, b.args.len()),
+                    ));
                 }
                 let mut args = Vec::with_capacity(b.args.len());
                 for (i, a) in b.args.iter().enumerate() {
@@ -409,11 +418,10 @@ fn compile_one<'a>(
                         && kind.input_positions(b.args.len()).contains(&i)
                         && kind != BuiltinKind::NoValue
                     {
-                        return Err(compiler_message(format_args!(
-                            "wildcard as input of builtin '{}'",
-                            b.name
-                        ))?
-                        .into());
+                        return Err(unsupported(
+                            budget,
+                            format_args!("wildcard as input of builtin '{}'", b.name),
+                        ));
                     }
                     args.push(s);
                 }
@@ -441,11 +449,10 @@ fn compile_one<'a>(
                         Some(match BudgetRegex::compile(l.value(), budget)? {
                             Some(regex) => regex,
                             None => {
-                                return Err(compiler_message(format_args!(
-                                    "invalid regex '{}'",
-                                    l.value()
-                                ))?
-                                .into());
+                                return Err(unsupported(
+                                    budget,
+                                    format_args!("invalid regex '{}'", l.value()),
+                                ));
                             }
                         })
                     }
@@ -472,7 +479,10 @@ fn compile_one<'a>(
                 let p = slot(&t.predicate, &mut var)?;
                 let o = slot(&t.object, &mut var)?;
                 if [s, p, o].contains(&Slot::Any) {
-                    return Err("wildcard in a head triple".into());
+                    return Err(unsupported(
+                        budget,
+                        format_args!("wildcard in a head triple"),
+                    ));
                 }
                 head.push(CHead::Triple(s, p, o));
             }
@@ -483,11 +493,10 @@ fn compile_one<'a>(
                         args.push(slot(argument, &mut var)?);
                     }
                     if args.len() != 3 {
-                        return Err(compiler_message(format_args!(
-                            "{} expects 3 arguments",
-                            b.name
-                        ))?
-                        .into());
+                        return Err(unsupported(
+                            budget,
+                            format_args!("{} expects 3 arguments", b.name),
+                        ));
                     }
                     head.push(CHead::Action(action, args));
                 }
@@ -539,10 +548,10 @@ fn compile_one<'a>(
             && !bound_vars[v]
         {
             let name = vars.iter().find(|(_, i)| **i == v).map_or("", |(n, _)| *n);
-            return Err(compiler_message(format_args!(
-                "head variable ?{name} is not bound by the body"
-            ))?
-            .into());
+            return Err(unsupported(
+                budget,
+                format_args!("head variable ?{name} is not bound by the body"),
+            ));
         }
         Ok(())
     };
@@ -563,7 +572,10 @@ fn compile_one<'a>(
     // every builtin must become evaluable
     let ranges = vec![(0u32, 0u32); rule.atoms.len()];
     if plan(&rule, &ranges, None).is_none() {
-        return Err("a builtin's input variables are never bound by the body".into());
+        return Err(unsupported(
+            budget,
+            format_args!("a builtin's input variables are never bound by the body"),
+        ));
     }
     let mut names = vec![String::new(); nvars];
     for (n, &i) in &vars {
@@ -579,11 +591,11 @@ fn compile_one<'a>(
 }
 
 /// `bound(?x…)` / `unbound(?x…)` are resolved statically from the textual position.
-fn static_bound_test(b: &BuiltinCall, bound: &HashSet<&str>) -> Result<Option<bool>, String> {
+fn static_bound_test(b: &BuiltinCall, bound: &HashSet<&str>) -> Option<bool> {
     let want = match b.name.as_str() {
         "bound" => true,
         "unbound" => false,
-        _ => return Ok(None),
+        _ => return None,
     };
     let mut all = true;
     for a in &b.args {
@@ -594,7 +606,7 @@ fn static_bound_test(b: &BuiltinCall, bound: &HashSet<&str>) -> Result<Option<bo
         };
         all &= is_bound == want;
     }
-    Ok(Some(all))
+    Some(all)
 }
 
 // ================================================================== planning ===

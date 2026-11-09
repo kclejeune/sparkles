@@ -346,9 +346,12 @@ impl Terms {
             return Ok(id.0);
         }
         let temporary = Held::try_new_exact(&self.budget(), key.len())?;
-        let id = self.local_keyed(key.to_vec(), LocalTerm::Key(Vec::new()), true, None)?;
-        drop(temporary);
-        Ok(id)
+        self.local_keyed(
+            Some(temporary),
+            key.to_vec(),
+            LocalTerm::Key(Vec::new()),
+            true,
+        )
     }
 
     fn id_charged(&self, t: &Term, strict: bool) -> Result<u64, BudgetFailure> {
@@ -433,25 +436,31 @@ impl Terms {
             .len()
             .checked_add(3)
             .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
-        let _temporary = Held::new_exact_mode(&self.budget(), bytes, strict)?;
+        let temporary = Held::new_exact_mode(&self.budget(), bytes, strict)?;
         let mut key = Vec::with_capacity(bytes);
         key.extend_from_slice(b"\0bn");
         key.extend_from_slice(node.as_str().as_bytes());
-        self.local_keyed(key, LocalTerm::RuleBNode(Vec::new()), strict, None)
+        self.local_keyed(
+            Some(temporary),
+            key,
+            LocalTerm::RuleBNode(Vec::new()),
+            strict,
+        )
     }
 
     /// The local id of `key`, made with `term` (a key term gets a copy of `key`) when
     /// it is new: its bytes, its entry, the map's growth and a new segment of the table
-    /// are charged first.
-    /// Intern `key`. A `carried` credit that already pays for the key buffer on
-    /// the same budget moves into the permanent credit, so the moved buffer is
-    /// not charged twice while it is interned.
+    /// are charged first. A `carried` credit on the same budget that already pays for
+    /// the key buffer moves into the permanent credit, so the buffer the map keeps is
+    /// not charged twice.
     fn local_keyed(
         &self,
+        // Parameters drop in reverse order, so on every early return the key buffer
+        // is freed before the carried credit that pays for it.
+        mut carried: Option<Held>,
         key: Vec<u8>,
         term: LocalTerm,
         strict: bool,
-        mut carried: Option<Held>,
     ) -> Result<u64, BudgetFailure> {
         loop {
             let (n, cap, len, grow, bytes) = {
@@ -554,13 +563,13 @@ impl Terms {
             .checked_mul(8)
             .and_then(|n| n.checked_add(3))
             .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
-        let _temporary = Held::try_new_exact(&self.budget(), bytes)?;
+        let temporary = Held::try_new_exact(&self.budget(), bytes)?;
         let mut key = Vec::with_capacity(bytes);
         key.extend_from_slice(b"\0sk");
         for a in args {
             key.extend_from_slice(&a.to_le_bytes());
         }
-        self.local_keyed(key, LocalTerm::BNode, true, None)
+        self.local_keyed(Some(temporary), key, LocalTerm::BNode, true)
     }
 
     /// A program-local blank constant cannot be recreated by inserting an RDF blank.

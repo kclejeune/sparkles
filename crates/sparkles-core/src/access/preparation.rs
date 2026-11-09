@@ -211,8 +211,8 @@ impl Preparation {
             return Err(Error::Timeout);
         }
         // Charge the Arc allocations this root makes: its Inner, which holds the
-        // control inline, and a new grant only when it creates one. The cancel
-        // flag and an existing grant are shared, not allocated here.
+        // control inline, a cancel flag when the caller gave none, and a new grant
+        // only when it creates one. A given flag and grant are shared.
         fn arc_bytes<T>() -> Result<u64> {
             let counters = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>();
             let (layout, _) = counters
@@ -222,6 +222,11 @@ impl Preparation {
                 .map_err(|_| Error::invalid("receiving root header size overflow"))
         }
         let mut bytes = arc_bytes::<Inner>()?;
+        if opts.cancel.is_none() {
+            bytes = bytes
+                .checked_add(arc_bytes::<std::sync::atomic::AtomicBool>()?)
+                .ok_or_else(|| Error::invalid("receiving root header size overflow"))?;
+        }
         if opts.grant.is_none() && opts.pool.is_some() {
             bytes = bytes
                 .checked_add(arc_bytes::<crate::sparql::pool::PoolGrant>()?)

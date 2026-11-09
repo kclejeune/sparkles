@@ -1939,6 +1939,46 @@ fn graph_vec_room<T>(ctx: &Ctx, held: &ctx::Charge<'_>, values: &mut Vec<T>) -> 
     held.resize(held.bytes() - (old * std::mem::size_of::<T>()) as u64)?;
     Ok(())
 }
+/// The buckets hashbrown allocates for a table that must hold `items`, following
+/// its `capacity_to_buckets`.
+fn set_buckets(items: usize) -> Option<usize> {
+    if items < 4 {
+        Some(4)
+    } else if items < 8 {
+        Some(8)
+    } else {
+        items
+            .checked_mul(8)
+            .map(|n| n / 7)?
+            .checked_next_power_of_two()
+    }
+}
+/// The buckets of an allocated table with `capacity`, the inverse of hashbrown's
+/// `bucket_mask_to_capacity`, which gives `buckets - 1` below 8 buckets and 7/8 of
+/// them above. A table with no capacity has no allocation.
+fn set_buckets_of(capacity: usize) -> Option<usize> {
+    if capacity == 0 {
+        Some(0)
+    } else if capacity < 8 {
+        capacity.checked_add(1)?.checked_next_power_of_two()
+    } else {
+        (capacity / 7).checked_mul(8)?.checked_next_power_of_two()
+    }
+}
+/// The allocation of a hashbrown table of `T` with `buckets`: the values rounded up
+/// to the control alignment, then one control byte per bucket and one trailing group.
+/// A group of 16 bytes is exact with SSE2 and an upper bound for 8-byte groups.
+fn set_table_bytes<T>(buckets: usize) -> Option<u64> {
+    if buckets == 0 {
+        return Some(0);
+    }
+    const GROUP: usize = 16;
+    let align = std::mem::align_of::<T>().max(GROUP);
+    let values = buckets
+        .checked_mul(std::mem::size_of::<T>())?
+        .checked_next_multiple_of(align)?;
+    u64::try_from(values.checked_add(buckets)?.checked_add(GROUP)?).ok()
+}
 fn graph_set_room<T: std::hash::Hash + Eq>(
     ctx: &Ctx,
     held: &ctx::Charge<'_>,
@@ -1948,40 +1988,49 @@ fn graph_set_room<T: std::hash::Hash + Eq>(
     if values.len() < values.capacity() {
         return Ok(());
     }
-    let slots = values
-        .len()
+    // The sets are insert-only, so a full table resizes to hold one more item than
+    // its capacity, and the old and new tables coexist while it moves.
+    let bytes = values
+        .capacity()
         .checked_add(1)
-        .and_then(|n| n.checked_mul(8))
-        .and_then(usize::checked_next_power_of_two)
-        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
-    let bytes = slots
-        .checked_mul(std::mem::size_of::<T>() + std::mem::align_of::<T>() + 1)
-        .and_then(|n| n.checked_add(128))
-        .and_then(|n| u64::try_from(n).ok())
+        .and_then(set_buckets)
+        .and_then(set_table_bytes::<T>)
         .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
     held.add(bytes)?;
     values
         .try_reserve(1)
         .map_err(|_| ctx.memory_exceeded(bytes))?;
-    if values.capacity() > slots {
+    let actual = set_buckets_of(values.capacity())
+        .and_then(set_table_bytes::<T>)
+        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+    if actual > bytes {
         return Err(Error::invalid("graph set exceeds admission"));
     }
-    // The old and new tables coexisted during the reserve, which the bound covered.
-    // Keep only the new table's actual buckets: capacity is 7/8 of a power-of-two
-    // bucket count, with one control byte per bucket and a group of slack.
-    let buckets = (values.capacity().saturating_mul(8) / 7)
-        .saturating_add(1)
-        .checked_next_power_of_two()
-        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
-    let actual = buckets
-        .checked_mul(std::mem::size_of::<T>() + 1)
-        .and_then(|n| n.checked_add(16 + std::mem::align_of::<T>()))
-        .and_then(|n| u64::try_from(n).ok())
-        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?
-        .min(bytes);
+    // The old table is freed, and the new one keeps its actual allocation.
     held.resize(held.bytes() - *storage - (bytes - actual))?;
     *storage = actual;
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn graph_set_charge_is_its_table_allocation() {
+    use crate::test_alloc::record_largest;
+    let mut set: FxHashSet<u64> = FxHashSet::default();
+    for n in 0..3000u64 {
+        if set.len() == set.capacity() {
+            let bound = set_buckets(set.capacity() + 1)
+                .and_then(set_table_bytes::<u64>)
+                .unwrap();
+            let largest = record_largest(|| set.reserve(1));
+            let actual = set_buckets_of(set.capacity())
+                .and_then(set_table_bytes::<u64>)
+                .unwrap();
+            assert_eq!(actual, largest as u64, "capacity {}", set.capacity());
+            assert_eq!(bound, actual, "capacity {}", set.capacity());
+        }
+        set.insert(n);
+    }
 }
 
 fn construct(

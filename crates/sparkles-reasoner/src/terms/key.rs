@@ -36,10 +36,10 @@ impl WorkingKey {
         let Self { bytes, _held } = self;
         // The key's own credit pays for the buffer the map keeps.
         terms.local_keyed(
+            Some(_held),
             bytes,
             super::LocalTerm::Key(Vec::new()),
             strict,
-            Some(_held),
         )
     }
 }

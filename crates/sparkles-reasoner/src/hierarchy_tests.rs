@@ -169,3 +169,47 @@ fn term_payloads_drop_before_parent_credit() {
     drop(budget);
     assert_eq!(owned.load(Ordering::SeqCst), 0);
 }
+
+/// A key or skolem buffer that moves into the term table is charged once: the
+/// caller's temporary credit becomes part of the permanent charge, so interning
+/// leaves no transient peak of a second key above what it keeps.
+#[test]
+fn interned_buffers_are_charged_once() {
+    let store = Store::in_memory(StoreOptions::default());
+    let terms = Terms::new(store.snapshot());
+    let budget = Budget::unlimited();
+    terms.set_budget(&budget).unwrap();
+    // A first small key takes the map's and table's first growth.
+    terms.try_id_for_key(b"\"warm").unwrap();
+    const KEY: usize = 1 << 16;
+    let mut key = vec![b'x'; KEY];
+    key[0] = b'"';
+    let before = budget.used();
+    let id = terms.try_id_for_key(&key).unwrap();
+    let kept = budget.used() - before;
+    assert!(
+        kept >= 2 * KEY,
+        "the map key and the table copy are kept: {kept}"
+    );
+    assert!(
+        budget.peak() < budget.used() + KEY / 2,
+        "the moved key was charged twice: peak {} used {}",
+        budget.peak(),
+        budget.used()
+    );
+    // Found again, the lookup releases its temporary and keeps nothing.
+    let used = budget.used();
+    assert_eq!(terms.try_id_for_key(&key).unwrap(), id);
+    assert_eq!(budget.used(), used);
+
+    let args = vec![7u64; KEY / 8];
+    let used = budget.used();
+    terms.try_skolem(&args).unwrap();
+    assert!(budget.used() - used >= KEY);
+    assert!(
+        budget.peak() < budget.used() + KEY / 2,
+        "the moved skolem key was charged twice: peak {} used {}",
+        budget.peak(),
+        budget.used()
+    );
+}

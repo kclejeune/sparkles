@@ -191,3 +191,75 @@ fn compiled_parent_refusal_is_not_a_skipped_rule_warning() {
     drop(budget);
     assert_eq!(pool.granted(), 0);
 }
+
+/// A rule that compiles is not charged for error messages it never makes: a long
+/// variable name is charged where the compiled rule keeps it, and not again for the
+/// unbound-head message that only a failing rule formats.
+#[test]
+fn compilation_charges_no_unmade_error_messages() {
+    const LEN: usize = 1 << 16;
+    let name = "v".repeat(LEN);
+    let var = |s: &str| Node::Var(s.into());
+    let rule = Rule {
+        name: Some("long-variable".into()),
+        body: vec![Clause::Triple(TriplePattern {
+            subject: var(&name),
+            predicate: var("p"),
+            object: var("o"),
+        })],
+        head: vec![Clause::Triple(TriplePattern {
+            subject: var("o"),
+            predicate: var("p"),
+            object: var(&name),
+        })],
+        direction: Direction::Forward,
+        line: 1,
+    };
+    let terms = terms();
+    let budget = terms.budget();
+    let before = budget.used();
+    let compiled = compile(&[rule], &terms, &mut WorkingWarnings::new(&budget)).unwrap();
+    assert_eq!(compiled.len(), 1);
+    let peak = budget.peak() - before;
+    assert!(
+        peak < 3 * LEN,
+        "compilation charged {peak} for two {LEN}-byte names"
+    );
+    drop(compiled);
+    assert_eq!(budget.used(), before);
+}
+
+/// A rule that fails charges its message while it is formatted and releases it after
+/// the warning is recorded.
+#[test]
+fn a_skipped_rule_charges_its_message() {
+    const LEN: usize = 1 << 16;
+    let rule = Rule {
+        name: Some("unknown-builtin".into()),
+        body: vec![
+            triple(false),
+            Clause::Builtin(crate::parser::BuiltinCall {
+                name: "u".repeat(LEN),
+                args: vec![Node::Var("s".into())],
+            }),
+        ],
+        head: vec![triple(true)],
+        direction: Direction::Forward,
+        line: 1,
+    };
+    let terms = terms();
+    let budget = terms.budget();
+    let before = budget.used();
+    let mut warnings = WorkingWarnings::new(&budget);
+    let compiled = compile(&[rule], &terms, &mut warnings).unwrap();
+    assert!(compiled.is_empty());
+    // The kept builtin name, the message and the recorded warning were live at once.
+    assert!(
+        budget.peak() - before >= 3 * LEN,
+        "peak {}",
+        budget.peak() - before
+    );
+    drop(compiled);
+    drop(warnings);
+    assert_eq!(budget.used(), before);
+}

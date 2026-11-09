@@ -22,7 +22,6 @@ pub(super) struct Shape {
     pub vars: usize,
     pub var_bytes: usize,
     pub builtin_bytes: usize,
-    pub errors: usize,
 }
 impl Shape {
     fn node(&mut self, node: &Node) -> Result<(), BudgetFailure> {
@@ -31,13 +30,7 @@ impl Shape {
                 self.vars = plus(self.vars, 1)?;
                 self.var_bytes = plus(self.var_bytes, v.len())?;
             }
-            Node::Functor(name, args) => {
-                self.errors = plus(
-                    self.errors,
-                    crate::budget::format_len(format_args!(
-                        "functor term '{name}(…)' is not supported by forward materialization"
-                    ))?,
-                )?;
+            Node::Functor(_, args) => {
                 for node in args {
                     self.node(node)?;
                 }
@@ -66,43 +59,6 @@ impl Shape {
                     for n in &b.args {
                         shape.node(n)?;
                     }
-                    // Each possible error has a literal and a borrowed lexical
-                    // input; formatting itself uses exactly its counted length.
-                    shape.errors = plus(
-                        shape.errors,
-                        crate::budget::format_len(format_args!(
-                            "unknown or unsupported builtin '{}'",
-                            b.name
-                        ))?,
-                    )?;
-                    shape.errors = plus(
-                        shape.errors,
-                        crate::budget::format_len(format_args!(
-                            "wildcard as input of builtin '{}'",
-                            b.name
-                        ))?,
-                    )?;
-                    shape.errors = plus(
-                        shape.errors,
-                        crate::budget::format_len(format_args!("{} expects 3 arguments", b.name))?,
-                    )?;
-                    shape.errors = plus(
-                        shape.errors,
-                        crate::budget::format_len(format_args!(
-                            "{}: wrong number of arguments ({})",
-                            b.name,
-                            b.args.len()
-                        ))?,
-                    )?;
-                    if let Some(Node::Const(Term::Literal(l))) = b.args.get(1) {
-                        shape.errors = plus(
-                            shape.errors,
-                            crate::budget::format_len(format_args!(
-                                "invalid regex '{}'",
-                                l.value()
-                            ))?,
-                        )?;
-                    }
                 }
             }
             shape.clauses = plus(shape.clauses, 1)?;
@@ -118,7 +74,6 @@ impl Shape {
             vars: plus(self.vars, other.vars)?,
             var_bytes: plus(self.var_bytes, other.var_bytes)?,
             builtin_bytes: plus(self.builtin_bytes, other.builtin_bytes)?,
-            errors: plus(self.errors, other.errors)?,
         })
     }
     /// The bytes one compiled rule keeps, which accumulate over the rules, and the
@@ -151,18 +106,7 @@ impl Shape {
         b.vector(plus(self.atoms, self.builtins)?, size_of::<Step>())?;
         b.vector(self.atoms, size_of::<usize>())?; // remaining atoms
         b.vector(self.builtins, size_of::<usize>())?; // remaining calls
-        b.raw(plus(self.errors, head.errors)?)?;
-        b.raw(plus(self.var_bytes, head.var_bytes)?)?;
-        b.raw(plus(
-            "head variable ? is not bound by the body".len(),
-            plus(self.var_bytes, head.var_bytes)?,
-        )?)?;
-        for literal in [
-            "wildcard in a head triple",
-            "a builtin's input variables are never bound by the body",
-        ] {
-            b.raw(literal.len())?;
-        }
+        // A rule that fails charges its message where the compiler formats it.
         Ok((kept.0, b.0))
     }
 }
