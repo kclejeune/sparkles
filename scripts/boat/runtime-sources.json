@@ -26,9 +26,9 @@
       "sha256": "283d4d66cee8c6a4db5ad82033f7bdf5580cbb9273696af4b62b9096ff05ddc6"
     },
     "diagnostic-probe.py": {
-      "bytes": 12145,
+      "bytes": 12352,
       "mode": 420,
-      "sha256": "7abb7cf0d61039bf7277190734847f1f3d1a1a1a800e38603df834a447bc01ed"
+      "sha256": "4938e969f69d77627ea6c93e0283399ddd00efa2a2c1c83f6c884439fa4f0900"
     },
     "job-closure.FALSE.json": {
       "bytes": 269,

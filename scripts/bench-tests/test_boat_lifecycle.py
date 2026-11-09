@@ -1654,3 +1654,24 @@ class UntrackedRoundOne(UntrackedDiagnostics):
         try:self.assertEqual(controller.remote_entry('/home/user'),['/usr/bin/env','-C','/home/user','/usr/bin/python3','-I','-B','-'])
         finally:common._PROFILE=saved
         self.assertIn("remote_entry(profile['worker_home'])",(Path(__file__).resolve().parents[1]/'boat/job_environment.py').read_text())
+
+
+class UntrackedRoundTwo(unittest.TestCase):
+    """Newlines in names, the exact byte cap and names at the cut."""
+    def test_names_with_newlines_are_still_matched(self):
+        d=diagnostic_module()
+        for name in ('secret\nDO_NOT_COPY','config/tokens\n/DO_NOT_COPY','.env.prod\nDO_NOT_COPY'):
+            self.assertTrue(d.credential_like(name),repr(name))
+        self.assertFalse(d.credential_like('plain\nname.txt'))
+
+    def test_the_cap_keeps_exit_status_and_whole_names(self):
+        import shutil as sh
+        d=diagnostic_module();sh_=sh.which('sh')
+        run=lambda script,limit:d.bounded_git([sh_,'-c',script],limit,10)
+        self.assertEqual(run("printf 'abcd'; exit 7",4),(b'abcd',False,7))
+        self.assertEqual(run("printf 'abcd'",4),(b'abcd',False,0))
+        self.assertEqual(run("printf 'abcde'",4),(b'abcd',True,None))
+        self.assertEqual(run("printf 'ab'; exit 3",4),(b'ab',False,3))
+        self.assertEqual(d.listed_names(b'a\0b\0',True),[b'a',b'b'])
+        self.assertEqual(d.listed_names(b'a\0bc',True),[b'a'])
+        self.assertEqual(d.listed_names(b'a\0b',False),[b'a',b'b'])

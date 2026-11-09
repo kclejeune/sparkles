@@ -157,7 +157,7 @@ UNTRACKED_MAX=200
 UNTRACKED_REPOS_MAX=4
 UNTRACKED_BYTES=4*1024*1024
 # Matched against every component of a path, so a credential-like parent hides its children.
-CREDENTIAL=re.compile(r'(\.env(\..*)?|\.netrc|\.npmrc|\.pypirc|\.pgpass|\.git-credentials|\.ssh|\.gnupg|\.aws|\.docker|\.kube|id_(rsa|dsa|ecdsa|ed25519).*|.*\.(pem|key|p12|pfx|jks|keystore|kdbx|gpg|asc|ovpn)|.*(credential|secret|token|passw|apikey|api-key|api_key|private).*)',re.I)
+CREDENTIAL=re.compile(r'(\.env(\..*)?|\.netrc|\.npmrc|\.pypirc|\.pgpass|\.git-credentials|\.ssh|\.gnupg|\.aws|\.docker|\.kube|id_(rsa|dsa|ecdsa|ed25519).*|.*\.(pem|key|p12|pfx|jks|keystore|kdbx|gpg|asc|ovpn)|.*(credential|secret|token|passw|apikey|api-key|api_key|private).*)',re.I|re.S)
 def credential_like(name):return any(CREDENTIAL.fullmatch(part) for part in name.split('/') if part)
 def bounded_git(argv,limit,seconds):
     """Git's stdout up to limit bytes, and whether it was cut there; the child is always reaped."""
@@ -173,8 +173,9 @@ def bounded_git(argv,limit,seconds):
                 if not sel.select(min(left,1.0)):continue
                 data=os.read(child.stdout.fileno(),65536)
                 if not data:break
-                chunks.append(data[:limit-size]);size+=len(data)
-                if size>=limit:cut=True;break
+                chunks.append(data[:max(0,limit-size)]);size+=len(data)
+                # Only output past the limit is a cut; exactly the limit reads to EOF.
+                if size>limit:cut=True;break
         code=None if cut else child.wait(max(0.1,end-time.monotonic()))
         return b''.join(chunks),cut,code
     finally:
@@ -183,6 +184,11 @@ def bounded_git(argv,limit,seconds):
             try:child.wait(5)
             except subprocess.TimeoutExpired:pass
         child.stdout.close()
+def listed_names(data,cut):
+    """The NUL-terminated names of a listing. A cut listing drops only a partial last name."""
+    parts=data.split(b'\0')
+    if cut and not data.endswith(b'\0'):parts=parts[:-1]
+    return [n for n in parts if n]
 def untracked(repos):
     out={}
     for repo in [r for r in repos if isinstance(r,str) and r.startswith('/')][:UNTRACKED_REPOS_MAX]:
@@ -193,9 +199,7 @@ def untracked(repos):
                                        'ls-files','--others','--exclude-standard','--directory','-z'],UNTRACKED_BYTES,20)
             if code:row['unread']='git exit %d'%code;out[text(repo,200)]=row;continue
             row['truncated']=cut
-            names=[n for n in data.split(b'\0') if n]
-            # A cut listing ends in a partial name, which is not reported.
-            if cut and names:names=names[:-1]
+            names=listed_names(data,cut)
             row['total']=len(names)
             for raw in names:
                 name=raw.decode('utf-8','replace')
