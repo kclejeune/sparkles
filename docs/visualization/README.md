@@ -669,6 +669,8 @@ with the files it names, and fetches or refreshes an import. A catalog load repl
 graph of each `uri` entry whose file is chosen with it, in one commit, and maps an entry
 whose `uri` is an absolute IRI to that graph. It lists the entries it skipped, such as
 `rewriteURI`, `nextCatalog`, an entry under an `xml:base` and a file that was not chosen.
+Choosing the catalog's folder instead of single files keeps each file's path below the
+folder, which an entry such as `sub/lib.ttl` needs.
 **Fetch into graph** downloads an `http` or `https` import through the server's outbound
 policy into the graph its IRI names, in one commit, and **Refresh** downloads it again. A
 refreshed document without blank nodes that equals the graph makes no commit. Readers and
@@ -677,7 +679,8 @@ only the entries whose graph they can read.
 
 The **Imported axioms** switch beside the graph picker includes or excludes the axioms of
 the imported graphs in every view of the editor, and the page keeps the choice in its URL.
-Edits write to the selected graph either way. Reads never fetch, and item 559 covers
+Edits write to the selected graph either way. Turning the switch or changing the map reads
+the trees, the filtered trees and the frame again. Reads never fetch, and item 559 covers
 fetching during a read. Reasoning runs keep their own location mapping, which item 772
 connects to the import map.
 

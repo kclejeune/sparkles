@@ -94,7 +94,8 @@ tag of its revision. A caller with `admin` on the dataset sees every entry. Any 
 caller sees only the entries whose graph holds triples that the caller's masked view of
 the branch shows, so a graph whose triples are all hidden counts as absent.
 `PATCH /$/ontology/{ds}/imports` sets and removes entries with `admin` and an `If-Match`
-that names the map's revision. Every write of the map holds the dataset's import-map
+that names the map's revision. A change without that header or with `*` is refused with
+`428`, and a set value may be a whole entry so that an unwritten entry can be replayed. Every write of the map holds the dataset's import-map
 lock, so map writes are serialized.
 
 ### Resolution order
@@ -478,15 +479,18 @@ The catalog reader takes `uri` entries only. The editor offers file choice for a
 files, keyed by file name or by the path below a chosen folder.
 
 Unit tests cover the resolution order, readable and empty candidates, the resource union,
-the closure's cycles, the digest, the catalog reader's refusals of document types, entity
-references, deep nesting and leaving paths, the catalog plan and the map's bounds. Router
-tests cover the map with its revisions and the changed tags, a digest-bearing `If-Match`,
+the closure's cycles and its edges past the import bound, the digest, blank nodes in triple
+terms and composite literals, the catalog reader's refusals of document types, entity
+references, deep nesting, truncated documents, skipped entries over the bound and leaving
+paths, the catalog plan and the map's bounds. Router
+tests cover the map with its required revisions, replayed entries and the changed tags, a digest-bearing `If-Match`,
 a catalog that loads, maps, skips and then changes nothing, a refused catalog and file that
 change nothing, a protected branch, a fetch and an unchanged refresh, a refused file
 location, an outbound refusal that changes nothing, and under auth the admin requirement
-and the reader projection. Playwright covers the closure with a cycle and an unresolved
-import, a map entry, a catalog load, a fetch, the switch, a reader at phone width and a
-protected branch against the mock, and against a real server a map entry that makes no
+and the reader projection, which hides entries whose graph is empty on the branch. Playwright covers the closure with a cycle and an unresolved
+import, a map entry, a catalog load, a catalog folder with a file in a subfolder, a fetch,
+the switch and a map change that read the tree, the filtered tree and the frame again, a
+reader at phone width and a protected branch against the mock, and against a real server a map entry that makes no
 commit, a catalog on a branch that main does not see, a refused fetch, a protected branch
 and a writer who is not an administrator. Item 772 connects reasoning runs to the map, item
 782 covers more of the XML catalog standard, and item 783 covers per-branch maps.

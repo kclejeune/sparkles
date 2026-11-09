@@ -2543,7 +2543,8 @@ graphs that a resource catalog vocabulary lists in this dataset when one of its 
 is the IRI, or the IRI followed by `#` or `/`. A candidate counts only when it holds triples
 the caller can read. The summary's `closure` lists one edge per `owl:imports` triple, with
 `from`, `iri`, `graphs`, `via` (`map`, `graph` or `resource`, or `null` when unresolved)
-and `cycle`. The entity tags of the summary, the hierarchy, the individuals and the term
+and `cycle`. An import past the 100 that a read follows keeps its edge, unresolved, and
+the read's warnings say that it was not followed. The entity tags of the summary, the hierarchy, the individuals and the term
 reads add a digest of the map and vocabulary entries after their format, as in
 `W/"…:12:owl.0123456789abcdef"`, and such a tag still satisfies an edit's `If-Match` at
 that commit.
@@ -2556,7 +2557,10 @@ reader sees those whose graph holds triples it can read. The map belongs to the 
 so every branch shares it. It holds at most 4,096 entries.
 
 `PATCH /$/ontology/{ds}/imports` takes `{"set": {IRI: graph}, "remove": [IRI]}` with
-`admin`, and an `If-Match` that names an older revision is `412`.
+`admin`. A graph given as a string makes a manual entry, and a set value can instead be a
+whole entry, such as one that an `import-map-unwritten` answer lists, which is kept as
+given. The `If-Match` header must name the map's revision. A change without it or with `*`
+is `428`, and one that names an older revision is `412`.
 
 `POST /$/ontology/{ds}/imports/catalog` takes a multipart body with a `catalog` part, an
 OASIS XML catalog of at most 1 MiB and 1,000 entries, and one part per file it names,
@@ -2565,7 +2569,10 @@ replaces the graph of its `name` with that file, and one whose `uri` is an absol
 maps its `name` to that graph. The files load in one commit on the branch, and the entries
 are then written to the map. The answer lists `loaded`, `entries` and `skipped` with the
 reasons, such as an unsupported entry type, an entry under an `xml:base` or a missing file.
-A document type or entity declaration is refused, and nothing outside the body is read.
+Skipped entries count toward the 1,000. A catalog that is not well-formed XML, such as one
+that ends inside an element, or that has a document type or entity declaration is refused,
+and nothing outside the body is read. Blank nodes keep their identity within each file,
+also inside triple terms and composite literals, and stay distinct between files.
 
 `POST /$/ontology/{ds}/imports/fetch` takes `{"iri", "location"?, "graph"?}` with `admin`.
 It downloads the location, which defaults to the entry's location and then to the IRI and
