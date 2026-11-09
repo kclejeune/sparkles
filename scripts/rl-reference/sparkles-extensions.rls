@@ -1,0 +1,88 @@
+% The triples and rules that Sparkles' owl-rl profile adds to the OWL 2 RL/RDF rules, for
+% the aligned comparison of scripts/rl-reference/compare.sh. Section 4.3 of OWL 2 Profiles
+% lets an implementation add axiomatic triples of RDF, RDFS and the OWL vocabulary and
+% entailment rules of RDFS. owl-rl.rules in crates/sparkles-reasoner/rules adds those below,
+% and this file restates them for Nemo, so that the closures can be compared whole. The
+% OWL 2 RL rules themselves stay those of owl2rl.rls, written from the recommendation.
+% scripts/rl-reference/README.md lists each addition. The file is appended to owl2rl.rls,
+% whose relations it uses.
+
+% ---------------------------------------------------------------- axiomatic triples
+
+t(rdf:type, rdfs:range, rdfs:Class) .
+t(rdfs:Resource, rdf:type, rdfs:Class) .
+t(rdfs:Literal, rdf:type, rdfs:Class) .
+t(rdf:nil, rdf:type, rdf:List) .
+t(rdfs:subPropertyOf, rdfs:domain, rdf:Property) .
+t(rdfs:subClassOf, rdfs:domain, rdfs:Class) .
+t(rdfs:domain, rdfs:domain, rdf:Property) .
+t(rdfs:range, rdfs:domain, rdf:Property) .
+t(rdfs:subPropertyOf, rdfs:range, rdf:Property) .
+t(rdfs:subClassOf, rdfs:range, rdfs:Class) .
+t(rdfs:domain, rdfs:range, rdfs:Class) .
+t(rdfs:range, rdfs:range, rdfs:Class) .
+t(rdfs:isDefinedBy, rdfs:subPropertyOf, rdfs:seeAlso) .
+t(rdfs:Datatype, rdfs:subClassOf, rdfs:Class) .
+
+t(owl:FunctionalProperty, rdfs:subClassOf, rdf:Property) .
+t(owl:ObjectProperty, rdfs:subClassOf, rdf:Property) .
+t(owl:DatatypeProperty, rdfs:subClassOf, rdf:Property) .
+t(owl:AnnotationProperty, rdfs:subClassOf, rdf:Property) .
+t(owl:InverseFunctionalProperty, rdfs:subClassOf, owl:ObjectProperty) .
+t(owl:TransitiveProperty, rdfs:subClassOf, owl:ObjectProperty) .
+t(owl:SymmetricProperty, rdfs:subClassOf, owl:ObjectProperty) .
+t(owl:AsymmetricProperty, rdfs:subClassOf, owl:ObjectProperty) .
+t(owl:ReflexiveProperty, rdfs:subClassOf, owl:ObjectProperty) .
+t(owl:IrreflexiveProperty, rdfs:subClassOf, owl:ObjectProperty) .
+t(owl:Class, rdfs:subClassOf, rdfs:Class) .
+t(owl:Restriction, rdfs:subClassOf, owl:Class) .
+t(owl:equivalentClass, rdfs:domain, owl:Class) .
+t(owl:equivalentClass, rdfs:range, owl:Class) .
+t(owl:disjointWith, rdfs:domain, owl:Class) .
+t(owl:disjointWith, rdfs:range, owl:Class) .
+t(owl:onProperty, rdfs:domain, owl:Restriction) .
+t(owl:onProperty, rdfs:range, rdf:Property) .
+t(owl:intersectionOf, rdfs:domain, owl:Class) .
+t(owl:unionOf, rdfs:domain, owl:Class) .
+t(owl:oneOf, rdfs:domain, owl:Class) .
+t(owl:imports, rdfs:domain, owl:Ontology) .
+t(owl:imports, rdfs:range, owl:Ontology) .
+
+t(owl:sameAs, rdf:type, owl:SymmetricProperty) .
+t(owl:differentFrom, rdf:type, owl:SymmetricProperty) .
+t(owl:disjointWith, rdf:type, owl:SymmetricProperty) .
+t(owl:inverseOf, rdf:type, owl:SymmetricProperty) .
+t(owl:equivalentClass, rdf:type, owl:SymmetricProperty) .
+t(owl:equivalentProperty, rdf:type, owl:SymmetricProperty) .
+
+% ---------------------------------------------------------------- RDFS rules
+
+% rdf1: every predicate is a property
+t(?p, rdf:type, rdf:Property) :- t(?x, ?p, ?y) .
+% rdfs10 and rdfs8: every class is a subclass of itself and of rdfs:Resource
+t(?c, rdfs:subClassOf, ?c), t(?c, rdfs:subClassOf, rdfs:Resource) :- t(?c, rdf:type, rdfs:Class) .
+% an OWL class, a restriction and an intersection are classes
+t(?c, rdf:type, rdfs:Class) :- t(?c, rdf:type, owl:Class) .
+t(?c, rdf:type, owl:Class) :- t(?c, rdf:type, owl:Restriction) .
+t(?c, rdf:type, owl:Class) :- intersectionOf(?c, ?l) .
+
+% ---------------------------------------------------------------- inverse properties
+
+% owl:inverseOf is symmetric
+t(?q, owl:inverseOf, ?p) :- inverseOf(?p, ?q), ~isLit(?q) .
+% the inverse of a functional property is inverse functional, and the other way round
+t(?q, rdf:type, owl:InverseFunctionalProperty) :- inverseOf(?p, ?q), t(?p, rdf:type, owl:FunctionalProperty), ~isLit(?q) .
+t(?q, rdf:type, owl:FunctionalProperty) :- inverseOf(?p, ?q), t(?p, rdf:type, owl:InverseFunctionalProperty), ~isLit(?q) .
+% the range of a property is the domain of its inverse, and the other way round
+t(?q, rdfs:domain, ?c) :- inverseOf(?p, ?q), range(?p, ?c), ~isLit(?q) .
+t(?q, rdfs:range, ?c) :- inverseOf(?p, ?q), domain(?p, ?c), ~isLit(?q) .
+
+% ---------------------------------------------------------------- functional subproperties
+
+t(?q, rdf:type, owl:FunctionalProperty) :- t(?p, rdf:type, owl:FunctionalProperty), subPropertyOf(?q, ?p) .
+t(?q, rdf:type, owl:InverseFunctionalProperty) :- t(?p, rdf:type, owl:InverseFunctionalProperty), subPropertyOf(?q, ?p) .
+
+% ---------------------------------------------------------------- equality of classes and properties
+
+t(?x, owl:equivalentClass, ?y) :- t(?x, owl:sameAs, ?y), ?x != ?y, t(?x, rdf:type, owl:Class) .
+t(?x, owl:equivalentProperty, ?y) :- t(?x, owl:sameAs, ?y), ?x != ?y, t(?x, rdf:type, owl:ObjectProperty) .

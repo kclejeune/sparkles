@@ -1,0 +1,5 @@
+# The known differences between Sparkles' owl-rl materialization and the reference
+# (scripts/rl-reference/compare.sh). Each row is a side (sparkles or reference), a Python
+# regular expression over the N-Triples line of a triple that only that side derives, and
+# the explanation, separated by tabs. The aligned comparison of LUBM, OWL2Bench and the
+# W3C OWL 2 RL test cases has no difference, so the table has no row.

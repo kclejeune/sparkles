@@ -10,7 +10,7 @@
 nixpkg() {
   local package=$1 installable
   case $package in
-    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree | robot | elk | hermit | whelk | konclude)
+    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree | robot | elk | hermit | whelk | konclude | nemo)
       installable="$ROOT#$package"
       ;;
     *) installable="nixpkgs#$package" ;;
@@ -42,7 +42,7 @@ nixexe() {
 nixbin() {
   local package=$1 binary=$2
   case $package in
-    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree | robot | elk | hermit | whelk | konclude) ;;
+    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree | robot | elk | hermit | whelk | konclude | nemo) ;;
     *)
       if command -v "$binary" > /dev/null; then
         command -v "$binary"

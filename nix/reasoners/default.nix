@@ -1,7 +1,8 @@
 # The reference reasoners that docs/benchmarks/el-classification compares the classifier of
-# sparkles-owl with: ROBOT, ELK, HermiT, Whelk and Konclude. Each comes from a
-# checksum-pinned release, the Java tools from Maven Central or the project's GitHub
-# releases and Konclude from its Linux x86_64 release binary. They are benchmark-only
+# sparkles-owl with: ROBOT, ELK, HermiT, Whelk and Konclude, and Nemo, the reference OWL 2
+# RL materializer of docs/benchmarks/reasoning. Each comes from a checksum-pinned release,
+# the Java tools from Maven Central or the project's GitHub releases, Konclude from its
+# Linux x86_64 release binary and Nemo from its release binaries. They are benchmark-only
 # packages and never ship with Sparkles.
 #
 # The Java packages carry a wrapper that names the JDK below, so a systemd unit with a
@@ -128,6 +129,22 @@ let
       '';
 
   elkJars = pinned ./elk.tsv;
+
+  # Nemo 0.10.1's release archives, with the SHA-256 that each archive's .sha256sum names.
+  nemoReleases = {
+    x86_64-linux = {
+      target = "x86_64-unknown-linux-gnu";
+      hash = "sha256-L2WcOAP6e5pM4clEmAMDjgRWLXTYPlzTJcykO0/N1vk=";
+    };
+    aarch64-linux = {
+      target = "aarch64-unknown-linux-gnu";
+      hash = "sha256-jGtf9BjbpZmm/comjovbGLit6I1s5rbFTqZN3iTPyPo=";
+    };
+    aarch64-darwin = {
+      target = "aarch64-apple-darwin";
+      hash = "sha256-Sx6an0ajFauMWQ+wEky0cMM7UpO586Yd1TIlsx7XnxY=";
+    };
+  };
 in
 {
   # ELK 0.6.0 on OWL API 5.1.20 (nix/reasoners/elk.tsv).
@@ -235,6 +252,54 @@ in
         EOF
         chmod +x $out/bin/robot
       '';
+}
+// lib.optionalAttrs (nemoReleases ? ${stdenv.hostPlatform.system}) {
+  # Nemo's release binary, the reference OWL 2 RL materializer of docs/benchmarks/reasoning
+  # (scripts/rl-reference). Nemo builds with a nightly Rust toolchain, so the package takes
+  # the project's release archive for the host, pinned by the hash that the release
+  # publishes beside it. The Linux binaries link only the C library and libgcc_s.
+  nemo = stdenv.mkDerivation (finalAttrs: {
+    pname = "nemo";
+    version = "0.10.1";
+
+    src = fetchurl {
+      url = "https://github.com/knowsys/nemo/releases/download/v${finalAttrs.version}/nemo_v${finalAttrs.version}_${
+        nemoReleases.${stdenv.hostPlatform.system}.target
+      }.tar.gz";
+      hash = nemoReleases.${stdenv.hostPlatform.system}.hash;
+    };
+
+    nativeBuildInputs = lib.optionals stdenv.hostPlatform.isLinux [ autoPatchelfHook ];
+    buildInputs = lib.optionals stdenv.hostPlatform.isLinux [ stdenv.cc.cc.lib ];
+    dontBuild = true;
+    dontStrip = true;
+
+    installPhase = ''
+      runHook preInstall
+      install -Dm755 nmo $out/bin/nmo
+      install -Dm644 -t $out/share/licenses/nemo LICENSE-APACHE LICENSE-MIT
+      install -Dm644 README.md $out/share/doc/nemo/README.md
+      runHook postInstall
+    '';
+
+    doInstallCheck = true;
+    installCheckPhase = ''
+      $out/bin/nmo --version | grep -qx 'nemo-cli ${finalAttrs.version}'
+    '';
+
+    meta = {
+      description = "Nemo, the Datalog rule engine, from its pinned release binary";
+      homepage = "https://github.com/knowsys/nemo";
+      changelog = "https://github.com/knowsys/nemo/releases/tag/v${finalAttrs.version}";
+      license = with lib.licenses; [
+        asl20
+        mit
+      ];
+      sourceProvenance = [ lib.sourceTypes.binaryNativeCode ];
+      platforms = builtins.attrNames nemoReleases;
+      mainProgram = "nmo";
+    };
+  });
 }
 // lib.optionalAttrs (stdenv.hostPlatform.system == "x86_64-linux") {
   # Konclude's release binary, which links Qt statically and the C libraries dynamically.
