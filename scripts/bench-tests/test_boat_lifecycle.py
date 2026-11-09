@@ -1333,6 +1333,38 @@ class Finish(unittest.TestCase):
             with patch.object(controller,'RealIO',return_value=io),self.assertRaises(controller.Refusal):
                 controller.finish_operation(f['operation'],seconds=2)
 
+    def test_a_guard_collected_after_its_clean_exit_is_closed(self):
+        # Item 776. The guard's transient unit is unloaded once it exits cleanly, so a
+        # finish that reads it after the collection sees a not-found unit with no
+        # invocation. That is the original guard's clean exit, not a replacement.
+        with tempfile.TemporaryDirectory()as tmp:
+            f=fixture(Path(tmp));r=f['release'];worker=f['profile']['worker'];now=f['now']
+            from datetime import datetime,timezone
+            iso=lambda t:datetime.fromtimestamp(t,timezone.utc).isoformat().replace('+00:00','Z')
+            safe={'id':worker,'access':'owner','environment':f['profile']['future_environment']['name'],'state':'stopped','type':'large','vcpu':8,'memoryGB':16,
+                  'snapshotAvailable':True,'lastSnapshotStatus':'completed','snapshotCompletedAt':iso(now+2),'stoppedAt':iso(now+2),
+                  'stop':{'id':'stop_fixture','status':'completed','error':None,'forced':False,'endedAt':iso(now+2)}}
+            closed={'worker':worker,'stop_operation':'stop_fixture','safe_info':safe,'stopped_confirmed':True,'owned_metadata_closed':True,'guard_may_exit':True}
+            gone=str(Path(tmp)/'collected-guard-cgroup')
+            def io_with(live):
+                class IO:
+                    def __init__(self):self.t=0;self.records={'closed.json':closed,'stop-intent.json':{'requested_wall':now+1},
+                                                              'guard-loaded.json':{'boot_id':f['qualified']['local_guard']['boot_id'],'loaded':{'InvocationID':'a'*32,'ControlGroup':gone}}}
+                    def mono(self):return self.t
+                    def read(self,n):return self.records[n]
+                    def exists(self,n):return n in self.records
+                    def wait(self,n):self.t+=1
+                    def show(self,u):return dict(live,Id=u)
+                return IO()
+            collected={'LoadState':'not-found','ActiveState':'inactive','SubState':'dead','MainPID':'0','ExecMainStatus':'0','InvocationID':'','ControlGroup':''}
+            with patch.object(controller.Path,'read_text',return_value=f['qualified']['local_guard']['boot_id']+'\n'):
+                result=controller.await_stop(r,io_with(collected),seconds=2)
+                self.assertEqual(result,{'worker':worker,'stopped_confirmed':True,'guard_closed':True,'stop_operation':'stop_fixture'})
+                # A loaded unit with another invocation is still a replacement.
+                for live in (dict(collected,LoadState='loaded',InvocationID='b'*32),dict(collected,LoadState='loaded',ActiveState='active',SubState='running',MainPID='7',InvocationID='b'*32),
+                             dict(collected,LoadState='not-found',ActiveState='active'),dict(collected,InvocationID='b'*32)):
+                    with self.assertRaisesRegex(controller.Refusal,'guard replaced during finish|verified stop not observed'):controller.await_stop(r,io_with(live),seconds=2)
+
 class BoundedFinalizerInterrupt(unittest.TestCase):
     def test_real_interrupts_finish_owned_closure_before_propagating(self):
         from finalizer_interrupt import run

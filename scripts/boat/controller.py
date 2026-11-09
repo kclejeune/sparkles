@@ -957,7 +957,17 @@ def await_stop(r,io,seconds=180):
             request=io.read('stop-intent.json');stop_complete(closed['safe_info'],closed['stop_operation'],request['requested_wall'],r['snapshot_continuity']['snapshot_completed_at'],r['provider_contract']['snapshot_policy'])
             loaded=io.show(r['guard_unit']+'.service');original=io.read('guard-loaded.json')
             need(Path('/proc/sys/kernel/random/boot_id').read_text().strip()==original['boot_id'],'guard boot changed during finish')
-            need(loaded.get('Id')==r['guard_unit']+'.service'and loaded.get('InvocationID')==original['loaded']['InvocationID'],'guard replaced during finish')
+            need(loaded.get('Id')==r['guard_unit']+'.service','guard replaced during finish')
+            # The guard runs as a transient unit without --collect, so systemd unloads it
+            # only after a clean exit; a failed guard stays loaded as failed. A unit that is
+            # no longer loaded, has no invocation and is inactive is the original guard
+            # collected after its clean exit, and its recorded cgroup must be gone or empty.
+            if loaded.get('LoadState')=='not-found' and loaded.get('InvocationID')=='' and loaded.get('ActiveState')=='inactive' and loaded.get('MainPID')=='0':
+                cg=original['loaded'].get('ControlGroup','')
+                root=Path('/sys/fs/cgroup')/cg.lstrip('/') if cg else None
+                need(root is None or not root.exists() or all(not f.read_text().strip() for f in root.rglob('cgroup.procs')),'guard cgroup not empty')
+                return {'worker':worker_id(),'stopped_confirmed':True,'guard_closed':True,'stop_operation':closed['stop_operation']}
+            need(loaded.get('InvocationID')==original['loaded']['InvocationID'],'guard replaced during finish')
             if loaded.get('ActiveState')in('inactive','failed')and loaded.get('MainPID')=='0':
                 need(loaded.get('ExecMainStatus')=='0','guard did not exit cleanly')
                 cg=loaded.get('ControlGroup','')
