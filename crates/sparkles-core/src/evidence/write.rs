@@ -1106,6 +1106,16 @@ const CACHE_ENTRY: u64 = 160;
 /// vector at up to twice the vector's length, and its entry in the caller's B-tree set.
 const IDENTITY_ENTRY: u64 = 160;
 
+/// The bytes a [`Reads`] cache takes once it holds an identity: its first B-tree node, a
+/// root leaf of 456 bytes on 64-bit targets, which can hold fewer entries than the
+/// half-full nodes [`CACHE_ENTRY`] covers. The charge rounds up.
+const CACHE_START: u64 = 1024;
+
+/// The bytes the first returned claim identity of a scan takes beside its entry: the
+/// vector's first allocation of four slots and the caller's set's first leaf, which
+/// coexist while the identities move into the set. The charge rounds up.
+const IDENTITY_START: u64 = 512;
+
 impl<'a> Reads<'a> {
     /// The preparation the reads are charged to.
     pub fn preparation(&self) -> &'a Preparation {
@@ -1130,7 +1140,7 @@ impl<'a> Reads<'a> {
         let entry = iri.len() as u64 + CACHE_ENTRY;
         match self.cached.as_mut() {
             Some(r) => r.grow_by(entry)?,
-            None => self.cached = Some(self.preparation.reserve(entry)?),
+            None => self.cached = Some(self.preparation.reserve(CACHE_START + entry)?),
         }
         self.ids.insert(iri.to_string(), id);
         Ok(id)
@@ -1446,7 +1456,8 @@ impl<'a> Reads<'a> {
             if let Some(n) = self.preparation.with_term(self.snap, s, |t| {
                 Ok(match t {
                     Some(Term::NamedNode(n)) => {
-                        held.grow_by(n.as_str().len() as u64 + IDENTITY_ENTRY)?;
+                        let start = if out.is_empty() { IDENTITY_START } else { 0 };
+                        held.grow_by(start + n.as_str().len() as u64 + IDENTITY_ENTRY)?;
                         Some(n.as_str().to_string())
                     }
                     _ => None,

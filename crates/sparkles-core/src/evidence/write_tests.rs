@@ -341,3 +341,46 @@ fn reads_charge_their_identity_cache() {
     }
     assert!(refused, "20,000 cached identities fit in 1 MiB uncharged");
 }
+
+/// A cache and a scan that hold a single identity charge their containers' first
+/// allocations, which are larger than any one entry's share.
+#[test]
+fn single_identities_charge_their_first_allocations() {
+    use crate::store::{Store, StoreOptions};
+    const LIMIT: u64 = 96 << 10;
+    let s = Store::in_memory(StoreOptions::default());
+    crate::sparql::update::update(
+        &s,
+        "INSERT DATA { GRAPH <urn:g> { <urn:c> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <urn:e> <urn:p> <urn:o> )>> } }",
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    let snap = s.snapshot();
+    // one cached identity keeps at least a root leaf charged
+    let preparation = Preparation::new(crate::task::Control::none(), LIMIT).unwrap();
+    let mut reads = Reads::new(&preparation, &snap);
+    assert_eq!(reads.subject_triples("urn:missing", "urn:g", 1).unwrap(), 0);
+    assert!(preparation.reserve(LIMIT - 1000).is_err());
+    drop(reads);
+    assert!(preparation.reserve(LIMIT - 1000).is_ok());
+    // one returned identity keeps the vector's and the set's first allocations charged
+    let preparation = Preparation::new(crate::task::Control::none(), LIMIT).unwrap();
+    let mut reads = Reads::new(&preparation, &snap);
+    let mut held = preparation.reserve(0).unwrap();
+    let wanted: BTreeSet<String> = ["urn:e".to_string()].into();
+    let (rows, _) = reads
+        .reifiers_about(
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies",
+            "urn:g",
+            &wanted,
+            10,
+            &mut held,
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    // the cache holds about 1.3 KiB, so a reservation that leaves 2 KiB fits only
+    // when the identity is charged at less than about 700 bytes
+    assert!(preparation.reserve(LIMIT - 2048).is_err());
+    drop(held);
+    assert!(preparation.reserve(LIMIT - 2048).is_ok());
+}
