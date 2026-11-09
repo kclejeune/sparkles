@@ -955,7 +955,7 @@ ex:A geo:sfTouches ex:p2 .
                     .map(|r| format!("{r:?}"))
                     .collect();
                 rows.sort();
-                (rows, index(&r.plan()).unwrap())
+                (rows, index(r.plan()).unwrap())
             })
             .collect()
     }

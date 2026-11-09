@@ -97,8 +97,8 @@ fn warned(r: &QueryResult, code: &str) -> bool {
 fn same(snap: &Arc<Snapshot>, q: &str) -> QueryResult {
     let fast = run(snap, q, &opts(true));
     let slow = run(snap, q, &opts(false));
-    assert!(find(&slow.plan(), "SpatialJoin").is_none(), "{q}");
-    assert!(find(&slow.plan(), "SpatialKnn").is_none(), "{q}");
+    assert!(find(slow.plan(), "SpatialJoin").is_none(), "{q}");
+    assert!(find(slow.plan(), "SpatialKnn").is_none(), "{q}");
     assert_eq!(rows(&fast), rows(&slow), "{q}");
     fast
 }
@@ -107,7 +107,7 @@ fn same(snap: &Arc<Snapshot>, q: &str) -> QueryResult {
 fn joined(snap: &Arc<Snapshot>, q: &str) -> QueryResult {
     let r = same(snap, q);
     assert!(
-        find(&r.plan(), "SpatialJoin").is_some(),
+        find(r.plan(), "SpatialJoin").is_some(),
         "{q}: not joined: {:#?}",
         r.plan()
     );
@@ -123,7 +123,7 @@ fn a_spatial_join_finds_containment() {
     // without an index the components are packed into trees for the query
     let r = joined(&s.snapshot(), q);
     assert_eq!(rows(&r), ["gA g1", "gC g2"]);
-    let j = find(&r.plan(), "SpatialJoin").unwrap();
+    let j = find(r.plan(), "SpatialJoin").unwrap();
     assert_eq!(j.description, "?wa sfContains ?wb [tree join]");
     // each WKT geometry of the default graph contains itself (gM too), then gA g1
     // and gC g2
@@ -138,7 +138,7 @@ fn a_spatial_join_finds_containment() {
     assert_eq!(rows(&r), ["gA g1", "gC g2"]);
     // a literal in an unknown CRS is not in the index, yet relates to itself: the
     // scans are read
-    let j = find(&r.plan(), "SpatialJoin").unwrap();
+    let j = find(r.plan(), "SpatialJoin").unwrap();
     assert!(j.description.ends_with("[tree join]"), "{}", j.description);
     let r = run(
         &s.snapshot(),
@@ -165,7 +165,7 @@ fn an_indexed_scan_is_probed() {
              FILTER(geof:sfContains(?wa, ?wb) && ?a != ?b) }";
     let r = joined(&snap, q);
     assert_eq!(rows(&r), ["gA g1", "gC g2"]);
-    let j = find(&r.plan(), "SpatialJoin").unwrap();
+    let j = find(r.plan(), "SpatialJoin").unwrap();
     assert_eq!(
         j.description,
         "?wa sfContains ?wb [index nested loop on <http://www.opengis.net/ont/geosparql#asWKT>]"
@@ -226,7 +226,7 @@ fn unjoinable_shapes_warn() {
         ),
     ] {
         let r = same(&snap, q);
-        assert!(find(&r.plan(), "SpatialJoin").is_none(), "{q}");
+        assert!(find(r.plan(), "SpatialJoin").is_none(), "{q}");
         let w = r
             .plan()
             .warnings
@@ -256,7 +256,7 @@ fn nearest_neighbours_come_first() {
          FILTER(BOUND(?d)) }} ORDER BY ?d LIMIT 2"
     );
     let r = same(&snap, &q);
-    let k = find(&r.plan(), "SpatialKnn").expect("nearest neighbours");
+    let k = find(r.plan(), "SpatialKnn").expect("nearest neighbours");
     assert_eq!(k.description, "?w k=2 metricDistance POINT(9 1)");
     assert_eq!(k.counters.as_ref().unwrap()["errorRows"], 0);
     let got: Vec<(String, f64)> = r
@@ -285,7 +285,7 @@ fn nearest_neighbours_come_first() {
     );
     let fast = run(&snap, &q, &opts(true));
     let slow = run(&snap, &q, &opts(false));
-    let k = find(&fast.plan(), "SpatialKnn").expect("nearest neighbours");
+    let k = find(fast.plan(), "SpatialKnn").expect("nearest neighbours");
     assert_eq!(k.counters.as_ref().unwrap()["errorRows"], 3);
     for r in [&fast, &slow] {
         let v = rows(r);
@@ -311,7 +311,7 @@ fn nearest_neighbours_come_first() {
          FILTER(BOUND(?d)) }}"
     );
     let r = same(&snap, &q);
-    assert!(find(&r.plan(), "SpatialKnn").is_some(), "{:#?}", r.plan());
+    assert!(find(r.plan(), "SpatialKnn").is_some(), "{:#?}", r.plan());
     assert_eq!(
         rows(&r).len(),
         rows(&run(&snap, &all, &opts(false))).len() - 1
@@ -354,7 +354,7 @@ fn nearest_neighbours_join_disconnected_patterns_after_empty_batches() {
         );
         let r = same(&snap, &q);
         assert_eq!(r.table().len(), expected, "{q}");
-        let knn = find(&r.plan(), "SpatialKnn").expect("disconnected nearest-neighbour join");
+        let knn = find(r.plan(), "SpatialKnn").expect("disconnected nearest-neighbour join");
         assert!(
             knn.counters.as_ref().unwrap()["batches"].as_u64().unwrap() >= 2,
             "the search must continue after an empty batch: {:#?}",
@@ -393,7 +393,7 @@ fn nearest_neighbours_preserve_independent_filter_scope_and_budget() {
         let slow = run(&s.snapshot(), &q, &slow);
         assert_eq!(fast.table().len(), 3, "{q}");
         assert_eq!(rows(&fast), rows(&slow), "{q}");
-        assert!(find(&fast.plan(), "SpatialKnn").is_some(), "{q}");
+        assert!(find(fast.plan(), "SpatialKnn").is_some(), "{q}");
     }
 }
 
@@ -433,13 +433,13 @@ fn nearest_neighbours_keep_callback_cardinality_and_volatile_group_identity() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(fast.table().len(), 6);
     assert_eq!(rows(&fast), rows(&slow));
-    assert!(find(&fast.plan(), "SpatialKnn").is_none());
+    assert!(find(fast.plan(), "SpatialKnn").is_none());
 
     let q = "SELECT ?g ?id { ?g geo:asWKT ?w . { BIND(UUID() AS ?id) } } \
              ORDER BY geof:metricDistance(?w, \"POINT(0 0)\"^^geo:wktLiteral) LIMIT 5";
     let r = run(&s.snapshot(), q, &opts(true));
     assert_eq!(r.table().len(), 5);
-    assert!(find(&r.plan(), "SpatialKnn").is_none());
+    assert!(find(r.plan(), "SpatialKnn").is_none());
     let got = r
         .rows()
         .unwrap()
@@ -480,7 +480,7 @@ fn nearest_neighbours_preserve_volatile_arq_group_identity_across_batches() {
                 .all(|row| row[1].is_some() && row[1] == got[0][1]),
             "{expression}: a group identity must survive every batch"
         );
-        assert!(find(&r.plan(), "SpatialKnn").is_none(), "{expression}");
+        assert!(find(r.plan(), "SpatialKnn").is_none(), "{expression}");
     }
 }
 
@@ -509,7 +509,7 @@ fn nearest_neighbours_keep_connected_groups_within_the_batch_budget() {
     let fast = run(&s.snapshot(), q, &fast);
     assert_eq!(fast.table().len(), 3);
     assert_eq!(rows(&fast), rows(&expected));
-    assert!(find(&fast.plan(), "SpatialKnn").is_some());
+    assert!(find(fast.plan(), "SpatialKnn").is_some());
 }
 
 #[test]
@@ -534,7 +534,7 @@ fn nearest_neighbours_preserve_volatile_connected_probe_filters() {
     let r = same(&s.snapshot(), q);
     assert_eq!(r.table().len(), 6);
     assert!(
-        find(&r.plan(), "SpatialKnn").is_none(),
+        find(r.plan(), "SpatialKnn").is_none(),
         "a volatile connected probe must keep its original evaluation scope: {:#?}",
         r.plan()
     );
@@ -575,7 +575,7 @@ fn nearest_neighbours_preserve_volatile_probe_copy_groups() {
         copies.values().all(|&n| n == 100),
         "partial volatile copy groups: {copies:?}"
     );
-    assert!(find(&r.plan(), "SpatialKnn").is_none());
+    assert!(find(r.plan(), "SpatialKnn").is_none());
 }
 
 #[test]
@@ -624,7 +624,7 @@ fn nearest_neighbours_filter_connected_groups_before_crossing() {
     let r = run(&s.snapshot(), &q, &fast);
     assert_eq!(r.table().len(), 0);
     assert_eq!(rows(&r), rows(&expected));
-    assert!(find(&r.plan(), "SpatialKnn").is_some());
+    assert!(find(r.plan(), "SpatialKnn").is_some());
 }
 
 #[test]
@@ -638,7 +638,7 @@ fn nearest_neighbour_shapes_that_stay_generic_warn() {
     s.enable_geo(GeoConfig::default()).unwrap();
     let snap = s.snapshot();
     let r = same(&snap, &q);
-    assert!(find(&r.plan(), "SpatialKnn").is_some());
+    assert!(find(r.plan(), "SpatialKnn").is_some());
     for (q, why) in [
         (
             format!(
@@ -654,7 +654,7 @@ fn nearest_neighbour_shapes_that_stay_generic_warn() {
         ),
     ] {
         let r = same(&snap, &q);
-        assert!(find(&r.plan(), "SpatialKnn").is_none(), "{q}");
+        assert!(find(r.plan(), "SpatialKnn").is_none(), "{q}");
         let w = r.plan().warnings.iter().find(|w| w.code == "geo-not-knn");
         if !why.is_empty() {
             let w = w.unwrap_or_else(|| panic!("{q}: {:?}", r.plan().warnings));
@@ -841,7 +841,7 @@ fn joins_agree(snap: &Arc<Snapshot>) -> usize {
             let r = same(snap, q);
             // the query whose geometries are in one GRAPH pattern is one component
             if i != 5 {
-                let j = find(&r.plan(), "SpatialJoin")
+                let j = find(r.plan(), "SpatialJoin")
                     .unwrap_or_else(|| panic!("{q}: not joined: {:#?}", r.plan()));
                 if j.counters.as_ref().unwrap()["indexProbes"] == true {
                     probed += 1;
@@ -851,7 +851,7 @@ fn joins_agree(snap: &Arc<Snapshot>) -> usize {
                 let fast = run(snap, q, &union(true));
                 let slow = run(snap, q, &union(false));
                 assert_eq!(rows(&fast), rows(&slow), "union default graph: {q}");
-                assert!(find(&fast.plan(), "SpatialJoin").is_some());
+                assert!(find(fast.plan(), "SpatialJoin").is_some());
             }
         }
     }
@@ -928,7 +928,7 @@ fn knn_agrees(snap: &Arc<Snapshot>, seed: u64) {
             let slow = run(snap, q, &opts(false));
             assert_eq!(keys(&fast), keys(&slow), "{q}");
             assert!(
-                find(&fast.plan(), "SpatialKnn").is_some(),
+                find(fast.plan(), "SpatialKnn").is_some(),
                 "{q}: {:?} {:#?}",
                 fast.plan().warnings,
                 fast.plan()

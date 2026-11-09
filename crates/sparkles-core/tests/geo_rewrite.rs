@@ -159,7 +159,7 @@ fn explain_names_the_operator() {
         &opts(),
     )
     .unwrap();
-    let n = find(&r.plan(), "SpatialRelate").expect("a SpatialRelate node");
+    let n = find(r.plan(), "SpatialRelate").expect("a SpatialRelate node");
     assert_eq!(
         n.description,
         "?x geo:sfContains <http://example.org/g1> [asserted ∪ derived]"
@@ -173,7 +173,7 @@ fn explain_names_the_operator() {
         &opts(),
     )
     .unwrap();
-    let n = find(&r.plan(), "SpatialRelate").unwrap();
+    let n = find(r.plan(), "SpatialRelate").unwrap();
     assert!(n.description.ends_with("[derived]"), "{}", n.description);
 }
 

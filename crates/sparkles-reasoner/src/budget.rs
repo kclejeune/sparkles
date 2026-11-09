@@ -271,18 +271,18 @@ impl Budget {
             return Ok(());
         }
         let next = self.add_usage(n, true)?;
-        if let Some(parent) = &self.parent {
-            if next > parent.reserved.load(Ordering::SeqCst) {
+        if let Some(parent) = &self.parent
+            && next > parent.reserved.load(Ordering::SeqCst)
+        {
+            self.used.fetch_sub(n, Ordering::SeqCst);
+            let mut lease = parent.lease.lock();
+            let next = self.add_usage(n, true)?;
+            if let Err(error) = self.grow_locked(parent, &mut lease, next) {
                 self.used.fetch_sub(n, Ordering::SeqCst);
-                let mut lease = parent.lease.lock();
-                let next = self.add_usage(n, true)?;
-                if let Err(error) = self.grow_locked(parent, &mut lease, next) {
-                    self.used.fetch_sub(n, Ordering::SeqCst);
-                    return Err(BudgetFailure::parent(error));
-                }
-                self.peak.fetch_max(next, Ordering::Relaxed);
-                return Ok(());
+                return Err(BudgetFailure::parent(error));
             }
+            self.peak.fetch_max(next, Ordering::Relaxed);
+            return Ok(());
         }
         self.peak.fetch_max(next, Ordering::Relaxed);
         Ok(())
@@ -329,12 +329,11 @@ impl Budget {
         }
         let prior = self.used.fetch_sub(n, Ordering::SeqCst);
         assert!(prior >= n, "release only owned reasoning bytes");
-        if let Some(parent) = &self.parent {
-            if parent.reserved.load(Ordering::SeqCst)
+        if let Some(parent) = &self.parent
+            && parent.reserved.load(Ordering::SeqCst)
                 > (prior - n).saturating_add(PARENT_SLACK + PARENT_STEP)
-            {
-                self.trim(parent);
-            }
+        {
+            self.trim(parent);
         }
     }
     fn trim(&self, parent: &Backing) {

@@ -1350,7 +1350,7 @@ impl Run<'_> {
     fn occurs_asserted(&self, row: &Row) -> sparkles_core::Result<bool> {
         let bindings = ["x", "p", "lit"]
             .iter()
-            .filter_map(|v| Some((v.to_string(), row.get(*v)?.clone())))
+            .filter_map(|v| Some((v.to_string(), row.get(v)?.clone())))
             .collect();
         let rows = self.select("SELECT * WHERE { ?x ?p ?lit } LIMIT 1", false, bindings)?;
         Ok(!rows.is_empty())

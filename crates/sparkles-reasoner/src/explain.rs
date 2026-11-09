@@ -918,8 +918,8 @@ fn materialized(
     let compiled = engine::compile_info(&parsed, &terms, &mut warnings, false)?;
     let (rules, infos) = (compiled.rules(), compiled.infos());
     let rs = RuleSet {
-        rules: &rules,
-        infos: &infos,
+        rules,
+        infos,
         sources: &sources,
         geo: input
             .extras
@@ -1391,13 +1391,13 @@ mod partial_tests {
         let (rules, infos) = (compiled.rules(), compiled.infos());
         let sources = vec!["rules".into()];
         let rs = RuleSet {
-            rules: &rules,
-            infos: &infos,
+            rules,
+            infos,
             sources: &sources,
             geo: None,
         };
         let mut g = Graph::with_capacity(0);
-        let plans = Plans::new(&mut g, &rules).unwrap();
+        let plans = Plans::new(&mut g, rules).unwrap();
         let extra = FxHashSet::from_iter([premise]);
         let opts = ExplainOptions::default();
         let mut search = Search {

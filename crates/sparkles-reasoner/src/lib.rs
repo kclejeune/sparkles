@@ -1437,7 +1437,7 @@ fn update_closure(
         let mut w = WorkingWarnings::new(&terms.budget());
         let compiled = engine::compile(&rules, &terms, &mut w)?;
         for r in compiled.iter() {
-            if let Some(why) = engine::incremental_blocker(&r, &terms) {
+            if let Some(why) = engine::incremental_blocker(r, &terms) {
                 return Err(Fallback(why).into());
             }
         }
