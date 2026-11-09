@@ -31,6 +31,7 @@
   } from '$lib/shacl';
   import { readLang, validateLangKey, type ValidateLang } from '$lib/shex';
   import { load, save } from '$lib/storage';
+  import { routes } from '$lib/routes';
   import { useCommands, useProvider } from '$lib/launcher.svelte';
   import { branchProvider } from '$lib/palette.svelte';
   import { cloneDetail, cloneMethodText, originSummary } from '$lib/clone';
@@ -1101,6 +1102,9 @@ ex:PersonShape a sh:NodeShape ;
                 {report.conforms ? 'Conforms' : 'Does not conform'}
               </span>
             {/if}
+            {#if lang === 'shacl'}<a class="btn ghost" href={routes.shapes(name, { branch })}
+                >Visual shape editor</a
+              >{/if}
           </div>
           {#if lang === 'shex'}
             <ShexPanel

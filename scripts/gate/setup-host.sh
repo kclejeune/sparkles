@@ -19,10 +19,12 @@ if is_bench "$host"; then
   echo "$host is the benchmark host (SPARKLES_BENCH_HOST) and never runs gate work" >&2
   exit 2
 fi
-ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10)
+# shellcheck source=scripts/remote-executor.sh
+. "$(dirname "$(readlink -f "$0")")/../remote-executor.sh"
+case $host in boat:*) rx_admit "$host" --minimum "${SPARKLES_REMOTE_MIN_LIFETIME:-7200}" > /dev/null ;; esac
 
 # shellcheck disable=SC2016
-ssh "${ssh_opts[@]}" "$host" '
+rx_exec "$host" '
   set -e
   mkdir -p "$HOME/gate/bin" "$HOME/gate/out" "$HOME/gate/suites" "$HOME/lanes"
   [ -d "$HOME/gate/repo.git" ] || git init -q --bare "$HOME/gate/repo.git"
@@ -32,12 +34,12 @@ ssh "${ssh_opts[@]}" "$host" '
 if [ "$host" != "$src" ]; then
   stage=$(mktemp -d)
   trap 'rm -rf "$stage"' EXIT
-  rsync -a "$src:gate/suites/" "$stage/"
-  rsync -a --delete "$stage/" "$host:gate/suites/"
+  rx_sync -- -a "$src:gate/suites/" "$stage/"
+  rx_sync -- -a "$stage/" "$host:gate/suites/"
 fi
 
 # shellcheck disable=SC2016
-ssh "${ssh_opts[@]}" "$host" '
+rx_exec "$host" '
   set -e
   s=$HOME/gate/suites
   cat > "$HOME/gate/conformance.env" << EOF

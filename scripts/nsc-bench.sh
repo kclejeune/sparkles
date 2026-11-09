@@ -2,6 +2,7 @@
 # Interleaved A/B query benchmark of two Sparkles builds on an ephemeral Namespace instance
 # (namespace.so), driven through the `nsc` CLI. See docs/DEVELOPMENT.md.
 #
+#   scripts/bench-remote.sh --executor nsc|boat:bx_ID [options]
 #   scripts/nsc-bench.sh [options] A B
 #
 # A and B are git revisions of this repository or paths to built `sparkles` binaries. A
@@ -60,6 +61,7 @@
 #                       SPARKLES_NSC_BUILD_HOSTS is set, else local)
 #   --machine-type T    Namespace machine type (default linux/amd64:8x16)
 #   --duration D        instance lifetime cap, as nsc takes it (default 2h)
+#   --executor E        nsc (default) or admitted boat:bx_ID
 #   --out DIR           results directory (default .artifacts/nsc-bench/<UTC time>)
 #   --allow-mixed-compilers
 #                       compare binaries built with different compilers anyway
@@ -76,6 +78,8 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CACHE=${SPARKLES_NSC_CACHE:-$HOME/.cache/sparkles-nsc}
+# shellcheck source=scripts/remote-screen.sh
+. "$ROOT/scripts/remote-screen.sh"
 PEOPLE=100000
 QUERIES=
 QUERY_DIR=
@@ -157,6 +161,7 @@ while [ $# -gt 0 ]; do
     --machine-type) MACHINE=$2 ;;
     --duration) DURATION=$2 ;;
     --out) OUT=$2 ;;
+    --executor) EXECUTOR=$2 ;;
     -h | --help) usage ;;
     -*) die "unknown option $1 (see --help)" ;;
     *)
@@ -170,7 +175,8 @@ while [ $# -gt 0 ]; do
 done
 [ ${#ARGS[@]} -eq 2 ] || usage 1
 bh_check_arg
-for t in nsc zstd python3 mbx cargo readelf flock; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
+screen_check
+for t in zstd python3 mbx cargo readelf flock; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
 OUT=$(realpath -m "${OUT:-$ROOT/.artifacts/nsc-bench/$(date -u +%Y%m%dT%H%M%SZ)}")
 mkdir -p "$OUT/stage/queries" "$OUT/logs" "$CACHE"/{bin,data,src,locks}
 STAGE=$OUT/stage
@@ -345,7 +351,14 @@ destroy() {
   local t
   [ -n "$ID" ] || return 0
   echo "destroying $ID"
-  nsc destroy --force "$ID" > "$OUT/logs/destroy.log" 2>&1 || echo "nsc-bench: destroying $ID failed; run nsc destroy $ID" >&2
+  screen_destroy > "$OUT/logs/destroy.log" 2>&1 || {
+    echo "cleanup uncertain; reconcile $OUT/logs/destroy.log and the exact recorded units" >&2
+    return 97
+  }
+  if [ "$EXECUTOR" != nsc ]; then
+    ID=
+    return
+  fi
   t=$(now)
   local s min
   s=$(secs "$T_CREATE" "$t")
@@ -357,24 +370,17 @@ trap 'destroy; cleanup_src' EXIT
 trap 'exit 130' INT TERM
 
 T_CREATE=$(now)
-nsc create --bare --machine_type "$MACHINE" --duration "$DURATION" \
-  --purpose "sparkles nsc-bench ${ARGS[0]} vs ${ARGS[1]}" --cidfile "$OUT/instance.id" \
-  --output_json_to "$OUT/instance.json" > "$OUT/logs/create.log" 2>&1 || {
-  # the instance may exist even though the command failed
-  [ -s "$OUT/instance.id" ] && ID=$(cat "$OUT/instance.id")
-  die "nsc create failed, see $OUT/logs/create.log"
-}
-ID=$(cat "$OUT/instance.id")
+screen_create "sparkles queries ${ARGS[0]} vs ${ARGS[1]}" || die "executor acquire failed; reconcile $OUT before retrying"
 T_UP=$(now)
 URL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("app_url", "?"))' "$OUT/instance.json")
 note "instance: $ID ($MACHINE, capped at $DURATION), $URL"
 note "phase create: $(secs "$T_CREATE" "$T_UP") s"
 
-rsh() { nsc ssh -T "$ID" -- "$@"; }
+rsh() { screen_exec "$@"; }
 for f in bin-A.zst bin-B.zst data.nt.zst queries.tar nsc-bench-remote.sh run.env; do
   ok=0
   for _try in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    if nsc instance upload "$ID" "$STAGE/$f" "$REMOTE/$f" --mkdir > "$OUT/logs/upload.log" 2>&1; then
+    if screen_upload "$STAGE/$f" "$REMOTE/$f" > "$OUT/logs/upload.log" 2>&1; then
       ok=1
       break
     fi
@@ -426,7 +432,7 @@ fetch_results() {
   [ "$ok" = 1 ] || die "could not pack the results"
   ok=0
   for _try in $(seq 40); do
-    if nsc instance download "$ID" "$REMOTE/results.tgz" "$dir/results.tgz" > "$OUT/logs/download.log" 2>&1; then
+    if screen_download "$REMOTE/results.tgz" "$dir/results.tgz" > "$OUT/logs/download.log" 2>&1; then
       ok=1
       break
     fi
@@ -439,10 +445,10 @@ fetch_results() {
     sleep 5
   done
   [ "$ok" = 1 ] || die "download failed"
-  tar -xzf "$dir/results.tgz" -C "$dir"
+  screen_unpack "$dir/results.tgz" "$dir"
 }
 
-rsh "cd $REMOTE && tar -xf queries.tar && setsid nohup bash nsc-bench-remote.sh > nohup.log 2>&1 < /dev/null &" ||
+screen_launch nsc-bench-remote.sh nohup.log "tar -xf queries.tar" ||
   die "could not start the remote run"
 wait_remote
 T_RAN=$(now)
@@ -464,7 +470,9 @@ if [ -n "$FLAGGED" ] && [ "$RERUN" = 1 ]; then
   note "rerun: $RERUN_ROUNDS rounds of A,B,B,A, $RERUN_REPS timed requests per query and server"
   # shellcheck disable=SC2086 # FLAGGED is a list of query names
   keep=$(printf '%s.rq ' $FLAGGED)
-  rsh "cd $REMOTE && mv results results-first && rm -f results.tgz && cd queries && for f in *.rq; do case ' $keep' in *\" \$f \"*) ;; *) rm \"\$f\" ;; esac; done && cd .. && sed -i -e 's/^ROUNDS=.*/ROUNDS=$RERUN_ROUNDS/' -e 's/^REPS=.*/REPS=$RERUN_REPS/' run.env && setsid nohup bash nsc-bench-remote.sh > nohup-rerun.log 2>&1 < /dev/null &" ||
+  # Both preparation and launch must succeed.
+  # shellcheck disable=SC2015
+  rsh "cd $REMOTE && mv results results-first && rm -f results.tgz && cd queries && for f in *.rq; do case ' $keep' in *\" \$f \"*) ;; *) rm \"\$f\" ;; esac; done && cd .. && sed -i -e 's/^ROUNDS=.*/ROUNDS=$RERUN_ROUNDS/' -e 's/^REPS=.*/REPS=$RERUN_REPS/' run.env" && screen_launch nsc-bench-remote.sh nohup-rerun.log ||
     die "could not start the rerun"
   T_RERUN=$(now)
   wait_remote

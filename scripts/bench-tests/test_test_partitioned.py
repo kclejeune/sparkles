@@ -114,7 +114,7 @@ class StopShare(unittest.TestCase):
         (bin_dir / "ssh").chmod(0o755)
         (bin_dir / "nsc").write_text("#!/bin/sh\nexit 0\n")
         (bin_dir / "nsc").chmod(0o755)
-        r = subprocess.run(["bash", "-c", functions("stop_share", "cleanup") + "\nssh_opts=()\ncleanup"],
+        r = subprocess.run(["bash", "-c", functions("stop_share", "cleanup") + "\nrx_exec() { ssh \"$@\"; }\ncleanup"],
                            env=dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
                                     root=str(self.root), keep="", out=str(out), STOP_SHARE_WAIT="2"),
                            capture_output=True, text=True)

@@ -8,6 +8,50 @@ use crate::branch::{BranchOptions, MergeOptions, MergeOutcome};
 use crate::history::At;
 
 #[test]
+fn authoring_revert_rejects_a_replaced_branch_at_the_same_head() {
+    let (_dir, store) = setup();
+    store
+        .create_branch("draft", &BranchOptions::default())
+        .unwrap();
+    let old_id = {
+        let old = store.branch("draft").unwrap();
+        apply(&old, "+<urn:old> <urn:p> <urn:x> .");
+        old.dataset_id()
+    };
+    store.delete_branch("draft", true).unwrap();
+    store
+        .create_branch("draft", &BranchOptions::default())
+        .unwrap();
+    let replacement = store.branch("draft").unwrap();
+    apply(&replacement, "+<urn:new> <urn:p> <urn:x> .");
+    let head = replacement.head_commit().seq;
+    let before = dump(&replacement);
+    let options = MergeOptions {
+        expect_target: Some(head),
+        expect_target_id: Some(old_id),
+        ..Default::default()
+    };
+    assert!(matches!(
+        store.revert("draft", head, &options),
+        Err(Error::PreconditionFailed(_))
+    ));
+    assert!(matches!(
+        store.preview_revert("draft", head, &options),
+        Err(Error::PreconditionFailed(_))
+    ));
+    assert_eq!(dump(&replacement), before);
+    let valid = MergeOptions {
+        expect_target_id: Some(replacement.dataset_id()),
+        ..options
+    };
+    assert!(matches!(
+        store.revert("draft", head, &valid),
+        Ok(MergeOutcome::Merged(_))
+    ));
+    assert!(!has(&replacement, "urn:new"));
+}
+
+#[test]
 fn a24_squash_merges_record_no_second_parent() {
     let (_dir, s) = setup();
     s.create_branch("dev", &BranchOptions::default()).unwrap();
@@ -733,4 +777,257 @@ fn a32_held_bytes_and_backups_count_the_branches() {
     // once dev rebuilds, the old generation is held by its base pin only
     s.branch("dev").unwrap().compact().unwrap();
     assert_eq!(s.branch_held_bytes(), 0);
+}
+
+/// Exercise the real source/target resolution boundary, never a set-model stand-in.
+fn consult_revert_aba(case: &str, preview: bool) {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (_dir, s) = setup();
+    for name in ["parked", "draft"] {
+        s.create_branch(name, &BranchOptions::default()).unwrap();
+    }
+    let a = s.branch("parked").unwrap();
+    let b = s.branch("draft").unwrap();
+    let (a_delta, b_delta) = match case {
+        "conflict" => (
+            "+<urn:value> <urn:p> <urn:a> .",
+            "+<urn:value> <urn:p> <urn:b> .",
+        ),
+        _ => (
+            "+<urn:a-only> <urn:p> <urn:x> .",
+            "+<urn:b-only> <urn:p> <urn:x> .",
+        ),
+    };
+    apply(&a, a_delta);
+    apply(&b, b_delta);
+    let commit = a.head_commit().seq;
+    if case == "noop" {
+        apply(&a, "-<urn:a-only> <urn:p> <urn:x> .");
+        apply(&b, "+<urn:later> <urn:p> <urn:x> .");
+    }
+    let head = a.head_commit().seq;
+    assert_eq!(head, b.head_commit().seq);
+    let aid = a.dataset_id();
+    let bid = b.dataset_id();
+    assert_ne!(aid, bid);
+    let before_a = dump(&a);
+    let before_b = dump(&b);
+    let options = MergeOptions {
+        expect_target_id: Some(aid),
+        expect_target: Some(head),
+        ..Default::default()
+    };
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    s.set_failpoint(
+        "pick-source-resolved",
+        Some(Arc::new(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("owned source-resolution barrier was not released");
+        })),
+    );
+    let result = std::thread::scope(|scope| {
+        let running = scope.spawn(|| {
+            if preview {
+                s.preview_revert("draft", commit, &options)
+            } else {
+                s.revert("draft", commit, &options).map(|o| match o {
+                    MergeOutcome::Merged(r) | MergeOutcome::UpToDate(r) => r,
+                    MergeOutcome::Conflicts(c) => panic!("wrong-incarnation conflict: {c:?}"),
+                })
+            }
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("actual engine never reached source-resolution barrier");
+        let rename_b = s.rename_branch("draft", "saved-b");
+        let rename_a = s.rename_branch("parked", "draft");
+        release_tx
+            .send(())
+            .expect("actual engine left the bounded barrier early");
+        let result = running.join().unwrap();
+        assert!(rename_b.is_ok(), "{rename_b:?}");
+        assert!(rename_a.is_ok(), "{rename_a:?}");
+        eprintln!(
+            "real revert ABA {case} preview={preview}: captured B={bid}, expected/current A={aid}, head={head}, result={result:?}"
+        );
+        result
+    });
+    s.set_failpoint("pick-source-resolved", None);
+    assert_eq!(
+        dump(&b),
+        before_b,
+        "resolved source B must never be written"
+    );
+    match result {
+        Err(Error::PreconditionFailed(_)) => {
+            assert_eq!(dump(&a), before_a);
+            assert_eq!(a.head_commit().seq, head);
+        }
+        Ok(report) => {
+            assert_eq!(report.target.branch_id, aid);
+            assert_eq!(
+                report.base.as_ref().unwrap().branch_id,
+                aid,
+                "revert combined B's inverse with A's authorized target: {report:?}"
+            );
+            assert_eq!(report.base.as_ref().unwrap().seq, commit);
+            if preview {
+                assert_eq!(dump(&a), before_a);
+            } else if case != "noop" {
+                assert!(!has(
+                    &a,
+                    if case == "conflict" {
+                        "urn:value"
+                    } else {
+                        "urn:a-only"
+                    }
+                ));
+            }
+        }
+        Err(e) => panic!("unexpected refusal instead of an identity precondition: {e:?}"),
+    }
+}
+
+#[test]
+fn authoring_consult_revert_aba_nonconflicting_preview() {
+    consult_revert_aba("nonconflict", true);
+}
+
+#[test]
+fn authoring_consult_revert_aba_nonconflicting_write() {
+    consult_revert_aba("nonconflict", false);
+}
+
+#[test]
+fn authoring_consult_revert_aba_conflicting_preview() {
+    consult_revert_aba("conflict", true);
+}
+
+#[test]
+fn authoring_consult_revert_aba_conflicting_write() {
+    consult_revert_aba("conflict", false);
+}
+
+#[test]
+fn authoring_consult_revert_aba_noop_preview() {
+    consult_revert_aba("noop", true);
+}
+
+#[test]
+fn authoring_consult_revert_aba_noop_write() {
+    consult_revert_aba("noop", false);
+}
+
+#[test]
+fn authoring_consult_revert_preserves_inherited_commit_lineage() {
+    let (_dir, s) = setup();
+    s.create_branch("draft", &BranchOptions::default()).unwrap();
+    let target = s.branch("draft").unwrap();
+    let id = target.dataset_id();
+    let before_main = dump(&s);
+    let head = target.head_commit().seq;
+    let options = MergeOptions {
+        expect_target_id: Some(id),
+        expect_target: Some(head),
+        ..Default::default()
+    };
+    let report = s.preview_revert("draft", 2, &options).unwrap();
+    assert_eq!(report.target.branch_id, id);
+    assert_eq!(report.base.as_ref().unwrap().branch_id, s.dataset_id());
+    assert_eq!((report.inserted, report.deleted), (0, 1));
+    let report = merged(s.revert("draft", 2, &options).unwrap());
+    assert_eq!(report.target.branch_id, id);
+    assert_eq!(target.head_commit().seq, head + 1);
+    assert!(!has(&target, "urn:b"));
+    assert_eq!(dump(&s), before_main);
+}
+
+#[test]
+fn authoring_consult_write_preview_captures_owner_and_branch_identity() {
+    use crate::guard::WriteOptions;
+    use crate::io::{RdfFormat, Source};
+    use crate::preview::{self, DryRun};
+
+    for persistent in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            bulk_threshold: 2,
+            ..Default::default()
+        };
+        let store = if persistent {
+            Store::open(&dir.path().join("db"), opts).unwrap()
+        } else {
+            Store::in_memory(opts)
+        };
+        apply(&store, "+<urn:seed> <urn:p> <urn:x> .");
+        store
+            .create_branch("draft", &BranchOptions::default())
+            .unwrap();
+        let owner = store.owner_dataset_id();
+        let original = dump(&store);
+        for name in ["main", "draft"] {
+            let target = store.branch(name).unwrap();
+            let id = target.branch_id();
+            assert_eq!(id == owner, name == "main");
+            let head = target.head_commit().seq;
+            let before = dump(&target);
+            for bulk in [false, true] {
+                let write = WriteOptions {
+                    dry_run: Some(DryRun {
+                        retain_states: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let result = if bulk {
+                    let body: String = (0..8)
+                        .map(|i| format!("<urn:preview-identity-{i}> <urn:p> <urn:x> .\n"))
+                        .collect();
+                    target.load_with(
+                        &[Source::from_bytes(
+                            body.into_bytes(),
+                            RdfFormat::NQuads,
+                            None,
+                        )],
+                        CommitKind::Load,
+                        &write,
+                    )
+                } else {
+                    let mut txn = target
+                        .try_write_with(CommitKind::Transaction, write)
+                        .unwrap();
+                    let quad = oxrdf::Quad::new(
+                        named("urn:preview-identity"),
+                        named("urn:p"),
+                        named("urn:x"),
+                        oxrdf::GraphName::DefaultGraph,
+                    );
+                    let ids = txn.encode_quad(&quad, &mut Default::default()).unwrap();
+                    txn.insert(ids).unwrap();
+                    txn.commit()
+                };
+                let preview = preview::catch(result).unwrap();
+                assert_eq!(preview.dataset_id, owner);
+                assert_eq!(preview.branch_id, id);
+                assert_eq!(preview.head.seq, head);
+                assert_eq!(preview.commit.unwrap().bulk, bulk);
+                let states = preview.states.as_ref().unwrap();
+                assert_eq!(states.before.len(), before.len() as u64);
+                assert_eq!(
+                    states.after.len(),
+                    before.len() as u64 + if bulk { 8 } else { 1 }
+                );
+                assert_eq!(states.after.dataset_id, owner);
+                assert_eq!(target.head_commit().seq, head);
+                assert_eq!(dump(&target), before);
+                assert_eq!(dump(&store), original);
+            }
+        }
+    }
 }

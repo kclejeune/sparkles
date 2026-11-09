@@ -261,6 +261,8 @@ pub struct MergeOptions {
     pub expect_source: Option<u64>,
     /// the target head the caller saw
     pub expect_target: Option<u64>,
+    /// The target store UUID the caller saw, including the branch incarnation.
+    pub expect_target_id: Option<uuid::Uuid>,
     /// the merge base to use when there are several
     pub base: Option<CommitRef>,
     /// merge the inferred graph like any other graph

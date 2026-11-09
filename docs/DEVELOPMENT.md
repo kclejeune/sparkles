@@ -357,10 +357,13 @@ for CI. Reusable dev and CI seeds are separate and contain no credentials or liv
 Verify snapshot and credential behavior before treating a seed as reusable. Tool setup
 alone does not qualify a compiler workload or snapshot lifecycle.
 
-The existing `bench:nsc` screen and `test:partitioned` Namespace selector remain
-provider-specific fallbacks. Neither command accepts a Boat selector. Use the documented
-supported transport, or a separately qualified Boat execution path; changing placement
-does not waive tests, benchmark comparability or performance acceptance criteria.
+The provider-neutral `bench:remote`, `bench:remote-writes` and `bench:jena-remote`
+commands accept an explicit admitted `boat:bx_ID` worker. Build hosts, partitioned test
+shares and gate hosts accept the same selector. The [remote executor commands](REMOTE-EXECUTORS.md)
+describe the tracked qualification/environment/finish commands, explicit private
+profile and admission inputs, warm reuse, artifact transport and cleanup. These adapters require
+real workload qualification before they replace the mandatory `bench:nsc` screen.
+Changing placement preserves the tests, benchmark comparability and acceptance criteria.
 
 ### Known flaky tests
 
@@ -378,17 +381,18 @@ runs one share of the tests on this machine and sends the archive to the other m
 where nextest runs the other shares with `--partition slice:K/N`. The machines come from
 `--hosts`, `TEST_PARTITION_HOSTS` or a `TEST_PARTITION_HOSTS=` line in
 `~/.config/sparkles/test-partition.env`. An entry is an ssh host, or `nsc` or
-`nsc:MACHINE` for an ephemeral Namespace instance that the run creates and destroys. An
-ssh host that is busy is left out, which means that another process holds its
+`nsc:MACHINE` for an ephemeral Namespace instance that the run creates and destroys,
+or `boat:bx_ID` for an admitted warm worker. An ssh host that is busy is left out, which means that another process holds its
 `~/lanes/.heavy.lock`, a gate unit runs there, its load exceeds half its processors or it
 has less than `TEST_PARTITION_MIN_FREE_GB` (default 40) GiB free. `--transport hc` starts
 each ssh host's share as a named terminal of the maintainer's terminal service, and the
 default starts it detached over plain ssh. Either way the share survives a dropped
 connection.
 
-The runner has no Boat selector. A Boat worker needs a separately qualified execution
-path before it can replace a share; the Namespace selector remains available as a
-fallback rather than the default placement policy.
+A Boat share checks its admission and remaining lifetime, uses the qualified installed
+tools and retains the existing archive and coverage checks. It never installs or
+refreshes toolchain pins during a job. The Namespace selector remains an explicit
+fallback while real Boat workload acceptance is outstanding under item 762.
 
 The test binaries hold the absolute paths of the checkout that built them, from
 `CARGO_MANIFEST_DIR`, `CARGO_BIN_EXE_*` and `CARGO_TARGET_TMPDIR`. Each share therefore
@@ -889,8 +893,10 @@ gate hosts cannot reach each other over ssh, so the laptop merges the halves whe
 waits, fetches or prints the status. The merged directory has one `steps.txt` that names
 the host of each step and one `gate.exit` that is 0 only when both halves pass. A fetch
 after both halves finish also copies the merged files back into the primary host's
-`~/gate/out/<name>/`. When the helper cannot be reached at the start, the primary host runs
-every step in sequence and its `progress.log` records the fallback.
+`~/gate/out/<name>/`. When an SSH helper cannot be reached at the start, the primary host runs
+every step in sequence and its `progress.log` records the fallback. An explicitly
+selected Boat helper fails closed without crossing providers, and an uncertain start
+keeps its recorded intent for reconciliation.
 
 | Invocation | Effect |
 |---|---|
@@ -899,10 +905,10 @@ every step in sequence and its `progress.log` records the fallback.
 | `gate.sh --status <rev>` | Prints each half's progress, steps and last memory sample. The last line is `active` while either half runs. |
 | `gate.sh --fetch <rev>` | Copies and merges the results into `.artifacts/gates/main-gate-<name>-<host>/` of the main checkout. |
 | `gate.sh --hosts` | Prints each host's lock state, number of gate units and free disk. |
-| `gate.sh --host atlas <rev>` | Runs ci on atlas, with the conformance half on a free helper. |
-| `gate.sh --host atlas --helper none <rev>` | Runs the whole gate on one host. |
+| `gate.sh --host wally <rev>` | Runs ci on wally, with the conformance half on a free configured helper. |
+| `gate.sh --host wally --helper none <rev>` | Runs the whole gate on one host. |
 | `gate.sh --base origin/main~3 <rev>` | Selects the checks from the changes since the merge base of `origin/main~3` and the commit. The default base is `GATE_BASE` or `origin/main`. |
-| `gate.sh --host atlas --link-only <rev>` | Runs only the server artifact link check on atlas, which needs podman. The nightly gate uses it. |
+| `gate.sh --host wally --link-only <rev>` | Runs only the server artifact link check on the named host, which needs podman. |
 | `gate.sh --full <rev>` | Runs every check with `--force` and no selection, as the nightly gate does. |
 | `gate.sh --cargo-jobs 6 <rev>` | Sets `CARGO_BUILD_JOBS` to 6 on every host of the run. |
 | `gate.sh --auto <rev>` | Splits when both hosts are idle and otherwise runs the whole gate on the idle host that has the disk for it. With no idle host it puts ci on the shortest queue and splits only onto a helper whose queue is no longer. |
@@ -923,8 +929,8 @@ as an explicitly permitted quiet migration fallback, with no benchmark using or 
 on it. Prefer local build hosts and Boat overflow for other work.
 
 `SPARKLES_BENCH_HOST` names the canonical benchmark host and defaults to forge. The
-driver drops that host from `GATE_HOSTS`, whose built-in defaults are wally, atlas and
-forge, and refuses it even when `--host` names it. The default helper is the first gate
+driver drops that host from `GATE_HOSTS`, whose built-in default is wally, and refuses
+it even when `--host` names it. The default helper is the first gate
 host other than the primary. Settings may also be lines in
 `~/.config/sparkles/gate.env`, and the environment takes precedence over that file.
 The driver's configurable host list does not override the placement policy. Keep Forge
@@ -1026,7 +1032,7 @@ applies the same `parse_elf` check as the packer. A call to a symbol from a newe
 such as `gettid` from 2.30, fails at the link or in that check. The build needs no UI or
 Wasm and takes about 12 minutes with the image pulled. `gate.sh --link-only --host H
 <rev>` runs it as a gate on one host. The nightly gate picks the first gate host that has
-podman, atlas first, or `GATE_LINK_HOST`, and runs the check before the full gate so
+podman from the configured gate hosts, or `GATE_LINK_HOST`, and runs the check before the full gate so
 that the full gate finds the host idle. A failure shows in `FAILED` as the `server-link`
 step, and a run where the check could not start counts as a failure while the full gate
 ran. The batch gate does not run the check.

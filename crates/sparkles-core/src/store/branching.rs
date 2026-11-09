@@ -3096,12 +3096,13 @@ impl Store {
         name: &str,
         at: &At,
     ) -> Result<(crate::history::Resolved, uuid::Uuid)> {
-        self.resolve_following(self.branch(name)?, at)
+        let store = self.branch(name)?;
+        self.resolve_following(&store, at)
     }
 
-    fn resolve_following(
+    pub(super) fn resolve_following(
         &self,
-        store: BranchStore<'_>,
+        store: &Store,
         at: &At,
     ) -> Result<(crate::history::Resolved, uuid::Uuid)> {
         match store.resolve(at) {
@@ -3121,8 +3122,8 @@ impl Store {
                     let owner = self.owned_set()?.normalize(c);
                     let up = self.branch_by_id(owner.branch_id)?;
                     match at {
-                        At::Time(_) => self.resolve_following(up, at),
-                        _ => self.resolve_following(up, &At::Commit(c.seq)),
+                        At::Time(_) => self.resolve_following(&up, at),
+                        _ => self.resolve_following(&up, &At::Commit(c.seq)),
                     }
                 }
                 None => Err(e),

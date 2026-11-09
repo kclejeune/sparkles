@@ -13,6 +13,9 @@ rustc-hash.workspace = true
 hashbrown.workspace = true
 parking_lot.workspace = true
 oxsdatatypes.workspace = true
+num-bigint = "=0.4.8"
+num-integer = "=0.1.47"
+num-traits = "=0.2.19"
 
 [dev-dependencies]
 sparkles-alloc.workspace = true

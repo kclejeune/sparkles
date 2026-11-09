@@ -1144,7 +1144,9 @@ pub fn normalize(
         if Norm::is_role_axiom(k) {
             continue;
         }
-        if n.axiom(k).is_ok() {
+        let accepted = n.axiom(k).is_ok();
+        n.it.ranges.check_halt()?;
+        if accepted {
             class_out.push(n.out);
             taken[i] = true;
         }

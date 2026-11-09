@@ -1289,20 +1289,22 @@ async fn shacl_sparql_constraints_cannot_reach_out() {
 <urn:s> a sh:NodeShape ; sh:targetNode <http://ex.org/wiki> ;
   sh:sparql [ sh:select "SELECT $this WHERE {{ SERVICE <http://127.0.0.1:{port}/x> {{ ?a ?b ?c }} }}" ] ."#
     );
-    let r = call(
-        &s.app,
-        "POST",
-        "/wiki/shacl",
-        &[
-            ("authorization", &b("bob")),
-            ("content-type", "text/turtle"),
-        ],
-        &shapes,
-    )
-    .await;
-    // SHACL-SPARQL refuses SERVICE for everyone
-    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
-    assert_eq!(conns.load(Ordering::SeqCst), 0);
+    for url in ["/wiki/shacl", "/wiki/shacl?storedBlankNodes=true"] {
+        let r = call(
+            &s.app,
+            "POST",
+            url,
+            &[
+                ("authorization", &b("bob")),
+                ("content-type", "text/turtle"),
+            ],
+            &shapes,
+        )
+        .await;
+        // SHACL-SPARQL refuses SERVICE for everyone
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+        assert_eq!(conns.load(Ordering::SeqCst), 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1864,5 +1866,42 @@ fn hashes_and_tokens() {
             false
         )
         .is_err()
+    );
+}
+
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn authoring_consult_nested_service_refuses_before_send_for_shacl_reader() {
+    let s = auth_server();
+    // bob has only read on team-a and no federate. The fixture stores this focus.
+    assert_eq!(head(&s.state, "team-a"), 1);
+    let endpoint = format!("http://127.0.0.1:1/consult-shacl-{}", uuid::Uuid::new_v4());
+    let probe = sparkles::outbound::probe::SendProbe::install(endpoint.clone());
+    let shapes = format!(
+        r#"@prefix sh: <http://www.w3.org/ns/shacl#> .
+<urn:s> a sh:NodeShape; sh:targetNode <http://ex.org/team-a>;
+sh:sparql [ sh:select "SELECT $this WHERE {{ FILTER(EXISTS {{ SERVICE <{endpoint}> {{ ?s ?p ?o }} }}) }}" ] ."#
+    );
+    let mut results = Vec::new();
+    for url in ["/team-a/shacl", "/team-a/shacl?storedBlankNodes=true"] {
+        let before = probe.entries();
+        let r = call(
+            &s.app,
+            "POST",
+            url,
+            &[
+                ("authorization", &b("bob")),
+                ("content-type", "text/turtle"),
+            ],
+            &shapes,
+        )
+        .await;
+        results.push((url, r.status, r.text(), probe.entries() - before));
+    }
+    assert!(
+        results
+            .iter()
+            .all(|(_, status, _, sends)| *status == StatusCode::BAD_REQUEST && *sends == 0),
+        "real nested-SERVICE status/report/send entries: {results:?}"
     );
 }

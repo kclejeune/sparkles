@@ -116,6 +116,18 @@ pub(super) async fn apply(
     let wanted = receipt_wanted(&params, &headers);
     let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers, Some(&p))?;
     wopts.opts.graphs = view;
+    if let Some(expect) = params.get("expect") {
+        let (expected_id, expected_seq) = super::conditional::expected_commit(expect)?;
+        let actual_id = ds.store.dataset_id();
+        wopts.opts.precondition = Some(sparkles::guard::Precondition::new(move |head| {
+            if actual_id != expected_id || head.commit != expected_seq {
+                return Err(Error::PreconditionFailed(
+                    "the patch source or head changed since the graph was read".into(),
+                ));
+            }
+            Ok(())
+        }));
+    }
     let dry = wopts
         .opts
         .dry_run

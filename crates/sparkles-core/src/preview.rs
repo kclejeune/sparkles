@@ -84,7 +84,11 @@ impl Outcome {
 /// What a write would do: the report of a dry run.
 #[derive(Debug)]
 pub struct Preview {
+    /// The owning dataset, including when the write targets a non-main branch.
     pub dataset_id: uuid::Uuid,
+    /// The actual target Store's branch incarnation, captured at the write boundary.
+    /// This equals `dataset_id` on main; a retained candidate copy has no new identity.
+    pub branch_id: uuid::Uuid,
     /// the head the write ran against (unchanged)
     pub head: CommitInfo,
     /// The commit the write would create (`None`: no net change). Its timestamp is the

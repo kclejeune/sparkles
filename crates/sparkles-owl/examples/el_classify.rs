@@ -9,7 +9,7 @@
 //! `Ontology(`), RDF/XML (`.owl`, `.rdf`), Turtle (`.ttl`) or N-Triples (`.nt`).
 //! `--ofn-out` writes the axioms read as functional-style syntax, which ELK reads, so
 //! that both reasoners classify the same axioms. `--taxonomy` writes the taxonomy as
-//! lines `EQ c1 c2 …` for each node of several classes and `SUB c d` for each direct
+//! lines `EQ c1 c2 …` for each nonempty node, including singletons and `SUB c d` for each direct
 //! subsumption between the first classes of two nodes, sorted. A JSON line on standard
 //! output gives the counts, the times of each step and the peak resident memory.
 //! The classification reads the axioms in place, as the server's does from an open
@@ -17,6 +17,8 @@
 //! `--heap` also counts the bytes allocated, which slows the run, and reports the most
 //! that the last run's classification held at once beyond the axioms read, for the
 //! comparison with the classifier's estimate.
+
+#![recursion_limit = "256"]
 
 use oxrdf::Triple;
 use oxrdfio::{RdfFormat, RdfParser};
@@ -226,7 +228,7 @@ fn main() {
         let t = &out.taxonomy;
         let mut lines: Vec<String> = Vec::new();
         for n in t.nodes() {
-            if n.classes.len() > 1 {
+            if !n.classes.is_empty() {
                 let names: Vec<&str> = n.classes.iter().map(|c| c.as_str()).collect();
                 lines.push(format!("EQ {}", names.join(" ")));
             }
@@ -261,6 +263,13 @@ fn main() {
             "nodes": out.taxonomy.nodes().len(),
             "unsatisfiable": out.taxonomy.unsatisfiable().count(),
             "consistent": out.consistent,
+            "complete": out.complete,
+            "incomplete": out.incomplete.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            "consistency": match out.consistency {
+                sparkles_owl::classify::Consistency::Consistent => "consistent",
+                sparkles_owl::classify::Consistency::Inconsistent => "inconsistent",
+                sparkles_owl::classify::Consistency::Unknown => "unknown",
+            },
             "outside": outside + rules,
             "rules": rules,
             "tier": s.tier.as_str(),
