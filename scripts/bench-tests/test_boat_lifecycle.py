@@ -795,6 +795,22 @@ class BoundedCommand(unittest.TestCase):
             with self.assertRaises(MemoryError):common.bounded_command([sys.executable,'-I','-c','import time;time.sleep(30)'],30,True)
         self.assertEqual(len(children),1);self.assertIsNotNone(children[0].child.returncode)
         self.assertTrue(children[0].child.stdout.closed and children[0].child.stderr.closed)
+    def test_each_cleanup_step_runs_when_another_fails(self):
+        import common,subprocess,selectors
+        children=[];actual=subprocess.Popen;real_selector=selectors.DefaultSelector
+        class Pipe:
+            def __init__(self,pipe):self.pipe=pipe
+            def __getattr__(self,name):return getattr(self.pipe,name)
+            def close(self):self.pipe.close();raise OSError(5,'close failed')
+        class Selector:
+            def __init__(self):self.inner=real_selector()
+            def __getattr__(self,name):return getattr(self.inner,name)
+            def close(self):self.inner.close();raise OSError(5,'close failed')
+        def launch(*a,**k):
+            child=actual(*a,**k);child.stdout=Pipe(child.stdout);children.append(child);return child
+        with patch.object(common.subprocess,'Popen',side_effect=launch),patch.object(common.selectors,'DefaultSelector',Selector):
+            with self.assertRaises(OSError):common.bounded_command([sys.executable,'-I','-c','import time;time.sleep(30)'],1,True)
+        self.assertIsNotNone(children[0].returncode);self.assertTrue(children[0].stdout.pipe.closed and children[0].stderr.closed)
     def test_timeout_kills_the_child_and_output_is_returned(self):
         import common,subprocess,time
         started=time.monotonic()

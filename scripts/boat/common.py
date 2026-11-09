@@ -268,8 +268,12 @@ def bounded_command(argv,limit,capture_stderr=False,cap=1024*1024):
         child.kill();child.wait(10);raise
     finally:
         # Cleanup reads the pipes from the child itself, so it needs nothing the
-        # setup above may not have built.
-        if chooser is not None:chooser.close()
-        for pipe in (child.stdout,child.stderr):
-            if pipe is not None:pipe.close()
+        # setup above may not have built, and each step runs even when another fails.
+        try:
+            if chooser is not None:chooser.close()
+        finally:
+            try:
+                if child.stdout is not None:child.stdout.close()
+            finally:
+                if child.stderr is not None:child.stderr.close()
     return subprocess.CompletedProcess(argv,child.returncode,bytes(out[id(child.stdout)]),bytes(out[id(child.stderr)]) if capture_stderr else None)
