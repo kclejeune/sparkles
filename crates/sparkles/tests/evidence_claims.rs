@@ -259,7 +259,14 @@ fn states_follow_current_decisions_and_withdrawals() {
     let accepted = review(&ds, &a, Disposition::Accepted, None);
     review(&ds, &b, Disposition::Rejected, None);
     let v = head(&ds);
-    let read = evidence::claim_states(&v, "main", &[a.0.clone()], all(), &Control::none()).unwrap();
+    let read = evidence::claim_states(
+        &v,
+        "main",
+        std::slice::from_ref(&a.0),
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
     let o = read[0].clone().unwrap();
     assert_eq!(o.state, ClaimState::Accepted);
     assert_eq!(o.decision.as_ref(), Some(&accepted));
@@ -274,7 +281,14 @@ fn states_follow_current_decisions_and_withdrawals() {
     // a reversal makes the later decision current
     let later = review(&ds, &a, Disposition::NeedsEvidence, Some(&accepted));
     let v = head(&ds);
-    let read = evidence::claim_states(&v, "main", &[a.0.clone()], all(), &Control::none()).unwrap();
+    let read = evidence::claim_states(
+        &v,
+        "main",
+        std::slice::from_ref(&a.0),
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
     assert_eq!(read[0].as_ref().unwrap().state, ClaimState::NeedsEvidence);
     assert_eq!(read[0].as_ref().unwrap().decision.as_ref(), Some(&later));
     withdraw(&ds, &b);
@@ -343,7 +357,7 @@ fn claims_about_entities_match_subject_or_object() {
     let read = evidence::claim_states(
         &head(&ds),
         "main",
-        &[other.0.clone()],
+        std::slice::from_ref(&other.0),
         all(),
         &Control::none(),
     )
@@ -359,8 +373,14 @@ fn hidden_unknown_and_wrong_kind_policies_answer_alike() {
     let a = claim(&ds, "advisory");
     let v = head(&ds);
     let message = |policy: &str, access: Option<Arc<GraphAccess>>| {
-        let e = evidence::claim_states(&v, policy, &[a.0.clone()], access, &Control::none())
-            .unwrap_err();
+        let e = evidence::claim_states(
+            &v,
+            policy,
+            std::slice::from_ref(&a.0),
+            access,
+            &Control::none(),
+        )
+        .unwrap_err();
         assert_eq!(e.code(), "invalid", "{e:?}");
         e.to_string().replace(policy, "NAME")
     };
@@ -626,8 +646,14 @@ fn instruction_typing_is_read_from_every_readable_graph() {
     ));
     ds.update(&update).unwrap();
     let origin = |access: Option<Arc<GraphAccess>>| {
-        evidence::claim_states(&head(&ds), "main", &[a.0.clone()], access, &Control::none())
-            .unwrap()[0]
+        evidence::claim_states(
+            &head(&ds),
+            "main",
+            std::slice::from_ref(&a.0),
+            access,
+            &Control::none(),
+        )
+        .unwrap()[0]
             .clone()
             .unwrap()
             .origin
@@ -650,8 +676,14 @@ fn instruction_typing_is_read_from_every_readable_graph() {
         "INSERT DATA {{ <urn:source:agents> a <{class}> }}"
     ))
     .unwrap();
-    let read = evidence::claim_states(&head(&ds), "main", &[a.0.clone()], all(), &Control::none())
-        .unwrap();
+    let read = evidence::claim_states(
+        &head(&ds),
+        "main",
+        std::slice::from_ref(&a.0),
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
     assert_eq!(read[0].as_ref().unwrap().origin, ClaimOrigin::Instructions);
 }
 
