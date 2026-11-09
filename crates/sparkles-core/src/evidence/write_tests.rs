@@ -262,3 +262,60 @@ fn identity_proposals_go_to_an_identity_graph_as_a_set_of_entities() {
     let after = plan_of(&input("o", "urn:o"), &t, Some("k")).unwrap();
     assert_eq!(before.payload_digest, after.payload_digest);
 }
+
+/// The claim identities a proposal-graph scan returns stay charged to the caller's
+/// reservation after the scan returns, so scans of several graphs share one bound.
+#[test]
+fn reifiers_about_charges_the_identities_it_returns() {
+    use crate::store::{Store, StoreOptions};
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("INSERT DATA { GRAPH <urn:g> {");
+    for i in 0..200 {
+        data.push_str(&format!(
+            " <urn:claim:{i}:{}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <urn:e> <urn:p> <urn:o{i}> )>> .",
+            "x".repeat(200)
+        ));
+    }
+    data.push_str(" } }");
+    crate::sparql::update::update(&s, &data, &crate::sparql::QueryOptions::default()).unwrap();
+    let snap = s.snapshot();
+    let wanted: BTreeSet<String> = ["urn:e".to_string()].into();
+    let scan = |limit: u64| -> Result<Vec<NamedNode>> {
+        let preparation = Preparation::new(crate::task::Control::none(), limit)?;
+        let mut reads = Reads::new(&preparation, &snap);
+        let mut held = preparation.reserve(0)?;
+        let mut out = Vec::new();
+        // the same graph twice stands for two graphs that each fit alone
+        for _ in 0..2 {
+            let (rows, more) = reads.reifiers_about(
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies",
+                "urn:g",
+                &wanted,
+                1_000,
+                &mut held,
+            )?;
+            assert!(!more);
+            out.extend(rows);
+        }
+        Ok(out)
+    };
+    assert_eq!(scan(16 << 20).unwrap().len(), 400);
+    // one scan keeps about 50 KiB of identities beside 64 KiB of rows, so it fits in
+    // 140 KiB, and two scans that keep the first one's identities do not
+    let one = Preparation::new(crate::task::Control::none(), 140 << 10).unwrap();
+    let mut reads = Reads::new(&one, &snap);
+    let mut held = one.reserve(0).unwrap();
+    assert!(
+        reads
+            .reifiers_about(
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies",
+                "urn:g",
+                &wanted,
+                1_000,
+                &mut held,
+            )
+            .is_ok()
+    );
+    drop(held);
+    assert!(matches!(scan(140 << 10), Err(Error::BudgetExceeded(_))));
+}

@@ -572,24 +572,28 @@ async fn claim_bounds_never_leave_dangling_citations() {
     assert!(listed.len() <= 1);
 }
 
-/// R1: claims read for an Ask summary are published only under the authority they
-/// were read with. A policy reload while the summary is written withholds the answer.
+/// Claims read for an Ask summary are sent and published only under the authority they
+/// were read with. A policy reload while the summary is written withholds the answer,
+/// and a reload before a provider retry stops the retry from being sent.
 #[cfg(feature = "mcp")]
 #[tokio::test(flavor = "multi_thread")]
 async fn ask_withholds_claims_when_authority_changes() {
     use crate::models::mock::{self, MockModel};
     use crate::models::{Models, ModelsConfig};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     let s = server(true);
     let ds = dataset(&s);
     ds.update("INSERT DATA { <urn:release> a <urn:Release> }")
         .unwrap();
     let c = propose(&ds, "advisory", affected(), Polarity::Positive);
     accept(&ds, &c);
-    let reload = Arc::new(AtomicBool::new(false));
+    // 0 answers, 1 reloads and answers, 2 reloads and answers 429 once
+    let reload = Arc::new(AtomicU8::new(0));
+    let summaries = Arc::new(AtomicUsize::new(0));
     let auth = s.auth();
     let flag = reload.clone();
+    let counted = summaries.clone();
     let draft = json!({
         "query": "SELECT ?r WHERE { ?r a <urn:Release> }",
         "explanation": "It lists the releases.",
@@ -600,8 +604,14 @@ async fn ask_withholds_claims_when_authority_changes() {
     .to_string();
     let m = MockModel::start(move |r, _| {
         if r.body.to_string().contains("rows of a query result") {
-            if flag.swap(false, Ordering::SeqCst) {
-                auth.reload().unwrap();
+            counted.fetch_add(1, Ordering::SeqCst);
+            match flag.swap(0, Ordering::SeqCst) {
+                0 => {}
+                1 => auth.reload().map(|_| ()).unwrap(),
+                _ => {
+                    auth.reload().unwrap();
+                    return (429, json!({ "error": { "message": "slow down" } }));
+                }
             }
             return (
                 200,
@@ -657,10 +667,15 @@ async fn ask_withholds_claims_when_authority_changes() {
     };
     let r = ask().await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    reload.store(true, Ordering::SeqCst);
-    let r = ask().await;
-    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
-    let out = r.json();
-    assert_eq!(out["error"]["code"], "forbidden", "{out}");
-    assert!(out.get("summary").is_none() && out.get("claims").is_none());
+    for mode in [1, 2] {
+        reload.store(mode, Ordering::SeqCst);
+        summaries.store(0, Ordering::SeqCst);
+        let r = ask().await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{mode}: {}", r.text());
+        let out = r.json();
+        assert_eq!(out["error"]["code"], "forbidden", "{out}");
+        assert!(out.get("summary").is_none() && out.get("claims").is_none());
+        // no attempt after the reload carries the claims to a provider
+        assert_eq!(summaries.load(Ordering::SeqCst), 1, "{mode}");
+    }
 }

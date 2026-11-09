@@ -50,7 +50,7 @@ use super::{
     IdentityNamespace, MethodRef, Polarity, RecordKey, RecordKind, RecordRef, RenditionContent,
     Settings, Sha256Digest, SourceContent,
 };
-use crate::access::Preparation;
+use crate::access::{Preparation, Reservation};
 use crate::id::Id;
 use crate::index::Perm;
 use crate::store::Snapshot;
@@ -1096,6 +1096,11 @@ pub struct Reads<'a> {
 }
 
 impl<'a> Reads<'a> {
+    /// The preparation the reads are charged to.
+    pub fn preparation(&self) -> &'a Preparation {
+        self.preparation
+    }
+
     pub fn new(preparation: &'a Preparation, snap: &'a Snapshot) -> Self {
         Reads {
             preparation,
@@ -1364,21 +1369,24 @@ impl<'a> Reads<'a> {
 
     /// The IRI subjects in `g` that reify, through `p`, a triple term whose subject or
     /// object is one of `entities`, in subject order. At most `scan` quads of `g` are
-    /// read, and the rows and identities kept are charged to the preparation. Returns
-    /// whether `g` holds more than `scan` quads, in which case the list is incomplete.
+    /// read. The rows read are charged to the preparation while the scan runs, and each
+    /// identity returned is charged to `held` before it is copied, so the caller keeps
+    /// it charged for as long as it keeps `held`. Returns whether `g` holds more than
+    /// `scan` quads, in which case the list is incomplete.
     pub fn reifiers_about(
         &mut self,
         p: &str,
         g: &str,
         entities: &BTreeSet<String>,
         scan: usize,
+        held: &mut Reservation,
     ) -> Result<(Vec<NamedNode>, bool)> {
         let (Some(p), Some(g)) = (self.id(p)?, self.id(g)?) else {
             return Ok((Vec::new(), false));
         };
         const ROW: u64 = std::mem::size_of::<(Id, Id)>() as u64;
         const CHUNK: usize = 4096;
-        let mut held = self.preparation.reserve(0)?;
+        let mut rows_held = self.preparation.reserve(0)?;
         let mut rows: Vec<(Id, Id)> = Vec::new();
         let mut read = 0usize;
         let mut more = false;
@@ -1390,7 +1398,7 @@ impl<'a> Reads<'a> {
             read += 1;
             if q[1] == p {
                 if rows.len() == rows.capacity() {
-                    held.grow_by(CHUNK as u64 * ROW)?;
+                    rows_held.grow_by(CHUNK as u64 * ROW)?;
                     rows.reserve_exact(CHUNK);
                 }
                 rows.push((q[0], q[2]));
@@ -1418,11 +1426,15 @@ impl<'a> Reads<'a> {
             }
             if let Some(n) = self.preparation.with_term(self.snap, s, |t| {
                 Ok(match t {
-                    Some(Term::NamedNode(n)) => Some(n.as_str().to_string()),
+                    Some(Term::NamedNode(n)) => {
+                        held.grow_by(
+                            n.as_str().len() as u64 + std::mem::size_of::<NamedNode>() as u64,
+                        )?;
+                        Some(n.as_str().to_string())
+                    }
                     _ => None,
                 })
             })? {
-                held.grow_by(n.len() as u64 + std::mem::size_of::<NamedNode>() as u64)?;
                 out.push(NamedNode::new_unchecked(n));
             }
         }

@@ -62,6 +62,40 @@ pub const DEFAULT_COMPLEXITY_THRESHOLD: u32 = 8;
 pub const DEFAULT_EXAMPLE_SCORE: f64 = 0.8;
 /// The most communities a local question's grounding names (C22 §7.3).
 const MAX_COMMUNITIES: usize = 3;
+/// The admission code of a model call refused because the caller's authority changed.
+const AUTHORITY_CHANGED: &str = "authority-changed";
+
+/// Admits a model call only while the authority the caller's grants were read under
+/// still holds, checked before every HTTP attempt (C22 §6.3, C25).
+struct AuthorityFence<'a> {
+    state: &'a crate::state::AppState,
+    principal: &'a Principal,
+}
+
+impl crate::models::admission::Admission for AuthorityFence<'_> {
+    fn admit(
+        &self,
+        _: &crate::models::admission::Attempt<'_>,
+    ) -> Result<crate::models::admission::Ticket, crate::models::CallError> {
+        if !self.state.access_current(self.principal) {
+            return Err(crate::models::CallError::Admission(
+                AUTHORITY_CHANGED,
+                "the caller's access changed, so the claims are not sent".into(),
+                false,
+            ));
+        }
+        Ok(crate::models::admission::Ticket::new(Box::new(Unmetered)))
+    }
+}
+
+/// The settlement of an attempt that no budget meters.
+struct Unmetered;
+
+impl crate::models::admission::Settle for Unmetered {
+    fn reported(self: Box<Self>, _: crate::models::admission::Usage) {}
+    fn unknown(self: Box<Self>) {}
+}
+
 /// The linked entities whose claims an ask that names a review policy reads.
 const MAX_CLAIM_SEEDS: usize = 20;
 /// The linked entities and matched classes whose predicate use grounding reads.
@@ -318,6 +352,7 @@ pub fn ask(
         claim_seeds: Vec::new(),
         claims: None,
         withheld: false,
+        fenced: false,
     };
     let mut out = a.run();
     // without a summary, the answer still carries the claims, read for the caller now
@@ -431,6 +466,8 @@ struct Asking<'a, 'e> {
     claims: Option<Value>,
     /// the claims changed for the caller before the summary was published
     withheld: bool,
+    /// whether model calls are admitted only under the caller's current authority
+    fenced: bool,
 }
 
 /// What `run_query` returns: the compact result and, with `full_results`, the full one.
@@ -610,9 +647,17 @@ impl Asking<'_, '_> {
                     format!("no provider and model answers the {} role", role.as_str()),
                 ));
             };
+            // a summary that carries claims sends each attempt, retries and escalations
+            // included, only under the authority the claims were read with (C25)
+            let fence = AuthorityFence {
+                state: &self.server.state,
+                principal: self.principal,
+            };
+            let admission: Option<&dyn crate::models::admission::Admission> =
+                if self.fenced { Some(&fence) } else { None };
             match self
                 .models
-                .call_prompt(Some(role), &pair, prompt, out, self.deadline, None)
+                .call_prompt(Some(role), &pair, prompt, out, self.deadline, admission)
             {
                 Ok(a) => {
                     self.push_step(role, a.record);
@@ -623,6 +668,13 @@ impl Asking<'_, '_> {
                     let message = f.error.message();
                     match f.error {
                         StepError::Budget(_) => return Err(("budget-exceeded", message)),
+                        StepError::Call(crate::models::CallError::Admission(
+                            AUTHORITY_CHANGED,
+                            ..,
+                        )) => {
+                            self.withheld = true;
+                            return Err((AUTHORITY_CHANGED, message));
+                        }
                         StepError::Deadline => return Err(("timeout", message)),
                         _ => {
                             self.failed_calls += 1;
@@ -2143,7 +2195,8 @@ impl Asking<'_, '_> {
         } else {
             prompts::summary()
         };
-        match self.call(
+        self.fenced = claims.is_some();
+        let called = self.call(
             Role::Summarize,
             &Prompt::plain(
                 if claims.is_some() {
@@ -2154,7 +2207,9 @@ impl Asking<'_, '_> {
                 &user,
             ),
             &schema,
-        ) {
+        );
+        self.fenced = false;
+        match called {
             Err((_, message)) => {
                 self.notes.push(format!("the summary failed: {message}"));
                 None

@@ -129,6 +129,11 @@ pub fn unknown_matching_policy(name: &str) -> Error {
     ))
 }
 
+/// Whether `e` is the refusal of a target whose records exceed [`MAX_EVIDENCE`].
+fn beyond_record_bound(e: &Error) -> bool {
+    matches!(e, Error::Managed(m) if m.kind == ManagedErrorKind::IncompleteEvidence)
+}
+
 fn can_read(access: Option<&Arc<GraphAccess>>, g: &str) -> bool {
     let term = Term::NamedNode(NamedNode::new_unchecked(g));
     access.is_none_or(|a| a.readable(Some(&term)))
@@ -288,7 +293,18 @@ impl PolicyClaims<'_> {
         Ok(out)
     }
 
+    /// The occurrence `claim` as the caller may see it. A claim whose own records, such
+    /// as its decisions, withdrawals or supports, exceed the record bound is read as a
+    /// hidden one, so that hidden records never surface as an `incomplete-evidence`
+    /// refusal.
     fn state_of(&mut self, claim: &NamedNode) -> Result<Option<ClaimOccurrence>> {
+        match self.state_of_bounded(claim) {
+            Err(e) if beyond_record_bound(&e) => Ok(None),
+            r => r,
+        }
+    }
+
+    fn state_of_bounded(&mut self, claim: &NamedNode) -> Result<Option<ClaimOccurrence>> {
         // the proposal graph that holds the claim as an authenticated record
         let mut home = None;
         for g in self.state.claim_graphs.clone() {
@@ -447,10 +463,21 @@ impl PolicyClaims<'_> {
     /// project it into the output graph, sorted. A support the caller's view hides is
     /// left out. The claims still need [`Self::states`] before they are shown.
     pub fn supports(&mut self, triples: &[Triple]) -> Result<Vec<Vec<NamedNode>>> {
-        let supports = self.graphs.supports.clone();
         let mut out = Vec::with_capacity(triples.len());
         for t in triples {
             self.control.check()?;
+            out.push(match self.supports_of(t) {
+                // a triple whose supports exceed the record bound cites none
+                Err(e) if beyond_record_bound(&e) => Vec::new(),
+                r => r?,
+            });
+        }
+        Ok(out)
+    }
+
+    fn supports_of(&mut self, t: &Triple) -> Result<Vec<NamedNode>> {
+        let supports = self.graphs.supports.clone();
+        {
             let mut claims = BTreeSet::new();
             for s in self.state.subjects(
                 &ev("supportedTriple"),
@@ -468,9 +495,8 @@ impl PolicyClaims<'_> {
                     claims.insert(c);
                 }
             }
-            out.push(claims.into_iter().collect());
+            Ok(claims.into_iter().collect())
         }
-        Ok(out)
     }
 
     /// The occurrences the caller may see in the readable proposal graphs of the
@@ -491,6 +517,8 @@ impl PolicyClaims<'_> {
             .filter(|(g, _)| self.settings.proposals.iter().any(|p| p == g.as_str()))
             .cloned()
             .collect();
+        // the identities found stay charged until the occurrences are read
+        let mut held = self.state.reads.preparation().reserve(0)?;
         let mut found = BTreeSet::new();
         for (g, _) in boundary {
             self.control.check()?;
@@ -502,6 +530,7 @@ impl PolicyClaims<'_> {
                 g.as_str(),
                 &wanted,
                 MAX_CLAIM_SCAN,
+                &mut held,
             )?;
             if more {
                 return Err(crate::managed::ManagedError::error(
@@ -545,5 +574,22 @@ impl PolicyClaims<'_> {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A target beyond the record bound is the one refusal a claim read turns into a
+    /// hidden occurrence; any other error still refuses.
+    #[test]
+    fn only_the_record_bound_reads_as_hidden() {
+        assert!(beyond_record_bound(&super::super::incomplete("decisions")));
+        assert!(!beyond_record_bound(&unknown_policy("main")));
+        assert!(!beyond_record_bound(&crate::managed::ManagedError::error(
+            ManagedErrorKind::ProjectionUnavailable,
+            "x"
+        )));
     }
 }
