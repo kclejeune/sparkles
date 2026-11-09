@@ -131,7 +131,7 @@ async fn list(
             .filter(|w| q.dataset.as_deref().is_none_or(|d| d == w.dataset))
             .filter(|w| q.entity.as_deref().is_none_or(|e| e == w.entity))
             .filter(|w| graph.is_none_or(|g| g == w.graph.as_deref()))
-            .filter(|w| reads(&p, &w.dataset, &w.branch, w.graph.as_deref()))
+            .filter(|w| reads_watch(&st, &p, w))
             .map(watch_json)
             .collect();
         let unread: usize = out.iter().filter_map(|w| w["unread"].as_u64()).sum::<u64>() as usize;
@@ -250,10 +250,31 @@ async fn create(
     .await
 }
 
+/// The current dataset and branch names of watch `w`'s branch, which a rename may have
+/// changed since the follower last recorded them; `None` when the branch is gone.
+fn current(st: &AppState, w: &Watch) -> Option<(String, String)> {
+    let found = |d: &Arc<crate::state::Dataset>| {
+        d.store
+            .listed_branch_name(w.branch_id, &Default::default())
+            .ok()
+            .flatten()
+            .map(|b| (d.name.clone(), b))
+    };
+    match st.lookup(&w.dataset) {
+        crate::state::Lookup::Open(d) => found(&d),
+        _ => st.datasets().values().find_map(found),
+    }
+}
+
+/// Whether `p` may read watch `w`'s graph now, on its branch's current name.
+fn reads_watch(st: &AppState, p: &Principal, w: &Watch) -> bool {
+    current(st, w).is_some_and(|(ds, b)| reads(p, &ds, &b, w.graph.as_deref()))
+}
+
 /// The caller's watch `id`, when it may still read the watch's graph.
 fn visible(st: &AppState, p: &Principal, o: &Owner, id: &str) -> ApiResult<Watch> {
     let w = st.watches.get(st, o, id).map_err(refusal)?;
-    if !reads(p, &w.dataset, &w.branch, w.graph.as_deref()) {
+    if !reads_watch(st, p, &w) {
         return Err(err_code(
             StatusCode::FORBIDDEN,
             "watch-access-lost",
@@ -270,6 +291,7 @@ async fn remove(
 ) -> ApiResult<StatusCode> {
     blocking(move || {
         let o = owner(&p)?;
+        visible(&st, &p, &o, &id)?;
         st.watches.delete(&st, &o, &id).map_err(refusal)?;
         Ok(StatusCode::NO_CONTENT)
     })
@@ -337,13 +359,13 @@ async fn seen(
     blocking(move || {
         let o = owner(&p)?;
         let w = visible(&st, &p, &o, &id)?;
-        let head = match st.lookup(&w.dataset) {
+        let head = current(&st, &w).and_then(|(ds, b)| match st.lookup(&ds) {
             crate::state::Lookup::Open(main) => st
-                .branch_dataset(&main, &w.branch)
+                .branch_dataset(&main, &b)
                 .map(|d| d.store.snapshot().commit)
                 .ok(),
             _ => None,
-        };
+        });
         if head.is_some_and(|h| b.commit > h) {
             return Err(bad("commit: above the branch's head"));
         }

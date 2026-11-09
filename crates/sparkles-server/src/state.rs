@@ -1236,6 +1236,11 @@ impl AppState {
         self.catalog.attach_expected(name, source)?;
         Ok(self.get(name).expect("attached"))
     }
+    /// Whether `name` is being deleted or renamed now.
+    pub fn is_leaving(&self, name: &str) -> bool {
+        self.leaving.lock().contains(name)
+    }
+
     /// Mark `name` as leaving until the guard drops. A second delete or rename of the
     /// same dataset is refused meanwhile.
     fn leave(&self, name: &str) -> Result<Leaving<'_>> {

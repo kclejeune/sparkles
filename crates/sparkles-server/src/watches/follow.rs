@@ -75,11 +75,10 @@ pub struct Followers {
 impl Followers {
     /// Read every watched branch's new commits and record the matches.
     pub fn step(&mut self, st: &Arc<AppState>) {
-        let Ok((watches, cursors)) = st.watches.snapshot(st) else {
+        let Ok((watches, cursors, version)) = st.watches.snapshot(st) else {
             self.by_branch.clear();
             return;
         };
-        let version = st.watches.version();
         let bounds = crate::notify::settings(st).watches;
         let mut groups: BTreeMap<uuid::Uuid, Vec<Watch>> = BTreeMap::new();
         for w in watches {
@@ -88,12 +87,28 @@ impl Followers {
         self.by_branch.retain(|id, _| groups.contains_key(id));
         let mut gone: Vec<uuid::Uuid> = Vec::new();
         for (bid, ws) in groups {
-            let dataset = ws[0].dataset.clone();
+            let mut dataset = ws[0].dataset.clone();
             let main = match st.lookup(&dataset) {
                 crate::state::Lookup::Open(ds) => ds,
+                crate::state::Lookup::Missing if st.is_leaving(&dataset) => continue,
                 crate::state::Lookup::Missing => {
-                    gone.push(bid);
-                    continue;
+                    // a renamed dataset keeps its branches' ids
+                    let moved = st.datasets().into_values().find(|d| {
+                        matches!(
+                            d.store.listed_branch_name(bid, &Default::default()),
+                            Ok(Some(_))
+                        )
+                    });
+                    match moved {
+                        Some(d) => {
+                            dataset = d.name.clone();
+                            d
+                        }
+                        None => {
+                            gone.push(bid);
+                            continue;
+                        }
+                    }
                 }
                 crate::state::Lookup::Unavailable(_) => continue,
             };
@@ -118,11 +133,23 @@ impl Followers {
                 .entry(bid)
                 .or_insert_with(|| Follower::new(cursor));
             if f.version != version {
-                f.sync(ws, version);
+                f.sync(ws, version, cursor);
             }
+            let before = f.cursor;
             let out = f.run(st, &ds.store, &dataset, &name, &bounds);
-            st.watches
-                .record(st, bid, out.cursor, out.found, &out.truncated, Some(&name));
+            let known: BTreeSet<String> = f.watches.iter().map(|w| w.id.clone()).collect();
+            let saved = st.watches.record(
+                st,
+                bid,
+                out.cursor,
+                out.found,
+                &out.truncated,
+                (&dataset, &name),
+                &known,
+            );
+            if !saved {
+                f.rewind(before);
+            }
         }
         if !gone.is_empty() {
             st.watches.remove_where(st, |w| gone.contains(&w.branch_id));
@@ -237,9 +264,14 @@ struct Binding {
     predicates: HashMap<Id, bool>,
     /// store id → name, for the names that have one
     names: HashMap<Id, u32>,
-    /// ids decoded once and found to be no name
+    /// ids decoded once and found to be no name, at most [`UNKNOWN`]
     unknown: HashSet<Id>,
+    /// a watched graph or a hierarchy predicate has no id yet
+    missing: bool,
 }
+
+/// The most ids [`Binding::unknown`] keeps before it starts again.
+const UNKNOWN: usize = 1 << 20;
 
 pub(crate) struct Follower {
     cursor: u64,
@@ -255,8 +287,6 @@ pub(crate) struct Follower {
     binding: Binding,
     /// the store the subscription is on, by address, and the subscription
     sub: Option<(usize, DeltaSubscription)>,
-    /// matches up to this commit are not exact (the state at the cursor was not readable)
-    approximate_until: u64,
 }
 
 impl Follower {
@@ -271,13 +301,22 @@ impl Follower {
             load: BTreeSet::new(),
             binding: Binding::default(),
             sub: None,
-            approximate_until: 0,
         }
     }
 
-    /// Take the branch's current watches.
-    pub(crate) fn sync(&mut self, ws: Vec<Watch>, version: u64) {
+    /// Read again from commit `cursor`, with the hierarchy read at it.
+    fn rewind(&mut self, cursor: u64) {
+        if cursor < self.cursor {
+            self.cursor = cursor;
+            self.load.extend(self.graphs.keys().cloned());
+        }
+    }
+
+    /// Take the branch's current watches. `cursor` is the saved cursor, which a new
+    /// watch can hold below the follower's own: the follower then reads from it again.
+    pub(crate) fn sync(&mut self, ws: Vec<Watch>, version: u64, cursor: u64) {
         self.version = version;
+        self.rewind(cursor);
         self.entities.clear();
         let mut watches = Vec::with_capacity(ws.len());
         for (i, w) in ws.into_iter().enumerate() {
@@ -336,6 +375,9 @@ impl Follower {
     fn bind(&mut self, snap: &Snapshot) {
         let uid = snap.generation.uid;
         if self.binding.uid == Some(uid) {
+            if self.binding.missing {
+                self.bind_missing(snap);
+            }
             return;
         }
         let mut b = Binding {
@@ -365,6 +407,41 @@ impl Follower {
             }
         }
         self.binding = b;
+        self.binding.missing =
+            self.missing_keys().next().is_some() || self.binding.predicates.len() < HIERARCHY.len();
+    }
+
+    /// The graph keys without an id.
+    fn missing_keys(&self) -> impl Iterator<Item = Option<String>> + '_ {
+        let bound: BTreeSet<&Option<String>> = self.binding.graphs.values().collect();
+        self.watches
+            .iter()
+            .map(|w| w.graph.clone())
+            .chain(self.graphs.keys().cloned())
+            .filter(move |g| !bound.contains(g))
+    }
+
+    /// Look up the graphs and hierarchy predicates that had no id, which a commit in
+    /// the same generation can add.
+    fn bind_missing(&mut self, snap: &Snapshot) {
+        let keys: BTreeSet<Option<String>> = self.missing_keys().collect();
+        for g in keys {
+            let id = match &g {
+                None => Some(Id::DEFAULT_GRAPH),
+                Some(iri) => snap.lookup_iri(iri),
+            };
+            if let Some(id) = id {
+                self.binding.unknown.remove(&id);
+                self.binding.graphs.insert(id, g);
+            }
+        }
+        for (p, child_is_subject) in HIERARCHY {
+            if let Some(id) = snap.lookup_iri(p) {
+                self.binding.predicates.insert(id, child_is_subject);
+            }
+        }
+        self.binding.missing =
+            self.missing_keys().next().is_some() || self.binding.predicates.len() < HIERARCHY.len();
     }
 
     /// The name of the IRI with store id `id`, if it is one.
@@ -384,6 +461,9 @@ impl Follower {
                 self.binding.names.insert(id, n);
             }
             None => {
+                if self.binding.unknown.len() >= UNKNOWN {
+                    self.binding.unknown.clear();
+                }
                 self.binding.unknown.insert(id);
             }
         }
@@ -436,9 +516,13 @@ impl Follower {
                 match store.snapshot_at(&At::Commit(self.cursor), &HistoryOptions::default()) {
                     Ok((snap, _)) => self.load_graphs(&snap, false),
                     Err(e) => {
-                        tracing::warn!(target: "sparkles::watches", "the state at commit {} of {dataset}@{branch} is not readable, so watches read the head: {e}", self.cursor);
-                        self.load_graphs(&live, false);
-                        self.approximate_until = self.approximate_until.max(live.commit);
+                        // the hierarchy can be read only at the head: the commits up
+                        // to it are unverified, and matching goes on from there
+                        tracing::warn!(target: "sparkles::watches", "the state at commit {} of {dataset}@{branch} is not readable, so its watches get an unverified match up to the head: {e}", self.cursor);
+                        let mut access = Access::new(st, dataset, branch);
+                        self.unverified(store, live.commit, &mut access, &mut out);
+                        self.load_graphs(&live, true);
+                        self.cursor = live.commit;
                     }
                 }
             }
@@ -593,7 +677,7 @@ impl Follower {
             return;
         }
         let (time, author) = meta(store, c.seq);
-        let exact = c.seq > self.approximate_until;
+        let exact = true;
         let mut hits: Vec<_> = hits.into_iter().collect();
         hits.sort_by_key(|(i, _)| *i);
         for (i, (ns, partial)) in hits {

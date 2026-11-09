@@ -14546,8 +14546,11 @@ watches of a deleted branch or dataset are removed. A branch made again under an
 is another branch.
 
 Watches and their matches are kept in `<dataDir>/watches.json`, outside every dataset,
-with mode 0600. A file that a newer release wrote, or one that does not parse, is left as
-it is, and the routes answer `503` with `watches-unavailable` until it is fixed.
+with mode 0600. A file that a newer release wrote, one without its `format` member, or one
+that does not parse, is left as it is, and the routes answer `503` with
+`watches-unavailable` until it is fixed. A watch whose graph the caller can no longer read
+on its branch's current name answers `403` with `watch-access-lost` to every route that
+names it, including `DELETE`.
 
 ### Ask history
 

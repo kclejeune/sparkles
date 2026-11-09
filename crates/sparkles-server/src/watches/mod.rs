@@ -208,6 +208,9 @@ struct Body {
     watches: Vec<Watch>,
 }
 
+/// Every watch, the follower cursors by branch id, and the version they belong to.
+pub(crate) type Snapshot = (Vec<Watch>, BTreeMap<uuid::Uuid, u64>, u64);
+
 /// The watches of the server (`AppState::watches`).
 #[derive(Default)]
 pub struct Watches {
@@ -248,7 +251,13 @@ fn now_text(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// The file's content. Unlike other settings files, a file without its `format`
+/// member is refused, since a reader cannot tell which release wrote it.
 fn parse(bytes: &[u8]) -> Result<Body, String> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| format!("{FILE}: {e}"))?;
+    if !v.get("format").is_some_and(serde_json::Value::is_u64) {
+        return Err(format!("{FILE} has no format member"));
+    }
     sparkles::formats::settings_from_slice::<Body>(FILE, bytes).map_err(|e| e.to_string())
 }
 
@@ -327,8 +336,13 @@ pub struct NewWatch {
 }
 
 impl Watches {
-    fn changed(&self) {
+    /// The watches changed: count it, under the lock of `_g`, so a reader of the
+    /// watches and the version together sees both or neither.
+    fn bump(&self, _g: &Inner) {
         self.version.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn changed(&self) {
         self.wake.notify_all();
     }
 
@@ -336,14 +350,13 @@ impl Watches {
         self.version.load(Ordering::Acquire)
     }
 
-    /// Every watch, and the follower cursors; `Err` when the file is refused.
-    pub(crate) fn snapshot(
-        &self,
-        st: &AppState,
-    ) -> Result<(Vec<Watch>, BTreeMap<uuid::Uuid, u64>), Refusal> {
+    /// Every watch, the follower cursors and the version they belong to; `Err` when
+    /// the file is refused.
+    pub(crate) fn snapshot(&self, st: &AppState) -> Result<Snapshot, Refusal> {
         let mut g = self.inner.lock();
+        let version = self.version();
         let b = g.body(st)?;
-        Ok((b.watches.clone(), b.cursors.clone()))
+        Ok((b.watches.clone(), b.cursors.clone(), version))
     }
 
     /// The watches of `owner`, after recording its current groups.
@@ -377,6 +390,7 @@ impl Watches {
                 }
                 Ok(())
             })?;
+            self.bump(&g);
             drop(g);
             self.changed();
         }
@@ -436,6 +450,9 @@ impl Watches {
             b.watches.push(w.clone());
             Ok((w, true))
         })?;
+        if out.1 {
+            self.bump(&g);
+        }
         drop(g);
         if out.1 {
             self.changed();
@@ -458,6 +475,7 @@ impl Watches {
             }
             Ok(())
         })?;
+        self.bump(&g);
         drop(g);
         self.changed();
         Ok(())
@@ -495,9 +513,14 @@ impl Watches {
     }
 
     /// Record what the follower found on branch `branch_id` up to `cursor`: the
-    /// matches by watch id, the watches whose subtree passed a bound, and the branch's
-    /// current name. Saves at once when something besides the cursor changed, and
-    /// otherwise at most every [`CURSOR_SAVE`].
+    /// matches by watch id, the watches whose hierarchy is not followed, and the
+    /// branch's current dataset and branch names. `known` are the watches the run
+    /// matched against: the cursor stays at or below the `since` of a watch it did not
+    /// know, so that watch's commits are read once the follower takes it. Saves at once
+    /// when something besides the cursor changed, and otherwise at most every
+    /// [`CURSOR_SAVE`]. `false` when the matches could not be saved, and the follower
+    /// then reads the commits again.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record(
         &self,
         st: &AppState,
@@ -505,16 +528,23 @@ impl Watches {
         cursor: u64,
         found: Vec<(String, Match)>,
         truncated: &BTreeMap<String, bool>,
-        name: Option<&str>,
-    ) {
+        names: (&str, &str),
+        known: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        let (dataset, branch) = names;
         let mut g = self.inner.lock();
-        let Ok(b) = g.body(st) else { return };
+        let Ok(b) = g.body(st) else { return false };
+        let cursor = b
+            .watches
+            .iter()
+            .filter(|w| w.branch_id == branch_id && !known.contains(&w.id))
+            .map(|w| w.since)
+            .fold(cursor, u64::min);
         let moved = b.cursors.get(&branch_id).is_none_or(|&c| c < cursor);
-        let renamed = name.is_some_and(|n| {
-            b.watches
-                .iter()
-                .any(|w| w.branch_id == branch_id && w.branch != n)
-        });
+        let renamed = b
+            .watches
+            .iter()
+            .any(|w| w.branch_id == branch_id && (w.branch != branch || w.dataset != dataset));
         let flags = b
             .watches
             .iter()
@@ -535,19 +565,16 @@ impl Watches {
                     g.saved = Some(Instant::now());
                 }
             }
-            return;
+            return true;
         }
         let r = g.change(st, |b| {
-            if b.cursors.contains_key(&branch_id)
-                || b.watches.iter().any(|w| w.branch_id == branch_id)
-            {
+            if b.watches.iter().any(|w| w.branch_id == branch_id) {
                 let c = b.cursors.entry(branch_id).or_insert(cursor);
                 *c = (*c).max(cursor);
             }
             for w in b.watches.iter_mut().filter(|w| w.branch_id == branch_id) {
-                if let Some(n) = name {
-                    w.branch = n.to_string();
-                }
+                w.branch = branch.to_string();
+                w.dataset = dataset.to_string();
                 if let Some(&t) = truncated.get(&w.id) {
                     w.truncated = t;
                 }
@@ -568,8 +595,12 @@ impl Watches {
             }
             Ok(())
         });
-        if let Err(e) = r {
-            tracing::warn!(target: "sparkles::watches", "cannot record matches: {e:?}");
+        match r {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(target: "sparkles::watches", "cannot record matches, so the commits are read again: {e:?}");
+                false
+            }
         }
     }
 
@@ -587,6 +618,9 @@ impl Watches {
             b.cursors.retain(|k, _| live.contains(k));
             Ok(())
         });
+        if r.is_ok() {
+            self.bump(&g);
+        }
         drop(g);
         match r {
             Ok(()) => self.changed(),

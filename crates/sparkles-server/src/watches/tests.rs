@@ -51,6 +51,15 @@ level = "read"
 graphs = ["urn:g:open"]
 
 [[users]]
+name = "rita"
+password = "{}"
+
+[[users.grants]]
+dataset = "ds"
+level = "read"
+branches = ["dev"]
+
+[[users]]
 name = "pat"
 password = "{}"
 datasets = {{ pds = "read" }}
@@ -63,6 +72,7 @@ predicates = ["urn:secret"]
         h("alice-pw"),
         h("bob-pw"),
         h("erin-pw"),
+        h("rita-pw"),
         h("pat-pw"),
     )
 }
@@ -505,7 +515,7 @@ async fn access_decides_what_can_be_watched_and_listed() {
             .unwrap();
     s.update("alice", "main", &label("urn:a", "A")).await;
     let _ = s.matched("erin", w["id"].as_str().unwrap()).await;
-    let (ws, _) = s.st.watches.snapshot(&s.st).unwrap();
+    let (ws, _, _) = s.st.watches.snapshot(&s.st).unwrap();
     let g = ws.iter().find(|x| x.id == gw.id).unwrap();
     assert!(g.matches.is_empty());
 }
@@ -554,4 +564,138 @@ async fn matches_and_cursors_survive_a_restart() {
     assert_eq!(commits(&s.matched("bob", &id).await), vec![first, second]);
     let saved = std::fs::read_to_string(s.st.data_dir.join(FILE)).unwrap();
     assert!(saved.contains("\"format\": 1"), "{saved}");
+}
+
+fn new_watch(s: &Srv, graph: &str, entity: &str) -> NewWatch {
+    let ds = s.st.datasets()["ds"].clone();
+    NewWatch {
+        dataset: "ds".into(),
+        branch: "main".into(),
+        branch_id: ds.store.branch_id(),
+        graph: Some(graph.into()),
+        entity: entity.into(),
+        scope: Scope::Entity,
+        depth: None,
+        head: s.head(),
+    }
+}
+
+fn user(name: &str) -> Owner {
+    Owner {
+        kind: Kind::User,
+        name: name.into(),
+        groups: vec![],
+    }
+}
+
+#[tokio::test]
+async fn a_watch_on_an_unreadable_graph_cannot_be_deleted_or_read() {
+    let s = server();
+    // erin reads only urn:g:open; a watch of hers on G, as a narrower token would see it
+    let (w, _) =
+        s.st.watches
+            .create(&s.st, &user("erin"), new_watch(&s, G, "urn:a"), Utc::now())
+            .unwrap();
+    let (st, v) = s
+        .call("DELETE", &format!("/$/watches/{}", w.id), "erin", J::Null)
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["code"], "watch-access-lost");
+    let (ws, _, _) = s.st.watches.snapshot(&s.st).unwrap();
+    assert!(ws.iter().any(|x| x.id == w.id));
+}
+
+#[tokio::test]
+async fn a_renamed_branch_is_authorized_under_its_new_name_at_once() {
+    let s = server();
+    let main = s.st.datasets()["ds"].clone();
+    main.store
+        .create_branch("dev", &Default::default())
+        .unwrap();
+    let w = s
+        .watch(
+            "rita",
+            json!({"dataset": "ds", "branch": "dev", "graph": G, "entity": "urn:a"}),
+        )
+        .await;
+    let id = w["id"].as_str().unwrap();
+    main.store.rename_branch("dev", "next").unwrap();
+    s.st.renamed_branch(&main, "dev", "next");
+    // rita's grant names dev, which no longer is this branch; the follower has not run
+    let (_, l) = s.call("GET", "/$/watches", "rita", J::Null).await;
+    assert_eq!(l["watches"], json!([]));
+    let (st, _) = s
+        .call("GET", &format!("/$/watches/{id}/matches"), "rita", J::Null)
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_graph_made_after_its_watch_is_followed() {
+    let mut s = server();
+    s.update("alice", "main", &label("urn:z", "Z")).await;
+    let w = s
+        .watch(
+            "bob",
+            json!({"dataset": "ds", "graph": "urn:g:later", "entity": "urn:a"}),
+        )
+        .await;
+    let id = w["id"].as_str().unwrap().to_string();
+    assert!(s.matched("bob", &id).await.is_empty());
+    s.update(
+        "alice",
+        "main",
+        "INSERT DATA { GRAPH <urn:g:later> { <urn:a> <urn:p> 1 } }",
+    )
+    .await;
+    let made = s.head();
+    assert_eq!(commits(&s.matched("bob", &id).await), vec![made]);
+}
+
+#[tokio::test]
+async fn a_watch_the_run_did_not_know_holds_the_cursor_back() {
+    let mut s = server();
+    let a = s
+        .watch(
+            "bob",
+            json!({"dataset": "ds", "graph": G, "entity": "urn:a"}),
+        )
+        .await;
+    let _ = s.matched("bob", a["id"].as_str().unwrap()).await;
+    let b = s
+        .watch(
+            "bob",
+            json!({"dataset": "ds", "graph": G, "entity": "urn:b"}),
+        )
+        .await;
+    s.update("alice", "main", &label("urn:b", "B")).await;
+    let head = s.head();
+    let bid = s.st.datasets()["ds"].store.branch_id();
+    let known: std::collections::BTreeSet<String> = [a["id"].as_str().unwrap().to_string()].into();
+    // a run that began before b existed finished at the head
+    assert!(s.st.watches.record(
+        &s.st,
+        bid,
+        head,
+        vec![],
+        &BTreeMap::new(),
+        ("ds", "main"),
+        &known
+    ));
+    let (_, cursors, _) = s.st.watches.snapshot(&s.st).unwrap();
+    assert!(cursors[&bid] <= b["since"].as_u64().unwrap());
+    assert_eq!(
+        commits(&s.matched("bob", b["id"].as_str().unwrap()).await),
+        vec![head]
+    );
+}
+
+#[tokio::test]
+async fn a_file_without_its_format_is_refused() {
+    let s = server();
+    let p = s.st.data_dir.join(FILE);
+    std::fs::write(&p, r#"{"watches": []}"#).unwrap();
+    let (st, _) = s.call("GET", "/$/watches", "bob", J::Null).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), r#"{"watches": []}"#);
 }
