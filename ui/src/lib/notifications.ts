@@ -234,6 +234,44 @@ export function routeErrors(
   return out;
 }
 
+/** The members of a channel type of which a channel has exactly one, by the field of each. */
+const ALTERNATIVES: Record<string, [string, string][]> = {
+  webhook: [
+    ['url', 'url'],
+    ['urlSecret', pathString(['urlSecret', 'secret'])],
+  ],
+};
+
+/**
+ * The whole configuration to `PUT` when the form switches a channel from one alternative
+ * to the other, such as a webhook from a URL the settings file declares to a URL secret.
+ * A merge patch cannot remove the declared member, since emptying its field only drops
+ * the runtime value. `effective` is the configuration the pending change gives, in which
+ * both alternatives are then present, and the member whose field the form emptied goes.
+ * Null when no channel needs this, so the form sends its merge patch.
+ */
+export function alternativesBody(effective: JsonObject, form: FormValues): JsonObject | null {
+  const channels = (effective.channels as Record<string, JsonObject | null> | undefined) ?? {};
+  let out: JsonObject | null = null;
+  for (const [name, c] of Object.entries(channels)) {
+    const alts = ALTERNATIVES[String(c?.type ?? '')];
+    if (!c || !alts) continue;
+    const present = alts.filter(([m]) => c[m] !== undefined);
+    if (present.length < 2) continue;
+    const emptied = present.filter(([, f]) => {
+      const v = form[pathString(['channels', name, ...parsePath(f)])];
+      return v === undefined || String(v).trim() === '';
+    });
+    if (emptied.length !== 1) continue;
+    out ??= JSON.parse(JSON.stringify(effective)) as JsonObject;
+    delete ((out.channels as JsonObject)[name] as JsonObject)[emptied[0][0]];
+  }
+  return out;
+}
+
+/** Each value once, in the order given, for keyed lists of values that may repeat. */
+export const distinct = <T>(xs: readonly T[]) => [...new Set(xs)];
+
 /** Declared channels removed at runtime: overrides whose runtime value is `null`. */
 export function removedChannels(k: SettingsKind | null): { name: string; path: string }[] {
   return (k?.overrides ?? [])
@@ -261,7 +299,7 @@ export const NAME = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
 export const ROUTE_KEY = /^(\*|[a-z0-9-]+(\.[a-z0-9-]+)*(\.\*)?)$/;
 
 /** A mail address that SMTP carries without SMTPUTF8, as the server checks it. */
-const MAIL = /^[^\s<>,"();:\\[\]@]{1,64}@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$/;
+const MAIL = /^(?:(?![<>,"();:\\[\]@])[\x21-\x7e]){1,64}@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$/;
 
 /** The Add channel form. Only the members of the chosen type are read. */
 export type NewChannel = {

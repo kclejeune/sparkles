@@ -156,11 +156,11 @@ test('edits a route in the configuration and refuses a missing channel', async (
   await expect(all.getByRole('list', { name: '*' }).getByRole('listitem')).toHaveCount(1);
   // a channel the server does not know is flagged before a save
   const input = all.getByPlaceholder('Add a channel');
-  await input.fill('pager');
+  await input.fill('beeper');
   await input.press('Enter');
-  await expect(all.getByText('No channel named pager')).toBeVisible();
-  await all.getByRole('button', { name: 'Remove pager' }).click();
-  await expect(all.getByText('No channel named pager')).toHaveCount(0);
+  await expect(all.getByText('No channel named beeper')).toBeVisible();
+  await all.getByRole('button', { name: 'Remove beeper' }).click();
+  await expect(all.getByText('No channel named beeper')).toHaveCount(0);
   // a known one is suggested and saved
   await all.getByRole('button', { name: 'Add phone' }).click();
   await panel.getByRole('button', { name: 'Save', exact: true }).click();
@@ -188,6 +188,93 @@ test('removes a declared channel from its routes and restores it', async ({ page
   await section.getByRole('button', { name: 'Use server config for channel ops' }).click();
   await expect(page.getByText('Channel ops uses the server config again')).toBeVisible();
   await expect(channels.locator('[data-channel=ops]')).toBeVisible();
+});
+
+test('a channel that a locked route names cannot be removed', async ({ page }) => {
+  const { section, routes } = await openSection(page);
+  const remove = section.getByRole('button', { name: 'Remove channel pager' });
+  await expect(remove).toBeDisabled();
+  await expect(remove).toHaveAttribute('title', /locks the route backup\.overdue/);
+  await expect(
+    section.getByRole('button', { name: 'Remove the route for backup.overdue' }),
+  ).toBeDisabled();
+  await expect(routes.locator('[data-route="backup.overdue"]')).toContainText('pager');
+});
+
+test('repeated channels and secrets show once per entry without breaking', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  // the server accepts a route that names a channel twice, and a webhook whose URL and
+  // signature come from one secret
+  const kind = await (await page.request.get(URL)).json();
+  const res = await page.request.patch(URL, {
+    headers: { 'If-Match': kind.etag },
+    data: {
+      channels: {
+        twin: {
+          type: 'webhook',
+          urlSecret: { secret: 'twin' },
+          signingSecret: { secret: 'twin' },
+        },
+      },
+      routes: { '*': ['ops', 'ops'] },
+    },
+  });
+  expect(res.ok()).toBe(true);
+  const { channels, routes } = await openSection(page);
+  await expect(routes.locator('[data-route="*"]')).toContainText('ops, ops');
+  await expect(channels.locator('[data-channel=twin]')).toContainText('twin');
+  await expect(channels.locator('[data-channel=twin] .badge')).toHaveCount(1);
+  expect(errors).toEqual([]);
+});
+
+test('switches a declared webhook from its URL to a URL secret', async ({ page }) => {
+  const { channels, panel, row } = await openSection(page);
+  await row('channels.ops.url').getByRole('textbox').fill('');
+  await row('channels.ops.urlSecret.secret').getByRole('combobox').fill('ops-url');
+  await panel.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('Saved the notification configuration settings')).toBeVisible();
+  await expect(channels.locator('[data-channel=ops]')).toContainText('the URL in secret ops-url');
+  const k = await (await page.request.get(URL)).json();
+  expect(k.effective.channels.ops.url).toBeUndefined();
+  expect(k.effective.channels.ops.urlSecret).toEqual({ secret: 'ops-url' });
+  expect(k.runtime.channels.ops).toEqual({ url: null, urlSecret: { secret: 'ops-url' } });
+});
+
+test('a reload shows a change made elsewhere in the configuration', async ({ page }) => {
+  const { section, row } = await openSection(page);
+  const url = row('channels.ops.url').getByRole('textbox');
+  await expect(url).toHaveValue('https://hooks.example.org/sparkles');
+  const kind = await (await page.request.get(URL)).json();
+  const res = await page.request.patch(URL, {
+    headers: { 'If-Match': kind.etag },
+    data: { channels: { ops: { url: 'https://hooks.example.org/other' } } },
+  });
+  expect(res.ok()).toBe(true);
+  await section.getByRole('button', { name: 'Reload notifications' }).click();
+  await expect(url).toHaveValue('https://hooks.example.org/other');
+});
+
+test('the mock refuses a reset that leaves a route to a missing channel', async ({ request }) => {
+  let kind = await (await request.get(URL)).json();
+  let res = await request.patch(URL, {
+    headers: { 'If-Match': kind.etag },
+    data: { channels: { ops: null }, routes: { 'backup.*': ['phone'], '*': [] } },
+  });
+  expect(res.ok()).toBe(true);
+  kind = await res.json();
+  res = await request.delete(`${URL}?field=${encodeURIComponent('routes.*')}`, {
+    headers: { 'If-Match': kind.etag },
+  });
+  expect(res.status()).toBe(400);
+  expect((await (await request.get(URL)).json()).runtime.routes['*']).toEqual([]);
+  // restating a locked value is no change
+  kind = await (await request.get(URL)).json();
+  res = await request.patch(URL, {
+    headers: { 'If-Match': kind.etag },
+    data: { channels: { phone: { topic: 'sparkles-ops' } } },
+  });
+  expect(res.ok()).toBe(true);
 });
 
 test('fits a phone', async ({ page }) => {

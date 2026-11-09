@@ -1,9 +1,10 @@
-// Mock of the outbound notifications of a server whose settings file declares two
-// channels and two routes (spec C21), for UI development and the mock UI tests:
+// Mock of the outbound notifications of a server whose settings file declares three
+// channels and three routes (spec C21), for UI development and the mock UI tests:
 // `GET /$/notifications`, `POST /$/notifications/test/{channel}` and
 // `/$/server/settings/notifications`, in the shapes of docs/openapi.json
 // (`NotificationStatus`, `NotificationTest`, `ServerSettingsKind`). The settings file
-// locks the `phone` channel. Writes change a runtime layer kept in memory, merged as RFC
+// locks the `phone` channel and the route of `backup.overdue` to `pager`, whose URL is a
+// secret. Writes change a runtime layer kept in memory, merged as RFC
 // 7396 says, and are checked as the server checks the main rules. A test to a channel
 // whose target names `fail` answers 502 as an unreachable channel does, and every test
 // joins the recent deliveries. `DELETE /$/server/settings/notifications` clears the
@@ -26,10 +27,11 @@ const DECLARED = {
       url: 'https://hooks.example.org/sparkles',
       signingSecret: { secret: 'hook-signing' },
     },
+    pager: { type: 'webhook', urlSecret: { secret: 'pager-url' } },
   },
-  routes: { 'backup.*': ['phone', 'ops'], '*': ['ops'] },
+  routes: { 'backup.*': ['phone', 'ops'], '*': ['ops'], 'backup.overdue': ['pager'] },
 };
-const LOCKED = ['channels.phone'];
+const LOCKED = ['channels.phone', 'routes.backup\\.overdue'];
 const SECRET_MEMBERS = ['token', 'urlSecret', 'signingSecret', 'password'];
 
 /** Deliveries since the mock started, before any test. */
@@ -87,6 +89,8 @@ let runtime = {};
 let version = 1;
 let tests = [];
 let testSeq = 100;
+/** The helpers of the mock server, from the last request. */
+let ctx0;
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const clone = (v) => (v === undefined ? v : JSON.parse(JSON.stringify(v)));
@@ -346,6 +350,7 @@ function readBody(req) {
 
 /** Handles the routes above; false when the request is not one of them. */
 export function handleNotifications(req, res, seg, ctx) {
+  ctx0 = ctx;
   const { send, fail } = ctx;
   if (seg[0] !== '$') return false;
   const path = seg.slice(1).join('/');
@@ -404,51 +409,102 @@ export function handleNotifications(req, res, seg, ctx) {
   }
   if (req.method === 'DELETE') {
     const field = url.searchParams.get('field');
-    if (field) removeAt(runtime, parse(field));
-    else {
-      runtime = {};
-      tests = [];
-    }
-    runtime = prune(runtime);
-    version++;
-    send(res, 200, kind());
+    let next = clone(runtime);
+    if (field) removeAt(next, parse(field));
+    else next = {};
+    if (commit(res, next) && !field) tests = [];
     return true;
   }
-  if (req.method !== 'PATCH') return (fail(res, 405, 'method not allowed'), true);
+  if (req.method !== 'PATCH' && req.method !== 'PUT')
+    return (fail(res, 405, 'method not allowed'), true);
   void readBody(req).then((text) => {
-    let patch;
+    let body;
     try {
-      patch = JSON.parse(text);
+      body = JSON.parse(text);
     } catch {
       return send(res, 400, { error: 'the body is not JSON', code: 'bad-settings' });
     }
-    let next = merge(runtime, patch);
-    // `null` for a declared channel removes it: the layer keeps the null
-    for (const [name, v] of Object.entries(patch.channels ?? {}))
-      if (v === null && DECLARED.channels[name]) setAt(next, ['channels', name], null);
-    next = prune(next);
-    for (const l of LOCKED) {
-      const p = parse(l);
-      if (covers(patch, p) && JSON.stringify(at(next, p)) !== JSON.stringify(at(DECLARED, p)))
-        return send(res, 409, {
-          error: `the settings file locks ${l} of notifications for the server`,
-          code: 'locked-by-config',
-          fields: [l],
-        });
+    if (!isObj(body))
+      return send(res, 400, { error: 'the body is not an object', code: 'bad-settings' });
+    let next;
+    if (req.method === 'PUT') {
+      // the fields where the body differs from the declared and default layers, a locked
+      // field left out keeping its value
+      const target = clone(body);
+      const eff = effectiveOf(runtime);
+      for (const l of LOCKED) {
+        const p = parse(l);
+        if (at(target, p) === undefined && at(eff, p) !== undefined) setAt(target, p, at(eff, p));
+      }
+      next = diff(base(), target) ?? {};
+    } else {
+      next = merge(runtime, body);
+      // `null` for a declared channel removes it: the layer keeps the null
+      for (const [name, v] of Object.entries(body.channels ?? {}))
+        if (v === null && DECLARED.channels[name]) setAt(next, ['channels', name], null);
     }
-    try {
-      check(effectiveOf(next));
-    } catch (e) {
-      if (!(e instanceof Refused)) throw e;
-      return send(res, 400, {
-        error: `notifications: ${e.message}`,
-        code: 'bad-settings',
-        field: e.field,
-      });
-    }
-    runtime = next;
-    version++;
-    send(res, 200, kind());
+    commit(res, next);
   });
+  return true;
+}
+
+/** The declared layer over the defaults, which a `PUT` is compared with. */
+const base = () => merge(clone(DEFAULTS), DECLARED);
+
+/** The merge patch that turns `from` into `to`, as the server's `diff`, or undefined. */
+function diff(from, to) {
+  if (isObj(from) && isObj(to)) {
+    const out = {};
+    for (const [k, v] of Object.entries(to)) {
+      if (!(k in from)) out[k] = clone(v);
+      else {
+        const d = diff(from[k], v);
+        if (d !== undefined) out[k] = d;
+      }
+    }
+    for (const k of Object.keys(from)) if (!(k in to)) out[k] = null;
+    return Object.keys(out).length ? out : undefined;
+  }
+  return JSON.stringify(from) === JSON.stringify(to) ? undefined : clone(to);
+}
+
+/**
+ * Store `next` as the runtime layer as the server's settings writer does, or answer why
+ * not: a write that leaves a locked field alone or restates it stores nothing for it and
+ * any other is refused, and the effective object must pass the checks. Nothing changes
+ * on a refusal. True when the layer was stored.
+ */
+function commit(res, next) {
+  const { send } = ctx0;
+  next = prune(next);
+  const before = merge(base(), runtime);
+  const after = merge(base(), next);
+  for (const l of LOCKED) {
+    const p = parse(l);
+    if (JSON.stringify(at(before, p)) !== JSON.stringify(at(after, p))) {
+      send(res, 409, {
+        error: `the settings file locks ${l} of notifications for the server`,
+        code: 'locked-by-config',
+        fields: [l],
+      });
+      return false;
+    }
+    removeAt(next, p);
+  }
+  next = prune(next);
+  try {
+    check(effectiveOf(next));
+  } catch (e) {
+    if (!(e instanceof Refused)) throw e;
+    send(res, 400, {
+      error: `notifications: ${e.message}`,
+      code: 'bad-settings',
+      field: e.field,
+    });
+    return false;
+  }
+  runtime = next;
+  version++;
+  send(res, 200, kind());
   return true;
 }

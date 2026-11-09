@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   CHANNEL_TYPES,
+  alternativesBody,
+  distinct,
   channelGroup,
   channelNames,
   emptyChannel,
@@ -259,5 +261,53 @@ describe('deliveries', () => {
     const [url, init] = fetch.mock.calls[0] as unknown as [string, RequestInit];
     expect(String(url)).toContain('/$/notifications/test/a%20b');
     expect(init.method).toBe('POST');
+  });
+});
+
+describe('alternativesBody', () => {
+  const eff = () => ({
+    enabled: true,
+    channels: {
+      ops: { type: 'webhook', url: 'https://h.example.org/x', urlSecret: { secret: 'u' } },
+      phone: { type: 'ntfy', topic: 't' },
+    },
+    routes: { '*': ['ops'] },
+  });
+
+  it('drops the alternative whose field the form emptied', () => {
+    const body = alternativesBody(eff(), {
+      'channels.ops.url': '',
+      'channels.ops.urlSecret.secret': 'u',
+    });
+    expect(body?.channels).toEqual({
+      ops: { type: 'webhook', urlSecret: { secret: 'u' } },
+      phone: { type: 'ntfy', topic: 't' },
+    });
+    expect(body?.routes).toEqual({ '*': ['ops'] });
+    const back = alternativesBody(eff(), {
+      'channels.ops.url': 'https://h.example.org/x',
+      'channels.ops.urlSecret.secret': ' ',
+    });
+    expect((back?.channels as Record<string, unknown>).ops).toEqual({
+      type: 'webhook',
+      url: 'https://h.example.org/x',
+    });
+  });
+
+  it('leaves a merge patch alone when no channel holds both', () => {
+    const e = eff();
+    delete (e.channels.ops as Record<string, unknown>).urlSecret;
+    expect(alternativesBody(e, { 'channels.ops.url': 'https://h.example.org/x' })).toBeNull();
+    // both filled in is for the server to refuse
+    expect(
+      alternativesBody(eff(), {
+        'channels.ops.url': 'https://h.example.org/x',
+        'channels.ops.urlSecret.secret': 'u',
+      }),
+    ).toBeNull();
+  });
+
+  it('distinct keeps the first of each value', () => {
+    expect(distinct(['a', 'b', 'a'])).toEqual(['a', 'b']);
   });
 });

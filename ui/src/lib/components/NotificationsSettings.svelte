@@ -16,6 +16,8 @@
     CHANNEL_TYPES,
     EVENT_TYPES,
     NOTIFICATIONS_URL,
+    alternativesBody,
+    distinct,
     ROUTES_GROUP,
     channelNames,
     channelTypes,
@@ -66,6 +68,11 @@
   let kind = $state<SettingsKind | null>(null);
   let kindError = $state<string | null>(null);
   let busy = $state(false);
+  /**
+   * Counts the loads and writes of the kind outside the panel. The panel keeps the kind it
+   * read itself, so it starts again after each of them to show the same version.
+   */
+  let outside = $state(0);
 
   let addOpen = $state(false);
   let add = $state(emptyChannel());
@@ -87,7 +94,8 @@
   const names = $derived(channelNames(kind));
   // the panel starts again when the channels, their types or the routes change, since its
   // form has a group of fields for each channel and a field for each route
-  const fieldsKey = $derived(JSON.stringify([channelTypes(kind), routeKeys(kind)]));
+  // and after a load or a write of the kind outside it
+  const fieldsKey = $derived(JSON.stringify([channelTypes(kind), routeKeys(kind), outside]));
   const removed = $derived(removedChannels(kind));
   const routes = $derived((kind?.effective.routes as Record<string, string[]> | undefined) ?? {});
   const recent = $derived(newestFirst(status?.recent ?? []));
@@ -149,6 +157,7 @@
     try {
       kind = await readKind(NOTIFICATIONS_URL);
       kindError = null;
+      outside++;
     } catch (e) {
       kindError = api.errorMessage(e);
     }
@@ -190,6 +199,7 @@
     busy = true;
     try {
       kind = await fn(kind?.etag);
+      outside++;
       toasts.push('success', what);
       void loadStatus();
       void loadSecrets();
@@ -304,6 +314,22 @@
   const routeLocked = (key: string) =>
     !!kind && fieldInfo(kind, pathString(['routes', key])).locked;
 
+  /** Whether the settings file locks the routes as a whole, so none can be added. */
+  const routesLocked = $derived(!!kind && fieldInfo(kind, 'routes').locked);
+
+  /**
+   * Why a channel cannot be removed, or null when it can: a lock on the channel, or on a
+   * route that names it, since removing the channel takes it out of its routes.
+   */
+  function removeBlocked(name: string): string | null {
+    if (channelLocked(name))
+      return 'This channel, or some of its fields, is locked in the settings file';
+    const locked = routesTo(routes, name).filter(routeLocked);
+    if (locked.length)
+      return `The settings file locks the ${locked.length > 1 ? 'routes' : 'route'} ${locked.join(', ')}, which removing this channel would change`;
+    return null;
+  }
+
   /** The last delivery of a channel, success or failure, whichever is newer. */
   function lastOf(c: NotificationStatus['channels'][number]) {
     const s = c.lastSuccess;
@@ -343,8 +369,12 @@
       >
       <button
         class="btn sm"
-        disabled={busy || !kind || names.length === 0}
-        title={names.length === 0 ? 'Add a channel first' : undefined}
+        disabled={busy || !kind || names.length === 0 || routesLocked}
+        title={routesLocked
+          ? 'The settings file locks the routes'
+          : names.length === 0
+            ? 'Add a channel first'
+            : undefined}
         onclick={() => {
           routeOpen = !routeOpen;
           addOpen = false;
@@ -517,7 +547,7 @@
                   <td class="muted">{c.type}</td>
                   <td class="mono small target">
                     {c.target}
-                    {#each c.secrets as s (s)}
+                    {#each distinct(c.secrets) as s (s)}
                       {@const info = secretOf(s)}
                       <span
                         class="badge {info && info.source === 'missing' ? 'danger' : ''}"
@@ -568,10 +598,8 @@
                     >
                     <button
                       class="btn ghost icon sm"
-                      disabled={busy || channelLocked(c.name)}
-                      title={channelLocked(c.name)
-                        ? 'This channel, or some of its fields, is locked in the settings file'
-                        : 'Remove this channel'}
+                      disabled={busy || removeBlocked(c.name) != null}
+                      title={removeBlocked(c.name) ?? 'Remove this channel'}
                       onclick={() => (removeChannel = c.name)}
                       aria-label="Remove channel {c.name}"><Icon name="trash" size={12} /></button
                     >
@@ -617,7 +645,7 @@
                   <tr data-route={key}>
                     <td class="mono">{key}</td>
                     <td class="small">
-                      {#each chans as ch, i (ch)}{i ? ', ' : ''}<span class="mono">{ch}</span
+                      {#each chans as ch, i (i)}{i ? ', ' : ''}<span class="mono">{ch}</span
                         >{:else}<span class="faint">none</span>{/each}
                     </td>
                     <td class="actions">
@@ -730,13 +758,14 @@
         forbiddenText="Changing notifications requires the server-admin permission on a server that is not read-only."
         onchange={onKind}
         check={checkRoutes}
+        replace={alternativesBody}
         {extras}
         secrets={secretFields}
       >
         {#snippet groupExtra(group: string)}
           {@const name = groupChannel(group)}
           {#if name}
-            {@const lock = channelLocked(name)}
+            {@const blocked = removeBlocked(name)}
             <div class="group-actions">
               <span class="spacer"></span>
               <button
@@ -748,10 +777,8 @@
               <button
                 type="button"
                 class="btn danger sm"
-                disabled={busy || lock}
-                title={lock
-                  ? 'This channel, or some of its fields, is locked in the settings file'
-                  : 'Remove this channel'}
+                disabled={busy || blocked != null}
+                title={blocked ?? 'Remove this channel'}
                 onclick={() => (removeChannel = name)}
                 ><Icon name="trash" size={12} /> Remove</button
               >
