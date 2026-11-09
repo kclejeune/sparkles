@@ -324,8 +324,9 @@ impl Extra {
             + self
                 .groups
                 .iter()
-                .map(|g| 96 + (g.funs.len() + g.roles.len() + g.val.opaque.len()) * 4)
+                .map(|g| (g.funs.capacity() + g.roles.capacity()) * 4 + g.val.owned_bytes())
                 .sum::<usize>()
+            + self.groups.capacity() * std::mem::size_of::<Group>()
             + self.horn.bytes()
             + self.dl.as_ref().map_or(0, |d| d.bytes())
     }
@@ -714,6 +715,13 @@ impl Outbox {
 
 /// Where the rules of a context send their conclusions.
 pub trait Sink {
+    /// Pre-admit functional-data allocation, with retained growth reconciled afterwards.
+    fn reserve_data(&mut self, _bytes: usize) -> bool {
+        true
+    }
+    fn release_data(&mut self, _bytes: usize) {}
+    fn data_overflow(&mut self) {}
+
     /// sends a conclusion to a context, which may be the one the rules run in
     fn send(&mut self, to: Ex, c: Concl);
     /// a conclusion for the context the rules run in
@@ -752,6 +760,28 @@ pub trait Sink {
 }
 
 impl Sink for Out<'_, '_> {
+    fn reserve_data(&mut self, bytes: usize) -> bool {
+        if bytes > isize::MAX as usize
+            || self
+                .run
+                .memory
+                .load(Ordering::Relaxed)
+                .checked_add(bytes)
+                .is_none()
+        {
+            self.data_overflow();
+            return false;
+        }
+        self.run.check(0, bytes, 0)
+    }
+    fn data_overflow(&mut self) {
+        self.run.peak.fetch_max(usize::MAX, Ordering::Relaxed);
+        self.run.halt(STOP_MEMORY);
+    }
+    fn release_data(&mut self, bytes: usize) {
+        self.run.memory.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
     #[inline]
     fn send(&mut self, to: Ex, c: Concl) {
         if to == self.me {
@@ -1787,7 +1817,29 @@ fn nominal<S: Sink>(ix: &Index, me: Ex, st: &mut State, n: Ex, out: &mut S) {
 #[cold]
 #[inline(never)]
 fn functional<S: Sink>(ix: &Index, st: &mut State, r: Role, w: Ex, out: &mut S) {
+    let before = st.bytes();
     let fs = ix.roles.functional(r);
+    // Covers the output group/vector and old/new capacity overlap of every merge.
+    // Numeric limbs are shared; this reservation owns only containers and handles.
+    let reserve = before
+        .checked_add(std::mem::size_of::<Extra>())
+        .and_then(|n| n.checked_add(std::mem::size_of::<Group>() * 4))
+        .and_then(|n| fs.len().checked_mul(8).and_then(|m| n.checked_add(m)))
+        .and_then(|n| {
+            ix.vals[w as usize]
+                .opaque
+                .len()
+                .checked_mul(8)
+                .and_then(|m| n.checked_add(m))
+        })
+        .and_then(|n| n.checked_mul(8));
+    let Some(reserve) = reserve else {
+        out.data_overflow();
+        return;
+    };
+    if !out.reserve_data(reserve) {
+        return;
+    }
     let x = st.extra.get_or_insert_with(Box::default);
     let mut merged = Group {
         funs: fs.to_vec(),
@@ -1820,6 +1872,9 @@ fn functional<S: Sink>(ix: &Index, st: &mut State, r: Role, w: Ex, out: &mut S) 
     }
     x.groups.push(merged);
     x.groups.sort_by(|a, b| a.funs.cmp(&b.funs));
+    let after = st.bytes();
+    debug_assert!(after.saturating_sub(before) <= reserve);
+    out.release_data(reserve.saturating_add(before).saturating_sub(after));
 }
 
 #[cfg(test)]
@@ -2264,5 +2319,72 @@ mod horn_accounting_tests {
                 if duplicate { STOP_NONE } else { STOP_MEMORY }
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod numeric_resource_tests {
+    use super::*;
+    use crate::classify::numeric::tests::measure;
+    use crate::classify::{Limits, Saturation};
+
+    struct DataSink {
+        admit: bool,
+        held: usize,
+    }
+    impl Sink for DataSink {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, _: Concl) {}
+        fn reserve_data(&mut self, bytes: usize) -> bool {
+            if self.admit {
+                self.held += bytes;
+            }
+            self.admit
+        }
+        fn release_data(&mut self, bytes: usize) {
+            self.held -= bytes;
+        }
+    }
+    #[test]
+    fn functional_group_refusal_precedes_box_vector_and_handle_storage() {
+        let doc = crate::ofn_read::parse(include_str!(
+            "../../tests/fixtures/precision663/functional-equal.ofn"
+        ))
+        .unwrap();
+        let refs: Vec<_> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let mut sat = Saturation::new();
+        sat.classify(&refs, None, &Limits::default()).unwrap();
+        let ix = sat.index.as_ref().unwrap();
+        let (role, value) = sat
+            .interner
+            .nodes
+            .iter()
+            .find_map(|n| match n {
+                Node::DataSome(r, w)
+                    if !ix.roles.functional(*r).is_empty()
+                        && ix.vals[*w as usize].single().is_some() =>
+                {
+                    Some((*r, *w))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let mut state = State::default();
+        let mut sink = DataSink {
+            admit: false,
+            held: 0,
+        };
+        let (_, stats) = measure(|| functional(ix, &mut state, role, value, &mut sink));
+        assert_eq!(stats.events, 0);
+        assert!(state.extra.is_none());
+        let retained = sat.interner.ranges.ledger.as_ref().unwrap().bytes();
+        sink.admit = true;
+        functional(ix, &mut state, role, value, &mut sink);
+        assert_eq!(sink.held, state.bytes());
+        assert_eq!(state.extra.as_ref().unwrap().groups.len(), 1);
+        assert_eq!(
+            sat.interner.ranges.ledger.as_ref().unwrap().bytes(),
+            retained
+        );
     }
 }

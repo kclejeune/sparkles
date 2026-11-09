@@ -86,6 +86,14 @@ as the ROBOT-compatible commands of items 634, 635 and 637, and the existential
 superclasses as `materialize`, item 636. The other phases remain under
 [item 457](../../ROADMAP.md).
 
+Integer, decimal and rational literals use exact arbitrary-precision canonical values,
+including values beyond 128 bits. Construction and copied storage obey the classifier's
+resource controls, and large values share immutable storage until their last owner
+releases it. XML namespace conformance is checked without canonicalizing XML values.
+Canonical XML values, ill-typed literal semantics, datatypes outside the supported map
+and chains through the top object property remain in item 663. Horn reasoning with
+individuals remains in item 692, and the shared hierarchical budget remains in item 675.
+
 The bounded named-class read phase of items 588 and 622, and the availability route
 of item 726, publish an immutable completed result beside the incremental saturation.
 `GET /$/ontology/{ds}/classification` and the Rust, Python, Node.js and JVM read adapters
@@ -164,8 +172,8 @@ Lutz, IJCAI 2005 and OWLED 2008) written from the papers. Item 587 added them, a
 next three paragraphs describe. The profile checker validates XML literal namespace
 conformance while retaining noncanonical spellings. Full canonical lexical acceptance
 and canonical value comparison remain in item 663. A literal or a datatype that the classifier cannot
-compare, which is an XML literal, an ill-typed literal, a datatype outside the OWL 2
-datatype map or a number past 128 bits, is an atom that only equals itself, and its
+compare, which is an XML literal, an ill-typed literal or a datatype outside the OWL 2
+datatype map, is an atom that only equals itself, and its
 axiom is reported as used in part. So is a property chain through the top object
 property, whose links the classifier does not compose. An axiom with an expression
 nested more than 256 deep takes no part, since no stand-in for a left-out expression is
@@ -208,7 +216,10 @@ down to `xsd:nonNegativeInteger`, from `rdf:PlainLiteral` down to `xsd:NCName`, 
 `xsd:base64Binary` and `rdf:XMLLiteral` stand alone, and datatypes on different chains
 have disjoint value spaces. Every value space is infinite, so a data range of the profile
 is empty, one datatype or one value, and the classifier keeps it as an element of that
-lattice. A literal's value is canonical. It is an exact rational for a number, a string,
+lattice. Integer, decimal and rational literals have exact canonical rational values
+with arbitrary-precision numerators and denominators. Equivalent spellings and reduced
+fractions compare and hash equally, including beyond 128 bits. Integer and decimal
+datatype membership uses the canonical value. Other comparable values are a string,
 a string with a lower-case language tag, decoded binary data, or for a date-time its
 instant with its offset, since two date-times with different offsets are different
 values (Structural Specification §4.7). Data values have no successors, so a data
@@ -261,6 +272,14 @@ of a parallel normalization count their interners and axioms with room for what 
 merge adds, the merge counts what it adds past that room, and a run whose chunks pass
 the budget or a refused grant normalizes on one thread instead. The memory pool is
 charged for the growth of the peak, once, from the normalization on.
+Numeric parsing and reduction poll cancellation and deadlines and admit construction
+scratch before allocation. Large canonical values share immutable limbs whose live
+storage remains counted until the last alias drops. Index copies, functional-data
+groups and key scratch admit overlapping storage before growth. A numeric memory,
+cancellation or deadline refusal stays a typed classification error through the Horn
+and DL paths. It does not turn the value into an opaque atom or a completed fallback.
+This accounting does not charge standalone XML lexical-validation scratch or complete
+the hierarchical owner integration of item 675.
 A counting allocator measured each run's peak heap within 15% of the estimate on GO,
 ChEBI lite and the largest ORE 2015 EL ontologies. A run that stops before its saturation ends
 drops its contexts, since the next run starts again. In the handle the threads come from the

@@ -492,7 +492,7 @@ mbx test $pkgs --doc
 ]
 
 [tasks."test:partitioned"]
-description = "The workspace's nextest tests, built once and run in shares here and on the configured hosts or Namespace instances, with a coverage check (scripts/test-partitioned.sh)"
+description = "The workspace's nextest tests, built once and run in shares here and on the configured SSH hosts, admitted Boat workers or Namespace instances, with a coverage check (scripts/test-partitioned.sh)"
 depends = ["ui:build"]
 run = "scripts/test-partitioned.sh"
 
@@ -1328,7 +1328,7 @@ flag "--write-rate <n>" default="0" help="pace the writers of writers and mixed 
 flag "--index <kind>" default="none" help="an index configured on every store after loading: none, text, geo or embed"
 flag "--views <spec>" default="none" help="views defined on every store after loading: none or async:N (commit:Q and graph:N wait for items 421 and 420)"
 flag "--cargo-args <flags>" help="extra cargo build flags for revisions"
-flag "--build-host <host>" help="where revisions are built: local, auto or a host name (default auto with SPARKLES_NSC_BUILD_HOSTS set, else local)"
+flag "--build-host <host>" help="where revisions are built: local, auto, SSH host or admitted boat:bx_ID (default auto with SPARKLES_NSC_BUILD_HOSTS set, else local)"
 flag "--duration <d>" default="2h" help="the instance's lifetime cap"
 flag "--out <dir>" help="results directory (default .artifacts/nsc-writes/<UTC time>)"
 '''
@@ -1359,7 +1359,7 @@ flag "--no-spin" help="no idle-priority busy loops on the server and client CPUs
 flag "--serve-args <flags>" help="extra sparkles serve flags for both servers"
 flag "--execution <mode>" help="execution=MODE with every query, or A_MODE,B_MODE per variant"
 flag "--cargo-args <flags>" help="extra cargo build flags for revisions"
-flag "--build-host <host>" help="where revisions are built: local, auto or a host name (default auto with SPARKLES_NSC_BUILD_HOSTS set, else local)"
+flag "--build-host <host>" help="where revisions are built: local, auto, SSH host or admitted boat:bx_ID (default auto with SPARKLES_NSC_BUILD_HOSTS set, else local)"
 flag "--duration <d>" default="2h" help="the instance's lifetime cap"
 flag "--out <dir>" help="results directory (default .artifacts/nsc-bench/<UTC time>)"
 flag "--flag-ratio <r>" default="1.10" help="flag a query whose execution-time ratio B/A is at least this"
@@ -1541,3 +1541,102 @@ python3 scripts/bench-gate.py metrics "$OUT/metrics.jsonl" --gate reasoning-late
   --setting harness="crates/sparkles-reasoner/examples/reasoning_latency.rs"
 SPARKLES_TASK
 '''
+
+[tasks."bench:remote"]
+description = "Interleaved query A/B on an explicit Namespace or admitted warm Boat worker; the mandatory full screen remains Namespace until Boat qualification"
+usage = '''
+flag "--executor <selector>" default="nsc" help="nsc or boat:bx_ID with SPARKLES_BOAT_ADMISSION"
+arg "<a>" help="the baseline: a git revision (built here or on a build host, and cached) or a sparkles binary"
+arg "<b>" help="the candidate: a git revision or a sparkles binary"
+flag "--people <n>" default="100000" help="dataset size in people (~10.5 triples each)"
+flag "--queries <list>" help="only these queries (default: all of bench.sh except export-500k)"
+flag "--query-dir <dir>" help="time DIR/*.rq instead of the bench.sh queries"
+flag "--rounds <n>" default="4" help="A,B,B,A rounds, each in fresh server processes"
+flag "--reps <n>" default="20" help="timed requests per query and server process"
+flag "--warmup <n>" default="3" help="untimed requests per query and server process"
+flag "--rayon-threads <n>" default="1" help="RAYON_NUM_THREADS of the servers, or default"
+flag "--no-spin" help="no idle-priority busy loops on the server and client CPUs"
+flag "--serve-args <flags>" help="extra sparkles serve flags for both servers"
+flag "--execution <mode>" help="execution=MODE with every query, or A_MODE,B_MODE per variant"
+flag "--cargo-args <flags>" help="extra cargo build flags for revisions"
+flag "--build-host <host>" help="where revisions are built: local, auto, SSH host or admitted boat:bx_ID (default auto with SPARKLES_NSC_BUILD_HOSTS set, else local)"
+flag "--duration <d>" default="2h" help="the instance's lifetime cap"
+flag "--out <dir>" help="results directory (default .artifacts/nsc-bench/<UTC time>)"
+flag "--flag-ratio <r>" default="1.10" help="flag a query whose execution-time ratio B/A is at least this"
+flag "--rerun-rounds <n>" default="8" help="rounds of the rerun of the flagged queries on the same instance"
+flag "--rerun-reps <n>" default="40" help="timed requests per query and server process in the rerun"
+flag "--no-rerun" help="report the first pass alone"
+'''
+run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+scripts/bench-remote.sh --executor "$usage_executor" --people "$usage_people" --rounds "$usage_rounds" --reps "$usage_reps" \
+  --warmup "$usage_warmup" --rayon-threads "$usage_rayon_threads" --duration "$usage_duration" \
+  ${usage_queries:+--queries "$usage_queries"} ${usage_query_dir:+--query-dir "$usage_query_dir"} \
+  ${usage_serve_args:+--serve-args "$usage_serve_args"} ${usage_execution:+--execution "$usage_execution"} \
+  ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} ${usage_build_host:+--build-host "$usage_build_host"} \
+  --flag-ratio "$usage_flag_ratio" --rerun-rounds "$usage_rerun_rounds" --rerun-reps "$usage_rerun_reps" \
+  ${usage_no_rerun:+--no-rerun} ${usage_out:+--out "$usage_out"} ${usage_no_spin:+--no-spin} "$usage_a" "$usage_b"
+SPARKLES_TASK
+'''
+
+[tasks."bench:remote-writes"]
+description = "Interleaved durable-write comparisons on an explicit Namespace or admitted warm Boat worker"
+usage = '''
+flag "--executor <selector>" default="nsc" help="nsc or boat:bx_ID with SPARKLES_BOAT_ADMISSION"
+arg "<variants>" var=#true help="NAME=REF[:FLAGS]: a revision or sparkles binary, and optional global flags to run it with"
+flag "--people <n>" default="100000" help="dataset size in people (~10.5 triples each)"
+flag "--scenarios <list>" default="serial-literal writers mixed" help="from serial-literal serial-iri serial-delete writers writers16 mixed serial-message writers-message writers16-message"
+flag "--rounds <n>" default="3" help="runs of every variant and scenario, each in a fresh server process"
+flag "--changes <n>" default="3000" help="requests of the serial scenarios"
+flag "--writer-changes <n>" default="20000" help="requests of the writers scenarios"
+flag "--mixed-changes <n>" default="5000" help="requests of the mixed scenario"
+flag "--write-rate <n>" default="0" help="pace the writers of writers and mixed to this many requests per second in total (0: unpaced)"
+flag "--index <kind>" default="none" help="an index configured on every store after loading: none, text, geo or embed"
+flag "--views <spec>" default="none" help="views defined on every store after loading: none or async:N (commit:Q and graph:N wait for items 421 and 420)"
+flag "--cargo-args <flags>" help="extra cargo build flags for revisions"
+flag "--build-host <host>" help="where revisions are built: local, auto, SSH host or admitted boat:bx_ID (default auto with SPARKLES_NSC_BUILD_HOSTS set, else local)"
+flag "--duration <d>" default="2h" help="the instance's lifetime cap"
+flag "--out <dir>" help="results directory (default .artifacts/nsc-writes/<UTC time>)"
+'''
+run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+# shellcheck disable=SC2154,SC2086 # usage_variants is a list of variants
+scripts/writes-remote.sh --executor "$usage_executor" --people "$usage_people" --scenarios "$usage_scenarios" --rounds "$usage_rounds" \
+  --changes "$usage_changes" --writer-changes "$usage_writer_changes" --mixed-changes "$usage_mixed_changes" \
+  --write-rate "$usage_write_rate" --index "$usage_index" --views "$usage_views" --duration "$usage_duration" ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} \
+  ${usage_build_host:+--build-host "$usage_build_host"} \
+  ${usage_out:+--out "$usage_out"} $usage_variants
+SPARKLES_TASK
+'''
+
+[tasks."bench:jena-remote"]
+description = "Jena comparison on an explicit executor; pass --executor nsc or boat:bx_ID and jena.py options after --"
+run = "mbx sparkles-task -- scripts/jena-remote.sh"
+
+[tasks."boat:qualify"]
+description = "Qualify one explicitly owned warm Boat worker under a named bounded local controller; private reviewed profile/release required"
+usage = '''
+flag "--unit <name>" required=#true help="unused local controller unit name"
+flag "--worker <id>" required=#true help="explicit existing owned bx_ID; no default worker"
+flag "--profile <path>" required=#true help="private independently admitted profile"
+flag "--release <path>" required=#true help="private reviewed finite release"
+'''
+run = '''
+systemd-run --user --wait --pipe --unit="$usage_unit" --property=Type=exec \
+  --property=MemoryMax=512M --property=MemorySwapMax=0 --property=RuntimeMaxSec=2700 \
+  --property=TimeoutStopSec=30 --property=KillMode=control-group --property=OOMPolicy=continue \
+  /usr/bin/python3 -I -B "$PWD/scripts/boat/controller.py" run \
+  --owned-worker "$usage_worker" --profile "$usage_profile" --release "$usage_release"
+'''
+
+[tasks."boat:job-env"]
+description = "Prepare deterministic PATH/token-FILE metadata for an actually qualified explicit worker; no lifecycle or source job"
+run = "python3 -I -B scripts/boat/job_environment.py"
+
+[tasks."boat:finish"]
+description = "Validate actual owned job closure, request the guard's normal stop and observe verified stop/guard closure"
+run = "python3 -I -B scripts/boat/controller.py finish"
+
+[tasks."test:boat-controls"]
+description = "Inert maintained Boat lifecycle controls and source-seal validation; no provider, manager, child or network calls"
+run = ["python3 -I -B scripts/boat/update_sources.py --check", "python3 -I -B scripts/boat/controls.py"]

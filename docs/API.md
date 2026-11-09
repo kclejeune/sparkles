@@ -3588,6 +3588,14 @@ commit in `prev`, so a chain of them applies in order and stops at the first gap
 repeat. A `prev` that names another dataset, or is not a commit IRI, is ignored, so a diff
 of one dataset applies to another. A patch without `prev` always applies.
 
+An authoring client can also send `expect=urn:uuid:UUID#commit:N` in the query string.
+This strict precondition requires both the source UUID and head to match under the
+writer lock. A foreign source is `412`, even though a foreign body `prev` remains
+compatible with replication when no strict expectation is supplied. Invalid expectations
+are `400`. Previews and commits use the same captured expectation. The visual shape
+editor uses it with its own `prev` to retain blank-node identity while refusing a dataset
+or branch recreated under the same name.
+
 Blank node labels follow the rules of [Blank nodes](#blank-nodes). A label is local to
 the patch, so its first use makes a new stored node and later uses name that node, as in
 `INSERT DATA`. When the headers at the start of the patch name a commit of this dataset
@@ -4760,7 +4768,7 @@ type MergeRequest = {
   conflicts?: "cell" | "subject" | "quad";      // default "cell"
   onConflict?: "fail" | "ours" | "theirs" | "union";   // default "fail"
   resolutions?: Resolution[];
-  expect?: { source?: number; target?: number };       // the heads the caller saw
+  expect?: { source?: number; target?: number; targetId?: string }; // heads and optional target branch UUID
   base?: { branchId: string; seq: number };     // to choose among several merge bases
   inferences?: "exclude" | "include";           // default "exclude"
   exempt?: string[];                            // predicates that never conflict here
@@ -4876,7 +4884,11 @@ task slot like other tasks. A dry run ignores the preference and answers at once
 `expect` carries the heads the caller saw in a report. When either head moved, the
 merge answers `409 head-moved` instead of applying resolutions to changes the caller has
 not seen. Without `expect`, a merge whose target moved while it was computed starts
-again, at most three times.
+again, at most three times. When supplied, `expect` must be an object and its head
+fields must be unsigned 64-bit integers. Strings, negative or fractional numbers,
+booleans, containers used as heads and null values return `400 invalid-merge`.
+`targetId` must be a UUID string when supplied. An empty object, omitted fields and
+a `targetId` without heads remain valid.
 
 The conflict report lists at most `limit` cells (default 100, at most 10,000), and at
 most 100 objects per side of a cell. `graphs` counts every conflict by graph:
@@ -4949,7 +4961,7 @@ changed relative to its first parent. The merge stays recorded, so merging the s
 source again does not bring those changes back.
 
 The body is optional. It takes `conflicts`, `onConflict`, `resolutions`, `expect`
-with `target` only, `inferences`, `limit`, `message` and `dryRun`, as a `MergeRequest`
+with `target` and optional `targetId`, `inferences`, `limit`, `message` and `dryRun`, as a `MergeRequest`
 does. The result is a `MergeResult` whose `source` is the commit's parent and whose
 `base` is the commit, with `reverted: {branch, seq}` added. A revert that would change
 nothing, because the branch no longer holds the commit's changes, makes no commit and
@@ -4957,6 +4969,19 @@ answers `upToDate: true`. The default message is `revert commit 57`. A revert ne
 `write` on the branch through the `merge` endpoint, from a grant without graph
 restrictions, and a protected branch refuses it with `403 branch-protected`, since its
 changes do not come through a merge. Reverting commit 0 answers `400 invalid-merge`.
+
+Successful branch responses carry `Sparkles-Branch-Id` from the actual serving Store
+or operation report, alongside its owner dataset UUID and commit. A branch rename or
+replacement after a snapshot cannot relabel its response with another branch's UUID.
+Unauthorized and hidden-branch refusals do not disclose these identity headers.
+
+`expect.targetId` is the UUID of the target branch the caller read. It refuses a branch
+recreated under the same name with `412`, even when its commit number matches the old
+branch's. `expect.target` retains the head check and returns `409 head-moved` when the
+head advances. Authoring clients use both expectations for revert previews and writes.
+A revert resolves its commit and target from one captured branch incarnation, including
+commits inherited from an upstream branch. Renaming branches during the operation
+cannot combine one branch's inverse with another branch's target identity.
 
 A cherry-pick applies the changes of one commit of another branch's history to a
 branch, as one commit of kind `cherry-pick`. `source` names the branch whose history
@@ -9352,6 +9377,12 @@ nothing.
 
 ## SHACL validation
 
+SHACL rejects SPARQL `SERVICE` while parsing shapes, including inside `EXISTS`,
+expressions, aggregates, custom validators and node expressions. This applies to every
+caller, inline and stored shapes, and both values of `storedBlankNodes`. Validation
+never enables outbound SERVICE execution. Ordinary local SPARQL constructs remain
+available under their existing SHACL restrictions.
+
 `POST /{ds}/shacl?graph=default|union|<iri>` validates a data graph of the dataset against
 the shapes graph in the request body, with Fuseki's semantics:
 
@@ -9381,6 +9412,15 @@ the shapes graph in the request body, with Fuseki's semantics:
   `400` when its guard is ShEx, and a missing shapes graph is a `404`. The Explore
   validation overlay uses these forms
   ([U07 §11](specs/U07-data-quality-and-schema-diagram.md#11-phase-4-a-validation-overlay-on-the-graph-2026-10-23)).
+* **`storedBlankNodes=true|false`.** An inline RDF draft can retain the identities of
+  blank-node constants copied from this dataset or branch. With `true`, existing stored
+  labels resolve at the selected `at` revision and new labels remain local. This covers
+  constants in targets, value sets and `sh:hasValue`, as well as node expressions. The
+  default is `false`, which keeps inline blank nodes local to the document. This option
+  does not combine with `shapes=` or SHACLC and does not bind `$shapesGraph`, because an
+  inline draft has not been written into the snapshot. Invalid boolean values and
+  incompatible combinations return `400`. The usual SHACL authorization, result budgets,
+  historical reads and cancellation apply.
 * **`reasoning=true|false`.** When the dataset has materialized inferences, validation
   runs over data ∪ `urn:x-sparkles:inferred` unless `reasoning=false`. With `false`, the
   inferred graph is also left out of `graph=union`.

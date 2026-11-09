@@ -1706,7 +1706,26 @@ fn a_number_past_128_bits_is_not_zero() {
     ]);
     let out = k.classify(&Limits::default()).unwrap();
     assert!(!out.taxonomy.is_subclass(&c("A"), &c("B")));
-    assert_eq!(partial_reasons(&k).values().sum::<usize>(), 1);
+    assert!(k.excluded().is_empty());
+    let mut equal = Classifier::of(&[
+        sub(
+            c("A"),
+            dvalue(
+                "d",
+                lit("170141183460469231731687303715884105728", "integer"),
+            ),
+        ),
+        sub(
+            dvalue(
+                "d",
+                lit("170141183460469231731687303715884105728.0", "decimal"),
+            ),
+            c("B"),
+        ),
+    ]);
+    let out = equal.classify(&Limits::default()).unwrap();
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
+    assert!(equal.excluded().is_empty());
     // zero is a number like any other
     let out = run(&[
         sub(c("A"), dvalue("d", lit("0.00", "decimal"))),

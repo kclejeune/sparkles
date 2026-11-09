@@ -114,8 +114,9 @@ class RevisionBinaryCache(unittest.TestCase):
         self.repo = self.root / "repo"
         (self.repo / "scripts").mkdir(parents=True)
         (self.repo / "scripts" / "gate").mkdir()
-        for name in ("nsc-bench.sh", "nsc-build.sh", "nsc-build-host.sh", "gate/config.sh"):
+        for name in ("remote-executor.sh", "remote-executor.py", "remote-screen.sh", "nsc-bench.sh", "nsc-build.sh", "nsc-build-host.sh", "gate/config.sh"):
             shutil.copy(ROOT / "scripts" / name, self.repo / "scripts" / name)
+        shutil.copytree(ROOT / "scripts/boat", self.repo / "scripts/boat", ignore=shutil.ignore_patterns("__pycache__"))
         git = ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t",
                "-c", "commit.gpgsign=false"]
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)

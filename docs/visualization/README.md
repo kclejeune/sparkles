@@ -17,7 +17,7 @@ The SvelteKit UI is embedded in the server binary.
   below a rule, the administration pages, in this order: Query, Explore, Browse,
   Workbench, Similar and Memory, then Datasets and Admin. Workbench, Similar and Admin are
   groups whose pages show under them while one of their pages is open or when the chevron
-  opens them. Workbench holds the Ontology and Thesaurus editors, Similar holds Search and
+  opens them. Workbench holds the Ontology, Thesaurus and SHACL shapes editors, Similar holds Search and
   Map, and Admin holds Server, Backups and Tokens. The rail shows Workbench only to a caller
   who may write the open dataset, so a reader's rail has Browse alone. A page has at most one
   row of tabs, and a further choice inside a page, such as the editor's entity kind, is a
@@ -421,6 +421,63 @@ Graph results use label literals present in their triples. When a caption shows 
 its label statements remain visible unless **Hide literals** is selected. Expanded Browse
 graphs retain the names supplied by each expansion. A failed label lookup leaves
 the IRI visible. Copying and navigation always keep the original IRI.
+
+### Visual SHACL shape editor
+
+**SHACL shapes** in the Workbench opens `/ui/workbench/shapes`, which the
+[editor screenshot](../images/shape-editor.png) shows. The dataset's Validate panel also
+links to it. Choose a branch and one shapes graph, or enter a new graph IRI.
+The source line identifies the dataset, branch, stored graph and commit. The unnamed
+shapes graph is the stored default graph even when queries use a union default graph.
+Leave the graph field empty to edit it. Reserved default and union query selectors
+cannot be used as named authoring graphs.
+
+The tree contains node and property shapes, including anonymous and nested shapes.
+Shared and recursive references appear as link leaves. The tree displays at most 5,000
+repeated reference leaves and reports omitted links. Every shape and its complete
+reference and list forms remain available. The forms edit the four Core
+target predicates, implicit class targets, severity, deactivation, names, descriptions,
+messages, groups, order and default values. They cover the SHACL Recommendation's Core
+constraints and the engine's four SHACL 1.2 draft list constraints. Logical constraints
+and nested shapes use references and ordered lists. A path editor composes predicates,
+inverse paths, sequences, alternatives, repetitions and optional paths recursively.
+Custom severities use an IRI, and literals retain their datatype, language and direction.
+
+Apply a field or path to the local draft before opening another shape or previewing.
+**Undo draft** and **Redo draft** move through up to 30 local draft states. **Preview
+commit** shows the exact RDF additions and removals, with at most 50 changed triples in
+the displayed diff, as the [preview screenshot](../images/shape-editor-preview.png)
+shows. Commit uses the same source UUID, commit and precondition. Another writer's
+commit refuses the write and retains the draft until explicit discard and reload.
+While a preview is open, refreshes from the change feed wait until it closes, so the
+answer of a slow commit is still recorded for undo.
+**Undo commit** and **Redo commit** use the branch's revert operation and preserve stored
+blank-node identities. Protected branches offer **Start session**. The server applies
+the caller's graph, endpoint and write grants to every request.
+
+Sample validation checks up to 100 explicit focus nodes, or all declared targets in a
+selected sample graph, against the draft at its source commit. The latter mode also
+checks literal target nodes. It debounces changes, cancels superseded work and
+shows at most 100 result rows. The check has a five-second server deadline and a
+ten-second client deadline. A conforming sample does not establish whole-dataset
+conformance, and canceled or failed checks clear earlier results. Stored blank-node
+constants retain their identities through the validation route's explicit draft option.
+A sample report must confirm the captured source UUID and commit before it can be
+shown as a result. Missing or changed identities clear earlier approval.
+
+The editor reads a complete graph of at most 5,000 triples. It caps the decoded response
+at 2 MiB before parsing JSON and refuses incomplete or oversized reads. Triple-filtered
+views cannot establish a complete definition and do not enable editing. On a different
+branch, the editor first confirms unrestricted visibility through the SHACL route when
+the caller's branch grants are unknown. A refused confirmation leaves the source closed.
+Paths nest at most 64 levels, and a path that reuses shared operands may expand to at
+most 1,000 steps. Unrecognized RDF stays intact and is visible in
+**Additional RDF** and **View Turtle**. A malformed path or list requires explicit
+replacement. Shared or annotated structures are retained when another field changes.
+
+**Use in text validator** explicitly replaces the dataset's saved text draft with a
+Turtle copy. Turtle and SHACLC text drafts remain independent of stored shape commits.
+Installing a write-time guard remains a separate action on the dataset page.
 
 ### Ontology editor
 

@@ -7,6 +7,7 @@
     title,
     width = 440,
     onclose,
+    closeDisabled = false,
     children,
     actions,
   }: {
@@ -14,6 +15,7 @@
     title: string;
     width?: number;
     onclose?: () => void;
+    closeDisabled?: boolean;
     children: Snippet;
     actions?: Snippet;
   } = $props();
@@ -27,6 +29,7 @@
   });
 
   function close() {
+    if (closeDisabled) return;
     open = false;
     onclose?.();
   }
@@ -36,13 +39,16 @@
   bind:this={dialog}
   style:width="{width}px"
   onclose={() => open && close()}
+  oncancel={(e) => {
+    if (closeDisabled) e.preventDefault();
+  }}
   onclick={(e) => e.target === dialog && close()}
   aria-labelledby="modal-title"
 >
   {#if open}
     <div class="head">
       <h2 id="modal-title">{title}</h2>
-      <button class="btn ghost icon sm" onclick={close} aria-label="Close"
+      <button class="btn ghost icon sm" onclick={close} aria-label="Close" disabled={closeDisabled}
         ><Icon name="x" size={14} /></button
       >
     </div>

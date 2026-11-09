@@ -18,13 +18,16 @@
 //! strings with lower-case tags, binary data and date-times as an instant with its
 //! offset, since §4.7 makes two date-times with different offsets different values. A
 //! literal without such a value, an XML literal, an ill-typed one, one of a datatype
-//! outside the map or a number past 128 bits, and a datatype outside the map, are opaque
+//! outside the map, and a datatype outside the map, are opaque
 //! atoms that only equal themselves, and their axioms are reported as used in part.
 
+use super::numeric::{self, Budget, Number, NumericLedger, Reservation};
+use super::{Error, Limits};
 use crate::datatypes;
 use crate::model::{DataRange, Datatype, Literal};
 use crate::vocab;
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 /// A datatype of the OWL 2 EL datatype map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -121,7 +124,7 @@ impl Kind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Value {
     /// a rational number in lowest terms, with a positive denominator
-    Num(i128, i128),
+    Num(Number),
     Str(String),
     /// a string with a lower-case language tag, a value of `rdf:PlainLiteral` alone
     Lang(String, String),
@@ -138,22 +141,7 @@ impl Value {
     pub fn is_a(&self, k: Kind) -> bool {
         use Kind::*;
         match self {
-            Value::Num(n, d) => match k {
-                Real | Rational => true,
-                Decimal => {
-                    let mut d = *d;
-                    while d % 2 == 0 {
-                        d /= 2;
-                    }
-                    while d % 5 == 0 {
-                        d /= 5;
-                    }
-                    d == 1
-                }
-                Integer => *d == 1,
-                NonNegativeInteger => *d == 1 && *n >= 0,
-                _ => false,
-            },
+            Value::Num(n) => n.is_a(k),
             Value::Str(s) => match k {
                 PlainLiteral | String => true,
                 NormalizedString => datatypes::normalized(s),
@@ -172,68 +160,27 @@ impl Value {
     }
 }
 
-fn gcd(mut a: i128, mut b: i128) -> i128 {
-    a = a.abs();
-    b = b.abs();
-    while b != 0 {
-        (a, b) = (b, a % b);
-    }
-    a
-}
-
-fn ratio(n: i128, d: i128) -> Option<Value> {
-    if d == 0 {
-        return None;
-    }
-    let g = gcd(n, d).max(1);
-    let (mut n, mut d) = (n / g, d / g);
-    if d < 0 {
-        n = n.checked_neg()?;
-        d = d.checked_neg()?;
-    }
-    Some(Value::Num(n, d))
-}
-
-fn integer(s: &str) -> Option<i128> {
-    let (neg, digits) = match s.as_bytes().first() {
-        Some(b'-') => (true, &s[1..]),
-        Some(b'+') => (false, &s[1..]),
-        _ => (false, s),
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let v: i128 = digits.parse().ok()?;
-    Some(if neg { -v } else { v })
-}
-
-fn decimal(s: &str) -> Option<Value> {
-    let (neg, body) = match s.as_bytes().first() {
-        Some(b'-') => (true, &s[1..]),
-        Some(b'+') => (false, &s[1..]),
-        _ => (false, s),
-    };
-    let (i, f) = body.split_once('.').unwrap_or((body, ""));
-    let f = f.trim_end_matches('0');
-    let all: String = format!("{i}{f}");
-    if all.is_empty() || !all.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    // a number past 128 bits has no value here, and its literal is opaque
-    let digits = all.trim_start_matches('0');
-    let n: i128 = if digits.is_empty() {
-        0
-    } else {
-        digits.parse().ok()?
-    };
-    let d = 10i128.checked_pow(u32::try_from(f.len()).ok()?)?;
-    ratio(if neg { -n } else { n }, d)
-}
-
 /// The canonical value of a literal, or `None` when it has none the classifier can
 /// compare: an ill-typed literal, an XML literal, one of a datatype outside the OWL 2 EL
-/// map or a number past 128 bits.
-pub fn value(l: &Literal) -> Option<Value> {
+/// map.
+fn value_at(l: &Literal, guard: &Arc<Budget>) -> Result<Option<Value>, Error> {
+    guard.poll()?;
+    let dt = l.datatype();
+    if l.language().is_none()
+        && let Some(k @ (Kind::Integer | Kind::NonNegativeInteger | Kind::Decimal | Kind::Rational)) =
+            Kind::of(dt)
+    {
+        return Ok(numeric::parse(l.value(), k, guard)?.map(Value::Num));
+    }
+    Ok(nonnumeric_value(l))
+}
+
+#[cfg(test)]
+fn value(l: &Literal) -> Option<Value> {
+    value_at(l, &Budget::new(&Limits::default(), 0, None)).unwrap()
+}
+
+fn nonnumeric_value(l: &Literal) -> Option<Value> {
     let lex = l.value();
     if let Some(lang) = l.language() {
         return Some(Value::Lang(lex.to_string(), lang.to_ascii_lowercase()));
@@ -256,12 +203,7 @@ pub fn value(l: &Literal) -> Option<Value> {
     }
     use Kind::*;
     match kind {
-        Integer | NonNegativeInteger => ratio(integer(lex)?, 1),
-        Decimal => decimal(lex),
-        Rational => {
-            let (n, d) = lex.split_once('/')?;
-            ratio(integer(n)?, integer(d)?)
-        }
+        Integer | NonNegativeInteger | Decimal | Rational => unreachable!("guarded numeric route"),
         String | NormalizedString | Token | Nmtoken | Name | NcName => {
             Some(Value::Str(lex.to_string()))
         }
@@ -346,6 +288,10 @@ pub struct DataVal {
 }
 
 impl DataVal {
+    pub(super) fn owned_bytes(&self) -> usize {
+        self.opaque.capacity() * std::mem::size_of::<u32>()
+    }
+
     pub const TOP: DataVal = DataVal {
         known: Known::Top,
         opaque: Vec::new(),
@@ -403,12 +349,109 @@ pub struct Ranges {
     pub opaque: Vec<Opaque>,
     opaque_ids: FxHashMap<Opaque, u32>,
     pub definitions: FxHashMap<Datatype, DataRange>,
+    pub(super) budget: Option<Arc<Budget>>,
+    pub(super) ledger: Option<Arc<NumericLedger>>,
+    halt: Option<Error>,
 }
 
 /// The deepest nesting of data ranges and datatype definitions followed.
 const MAX_DEPTH: usize = 64;
 
 impl Ranges {
+    pub(super) fn begin(&mut self, budget: Arc<Budget>) {
+        self.halt = None;
+        self.budget = Some(budget);
+    }
+    pub(super) fn end(&mut self) {
+        if let Some(b) = self.budget.take() {
+            self.ledger = b.ledger();
+        }
+    }
+    pub(super) fn check(&self) -> Result<(), Error> {
+        self.halt.clone().map_or(Ok(()), Err)
+    }
+    pub(super) fn check_halt(&self) -> Result<(), super::index::Halt> {
+        self.check().map_err(|e| match e {
+            Error::Memory { used, .. } => super::index::Halt::Memory(used),
+            _ => super::index::Halt::Stopped,
+        })
+    }
+    pub(super) fn admit_checked(&mut self, bytes: Option<usize>) -> bool {
+        match bytes {
+            Some(bytes) => self.admit(bytes),
+            None => {
+                self.halt = Some(Error::Memory {
+                    limit: usize::MAX,
+                    used: usize::MAX,
+                });
+                false
+            }
+        }
+    }
+    /// Preallocate interner storage while its old buffers are still retained. The
+    /// default helper interner has no build budget and needs no allocated guard.
+    pub(super) fn reserve_storage(
+        &mut self,
+        bytes: Option<usize>,
+    ) -> Result<Option<Reservation>, ()> {
+        if self.halt.is_some() {
+            return Err(());
+        }
+        let result = match bytes {
+            Some(bytes) => self.budget.as_ref().map(|b| b.reserve(bytes)).transpose(),
+            None => Err(Error::Memory {
+                limit: usize::MAX,
+                used: usize::MAX,
+            }),
+        };
+        result.map_err(|e| {
+            self.halt = Some(e);
+        })
+    }
+    pub(super) fn retain_storage(
+        &mut self,
+        reservation: Option<Reservation>,
+        bytes: Option<usize>,
+        planned: usize,
+    ) -> bool {
+        let result = match reservation {
+            Some(r) => r.retain(bytes),
+            None if bytes.is_some_and(|n| n <= planned) => Ok(()),
+            None => Err(Error::Memory {
+                limit: usize::MAX,
+                used: usize::MAX,
+            }),
+        };
+        if let Err(e) = result {
+            self.halt = Some(e);
+            return false;
+        }
+        true
+    }
+    pub(super) fn admit_copies(&mut self, vals: &[DataVal]) -> bool {
+        let bytes = vals
+            .len()
+            .checked_mul(std::mem::size_of::<DataVal>())
+            .and_then(|base| {
+                vals.iter().try_fold(base, |total, v| {
+                    total.checked_add(v.opaque.len().checked_mul(4)?)
+                })
+            });
+        self.admit_checked(bytes)
+    }
+    pub(super) fn admit(&mut self, bytes: usize) -> bool {
+        if self.halt.is_some() {
+            return false;
+        }
+        if let Some(b) = &self.budget
+            && let Err(e) = b.grow_base(bytes)
+        {
+            self.halt = Some(e);
+            return false;
+        }
+        true
+    }
+
     fn atom(&mut self, o: Opaque) -> DataVal {
         let id = match self.opaque_ids.get(&o) {
             Some(&id) => id,
@@ -427,7 +470,27 @@ impl Ranges {
 
     /// The lattice element of a literal, and whether it is opaque.
     pub fn literal(&mut self, l: &Literal) -> (DataVal, bool) {
-        match value(l) {
+        if self.halt.is_some() {
+            return (DataVal::TOP, false);
+        }
+        let default;
+        let guard = match &self.budget {
+            Some(b) => b,
+            None => {
+                default = Budget::new(&Limits::default(), 0, self.ledger.clone());
+                &default
+            }
+        };
+        let parsed = value_at(l, guard);
+        self.ledger = guard.ledger();
+        let parsed = match parsed {
+            Ok(v) => v,
+            Err(e) => {
+                self.halt = Some(e);
+                return (DataVal::TOP, false);
+            }
+        };
+        match parsed {
             Some(v) => (
                 DataVal {
                     known: Known::Value(v),
@@ -454,6 +517,9 @@ impl Ranges {
                 let mut opaque = false;
                 for r in rs {
                     let (v, o) = self.range_at(r, depth + 1);
+                    if self.halt.is_some() {
+                        return (DataVal::TOP, false);
+                    }
                     acc = acc.meet(&v);
                     opaque |= o;
                 }

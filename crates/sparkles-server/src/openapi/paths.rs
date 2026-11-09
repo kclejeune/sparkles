@@ -2708,7 +2708,7 @@ fn branches(p: &mut Paths) {
                 "Conflicts remain (`merge-conflict`, with the report), the target moved (`head-moved`), not a fast-forward (`not-fast-forward`), or several merge bases (`ambiguous-merge-base`).",
                 Some(json!({ "application/json": { "schema": sref("ConflictReport") } })),
             )
-            .errors(&[400, 403, 404, 410, 422, 507]),
+            .errors(&[400, 403, 404, 410, 412, 422, 507]),
     );
     p.add(
         op(GET, "/$/revert/{ds}", "previewRevert", "Branches", "Preview a revert")
@@ -2737,7 +2737,7 @@ fn branches(p: &mut Paths) {
                 "Conflicts remain (`merge-conflict`, with the report), or the branch moved (`head-moved`).",
                 Some(json!({ "application/json": { "schema": sref("ConflictReport") } })),
             )
-            .errors(&[400, 403, 404, 410, 422, 507]),
+            .errors(&[400, 403, 404, 410, 412, 422, 507]),
     );
     p.add(
         op(GET, "/$/cherry-pick/{ds}", "previewCherryPick", "Branches", "Preview a cherry-pick")
@@ -2768,7 +2768,7 @@ fn branches(p: &mut Paths) {
                 "Conflicts remain (`merge-conflict`, with the report), or the branch moved (`head-moved`).",
                 Some(json!({ "application/json": { "schema": sref("ConflictReport") } })),
             )
-            .errors(&[400, 403, 404, 410, 422, 507]),
+            .errors(&[400, 403, 404, 410, 412, 422, 507]),
     );
     p.add(
         op(GET, "/$/commit-graph/{ds}", "getCommitGraph", "Branches", "Get the commit graph")
@@ -5107,6 +5107,7 @@ fn protocol(p: &mut Paths) {
         let o = op(m, "/{ds}/patch", id, "Graph Store", "Apply an RDF Patch")
             .doc("Applies an RDF Patch as one write transaction, as Fuseki's `patch` operation does. The text form is `application/rdf-patch`, which a missing content type or `application/x-www-form-urlencoded` also means, and the binary form is `application/rdf-patch+thrift`. `TX`, `TC` and `Z` are markers, and `TA` aborts the whole patch with `200` and `aborted: true`. `PA` and `PD` change the dataset's prefixes. A `prev` header that names a commit of this dataset applies the patch only when that commit is the head, and is `412` otherwise. The body is limited by `--max-upload-mb`. A patch that changes data makes one commit of kind `patch`. The other methods are `405`.")
             .see("applying-rdf-patch")
+            .query("expect", s(), "Strict authoring precondition urn:uuid:UUID#commit:N. Both source UUID and head must match under the writer lock or the response is 412. Unlike a foreign body prev, a foreign expectation is never ignored.")
             .body(
                 true,
                 "The patch.",
@@ -5158,6 +5159,7 @@ fn protocol(p: &mut Paths) {
             .param("graphSel")
             .query("target", json!({ "type": "array", "items": { "type": "string" }, "maxItems": 1000 }), "Validate these nodes against the shapes whose targets select them. Each is an IRI, a prefixed name or a blank node label, and the parameter may repeat up to 1,000 times.")
             .query("shapes", s(), "`guard` for the write-time guard's shapes on its data graph, or the IRI of a shapes graph of the dataset.")
+            .query("storedBlankNodes", boolean(), "For an inline RDF draft, resolve existing stored blank-node labels at the selected revision. New labels remain local. The default keeps all inline blank nodes local. Does not combine with shapes= or SHACLC, and does not bind $shapesGraph for the inline draft.")
             .params(&["reasoning", "timeout", "at", "format"])
             .body(false, "The shapes graph, or with `shapes` an empty body or a form of parameters.", J::Object(shapes))
             .resp("200", "The validation report.", Some(J::Object(report)))

@@ -561,12 +561,13 @@ export const SPARKLES_JSON = 'application/x-sparkles+json';
 
 const enc = encodeURIComponent;
 
-async function toError(res: Response): Promise<ApiError> {
+async function toError(res: Response, maxBytes?: number): Promise<ApiError> {
   const requestId = res.headers.get('X-Request-Id') ?? undefined;
   let text = '';
   try {
-    text = await res.text();
-  } catch {
+    text = maxBytes == null ? await res.text() : await boundedText(res, maxBytes);
+  } catch (e) {
+    if (maxBytes != null) throw e;
     /* ignore */
   }
   try {
@@ -631,7 +632,11 @@ async function withCsrf(init: RequestInit): Promise<RequestInit> {
  * Fetch a path of the API. A dataset written as `name@branch` (see `onBranch`) works on
  * that branch: `branchPath` turns it into the path form or the `branch=` parameter.
  */
-export async function request(path: string, init: RequestInit = {}): Promise<Response> {
+export async function request(
+  path: string,
+  init: RequestInit = {},
+  maxResponseBytes?: number,
+): Promise<Response> {
   const withToken = await withCsrf(init);
   let res: Response;
   try {
@@ -643,8 +648,41 @@ export async function request(path: string, init: RequestInit = {}): Promise<Res
     });
   }
   if (res.status === 401) authHooks.unauthorized();
-  if (!res.ok) throw await toError(res);
+  if (!res.ok) throw await toError(res, maxResponseBytes);
   return res;
+}
+
+/** Bound decoded response bytes before text/JSON materialization, even without Content-Length. */
+export async function boundedText(res: Response, maxBytes: number): Promise<string> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1)
+    throw new Error('Invalid response byte limit.');
+  if (!res.body) throw new Error('The server returned no response body.');
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    const declared = Number(res.headers.get('Content-Length'));
+    if (declared > maxBytes)
+      throw new Error(`The response exceeds the ${maxBytes} byte editor limit.`);
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      size += next.value.byteLength;
+      if (size > maxBytes)
+        throw new Error(`The response exceeds the ${maxBytes} byte editor limit.`);
+      chunks.push(next.value);
+    }
+    const bytes = new Uint8Array(size);
+    let at = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, at);
+      at += chunk.length;
+    }
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
 }
 
 export async function json<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -1152,6 +1190,8 @@ export async function schema(
 // --- SPARQL -------------------------------------------------------------------
 
 export type QueryOptions = {
+  /** Browser-side decoded response bound, enforced before JSON parsing. */
+  maxResponseBytes?: number;
   send?: number;
   /**
    * How the server runs the query. The table view asks for `eager`, because it shows the
@@ -1186,16 +1226,24 @@ export async function query(
   sparql: string,
   opts: QueryOptions = {},
 ): Promise<SparklesResult> {
-  const res = await request(`/${enc(ds)}/sparql${queryParams({ execution: 'eager', ...opts })}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/sparql-query',
-      Accept: SPARKLES_JSON,
+  const res = await request(
+    `/${enc(ds)}/sparql${queryParams({ execution: 'eager', ...opts })}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/sparql-query',
+        Accept: SPARKLES_JSON,
+      },
+      body: sparql,
+      signal: opts.signal,
     },
-    body: sparql,
-    signal: opts.signal,
-  });
-  const body = (await res.json()) as SparklesResult;
+    opts.maxResponseBytes,
+  );
+  const body = (
+    opts.maxResponseBytes == null
+      ? await res.json()
+      : JSON.parse(await boundedText(res, opts.maxResponseBytes))
+  ) as SparklesResult;
   const inferences = parseInferencesHeader(res.headers.get('Sparkles-Inferences'));
   if (inferences) body.inferences = inferences;
   const at = atInfo(res.headers);
@@ -1369,16 +1417,25 @@ export type ShaclResult = {
 export type ShaclReport = { conforms: boolean; results: ShaclResult[] };
 
 export type ShaclOptions = {
+  maxResponseBytes?: number;
+  /** Local response expectation for a draft read from this exact source/revision. */
+  source?: { id: string; commit: number };
   /** `default`, `union` or a graph IRI. */
   graph?: string;
   /** Include materialized inferences (server default: yes, when present). */
   reasoning?: boolean;
   /** The syntax of the shapes: Turtle (the default) or SHACLC. */
   syntax?: 'turtle' | 'shaclc';
+  /** Validate only these sample focus nodes against the inline shapes. */
+  targets?: Term[];
+  /** Inline RDF draft constants refer to this target's stored blank labels at `at`. */
+  storedBlankNodes?: boolean;
+  at?: string;
+  timeout?: number;
   signal?: AbortSignal;
 };
 
-function shaclRequest(
+async function shaclRequest(
   ds: string,
   shapes: string,
   accept: string,
@@ -1387,16 +1444,41 @@ function shaclRequest(
   const p = new URLSearchParams();
   if (opts.graph) p.set('graph', opts.graph);
   if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
+  if (opts.at) p.set('at', opts.at);
+  if (opts.timeout != null) p.set('timeout', String(opts.timeout));
+  if (opts.storedBlankNodes != null) p.set('storedBlankNodes', String(opts.storedBlankNodes));
+  for (const t of opts.targets ?? []) {
+    if (t.type !== 'uri' && t.type !== 'bnode')
+      throw new Error('A sample focus must be an IRI or blank node.');
+    p.append('target', t.type === 'uri' ? `<${t.value}>` : `_:${t.value}`);
+  }
   const qs = p.toString();
-  return request(`/${enc(ds)}/shacl${qs ? `?${qs}` : ''}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': opts.syntax === 'shaclc' ? 'text/shaclc' : 'text/turtle',
-      Accept: accept,
+  const res = await request(
+    `/${enc(ds)}/shacl${qs ? `?${qs}` : ''}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': opts.syntax === 'shaclc' ? 'text/shaclc' : 'text/turtle',
+        Accept: accept,
+      },
+      body: shapes,
+      signal: opts.signal,
     },
-    body: shapes,
-    signal: opts.signal,
-  });
+    opts.maxResponseBytes,
+  );
+  if (opts.source) {
+    const actual = res.headers.get('Sparkles-Branch-Id') ?? res.headers.get('Sparkles-Dataset-Id');
+    if (
+      actual !== opts.source.id ||
+      res.headers.get('Sparkles-Commit') !== String(opts.source.commit)
+    ) {
+      await res.body?.cancel().catch(() => {});
+      throw new Error(
+        'The sample report does not confirm the captured source UUID and commit. Refresh the source before checking this draft.',
+      );
+    }
+  }
+  return res;
 }
 
 /** Validate a data graph against a shapes graph (Turtle or SHACLC); compact JSON report. */
@@ -1406,7 +1488,11 @@ export async function shacl(
   opts: ShaclOptions = {},
 ): Promise<ShaclReport> {
   const res = await shaclRequest(ds, shapes, 'application/json', opts);
-  return (await res.json()) as ShaclReport;
+  return (
+    opts.maxResponseBytes == null
+      ? await res.json()
+      : JSON.parse(await boundedText(res, opts.maxResponseBytes))
+  ) as ShaclReport;
 }
 
 /** Same validation, report in an RDF syntax (e.g. `text/turtle`) for download. */

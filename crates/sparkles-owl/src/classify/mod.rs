@@ -64,6 +64,7 @@ mod dl_rules;
 mod horn;
 mod horn_rules;
 mod index;
+mod numeric;
 mod query;
 #[cfg(test)]
 mod retained_accounting_tests;
@@ -429,6 +430,8 @@ pub struct Saturation {
     /// set when a Tier D classification requesting partial answers cannot fit its
     /// completed or stopped result, so the error does not retry without Tier D
     partial_over: bool,
+    /// A normalization resource halt must survive Horn/DL fallback unchanged.
+    numeric_halt: bool,
     /// what the last run's partial answer leaves open: the classes not complete and the
     /// consistency
     partial: Option<(Vec<Class>, Consistency)>,
@@ -770,6 +773,7 @@ impl Saturation {
             no_counting: false,
             dl_worked: Default::default(),
             partial_over: false,
+            numeric_halt: false,
             partial: None,
         }
     }
@@ -849,6 +853,7 @@ impl Saturation {
             && limits.threads != 1
             && !limits.el_only
             && !self.partial_over
+            && !self.numeric_halt
             && self.dl_worked.load(Ordering::Relaxed)
         {
             // Tier D passed its bound on derived conclusions, and how many it derives
@@ -884,6 +889,7 @@ impl Saturation {
             && self.dl_tried
             && !limits.el_only
             && !self.partial_over
+            && !self.numeric_halt
             && self.dl_worked.load(Ordering::Relaxed)
         {
             // Tier D with counting passed its bound on derived conclusions, which a run
@@ -918,6 +924,7 @@ impl Saturation {
             && self.dl_tried
             && !limits.el_only
             && !self.partial_over
+            && !self.numeric_halt
         {
             // Tier D passed its budget or the caller's: the run starts again with the Horn
             // rules, which leave the disjunctive axioms out. Its charges draw first on
@@ -953,6 +960,7 @@ impl Saturation {
             && self.horn_tried
             && !limits.el_only
             && !self.partial_over
+            && !self.numeric_halt
         {
             // The Horn rules passed their budget or the caller's: the run starts again by
             // the EL rules alone, which leave the axioms outside OWL 2 EL out, as the
@@ -1015,6 +1023,27 @@ impl Saturation {
         held_bytes: usize,
         limits: &Limits,
     ) -> Result<(Axioms, Index, usize, OutsideEl), Error> {
+        let budget = numeric::Budget::new(
+            limits,
+            held_bytes + self.context_bytes(),
+            self.interner.ranges.ledger.clone(),
+        );
+        budget.baseline(self.interner.bytes())?;
+        self.interner.ranges.begin(budget.clone());
+        let result = self.build_inner(axioms, outside, threads, held_bytes, limits);
+        self.numeric_halt |= self.interner.ranges.check().is_err();
+        self.interner.ranges.end();
+        result.map(|(ax, ix, peak, outside)| (ax, ix, peak.max(budget.peak()), outside))
+    }
+
+    fn build_inner(
+        &mut self,
+        axioms: &[&AxiomKind],
+        outside: &[(usize, (String, String))],
+        threads: usize,
+        held_bytes: usize,
+        limits: &Limits,
+    ) -> Result<(Axioms, Index, usize, OutsideEl), Error> {
         let mut ax = Axioms::default();
         let mut partial: BTreeMap<&AxiomKind, &'static str> = BTreeMap::new();
         let mut chains: Vec<&AxiomKind> = Vec::new();
@@ -1048,15 +1077,20 @@ impl Saturation {
         if threads > 1 && axioms.len() >= PARALLEL_AXIOMS {
             let gauge = Gauge {
                 limits,
+                numeric: self.interner.ranges.budget.clone(),
                 base: held_bytes + self.interner.bytes(),
                 held: AtomicUsize::new(0),
                 peak: parking_lot::Mutex::new(0),
                 over: std::sync::atomic::AtomicBool::new(false),
             };
+            let numeric = self.interner.ranges.budget.clone();
             let definitions = &self.interner.ranges.definitions;
             let is_outside = &is_outside;
             let parts = par_map(axioms, threads, MIN_AXIOMS, |at, chunk| {
                 let mut it = Interner::chunk(definitions);
+                if let Some(b) = &numeric {
+                    it.ranges.begin(b.clone());
+                }
                 let mut out = Normalized::default();
                 let r = normalize_axioms(
                     chunk,
@@ -1067,11 +1101,16 @@ impl Saturation {
                     limits,
                     Some(&gauge),
                 );
+                it.ranges.end();
                 (r, it, out)
             });
             for (r, _, _) in &parts {
                 match r {
-                    Err(Error::Memory { .. }) => {}
+                    Err(Error::Memory { .. }) => {
+                        // Numeric admission can refuse before the ordinary chunk
+                        // gauge runs or before the chunk has a data value to flag.
+                        gauge.over.store(true, Ordering::Relaxed);
+                    }
                     r => r.clone()?,
                 }
             }
@@ -1089,12 +1128,7 @@ impl Saturation {
                     if extra > told {
                         let grown = extra - told;
                         told = extra;
-                        if !gauge.tell(grown) {
-                            return Err(Error::Memory {
-                                limit: limits.max_memory.unwrap_or(usize::MAX),
-                                used: gauge.base + gauge.held.load(Ordering::Relaxed),
-                            });
-                        }
+                        gauge.tell(grown)?;
                     }
                     Ok(())
                 };
@@ -1158,6 +1192,7 @@ impl Saturation {
                 if let Some(why) = index::normalize(k, &mut self.interner, &mut ax) {
                     partial.insert(k, why);
                 }
+                self.interner.ranges.check()?;
             }
         }
         // what each axiom outside OWL 2 EL needs, counted once however often it occurs; a
@@ -1227,6 +1262,7 @@ impl Saturation {
                 &stop,
             )
             .map_err(halt)?;
+            self.interner.ranges.check()?;
             taken.extend(
                 candidates
                     .iter()
@@ -1235,7 +1271,11 @@ impl Saturation {
                     .map(|(k, _)| *k),
             );
         }
+        self.interner.ranges.check()?;
         ax.classes.extend(self.interner.met_classes());
+        if let Some(b) = &self.interner.ranges.budget {
+            b.baseline(self.interner.bytes() + ax.bytes())?;
+        }
         let ix = Index::build(&ax, &mut self.interner, limits.max_memory, &stop).map_err(halt)?;
         let mut excluded: Vec<Excluded> = Vec::new();
         for (i, (rule, message)) in outside {
@@ -1315,6 +1355,7 @@ impl Saturation {
         self.horn_tried = false;
         self.dl_tried = false;
         self.partial_over = false;
+        self.numeric_halt = false;
         let changes = changes.filter(|_| !again);
         let full = self.entangled
             || changes.is_none_or(|c| c.added.iter().chain(c.removed).any(|k| needs_full_run(k)));
@@ -1335,6 +1376,9 @@ impl Saturation {
             }
             _ => None,
         };
+        // The old index is no longer read. Drop its handles before constructing the
+        // replacement, while cached contexts retain their shared numeric ledger.
+        self.index = None;
         // the profile check of each axiom, which depends on it alone
         let outside: Vec<(usize, (String, String))> =
             par_map(axioms, threads, MIN_AXIOMS, |at, chunk| {
@@ -1644,7 +1688,26 @@ impl Saturation {
                 };
                 let view = world::Global(&self.ctx);
                 let facts = world::universal_facts(&ix, &view, &universal);
-                let merges = world::key_merges(&ix, &view);
+                let key_budget = WorldBudget {
+                    limits,
+                    charge: charge_fn,
+                    base: totals.memory,
+                    held: AtomicIsize::new(0),
+                    peak: AtomicUsize::new(totals.peak),
+                    halt: AtomicU8::new(0),
+                    halted_at: AtomicUsize::new(0),
+                };
+                let key_bound = |delta: isize| key_budget.tell(delta);
+                let merges = world::key_merges(&ix, &view, &key_bound).map_err(|h| {
+                    key_budget.stopped().err().unwrap_or_else(|| match h {
+                        index::Halt::Memory(used) => Error::Memory {
+                            limit: limits.max_memory.unwrap_or(usize::MAX),
+                            used,
+                        },
+                        index::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
+                    })
+                })?;
+                totals.peak = totals.peak.max(key_budget.peak.load(Ordering::Relaxed));
                 if facts.is_empty() && merges.is_empty() {
                     break;
                 }
@@ -1656,7 +1719,7 @@ impl Saturation {
                     }
                 }
                 universal.extend_from_slice(&facts);
-                for (a, b) in merges {
+                for &(a, b) in merges.iter() {
                     seeds.push((a, saturate::Concl::Sub(b)));
                     seeds.push((b, saturate::Concl::Sub(a)));
                 }
@@ -1689,18 +1752,25 @@ impl Saturation {
                     let mut out = Vec::with_capacity(chunk.len());
                     for &d in chunk {
                         let w = world::World::new(&ix, &self.ctx, &universal, &real, &bound);
-                        let Some(f) = w.classify(d) else {
-                            break;
-                        };
+                        let f = w.classify(d)?;
                         let kept = 48 + f.subs.len() * 4;
                         if !bound(kept as isize) {
-                            break;
+                            return Err(index::Halt::Stopped);
                         }
                         out.push((d, f, kept));
                     }
-                    out
-                });
+                    Ok(out)
+                })
+                .into_iter()
+                .collect::<Result<Vec<_>, index::Halt>>();
                 budget.stopped()?;
+                let found = found.map_err(|h| match h {
+                    index::Halt::Memory(used) => Error::Memory {
+                        limit: limits.max_memory.unwrap_or(usize::MAX),
+                        used,
+                    },
+                    index::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
+                })?;
                 totals.peak = budget.peak.load(Ordering::Relaxed);
                 for (d, f, kept) in found.into_iter().flatten() {
                     world_bytes += kept;
@@ -1870,6 +1940,11 @@ impl Saturation {
         self.interner.len() * 40
             + self.interner.classes.bytes()
             + self.interner.classes.name_bytes()
+            + self.interner.data_bytes()
+            + ix.numeric_ledger
+                .as_ref()
+                .or(self.interner.ranges.ledger.as_ref())
+                .map_or(0, |l| l.bytes())
             + ix.bytes()
     }
 
@@ -2046,12 +2121,7 @@ fn normalize_axioms<'k>(
             let now = it.bytes() + it.merge_bytes() + out.ax.rough_bytes();
             let grown = now.saturating_sub(told);
             told = told.max(now);
-            if !g.tell(grown) {
-                return Err(Error::Memory {
-                    limit: limits.max_memory.unwrap_or(usize::MAX),
-                    used: g.base + g.held.load(Ordering::Relaxed),
-                });
-            }
+            g.tell(grown)?;
         }
         Ok(())
     };
@@ -2076,9 +2146,15 @@ fn normalize_axioms<'k>(
             out.chains.push(k);
             continue;
         }
+        if gauge.is_none()
+            && let Some(b) = &it.ranges.budget
+        {
+            b.refresh_base(it.bytes() + out.ax.rough_bytes())?;
+        }
         if let Some(why) = index::normalize(k, it, &mut out.ax) {
             out.partial.insert(k, why);
         }
+        it.ranges.check()?;
     }
     tell(it, out)
 }
@@ -2092,6 +2168,7 @@ const GAUGE_AXIOMS: usize = if cfg!(test) { 16 } else { 4096 };
 /// charges only what its state passes the peak by.
 struct Gauge<'a> {
     limits: &'a Limits,
+    numeric: Option<std::sync::Arc<numeric::Budget>>,
     /// the caller's bytes and the run's interner before the normalization
     base: usize,
     held: AtomicUsize,
@@ -2102,28 +2179,44 @@ struct Gauge<'a> {
 }
 
 impl Gauge<'_> {
-    /// Adds `grown` bytes, and answers false once the chunks pass the budget, the pool
-    /// refuses the growth, or another chunk found either.
-    fn tell(&self, grown: usize) -> bool {
+    /// Adds `grown` bytes, and answers [`Error::Memory`] once the chunks pass the
+    /// budget, the pool refuses the growth, or another chunk found either. The numeric
+    /// admission also polls the run, and its cancellation or deadline stays that error,
+    /// since a one-shot cancellation must not turn into a serial retry.
+    fn tell(&self, grown: usize) -> Result<(), Error> {
+        let over = || {
+            self.over.store(true, Ordering::Relaxed);
+            Error::Memory {
+                limit: self.limits.max_memory.unwrap_or(usize::MAX),
+                used: self.base + self.held.load(Ordering::Relaxed),
+            }
+        };
         if self.over.load(Ordering::Relaxed) {
-            return false;
+            return Err(over());
         }
         let used = self.base + self.held.fetch_add(grown, Ordering::Relaxed) + grown;
+        if let Some(numeric) = &self.numeric {
+            match numeric.grow_base(grown) {
+                Ok(()) => {}
+                Err(Error::Memory { .. }) => return Err(over()),
+                Err(e) => return Err(e),
+            }
+            *self.peak.lock() = numeric.peak();
+            return Ok(());
+        }
         if self.limits.max_memory.is_some_and(|m| used > m) {
-            self.over.store(true, Ordering::Relaxed);
-            return false;
+            return Err(over());
         }
         let mut peak = self.peak.lock();
         let more = used.saturating_sub(*peak);
         if more == 0 {
-            return true;
+            return Ok(());
         }
         if self.limits.charge.as_ref().is_some_and(|f| !f(more)) {
-            self.over.store(true, Ordering::Relaxed);
-            return false;
+            return Err(over());
         }
         *peak = used;
-        true
+        Ok(())
     }
 }
 
@@ -2968,3 +3061,7 @@ mod tests {
         assert_eq!(horn(None, &|| false).ok(), Some(vec![true]));
     }
 }
+
+#[cfg(test)]
+#[path = "a1_probe_alloc.rs"]
+mod a1_probe_alloc;

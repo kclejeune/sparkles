@@ -33,6 +33,7 @@
     describe,
     oncommitted,
     onstale,
+    disabled = false,
   }: {
     open?: boolean;
     title: string;
@@ -49,24 +50,30 @@
       sel: Selection;
       etag: string | null;
       head: number | null;
+      sourceId?: string;
     } | null;
     /** An axiom as the editor shows it. */
     describe: (a: AxiomInput) => string;
     oncommitted: (op: Op, a: OpAnswer, message: string) => void;
     /** The precondition failed: another commit landed since the editor loaded. */
     onstale: () => void;
+    /** The origin is no longer writable or its read is stale. */
+    disabled?: boolean;
   } = $props();
 
   let preview = $state<WritePreview | null>(null);
   let error = $state<string | null>(null);
   let busy = $state(false);
+  let committing = $state(false);
   let message = $state('');
   /** The dry run of a revert found that the head moved on. */
   let movedOn = $state(false);
   let ran: Op | null = null;
+  let dryCtl: AbortController | null = null;
   /** The tag and head of the state the dry run read, which the commit names too. */
   let tag: string | null = null;
   let at: number | null = null;
+  let sourceId: string | undefined;
   /** The target and graphs the dry run ran on, which the commit writes to. */
   let ranTarget = '';
   let ranSel: Selection = { graph: null, imports: true };
@@ -87,6 +94,7 @@
     const origin = pin?.op === op ? pin : null;
     tag = origin ? origin.etag : etag;
     at = origin ? origin.head : head;
+    sourceId = origin?.sourceId;
     ranTarget = origin ? origin.target : target;
     ranSel = { ...(origin ? origin.sel : sel) };
     message = title;
@@ -94,21 +102,35 @@
   });
 
   $effect(() => {
-    if (!open) ran = null;
+    if (!open) {
+      ran = null;
+      dryCtl?.abort();
+    }
   });
 
+  $effect(() => () => dryCtl?.abort());
+
   async function dry(o: Op) {
+    dryCtl?.abort();
+    const ctl = new AbortController();
+    dryCtl = ctl;
     preview = null;
     error = null;
     movedOn = false;
     busy = true;
     try {
-      const r = await runOp(ranTarget, ranSel, o, { dryRun: true, etag: tag, head: at });
-      if (ran !== o) return;
+      const r = await runOp(ranTarget, ranSel, o, {
+        dryRun: true,
+        etag: tag,
+        head: at,
+        sourceId,
+        signal: ctl.signal,
+      });
+      if (ran !== o || ctl.signal.aborted) return;
       if (isPreview(r)) preview = r;
       else error = 'The server answered a dry run without its preview.';
     } catch (e) {
-      if (ran !== o) return;
+      if (ran !== o || ctl.signal.aborted) return;
       if (isStale(e)) movedOn = true;
       else error = problemOf(e);
     } finally {
@@ -117,7 +139,7 @@
   }
 
   async function commit() {
-    if (!op || ran !== op) return;
+    if (!op || ran !== op || disabled || !canCommit) return;
     const operation = op;
     // the page moved to another dataset, branch or graph since the dry run
     if (ranTarget !== target || ranSel.graph !== sel.graph) {
@@ -125,11 +147,13 @@
       return;
     }
     busy = true;
+    committing = true;
     error = null;
     try {
       const r = await runOp(ranTarget, ranSel, operation, {
         etag: tag,
         head: at,
+        sourceId,
         message: message.trim() || title,
       });
       if (ran !== operation || !open) return;
@@ -143,18 +167,19 @@
         onstale();
       } else error = problemOf(e);
     } finally {
+      committing = false;
       if (ran === operation) busy = false;
     }
   }
 
   const lists = $derived(op ? opAxioms(op) : { add: [], remove: [] });
   const stale = $derived(movedOn || preview?.outcome === 'precondition-failed');
-  const canCommit = $derived(!!preview && preview.outcome === 'commit' && !busy);
+  const canCommit = $derived(!!preview && preview.outcome === 'commit' && !busy && !disabled);
   /** An undo or redo whose changes the head no longer holds, which only leaves the list. */
   const spent = $derived(op?.kind === 'revert' && preview?.outcome === 'no-change');
 </script>
 
-<Modal bind:open {title} width={620}>
+<Modal bind:open {title} width={620} closeDisabled={committing}>
   <div class="preview" aria-live="polite">
     {#if op?.kind === 'axioms'}
       {#if lists.remove.length}
@@ -189,6 +214,11 @@
       <details>
         <summary>SPARQL update</summary>
         <pre class="sparql">{op.sparql}</pre>
+      </details>
+    {:else if op?.kind === 'patch'}
+      <details>
+        <summary>RDF changes</summary>
+        <pre class="sparql">{op.patch}</pre>
       </details>
     {/if}
 
@@ -237,7 +267,7 @@
     {/if}
   </div>
   {#snippet actions()}
-    <button class="btn" onclick={() => (open = false)}>Cancel</button>
+    <button class="btn" disabled={committing} onclick={() => (open = false)}>Cancel</button>
     {#if stale}
       <button
         class="btn primary"

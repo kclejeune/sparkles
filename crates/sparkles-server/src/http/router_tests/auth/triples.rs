@@ -361,18 +361,20 @@ async fn routes_listings_and_whoami() {
         assert_eq!(r.status, StatusCode::FORBIDDEN, "{u}: {}", r.text());
         assert_ne!(get(u, "tadmin").await.status, StatusCode::FORBIDDEN, "{u}");
     }
-    let r = call(
-        &s.app,
-        "POST",
-        "/hr/shacl",
-        &[
-            ("authorization", &b("tstaff")),
-            ("content-type", "text/turtle"),
-        ],
-        "",
-    )
-    .await;
-    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    for uri in ["/hr/shacl", "/hr/shacl?storedBlankNodes=true&target=_:b1"] {
+        let r = call(
+            &s.app,
+            "POST",
+            uri,
+            &[
+                ("authorization", &b("tstaff")),
+                ("content-type", "text/turtle"),
+            ],
+            "",
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN);
+    }
     // the size of the dataset is the visible triples'
     let r = get("/$/datasets/hr", "tstaff").await.json();
     assert_eq!(r["quads"], 3, "{r}");

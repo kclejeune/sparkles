@@ -1,0 +1,86 @@
+{
+  "schema": "sparkles.boat.worker-profile",
+  "version": 1,
+  "admitted_by_Root": false,
+  "profile_review_sha256": null,
+  "worker": null,
+  "worker_uid": null,
+  "worker_home": null,
+  "future_environment": {
+    "id": null,
+    "name": null,
+    "version": null,
+    "version_id": null,
+    "hook_sha256": null,
+    "hook_bytes": null,
+    "setup_blocking": true
+  },
+  "machine": {
+    "type": "large",
+    "vcpu": 8,
+    "memoryGB": 16
+  },
+  "installed_bundle": null,
+  "retained_old_bundle": null,
+  "runtime_members": {
+    "bootstrap.sh": {
+      "sha256": null,
+      "embedded_mode": 448
+    },
+    "repository-start.sh": {
+      "sha256": null,
+      "embedded_mode": 448
+    },
+    "toolchain-state.py": {
+      "sha256": null,
+      "embedded_mode": 384
+    },
+    "tools.toml": {
+      "sha256": null,
+      "embedded_mode": 384
+    },
+    "expected-cargo-launcher": {
+      "sha256": null,
+      "embedded_mode": 384
+    }
+  },
+  "old_runtime_members": {
+    "bootstrap.sh": {
+      "sha256": null,
+      "embedded_mode": 448
+    },
+    "repository-start.sh": {
+      "sha256": null,
+      "embedded_mode": 448
+    },
+    "toolchain-state.py": {
+      "sha256": null,
+      "embedded_mode": 384
+    },
+    "tools.toml": {
+      "sha256": null,
+      "embedded_mode": 384
+    },
+    "expected-cargo-launcher": {
+      "sha256": null,
+      "embedded_mode": 384
+    }
+  },
+  "saved_toolchain_manifest_sha256": null,
+  "startup_repositories": {
+    "default": null,
+    "retained": null
+  },
+  "tool_versions": {
+    "rust": "1.99.1",
+    "mbx": "1.29.1",
+    "mise": "2026.8.16"
+  },
+  "bootstrap_contract": "existing_lock_manifest_fence_v1",
+  "stop_contract_sha256": null,
+  "mbx_remote_config": {
+    "url": null,
+    "namespace": null,
+    "mode": "read-only"
+  }
+}

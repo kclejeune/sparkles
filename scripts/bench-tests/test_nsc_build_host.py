@@ -7,6 +7,7 @@ on a real host. A fake systemd-run makes each scope its own process group, which
 systemctl stop kills."""
 
 import json
+import ctypes
 import os
 from pathlib import Path
 import shutil
@@ -14,10 +15,11 @@ import signal
 import subprocess
 import tempfile
 import time
+import threading
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS = ["nsc-bench.sh", "nsc-writes.sh", "nsc-build.sh", "nsc-build-host.sh",
+SCRIPTS = ["remote-executor.sh", "remote-executor.py", "remote-screen.sh", "nsc-bench.sh", "nsc-writes.sh", "nsc-build.sh", "nsc-build-host.sh",
            "nsc-build-remote.sh", "nsc-writes-remote.sh", "cargo-sparkles-task", "gate/config.sh"]
 
 TOOLS = {
@@ -69,13 +71,20 @@ if 'stop' in a:
     if f.exists():
         try:os.killpg(int(f.read_text().split()[0]),signal.SIGKILL)
         except ProcessLookupError:pass
+        (state/(name+'.stopped')).touch()
+if 'is-active' in a:
+    name=a[-1] if '.' in a[-1] else a[-1]+'.service'
+    f=state/'units'/name
+    if not f.exists() or (state/(name+'.stopped')).exists():raise SystemExit(3)
+    try:os.kill(int(f.read_text().split()[0]),0)
+    except ProcessLookupError:raise SystemExit(3)
 """,
     "mbx": """#!/usr/bin/env python3
 import json,os,pathlib,subprocess,sys,time
 a=sys.argv[1:]
 if a==['--version']:print('mbx 9.9.9');raise SystemExit(0)
 if a[:2]==['sparkles-task','--']:raise SystemExit(subprocess.run(a[2:]).returncode)
-with open(os.environ['FAKE_BUILDS'],'a') as s:s.write(json.dumps({'home':os.environ['HOME'],'cwd':os.getcwd(),'args':a,'jobs':os.environ.get('CARGO_BUILD_JOBS')})+'\\n')
+with open(os.environ['FAKE_BUILDS'],'a') as s:s.write(json.dumps({'home':os.environ['HOME'],'cwd':os.getcwd(),'args':a,'jobs':os.environ.get('CARGO_BUILD_JOBS'),'target_override':os.environ.get('CARGO_TARGET_DIR'),'cache_override':os.environ.get('MBX_CACHE_DIR')})+'\\n')
 pathlib.Path(os.environ['FAKE_HOSTS'],'build-started').touch()
 time.sleep(float(os.environ.get('FAKE_BUILD_DELAY','0')))
 if os.environ.get('FAKE_BUILD_FAIL'):raise SystemExit(17)
@@ -106,6 +115,7 @@ class BuildHost(unittest.TestCase):
         for name in SCRIPTS:
             (self.repo / "scripts" / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(ROOT / "scripts" / name, self.repo / "scripts" / name)
+        shutil.copytree(ROOT / "scripts/boat", self.repo / "scripts/boat", ignore=shutil.ignore_patterns("__pycache__"))
         (self.repo / "mise.toml").write_text('[tools]\nmr-boxington = "9.9.9"\n')
         git = ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t",
                "-c", "commit.gpgsign=false"]
@@ -138,16 +148,41 @@ class BuildHost(unittest.TestCase):
             self.env.pop(name, None)
         self.runs = 0
         self.holders = []
+        self.fixture_libc=ctypes.CDLL(None);self.fixture_previous=ctypes.c_int()
+        self.assertEqual(self.fixture_libc.prctl(37,ctypes.byref(self.fixture_previous),0,0,0),0)
+        self.assertEqual(self.fixture_libc.prctl(36,1,0,0,0),0)
+        self.reaper_stop=threading.Event()
+        def reap_owned_mock_scopes():
+            while not self.reaper_stop.wait(0.01):
+                for path in (self.hosts/'units').glob('*.scope'):
+                    try:
+                        group=int(path.read_text().split()[0])
+                        while os.waitpid(-group,os.WNOHANG)[0]>0:pass
+                    except (ChildProcessError,FileNotFoundError,ProcessLookupError,ValueError):pass
+        self.fixture_reaper=threading.Thread(target=reap_owned_mock_scopes,daemon=True)
+        self.fixture_reaper.start()
 
     def tearDown(self):
         for holder in self.holders:
-            holder.kill()
-            holder.wait()
+            try:os.killpg(holder.pid,signal.SIGTERM)
+            except ProcessLookupError:pass
+            holder.wait(timeout=3)
+            end=time.monotonic()+3
+            while True:
+                try:
+                    while os.waitpid(-holder.pid,os.WNOHANG)[0]>0:pass
+                except ChildProcessError:pass
+                try:os.killpg(holder.pid,0)
+                except ProcessLookupError:break
+                self.assertLess(time.monotonic(),end,'owned lock fixture did not close')
+                time.sleep(0.01)
+        self.reaper_stop.set();self.fixture_reaper.join(timeout=1)
+        self.fixture_libc.prctl(36,self.fixture_previous.value,0,0,0)
 
     def hold_lock(self, host, seconds=60):
         lanes = self.hosts / host / "lanes"
         lanes.mkdir(exist_ok=True)
-        holder = subprocess.Popen(["flock", str(lanes / ".heavy.lock"), "sleep", str(seconds)])
+        holder = subprocess.Popen(["flock", str(lanes / ".heavy.lock"), "sleep", str(seconds)],start_new_session=True)
         self.holders.append(holder)
         deadline = time.monotonic() + 5
         while subprocess.run(["flock", "-n", str(lanes / ".heavy.lock"), "true"]).returncode == 0:
@@ -341,6 +376,31 @@ class BuildHost(unittest.TestCase):
             os.killpg(scope, 0)
         self.assertFalse((self.entry() / "build.txt").exists())
 
+    def test_writes_local_build_uses_managed_mbx_source_and_exact_feature_cache(self):
+        (self.cache/'data').mkdir(parents=True)
+        (self.cache/'data/people-100000.nt.zst').write_text('data')
+        (self.repo/'crates/sparkles-core/tests/support').mkdir(parents=True)
+        for index,flags in enumerate(('--features text --locked','--no-default-features')):
+            out=self.root/f'local-writes-{index}'
+            result=subprocess.run(['bash',str(self.repo/'scripts/nsc-writes.sh'),'--out',str(out),
+                                   '--build-host','local','--cargo-args',flags,f'a={self.sha}',f'b={self.sha}'],
+                                  env=self.env,capture_output=True,text=True,timeout=30)
+            self.assertIn('executor acquire failed',result.stderr,result.stderr)
+        builds=self.builds();self.assertEqual(len(builds),2)
+        for build in builds:
+            self.assertIsNone(build['target_override']);self.assertIsNone(build['cache_override'])
+            self.assertNotIn('--target-dir',build['args'])
+            self.assertIn('/writes-v2/src/',build['cwd'])
+        self.assertEqual(builds[0]['args'][4:],['--features','text','--locked'])
+        self.assertEqual(builds[1]['args'][4:],['--no-default-features'])
+        entries=list((self.cache/'writes-v2/bin').iterdir());self.assertEqual(len(entries),2)
+        for entry in entries:
+            record=json.loads((entry/'build.json').read_text())
+            self.assertEqual(record['build_policy'],'mbx-managed-v1')
+            self.assertIn('managed target lease',record['command'])
+        self.assertFalse((self.cache/'writes-v2/target').exists())
+        self.assertEqual(list((self.cache/'writes-v2/src').iterdir()),[])
+
     def test_nsc_writes_builds_on_the_host_and_records_it(self):
         # nsc-writes stops when it tries to create the instance, after staging the binaries.
         (self.cache / "data").mkdir(parents=True)
@@ -353,21 +413,21 @@ class BuildHost(unittest.TestCase):
             result = subprocess.run(["bash", str(self.repo / "scripts/nsc-writes.sh"), "--out", str(out),
                                      *args, f"a={self.sha}", f"b={self.sha}:--flag"], env=self.env,
                                     capture_output=True, text=True, timeout=60)
-            self.assertIn("nsc create failed", result.stderr, result.stderr)
+            self.assertIn("executor acquire failed", result.stderr, result.stderr)
             return result, out
 
         result, out = writes("--build-host", "h2", "--cargo-args", "--features text")
         [build] = self.builds()
         self.assertEqual(Path(build["home"]), self.hosts / "h2")
         self.assertEqual(build["args"][4:], ["--features", "text"])
-        [entry] = (self.cache / "writes-v1" / "bin").iterdir()
+        [entry] = (self.cache / "writes-v2" / "bin").iterdir()
         record = json.loads((entry / "build.json").read_text())
         self.assertEqual(record["build_host"], "h2")
         self.assertEqual(record["rustc"], "rustc test\n")
         self.assertIn("build host h2", record["command"])
         self.assertIn("built on h2", (out / "manifest.txt").read_text())
         self.assertEqual(self.scratch("h2"), [])
-        self.assertEqual(list((self.cache / "writes-v1" / "src").iterdir()), [])
+        self.assertEqual(list((self.cache / "writes-v2" / "src").iterdir()), [])
         # The verified entry is reused by a later run, which builds nothing.
         result, out = writes("--build-host", "h1", "--cargo-args", "--features text")
         self.assertEqual(len(self.builds()), 1)

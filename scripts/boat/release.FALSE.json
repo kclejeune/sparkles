@@ -1,0 +1,96 @@
+{
+  "schema": 1,
+  "authorized_by_Root": false,
+  "worker": null,
+  "profile_sha256": null,
+  "profile_review_sha256": null,
+  "controller_packet_manifest_sha256": null,
+  "different_controller_review_sha256": null,
+  "operation": null,
+  "guard_unit": null,
+  "startup_mode": "normal_pinned_provisioning",
+  "no_source_transport_or_jobs": true,
+  "private_credential_snapshot_acknowledged": false,
+  "clean_next_snapshot_required": false,
+  "root_exclusive_worker_use": false,
+  "useful_job_ready": false,
+  "separate_Root_handoff": null,
+  "boat": {
+    "path": null,
+    "sha256": null,
+    "uid": null,
+    "mode": null,
+    "bytes": null,
+    "version": "1.0.92"
+  },
+  "local_first": {
+    "observed_unix": null,
+    "verified_by_Root": false,
+    "receipt_sha256": null,
+    "overflow_currently_needed": false
+  },
+  "start_ledger": {
+    "observed_unix": null,
+    "verified_by_Root": false,
+    "receipt_sha256": null,
+    "limit": 200,
+    "starts_and_reservations": null,
+    "this_one_resume_reserved": false,
+    "all_actors_included": false,
+    "window": null,
+    "timezone": null,
+    "provider_rate_admitted": false
+  },
+  "environment": {
+    "observed_unix": null,
+    "verified_by_Root": false,
+    "receipt_sha256": null,
+    "name": null,
+    "version": null,
+    "hook_sha256": null,
+    "latest_version_id": null,
+    "assigned_editors_excluded": false,
+    "lock_path": null,
+    "post_resume_fact_path": null,
+    "environment_id": null
+  },
+  "snapshot_continuity": {
+    "observed_unix": null,
+    "verified_by_Root": false,
+    "receipt_sha256": null,
+    "manifest_sha256": null,
+    "continuity_is_retained_evidence_inference": true,
+    "snapshot_completed_at": null,
+    "pre_resume_environment_version": null,
+    "startup_repo": null,
+    "hook_token_metadata_open_fchmod_accepted": false,
+    "token_path": null,
+    "dev_read_only_scope": false,
+    "default_source": null,
+    "retained_source": null
+  },
+  "previous_native_closure": {
+    "observed_unix": null,
+    "verified_by_Root": false,
+    "receipt_sha256": null,
+    "all_native_and_leases_closed": false
+  },
+  "provider_contract": {
+    "observed_unix": null,
+    "verified_by_Root": false,
+    "receipt_sha256": null,
+    "readiness_predicate": "CLI_ready_idle_running_plus_actual_probe",
+    "ttl_basis": "accepted_resume_ttl10800_and_local_earlier_deadline",
+    "stop_completed_requires_fresh_info": false,
+    "snapshot_policy": "documented_normal_stop_final_snapshot",
+    "final_snapshot_document_sha256": null,
+    "stop_status_schema_verified_by_Root": false,
+    "stop_status_receipt_sha256": null,
+    "resume_ack": {
+      "verified_by_Root": false,
+      "receipt_sha256": null,
+      "kind": "cli_accepted_resuming",
+      "positive_literal": "resuming"
+    }
+  }
+}

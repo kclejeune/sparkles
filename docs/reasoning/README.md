@@ -314,7 +314,17 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   with an individual, a data property, a datatype or a key, and any change after a run
   that took that step or an axiom outside OWL 2 EL, saturates everything again. A run stops at its deadline, its
   memory budget or a cancellation, which it checks while it indexes, builds the property
-  closure, saturates and builds the taxonomy. `Stats::memory` recounts retained index
+  closure, saturates and builds the taxonomy. Integer, decimal and rational literals
+  use exact arbitrary-precision values, so equal reduced fractions and equivalent
+  spellings compare equally beyond 128 bits. Numeric construction polls these controls
+  and admits scratch and overlapping copies before growth. Large values share immutable
+  storage that remains counted until the last alias drops. A numeric memory,
+  cancellation or deadline refusal is returned as a typed error through the Horn and
+  DL paths, rather than making the value opaque or reporting a completed fallback.
+  XML namespace validation retains lexical spellings and does not establish canonical
+  XML value equality. Its standalone scratch is not charged by the numeric budget.
+  Full XML semantics remain in item 663 and shared hierarchical ownership in item 675.
+  `Stats::memory` recounts retained index
   and context storage when saturation ends, using the same estimates for fresh and
   unchanged reused state. This adds a traversal of the retained tables. The final
   estimate can differ from the allowances charged as conclusions arrive, while the
@@ -693,10 +703,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   report. Roadmap item 578.
 * An ontology read has no size budget of its own beyond the query deadline, and its cost
   on large ontologies is not measured. Roadmap item 539.
-* The EL classifier uses literals and datatypes it cannot compare, which are XML
-  literals, ill-typed literals, datatypes outside the OWL 2 datatype map and numbers
-  past 128 bits, and property chains through the top object property only in part.
-  Roadmap item 663.
+* The EL classifier compares integer, decimal and rational values exactly at arbitrary
+  precision under its resource controls. XML literals, ill-typed literals, datatypes
+  outside the supported OWL 2 datatype map and chains through the top object property
+  remain partial. XML namespace conformance preserves lexical spellings and does not
+  provide canonical value equality. Roadmap item 663.
 * An EL classification after a change to an axiom with an individual, a data property
   or a key saturates everything again, and so does any change after a run that merged
   a context with an individual.

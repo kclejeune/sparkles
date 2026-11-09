@@ -586,6 +586,7 @@ impl Parser<'_> {
             let query = sparkles_core::sparql::parse_query(&text, None, &prefixes)
                 .map_err(|e| anyhow!("{e}"))
                 .with_context(|| format!("invalid SPARQL in {}:\n{text}", p.as_str()))?;
+            crate::sparql::check_no_service(&query)?;
             if !matches!(query, Query::Select { .. }) {
                 bail!("{} is not a SELECT query", p.as_str());
             }
@@ -649,6 +650,7 @@ impl Parser<'_> {
         let query = sparkles_core::sparql::parse_query(&text, None, &[])
             .map_err(|e| anyhow!("{e}"))
             .with_context(|| format!("sparql:{name} with {} arguments", args.len()))?;
+        crate::sparql::check_no_service(&query)?;
         Ok(self.push_expr(
             node,
             Expr::SparqlFn {

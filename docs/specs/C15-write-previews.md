@@ -256,7 +256,8 @@ pub struct DryRun {
     pub max_changes: u64,     // the most changes a full listing may hold (0: no limit)
 }
 pub struct Preview {
-    pub dataset_id: uuid::Uuid,
+    pub dataset_id: uuid::Uuid,        // owning dataset, also for a branch write
+    pub branch_id: uuid::Uuid,         // actual selected target incarnation
     pub head: CommitInfo,
     pub commit: Option<CommitInfo>,     // None: no net change
     pub message: Option<Arc<str>>,
@@ -280,6 +281,13 @@ DryRun(Box<Preview>),
 // WriteTxn gains
 pub fn preview(self, dr: DryRun) -> Result<Preview>;
 ```
+
+The Rust preview captures `branch_id` from the actual target Store at the write
+boundary. It equals `dataset_id` on `main` and differs on other branches. A commit
+inherited from upstream does not change the selected target identity. Retained
+candidate views keep the owning dataset identity for analysis; their private copies
+do not identify a new branch. HTTP `datasetId` keeps naming the owning dataset, and
+the branch headers and merge report identify the captured target branch.
 
 A write whose options carry `dry_run` ends with `Err(Error::DryRun(preview))` instead of
 a receipt. Every write path of the store then stops where it would have committed:

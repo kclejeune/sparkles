@@ -251,9 +251,76 @@ pub(crate) const SPARKLES_BRANCH_ID: &str = "sparkles-branch-id";
 #[cfg_attr(not(feature = "auth"), allow(dead_code))]
 pub(crate) struct SelectedBranch(pub String);
 
+/// Evidence captured from the Store that actually served a response. Never inferred
+/// from a request name or an expected UUID after a handler has returned.
+#[derive(Clone)]
+pub(super) struct ServingSource {
+    owner: uuid::Uuid,
+    branch: uuid::Uuid,
+    name: String,
+}
+
+impl ServingSource {
+    pub(super) fn of(ds: &Dataset) -> Self {
+        Self {
+            owner: ds.store.owner_dataset_id(),
+            branch: ds.store.branch_id(),
+            name: ds.store.branch_name(),
+        }
+    }
+
+    pub(super) fn attach(&self, response: &mut Response) {
+        let headers = response.headers_mut();
+        headers.insert(
+            SPARKLES_DATASET_ID,
+            self.owner.to_string().parse().expect("UUID header"),
+        );
+        if self.branch == self.owner {
+            headers.remove(SPARKLES_BRANCH);
+            headers.remove(SPARKLES_BRANCH_ID);
+        } else {
+            if let Ok(name) = self.name.parse() {
+                headers.insert(SPARKLES_BRANCH, name);
+            }
+            headers.insert(
+                SPARKLES_BRANCH_ID,
+                self.branch.to_string().parse().expect("UUID header"),
+            );
+        }
+        response.extensions_mut().insert(self.clone());
+    }
+}
+
 tokio::task_local! {
     /// The branch the request being handled chose (`None`: `main`).
     static BRANCH: Option<String>;
+    /// Captured by dataset() only after routing/authorization. Snapshot and receipt
+    /// response extensions take precedence over this metadata-response fallback.
+    static SERVING: std::cell::RefCell<Option<ServingSource>>;
+}
+
+pub(super) fn served(ds: &Dataset) {
+    let _ = SERVING.try_with(|source| *source.borrow_mut() = Some(ServingSource::of(ds)));
+}
+
+fn with_report(
+    mut response: Response,
+    owner: uuid::Uuid,
+    report: &MergeReport,
+    seq: u64,
+) -> Response {
+    response.headers_mut().insert(SPARKLES_COMMIT, seq.into());
+    ServingSource {
+        owner,
+        branch: report.target.branch_id,
+        name: report
+            .target
+            .branch
+            .clone()
+            .unwrap_or_else(|| MAIN.to_string()),
+    }
+    .attach(&mut response);
+    response
 }
 
 /// The branch of the request being handled (`None`: `main`).
@@ -409,28 +476,38 @@ pub(crate) async fn select(
         }
     }
     req.extensions_mut().insert(SelectedBranch(branch.clone()));
-    let ds_name = req
-        .uri()
-        .path()
-        .split('/')
-        .nth(if admin { 3 } else { 1 })
-        .map(|s| {
-            percent_encoding::percent_decode_str(s)
-                .decode_utf8_lossy()
-                .into_owned()
+    #[cfg(test)]
+    let response_gate = req
+        .extensions()
+        .get::<super::algo::probe::Probe>()
+        .and_then(|p| p.branch_response.clone());
+    let (mut resp, captured) = SERVING
+        .scope(std::cell::RefCell::new(None), async {
+            let response = BRANCH.scope(Some(branch), next.run(req)).await;
+            let source = SERVING.with(|source| source.borrow().clone());
+            (response, source)
+        })
+        .await;
+    #[cfg(test)]
+    if let Some(gate) = response_gate {
+        tokio::task::spawn_blocking(move || {
+            let _completion = super::algo::probe::Completion(gate.clone());
+            gate.wait();
+        })
+        .await
+        .expect("branch response test gate");
+    }
+    let source = resp
+        .extensions()
+        .get::<ServingSource>()
+        .cloned()
+        .or_else(|| {
+            (resp.status().is_success() || resp.status() == StatusCode::NOT_MODIFIED)
+                .then_some(captured)
+                .flatten()
         });
-    let mut resp = BRANCH.scope(Some(branch.clone()), next.run(req)).await;
-    if branch != MAIN
-        && let Some(ds) = ds_name.and_then(|n| st.get(&n))
-        && let Ok(id) = ds.store.branch_id_of(&branch)
-    {
-        let h = resp.headers_mut();
-        if let Ok(v) = header::HeaderValue::from_str(&branch) {
-            h.insert(SPARKLES_BRANCH, v);
-        }
-        if let Ok(v) = header::HeaderValue::from_str(&id.to_string()) {
-            h.insert(SPARKLES_BRANCH_ID, v);
-        }
+    if let Some(source) = source {
+        source.attach(&mut resp);
     }
     resp
 }
@@ -1091,8 +1168,29 @@ fn merge_options(st: &AppState, v: &J, preview: bool) -> ApiResult<MergeAsk> {
         }
     }
     if let Some(e) = v.get("expect") {
-        o.expect_source = e.get("source").and_then(J::as_u64);
-        o.expect_target = e.get("target").and_then(J::as_u64);
+        let e = e
+            .as_object()
+            .ok_or_else(|| invalid("invalid-merge", "expect must be an object"))?;
+        let head = |field: &str| -> ApiResult<Option<u64>> {
+            e.get(field)
+                .map(|value| {
+                    value.as_u64().ok_or_else(|| {
+                        invalid(
+                            "invalid-merge",
+                            format!("expect.{field} must be an unsigned integer head"),
+                        )
+                    })
+                })
+                .transpose()
+        };
+        o.expect_source = head("source")?;
+        o.expect_target = head("target")?;
+        o.expect_target_id = match e.get("targetId") {
+            None => None,
+            Some(id) => Some(id.as_str().and_then(|id| id.parse().ok()).ok_or_else(|| {
+                invalid("invalid-merge", "expect.targetId must be a branch UUID")
+            })?),
+        };
     }
     match s("inferences").as_deref() {
         None | Some("exclude") => {}
@@ -1327,9 +1425,15 @@ async fn run_preview(
     o: MergeOptions,
 ) -> ApiResult {
     op.access(p, name)?;
+    let owner = ds.store.owner_dataset_id();
     let op2 = op.clone();
     let r = blocking(move || Ok(op2.preview(&ds.store, &o)?)).await?;
-    Ok(Json(op.json(&r, None)).into_response())
+    Ok(with_report(
+        Json(op.json(&r, None)).into_response(),
+        owner,
+        &r,
+        r.target.seq,
+    ))
 }
 
 /// Compute the target before/after the complete merge candidate under pinned heads.
@@ -1367,17 +1471,36 @@ async fn preview_entailments(
     let op2 = op.clone();
     blocking(move || {
         let report = op2.preview(&ds.store, &options)?;
+        if report.target.branch_id != target.store.branch_id() {
+            return Err(
+                Error::PreconditionFailed("the preview target identity changed".into()).into(),
+            );
+        }
         let mut doc = op2.json(&report, None);
         if report.conflicts.is_some() && report.conflicts_found > report.conflicts_resolved {
             doc["entailments"] = J::Null;
             doc["entailmentsUnavailable"] =
                 json!("resolve the merge conflicts to compute a candidate");
-            return Ok(Json(doc).into_response());
+            return Ok(with_report(
+                Json(doc).into_response(),
+                ds.store.owner_dataset_id(),
+                &report,
+                report.target.seq,
+            ));
         }
         options.expect_source = Some(report.source.seq);
         options.expect_target = Some(report.target.seq);
+        options.expect_target_id = Some(report.target.branch_id);
         match op2.run(&ds.store, &options) {
             Err(Error::DryRun(preview)) => {
+                if preview.branch_id != report.target.branch_id
+                    || preview.dataset_id != target.store.owner_dataset_id()
+                {
+                    return Err(Error::PreconditionFailed(
+                        "the preview target identity changed".into(),
+                    )
+                    .into());
+                }
                 let checked = request.json_checked(&target, &preview)?;
                 doc["entailments"] = checked.get("entailments").cloned().unwrap_or(J::Null);
                 if let Some(reason) = checked.get("entailmentsUnavailable") {
@@ -1402,7 +1525,12 @@ async fn preview_entailments(
             }
             Err(error) => return Err(error.into()),
         }
-        Ok(Json(doc).into_response())
+        Ok(with_report(
+            Json(doc).into_response(),
+            ds.store.owner_dataset_id(),
+            &report,
+            report.target.seq,
+        ))
     })
     .await
 }
@@ -1637,6 +1765,16 @@ async fn execute(
     }
     match out {
         Err(preview) => {
+            if preview.branch_id != tds.store.branch_id()
+                || preview.dataset_id != tds.store.owner_dataset_id()
+            {
+                return Err(Error::PreconditionFailed(
+                    "the preview target identity changed".into(),
+                )
+                .into());
+            }
+            let preview_id = preview.branch_id;
+            let preview_head = preview.head.seq;
             // a dry run: the C15 preview of the merge commit, with the merge fields
             let req = response.expect("only a dry run previews");
             let target = tds.clone();
@@ -1644,12 +1782,19 @@ async fn execute(
             let d = ds.clone();
             let mut po = o;
             po.write.dry_run = None;
+            po.expect_target_id = Some(preview_id);
+            po.expect_target = Some(preview_head);
             let op2 = op.clone();
             let fields = blocking(move || Ok(op2.preview(&d.store, &po)?)).await?;
             if let Some(obj) = doc.as_object_mut() {
                 obj.insert("merge".into(), op.json(&fields, None));
             }
-            Ok(Json(doc).into_response())
+            Ok(with_report(
+                Json(doc).into_response(),
+                ds.store.owner_dataset_id(),
+                &fields,
+                preview_head,
+            ))
         }
         Ok(MergeOutcome::Conflicts(c)) => Err(ApiError(
             StatusCode::CONFLICT,
@@ -1658,13 +1803,24 @@ async fn execute(
         Ok(MergeOutcome::UpToDate(r)) => {
             let mut doc = op.json(&r, None);
             if requested {
+                if r.target.branch_id != tds.store.branch_id() {
+                    return Err(Error::PreconditionFailed(
+                        "the preview target identity changed".into(),
+                    )
+                    .into());
+                }
                 let target = tds.clone();
                 let req = response.expect("analysis requires dry run");
                 let commit = r.target.seq;
                 doc["entailments"] =
                     blocking(move || req.unchanged_entailments(&target, commit)).await?;
             }
-            Ok(Json(doc).into_response())
+            Ok(with_report(
+                Json(doc).into_response(),
+                ds.store.owner_dataset_id(),
+                &r,
+                r.target.seq,
+            ))
         }
         Ok(MergeOutcome::Merged(r)) => {
             // a merged review branch leaves the memory review inbox
@@ -1673,7 +1829,7 @@ async fn execute(
             let stale = reasoned && (r.inserted + r.deleted) > 0;
             let seq = r.commit.as_ref().map_or(r.target.seq, |c| c.commit.seq);
             let resp = Json(op.json(&r, Some(stale))).into_response();
-            Ok(with_commit(resp, &tds, seq))
+            Ok(with_report(resp, ds.store.owner_dataset_id(), &r, seq))
         }
     }
 }

@@ -1053,10 +1053,12 @@ pub(crate) fn dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
         }
     };
     // the branch the request chose (`?branch=`, `/{ds}@{branch}/…`)
-    match branches::current() {
-        Some(b) if b != sparkles::branch::MAIN => Ok(st.branch_dataset(&ds, &b)?),
-        _ => Ok(ds),
-    }
+    let ds = match branches::current() {
+        Some(b) if b != sparkles::branch::MAIN => st.branch_dataset(&ds, &b)?,
+        _ => ds,
+    };
+    branches::served(&ds);
+    Ok(ds)
 }
 
 /// The `503` of a request to a dataset that is still opening (`dataset-opening`, with
@@ -2473,12 +2475,8 @@ const SPARKLES_DATASET_ID: &str = "sparkles-dataset-id";
 
 /// Add the commit headers to a response.
 fn with_commit(mut r: Response, ds: &Dataset, seq: u64) -> Response {
-    let h = r.headers_mut();
-    h.insert(SPARKLES_COMMIT, seq.into());
-    // the dataset's id, also on a branch (whose own id is in `Sparkles-Branch-Id`)
-    if let Ok(v) = header::HeaderValue::from_str(&ds.store.owner_dataset_id().to_string()) {
-        h.insert(SPARKLES_DATASET_ID, v);
-    }
+    r.headers_mut().insert(SPARKLES_COMMIT, seq.into());
+    branches::ServingSource::of(ds).attach(&mut r);
     r
 }
 
@@ -5830,6 +5828,22 @@ async fn shacl(
     let ct = content_type(&headers);
     // a named source: the body holds no shapes, at most a form of parameters
     let source = params.get("shapes").map(str::to_string);
+    let stored_blank_nodes = match params.get("storedBlankNodes") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "storedBlankNodes must be true or false",
+            ));
+        }
+    };
+    if stored_blank_nodes && source.is_some() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "storedBlankNodes applies only to an inline RDF draft, not shapes=",
+        ));
+    }
     let mut body = body;
     if source.is_some() {
         if ct == "application/x-www-form-urlencoded" {
@@ -5849,6 +5863,12 @@ async fn shacl(
         "text/plain" => sparkles_shacl::ShapesSyntax::default(),
         ct => sparkles_shacl::ShapesSyntax::from_media_type(ct).unwrap_or_default(),
     };
+    if stored_blank_nodes && format == sparkles_shacl::ShapesSyntax::Compact {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "storedBlankNodes needs RDF with explicit blank labels, not SHACLC",
+        ));
+    }
     let guard_shapes = match source.as_deref() {
         None => None,
         Some("guard") => {
@@ -5983,8 +6003,14 @@ async fn shacl(
                 None => {
                     let text = std::str::from_utf8(&body)
                         .map_err(|_| err(StatusCode::BAD_REQUEST, "shapes graph is not UTF-8"))?;
-                    sparkles_shacl::Shapes::parse(text, format, None)
-                        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?
+                    let parsed = if stored_blank_nodes {
+                        sparkles_shacl::syntax::read_document(text, format, None).and_then(|doc| {
+                            sparkles_shacl::Shapes::from_graph_with_stored_blank_nodes(doc.graph)
+                        })
+                    } else {
+                        sparkles_shacl::Shapes::parse(text, format, None)
+                    };
+                    parsed.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?
                 }
             };
             if let GraphParam::Named(iri) = &graph

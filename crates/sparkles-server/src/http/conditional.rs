@@ -98,6 +98,25 @@ fn failed(msg: &str) -> ApiError {
     )
 }
 
+/// An explicit authoring expectation, unlike a replication patch's foreign `prev`,
+/// must retain both the source UUID and its commit number.
+pub(super) fn expected_commit(text: &str) -> ApiResult<(DatasetId, u64)> {
+    let bad = || {
+        err(
+            StatusCode::BAD_REQUEST,
+            "expect must be urn:uuid:UUID#commit:N",
+        )
+    };
+    let (source, seq) = text
+        .strip_prefix("urn:uuid:")
+        .and_then(|s| s.split_once("#commit:"))
+        .ok_or_else(bad)?;
+    Ok((
+        source.parse().map_err(|_| bad())?,
+        seq.parse().map_err(|_| bad())?,
+    ))
+}
+
 /// What a conditional `GET`/`HEAD` gets instead of the representation.
 pub(super) enum ReadOutcome {
     /// send the representation

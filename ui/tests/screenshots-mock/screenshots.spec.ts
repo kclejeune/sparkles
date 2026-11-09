@@ -1467,3 +1467,61 @@ test('thesaurus-move', async ({ page }) => {
   await shoot(page, 'thesaurus-move');
   await preview.getByRole('button', { name: 'Cancel' }).click();
 });
+
+// The visual SHACL shape editor on a small shapes graph: the shape tree with a node shape
+// and its property shapes, and the form of the name property with its path and
+// constraints, after a count edit that the editor holds as a draft.
+const SHAPES = 'shapes';
+const SG = 'http://example.org/shapes/';
+const SHG = `${SG}graph`;
+
+test('shape-editor', async ({ page, request }) => {
+  const r = await request.post('/$/datasets', { data: { dbName: SHAPES, dbType: 'persistent' } });
+  expect([200, 201, 409]).toContain(r.status());
+  if (r.status() !== 409) {
+    const u = await request.post(`/${SHAPES}/update`, {
+      headers: { 'Content-Type': 'application/sparql-update' },
+      data: `PREFIX sh: <http://www.w3.org/ns/shacl#> PREFIX ex: <${SG}>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        INSERT DATA { GRAPH <${SHG}> {
+          ex:PersonShape a sh:NodeShape ; sh:name "Person" ; sh:targetClass ex:Person ;
+            sh:property ex:NameShape , ex:EmailShape , ex:EmployerShape .
+          ex:NameShape a sh:PropertyShape ; sh:name "Name" ; sh:path ex:name ;
+            sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string .
+          ex:EmailShape a sh:PropertyShape ; sh:name "Email" ; sh:path ex:email ;
+            sh:pattern "^[^@]+@[^@]+$" ; sh:severity sh:Warning .
+          ex:EmployerShape a sh:PropertyShape ; sh:name "Employer" ;
+            sh:path ( ex:worksFor ex:organization ) ; sh:class ex:Company .
+          ex:CompanyShape a sh:NodeShape ; sh:name "Company" ; sh:targetClass ex:Company .
+        } }`,
+    });
+    expect(u.ok(), await u.text()).toBe(true);
+  }
+  await page.goto(`/ui/workbench/shapes?${new URLSearchParams({ ds: SHAPES, graph: SHG })}`);
+  const tree = page.getByRole('tree', { name: 'SHACL shapes' });
+  await expect(tree).toBeVisible({ timeout: 30_000 });
+  const expand = tree.getByRole('button', { name: 'Expand Person', exact: true });
+  if (await expand.count()) await expand.click();
+  await tree.getByRole('button', { name: 'Employer', exact: true }).first().click();
+  await expect(page.locator('.definition h2')).toBeVisible();
+  await shoot(page, 'shape-editor');
+});
+
+test('shape-editor-preview', async ({ page }) => {
+  // the preview of a draft that raises the name's minimum count, cancelled so the
+  // mock keeps its shapes
+  await page.goto(`/ui/workbench/shapes?${new URLSearchParams({ ds: SHAPES, graph: SHG })}`);
+  const tree = page.getByRole('tree', { name: 'SHACL shapes' });
+  await expect(tree).toBeVisible({ timeout: 30_000 });
+  const expand = tree.getByRole('button', { name: 'Expand Person', exact: true });
+  if (await expand.count()) await expand.click();
+  await tree.getByRole('button', { name: 'Name', exact: true }).first().click();
+  await page.getByRole('textbox', { name: 'minCount value 1', exact: true }).fill('2');
+  await page.getByRole('button', { name: 'Apply minCount', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview commit', exact: true }).click();
+  const preview = page.getByRole('dialog');
+  await expect(preview.locator('[data-outcome]')).toHaveAttribute('data-outcome', 'commit');
+  await preview.getByText('RDF changes', { exact: true }).click();
+  await shoot(page, 'shape-editor-preview');
+  await preview.getByRole('button', { name: 'Cancel', exact: true }).click();
+});

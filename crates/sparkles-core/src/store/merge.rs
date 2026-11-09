@@ -455,6 +455,13 @@ impl Store {
         }
         let src = self.branch(source)?;
         let tgt = self.branch(target)?;
+        if o.expect_target_id
+            .is_some_and(|expected| expected != tgt.dataset_id)
+        {
+            return Err(Error::PreconditionFailed(
+                "the target branch identity changed since it was read".into(),
+            ));
+        }
         let (sid, tid) = (src.dataset_id, tgt.dataset_id);
         for _attempt in 0..3 {
             let s_head = src.head_commit().seq;
@@ -846,8 +853,18 @@ impl Store {
                 "commit 0 is the dataset's first commit and has no parent",
             ));
         }
-        // the commit and its first parent, on the branches that made them
-        let (_, owner) = self.branch_resolve(source, &At::Commit(seq))?;
+        // A revert derives its inverse and target from one captured incarnation.
+        // Following inherited history may yield another owner, but never another
+        // target obtained by looking this name up again.
+        let captured_target = if pick == Pick::Revert {
+            Some(self.branch(target)?)
+        } else {
+            None
+        };
+        let (_, owner) = match &captured_target {
+            Some(target) => self.resolve_following(target, &At::Commit(seq))?,
+            None => self.branch_resolve(source, &At::Commit(seq))?,
+        };
         let c = set.normalize(CommitRef {
             branch_id: owner,
             seq,
@@ -856,11 +873,22 @@ impl Store {
             branch_id: owner,
             seq: seq - 1,
         });
+        self.failpoint("pick-source-resolved");
         let (theirs, base) = match pick {
             Pick::Revert => (parent, c),
             Pick::CherryPick => (c, parent),
         };
-        let tgt = self.branch(target)?;
+        let tgt = match captured_target {
+            Some(target) => target,
+            None => self.branch(target)?,
+        };
+        if o.expect_target_id
+            .is_some_and(|expected| expected != tgt.dataset_id)
+        {
+            return Err(Error::PreconditionFailed(
+                "the target branch identity changed since it was read".into(),
+            ));
+        }
         // a protected branch takes merges only: refused before any planning
         if !preview {
             tgt.check_protected(match pick {

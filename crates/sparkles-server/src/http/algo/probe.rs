@@ -14,6 +14,8 @@ pub(crate) struct Probe {
     pub completion: Option<Arc<Gate>>,
     /// Pause after the real FnOnce writer returns, before producer finalization.
     pub after_write: Option<Arc<Gate>>,
+    /// Pause after a branch handler returns, before selector response decoration.
+    pub branch_response: Option<Arc<Gate>>,
     pub cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 

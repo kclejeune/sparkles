@@ -1634,6 +1634,13 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
+Authoring clients can opt into `expect=urn:uuid:UUID#commit:N` on patch requests.
+It checks the resolved source UUID and head under the writer lock, for previews and
+commits, and refuses either mismatch with 412. This preserves the default replication
+contract that ignores a foreign body `prev`, while preventing an authoring draft from
+writing into a replacement dataset or branch with the same name and commit number.
+
+
 **Phase 1 delivered on 2026-10-02** as applying RDF Patch, a Jena and Fuseki compatibility
 feature. Phases 2 and 3 are deferred. The maintainer decided during Phase 1 that
 replication waits until all other planned work is done, so the apply path was built for

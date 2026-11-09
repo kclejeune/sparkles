@@ -10,7 +10,7 @@
 #   gate.sh --hosts                    print each gate host's lock, queue and free disk
 #
 # Options:
-#   --host H        run ci on H (default GATE_PRIMARY or the first gate host)
+#   --host H        SSH host or admitted boat:bx_ID; run ci on H (default GATE_PRIMARY or the first gate host)
 #   --helper H      run the conformance half on H while ci runs on the primary host, or
 #                   "none" to run the whole gate on the primary host
 #   --auto          pick the hosts from their heavy locks and gate queues (see below)
@@ -43,8 +43,7 @@
 # files back into the primary host's ~/gate/out/<name>/.
 #
 # Host roles: SPARKLES_BENCH_HOST (default forge) names the benchmark host, which never
-# runs gate work, not even when named with --host. GATE_HOSTS (default "wally atlas
-# forge") lists the hosts that may run gates, and the benchmark host is dropped from it.
+# runs gate work, not even when named with --host. GATE_HOSTS (default "wally") lists the hosts that may run gates, and the benchmark host is dropped from it.
 # GATE_PRIMARY (or the older WALLY_HOST) sets the default primary host. GATE_HELPER names
 # a helper to use whether or not it is free, GATE_HELPER=none disables the split, and a
 # GATE_HELPER that does not resolve exercises the unreachable-helper fallback.
@@ -79,6 +78,8 @@ self=$(readlink -f "${BASH_SOURCE[0]}")
 here=$(dirname "$self")
 # shellcheck source=scripts/gate/config.sh
 . "$here/config.sh"
+# shellcheck source=scripts/remote-executor.sh
+. "$here/../remote-executor.sh"
 primary=${GATE_PRIMARY:-${WALLY_HOST:-${gate_hosts[0]:-wally}}}
 default_helper() {
   local h
@@ -99,7 +100,6 @@ all_checks=0
 link_only=0
 tag=
 helper_set=0
-ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10)
 
 usage() { sed -n '2,/^set -euo/p' "$self" | sed '$d; s/^# \{0,1\}//'; }
 die() {
@@ -164,6 +164,11 @@ if [ $link_only = 1 ]; then
   helper=none
   helper_set=1
 fi
+case $primary in boat:*) if [ "$helper_set" = 0 ] && [ -z "${GATE_HELPER+x}" ]; then
+  helper=none
+  helper_set=1
+fi ;; esac
+
 # A helper named by --helper or GATE_HELPER is used as given. Otherwise the run picks a
 # free one below, once it knows whether the batch needs the conformance suites.
 pick_helper=0
@@ -177,7 +182,7 @@ statedir=$root/.artifacts/gates/state
 # lock is free or held. Prints "unreachable" when ssh fails.
 probe() {
   # shellcheck disable=SC2016
-  ssh "${ssh_opts[@]}" "$1" '
+  rx_exec "$1" '
     if flock -n "$HOME/gate/.lock" true; then l=free; else l=held; fi
     u=$(systemctl --user list-units "gate-*" --state=active --plain --no-legend | wc -l)
     d=$(df -BG --output=avail "$HOME" | tail -n1 | tr -dc 0-9)
@@ -210,7 +215,7 @@ if [ $mode = status ] || [ $mode = fetch ]; then
       best=0
       for h in "${gate_hosts[@]}"; do
         # shellcheck disable=SC2029
-        t=$(ssh "${ssh_opts[@]}" "$h" "stat -c %Y ~/gate/out/$name/progress.log" 2> /dev/null) || continue
+        t=$(rx_exec "$h" "stat -c %Y ~/gate/out/$name/progress.log" 2> /dev/null) || continue
         if [ "${t:-0}" -gt "$best" ]; then
           best=$t
           primary=$h
@@ -240,7 +245,7 @@ install_remote() {
   local h=$1 v
   v=$(cat "$here/remote/gate-start.sh" "$here/remote/gate-inner.sh" | sha256sum | cut -c1-12)
   # shellcheck disable=SC2029
-  tar -C "$here/remote" -cf - gate-start.sh gate-inner.sh | ssh "${ssh_opts[@]}" "$h" "
+  tar -C "$here/remote" -cf - gate-start.sh gate-inner.sh | rx_exec "$h" "
     d=\$HOME/gate/bin/v-$v
     if [ ! -x \"\$d/gate-start.sh\" ]; then
       t=\$(mktemp -d \"\$HOME/gate/bin/.v-$v.XXXXXX\")
@@ -255,26 +260,41 @@ install_remote() {
 # start_on HOST NAME PART [NOTE]
 start_on() {
   local h=$1 n=$2 p=$3 note=${4:-} bin args cj
-  git push -q "ssh://$h/home/$USER/gate/repo.git" "$full:refs/heads/gate-$short"
+  mkdir -p "$statedir"
+  printf 'host=%s\nname=%s\npart=%s\nsource=%s\n' "$h" "$n" "$p" "$full" > "$statedir/start-intent-$n"
+  case $h in
+    boat:*)
+      rx_admit "$h" --minimum "${SPARKLES_REMOTE_MIN_LIFETIME:-7200}" > "$statedir/admission-$n.json" || return
+      rx_bundle "$h" "$full" "$mb" --record "$statedir/source-$n.json" || return
+      ;;
+    *) git push -q "ssh://$h/home/$USER/gate/repo.git" "$full:refs/heads/gate-$short" ;;
+  esac
   bin=$(install_remote "$h")
   args="--name $n --part $p --jobs $jobs"
+  case $h in boat:*)
+    local runtime
+    runtime=$(python3 -c 'import json,sys,time; print(int(json.load(open(sys.argv[1]))["expires_at"]-time.time())-60)' "$statedir/admission-$n.json")
+    args+=" --executor boat --runtime $runtime"
+    ;;
+  esac
   cj=$(cargo_jobs_for "$h")
   case $cj in '' | *[!0-9]* | 0) ;; *) args+=" --cargo-jobs $cj" ;; esac
   [ -z "$mb" ] || args+=" --base $mb"
   [ $all_checks = 0 ] || args+=" --full"
   # shellcheck disable=SC2029
-  ssh "${ssh_opts[@]}" "$h" "\$HOME/$bin/gate-start.sh $full $args --note $(printf '%q' "$note")"
+  printf 'phase=start-requested\n' >> "$statedir/start-intent-$n"
+  rx_exec "$h" "\$HOME/$bin/gate-start.sh $full $args --note $(printf '%q' "$note")"
 }
 
 # 0 when the run NAME on HOST has finished: it wrote its exit file or its unit stopped.
 finished() {
   # shellcheck disable=SC2029
-  ssh "${ssh_opts[@]}" "$1" "test -e ~/gate/out/$2/gate.exit || test -e ~/gate/out/$2/part.exit || ! systemctl --user is-active -q gate-$2"
+  rx_exec "$1" "test -e ~/gate/out/$2/gate.exit || test -e ~/gate/out/$2/part.exit || ! systemctl --user is-active -q gate-$2"
 }
 
 status_of() {
   # shellcheck disable=SC2029
-  ssh "${ssh_opts[@]}" "$1" "cat ~/gate/out/$2/progress.log; echo; cat ~/gate/out/$2/steps.txt 2>/dev/null; tail -n1 ~/gate/out/$2/mempeak.log 2>/dev/null; systemctl --user is-active gate-$2 || true"
+  rx_exec "$1" "cat ~/gate/out/$2/progress.log; echo; cat ~/gate/out/$2/steps.txt 2>/dev/null; tail -n1 ~/gate/out/$2/mempeak.log 2>/dev/null; systemctl --user is-active gate-$2 || true"
 }
 
 status() {
@@ -317,18 +337,21 @@ wall() {
 }
 
 fetch() {
-  mkdir -p "$dest"
+  case $primary in
+    boat:*) python3 "$RX_DIR/remote-executor.py" invalidate-mirror "$dest" || return 97 ;;
+    *) mkdir -p "$dest" ;;
+  esac
   if [ "$helper" = none ]; then
     # --delete keeps an earlier run's gate.exit from standing in for a rerun's result.
-    rsync -a --delete "$primary:$pout/" "$dest/" || return 97
+    rx_sync -- -a --delete "$primary:$pout/" "$dest/" || return 97
     wall "$dest" > "$dest/wall.txt"
     echo "results in $dest"
     return 0
   fi
   # A split gate whose merge was already copied back to the primary needs no new merge.
   # shellcheck disable=SC2029
-  if ssh "${ssh_opts[@]}" "$primary" "test -e ~/$pout/gate.exit"; then
-    rsync -a --delete "$primary:$pout/" "$dest/" || return 97
+  if rx_exec "$primary" "test -e ~/$pout/gate.exit"; then
+    rx_sync -- -a --delete "$primary:$pout/" "$dest/" || return 97
     echo "results in $dest"
     return 0
   fi
@@ -337,13 +360,13 @@ fetch() {
   conf=$tmp/conf
   mkdir -p "$conf"
   # Each transfer checks its own result, since a caller may run fetch where errexit is off.
-  if ! rsync -a "$primary:$pout/" "$tmp/"; then
+  if ! rx_sync -- -a "$primary:$pout/" "$tmp/"; then
     rm -rf "$tmp"
     echo "could not copy the ci half from $primary" >&2
     return 97
   fi
-  if ! rsync -a "$helper:$hout/" "$conf/"; then
-    rsync -a "$tmp/" "$dest/"
+  if ! rx_sync -- -a "$helper:$hout/" "$conf/"; then
+    rx_sync -- -a "$tmp/" "$dest/"
     rm -rf "$tmp"
     echo "conformance half on $helper is unreachable; ci results in $dest" >&2
     return 98
@@ -377,9 +400,9 @@ fetch() {
     # above. Look again before taking a missing file as a run that stopped without one.
     local pe he
     # shellcheck disable=SC2029
-    pe=$(ssh "${ssh_opts[@]}" "$primary" "test -e ~/$pout/part.exit && echo yes || echo no") || pe=
+    pe=$(rx_exec "$primary" "test -e ~/$pout/part.exit && echo yes || echo no") || pe=
     # shellcheck disable=SC2029
-    he=$(ssh "${ssh_opts[@]}" "$helper" "test -e ~/$hout/part.exit && echo yes || echo no") || he=
+    he=$(rx_exec "$helper" "test -e ~/$hout/part.exit && echo yes || echo no") || he=
     if [ -z "$pe" ] || [ -z "$he" ]; then
       rm -rf "$tmp"
       echo "could not recheck the exit files; not merging yet" >&2
@@ -397,14 +420,14 @@ fetch() {
     echo "$code" > "$tmp/gate.exit"
     # Keep the primary's out directory complete for anyone reading it on the host.
     # gate.exit goes last, since a fetch that finds it there trusts the merge.
-    if ! rsync -a --exclude gate.exit "$tmp/" "$primary:$pout/" ||
-      ! rsync -a "$tmp/gate.exit" "$primary:$pout/gate.exit"; then
+    if ! rx_sync -- -a --exclude gate.exit "$tmp/" "$primary:$pout/" ||
+      ! rx_sync -- -a "$tmp/gate.exit" "$primary:$pout/gate.exit"; then
       rm -rf "$tmp"
       echo "could not copy the merge back to $primary" >&2
       return 97
     fi
   fi
-  if ! rsync -a --delete "$tmp/" "$dest/"; then
+  if ! rx_sync -- -a --delete "$tmp/" "$dest/"; then
     rm -rf "$tmp"
     return 97
   fi
@@ -546,10 +569,19 @@ if [ $dry = 1 ]; then
   exit 0
 fi
 
+# Validate Boat tools and lifetime before any cache collection or other mutation.
+for admit_host in "$primary" "$helper"; do
+  case $admit_host in boat:*)
+    mkdir -p "$statedir"
+    rx_admit "$admit_host" --minimum "${SPARKLES_REMOTE_MIN_LIFETIME:-7200}" > "$statedir/preflight-$name-${admit_host#boat:}.json" || die "Boat gate admission failed"
+    ;;
+  esac
+done
+
 # Free GiB under the host's home directory, or nothing when ssh fails.
 free_gib() {
   # shellcheck disable=SC2016
-  ssh "${ssh_opts[@]}" "$1" 'df -BG --output=avail "$HOME" | tail -n1 | tr -dc 0-9' 2> /dev/null
+  rx_exec "$1" 'df -BG --output=avail "$HOME" | tail -n1 | tr -dc 0-9' 2> /dev/null
 }
 
 # ensure_disk HOST NEED_GIB WHAT: refuse to start WHAT on HOST unless the host has NEED_GIB
@@ -562,7 +594,7 @@ ensure_disk() {
   [ -n "$d" ] || return 0
   [ "$d" -ge "$need" ] && return 0
   echo "gate.sh: $h has $d GiB free and the $what needs $need GiB, so mbx gc runs there first" >&2
-  ssh "${ssh_opts[@]}" "$h" 'mbx gc' >&2 || echo "gate.sh: mbx gc on $h failed" >&2
+  rx_exec "$h" 'mbx gc' >&2 || echo "gate.sh: mbx gc on $h failed" >&2
   d=$(free_gib "$h")
   if [ -z "$d" ] || [ "$d" -lt "$need" ]; then
     die "$h has ${d:-an unknown number of} GiB free after mbx gc and the $what needs $need GiB. Free space there, choose another host with --host or --helper, or lower GATE_NEED_CI_GB or GATE_NEED_CONF_GB."
@@ -577,17 +609,22 @@ case $need_conf in '' | *[!0-9]*) die "bad GATE_NEED_CONF_GB $need_conf" ;; esac
 # A whole gate runs the suites in the ci half's worktree after it, so it needs what the ci
 # half needs. An unreachable helper is left to the fallback below.
 ensure_disk "$primary" "$need_ci" "ci half"
-if [ "$helper" != none ] && ssh "${ssh_opts[@]}" "$helper" true 2> /dev/null; then
+if [ "$helper" != none ] && rx_exec "$helper" true 2> /dev/null; then
   ensure_disk "$helper" "$need_conf" "conformance half"
 fi
 note=
-if [ "$helper" != none ] && ! ssh "${ssh_opts[@]}" "$helper" true 2> /dev/null; then
+if [ "$helper" != none ] && ! rx_exec "$helper" true 2> /dev/null; then
+  case "$primary $helper" in *boat:*) die "helper unreachable; explicit Boat placement never crosses providers" ;; esac
   note="helper $helper is unreachable; running the conformance suites on $primary after ci"
   echo "$note" >&2
   helper=none
 fi
 if [ "$helper" != none ]; then
   if ! start_on "$helper" "$hname" conformance >&2; then
+    if grep -qx 'phase=start-requested' "$statedir/start-intent-$hname"; then
+      die "helper acceptance unknown; reconcile start-intent-$hname before retrying or falling back"
+    fi
+    case "$primary $helper" in *boat:*) die "helper setup failed; explicit Boat placement never crosses providers" ;; esac
     note="starting the conformance half on $helper failed; running it on $primary after ci"
     echo "$note" >&2
     helper=none
@@ -617,7 +654,7 @@ if [ $mode = nowait ]; then
   exit 0
 fi
 while ! finished "$primary" "$name" || { [ "$helper" != none ] && ! finished "$helper" "$hname"; }; do
-  sleep 120
+  sleep 30
 done
 fetch
 cat "$dest/selection.txt" 2> /dev/null || true

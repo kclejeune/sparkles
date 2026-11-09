@@ -746,3 +746,113 @@ async fn read_only_servers_refuse_branch_mutations() {
         String::from_utf8_lossy(&r.body)
     );
 }
+
+#[tokio::test]
+async fn authoring_consult_hidden_branch_uuid_is_not_an_oracle() {
+    let extra = format!(
+        "{}\n[[users]]\nname = \"info-only\"\npassword = \"{}\"\n[[users.grants]]\ndataset = \"br\"\nlevel = \"read\"\nendpoints = [\"info\"]\n",
+        users(),
+        hash_password_with("info-only-pw", 8, 1, 1).unwrap()
+    );
+    let s = build(Fixture {
+        extra,
+        ..Default::default()
+    });
+    s.state.attach("br", DbType::Persistent, None).unwrap();
+    for name in ["dev", "hidden"] {
+        let r = post_json(
+            &s.app,
+            "owner",
+            "/$/branches/br",
+            &format!(r#"{{"name":"{name}"}}"#),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    }
+    let mut failures = Vec::new();
+    for method in ["GET", "POST"] {
+        for path_form in [true, false] {
+            let mut denied = Vec::new();
+            for name in ["hidden", "missing"] {
+                let query = "query=ASK%7B%7D";
+                let uri = if path_form {
+                    format!("/br@{name}/sparql?{query}")
+                } else {
+                    format!("/br/sparql?branch={name}&{query}")
+                };
+                let r = call(
+                    &s.app,
+                    method,
+                    &uri,
+                    &[
+                        ("authorization", &b("devs")),
+                        ("content-type", "application/sparql-query"),
+                    ],
+                    if method == "POST" { "ASK {}" } else { "" },
+                )
+                .await;
+                if r.status != StatusCode::NOT_FOUND
+                    || !r.header("sparkles-branch-id").is_empty()
+                    || !r.header("sparkles-branch").is_empty()
+                {
+                    failures.push(format!(
+                        "{method} {uri}: {} headers={:?} body={}",
+                        r.status,
+                        r.headers,
+                        r.text()
+                    ));
+                }
+                let mut normalized = r.err();
+                normalized["error"] = J::String(
+                    normalized["error"]
+                        .as_str()
+                        .unwrap()
+                        .replace(name, "<requested>"),
+                );
+                denied.push(normalized);
+            }
+            assert_eq!(
+                denied[0], denied[1],
+                "hidden and absent refusal bodies differ"
+            );
+        }
+    }
+    let unauth = get_as(&s.app, "/br@hidden/sparql?query=ASK%7B%7D", None).await;
+    if unauth.status != StatusCode::UNAUTHORIZED || !unauth.header("sparkles-branch-id").is_empty()
+    {
+        failures.push(format!(
+            "unauthenticated response: {} {:?}",
+            unauth.status, unauth.headers
+        ));
+    }
+    let endpoint_denied = get_as(
+        &s.app,
+        "/br@hidden/sparql?query=ASK%7B%7D",
+        Some(&b("info-only")),
+    )
+    .await;
+    if endpoint_denied.status != StatusCode::FORBIDDEN
+        || !endpoint_denied.header("sparkles-branch-id").is_empty()
+    {
+        failures.push(format!(
+            "endpoint denial: {} {:?}",
+            endpoint_denied.status, endpoint_denied.headers
+        ));
+    }
+    let allowed = get_as(&s.app, "/br@dev/sparql?query=ASK%7B%7D", Some(&b("devs"))).await;
+    assert_eq!(allowed.status, StatusCode::OK, "{}", allowed.text());
+    assert_eq!(
+        allowed.header("sparkles-branch-id"),
+        s.state
+            .get("br")
+            .unwrap()
+            .store
+            .branch_id_of("dev")
+            .unwrap()
+            .to_string()
+    );
+    assert!(
+        failures.is_empty(),
+        "identity oracle responses: {failures:#?}"
+    );
+}

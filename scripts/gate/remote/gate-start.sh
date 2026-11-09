@@ -31,6 +31,8 @@ cargo_jobs=
 base=
 all_checks=0
 note=
+runtime=32400
+executor=ssh
 while [ $# -gt 0 ]; do
   case $1 in
     --name)
@@ -56,6 +58,14 @@ while [ $# -gt 0 ]; do
     --full)
       all_checks=1
       shift
+      ;;
+    --runtime)
+      runtime=$2
+      shift 2
+      ;;
+    --executor)
+      executor=$2
+      shift 2
       ;;
     --note)
       note=$2
@@ -89,6 +99,17 @@ case $cargo_jobs in *[!0-9]* | 0)
 esac
 case $base in *[!0-9a-f]*)
   echo "gate-start.sh: bad --base $base" >&2
+  exit 2
+  ;;
+esac
+
+case $runtime in '' | *[!0-9]* | 0)
+  echo 'invalid gate runtime' >&2
+  exit 2
+  ;;
+esac
+case $executor in ssh | boat) ;; *)
+  echo 'invalid gate executor' >&2
   exit 2
   ;;
 esac
@@ -136,8 +157,9 @@ mode=selected
 echo "$(date -u +%FT%TZ) queued $full part=$part jobs=$jobs cargo_jobs=$cargo_jobs memory=$mem base=${base:-none} checks=$mode host=$(hostname)" >> "$out/progress.log"
 
 systemd-run --user --unit "$unit" --collect -q \
-  -p MemoryMax="$mem" -p MemorySwapMax=2G \
-  --setenv=HOME="$HOME" --setenv=USER="$USER" \
+  -p MemoryMax="$mem" -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec="$runtime" \
+  --setenv=HOME="$HOME" --setenv=USER="$USER" --setenv=PATH="$PATH" \
+  --setenv=MBX_REMOTE_TOKEN_FILE="${MBX_REMOTE_TOKEN_FILE:-}" --setenv=SPARKLES_REMOTE_EXECUTOR="$executor" \
   --setenv=GATE_CARGO_JOBS="$cargo_jobs" --setenv=GATE_BASE="$base" --setenv=GATE_FULL="$all_checks" \
-  /run/current-system/sw/bin/timeout 9h "$bin/gate-inner.sh" "$full" "$name" "$part" "$jobs"
+  timeout --signal=TERM --kill-after=30s "$runtime" "$bin/gate-inner.sh" "$full" "$name" "$part" "$jobs"
 echo "$unit"

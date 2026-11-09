@@ -296,6 +296,14 @@ editor and browser and the app shell. The collapsed panel below it has more work
     <td>The SKOS Reference's integrity conditions checked by built-in shapes</td>
   </tr>
   <tr>
+    <td><img src="docs/images/shape-editor.png" alt="The SHACL shape editor with a tree of a Person node shape and its Email, Employer and Name property shapes, and the form of the Employer shape with a sequence path of worksFor and organization, its targets and its name"></td>
+    <td><img src="docs/images/shape-editor-preview.png" alt="The preview of a shape edit that raises the minimum count of the Name property shape from 1 to 2, with the RDF patch pinned to the source commit, the one triple it removes and the one it adds, and a button that commits it"></td>
+  </tr>
+  <tr>
+    <td>The SHACL shape editor shows shapes as a tree and edits their targets, paths and constraints in forms.</td>
+    <td>Each shape edit is previewed as one exact RDF patch before it commits.</td>
+  </tr>
+  <tr>
     <td><img src="docs/images/forms-nested.png" alt="The editing form of a SKOS concept with its SKOS-XL labels as nested forms, the stored label edited to All animals and a new French label added from the label shape's template, with the previewed commit listing the triples it adds and removes"></td>
     <td><img src="docs/images/forms-list.png" alt="The editing form of a SKOS collection, with its member chosen as a Concept among the alternatives of sh:or and its ordered member list after fish moved up, each member with buttons that move or remove it"></td>
   </tr>
