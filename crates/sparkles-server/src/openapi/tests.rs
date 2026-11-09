@@ -435,6 +435,10 @@ fn notification_settings_schema_matches_the_configuration() {
         names(delivery),
         set(crate::notify::config::DELIVERY_MEMBERS)
     );
+    assert_eq!(
+        names(&kind["properties"]["watches"]),
+        set(crate::notify::config::WATCH_MEMBERS)
+    );
     let channel = &schemas["NotificationChannelSettings"];
     assert_eq!(order(channel), names(channel));
     // a minimal valid channel of each type, to which one member is added

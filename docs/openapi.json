@@ -18091,6 +18091,52 @@
             "title": "Server name",
             "type": "string",
             "x-sparkles-unset": "the host name"
+          },
+          "watches": {
+            "additionalProperties": false,
+            "description": "The bounds of watches on entities.",
+            "properties": {
+              "batchSecs": {
+                "default": 300,
+                "description": "Seconds that gather one owner's matches in one dataset into one message.",
+                "maximum": 86400.0,
+                "minimum": 10.0,
+                "title": "Batch window",
+                "type": "integer"
+              },
+              "identityMaxAgeDays": {
+                "default": 30,
+                "description": "Days after an OIDC or proxy owner's last sign-in after which its watches are told only in the web UI.",
+                "maximum": 3650.0,
+                "minimum": 1.0,
+                "title": "Identity age",
+                "type": "integer"
+              },
+              "largeCommit": {
+                "default": 1000,
+                "description": "The most members of one watch a commit can name before its match becomes one summary entry.",
+                "maximum": 1000000.0,
+                "minimum": 1.0,
+                "title": "Large commit",
+                "type": "integer"
+              },
+              "maxAncestors": {
+                "default": 10000,
+                "description": "The most ancestors one upward walk of a subtree watch visits.",
+                "maximum": 1000000.0,
+                "minimum": 1.0,
+                "title": "Ancestors per walk",
+                "type": "integer"
+              }
+            },
+            "title": "Watches",
+            "type": "object",
+            "x-sparkles-order": [
+              "maxAncestors",
+              "largeCommit",
+              "identityMaxAgeDays",
+              "batchSecs"
+            ]
           }
         },
         "title": "Notification configuration",
@@ -18102,7 +18148,8 @@
           "repeatEvery",
           "channels",
           "routes",
-          "delivery"
+          "delivery",
+          "watches"
         ]
       },
       "OAuthError": {
@@ -27265,6 +27312,244 @@
           "resource",
           "version",
           "graphs"
+        ],
+        "type": "object"
+      },
+      "Watch": {
+        "description": "A watch of the caller's.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#watches"
+        },
+        "properties": {
+          "branch": {
+            "description": "The branch's current name. A renamed branch keeps its watches.",
+            "type": "string"
+          },
+          "created": {
+            "type": "string"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "depth": {
+            "type": "integer"
+          },
+          "entity": {
+            "description": "An absolute IRI.",
+            "type": "string"
+          },
+          "graph": {
+            "description": "The graph's IRI, absent for the default graph.",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "latest": {
+            "description": "The newest matched commit.",
+            "type": "integer"
+          },
+          "overflow": {
+            "description": "Older matches were dropped, since a watch keeps 200.",
+            "type": "boolean"
+          },
+          "scope": {
+            "enum": [
+              "entity",
+              "subtree"
+            ],
+            "type": "string"
+          },
+          "seen": {
+            "description": "The last commit marked as read.",
+            "type": "integer"
+          },
+          "since": {
+            "description": "The head when the watch was made. Only later commits match.",
+            "type": "integer"
+          },
+          "truncated": {
+            "description": "The graph's hierarchy is too large to follow, so the subtree matches only the entity.",
+            "type": "boolean"
+          },
+          "unread": {
+            "description": "The matched commits after `seen`.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "dataset",
+          "branch",
+          "entity",
+          "scope",
+          "created",
+          "since",
+          "seen",
+          "unread",
+          "overflow",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "WatchCreate": {
+        "description": "A new watch.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#watches"
+        },
+        "properties": {
+          "branch": {
+            "description": "The branch, `main` when absent.",
+            "type": "string"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "depth": {
+            "description": "For a subtree, the most levels below the entity that count.",
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "entity": {
+            "description": "An absolute IRI.",
+            "type": "string"
+          },
+          "graph": {
+            "description": "The graph's IRI. Absent, or `default`, names the default graph.",
+            "type": "string"
+          },
+          "scope": {
+            "description": "`entity` matches commits that name the entity, and `subtree` also those that name a class, property or concept below it in the asserted hierarchy. The default is `entity`.",
+            "enum": [
+              "entity",
+              "subtree"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataset",
+          "entity"
+        ],
+        "type": "object"
+      },
+      "WatchList": {
+        "description": "The caller's watches on graphs it can read now.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#watches"
+        },
+        "properties": {
+          "unread": {
+            "description": "The unread matches of every watch listed.",
+            "type": "integer"
+          },
+          "watches": {
+            "items": {
+              "$ref": "#/components/schemas/Watch"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "watches",
+          "unread"
+        ],
+        "type": "object"
+      },
+      "WatchMatch": {
+        "description": "A commit a watch matched.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#watches"
+        },
+        "properties": {
+          "author": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "integer"
+          },
+          "count": {
+            "description": "How many watched IRIs the commit's changes named.",
+            "type": "integer"
+          },
+          "exact": {
+            "description": "`false` when the commit's changes were not listed, such as a bulk load, so it may or may not change the entity.",
+            "type": "boolean"
+          },
+          "members": {
+            "description": "The watched IRIs the commit's changes named, at most 20 in IRI order.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "own": {
+            "description": "The caller made the commit.",
+            "type": "boolean"
+          },
+          "partial": {
+            "description": "An ancestor walk stopped at the `maxAncestors` bound, so members may be missing.",
+            "type": "boolean"
+          },
+          "summary": {
+            "description": "The commit named more IRIs than the `largeCommit` bound, so it is one entry without members.",
+            "type": "boolean"
+          },
+          "time": {
+            "type": "string"
+          },
+          "unread": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "commit",
+          "time",
+          "count",
+          "exact",
+          "unread"
+        ],
+        "type": "object"
+      },
+      "WatchMatches": {
+        "description": "A page of a watch's matched commits, newest first.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#watches"
+        },
+        "properties": {
+          "matches": {
+            "items": {
+              "$ref": "#/components/schemas/WatchMatch"
+            },
+            "type": "array"
+          },
+          "more": {
+            "type": "boolean"
+          },
+          "watch": {
+            "$ref": "#/components/schemas/Watch"
+          }
+        },
+        "required": [
+          "watch",
+          "matches",
+          "more"
+        ],
+        "type": "object"
+      },
+      "WatchSeen": {
+        "description": "The last commit to mark as read.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#watches"
+        },
+        "properties": {
+          "commit": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "commit"
         ],
         "type": "object"
       },
@@ -47600,7 +47885,7 @@
               }
             }
           },
-          "description": "Fields of the kind: `providers`, `roles` and `routing` of `models` (`ModelsSettings`), or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes` and `delivery` of `notifications`.",
+          "description": "Fields of the kind: `providers`, `roles` and `routing` of `models` (`ModelsSettings`), or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes`, `delivery` and `watches` of `notifications`.",
           "required": true
         },
         "responses": {
@@ -47687,7 +47972,7 @@
               }
             }
           },
-          "description": "Fields of the kind: `providers`, `roles` and `routing` of `models` (`ModelsSettings`), or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes` and `delivery` of `notifications`.",
+          "description": "Fields of the kind: `providers`, `roles` and `routing` of `models` (`ModelsSettings`), or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes`, `delivery` and `watches` of `notifications`.",
           "required": true
         },
         "responses": {
@@ -51069,6 +51354,365 @@
           "Views"
         ],
         "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/watches": {
+      "get": {
+        "description": "The caller's watches on entities, with their unread counts, limited to the graphs the caller can read now on each watch's branch. Watches belong to a user, an OIDC or proxy account, or a minted token's owner. A watches file that this server cannot read answers `503` with `watches-unavailable` and is left as it is.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#watches"
+        },
+        "operationId": "listWatches",
+        "parameters": [
+          {
+            "description": "Only the watches on this dataset.",
+            "in": "query",
+            "name": "dataset",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only the watches of this entity.",
+            "in": "query",
+            "name": "entity",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only the watches in this graph, `default` for the default graph.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WatchList"
+                }
+              }
+            },
+            "description": "The watches."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List your watches",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "signed in"
+      },
+      "post": {
+        "description": "Watches an entity, or its asserted subtree, in one graph of a branch. It needs read access to the graph through the history endpoint, and is refused with `409` and `watch-unsupported-protections` while triple protections limit what the caller reads in the dataset. The same watch made again is answered with `200`. An owner has at most 200 watches and the server at most 20,000, beyond which the answer is `409` with `watch-limit`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#watches"
+        },
+        "operationId": "createWatch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WatchCreate"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Watch"
+                }
+              }
+            },
+            "description": "The same watch already existed."
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Watch"
+                }
+              }
+            },
+            "description": "The new watch."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Watch an entity",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "signed in"
+      }
+    },
+    "/$/watches/{id}": {
+      "delete": {
+        "description": "Removes one of the caller's watches.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#watches"
+        },
+        "operationId": "deleteWatch",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Remove a watch",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "signed in"
+      }
+    },
+    "/$/watches/{id}/matches": {
+      "get": {
+        "description": "The commits that changed the watched entity or its subtree, newest first. A watch keeps its 200 newest matches. The caller must still read the watched graph, or the answer is `403` with `watch-access-lost`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#watches"
+        },
+        "operationId": "listWatchMatches",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "description": "Only commits above this one.",
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only commits below this one, for the next page.",
+            "in": "query",
+            "name": "before",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most matches listed.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WatchMatches"
+                }
+              }
+            },
+            "description": "The matches."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List the commits a watch matched",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "signed in"
+      }
+    },
+    "/$/watches/{id}/seen": {
+      "post": {
+        "description": "Marks the matches up to the commit as read. A commit below the current mark leaves it as it is, and one above the branch's head is refused.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#watches"
+        },
+        "operationId": "markWatchSeen",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WatchSeen"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Watch"
+                }
+              }
+            },
+            "description": "The watch."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Mark a watch's matches as read",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "signed in"
       }
     },
     "/$/whoami": {

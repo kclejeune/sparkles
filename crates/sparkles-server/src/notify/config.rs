@@ -22,6 +22,14 @@ pub const MEMBERS: &[&str] = &[
     "channels",
     "routes",
     "delivery",
+    "watches",
+];
+
+pub const WATCH_MEMBERS: &[&str] = &[
+    "maxAncestors",
+    "largeCommit",
+    "identityMaxAgeDays",
+    "batchSecs",
 ];
 
 pub const DELIVERY_MEMBERS: &[&str] = &["attempts", "backoffSecs", "maxBackoffSecs", "timeoutSecs"];
@@ -73,6 +81,9 @@ pub struct NotifySettings {
     pub routes: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub delivery: Delivery,
+    /// the bounds of watches on entities (spec U12, item 619)
+    #[serde(default)]
+    pub watches: WatchSettings,
 }
 
 impl Default for NotifySettings {
@@ -85,6 +96,7 @@ impl Default for NotifySettings {
             channels: BTreeMap::new(),
             routes: BTreeMap::new(),
             delivery: Delivery::default(),
+            watches: WatchSettings::default(),
         }
     }
 }
@@ -256,6 +268,68 @@ pub fn check_address(s: &str) -> Result<(), String> {
         Err(format!(
             "{s:?} is not a mail address such as ops@example.org"
         ))
+    }
+}
+
+/// `watches`: the bounds of matching commits against watches on entities, and of
+/// telling their owners.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WatchSettings {
+    /// the most ancestors one upward walk of a subtree watch visits
+    #[serde(default = "WatchSettings::max_ancestors")]
+    pub max_ancestors: u32,
+    /// the most members of one watch a commit names before its match becomes a summary
+    #[serde(default = "WatchSettings::large_commit")]
+    pub large_commit: u32,
+    /// an OIDC or proxy owner whose groups are older than this many days is not told
+    /// outside the UI
+    #[serde(default = "WatchSettings::identity_max_age_days")]
+    pub identity_max_age_days: u32,
+    /// the window that gathers one owner's matches in one dataset into one message
+    #[serde(default = "WatchSettings::batch_secs")]
+    pub batch_secs: u32,
+}
+
+impl WatchSettings {
+    fn max_ancestors() -> u32 {
+        10_000
+    }
+    fn large_commit() -> u32 {
+        1_000
+    }
+    fn identity_max_age_days() -> u32 {
+        30
+    }
+    fn batch_secs() -> u32 {
+        300
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if !(1..=1_000_000).contains(&self.max_ancestors) {
+            return Err("watches.maxAncestors: from 1 to 1000000".into());
+        }
+        if !(1..=1_000_000).contains(&self.large_commit) {
+            return Err("watches.largeCommit: from 1 to 1000000".into());
+        }
+        if !(1..=3650).contains(&self.identity_max_age_days) {
+            return Err("watches.identityMaxAgeDays: from 1 to 3650".into());
+        }
+        if !(10..=86_400).contains(&self.batch_secs) {
+            return Err("watches.batchSecs: from 10 to 86400".into());
+        }
+        Ok(())
+    }
+}
+
+impl Default for WatchSettings {
+    fn default() -> WatchSettings {
+        WatchSettings {
+            max_ancestors: Self::max_ancestors(),
+            large_commit: Self::large_commit(),
+            identity_max_age_days: Self::identity_max_age_days(),
+            batch_secs: Self::batch_secs(),
+        }
     }
 }
 
@@ -438,6 +512,7 @@ impl NotifySettings {
             check_url(b, true).map_err(|e| format!("baseUrl: {e}"))?;
         }
         days("repeatEvery", &self.repeat_every)?;
+        self.watches.validate()?;
         if self.channels.len() > MAX_CHANNELS {
             return Err(format!(
                 "channels: at most {MAX_CHANNELS} channels, not {}",
@@ -607,6 +682,12 @@ pub fn check_lock(p: &[String]) -> Result<(), String> {
         && !DELIVERY_MEMBERS.contains(&m.as_str())
     {
         return Err(format!("delivery has no member {m:?}"));
+    }
+    if top == "watches"
+        && let Some(m) = p.get(1)
+        && !WATCH_MEMBERS.contains(&m.as_str())
+    {
+        return Err(format!("watches has no member {m:?}"));
     }
     Ok(())
 }

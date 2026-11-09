@@ -345,6 +345,52 @@
         "title": "Server name",
         "type": "string",
         "x-sparkles-unset": "the host name"
+      },
+      "watches": {
+        "additionalProperties": false,
+        "description": "The bounds of watches on entities.",
+        "properties": {
+          "batchSecs": {
+            "default": 300,
+            "description": "Seconds that gather one owner's matches in one dataset into one message.",
+            "maximum": 86400,
+            "minimum": 10,
+            "title": "Batch window",
+            "type": "integer"
+          },
+          "identityMaxAgeDays": {
+            "default": 30,
+            "description": "Days after an OIDC or proxy owner's last sign-in after which its watches are told only in the web UI.",
+            "maximum": 3650,
+            "minimum": 1,
+            "title": "Identity age",
+            "type": "integer"
+          },
+          "largeCommit": {
+            "default": 1000,
+            "description": "The most members of one watch a commit can name before its match becomes one summary entry.",
+            "maximum": 1000000,
+            "minimum": 1,
+            "title": "Large commit",
+            "type": "integer"
+          },
+          "maxAncestors": {
+            "default": 10000,
+            "description": "The most ancestors one upward walk of a subtree watch visits.",
+            "maximum": 1000000,
+            "minimum": 1,
+            "title": "Ancestors per walk",
+            "type": "integer"
+          }
+        },
+        "title": "Watches",
+        "type": "object",
+        "x-sparkles-order": [
+          "maxAncestors",
+          "largeCommit",
+          "identityMaxAgeDays",
+          "batchSecs"
+        ]
       }
     },
     "title": "Notification configuration",
@@ -356,7 +402,8 @@
       "repeatEvery",
       "channels",
       "routes",
-      "delivery"
+      "delivery",
+      "watches"
     ]
   }
 }

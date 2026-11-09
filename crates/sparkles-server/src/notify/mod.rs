@@ -992,6 +992,8 @@ pub fn status_json(st: &AppState) -> Value {
         "queued": g.queued(),
         "active": active,
         "recent": g.recent.iter().cloned().collect::<Vec<_>>(),
+        // the number of watches per dataset, without their owners or entities
+        "watches": st.watches.counts(st).unwrap_or_default(),
     })
 }
 

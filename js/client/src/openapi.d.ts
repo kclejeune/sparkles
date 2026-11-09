@@ -3984,6 +3984,90 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/watches": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List your watches
+         * @description The caller's watches on entities, with their unread counts, limited to the graphs the caller can read now on each watch's branch. Watches belong to a user, an OIDC or proxy account, or a minted token's owner. A watches file that this server cannot read answers `503` with `watches-unavailable` and is left as it is.
+         */
+        get: operations["listWatches"];
+        put?: never;
+        /**
+         * Watch an entity
+         * @description Watches an entity, or its asserted subtree, in one graph of a branch. It needs read access to the graph through the history endpoint, and is refused with `409` and `watch-unsupported-protections` while triple protections limit what the caller reads in the dataset. The same watch made again is answered with `200`. An owner has at most 200 watches and the server at most 20,000, beyond which the answer is `409` with `watch-limit`.
+         */
+        post: operations["createWatch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/watches/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove a watch
+         * @description Removes one of the caller's watches.
+         */
+        delete: operations["deleteWatch"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/watches/{id}/matches": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the commits a watch matched
+         * @description The commits that changed the watched entity or its subtree, newest first. A watch keeps its 200 newest matches. The caller must still read the watched graph, or the answer is `403` with `watch-access-lost`.
+         */
+        get: operations["listWatchMatches"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/watches/{id}/seen": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mark a watch's matches as read
+         * @description Marks the matches up to the commit as read. A commit below the current mark leaves it as it is, and one above the branch's head is refused.
+         */
+        post: operations["markWatchSeen"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/whoami": {
         parameters: {
             query?: never;
@@ -10055,6 +10139,36 @@ export interface components {
              * @description The server's name in each notification.
              */
             server?: string;
+            /**
+             * Watches
+             * @description The bounds of watches on entities.
+             */
+            watches?: {
+                /**
+                 * Batch window
+                 * @description Seconds that gather one owner's matches in one dataset into one message.
+                 * @default 300
+                 */
+                batchSecs: number;
+                /**
+                 * Identity age
+                 * @description Days after an OIDC or proxy owner's last sign-in after which its watches are told only in the web UI.
+                 * @default 30
+                 */
+                identityMaxAgeDays: number;
+                /**
+                 * Large commit
+                 * @description The most members of one watch a commit can name before its match becomes one summary entry.
+                 * @default 1000
+                 */
+                largeCommit: number;
+                /**
+                 * Ancestors per walk
+                 * @description The most ancestors one upward walk of a subtree watch visits.
+                 * @default 10000
+                 */
+                maxAncestors: number;
+            };
         };
         OAuthError: {
             /**
@@ -12759,6 +12873,85 @@ export interface components {
             }[];
             resource: string;
             version: string | null;
+        };
+        /** @description A watch of the caller's. */
+        Watch: {
+            /** @description The branch's current name. A renamed branch keeps its watches. */
+            branch: string;
+            created: string;
+            dataset: string;
+            depth?: number;
+            /** @description An absolute IRI. */
+            entity: string;
+            /** @description The graph's IRI, absent for the default graph. */
+            graph?: string;
+            id: string;
+            /** @description The newest matched commit. */
+            latest?: number;
+            /** @description Older matches were dropped, since a watch keeps 200. */
+            overflow: boolean;
+            /** @enum {string} */
+            scope: "entity" | "subtree";
+            /** @description The last commit marked as read. */
+            seen: number;
+            /** @description The head when the watch was made. Only later commits match. */
+            since: number;
+            /** @description The graph's hierarchy is too large to follow, so the subtree matches only the entity. */
+            truncated: boolean;
+            /** @description The matched commits after `seen`. */
+            unread: number;
+        };
+        /** @description A new watch. */
+        WatchCreate: {
+            /** @description The branch, `main` when absent. */
+            branch?: string;
+            dataset: string;
+            /** @description For a subtree, the most levels below the entity that count. */
+            depth?: number;
+            /** @description An absolute IRI. */
+            entity: string;
+            /** @description The graph's IRI. Absent, or `default`, names the default graph. */
+            graph?: string;
+            /**
+             * @description `entity` matches commits that name the entity, and `subtree` also those that name a class, property or concept below it in the asserted hierarchy. The default is `entity`.
+             * @enum {string}
+             */
+            scope?: "entity" | "subtree";
+        };
+        /** @description The caller's watches on graphs it can read now. */
+        WatchList: {
+            /** @description The unread matches of every watch listed. */
+            unread: number;
+            watches: components["schemas"]["Watch"][];
+        };
+        /** @description A commit a watch matched. */
+        WatchMatch: {
+            author?: string;
+            commit: number;
+            /** @description How many watched IRIs the commit's changes named. */
+            count: number;
+            /** @description `false` when the commit's changes were not listed, such as a bulk load, so it may or may not change the entity. */
+            exact: boolean;
+            /** @description The watched IRIs the commit's changes named, at most 20 in IRI order. */
+            members?: string[];
+            /** @description The caller made the commit. */
+            own?: boolean;
+            /** @description An ancestor walk stopped at the `maxAncestors` bound, so members may be missing. */
+            partial?: boolean;
+            /** @description The commit named more IRIs than the `largeCommit` bound, so it is one entry without members. */
+            summary?: boolean;
+            time: string;
+            unread: boolean;
+        };
+        /** @description A page of a watch's matched commits, newest first. */
+        WatchMatches: {
+            matches: components["schemas"]["WatchMatch"][];
+            more: boolean;
+            watch: components["schemas"]["Watch"];
+        };
+        /** @description The last commit to mark as read. */
+        WatchSeen: {
+            commit: number;
         };
         Whoami: {
             authEnabled: boolean;
@@ -21968,7 +22161,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description Fields of the kind: `providers`, `roles` and `routing` of `models` (`ModelsSettings`), or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes` and `delivery` of `notifications`. */
+        /** @description Fields of the kind: `providers`, `roles` and `routing` of `models` (`ModelsSettings`), or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes`, `delivery` and `watches` of `notifications`. */
         requestBody: {
             content: {
                 "application/json": Record<string, never>;
@@ -22042,7 +22235,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description Fields of the kind: `providers`, `roles` and `routing` of `models` (`ModelsSettings`), or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes` and `delivery` of `notifications`. */
+        /** @description Fields of the kind: `providers`, `roles` and `routing` of `models` (`ModelsSettings`), or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes`, `delivery` and `watches` of `notifications`. */
         requestBody: {
             content: {
                 "application/json": Record<string, never>;
@@ -23594,6 +23787,172 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listWatches: {
+        parameters: {
+            query?: {
+                /** @description Only the watches on this dataset. */
+                dataset?: string;
+                /** @description Only the watches of this entity. */
+                entity?: string;
+                /** @description Only the watches in this graph, `default` for the default graph. */
+                graph?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The watches. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WatchList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createWatch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WatchCreate"];
+            };
+        };
+        responses: {
+            /** @description The same watch already existed. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Watch"];
+                };
+            };
+            /** @description The new watch. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Watch"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteWatch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listWatchMatches: {
+        parameters: {
+            query?: {
+                /** @description Only commits above this one. */
+                after?: number;
+                /** @description Only commits below this one, for the next page. */
+                before?: number;
+                /** @description The most matches listed. */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The matches. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WatchMatches"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    markWatchSeen: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WatchSeen"];
+            };
+        };
+        responses: {
+            /** @description The watch. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Watch"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };

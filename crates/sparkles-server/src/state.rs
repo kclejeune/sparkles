@@ -494,6 +494,8 @@ pub struct AppState {
     /// the queue, the conditions and the delivery status of outbound notifications
     /// (spec C21)
     pub notifier: crate::notify::Notifier,
+    /// watches on entities and the follower's record of their matches (spec U12)
+    pub watches: crate::watches::Watches,
     /// ingestion tasks and the PDF workers (spec C18 Phase 4)
     #[cfg(feature = "mcp")]
     pub ingest: crate::ingest::Runtime,
@@ -813,6 +815,7 @@ impl AppState {
             settings: crate::settings::Settings::in_dir(data_dir),
             asks: Default::default(),
             notifier: Default::default(),
+            watches: Default::default(),
             #[cfg(feature = "mcp")]
             ingest: Default::default(),
         }
@@ -882,6 +885,7 @@ impl AppState {
             settings: Default::default(),
             asks: Default::default(),
             notifier: Default::default(),
+            watches: Default::default(),
             #[cfg(feature = "mcp")]
             ingest: Default::default(),
             rate_limit: None,
