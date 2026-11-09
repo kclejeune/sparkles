@@ -304,6 +304,12 @@ class LifetimeExtension(unittest.TestCase):
 
     def receipts(self):return sorted(n for n in os.listdir(self.op) if n.startswith('lifetime-extension-0') and not n.endswith('-accepted.json'))
 
+    def test_a_withdrawn_handoff_is_never_extended(self):
+        w=self.op/'root-handoff-withdrawn.json';w.write_text('{}\n');w.chmod(0o600)
+        io=self.io(self.left-600)
+        with self.assertRaises(Exception) as caught:self.extend(io,3600,accept=False)
+        self.assertIn('no qualified Root handoff to extend',str(caught.exception));self.assertEqual(io.calls,[])
+
     def test_extension_is_a_receipted_act_with_a_new_bounded_end(self):
         io=self.io(self.left-600)
         receipt=self.extend(io,3600)
@@ -880,7 +886,8 @@ class AdmissionClocks(unittest.TestCase):
         io.guard_for_admission=broken
         io.diagnose=lambda seconds:{'schema':1,'processes':{'count':0,'rows':[]},'state':{'entries':[],'phases':{}}}
         with self.assertRaises(ValueError):controller.drive(r,io)
-        self.assertTrue(io.exists('root-handoff.json'));self.assertFalse(io.exists('qualified-worker-admission.json'))
+        # The handoff is published only after its admission, so none stands.
+        self.assertFalse(io.exists('root-handoff.json'));self.assertFalse(io.exists('qualified-worker-admission.json'))
         self.assertTrue(io.exists('root-handoff-withdrawn.json'));self.assertTrue(io.exists('stop-trigger.json'))
         self.assertTrue(io.exists('diagnostics.json'))
         # Without the withdrawal the guard would wait for a job closure that can never
@@ -889,12 +896,48 @@ class AdmissionClocks(unittest.TestCase):
         self.assertTrue(io.exists('closed.json'));self.assertFalse(io.exists('unresolved.json'))
         self.assertEqual([x[0] for x in io.calls],['resume','stop'])
 
+    def failing_writes(self,io,names):
+        record=io.record
+        def write(name,value):
+            if name in names:raise OSError('injected write failure: '+name)
+            return record(name,value)
+        io.record=write
+
+    def stops_normally(self,r,io):
+        self.assertTrue(io.exists('stop-trigger.json'));self.assertFalse(controller.handoff_active(io))
+        self.assertTrue(controller.guard_loop(r,io,io.read('controller-intent.json')))
+        self.assertTrue(io.exists('closed.json'));self.assertFalse(io.exists('unresolved.json'))
+        self.assertEqual([x[0] for x in io.calls],['resume','stop'])
+
+    def test_a_failed_withdrawal_write_still_stops_the_worker(self):
+        r=handoff_release();io=controls.InertIO(r)
+        def broken():raise ValueError('earlier effective deadline')
+        io.guard_for_admission=broken;io.diagnose=lambda seconds:{'schema':1,'processes':{'count':0,'rows':[]},'state':{'entries':[],'phases':{}}}
+        self.failing_writes(io,{'root-handoff-withdrawn.json'})
+        with self.assertRaises(ValueError):controller.drive(r,io)
+        self.assertFalse(io.exists('root-handoff-withdrawn.json'))
+        self.stops_normally(r,io)
+
+    def test_a_failed_handoff_write_after_the_admission_still_stops_the_worker(self):
+        r=handoff_release();io=controls.InertIO(r);io.guard_for_admission=lambda:guard_row(io)
+        io.diagnose=lambda seconds:{'schema':1,'processes':{'count':0,'rows':[]},'state':{'entries':[],'phases':{}}}
+        self.failing_writes(io,{'root-handoff.json','root-handoff-withdrawn.json'})
+        with self.assertRaises(OSError):controller.drive(r,io)
+        self.assertTrue(io.exists('qualified-worker-admission.json'));self.assertFalse(io.exists('root-handoff.json'))
+        self.stops_normally(r,io)
+
+    def test_an_admission_without_its_handoff_admits_nothing(self):
+        op=self.f['operation'];(op/'root-handoff.json').unlink()
+        with self.assertRaises(FileNotFoundError):controller.lifetime.export_operation(op,self.f['now'],self.f['profile']['worker'],self.f['profile'])
+        self.assertFalse(controller.handoff_active(controls.DiskIO(self.f['release'],op)))
+
     def test_a_withdrawn_handoff_admits_nothing(self):
         op=self.f['operation'];(op/'root-handoff-withdrawn.json').write_text('{}\n');(op/'root-handoff-withdrawn.json').chmod(0o600)
         with self.assertRaises(ValueError) as caught:controller.lifetime.export_operation(op,self.f['now'],self.f['profile']['worker'],self.f['profile'])
         self.assertEqual(str(caught.exception),'Root handoff withdrawn')
-        # A withdrawal that comes after an admission receipt does not cancel the handoff.
-        io=controls.DiskIO(self.f['release'],op);self.assertTrue(controller.handoff_active(io))
+        # A withdrawal cancels the handoff even after its admission receipt, since
+        # the controller writes one only when it did not return a standing handoff.
+        io=controls.DiskIO(self.f['release'],op);self.assertFalse(controller.handoff_active(io))
 
 
 class Op4PhaseReplay(unittest.TestCase):
@@ -1028,6 +1071,10 @@ class ClosureWatch(unittest.TestCase):
         return controller.closure_watch(self.f['release'],io,lead,local_units,observe=lambda r,x:self.observed.append(x.exists('stop-trigger.json')))
 
     def read(self,name):return json.loads((self.op/name).read_text())
+    def test_a_withdrawn_handoff_is_never_watched(self):
+        w=self.op/'root-handoff-withdrawn.json';w.write_text('{}\n');w.chmod(0o600)
+        with self.assertRaises(Exception) as caught:self.watch(ExtendIO(self.f))
+        self.assertIn('no qualified Root handoff to watch',str(caught.exception))
     def left(self,w,t,end=None):
         wall_end,boot_end,_=end or self.end;return min(wall_end-w,boot_end-t)
 

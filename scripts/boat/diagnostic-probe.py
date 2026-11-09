@@ -136,7 +136,11 @@ def units():
     except (OSError,subprocess.TimeoutExpired) as error:return {'unread':type(error).__name__}
 
 # The commands the screen and build scripts need on the worker, as admission checks them.
-TOOLS=('python3','systemd-run','flock','zstd','curl','taskset','chrt','awk','sed','sha256sum','timeout','tar','free','du','mkfifo')
+TOOLS=('bash','sh','env','python3','git','systemd-run','systemctl','flock','timeout','mkfifo',
+       'tar','gzip','zstd','curl','taskset','chrt','cc','cargo','realpath','sha256sum',
+       'awk','sed','grep','cut','head','sort','seq','tr','wc','tee','cat','date','uname',
+       'free','du','df','tail','chmod','ln','mkdir','mktemp','mv','rm','dirname','sleep',
+       '/lib64/ld-linux-x86-64.so.2')
 def commands():
     return {name:shutil.which(name) is not None for name in TOOLS}
 

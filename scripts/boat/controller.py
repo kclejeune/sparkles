@@ -506,15 +506,20 @@ def drive(r,io):
                 h=r.get('separate_Root_handoff',{})
                 need(sha(h.get('job_release_sha256')) and sha(h.get('different_job_review_sha256')) and h.get('Root_owns_job_and_deadline_closure') is True,'unbound useful job handoff')
                 budget(io.mono(),min(intent['deadline_mono'],io.mono()+expiry-io.wall()),h.get('finite_job_and_closure_seconds',10800))
-                io.record('root-handoff.json',{'worker':worker_id(),'separate_job_release':h,'deadline_wall':intent['deadline_wall'],'qualification_only_controller':True,'job_started_by_controller':False})
-                admission=make_admission(r,intent,io.read('qualification.json'),io.read('startup-closed.json'),io.guard_for_admission(),io.read('root-handoff.json'),io.wall())
+                # The handoff is staged. Its admission is computed from the same
+                # values and published first, and the handoff is published last, so
+                # a failure at any step leaves no standing handoff and the worker
+                # stops normally without a job closure.
+                handoff=json.loads(json.dumps({'worker':worker_id(),'separate_job_release':h,'deadline_wall':intent['deadline_wall'],'qualification_only_controller':True,'job_started_by_controller':False}))
+                admission=make_admission(r,intent,io.read('qualification.json'),io.read('startup-closed.json'),io.guard_for_admission(),handoff,io.wall())
                 io.record('qualified-worker-admission.json',admission)
+                io.record('root-handoff.json',handoff)
             except Exception as error:
                 record_refusal(io,'admission',error)
-                # No job can be admitted without the admission receipt, so a handoff
-                # that never produced one is withdrawn and the worker stops normally.
-                if io.exists('root-handoff.json') and not io.exists('qualified-worker-admission.json'):
-                    io.record(lifetime.HANDOFF_WITHDRAWN,{'worker':worker_id(),'reason_code':reason_code(error),'qualified_worker_admission_absent':True,'observed_wall':io.wall()})
+                # The withdrawal marks the operation for every consumer. Its own failure
+                # changes nothing, since the stop does not depend on it.
+                try:io.record(lifetime.HANDOFF_WITHDRAWN,{'worker':worker_id(),'reason_code':reason_code(error),'qualified_worker_admission_present':io.exists('qualified-worker-admission.json'),'root_handoff_present':io.exists('root-handoff.json'),'observed_wall':io.wall()})
+                except Exception:pass
                 raise
             return 'QUALIFIED_ROOT_HANDOFF_GUARD_ACTIVE'
         return 'QUALIFIED_STOP_REQUESTED'
@@ -557,7 +562,9 @@ def diagnostic_hold(io,intent):
     closure. It returns before the controller writes its stop trigger, and every
     error ends the hold, so the trigger is never lost."""
     try:
+        # A published handoff never holds, even withdrawn, since a job could be bound to it.
         if not isinstance(intent,dict) or handoff_active(io) or io.exists('no-ready-confirmed.json'):return
+        if io.exists('root-handoff.json') and io.exists('qualified-worker-admission.json'):return
         if not io.exists('resume-outcome.json') or io.read('resume-outcome.json').get('acceptance')!='positive':return
         if not any(n.startswith('info-') and io.read(n).get('state') in ('ready','idle','running') for n in io.names()):return
         start=io.mono();end=min(start+HOLD_MAX,intent['mono']+CONTROLLER_RUNTIME-HOLD_RESERVE,intent['deadline_mono']-HOLD_DEADLINE_RESERVE)
@@ -578,8 +585,10 @@ def diagnostic_hold(io,intent):
 def handoff_active(io):
     """Whether a Root handoff stands, so that a normal stop needs the job closure.
 
-    A handoff withdrawn before any admission receipt existed admitted no job."""
-    return io.exists('root-handoff.json') and not (io.exists(lifetime.HANDOFF_WITHDRAWN) and not io.exists('qualified-worker-admission.json'))
+    The controller publishes the handoff after its admission receipt, and withdraws
+    it whenever it does not return a standing handoff. A handoff without its
+    admission, or a withdrawn one, admitted no job."""
+    return io.exists('root-handoff.json') and io.exists('qualified-worker-admission.json') and not io.exists(lifetime.HANDOFF_WITHDRAWN)
 
 def matching_root_job_closed(r,io,closed):
     freshness(closed,io.wall())
@@ -748,7 +757,7 @@ def extend_operation(r,io,seconds,fact_path,reason):
     """
     need(type(seconds) is int and 0<seconds<=lifetime.EXTENSION_MAX,'extension seconds out of range')
     need(isinstance(reason,str) and 0<len(reason)<=200 and all(' '<=c<='~' for c in reason),'extension reason must be short printable text')
-    need(io.exists('root-handoff.json') and io.exists('qualified-worker-admission.json') and io.exists('guard-admission.json'),'no qualified Root handoff to extend')
+    need(handoff_active(io) and io.exists('guard-admission.json'),'no qualified Root handoff to extend')
     for name in ('stop-trigger.json','stop-intent.json','closed.json','unresolved.json'):need(not io.exists(name),'operation is stopping or closed')
     intent=io.read('controller-intent.json');guard=io.read('guard-admission.json');handoff=io.read('root-handoff.json');q=io.read('qualification.json')
     identity=lifetime.operation_identity(intent,guard,q,r['guard_unit'],profile())
@@ -973,7 +982,7 @@ def closure_watch(r,io,lead=WATCH_LEAD,local_units=(),poll=WATCH_POLL,observe=aw
     """
     need(type(lead)is int and 300<=lead<=3600,'closure watch lead out of range')
     need(len(local_units)<=8 and all(isinstance(u,str) and re.fullmatch(r'[A-Za-z0-9@_.:-]{1,200}',u) for u in local_units),'local job unit name')
-    need(io.exists('root-handoff.json') and io.exists('qualified-worker-admission.json') and io.exists('guard-admission.json'),'no qualified Root handoff to watch')
+    need(handoff_active(io) and io.exists('guard-admission.json'),'no qualified Root handoff to watch')
     io.record('closure-watch.json',{'worker':worker_id(),'operation_id':r['guard_unit'],'lead_seconds':lead,'poll_seconds':poll,'local_units':list(local_units),'started_wall':io.wall(),'started_boottime':io.mono()})
     checks=0;last='not_checked'
     terminal=('stop-trigger.json','closed.json','unresolved.json','root-job-closed.json')

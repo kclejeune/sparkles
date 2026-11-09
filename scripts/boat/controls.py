@@ -327,7 +327,11 @@ class Controls(unittest.TestCase):
         with self.assertRaises(Refusal):safe_info({'worker':{}})
     def test_live_Root_handoff_lease_refuses_before_stop(self):
         r=fixture();io=InertIO(r);io.record('root-handoff.json',{'separate_job_release':{'job_release_sha256':'1'*64}})
+        io.record('qualified-worker-admission.json',{'local_guard':{}})
         self.assertFalse(c.reconcile_stop(r,io));self.assertEqual(io.calls,[])
+        # A handoff without its admission, which the controller never publishes, bound no job.
+        io=InertIO(r);io.record('root-handoff.json',{'separate_job_release':{'job_release_sha256':'1'*64}})
+        self.assertFalse(c.handoff_active(io))
     def test_unreviewed_useful_job_handoff_refused(self):
         r=fixture();r['useful_job_ready']=True;r['separate_Root_handoff']={};io=InertIO(r)
         with self.assertRaises(Refusal):c.drive(r,io)

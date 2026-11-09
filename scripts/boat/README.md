@@ -175,12 +175,15 @@ The controller reads the wall and boot clocks once for its intent, and both dead
 exactly 10,500 seconds after those readings, so the admission end derived from the
 guard's paired observation never passes the intent's own wall deadline. Admission still
 accepts up to a millisecond of skew between the two in receipts of earlier controllers.
-The controller writes `root-handoff.json` before it computes the admission. When that
-computation fails, no `qualified-worker-admission.json` exists and no job can be
-admitted, so the controller withdraws the handoff in `root-handoff-withdrawn.json`, holds
-for diagnostics and triggers a normal stop that needs no job closure. A withdrawn
-handoff admits nothing. Before any job work, `remote-executor.py admit` refuses a worker
-that lacks one of the commands the screen and build scripts run there, and names it.
+The controller stages the handoff. It computes the admission from the handoff's
+values, publishes `qualified-worker-admission.json` first and `root-handoff.json` last,
+and a handoff stands only while both receipts exist. When any step fails, no handoff
+stands, so the controller holds for diagnostics and triggers a normal stop that needs
+no job closure. It also writes `root-handoff-withdrawn.json`, which job preparation,
+export, extension and the closure watch all refuse, and the stop does not depend on
+that write. Before any job work, `remote-executor.py admit` refuses a worker that lacks
+one of the commands the screen and build scripts run there, and names it. A test
+derives those commands from the worker-side scripts and remote command strings.
 
 Qualification runs in a named local 512-MiB, zero-swap controller unit with 2,700-second
 runtime and 30-second stop limits. The controller returns after qualification/handoff;

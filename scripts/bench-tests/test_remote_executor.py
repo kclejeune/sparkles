@@ -24,6 +24,62 @@ RX = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RX)
 
 
+
+REMOTE_CALLS={'rx_exec','rsh','screen_exec'}
+WRAPPERS={'exec','timeout','nohup','env','setsid','taskset','chrt','nice','command','flock','systemd-run','xargs'}
+def shell_builtins():
+    import subprocess as sp
+    return set(sp.run(['bash','-c','compgen -b; compgen -k'],capture_output=True,text=True,check=True).stdout.split())
+
+def quoted_text(source,word):
+    """The shell text inside one quoted word, unescaped as the outer shell would."""
+    parts=word.get('Parts',[])
+    if len(parts)!=1 or parts[0].get('Type') not in ('DblQuoted','SglQuoted'):return None
+    raw=source.encode()[word['Pos']['Offset']+1:word['End']['Offset']-1].decode()
+    if parts[0]['Type']=='DblQuoted':
+        for a,b in (('\\"','"'),('\\$','$'),('\\`','`'),('\\\\','\\')):raw=raw.replace(a,b)
+    return raw
+
+def shell_commands(source,remote_only=False):
+    """The literal external command names that a shell text runs.
+
+    With remote_only, only the text passed to a remote call is read, recursively,
+    including bash -c and sh -c arguments inside it."""
+    import json as js,subprocess as sp
+    builtins=shell_builtins();found=set();funcs=set()
+    def parse(text):return js.loads(sp.run(['shfmt','--to-json'],input=text,capture_output=True,text=True,check=True).stdout)
+    def literal(arg):
+        parts=arg.get('Parts',[]);return parts[0].get('Value') if len(parts)==1 and parts[0].get('Type')=='Lit' else None
+    def walk(node,text,local):
+        if isinstance(node,dict):
+            if node.get('Type')=='FuncDecl':funcs.add(node['Name']['Value'])
+            if node.get('Type')=='CallExpr' and node.get('Args'):
+                args=node['Args'];words=[literal(a) for a in args];first=words[0]
+                if first in REMOTE_CALLS:
+                    inner=quoted_text(text,args[-1])
+                    if inner is not None:visit(inner,True)
+                if local:
+                    i=0
+                    while i<len(words) and words[i] is not None:
+                        found.add(words[i])
+                        if words[i] in WRAPPERS:
+                            i+=1
+                            # Options, their values and assignments; a computed command ends the scan.
+                            while i<len(words) and (words[i] is None and words[i-1] is not None and words[i-1].startswith('-') or words[i] is not None and (words[i].startswith('-') or '=' in words[i] or words[i][:1].isdigit())):i+=1
+                            continue
+                        break
+                    if first in ('bash','sh') and '-c' in words:
+                        j=words.index('-c')
+                        if j+1<len(args):
+                            inner=quoted_text(text,args[j+1])
+                            if inner is not None:visit(inner,True)
+            for v in node.values():walk(v,text,local)
+        elif isinstance(node,list):
+            for v in node:walk(v,text,local)
+    def visit(text,local):walk(parse(text),text,local)
+    visit(source,not remote_only)
+    return {w for w in found if w not in builtins and w not in funcs and w not in REMOTE_CALLS}
+
 class Admission(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
@@ -294,14 +350,33 @@ class Admission(unittest.TestCase):
         # A worker without zstd is refused by name before any job work.
         tools=self.root/'some-tools';tools.mkdir()
         for name in RX.WORKER_TOOLS:
-            if name!='zstd' and shutil.which(name):(tools/name).symlink_to(shutil.which(name))
+            if name!='zstd' and '/' not in name and shutil.which(name):(tools/name).symlink_to(shutil.which(name))
         script="refuse(){ printf 'ADMIT-REFUSAL: %s\\n' \"$1\"; exit 86; }\n"+RX.worker_tools_check()
         result=sp.run(['/bin/bash','-c',script],env={'PATH':str(tools)},stdin=sp.DEVNULL,capture_output=True,text=True,timeout=10)
         self.assertEqual(result.returncode,86);self.assertEqual(RX.refusal_reason(result.stdout.encode()),'zstd is not on the worker')
         (tools/'zstd').symlink_to(shutil.which('true'))
-        missing=[n for n in RX.WORKER_TOOLS if not (tools/n).exists()]
+        missing=[n for n in RX.WORKER_TOOLS if not (shutil.which(n) if '/' in n else (tools/n).exists())]
         result=sp.run(['/bin/bash','-c',script],env={'PATH':str(tools)},stdin=sp.DEVNULL,capture_output=True,text=True,timeout=10)
         self.assertEqual(result.returncode,86 if missing else 0,(missing,result.stdout))
+
+    def test_admission_checks_every_command_the_worker_scripts_run(self):
+        """Each external command of the worker-side scripts and remote strings is checked at admission."""
+        if not shutil.which('shfmt'):self.skipTest('shfmt is needed to parse the worker scripts')
+        found={}
+        scripts=Path(__file__).resolve().parents[1]
+        for name in ('nsc-bench-remote.sh','nsc-build-remote.sh','nsc-build.sh','cargo-sparkles-task'):
+            for word in shell_commands((scripts/name).read_text()):found.setdefault(word,name)
+        for name in ('remote-screen.sh','nsc-build-host.sh','nsc-bench.sh'):
+            for word in shell_commands((scripts/name).read_text(),remote_only=True):found.setdefault(word,name)
+        # The command strings remote-executor.py itself sends for put, get, sync and bundle.
+        for word in ('bash','env','python3','mkdir','mktemp','cat','sha256sum','cut','mv','tar','git','rm','dirname'):found.setdefault(word,'remote-executor.py')
+        # mbx and rustc are pinned by tool_check, c++ only feeds the build's info.txt, and
+        # remote-screen.sh runs nohup and setsid only on the nsc branch.
+        exempt={'mbx','rustc','c++','nohup','setsid'}
+        missing={w:f for w,f in found.items() if w not in RX.WORKER_TOOLS and w not in exempt}
+        self.assertEqual(missing,{})
+        self.assertIn('realpath',found);self.assertIn('tee',found);self.assertIn('gzip',RX.WORKER_TOOLS)
+        self.assertIn('/lib64/ld-linux-x86-64.so.2',found)
 
     def test_admit_reports_the_worker_refusal_reason(self):
         self.assertEqual(RX.refusal_reason(b'noise\nADMIT-REFUSAL: mbx is not on the job PATH\n'),'mbx is not on the job PATH')
