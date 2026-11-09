@@ -1373,6 +1373,13 @@ identity. Repeated identity changes retain earlier imported origins and add only
 new imported suffixes, without duplicating large WAL files. Rebuild clones have no
 old WAL history and establish their own destination root explicitly.
 
+A clone of a dataset whose configuration history is activated is refused with an
+`unsupported` error before anything is captured or written, because a clone copies
+the registry's history root without the evidence-history closure and native
+generations that the root names. Such a dataset is copied by a backup and a restore
+that keeps its identity. Roadmap item 764 adds clones that carry or rebuild the
+closure.
+
 Historical configuration supplies semantics, never current access. Source
 retention, current graph protections, caller grants and provider admission remain
 independent restrictions through Recall, Ask, queued responses and publication.
