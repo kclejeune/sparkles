@@ -100,6 +100,7 @@
   import EntityHistory from '$components/EntityHistory.svelte';
   import Discussions from '$components/Discussions.svelte';
   import BulkEdit from '$components/BulkEdit.svelte';
+  import OntoImports from '$components/OntoImports.svelte';
   import { isDiscussionGraph } from '$lib/discussions';
   import TreeCrumbs from '$components/TreeCrumbs.svelte';
 
@@ -112,6 +113,7 @@
     ['history', 'History'],
     ['discussions', 'Discussions'],
     ['bulk', 'Bulk edits'],
+    ['imports', 'Imports'],
   ];
 
   type Tab = OntologyTab;
@@ -122,7 +124,9 @@
   const branch = $derived(branchParam(q.get('branch')));
   const target = $derived(onBranch(name, branch));
   const graph = $derived(q.get('graph') || null);
-  const sel: Selection = $derived({ graph, imports: true });
+  // `imports=0` excludes the imported axioms from every view (spec U12, import resolution)
+  const withImports = $derived(q.get('imports') !== '0');
+  const sel: Selection = $derived({ graph, imports: withImports });
   // the page's one tab row: the tree, DL Query, the header and the history (ROADMAP item 633)
   const tab = $derived<Tab>(
     (ONTOLOGY_TABS as readonly string[]).includes(q.get('tab') ?? '')
@@ -371,6 +375,25 @@
       session.reset(`sparkles.onto.undo.${target}|${graph ?? ''}`);
       void loadAll();
       void loadSide();
+    });
+  });
+
+  // including or excluding the imported axioms reads every view again, and keeps the undo stack
+  let importsShown: boolean | null = null;
+  $effect(() => {
+    const w = withImports;
+    untrack(() => {
+      if (importsShown !== null && importsShown !== w) {
+        summary = null;
+        shown = 0;
+        loadedTarget = null;
+        resetLazy();
+        for (const lt of levelTrees.values()) lt.drop();
+        individualLevel.drop();
+        classification = null;
+        void loadAll();
+      }
+      importsShown = w;
     });
   });
 
@@ -1435,6 +1458,14 @@
           {#if graph && !graphs.includes(graph)}<option value={graph}>{graph}</option>{/if}
         </select>
       </label>
+      <label class="form-row check" title="Include or exclude the axioms of the imported graphs">
+        <input
+          type="checkbox"
+          checked={withImports}
+          onchange={(e) => nav({ imports: e.currentTarget.checked ? null : '0' })}
+        />
+        Imported axioms
+      </label>
       {#if branchList.length}
         <label class="form-row">
           Branch
@@ -1523,6 +1554,22 @@
               onedit={(op, label) =>
                 // the plan was read without the imports, and its edit reads and writes the same
                 edit(op, label, undefined, null, { graph, imports: false })}
+            />{/key}
+        </div>
+      </section>
+    {:else if tab === 'imports' && summary}
+      <section class="panel" aria-label="Imports">
+        <div class="panel-body">
+          {#key target}<OntoImports
+              {target}
+              root={graph ?? 'default'}
+              closure={summary.closure ?? []}
+              {etag}
+              {readonly}
+              imports={withImports}
+              name={(i) => (i === 'default' ? 'default graph' : iriName(i, prefixes))}
+              oncommitted={discussed}
+              onchanged={() => void loadAll()}
             />{/key}
         </div>
       </section>

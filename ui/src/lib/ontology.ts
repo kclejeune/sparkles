@@ -88,6 +88,8 @@ export type OntologySummary = {
   mode: string;
   graphs: string[];
   imports: { iri: string; graph: string | null }[];
+  /** One edge per `owl:imports` triple of a graph read (spec U12, import resolution). */
+  closure?: import('./ontology-imports').ImportEdge[];
   warnings?: string[];
   header: {
     iri: string | null;

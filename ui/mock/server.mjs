@@ -60,6 +60,7 @@ import {
   UNI_PREFIXES,
   UNI_TURTLE,
 } from './ontology.mjs';
+import { handleImports } from './imports.mjs';
 import { handleSkos, isSkosShapes, skosReport, THES_PREFIXES, THES_TURTLE } from './skos.mjs';
 import { PREFIXES, buildTurtle, provenanceTrig, scratchTurtle, vectorTurtle } from './data.mjs';
 
@@ -2513,6 +2514,18 @@ const server = http.createServer(async (req, res) => {
       return;
     // the built-in SKOS shapes (mock/skos.mjs)
     if (handleSkos(req, res, seg, { send })) return;
+    // the ontology editor's import map and import actions (mock/imports.mjs)
+    if (
+      await handleImports(req, res, url, seg, {
+        datasets,
+        send,
+        fail,
+        readBody,
+        quadSet,
+        commitWrite,
+      })
+    )
+      return;
     // the ontology editor's routes and the change feed (mock/ontology.mjs)
     if (
       await handleOntology(req, res, url, seg, {
