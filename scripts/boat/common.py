@@ -132,6 +132,27 @@ def drift_evidence(x):
     for name in SOURCE_FIELDS:
         f=fields.get(name) if isinstance(fields.get(name),dict) else {}
         out['fields'][name]={'recorded':source_hex(f.get('recorded')),'observed':source_hex(f.get('observed')),'differs':f.get('differs') is True}
+    if 'status' in x:out['status']=status_evidence(x['status'])
+    return out
+# A checkout's porcelain status lines, bounded like the diagnostic's untracked list: at
+# most STATUS_MAX lines, each an XY code and a printable repository-relative path, with
+# the lstat kind, size and mode of the path and, for a tracked path, the size and mode
+# its index entry records. A credential-like path is left out and only counted.
+STATUS_MAX=200
+STATUS_XY=re.compile(r'[ MTADRCU?!]{2}')
+def status_count(v):return v if type(v) is int and 0<=v<2**63 else None
+def status_text(v,limit=300):return ''.join(c if ' '<=c<='~' else '?' for c in v[:limit]) if isinstance(v,str) else None
+def status_evidence(x):
+    if not isinstance(x,dict):return None
+    out={'sha256':source_hex(x.get('sha256')),'total':status_count(x.get('total')),'omitted_credential_like':status_count(x.get('omitted_credential_like')),
+         'truncated':x.get('truncated') is True,'stat_only':x.get('stat_only') is True,'entries':[]}
+    if isinstance(x.get('unread'),str):out['unread']=status_text(x['unread'],64)
+    for e in (x.get('entries') if isinstance(x.get('entries'),list) else [])[:STATUS_MAX]:
+        if not isinstance(e,dict):continue
+        row={'xy':e['xy'] if isinstance(e.get('xy'),str) and STATUS_XY.fullmatch(e['xy']) else None,'path':status_text(e.get('path'))}
+        for k in ('kind',):row[k]=e[k] if e.get(k) in ('file','directory','link','other','absent') else None
+        for k in ('bytes','mode','index_bytes','index_mode'):row[k]=status_count(e.get(k))
+        out['entries'].append(row)
     return out
 def validate_release(r,now):
     need(r.get('schema')==1 and r.get('authorized_by_Root') is True,'release is false')

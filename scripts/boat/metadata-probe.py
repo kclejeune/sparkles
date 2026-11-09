@@ -34,14 +34,87 @@ def command(argv,seconds=15,env=None,cwd=None):
     need(r.returncode==0 and len(r.stdout)<=1024*1024,'qualification command failed')
     return r.stdout
 
+# The same credential-like stems as the diagnostic's untracked list.
+STATUS_CREDENTIAL_STEMS=('credential','secret','token','passw','apikey','api-key','api_key','private','netrc','npmrc','pypirc','pgpass',
+                         'id_rsa','id_dsa','id_ecdsa','id_ed25519','.pem','.key','.p12','.pfx','.jks','keystore','.kdbx','.gpg','.asc','.ovpn',
+                         '.env','.ssh','.gnupg','.aws','.docker','.kube')
+def status_credential_like(name):
+    return any(part and any(stem in part.lower() for stem in STATUS_CREDENTIAL_STEMS) for part in name.split('/'))
+EMPTY_SHA256=hash_bytes(b'')
+STATUS_INDEX_MAX=20
+def status_lines(data):
+    """The (XY, path) pairs of `git status --porcelain=v1 -z`; a rename's source is skipped."""
+    parts=data.split(b'\0');out=[];i=0
+    while i<len(parts):
+        item=parts[i];i+=1
+        if not item:continue
+        need(len(item)>3 and item[2:3]==b' ','status line shape')
+        xy=item[:2].decode('ascii','replace');out.append((xy,item[3:]))
+        if xy[0] in 'RC':i+=1
+    return out
+def index_records(repo,paths,env):
+    """The size and mode each index entry of ``paths`` records, from `git ls-files --debug`."""
+    if not paths:return {}
+    data=command(['git','-C',str(repo),'-c','core.fsmonitor=false','--no-optional-locks','--literal-pathspecs','ls-files','--stage','--debug','-z','--']+[p.decode('utf-8','surrogateescape') for p in paths],15,env,repo)
+    out={}
+    for m in re.finditer(rb'([0-7]{6}) [0-9a-f]{40,64} [0-3]\t([^\0]*)\0((?:  [^\n]*\n)*)',data):
+        size=re.search(rb'size: ([0-9]+)',m[3])
+        out[m[2]]={'index_mode':int(m[1],8),'index_bytes':int(size[1]) if size else None}
+    return out
+def status_record(repo,env):
+    """The checkout's status lines, bounded and credential-free, with the hash of the raw listing."""
+    row={'sha256':None,'total':0,'omitted_credential_like':0,'truncated':False,'stat_only':False,'entries':[]}
+    try:
+        data=command(['git','-C',str(repo),'-c','core.fsmonitor=false','-c','core.untrackedCache=false','--no-optional-locks','status','--porcelain=v1','-z'],30,env,repo)
+        row['sha256']=hash_bytes(data);lines=status_lines(data);row['total']=len(lines)
+        kept=[]
+        for xy,raw in lines:
+            name=raw.decode('utf-8','replace')
+            if status_credential_like(name):row['omitted_credential_like']+=1;continue
+            if len(kept)>=STATUS_MAX:row['truncated']=True;continue
+            kept.append((xy,raw,name))
+        tracked=[raw for xy,raw,_ in kept if xy not in ('??','!!')][:STATUS_INDEX_MAX]
+        index=index_records(repo,tracked,env)
+        for xy,raw,name in kept:
+            entry={'xy':xy,'path':name}
+            try:
+                st=os.lstat(os.path.join(os.fsencode(str(repo)),raw))
+                entry.update(kind='directory' if stat.S_ISDIR(st.st_mode) else ('file' if stat.S_ISREG(st.st_mode) else ('link' if stat.S_ISLNK(st.st_mode) else 'other')),bytes=st.st_size,mode=st.st_mode)
+            except FileNotFoundError:entry['kind']='absent'
+            entry.update(index.get(raw,{}))
+            row['entries'].append(entry)
+        row['_lines']=lines
+    except Exception as error:row['unread']=reason_code(error)
+    return row
+def stat_only_status(recorded,observed,status):
+    """Whether a status that differs from a clean recording shows only stale index stat data.
+
+    Git reports ` M` without reading content when a path's size differs from the size its
+    index entry records, as a restored symbolic link can, and no refresh clears it. The
+    identity still holds when the recording was clean, every other field is unchanged,
+    the tracked diff against HEAD is empty, the probe's own listing is the one the helper
+    hashed, and every line is a worktree-only modification of a tracked path, so tracked
+    content and modes equal HEAD and no path is untracked or staged.
+    """
+    r,o=source_fields(recorded),source_fields(observed)
+    if any(r[k]!=o[k] for k in SOURCE_FIELDS if k!='status_sha256'):return False
+    if r['status_sha256']!=EMPTY_SHA256 or o['tracked_diff_sha256']!=EMPTY_SHA256:return False
+    if set(recorded)!=set(observed) or recorded.get('inputs')!=observed.get('inputs'):return False
+    lines=status.get('_lines')
+    if status.get('sha256')!=o['status_sha256'] or not lines or status.get('truncated') or status.get('omitted_credential_like'):return False
+    return all(xy==' M' for xy,_ in lines)
+def public_status(status):
+    return {k:v for k,v in status.items() if k!='_lines'}
+
 class SourceDrift(Refusal):
     """A checkout whose source identity differs, with every field recorded beside observed."""
-    def __init__(self,reason,repo,recorded,observed):
+    def __init__(self,reason,repo,recorded,observed,status=None):
         super().__init__(reason);r,o=source_fields(recorded),source_fields(observed)
         other=lambda row:{k:v for k,v in row.items() if k not in ('head','status_sha256','tracked_diff_sha256','inputs')} if isinstance(row,dict) else None
         inputs=lambda row:{k:v for k,v in row.get('inputs',{}).items() if k not in ('mise.toml','rust-toolchain.toml')} if isinstance(row,dict) and isinstance(row.get('inputs'),dict) else None
         self.source_drift=drift_evidence({'repository':str(repo),'fields':{k:{'recorded':r[k],'observed':o[k],'differs':r[k]!=o[k]} for k in SOURCE_FIELDS},
-                                          'other_fields_differ':other(recorded)!=other(observed) or inputs(recorded)!=inputs(observed)})
+                                          'other_fields_differ':other(recorded)!=other(observed) or inputs(recorded)!=inputs(observed),
+                                          **({} if status is None else {'status':public_status(status)})})
 def validate_runtime(unit,pid,cgline,maxmem,maxswap,properties,runtime_seconds=240):
     need(maxmem=='536870912' and maxswap=='0','effective metadata cap')
     need(properties.get('MemoryMax')==maxmem and properties.get('MemorySwapMax')=='0' and properties.get('KillMode')=='control-group' and properties.get('OOMPolicy')=='continue' and properties.get('MainPID')==str(pid),'loaded metadata properties')
@@ -130,12 +203,19 @@ def probe(payload):
     helper=str(new/'toolchain-state.py');sources={};checks={}
     for repo,expected in [(Path(profile()['startup_repositories']['default']),s['default_source']),(Path(profile()['startup_repositories']['retained']),s['retained_source'])]:
         first=json.loads(command(['/usr/bin/python3',helper,'source',str(repo)],30,env,repo))
-        if first!=expected:raise SourceDrift('existing source drift',repo,expected,first)
+        stale=None
+        if first!=expected:
+            status=status_record(repo,env)
+            if not stat_only_status(expected,first,status):raise SourceDrift('existing source drift',repo,expected,first,status)
+            stale=dict(public_status(status),stat_only=True)
         check=json.loads(command(['/bin/bash',str(new/'repository-start.sh'),str(repo)],55,env,repo))
         need(check['native_started'] is False and check['status']=='tools-ready-workload-admission-still-required' and check['uid']==uid,'checker outcome')
         last=json.loads(command(['/usr/bin/python3',helper,'source',str(repo)],30,env,repo))
-        if last!=first:raise SourceDrift('existing source changed during qualification',repo,first,last)
+        # The checker may refresh the index, so a stat-only status can clear, but content cannot move.
+        if last!=first and not (stale is not None and (last==expected or stat_only_status(expected,last,status_record(repo,env)))):
+            raise SourceDrift('existing source changed during qualification',repo,first,last,status_record(repo,env))
         sources[str(repo)]={'before':first,'after':last};checks[str(repo)]={'status':check['status'],'installed_bindings':check['installed_bindings']}
+        if stale is not None:sources[str(repo)]['stat_only_status']=status_evidence(stale)
     after,_=safe_file(state/'toolchain.json',uid,denied,1024*1024);need(after==before,'manifest changed during checker')
     # Check parent capacity, excluding the deliberately smaller metadata service.
     ancestors=[];ancestor=cg.parent

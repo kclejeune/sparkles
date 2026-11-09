@@ -1576,6 +1576,77 @@ class SourceDriftRecord(unittest.TestCase):
         self.assertEqual(self.git(repo,'diff','HEAD','--binary'),self.git(copy,'diff','HEAD','--binary'))
 
 
+class StatOnlyStatus(SourceDriftRecord):
+    """Item 778. A restored symbolic link whose lstat size differs from its index entry
+    shows as ` M` with an empty tracked diff, which runs 6, 7 and 10 refused as drift."""
+    def source(self,repo):
+        # The installed helper's identity, as toolchain-state.py computes it.
+        sha=lambda b:hashlib.sha256(b).hexdigest()
+        return {'head':self.git(repo,'rev-parse','HEAD').decode().strip(),'status_sha256':sha(self.git(repo,'status','--porcelain=v1','-z')),
+                'tracked_diff_sha256':sha(self.git(repo,'diff','HEAD','--binary','--no-ext-diff','--no-textconv')),'inputs':{'mise.toml':'c'*64,'rust-toolchain.toml':'f'*64}}
+
+    def linked(self):
+        repo=self.repository();(repo/'crates').mkdir();os.symlink('../a.txt',repo/'crates'/'LICENSE')
+        self.git(repo,'add','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','-c','commit.gpgsign=false','commit','-qm','link')
+        return repo
+
+    def stale_link_size(self,repo,size=99):
+        """Write the size a restored filesystem could report into the link's index entry."""
+        import struct
+        d=bytearray((repo/'.git'/'index').read_bytes());n=struct.unpack('>I',d[8:12])[0];off=12
+        for _ in range(n):
+            mode=struct.unpack('>I',d[off+24:off+28])[0];nl=struct.unpack('>H',d[off+60:off+62])[0]&0xfff
+            if mode==0o120000:d[off+36:off+40]=struct.pack('>I',size)
+            off+=(62+nl+8)&~7
+        d=d[:-20];d+=hashlib.sha1(d).digest();(repo/'.git'/'index').write_bytes(bytes(d))
+
+    def test_a_stale_link_size_is_a_stat_only_status(self):
+        repo=self.linked();clean=self.source(repo);self.stale_link_size(repo)
+        self.assertEqual(self.git(repo,'status','--porcelain=v1','-z'),b' M crates/LICENSE\0')
+        # No refresh clears it, since git trusts the size difference without reading the link.
+        self.git(repo,'update-index','-q','--really-refresh');observed=self.source(repo)
+        self.assertNotEqual(observed['status_sha256'],clean['status_sha256']);self.assertEqual(observed['tracked_diff_sha256'],clean['tracked_diff_sha256'])
+        status=self.O['status_record'](repo,None)
+        self.assertEqual(status['sha256'],observed['status_sha256'])
+        self.assertEqual(self.O['public_status'](status)['entries'],[{'xy':' M','path':'crates/LICENSE','kind':'link','bytes':8,'mode':0o120777,'index_mode':0o120000,'index_bytes':99}])
+        self.assertTrue(self.O['stat_only_status'](clean,observed,status))
+        # The drift record keeps the lines bounded when the probe refuses.
+        drift=self.O['SourceDrift']('existing source drift',repo,clean,observed,status).source_drift
+        self.assertEqual(drift['status']['entries'][0]['xy'],' M');self.assertEqual(drift['status']['entries'][0]['index_bytes'],99)
+        self.assertNotIn('_lines',drift['status'])
+
+    def test_content_untracked_and_staged_changes_stay_drift(self):
+        cases={}
+        repo=self.linked();clean=self.source(repo);(repo/'a.txt').write_text('changed\n');cases['content']=(repo,clean)
+        repo=self.linked();clean=self.source(repo);(repo/'new.txt').write_text('x\n');cases['untracked']=(repo,clean)
+        repo=self.linked();clean=self.source(repo);(repo/'a.txt').write_text('staged\n');self.git(repo,'add','a.txt');(repo/'a.txt').write_text('a\n');cases['staged then restored']=(repo,clean)
+        repo=self.linked();clean=self.source(repo);(repo/'run.sh').chmod(0o644);cases['mode']=(repo,clean)
+        repo=self.linked();clean=self.source(repo);self.stale_link_size(repo);(repo/'new.txt').write_text('x\n');cases['stale link and untracked']=(repo,clean)
+        repo=self.linked();clean=self.source(repo);(repo/'.netrc-copy').write_text('x\n');cases['credential-like']=(repo,clean)
+        for name,(repo,clean) in cases.items():
+            with self.subTest(name):
+                observed=self.source(repo);status=self.O['status_record'](repo,None)
+                self.assertNotEqual(observed,clean);self.assertFalse(self.O['stat_only_status'](clean,observed,status))
+        repo,clean=cases['credential-like'];status=self.O['public_status'](self.O['status_record'](repo,None))
+        self.assertEqual((status['omitted_credential_like'],status['entries']),(1,[]))
+        # A stat-only status against a recording that was not clean, or a listing other than the hashed one, is still drift.
+        repo=self.linked();clean=self.source(repo);self.stale_link_size(repo);observed=self.source(repo);status=self.O['status_record'](repo,None)
+        self.assertFalse(self.O['stat_only_status'](dict(clean,status_sha256='1'*64),observed,status))
+        self.assertFalse(self.O['stat_only_status'](clean,observed,dict(status,sha256='2'*64)))
+        self.assertFalse(self.O['stat_only_status'](clean,dict(observed,head='9'*40),status))
+
+    def test_status_evidence_is_bounded(self):
+        x={'sha256':'$(x)','total':-1,'entries':[{'xy':'ZZ','path':'a\x1b[31m'+'b'*400,'kind':'socket','bytes':'7','note':'DO_NOT_COPY'}]*300,'secret':'DO_NOT_COPY'}
+        row=self.O['status_evidence'](x);self.assertNotIn('DO_NOT_COPY',json.dumps(row))
+        self.assertEqual(len(row['entries']),200);e=row['entries'][0]
+        self.assertEqual((e['xy'],e['kind'],e['bytes'],len(e['path'])),(None,None,None,300));self.assertNotIn('\x1b',e['path'])
+        self.assertIsNone(row['sha256']);self.assertIsNone(row['total'])
+        self.assertEqual(controller.drift_evidence({'repository':'/r','fields':{},'status':x})['status'],row)
+
+    def test_the_credential_stems_match_the_diagnostic(self):
+        self.assertEqual(self.O['STATUS_CREDENTIAL_STEMS'],diagnostic_module().CREDENTIAL_STEMS)
+
+
 class SourceDriftBounds(SourceDriftRecord):
     """The drift summary keeps its reason code, its time and output bounds, and git's formats."""
     def test_both_drift_reason_codes_survive_into_the_receipt(self):

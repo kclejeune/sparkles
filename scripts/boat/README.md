@@ -40,7 +40,12 @@ The lifecycle requests one 10,800-second resume and arms a local guard at the ea
 seconds, which covers the 12-hour extension cap, the wait for a running extension act
 and the stop margin. The provider TTL stays the worker's backstop. It checks the live guard's boot, invocation,
 loaded command, PID, cgroup and limits. Null, malformed or lost acknowledgements retain
-the start reservation and never authorize another resume. Provider readiness alone does
+the start reservation and never authorize another resume. `resume-outcome.json` keeps a
+bounded summary of the reply beside the acceptance, with its byte and line counts,
+whether it parsed as one JSON document or as JSON lines, and for at most four objects
+their key names and the `event`, `status`, `state`, `code`, `ok` and error code fields.
+A field value is kept only when it is a short lowercase word, and the worker ID only in
+its `bx_` form, so messages, URLs and other provider text never reach the record. Provider readiness alone does
 not qualify the worker. The pinned provisioning hook may run its reviewed normal setup,
 including first bootstrap. Actual bootstrap-lock, descendant, tool, manifest, source,
 capacity, token metadata and metadata-service closure checks must pass afterward. A
@@ -118,9 +123,27 @@ inodes, mtimes or the device, so those changes leave the identity unchanged, but
 track the executable bit. When the identity differs, the metadata refusal keeps a
 `source_drift` record with each field's recorded and observed value and whether it
 differs, and a flag for any field outside the identity. A changed status hash with an
-unchanged diff hash points to untracked files or a change in what is staged, and a
-changed diff hash to tracked content or modes. The probe runs no git command of its own for the record, so a
-repository's filters and hooks get no further chance to run.
+unchanged diff hash points to untracked files, a change in what is staged or stale index
+stat data, and a changed diff hash to tracked content or modes.
+
+When the identity differs, the probe lists the checkout's porcelain status itself, with
+no fsmonitor, untracked cache or optional lock, and keeps up to 200 lines in the
+`status` part of the drift record. Each line has its XY code and path, the path's
+`lstat` kind, size and mode, and for a tracked path the size and mode its index entry
+records. Paths follow the credential-like rule of the untracked list below. Git reports
+` M` without reading a file when its size differs from the size its index entry
+records, and no refresh clears it, which a restored symbolic link can cause. The
+startup checkout has one symbolic link, `crates/sparkles-py/LICENSE`, and the ` M` line
+of that path is the status change this produces.
+The probe therefore accepts a status that differs only in such lines. It requires a
+clean recorded status, every other identity field unchanged, an empty tracked diff
+against HEAD, its own listing hashing to the status the helper observed, and every line
+a worktree-only ` M` of a tracked path. Tracked content and modes then equal HEAD, and
+no path is untracked, staged or hidden as credential-like. The qualification keeps the
+lines as `stat_only_status` beside the checkout's source observations. Any other status
+change remains a refusal, and so does a stat-only status whose content later changes
+during the checker. The repository's filters run only for git's own status and diff,
+and no hook runs.
 
 A refused qualification holds its stop trigger for at most 600 seconds when the resume
 was acknowledged and the worker was seen running. During the hold the controller runs
@@ -357,7 +380,12 @@ watch records `closure-watch-unresolved.json` with the last reason code and leav
 guard's own deadline stop in place. One watch runs per operation.
 
 `finish` waits up to 180 seconds for the same operation's verified completed/nonforced
-stop, current stopped/snapshot proof and clean local guard exit. A pending, submitted,
+stop, current stopped/snapshot proof and clean local guard exit. The guard is a transient
+unit started without `--collect`, so systemd unloads it after a clean exit and keeps a
+failed guard loaded as failed. A guard unit that is no longer loaded, with no invocation
+and no main process, is therefore the original guard after its clean exit, and its
+recorded cgroup must be gone or empty. A loaded unit with another invocation is still a
+replaced guard. A pending, submitted,
 unknown or unresolved stop fails and retains reconciliation ownership. It never forces,
 resumes, retries stop or selects another worker. `request-stop --operation OPERATION`
 remains available to submit the trigger without claiming completion. Recovery uses the
