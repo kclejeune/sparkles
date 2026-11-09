@@ -127,17 +127,6 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
         preparation.check()?;
         return finish(access, snap.clone(), held, preparation, input);
     };
-    for rule in &rules.rules {
-        preparation.check()?;
-        if rule.read.is_all() {
-            continue;
-        }
-        if rule.protection.pattern.is_some() {
-            return Err(Error::Unsupported(
-                "controlled permission preparation does not yet support protection pattern planning".into(),
-            ));
-        }
-    }
     let (key, key_held) = cache_key(&access, rules, preparation)?;
     if let Some(mask) = &snap.mask {
         // A mask left by another policy could show triples this policy hides, so only
@@ -531,6 +520,17 @@ fn hidden(
                 )
             })
             .transpose()?;
+        let pass = match &protection.pattern {
+            Some(pattern) => Some(passes(
+                snap,
+                protection,
+                pattern,
+                &rules.caller,
+                &rules.limits,
+                preparation,
+            )?),
+            None => None,
+        };
         let mut by_graph = Map::new(preparation)?;
         let mut visit = |quad: [Id; 4]| -> Result<bool> {
             preparation.check()?;
@@ -566,7 +566,7 @@ fn hidden(
                 by_graph.insert(graph.0, hide)?;
                 hide
             };
-            if hide {
+            if hide && !pass.as_ref().is_some_and(|pass| pass.passes(&quad)) {
                 if hidden.len() as u64 >= rules.limits.max_hidden {
                     return Err(too_many(
                         &rules.limits,
@@ -611,6 +611,140 @@ fn hidden(
     }
     hidden.truncate(kept);
     Ok(hidden)
+}
+
+/// The solutions of a protection's pattern, as [`super::Passes`] holds them for the
+/// legacy path, in a map charged to the preparation.
+enum Pass {
+    All,
+    None,
+    Keys {
+        cols: [bool; 3],
+        set: Map<[u64; 3], ()>,
+    },
+}
+
+impl Pass {
+    fn passes(&self, quad: &[Id; 4]) -> bool {
+        match self {
+            Self::All => true,
+            Self::None => false,
+            Self::Keys { cols, set } => {
+                let mut key = [0; 3];
+                for (index, on) in cols.iter().enumerate() {
+                    if *on {
+                        key[index] = quad[index].0;
+                    }
+                }
+                set.contains_key(&key)
+            }
+        }
+    }
+}
+
+/// Evaluate a protection's pattern as [`super::passes`] does, with every graph merged
+/// into the default graph and `GRAPH` for the named ones. The query text, the list of
+/// named graphs and the pattern's query are charged to `preparation`, and the query
+/// runs under its controls on the unmasked snapshot.
+fn passes(
+    snap: &Arc<Snapshot>,
+    protection: &Protection,
+    pattern: &str,
+    caller: &Caller,
+    limits: &Limits,
+    preparation: &Preparation,
+) -> Result<Pass> {
+    preparation.check()?;
+    // The text holds the prefixes, the caller's values as escaped literals and the
+    // pattern. Escaping at most doubles a value, and building it formats each piece once.
+    let inputs = protection
+        .prefixes
+        .iter()
+        .map(|(k, v)| k.len().saturating_add(v.len()).saturating_add(16))
+        .chain(caller.user.iter().map(String::len))
+        .chain(caller.roles.iter().map(String::len))
+        .chain(caller.groups.iter().map(String::len))
+        .fold(pattern.len(), usize::saturating_add);
+    let text_bytes = (inputs as u64).saturating_mul(4).saturating_add(1024);
+    let _text_held = preparation.reserve(text_bytes)?;
+    let Some((text, cols)) = pattern_query(protection, pattern, caller) else {
+        return Ok(Pass::None);
+    };
+    if text.capacity() as u64 > text_bytes {
+        return Err(preparation.exhausted());
+    }
+    let graphs = snap.graph_ids()?;
+    let mut named_held = preparation.reserve(
+        (graphs.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<Id>() as u64)
+            .saturating_add(
+                (graphs.len() as u64).saturating_mul(std::mem::size_of::<String>() as u64),
+            ),
+    )?;
+    let mut named: Vec<String> = Vec::new();
+    named
+        .try_reserve_exact(graphs.len())
+        .map_err(|_| preparation.exhausted())?;
+    for graph in graphs {
+        preparation.with_term(snap, graph, |term| {
+            if let Some(Term::NamedNode(node)) = term {
+                named_held.merge(preparation.reserve(node.as_str().len() as u64)?);
+                named.push(node.as_str().to_owned());
+            }
+            Ok(())
+        })?;
+    }
+    let opts = crate::sparql::QueryOptions {
+        default_graph_extra: named,
+        max_rows: Some(usize::try_from(limits.max_pattern_rows).unwrap_or(usize::MAX)),
+        ..preparation.nested_query_options()
+    };
+    let rows_refused = |requested| {
+        Error::BudgetExceeded(Budget {
+            kind: BudgetKind::Rows,
+            limit: limits.max_pattern_rows,
+            requested,
+        })
+    };
+    let view = GraphAccess::all().masked_controlled(snap, preparation)?;
+    let result = crate::sparql::query_prepared_source(view.read_source(), &text, &opts).map_err(
+        |error| match error {
+            Error::BudgetExceeded(Budget {
+                kind: BudgetKind::Rows,
+                ..
+            }) => rows_refused(limits.max_pattern_rows.saturating_add(1)),
+            Error::SparqlSyntax(error) => Error::invalid(format!(
+                "the pattern of protection '{}': {error}",
+                protection.name
+            )),
+            error => error,
+        },
+    )?;
+    let table = result.table();
+    if table.len() as u64 > limits.max_pattern_rows {
+        return Err(rows_refused(table.len() as u64));
+    }
+    if !cols.iter().any(|on| *on) {
+        return Ok(if table.is_empty() {
+            Pass::None
+        } else {
+            Pass::All
+        });
+    }
+    let mut set = Map::new(preparation)?;
+    for row in 0..table.len() {
+        preparation.check()?;
+        let mut key = [0; 3];
+        let mut column = 0;
+        for (index, on) in cols.iter().enumerate() {
+            if *on {
+                key[index] = table.get(row, column)?.0;
+                column += 1;
+            }
+        }
+        set.insert(key, ())?;
+    }
+    Ok(Pass::Keys { cols, set })
 }
 
 /// Lower the predicate statistics for the hidden quads the delta had inserted, by
@@ -1192,5 +1326,79 @@ mod tests {
             );
             assert_eq!(store.snapshot().len(), 1);
         }
+    }
+
+    fn owned_by(user: &str) -> GraphAccess {
+        GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::none(),
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "owned".into(),
+                        predicates: Some(vec!["urn:p".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: Some("?s <urn:owner> ?user".into()),
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller {
+                    user: Some(user.into()),
+                    ..Caller::default()
+                },
+                limits: Limits::default(),
+            },
+        )
+    }
+
+    fn quads(snap: &Snapshot) -> Vec<[Id; 4]> {
+        let mut out = Vec::new();
+        snap.for_each_quad(|q| {
+            out.push(*q);
+            Ok(())
+        })
+        .unwrap();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn protection_patterns_hide_what_the_legacy_mask_hides_and_key_their_caller() {
+        let store = crate::store::Store::in_memory(Default::default());
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:a> <urn:p> 1 . <urn:b> <urn:p> 2 . \
+             <urn:a> <urn:owner> \"alice\" . <urn:b> <urn:owner> \"bob\" . \
+             GRAPH <urn:g> { <urn:c> <urn:p> 3 . <urn:c> <urn:owner> \"alice\" } }",
+            &Default::default(),
+        )
+        .unwrap();
+        let snap = store.snapshot();
+        let all = quads(&snap);
+        for user in ["alice", "bob", "carol"] {
+            let access = owned_by(user);
+            let legacy = quads(&access.masked(&snap).unwrap());
+            let prep = Preparation::new(Control::none(), 8 << 20).unwrap();
+            let view = access.masked_controlled(&snap, &prep).unwrap();
+            assert_eq!(quads(view.snapshot()), legacy, "{user}");
+            let hidden = all.len() - legacy.len();
+            let expected = match user {
+                "alice" => 1,
+                "bob" => 2,
+                _ => 3,
+            };
+            assert_eq!(hidden, expected, "{user}");
+        }
+        let prep = Preparation::new(Control::none(), 8 << 20).unwrap();
+        let alice = owned_by("alice");
+        let bob = owned_by("bob");
+        let (a, _a_held) = cache_key(&alice, alice.triples.as_ref().unwrap(), &prep).unwrap();
+        let (b, _b_held) = cache_key(&bob, bob.triples.as_ref().unwrap(), &prep).unwrap();
+        assert_ne!(a, b, "a pattern's mask is keyed by its caller");
     }
 }

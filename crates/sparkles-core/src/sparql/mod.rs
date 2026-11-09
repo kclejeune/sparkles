@@ -1200,6 +1200,19 @@ pub fn query_source(
     Ok(result)
 }
 
+/// Run query text over a source that this crate has just prepared, without the store
+/// instance check of [`query_source`]. Permission preparation evaluates the patterns of
+/// protections this way, so that their work is charged to the same preparation.
+pub(crate) fn query_prepared_source(
+    source: crate::store::BoundReadSource,
+    q: &str,
+    opts: &QueryOptions,
+) -> Result<QueryResult> {
+    source.query_input().2.check()?;
+    let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
+    execute_retained_source(source, &parsed, opts, 0.0)
+}
+
 /// Execute an already parsed query using a genuine physical source and the
 /// actual Store. The caller still supplies current policy and original controls;
 /// retaining a source grants no authority and cannot relabel its paid parent.

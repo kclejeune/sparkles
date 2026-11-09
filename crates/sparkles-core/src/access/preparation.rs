@@ -340,6 +340,18 @@ impl Preparation {
         Ok(view)
     }
 
+    /// Options that carry this preparation's descendant query controls, if it has
+    /// any, so that a query it runs over its own source reuses them unchanged.
+    pub(crate) fn nested_query_options(&self) -> crate::sparql::QueryOptions {
+        let mut opts = crate::sparql::QueryOptions::default();
+        if let Some(query) = &self.query {
+            opts.cancel = query.cancel.clone();
+            opts.cancellation = query.cancellation.clone();
+            opts.deadline = query.deadline;
+        }
+        opts
+    }
+
     pub(crate) fn grant(&self) -> Option<&Arc<crate::sparql::pool::PoolGrant>> {
         self.inner.grant.as_ref()
     }
