@@ -27,6 +27,9 @@ The `expect` heads of `POST /$/merge/{ds}`, `POST /$/cherry-pick/{ds}` and
 branch UUID, or a null in their place, now returns `400` instead of being ignored.
 Omitted fields and an empty object keep their previous meaning.
 
+The `--mode` flag of `sparkles ingest` accepts `claims` (item 651). Every value it
+accepted before parses and behaves as before.
+
 ### Added
 
 Roadmap item 651 adds a `claims` mode to `POST /$/ingest/{ds}` and `sparkles ingest`. It registers
