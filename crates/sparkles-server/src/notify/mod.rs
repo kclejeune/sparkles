@@ -3,9 +3,11 @@
 //!
 //! [`raise`] routes an event to the channels of the `notifications` settings kind,
 //! skips it while a lasting condition with the same key was notified less than its
-//! repeat interval ago, and queues one delivery per channel. One worker thread sends
-//! the deliveries through the server's outbound policy and retries the transient
-//! failures with backoff. The keys of lasting conditions are kept in
+//! repeat interval ago, and queues one delivery per channel. Each channel has its own
+//! queue, its share of [`MAX_QUEUE`], and its own worker thread, which sends the
+//! channel's deliveries through the server's outbound policy and retries the transient
+//! failures with backoff, so a channel that hangs or fails holds only its own
+//! deliveries. Raising an event never waits for a delivery. The keys of lasting conditions are kept in
 //! `<dataDir>/notifications-state.json`, and the queue, the counters and the recent
 //! deliveries live in the process.
 //!
@@ -27,18 +29,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-/// The most deliveries that wait in the queue (§6.5).
+/// The deliveries that the channels' queues share (§6.5). Each channel holds its share
+/// of them, at least [`MIN_SHARE`], counting the one in flight.
 const MAX_QUEUE: usize = 1000;
+/// The smallest share of a channel's queue.
+const MIN_SHARE: usize = 50;
 /// The recent deliveries that `GET /$/notifications` lists.
 const RECENT: usize = 50;
 /// The file of the keys of lasting conditions, in the data directory.
 pub const STATE_FILE: &str = "notifications-state.json";
-/// The longest the worker waits before it looks at the server again.
+/// The longest a worker waits before it looks at the server again.
 const IDLE: Duration = Duration::from_millis(500);
+/// How long a channel's worker stays with an empty queue before it ends. The next
+/// delivery to the channel starts a new one.
+const LINGER: Duration = Duration::from_secs(30);
 
 /// How serious an event is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,8 +118,35 @@ pub struct Notifier {
 #[derive(Default)]
 struct Shared {
     inner: Mutex<Inner>,
-    wake: Condvar,
-    started: AtomicBool,
+}
+
+/// The queue of one channel and the state of its worker thread.
+struct Lane {
+    queue: Vec<Job>,
+    /// the deliveries the queue holds, the one in flight included
+    capacity: usize,
+    /// whether the worker is sending a delivery
+    in_flight: bool,
+    /// whether a worker thread serves the lane
+    running: bool,
+    wake: Arc<Condvar>,
+}
+
+impl Lane {
+    fn new(capacity: usize) -> Lane {
+        Lane {
+            queue: Vec::new(),
+            capacity,
+            in_flight: false,
+            running: false,
+            wake: Arc::new(Condvar::new()),
+        }
+    }
+}
+
+/// A channel's share of the queue when the kind has `channels` channels.
+fn share(channels: usize) -> usize {
+    (MAX_QUEUE / channels.max(1)).max(MIN_SHARE)
 }
 
 /// One delivery: the envelope, the channel as it was when the event was raised, and
@@ -165,7 +199,8 @@ struct ChannelStatus {
 
 #[derive(Default)]
 struct Inner {
-    queue: Vec<Job>,
+    /// the channels' queues, by channel name
+    lanes: BTreeMap<String, Lane>,
     /// the keys of lasting conditions, read from the state file at the first use
     active: Option<BTreeMap<String, Active>>,
     channels: BTreeMap<String, ChannelStatus>,
@@ -191,6 +226,11 @@ fn parse_state(bytes: &[u8]) -> sparkles::error::Result<BTreeMap<String, Active>
 }
 
 impl Inner {
+    /// The deliveries waiting in every channel's queue.
+    fn queued(&self) -> usize {
+        self.lanes.values().map(|l| l.queue.len()).sum()
+    }
+
     fn active(&mut self, st: &AppState) -> &mut BTreeMap<String, Active> {
         self.active.get_or_insert_with(|| {
             let Some(p) = state_path(st) else {
@@ -312,42 +352,62 @@ fn envelope(cfg: &NotifySettings, ev: &Event, now: DateTime<Utc>) -> Value {
 }
 
 impl Notifier {
-    /// Start the delivery worker unless it runs.
-    fn start(&self, st: &Arc<AppState>) {
-        if self.shared.started.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let shared = self.shared.clone();
-        let weak = Arc::downgrade(st);
-        let spawned = std::thread::Builder::new()
-            .name("notify-delivery".into())
-            .spawn(move || worker(shared, weak));
-        if let Err(e) = spawned {
-            self.shared.started.store(false, Ordering::SeqCst);
-            tracing::error!(target: "sparkles::notify", "cannot start the delivery worker: {e}");
-        }
-    }
-
-    fn enqueue(&self, st: &Arc<AppState>, jobs: Vec<Job>) {
-        let mut dropped = Vec::new();
-        {
-            let mut g = self.shared.inner.lock();
-            for j in jobs {
-                if g.queue.len() >= MAX_QUEUE {
-                    dropped.push(j);
-                } else {
-                    g.queue.push(j);
+    /// Queue `jobs`, each in its channel's queue, when the kind has `channels`
+    /// channels. A delivery that does not fit its channel's share is dropped (§6.5).
+    fn enqueue(&self, st: &Arc<AppState>, jobs: Vec<Job>, channels: usize) {
+        let cap = share(channels);
+        let mut g = self.shared.inner.lock();
+        for j in jobs {
+            let lane = g
+                .lanes
+                .entry(j.channel.clone())
+                .or_insert_with(|| Lane::new(cap));
+            lane.capacity = cap;
+            if lane.queue.len() + usize::from(lane.in_flight) >= lane.capacity {
+                tracing::warn!(target: "sparkles::notify", channel = j.channel.as_str(), event = j.event,
+                    capacity = cap, "the channel's notification queue is full, a delivery is dropped");
+                g.record(
+                    &j,
+                    "dropped",
+                    json!({ "error": "the channel's queue is full" }),
+                    0,
+                );
+                continue;
+            }
+            let name = j.channel.clone();
+            lane.queue.push(j);
+            lane.wake.notify_one();
+            if !lane.running {
+                lane.running = true;
+                if let Err(e) = spawn_worker(&self.shared, st, &name) {
+                    tracing::error!(target: "sparkles::notify", channel = name.as_str(),
+                        "cannot start the channel's delivery worker: {e}");
+                    let lane = g.lanes.remove(&name).unwrap_or_else(|| Lane::new(cap));
+                    for j in lane.queue {
+                        g.record(
+                            &j,
+                            "dropped",
+                            json!({ "error": "the channel's delivery worker cannot start" }),
+                            0,
+                        );
+                    }
                 }
             }
-            for j in &dropped {
-                tracing::warn!(target: "sparkles::notify", channel = j.channel.as_str(), event = j.event,
-                    "the notification queue is full, a delivery is dropped");
-                g.record(j, "dropped", json!({ "error": "the queue is full" }), 0);
-            }
         }
-        self.shared.wake.notify_all();
-        self.start(st);
     }
+}
+
+fn spawn_worker(shared: &Arc<Shared>, st: &Arc<AppState>, channel: &str) -> std::io::Result<()> {
+    let shared = shared.clone();
+    let weak = Arc::downgrade(st);
+    let name = channel.to_string();
+    std::thread::Builder::new()
+        .name(format!(
+            "notify-{}",
+            channel.chars().take(8).collect::<String>()
+        ))
+        .spawn(move || worker(shared, weak, name))
+        .map(|_| ())
 }
 
 /// Raise `ev` at `now`: route it, hold it back while `cond` was notified less than its
@@ -404,7 +464,7 @@ pub fn raise(st: &Arc<AppState>, ev: Event, cond: Option<Condition>, now: DateTi
             })
         })
         .collect();
-    n.enqueue(st, jobs);
+    n.enqueue(st, jobs, cfg.channels.len());
     Raised::Queued(channels)
 }
 
@@ -434,33 +494,59 @@ enum Attempt {
     Refused(String),
 }
 
-fn worker(shared: Arc<Shared>, weak: Weak<AppState>) {
+/// The worker of channel `name`: it sends the deliveries of the channel's queue in
+/// the order they are due, and ends when the server is gone or the queue stayed empty
+/// for [`LINGER`].
+fn worker(shared: Arc<Shared>, weak: Weak<AppState>, name: String) {
+    let mut idle_since = Instant::now();
     loop {
         let job = {
             let mut g = shared.inner.lock();
+            let Some(lane) = g.lanes.get_mut(&name) else {
+                return;
+            };
             let now = Instant::now();
-            let next = g
+            let next = lane
                 .queue
                 .iter()
                 .enumerate()
                 .min_by_key(|(_, j)| j.due)
                 .map(|(i, j)| (i, j.due));
             match next {
-                Some((i, due)) if due <= now => Some(g.queue.swap_remove(i)),
+                Some((i, due)) if due <= now => {
+                    lane.in_flight = true;
+                    Some(lane.queue.swap_remove(i))
+                }
                 Some((_, due)) => {
-                    shared.wake.wait_for(&mut g, (due - now).min(IDLE));
+                    idle_since = now;
+                    let wake = lane.wake.clone();
+                    wake.wait_for(&mut g, (due - now).min(IDLE));
                     None
                 }
+                None if now.duration_since(idle_since) >= LINGER => {
+                    g.lanes.remove(&name);
+                    return;
+                }
                 None => {
-                    shared.wake.wait_for(&mut g, IDLE);
+                    let wake = lane.wake.clone();
+                    wake.wait_for(&mut g, IDLE);
                     None
                 }
             }
         };
-        let Some(st) = weak.upgrade() else { return };
+        let Some(st) = weak.upgrade() else {
+            if let Some(lane) = shared.inner.lock().lanes.get_mut(&name) {
+                lane.running = false;
+                lane.in_flight = false;
+            }
+            return;
+        };
         let Some(mut job) = job else { continue };
         let outcome = attempt(&st, &job.channel, &job.config, &job.envelope, &job.delivery);
+        drop(st);
+        idle_since = Instant::now();
         let mut g = shared.inner.lock();
+        let mut retry = None;
         match outcome {
             Attempt::Ok(status) => {
                 tracing::info!(target: "sparkles::notify", channel = job.channel.as_str(), event = job.event, status, "notification delivered");
@@ -473,7 +559,7 @@ fn worker(shared: Arc<Shared>, weak: Weak<AppState>) {
                 tracing::info!(target: "sparkles::notify", channel = job.channel.as_str(), event = job.event,
                     attempt = job.attempt, wait_secs = wait.as_secs_f64(), "notification retried: {e}");
                 job.due = Instant::now() + wait;
-                g.queue.push(job);
+                retry = Some(job);
             }
             Attempt::Retry(e, _) | Attempt::Failed(e) => {
                 tracing::warn!(target: "sparkles::notify", channel = job.channel.as_str(), event = job.event,
@@ -484,6 +570,13 @@ fn worker(shared: Arc<Shared>, weak: Weak<AppState>) {
                 tracing::warn!(target: "sparkles::notify", channel = job.channel.as_str(), event = job.event,
                     "notification refused by the outbound policy: {e}");
                 g.record(&job, "refused", json!({ "error": e }), job.attempt);
+            }
+        }
+        // a retry waits in the channel's own queue, in the place its attempt held
+        if let Some(lane) = g.lanes.get_mut(&name) {
+            lane.in_flight = false;
+            if let Some(j) = retry {
+                lane.queue.push(j);
             }
         }
     }
@@ -740,6 +833,7 @@ pub fn status_json(st: &AppState) -> Value {
         .iter()
         .map(|(name, c)| {
             let s = g.channels.get(name).cloned().unwrap_or_default();
+            let lane = g.lanes.get(name);
             json!({
                 "name": name,
                 "type": c.type_name(),
@@ -749,6 +843,9 @@ pub fn status_json(st: &AppState) -> Value {
                 "lastFailure": s.last_failure,
                 "sent": s.sent,
                 "failed": s.failed,
+                "queued": lane.map_or(0, |l| l.queue.len()),
+                "inFlight": lane.is_some_and(|l| l.in_flight),
+                "queueCapacity": lane.map_or_else(|| share(cfg.channels.len()), |l| l.capacity),
             })
         })
         .collect();
@@ -756,7 +853,7 @@ pub fn status_json(st: &AppState) -> Value {
         "enabled": cfg.enabled,
         "channels": channels,
         "routes": cfg.routes,
-        "queued": g.queue.len(),
+        "queued": g.queued(),
         "active": active,
         "recent": g.recent.iter().cloned().collect::<Vec<_>>(),
     })
@@ -826,7 +923,35 @@ pub fn metrics(st: &AppState, out: &mut String) {
         out,
         "sparkles_notifications_queued",
         "gauge",
-        "Notification deliveries waiting in the queue.",
+        "Notification deliveries waiting in the channels' queues.",
     );
-    let _ = writeln!(out, "sparkles_notifications_queued {}", g.queue.len());
+    let _ = writeln!(out, "sparkles_notifications_queued {}", g.queued());
+    family(
+        out,
+        "sparkles_notifications_channel_queued",
+        "gauge",
+        "Notification deliveries waiting in a channel's queue, by channel.",
+    );
+    for (c, l) in &g.lanes {
+        let _ = writeln!(
+            out,
+            "sparkles_notifications_channel_queued{{channel=\"{}\"}} {}",
+            label(c),
+            l.queue.len()
+        );
+    }
+    family(
+        out,
+        "sparkles_notifications_channel_queue_capacity",
+        "gauge",
+        "The deliveries a channel's queue holds, the one in flight included; a delivery beyond it ends dropped.",
+    );
+    for (c, l) in &g.lanes {
+        let _ = writeln!(
+            out,
+            "sparkles_notifications_channel_queue_capacity{{channel=\"{}\"}} {}",
+            label(c),
+            l.capacity
+        );
+    }
 }

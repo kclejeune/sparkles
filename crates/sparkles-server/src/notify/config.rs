@@ -32,6 +32,10 @@ const SECRET_MEMBERS: &[&str] = &["token", "urlSecret", "signingSecret"];
 /// The ntfy server a channel uses without `server`.
 pub const NTFY_SH: &str = "https://ntfy.sh";
 
+/// The most channels the kind holds. Each channel has a delivery thread of its own,
+/// so the cap bounds the threads.
+pub const MAX_CHANNELS: usize = 32;
+
 /// The shortest repeat interval, in days (one minute).
 const MIN_REPEAT_DAYS: f64 = 1.0 / 1440.0;
 
@@ -328,6 +332,12 @@ impl NotifySettings {
             check_url(b, true).map_err(|e| format!("baseUrl: {e}"))?;
         }
         days("repeatEvery", &self.repeat_every)?;
+        if self.channels.len() > MAX_CHANNELS {
+            return Err(format!(
+                "channels: at most {MAX_CHANNELS} channels, not {}",
+                self.channels.len()
+            ));
+        }
         for (name, c) in &self.channels {
             crate::models::check_secret_name(name).map_err(|_| {
                 format!("channels: {name:?} is not a channel name of letters, digits, _, - and .")

@@ -73,7 +73,8 @@ callers and records the selected numeric user in its receipt.
   waits too long, a backup policy run fails, or a provider's daily token budget is used
   up ([C21](../specs/C21-outbound-notifications.md), [API.md](../API.md#notifications),
   [USAGE.md](../USAGE.md#sending-notifications)). Channels and routes are a server settings
-  kind, failures are retried with backoff, and `sparkles notify status` and
+  kind, failures are retried with backoff, each channel delivers from its own queue so
+  that a slow channel delays no other, and `sparkles notify status` and
   `sparkles notify test` show and test channels.
 
 ### Memory and resource limits

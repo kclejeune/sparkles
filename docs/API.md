@@ -14309,7 +14309,7 @@ defaults, the settings file's `server.notifications` object and the runtime laye
 | `server` | The server's name in each notification. The host name by default. |
 | `baseUrl` | The URL of the server, which makes the links of notifications absolute. Without it a link is a path under `/ui`. |
 | `repeatEvery` | The shortest time between two notifications about one lasting condition, at least `1m`. `1d` by default. |
-| `channels` | Channels by name. A name has the form of a secret's name. |
+| `channels` | Channels by name, at most 32. A name has the form of a secret's name. |
 | `routes` | Event types to channel names. A key is an event type, a prefix such as `backup.*`, or `*`. An event goes to the union of the channels of every key that matches it. |
 | `delivery` | `attempts` from 1 to 10 with the first included, `backoffSecs` before the second attempt and doubled for each later one, `maxBackoffSecs`, and `timeoutSecs` per attempt, at most the outbound policy's timeout. |
 
@@ -14378,18 +14378,25 @@ Every request goes through the outbound policy. A channel on a loopback or priva
 address needs `--outbound-allow-private`, and a refused delivery is not retried. A
 connection error, a timeout, `408`, `429` and `5xx` are retried with backoff, honoring
 `Retry-After` up to `maxBackoffSecs`. Other answers and a missing secret end the
-delivery. Deliveries wait in a queue in the process of at most 1,000 entries, which a
-restart loses.
+delivery. Each channel has a queue and a delivery thread of its own, so a channel that
+hangs or fails delays only its own deliveries, and raising an event never waits for one.
+A channel's queue holds its share of 1,000 deliveries, which is 1,000 divided by the
+number of channels and at least 50, counting the delivery in flight. A retry waits in
+its channel's queue. A delivery that does not fit is dropped with the result `dropped`
+and a warning in the log. The queues live in the process, and a restart loses them.
 
 | Method | Path | Needs | Effect |
 |---|---|---|---|
-| GET | `/$/notifications` | `server-admin` | `{enabled, channels, routes, queued, active, recent}`. Each channel has its `name`, `type`, `target` without credentials, `secrets`, `lastSuccess`, `lastFailure`, `sent` and `failed`. `active` lists the conditions that were notified, and `recent` the last 50 deliveries with their `result` (`ok`, `failed`, `refused` or `dropped`) and `attempts`. |
+| GET | `/$/notifications` | `server-admin` | `{enabled, channels, routes, queued, active, recent}`. Each channel has its `name`, `type`, `target` without credentials, `secrets`, `lastSuccess`, `lastFailure`, `sent`, `failed`, `queued`, `inFlight` and `queueCapacity`. `active` lists the conditions that were notified, and `recent` the last 50 deliveries with their `result` (`ok`, `failed`, `refused` or `dropped`) and `attempts`. |
 | POST | `/$/notifications/test/{channel}` | `server-admin` | Sends a `notification.test` now, in one attempt. `200` with `{channel, type, result, status, id, latencyMs}`, `404` with `unknown-channel`, or `502` with `delivery-failed` or `outbound-refused` and the error. |
 
 The metrics are `sparkles_notifications_sent_total{channel,event,result}`,
 `sparkles_notifications_retries_total{channel}`,
-`sparkles_notifications_suppressed_total{event}` and the gauge
-`sparkles_notifications_queued`. A test send is logged under `sparkles::audit` as
+`sparkles_notifications_suppressed_total{event}`, the gauge
+`sparkles_notifications_queued` of every channel's waiting deliveries, and the gauges
+`sparkles_notifications_channel_queued{channel}` and
+`sparkles_notifications_channel_queue_capacity{channel}`. A dropped delivery counts in
+`sparkles_notifications_sent_total` with `result="dropped"`. A test send is logged under `sparkles::audit` as
 `notification_test` with the channel, the result and the `principal`, and each failed
 delivery is logged under `sparkles::notify` with an error that never holds a secret.
 `sparkles notify status` and `sparkles notify test CHANNEL` use these routes.

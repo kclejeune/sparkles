@@ -450,6 +450,14 @@ CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
 
+Notification channels deliver independently (item 46). Each channel has its own queue
+and delivery thread, so a webhook or ntfy server that hangs or fails delays only its own
+deliveries. A channel's queue holds its share of 1,000 deliveries, at least 50, and a
+delivery beyond it ends `dropped` for that channel alone. The `notifications` kind holds
+at most 32 channels. `GET /$/notifications` reports each channel's `queued`, `inFlight`
+and `queueCapacity`, and the gauges `sparkles_notifications_channel_queued` and
+`sparkles_notifications_channel_queue_capacity` show them per channel.
+
 The web UI's Browse term page has a new layout (roadmap item 734). A right rail of cards holds
 Metadata, with the cross-references as Identifiers by database above the downloads, and then
 Hierarchy, whose place no longer changes between Tree and Graph. The graph in the rail shows the

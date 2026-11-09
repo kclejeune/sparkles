@@ -9,6 +9,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::Ordering;
 use tower::ServiceExt;
 
 /// One request the receiver got.
@@ -655,4 +656,169 @@ fn a_newer_state_file_is_refused() {
     assert!(parse_state(br#"{"active": {}}"#).unwrap().is_empty());
     let saved = sparkles::formats::settings_to_vec(STATE_FILE, &StateFile::default()).unwrap();
     assert!(parse_state(&saved).is_ok());
+}
+
+/// A local server that accepts connections and never answers, as a hung webhook does.
+struct Stalled {
+    port: u16,
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Stalled {
+    fn start() -> Stalled {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let accepted: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+        let a = accepted.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for c in l.incoming() {
+                let Ok(c) = c else { continue };
+                a.fetch_add(1, Ordering::SeqCst);
+                held.push(c);
+            }
+        });
+        Stalled { port, accepted }
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}/hook", self.port)
+    }
+}
+
+/// The channel's entry in `GET /$/notifications`.
+fn channel_of(v: &Value, name: &str) -> Value {
+    v["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == name)
+        .cloned()
+        .unwrap()
+}
+
+/// A hung channel holds only its own deliveries: an event for another channel, raised
+/// after the hung one's, arrives at once while the hung channel waits for its timeout,
+/// and raising events never waits for a delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hung_channel_does_not_delay_the_others() {
+    let slow = Stalled::start();
+    let rx = Receiver::start(vec![]);
+    let f = fixture(None, true);
+    let (s, v) = f
+        .patch(json!({
+            "enabled": true,
+            "channels": {
+                "slow": {"type": "webhook", "url": slow.url()},
+                "fast": {"type": "webhook", "url": rx.url()}
+            },
+            "routes": {"backup.*": ["slow"], "memory.*": ["fast"]},
+            "delivery": {"attempts": 1, "backoffSecs": 1, "maxBackoffSecs": 1, "timeoutSecs": 20},
+        }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    for _ in 0..3 {
+        let t = Instant::now();
+        raise(&f.st, event("backup.failed"), None, Utc::now());
+        assert!(
+            t.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+    // the hung channel has started its first attempt
+    for _ in 0..200 {
+        if slow.accepted.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(slow.accepted.load(Ordering::SeqCst), 1);
+    let t = Instant::now();
+    raise(&f.st, event("memory.review.pending"), None, Utc::now());
+    let v = settled(&f.st, "fast", 1).await;
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert_eq!(rx.got().len(), 1);
+    assert_eq!(channel_of(&v, "fast")["sent"], 1);
+    let s = channel_of(&v, "slow");
+    assert_eq!(s["sent"], 0);
+    assert_eq!(s["failed"], 0);
+    assert_eq!(s["queued"], 2, "{v}");
+    assert_eq!(v["queued"], 2, "{v}");
+    let m = f.metrics().await;
+    assert!(
+        m.contains(r#"sparkles_notifications_channel_queued{channel="slow"} 2"#),
+        "{m}"
+    );
+    assert!(m.contains("sparkles_notifications_queued 2"), "{m}");
+}
+
+/// Each channel has its share of the queue, at least 50 deliveries: a hung channel
+/// that fills its share drops its own new deliveries with the result `dropped`, and
+/// another channel still queues and delivers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_channel_queue_drops_only_its_own_deliveries() {
+    let slow = Stalled::start();
+    let rx = Receiver::start(vec![]);
+    let f = fixture(None, true);
+    let mut channels = serde_json::Map::new();
+    channels.insert("slow".into(), json!({"type": "webhook", "url": slow.url()}));
+    channels.insert("fast".into(), json!({"type": "webhook", "url": rx.url()}));
+    // 30 channels: a share of 1000 / 30 = 33, raised to the floor of 50
+    for i in 0..28 {
+        channels.insert(
+            format!("idle{i}"),
+            json!({"type": "webhook", "url": "https://hooks.example.org/x"}),
+        );
+    }
+    let (s, v) = f
+        .patch(json!({
+            "enabled": true,
+            "channels": channels,
+            "routes": {"backup.*": ["slow"], "memory.*": ["fast"]},
+            "delivery": {"attempts": 1, "backoffSecs": 1, "maxBackoffSecs": 1, "timeoutSecs": 20},
+        }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    for _ in 0..60 {
+        raise(&f.st, event("backup.failed"), None, Utc::now());
+    }
+    raise(&f.st, event("memory.review.pending"), None, Utc::now());
+    for _ in 0..200 {
+        if slow.accepted.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let v = settled(&f.st, "fast", 1).await;
+    assert_eq!(channel_of(&v, "fast")["sent"], 1);
+    let s = channel_of(&v, "slow");
+    // one in flight and 49 waiting fill the share of 50, and the other 10 are dropped
+    assert_eq!(s["queueCapacity"], 50, "{v}");
+    assert_eq!(s["queued"], 49, "{v}");
+    assert_eq!(s["failed"], 10, "{v}");
+    assert_eq!(s["lastFailure"]["error"], "the channel's queue is full");
+    let m = f.metrics().await;
+    assert!(m.contains(r#"sparkles_notifications_sent_total{channel="slow",event="backup.failed",result="dropped"} 10"#), "{m}");
+    assert!(
+        m.contains(r#"sparkles_notifications_channel_queue_capacity{channel="slow"} 50"#),
+        "{m}"
+    );
+}
+
+/// The kind has at most 32 channels, which bounds the delivery threads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_kind_has_at_most_32_channels() {
+    let f = fixture(None, true);
+    let channels: serde_json::Map<String, Value> = (0..33)
+        .map(|i| {
+            (
+                format!("c{i}"),
+                json!({"type": "webhook", "url": "https://hooks.example.org/x"}),
+            )
+        })
+        .collect();
+    let (s, v) = f.patch(json!({ "channels": channels })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v.to_string().contains("at most 32"), "{v}");
 }

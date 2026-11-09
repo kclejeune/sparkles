@@ -532,8 +532,21 @@ These points differ from the design or settle what it left open.
 - Secrets have no new flag. The declared source of a notification secret is
   `--model-secret`, and on NixOS `services.sparkles.models.secrets`. A dedicated
   `--secret` flag would be clearer and is left for later.
-- One worker thread sends the deliveries in turn, so a channel that times out delays
-  the others by up to `timeoutSecs` per attempt.
+- Each channel has its own queue and delivery thread (item 46). A channel's queue
+  holds its share of the 1,000 deliveries of §6.5, which is 1,000 divided by the number
+  of channels and at least 50, and the delivery in flight counts against it. A
+  delivery that does not fit ends `dropped`, as §6.5 says for the single queue, and
+  only the channel that is full drops. A retry waits in its channel's queue, so a
+  channel that times out or fails delays only its own deliveries, and raising an event
+  never waits for a delivery. The kind holds at most 32 channels, which bounds the
+  threads, and a channel's thread ends after 30 seconds with an empty queue. The
+  gauges `sparkles_notifications_channel_queued{channel}` and
+  `sparkles_notifications_channel_queue_capacity{channel}` show each queue, and the
+  channel entries of `GET /$/notifications` gain `queued`, `inFlight` and
+  `queueCapacity`. With 32 channels the shares add up to 1,600 deliveries, since the
+  floor of 50 is kept. The tests hold one webhook that never answers while another
+  channel receives an event raised after the hung one's within a second, and fill a
+  hung channel's share of 50 while another channel still delivers.
 - A test send is counted in the metrics and the channel status with the event
   `notification.test`.
 - The OpenAPI description gained a shared `502` response, `BadGateway`.
