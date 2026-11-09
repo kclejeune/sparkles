@@ -478,6 +478,32 @@ class LifetimeExtension(unittest.TestCase):
                 path.write_text(json.dumps(value));path.chmod(0o600)
                 with self.assertRaises(ValueError):self.lifetime()
 
+    def test_an_acceptance_written_late_grants_nothing(self):
+        io=self.io(self.left-600);self.extend(io,3600,accept=False)
+        # The guard samples its clocks in time, but the write ends after the previous end.
+        guard=ExtendIO(self.f,self.f['now']+self.left-40,self.f['boot_now']+self.left-40);real=guard.record
+        def slow(name,value):
+            real(name,value)
+            if name.endswith('-accepted.json'):guard.t+=41;guard.w+=41
+        guard.record=slow
+        self.assertEqual(controller.guard_deadlines(guard,self.intent),(self.original['boot_end'],self.original['wall_end']))
+        self.assertEqual(controller.guard_deadlines(guard,self.intent),(self.original['boot_end'],self.original['wall_end']))
+        # The guard's veto record makes every other reader ignore that acceptance too.
+        self.assertTrue((self.op/'lifetime-extension-0001-vetoed.json').exists())
+        self.assertEqual(self.lifetime(),self.original)
+        # Too close to the end, the guard does not accept at all.
+        (self.op/'lifetime-extension-0001-accepted.json').unlink();(self.op/'lifetime-extension-0001-vetoed.json').unlink()
+        near=ExtendIO(self.f,self.f['now']+self.left-20,self.f['boot_now']+self.left-20)
+        self.assertEqual(controller.guard_deadlines(near,self.intent),(self.original['boot_end'],self.original['wall_end']))
+        self.assertFalse((self.op/'lifetime-extension-0001-accepted.json').exists())
+
+    def test_acceptances_follow_each_other_in_order(self):
+        self.extend(self.io(self.left-600),3600);second=self.extend(self.io(self.left+1000),10500)
+        path=self.op/'lifetime-extension-0001-accepted.json';first=json.loads(path.read_text())
+        moved=dict(first,accepted_boottime=second['observed_boottime']+1,accepted_wall=second['observed_wall']+1)
+        path.write_text(json.dumps(moved));path.chmod(0o600)
+        with self.assertRaises(ValueError):self.lifetime()
+
     def test_concurrent_stop_trigger_does_not_end_the_guard_before_reconciliation(self):
         guard=controller.RealIO(self.f['release'],self.op);real=guard.exists
         def racing(name):

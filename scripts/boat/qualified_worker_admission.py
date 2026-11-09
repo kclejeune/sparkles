@@ -52,7 +52,8 @@ def extension_names(names):
     numbers=[];accepted=[]
     for name in names:
         if not name.startswith('lifetime-extension-')or re.fullmatch('lifetime-extension-attempt-[0-9a-f]{32}(-failed)?[.]json',name):continue
-        match=re.fullmatch('lifetime-extension-([0-9]{4})(-accepted)?[.]json',name);require(match is not None,'malformed lifetime extension name')
+        match=re.fullmatch('lifetime-extension-([0-9]{4})(-accepted|-vetoed)?[.]json',name);require(match is not None,'malformed lifetime extension name')
+        if match[2]=='-vetoed':continue
         if match[2]:accepted.append(int(match[1]))
         else:numbers.append(int(match[1]))
     numbers.sort();accepted.sort();require(numbers==list(range(1,len(numbers)+1)),'lifetime extension sequence gap')
@@ -75,7 +76,7 @@ def acceptance_record(number,e,identity,now_wall,now_boot):
             'guard':{'boot_id':identity['boot_id'],'invocation_id':identity['invocation_id']},
             'accepted_wall':now_wall,'accepted_boottime':now_boot}
 
-def apply_extensions(names,read,intent,wall,boot,identity,accept=None):
+def apply_extensions(names,read,intent,wall,boot,identity,accept=None,vetoed=()):
     """Return the end pair after the guard-accepted prefix of valid receipts.
 
     Each act is observed after the previous act was published and published
@@ -83,7 +84,12 @@ def apply_extensions(names,read,intent,wall,boot,identity,accept=None):
     receipt grants time only when the guard accepted it, by its own clocks,
     before the previous end. The guard passes ``accept``, which records that
     acceptance or returns None, and every other reader only checks the record.
-    A malformed receipt or acceptance refuses the whole chain.
+    An acceptance must leave the closure reserve before the previous end, so
+    its own publication completes in time, and each act is observed after the
+    previous acceptance. The guard vetoes an acceptance whose publication it saw
+    finish late, in memory and with a veto record, and a vetoed acceptance grants
+    nothing to any reader. A
+    malformed receipt or acceptance refuses the whole chain.
     """
     numbers=extension_names(names);after=identity['handoff_boottime'];granted=0;open_chain=True
     for number in numbers:
@@ -108,14 +114,18 @@ def apply_extensions(names,read,intent,wall,boot,identity,accept=None):
         require(adoption['environment_version']==environment['version'] and adoption['environment_version_id']==environment['version_id'] and adoption['hook_sha256']==environment['hook_sha256'] and hexsha(adoption['environment_fact_sha256']),'lifetime extension environment adoption')
         if not open_chain:continue
         name='lifetime-extension-%04d-accepted.json'%number
+        if number in vetoed or 'lifetime-extension-%04d-vetoed.json'%number in names:
+            open_chain=False;continue
         if name in names:
             a=read(name)
             require(isinstance(a,dict)and a.get('schema')==ACCEPTANCE_SCHEMA and type(a.get('version'))is int and a['version']==1,'unknown lifetime extension acceptance schema')
             require(set(a)=={'schema','version','sequence','receipt_sha256','guard','accepted_wall','accepted_boottime'}and a['sequence']==number and a['receipt_sha256']==receipt_digest(e) and a['guard']==e['guard'],'lifetime extension acceptance identity')
-            require(finite(a['accepted_wall'])and finite(a['accepted_boottime'])and a['accepted_boottime']>=e['published_boottime'] and a['accepted_wall']<wall and a['accepted_boottime']<boot,'lifetime extension accepted after the previous end')
-        elif accept is None or accept(number,e,wall,boot) is None:
-            open_chain=False;continue
-        wall,boot,after=e['wall_end'],e['boot_end'],e['published_boottime'];granted+=1
+            require(finite(a['accepted_wall'])and finite(a['accepted_boottime'])and a['accepted_boottime']>=e['published_boottime'] and a['accepted_wall']+CLOSURE_RESERVE<wall and a['accepted_boottime']+CLOSURE_RESERVE<boot,'lifetime extension accepted after the previous end')
+        else:
+            a=None if accept is None else accept(number,e,wall,boot)
+            if a is None:
+                open_chain=False;continue
+        wall,boot,after=e['wall_end'],e['boot_end'],a['accepted_boottime'];granted+=1
     return wall,boot,granted
 
 def operation_identity(intent,guard,qualification,operation_id,profile):

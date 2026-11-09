@@ -405,12 +405,22 @@ def guard_deadlines(io,intent):
         if not lifetime.extension_names(names):return base
         guard=io.read('guard-admission.json')
         identity=lifetime.operation_identity(intent,guard,io.read('qualification.json'),io.r['guard_unit'],profile())
+        vetoed=io.__dict__.setdefault('vetoed_acceptances',set())
         def accept(number,e,wall,boot):
+            # Accept only with the closure reserve left, and confirm after the write
+            # that it finished before the previous end. A late write is vetoed for the
+            # guard's life, so the guard stops, and its stop trigger refuses admission.
             now_wall,now_boot=io.wall(),io.mono()
-            if not(now_wall<wall and now_boot<boot):return None
+            if not(now_wall+lifetime.CLOSURE_RESERVE<wall and now_boot+lifetime.CLOSURE_RESERVE<boot):return None
             row=lifetime.acceptance_record(number,e,identity,now_wall,now_boot)
-            io.record('lifetime-extension-%04d-accepted.json'%number,row);return row
-        wall,boot,_=lifetime.apply_extensions(names,io.read,intent,base[1],base[0],identity,accept)
+            io.record('lifetime-extension-%04d-accepted.json'%number,row)
+            if not(io.wall()<wall and io.mono()<boot):
+                vetoed.add(number)
+                try:io.record('lifetime-extension-%04d-vetoed.json'%number,{'sequence':number,'receipt_sha256':row['receipt_sha256'],'observed_wall':io.wall(),'observed_boottime':io.mono()})
+                except Exception:pass
+                return None
+            return row
+        wall,boot,_=lifetime.apply_extensions(names,io.read,intent,base[1],base[0],identity,accept,vetoed)
         return boot,wall
     except Exception:return base
 

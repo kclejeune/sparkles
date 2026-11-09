@@ -126,7 +126,9 @@ while the 30-second closure reserve remains. The receipt records that publicatio
 with the observation, provider confirmation and adoption facts. A receipt grants time
 only after the running guard accepts it. The guard reads new receipts on every pass and
 records `lifetime-extension-NNNN-accepted.json`, bound to the receipt's digest, only
-when its own clocks are still before the previous end. The command waits up to 15
+while its own clocks leave the closure reserve before the previous end. If that write
+finishes after the previous end, the guard records a veto, ignores the acceptance for
+its life and stops at the earlier end. Each act must follow the previous acceptance. The command waits up to 15
 seconds for that acceptance and exits nonzero without it. A later act refuses while an
 earlier receipt is unaccepted. One act runs at a time
 under the operation's extension lock. The guard takes the same lock before it stops,
