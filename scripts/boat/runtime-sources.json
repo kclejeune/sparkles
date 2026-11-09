@@ -1,9 +1,9 @@
 {
   "files": {
     "README.md": {
-      "bytes": 30690,
+      "bytes": 30809,
       "mode": 420,
-      "sha256": "9515a8160d46972cf05f61d05eef201f21706847b66b29dcb449d10adbd9fec3"
+      "sha256": "97bc39594e40169ece3d7eb999e74b81704d72ab824eee0c20ed66a49dd6a62a"
     },
     "common.py": {
       "bytes": 24734,
@@ -41,9 +41,9 @@
       "sha256": "8ce4e8aed1186d9660c477111ccdf92c5679437bd8afc393720341cdca3f4dbd"
     },
     "metadata-probe.py": {
-      "bytes": 24942,
+      "bytes": 25601,
       "mode": 420,
-      "sha256": "80206f6f886e40798376c7f8e7010947f14eeaf1d0556d2a2a61739b1185c05c"
+      "sha256": "8053168cd135c40bea0fb65cd38ba91ec7e79f8d1e1451bfaa35eaf8ee2e5a6a"
     },
     "owned_group.py": {
       "bytes": 9498,

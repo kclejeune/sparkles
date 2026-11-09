@@ -1729,6 +1729,23 @@ class TransientStatOnlyStatus(unittest.TestCase):
             with self.assertRaises(self.O['SourceDrift']):self.O['startup_source'](repo,clean,observe,None,lambda s:None)
             self.assertEqual(len(seen),2)
 
+    def test_a_listing_with_any_other_drift_is_refused(self):
+        # Review round 2. The probe's own listing can show a change the helper's observation
+        # missed. A listing with anything but stale link lines refuses at every step, here
+        # with the helper's rows injected and the checkout itself changed.
+        link=lambda clean:dict(clean,status_sha256=self.line('crates/LICENSE'))
+        for change in ('content','untracked'):
+            for rows in (lambda c:[link(c),link(c),c],lambda c:[link(c),c],lambda c:[link(c)]):
+                with self.subTest(change=change,rows=len(rows({}))):
+                    repo=self.linked();clean=self.source(repo)
+                    if change=='content':(repo/'a.txt').write_text('changed\n')
+                    else:(repo/'new.txt').write_text('x\n')
+                    seq=rows(clean);seen=[]
+                    def observe():seen.append(seq[min(len(seen),len(seq)-1)]);return seen[-1]
+                    with self.assertRaises(self.O['SourceDrift']) as caught:self.O['startup_source'](repo,clean,observe,None,lambda s:None)
+                    self.assertLessEqual(len(seen),2)
+                    self.assertEqual([e['xy'] for e in caught.exception.source_drift['status']['entries']],[' M' if change=='content' else '??'])
+
     def test_a_link_line_still_listed_keeps_the_item_778_path(self):
         repo=self.linked();clean=self.source(repo);self.stale_link_size(repo);rows=[]
         def observe():rows.append(self.source(repo));return rows[-1]
@@ -1775,8 +1792,13 @@ class TransientStatOnlyStatus(unittest.TestCase):
     def test_the_second_observation_must_be_clean_or_stat_only(self):
         repo=self.linked();clean=self.source(repo);(repo/'new.txt').write_text('x\n');dirty=self.source(repo)
         drift=self.refused(repo,clean,[dict(clean,status_sha256=self.line('crates/LICENSE')),dirty])
-        self.assertEqual(drift['fields']['status_sha256']['observed'],dirty['status_sha256'])
+        # The probe's first listing already shows the untracked file, so it refuses there.
+        self.assertEqual(drift['fields']['status_sha256']['observed'],self.line('crates/LICENSE'))
         self.assertEqual([e['xy'] for e in drift['status']['entries']],['??'])
+        # A dirty helper reread with a clean listing refuses at the reread.
+        (repo/'new.txt').unlink()
+        drift=self.refused(repo,clean,[dict(clean,status_sha256=self.line('crates/LICENSE')),dirty])
+        self.assertEqual(drift['fields']['status_sha256']['observed'],dirty['status_sha256'])
 
     def test_a_subset_of_several_links_is_attributed_in_git_order(self):
         repo=self.linked()

@@ -165,7 +165,8 @@ path never accounts for a status. The probe then observes the checkout again, up
 times a second apart, and needs an observation equal to the recording or one that its
 own listing shows to be stat-only as above. A reread whose status the links cannot
 account for in the same way, or whose other fields differ, is a refusal at once, even
-when a later observation would be clean. The record marks such a status `transient`
+when a later observation would be clean. So is any listing of the probe's own, at the
+first observation or a reread, with a line that is not a stale link line. The record marks such a status `transient`
 and names the links it attributed. No index refresh is used, since git keeps a size
 mismatch without reading the link and a refresh would only write the startup checkout's
 index. Any other status change

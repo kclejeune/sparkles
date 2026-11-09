@@ -114,6 +114,13 @@ def stat_only_status(recorded,observed,status):
     if set(recorded)!=set(observed) or recorded.get('inputs')!=observed.get('inputs'):return False
     lines=status.get('_lines')
     if status.get('sha256')!=o['status_sha256'] or not lines or status.get('truncated') or status.get('omitted_credential_like'):return False
+    return stat_only_listing(status)
+def stat_only_listing(status):
+    """Whether the probe's own listing is complete and every line in it, if any, is a stale
+    link line: a worktree-only ` M` of a link in the worktree, the index and HEAD, whose lstat
+    size differs from its index size and whose raw target is the blob HEAD records."""
+    lines=status.get('_lines')
+    if not isinstance(lines,list) or 'unread' in status or status.get('truncated') or status.get('omitted_credential_like'):return False
     entries=status.get('entries') or []
     if len(entries)!=len(lines):return False
     return all(xy==' M' and e.get('xy')==' M' and e.get('kind')=='link' and e.get('index_mode')==0o120000 and isinstance(e.get('index_bytes'),int)
@@ -182,18 +189,20 @@ def startup_source(repo,expected,observe,env,pause=None):
     if first==expected:return first,None
     status=status_record(repo,env)
     if stat_only_status(expected,first,status):return first,dict(public_status(status),stat_only=True)
-    try:names=stat_only_lines(expected,first,repo,env)
-    except Exception:names=None
+    def attributed(row):
+        try:return stat_only_lines(expected,row,repo,env)
+        except Exception:return None
+    # The probe's own listing must show nothing but stale link lines at every step too.
+    names=attributed(first) if stat_only_listing(status) else None
     if names is None:raise SourceDrift('existing source drift',repo,expected,first,status)
     again,now=first,status
     for attempt in range(SOURCE_REREADS):
         if attempt:(pause or __import__('time').sleep)(1)
         again=observe();now=status_record(repo,env)
+        if not stat_only_listing(now):break
         if again==expected or stat_only_status(expected,again,now):
             return first,dict(public_status(now),stat_only=True,transient=True,attributed=[raw.decode('utf-8','replace') for raw in names])
-        try:still=stat_only_lines(expected,again,repo,env)
-        except Exception:still=None
-        if still is None:break
+        if attributed(again) is None:break
     raise SourceDrift('existing source drift',repo,expected,again,now)
 
 class SourceDrift(Refusal):
