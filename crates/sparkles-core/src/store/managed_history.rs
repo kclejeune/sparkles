@@ -44,8 +44,14 @@ pub(crate) fn check_activated_registry(
         Some(crate::managed::ManagedState::Installed(installed)) => {
             installed.configuration_history.is_some()
         }
-        // An unavailable registry already refuses what depends on it.
-        Some(crate::managed::ManagedState::Unavailable { .. }) => return Ok(()),
+        // An unavailable registry refuses what depends on it, but only a readable
+        // history root keeps an activated family from reading as legacy.
+        Some(crate::managed::ManagedState::Unavailable { .. }) => {
+            match std::fs::read(root.join(crate::managed::FILE)) {
+                Ok(bytes) => matches!(crate::managed::recorded_history(&bytes), Ok(Some(_))),
+                Err(_) => false,
+            }
+        }
         None => false,
     };
     if !anchored && activation_recorded(root)? {

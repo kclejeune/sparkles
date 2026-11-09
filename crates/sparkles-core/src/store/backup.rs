@@ -1605,6 +1605,12 @@ impl Store {
             .prefix(MEMORY_CAPTURE_PREFIX)
             .tempdir_in(&o.tmp_dir)?;
         let dir = tmp.path();
+        // The captured registry, not the live one, decides the versions this
+        // capture writes: in-memory activation can race the build below.
+        let activated = super::managed_history::activated(
+            managed_state.as_deref(),
+            self.managed_root().as_deref(),
+        );
         let history_files = match managed_state.as_deref() {
             Some(crate::managed::ManagedState::Installed(installed))
                 if installed.configuration_history.is_some() =>
@@ -1681,14 +1687,11 @@ impl Store {
                 self.dataset_id,
                 "memory",
                 &commit,
-                self.configuration_activated(),
+                activated,
                 binding,
             ),
         )?;
-        super::wal::create(
-            &gdir.join("wal.log"),
-            super::wal::version_for(self.configuration_activated()),
-        )?;
+        super::wal::create(&gdir.join("wal.log"), super::wal::version_for(activated))?;
         super::sync_dir(&gdir)?;
         crate::commit::Catalog::create(&dir.join("commits.bin"), self.dataset_id, commit)?;
         let mut files = Vec::new();
@@ -1737,7 +1740,7 @@ impl Store {
             dataset = crate::commit::with_reader(&dataset, crate::managed::READER)?;
         }
         // the capture holds version 2 files of an activated store, which need its reader
-        if !history_files.is_empty() {
+        if activated {
             dataset = crate::commit::with_reader(&dataset, super::managed_history::READER)?;
         }
         files.push(meta_file("dataset.json", dataset));
@@ -4998,6 +5001,54 @@ mod tests {
 
     /// An in-memory capture is a database with the store's id, head and content; its
     /// temporary directory goes with the lease.
+    /// In-memory activation can race a memory capture's build. The capture writes
+    /// the versions of the registry it captured, so it stays consistent and opens.
+    #[test]
+    fn a_memory_capture_racing_activation_keeps_its_captured_versions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::in_memory(StoreOptions::default()));
+        update(
+            &store,
+            "INSERT DATA { <urn:s> <urn:p> 1 }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let racing = store.clone();
+        let activated = Arc::new(AtomicBool::new(false));
+        let once = activated.clone();
+        let o = MemoryCaptureOptions {
+            tmp_dir: tmp.path().join("scratch"),
+            progress: Some(Arc::new(move |_, message: &str| {
+                if message == "writing quads" && !once.swap(true, Ordering::SeqCst) {
+                    let preparation =
+                        crate::access::Preparation::new(crate::task::Control::none(), 64 << 20)
+                            .unwrap();
+                    racing
+                        .activate_memory_configuration_history(&preparation)
+                        .unwrap();
+                }
+            })),
+            ..Default::default()
+        };
+        let capture = store.memory_backup_capture("race", &o).unwrap();
+        assert!(activated.load(Ordering::SeqCst));
+        let out = tmp.path().join("restored");
+        capture.write_to(&out).unwrap();
+        drop(capture);
+        let json = |path: &str| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(out.join(path)).unwrap()).unwrap()
+        };
+        assert_eq!(json("gen-0001/commit.json")["format"], 1);
+        let wal = std::fs::read(out.join("gen-0001/wal.log")).unwrap();
+        assert_eq!(
+            &wal[..super::super::WAL_REC],
+            &super::super::wal::header_record()
+        );
+        assert!(json("dataset.json")["minimumReader"].as_u64().unwrap() < 8);
+        assert!(!out.join("evidence-history").exists());
+        drop(Store::open(&out, StoreOptions::default()).unwrap());
+    }
+
     #[test]
     fn in_memory_captures_build_a_database() {
         let tmp = tempfile::tempdir().unwrap();

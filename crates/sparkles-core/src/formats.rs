@@ -1000,15 +1000,35 @@ pub(crate) fn admit_configuration_version(
     what: &str,
     version: u32,
 ) -> Result<()> {
-    let reader = crate::store::managed_history::READER;
-    match crate::commit::read_dataset_versions(root)? {
-        Some(versions) if versions.minimum_reader < reader => Err(Error::Unsupported(format!(
-            "{what} has version {version}, which a dataset records only with configuration \
-             history (reader {reader}); this dataset records reader {}",
-            versions.minimum_reader
-        ))),
-        _ => Ok(()),
+    // Bounded readers call this, so it reads a fixed amount and decodes one member.
+    // A real dataset.json is far smaller; a larger one gives no bound here, and
+    // the dataset checks that read it whole still apply.
+    const LIMIT: u64 = 64 << 10;
+    #[derive(serde::Deserialize)]
+    struct Versions {
+        #[serde(rename = "minimumReader")]
+        minimum_reader: Option<u64>,
     }
+    let bytes = match read_bounded(&root.join("dataset.json"), LIMIT) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let recorded = serde_json::from_slice::<Versions>(&bytes)
+        .map_err(|error| {
+            Error::Corrupt(format!("{}: {error}", root.join("dataset.json").display()))
+        })?
+        .minimum_reader
+        .unwrap_or(1);
+    let reader = crate::store::managed_history::READER;
+    if recorded < u64::from(reader) {
+        return Err(Error::Unsupported(format!(
+            "{what} has version {version}, which a dataset records only with configuration \
+             history (reader {reader}); this dataset records reader {recorded}"
+        )));
+    }
+    Ok(())
 }
 
 pub fn check_settings(name: &str, v: &serde_json::Value) -> Result<u32> {
@@ -1111,6 +1131,30 @@ pub fn report() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configuration_versions_are_bounded_by_the_recorded_reader_in_a_fixed_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |value: serde_json::Value| {
+            std::fs::write(dir.path().join("dataset.json"), value.to_string()).unwrap()
+        };
+        // no dataset.json: a directory being assembled gives no bound
+        admit_configuration_version(dir.path(), "wal", 2).unwrap();
+        write(serde_json::json!({"format": 1, "minimumReader": 5}));
+        assert!(matches!(
+            admit_configuration_version(dir.path(), "wal", 2),
+            Err(Error::Unsupported(_))
+        ));
+        write(serde_json::json!({"format": 1, "minimumReader": 8}));
+        admit_configuration_version(dir.path(), "wal", 2).unwrap();
+        // the check reads a fixed amount: a larger file gives no bound here
+        write(serde_json::json!({
+            "format": 1,
+            "minimumReader": 5,
+            "extension": "x".repeat(128 << 10),
+        }));
+        admit_configuration_version(dir.path(), "wal", 2).unwrap();
+    }
+
     use super::*;
 
     #[test]

@@ -206,7 +206,12 @@ fn an_activated_store_without_its_registry_root_refuses_to_open() {
         .unwrap()
         .remove("configurationHistory");
     legacy["format"] = PLAIN_MANAGED.into();
-    for replacement in [None, Some(serde_json::to_vec_pretty(&legacy).unwrap())] {
+    // and a registry this build cannot read at all, which names no root either
+    for replacement in [
+        None,
+        Some(serde_json::to_vec_pretty(&legacy).unwrap()),
+        Some(b"{}".to_vec()),
+    ] {
         match &replacement {
             None => std::fs::remove_file(root.join("managed.json")).unwrap(),
             Some(bytes) => std::fs::write(root.join("managed.json"), bytes).unwrap(),
