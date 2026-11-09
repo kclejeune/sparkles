@@ -170,7 +170,9 @@ A request chooses a branch in one of two ways.
 When both are given they must agree, or the request gets `400`. Without either, the
 request works on `main`. Admin routes under `/$/` take `branch` as a parameter only.
 
-Every response from a branch other than `main` carries two more headers:
+A response served from a branch other than `main` carries two more headers. They come
+from the actual serving Store or operation report. A refusal before authorization or
+branch resolution discloses no branch identity:
 
 ```
 Sparkles-Branch: dev
@@ -178,7 +180,9 @@ Sparkles-Branch-Id: 9d0c41e2-…
 ```
 
 `Sparkles-Commit` gives the seq on that branch, and `Sparkles-Dataset-Id` keeps giving the
-dataset id. CORS exposes both new headers. Entity tags on a branch use the branch id,
+dataset id. A response keeps its captured branch UUID if a rename, replacement or
+deletion occurs after its snapshot. Inherited reads retain the selected branch UUID
+while their commit may belong to upstream history. CORS exposes both new headers. Entity tags on a branch use the branch id,
 `W/"<branchId>:<seq>:<format>"`, so `main`'s tags do not change and two branches never
 share a tag. The result cache keys on the generation instance and the commit, as
 [F06 §5.5](F06-snapshots-and-point-in-time.md) changed it, and each branch has its own
@@ -319,7 +323,11 @@ at most 100 objects per cell. `graphs` always counts every conflict, grouped by 
 - **`expect`.** The heads the caller saw when it read the conflict report. When either
   head has moved, the merge fails with `409 head-moved` rather than applying resolutions
   to changes the caller has not seen. This is the optimistic check that Nessie makes
-  with an expected hash.
+  with an expected hash. Supplied heads are unsigned 64-bit integers, and a supplied
+  `targetId` is a UUID string. Malformed values or a nonobject `expect` return
+  `400 invalid-merge`, including nulls. An empty object, omitted fields and `targetId` alone
+  remain valid. A revert captures one target incarnation and derives the selected
+  commit from that same lineage, including inherited commits.
 - **`inferences`.** With `exclude`, the default, changes to the inferred graph
   `urn:x-sparkles:inferred` are left out of the merge (§4.9). With `include`, the
   inferred graph merges like any other graph.
@@ -1510,6 +1518,14 @@ capabilities and remaining work are described by the spec status and Outcome.
   - a branch syntax inside `at`.
 
 ## Outcome
+
+Merge, revert and cherry-pick requests accept `expect.targetId` alongside the existing
+head expectations. The UUID pins the resolved target branch incarnation and returns
+412 if it changed. The head check retains its existing `409 head-moved` behavior.
+Previews and writes use the same expectation, and callers that omit it retain the
+existing API contract. Visual SHACL authoring uses both values for committed undo
+and redo.
+
 
 **Delivered.** Phase 1 landed on 2026-10-03. The engine came first, then the HTTP API,
 the CLI and the UI, each with its tests.

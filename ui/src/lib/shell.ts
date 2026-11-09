@@ -29,6 +29,7 @@ const CARRIES_DATASET = new Set([
   '/browse',
   '/workbench/ontology',
   '/workbench/thesaurus',
+  '/workbench/shapes',
   '/similar',
   '/similar/map',
   '/memory',
@@ -47,6 +48,7 @@ export function adminPages(backupsVisible: boolean): NavLink[] {
 export const WORKBENCH_PAGES: NavLink[] = [
   { href: '/workbench/ontology', label: 'Ontology', icon: 'tree' },
   { href: '/workbench/thesaurus', label: 'Thesaurus', icon: 'layers' },
+  { href: '/workbench/shapes', label: 'SHACL shapes', icon: 'check' },
 ];
 
 /** What the caller may see in the rail. */

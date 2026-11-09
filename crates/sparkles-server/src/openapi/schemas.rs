@@ -883,8 +883,8 @@ pub(super) fn schemas() -> Map<String, J> {
                 })),
                 "expect": {
                     "type": "object",
-                    "properties": { "source": { "type": "integer" }, "target": { "type": "integer" } },
-                    "description": "The heads the caller saw: `409 head-moved` when either moved.",
+                    "properties": { "source": { "type": "integer", "minimum": 0, "maximum": u64::MAX }, "target": { "type": "integer", "minimum": 0, "maximum": u64::MAX }, "targetId": { "type": "string", "format": "uuid" } },
+                    "description": "The heads the caller saw: `409 head-moved` when either moved. Optional targetId pins the target branch incarnation and returns 412 when it changed. Supplied heads must be unsigned 64-bit integers. A malformed expect object, head or UUID returns 400 invalid-merge; null is invalid. Omitted fields and an empty object are allowed.",
                 },
                 "base": { "type": "object", "description": "The merge base to use among several." },
                 "inferences": string_enum(&["exclude", "include"]),
@@ -908,8 +908,8 @@ pub(super) fn schemas() -> Map<String, J> {
                 "exempt": { "type": "array", "items": { "type": "string" } },
                 "expect": {
                     "type": "object",
-                    "properties": { "target": { "type": "integer" } },
-                    "description": "The head of the branch written to that the caller saw: `409 head-moved` when it moved.",
+                    "properties": { "target": { "type": "integer", "minimum": 0, "maximum": u64::MAX }, "targetId": { "type": "string", "format": "uuid" } },
+                    "description": "The head of the branch written to that the caller saw: `409 head-moved` when it moved. Optional targetId pins the target branch incarnation and returns 412 when it changed. Supplied heads must be unsigned 64-bit integers. A malformed expect object, head or UUID returns 400 invalid-merge; null is invalid. Omitted fields and an empty object are allowed.",
                 },
                 "inferences": string_enum(&["exclude", "include"]),
                 "limit": { "type": "integer" },
