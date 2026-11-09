@@ -920,3 +920,30 @@ fn retained_original_header_reauthenticates_its_target_in_each_operation() {
         .generation(&root, &preparation, seq, binding)
         .unwrap();
 }
+
+#[test]
+fn a_clone_racing_memory_activation_refuses_under_the_writer() {
+    let store = Store::in_memory(StoreOptions::default());
+    update(&store, "before");
+    store.set_failpoint(
+        "clone-admitting",
+        Some(std::sync::Arc::new(|s: &Store| {
+            s.activate_memory_configuration_history(&preparation())
+                .unwrap();
+        })),
+    );
+    let temporary = tempfile::tempdir().unwrap();
+    let destination = temporary.path().join("clone");
+    let error = store
+        .clone_to(&destination, &Default::default())
+        .expect_err("a clone admitted after activation must refuse");
+    assert_eq!(error.code(), "unsupported", "{error}");
+    assert!(!destination.exists());
+    store.set_failpoint("clone-admitting", None);
+    let error = store
+        .clone_to_memory(&Default::default(), StoreOptions::default())
+        .err()
+        .expect("an activated in-memory store must not clone");
+    assert_eq!(error.code(), "unsupported", "{error}");
+    update(&store, "after");
+}
