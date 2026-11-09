@@ -2020,10 +2020,12 @@ project it, through `sparkles::evidence::with_policy_claims` with the principal'
 A claim counts only when its occurrence is visible to the principal under the rules of
 [claim states](#claim-states) and its state is `accepted`, and it counts with its
 current decision. A triple of the output graph with no such claim, because the view
-hides its supports or they exceed the record bound of 10,000, is left out of every
-input unless another graph of the projection also holds it, in which case it enters as
-an ordinary fact with no claim. It still links its ends when the hierarchy is computed,
-as every edge the principal can read does.
+hides its supports, is left out of every input unless another graph of the projection
+also holds it, in which case it enters as an ordinary fact with no claim. It still links
+its ends when the hierarchy is computed, as every edge the principal can read does. A
+triple whose supports exceed the record bound of 10,000 refuses the run as
+`incomplete-evidence`, so a triple never leaves an input only because it gained
+supports.
 
 The rejected alternative reads only the output graph. Ordinary data such as an
 organisation chart often links the entities of accepted claims into communities, and a
@@ -2049,7 +2051,9 @@ records of the reports graph and not assessments, so the 64-input bound of an
 assessment does not apply to them, and their bounds are those below. A report of a
 higher level reaches its children's claims through those child reports. A failed report
 records no claim. A person's edit of a report keeps its citations, policy and
-configuration and has no activity, as C22 §4 says of edits.
+configuration and has no activity, as C22 §4 says of edits. A child report that a kept
+parent's activity used stays in the reports graph, with its footprint, as a child that
+the parent cites does under C22's retention rule, so the parent's provenance resolves.
 
 The rejected alternative sends each fact's claims to the model and lets it cite them.
 The claims of a fact are a function of the fact under the policy, so the server
@@ -2068,13 +2072,20 @@ the graph is proven follow the inputs with SPARQL.
 A community's claims are read within one evidence read with the resolver's shared
 preparation allowance. More than 10,000 visible occurrences behind one community's input
 refuse the run as `incomplete-evidence` before the estimate, naming the community. A run
-keeps the occurrences it reads in one table whose entries the inputs name by position,
-and counts them as it reads them. More than 1,000,000 distinct occurrences in a run, or
-more than 1,000,000 links between the triples of its inputs and their occurrences,
-refuse the run in the same way. A report never records a partial list of its inputs,
-and nothing is truncated. A report therefore names at most 10,000 claims with their
-decisions in `prov:used`, and a finding cites at most the occurrences of the facts it
-cites.
+keeps the occurrences it reads in one table whose entries the inputs name by position.
+It charges the bytes of each entry and each link to a run allowance of 256 MiB before it
+keeps them, and refuses in the same way when the allowance is spent. More than 1,000,000
+distinct occurrences in a run, or more than 1,000,000 links between the triples of its
+inputs and their occurrences, refuse the run too. A report never records a partial list
+of its inputs, and nothing is truncated.
+
+These bounds also bound what a run writes and serves. A report names at most 10,000
+claims with their decisions in `prov:used`, besides its child reports, and a finding
+cites at most the occurrences of the facts it cites. A parent's recorded pairs include
+its children's, and a pair belongs to at most one community at each of the at most eight
+levels of C22, so the state's entries of reports and pairs number at most eight per
+distinct occurrence. The responses of C22 §2.3 read the stored citations and carry no
+more than the reports hold.
 
 #### Access
 
@@ -2095,17 +2106,24 @@ changed support, a new acceptance of a projected triple or a new policy version
 therefore counts as a changed fact toward `minChangedFraction`, as a changed triple
 does.
 
-The GraphRAG state records, for each report written under a policy, the pairs of claim
-and decision its input used, and a parent's pairs include those of every child report
-its input read, so they cover a replaced child revision that the parent still reflects.
-The state's format becomes version 3. This build reads version 2 states, whose reports
-record no policy, and a release that reads only version 2 refuses version 3 as a newer
-file. A report is rewritten, whatever the fraction, when it does not record the run's
-policy and version, or records a policy that the run does not have, and when one of its
+The GraphRAG state records, for each report written under a policy, the report's IRI
+and the pairs of claim and decision its input used, which name entries of one table of
+pairs by position. A parent's pairs include those of every child report its input read,
+so they cover a replaced child revision that the parent still reflects. The state's
+format becomes version 3. This build reads version 2 states, whose reports record no
+policy, and a release that reads only version 2 refuses version 3 as a newer file. A run
+saves the state after its last commit, so a crash between commits can leave a community
+whose report in the reports graph is not the one the state names. Such a report, and
+one for which the state records no pairs, is rewritten by the next refresh.
+
+A report is rewritten, whatever the fraction, when it does not record the run's policy
+and version, or records a policy that the run does not have, and when one of its
 recorded pairs has ended. A pair has ended when its claim is not accepted under the
-policy at the run's view and the principal's access, or its decision is no longer the
-claim's current one. A claim whose current decision or withdrawal the principal can no
-longer see counts as ended, since its state can no longer be shown. A parent is
+policy at the run's view and the principal's access, when its decision is no longer the
+claim's current one, or when the claim's proposition is no longer in the output graph as
+the principal's view reads it. A claim whose current decision, withdrawal or support the
+principal can no longer see counts as ended, since its state can no longer be shown. A
+parent is
 rewritten whenever a child is rewritten for one of these reasons, whatever the share of
 its children that changed. A withdrawal, a reversal or a superseding decision of
 anything a report read therefore rewrites that report and its ancestors, while a new
@@ -2114,16 +2132,21 @@ revises, so the same check applies to it.
 
 The automatic refresh of C22 §5 counts the changes of the output graph as it counts those
 of the projection's graphs. It also makes the dataset due, without any new commit, when
-the settings' policy, the policy's version or the selected configuration generation
-differs from the one the last build recorded, so enabling, switching or removing
-`reviewPolicy` and a settings-only change take effect on an idle dataset. A commit that
-adds a decision to the policy's decisions graph, a support to its supports graph or a
-withdrawal to a proposal graph makes the dataset due as well, because such a change can
-end a support without changing the output graph. That check reads the change feed
-without the principal's view, so a record hidden from the principal still starts a
-refresh, and it reports only that the policy's evidence changed, naming no record or
-graph. The refresh then applies the rules above, so a decision that ends nothing a
-report read rewrites nothing.
+the settings' policy or the policy's version differs from the one the last build
+recorded, so enabling, switching or removing `reviewPolicy` takes effect on an idle
+dataset, and every report is then rewritten.
+
+A pair can end without any change that the principal's feed shows, through a decision,
+support or withdrawal hidden from the principal, a settings-only change of the evidence
+configuration or a reload of the access policy. The loop therefore checks the recorded
+pairs privately when a commit adds a record to the policy's decisions or supports graph
+or a withdrawal to a proposal graph, which it learns from the change feed read without
+the principal's view, when the selected configuration generation differs from the one
+it last checked, and when the access policy is reloaded or the server starts. The check
+reads the pairs under the rules above and decides only whether one has ended. When none
+has, it starts nothing and changes no status, state, task or report, so a reader cannot
+tell that it ran. When one has, the dataset is due and the refresh rewrites the reports
+that read it, as a manual refresh would.
 
 A rewrite spends tokens within `tokensPerDay` like any other. When the budget stops a
 run, a report waiting for its rewrite keeps its earlier citations, which name what it
