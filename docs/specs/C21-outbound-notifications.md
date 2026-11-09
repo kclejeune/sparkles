@@ -1,6 +1,6 @@
 # C21: Outbound notifications
 
-> **Status:** implemented in part (Phases 1 and 2)
+> **Status:** implemented
 >
 > **Phases:** Phase 1 is the `notifications` settings kind, the webhook and ntfy
 > channels, delivery with retries, deduplication and repeats, a test send, delivery
@@ -503,7 +503,7 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
-Phase 1 landed on 2026-10-10 and Phase 2 on 2026-11-09. Phase 3 is not built.
+Phase 1 landed on 2026-10-10, and Phases 2 and 3 landed on 2026-11-09.
 
 The module `crates/sparkles-server/src/notify/` holds the settings type, the delivery
 queue and worker, the events, the routes and the HMAC signing. It is not behind a cargo
@@ -605,8 +605,31 @@ These points differ from the design or settle what it left open.
 - A test send is counted in the metrics and the channel status with the event
   `notification.test`.
 - The OpenAPI description gained a shared `502` response, `BadGateway`.
-- The Notifications section of the UI is Phase 3. The server page's Models section
-  was changing in parallel work, and the API and CLI cover the operations.
+- The Notifications section of Phase 3 is
+  `ui/src/lib/components/NotificationsSettings.svelte`, on the server page after the
+  Models section and shown to server administrators only. It lists each channel with
+  its type, target, the secrets it names and whether they have a value, the routes that
+  reach it, its delivery counts, its queue and its last delivery, and it has a Send test
+  button whose answer or error stays on the channel's row. Forms add a channel of any
+  of the three types with the members it requires and add a route, which the section
+  calls the subscription of an event type to channels. Removing a channel also takes it
+  out of the routes that name it, so that the write is not refused. A runtime route left
+  without channels is removed, and a declared route keeps an empty list, since the
+  layers do not remove a declared route. Declared routes cannot be removed from the
+  section, and a channel that the settings file locks cannot be removed either. The
+  section lists the active conditions and the recent deliveries, newest first, and polls
+  the status every 10 seconds while the page is visible. The kind itself is edited with
+  C19's settings panel, whose form is built from the new `NotificationsSettings` and
+  `NotificationChannelSettings` schemas of the OpenAPI description. Each channel gets
+  the members of its type, each route is a list of channels checked against the
+  channels before a save, and a secret member shows whether its secret has a value and
+  sets one write-only. A channel's type is not a field, since changing it would leave
+  the members of the old type. `GET /$/server/secrets` already named the channels of
+  each secret, and the Models section's API keys now list them as users. An
+  OpenAPI test checks that the schemas name every member the kind and each channel type
+  accept. The mock backend serves the kind, the status and test sends, and Playwright
+  tests against it and against a real server add a webhook channel and a route, send
+  a test and see the delivery.
 - The email channel of Phase 2 is a small SMTP client in `notify/smtp.rs` on rustls,
   without a mail crate. `tls` is `starttls` or `tls`, and a plain value is refused when
   the kind is written. The port defaults to 587 or 465. A channel with `username` needs
@@ -648,13 +671,8 @@ These points differ from the design or settle what it left open.
 [ROADMAP](../ROADMAP.md)).
 
 * **The email channel (Phase 2).** This part is built, as the Outcome above records.
-* **The administration UI (Phase 3).** §11 designs a Notifications section on the server
-  page next to Models, showing `GET /$/notifications`, editing the kind with C19's
-  settings components and a Send test button per channel. The Models section that
-  delayed it has since settled (`ui/src/lib/components/ModelsSettings.svelte`), so the
-  section follows its layout. The mock server serves the notifications kind and the
-  status, and a Playwright test adds a webhook channel, sends a test and sees its
-  status.
+* **The administration UI (Phase 3).** This part is built, as the Outcome above
+  records.
 * **Broader backup-failure coverage.** This part is built, as the Outcome above
   records.
 * **Delivery that a slow channel cannot delay.** This part is built, as the Outcome

@@ -56,6 +56,12 @@ the top, refusing a cycle. Each edit is one previewed commit through the editor'
 and undo stack, and an edit of more than 1,000 changes is refused with its count.
 
 
+The server page has a Notifications section (item 46, spec C21 Phase 3). Server
+administrators list, add, edit, test and remove notification channels and routes, see
+each channel's secrets, queue and last delivery, and read the active conditions and the
+recent deliveries. The OpenAPI description gains the `NotificationsSettings` and
+`NotificationChannelSettings` schemas that the section builds its form from.
+
 Failed background backup operations raise notifications (item 46). A backup started
 by hand that fails, a policy run that stops on an error, cannot start or fails its
 retention, a verification that fails or finds a damaged backup, and a GC that fails or
