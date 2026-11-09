@@ -56,7 +56,9 @@ def shell_commands(source,remote_only=False):
             # A heredoc fed to a shell, directly or through a wrapper such as
             # mbx sparkles-task, runs as shell code on the same host.
             cmd=node.get('Cmd')
-            if local and isinstance(cmd,dict) and cmd.get('Type')=='CallExpr' and {'bash','sh'}&{literal(a) for a in cmd.get('Args',[])}:
+            staged=isinstance(cmd,dict) and cmd.get('Type')=='CallExpr' and [literal(a) for a in cmd.get('Args',[])]==['cat'] and any(
+                r.get('Op')=='>' and text.encode()[r['Word']['Pos']['Offset']:r['Word']['End']['Offset']].decode().rstrip('"').endswith('/remote.sh') for r in node.get('Redirs') or [])
+            if (local or staged) and isinstance(cmd,dict) and cmd.get('Type')=='CallExpr' and (staged or {'bash','sh'}&{literal(a) for a in cmd.get('Args',[])}):
                 for redirect in node.get('Redirs') or []:
                     body=redirect.get('Hdoc')
                     if redirect.get('Op') in ('<<','<<-') and body:
@@ -376,12 +378,13 @@ class Admission(unittest.TestCase):
         if not shutil.which('shfmt'):self.skipTest('shfmt is needed to parse the worker scripts')
         found={}
         scripts=Path(__file__).resolve().parents[1]
-        for name in ('nsc-bench-remote.sh','nsc-build-remote.sh','nsc-build.sh','cargo-sparkles-task'):
-            for word in shell_commands((scripts/name).read_text()):found.setdefault(word,name)
-        for name in ('remote-screen.sh','nsc-build-host.sh','nsc-bench.sh'):
-            for word in shell_commands((scripts/name).read_text(),remote_only=True):found.setdefault(word,name)
+        for name in ('nsc-bench-remote.sh','nsc-writes-remote.sh','nsc-build-remote.sh','nsc-build.sh','cargo-sparkles-task'):
+            for word in shell_commands((scripts/name).read_text()):found.setdefault(word,set()).add(name)
+        # nsc-jena.sh writes its worker script, remote.sh, from a heredoc.
+        for name in ('remote-screen.sh','nsc-build-host.sh','nsc-bench.sh','nsc-writes.sh','nsc-jena.sh'):
+            for word in shell_commands((scripts/name).read_text(),remote_only=True):found.setdefault(word,set()).add(name)
         # The command strings remote-executor.py itself sends for put, get, sync and bundle.
-        for word in ('bash','env','python3','mkdir','mktemp','cat','sha256sum','cut','mv','tar','git','rm','dirname'):found.setdefault(word,'remote-executor.py')
+        for word in ('bash','env','python3','mkdir','mktemp','cat','sha256sum','cut','mv','tar','git','rm','dirname'):found.setdefault(word,set()).add('remote-executor.py')
         # mbx and rustc are pinned by tool_check, c++ only feeds the build's info.txt, and
         # remote-screen.sh runs nohup and setsid only on the nsc branch.
         exempt={'mbx','rustc','c++','nohup','setsid'}
@@ -390,7 +393,8 @@ class Admission(unittest.TestCase):
         self.assertIn('realpath',found);self.assertIn('tee',found);self.assertIn('gzip',RX.WORKER_TOOLS)
         self.assertIn('/lib64/ld-linux-x86-64.so.2',found)
         # The build body reaches bash -s through a heredoc of mbx sparkles-task.
-        self.assertEqual(found.get('cp'),'nsc-build.sh')
+        self.assertIn('nsc-build.sh',found['cp'])
+        self.assertIn('nsc-writes-remote.sh',found['tac']);self.assertIn('nsc-jena.sh',found['ls'])
 
     def test_admit_reports_the_worker_refusal_reason(self):
         self.assertEqual(RX.refusal_reason(b'noise\nADMIT-REFUSAL: mbx is not on the job PATH\n'),'mbx is not on the job PATH')

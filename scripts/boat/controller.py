@@ -506,7 +506,7 @@ def drive(r,io):
         # No source job or transport implementation in this packet. Default is stop.
         if r.get('useful_job_ready') is True:
             try:
-                h=r.get('separate_Root_handoff',{})
+                h=r.get('separate_Root_handoff',{});publishing=False
                 need(sha(h.get('job_release_sha256')) and sha(h.get('different_job_review_sha256')) and h.get('Root_owns_job_and_deadline_closure') is True,'unbound useful job handoff')
                 budget(io.mono(),min(intent['deadline_mono'],io.mono()+expiry-io.wall()),h.get('finite_job_and_closure_seconds',10800))
                 # The handoff is staged. Its admission is computed from the same
@@ -519,6 +519,7 @@ def drive(r,io):
                 # checks, so under the exclusive lock no job is admitted between a
                 # publication and its withdrawal.
                 need(io.lock_jobs(),'job lock held before the Root handoff')
+                publishing=True
                 try:
                     io.record('qualified-worker-admission.json',admission)
                     io.record('root-handoff.json',handoff)
@@ -527,7 +528,10 @@ def drive(r,io):
                 finally:io.unlock_jobs()
             except Exception as error:
                 record_refusal(io,'admission',error)
-                if not io.exists(lifetime.HANDOFF_WITHDRAWN):withdraw_handoff(io,error)
+                # After publication began, revocation was tried under the lock only. A
+                # handoff left standing then may have admitted a job once the lock was
+                # released, so it keeps its closure requirement.
+                if not publishing:withdraw_handoff(io,error)
                 raise
             return 'QUALIFIED_ROOT_HANDOFF_GUARD_ACTIVE'
         return 'QUALIFIED_STOP_REQUESTED'
@@ -595,14 +599,16 @@ def withdraw_handoff(io,error):
 
     The withdrawal receipt marks the operation for every consumer. When it cannot be
     written, a published handoff receipt is renamed away instead. Neither failure stops
-    the controller from triggering the normal stop."""
+    the controller from triggering the normal stop. It returns whether no handoff stands.
+    When both fail after publication, the handoff stands with its closure requirement."""
     try:
         io.record(lifetime.HANDOFF_WITHDRAWN,{'worker':worker_id(),'reason_code':reason_code(error),'qualified_worker_admission_present':io.exists('qualified-worker-admission.json'),'root_handoff_present':io.exists('root-handoff.json'),'observed_wall':io.wall()})
-        return
+        return True
     except Exception:pass
     try:
         if io.exists('root-handoff.json'):io.unpublish('root-handoff.json')
-    except Exception:pass
+        return True
+    except Exception:return False
 
 def handoff_active(io):
     """Whether a Root handoff stands, so that a normal stop needs the job closure.

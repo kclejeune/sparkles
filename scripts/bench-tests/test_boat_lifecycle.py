@@ -960,6 +960,23 @@ class AdmissionClocks(unittest.TestCase):
         self.assertFalse(io.exists('root-handoff.json'));self.assertTrue(io.exists('unpublished-root-handoff.json'))
         self.stops_normally(r,io)
 
+    def test_an_unrevocable_published_handoff_keeps_its_closure_requirement(self):
+        r,io=self.published_io();self.failing_after_publication(io,'root-handoff.json')
+        record=io.record;attempts=[]
+        def write(n,value):
+            if n=='root-handoff-withdrawn.json':attempts.append(io.jobs_locked);raise OSError('injected withdrawal failure')
+            return record(n,value)
+        io.record=write
+        def unpublish(name):attempts.append(io.jobs_locked);raise OSError('injected rename failure')
+        io.unpublish=unpublish
+        with self.assertRaises(OSError):controller.drive(r,io)
+        # Revocation is tried only under the job lock. Once the lock is released with
+        # the handoff standing, a job may have been admitted, so nothing withdraws it
+        # later and the stop keeps requiring the job closure.
+        self.assertEqual(attempts,[True,True]);self.assertTrue(controller.handoff_active(io))
+        self.assertFalse(io.exists('stop-trigger.json'))
+        io.trigger();self.assertFalse(controller.reconcile_stop(r,io));self.assertEqual([x[0] for x in io.calls],['resume'])
+
     def test_a_held_job_lock_publishes_no_handoff(self):
         r,io=self.published_io();io.diagnose=lambda seconds:{'schema':1,'processes':{'count':0,'rows':[]},'state':{'entries':[],'phases':{}}}
         io.live_jobs=True

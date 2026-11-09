@@ -1,9 +1,9 @@
 {
   "files": {
     "README.md": {
-      "bytes": 21996,
+      "bytes": 22405,
       "mode": 420,
-      "sha256": "1f97ffcd38a03efb417a750ce92bf90b69a3d36706b1fdb57eb2c1453b0fa7da"
+      "sha256": "e246f7537dae9e39c71c5c0d15326f8cd272cc7307bad84b97f812c498e5d4ce"
     },
     "common.py": {
       "bytes": 20155,
@@ -16,9 +16,9 @@
       "sha256": "e25e6f2070a71461366145e3a4f126e5f46a7bfa97334ed56e074622eec18b08"
     },
     "controller.py": {
-      "bytes": 78556,
+      "bytes": 78975,
       "mode": 420,
-      "sha256": "1847259224e32e989a80e1ca17d688a4181df7caa8c104d3bf16b861a73a4ae6"
+      "sha256": "3e77d6f5f7cd5721e1344dbf1bdba1fdb707d52f54ee20a9d8871b45007c1922"
     },
     "controls.py": {
       "bytes": 110890,
@@ -26,9 +26,9 @@
       "sha256": "283d4d66cee8c6a4db5ad82033f7bdf5580cbb9273696af4b62b9096ff05ddc6"
     },
     "diagnostic-probe.py": {
-      "bytes": 7944,
+      "bytes": 7955,
       "mode": 420,
-      "sha256": "84582095d73627961cdb130a5ee79889710bc30184b07fb5a4c2da9d90503a1e"
+      "sha256": "1783be7ef3bb709a8c9f611ee11758c0a7e9d3c67f8a8cd86d6d786cc5c3d2a9"
     },
     "job-closure.FALSE.json": {
       "bytes": 269,

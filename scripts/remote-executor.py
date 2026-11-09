@@ -114,14 +114,15 @@ test "$version" = {rust} || refuse "rustc reports $version, pinned {rust} (RUSTU
            mbx=shlex.quote(mbx),rust=shlex.quote(rust))
 
 
-# Commands the screen and build scripts run on the worker, including gzip for tar -z
+# Commands the query, write and Jena screens and the remote build run on the worker,
+# including gzip for tar -z
 # and the dynamic loader that nsc-bench-remote.sh starts the server binary through.
 # Admission names the first missing one, so a job never stops partway through for a
 # tool the worker lacks. mbx and rustc are checked by tool_check, and test_remote_executor
 # derives the external commands of the worker scripts to keep this list complete.
 WORKER_TOOLS=('bash','sh','env','python3','git','systemd-run','systemctl','flock','timeout','mkfifo',
               'tar','gzip','zstd','curl','taskset','chrt','cc','cargo','realpath','sha256sum',
-              'awk','sed','grep','cut','head','sort','seq','tr','wc','tee','cat','date','uname',
+              'awk','sed','grep','tac','ls','cut','head','sort','seq','tr','wc','tee','cat','date','uname',
               'free','du','df','tail','chmod','cp','ln','mkdir','mktemp','mv','rm','dirname','sleep',
               '/lib64/ld-linux-x86-64.so.2')
 

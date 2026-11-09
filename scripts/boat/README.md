@@ -183,9 +183,17 @@ no job closure. It also writes `root-handoff-withdrawn.json`, which job preparat
 export, extension and the closure watch all refuse, and renames a published handoff
 receipt away when that write fails. Publication and withdrawal run under the
 operation's exclusive job lock, which every job command holds shared from before its
-stopping checks, so no job is admitted on a handoff the controller withdraws. Before any job work, `remote-executor.py admit` refuses a worker that lacks
-one of the commands the screen and build scripts run there, and names it. A test
-derives those commands from the worker-side scripts and remote command strings.
+stopping checks, so no job is admitted on a handoff the controller withdraws. The
+controller tries revocation only while it holds that lock. A published handoff that
+neither the withdrawal nor the rename could revoke keeps its job-closure requirement,
+since a job may have been admitted after the lock was released, and the provider TTL
+bounds that case.
+
+Before any job work, `remote-executor.py admit` refuses a worker that lacks one of the
+commands that the query, write and Jena screens and the remote build run there, and
+names it. A test derives those commands from the worker-side scripts, their heredocs
+and the remote command strings. The check does not cover the commands of Boat gates
+or partitioned test shares.
 
 Qualification runs in a named local 512-MiB, zero-swap controller unit with 2,700-second
 runtime and 30-second stop limits. The controller returns after qualification/handoff;
