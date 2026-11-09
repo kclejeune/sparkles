@@ -1214,26 +1214,23 @@ Each commit adds a test store of 0.3 to 0.6 GB and a Clippy store of 0.2 to 0.5 
 10 GB repository cache drops the least recently used entries first, so it keeps the
 stores of the last several main commits next to the other workflows' caches.
 
-The binding workflows and the server candidate build use the same two caches. Their keys
+The binding workflows and the server candidate build use the same caches, with keys that
 also name the platform and the build profile. The JVM natives and the Node addon build on
-the runner and keep a rust-cache entry for each platform and profile, whose cleanup keeps
-the binding workspace's dependencies. The JVM jars and compatibility jobs restore the Linux
-x86_64 dev natives' caches without saving, since they build the dev bindings generator on
-that platform. The Linux wheels, the Alpine addons and the server candidate build in
-containers, so they keep only the object store. A binding workflow saves only on a push to
-`main`, which builds the dev profile on Linux x86_64. Release tags and manual runs build the
-release profile and every platform from an empty store. `MBX_GC_MAX_SIZE` is 2 GiB for the
-bindings and 3 GiB for the server candidate.
+the runner and use both caches. Their rust-cache entry is kept for each platform and
+profile, and its cleanup keeps the binding workspace's dependencies. The JVM jars and
+compatibility jobs restore the Linux x86_64 dev natives' caches without saving, since they
+build the dev bindings generator on that platform. The Linux wheels and the server
+candidate build in containers and cache only the object store. The Alpine addons cache
+only their Rustup, Cargo tool and pnpm downloads, and their store starts empty. A binding
+workflow saves only on a push to `main`, which builds the dev profile on Linux x86_64.
+Release tags and manual runs build the release profile and every platform from an empty
+store. `MBX_GC_MAX_SIZE` is 2 GiB for the bindings and 3 GiB for the server candidate.
 
-On GitHub's runner, a cold run of these jobs took 15 min for the Linux wheel, 27 min for
-the Node addon, 21 min for the JVM natives and 40 min for the server candidate. With both
-caches restored and no Rust change, the wheel took 4 min, the JVM natives 4 min and the
-server candidate 21 min. The Node addon still took 14 min, since its addon and server
-builds reuse little of the restored caches. Each main push adds a store of about 0.35 GB
-for the wheel, 0.55 GB for the addon, 0.45 GB for the natives and 2.7 GB for the server
-candidate, and the addon's and the natives' target entries are about 0.9 and 0.6 GB. With
-`ci.yml`'s entries, one main push's set is close to the 10 GB limit, so GitHub evicts the
-older commits' stores first. The server candidate's save takes 3 to 5 min of its job.
+Each main push adds a store of about 0.35 GB for the wheel, 0.55 GB for the addon, 0.45 GB
+for the natives and 2.7 GB for the server candidate, and the addon's and the natives'
+target entries are about 0.9 and 0.6 GB. With `ci.yml`'s entries, one main push's set comes
+close to the 10 GB limit, so GitHub evicts the older commits' stores first. The server
+candidate's save takes 3 to 5 min of its job.
 
 Native build commands and shell build scripts call `mbx` directly. Maturin and napi builds
 use the supported Cargo shim because those tools invoke Cargo themselves. CI keeps its

@@ -114,14 +114,14 @@ jobs:
             !.cache/mbx/targets
           key: mbx-store-python-${{ matrix.libc }}-${{ matrix.target }}-${{ env.PROFILE_ARG == '--release' && 'release' || 'dev' }}-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
           restore-keys: mbx-store-python-${{ matrix.libc }}-${{ matrix.target }}-${{ env.PROFILE_ARG == '--release' && 'release' || 'dev' }}-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
-      # The host's Boxington collects that store before a save.
+      # The host's Boxington collects that store before a save. The toolchain step runs on
+      # every event, since maturin forwards the Cargo settings it exports into the
+      # container, and pull requests and main then build the same wheel.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         with: { cache: false, rustflags: "" }
       # local mode: no remote cache, and no link cache, which would add the wheel's
       # library to the saved store
       - uses: jdx/mr-boxington-action@v1.7.3
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         with:
           backend: local
           version: 1.29.1
