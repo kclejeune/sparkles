@@ -37,7 +37,6 @@ use sparkles::commit::CommitKind;
 use sparkles::sparql::{self, QueryOptions};
 use sparkles::store::Snapshot;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};

@@ -14,7 +14,6 @@
 use super::guard::{DISCLOSURE_GRAPH, GR, gr};
 use super::report::{Checked, Item, Rendered};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
-use std::fmt::Write as _;
 
 pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 pub const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
