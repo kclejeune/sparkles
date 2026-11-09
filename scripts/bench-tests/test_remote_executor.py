@@ -123,6 +123,43 @@ class Admission(unittest.TestCase):
             first=RX.remaining(deadline);self.assertLessEqual(first,left-30)
         with self.clocks(now-7200,boot+left-29),self.assertRaises(ValueError):RX.remaining(deadline)
 
+    def observation(self,wall,boot):
+        """Run admit with its probes stubbed and return the printed observation."""
+        out=io.StringIO()
+        with self.clocks(wall,boot),patch.object(RX.boat_environment.controller,'bounded',return_value={'exit':0,'error':None,'body':{'sandbox':{
+                'id':'bx_fixture','environment':self.fixtures['qualified']['environment']['name'],
+                'environmentVersion':self.fixtures['qualified']['environment']['version'],'type':'large','vcpu':8,'memoryGB':16,'state':'ready'}}}),\
+             patch.object(RX,'exchange',return_value=0),patch('sys.stdout',out):
+            RX.admit('boat:bx_fixture',60)
+        return json.loads(out.getvalue())
+
+    def runtime(self,path,wall,boot,boot_id=None):
+        out=io.StringIO()
+        with self.clocks(wall,boot,boot_id),patch.object(sys,'argv',['remote-executor.py','runtime',str(path),'--reserve','60']),patch('sys.stdout',out):
+            code=RX.main()
+        return code,out.getvalue().strip()
+
+    def test_saved_observation_runtime_uses_both_original_ends(self):
+        now,boot,left=self.fixtures['now'],self.fixtures['boot_now'],self.original_left()
+        value=self.observation(now,boot);self.assertEqual(value['version'],2)
+        path=self.root/'observation.json';path.write_text(json.dumps(value))
+        # A wall rollback after the observation was saved cannot lengthen the runtime.
+        code,text=self.runtime(path,now-7200,boot+100)
+        self.assertEqual(code,0);self.assertLessEqual(int(text),left-100-60)
+        # A suspend that the wall clock missed is counted too.
+        code,text=self.runtime(path,now,boot+1000);self.assertLessEqual(int(text),left-1000-60)
+        with self.assertRaises(ValueError):self.runtime(path,now,boot,'99999999-2222-3333-4444-555555555555')
+        with self.assertRaises(ValueError):self.runtime(path,now,boot+left)
+        for version in (1,3):
+            path.write_text(json.dumps({**value,'version':version}))
+            with self.subTest(version=version),self.assertRaises(ValueError):self.runtime(path,now,boot)
+
+    def test_shell_runtime_consumers_use_the_observation_reader(self):
+        for name in ('scripts/remote-screen.sh','scripts/gate/gate.sh'):
+            text=(ROOT/name).read_text()
+            with self.subTest(name=name):
+                self.assertNotIn('["expires_at"]-time.time()',text);self.assertIn('rx_runtime',text)
+
     def test_unsafe_selectors_refuse_before_execution(self):
         for host in ('boat:current','boat:bx_test;echo','-oProxyCommand=bad','h x','a:12'):
             with self.subTest(host=host),self.assertRaises(ValueError):RX.boat_id(host)
@@ -491,7 +528,10 @@ class ScreenAcceptance(unittest.TestCase):
     def test_unknown_launch_is_recorded_once_and_cleanup_retains_lock_on_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            receipt = root/'admission.json'; receipt.write_text(json.dumps({'expires_at':time.time()+3600}))
+            boot = RX.boat_clock.boottime()
+            receipt = root/'admission.json'; receipt.write_text(json.dumps({'schema':'sparkles.boat.adapter-observation','version':2,
+                'expires_at':time.time()+3600,'original_wall_end':time.time()+3600,'boot_end':boot+3600,
+                'guard_boot_id':RX.boat_clock.current_boot_id()}))
             program = r'''
 set -euo pipefail
 . "$SCRIPTS/remote-screen.sh"

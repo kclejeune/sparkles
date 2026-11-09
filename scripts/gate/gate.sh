@@ -273,7 +273,7 @@ start_on() {
   args="--name $n --part $p --jobs $jobs"
   case $h in boat:*)
     local runtime
-    runtime=$(python3 -c 'import json,sys,time; print(int(json.load(open(sys.argv[1]))["expires_at"]-time.time())-60)' "$statedir/admission-$n.json")
+    runtime=$(rx_runtime "$statedir/admission-$n.json" --reserve 60) || return
     args+=" --executor boat --runtime $runtime"
     ;;
   esac

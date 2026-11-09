@@ -92,6 +92,25 @@ class EnvironmentAdmission(unittest.TestCase):
             with self.assertRaises(ValueError):
                 env.prepare(self.f['profile_path'],self.f['operation'],self.f['profile']['worker'],self.f['operation']/'late.json')
 
+    def test_preparation_transport_stops_when_suspend_consumes_the_original_end(self):
+        import qualified_worker_admission as qwa,sys,time
+        from datetime import datetime
+        left=datetime.fromisoformat(self.f['qualified']['expires_at'].replace('Z','+00:00')).timestamp()-self.f['now']
+        real_context=env.context;real_bounded=controller.bounded;boot=[self.f['boot_now']]
+        def context(*args,**kwargs):
+            kwargs['guard_reader']=lambda unit:self.f['guard'];return real_context(*args,**kwargs)
+        def transport(argv,seconds,*rest,**kwargs):
+            # The suspend happens once the preparation is in flight.
+            boot[0]=self.f['boot_now']+left-25
+            return real_bounded([sys.executable,'-c','import time;time.sleep(20)'],seconds,None,**kwargs)
+        start=time.monotonic()
+        with patch.object(env,'context',side_effect=context),patch.object(env.time,'time',return_value=self.f['now']),\
+             patch.object(qwa,'boottime',side_effect=lambda:boot[0]),patch.object(qwa,'current_boot_id',return_value=self.f['boot_id'],create=True),\
+             patch.object(controller,'bounded',side_effect=transport):
+            with self.assertRaises(ValueError):
+                env.prepare(self.f['profile_path'],self.f['operation'],self.f['profile']['worker'],self.f['operation']/'suspended.json')
+        self.assertLess(time.monotonic()-start,8)
+
     def test_reviewed_rollback_scenario_leaves_1570_seconds(self):
         import qualified_worker_admission as qwa
         intent={'deadline_wall':11500,'deadline_mono':10600};handoff={'deadline_wall':11500}

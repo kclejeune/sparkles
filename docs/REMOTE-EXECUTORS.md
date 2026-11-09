@@ -70,9 +70,14 @@ same instant on `CLOCK_BOOTTIME` for the guard's boot and invocation. Each check
 takes the earlier of the two remaining times and subtracts the 30-second closure
 reserve, so a wall clock moved backward cannot lengthen the lifetime and a suspend
 counts even when the wall clock misses it. A different boot refuses the admission.
-`admit --minimum` and environment preparation use this measure, and each operation
-freezes a deadline bounded by both ends. The `expires_at` that `admit` reports is
-the effective wall end at that observation and is never later than the original.
+`admit --minimum` uses this measure. Environment preparation and each operation
+also check both ends while they run, so a suspend during a transfer is counted.
+`admit` prints a version-2 `sparkles.boat.adapter-observation` that records the
+original wall and BOOTTIME ends. Its `expires_at` is the effective wall end at that
+observation and is never later than the original. Scripts take a job runtime from a
+saved observation with `remote-executor.py runtime FILE --reserve SECONDS`, which
+measures both ends again and refuses another version, another boot or an exhausted
+lifetime.
 
 ## Warm worker commands
 

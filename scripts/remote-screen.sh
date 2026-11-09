@@ -31,7 +31,7 @@ screen_create() {
     return
   fi
   rx_admit "$EXECUTOR" --minimum "${SPARKLES_REMOTE_MIN_LIFETIME:-1800}" > "$OUT/admission.json" || return
-  ttl=$(python3 -c 'import json,sys,time; print(int(json.load(open(sys.argv[1]))["expires_at"]-time.time())-60)' "$OUT/admission.json")
+  ttl=$(rx_runtime "$OUT/admission.json" --reserve 60) || return
   token=$(python3 -c 'import secrets;print(secrets.token_hex(12))')
   SCREEN_LOCK=sparkles-screen-lock-$token
   ID=${EXECUTOR#boat:}
@@ -94,7 +94,10 @@ screen_launch() {
     SCREEN_RUN=$((SCREEN_RUN + 1))
     SCREEN_UNIT=${SCREEN_LOCK/lock-/run-}-$SCREEN_RUN
     printf '%s\n' "$SCREEN_UNIT" >> "$OUT/workload-units"
-    screen_exec "systemd-run --user --unit=$SCREEN_UNIT --collect -q -p MemoryMax=12G -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec=$(python3 -c 'import json,sys,time;print(max(1,int(json.load(open(sys.argv[1]))["expires_at"]-time.time())-60))' "$OUT/admission.json") bash -c $(printf '%q' "$text")"
+    # An empty RuntimeMaxSec would mean no limit, so an exhausted lifetime stops here.
+    local runtime
+    runtime=$(rx_runtime "$OUT/admission.json" --reserve 60) || return
+    screen_exec "systemd-run --user --unit=$SCREEN_UNIT --collect -q -p MemoryMax=12G -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec=$runtime bash -c $(printf '%q' "$text")"
   fi
 }
 screen_destroy() {

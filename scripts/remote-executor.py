@@ -72,7 +72,6 @@ def admission(host, minimum=0):
     guard = qualified['local_guard']
     return {'worker':worker, 'environment':qualified['environment']['name'],
             'environment_version':qualified['environment']['version'], 'expires_at':expiry,
-            'remaining_seconds':left, 'boot_end':lifetime['boot_end'],
             'owner':qualified['safe_owner']['operation_id'], 'guard_unit':guard['unit'],
             'guard_boot_id':guard['boot_id'], 'guard_invocation_id':guard['invocation_id'],
             'toolchain_manifest_path':qualified['toolchain_manifest']['path'],
@@ -154,7 +153,34 @@ command -v systemd-run >/dev/null
     if code:
         fail('worker guard or physical toolchain check failed')
     # Retain only bounded non-secret identities, never arbitrary provider metadata.
-    print(json.dumps({**{k:v for k,v in data.items() if not k.startswith('_')}, 'schema':'sparkles.boat.adapter-observation', 'version':1, 'observed_at':int(time.time()), 'provider':'boat'}))
+    # Version 2 records the original end pair so that a later runtime is taken
+    # from both clocks. expires_at is recomputed after the probes.
+    life=data['_lifetime'];wall=time.time()
+    left=boat_clock.lifetime_left(life,wall)
+    print(json.dumps({**{k:v for k,v in data.items() if not k.startswith('_')},
+                      'expires_at':min(life['wall_end'],wall+left), 'original_wall_end':life['wall_end'],
+                      'boot_end':life['boot_end'], 'schema':OBSERVATION, 'version':2,
+                      'observed_at':int(wall), 'provider':'boat'}))
+
+
+OBSERVATION='sparkles.boat.adapter-observation'
+
+
+def observation_runtime(path, reserve):
+    """Seconds a job may still run from a saved admit observation, after reserve."""
+    if reserve < 0:fail('runtime reserve cannot be negative')
+    raw=Path(path).read_bytes()
+    if len(raw)>65536:fail('admission observation too large')
+    value=json.loads(raw)
+    if not isinstance(value,dict) or value.get('schema')!=OBSERVATION or type(value.get('version')) is not int or value['version']!=2:
+        fail('unknown admission observation schema')
+    for key in ('original_wall_end','boot_end'):
+        if type(value.get(key)) not in (int,float) or not math.isfinite(value[key]):fail('admission observation clock fields')
+    if not isinstance(value.get('guard_boot_id'),str):fail('admission observation boot identity')
+    life={'wall_end':value['original_wall_end'],'boot_end':value['boot_end'],'boot_id':value['guard_boot_id']}
+    left=int(boat_clock.lifetime_left(life,time.time()))-reserve
+    if left<=0:fail('admission observation lifetime exhausted')
+    return left
 
 
 # This program is also sent to Boat for extraction. Bound every archive before
@@ -667,6 +693,7 @@ def main():
     va = sub.add_parser('validate'); va.add_argument('host')
     ec = sub.add_parser('extract-command'); ec.add_argument('destination'); ec.add_argument('--max-bytes', type=int, default=MAX_ARCHIVE)
     ad = sub.add_parser('admit'); ad.add_argument('host'); ad.add_argument('--minimum', type=int, default=300)
+    rt = sub.add_parser('runtime'); rt.add_argument('observation'); rt.add_argument('--reserve', type=int, default=60)
     sy = sub.add_parser('sync'); sy.add_argument('args', nargs=argparse.REMAINDER)
     un = sub.add_parser('unpack'); un.add_argument('destination')
     for action in ('put', 'get'):
@@ -691,6 +718,8 @@ def main():
         os.execvp(argv[0], argv)
     if args.action == 'admit':
         admit(args.host, args.minimum); return 0
+    if args.action == 'runtime':
+        print(observation_runtime(args.observation, args.reserve)); return 0
     if args.action in ('put', 'get'):
         return globals()[args.action](args.host, args.source, args.destination)
     if args.action == 'unpack':

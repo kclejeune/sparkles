@@ -10,8 +10,12 @@ import argparse,fcntl,selectors,signal,subprocess,time,shlex,base64
 
 ROOT=Path(__file__).resolve().parent
 
-def bounded(argv,seconds,input_bytes=None):
+def bounded(argv,seconds,input_bytes=None,limit=None):
     """Only Root's real adapter calls this. Kill only this new process group.
+
+    ``limit``, when given, returns the seconds left before an outer end, such as
+    the original wall and BOOTTIME lifetime. It is checked with the monotonic
+    window throughout, so a suspend or wall jump during the call is counted.
 
     SIGINT is recorded from before the child starts. The loop hands it to the
     previous handler at its checks, and owned_group.finish counts it during
@@ -29,10 +33,13 @@ def bounded(argv,seconds,input_bytes=None):
         if input_bytes is not None:
             os.set_blocking(child.stdin.fileno(),False);select.register(child.stdin,selectors.EVENT_WRITE)
         data=bytearray();position=0;end=time.monotonic()+seconds;reason=None
+        def left():
+            value=end-time.monotonic()
+            return value if limit is None else min(value,limit())
         while select.get_map():
             cancel.check()
-            if time.monotonic()>=end:reason='timeout';break
-            for key,mask in select.select(min(0.2,max(0,end-time.monotonic()))):
+            if left()<=0:reason='timeout';break
+            for key,mask in select.select(min(0.2,max(0,left()))):
                 if mask&selectors.EVENT_WRITE:
                     try:position+=os.write(key.fd,input_bytes[position:position+4096])
                     except BrokenPipeError:position=len(input_bytes)
@@ -48,10 +55,10 @@ def bounded(argv,seconds,input_bytes=None):
         else:
             code=None
             while code is None:
-                cancel.check();left=end-time.monotonic()
-                try:code=child.wait(timeout=max(0.001,min(0.2,left)))
+                cancel.check();rest=left()
+                try:code=child.wait(timeout=max(0.001,min(0.2,rest)))
                 except subprocess.TimeoutExpired:
-                    if left<=0.2:break
+                    if rest<=0.2:break
             if code is None:result={'exit':None,'error':'timeout','body':None}
             else:
                 try:body=json.loads(data)
