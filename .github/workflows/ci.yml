@@ -312,11 +312,12 @@ jobs:
     runs-on: ${{ !inputs.github-hosted && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER_LARGE || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
-      # The build's target, the uncompressed archive, the final archives, the cache and
-      # the swap file outgrow the free disk of GitHub's runner image. The removal of
-      # unused preinstalled toolchains runs in the background during the setup steps.
+      # The build's target, the uncompressed archive, the final archives and the swap file
+      # take about 40 GB. When the runner has less than 60 GiB free, unused preinstalled
+      # toolchains are removed in the background during the setup steps. The test shards
+      # use about 30 GB and the doctests about 15 GB.
       - name: Free disk space
-        run: &free-disk scripts/ci-free-disk.sh start
+        run: &free-disk scripts/ci-free-disk.sh start 60
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
       # The test build can exceed the physical memory of a 16 GB runner. A larger runner
@@ -424,8 +425,7 @@ jobs:
     runs-on: *runner
     steps:
       - uses: actions/checkout@v5
-      # The doctest build of the workspace's libraries and the swap file outgrow the free
-      # disk of GitHub's runner image, as the test build does.
+      # The same removal as in the test build, when the runner has less than 60 GiB free
       - name: Free disk space
         run: *free-disk
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -477,7 +477,7 @@ jobs:
     runs-on: *runner
     steps:
       - uses: actions/checkout@v5
-      # The extracted archive and the tests' own files need more than the image leaves.
+      # The same removal as in the test build, when the runner has less than 60 GiB free
       - name: Free disk space
         run: *free-disk
       - uses: taiki-e/install-action@v2
