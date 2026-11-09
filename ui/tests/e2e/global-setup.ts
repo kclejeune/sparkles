@@ -37,6 +37,7 @@ import {
   DATASET,
   DISCUSSIONS_AUTH,
   BULK_AUTH,
+  IMPORTS_AUTH,
   DATA,
   DECLARED_DATASET,
   DECLARED_KEY,
@@ -206,6 +207,10 @@ level = "write"
 dataset = "${BULK_AUTH}"
 level = "write"
 
+[[roles.pattern-writer.grants]]
+dataset = "${IMPORTS_AUTH}"
+level = "write"
+
 [[roles.pattern-reader.grants]]
 dataset = "${PATTERN_DATASET}"
 level = "read"
@@ -216,6 +221,10 @@ level = "read"
 
 [[roles.pattern-reader.grants]]
 dataset = "${BULK_AUTH}"
+level = "read"
+
+[[roles.pattern-reader.grants]]
+dataset = "${IMPORTS_AUTH}"
 level = "read"
 
 [[roles.pattern-reader.grants]]

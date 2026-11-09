@@ -2269,3 +2269,540 @@ async fn inferred_browse_rejects_ambiguous_and_non_json_selectors_before_reading
         assert_eq!(response.headers[header::CACHE_CONTROL], "no-store");
     }
 }
+
+// ------------------------------------------------------------- import resolution ------
+
+/// A server whose outbound policy may reach loopback addresses, for the fetch tests.
+fn server_with_outbound(allow_private: bool) -> Server {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    state.outbound.allow_private = allow_private;
+    let state = Arc::new(state);
+    let ds = state.attach("t", DbType::Mem, None).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            DATA.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let app = router(state.clone());
+    Server {
+        _dir: dir,
+        _state: state,
+        app,
+    }
+}
+
+async fn update(app: &Router, ds: &str, u: &str) {
+    let r = send(
+        app,
+        "POST",
+        &format!("/{ds}/update"),
+        &[(header::CONTENT_TYPE.as_str(), "application/sparql-update")],
+        u,
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
+}
+
+fn edge<'a>(summary: &'a J, iri: &str) -> &'a J {
+    summary["closure"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["iri"] == iri)
+        .unwrap_or_else(|| panic!("no edge {iri}: {}", summary["closure"]))
+}
+
+#[tokio::test]
+async fn the_import_map_resolves_imports_and_changes_the_tags() {
+    let s = server();
+    update(
+        &s.app,
+        "t",
+        "INSERT DATA { <http://ex.org/o> <http://www.w3.org/2002/07/owl#imports> <http://ex.org/lib> .
+          GRAPH <urn:local> { <http://ex.org/Extra> a <http://www.w3.org/2002/07/owl#Class> } }",
+    )
+    .await;
+    let r = get(&s.app, "/$/ontology/t").await;
+    let before = r.json();
+    let tag = r.headers[header::ETAG].to_str().unwrap().to_string();
+    assert!(tag.ends_with(":owl\""), "{tag}");
+    let e = edge(&before, "http://ex.org/lib");
+    assert_eq!(
+        (e["graphs"].clone(), e["via"].clone()),
+        (json!([]), J::Null)
+    );
+    // the map
+    let r = get(&s.app, "/$/ontology/t/imports").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let rev = r.headers[header::ETAG].to_str().unwrap().to_string();
+    assert_eq!(r.json()["entries"], json!([]));
+    let patch = json!({"set": {"http://ex.org/lib": "urn:local"}}).to_string();
+    let ct = (header::CONTENT_TYPE.as_str(), "application/json");
+    let r = send(
+        &s.app,
+        "PATCH",
+        "/$/ontology/t/imports",
+        &[ct, ("if-match", &rev)],
+        &patch,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["entries"][0]["source"], "manual");
+    let current = r.headers[header::ETAG].to_str().unwrap().to_string();
+    // a change must name the revision it starts from: no If-Match, or *, is refused
+    for h in [None, Some("*")] {
+        let mut headers = vec![ct];
+        if let Some(h) = h {
+            headers.push(("if-match", h));
+        }
+        let r = send(
+            &s.app,
+            "PATCH",
+            "/$/ontology/t/imports",
+            &headers,
+            r#"{"remove": ["http://ex.org/lib"]}"#,
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            StatusCode::PRECONDITION_REQUIRED,
+            "{h:?}: {}",
+            r.text()
+        );
+    }
+    // a stale revision is refused
+    let r = send(
+        &s.app,
+        "PATCH",
+        "/$/ontology/t/imports",
+        &[ct, ("if-match", &rev)],
+        &patch,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.text());
+    let r = send(
+        &s.app,
+        "PATCH",
+        "/$/ontology/t/imports",
+        &[ct, ("if-match", &current)],
+        r#"{"set": {"http://ex.org/x": "not an iri"}}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    // the read follows the map, and its tag changes without a commit
+    let r = get(&s.app, "/$/ontology/t").await;
+    let after = r.json();
+    assert_eq!(after["commit"], before["commit"]);
+    let mapped = r.headers[header::ETAG].to_str().unwrap().to_string();
+    assert_ne!(mapped, tag);
+    assert!(mapped.contains(":owl."), "{mapped}");
+    let e = edge(&after, "http://ex.org/lib");
+    assert_eq!(
+        (e["graphs"].clone(), e["via"].clone()),
+        (json!(["urn:local"]), json!("map"))
+    );
+    assert!(
+        after["graphs"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("urn:local"))
+    );
+    assert!(
+        after["entities"]["Class"].as_u64().unwrap()
+            > before["entities"]["Class"].as_u64().unwrap()
+    );
+    // without imports nothing changes, and the tag has no digest
+    let r = get(&s.app, "/$/ontology/t?imports=false").await;
+    assert!(
+        r.headers[header::ETAG]
+            .to_str()
+            .unwrap()
+            .ends_with(":owl\"")
+    );
+    // an edit's If-Match takes the digest-bearing tag of the head
+    let body = json!({"add": [sub("http://ex.org/Lecturer", json!("http://ex.org/Person"))]});
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/axioms",
+        &[ct, ("if-match", &mapped)],
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // the old commit's tag is stale whatever its digest
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/axioms",
+        &[ct, ("if-match", &mapped)],
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.text());
+    // removing the entry
+    let r = send(
+        &s.app,
+        "PATCH",
+        "/$/ontology/t/imports",
+        &[ct, ("if-match", &current)],
+        r#"{"remove": ["http://ex.org/lib"]}"#,
+    )
+    .await;
+    assert_eq!(r.json()["entries"], json!([]));
+    let e = edge(
+        &get(&s.app, "/$/ontology/t").await.json(),
+        "http://ex.org/lib",
+    )
+    .clone();
+    assert_eq!(e["graphs"], json!([]));
+}
+
+/// A multipart body of `parts`, each a name, a file name and its bytes.
+fn multipart(parts: &[(&str, &str, &str)]) -> (String, String) {
+    let b = "XbOuNdArY";
+    let mut body = String::new();
+    for (name, file, text) in parts {
+        body.push_str(&format!(
+            "--{b}\r\ncontent-disposition: form-data; name=\"{name}\"; filename=\"{file}\"\r\n\r\n{text}\r\n"
+        ));
+    }
+    body.push_str(&format!("--{b}--\r\n"));
+    (format!("multipart/form-data; boundary={b}"), body)
+}
+
+const CATALOG: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<catalog prefer="public" xmlns="urn:oasis:names:tc:entity:xmlns:xml:catalog">
+  <group prefer="public">
+    <uri name="http://ex.org/lib" uri="./lib.ttl"/>
+    <uri name="http://ex.org/mirror" uri="urn:local"/>
+    <uri name="http://ex.org/gone" uri="gone.owl"/>
+  </group>
+  <rewriteURI uriStartString="http://ex.org/r/" rewritePrefix="r/"/>
+</catalog>"#;
+
+#[tokio::test]
+async fn a_catalog_loads_its_files_and_maps_its_entries() {
+    let s = server();
+    update(
+        &s.app,
+        "t",
+        "INSERT DATA { <http://ex.org/o> <http://www.w3.org/2002/07/owl#imports> <http://ex.org/lib>, <http://ex.org/mirror> .
+          GRAPH <urn:local> { <http://ex.org/M> a <http://www.w3.org/2002/07/owl#Class> } }",
+    )
+    .await;
+    let lib = "<http://ex.org/Lib> a <http://www.w3.org/2002/07/owl#Class> .";
+    let (ct, body) = multipart(&[
+        ("catalog", "catalog-v001.xml", CATALOG),
+        ("lib.ttl", "lib.ttl", lib),
+    ]);
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/imports/catalog",
+        &[(header::CONTENT_TYPE.as_str(), &ct)],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(
+        j["loaded"],
+        json!([{"graph": "http://ex.org/lib", "file": "lib.ttl", "triples": 1}])
+    );
+    assert_eq!(j["changed"], true);
+    let skipped: Vec<&str> = j["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["entry"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        skipped,
+        ["rewriteURI http://ex.org/r/", "uri http://ex.org/gone"]
+    );
+    let map = get(&s.app, "/$/ontology/t/imports").await.json();
+    let entries: Vec<(String, String, String)> = map["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["iri"].as_str().unwrap().into(),
+                e["graph"].as_str().unwrap().into(),
+                e["source"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            (
+                "http://ex.org/lib".to_string(),
+                "http://ex.org/lib".to_string(),
+                "catalog".to_string()
+            ),
+            (
+                "http://ex.org/mirror".into(),
+                "urn:local".into(),
+                "catalog".into()
+            ),
+        ]
+    );
+    assert!(
+        map["entries"][0]["digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    let summary = get(&s.app, "/$/ontology/t").await.json();
+    assert_eq!(edge(&summary, "http://ex.org/lib")["via"], "map");
+    assert_eq!(
+        edge(&summary, "http://ex.org/mirror")["graphs"],
+        json!(["urn:local"])
+    );
+    // the same upload again changes nothing
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/imports/catalog",
+        &[(header::CONTENT_TYPE.as_str(), &ct)],
+        &body,
+    )
+    .await;
+    assert_eq!(r.json()["changed"], false, "{}", r.text());
+    // a catalog with a document type declaration is refused before anything changes
+    let commit = summary["commit"].clone();
+    let bad_catalog = CATALOG.replacen("?>", "?><!DOCTYPE catalog [ <!ENTITY x \"y\"> ]>", 1);
+    let (ct2, body2) = multipart(&[
+        ("catalog", "c.xml", &bad_catalog),
+        ("lib.ttl", "lib.ttl", "<urn:x> <urn:y> <urn:z> ."),
+    ]);
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/imports/catalog",
+        &[(header::CONTENT_TYPE.as_str(), &ct2)],
+        &body2,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert!(r.text().contains("document type"), "{}", r.text());
+    // a file that does not parse is refused before anything changes
+    let (ct3, body3) = multipart(&[
+        ("catalog", "c.xml", CATALOG),
+        ("lib.ttl", "lib.ttl", "this is not turtle"),
+    ]);
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/imports/catalog",
+        &[(header::CONTENT_TYPE.as_str(), &ct3)],
+        &body3,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    // so is a catalog cut off before its end, although its entries are usable
+    let truncated = CATALOG.replace("</catalog>", "");
+    let (ct4, body4) = multipart(&[
+        ("catalog", "c.xml", &truncated),
+        ("lib.ttl", "lib.ttl", "<urn:x> <urn:y> <urn:z> ."),
+    ]);
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/imports/catalog",
+        &[(header::CONTENT_TYPE.as_str(), &ct4)],
+        &body4,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert_eq!(get(&s.app, "/$/ontology/t").await.json()["commit"], commit);
+    // an entry as the map gives it (and as an import-map-unwritten answer lists it) can be
+    // set again whole, keeping its source, file and digest
+    let r = get(&s.app, "/$/ontology/t/imports").await;
+    let rev = r.headers[header::ETAG].to_str().unwrap().to_string();
+    let lib_entry = r.json()["entries"][0].clone();
+    assert_eq!(lib_entry["iri"], "http://ex.org/lib");
+    let ct = (header::CONTENT_TYPE.as_str(), "application/json");
+    let r = send(
+        &s.app,
+        "PATCH",
+        "/$/ontology/t/imports",
+        &[ct, ("if-match", &rev)],
+        r#"{"remove": ["http://ex.org/lib"]}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let rev = r.headers[header::ETAG].to_str().unwrap().to_string();
+    let replay = json!({"set": {"http://ex.org/lib": lib_entry}}).to_string();
+    let r = send(
+        &s.app,
+        "PATCH",
+        "/$/ontology/t/imports",
+        &[ct, ("if-match", &rev)],
+        &replay,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["entries"][0], lib_entry);
+    // an entry object is validated like the map file
+    let rev = r.headers[header::ETAG].to_str().unwrap().to_string();
+    let r = send(
+        &s.app,
+        "PATCH",
+        "/$/ontology/t/imports",
+        &[ct, ("if-match", &rev)],
+        r#"{"set": {"http://ex.org/q": {"graph": "urn:g", "source": "fetch", "other": 1}}}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}
+
+#[tokio::test]
+async fn a_protected_branch_refuses_a_catalog_and_a_fetch() {
+    let s = persistent();
+    let ds = s._state.get("h").unwrap();
+    ds.dataset
+        .create_branch("dev", &Default::default())
+        .unwrap();
+    ds.dataset.set_branch_protected("dev", true).unwrap();
+    let (ct, body) = multipart(&[
+        ("catalog", "catalog-v001.xml", CATALOG),
+        ("lib.ttl", "lib.ttl", "<urn:a> <urn:b> <urn:c> ."),
+    ]);
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/h/imports/catalog?branch=dev",
+        &[(header::CONTENT_TYPE.as_str(), &ct)],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    // a catalog that only maps changes no graph, and is refused before the map changes
+    let (ct, body) = multipart(&[(
+        "catalog",
+        "c.xml",
+        r#"<catalog><uri name="http://ex.org/z" uri="urn:z"/></catalog>"#,
+    )]);
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/h/imports/catalog?branch=dev",
+        &[(header::CONTENT_TYPE.as_str(), &ct)],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    let r = post(
+        &s.app,
+        "/$/ontology/h/imports/fetch?branch=dev",
+        json!({"iri": "http://ex.org/far"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    assert_eq!(
+        get(&s.app, "/$/ontology/h/imports").await.json()["entries"],
+        json!([])
+    );
+}
+
+/// A server that answers every request with `body` as Turtle and `etag`.
+fn serve_turtle(body: &'static str, etag: &'static str) -> u16 {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut c) = c else { continue };
+            let _ = c.set_read_timeout(Some(Duration::from_millis(200)));
+            let _ = c.read(&mut [0u8; 4096]);
+            let _ = write!(
+                c,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/turtle\r\netag: {etag}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn a_fetch_loads_an_import_and_a_refresh_of_the_same_document_commits_nothing() {
+    let port = serve_turtle(
+        "<http://ex.org/Far> a <http://www.w3.org/2002/07/owl#Class> .",
+        "\"v1\"",
+    );
+    let s = server_with_outbound(true);
+    update(&s.app, "t", "INSERT DATA { <http://ex.org/o> <http://www.w3.org/2002/07/owl#imports> <http://ex.org/far> }").await;
+    let location = format!("http://127.0.0.1:{port}/far.ttl");
+    let r = post(
+        &s.app,
+        "/$/ontology/t/imports/fetch",
+        json!({"iri": "http://ex.org/far", "location": location}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["changed"], true);
+    assert_eq!(j["entry"]["etag"], "\"v1\"");
+    assert_eq!(j["entry"]["graph"], "http://ex.org/far");
+    assert_eq!(j["entry"]["location"], location);
+    assert_eq!(j["entry"]["branch"], "main");
+    assert!(
+        j["entry"]["digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    let summary = get(&s.app, "/$/ontology/t").await.json();
+    assert_eq!(
+        edge(&summary, "http://ex.org/far")["graphs"],
+        json!(["http://ex.org/far"])
+    );
+    // a refresh reads the recorded location again
+    let r = post(
+        &s.app,
+        "/$/ontology/t/imports/fetch",
+        json!({"iri": "http://ex.org/far"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["changed"], false);
+    assert_eq!(
+        get(&s.app, "/$/ontology/t").await.json()["commit"],
+        summary["commit"]
+    );
+    // only http and https locations are fetched
+    let r = post(
+        &s.app,
+        "/$/ontology/t/imports/fetch",
+        json!({"iri": "http://ex.org/x", "location": "file:///etc/passwd"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}
+
+#[tokio::test]
+async fn the_outbound_policy_refuses_a_fetch_and_nothing_changes() {
+    let port = serve_turtle("<urn:a> <urn:b> <urn:c> .", "\"v1\"");
+    let s = server_with_outbound(false);
+    let commit = get(&s.app, "/$/ontology/t").await.json()["commit"].clone();
+    let r = post(
+        &s.app,
+        "/$/ontology/t/imports/fetch",
+        json!({"iri": "http://ex.org/far", "location": format!("http://127.0.0.1:{port}/x.ttl")}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    assert_eq!(
+        get(&s.app, "/$/ontology/t/imports").await.json()["entries"],
+        json!([])
+    );
+    assert_eq!(get(&s.app, "/$/ontology/t").await.json()["commit"], commit);
+}

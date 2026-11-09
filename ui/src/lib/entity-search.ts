@@ -56,6 +56,8 @@ export async function searchEntities(
     kind?: EntitySearchKind[];
     /** the graph to search, null for the default graph; the server's choice when absent */
     graph?: string | null;
+    /** false to leave out the imported graphs; the server includes them when absent */
+    imports?: boolean;
     signal?: AbortSignal;
   } = {},
 ): Promise<EntitySearch> {
@@ -65,6 +67,7 @@ export async function searchEntities(
   if (opts.offset) p.set('offset', String(opts.offset));
   if (opts.kind?.length) p.set('kind', opts.kind.join(','));
   if (opts.graph !== undefined) p.set('graph', opts.graph ?? 'default');
+  if (opts.imports === false) p.set('imports', 'false');
   const res = await request(`/$/ontology/${encodeURIComponent(ds)}/search?${p}`, {
     headers: { Accept: 'application/json' },
     signal: opts.signal,

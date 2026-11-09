@@ -68,7 +68,7 @@ use crate::store::{Snapshot, Store};
 use crate::task::Control;
 use index::{Index, LOCAL_NAME, NOTATION, OBO_ID, PROPS};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
-use sparkles_reasoner::inputs::{GraphRef, Import, Inputs};
+use sparkles_reasoner::inputs::{GraphRef, Import};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -384,13 +384,7 @@ impl Ontologies {
             None => snap.clone(),
         };
         let readable = |g: crate::id::Id| access.as_ref().is_none_or(|a| a.readable_id(&snap, g));
-        let inputs = Inputs {
-            data_graphs: req.graphs(),
-            ontology_graphs: Vec::new(),
-            imports: req.imports,
-            location_mapping: Default::default(),
-        };
-        let resolved = sparkles_reasoner::inputs::resolve_readable(&view, &inputs, &readable);
+        let (resolved, _) = req.resolve(&view, &readable);
         let mut graphs = vec![false; ix.graphs.len()];
         for g in &resolved.graphs {
             let Some(id) = g.id(&view) else { continue };

@@ -135,6 +135,15 @@ impl Op {
         self
     }
 
+    /// A required request header.
+    pub fn header_req(mut self, name: &str, schema: J, description: &str) -> Self {
+        self.params.push(json!({
+            "name": name, "in": "header", "required": true, "schema": schema,
+            "description": description,
+        }));
+        self
+    }
+
     /// The request body: `content` maps media types to media type objects.
     pub fn body(mut self, required: bool, description: &str, content: J) -> Self {
         self.obj.insert(
@@ -255,6 +264,7 @@ fn error_response(status: u16) -> &'static str {
         413 => "PayloadTooLarge",
         415 => "UnsupportedMediaType",
         422 => "Unprocessable",
+        428 => "PreconditionRequired",
         429 => "TooManyRequests",
         501 => "NotImplemented",
         502 => "BadGateway",
@@ -453,6 +463,12 @@ fn error_responses() -> Map<String, J> {
     put(
         "PreconditionFailed",
         err("`If-Match` or `If-None-Match` failed (`code: precondition-failed`)."),
+    );
+    put(
+        "PreconditionRequired",
+        err(
+            "The change must name the revision it starts from in `If-Match` (`code: precondition-required`).",
+        ),
     );
     put("PayloadTooLarge", err("The body is over its ceiling."));
     put(

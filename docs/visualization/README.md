@@ -655,6 +655,35 @@ each moved entity that the graphs type as something else is refused, and the mov
 nothing. The cycle check follows only the graph's own named `SubClassOf` axioms.
 Item 770 covers bulk edits of larger ontologies.
 
+The **Imports** tab shows where the selected graph's `owl:imports` lead
+([screenshot](../images/ontology-imports.png)). It draws the imports closure as a tree, with
+each import's graphs and the source that resolved it, and marks the edges that close a cycle
+and the imports that resolve to no graph the caller can read. An import resolves first to the
+graph that the dataset's import map names for it, then to the graph its IRI names, and then
+to the graphs of a resource catalog vocabulary whose namespace matches it. The map is
+dataset-wide, so every branch shares it, and the tab lists each entry's source, file,
+location, ETag, digest and fetch time.
+
+An administrator of the dataset adds and removes map entries, loads an OASIS XML catalog
+with the files it names, and fetches or refreshes an import. A catalog load replaces the
+graph of each `uri` entry whose file is chosen with it, in one commit, and maps an entry
+whose `uri` is an absolute IRI to that graph. It lists the entries it skipped, such as
+`rewriteURI`, `nextCatalog`, an entry under an `xml:base` and a file that was not chosen.
+Choosing the catalog's folder instead of single files keeps each file's path below the
+folder, which an entry such as `sub/lib.ttl` needs.
+**Fetch into graph** downloads an `http` or `https` import through the server's outbound
+policy into the graph its IRI names, in one commit, and **Refresh** downloads it again. A
+refreshed document without blank nodes that equals the graph makes no commit. Readers and
+protected branches see the closure and the map without the actions, and other writers see
+only the entries whose graph they can read.
+
+The **Imported axioms** switch beside the graph picker includes or excludes the axioms of
+the imported graphs in every view of the editor, and the page keeps the choice in its URL.
+Edits write to the selected graph either way. Turning the switch or changing the map reads
+the trees, the filtered trees and the frame again. Reads never fetch, and item 559 covers
+fetching during a read. Reasoning runs keep their own location mapping, which item 772
+connects to the import map.
+
 **Inferred** reveals the
 kept hierarchy beside the asserted class tree. It reads roots and expanded levels from
 an existing result, with the classifier's actual tier and outcome

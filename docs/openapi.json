@@ -780,6 +780,16 @@
         },
         "description": "`If-Match` or `If-None-Match` failed (`code: precondition-failed`)."
       },
+      "PreconditionRequired": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        },
+        "description": "The change must name the revision it starts from in `If-Match` (`code: precondition-required`)."
+      },
       "QueryResults": {
         "content": {
           "application/ld+json": {
@@ -40607,6 +40617,918 @@
           "Ontology"
         ],
         "x-sparkles-permission": "read"
+      }
+    },
+    "/$/ontology/{ds}/imports": {
+      "get": {
+        "description": "The dataset's import map, which sends an import IRI to a graph of the dataset before a read looks for the graph the IRI names. Every branch shares it. A caller with `admin` sees every entry, and another caller sees the entries whose graph holds triples it can read. The entity tag is the map's revision.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "getOntologyImportMap",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Follow `owl:imports` to graphs of the dataset (the default).",
+            "in": "query",
+            "name": "imports",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "lenient",
+                "strict"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "admin": {
+                      "description": "Whether the caller sees every entry.",
+                      "type": "boolean"
+                    },
+                    "dataset": {
+                      "type": "string"
+                    },
+                    "entries": {
+                      "items": {
+                        "properties": {
+                          "branch": {
+                            "type": "string"
+                          },
+                          "commit": {
+                            "type": "integer"
+                          },
+                          "digest": {
+                            "description": "`sha256:` and the hex digest of the bytes loaded.",
+                            "type": "string"
+                          },
+                          "etag": {
+                            "type": "string"
+                          },
+                          "fetched": {
+                            "format": "date-time",
+                            "type": "string"
+                          },
+                          "file": {
+                            "description": "The catalog's path of the file loaded into the graph.",
+                            "type": "string"
+                          },
+                          "graph": {
+                            "type": "string"
+                          },
+                          "iri": {
+                            "description": "The import IRI or version IRI.",
+                            "type": "string"
+                          },
+                          "location": {
+                            "description": "The URL fetched.",
+                            "type": "string"
+                          },
+                          "source": {
+                            "enum": [
+                              "manual",
+                              "catalog",
+                              "fetch"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "maxEntries": {
+                      "type": "integer"
+                    },
+                    "revision": {
+                      "description": "The map's entity tag, which a PATCH's `If-Match` names.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The map."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "The import map",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "patch": {
+        "description": "Sets and removes entries of the import map. A graph given as a string makes a manual entry, and an entry object, such as one that an `import-map-unwritten` answer lists, is kept as given. The map holds at most 4,096 entries, and each IRI and graph is at most 4 KiB. The `If-Match` header must name the map's revision. Without it, or with `*`, the change is `428`, and a stale revision is `412`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "patchOntologyImportMap",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The map's revision that the change starts from, as `GET` gives it. `*` is refused.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "remove": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "set": {
+                    "additionalProperties": {
+                      "oneOf": [
+                        {
+                          "description": "The graph, for a manual entry.",
+                          "type": "string"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "description": "An entry of the map, with or without its `iri`, kept as given.",
+                          "properties": {
+                            "branch": {
+                              "type": "string"
+                            },
+                            "commit": {
+                              "type": "integer"
+                            },
+                            "digest": {
+                              "description": "`sha256:` and the hex digest of the bytes loaded.",
+                              "type": "string"
+                            },
+                            "etag": {
+                              "type": "string"
+                            },
+                            "fetched": {
+                              "format": "date-time",
+                              "type": "string"
+                            },
+                            "file": {
+                              "description": "The catalog's path of the file loaded into the graph.",
+                              "type": "string"
+                            },
+                            "graph": {
+                              "type": "string"
+                            },
+                            "iri": {
+                              "description": "The import IRI or version IRI.",
+                              "type": "string"
+                            },
+                            "location": {
+                              "description": "The URL fetched.",
+                              "type": "string"
+                            },
+                            "source": {
+                              "enum": [
+                                "manual",
+                                "catalog",
+                                "fetch"
+                              ],
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "graph",
+                            "source"
+                          ],
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    "description": "Import IRI to graph or entry.",
+                    "type": "object"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "The change.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "admin": {
+                      "description": "Whether the caller sees every entry.",
+                      "type": "boolean"
+                    },
+                    "dataset": {
+                      "type": "string"
+                    },
+                    "entries": {
+                      "items": {
+                        "properties": {
+                          "branch": {
+                            "type": "string"
+                          },
+                          "commit": {
+                            "type": "integer"
+                          },
+                          "digest": {
+                            "description": "`sha256:` and the hex digest of the bytes loaded.",
+                            "type": "string"
+                          },
+                          "etag": {
+                            "type": "string"
+                          },
+                          "fetched": {
+                            "format": "date-time",
+                            "type": "string"
+                          },
+                          "file": {
+                            "description": "The catalog's path of the file loaded into the graph.",
+                            "type": "string"
+                          },
+                          "graph": {
+                            "type": "string"
+                          },
+                          "iri": {
+                            "description": "The import IRI or version IRI.",
+                            "type": "string"
+                          },
+                          "location": {
+                            "description": "The URL fetched.",
+                            "type": "string"
+                          },
+                          "source": {
+                            "enum": [
+                              "manual",
+                              "catalog",
+                              "fetch"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "maxEntries": {
+                      "type": "integer"
+                    },
+                    "revision": {
+                      "description": "The map's entity tag, which a PATCH's `If-Match` names.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The map after the change."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Change the import map",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/ontology/{ds}/imports/catalog": {
+      "post": {
+        "description": "Loads an OASIS XML catalog and the files it names in one commit on the branch, and writes its entries to the import map with source `catalog`. Each `uri` entry maps its `name` to a graph. A relative `uri` whose file is a part of the body replaces the graph named by `name`, and an absolute `uri` maps the name to that graph. Other entries, entries under an `xml:base` and missing files are listed in `skipped`. A document type or entity declaration is refused, and nothing outside the body is read. The catalog is at most 1 MiB with 1,000 entries.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "loadOntologyImportCatalog",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/dryRun"
+          },
+          {
+            "$ref": "#/components/parameters/changes"
+          },
+          {
+            "$ref": "#/components/parameters/receipt"
+          },
+          {
+            "$ref": "#/components/parameters/validate"
+          },
+          {
+            "$ref": "#/components/parameters/commitMessage"
+          },
+          {
+            "$ref": "#/components/parameters/dryRunHeader"
+          },
+          {
+            "description": "The most validation results reported when a write is rejected.",
+            "in": "query",
+            "name": "validationLimit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "additionalProperties": {
+                  "contentMediaType": "application/octet-stream",
+                  "type": "string"
+                },
+                "properties": {
+                  "catalog": {
+                    "contentMediaType": "application/xml",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "catalog"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "The `catalog` part, and one part per file, named by the path the catalog gives.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "changed": {
+                      "type": "boolean"
+                    },
+                    "entries": {
+                      "items": {
+                        "properties": {
+                          "branch": {
+                            "type": "string"
+                          },
+                          "commit": {
+                            "type": "integer"
+                          },
+                          "digest": {
+                            "description": "`sha256:` and the hex digest of the bytes loaded.",
+                            "type": "string"
+                          },
+                          "etag": {
+                            "type": "string"
+                          },
+                          "fetched": {
+                            "format": "date-time",
+                            "type": "string"
+                          },
+                          "file": {
+                            "description": "The catalog's path of the file loaded into the graph.",
+                            "type": "string"
+                          },
+                          "graph": {
+                            "type": "string"
+                          },
+                          "iri": {
+                            "description": "The import IRI or version IRI.",
+                            "type": "string"
+                          },
+                          "location": {
+                            "description": "The URL fetched.",
+                            "type": "string"
+                          },
+                          "source": {
+                            "enum": [
+                              "manual",
+                              "catalog",
+                              "fetch"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "loaded": {
+                      "items": {
+                        "properties": {
+                          "file": {
+                            "type": "string"
+                          },
+                          "graph": {
+                            "type": "string"
+                          },
+                          "triples": {
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "revision": {
+                      "type": "string"
+                    },
+                    "skipped": {
+                      "items": {
+                        "properties": {
+                          "entry": {
+                            "type": "string"
+                          },
+                          "reason": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "What the upload loaded and mapped, with the receipt when asked for."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Load an XML catalog",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/ontology/{ds}/imports/fetch": {
+      "post": {
+        "description": "Fetches an import's document through the server's outbound policy and makes the graph hold it in one commit on the branch, then records the map entry with source `fetch`, the location, the branch and commit, the ETag, the SHA-256 digest and the time. The location defaults to the entry's and then to the IRI, and must be http or https. The graph defaults to the entry's and then to the IRI. A refresh is the same request, and a document without blank nodes that equals the graph makes no commit. A refused destination is `403`, and a document that does not parse is `422`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "fetchOntologyImport",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/dryRun"
+          },
+          {
+            "$ref": "#/components/parameters/changes"
+          },
+          {
+            "$ref": "#/components/parameters/receipt"
+          },
+          {
+            "$ref": "#/components/parameters/validate"
+          },
+          {
+            "$ref": "#/components/parameters/commitMessage"
+          },
+          {
+            "$ref": "#/components/parameters/dryRunHeader"
+          },
+          {
+            "description": "The most validation results reported when a write is rejected.",
+            "in": "query",
+            "name": "validationLimit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "graph": {
+                    "type": "string"
+                  },
+                  "iri": {
+                    "type": "string"
+                  },
+                  "location": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "iri"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "The import.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "changed": {
+                      "type": "boolean"
+                    },
+                    "entry": {
+                      "properties": {
+                        "branch": {
+                          "type": "string"
+                        },
+                        "commit": {
+                          "type": "integer"
+                        },
+                        "digest": {
+                          "description": "`sha256:` and the hex digest of the bytes loaded.",
+                          "type": "string"
+                        },
+                        "etag": {
+                          "type": "string"
+                        },
+                        "fetched": {
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "file": {
+                          "description": "The catalog's path of the file loaded into the graph.",
+                          "type": "string"
+                        },
+                        "graph": {
+                          "type": "string"
+                        },
+                        "iri": {
+                          "description": "The import IRI or version IRI.",
+                          "type": "string"
+                        },
+                        "location": {
+                          "description": "The URL fetched.",
+                          "type": "string"
+                        },
+                        "source": {
+                          "enum": [
+                            "manual",
+                            "catalog",
+                            "fetch"
+                          ],
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "revision": {
+                      "type": "string"
+                    },
+                    "triples": {
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The entry written, with the receipt when asked for."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Fetch an import into a graph",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "admin"
       }
     },
     "/$/ontology/{ds}/individuals": {

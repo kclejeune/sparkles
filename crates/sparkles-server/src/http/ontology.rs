@@ -48,8 +48,33 @@ fn mode_of(v: &str) -> ApiResult<owl::Mode> {
     owl::Mode::parse(v).ok_or_else(|| bad(format!("mode must be lenient or strict, not '{v}'")))
 }
 
-/// The ontology the query parameters name.
-fn request_of(params: &Params) -> ApiResult<OntologyRequest> {
+mod imports;
+pub(super) use imports::{
+    catalog as imports_catalog, fetch as imports_fetch, get_map as imports_get,
+    patch_map as imports_patch,
+};
+
+/// The ontology the query parameters name, with the import map and the vocabulary
+/// resources its imports may resolve through (spec U12, import resolution).
+fn request_of(st: &AppState, ds: &Arc<Dataset>, params: &Params) -> ApiResult<OntologyRequest> {
+    let mut req = request_params(params)?;
+    req.import_targets = imports::targets(st, ds);
+    Ok(req)
+}
+
+/// The format member of an entity tag of a read of `req`: `base`, followed by the digest
+/// of the import targets when the read follows imports and has targets, so that a change
+/// of the map or of the vocabulary resources changes the tag.
+fn tag_format(base: &str, req: &OntologyRequest) -> String {
+    if req.imports == ImportMode::None || req.import_targets.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}.{:016x}", req.import_targets.digest())
+    }
+}
+
+/// The ontology the query parameters name, without import targets.
+fn request_params(params: &Params) -> ApiResult<OntologyRequest> {
     let mut req = OntologyRequest::default();
     let graphs = params.all("graph");
     if !graphs.is_empty() {
@@ -184,7 +209,7 @@ pub(super) async fn summary(
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
-    let req = request_of(&params)?;
+    let req = request_of(&st, &ds, &params)?;
     let metrics = match params.get("metrics") {
         None | Some("false") => false,
         Some("true") => true,
@@ -212,7 +237,7 @@ pub(super) async fn summary(
         let tag = conditional::etag(
             ds.store.dataset_id(),
             seq,
-            if metrics { "owl-metrics" } else { "owl" },
+            &tag_format(if metrics { "owl-metrics" } else { "owl" }, &req),
         );
         let resp = match conditional::check_read(&headers, ds.store.dataset_id(), seq, &tag)? {
             conditional::ReadOutcome::NotModified => conditional::not_modified(&tag),
@@ -236,7 +261,7 @@ pub(super) async fn axioms(
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
-    let req = request_of(&params)?;
+    let req = request_of(&st, &ds, &params)?;
     let types = match params.get("type") {
         None => None,
         Some(t) => Some(onto::parse_axiom_types(t).map_err(|e| bad(e.to_string()))?),
@@ -340,7 +365,7 @@ pub(super) async fn entities(
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
-    let req = request_of(&params)?;
+    let req = request_of(&st, &ds, &params)?;
     let kinds = match params.get("kind") {
         None => None,
         Some(k) => Some(onto::wire::parse_entity_kinds(k).map_err(|e| bad(e.to_string()))?),
@@ -371,7 +396,7 @@ pub(super) async fn entity(
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
-    let req = request_of(&params)?;
+    let req = request_of(&st, &ds, &params)?;
     let iri = params
         .get("iri")
         .ok_or_else(|| bad("iri names the entity"))?
@@ -428,7 +453,7 @@ pub(super) async fn check(
             "maxViolations",
         ],
     )?;
-    let req = request_body(&o, request_of(&params)?)?;
+    let req = request_body(&o, request_of(&st, &ds, &params)?)?;
     let mut check = CheckRequest::default();
     if let Some(v) = params.get("profiles") {
         check.profiles = onto::parse_profiles(v).map_err(|e| bad(e.to_string()))?;
@@ -512,7 +537,7 @@ pub(super) async fn parse(
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let o = body_object(&bytes, &["graph", "imports", "mode", "text", "as"])?;
-    let req = request_body(&o, request_of(&params)?)?;
+    let req = request_body(&o, request_of(&st, &ds, &params)?)?;
     if req.inferences {
         return Err(bad(
             "a parse reads the asserted axioms: leave out 'inferences'",
@@ -584,7 +609,7 @@ pub(super) async fn dl_query(
             "maxDerived",
         ],
     )?;
-    let req = request_body(&o, request_of(&params)?)?;
+    let req = request_body(&o, request_of(&st, &ds, &params)?)?;
     let (q, limit) = onto::wire::dl_query_of(&o).map_err(ontology_error)?;
     let mut opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
     // a client that goes away stops the run
@@ -663,7 +688,7 @@ pub(super) async fn edit(
             "graph", "imports", "mode", "add", "remove", "declare", "target", "message",
         ],
     )?;
-    let req = request_body(&o, request_of(&params)?)?;
+    let req = request_body(&o, request_of(&st, &ds, &params)?)?;
     let prefixes: Vec<(String, String)> = ds.dataset.prefixes().into_iter().collect();
     let edit = EditRequest {
         add: axiom_list(&o, "add", &prefixes)?,
@@ -758,7 +783,7 @@ pub(super) async fn remove_entity(
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     history::reject_at(&params)?;
-    let req = request_of(&params)?;
+    let req = request_of(&st, &ds, &params)?;
     if req.inferences {
         return Err(bad(
             "a removal changes the asserted axioms: leave out 'inferences'",
@@ -845,7 +870,7 @@ pub(super) async fn diff(
     if params.get("at").is_some() {
         return Err(bad("a diff takes from and to, not at"));
     }
-    let req = request_of(&params)?;
+    let req = request_of(&st, &ds, &params)?;
     let from = super::diff::selector(&params, "from")?
         .ok_or_else(|| bad("from names the earlier commit"))?;
     let to = super::diff::selector(&params, "to")?.unwrap_or(sparkles::history::At::Head);
@@ -949,7 +974,7 @@ pub(super) async fn search(
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
-    let req = request_of(&params)?;
+    let req = request_of(&st, &ds, &params)?;
     let mut a = serde_json::Map::new();
     let q = params
         .get("q")
@@ -1184,7 +1209,7 @@ async fn hierarchy_read(
             "deprecated",
         ],
     )?;
-    let req = request_of(&params)?;
+    let req = request_of(&st, &ds, &params)?;
     let mut a = browse_args(
         &params,
         &headers,
@@ -1203,7 +1228,14 @@ async fn hierarchy_read(
             .hierarchy(&req, &h, &opts)
             .map_err(ontology_error)?;
         let j = onto::wire::hierarchy_body(&ds.name, &h, &found);
-        browse_tagged(&ds, &headers, found.commit, "owl-tree", j, req.inferences)
+        browse_tagged(
+            &ds,
+            &headers,
+            found.commit,
+            &tag_format("owl-tree", &req),
+            j,
+            req.inferences,
+        )
     })
     .await
 }
@@ -1219,7 +1251,7 @@ async fn individuals_read(
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     materialized_selectors(&params, &["type", "iri", "after", "limit", "untyped"])?;
-    let req = request_of(&params)?;
+    let req = request_of(&st, &ds, &params)?;
     let mut a = browse_args(
         &params,
         &headers,
@@ -1240,7 +1272,7 @@ async fn individuals_read(
             &ds,
             &headers,
             found.commit,
-            "owl-individuals",
+            &tag_format("owl-individuals", &req),
             j,
             req.inferences,
         )
@@ -1272,7 +1304,7 @@ pub(super) async fn kept_classification(
                 return Err(bad(format!("duplicate selector '{key}'")));
             }
         }
-        let req = request_of(&params)?;
+        let req = request_of(&st, &ds, &params)?;
         let mut a = browse_args(
             &params,
             &headers,
@@ -1383,7 +1415,7 @@ async fn term_read(
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     materialized_selectors(&params, &["iri", "mentions", "incoming", "format"])?;
-    let req = request_of(&params)?;
+    let req = request_of(&st, &ds, &params)?;
     let mut a = browse_args(
         &params,
         &headers,
@@ -1406,7 +1438,14 @@ async fn term_read(
         let r = renderer(&ds);
         let Some((fmt, mime, ext)) = format else {
             let j = onto::wire::term_body(&ds.name, &page, &r);
-            return browse_tagged(&ds, &headers, page.commit, "owl-term", j, req.inferences);
+            return browse_tagged(
+                &ds,
+                &headers,
+                page.commit,
+                &tag_format("owl-term", &req),
+                j,
+                req.inferences,
+            );
         };
         let body: Vec<u8> = if ext == "ofn" {
             let header = owl::Header::default();
@@ -1484,7 +1523,7 @@ pub(super) async fn classify(
             "lang",
         ],
     )?;
-    let req = request_body(&o, request_of(&params)?)?;
+    let req = request_body(&o, request_of(&st, &ds, &params)?)?;
     let flag = |k: &str| -> ApiResult<bool> {
         match o.get(k) {
             None | Some(J::Null) => Ok(params.get(k).is_some_and(truthy)),

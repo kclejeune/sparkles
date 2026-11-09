@@ -270,6 +270,11 @@ mapping, and fetching only when the caller asks for it). Each axiom remembers th
 it came from, so a write can target the graph that holds an axiom and a report can name
 it.
 
+The import resolution of [U12](U12-ontology-workbench/SPEC.md#import-resolution) adds two
+sources of dataset graphs before and after the graph named by an import's IRI. The
+dataset's import map comes first, and a C30 vocabulary resource whose namespace matches
+the import comes last. Reads still fetch nothing.
+
 ### 4.4 Blank nodes
 
 Blank nodes are read with their store labels (`_:b<hex>`, see
@@ -977,8 +982,12 @@ deadline. Roadmap item 540 adds the builder, the closure and the entity accessor
 describes.
 
 **Imports.** A read follows `owl:imports` only to graphs of the dataset that the caller
-can read. Fetching is refused, because a read route would otherwise make outbound
-requests. Roadmap item 559 adds fetching through the outbound policy.
+can read. The server's reads add the dataset's import map and the resource catalog's
+vocabularies as sources of those graphs, as U12's
+[import resolution](U12-ontology-workbench/SPEC.md#import-resolution) describes, and the
+summary lists the closure. Fetching is refused, because a read route would otherwise make
+outbound requests. The editor's explicit fetch stores a remote import as a graph, and
+roadmap item 559 adds fetching during a read through the outbound policy.
 
 **Caching.** The handle keeps the last four reads of up to two million triples each. An
 entry is keyed by commit, graphs, imports and mode, so any commit replaces it, and only

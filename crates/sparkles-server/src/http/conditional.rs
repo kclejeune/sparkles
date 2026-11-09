@@ -88,6 +88,8 @@ fn names_commit(opaque: &str, id: DatasetId, seq: u64) -> bool {
     let (Some(fmt), Some(s), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
         return false;
     };
+    // an ontology read's tag may add the digest of its import targets (`owl.<hex>`)
+    let fmt = fmt.split_once('.').map_or(fmt, |(base, _)| base);
     FORMATS.contains(&fmt) && s.parse() == Ok(seq) && d.parse::<DatasetId>() == Ok(id)
 }
 

@@ -1676,3 +1676,40 @@ test('ontology-bulk', async ({ page, request }) => {
   await shoot(page, 'ontology-bulk');
   await request.delete(`/$/branches/uni/${branch}?force=true`);
 });
+
+test('ontology-imports', async ({ page, request }) => {
+  // the Imports tab with a cycle between two library graphs, an unresolved import, an import
+  // resolved through the import map and one fetched into a graph
+  const branch = 'imports-shot';
+  const owl = 'http://www.w3.org/2002/07/owl#';
+  await request.post('/$/branches/uni', { data: { name: branch } });
+  const u = await request.post(`/uni@${branch}/update`, {
+    headers: { 'Content-Type': 'application/sparql-update' },
+    data: `INSERT DATA {
+      <http://example.org/uni> <${owl}imports> <http://example.org/core>, <http://example.org/people>,
+        <http://imports.mock/units.ttl>, <http://purl.example.org/geo> .
+      GRAPH <http://example.org/core> { <http://example.org/core> <${owl}imports> <http://example.org/terms> }
+      GRAPH <http://example.org/terms> { <http://example.org/terms> <${owl}imports> <http://example.org/core> }
+      GRAPH <http://example.org/people-v2> { <http://example.org/people-v2> a <${owl}Ontology> }
+    }`,
+  });
+  expect(u.ok(), await u.text()).toBe(true);
+  const m = await request.patch('/$/ontology/uni/imports', {
+    data: { set: { 'http://example.org/people': 'http://example.org/people-v2' } },
+  });
+  expect(m.ok(), await m.text()).toBe(true);
+  const f = await request.post(`/$/ontology/uni/imports/fetch?branch=${branch}`, {
+    data: { iri: 'http://imports.mock/units.ttl' },
+  });
+  expect(f.ok(), await f.text()).toBe(true);
+  await page.goto(
+    `/ui/workbench/ontology?${new URLSearchParams({ ds: 'uni', branch, tab: 'imports' })}`,
+  );
+  await expect(page.getByRole('table', { name: 'Import map' })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByLabel('Imports closure').getByText('cycle')).toHaveCount(2);
+  await shoot(page, 'ontology-imports');
+  await request.patch('/$/ontology/uni/imports', {
+    data: { remove: ['http://example.org/people', 'http://imports.mock/units.ttl'] },
+  });
+  await request.delete(`/$/branches/uni/${branch}?force=true`);
+});

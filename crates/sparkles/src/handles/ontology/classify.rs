@@ -498,6 +498,7 @@ impl Ontologies {
             mode: Mode::Lenient,
             at: None,
             inferences: false,
+            import_targets: Default::default(),
         };
         let props = ["wasGeneratedBy", "generatedAtTime", "wasDerivedFrom"]
             .map(|l| AnnotationProperty::new(format!("{PROV}{l}")));
