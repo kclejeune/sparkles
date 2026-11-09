@@ -395,6 +395,67 @@ class LifetimeExtension(unittest.TestCase):
         self.assertEqual(len([n for n in attempts if n.endswith('-failed.json')]),2)
         self.assertEqual(self.lifetime(),self.original)
 
+    def test_an_act_slowed_past_the_previous_end_publishes_nothing(self):
+        # The last guard query takes 40 seconds, which crosses the closure reserve.
+        io=self.io(self.left-60);io.show_delay=40
+        with self.assertRaisesRegex(controller.Refusal,'previous end'):self.extend(io)
+        self.assertEqual(self.receipts(),[]);self.assertEqual(self.lifetime(),self.original)
+        # A receipt whose publication time is after the previous end is refused.
+        receipt=self.extend(self.io(self.left-600),3600)
+        late=dict(receipt,published_boottime=self.original['boot_end']+1)
+        path=self.op/'lifetime-extension-0001.json';path.write_text(json.dumps(late));path.chmod(0o600)
+        with self.assertRaises(ValueError):self.lifetime()
+
+    def test_fabricated_or_out_of_order_receipts_are_refused(self):
+        receipt=self.extend(self.io(self.left-600),3600)
+        good=(self.op/'lifetime-extension-0001.json').read_text()
+        cases={'partial adoption':dict(receipt,adoption={'worker_boot_id':receipt['adoption']['worker_boot_id']}),
+               'adoption other environment':dict(receipt,adoption=dict(receipt['adoption'],hook_sha256='e'*64)),
+               'adoption other local boot':dict(receipt,adoption=dict(receipt['adoption'],local_boot_id='22222222-2222-2222-2222-222222222222')),
+               'adoption other guard pid':dict(receipt,adoption=dict(receipt['adoption'],guard_pid=999)),
+               'archive not a time':dict(receipt,provider=dict(receipt['provider'],archive_after='NOT A TIMESTAMP')),
+               'archive disagrees':dict(receipt,provider=dict(receipt['provider'],archive_after_unix=receipt['provider']['archive_after_unix']+5000)),
+               'null reason':dict(receipt,reason=None),
+               'published before observed':dict(receipt,published_boottime=receipt['observed_boottime']-1)}
+        for name,value in cases.items():
+            with self.subTest(name):
+                path=self.op/'lifetime-extension-0001.json';path.write_text(json.dumps(value));path.chmod(0o600)
+                with self.assertRaises(ValueError):self.lifetime()
+        path=self.op/'lifetime-extension-0001.json';path.write_text(good);path.chmod(0o600)
+        second=self.extend(self.io(self.left+2000),10500)
+        earlier=dict(second,observed_boottime=receipt['observed_boottime']-100,boot_end=receipt['observed_boottime']-100+10500,
+                     published_boottime=receipt['observed_boottime']-99)
+        path=self.op/'lifetime-extension-0002.json';path.write_text(json.dumps(earlier));path.chmod(0o600)
+        with self.assertRaises(ValueError):self.lifetime()
+
+    def test_stop_decisions_freeze_extensions_and_refuse_admission(self):
+        # An explicit stop trigger takes the extension lock before the guard stops.
+        io=self.io(100);io.record('stop-trigger.json',{'requested_wall':io.wall()});frozen=[]
+        io.freeze_extensions=lambda:frozen.append(io.mono()) or True
+        with patch.object(controller,'reconcile_stop',return_value=True):
+            self.assertTrue(controller.guard_loop(self.f['release'],io,self.intent))
+        self.assertTrue(frozen)
+        # A deadline stop publishes the stopping state while it holds the lock.
+        (self.op/'stop-trigger.json').unlink()
+        io=self.io(self.left+60)
+        with patch.object(controller,'reconcile_stop',return_value=True):
+            self.assertTrue(controller.guard_loop(self.f['release'],io,self.intent))
+        self.assertTrue((self.op/'stop-trigger.json').exists())
+        # Admission refuses an operation that is stopping, extended or not.
+        with self.assertRaises(ValueError):
+            env.load_job_admission(self.f['admission'],self.f['profile_path'],self.f['profile']['worker'],self.f['now'],lambda unit:self.f['guard'])
+
+    def test_guard_fallback_never_restores_a_later_end(self):
+        # A forward wall jump at handoff makes the conservative original end earlier than the intent's.
+        path=self.op/'guard-admission.json';guard=json.loads(path.read_text());guard['observed_wall']+=2000
+        path.write_text(json.dumps(guard));path.chmod(0o600)
+        wall,boot=self.qwa.original_ends(self.intent,guard,json.loads((self.op/'root-handoff.json').read_text()))
+        self.assertLess(boot,self.intent['deadline_mono'])
+        io=self.io(0)
+        self.assertEqual(controller.guard_deadlines(io,self.intent),(boot,wall))
+        bad=self.op/'lifetime-extension-0001.json';bad.write_text('{"schema":"sparkles.boat.lifetime-extension","version":2}');bad.chmod(0o600)
+        self.assertEqual(controller.guard_deadlines(io,self.intent),(boot,wall))
+
     def test_the_guard_lock_excludes_an_extension_act(self):
         guard=controller.RealIO(self.f['release'],self.op)
         self.assertTrue(guard.freeze_extensions())
@@ -425,6 +486,8 @@ class LifetimeExtension(unittest.TestCase):
         with patch.object(controller,'reconcile_stop',side_effect=lambda r,io:seen.append((io.mono(),io.wall())) or True):
             self.assertTrue(controller.guard_loop(self.f['release'],io,self.intent))
         self.assertGreaterEqual(seen[0][0],receipt['boot_end']);self.assertLess(seen[0][0],receipt['boot_end']+2)
+        # That stop published the stopping state. Remove it to exercise a second run.
+        self.assertTrue((self.op/'stop-trigger.json').exists());(self.op/'stop-trigger.json').unlink()
         # An act that publishes while the guard waits for the lock keeps the worker.
         receipt_two={}
         io=self.io(self.left+3000-30);later=self.io(self.left+3000-60)

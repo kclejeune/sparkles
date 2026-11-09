@@ -121,12 +121,22 @@ the controller intent. The act sets the provider TTL 300 seconds past the new en
 `lifetime-extension-NNNN.json`. A failure leaves only an attempt record, which grants
 nothing, and the provider lifetime may then be longer than the guard's deadline.
 
-One act runs at a time under the operation's extension lock. The guard takes the same
-lock before it stops at its deadline and reads the receipts again, so no extension is
-published after it decides to stop. Admission, job preparation and the guard accept
-only consecutive version-1 receipts for the same worker, operation, guard and worker
-boot, each recorded before the previous end. A job admitted before an extension keeps
-the deadline it started with.
+The act checks the previous end again after its last blocking call and publishes only
+while the 30-second closure reserve remains. The receipt records that publication time
+with the observation, provider confirmation and adoption facts. One act runs at a time
+under the operation's extension lock. The guard takes the same lock before it stops,
+whether at its deadline or on an explicit stop trigger. At the deadline it reads the
+receipts again under the lock and, if no valid extension appeared, records the stop
+trigger before it stops. Admission and job preparation refuse an operation with a stop
+trigger, a stop request or a closure record, extended or not.
+
+Admission, job preparation and the guard accept only consecutive version-1 receipts
+whose every field matches the worker, operation, guard, worker boot and qualified
+environment, each observed after the previous act was published and published before
+the previous end. Without a valid chain the guard uses the conservative original end
+that admission uses, so missing or damaged receipts can only end the lifetime sooner.
+Receipts carry the same owner-only file trust as the other operation receipts. A job
+admitted before an extension keeps the deadline it started with.
 
 ## Closure and normal stop
 

@@ -98,9 +98,11 @@ sets a new end of at most 10,500 seconds after its own observation on both clock
 no end may fall more than 12 hours after the original controller intent. The provider
 lifetime is set past the new end and confirmed before the act publishes a numbered
 `sparkles.boat.lifetime-extension` version-1 receipt in the operation directory.
-Admission and the guard apply only a consecutive chain of valid receipts, each recorded
-before the previous end. A malformed or unknown receipt refuses admission and leaves
-the guard on its original deadline.
+Admission and the guard apply only a consecutive chain of valid receipts, each
+published before the previous end. A malformed or unknown receipt refuses admission and
+leaves the guard on the conservative original deadline. The guard holds the extension
+lock when it decides to stop and records the stop trigger, and admission refuses a
+stopping operation.
 `admit --minimum` uses this measure. Environment preparation and each operation
 also check both ends while they run, so a suspend during a transfer is counted.
 `admit` prints a version-2 `sparkles.boat.adapter-observation` that records the

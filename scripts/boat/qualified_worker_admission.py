@@ -41,7 +41,8 @@ EXTENSION_MAX=10500
 MAX_LIFETIME=43200
 PROVIDER_MARGIN=300
 STOP_MARGIN=200
-EXTENSION_KEYS={'schema','version','sequence','worker','operation_id','guard','observed_wall','observed_boottime','seconds','wall_end','boot_end','provider','adoption','reason'}
+EXTENSION_KEYS={'schema','version','sequence','worker','operation_id','guard','observed_wall','observed_boottime','published_wall','published_boottime','seconds','wall_end','boot_end','provider','adoption','reason'}
+ADOPTION_KEYS={'worker_boot_id','local_boot_id','guard_pid','environment_version','environment_version_id','hook_sha256','environment_fact_sha256'}
 UUID='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 
 def finite(value):return type(value)in(int,float)and value==value and abs(value)!=float('inf')
@@ -56,38 +57,56 @@ def extension_names(names):
     numbers.sort();require(numbers==list(range(1,len(numbers)+1)),'lifetime extension sequence gap')
     return numbers
 
+def printable(text):return isinstance(text,str)and 0<len(text)<=200 and all(' '<=c<='~'for c in text)
+
+def iso_unix(value):
+    require(isinstance(value,str),'lifetime extension provider time')
+    try:return datetime.fromisoformat(value.replace('Z','+00:00')).timestamp()
+    except ValueError:raise ValueError('lifetime extension provider time')from None
+
 def apply_extensions(names,read,intent,wall,boot,identity):
-    """Return the end pair after every valid receipt, or refuse the whole chain."""
-    numbers=extension_names(names)
+    """Return the end pair after every valid receipt, or refuse the whole chain.
+
+    Each act is observed after the previous act was published and published
+    before the previous end with the closure reserve left on both clocks.
+    """
+    numbers=extension_names(names);after=identity['handoff_boottime']
     for number in numbers:
         e=read('lifetime-extension-%04d.json'%number)
         require(isinstance(e,dict)and e.get('schema')==EXTENSION_SCHEMA and type(e.get('version'))is int and e['version']==1,'unknown lifetime extension schema')
         require(set(e)==EXTENSION_KEYS,'lifetime extension fields')
         require(type(e['sequence'])is int and e['sequence']==number and e['worker']==identity['worker'] and e['operation_id']==identity['operation_id'],'lifetime extension owner')
         require(e['guard']=={'boot_id':identity['boot_id'],'invocation_id':identity['invocation_id']},'lifetime extension guard identity')
-        require(all(finite(e[k])for k in('observed_wall','observed_boottime','wall_end','boot_end'))and type(e['seconds'])is int and 0<e['seconds']<=EXTENSION_MAX,'lifetime extension values')
-        require(e['observed_wall']+CLOSURE_RESERVE<wall and e['observed_boottime']+CLOSURE_RESERVE<boot,'lifetime extension recorded after the previous end')
+        require(all(finite(e[k])for k in('observed_wall','observed_boottime','published_wall','published_boottime','wall_end','boot_end'))and type(e['seconds'])is int and 0<e['seconds']<=EXTENSION_MAX,'lifetime extension values')
+        require(after<=e['observed_boottime']<=e['published_boottime'] and e['observed_wall']<=e['published_wall'],'lifetime extension chronology')
+        require(e['published_wall']+CLOSURE_RESERVE<wall and e['published_boottime']+CLOSURE_RESERVE<boot,'lifetime extension recorded after the previous end')
+        require(printable(e['reason']),'lifetime extension reason')
         require(e['wall_end']==e['observed_wall']+e['seconds'] and e['boot_end']==e['observed_boottime']+e['seconds'],'lifetime extension end')
         require(e['wall_end']>=wall and e['boot_end']>=boot,'lifetime extension shortens')
         require(e['wall_end']<=intent['wall']+MAX_LIFETIME and e['boot_end']<=intent['mono']+MAX_LIFETIME,'lifetime extension beyond the total lifetime cap')
         provider=e['provider']
         require(isinstance(provider,dict)and set(provider)=={'ttl_seconds','archive_after','archive_after_unix'}and provider['ttl_seconds']==e['seconds']+PROVIDER_MARGIN,'lifetime extension provider request')
-        require(finite(provider['archive_after_unix'])and provider['archive_after_unix']>=e['wall_end']+STOP_MARGIN,'lifetime extension provider confirmation')
-        adoption=e['adoption']
-        require(isinstance(adoption,dict)and adoption.get('worker_boot_id')==identity['worker_boot_id'],'lifetime extension worker boot')
-        wall,boot=e['wall_end'],e['boot_end']
+        require(finite(provider['archive_after_unix'])and abs(iso_unix(provider['archive_after'])-provider['archive_after_unix'])<0.001 and provider['archive_after_unix']>=e['wall_end']+STOP_MARGIN,'lifetime extension provider confirmation')
+        adoption=e['adoption'];environment=identity['environment']
+        require(isinstance(adoption,dict)and set(adoption)==ADOPTION_KEYS and identity['worker_boot_id']is not None and adoption['worker_boot_id']==identity['worker_boot_id'],'lifetime extension worker boot')
+        require(adoption['local_boot_id']==identity['boot_id'] and type(adoption['guard_pid'])is int and adoption['guard_pid']==identity['guard_pid'],'lifetime extension local guard adoption')
+        require(adoption['environment_version']==environment['version'] and adoption['environment_version_id']==environment['version_id'] and adoption['hook_sha256']==environment['hook_sha256'] and hexsha(adoption['environment_fact_sha256']),'lifetime extension environment adoption')
+        wall,boot,after=e['wall_end'],e['boot_end'],e['published_boottime']
     return wall,boot,len(numbers)
 
-def operation_identity(intent,guard,qualification,operation_id):
-    worker_boot=qualification.get('worker_boot_id')
+def operation_identity(intent,guard,qualification,operation_id,profile):
+    worker_boot=qualification.get('worker_boot_id');env=profile['future_environment']
     return {'worker':intent['worker'],'operation_id':operation_id,'boot_id':guard['boot_id'],
-            'invocation_id':guard['loaded']['InvocationID'],'worker_boot_id':worker_boot if isinstance(worker_boot,str)and re.fullmatch(UUID,worker_boot)else None}
+            'invocation_id':guard['loaded']['InvocationID'],'guard_pid':guard['pid'],'handoff_boottime':guard['observed_boottime'],
+            'environment':{'version':env['version'],'version_id':env['version_id'],'hook_sha256':env['hook_sha256']},
+            'worker_boot_id':worker_boot if isinstance(worker_boot,str)and re.fullmatch(UUID,worker_boot)else None}
 
 def extended_ends(root,intent,guard,handoff,operation_id):
     """The original end pair with the operation's lifetime extensions applied."""
     wall,boot=original_ends(intent,guard,handoff);names=os.listdir(root)
     if not extension_names(names):return wall,boot,0
-    return apply_extensions(names,lambda n:owned_json(root/n),intent,wall,boot,operation_identity(intent,guard,owned_json(root/'qualification.json'),operation_id))
+    profile=release_profile(owned_json(root/'release.json'))
+    return apply_extensions(names,lambda n:owned_json(root/n),intent,wall,boot,operation_identity(intent,guard,owned_json(root/'qualification.json'),operation_id,profile))
 
 def operation_lifetime(operation,qualification):
     """Recover the original end pair, tied to the qualification's boot and guard invocation."""

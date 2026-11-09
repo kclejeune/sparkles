@@ -63,10 +63,12 @@ class ExtendIO(controls.DiskIO):
         self.w=f['now'] if wall is None else wall;self.t=f['boot_now'] if boot is None else boot
         self.archive=None;self.worker_boot=WORKER_BOOT_ID;self.extend_exit=0;self.archive_shortfall=0
         self.live=dict(f['guard']);self.local_boot=f['boot_id']
-        self.env_version=None
+        self.env_version=None;self.shows=0;self.show_delay=0
 
     def show(self,unit):
-        assert unit==self.r['guard_unit']+'.service';return dict(self.live)
+        assert unit==self.r['guard_unit']+'.service';self.shows+=1
+        if self.show_delay and self.shows>1:self.t+=self.show_delay;self.w+=self.show_delay
+        return dict(self.live)
 
     def boat(self,args,*a,**k):
         self.calls.append(list(args))

@@ -76,6 +76,9 @@ def context(profile_path, qualification_path, worker, now, guard_reader=None):
     require(qualification.get('profile_sha256')==digest(raw_profile), 'profile file changed')
     require(qualification==export_operation(path.parent, now, worker, profile), 'qualification operation changed')
     live = (local_guard if guard_reader is None else guard_reader)(qualification['local_guard']['unit'])
+    # A stopping or closed operation admits nothing, even with an extension receipt.
+    for name in ('stop-trigger.json', 'stop-intent.json', 'closed.json', 'unresolved.json'):
+        require(not (path.parent/name).exists(), 'operation is stopping or closed')
     # The lifetime includes any receipted extension of this same operation.
     lifetime = operation_lifetime(path.parent, qualification)
     validate_admission(qualification, Path('/proc/sys/kernel/random/boot_id').read_text().strip(), live, now, profile, lifetime['wall_end'])

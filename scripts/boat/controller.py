@@ -380,19 +380,25 @@ def reconcile_stop(r,io):
 def guard_deadlines(io,intent):
     """The guard's (BOOTTIME, wall) deadline, moved only by valid extension receipts.
 
-    Without receipts this is the intent's own pair. Any unreadable or malformed
-    receipt chain falls back to that original pair, so it can only end sooner.
+    Before a Root handoff this is the intent's own pair. After it, the base is the
+    admission's conservative original pair, never later than the intent's. Any
+    missing, unreadable or malformed receipt chain falls back to that base, so
+    lost or damaged evidence can only end the lifetime sooner.
     """
     original=(intent['deadline_mono'],intent['deadline_wall'])
+    if not io.exists('root-handoff.json'):return original
     try:
-        names=io.names()
-        if not lifetime.extension_names(names):return original
         guard=io.read('guard-admission.json');handoff=io.read('root-handoff.json')
         wall,boot=lifetime.original_ends(intent,guard,handoff)
-        identity=lifetime.operation_identity(intent,guard,io.read('qualification.json'),io.r['guard_unit'])
-        wall,boot,_=lifetime.apply_extensions(names,io.read,intent,wall,boot,identity)
-        return boot,wall
+        base=(min(boot,original[0]),min(wall,original[1]))
     except Exception:return original
+    try:
+        names=io.names()
+        if not lifetime.extension_names(names):return base
+        identity=lifetime.operation_identity(intent,guard,io.read('qualification.json'),io.r['guard_unit'],profile())
+        wall,boot,_=lifetime.apply_extensions(names,io.read,intent,base[1],base[0],identity)
+        return boot,wall
+    except Exception:return base
 
 def guard_loop(r,io,intent):
     while True:
@@ -404,6 +410,8 @@ def guard_loop(r,io,intent):
                 deadline_mono,deadline_wall=guard_deadlines(io,intent)
                 if io.mono()<deadline_mono and io.wall()<deadline_wall:
                     io.thaw_extensions();continue
+            # The stopping state is published before the stop, so admission refuses it.
+            io.trigger()
             break
         if io.exists('no-ready-confirmed.json'):
             check=io.read('no-ready-confirmed.json');stopped(check['safe_info'])
@@ -411,6 +419,8 @@ def guard_loop(r,io,intent):
         if io.exists('cancel-before-resume.json') and not io.exists('resume-intent.json'):
             io.record('closed-no-resume.json',{'no_resume_intent':True,'guard_may_exit':True});return True
         if io.exists('stop-trigger.json'):
+            # An explicit stop also waits out and then excludes any extension act.
+            io.freeze_extensions()
             if not io.exists('startup-closed.json'):
                 if min(deadline_mono-io.mono(),deadline_wall-io.wall())<=200:break
                 try:
@@ -444,7 +454,7 @@ def extend_operation(r,io,seconds,fact_path,reason):
     need(io.exists('root-handoff.json') and io.exists('qualified-worker-admission.json') and io.exists('guard-admission.json'),'no qualified Root handoff to extend')
     for name in ('stop-trigger.json','stop-intent.json','closed.json','unresolved.json'):need(not io.exists(name),'operation is stopping or closed')
     intent=io.read('controller-intent.json');guard=io.read('guard-admission.json');handoff=io.read('root-handoff.json');q=io.read('qualification.json')
-    identity=lifetime.operation_identity(intent,guard,q,r['guard_unit'])
+    identity=lifetime.operation_identity(intent,guard,q,r['guard_unit'],profile())
     need(identity['worker_boot_id'] is not None,'qualification lacks the worker boot identity')
     names=io.names();wall,boot=lifetime.original_ends(intent,guard,handoff)
     try:wall,boot,count=lifetime.apply_extensions(names,io.read,intent,wall,boot,identity)
@@ -477,13 +487,16 @@ def extend_operation(r,io,seconds,fact_path,reason):
         need(archive>=new_wall+lifetime.STOP_MARGIN,'provider lifetime not confirmed past the new end')
         # The act's bound, the previous end, the stop path and the guard are checked
         # again just before publication. The guard holds the lock before it stops.
-        need(io.mono()-started<=EXTEND_ACT_MAX,'extension act exceeded its bound')
-        need(min(wall-io.wall(),boot-io.mono())>0,'previous end passed during the extension act')
-        for name in ('stop-trigger.json','stop-intent.json','closed.json','unresolved.json'):need(not io.exists(name),'operation is stopping or closed')
         live=io.show(unit);need(live.get('ActiveState')=='active' and live.get('InvocationID')==identity['invocation_id'],'guard not live or replaced')
+        for name in ('stop-trigger.json','stop-intent.json','closed.json','unresolved.json'):need(not io.exists(name),'operation is stopping or closed')
+        # The last blocking call is behind us. Publication keeps the closure reserve
+        # of the previous end, and the receipt records this time for every reader.
+        published_wall,published_boot=io.wall(),io.mono()
+        need(published_boot-started<=EXTEND_ACT_MAX,'extension act exceeded its bound')
+        need(published_wall+lifetime.CLOSURE_RESERVE<wall and published_boot+lifetime.CLOSURE_RESERVE<boot,'previous end reached during the extension act')
         receipt={'schema':lifetime.EXTENSION_SCHEMA,'version':1,'sequence':count+1,'worker':worker_id(),'operation_id':r['guard_unit'],
                  'guard':{'boot_id':identity['boot_id'],'invocation_id':identity['invocation_id']},
-                 'observed_wall':observed_wall,'observed_boottime':observed_boot,'seconds':seconds,'wall_end':new_wall,'boot_end':new_boot,
+                 'observed_wall':observed_wall,'observed_boottime':observed_boot,'published_wall':published_wall,'published_boottime':published_boot,'seconds':seconds,'wall_end':new_wall,'boot_end':new_boot,
                  'provider':{'ttl_seconds':ttl,'archive_after':after['archiveAfter'],'archive_after_unix':archive},
                  'adoption':{'worker_boot_id':identity['worker_boot_id'],'local_boot_id':guard['boot_id'],'guard_pid':guard['pid'],
                              'environment_version':env['version'],'environment_version_id':r['environment']['latest_version_id'],'hook_sha256':hook_sha(),
