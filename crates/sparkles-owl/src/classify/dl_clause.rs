@@ -320,11 +320,6 @@ impl Table {
     }
 }
 
-/// The bytes one key of [`Store`]'s index by maximal successor literal takes at most: a
-/// table entry of the literal and a list, twice over for the table's room to grow, its
-/// control byte, and the list's first allocation.
-const SUCC_KEY: usize = 2 * 32 + 1 + 16 + 15;
-
 /// A clause of a context's store.
 #[derive(Clone)]
 pub struct Stored {
@@ -448,8 +443,9 @@ impl Store {
         }
         let id = self.clauses.len() as u32;
         // the head's entries in the literal indexes, the queue's entry, and the entries in
-        // the maximal-literal indexes once processed, with room for their lists to double
-        let bytes = c.bytes() + 8 * (c.head().len() + 2) + 16;
+        // the maximal-literal indexes once processed; the index by successor literal counts
+        // its own growth as it is made
+        let bytes = c.bytes() + 8 * (c.head().len() + 2) + 8;
         match c.head().last() {
             None => self.empty.push(id),
             Some(&l) => self.by_last.entry(l).or_default().push(id),
@@ -499,12 +495,12 @@ impl Store {
                     X => self.by_x.entry(l.atom()).or_default().push(id),
                     RL => {
                         self.by_f.entry(l.fun()).or_default().push(id);
-                        self.grown += self.index_succ(l, id);
+                        self.index_succ(l, id);
                         self.by_rl.entry(l.atom()).or_default().push(id);
                     }
                     _ => {
                         self.by_f.entry(l.fun()).or_default().push(id);
-                        self.grown += self.index_succ(l, id);
+                        self.index_succ(l, id);
                     }
                 }
             }
@@ -519,20 +515,16 @@ impl Store {
         None
     }
 
-    /// Indexes a processed clause by its maximal literal over a successor term. The answer
-    /// is the bytes a new key takes, its table entry with the table's room to grow and its
-    /// list's first allocation, since a store can hold as many keys as clauses.
-    fn index_succ(&mut self, l: Lit, id: u32) -> usize {
-        match self.by_succ.entry(l) {
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                o.get_mut().push(id);
-                0
-            }
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(vec![id]);
-                SUCC_KEY
-            }
-        }
+    /// Indexes a processed clause by its maximal literal over a successor term, and adds
+    /// what the table and the list grew by to the bytes the run's estimate has not seen,
+    /// since a store can hold as many keys as clauses.
+    fn index_succ(&mut self, l: Lit, id: u32) {
+        let table = table_bytes(self.by_succ.capacity(), 32);
+        let list = self.by_succ.entry(l).or_default();
+        let cap = list.capacity();
+        list.push(id);
+        let list = (list.capacity() - cap) * 4;
+        self.grown += table_bytes(self.by_succ.capacity(), 32).saturating_sub(table) + list;
     }
 
     /// The bytes processing added to the indexes since the last call, for the run's
@@ -659,27 +651,33 @@ mod tests {
 
     #[test]
     fn the_index_by_successor_literal_is_counted() {
-        // as many keys as clauses, the case the per-clause allowance alone misses
+        // what the run's estimate is handed covers what the index holds, from its first
+        // key on, with a key per clause and with many clauses under one key
         let mut s = Store::default();
         let mut counted = 0;
+        let held = |s: &Store| {
+            table_bytes(s.by_succ.capacity(), 32)
+                + s.by_succ.values().map(|v| v.capacity() * 4).sum::<usize>()
+        };
         for i in 0..5000u32 {
-            counted += s.index_succ(Lit::f(i % 97, i), i);
-            // the per-clause allowance of `add` for the id in the list
-            counted += 8;
+            s.index_succ(Lit::f(i % 97, i), i);
+            counted += s.take_grown();
+            assert!(
+                counted >= held(&s),
+                "{counted} counted for {} held",
+                held(&s)
+            );
         }
-        // and many clauses under one key
         for i in 0..5000u32 {
-            counted += s.index_succ(Lit::f(1, 0), i);
-            counted += 8;
+            s.index_succ(Lit::f(1, 0), i);
+            counted += s.take_grown();
+            assert!(
+                counted >= held(&s),
+                "{counted} counted for {} held",
+                held(&s)
+            );
         }
-        let held = table_bytes(s.by_succ.capacity(), 32)
-            + s.by_succ.values().map(|v| v.capacity() * 4).sum::<usize>();
-        assert!(counted >= held, "{counted} counted for {held} held");
-        assert_eq!(
-            s.take_grown(),
-            0,
-            "index_succ alone leaves the processing total"
-        );
+        assert_eq!(s.take_grown(), 0, "the bytes are handed over once");
     }
 
     #[test]
