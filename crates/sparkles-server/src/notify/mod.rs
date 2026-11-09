@@ -435,17 +435,41 @@ fn spawn_worker(shared: &Arc<Shared>, st: &Arc<AppState>, channel: &str) -> std:
 /// Raise `ev` at `now`: route it, hold it back while `cond` was notified less than its
 /// interval ago, and queue a delivery per channel.
 pub fn raise(st: &Arc<AppState>, ev: Event, cond: Option<Condition>, now: DateTime<Utc>) -> Raised {
+    raise_with(st, ev, cond, now, |_| (true, false)).unwrap_or(Raised::Unrouted)
+}
+
+/// [`raise`] after `first` has changed the conditions, in one step under the
+/// notifier's lock, so that no other change to the conditions comes between them.
+/// `first` answers whether to raise the event and whether it changed anything; it runs
+/// whether or not notifications are on. `None`: `first` said not to raise.
+fn raise_with(
+    st: &Arc<AppState>,
+    ev: Event,
+    cond: Option<Condition>,
+    now: DateTime<Utc>,
+    first: impl FnOnce(&mut BTreeMap<String, Active>) -> (bool, bool),
+) -> Option<Raised> {
     let cfg = settings(st);
-    if !cfg.enabled {
-        return Raised::Disabled;
-    }
     let channels = cfg.route(ev.kind);
-    if channels.is_empty() {
-        return Raised::Unrouted;
-    }
     let n = &st.notifier;
     {
         let mut g = n.shared.inner.lock();
+        let (go, changed) = first(g.active(st));
+        let outcome = if !go {
+            Some(None)
+        } else if !cfg.enabled {
+            Some(Some(Raised::Disabled))
+        } else if channels.is_empty() {
+            Some(Some(Raised::Unrouted))
+        } else {
+            None
+        };
+        if let Some(out) = outcome {
+            if changed {
+                g.save(st);
+            }
+            return out;
+        }
         if let Some(c) = &cond {
             let held = g
                 .active(st)
@@ -457,7 +481,10 @@ pub fn raise(st: &Arc<AppState>, ev: Event, cond: Option<Condition>, now: DateTi
                 });
             if held {
                 *g.suppressed.entry(ev.kind.to_string()).or_default() += 1;
-                return Raised::Suppressed;
+                if changed {
+                    g.save(st);
+                }
+                return Some(Raised::Suppressed);
             }
             let a = g.active(st).entry(c.key.clone()).or_insert_with(|| Active {
                 event: ev.kind.into(),
@@ -468,6 +495,8 @@ pub fn raise(st: &Arc<AppState>, ev: Event, cond: Option<Condition>, now: DateTi
             });
             a.last = rfc3339(now);
             a.count += 1;
+            g.save(st);
+        } else if changed {
             g.save(st);
         }
     }
@@ -487,7 +516,7 @@ pub fn raise(st: &Arc<AppState>, ev: Event, cond: Option<Condition>, now: DateTi
         })
         .collect();
     n.enqueue(st, jobs, cfg.channels.len());
-    Raised::Queued(channels)
+    Some(Raised::Queued(channels))
 }
 
 /// The condition `key` cleared: the next event with it is notified at once.
@@ -496,20 +525,6 @@ pub fn clear(st: &AppState, key: &str) {
     if g.active(st).remove(key).is_some() {
         g.save(st);
     }
-}
-
-/// Change the conditions in one step under the notifier's lock, saving them once when
-/// `f` says it changed them.
-fn with_conditions<R>(
-    st: &AppState,
-    f: impl FnOnce(&mut BTreeMap<String, Active>) -> (R, bool),
-) -> R {
-    let mut g = st.notifier.shared.inner.lock();
-    let (r, changed) = f(g.active(st));
-    if changed {
-        g.save(st);
-    }
-    r
 }
 
 /// Clear every condition whose key `cleared` accepts.

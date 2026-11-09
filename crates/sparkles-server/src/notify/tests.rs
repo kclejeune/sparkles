@@ -1709,3 +1709,67 @@ fn overlapping_secrets_are_scrubbed_whole() {
     );
     assert_eq!(out, "554 rejected [redacted] for [redacted]");
 }
+
+/// Verifications that fail and succeed at once from several threads always leave the
+/// repository's condition exactly when one of its problems is left, since each one
+/// changes the problems and the condition in one step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_verifications_keep_the_repository_condition_consistent() {
+    let f = fixture(None, false);
+    let (s, v) = f
+        .patch(json!({
+            "enabled": true,
+            "repeatEvery": "1m",
+            "channels": {"hook": {"type": "webhook", "url": "http://127.0.0.1:9/x"}},
+            "routes": {"*": ["hook"]},
+        }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let key = "backup.verify.failed/r";
+    let consistent = |st: &AppState| {
+        let keys = active_keys(st);
+        let problems = keys.iter().any(|k| k.starts_with(&format!("{key}/")));
+        keys.iter().any(|k| k == key) == problems
+    };
+    let threads: Vec<_> = (0..4)
+        .map(|t| {
+            let st = f.st.clone();
+            std::thread::spawn(move || {
+                let names = vec!["b1".to_string()];
+                for i in 0..200 {
+                    let fail = (i + t) % 2 == 0;
+                    let broken: &[String] = if fail { &names } else { &[] };
+                    events::backup_verify(
+                        &st,
+                        "r",
+                        false,
+                        "data",
+                        &names,
+                        &names,
+                        broken,
+                        None,
+                        Utc::now(),
+                    );
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert!(consistent(&f.st), "{:?}", active_keys(&f.st));
+    // a last success leaves nothing
+    let names = vec!["b1".to_string()];
+    events::backup_verify(
+        &f.st,
+        "r",
+        false,
+        "data",
+        &names,
+        &names,
+        &[],
+        None,
+        Utc::now(),
+    );
+    assert!(active_keys(&f.st).iter().all(|k| !k.starts_with(key)));
+}

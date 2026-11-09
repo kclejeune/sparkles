@@ -467,7 +467,7 @@ pub fn backup_verify(
     } else {
         Default::default()
     };
-    super::with_conditions(st, |active| {
+    let update = |active: &mut std::collections::BTreeMap<String, super::Active>| {
         let before = active.len();
         if error.is_none() {
             active.retain(|k, _| {
@@ -502,11 +502,8 @@ pub fn backup_verify(
             .is_some_and(|(k, _)| k.starts_with(&prefix));
         let cleared = !left && active.remove(&key).is_some();
         let changed = active.len() != before || cleared || !marks.is_empty();
-        ((), changed)
-    });
-    if marks.is_empty() {
-        return None;
-    }
+        (!marks.is_empty(), changed)
+    };
     let summary = match error {
         Some(e) => format!("A verification of repository {repository} failed: {e}"),
         None => format!(
@@ -516,22 +513,32 @@ pub fn backup_verify(
             broken.join(", ")
         ),
     };
-    let mut data = json!({ "level": level, "backups": broken });
+    let mut data = json!({ "level": level, "backups": broken, "repository": repository });
     if let Some(e) = error {
         data["error"] = e.into();
     }
-    Some(backup_failure(
+    let ev = Event {
+        kind: "backup.verify.failed",
+        dataset: None,
+        severity: Severity::Critical,
+        title: format!("Backup verification failed in {repository}"),
+        summary,
+        link: Some("/ui/backups".into()),
+        data,
+    };
+    let repeat = settings(st).repeat();
+    // the problems, the repository's condition and its repeat are one step, so that a
+    // verification that clears cannot come between another's problems and its event
+    super::raise_with(
         st,
-        BackupFailure {
-            kind: "backup.verify.failed",
-            key,
-            title: format!("Backup verification failed in {repository}"),
-            summary,
-            repository,
-            data,
-        },
+        ev,
+        Some(Condition {
+            key: key.clone(),
+            repeat: Some(repeat),
+        }),
         now,
-    ))
+        update,
+    )
 }
 
 /// The end of a GC of `repository` (`dry_run`: one that deletes nothing), or a GC that
