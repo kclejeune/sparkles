@@ -30,3 +30,7 @@ systemd-run --user --scope -q -p MemoryMax=16G -p MemorySwapMax=0 timeout 600 \
 # seconds, and owl2bench-1-full-t16-2.time shows a full run on 16 threads at 787,216 KiB,
 # or 769 MiB, at most. The deletion run ended at the 8G limit with oom_kill 1 in its
 # scope's memory.events (owl2bench-1-delete-8g-2.events) after 28 s.
+
+# workload.txt gives the counts of the workloads, the OWL2Bench(1) change and its clique
+# and the W3C cases. lubm-1-record-2.json and owl2bench-1-record-2.json are the second
+# round's complete runner records, and the *-summary.md files its summaries.

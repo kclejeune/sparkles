@@ -24,16 +24,17 @@
 #
 # Every engine run is timed by GNU time for its wall time and peak RSS, in its own systemd
 # scope with MemoryMax=MEM_MAX and no swap where systemd-run exists (SCOPE=0 runs it
-# directly), and within RUN_TIMEOUT seconds. A run is recorded as ok, timeout, oom when the
-# kernel killed a process of its scope at the memory limit, killed for another SIGKILL, or
-# error. The correctness check
-# and the materializations that prepare the incremental runs share the cap and the
-# deadline. Nemo's own report adds its import, reasoning and export times. WORKDIR/results/rl-reference.json holds every run and summary.md the medians.
+# directly), and within RUN_TIMEOUT seconds. A run is recorded as ok, timeout, oom when
+# the kernel's out-of-memory killer ended a process of its scope, killed for another
+# SIGKILL, or error. The correctness check and the materializations that prepare the
+# incremental runs share the cap and the deadline. Nemo's own report adds its import,
+# reasoning and export times. WORKDIR/results/rl-reference.json holds every run and
+# summary.md the medians.
 #
 # Env: RUNS (default 3), THREADS (default all cores), DELTA_EVERY (default 100), MEM_MAX
 # (default 24G), RUN_TIMEOUT (default 3600), KILL_AFTER (seconds from TERM to KILL at the
-# deadline, default 30), SCOPE, SPARKLES (default
-# target/release/sparkles), NMO (default the flake's nemo package), PYTHON.
+# deadline, default 30), SCOPE, SPARKLES (default target/release/sparkles), NMO (default
+# the flake's nemo package), PYTHON.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -46,7 +47,7 @@ RUN_TIMEOUT=${RUN_TIMEOUT:-3600}
 INFERRED=urn:x-sparkles:inferred
 
 [ $# -eq 3 ] || {
-  sed -n '2,36p' "$0" >&2
+  sed -n '2,37p' "$0" >&2
   exit 2
 }
 suite=$1 scale=$2
@@ -66,10 +67,10 @@ log() { echo "[$(date +%T)] $*" >&2; }
 # capped NAME [-t TIMEFILE] CMD...: CMD in a scope of its own with MemoryMax=MEM_MAX and
 # no swap, within RUN_TIMEOUT seconds, with its output in logs/NAME.log. With -t, GNU time
 # reports on the timeout supervisor and CMD to TIMEFILE, so that timeout signals CMD
-# itself and waits for it. It sets CAPPED_STATUS to ok, timeout, oom (the kernel killed a
-# process of the scope at its memory limit, which the scope's memory.events, copied to
-# logs/NAME.events, records), killed (another SIGKILL) or error (any other failure,
-# including a scope that did not start), and returns 0 only for ok. A small shell in the
+# itself and waits for it. It sets CAPPED_STATUS to ok, timeout, oom (the kernel's
+# out-of-memory killer ended a process of the scope, which the scope's memory.events,
+# copied to logs/NAME.events, records), killed (another SIGKILL) or error (any other
+# failure, including a scope that did not start), and returns 0 only for ok. A small shell in the
 # scope runs CMD, copies memory.events when it ends and kills whatever is left in the
 # scope, so no process outlives the run.
 capped() {

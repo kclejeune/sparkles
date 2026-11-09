@@ -70,8 +70,10 @@ same. The aligned closure must equal Sparkles' closure. The core comparison runs
 program alone, and each of its triples must be in Sparkles' closure. A difference that is
 understood is listed in `scripts/rl-reference/known.tsv` with its explanation, and any
 other difference fails the comparison. The encoding refuses input whose IRIs use the
-encoded namespaces, and it gives a literal a datatype only when its lexical form is valid
-for that datatype, with calendar and time zone bounds for dates.
+encoded namespaces. It checks each literal's lexical form against its own datatype, with
+calendar and time zone bounds for dates and the alphabets of the binary types, and gives an
+ill-typed literal no datatype. The value of a valid literal then decides which datatypes'
+value spaces hold it.
 
 `mise run test:rl-reference` compares the closures of the premise ontologies of the W3C
 OWL 2 test cases that list the RL profile. `mise run bench:rl-reference lubm 1` or
@@ -89,9 +91,9 @@ then times both engines for `--runs` rounds.
   closure of the same data.
 - GNU time gives each run's wall time and peak resident memory, and each run has its own
   memory-limited systemd scope and a deadline. A run is recorded as out of memory only
-  when the scope's `memory.events` counts a kill at its limit, and the closure check and
-  the materializations that prepare the incremental runs have the same limit and
-  deadline. At the deadline the engine gets SIGTERM and, 30 seconds later, SIGKILL, and
+  when the scope's `memory.events` records an out-of-memory kill in the scope. The
+  closure check and the materializations that prepare the incremental runs have the same
+  limit and deadline. At the deadline the engine gets SIGTERM and, 30 seconds later, SIGKILL, and
   no process of a run outlives it. Sparkles' time starts from a loaded store and includes
   writing the derived graph to it. Nemo's time includes reading the encoded N-Triples and
   writing the derived triples, and its own report gives the reasoning time apart.
