@@ -111,6 +111,15 @@ it counted. A refused metadata phase also names every check its result failed, f
 `worker_boot_id`, and its refusal names the first of them. Writing a record never masks
 the refusal it describes.
 
+A checkout's source identity is content only. It is the commit, the hashes of the
+porcelain status and of the tracked diff against that commit, and the hashes of
+`mise.toml` and `rust-toolchain.toml`. Git compares file content when a restore changes
+inodes, mtimes or the device, so those changes leave the identity unchanged, but it does
+track the executable bit. When the identity differs, the metadata refusal keeps a
+`source_drift` record with each field's recorded and observed value and whether it
+differs. It also counts the checkout's porcelain entries, untracked files, staged and
+unstaged entries, and mode-only and content changes against the commit.
+
 A refused qualification holds its stop trigger for at most 600 seconds when the resume
 was acknowledged and the worker was seen running. During the hold the controller runs
 `diagnostic-probe.py` on the worker and keeps its output in `diagnostics.json`. The

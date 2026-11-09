@@ -93,6 +93,8 @@ def phase_evidence(result):
     events=result.get('memory_events')
     if isinstance(events,dict):evidence['memory_events']={k:v for k,v in list(events.items())[:16] if isinstance(k,str) and re.fullmatch(r'[a-z_]{1,32}',k) and isinstance(v,str) and re.fullmatch(r'[0-9]{1,20}',v)}
     out['evidence']=evidence
+    drift=drift_evidence(result.get('source_drift'))
+    if drift is not None:out['source_drift']=drift
     return out
 
 def record_refusal(io,phase,error=None,result=None,code=None,failed=()):

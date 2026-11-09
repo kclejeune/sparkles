@@ -112,6 +112,30 @@ def source_shape(row):
     need(re.fullmatch('[0-9a-f]{40}',row['head']) is not None,'source HEAD')
     need(sha(row['status_sha256']) and sha(row['tracked_diff_sha256']),'source status/diff')
     need(set(row['inputs'])=={'mise.toml','rust-toolchain.toml'} and all(sha(x) for x in row['inputs'].values()),'source inputs')
+# The fields of a checkout's source identity, which are all content: the commit, the
+# hashes of the porcelain status and of the tracked diff against it, and the hashes of
+# the two toolchain input files. A drift records each one, recorded beside observed.
+SOURCE_FIELDS=('head','status_sha256','tracked_diff_sha256','inputs.mise.toml','inputs.rust-toolchain.toml')
+WORKTREE_COUNTS=('entries','untracked','staged','unstaged','mode_changes','content_changes')
+def source_hex(value):
+    return value if isinstance(value,str) and re.fullmatch('[0-9a-f]{40}|[0-9a-f]{64}',value) is not None else None
+def source_fields(row):
+    row=row if isinstance(row,dict) else {};inputs=row.get('inputs') if isinstance(row.get('inputs'),dict) else {}
+    out={k:row.get(k) for k in SOURCE_FIELDS[:3]}
+    for name in ('mise.toml','rust-toolchain.toml'):out['inputs.'+name]=inputs.get(name)
+    return out
+def drift_evidence(x):
+    """A bounded copy of a source drift: fixed field names, hex values and counts only."""
+    if not isinstance(x,dict):return None
+    fields=x.get('fields') if isinstance(x.get('fields'),dict) else {}
+    out={'repository':x['repository'] if isinstance(x.get('repository'),str) and re.fullmatch('/[A-Za-z0-9._/-]{1,200}',x['repository']) else None,
+         'fields':{},'other_fields_differ':x.get('other_fields_differ') is True}
+    for name in SOURCE_FIELDS:
+        f=fields.get(name) if isinstance(fields.get(name),dict) else {}
+        out['fields'][name]={'recorded':source_hex(f.get('recorded')),'observed':source_hex(f.get('observed')),'differs':f.get('differs') is True}
+    w=x.get('worktree')
+    out['worktree']={k:w[k] for k in WORKTREE_COUNTS if k in w and type(w[k]) is int and 0<=w[k]<2**31} if isinstance(w,dict) else None
+    return out
 def validate_release(r,now):
     need(r.get('schema')==1 and r.get('authorized_by_Root') is True,'release is false')
     need(r.get('worker')==worker_id(),'release worker')

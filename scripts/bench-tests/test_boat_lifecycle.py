@@ -1479,3 +1479,62 @@ class Op5RemoteTransport(Op5Clocks,RemoteTransport):pass
 class Op5JobClosureProgram(Op5Clocks,JobClosureProgram):pass
 class Op5ClosureWatch(Op5Clocks,ClosureWatch):pass
 class Op5Finish(Op5Clocks,Finish):pass
+
+
+class SourceDriftRecord(unittest.TestCase):
+    """A metadata source drift names each recorded field next to the observed one."""
+    RECORDED={'head':'8'*40,'status_sha256':'e'*64,'tracked_diff_sha256':'e'*64,'inputs':{'mise.toml':'c'*64,'rust-toolchain.toml':'f'*64}}
+    def setUp(self):
+        self.O=controls.OBSERVER;self.O['bind_profile'](controls.synthetic_profile())
+
+    def observed(self,**change):
+        row=json.loads(json.dumps(self.RECORDED));row.update(change);return row
+
+    def test_a_drift_names_exactly_the_differing_fields(self):
+        error=self.O['SourceDrift']('existing source drift','/home/worker-fixture/sparkles',self.RECORDED,self.observed(status_sha256='1'*64,tracked_diff_sha256='2'*64),{'entries':1,'untracked':0,'staged':0,'unstaged':1,'mode_changes':1,'content_changes':0})
+        d=error.source_drift;self.assertEqual(str(error),'existing source drift')
+        self.assertEqual(sorted(k for k,v in d['fields'].items() if v['differs']),['status_sha256','tracked_diff_sha256'])
+        self.assertEqual(d['fields']['status_sha256'],{'recorded':'e'*64,'observed':'1'*64,'differs':True})
+        self.assertEqual(d['fields']['head'],{'recorded':'8'*40,'observed':'8'*40,'differs':False})
+        self.assertEqual(d['worktree']['mode_changes'],1);self.assertFalse(d['other_fields_differ'])
+
+    def test_the_phase_result_keeps_the_drift(self):
+        def qualify(payload):raise self.O['SourceDrift']('existing source drift','/home/worker-fixture/sparkles',self.RECORDED,self.observed(head='9'*40),None)
+        result,closed=self.O['run_phase']({'phase':'metadata'},None,qualify)
+        self.assertFalse(closed);self.assertEqual(result['reason_code'],'refusal:existing source drift')
+        self.assertTrue(result['source_drift']['fields']['head']['differs'])
+
+    def test_the_metadata_refusal_records_the_drift_bounded(self):
+        r=controls.fixture();io=controls.InertIO(r);controller.bind_release_profile(r)
+        drift=self.O['SourceDrift']('existing source drift','/home/worker-fixture/sparkles',self.RECORDED,self.observed(head='9'*40),None).source_drift
+        drift['fields']['head']['observed']='$(rm -rf /)';drift['secret']='DO_NOT_COPY';drift['worktree']={'entries':2,'free_text':'DO_NOT_COPY'}
+        controller.record_refusal(io,'metadata',controller.Refusal('metadata refused: probe_not_qualified'),{'qualified':False,'reason_code':'refusal:existing source drift','source_drift':drift},failed=['probe_not_qualified'])
+        row=io.read('metadata-refused.json');self.assertNotIn('DO_NOT_COPY',json.dumps(row))
+        self.assertEqual(row['source_drift']['fields']['head'],{'recorded':'8'*40,'observed':None,'differs':True})
+        self.assertEqual(row['source_drift']['worktree'],{'entries':2})
+
+    def git(self,repo,*args):
+        import subprocess as sp;return sp.run(['git','-C',str(repo),*args],check=True,capture_output=True,timeout=30).stdout
+
+    def repository(self):
+        tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup);repo=Path(tmp.name)/'repo';repo.mkdir()
+        self.git(repo,'init','-q');(repo/'run.sh').write_text('true\n');(repo/'run.sh').chmod(0o755);(repo/'a.txt').write_text('a\n')
+        self.git(repo,'add','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','commit','-qm','x')
+        return repo
+
+    def test_the_worktree_summary_separates_mode_changes_from_content(self):
+        repo=self.repository();summary=self.O['worktree_summary']
+        self.assertEqual(summary(repo),{'entries':0,'untracked':0,'staged':0,'unstaged':0,'mode_changes':0,'content_changes':0})
+        (repo/'run.sh').chmod(0o644);(repo/'new.txt').write_text('n\n')
+        self.assertEqual(summary(repo),{'entries':2,'untracked':1,'staged':0,'unstaged':1,'mode_changes':1,'content_changes':0})
+
+    def test_new_inodes_and_mtimes_do_not_change_the_worktree(self):
+        # Every resume so far gave the home filesystem a new device and new inodes. A
+        # copy with new inodes and mtimes leaves the checkout's content identity clean.
+        import shutil as sh;repo=self.repository();copy=repo.parent/'copy';sh.copytree(repo,copy,copy_function=sh.copy)
+        for path in copy.rglob('*'):
+            if '.git' not in path.parts and path.is_file():os.utime(path,(1577836800,1577836800))
+        self.assertNotEqual(os.stat(repo/'a.txt').st_ino,os.stat(copy/'a.txt').st_ino)
+        self.assertEqual(self.O['worktree_summary'](copy)['entries'],0)
+        self.assertEqual(self.git(repo,'status','--porcelain=v1','-z'),self.git(copy,'status','--porcelain=v1','-z'))
+        self.assertEqual(self.git(repo,'diff','HEAD','--binary'),self.git(copy,'diff','HEAD','--binary'))

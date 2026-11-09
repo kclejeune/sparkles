@@ -34,6 +34,32 @@ def command(argv,seconds=15,env=None,cwd=None):
     need(r.returncode==0 and len(r.stdout)<=1024*1024,'qualification command failed')
     return r.stdout
 
+class SourceDrift(Refusal):
+    """A checkout whose source identity differs, with every field recorded beside observed."""
+    def __init__(self,reason,repo,recorded,observed,worktree):
+        super().__init__(reason);r,o=source_fields(recorded),source_fields(observed)
+        other=lambda row:{k:v for k,v in row.items() if k not in ('head','status_sha256','tracked_diff_sha256','inputs')} if isinstance(row,dict) else None
+        inputs=lambda row:{k:v for k,v in row.get('inputs',{}).items() if k not in ('mise.toml','rust-toolchain.toml')} if isinstance(row,dict) and isinstance(row.get('inputs'),dict) else None
+        self.source_drift=drift_evidence({'repository':str(repo),'fields':{k:{'recorded':r[k],'observed':o[k],'differs':r[k]!=o[k]} for k in SOURCE_FIELDS},
+                                          'other_fields_differ':other(recorded)!=other(observed) or inputs(recorded)!=inputs(observed),'worktree':worktree})
+def worktree_summary(repo,env=None):
+    """Counts of a checkout's porcelain entries, separating mode-only changes from content."""
+    try:
+        git=lambda *a:command(['git','-C',str(repo),*a],30,env,repo)
+        tokens=git('status','--porcelain=v1','-z').split(b'\0');counts=dict.fromkeys(WORKTREE_COUNTS,0);i=0
+        while i<len(tokens):
+            entry=tokens[i];i+=1
+            if len(entry)<4:continue
+            x,y=chr(entry[0]),chr(entry[1]);counts['entries']+=1
+            if x+y=='??':counts['untracked']+=1;continue
+            if x in 'RC':i+=1
+            counts['staged']+=x!=' ';counts['unstaged']+=y!=' '
+        raw=git('diff','HEAD','--raw','-z','--no-renames').split(b'\0')
+        counts['mode_changes']=sum(1 for t in raw if t.startswith(b':') and t[1:].split()[0]!=t.split()[1])
+        rows=[t.split(b'\t') for t in git('diff','HEAD','--numstat','-z','--no-renames').split(b'\0') if t.count(b'\t')>=2]
+        counts['content_changes']=sum(1 for t in rows if (t[0],t[1])!=(b'0',b'0'))
+        return counts
+    except Exception:return None
 def validate_runtime(unit,pid,cgline,maxmem,maxswap,properties,runtime_seconds=240):
     need(maxmem=='536870912' and maxswap=='0','effective metadata cap')
     need(properties.get('MemoryMax')==maxmem and properties.get('MemorySwapMax')=='0' and properties.get('KillMode')=='control-group' and properties.get('OOMPolicy')=='continue' and properties.get('MainPID')==str(pid),'loaded metadata properties')
@@ -122,10 +148,11 @@ def probe(payload):
     helper=str(new/'toolchain-state.py');sources={};checks={}
     for repo,expected in [(Path(profile()['startup_repositories']['default']),s['default_source']),(Path(profile()['startup_repositories']['retained']),s['retained_source'])]:
         first=json.loads(command(['/usr/bin/python3',helper,'source',str(repo)],30,env,repo))
-        need(first==expected,'existing source drift')
+        if first!=expected:raise SourceDrift('existing source drift',repo,expected,first,worktree_summary(repo,env))
         check=json.loads(command(['/bin/bash',str(new/'repository-start.sh'),str(repo)],55,env,repo))
         need(check['native_started'] is False and check['status']=='tools-ready-workload-admission-still-required' and check['uid']==uid,'checker outcome')
-        last=json.loads(command(['/usr/bin/python3',helper,'source',str(repo)],30,env,repo));need(last==first,'existing source changed during qualification')
+        last=json.loads(command(['/usr/bin/python3',helper,'source',str(repo)],30,env,repo))
+        if last!=first:raise SourceDrift('existing source changed during qualification',repo,first,last,worktree_summary(repo,env))
         sources[str(repo)]={'before':first,'after':last};checks[str(repo)]={'status':check['status'],'installed_bindings':check['installed_bindings']}
     after,_=safe_file(state/'toolchain.json',uid,denied,1024*1024);need(after==before,'manifest changed during checker')
     # Check parent capacity, excluding the deliberately smaller metadata service.

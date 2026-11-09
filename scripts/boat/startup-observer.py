@@ -261,6 +261,9 @@ def run_phase(payload,observe,qualify,clock=time.monotonic):
     try:result=observe(payload) if payload['phase']!='metadata' else qualify(payload)
     except Exception as error:
         result={'qualified':False,'startup_closed':False,'engine_or_job_started':False,'failure':'bounded phase refused; no arbitrary error content','reason_code':reason_code(error)}
+        # A source drift names each recorded field beside the observed one.
+        drift=drift_evidence(getattr(error,'source_drift',None))
+        if drift is not None:result['source_drift']=drift
     closed=result.get('startup_closed')is True if payload['phase']!='metadata' else result.get('qualified')is True
     if not closed:result.setdefault('reason_code','unreported')
     result['elapsed_seconds']=round(clock()-started,3)
