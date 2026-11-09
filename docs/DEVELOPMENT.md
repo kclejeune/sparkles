@@ -353,7 +353,7 @@ the account's shared daily and rate limits.
 
 Development environments and CI runners have separate setup and authentication. Inject
 development credentials into owned development sandboxes, and keep Actions OIDC authentication
-for CI. Reusable dev and CI seeds are separate and contain no credentials or live leases.
+for the workflows that use the remote cache. Reusable dev and CI seeds are separate and contain no credentials or live leases.
 Verify snapshot and credential behavior before treating a seed as reusable. Tool setup
 alone does not qualify a compiler workload or snapshot lifecycle.
 
