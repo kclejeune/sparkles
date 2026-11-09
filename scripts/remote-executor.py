@@ -146,6 +146,7 @@ WORKER_TOOLS=('bash','sh','env','python3','git','systemd-run','systemctl','flock
               'tar','gzip','zstd','curl','taskset','chrt','cc','cargo','realpath','sha256sum',
               'awk','sed','grep','tac','ls','cut','head','sort','seq','tr','wc','tee','cat','date','uname',
               'free','du','df','tail','chmod','cp','ln','mkdir','mktemp','mv','rm','dirname','sleep',
+              'setsid','nohup',
               '/lib64/ld-linux-x86-64.so.2')
 
 

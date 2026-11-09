@@ -3,41 +3,109 @@
 # this file, scripts/nsc-build.sh and scripts/cargo-sparkles-task into DIR/bin and the
 # revision's `git archive` into DIR/src before it calls it over ssh.
 #
-#   nsc-build-remote.sh DIR UNIT [feature and dependency-resolution flags...]
+#   nsc-build-remote.sh DIR UNIT RUNTIME [feature and dependency-resolution flags...]
+#   nsc-build-remote.sh --status DIR UNIT OFFSET
+#   nsc-build-remote.sh --run DIR [flags...]
 #
-# The build runs scripts/nsc-build.sh in the transient systemd user scope UNIT, so that it can
-# be listed and stopped by name and an out-of-memory kill ends the build alone. The scope has
-# the gate's memory cap, the smaller of 24G and the host's RAM less 2G, with 2G of swap
-# (SPARKLES_NSC_BUILD_MEMORY_MAX overrides it). Inside it the build holds
-# ~/lanes/.heavy.lock, which gates and other heavy work on the host share, and waits for it
-# when another process holds it. CARGO_BUILD_JOBS defaults to the gate's value for the cap.
-# The host's own Boxington cache serves the build, with the remote cache settings the
-# caller's environment gives it. The scope inherits that environment, so a Boat job's
-# local-only mbx settings reach the build unchanged.
+# The first form checks the host and starts the build detached, then returns at once. The
+# build runs in the transient systemd user scope UNIT, so that it can be listed and stopped
+# by name, an out-of-memory kill ends the build alone, and a dropped ssh connection does not
+# end it. RUNTIME is the scope's RuntimeMaxSec. The scope has the gate's memory cap, the
+# smaller of 24G and the host's RAM less 2G, with 2G of swap (SPARKLES_NSC_BUILD_MEMORY_MAX
+# overrides it). Inside it the build holds ~/lanes/.heavy.lock, which gates and other heavy
+# work on the host share, and waits for it when another process holds it. CARGO_BUILD_JOBS
+# defaults to the gate's value for the cap. The host's own Boxington cache serves the build,
+# with the remote cache settings the caller's environment gives it. The detached process
+# inherits that environment, so a Boat job's local-only mbx settings reach the build
+# unchanged. DIR/launched records the start, so a repeated start after a lost reply never
+# starts a second build. A refused start records its exit status in DIR/start.exit.
 #
-# The binary goes to DIR/out/sparkles with its SHA-256 in DIR/out/sha256. DIR/out/info.txt
-# gets the host's cc, c++ and rustc versions in the form of build.txt, DIR/out/rustc.txt and
-# cargo.txt the verbose versions, and DIR/out/env.txt the build variables that were set.
-# The caller removes DIR.
+# --status prints one state line and then the build log from byte OFFSET, at most 1 MiB.
+# The state is `running`, `exited N` with the build's exit status, `refused N` for a refused
+# start, `gone` when the scope ended without an exit status, or `unlaunched`.
+#
+# --run is the build inside the scope. The binary goes to DIR/out/sparkles with its SHA-256
+# in DIR/out/sha256. DIR/out/info.txt gets the host's cc, c++ and rustc versions in the form
+# of build.txt, DIR/out/rustc.txt and cargo.txt the verbose versions, and DIR/out/env.txt the
+# build variables that were set. Its exit status goes to DIR/exit. The caller removes DIR.
 set -euo pipefail
 
-if [ "$#" -lt 2 ]; then
-  echo 'usage: nsc-build-remote.sh DIR UNIT [cargo flags...]' >&2
-  exit 2
-fi
-dir=$1
-unit=$2
-shift 2
 fail() {
   echo "nsc-build-remote ($(uname -n)): $*" >&2
   exit 3
 }
+lock=$HOME/lanes/.heavy.lock
+
+if [ "${1:-}" = --status ]; then
+  [ "$#" = 4 ] || fail 'usage: nsc-build-remote.sh --status DIR UNIT OFFSET'
+  dir=$2 unit=$3 offset=$4
+  case $offset in '' | *[!0-9]*) fail "bad log offset $offset" ;; esac
+  # The scope writes DIR/exit before it ends, so a scope seen inactive has its status
+  # written when it finished normally.
+  if systemctl --user is-active --quiet "$unit.scope"; then
+    echo running
+  elif [ -f "$dir/exit" ]; then
+    echo "exited $(cat "$dir/exit")"
+  elif [ -f "$dir/start.exit" ] && [ ! -e "$dir/launched" ]; then
+    echo "refused $(cat "$dir/start.exit")"
+  elif [ -e "$dir/launched" ]; then
+    echo gone
+  else
+    echo unlaunched
+  fi
+  if [ -f "$dir/build.log" ]; then tail -c +$((offset + 1)) "$dir/build.log" | head -c 1048576; fi
+  exit 0
+fi
+
+if [ "${1:-}" = --run ]; then
+  dir=$2
+  shift 2
+  trap 'echo "$?" > "$dir/exit.tmp"; mv "$dir/exit.tmp" "$dir/exit"' EXIT
+  cd "$dir/src"
+  export PATH="$dir/bin:$PATH"
+  if ! flock -n "$lock" true; then
+    echo "waiting for $lock on $(uname -n), which another process holds"
+  fi
+  flock "$lock" bash "$dir/bin/nsc-build.sh" "$dir/out/sparkles" "$@"
+  {
+    echo "cc: $(cc --version 2> /dev/null | head -1)"
+    echo "c++: $(c++ --version 2> /dev/null | head -1)"
+    rustc -V
+  } > "$dir/out/info.txt"
+  rustc -vV > "$dir/out/rustc.txt"
+  cargo -V > "$dir/out/cargo.txt"
+  for n in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTUP_TOOLCHAIN CARGO_BUILD_TARGET RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER \
+    MBX_REMOTE_URL MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE; do
+    [ -z "${!n+x}" ] || printf '%s=%s\n' "$n" "${!n}"
+  done > "$dir/out/env.txt"
+  sha256sum "$dir/out/sparkles" | cut -d' ' -f1 > "$dir/out/sha256"
+  exit 0
+fi
+
+if [ "$#" -lt 3 ]; then
+  echo 'usage: nsc-build-remote.sh DIR UNIT RUNTIME [cargo flags...]' >&2
+  exit 2
+fi
+dir=$1
+unit=$2
+runtime=$3
+shift 3
 [ -d "$dir/src" ] && [ -d "$dir/bin" ] || fail "$dir has no src and bin directories"
+if [ -e "$dir/launched" ]; then
+  echo "the build in scope $unit was already started"
+  exit 0
+fi
+refused() {
+  local code=$?
+  [ -e "$dir/launched" ] || echo "$code" > "$dir/start.exit"
+}
+trap refused EXIT
+case $runtime in '' | *[!0-9]* | 0) fail "bad runtime $runtime" ;; esac
 cd "$dir/src"
 # The copied scripts come first, so the build uses the caller's nsc-build.sh and finds the
 # cargo subcommand behind `mbx sparkles-task`.
 export PATH="$dir/bin:$PATH"
-for t in mbx rustc cargo flock systemd-run sha256sum; do command -v "$t" > /dev/null || fail "$t is not on PATH"; done
+for t in mbx rustc cargo flock systemd-run systemctl setsid nohup sha256sum; do command -v "$t" > /dev/null || fail "$t is not on PATH"; done
 have=$(mbx --version | awk '{print $2}')
 systemd-run --user --scope -q --collect true 2> /dev/null || fail "systemd-run --user --scope does not work"
 
@@ -53,25 +121,13 @@ jobs=${CARGO_BUILD_JOBS:-$(((mem_g - 1) / 2))}
 [ "$jobs" -ge 2 ] || jobs=2
 [ "$jobs" -le 8 ] || jobs=8
 
-lock=$HOME/lanes/.heavy.lock
 mkdir -p "$HOME/lanes" "$dir/out"
-if ! flock -n "$lock" true; then
-  echo "waiting for $lock on $(uname -n), which another process holds"
-fi
-echo "building in scope $unit on $(uname -n): MemoryMax=$mem, CARGO_BUILD_JOBS=$jobs, mbx $have"
-systemd-run --user --scope -q --collect --unit "$unit" \
-  -p MemoryMax="$mem" -p MemorySwapMax=2G -p OOMPolicy=continue -- \
-  env CARGO_BUILD_JOBS="$jobs" flock "$lock" bash "$dir/bin/nsc-build.sh" "$dir/out/sparkles" "$@"
-
-{
-  echo "cc: $(cc --version 2> /dev/null | head -1)"
-  echo "c++: $(c++ --version 2> /dev/null | head -1)"
-  rustc -V
-} > "$dir/out/info.txt"
-rustc -vV > "$dir/out/rustc.txt"
-cargo -V > "$dir/out/cargo.txt"
-for n in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTUP_TOOLCHAIN CARGO_BUILD_TARGET RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER \
-  MBX_REMOTE_URL MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE; do
-  [ -z "${!n+x}" ] || printf '%s=%s\n' "$n" "${!n}"
-done > "$dir/out/env.txt"
-sha256sum "$dir/out/sparkles" | cut -d' ' -f1 > "$dir/out/sha256"
+echo "building in scope $unit on $(uname -n): MemoryMax=$mem, CARGO_BUILD_JOBS=$jobs, RuntimeMaxSec=$runtime, mbx $have"
+: > "$dir/launched"
+# The build runs in its own session with no tie to this connection, and its output goes
+# to DIR/build.log, which --status reads.
+setsid nohup systemd-run --user --scope -q --collect --unit "$unit" \
+  -p MemoryMax="$mem" -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec="$runtime" -- \
+  env CARGO_BUILD_JOBS="$jobs" bash "$dir/bin/nsc-build-remote.sh" --run "$dir" "$@" \
+  > "$dir/build.log" 2>&1 < /dev/null &
+echo "started"

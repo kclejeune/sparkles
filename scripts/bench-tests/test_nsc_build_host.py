@@ -24,7 +24,7 @@ SCRIPTS = ["remote-executor.sh", "remote-executor.py", "remote-screen.sh", "nsc-
 
 TOOLS = {
     "ssh": """#!/usr/bin/env python3
-import os,pathlib,signal,subprocess,sys
+import os,pathlib,signal,subprocess,sys,time
 a=sys.argv[1:]
 while a and a[0].startswith('-'):
     a=a[2:] if a[0]=='-o' else a[1:]
@@ -34,6 +34,21 @@ with open(os.environ['FAKE_SSH_LOG'],'a') as s:s.write(host+'\\t'+cmd+'\\n')
 if not home.is_dir() or (home/'unreachable').exists():
     sys.stderr.write('ssh: connect to host '+host+': unreachable\\n');raise SystemExit(255)
 env=dict(os.environ,HOME=str(home))
+# FAKE_SSH_DROP=TEXT:N drops the connection of the first N commands that contain TEXT,
+# after the remote command has started and has received at most 4 KiB of input. The
+# remote command keeps running, as on a real host.
+drop=os.environ.get('FAKE_SSH_DROP','')
+if drop:
+    text,count=drop.rsplit(':',1)
+    counter=pathlib.Path(os.environ['FAKE_HOSTS'])/'drops'
+    done=int(counter.read_text()) if counter.exists() else 0
+    if text in cmd and done<int(count):
+        counter.write_text(str(done+1))
+        p=subprocess.Popen(['bash','-c',cmd],cwd=home,env=env,start_new_session=True,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL)
+        try:p.stdin.write(sys.stdin.buffer.read(4096));p.stdin.close()
+        except BrokenPipeError:pass
+        time.sleep(0.3)
+        sys.stderr.write('Connection to '+host+' closed by remote host.\\n');os._exit(255)
 p=subprocess.Popen(['bash','-c',cmd],cwd=home,env=env,start_new_session=True)
 signal.signal(signal.SIGINT,lambda *_:os._exit(255))
 raise SystemExit(p.wait())
@@ -52,7 +67,8 @@ state=pathlib.Path(os.environ['FAKE_HOSTS'])/'units'
 state.mkdir(exist_ok=True)
 if unit:
     if '.' not in unit:unit+='.scope'
-    os.setsid()
+    # A detached build is already a session leader, whose group the stop can kill.
+    if os.getsid(0)!=os.getpid():os.setsid()
     (state/unit).write_text(str(os.getpid())+'\\n'+' '.join(props)+'\\n')
 os.execvp(a[0],a)
 """,
@@ -142,9 +158,11 @@ class BuildHost(unittest.TestCase):
                         FAKE_HOSTS=str(self.hosts), FAKE_BUILDS=str(self.builds_log),
                         FAKE_SSH_LOG=str(self.ssh_log), SPARKLES_BENCH_HOST="bench",
                         SPARKLES_GATE_CONFIG=str(self.root / "no-gate.env"),
-                        SPARKLES_NSC_BUILD_MIN_FREE_GB="0")
+                        SPARKLES_NSC_BUILD_MIN_FREE_GB="0", SPARKLES_NSC_BUILD_POLL_SECONDS="0.1",
+                        SPARKLES_NSC_BUILD_RETRY_SECONDS="0.1")
         for name in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET", "SPARKLES_NSC_BUILD_HOSTS",
-                     "SPARKLES_NSC_BUILD_CONFIG", "CARGO_BUILD_JOBS"):
+                     "SPARKLES_NSC_BUILD_CONFIG", "CARGO_BUILD_JOBS", "SPARKLES_NSC_BUILD_RETRIES",
+                     "SPARKLES_NSC_BUILD_MEMORY_MAX", "FAKE_SSH_DROP"):
             self.env.pop(name, None)
         self.runs = 0
         self.holders = []
@@ -352,6 +370,62 @@ class BuildHost(unittest.TestCase):
         self.assertIn("mbx 9.9.9", (out / "logs" / "build-A.log").read_text())
         self.assertEqual(self.scratch("h1"), [])
         self.assertTrue(self.builds())
+
+    def test_a_dropped_connection_neither_ends_nor_repeats_the_build(self):
+        """The build runs detached, so lost replies of the start and of status polls are retried
+        and the one build that started finishes and is fetched."""
+        # The start command alone names the scratch directory right after the script. A lost
+        # start reply is resolved by one status query, which finds the build started.
+        for text, drops in (("nsc-build-remote.sh /", "1"), ("--status", "2")):
+            with self.subTest(drop=text):
+                (self.hosts / "drops").unlink(missing_ok=True)
+                (self.entry() / "build.txt").unlink(missing_ok=True)
+                env = dict(self.env, FAKE_SSH_DROP=text + ":2", FAKE_BUILD_DELAY="1")
+                before = len(self.builds())
+                result, out = self.bench("--build-host", "h1", env=env)
+                self.assertEqual(len(self.builds()), before + 1, "exactly one build ran")
+                self.assertEqual((self.hosts / "drops").read_text(), drops)
+                log = (out / "logs" / "build-A.log").read_text()
+                self.assertIn("closed by remote host", log)
+                if drops == "2":
+                    self.assertIn("polling the build on h1 failed with exit 255", log)
+                self.assertIn("built on h1, sha256", log)
+                self.assertEqual(self.scratch("h1"), [])
+
+    def test_a_dropped_source_copy_is_retried_into_a_fresh_tree(self):
+        env = dict(self.env, FAKE_SSH_DROP="tar -x -m:1")
+        result, out = self.bench("--build-host", "h1", env=env)
+        [build] = self.builds()
+        self.assertTrue(build["cwd"].endswith("/src"), build["cwd"])
+        log = (out / "logs" / "build-A.log").read_text()
+        self.assertIn("copying the source of", log)
+        self.assertIn("retrying", log)
+        self.assertEqual(self.scratch("h1"), [])
+
+    def test_lost_contact_fails_after_bounded_retries_and_stops_the_build(self):
+        env = dict(self.env, FAKE_SSH_DROP="--status:1000", FAKE_BUILD_DELAY="30",
+                   SPARKLES_NSC_BUILD_RETRIES="3")
+        started = time.monotonic()
+        result, out = self.bench("--build-host", "h1", env=env, ok_stop=False)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertIn("on h1 failed", result.stderr)
+        log = (out / "logs" / "build-A.log").read_text()
+        self.assertIn("polling the build on h1 failed 3 times", log)
+        self.assertIn("lost contact with the build on h1", log)
+        [unit] = list((self.hosts / "units").iterdir())
+        self.assertIn(f"stop {unit.name}", (self.hosts / "systemctl.log").read_text())
+        self.assertEqual(self.scratch("h1"), [])
+        self.assertFalse((self.entry() / "build.txt").exists())
+
+    def test_a_refused_start_fails_at_once_without_retries(self):
+        env = dict(self.env, SPARKLES_NSC_BUILD_MEMORY_MAX="lots")
+        result, out = self.bench("--build-host", "h1", env=env, ok_stop=False)
+        log = (out / "logs" / "build-A.log").read_text()
+        self.assertIn("not a whole number of G", log)
+        self.assertIn("refused the build with exit 3", log)
+        self.assertNotIn("retrying", log)
+        self.assertEqual(self.builds(), [])
+        self.assertEqual(self.scratch("h1"), [])
 
     def test_an_interrupt_stops_the_scope_and_removes_the_scratch(self):
         out = self.root / "out-interrupted"

@@ -466,12 +466,12 @@ class Admission(unittest.TestCase):
             for word in shell_commands((scripts/name).read_text(),remote_only=True):found.setdefault(word,set()).add(name)
         # The command strings remote-executor.py itself sends for put, get, sync and bundle.
         for word in ('bash','env','python3','mkdir','mktemp','cat','sha256sum','cut','mv','tar','git','rm','dirname'):found.setdefault(word,set()).add('remote-executor.py')
-        # mbx and rustc are pinned by tool_check, c++ only feeds the build's info.txt, and
-        # remote-screen.sh runs nohup and setsid only on the nsc branch.
-        exempt={'mbx','rustc','c++','nohup','setsid'}
+        # mbx and rustc are pinned by tool_check, and c++ only feeds the build's info.txt.
+        # nsc-build-remote.sh starts the detached build with setsid and nohup.
+        exempt={'mbx','rustc','c++'}
         missing={w:f for w,f in found.items() if w not in RX.WORKER_TOOLS and w not in exempt}
         self.assertEqual(missing,{})
-        self.assertIn('realpath',found);self.assertIn('tee',found);self.assertIn('gzip',RX.WORKER_TOOLS)
+        self.assertIn('realpath',found);self.assertIn('setsid',found);self.assertIn('nohup',found);self.assertIn('tee',found);self.assertIn('gzip',RX.WORKER_TOOLS)
         self.assertIn('/lib64/ld-linux-x86-64.so.2',found)
         # The build body reaches bash -s through a heredoc of mbx sparkles-task.
         self.assertIn('nsc-build.sh',found['cp'])
