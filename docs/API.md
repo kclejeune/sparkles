@@ -14492,6 +14492,62 @@ The metrics are `sparkles_notifications_sent_total{channel,event,result}`,
 `notification_test` with the channel, the result and the `principal`, and each failed
 delivery is logged under `sparkles::notify` with an error that never holds a secret.
 `sparkles notify status` and `sparkles notify test CHANNEL` use these routes.
+`GET /$/notifications` also counts the watches of each dataset under `watches`, without
+their owners or entities.
+
+### Watches
+
+A watch tells its owner about the commits that change an entity, or the entity's
+asserted subtree, in one graph of one branch. The design is in
+[U12](specs/U12-ontology-workbench/SPEC.md#watches). Watches belong to an identity,
+which is a configured user, an OIDC or proxy account, or the owner of a minted token.
+Anonymous callers and static tokens cannot watch. Without auth, watches belong to
+`local`. Every route answers only the caller's own watches, and only those whose graph
+the caller can read now on the watch's branch through the history endpoint. A token
+limited to one dataset therefore sees nothing of another.
+
+| Method | Path | Effect |
+|---|---|---|
+| GET | `/$/watches` | The caller's watches with `unread` for each and in all. `dataset`, `entity` and `graph` (`default` for the default graph) filter them. |
+| POST | `/$/watches` | `{dataset, branch?, graph?, entity, scope?, depth?}` makes a watch, `201`, or answers the same watch with `200`. `scope` is `entity` or `subtree`, and `depth` limits a subtree to that many levels below the entity. |
+| DELETE | `/$/watches/{id}` | Removes the watch, `204`. |
+| GET | `/$/watches/{id}/matches` | The matched commits, newest first, with `after`, `before` and `limit` (at most 200). |
+| POST | `/$/watches/{id}/seen` | `{commit}` marks the matches up to that commit as read. A lower value than the current mark is kept as it is. |
+
+An `entity` watch matches a commit whose net changes on the branch include a quad in the
+graph that names the entity as subject, predicate or object, which is the rule of the
+editor's History view. A `subtree` watch also matches a commit whose changes name an IRI
+from which the entity is reachable upward through `rdfs:subClassOf`,
+`rdfs:subPropertyOf`, `skos:broader` or the inverse of `skos:narrower`, in the graph's
+asserted hierarchy before or after the commit. A class moved into or out of the subtree
+therefore matches, and so does one deleted from it. Imports and inferred hierarchy are
+not followed.
+
+A match has `commit`, `time`, `author`, `members` (at most 20 of the IRIs the commit
+named, in IRI order), `count`, `exact`, and `own` when the caller made the commit. A
+commit that names more members of one watch than the `largeCommit` bound is one entry
+with `summary: true` and no members. `partial` says that an ancestor walk stopped at the
+`maxAncestors` bound. `exact: false` marks a commit whose changes were not listed, such as
+a bulk load, or a stretch of history that is no longer readable, which may or may not
+change the entity. A watch keeps its 200 newest matches and then shows `overflow`. A
+graph with more than 2,000,000 hierarchy edges is not followed, and its subtree watches
+show `truncated` and match only the entity.
+
+The bounds are the `watches` member of the `notifications` kind: `maxAncestors`
+(default 10,000), `largeCommit` (default 1,000), `identityMaxAgeDays` (default 30) and
+`batchSecs` (default 300).
+
+A watch is refused with `403` when the caller cannot read the graph, with `409` and
+`watch-unsupported-protections` while triple protections limit what the caller reads in
+the dataset, and with `409` and `watch-limit` past 200 watches of one owner or 20,000 in
+all. A watch of an owner who no longer exists, is no longer admitted or can no longer read
+the graph matches nothing. A renamed branch keeps its watches under its new name, and the
+watches of a deleted branch or dataset are removed. A branch made again under an old name
+is another branch.
+
+Watches and their matches are kept in `<dataDir>/watches.json`, outside every dataset,
+with mode 0600. A file that a newer release wrote, or one that does not parse, is left as
+it is, and the routes answer `503` with `watches-unavailable` until it is fixed.
 
 ### Ask history
 

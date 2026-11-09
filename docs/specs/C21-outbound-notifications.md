@@ -57,8 +57,12 @@ Goals:
 
 Non-goals:
 
-- Notifications to dataset users. The recipients are the people who run the server.
-  Dataset admins choose the thresholds of their dataset's events but not the channels.
+- Notifications to dataset users through channels of their own. The recipients of the
+  events of §3.1 are the people who run the server, and dataset admins choose the
+  thresholds of their dataset's events but not the channels. The one exception is a
+  watch on an entity ([U12](U12-ontology-workbench/SPEC.md#watches)), whose owner is
+  told through an email channel that a server administrator marks for watchers, at the
+  owner's verified address, as the Outcome records.
 - A general event bus or a subscription API. The change feed of
   [CI](CI-commit-identity.md) already serves programs that follow commits.
 - Chat formats such as Slack's or Discord's message payloads. A webhook relay or ntfy
@@ -420,7 +424,10 @@ section is changing in parallel work.
 - **Chat-specific payloads.** Each chat service has its own format and its own
   versioning. A webhook relay or ntfy's integrations translate the envelope.
 - **Dataset admins choosing channels.** Channels are outbound connections of the
-  server, which C19 leaves to server administrators.
+  server, which C19 leaves to server administrators. Watches on entities keep this
+  rule. A user does not name a destination, and an administrator decides which email
+  channel may carry watches, while the address is the user's own verified one. Webhook
+  and ntfy channels have no per-user address and do not carry watches.
 
 ## 14. Acceptance examples
 
