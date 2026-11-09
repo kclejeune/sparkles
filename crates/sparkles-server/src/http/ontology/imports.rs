@@ -649,6 +649,22 @@ fn replace_graph(
     Ok(())
 }
 
+/// Refuse an import action on a protected branch before anything changes: an action that
+/// changes no graph would otherwise commit nothing, pass the guard and still write the map.
+fn refuse_protected(ds: &Dataset) -> ApiResult<()> {
+    if ds.store.branch_protected() {
+        return Err(err_code(
+            StatusCode::FORBIDDEN,
+            "branch-protected",
+            format!(
+                "branch {} is protected and takes changes through merges only",
+                branch_name()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn sha256(bytes: &[u8]) -> String {
     use sha2::Digest;
     let d = sha2::Sha256::digest(bytes);
@@ -835,6 +851,7 @@ pub(in crate::http) async fn catalog(
         wopts.message = Some("Load an XML catalog's imports".into());
     }
     blocking(move || {
+        refuse_protected(&ds)?;
         let l = lock(&ds);
         let _held = l.lock();
         let mut m = read_map(&st, &ds).map_err(internal)?;
@@ -932,6 +949,7 @@ pub(in crate::http) async fn fetch(
         wopts.message = Some(format!("Fetch the import <{iri}>").into());
     }
     blocking(move || {
+        refuse_protected(&ds)?;
         let l = lock(&ds);
         let _held = l.lock();
         let mut m = read_map(&st, &ds).map_err(internal)?;

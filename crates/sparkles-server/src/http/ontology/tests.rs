@@ -2588,7 +2588,7 @@ async fn a_catalog_loads_its_files_and_maps_its_entries() {
 }
 
 #[tokio::test]
-async fn a_protected_branch_refuses_a_catalog() {
+async fn a_protected_branch_refuses_a_catalog_and_a_fetch() {
     let s = persistent();
     let ds = s._state.get("h").unwrap();
     ds.dataset
@@ -2605,6 +2605,28 @@ async fn a_protected_branch_refuses_a_catalog() {
         "/$/ontology/h/imports/catalog?branch=dev",
         &[(header::CONTENT_TYPE.as_str(), &ct)],
         &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    // a catalog that only maps changes no graph, and is refused before the map changes
+    let (ct, body) = multipart(&[(
+        "catalog",
+        "c.xml",
+        r#"<catalog><uri name="http://ex.org/z" uri="urn:z"/></catalog>"#,
+    )]);
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/h/imports/catalog?branch=dev",
+        &[(header::CONTENT_TYPE.as_str(), &ct)],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    let r = post(
+        &s.app,
+        "/$/ontology/h/imports/fetch?branch=dev",
+        json!({"iri": "http://ex.org/far"}),
     )
     .await;
     assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
