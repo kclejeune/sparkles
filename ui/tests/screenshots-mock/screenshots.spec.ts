@@ -9,7 +9,8 @@
 // `share_query`. The maps of relations, the communities, the Pattern pane, the diff graph
 // and the path finder on a query's graph use the `world` showcase dataset of
 // mock/world.mjs. The model configuration form uses the declared configuration of
-// mock/models.mjs. The ontology editor uses the `uni` dataset of mock/ontology.mjs, and the
+// mock/models.mjs, and the Notifications section the declared channels of
+// mock/notifications.mjs. The ontology editor uses the `uni` dataset of mock/ontology.mjs, and the
 // thesaurus editor the `thes` dataset of mock/skos.mjs. Run
 // with `mise run docs:screenshots`.
 
@@ -1197,6 +1198,24 @@ test('models-settings', async ({ page, request }) => {
   await allowed.evaluate((e) => e.scrollIntoView({ block: 'start' }));
   await page.evaluate(() => document.querySelector('main')?.scrollBy(0, -40));
   await shoot(page, 'models-settings');
+});
+
+test('notifications-settings', async ({ page, request }) => {
+  // the declared channels with their secrets and routes, a test just sent to ops, and the
+  // recent deliveries below
+  await request.delete('/$/server/settings/notifications');
+  await page.goto('/ui/admin/server');
+  const section = page.getByTestId('notifications-section');
+  const ops = section.locator('[data-channel=ops]');
+  await expect(ops).toBeVisible();
+  await section.getByRole('button', { name: 'Send a test to ops' }).click();
+  await expect(ops.getByRole('status')).toContainText('Delivered');
+  // the toast that confirms the test would cover the deliveries
+  await page.getByRole('button', { name: 'Dismiss' }).click();
+  await page.waitForTimeout(400);
+  await section.evaluate((e) => e.scrollIntoView({ block: 'start' }));
+  await page.evaluate(() => document.querySelector('main')?.scrollBy(0, -16));
+  await shoot(page, 'notifications-settings');
 });
 
 test('models-settings-errors', async ({ page, request }) => {

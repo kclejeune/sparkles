@@ -6,7 +6,9 @@
 // `sparkles serve`) starts with only an in-memory dataset the operator declares, a
 // settings file that also locks a model provider's endpoint, a model configuration with
 // a declared key, and a backup config that lets its API register repositories under a
-// temporary directory. The returned function is the global teardown.
+// temporary directory. It allows private outbound addresses, so that a notification test
+// reaches a receiver the test runs on 127.0.0.1. The returned function is the global
+// teardown.
 //
 // SPARKLES_BIN selects the binary (default: ../target/debug/sparkles, which serves ui/build
 // from disk); SPARKLES_E2E_KEEP=1 keeps the data directory and server log;
@@ -400,6 +402,7 @@ graphs = ["urn:x-arq:DefaultGraph"]
         models,
         '--model-secret',
         `anthropic=file:${key}`,
+        '--outbound-allow-private',
       ],
       1,
     );

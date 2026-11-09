@@ -126,6 +126,8 @@ export type SecretInfo = {
   /** A stored value that the lock ignores. */
   overridden: boolean;
   providers: string[];
+  /** The notification channels that name the secret (spec C21). */
+  channels?: string[];
 };
 
 /** `GET /$/server/secrets`: how stored values are kept, and the secrets. */

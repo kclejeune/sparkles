@@ -38,6 +38,7 @@ import {
 import { handleDescribe } from './describe.mjs';
 import { PathError, pathSearch } from './paths.mjs';
 import { handleModels } from './models.mjs';
+import { handleNotifications } from './notifications.mjs';
 import { handleAsk, isAdmin, ORG_MEMORY, ORG_PREFIXES, orgTrig, whoamiFor } from './memory.mjs';
 import { handleAssistant } from './assistant.mjs';
 import { handleFacets } from './facets.mjs';
@@ -2482,6 +2483,8 @@ const server = http.createServer(async (req, res) => {
       return;
     // the model configuration, its keys and its runtime changes (mock/models.mjs)
     if (handleModels(req, res, seg, { send, fail })) return;
+    // outbound notifications: the kind, the status and test sends (mock/notifications.mjs)
+    if (handleNotifications(req, res, seg, { send, fail })) return;
     // the facets of a set (mock/facets.mjs)
     if (await handleFacets(req, res, seg, { datasets, send, fail, readBody })) return;
     // GraphRAG community reports (mock/graphrag.mjs)

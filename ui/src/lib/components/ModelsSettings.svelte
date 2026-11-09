@@ -325,6 +325,12 @@
     }
   }
 
+  /** Who names a secret: providers, then notification channels. */
+  const usedBy = (s: SecretInfo) => {
+    const users = [...s.providers, ...(s.channels ?? []).map((c) => `channel ${c}`)];
+    return users.length ? `Used by ${users.join(', ')}.` : 'Not used by any provider.';
+  };
+
   const keyOf = (p: { apiKey?: { secret: string; source: string } }) =>
     p.apiKey ? `${p.apiKey.secret} (${p.apiKey.source})` : 'none';
 </script>
@@ -618,9 +624,7 @@
                 {/if}
               </div>
               <div class="faint small">
-                {s.setAt ? `Set ${fmtTime(s.setAt)}. ` : ''}{s.providers.length
-                  ? `Used by ${s.providers.join(', ')}.`
-                  : 'Not used by any provider.'}
+                {s.setAt ? `Set ${fmtTime(s.setAt)}. ` : ''}{usedBy(s)}
               </div>
               {#if replacing === s.name}
                 <form class="replace" onsubmit={(e) => replaceKey(e, s.name)}>
