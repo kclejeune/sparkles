@@ -34,6 +34,9 @@ class Admission(unittest.TestCase):
         self.clock.start();self.addCleanup(self.clock.stop)
         self.guard=patch.object(RX.boat_environment,'local_guard',return_value=self.fixtures['guard'])
         self.guard.start();self.addCleanup(self.guard.stop)
+        # The fixture's BOOTTIME observation stands for the current boot clock.
+        self.boot=patch.object(RX.boat_clock,'boottime',return_value=self.fixtures['boot_now'])
+        self.boot.start();self.addCleanup(self.boot.stop)
 
     def test_exact_warm_identity_and_binary_safe_command(self):
         result=RX.command('boat:bx_fixture',"printf '%s' 'a;$(bad)' && cat")
@@ -60,6 +63,134 @@ class Admission(unittest.TestCase):
 
     def test_remaining_lifetime_is_a_job_constraint(self):
         with self.assertRaises(ValueError):RX.admission('boat:bx_fixture',10800)
+
+    def clocks(self,wall,boot,boot_id=None):
+        """Patch wall time, CLOCK_BOOTTIME and the boot id seen by admission."""
+        import qualified_worker_admission as qwa
+        stack=__import__('contextlib').ExitStack()
+        stack.enter_context(patch.object(RX.time,'time',return_value=wall))
+        stack.enter_context(patch.object(qwa,'boottime',return_value=boot,create=True))
+        stack.enter_context(patch.object(qwa,'current_boot_id',return_value=boot_id or self.fixtures['boot_id'],create=True))
+        return stack
+
+    def original_left(self):
+        from datetime import datetime
+        return datetime.fromisoformat(self.fixtures['qualified']['expires_at'].replace('Z','+00:00')).timestamp()-self.fixtures['now']
+
+    def test_wall_rollback_between_calls_cannot_extend_original_lifetime(self):
+        now,boot,left=self.fixtures['now'],self.fixtures['boot_now'],self.original_left()
+        original=self.fixtures['qualified_path'].read_bytes()
+        with self.clocks(now-7200,boot):
+            with self.assertRaises(ValueError):RX.admission('boat:bx_fixture',left)
+            data=RX.admission('boat:bx_fixture',left-31)
+            self.assertLessEqual(data['expires_at']-(now-7200),left)
+            deadline=RX.operation_deadline('boat:bx_fixture',seconds=10**6)
+            self.assertLessEqual(RX.remaining(deadline),left-30)
+        self.assertEqual(self.fixtures['qualified_path'].read_bytes(),original)
+        self.assertIsNone(json.loads(original)['runtime_env_file'])
+
+    def test_raw_exec_dispatch_uses_the_earlier_original_end(self):
+        now,boot,left=self.fixtures['now'],self.fixtures['boot_now'],self.original_left()
+        seen=[]
+        def spy(argv,output,**kw):seen.append(RX.remaining(kw['deadline']));return 0
+        with self.clocks(now-7200,boot),patch.object(RX,'exchange',side_effect=spy),patch.object(sys,'argv',['remote-executor.py','exec','boat:bx_fixture','true']),patch.object(sys.stdin,'isatty',return_value=True):
+            self.assertEqual(RX.main(),0)
+        self.assertEqual(len(seen),1);self.assertLessEqual(seen[0],left-30)
+
+    def test_one_warm_worker_across_many_calls_and_a_lane_boundary(self):
+        """Successive invocations and a later lane share one original end that never grows."""
+        import qualified_worker_admission as qwa
+        now,boot,left=self.fixtures['now'],self.fixtures['boot_now'],self.original_left()
+        original=self.fixtures['qualified_path'].read_bytes()
+        expected=RX.boat_environment.expected_environment(self.fixtures['profile'],self.fixtures['qualified'])
+        # Lane two prepares its own job-admission record from the same qualification.
+        lane_two=self.root/'lane-two-admission.json'
+        with self.clocks(now-3600,boot+100),patch.object(RX.boat_environment,'local_guard',return_value=self.fixtures['guard']),\
+             patch.object(RX.boat_environment.controller,'bounded',return_value={'exit':0,'body':expected}):
+            RX.boat_environment.prepare(self.fixtures['profile_path'],self.fixtures['operation'],self.fixtures['profile']['worker'],lane_two)
+        lane_two.chmod(0o600)
+        elapsed=0
+        for index in range(24):
+            elapsed+=37
+            # The wall clock wanders backward and forward between calls.
+            wall=now+elapsed+(-5000 if index%3==0 else 2000 if index%3==1 else 0)
+            record=self.path if index<12 else lane_two
+            with self.subTest(index=index),self.clocks(wall,boot+elapsed),patch.dict(os.environ,SPARKLES_BOAT_ADMISSION=str(record)):
+                data=RX.admission('boat:bx_fixture')
+                deadline=RX.operation_deadline('boat:bx_fixture',seconds=10**6)
+                # Never more than the original end on BOOTTIME, whatever the wall says.
+                self.assertLessEqual(RX.remaining(deadline),left-elapsed-30)
+                self.assertLessEqual(data['expires_at']-wall,left-elapsed)
+                self.assertEqual(data['_lifetime']['boot_end'],boot+left)
+        self.assertEqual(self.fixtures['qualified_path'].read_bytes(),original)
+        self.assertEqual(json.loads(lane_two.read_text())['qualification']['sha256'],hashlib.sha256(original).hexdigest())
+        # Re-exporting after a rollback reproduces the same bytes, so it renews nothing.
+        with self.clocks(now-7000,boot+elapsed):
+            self.assertEqual(json.dumps(qwa.export_operation(self.fixtures['operation'],now-7000,'bx_fixture',self.fixtures['profile']),sort_keys=True),
+                             json.dumps(json.loads(original),sort_keys=True))
+
+    def test_forward_wall_suspend_reboot_and_exact_margin(self):
+        now,boot,left=self.fixtures['now'],self.fixtures['boot_now'],self.original_left()
+        # A forward wall jump shortens the remaining time through the wall bound.
+        with self.clocks(now+3000,boot):
+            with self.assertRaises(ValueError):RX.admission('boat:bx_fixture',left-3000-30)
+            RX.admission('boat:bx_fixture',left-3000-31)
+        # A suspend advances BOOTTIME. It counts even when the wall clock missed it.
+        for wall in (now+3000,now):
+            with self.subTest(wall=wall),self.clocks(wall,boot+3000):
+                with self.assertRaises(ValueError):RX.admission('boat:bx_fixture',left-3000-30)
+                RX.admission('boat:bx_fixture',left-3000-31)
+        # The 30-second reserve is subtracted, and an exact margin refuses.
+        with self.clocks(now,boot):
+            with self.assertRaises(ValueError):RX.admission('boat:bx_fixture',left-30)
+            RX.admission('boat:bx_fixture',left-31)
+        # A reboot invalidates the original BOOTTIME end.
+        with self.clocks(now,boot,'99999999-2222-3333-4444-555555555555'),self.assertRaises(ValueError):
+            RX.admission('boat:bx_fixture')
+
+    def test_in_flight_deadline_counts_suspend_and_never_lengthens(self):
+        now,boot,left=self.fixtures['now'],self.fixtures['boot_now'],self.original_left()
+        with self.clocks(now,boot):deadline=RX.operation_deadline('boat:bx_fixture',seconds=10**6)
+        with self.clocks(now-7200,boot):
+            first=RX.remaining(deadline);self.assertLessEqual(first,left-30)
+        with self.clocks(now-7200,boot+left-29),self.assertRaises(ValueError):RX.remaining(deadline)
+
+    def observation(self,wall,boot):
+        """Run admit with its probes stubbed and return the printed observation."""
+        out=io.StringIO()
+        with self.clocks(wall,boot),patch.object(RX.boat_environment.controller,'bounded',return_value={'exit':0,'error':None,'body':{'sandbox':{
+                'id':'bx_fixture','environment':self.fixtures['qualified']['environment']['name'],
+                'environmentVersion':self.fixtures['qualified']['environment']['version'],'type':'large','vcpu':8,'memoryGB':16,'state':'ready'}}}),\
+             patch.object(RX,'exchange',return_value=0),patch('sys.stdout',out):
+            RX.admit('boat:bx_fixture',60)
+        return json.loads(out.getvalue())
+
+    def runtime(self,path,wall,boot,boot_id=None):
+        out=io.StringIO()
+        with self.clocks(wall,boot,boot_id),patch.object(sys,'argv',['remote-executor.py','runtime',str(path),'--reserve','60']),patch('sys.stdout',out):
+            code=RX.main()
+        return code,out.getvalue().strip()
+
+    def test_saved_observation_runtime_uses_both_original_ends(self):
+        now,boot,left=self.fixtures['now'],self.fixtures['boot_now'],self.original_left()
+        value=self.observation(now,boot);self.assertEqual(value['version'],2)
+        path=self.root/'observation.json';path.write_text(json.dumps(value))
+        # A wall rollback after the observation was saved cannot lengthen the runtime.
+        code,text=self.runtime(path,now-7200,boot+100)
+        self.assertEqual(code,0);self.assertLessEqual(int(text),left-100-60)
+        # A suspend that the wall clock missed is counted too.
+        code,text=self.runtime(path,now,boot+1000);self.assertLessEqual(int(text),left-1000-60)
+        with self.assertRaises(ValueError):self.runtime(path,now,boot,'99999999-2222-3333-4444-555555555555')
+        with self.assertRaises(ValueError):self.runtime(path,now,boot+left)
+        for version in (1,3):
+            path.write_text(json.dumps({**value,'version':version}))
+            with self.subTest(version=version),self.assertRaises(ValueError):self.runtime(path,now,boot)
+
+    def test_shell_runtime_consumers_use_the_observation_reader(self):
+        for name in ('scripts/remote-screen.sh','scripts/gate/gate.sh'):
+            text=(ROOT/name).read_text()
+            with self.subTest(name=name):
+                self.assertNotIn('["expires_at"]-time.time()',text);self.assertIn('rx_runtime',text)
 
     def test_unsafe_selectors_refuse_before_execution(self):
         for host in ('boat:current','boat:bx_test;echo','-oProxyCommand=bad','h x','a:12'):
@@ -162,6 +293,20 @@ class LocalTransport(unittest.TestCase):
     def test_original_wall_deadline_cannot_be_extended_by_suspend(self):
         deadline=RX.OperationDeadline(time.monotonic()+100,time.time()-1)
         with self.assertRaises(ValueError):RX.remaining(deadline)
+
+    def test_completion_after_the_original_end_is_not_success(self):
+        real_time=time.time;base=RX.boat_clock.boottime()
+        for clock in ('boot','wall'):
+            with self.subTest(clock=clock),tempfile.TemporaryDirectory()as tmp:
+                marker=Path(tmp)/'done'
+                # Output closes first, so the end passes during the final leader wait.
+                argv=['bash','-c','exec 1>&- 2>&-; sleep 0.3; : > '+shlex.quote(str(marker))]
+                jump=lambda:100 if marker.exists() else 0
+                boot=(lambda:base+jump())if clock=='boot' else (lambda:base)
+                wall=(lambda:real_time()+jump())if clock=='wall' else real_time
+                deadline=RX.OperationDeadline(time.monotonic()+5,real_time()+5,base+5)
+                with patch.object(RX.boat_clock,'boottime',side_effect=boot),patch.object(RX.time,'time',side_effect=wall):
+                    with self.assertRaises(ValueError):RX.exchange(argv,io.BytesIO(),deadline=deadline)
 
     def test_numeric_exit_and_receive_limit(self):
         with tempfile.TemporaryFile() as output:
@@ -268,9 +413,12 @@ class LocalTransport(unittest.TestCase):
     def test_sender_uses_original_deadline_after_receipt_changes_and_preparation(self):
         source=self.root/'blob';source.write_bytes(b'x')
         self.deadline.stop()
-        with patch.object(RX,'admission',return_value={'expires_at':time.time()+30.06}):
+        def life(seconds):
+            return {'_lifetime':{'wall_end':time.time()+seconds,'boot_end':RX.boat_clock.boottime()+seconds,
+                                 'boot_id':RX.boat_clock.current_boot_id(),'invocation_id':'a'*32}}
+        with patch.object(RX,'admission',return_value=life(30.06)):
             deadline=RX.operation_deadline('boat:bx_test')
-        with patch.object(RX,'admission',return_value={'expires_at':time.time()+10000}),patch.object(RX,'command',return_value=['bash','-c','cat >/dev/null; sleep 1']),source.open('rb')as data:
+        with patch.object(RX,'admission',return_value=life(10000)),patch.object(RX,'command',return_value=['bash','-c','cat >/dev/null; sleep 1']),source.open('rb')as data:
             with self.assertRaises(ValueError):RX.send('boat:bx_test','ignored',data,deadline)
         calls=len(self.calls)
         real_digest=hashlib.file_digest
@@ -426,7 +574,10 @@ class ScreenAcceptance(unittest.TestCase):
     def test_unknown_launch_is_recorded_once_and_cleanup_retains_lock_on_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            receipt = root/'admission.json'; receipt.write_text(json.dumps({'expires_at':time.time()+3600}))
+            boot = RX.boat_clock.boottime()
+            receipt = root/'admission.json'; receipt.write_text(json.dumps({'schema':'sparkles.boat.adapter-observation','version':2,
+                'expires_at':time.time()+3600,'original_wall_end':time.time()+3600,'boot_end':boot+3600,
+                'guard_boot_id':RX.boat_clock.current_boot_id()}))
             program = r'''
 set -euo pipefail
 . "$SCRIPTS/remote-screen.sh"
