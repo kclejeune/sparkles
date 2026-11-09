@@ -98,6 +98,32 @@ The kernel limits still bound the few writes that follow the cgroup read. The la
 reads at most 1 MiB from each output stream of a command as it reads it, and kills and
 reaps a command that writes more or outlives its time limit.
 
+## Refusal records and the diagnostic hold
+
+The startup, metadata, admission, stop-check and closure phases keep their first refusal
+in `startup-refused.json`, `metadata-refused.json`, `admission-refused.json`,
+`stopcheck-refused.json` and `closure-refused.json` through one shared function. Each
+record holds the local reason code, the remote phase's own reason code, the bounded
+terminal properties and memory evidence of the phase unit, and for startup the processes
+it counted. A refused metadata phase also names every check its result failed, from
+`metadata_not_closed`, `probe_not_qualified`, `startup_not_closed`,
+`engine_or_job_started`, `memory_cap`, `swap_cap`, `manifest_changed` and
+`worker_boot_id`, and its refusal names the first of them. Writing a record never masks
+the refusal it describes.
+
+A refused qualification holds its stop trigger for at most 600 seconds when the resume
+was acknowledged and the worker was seen running. During the hold the controller runs
+`diagnostic-probe.py` on the worker and keeps its output in `diagnostics.json`. The
+program reads the process table, the package's state directory listing and every phase's
+`probe-result.json`, the host memory summary, free disk space and the package's user
+units. It reads no other file, so the token and the repository are never opened. A failed
+read is kept in `diagnostics-failed-NNNN.json` and retried after 15 seconds. The hold ends
+300 seconds before the controller unit's 2,700-second runtime limit and 600 seconds
+before the guard's deadline, and any error ends it, so the controller always writes the
+stop trigger and the guard then stops the worker normally. The hold applies only to
+qualification, before a Root handoff, and never to a job, an extension, a closure watch
+or a finish.
+
 Every refusal records a bounded reason code. A refusal of this package keeps its literal
 reason, and any other exception records only its type and the function and line where it
 was raised, never its text. The controller keeps a remote code only in one of these

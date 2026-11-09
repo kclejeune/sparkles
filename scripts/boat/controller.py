@@ -37,7 +37,7 @@ WATCH_DECISION=90
 FIXED_REASONS=frozenset({'startup_unobserved','startup_busy:unallowed_processes','startup_busy:bootstrap_lock_held','startup_busy:lock_or_manifest_absent','startup_busy:bootstrap_lock_replaced','startup_busy:state_restore_in_progress','existing_phase_pending','unreported'})
 def packet_refusals():
     found=set()
-    for name in ('common.py','config_schema.py','metadata-probe.py','startup-observer.py','remote-launcher.py'):
+    for name in ('common.py','config_schema.py','metadata-probe.py','startup-observer.py','remote-launcher.py','diagnostic-probe.py'):
         for node in ast.walk(ast.parse((ROOT/name).read_text())):
             if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id in ('need','require','Refusal'):
                 for arg in node.args:
@@ -55,6 +55,62 @@ def remote_reason(code):
     return 'malformed'
 def remote_name(value):
     return value if isinstance(value,str) and re.fullmatch(r'[ -~]{1,16}',value) else None
+
+# Every phase keeps its first refusal in <phase>-refused.json through record_refusal.
+REFUSAL_PHASES=('startup','metadata','admission','stopcheck','closure')
+# The fixed names of the metadata checks, in the order the controller applies them.
+METADATA_CHECKS=('metadata_not_closed','probe_not_qualified','startup_not_closed','engine_or_job_started','memory_cap','swap_cap','manifest_changed','worker_boot_id')
+def metadata_failures(q):
+    """The names of every metadata check that a phase result fails, in check order."""
+    q=q if isinstance(q,dict) else {}
+    failed={'metadata_not_closed':q.get('metadata_closed')is not True,'probe_not_qualified':q.get('qualified')is not True,'startup_not_closed':q.get('startup_closed')is not True,
+            'engine_or_job_started':q.get('engine_or_job_started')is not False,'memory_cap':q.get('memory_max')!=str(MEMORY),'swap_cap':q.get('swap_max')!='0',
+            'manifest_changed':q.get('manifest_unchanged')is not True,'worker_boot_id':not(isinstance(q.get('worker_boot_id'),str) and re.fullmatch(lifetime.UUID,q['worker_boot_id']) is not None)}
+    return [name for name in METADATA_CHECKS if failed[name]]
+
+def bounded_int(value):return value if type(value)is int and 0<=value<2**63 else None
+def phase_evidence(result):
+    """The bounded terminal evidence of a phase result, never its free text."""
+    if not isinstance(result,dict):return {}
+    terminal=result.get('terminal_properties') if isinstance(result.get('terminal_properties'),dict) else {}
+    def row(x):
+        return {'pid':bounded_int(x.get('pid')),'comm':remote_name(x.get('comm')),'uid':bounded_int(x.get('uid')),
+                'ppid':bounded_int(x.get('ppid')),'parent_comm':remote_name(x.get('parent_comm')),'parent_uid':bounded_int(x.get('parent_uid'))}
+    rows=result.get('unallowed')
+    out={'phase_closed':result.get('phase_closed') is True,'existing_phase_pending':result.get('existing_phase_pending') is True,
+         'unallowed':[row(x) for x in rows[:32] if isinstance(x,dict)] if isinstance(rows,list) else [],
+         'unallowed_count':bounded_int(result.get('unallowed_count')),
+         'elapsed_seconds':result.get('elapsed_seconds') if type(result.get('elapsed_seconds'))in(int,float) and 0<=result['elapsed_seconds']<10**6 else None,
+         'terminal':{k:terminal[k] for k in ('ExecMainStatus','Result','LoadState','ActiveState') if isinstance(terminal.get(k),str) and re.fullmatch(r'[a-z0-9-]{1,32}',terminal[k])}}
+    evidence={}
+    for name in ('terminal_evidence','phase_memory'):
+        x=result.get(name)
+        if isinstance(x,dict):
+            evidence[name]={k:bounded_int(x.get(k)) for k in ('memory_peak','swap_peak') if k in x}
+            for k in ('source','terminal_source'):
+                if isinstance(x.get(k),str) and re.fullmatch(r'[a-z_]{1,32}',x[k]):evidence[name][k]=x[k]
+            if 'reason_code' in x:evidence[name]['reason_code']=remote_reason(x['reason_code'])
+    events=result.get('memory_events')
+    if isinstance(events,dict):evidence['memory_events']={k:v for k,v in list(events.items())[:16] if isinstance(k,str) and re.fullmatch(r'[a-z_]{1,32}',k) and isinstance(v,str) and re.fullmatch(r'[0-9]{1,20}',v)}
+    out['evidence']=evidence
+    return out
+
+def record_refusal(io,phase,error=None,result=None,code=None,failed=()):
+    """Keep the first refusal of ``phase`` with its bounded reason and terminal evidence.
+
+    The reason is the local refusal's code when there is one, then a fixed code the
+    caller names, then the remote phase's own code. The remote code is kept beside it.
+    Recording never masks the refusal it describes, so its errors are swallowed."""
+    try:
+        need(phase in REFUSAL_PHASES,'unknown refusal phase')
+        name=phase+'-refused.json'
+        if io.exists(name):return
+        remote=remote_reason(result.get('reason_code')) if isinstance(result,dict) else None
+        reason=reason_code(error) if error is not None else (bounded_text(code) if isinstance(code,str) else (remote or 'unreported'))
+        row={'phase':phase,'reason_code':reason,'remote_reason_code':remote,'failed_checks':[x for x in failed if x in METADATA_CHECKS],'observed_wall':io.wall()}
+        row.update(phase_evidence(result))
+        io.record(name,row)
+    except Exception:pass
 
 # Job work on the worker. A unit named for a screen, build or gate is job work,
 # and so is any process the startup observer would count, which is every process
@@ -189,6 +245,11 @@ class RealIO:
         """
         source=('import sys\nsys.argv=[\'remote\']+'+repr([str(a) for a in args])+'\n'+program).encode()
         return self.boat(['ssh',worker_id(),'--','/usr/bin/python3','-I','-B','-'],seconds,source,json_mode=False)
+    def diagnose(self,seconds):
+        """Run the maintained read-only diagnostic program on the worker."""
+        r=self.remote_python((ROOT/'diagnostic-probe.py').read_text(),[],seconds)
+        need(r['exit']==0 and isinstance(r['body'],dict),'diagnostics unavailable')
+        return r['body']
     def worker_boot_id(self):
         code="import json;print(json.dumps({'boot_id':open('/proc/sys/kernel/random/boot_id').read().strip()}))"
         r=self.remote_python(code,[],20)
@@ -359,25 +420,15 @@ if __name__=='__main__':
         return True
     def startup_refused(self,result):
         """Keep the first refused startup's bounded reason, never its free text."""
-        if self.exists('startup-refused.json'):return
-        rows=result.get('unallowed')
-        terminal=result.get('terminal_properties') if isinstance(result.get('terminal_properties'),dict) else {}
-        def row(x):
-            return {'pid':x.get('pid') if type(x.get('pid'))is int else None,'comm':remote_name(x.get('comm')),'uid':x.get('uid') if type(x.get('uid'))is int else None,
-                    'ppid':x.get('ppid') if type(x.get('ppid'))is int else None,'parent_comm':remote_name(x.get('parent_comm')),
-                    'parent_uid':x.get('parent_uid') if type(x.get('parent_uid'))is int else None}
-        safe={'reason_code':remote_reason(result.get('reason_code')),
-              'phase_closed':result.get('phase_closed') is True,'existing_phase_pending':result.get('existing_phase_pending') is True,
-              'unallowed':[row(x) for x in rows[:32] if isinstance(x,dict)] if isinstance(rows,list) else [],
-              'unallowed_count':result.get('unallowed_count') if type(result.get('unallowed_count'))is int else None,
-              'elapsed_seconds':result.get('elapsed_seconds') if type(result.get('elapsed_seconds'))in(int,float) else None,
-              'terminal':{k:terminal[k] for k in ('ExecMainStatus','Result') if isinstance(terminal.get(k),str) and re.fullmatch(r'[a-z0-9-]{1,32}',terminal[k])},'observed_wall':self.wall()}
-        try:self.record('startup-refused.json',safe)
-        except FileExistsError:pass
+        record_refusal(self,'startup',result=result)
     def stop_quiescent(self):
         if self.exists('stop-startup-closed.json'):return True
-        result=self.phase('stopcheck',5)
-        need(result.get('startup_closed')is True and result.get('phase_closed')is True,'current startup/installer closure unavailable before stop')
+        result=None
+        try:
+            result=self.phase('stopcheck',5)
+            need(result.get('startup_closed')is True and result.get('phase_closed')is True,'current startup/installer closure unavailable before stop')
+        except Exception as error:
+            record_refusal(self,'stopcheck',error,result);raise
         self.record('stop-startup-closed.json',result)
         if not self.exists('startup-closed.json'):self.record('startup-closed.json',result)
         return True
@@ -385,11 +436,14 @@ if __name__=='__main__':
         budget(self.mono(),min(intent['deadline_mono'],self.mono()+intent['deadline_wall']-self.wall()),330)
         need(self.exists('startup-closed.json'),'startup closure absent')
         self.record('metadata-started.json',{'unit':self.r['guard_unit']+'-metadata.service','wall':self.wall()})
-        q=self.phase('metadata')
-        if q.get('metadata_closed')is True:self.record('qualification-closed.json',{'metadata_closed':True,'unit':self.r['guard_unit']+'-metadata.service'})
-        need(q.get('qualified')is True and q.get('startup_closed')is True and q.get('metadata_closed')is True and q.get('engine_or_job_started')is False,'metadata/startup closure refused')
-        need(q.get('memory_max')==str(MEMORY) and q.get('swap_max')=='0' and q.get('manifest_unchanged')is True,'metadata cap/pins refused')
-        need(isinstance(q.get('worker_boot_id'),str) and re.fullmatch(lifetime.UUID,q['worker_boot_id']) is not None,'worker boot identity missing')
+        q=None;failed=[]
+        try:
+            q=self.phase('metadata')
+            if q.get('metadata_closed')is True:self.record('qualification-closed.json',{'metadata_closed':True,'unit':self.r['guard_unit']+'-metadata.service'})
+            failed=metadata_failures(q)
+            if failed:raise Refusal('metadata refused: '+failed[0])
+        except Exception as error:
+            record_refusal(self,'metadata',error,q,failed=failed);raise
         self.record('qualification.json',q);return q
 
 
@@ -441,20 +495,61 @@ def drive(r,io):
         io.qualification(intent)
         # No source job or transport implementation in this packet. Default is stop.
         if r.get('useful_job_ready') is True:
-            h=r.get('separate_Root_handoff',{})
-            need(sha(h.get('job_release_sha256')) and sha(h.get('different_job_review_sha256')) and h.get('Root_owns_job_and_deadline_closure') is True,'unbound useful job handoff')
-            budget(io.mono(),min(intent['deadline_mono'],io.mono()+expiry-io.wall()),h.get('finite_job_and_closure_seconds',10800))
-            io.record('root-handoff.json',{'worker':worker_id(),'separate_job_release':h,'deadline_wall':intent['deadline_wall'],'qualification_only_controller':True,'job_started_by_controller':False})
-            admission=make_admission(r,intent,io.read('qualification.json'),io.read('startup-closed.json'),io.guard_for_admission(),io.read('root-handoff.json'),io.wall())
-            io.record('qualified-worker-admission.json',admission)
+            try:
+                h=r.get('separate_Root_handoff',{})
+                need(sha(h.get('job_release_sha256')) and sha(h.get('different_job_review_sha256')) and h.get('Root_owns_job_and_deadline_closure') is True,'unbound useful job handoff')
+                budget(io.mono(),min(intent['deadline_mono'],io.mono()+expiry-io.wall()),h.get('finite_job_and_closure_seconds',10800))
+                io.record('root-handoff.json',{'worker':worker_id(),'separate_job_release':h,'deadline_wall':intent['deadline_wall'],'qualification_only_controller':True,'job_started_by_controller':False})
+                admission=make_admission(r,intent,io.read('qualification.json'),io.read('startup-closed.json'),io.guard_for_admission(),io.read('root-handoff.json'),io.wall())
+                io.record('qualified-worker-admission.json',admission)
+            except Exception as error:
+                record_refusal(io,'admission',error);raise
             return 'QUALIFIED_ROOT_HANDOFF_GUARD_ACTIVE'
         return 'QUALIFIED_STOP_REQUESTED'
     except Exception as error:
         io.record('qualification-failed.json',{'qualification':False,'resume_not_retried':True,'Root_must_reconcile_if_guard_unresolved':True,'reason_code':reason_code(error)})
+        diagnostic_hold(io,intent)
         raise
     finally:
         if not io.exists('no-ready-confirmed.json') and not io.exists('root-handoff.json'):io.trigger()
 
+
+# After a refused qualification, the controller holds its stop trigger for at most
+# HOLD_MAX seconds to read the worker's state. The hold ends HOLD_RESERVE seconds
+# before the controller unit's CONTROLLER_RUNTIME limit, which boat:qualify sets, so
+# the trigger is always written, and HOLD_DEADLINE_RESERVE seconds before the
+# guard's own deadline. Each read waits DIAGNOSE_RETRY seconds after a failure.
+HOLD_MAX=600
+CONTROLLER_RUNTIME=2700
+HOLD_RESERVE=300
+HOLD_DEADLINE_RESERVE=600
+DIAGNOSE_SECONDS=120
+DIAGNOSE_RETRY=15
+def diagnostic_hold(io,intent):
+    """Read the worker's processes, state and phase results once after a refused qualification.
+
+    It runs only in qualification, before any Root handoff, after a positive resume
+    acknowledgement and a running worker. It never runs for a job, an extension or a
+    closure. It returns before the controller writes its stop trigger, and every
+    error ends the hold, so the trigger is never lost."""
+    try:
+        if not isinstance(intent,dict) or io.exists('root-handoff.json') or io.exists('no-ready-confirmed.json'):return
+        if not io.exists('resume-outcome.json') or io.read('resume-outcome.json').get('acceptance')!='positive':return
+        if not any(n.startswith('info-') and io.read(n).get('state') in ('ready','idle','running') for n in io.names()):return
+        start=io.mono();end=min(start+HOLD_MAX,intent['mono']+CONTROLLER_RUNTIME-HOLD_RESERVE,intent['deadline_mono']-HOLD_DEADLINE_RESERVE)
+        io.record('diagnostic-hold.json',{'started_boottime':start,'end_boottime':end,'seconds':max(0,end-start),'started_wall':io.wall(),'qualification_only':True})
+        attempt=0
+        while end-io.mono()>=10:
+            attempt+=1
+            try:
+                body=io.diagnose(min(DIAGNOSE_SECONDS,end-io.mono()))
+                need(isinstance(body,dict) and body.get('schema')==1,'diagnostics malformed')
+                io.record('diagnostics.json',dict(body,observed_wall=io.wall(),attempt=attempt));break
+            except Exception as error:
+                io.record('diagnostics-failed-%04d.json'%attempt,{'reason_code':reason_code(error),'observed_wall':io.wall()})
+            pause(io,min(DIAGNOSE_RETRY,max(0,end-io.mono())))
+        io.record('diagnostic-hold-ended.json',{'ended_boottime':io.mono(),'attempts':attempt,'captured':io.exists('diagnostics.json')})
+    except Exception:return
 
 def matching_root_job_closed(r,io,closed):
     freshness(closed,io.wall())
@@ -759,6 +854,11 @@ def finish_operation(op,job_closure=None,seconds=180):
     """Publish only an externally verified closure, then observe the sole guard."""
     r=bind_release_profile(load(op/'release.json'));verify_packet(r['controller_packet_manifest_sha256']);verify_cli(r)
     io=RealIO(r,op)
+    try:return _finish(r,io,job_closure,seconds)
+    except Exception as error:
+        record_refusal(io,'closure',error);raise
+
+def _finish(r,io,job_closure,seconds):
     if io.exists('root-handoff.json'):
         if job_closure is not None:
             closed=load(job_closure);matching_root_job_closed(r,io,closed)
@@ -848,6 +948,7 @@ def closure_watch(r,io,lead=WATCH_LEAD,local_units=(),poll=WATCH_POLL,observe=aw
     checks=0;last='not_checked'
     terminal=('stop-trigger.json','closed.json','unresolved.json','root-job-closed.json')
     def unresolved(code):
+        record_refusal(io,'closure',code='closure_watch:'+code)
         io.record('closure-watch-unresolved.json',{'worker':worker_id(),'reason_code':code,'checks':checks,'observed_wall':io.wall(),'action':'the guard keeps its own deadline stop; Root must establish job closure or reconcile the worker'})
         return 'UNRESOLVED_JOB_OPEN'
     def check_jobs(seconds):
@@ -912,6 +1013,7 @@ def closure_watch_entry(op,lead,local_units):
     io=RealIO(r,op)
     try:return closure_watch(r,io,lead,tuple(local_units))
     except Exception as error:
+        record_refusal(io,'closure',error)
         try:io.record('closure-watch-unresolved.json',{'worker':worker_id(),'reason_code':reason_code(error),'observed_wall':io.wall(),'action':'the guard keeps its own deadline stop; Root must establish job closure or reconcile the worker'})
         except Exception:pass
         raise

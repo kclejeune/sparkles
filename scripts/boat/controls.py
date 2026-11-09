@@ -1034,6 +1034,140 @@ class Controls(unittest.TestCase):
             (unit/'memory.swap.peak').unlink();self.assertRegex(f('x-startup.service',proc,root)['reason_code'],'^unexpected:FileNotFoundError:')
             proc.write_text('1:name=x:/\n');self.assertEqual(f('x-startup.service',proc,root)['reason_code'],'refusal:phase cgroup')
 
+    # Shared refusal records and the diagnostic hold.
+    def metadata_io(self,body):
+        class MetaIO(PhaseIO):
+            qualification=c.RealIO.qualification
+            def __init__(self,r):super().__init__(r);self.diagnosed=[]
+            def phase(self,phase,seconds=0):
+                self.phase_calls.append((phase,seconds))
+                if phase!='metadata':return {'startup_closed':True,'phase_closed':True,'qualification_eligible':True,'bootstrap_occurrence':'unknown'}
+                if isinstance(body,Exception):raise body
+                return copy.deepcopy(body)
+            def diagnose(self,seconds):
+                self.diagnosed.append((self.mono(),seconds));return {'schema':1,'processes':{'count':1,'rows':[]}}
+        return MetaIO(fixture())
+    OP4_LIKE={'qualified':False,'startup_closed':False,'metadata_closed':True,'phase_closed':True,'engine_or_job_started':False,'reason_code':'refusal:insufficient host headroom for proposed12GiB job',
+              'elapsed_seconds':4.2,'terminal_properties':{'Result':'success','ExecMainStatus':'0','LoadState':'not-found','ActiveState':'inactive','MemoryPeak':'[not set]'},
+              'terminal_evidence':{'source':'cgroup','memory_peak':60000000,'swap_peak':0,'terminal_source':'systemd_run_exit'},'phase_memory':{'source':'cgroup','cgroup':'/a/x.service','memory_peak':60000000,'swap_peak':0},
+              'memory_events':{'max':'0','oom':'0'},'failure':'bounded phase refused; no arbitrary error content'}
+    def test_a_metadata_refusal_names_every_failed_check_and_the_remote_reason(self):
+        io=self.metadata_io(self.OP4_LIKE);io.record('startup-closed.json',{});intent={'deadline_mono':io.mono()+10000,'deadline_wall':io.wall()+10000}
+        with self.assertRaises(Refusal) as caught:io.qualification(intent)
+        self.assertEqual(str(caught.exception),'metadata refused: probe_not_qualified')
+        q=io.read('metadata-refused.json')
+        self.assertEqual(q['reason_code'],'refusal:metadata refused: probe_not_qualified');self.assertEqual(q['remote_reason_code'],'refusal:insufficient host headroom for proposed12GiB job')
+        self.assertEqual(q['failed_checks'],['probe_not_qualified','startup_not_closed','memory_cap','swap_cap','manifest_changed','worker_boot_id'])
+        self.assertEqual(q['terminal'],{'Result':'success','ExecMainStatus':'0','LoadState':'not-found','ActiveState':'inactive'})
+        self.assertEqual(q['evidence']['terminal_evidence'],{'memory_peak':60000000,'swap_peak':0,'source':'cgroup','terminal_source':'systemd_run_exit'})
+        self.assertNotIn('failure',json.dumps(q));self.assertTrue(io.exists('qualification-closed.json'));self.assertFalse(io.exists('qualification.json'))
+        # A failed remote invocation is recorded too, with no checks to name.
+        io=self.metadata_io(Refusal('remote phase invocation failed'));io.record('startup-closed.json',{})
+        with self.assertRaises(Refusal):io.qualification(intent)
+        q=io.read('metadata-refused.json');self.assertEqual((q['reason_code'],q['remote_reason_code'],q['failed_checks']),('refusal:remote phase invocation failed',None,[]))
+        # A passing result records no refusal.
+        good=dict(self.OP4_LIKE,qualified=True,startup_closed=True,memory_max=str(MEMORY),swap_max='0',manifest_unchanged=True,worker_boot_id='87654321-4321-4321-4321-210987654321')
+        io=self.metadata_io(good);io.record('startup-closed.json',{});io.qualification(intent);self.assertFalse(io.exists('metadata-refused.json'));self.assertTrue(io.exists('qualification.json'))
+    def test_a_refused_qualification_holds_its_stop_to_read_the_worker(self):
+        io=self.metadata_io(self.OP4_LIKE)
+        with self.assertRaises(Refusal):c.drive(io.r,io)
+        self.assertEqual(io.read('qualification-failed.json')['reason_code'],'refusal:metadata refused: probe_not_qualified')
+        names=list(io.records)
+        self.assertTrue(io.exists('diagnostics.json'));self.assertEqual(len(io.diagnosed),1)
+        self.assertLess(names.index('metadata-refused.json'),names.index('diagnostics.json'));self.assertLess(names.index('diagnostics.json'),names.index('stop-trigger.json'))
+        hold=io.read('diagnostic-hold.json');self.assertLessEqual(hold['seconds'],c.HOLD_MAX)
+        self.assertTrue(io.read('diagnostic-hold-ended.json')['captured'])
+    def test_the_hold_is_bounded_and_always_ends_in_the_trigger(self):
+        for case in ('fails','raises_base'):
+            io=self.metadata_io(self.OP4_LIKE)
+            def diagnose(seconds,io=io):
+                io.diagnosed.append((io.mono(),seconds));io.wait(seconds)
+                raise Refusal('diagnostics unavailable')
+            io.diagnose=diagnose
+            with self.assertRaises(Refusal):c.drive(io.r,io)
+            hold=io.read('diagnostic-hold.json');self.assertEqual(hold['seconds'],c.HOLD_MAX)
+            self.assertTrue(all(t+s<=hold['end_boottime'] for t,s in io.diagnosed));self.assertGreater(len(io.diagnosed),1)
+            self.assertLessEqual(io.read('diagnostic-hold-ended.json')['ended_boottime'],hold['end_boottime']+c.DIAGNOSE_RETRY)
+            self.assertFalse(io.read('diagnostic-hold-ended.json')['captured']);self.assertTrue(io.exists('stop-trigger.json'))
+            self.assertTrue(io.exists('diagnostics-failed-0001.json'))
+        # Late in the controller's life the hold ends before the controller's own limit.
+        io=self.metadata_io(self.OP4_LIKE);io.diagnose=lambda seconds:(_ for _ in ()).throw(Refusal('diagnostics unavailable'))
+        real_phase=io.phase
+        def late(phase,seconds=0):
+            io.t+=c.CONTROLLER_RUNTIME-c.HOLD_RESERVE-100;return real_phase(phase,seconds)
+        io.phase=late
+        with self.assertRaises(Refusal):c.drive(io.r,io)
+        intent=io.read('controller-intent.json');hold=io.read('diagnostic-hold.json')
+        self.assertEqual(hold['end_boottime'],intent['mono']+c.CONTROLLER_RUNTIME-c.HOLD_RESERVE);self.assertLess(hold['seconds'],c.HOLD_MAX)
+        # An error inside the hold itself still leaves the trigger.
+        io=self.metadata_io(self.OP4_LIKE);io.names=lambda:(_ for _ in ()).throw(OSError(5,'x'))
+        with self.assertRaises(Refusal):c.drive(io.r,io)
+        self.assertTrue(io.exists('stop-trigger.json'));self.assertFalse(io.exists('diagnostic-hold.json'))
+    def test_no_hold_without_a_running_worker_or_after_a_handoff(self):
+        for mode in ('malformed','timeout'):
+            io=self.metadata_io(self.OP4_LIKE);io.mode=mode
+            with self.assertRaises(Refusal):c.drive(io.r,io)
+            self.assertFalse(io.exists('diagnostic-hold.json'),mode);self.assertTrue(io.exists('stop-trigger.json'))
+        io=self.metadata_io(self.OP4_LIKE);io.startup_bad=True;io.started_never=True
+        real=io.info
+        io.info=lambda:dict(real(),state='stopped') if io.started else real()
+        with self.assertRaises(Refusal):c.drive(io.r,io)
+        self.assertFalse(io.exists('diagnostic-hold.json'))
+        # After a handoff the controller is no longer qualifying, so a refusal never holds.
+        r=fixture();r.update(useful_job_ready=True,separate_Root_handoff={'job_release_sha256':'a'*64,'different_job_review_sha256':'b'*64,'Root_owns_job_and_deadline_closure':True,'finite_job_and_closure_seconds':7200})
+        io=InertIO(r);io.diagnose=lambda s:self.fail('hold after handoff')
+        io.guard_for_admission=lambda:(_ for _ in ()).throw(Refusal('guard not live at handoff'))
+        with self.assertRaises(Refusal):c.drive(r,io)
+        self.assertTrue(io.exists('root-handoff.json'));self.assertFalse(io.exists('diagnostic-hold.json'))
+        q=io.read('admission-refused.json');self.assertEqual((q['phase'],q['reason_code']),('admission','refusal:guard not live at handoff'))
+        # The hold has one call site, the controller's qualification.
+        callers=[f.name for f in ast.walk(ast.parse(Path(c.__file__).read_text())) if isinstance(f,ast.FunctionDef) and any(isinstance(n,ast.Call) and getattr(n.func,'id',None)=='diagnostic_hold' for n in ast.walk(f))]
+        self.assertEqual(callers,['drive'])
+    def test_an_unbound_handoff_records_an_admission_refusal(self):
+        r=fixture();r.update(useful_job_ready=True,separate_Root_handoff={})
+        io=InertIO(r);io.diagnose=lambda s:{'schema':1}
+        with self.assertRaises(Refusal):c.drive(r,io)
+        self.assertEqual(io.read('admission-refused.json')['reason_code'],'refusal:unbound useful job handoff');self.assertTrue(io.exists('diagnostics.json'))
+    def test_a_stopcheck_refusal_keeps_its_remote_reason(self):
+        class StopIO(PhaseIO):
+            stop_quiescent=c.RealIO.stop_quiescent
+        io=StopIO(fixture());io.refusal_body={'startup_closed':False,'phase_closed':True,'reason_code':'unit_unhealthy:memory_peak_unavailable','terminal_properties':{'LoadState':'not-found','Result':'success','ExecMainStatus':'0'}}
+        with self.assertRaises(Refusal):io.stop_quiescent()
+        q=io.read('stopcheck-refused.json')
+        self.assertEqual((q['reason_code'],q['remote_reason_code']),('refusal:current startup/installer closure unavailable before stop','unit_unhealthy:memory_peak_unavailable'))
+        self.assertEqual(q['terminal']['LoadState'],'not-found')
+        # The first refusal of a phase is kept, and recording never raises.
+        io.refusal_body=dict(io.refusal_body,reason_code='unreported')
+        with self.assertRaises(Refusal):io.stop_quiescent()
+        self.assertEqual(io.read('stopcheck-refused.json'),q)
+        broken=StopIO(fixture());broken.record=lambda n,v:(_ for _ in ()).throw(OSError(28,'full'))
+        c.record_refusal(broken,'stopcheck',Refusal('x'));c.record_refusal(io,'unknown',Refusal('x'));self.assertFalse(io.exists('unknown-refused.json'))
+    def test_the_diagnostic_program_reads_only_its_own_results(self):
+        spec=importlib.util.spec_from_file_location('diagnostic_probe',Path(__file__).with_name('diagnostic-probe.py'));d=importlib.util.module_from_spec(spec);spec.loader.exec_module(d)
+        with tempfile.TemporaryDirectory() as t:
+            home=Path(t);state=home/'.local/state/sparkles-boat';(home/'.config/mbx').mkdir(parents=True);state.mkdir(parents=True)
+            token=home/'.config/mbx/remote-token';token.write_text('SECRET-TOKEN-CONTENT');os.chmod(token,0o600)
+            (state/'toolchain.json').write_text('{"tool":"SECRET-TOOL-CONTENT"}')
+            def phase(name,body,mode=0o600):
+                (state/name).mkdir();f=state/name/'probe-result.json';f.write_text(json.dumps(body));os.chmod(f,mode)
+            phase('qualification-a-metadata',{'qualified':False,'reason_code':'refusal:insufficient host headroom for proposed12GiB job'})
+            phase('qualification-a-startup',{'startup_closed':True},0o644)
+            phase('qualification-b-startup',{'x':'y'*(d.RESULT_MAX+10)})
+            (state/'qualification-c-stopcheck').mkdir()
+            with patch.object(d,'units',return_value={'rows':[]}):body=d.collect(home,os.getuid())
+            text=json.dumps(body);self.assertNotIn('SECRET',text);self.assertLess(len(text),d.OUTPUT_MAX)
+            phases=body['state']['phases']
+            self.assertEqual(phases['qualification-a-metadata']['result']['reason_code'],'refusal:insufficient host headroom for proposed12GiB job')
+            self.assertEqual(phases['qualification-a-startup']['unread'],'not a private regular file');self.assertEqual(phases['qualification-b-startup']['unread'],'over the result bound')
+            self.assertEqual(phases['qualification-c-stopcheck'],{'entries':[]})
+            self.assertIn('toolchain.json',[e['name'] for e in body['state']['entries']]);self.assertIn('MemTotal',body['memory_bytes'])
+            self.assertTrue(any(r['pid']==os.getpid() for r in body['processes']['rows']))
+            # Results are dropped, largest first, until the output fits.
+            for n in range(20):phase('qualification-z%02d-metadata'%n,{'x':'y'*60000})
+            with patch.object(d,'units',return_value={'rows':[]}):body=d.collect(home,os.getuid())
+            self.assertLessEqual(len(json.dumps(body)),d.OUTPUT_MAX);self.assertIn('result',body['state']['phases']['qualification-a-metadata'])
+            self.assertTrue(any(v.get('unread')=='dropped to fit the output bound' for v in body['state']['phases'].values()))
+
     def test_final_runtime_source_map(self):
         path=Path(__file__).with_name('runtime-sources.json')
         self.assertTrue(path.exists());c.verify_packet(digest(path.read_bytes()))

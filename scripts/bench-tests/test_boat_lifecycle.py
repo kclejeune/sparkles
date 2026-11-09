@@ -821,6 +821,39 @@ class BoundedCommand(unittest.TestCase):
         r=common.bounded_command([sys.executable,'-I','-c',"import sys;sys.stderr.write('ignored')"],30);self.assertIsNone(r.stderr)
 
 
+class Op4PhaseReplay(unittest.TestCase):
+    """Each phase's own checks against what the worker reported in op-3 and op-4."""
+    def setUp(self):
+        import controls
+        self.O=controls.OBSERVER;self.O['bind_profile'](controls.synthetic_profile())
+        self.e=json.loads((Path(__file__).parent/'fixtures/boat-phase-evidence-op4.json').read_text())
+
+    def runtime(self,props,seconds):
+        cg='0::'+props['ControlGroup'];self.O['validate_runtime'](props['ControlGroup'].rsplit('/',1)[-1],int(props['MainPID']),cg,props['MemoryMax'],props['MemorySwapMax'],props,seconds)
+
+    def test_systemd_255_unit_properties_pass_every_phase_runtime_check(self):
+        self.runtime(self.e['startup']['loaded_properties'],32*60+56);self.runtime(self.e['stopcheck']['loaded_properties'],20)
+        # The metadata unit's 240 seconds, as systemd 255 formats them.
+        metadata=dict(self.e['stopcheck']['loaded_properties'],RuntimeMaxUSec='4min',ControlGroup=self.e['stopcheck']['loaded_properties']['ControlGroup'].replace('stopcheck','metadata'))
+        self.runtime(metadata,240)
+        with self.assertRaises(Exception):self.runtime(dict(metadata,RuntimeMaxUSec='4min 1s'),240)
+
+    def test_op4_startup_and_stopcheck_ends_are_healthy(self):
+        import common
+        for phase in ('startup','stopcheck'):
+            x=self.e[phase];result={'unit':x['unit'],'phase_memory':x['phase_memory']}
+            ok,code,evidence=common.terminal_health(result,x['terminal_properties'],True,0)
+            self.assertTrue(ok,(phase,code));self.assertEqual(evidence,x['terminal_evidence'])
+            self.O['validate_pressure'](x['memory_events'],'0')
+
+    def test_the_op3_tree_has_no_startup_or_job_work(self):
+        d=json.loads((Path(__file__).parent/'fixtures/boat-session-tree-op3.json').read_text())
+        rows={r['pid']:dict(r,group=r['pid']) for r in d['rows']};me=d['own_session'][-1]
+        manager=[(r['pid'],r['start']) for r in rows.values() if r['comm']=='systemd' and r['uid']==1000 and r['ppid']==1]
+        self.assertEqual(len(manager),1)
+        self.assertEqual(self.O['foreign_startup'](rows,{'pid':me,'start':rows[me]['start']},me,set(),manager[0]),[])
+
+
 class ProviderSessionTrees(unittest.TestCase):
     """The session allowance against the trees observed on bx_gy2ytgh8."""
     def setUp(self):
@@ -1060,6 +1093,8 @@ class ClosureWatch(unittest.TestCase):
         self.assertEqual(self.watch(io),'GUARD_UNRESOLVED')
         self.setUp();io=WatchIO(self.f);io.trigger()
         self.assertEqual(self.watch(io),'UNRESOLVED_JOB_OPEN');self.assertEqual(self.read('closure-watch-unresolved.json')['reason_code'],'stop_triggered_without_job_closure')
+        # The closure phase keeps its refusal through the shared record.
+        q=self.read('closure-refused.json');self.assertEqual((q['phase'],q['reason_code']),('closure','closure_watch:stop_triggered_without_job_closure'))
         # A stop trigger that appears while the lock is awaited prevents publication.
         self.setUp();io=WatchIO(self.f);io.on_freeze=io.trigger
         self.assertEqual(self.watch(io),'UNRESOLVED_JOB_OPEN');self.assertFalse(io.exists('root-job-closed.json'))
