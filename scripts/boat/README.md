@@ -131,8 +131,8 @@ stat data, and a changed diff hash to tracked content or modes.
 When the identity differs, the probe lists the checkout's porcelain status itself, with
 no fsmonitor, untracked cache or optional lock, and keeps up to 200 lines in the
 `status` part of the drift record. Each line has its XY code and path, the path's
-`lstat` kind, size and mode, and for a tracked path the size and mode its index entry
-records. Paths follow the credential-like rule of the untracked list below. Git reports
+`lstat` kind, size and mode, and for the first 20 tracked paths the size and mode their
+index entries record. Paths follow the credential-like rule of the untracked list below. Git reports
 ` M` without reading a file when its size differs from the size its index entry
 records, and no refresh clears it, which a restored symbolic link can cause. The
 startup checkout has one symbolic link, `crates/sparkles-py/LICENSE`, and the ` M` line
