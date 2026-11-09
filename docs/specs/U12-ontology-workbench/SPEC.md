@@ -136,6 +136,39 @@ the controls and bounds. Text transfer explicitly replaces the saved Turtle draf
 does not install a guard or commit a shape graph. General classifier-backed entailments
 and justifications remain separate work under F24.
 
+### Entity history
+
+Item 620 adds a **History** view to the ontology editor's entity frame, beside **Frame**
+and **Usage**. It lists the commits of the branch that changed a triple naming the entity
+as subject, predicate or object in the editor's graph, newest first. The view asks
+`GET /{ds}/history` once for each position with `order=desc`, the graph, at most 200
+changes and the same `to`, which is the head the editor shows for the first page, so a
+commit that lands between the three lookups cannot be counted by only some of them. It keeps only the commits above the oldest commit at which a cut lookup
+stopped, so a commit is never shown with part of its changes. The next page reads up to
+that commit again. A single commit larger than one page is shown alone with its counts
+marked partial, and the next page starts below it. A triple that names the entity twice
+is counted once. Bulk loads, gaps and commits older than the change log are named at the
+end of the list.
+
+Opening a commit reads `GET /$/ontology/{ds}/diff` from its parent to it, without
+imports and with assertions, and the route's new `entity` parameter keeps only the
+axioms that mention the entity, as the usage view reads them. At most 100 axioms are
+listed on each side, with the full diff linked for the rest. A caller who can edit the
+branch reverts a commit through the editor's preview, which runs `POST /$/revert/{ds}`
+as a dry run against the head the page shows and commits it with the same expectation.
+The revert enters the session's undo stack. The server still requires write access to
+the whole branch for a revert. Readers, protected branches and callers whose grants cover
+only some graphs see no revert button. An opened commit's answer that arrives after the
+view moved to another entity, graph, branch or head is dropped, and unrecorded ranges
+are kept across pages.
+
+The mock backend answers the entity diff from its recorded states. Unit tests cover the
+page assembly and the lookups, the server test covers the entity filter, and Playwright
+covers the list, an opened commit, a revert, an empty history, a reader without the
+revert and the phone layout against the mock, and the same flow against a real server.
+A commit that changed only blank-node triples of a restriction or an annotated axiom is
+not found by the three lookups, and item 765 covers following those structures.
+
 ### Ontology metrics and expressivity
 
 Item 621 adds an on-demand metrics panel to the ontology Header view and the ontology

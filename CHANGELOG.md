@@ -29,6 +29,13 @@ Omitted fields and an empty object keep their previous meaning.
 
 ### Added
 
+The ontology editor's entity frame has a History view (item 620). It lists the branch's
+commits that changed a triple naming the entity in the editor's graph, newest first and
+in bounded pages, opens each to the axioms mentioning the entity that it added and
+removed, and reverts a commit as one previewed commit for a caller who can write the
+branch. `GET /$/ontology/{ds}/diff` takes `entity` to keep only the axioms that mention
+one IRI.
+
 The derived-table cache has a process-wide `--derived-table-cache-mb` budget and
 metrics-protected capacity, occupancy, hit and miss counters in the server statistics.
 
