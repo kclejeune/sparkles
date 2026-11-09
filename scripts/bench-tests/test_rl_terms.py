@@ -78,9 +78,13 @@ class Datatypes(unittest.TestCase):
             f'"zz"^^<{XSD}hexBinary>',
             f'"SGVsbG8"^^<{XSD}base64Binary>',
             f'"\u0661\u0662"^^<{XSD}integer>',
+            f'"02024-01-01T00:00:00Z"^^<{XSD}dateTime>',
+            f'"2024-01-01T24:00:00.{"0" * 325}1Z"^^<{XSD}dateTime>',
         ):
             self.assertEqual(dts(term), set(), term)
         self.assertIn(XSD + "dateTimeStamp", dts(f'"2024-02-29T24:00:00Z"^^<{XSD}dateTime>'))
+        self.assertIn(XSD + "dateTimeStamp", dts(f'"2024-01-01T00:00:59.999999999999999999Z"^^<{XSD}dateTime>'))
+        self.assertIn(XSD + "dateTime", dts(f'"0024-01-01T00:00:00"^^<{XSD}dateTime>'))
         self.assertIn(XSD + "hexBinary", dts(f'"0fb7"^^<{XSD}hexBinary>'))
         self.assertIn(XSD + "base64Binary", dts(f'"SGVsbG8="^^<{XSD}base64Binary>'))
 
@@ -120,6 +124,10 @@ class RoundTrip(unittest.TestCase):
             f = Path(d) / "x.nt"
             f.write_text("<urn:s> <urn:p> _:b. # a comment\n")
             self.assertEqual(list(rl.triples(str(f))), [("<urn:s>", "<urn:p>", "_:b")])
+        self.assertEqual(rl.terms("_:1x <urn:p> _:\u00e9\u00b7x .", 3)[0], ["_:1x", "<urn:p>", "_:\u00e9\u00b7x"])
+        for line in ("<urn:s> <urn:p> _:-bad .", "<urn:s> <urn:p> _:bad/name .", "<urn:s> <urn:p> _:.b ."):
+            with self.assertRaises(ValueError, msg=line):
+                rl.terms(line, 3)
 
     def test_encode_marks_blank_nodes_and_refuses_reserved_iris(self):
         with tempfile.TemporaryDirectory() as d:
@@ -127,9 +135,10 @@ class RoundTrip(unittest.TestCase):
             (d / "in.nt").write_text("_:x <urn:p> <urn:o> .\n")
             rl.encode(str(d / "in.nt"), str(d))
             self.assertIn(f"<{rl.RL}kind> <{rl.RL}bnode>", (d / "literals.nt").read_text())
-            (d / "bad.nt").write_text('<urn:x-lit:0> <urn:p> "x" .\n')
-            with self.assertRaises(ValueError):
-                rl.encode(str(d / "bad.nt"), str(d))
+            for bad in ("<urn:x-lit:0>", "<urn:\\u0078-lit:0>", "<urn:x\\u002Dbnode:1>"):
+                (d / "bad.nt").write_text(f'{bad} <urn:p> "x" .\n')
+                with self.assertRaises(ValueError, msg=bad):
+                    rl.encode(str(d / "bad.nt"), str(d))
 
     def test_decode_refuses_an_unknown_encoded_term(self):
         with tempfile.TemporaryDirectory() as d:

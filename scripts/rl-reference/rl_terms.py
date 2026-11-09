@@ -46,9 +46,16 @@ LIT = "urn:x-lit:"
 BNODE = "urn:x-bnode:"
 RL = "urn:x-rl:"
 
-# A blank node label may hold dots but does not end with one (N-Triples BLANK_NODE_LABEL).
+# N-Triples BLANK_NODE_LABEL: '_:' (PN_CHARS_U | [0-9]) ((PN_CHARS | '.')* PN_CHARS)?
+PN_CHARS_BASE = (
+    "A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u02ff\u0370-\u037d\u037f-\u1fff\u200c-\u200d"
+    "\u2070-\u218f\u2c00-\u2fef\u3001-\ud7ff\uf900-\ufdcf\ufdf0-\ufffd\U00010000-\U000effff"
+)
+PN_CHARS_U = PN_CHARS_BASE + "_:"
+PN_CHARS = PN_CHARS_U + "\\-0-9\u00b7\u0300-\u036f\u203f-\u2040"
+BLANK = rf"_:[{PN_CHARS_U}0-9](?:[{PN_CHARS}.]*[{PN_CHARS}])?"
 TERM = re.compile(
-    r'\s*(<[^>]*>|_:[^\s.<>"#]+(?:\.+[^\s.<>"#]+)*|"(?:[^"\\]|\\.)*"(?:@[A-Za-z0-9-]+|\^\^<[^>]*>)?)'
+    rf'\s*(<[^>]*>|{BLANK}|"(?:[^"\\]|\\.)*"(?:@[A-Za-z0-9-]+|\^\^<[^>]*>)?)(?=[\s.<"#_]|$)'
 )
 QUAD_END = re.compile(r"\s*\.\s*(#.*)?$")
 
@@ -147,7 +154,8 @@ BASE64 = re.compile(
     rf"(({B64}){{4}})*((({B64}){{3}}[A-Za-z0-9+/])|(({B64}){{2}}[AEIMQUYcgkosw048] ?=)|({B64}[AQgw] ?= ?=))?"
 )
 DATETIME = re.compile(
-    r"(-?[0-9]{4,})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2}(\.[0-9]+)?)(Z|[+-][0-9]{2}:[0-9]{2})?"
+    r"(-?(?:[1-9][0-9]{3,}|0[0-9]{3}))-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2}(\.[0-9]+)?)"
+    r"(Z|[+-][0-9]{2}:[0-9]{2})?"
 )
 
 
@@ -217,9 +225,10 @@ def value(lex, lang, dt):
 
 
 def valid_datetime(m):
-    """The fields of a dateTime match within their ranges, with 24:00:00 for midnight."""
+    """The fields of a dateTime match within their ranges, with 24:00:00 for midnight. The
+    seconds are compared as exact decimals."""
     year, month, day, hour, minute = (int(m.group(i)) for i in range(1, 6))
-    second, tz = float(m.group(6)), m.group(8)
+    second, tz = Decimal(m.group(6)), m.group(8)
     if not 1 <= month <= 12 or minute > 59 or second >= 60:
         return False
     leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
@@ -299,7 +308,7 @@ def encode(src, out):
 
     def enc(term):
         if term[0] == "<":
-            if term.startswith(("<" + LIT, "<" + BNODE)):
+            if unescape(term).startswith(("<" + LIT, "<" + BNODE)):
                 raise ValueError(f"{src} holds the IRI {term}, which the encoding reserves")
             return term
         e = ids.get(term)
