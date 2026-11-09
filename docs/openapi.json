@@ -38767,7 +38767,7 @@
     },
     "/$/ontology/{ds}/diff": {
       "get": {
-        "description": "The axioms that differ between the commits `from` and `to` (the head by default), with the graph of each. The terminology of each state is read as the summary reads it, and the two sets of axioms are compared. With `assertions=true`, the assertions that the triples changed between the two commits carry are added and removed too. When no triple of the graphs read changed, the diff is empty. `format=text` answers `+ axiom` and `- axiom` lines in functional-style syntax. A caller whose grants limit endpoints needs the `diff` endpoint.",
+        "description": "The axioms that differ between the commits `from` and `to` (the head by default), with the graph of each. The terminology of each state is read as the summary reads it, and the two sets of axioms are compared. With `assertions=true`, the assertions that the triples changed between the two commits carry are added and removed too. When no triple of the graphs read changed, the diff is empty. `format=text` answers `+ axiom` and `- axiom` lines in functional-style syntax. With `entity`, only the axioms that mention that IRI are kept, which is how the entity frame's history reads one commit. A caller whose grants limit endpoints needs the `diff` endpoint.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
         },
@@ -38829,6 +38829,14 @@
             "name": "assertions",
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "description": "An entity IRI. Only the axioms that mention it are listed and counted.",
+            "in": "query",
+            "name": "entity",
+            "schema": {
+              "type": "string"
             }
           },
           {

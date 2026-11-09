@@ -179,8 +179,7 @@ DL Query tab, the SKOS editor, the web UI shell of item 632 and the visual SHACL
 editor of item 617 come these, in order:
 1. Inferred axioms in entity frames (622), with the inferred property and individual
    trees of item 609. Their explanation links wait for F24's justifications.
-2. Entity history (620), discussions (618) and watches (619), the last after the
-   notifications of item 46.
+2. Discussions (618) and watches (619), the last after the notifications of item 46.
 3. Import resolution (624), bulk edits (626) and pattern-based axiom generation (623).
 4. Vocabulary governance and change requests (627), after item 459.
 
@@ -848,7 +847,7 @@ Rows that need backend work name it first.
 | 660 | **One entity search across the ontology pages.** The ontology editor's tree filter uses the entity search, while the thesaurus editor's label search scans labels for a substring and DL Query completes entity names on its own. Move them to `GET /$/ontology/{ds}/search`, which ranks and tolerates typos at ChEBI's size. | [U12](specs/U12-ontology-workbench/SPEC.md#ontology-browser-search) | S |
 | 618 | **Discussions on entities.** Comment threads on an entity or axiom with mentions, resolve and reopen, shown in the entity frame and listed per ontology, as WebProtégé offers. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | M |
 | 619 | **Watches on entities.** Let a user watch an entity or its subtree and be told of commits that change it, through the notifications of item 46. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | S–M |
-| 620 | **Entity history.** A history tab in the entity frame listing the commits that changed the entity's axioms and annotations, with diffs and revert. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | S–M |
+| 765 | **Blank-node changes in entity history.** The entity frame's History view finds commits through the change log's triples that name the entity, so a commit that changed only the blank nodes of a restriction or an annotated axiom is not listed. Follow the entity's blank-node structures, for example by recording the named roots of changed blank nodes, so every commit that changes an axiom about the entity is listed. | [U12](specs/U12-ontology-workbench/SPEC.md#entity-history) | S–M |
 | 622 | **Inferred axioms in entity frames.** Named-class frames read bounded direct-parent/equivalence clauses from kept state with inferred badges, precise source/outcome and an explicit scoped fallback. Kept class hierarchies and strict fresh materialization-backed property and individual frames are available. General classifier-backed inferred axiom listings and explanation links still depend on matching F24 entailments and justifications. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | M |
 | 751 | **Navigation after an entity is removed.** Handle an outstanding tree reveal's not-found response when the selected entity has been deleted. Preserve selection and revision pins, normal reveals and cancellation when the view changes. | [U12](specs/U12-ontology-workbench/SPEC.md#outcome) | S |
 | 623 | **Pattern-based axiom generation.** Generate axioms from spreadsheet rows through templates and design patterns, in the manner of Cellfie, ROBOT template and DOSDP, previewed as one commit. | [U12](specs/U12-ontology-workbench/SPEC.md#candidate-phases) | M |
@@ -976,6 +975,7 @@ for them.
 
 ## Completed
 
+- **620.** The ontology editor's entity frame has a History view that lists, newest first and in bounded pages, the commits of the branch that changed a triple naming the entity in the editor's graph. Each commit opens to the axioms and assertions mentioning the entity that it added and removed, through `GET /$/ontology/{ds}/diff?entity=`, links to its full diff and can be reverted as one previewed commit by a caller with write access to the branch. [U12](specs/U12-ontology-workbench/SPEC.md#entity-history)
 - **617.** The Workbench's SHACL shapes page authors node and property shapes through a tree and forms, with Core targets and constraints, recursive property paths and severities. Each draft is previewed and committed as one exact graph patch pinned to the source branch UUID and commit, and committed edits are undone through reverts. Live sample checks run against the draft at that revision, and RDF the forms do not recognize is preserved beside the Turtle and SHACLC text validator. [U12](specs/U12-ontology-workbench/SPEC.md#visual-shacl-shape-editor)
 
 - **760.** Normal CI and batch gates retain each selected nextest profile’s JUnit report and managed-target metadata under the original target lease. The retained manifest distinguishes test results from retention failures, and verification checks the retained bytes without compiler targets. [DEVELOPMENT](DEVELOPMENT.md#batch-gate)

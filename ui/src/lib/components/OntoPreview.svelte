@@ -6,7 +6,7 @@
   // a redo is a revert of one commit, which expects the head the editor shows instead.
   import { ApiError, errorMessage } from '$lib/api';
   import { splitTarget } from '$lib/branches';
-  import { fmtInt } from '$lib/format';
+  import { fmtCount, fmtInt } from '$lib/format';
   import {
     isPreview,
     OUTCOME,
@@ -210,16 +210,6 @@
           revert. The entry can only leave the list.
         </p>
       {/if}
-    {:else if op?.kind === 'update'}
-      <details>
-        <summary>SPARQL update</summary>
-        <pre class="sparql">{op.sparql}</pre>
-      </details>
-    {:else if op?.kind === 'patch'}
-      <details>
-        <summary>RDF changes</summary>
-        <pre class="sparql">{op.patch}</pre>
-      </details>
     {/if}
 
     {#if busy && !preview}
@@ -239,7 +229,7 @@
       >
         <strong>{OUTCOME[preview.outcome] ?? preview.outcome}</strong>
         {#if preview.commit && preview.outcome === 'commit'}
-          {fmtInt(preview.commit.inserted)} triples added, {fmtInt(preview.commit.deleted)} removed.
+          {fmtCount(preview.commit.inserted, 'triple')} added, {fmtInt(preview.commit.deleted)} removed.
         {/if}
       </p>
       {#if stale}
@@ -257,6 +247,18 @@
           ds={target}
         />
       {/if}
+    {/if}
+    <!-- the request as sent, collapsed below the rendered change set -->
+    {#if op?.kind === 'update'}
+      <details class="raw">
+        <summary>SPARQL update</summary>
+        <pre class="sparql">{op.sparql}</pre>
+      </details>
+    {:else if op?.kind === 'patch'}
+      <details class="raw">
+        <summary>RDF changes</summary>
+        <pre class="sparql">{op.patch}</pre>
+      </details>
     {/if}
     {#if error}<p class="error-box" role="alert">{error}</p>{/if}
     {#if preview && !stale}

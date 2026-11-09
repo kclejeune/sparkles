@@ -15,7 +15,7 @@
 import ox from 'oxigraph';
 import { createHash, randomUUID } from 'node:crypto';
 import { linesOf } from './branches.mjs';
-import { stateLines } from './history.mjs';
+import { pastView, stateLines, storeAt } from './history.mjs';
 
 const RDF = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#';
 const RDFS = 'http://www.w3.org/2000/01/rdf-schema#';
@@ -2133,6 +2133,48 @@ export async function handleOntology(req, res, url, seg, ctx) {
       total: list.length,
       offset,
       next: offset + limit < list.length ? offset + limit : null,
+    });
+    return true;
+  }
+  if (req.method === 'GET' && sub === 'diff') {
+    // the axioms of two recorded states, compared as the server's diff compares them
+    const from = Number(String(p.get('from') ?? '').replace(/^commit:/, ''));
+    const to = p.has('to') ? Number(String(p.get('to')).replace(/^commit:/, '')) : head();
+    if (!Number.isInteger(from) || !Number.isInteger(to))
+      return (fail(res, 400, 'the mock diffs commit numbers only'), true);
+    const a = storeAt(ds, from);
+    const b = storeAt(ds, to);
+    if (!a || !b)
+      return (
+        fail(res, 410, `commit ${a ? to : from} is not reconstructable`, { code: 'history-gone' }),
+        true
+      );
+    const entity = p.get('entity')?.replace(/^<|>$/g, '') ?? null;
+    const assertions = ['true', '1'].includes(String(p.get('assertions')));
+    const limit = Number(p.get('limit') ?? 1000);
+    const keep = (x) =>
+      (!entity || mentions(x.json, entity)) && (assertions || !ASSERTION_TYPES.has(x.json.type));
+    const side = (st) => readOntology(pastView(ds, st), graph).axioms.filter(keep);
+    const [oa, ob] = [side(a), side(b)];
+    const ka = new Set(oa.map((x) => axiomKey(x.json)));
+    const kb = new Set(ob.map((x) => axiomKey(x.json)));
+    const added = ob.filter((x) => !ka.has(axiomKey(x.json)));
+    const removed = oa.filter((x) => !kb.has(axiomKey(x.json)));
+    send(res, 200, {
+      dataset: ds.name,
+      from,
+      to,
+      graphs: [graph],
+      mode: 'lenient',
+      assertions,
+      ...(entity ? { entity } : {}),
+      added: added.slice(0, limit).map(item),
+      removed: removed.slice(0, limit).map(item),
+      addedCount: added.length,
+      removedCount: removed.length,
+      truncated: added.length > limit || removed.length > limit,
+      changedQuads: added.length + removed.length,
+      method: 'mock',
     });
     return true;
   }

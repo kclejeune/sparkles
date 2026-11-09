@@ -901,11 +901,12 @@ fn ontology(p: &mut Paths) {
     );
     p.add(
         read(op(GET, "/$/ontology/{ds}/diff", "diffOntology", "Ontology", "Diff the axioms of two commits"))
-            .doc("The axioms that differ between the commits `from` and `to` (the head by default), with the graph of each. The terminology of each state is read as the summary reads it, and the two sets of axioms are compared. With `assertions=true`, the assertions that the triples changed between the two commits carry are added and removed too. When no triple of the graphs read changed, the diff is empty. `format=text` answers `+ axiom` and `- axiom` lines in functional-style syntax. A caller whose grants limit endpoints needs the `diff` endpoint.")
+            .doc("The axioms that differ between the commits `from` and `to` (the head by default), with the graph of each. The terminology of each state is read as the summary reads it, and the two sets of axioms are compared. With `assertions=true`, the assertions that the triples changed between the two commits carry are added and removed too. When no triple of the graphs read changed, the diff is empty. `format=text` answers `+ axiom` and `- axiom` lines in functional-style syntax. With `entity`, only the axioms that mention that IRI are kept, which is how the entity frame's history reads one commit. A caller whose grants limit endpoints needs the `diff` endpoint.")
             .see("ontology")
             .query("from", s(), "The earlier state: a commit number, a timestamp or a named snapshot, as `at` takes them.")
             .query("to", s(), "The later state (the head by default).")
             .query("assertions", boolean(), "Also diff the assertions that the changed triples carry.")
+            .query("entity", s(), "An entity IRI. Only the axioms that mention it are listed and counted.")
             .query("format", json!({ "type": "string", "enum": ["json", "text"] }), "`json` (the default) or `text`.")
             .query("limit", int(), "The most axioms listed on each side, from 1 to 10,000 (1,000 by default).")
             .resp(

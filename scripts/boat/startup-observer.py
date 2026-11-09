@@ -2,6 +2,21 @@
 import fcntl,time,contextlib
 
 INFRASTRUCTURE={'systemd','(sd-pam)','dbus-daemon'}
+# Persistent processes of the provider's desktop session, which start with the
+# first SSH connection and stay. Each entry names a process of the worker's uid
+# and its parent, taken from the listing observed on the admitted large worker
+# bx_gy2ytgh8 (environment v8). SESSION_UNDER_INIT holds children of pid 1 as
+# root. SESSION_UNDER_MANAGER holds children of the worker's own user manager,
+# the MainPID that the system manager reports for user@UID.service. The pairs in
+# SESSION_UNDER_PROCESS hold children of another allowed process of the worker's
+# uid. A process outside these tables, or one under another parent, still counts
+# as startup work, and so does any descendant of tracked startup work.
+SESSION_UNDER_INIT=frozenset(['pulseaudio','ascii-agent-sup','ibus-daemon','ibus-x11','sunshine','dbus-launch','at-spi-bus-laun','at-spi2-registr'])
+SESSION_UNDER_MANAGER=frozenset(['pipewire','wireplumber','pipewire-pulse','gvfsd','gvfsd-fuse','at-spi-bus-laun','xdg-desktop-por',
+    'xdg-document-po','xdg-permission-','cua-driver','dconf-service','ibus-portal','at-spi2-registr','gnome-keyring-d'])
+SESSION_UNDER_PROCESS=frozenset([('ascii-agents-se','ascii-agent-sup'),('ibus-memconf','ibus-daemon'),('ibus-ui-gtk3','ibus-daemon'),
+    ('ibus-extension-','ibus-daemon'),('ibus-engine-sim','ibus-daemon'),('ascii-desktop','dbus-run-sessio'),('openbox','ascii-desktop')])
+UNALLOWED_MAX=32
 INSTALLER={'bash','sh','dash','sudo','apt','apt-get','dpkg','dpkg-deb','dpkg-preconfigu','needrestart','perl','curl','wget','minisign','rustup','mise','mbx','cargo','rustc','python','python3','python3.12','python3.13'}
 
 def process_rows(proc=Path('/proc')):
@@ -16,7 +31,41 @@ def process_rows(proc=Path('/proc')):
         except (FileNotFoundError,ProcessLookupError,PermissionError):continue
     return rows
 
-def foreign_startup(rows,launcher,probe_pid,tracked):
+def provider_session(pid,rows,manager=None,depth=0):
+    """Whether this process is an allowed session process under an allowed parent.
+
+    ``manager`` is the (pid, start) of the worker's user manager as the system
+    manager reports it, or None when that is unknown, which allows none of its
+    children. A parent's name never stands in for pid 1 or the manager.
+    """
+    row=rows.get(pid);uid=profile()['worker_uid']
+    if row is None or row['uid']!=uid or depth>8:return False
+    parent=rows.get(row['ppid'])
+    if parent is None:return False
+    if parent['pid']==1:return parent['uid']==0 and parent['comm']=='systemd' and row['comm'] in SESSION_UNDER_INIT
+    if manager is not None and (parent['pid'],parent['start'])==tuple(manager):
+        return parent['uid']==uid and parent['ppid']==1 and row['comm'] in SESSION_UNDER_MANAGER
+    return (row['comm'],parent['comm']) in SESSION_UNDER_PROCESS and provider_session(parent['pid'],rows,manager,depth+1)
+
+def user_manager(rows,uid):
+    """The worker's user manager by the system manager's own MainPID for user@UID.service."""
+    try:raw=command(['systemctl','show','user@%d.service'%uid,'--property=MainPID'],10).decode().strip()
+    except Exception:return None
+    if not re.fullmatch(r'MainPID=[0-9]{1,9}',raw):return None
+    row=rows.get(int(raw.split('=',1)[1]))
+    if row is None or row['comm']!='systemd' or row['uid']!=uid or row['ppid']!=1:return None
+    return (row['pid'],row['start'])
+
+def unallowed_inventory(rows,busy):
+    """Name, uid and parent of each busy process, bounded and without command lines."""
+    out=[]
+    for row in sorted(busy,key=lambda x:x['pid'])[:UNALLOWED_MAX]:
+        parent=rows.get(row['ppid'])
+        out.append({'pid':row['pid'],'comm':bounded_text(row['comm'],16),'uid':row['uid'],'ppid':row['ppid'],
+                    'parent_comm':None if parent is None else bounded_text(parent['comm'],16),'parent_uid':None if parent is None else parent['uid']})
+    return out
+
+def foreign_startup(rows,launcher,probe_pid,tracked,manager=None):
     # Exact launcher identity is passed by our own remote parent, never inferred
     # from a command-line substring. Only its tree/ancestors and our own service
     # tree are excluded; other SSH/scripts/installers remain unknown/busy.
@@ -33,7 +82,7 @@ def foreign_startup(rows,launcher,probe_pid,tracked):
             if row['ppid'] in own and pid not in own:own.add(pid);changed=True
     excluded=own|ancestors
     for pid,row in rows.items():
-        if pid in excluded:continue
+        if pid in excluded or provider_session(pid,rows,manager):continue
         if (row['uid']==profile()['worker_uid'] and row['comm']not in INFRASTRUCTURE) or row['comm']in INSTALLER:
             tracked.add((pid,row['start']))
     changed=True
@@ -57,8 +106,8 @@ def bootstrap_lock(path,uid,denied):
         after=path.lstat();need((after.st_dev,after.st_ino,after.st_nlink,after.st_size)==(s.st_dev,s.st_ino,1,0),'bootstrap lock changed during observation')
     finally:os.close(fd)
 
-def checkpoint_at(state,uid,denied,launcher,probe_pid,expected_manifest,seconds,rows_reader=process_rows,clock=time.monotonic,pause=time.sleep):
-    deadline=clock()+seconds;tracked=set();last='not observed'
+def checkpoint_at(state,uid,denied,launcher,probe_pid,expected_manifest,seconds,rows_reader=process_rows,clock=time.monotonic,pause=time.sleep,manager_reader=lambda rows:None):
+    deadline=clock()+seconds;tracked=set();last='not observed';code='startup_unobserved';rows={};busy=[]
     while clock()<deadline:
         try:
             with bootstrap_lock(state/'bootstrap.lock',uid,denied) as lock:
@@ -66,21 +115,34 @@ def checkpoint_at(state,uid,denied,launcher,probe_pid,expected_manifest,seconds,
                 # The actual pinned hook has no manifest deletion branch. If not
                 # yet at its absence test it now skips bootstrap; a running
                 # bootstrap still owns fd9/flock until its waited children end.
-                busy=foreign_startup(rows_reader(),launcher,probe_pid,tracked)
-                if busy:last='live or unknown startup descendants';pause(0.5);continue
+                rows=rows_reader();busy=foreign_startup(rows,launcher,probe_pid,tracked,manager_reader(rows))
+                if busy:last='live or unknown startup descendants';code='startup_busy:unallowed_processes';pause(0.5);continue
                 pause(0.5)
-                busy=foreign_startup(rows_reader(),launcher,probe_pid,tracked)
+                rows=rows_reader();busy=foreign_startup(rows,launcher,probe_pid,tracked,manager_reader(rows))
                 current,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
                 need(current==manifest,'startup manifest path/bytes changed')
-                if busy:last='live or unknown startup descendants';continue
+                if busy:last='live or unknown startup descendants';code='startup_busy:unallowed_processes';continue
                 return {'startup_closed':True,'installer_quiescent':True,'manifest_sha256':manifest['sha256'],'qualification_eligible':manifest['sha256']==expected_manifest,'bootstrap_lock':lock,'bootstrap_occurrence':'unknown','hook_terminal_observed':False,'closure_basis':'existing bootstrap fd9 lock, stable owned present manifest and repeated exact PID/start/descendant observations; any not-yet-entered pinned absence branch must skip bootstrap','unknown_or_live_descendants':[],'engine_or_job_started':False}
-        except (BlockingIOError,FileNotFoundError):last='bootstrap lock busy or manifest not yet present';pause(0.5)
-    return {'startup_closed':False,'installer_quiescent':False,'qualification_eligible':False,'bootstrap_occurrence':'unknown','reason':last,'engine_or_job_started':False}
+        except BlockingIOError:last='bootstrap lock busy or manifest not yet present';code='startup_busy:bootstrap_lock_held';busy=[];pause(0.5)
+        except FileNotFoundError:last='bootstrap lock busy or manifest not yet present';code='startup_busy:lock_or_manifest_absent';busy=[];pause(0.5)
+    return {'startup_closed':False,'installer_quiescent':False,'qualification_eligible':False,'bootstrap_occurrence':'unknown','reason':last,'reason_code':code,
+            'unallowed':unallowed_inventory(rows,busy),'unallowed_count':len(busy),'engine_or_job_started':False}
+
+def run_phase(payload,observe,qualify,clock=time.monotonic):
+    """One remote phase's result. Every refusal carries a bounded reason code."""
+    started=clock()
+    try:result=observe(payload) if payload['phase']!='metadata' else qualify(payload)
+    except Exception as error:
+        result={'qualified':False,'startup_closed':False,'engine_or_job_started':False,'failure':'bounded phase refused; no arbitrary error content','reason_code':reason_code(error)}
+    closed=result.get('startup_closed')is True if payload['phase']!='metadata' else result.get('qualified')is True
+    if not closed:result.setdefault('reason_code','unreported')
+    result['elapsed_seconds']=round(clock()-started,3)
+    return result,closed
 
 def startup_checkpoint(payload,seconds):
     home=Path.home();uid=os.getuid();need(uid==profile()['worker_uid'] and home==Path(profile()['worker_home']),'startup worker user')
     token=token_metadata(home/'.config/mbx/remote-token',uid);denied=(token['device'],token['inode']);state=home/'.local/state/sparkles-boat'
-    return checkpoint_at(state,uid,denied,payload['launcher_identity'],os.getpid(),payload['pins']['saved_toolchain_manifest_sha256'],seconds)
+    return checkpoint_at(state,uid,denied,payload['launcher_identity'],os.getpid(),payload['pins']['saved_toolchain_manifest_sha256'],seconds,manager_reader=lambda rows:user_manager(rows,uid))
 
 def observe_startup(payload):
     seconds=payload['observation_seconds'];need(type(seconds)is int and 1<=seconds<=1950,'startup observation bound')
@@ -99,9 +161,9 @@ def qualify_with_startup_lock(payload):
     with bootstrap_lock(state/'bootstrap.lock',uid,denied) as lock:
         before,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
         need(before['sha256']==payload['pins']['saved_toolchain_manifest_sha256'],'qualification manifest pin')
-        need(not foreign_startup(process_rows(),payload['launcher_identity'],os.getpid(),tracked),'startup not quiescent before tools')
+        rows=process_rows();need(not foreign_startup(rows,payload['launcher_identity'],os.getpid(),tracked,user_manager(rows,uid)),'startup not quiescent before tools')
         result=probe(payload)
         after,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
-        need(after==before and not foreign_startup(process_rows(),payload['launcher_identity'],os.getpid(),tracked),'startup/source drift during qualification')
+        rows=process_rows();need(after==before and not foreign_startup(rows,payload['launcher_identity'],os.getpid(),tracked,user_manager(rows,uid)),'startup/source drift during qualification')
         result.update({'startup_closed':True,'bootstrap_lock':lock,'bootstrap_occurrence':'unknown','actual_toolchain_manifest':{'path':str(state/'toolchain.json'),'sha256':before['sha256']},'runtime_env_file':None})
         return result

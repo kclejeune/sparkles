@@ -28,12 +28,16 @@ def launch():
             if root.exists():closed=closed and all(not path.read_text().strip()for path in root.rglob('cgroup.procs'))
         result.update({'metadata_closed':closed,'phase_closed':closed,'metadata_unit':unit,'terminal_properties':loaded})
         healthy=closed and loaded.get('MemorySwapPeak')=='0' and loaded.get('MemoryPeak','').isdigit() and int(loaded['MemoryPeak'])<=536870912 and loaded.get('ExecMainStatus')=='0' and loaded.get('Result')=='success'
-        if not healthy:result['qualified']=False;result['startup_closed']=False
+        if not healthy:
+            result['qualified']=False;result['startup_closed']=False
+            # The probe's own code names its refusal. Otherwise the unit's end does.
+            if not isinstance(result.get('reason_code'),str):
+                result['reason_code']=bounded_text('unit_unhealthy:'+('open' if not closed else loaded.get('Result','unknown')+':'+loaded.get('ExecMainStatus','unknown')))
         return result
     if operation.exists():
         need(operation.resolve()==operation and operation.stat().st_uid==profile()['worker_uid'],'operation recovery owner')
         if (operation/'probe-result.json').exists():print(json.dumps(finish()));return
-        print(json.dumps({'qualified':False,'startup_closed':False,'phase_closed':False,'existing_phase_pending':True,'unit':unit,'engine_or_job_started':False}));return
+        print(json.dumps({'qualified':False,'startup_closed':False,'phase_closed':False,'existing_phase_pending':True,'reason_code':'existing_phase_pending','unit':unit,'engine_or_job_started':False}));return
     operation.mkdir(mode=0o700)
     initial=show();need(initial.get('LoadState')=='not-found' and initial.get('ActiveState')=='inactive' and initial.get('MainPID')=='0','unit name reused')
     stattext=Path('/proc/self/stat').read_text();payload['launcher_identity']={'pid':os.getpid(),'start':int(stattext[stattext.rfind(')')+2:].split()[19])};payload['phase_runtime_seconds']=runtime;payload['result_directory']=str(operation);payload['program_sha256']=program_sha
@@ -42,4 +46,4 @@ def launch():
     print(json.dumps(finish()))
 if __name__=='__main__':
     try:launch()
-    except Exception:print(json.dumps({'qualified':False,'startup_closed':False,'metadata_closed':False,'phase_closed':False,'engine_or_job_started':False,'failure':'owned phase requires Root reconciliation; no arbitrary stderr'}))
+    except Exception as error:print(json.dumps({'qualified':False,'startup_closed':False,'metadata_closed':False,'phase_closed':False,'engine_or_job_started':False,'failure':'owned phase requires Root reconciliation; no arbitrary stderr','reason_code':'launcher:'+reason_code(error)}))

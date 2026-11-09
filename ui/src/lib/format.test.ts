@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { fmtBytes, fmtCompact, fmtDuration, fmtInt, fmtMs, fmtRelative, formatSse } from './format';
+import {
+  fmtBytes,
+  fmtCompact,
+  fmtCount,
+  fmtDuration,
+  fmtInt,
+  fmtMs,
+  fmtRelative,
+  formatSse,
+} from './format';
 
 describe('number formatting', () => {
   it('fmtInt rounds and groups, dash for missing', () => {
@@ -68,5 +77,14 @@ describe('formatSse', () => {
 
   it('leaves multi-line input unchanged', () => {
     expect(formatSse('(a\n b)')).toBe('(a\n b)');
+  });
+});
+
+describe('fmtCount', () => {
+  it('names one thing in the singular and others in the plural', () => {
+    expect(fmtCount(1, 'triple')).toBe('1 triple');
+    expect(fmtCount(0, 'triple')).toBe('0 triples');
+    expect(fmtCount(1024, 'axiom')).toBe('1,024 axioms');
+    expect(fmtCount(2, 'entry', 'entries')).toBe('2 entries');
   });
 });

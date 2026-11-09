@@ -24,9 +24,10 @@
   import type { InferredKind } from '$lib/inferred-tree.svelte';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
+  import { graphRestricted } from '$lib/auth';
   import { branchParam, MAIN, onBranch } from '$lib/branches';
   import { EditSession, startSessionBranch } from '$lib/edit-session.svelte';
-  import { fmtInt } from '$lib/format';
+  import { fmtCount, fmtInt } from '$lib/format';
   import { fetchHierarchy, fetchIndividuals, type Name, type TreeKind } from '$lib/browse';
   import { searchEntities } from '$lib/entity-search';
   import { IndividualTree, isGroup, groupIri } from '$lib/individual-tree.svelte';
@@ -96,6 +97,7 @@
   import OntoPreview from '$components/OntoPreview.svelte';
   import OntoTree from '$components/OntoTree.svelte';
   import EditorHistory from '$components/EditorHistory.svelte';
+  import EntityHistory from '$components/EntityHistory.svelte';
   import TreeCrumbs from '$components/TreeCrumbs.svelte';
 
   import { ONTOLOGY_TABS, routes, type OntologyTab } from '$lib/routes';
@@ -131,7 +133,9 @@
   /** The entity kind of the tree, when the page shows it. */
   const kindTab = $derived<EntityKind | null>(tab === 'tree' ? kind : null);
   const selected = $derived(q.get('iri'));
-  const view = $derived(q.get('view') === 'usage' ? 'usage' : 'frame');
+  const view = $derived(
+    q.get('view') === 'usage' ? 'usage' : q.get('view') === 'history' ? 'history' : 'frame',
+  );
   const inferredOn = $derived(q.get('inferred') === '1');
   const inferredKind = $derived<InferredKind | null>(
     kindTab && ['Class', 'ObjectProperty', 'DataProperty', 'NamedIndividual'].includes(kindTab)
@@ -1209,7 +1213,7 @@
     const uses = frameFor === iri ? frameItems.length : null;
     edit(
       { kind: 'removeEntity', iri },
-      `Delete ${nameOf(iri)}${uses != null ? ` and the ${fmtInt(uses)} axioms that mention it` : ''}`,
+      `Delete ${nameOf(iri)}${uses != null ? ` and the ${fmtCount(uses, 'axiom')} that mention${uses === 1 ? 's' : ''} it` : ''}`,
       () => {
         if (selected === iri) void nav({ iri: null, view: null });
       },
@@ -1789,6 +1793,9 @@
                     ? ` ${fmtInt(frameItems.length)}`
                     : ''}</button
                 >
+                <button aria-pressed={view === 'history'} onclick={() => nav({ view: 'history' })}
+                  >History</button
+                >
               </div>
             </div>
             <div class="panel-body">
@@ -1850,6 +1857,17 @@
                     />
                   {/if}
                 {/key}
+              {:else if view === 'history' && summary}
+                <EntityHistory
+                  {name}
+                  {target}
+                  {branch}
+                  {sel}
+                  iri={selected}
+                  readonly={readonly || graphRestricted(auth.who, name)}
+                  refreshKey={summary.commit}
+                  onrevert={(seq, label) => session.edit({ kind: 'revert', commit: seq }, label)}
+                />
               {:else if frameFor === selected && view === 'usage'}
                 {#if !usageGroups.length}<p class="empty">No axiom mentions this entity.</p>{/if}
                 {#each usageGroups as [type, items] (type)}
