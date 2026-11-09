@@ -926,6 +926,47 @@ class AdmissionClocks(unittest.TestCase):
         self.assertTrue(io.exists('qualified-worker-admission.json'));self.assertFalse(io.exists('root-handoff.json'))
         self.stops_normally(r,io)
 
+    def failing_after_publication(self,io,name):
+        """The receipt becomes visible and the write then raises, as a failed directory fsync would."""
+        record=io.record;self.under_lock=[]
+        def write(n,value):
+            self.under_lock.append((n,getattr(io,'jobs_locked',None)));record(n,value)
+            if n==name:raise OSError('injected failure after publication: '+n)
+        io.record=write
+
+    def published_io(self):
+        r=handoff_release();io=controls.InertIO(r);io.guard_for_admission=lambda:guard_row(io)
+        io.diagnose=lambda seconds:self.fail('a published handoff never holds')
+        return r,io
+
+    def test_a_handoff_failing_after_publication_is_withdrawn_under_the_job_lock(self):
+        r,io=self.published_io();self.failing_after_publication(io,'root-handoff.json')
+        with self.assertRaises(OSError):controller.drive(r,io)
+        # Publication and withdrawal both ran under the exclusive job lock, so no job
+        # command was admitted between them and the stop needs no job closure.
+        locked=dict(self.under_lock)
+        for name in ('qualified-worker-admission.json','root-handoff.json','root-handoff-withdrawn.json'):self.assertIs(locked[name],True,name)
+        self.assertFalse(io.jobs_locked)
+        self.stops_normally(r,io)
+
+    def test_a_failed_withdrawal_after_publication_unpublishes_the_handoff(self):
+        r,io=self.published_io();self.failing_after_publication(io,'root-handoff.json')
+        record=io.record
+        def write(n,value):
+            if n=='root-handoff-withdrawn.json':raise OSError('injected withdrawal failure')
+            return record(n,value)
+        io.record=write
+        with self.assertRaises(OSError):controller.drive(r,io)
+        self.assertFalse(io.exists('root-handoff.json'));self.assertTrue(io.exists('unpublished-root-handoff.json'))
+        self.stops_normally(r,io)
+
+    def test_a_held_job_lock_publishes_no_handoff(self):
+        r,io=self.published_io();io.diagnose=lambda seconds:{'schema':1,'processes':{'count':0,'rows':[]},'state':{'entries':[],'phases':{}}}
+        io.live_jobs=True
+        with self.assertRaises(Exception):controller.drive(r,io)
+        self.assertFalse(io.exists('qualified-worker-admission.json'));self.assertFalse(io.exists('root-handoff.json'))
+        self.stops_normally(r,io)
+
     def test_an_admission_without_its_handoff_admits_nothing(self):
         op=self.f['operation'];(op/'root-handoff.json').unlink()
         with self.assertRaises(FileNotFoundError):controller.lifetime.export_operation(op,self.f['now'],self.f['profile']['worker'],self.f['profile'])

@@ -289,6 +289,9 @@ class RealIO:
         need(safe['day']['used']<self.r['start_ledger']['starts_and_reservations'],'start ledger stale or missing this reservation')
         self.record('account-starts-before-resume.json',{'observed_wall':self.wall(),'account_wide':True,'starts':safe,'large_available':True,'no_wallet_or_plan_changes':True})
         return safe
+    def unpublish(self,name):
+        """Rename a published receipt away, keeping its bytes as evidence."""
+        os.rename(self.op/name,self.op/('unpublished-'+name))
     def lock_jobs(self):
         """Take the operation's job lock exclusively without waiting, or report that a command holds it."""
         fd=open_lock(self.op/JOB_LOCK)
@@ -512,14 +515,19 @@ def drive(r,io):
                 # stops normally without a job closure.
                 handoff=json.loads(json.dumps({'worker':worker_id(),'separate_job_release':h,'deadline_wall':intent['deadline_wall'],'qualification_only_controller':True,'job_started_by_controller':False}))
                 admission=make_admission(r,intent,io.read('qualification.json'),io.read('startup-closed.json'),io.guard_for_admission(),handoff,io.wall())
-                io.record('qualified-worker-admission.json',admission)
-                io.record('root-handoff.json',handoff)
+                # Every job command holds the job lock shared from before its stopping
+                # checks, so under the exclusive lock no job is admitted between a
+                # publication and its withdrawal.
+                need(io.lock_jobs(),'job lock held before the Root handoff')
+                try:
+                    io.record('qualified-worker-admission.json',admission)
+                    io.record('root-handoff.json',handoff)
+                except Exception as error:
+                    withdraw_handoff(io,error);raise
+                finally:io.unlock_jobs()
             except Exception as error:
                 record_refusal(io,'admission',error)
-                # The withdrawal marks the operation for every consumer. Its own failure
-                # changes nothing, since the stop does not depend on it.
-                try:io.record(lifetime.HANDOFF_WITHDRAWN,{'worker':worker_id(),'reason_code':reason_code(error),'qualified_worker_admission_present':io.exists('qualified-worker-admission.json'),'root_handoff_present':io.exists('root-handoff.json'),'observed_wall':io.wall()})
-                except Exception:pass
+                if not io.exists(lifetime.HANDOFF_WITHDRAWN):withdraw_handoff(io,error)
                 raise
             return 'QUALIFIED_ROOT_HANDOFF_GUARD_ACTIVE'
         return 'QUALIFIED_STOP_REQUESTED'
@@ -581,6 +589,20 @@ def diagnostic_hold(io,intent):
             pause(io,min(DIAGNOSE_RETRY,max(0,end-io.mono())))
         io.record('diagnostic-hold-ended.json',{'ended_boottime':io.mono(),'attempts':attempt,'captured':io.exists('diagnostics.json')})
     except Exception:return
+
+def withdraw_handoff(io,error):
+    """Withdraw a handoff the controller is not returning, without depending on any one write.
+
+    The withdrawal receipt marks the operation for every consumer. When it cannot be
+    written, a published handoff receipt is renamed away instead. Neither failure stops
+    the controller from triggering the normal stop."""
+    try:
+        io.record(lifetime.HANDOFF_WITHDRAWN,{'worker':worker_id(),'reason_code':reason_code(error),'qualified_worker_admission_present':io.exists('qualified-worker-admission.json'),'root_handoff_present':io.exists('root-handoff.json'),'observed_wall':io.wall()})
+        return
+    except Exception:pass
+    try:
+        if io.exists('root-handoff.json'):io.unpublish('root-handoff.json')
+    except Exception:pass
 
 def handoff_active(io):
     """Whether a Root handoff stands, so that a normal stop needs the job closure.

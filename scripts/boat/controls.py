@@ -64,6 +64,11 @@ class InertIO:
     def names(self):return sorted(self.records)
     def freeze_extensions(self):self.frozen=True;return True
     def thaw_extensions(self):self.frozen=False
+    def lock_jobs(self):
+        if getattr(self,'live_jobs',False):return False
+        self.jobs_locked=True;return True
+    def unlock_jobs(self):self.jobs_locked=False
+    def unpublish(self,name):self.records['unpublished-'+name]=self.records.pop(name)
     def read(self,n):
         if n not in self.records:raise FileNotFoundError(n)
         return copy.deepcopy(self.records[n])

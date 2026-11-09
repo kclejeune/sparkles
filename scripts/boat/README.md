@@ -180,8 +180,10 @@ values, publishes `qualified-worker-admission.json` first and `root-handoff.json
 and a handoff stands only while both receipts exist. When any step fails, no handoff
 stands, so the controller holds for diagnostics and triggers a normal stop that needs
 no job closure. It also writes `root-handoff-withdrawn.json`, which job preparation,
-export, extension and the closure watch all refuse, and the stop does not depend on
-that write. Before any job work, `remote-executor.py admit` refuses a worker that lacks
+export, extension and the closure watch all refuse, and renames a published handoff
+receipt away when that write fails. Publication and withdrawal run under the
+operation's exclusive job lock, which every job command holds shared from before its
+stopping checks, so no job is admitted on a handoff the controller withdraws. Before any job work, `remote-executor.py admit` refuses a worker that lacks
 one of the commands the screen and build scripts run there, and names it. A test
 derives those commands from the worker-side scripts and remote command strings.
 

@@ -53,6 +53,18 @@ def shell_commands(source,remote_only=False):
     def walk(node,text,local):
         if isinstance(node,dict):
             if node.get('Type')=='FuncDecl':funcs.add(node['Name']['Value'])
+            # A heredoc fed to a shell, directly or through a wrapper such as
+            # mbx sparkles-task, runs as shell code on the same host.
+            cmd=node.get('Cmd')
+            if local and isinstance(cmd,dict) and cmd.get('Type')=='CallExpr' and {'bash','sh'}&{literal(a) for a in cmd.get('Args',[])}:
+                for redirect in node.get('Redirs') or []:
+                    body=redirect.get('Hdoc')
+                    if redirect.get('Op') in ('<<','<<-') and body:
+                        # The body's span ends with the delimiter line, which is not code.
+                        lines=text.encode()[body['Pos']['Offset']:body['End']['Offset']].decode().splitlines()
+                        delimiter=text.encode()[redirect['Word']['Pos']['Offset']:redirect['Word']['End']['Offset']].decode().strip('\'"')
+                        if lines and lines[-1].strip()==delimiter:lines=lines[:-1]
+                        visit('\n'.join(lines)+'\n',True)
             if node.get('Type')=='CallExpr' and node.get('Args'):
                 args=node['Args'];words=[literal(a) for a in args];first=words[0]
                 if first in REMOTE_CALLS:
@@ -377,6 +389,8 @@ class Admission(unittest.TestCase):
         self.assertEqual(missing,{})
         self.assertIn('realpath',found);self.assertIn('tee',found);self.assertIn('gzip',RX.WORKER_TOOLS)
         self.assertIn('/lib64/ld-linux-x86-64.so.2',found)
+        # The build body reaches bash -s through a heredoc of mbx sparkles-task.
+        self.assertEqual(found.get('cp'),'nsc-build.sh')
 
     def test_admit_reports_the_worker_refusal_reason(self):
         self.assertEqual(RX.refusal_reason(b'noise\nADMIT-REFUSAL: mbx is not on the job PATH\n'),'mbx is not on the job PATH')

@@ -122,7 +122,7 @@ test "$version" = {rust} || refuse "rustc reports $version, pinned {rust} (RUSTU
 WORKER_TOOLS=('bash','sh','env','python3','git','systemd-run','systemctl','flock','timeout','mkfifo',
               'tar','gzip','zstd','curl','taskset','chrt','cc','cargo','realpath','sha256sum',
               'awk','sed','grep','cut','head','sort','seq','tr','wc','tee','cat','date','uname',
-              'free','du','df','tail','chmod','ln','mkdir','mktemp','mv','rm','dirname','sleep',
+              'free','du','df','tail','chmod','cp','ln','mkdir','mktemp','mv','rm','dirname','sleep',
               '/lib64/ld-linux-x86-64.so.2')
 
 
