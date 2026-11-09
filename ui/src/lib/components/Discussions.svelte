@@ -306,8 +306,11 @@
 <style>
   .discussions {
     display: grid;
+    /* a long axiom in the picker must not widen the view past its panel */
+    grid-template-columns: minmax(0, 1fr);
     gap: var(--sp-2);
     align-content: start;
+    min-width: 0;
   }
   .bar,
   .row,
@@ -322,8 +325,14 @@
     min-width: 0;
     overflow-wrap: anywhere;
   }
+  .compose,
+  .threads,
+  article {
+    min-width: 0;
+  }
   .compose {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: var(--sp-2);
   }
   .compose textarea {
@@ -332,14 +341,16 @@
     resize: vertical;
   }
   .compose select {
-    max-width: 100%;
+    width: 0;
     min-width: 0;
     flex: 1 1 16rem;
+    text-overflow: ellipsis;
   }
   .spacer {
     flex: 1;
   }
   .threads {
+    grid-template-columns: minmax(0, 1fr);
     margin: 0;
     padding: 0;
     list-style: none;
