@@ -230,14 +230,16 @@ editor's preview, so the dry run, the shared change set, `If-Match` on the shown
 and the undo stack are the ones every other edit uses. No server route was added. The
 annotation edit declares an annotation property that the ontology does not declare yet, so
 its values read back as annotations, and the subjects of annotation assertions are not
-declared. Setting a property that the ontology or its imports declare as another kind, such
+declared. Setting a property that the ontology or its imports type as another kind, such
 as a data property, is refused before the preview, since its declaration as an annotation
 property would change how the existing assertions read. A move declares nothing, and its new
 parent must be a class of the ontology or its imports, or `owl:Thing`. Each moved entity
 must be a class or an IRI the ontology does not know, since a `SubClassOf` would otherwise
-turn a property or an individual into a class. The kinds are read through
-`GET /$/ontology/{ds}/entity` at the shown commit, eight at a time, which the server answers
-from the commit's mapped ontology. It reads and writes the graph
+turn a property or an individual into a class. The kinds come from the `rdf:type`
+values of the listed IRIs in the graphs the ontology reads, its imports included, at the
+shown commit, through one SPARQL query for each 200 IRIs. An OWL or RDFS declaration type
+gives its kind and any other type an individual, as the lenient read does, and a
+calculation that a new input supersedes aborts its queries. It reads and writes the graph
 without its imports, as it was planned, so an imported copy of a new value does not stop the
 server from adding that value to the edited graph.
 

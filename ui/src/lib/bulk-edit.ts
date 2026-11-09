@@ -4,6 +4,7 @@
 // classes under a new parent. Each builds one `axioms` operation from the axioms the editor
 // read at one commit, which the editor previews and commits like any other edit, so it is one
 // commit on the undo stack. Every function here is pure; the component reads the axioms.
+import type { EntityKind } from './ontology';
 import {
   annotationAssertion,
   axiomKey,
@@ -15,7 +16,7 @@ import {
   type Lit,
   type Op,
 } from './ontology';
-import { WELL_KNOWN, type PrefixMap } from './rdf';
+import { sparqlIri, WELL_KNOWN, type PrefixMap } from './rdf';
 
 const RDFS = WELL_KNOWN.rdfs;
 const SKOS = WELL_KNOWN.skos;
@@ -471,4 +472,57 @@ export function valueOf(
   if (lang.trim()) return { '@value': text, '@language': lang.trim() };
   if (datatype && datatype !== XSD + 'string') return { '@value': text, '@type': datatype };
   return { '@value': text };
+}
+
+// --- kinds of listed entities ----------------------------------------------------------------
+
+const OWL = WELL_KNOWN.owl;
+/** The kind each OWL or RDFS type gives its instances. Any other type makes an individual. */
+const TYPE_KIND: Record<string, EntityKind | null> = {
+  [OWL + 'Class']: 'Class',
+  [RDFS + 'Class']: 'Class',
+  [OWL + 'ObjectProperty']: 'ObjectProperty',
+  [OWL + 'DatatypeProperty']: 'DataProperty',
+  [OWL + 'AnnotationProperty']: 'AnnotationProperty',
+  [RDFS + 'Datatype']: 'Datatype',
+  [OWL + 'NamedIndividual']: 'NamedIndividual',
+  // characteristics and other vocabulary types say nothing beyond the declarations above
+  [RDF + 'Property']: null,
+  [OWL + 'FunctionalProperty']: null,
+  [OWL + 'InverseFunctionalProperty']: null,
+  [OWL + 'TransitiveProperty']: null,
+  [OWL + 'SymmetricProperty']: null,
+  [OWL + 'AsymmetricProperty']: null,
+  [OWL + 'ReflexiveProperty']: null,
+  [OWL + 'IrreflexiveProperty']: null,
+  [OWL + 'Ontology']: null,
+  [OWL + 'DeprecatedClass']: null,
+  [OWL + 'DeprecatedProperty']: null,
+  [OWL + 'Restriction']: null,
+  [OWL + 'AllDisjointClasses']: null,
+};
+
+/** Jena's name for the stored default graph, which a query reads even under a union default. */
+export const DEFAULT_GRAPH_IRI = 'urn:x-arq:DefaultGraph';
+
+/**
+ * The SPARQL that reads the `rdf:type` values of `iris` in `graphs`, the graph names the
+ * ontology read with `default` for the stored default graph.
+ */
+export function typesQuery(iris: readonly string[], graphs: readonly string[]): string {
+  const gs = graphs.map((g) => sparqlIri(g === 'default' ? DEFAULT_GRAPH_IRI : g)).join(' ');
+  const ss = iris.map((i) => sparqlIri(i)).join(' ');
+  return `SELECT DISTINCT ?s ?t WHERE { VALUES ?g { ${gs} } VALUES ?s { ${ss} } GRAPH ?g { ?s a ?t } FILTER(isIRI(?t)) }`;
+}
+
+/** The kinds that `rdf:type` values give each subject, as the ontology's lenient read does. */
+export function kindsOfTypes(rows: { s: string; t: string }[]): Map<string, EntityKind[]> {
+  const out = new Map<string, Set<EntityKind>>();
+  for (const { s, t } of rows) {
+    const k = t in TYPE_KIND ? TYPE_KIND[t] : 'NamedIndividual';
+    if (!k) continue;
+    if (!out.has(s)) out.set(s, new Set());
+    out.get(s)!.add(k);
+  }
+  return new Map([...out].map(([s, ks]) => [s, [...ks]]));
 }

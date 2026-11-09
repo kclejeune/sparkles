@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
+import ox from 'oxigraph';
 import {
   BULK_LIMIT,
   changesOp,
   compileFind,
   descendants,
+  kindsOfTypes,
+  typesQuery,
   findMatches,
   langMatches,
   namedParents,
@@ -362,5 +365,39 @@ describe('the entity list', () => {
     const r = parseEntityList(`ex:A\n<${EX}B>, ${EX}C  nope ex:A`, { ex: EX });
     expect(r.iris).toEqual([EX + 'A', EX + 'B', EX + 'C']);
     expect(r.bad).toEqual(['nope']);
+  });
+});
+
+describe('the kinds of listed entities', () => {
+  it('reads types in the ontology graphs only and maps them to kinds', () => {
+    const OWL = 'http://www.w3.org/2002/07/owl#';
+    const store = new ox.Store();
+    const G = 'http://example.org/onto';
+    store.load(
+      `<${G}> {
+        <${EX}C> a <${OWL}Class> .
+        <${EX}p> a <${OWL}ObjectProperty> , <${OWL}TransitiveProperty> .
+        <${EX}ada> a <${OWL}NamedIndividual> , <${EX}C> .
+        <${EX}bob> a <${EX}C> .
+        <${EX}pun> a <${OWL}Class> , <${OWL}NamedIndividual> .
+      }
+      <http://example.org/other> { <${EX}q> a <${OWL}DatatypeProperty> . }`,
+      { format: 'application/trig' },
+    );
+    const iris = ['C', 'p', 'ada', 'bob', 'pun', 'q', 'unknown'].map((x) => EX + x);
+    const rows = (store.query(typesQuery(iris, [G])) as Map<string, ox.Term>[]).map((m) => ({
+      s: m.get('s')!.value,
+      t: m.get('t')!.value,
+    }));
+    const k = kindsOfTypes(rows);
+    expect(k.get(EX + 'C')).toEqual(['Class']);
+    expect(k.get(EX + 'p')).toEqual(['ObjectProperty']);
+    expect(k.get(EX + 'ada')).toEqual(['NamedIndividual']);
+    expect(k.get(EX + 'bob')).toEqual(['NamedIndividual']);
+    expect(k.get(EX + 'pun')?.sort()).toEqual(['Class', 'NamedIndividual']);
+    // another graph than those the ontology reads, and an unknown IRI, give nothing
+    expect(k.has(EX + 'q')).toBe(false);
+    expect(k.has(EX + 'unknown')).toBe(false);
+    expect(typesQuery([EX + 'C'], ['default'])).toContain('urn:x-arq:DefaultGraph');
   });
 });

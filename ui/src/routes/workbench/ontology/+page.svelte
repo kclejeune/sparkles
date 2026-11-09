@@ -1518,6 +1518,7 @@
               {readonly}
               {prefixes}
               {annotationProperties}
+              graphs={summary.graphs}
               name={nameOf}
               onedit={(op, label) =>
                 // the plan was read without the imports, and its edit reads and writes the same

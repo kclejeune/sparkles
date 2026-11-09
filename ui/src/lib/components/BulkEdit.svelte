@@ -23,6 +23,8 @@
     removeAnnotation,
     setAnnotation,
     valueOf,
+    kindsOfTypes,
+    typesQuery,
     type Change,
     type LangFilter,
     type PropertyScope,
@@ -35,7 +37,6 @@
     KIND_SINGULAR,
     LITERAL_TYPES,
     ontologyAxioms,
-    ontologyEntity,
     type EntityKind,
     resolveInput,
     type AnnValue,
@@ -54,6 +55,7 @@
     readonly,
     prefixes,
     annotationProperties = [],
+    graphs = [],
     name = (i: string) => i,
     onedit,
   }: {
@@ -68,6 +70,8 @@
     prefixes: PrefixMap;
     /** The annotation properties the ontology declares, offered beside the common ones. */
     annotationProperties?: readonly string[];
+    /** The graphs the ontology reads with its imports, `default` for the default graph. */
+    graphs?: readonly string[];
     name?: (iri: string) => string;
     /** Preview `op` as one edit labelled `label`. */
     onedit: (op: Op, label: string) => void;
@@ -113,33 +117,29 @@
     return p;
   }
 
-  /** The kinds the ontology and its imports give `iri` at the shown commit. */
-  async function kindsOf(iri: string): Promise<EntityKind[]> {
-    const r = await ontologyEntity(
-      target,
-      { graph, imports: true },
-      iri,
-      ctl.signal,
-      commit != null ? `commit:${commit}` : undefined,
-    );
-    return r?.kinds ?? [];
+  /**
+   * The kinds that the graphs the ontology reads give each of `iris` through `rdf:type`, at
+   * the shown commit: one SPARQL query for each 200 IRIs, stopped by `signal`.
+   */
+  async function kindsOfAll(
+    iris: readonly string[],
+    signal: AbortSignal,
+  ): Promise<Map<string, EntityKind[]>> {
+    const out = new Map<string, EntityKind[]>();
+    for (let i = 0; i < iris.length; i += 200) {
+      const rows = await api.select(target, typesQuery(iris.slice(i, i + 200), graphs), {
+        at: commit != null ? `commit:${commit}` : undefined,
+        nocache: true,
+        signal,
+      });
+      const typed = rows.flatMap((r) =>
+        r.s?.type === 'uri' && r.t?.type === 'uri' ? [{ s: r.s.value, t: r.t.value }] : [],
+      );
+      for (const [s, ks] of kindsOfTypes(typed)) out.set(s, ks);
+    }
+    return out;
   }
   const OWL_THING = 'http://www.w3.org/2002/07/owl#Thing';
-  /** The entities of `iris` that the ontology knows as something other than a class. */
-  async function knownNotClasses(iris: readonly string[]): Promise<[string, EntityKind[]][]> {
-    const out: [string, EntityKind[]][] = [];
-    const queue = [...iris];
-    // a few reads at a time; the server keeps the mapped ontology of the commit between them
-    await Promise.all(
-      Array.from({ length: Math.min(8, queue.length) }, async () => {
-        for (let i = queue.shift(); i !== undefined; i = queue.shift()) {
-          const kinds = await kindsOf(i);
-          if (kinds.length && !kinds.includes('Class')) out.push([i, kinds]);
-        }
-      }),
-    );
-    return out.sort(([a], [b]) => iris.indexOf(a) - iris.indexOf(b));
-  }
   /** Kinds as a phrase: `a data property and an individual`. */
   const kindWords = (kinds: EntityKind[]) =>
     kinds
@@ -256,8 +256,12 @@
   let run = 0;
 
   /** Drop the plan and any calculation still reading, whose answer belongs to old inputs. */
+  /** Aborts the reads of the calculation in flight. */
+  let runCtl: AbortController | null = null;
   function invalidate() {
     run++;
+    runCtl?.abort();
+    runCtl = null;
     busy = false;
     plan = null;
     error = null;
@@ -300,13 +304,15 @@
 
   async function compute() {
     const my = ++run;
+    runCtl?.abort();
+    const c = (runCtl = new AbortController());
     const at = commit;
     const m = mode;
     busy = true;
     error = null;
     plan = null;
     try {
-      const p = await build(m);
+      const p = await build(m, c.signal);
       if (my !== run || m !== mode || at !== commit) return;
       plan = { ...p, commit: at, mode: m };
     } catch (e) {
@@ -347,7 +353,7 @@
    * The plan of operation `m`. Every input is read before the first await, so a field changed
    * while the graph is read cannot mix into the plan.
    */
-  async function build(m: Mode): Promise<Built> {
+  async function build(m: Mode, signal: AbortSignal): Promise<Built> {
     const ents = [...entities];
     if (m === 'replace') {
       const props: PropertyScope =
@@ -392,7 +398,7 @@
             valueIri ? 'Name the value as a prefixed name or an IRI.' : 'Type the value to set.',
           );
         const how = setMode;
-        const kinds = await kindsOf(p);
+        const kinds = (await kindsOfAll([p], signal)).get(p) ?? [];
         if (kinds.length && !kinds.includes('AnnotationProperty'))
           return refuse(
             `${name(p)} is ${kindWords(kinds)} in this ontology, not an annotation property, so its values cannot be set as annotations.`,
@@ -436,7 +442,7 @@
     if (to === undefined) return refuse('Pick the new parent class, or move to the top.');
     const keep = keepParents && !toTop;
     if (to !== null && to !== OWL_THING) {
-      const kinds = await kindsOf(to);
+      const kinds = (await kindsOfAll([to], signal)).get(to) ?? [];
       if (!kinds.includes('Class'))
         return refuse(
           kinds.length
@@ -445,7 +451,11 @@
         );
     }
     // a known entity that is not a class would become one through its SubClassOf
-    const notClasses = await knownNotClasses(ents);
+    const known = await kindsOfAll(ents, signal);
+    const notClasses = ents.flatMap((i): [string, EntityKind[]][] => {
+      const k = known.get(i);
+      return k && !k.includes('Class') ? [[i, k]] : [];
+    });
     if (notClasses.length)
       return refuse(
         `${notClasses
