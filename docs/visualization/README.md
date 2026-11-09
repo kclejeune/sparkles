@@ -592,13 +592,15 @@ thread, and resolves or reopens it. Writing `@name` in a comment mentions that p
 and the mention is highlighted and recorded with the comment. The view shows open
 threads, resolved threads or both, with each comment's author and time, and the
 ontology's **Discussions** tab lists every thread of the ontology graph with a link to
-its entity. A read lists at most 1,000 threads and replies, oldest first, and says when
-it stopped there.
+its entity. A read lists at most 1,000 comments and replies, oldest first, and says when
+it stopped there, since later comments and replies are then not listed.
 
 The threads are W3C Web Annotation RDF in an ordinary named graph beside the ontology
-graph on the branch. The graph of `http://example.org/uni` is
-`http://example.org/uni/discussions`, and the default graph's threads are in
-`urn:x-sparkles:discussions:default`. A thread is an `oa:Annotation` motivated by
+graph on the branch. Its IRI is the ontology graph's IRI under
+`urn:x-sparkles:discussions:`, so the threads of `http://example.org/uni` are in
+`urn:x-sparkles:discussions:http://example.org/uni` and those of the default graph are in
+`urn:x-sparkles:discussions:default`. Each ontology graph has its own discussion graph,
+and none can be an ontology graph's own IRI. A thread is an `oa:Annotation` motivated by
 `oa:commenting` whose `oa:hasTarget` is the entity, or an `oa:SpecificResource` with the
 entity as `oa:hasSource` and the axiom's functional-style syntax as an
 `oa:TextQuoteSelector`. A reply is an `oa:replying` annotation that targets the thread.

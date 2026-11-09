@@ -128,6 +128,28 @@ test('starts a thread with a mention, replies, resolves and reopens it, each a c
   }
 });
 
+test("another entity starts with an empty composer, not the last entity's draft", async ({
+  page,
+  request,
+}) => {
+  const branch = 'disc-scope';
+  await newBranch(request, branch);
+  try {
+    await openDiscussion(page, branch);
+    const compose = page.getByRole('form', { name: 'New thread' });
+    await compose.getByRole('textbox', { name: 'Comment' }).fill('About Professor only.');
+    await compose.getByRole('combobox', { name: 'About' }).selectOption({ index: 1 });
+    // the breadcrumb keeps the Discussion view while it moves to Employee
+    await page.locator('.crumbs').getByRole('button', { name: 'Employee', exact: true }).click();
+    await expect(page).toHaveURL(/Employee/);
+    await expect(compose.getByRole('textbox', { name: 'Comment' })).toHaveValue('');
+    const about = compose.getByRole('combobox', { name: 'About' });
+    if (await about.count()) await expect(about).toHaveValue('');
+  } finally {
+    await request.delete(`/$/branches/uni/${branch}?force=true`);
+  }
+});
+
 test("the Discussions tab lists the ontology's threads and opens their entity", async ({
   page,
   request,

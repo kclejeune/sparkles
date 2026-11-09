@@ -1498,16 +1498,16 @@
     {:else if tab === 'discussions' && summary}
       <section class="panel" aria-label="Discussions">
         <div class="panel-body">
-          <Discussions
-            {target}
-            {sel}
-            {readonly}
-            user={commenter}
-            name={nameOf}
-            refreshKey={summary.commit ?? 0}
-            oncommitted={discussed}
-            onopen={(iri) => nav({ tab: null, iri, view: 'discussion' })}
-          />
+          {#key `${target}|${graph}`}<Discussions
+              {target}
+              {sel}
+              {readonly}
+              user={commenter}
+              name={nameOf}
+              refreshKey={summary.commit ?? 0}
+              oncommitted={discussed}
+              onopen={(iri) => nav({ tab: null, iri, view: 'discussion' })}
+            />{/key}
         </div>
       </section>
     {:else if tab === 'history' && summary}
@@ -1893,17 +1893,17 @@
                   {/if}
                 {/key}
               {:else if view === 'discussion' && summary && selected}
-                <Discussions
-                  {target}
-                  {sel}
-                  iri={selected}
-                  {readonly}
-                  user={commenter}
-                  axioms={frameFor === selected ? frameItems.map((it) => it.ofn) : []}
-                  name={nameOf}
-                  refreshKey={summary.commit ?? 0}
-                  oncommitted={discussed}
-                />
+                {#key `${target}|${graph}|${selected}`}<Discussions
+                    {target}
+                    {sel}
+                    iri={selected}
+                    {readonly}
+                    user={commenter}
+                    axioms={frameFor === selected ? frameItems.map((it) => it.ofn) : []}
+                    name={nameOf}
+                    refreshKey={summary.commit ?? 0}
+                    oncommitted={discussed}
+                  />{/key}
               {:else if view === 'history' && summary}
                 <EntityHistory
                   {name}

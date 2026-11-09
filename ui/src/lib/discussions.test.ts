@@ -25,21 +25,41 @@ function read(store: ox.Store, entity: string | null, graph: string | null = G) 
 }
 
 describe('discussion graphs', () => {
-  it('sits beside the ontology graph, and the default graph has its own', () => {
-    expect(discussionGraph(G)).toBe(`${G}/discussions`);
-    expect(discussionGraph(`${G}#`)).toBe(`${G}/discussions`);
-    expect(discussionGraph(`${G}/`)).toBe(`${G}/discussions`);
+  it('names one graph for each ontology graph, and the default graph has its own', () => {
+    const D = 'urn:x-sparkles:discussions:';
+    expect(discussionGraph(G)).toBe(D + G);
     expect(discussionGraph(null)).toBe(DEFAULT_DISCUSSIONS);
-    expect(isDiscussionGraph(`${G}/discussions`)).toBe(true);
+    // graphs that differ only in a trailing `/` or `#` are distinct ontologies
+    const names = [G, `${G}/`, `${G}#`].map(discussionGraph);
+    expect(new Set(names).size).toBe(3);
+    expect(isDiscussionGraph(D + G)).toBe(true);
     expect(isDiscussionGraph(DEFAULT_DISCUSSIONS)).toBe(true);
     expect(isDiscussionGraph(G)).toBe(false);
+    // an ontology graph whose IRI happens to end in /discussions is not one
+    expect(isDiscussionGraph(`${G}/discussions`)).toBe(false);
     expect(isDiscussionGraph(null)).toBe(false);
+  });
+
+  it('keeps the threads of graphs that differ only in a trailing / apart', () => {
+    const store = new ox.Store();
+    const c = { text: 'Hi', user: 'bo', now: '2026-11-01T10:00:00Z', entity: EX + 'A' };
+    store.update(newThreadUpdate(G, { ...c, id: 'urn:uuid:1' }));
+    store.update(newThreadUpdate(`${G}/`, { ...c, id: 'urn:uuid:2' }));
+    expect(read(store, null, G).threads.map((t) => t.id)).toEqual(['urn:uuid:1']);
+    expect(read(store, null, `${G}/`).threads.map((t) => t.id)).toEqual(['urn:uuid:2']);
+    expect(read(store, null, `${G}#`).threads).toEqual([]);
   });
 });
 
 describe('mentions', () => {
   it('reads @names once each, not e-mail addresses', () => {
     expect(mentionsOf('@ana and @bo.k, again @ana; mail x@y.org')).toEqual(['ana', 'bo.k']);
+    // one-character names and principals that are e-mail addresses
+    expect(mentionsOf('@a and @alice@example.org.')).toEqual(['a', 'alice@example.org']);
+    expect(textParts('@alice@example.org.')).toEqual([
+      { text: '@alice@example.org', mention: true },
+      { text: '.', mention: false },
+    ]);
     expect(textParts('Ask @ana.')).toEqual([
       { text: 'Ask ', mention: false },
       { text: '@ana', mention: true },
@@ -94,7 +114,7 @@ describe('threads as Web Annotation RDF', () => {
 
   it('writes into the discussion graph only, and never as rdfs:comment', () => {
     const graphs = new Set(store.match().map((q) => q.graph.value));
-    expect([...graphs]).toEqual([`${G}/discussions`]);
+    expect([...graphs]).toEqual([discussionGraph(G)]);
     expect(
       store.match(null, ox.namedNode('http://www.w3.org/2000/01/rdf-schema#comment')),
     ).toHaveLength(0);
@@ -139,6 +159,20 @@ describe('threads as Web Annotation RDF', () => {
       ox.namedNode('urn:x-sparkles:discussion#resolved'),
     );
     expect(values).toHaveLength(1);
+  });
+
+  it('shows a creator IRI that is not valid percent-encoding as it is', () => {
+    const rows = [
+      {
+        a: { value: 'urn:uuid:bad' },
+        motivation: { value: 'http://www.w3.org/ns/oa#commenting' },
+        target: { value: EX + 'A' },
+        text: { value: 'Imported.' },
+        creator: { value: 'urn:x-sparkles:user:bad%FF' },
+        created: { value: '2026-11-01T10:00:00Z' },
+      },
+    ];
+    expect(parseThreads(rows).threads[0].creator).toBe('urn:x-sparkles:user:bad%FF');
   });
 
   it('refuses empty and oversized comments', () => {

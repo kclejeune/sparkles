@@ -1,8 +1,8 @@
 // Discussions on entities (ROADMAP item 618, docs/specs/U12-ontology-workbench/SPEC.md and
 // docs/specs/C31-checks-and-protected-merges/SPEC.md): comment threads on an entity or one of
 // its axioms, stored as W3C Web Annotation RDF in an ordinary named graph beside the ontology
-// graph on the branch. A thread is an `oa:Annotation` motivated by `oa:commenting` whose
-// target is the entity, or an `oa:SpecificResource` with the entity as source and the
+// graph on the branch, `urn:x-sparkles:discussions:<graph>`. A thread is an `oa:Annotation`
+// motivated by `oa:commenting` whose target is the entity, or an `oa:SpecificResource` with the entity as source and the
 // axiom's functional-style syntax as an `oa:TextQuoteSelector`. A reply is an annotation
 // motivated by `oa:replying` whose target is the thread. Each body is an `oa:TextualBody`.
 // Every comment, resolve and reopen is one ordinary commit through `POST /{ds}/update`.
@@ -15,8 +15,10 @@ const XSD = 'http://www.w3.org/2001/XMLSchema#';
 const SCHEMA = 'https://schema.org/';
 /** Sparkles' own terms for what Web Annotation leaves out: whether a thread is resolved. */
 export const DISC = 'urn:x-sparkles:discussion#';
+/** The prefix of every discussion graph's IRI. */
+export const DISCUSSIONS = 'urn:x-sparkles:discussions:';
 /** The discussion graph of the default graph. */
-export const DEFAULT_DISCUSSIONS = 'urn:x-sparkles:discussions:default';
+export const DEFAULT_DISCUSSIONS = DISCUSSIONS + 'default';
 /** The IRI prefix of a principal named as a creator or a mention. */
 export const USER = 'urn:x-sparkles:user:';
 
@@ -25,26 +27,44 @@ export const READ_LIMIT = 1000;
 /** The longest comment, in characters. */
 export const MAX_TEXT = 10_000;
 
-/** The graph that holds the discussions of the ontology in `graph` (null: the default graph). */
+/**
+ * The graph that holds the discussions of the ontology in `graph` (null: the default graph):
+ * the ontology graph's whole IRI under `urn:x-sparkles:discussions:`. The name is distinct for
+ * every ontology graph, `onto`, `onto/` and `onto#` included, and cannot be an ontology
+ * graph's own IRI.
+ */
 export function discussionGraph(graph: string | null): string {
-  if (!graph) return DEFAULT_DISCUSSIONS;
-  return `${graph.replace(/[/#]+$/, '')}/discussions`;
+  return graph ? DISCUSSIONS + graph : DEFAULT_DISCUSSIONS;
 }
 
 /** Whether a graph IRI names a discussion graph, which the editor never reads as an ontology. */
 export function isDiscussionGraph(iri: string | null | undefined): boolean {
-  return !!iri && (iri === DEFAULT_DISCUSSIONS || /\/discussions$/.test(iri));
+  return !!iri && iri.startsWith(DISCUSSIONS);
 }
 
 export const userIri = (name: string) => USER + encodeURIComponent(name);
-export const userName = (iri: string) =>
-  iri.startsWith(USER) ? decodeURIComponent(iri.slice(USER.length)) : iri;
+/** The principal a creator IRI names, or the IRI itself when it is not one of ours. */
+export function userName(iri: string): string {
+  if (!iri.startsWith(USER)) return iri;
+  try {
+    return decodeURIComponent(iri.slice(USER.length));
+  } catch {
+    return iri;
+  }
+}
+
+/**
+ * A mention: `@` and a principal's name of word characters, with `.`, `:`, `@` and `-`
+ * inside, such as `@a` or `@alice@example.org`. It is not preceded by a word character or
+ * `@`, so an e-mail address in the text is not one.
+ */
+const MENTION = /(^|[^\w@])(@\w(?:[\w.:@-]*\w)?)/g;
 
 /** The principals a text mentions as `@name`, each once, in order. */
 export function mentionsOf(text: string): string[] {
   const out: string[] = [];
-  for (const m of text.matchAll(/(?:^|[^\w@])@([\w][\w.:-]*[\w])/g))
-    if (!out.includes(m[1])) out.push(m[1]);
+  for (const p of textParts(text))
+    if (p.mention && !out.includes(p.text.slice(1))) out.push(p.text.slice(1));
   return out;
 }
 
@@ -225,7 +245,7 @@ export function parseThreads(rows: readonly Row[]): { threads: Thread[]; truncat
 export function textParts(text: string): { text: string; mention: boolean }[] {
   const out: { text: string; mention: boolean }[] = [];
   let last = 0;
-  for (const m of text.matchAll(/(^|[^\w@])(@[\w][\w.:-]*[\w])/g)) {
+  for (const m of text.matchAll(MENTION)) {
     const at = (m.index ?? 0) + m[1].length;
     if (at > last) out.push({ text: text.slice(last, at), mention: false });
     out.push({ text: m[2], mention: true });

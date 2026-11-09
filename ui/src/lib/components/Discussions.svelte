@@ -11,6 +11,7 @@
     discussionGraph,
     MAX_TEXT,
     newId,
+    READ_LIMIT,
     newThreadUpdate,
     parseThreads,
     replyUpdate,
@@ -19,7 +20,7 @@
     threadsQuery,
     type Thread,
   } from '$lib/discussions';
-  import { fmtCount, fmtRelative } from '$lib/format';
+  import { fmtInt, fmtRelative } from '$lib/format';
   import { committedSeq, runUpdate, type Selection } from '$lib/ontology';
   import { LatestRun } from '$lib/supersede';
 
@@ -124,41 +125,37 @@
 
   const stamp = () => new Date().toISOString();
 
+  // The page mounts one view for each target, graph and entity, so a write never finishes
+  // into another entity's composer. The inputs are disabled while a write runs, and a
+  // finished write clears only the text it sent.
   function start() {
     if (!iri) return;
     const entity = iri;
+    const text = draft;
+    // an axiom the frame no longer lists is not attached
+    const axiom = about && axioms.includes(about) ? about : null;
     void write(
       'new',
-      () =>
-        newThreadUpdate(sel.graph, {
-          id: newId(),
-          entity,
-          axiom: about || null,
-          text: draft,
-          user,
-          now: stamp(),
-        }),
+      () => newThreadUpdate(sel.graph, { id: newId(), entity, axiom, text, user, now: stamp() }),
       `Comment on ${name(entity)}`,
       () => {
-        draft = '';
-        about = '';
+        if (draft === text) {
+          draft = '';
+          about = '';
+        }
       },
     );
   }
 
   function reply(t: Thread) {
+    const text = replies[t.id] ?? '';
     void write(
       `reply:${t.id}`,
-      () =>
-        replyUpdate(sel.graph, {
-          id: newId(),
-          thread: t.id,
-          text: replies[t.id] ?? '',
-          user,
-          now: stamp(),
-        }),
+      () => replyUpdate(sel.graph, { id: newId(), thread: t.id, text, user, now: stamp() }),
       `Reply on ${name(t.entity)}`,
-      () => (replies = { ...replies, [t.id]: '' }),
+      () => {
+        if ((replies[t.id] ?? '') === text) replies = { ...replies, [t.id]: '' };
+      },
     );
   }
 
@@ -213,7 +210,7 @@
         bind:value={draft}></textarea>
       <div class="row">
         {#if axioms.length}
-          <select class="select sm" aria-label="About" bind:value={about}>
+          <select class="select sm" aria-label="About" disabled={busy != null} bind:value={about}>
             <option value="">About the entity</option>
             {#each axioms.slice(0, 200) as a (a)}<option value={a}>{a}</option>{/each}
           </select>
@@ -279,6 +276,7 @@
                   aria-label="Reply to {t.creator}"
                   placeholder="Reply"
                   maxlength={MAX_TEXT}
+                  disabled={busy != null}
                   value={replies[t.id] ?? ''}
                   oninput={(e) => (replies = { ...replies, [t.id]: e.currentTarget.value })}
                 />
@@ -298,8 +296,9 @@
     {/each}
   </ol>
   {#if loading}<p class="faint small"><span class="spinner"></span> Reading the threads…</p>{/if}
-  {#if truncated}<p class="faint small">
-      Showing the first {fmtCount(threads.length, 'thread')} and their replies.
+  {#if truncated}<p class="faint small" role="status">
+      The read stopped at the first {fmtInt(READ_LIMIT)} comments and replies, oldest first, so later
+      comments and replies, including replies to the threads shown, are not listed.
     </p>{/if}
 </div>
 

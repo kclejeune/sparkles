@@ -176,13 +176,18 @@ Item 618 adds a **Discussion** view to the entity frame, beside **Frame**, **Usa
 on the entity and on its axioms with their replies, and a caller who can write the branch
 starts a thread, replies, and resolves or reopens a thread. The tab lists every thread of
 the ontology graph and opens a thread's entity in the Discussion view. Both read with one
-SELECT of at most 1,000 threads and replies, oldest first, and say when it stopped there.
+SELECT of at most 1,000 comments and replies, oldest first, and say when it stopped there.
+Later comments and replies are then not listed, and paging them is left open.
 
 Threads are stored as the [C31](../C31-checks-and-protected-merges/SPEC.md#outcome)
 comments phase specifies, as W3C Web Annotation RDF. The maintainer chose the simple
 storage. The annotations live in an ordinary named graph per ontology graph on the
-branch, `<graph>/discussions` with a trailing `/` or `#` of the graph removed, or
-`urn:x-sparkles:discussions:default` for the default graph. A thread is an
+branch, whose IRI is the ontology graph's whole IRI under
+`urn:x-sparkles:discussions:`, or `urn:x-sparkles:discussions:default` for the default
+graph. A name such as `<graph>/discussions` was set aside, because it either merges the
+threads of `onto`, `onto/` and `onto#` or can fall on a real ontology graph. The namespace
+keeps one discussion graph for each ontology graph and lets the editor recognize
+discussion graphs by their prefix. A thread is an
 `oa:Annotation` motivated by `oa:commenting`. Its `oa:hasTarget` is the entity's IRI, or
 for an axiom an `oa:SpecificResource` whose `oa:hasSource` is the entity and whose
 `oa:TextQuoteSelector` holds the axiom in functional-style syntax as the frame shows it.

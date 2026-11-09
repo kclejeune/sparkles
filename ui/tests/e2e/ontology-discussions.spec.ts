@@ -15,7 +15,7 @@ open.describe.configure({ mode: 'serial', timeout: 120_000 });
 const DS = 'onto-discussions-e2e';
 const BRANCH = 'talk';
 const GRAPH = 'http://example.org/uni';
-const DISCUSSIONS = `${GRAPH}/discussions`;
+const DISCUSSIONS = `urn:x-sparkles:discussions:${GRAPH}`;
 const UNI = 'http://example.org/uni#';
 const OA = 'http://www.w3.org/ns/oa#';
 

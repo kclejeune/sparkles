@@ -42,7 +42,7 @@ The ontology editor's entity frame has a Discussion view (item 618) with comment
 on the entity and on its axioms, `@` mentions, replies, resolve and reopen, and a
 Discussions tab lists an ontology's threads. Threads are W3C Web Annotation RDF in a
 named graph beside the ontology graph on the branch, such as
-`http://example.org/uni/discussions`, and each comment, resolve or reopen is an ordinary
+`urn:x-sparkles:discussions:http://example.org/uni`, and each comment, resolve or reopen is an ordinary
 commit. Comments therefore appear in history and exports, protected branches refuse
 them, and writing one needs `write`.
 

@@ -85,7 +85,8 @@ mentioned principal and `urn:x-sparkles:discussion#resolved` for its state. Its
 `oa:hasTarget` is the resource's IRI, or an `oa:SpecificResource` whose source is the
 resource and whose `oa:TextQuoteSelector` holds an axiom. A reply is an `oa:replying`
 annotation that targets the thread. The annotations are kept in an ordinary named graph
-beside the graph they discuss, `<graph>/discussions`, and each comment, resolve or reopen
+beside the graph they discuss, named by that graph's IRI under
+`urn:x-sparkles:discussions:`, and each comment, resolve or reopen
 is an ordinary commit. They therefore appear in history and exports, protected branches
 refuse them and writing needs `write`. Item 768 covers an optional separate store that
 keeps comments outside versioning. Diff-line anchors, C21 notifications and the threads
