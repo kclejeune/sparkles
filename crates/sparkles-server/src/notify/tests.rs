@@ -1649,16 +1649,16 @@ fn one_line_server(
 ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
-    let n: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
-    let n2 = n.clone();
+    let taken: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+    let counter = taken.clone();
     std::thread::spawn(move || {
         for c in l.incoming().take(n) {
             let Ok(mut c) = c else { continue };
-            n2.fetch_add(1, Ordering::SeqCst);
+            counter.fetch_add(1, Ordering::SeqCst);
             let _ = c.write_all(greeting);
         }
     });
-    (port, n)
+    (port, taken)
 }
 
 /// A connection that ends within a line is a transient failure, which is retried, and
