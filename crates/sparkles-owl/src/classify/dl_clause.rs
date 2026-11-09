@@ -785,7 +785,8 @@ pub struct Store {
     /// the clauses with an equality or an inequality of successor terms in the head, by
     /// each term's function symbol, which a new certificate simplifies
     pub by_eq: FxHashMap<Ex, Vec<u32>>,
-    /// the processed clauses whose head is over y alone
+    /// the processed clauses whose head is over y alone, and in a rooted run those that
+    /// go to the predecessors, which the rules list
     pub preds: Vec<u32>,
     /// in a rooted run, the maximal literals of each processed clause that has more than
     /// one, whose first is [`Stored::max`]
@@ -925,7 +926,8 @@ impl Store {
                 Some(o) => s.c.maximal_rooted(o, max),
             }
             s.max = max.first().copied();
-            if max.is_empty() {
+            // a rooted run lists the clauses over the predecessor by its own test
+            if max.is_empty() && rooted.is_none() {
                 self.preds.push(id);
             }
             if max.len() > 1 {

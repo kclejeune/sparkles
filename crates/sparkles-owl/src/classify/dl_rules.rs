@@ -2073,12 +2073,14 @@ fn process<S: Sink>(
                 }
             }
         }
+        // the predecessors that register later replay the clauses over the predecessor,
+        // which a rooted run's store leaves to this test
+        if rooted {
+            ds(st).store.preds.push(id);
+        }
         if !rooted || max.is_empty() {
             return;
         }
-        // the predecessors that register later replay the clauses over the predecessor,
-        // which the store lists only when they have no maximal literal
-        ds(st).store.preds.push(id);
     }
     let mut found = Found::default();
     let mut ps: Vec<(Role, Ex)> = Vec::new();

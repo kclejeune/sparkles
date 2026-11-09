@@ -582,11 +582,15 @@ mod tests {
                 Made::Lit(l) => l,
                 _ => panic!("a literal"),
             };
-            let c = ctx[root as usize].get_or_init(Box::default);
+            // the seeds go to the first context saturated
+            let to = before.first().copied().unwrap_or(root);
+            let c = ctx[to as usize].get_or_init(Box::default);
             let mut st = c.st.lock();
             st.init = true;
             let x = ds(&mut st);
-            x.root.get_or_insert_with(Box::default);
+            if to == root {
+                x.root.get_or_insert_with(Box::default);
+            }
             for (b, h) in &seeds {
                 x.store.add(Clause::new(
                     b.iter().map(l).collect(),
@@ -1062,5 +1066,26 @@ mod tests {
         assert!(!ready(vec![XLit::Ne(RTerm::Y, ua)]));
         assert!(!ready(vec![XLit::Ne(ua, ub)]));
         assert!(!ready(vec![XLit::Atom(bb, RTerm::X)]));
+    }
+
+    #[test]
+    fn a_later_predecessor_replays_no_clause_outside_the_triggers() {
+        // B's context holds ⊤ → s(y, y) before A ⊑ ∃r.B reaches it: A gets no s(x, x)
+        let mut s = Sig::new();
+        let _ = s.ind("o");
+        let [a, b] = ["A", "B"].map(|n| s.class(n));
+        let r = s.role("r");
+        let t = s.role("s");
+        let e = s.some(r, b);
+        s.sub(a, e);
+        let d = saturate_after(s, &[b], Some(a), |_, _| {
+            vec![(vec![], vec![XLit::Role(t, RTerm::Y, RTerm::Y)])]
+        });
+        assert!(!d.has(&[XLit::Role(t, RTerm::X, RTerm::X)]));
+        assert!(
+            !d.clauses()
+                .iter()
+                .any(|(_, h)| h.contains(&XLit::Role(t, RTerm::X, RTerm::X)))
+        );
     }
 }
