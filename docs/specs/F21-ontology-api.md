@@ -270,6 +270,11 @@ mapping, and fetching only when the caller asks for it). Each axiom remembers th
 it came from, so a write can target the graph that holds an axiom and a report can name
 it.
 
+The import resolution of [U12](U12-ontology-workbench/SPEC.md#import-resolution) adds two
+sources of dataset graphs before and after the graph named by an import's IRI. The
+dataset's import map comes first, and a C30 vocabulary resource whose namespace matches
+the import comes last. Reads still fetch nothing.
+
 ### 4.4 Blank nodes
 
 Blank nodes are read with their store labels (`_:b<hex>`, see
