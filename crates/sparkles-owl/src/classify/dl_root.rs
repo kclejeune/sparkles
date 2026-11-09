@@ -2424,4 +2424,51 @@ mod tests {
         );
         assert!(run.bytes() > before);
     }
+
+    #[test]
+    fn the_root_takes_a_propagation_over_any_role_of_its_successor() {
+        // B's context by r, with r not below s, holds ∀s⁻.K as a unit: the root gets
+        // s(y, x) → K(y) whether it registers before or after the unit, and another
+        // predecessor by r does not
+        for register_first in [true, false] {
+            let mut s = Sig::new();
+            let _ = s.ind("a");
+            let [a, b, k] = ["A", "B", "K"].map(|n| s.class(n));
+            let r = s.role("r");
+            let _ = s.role("s");
+            let si = s.it.role(RoleName::Inverse(ObjectProperty::new("urn:t:s")));
+            let e = s.some(r, b);
+            let all = s.all(si, k);
+            let (ix, root) = probe_ix(s);
+            let run = DlRun::new(false, Default::default());
+            let mut out = Probe {
+                run: &run,
+                sent: Vec::new(),
+                mine: Vec::new(),
+            };
+            let mut st = State {
+                init: true,
+                ..State::default()
+            };
+            ds(&mut st);
+            if !register_first {
+                super::super::dl_rules::sub(&ix, b, &mut st, all, &mut out);
+            }
+            super::super::dl_rules::dedge(&ix, b, &mut st, root, e, &mut out);
+            super::super::dl_rules::dedge(&ix, b, &mut st, a, e, &mut out);
+            if register_first {
+                super::super::dl_rules::sub(&ix, b, &mut st, all, &mut out);
+            }
+            let to = |v: Ex| {
+                out.sent
+                    .iter()
+                    .any(|&(w, c)| w == v && matches!(c, Concl::PredC(f, _) if f == b))
+            };
+            assert!(to(root), "the root, register first {register_first}");
+            assert!(
+                !to(a),
+                "another predecessor, register first {register_first}"
+            );
+        }
+    }
 }

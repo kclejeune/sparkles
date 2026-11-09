@@ -1690,7 +1690,8 @@ fn props_to_dpreds<S: Sink>(ix: &Index, me: Ex, st: &mut State, s: Role, c: Ex, 
     }
     let id = prop_id(x, s, c, out);
     for &(u, e) in &x.dpreds {
-        if counting || role_of(ix, e).is_some_and(|r| ix.roles.sub(r, s)) {
+        // the root as predecessor finds the role premises itself, with every role over f(u)
+        if counting || dix(ix).is_root(u) || role_of(ix, e).is_some_and(|r| ix.roles.sub(r, s)) {
             out.send(u, Concl::PredC(me, id));
         }
     }
