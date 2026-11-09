@@ -1283,9 +1283,9 @@ about the assessments. F22's maintained analyses, roadmap item 340, consume it.
    assessment is left out, which follows the claims rule that a hidden record answers
    as a missing one.
 
-The rest of Phase 3 is planned as separate roadmap items. Recall and Ask citations of
-reviewed claims under their review state, identity resolution and access are
-650. Ingestion of extracted facts as claim proposals with their sources is
+The rest of Phase 3 is separate roadmap items. Recall and Ask citations of reviewed
+claims under their review state, identity resolution and access are item 650, which
+[Recall and Ask with claims](#recall-and-ask-with-claims) describes. Ingestion of extracted facts as claim proposals with their sources is
 651. Reports and community summaries that draw on accepted evidence are
 652. The bindings remain item 509.
 
@@ -1389,7 +1389,7 @@ independent restrictions through Recall, Ask, queued responses and publication.
 Read, query and output owners retain the actual selected view through their last
 physical consumer. A borrowed cloneable snapshot or a separate metadata token
 does not establish that lifetime, and newly copied output needs its receiving
-budget. Item 650 additionally owns the named policy and matching-map consumer
+budget. Item 650 adds the named policy and matching-map consumer
 integration, reviewed claim-occurrence citations and A10 treatment of source
 instructions as untrusted data.
 
@@ -1437,9 +1437,10 @@ preparation. Guarded Dataset queries and U02 readers still adopt them under item
 
 ### Recall and Ask with claims
 
-This section proposes the contract of roadmap item 650 and awaits the maintainer's
-approval. Nothing in it is implemented. Each decision states the recommended behaviour
-and the strongest alternative that was rejected. Every choice keeps the current output
+Roadmap item 650 delivers this contract in `recall`, `POST /{ds}/recall` and
+`POST /{ds}/ask`, with `sparkles::evidence::claim_states`, `with_policy_claims` and
+`resolve_entities_at` for Rust callers. Each decision states the adopted behaviour and
+the strongest alternative that was rejected. Every choice keeps the current output
 of `recall` and Ask unchanged unless the caller names a policy, and a state that cannot
 be represented faithfully is refused with a stable code rather than reported in a
 reduced form.
@@ -1469,7 +1470,10 @@ asserted knowledge, as acceptance case A2 requires.
 The claims section is bounded by a new `maxClaims` argument, 50 by default and at most
 200, and its lines count toward `maxBytes`. Recall sets the section's own truncated flag
 when either bound cuts it. Its reads use the call's snapshot, graph view and query
-budgets, with the evidence resolver's shared preparation allowance.
+budgets, with the evidence resolver's shared preparation allowance. Finding the claims
+about the result reads every quad of each boundary proposal graph and refuses with
+`incomplete-evidence` past one million quads, and roadmap item 766 adds an index that
+avoids the scan.
 
 The rejected alternative cites only the supports of accepted projected facts. That
 cannot show unreviewed observations, hypotheses, denials or conflicting occurrences,
@@ -1601,34 +1605,40 @@ the view selects.
 
 #### Ask
 
-`POST /{ds}/ask` and the `ask_graph` tool accept the same two arguments and pass them
-to a new grounding stage, which calls `recall` with the policies for the linked entities
-at hop 0. The claims section enters only the summary step's context, under the same
-structural label, and the summary may cite occurrences as `[c1]`. The query drafting,
-repair and escalation steps never receive it. The summary step already uses only
-providers that may receive rows under C18 §3.5. When no such provider remains, the
-summary is left out as it is today, and the response still carries the claims for the
-caller. A cited occurrence must exist in the context, as a cited row or point must
-today. Ask does not rewrite its SPARQL query to read proposal graphs, so a result row
-cites claims only through that context.
+`POST /{ds}/ask` accepts the same two arguments and passes them to a new grounding
+stage, which calls `recall` with the policies for the linked entities at hop 0. MCP has
+no Ask tool, and an MCP client reads claims through `recall` itself. An ask that names
+a policy answers from the data, so `mode` `global` is refused with `400` and `auto`
+answers locally. Its policies and the store's configuration history are checked before
+any model call, with the refusals of `recall`.
+
+The claims section enters only the summary step's context, under the same structural
+label, and the summary may cite occurrences as `[c1]`. The query drafting, repair and
+escalation steps never receive it. The summary step already uses only providers that
+may receive rows under C18 §3.5. When no such provider remains, the summary is left out
+as it is today, and the response still carries the claims for the caller. A cited
+occurrence must exist in the context, as a cited row or point must today. Ask does not
+rewrite its SPARQL query to read proposal graphs, so a result row cites claims only
+through that context.
 
 The summary's JSON keeps its numeric `citations` for rows and gains `claimCitations`, a
-list of occurrence identifiers such as `"c1"`. The final answer event and the final JSON
+list of occurrence identifiers such as `"c1"`. The `summary` event and the final JSON
 carry the `claims` member that recall's JSON format defines, with its version, policy
 and occurrences. No earlier event carries claim content.
 
-An Ask selects its evidence view once and keeps it until it answers. Before it emits
-the summary, Ask builds the claims section again at the same view with the caller's
-current grants, protections and source holds, and compares it with the section in the
-context. Any difference, including an occurrence the caller can no longer see, a
-changed resolution or a changed origin label, withholds the answer with the existing
-non-disclosing access response, and the caller must ask again. A policy change after
-selection does not alter the answer, which reports the policy version of its view.
+Before it emits the summary, Ask reads the claims section again with the same selector
+and the caller's current grants, protections and source holds, and compares it, with
+its commit and resolution, with the section in the context. Any difference withholds
+the answer with a `forbidden` error that does not say what changed, and the caller must
+ask again. A different occurrence, state, resolution or origin label counts, and so does
+a head that moved in between. A policy change after the first read changes the second
+read and withholds the answer too.
 
-A kept answer stores its `claimCitations` and `claims` with its summary. The graphs that
-the claims section read join the answer's footprint under C18 §6.4. The list route
-withholds the answer from a reader who cannot read one of those graphs or whose view
-masks a triple in one of them.
+A kept answer stores its `claimCitations` with its summary and the occurrences they
+cite under `claims`. Its footprint under C18 §6.4 already covers every graph the
+asker's view could read, the claims' graphs among them, so the list route withholds
+the answer from a reader whose view does not cover that footprint under the same
+protections.
 
 The rejected alternative maps each SPARQL result row to the acceptance supports of the
 triples that produced it. Ask has no row-to-triple provenance, and building it belongs
