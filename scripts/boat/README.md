@@ -69,9 +69,11 @@ The setup hook can still be restoring the state directory when the observer star
 a file of a restored layer can get a new inode on its first open for writing. The hook
 writes no completion marker. A bootstrap lock or manifest replaced during an attempt,
 or a state directory whose entries change during it, therefore counts as startup still
-running. The observer then waits until the directory's entries keep the same identity,
-size and times for five seconds and observes again. It refuses only when its observation
-deadline passes, with `startup_busy:bootstrap_lock_replaced` or
+running. The observer then waits until the directory is present and its entries keep
+the same identity, size and times for five seconds, and observes again. The phase
+directories this package keeps there are left out of that comparison. Every wait ends at
+the observation deadline, and a closure seen after it does not count. The observer
+refuses only when that deadline passes, with `startup_busy:bootstrap_lock_replaced` or
 `startup_busy:state_restore_in_progress` when that was the last thing it saw.
 
 Every refusal records a bounded reason code. A refusal of this package keeps its literal

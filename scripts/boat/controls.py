@@ -612,6 +612,43 @@ class Controls(unittest.TestCase):
             with patch.dict(OBSERVER['os'].__dict__,{'open':copy_up}):
                 q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),30,proc_fixture_reader(),clock.now,clock.pause)
             self.assertTrue(q['startup_closed'],q)
+    def test_settling_never_authorizes_startup_after_the_deadline(self):
+        for seconds in [5.5,6,6.5,7]:
+            with tempfile.TemporaryDirectory(prefix='boat-v2-late-') as d:
+                root,m=self.checkpoint_dir(d);clock=Clock();calls=[0]
+                def rows():
+                    calls[0]+=1
+                    if calls[0]==1:self.replace(root/'bootstrap.lock')
+                    return proc_fixture()
+                q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),seconds,rows,clock.now,clock.pause)
+                self.assertLessEqual(clock.t,seconds,seconds)
+                if q['startup_closed']:self.assertLess(clock.t,seconds)
+                else:self.assertEqual(q['reason_code'],'startup_busy:bootstrap_lock_replaced')
+    def test_a_state_directory_absent_during_settling_is_waited_for(self):
+        with tempfile.TemporaryDirectory(prefix='boat-v2-absent-') as d:
+            (Path(d)/'state').mkdir();root,m=self.checkpoint_dir(Path(d)/'state');clock=Clock();calls=[0];moved=Path(d)/'moved'
+            def rows():
+                calls[0]+=1
+                if calls[0]==1:self.replace(root/'bootstrap.lock')
+                return proc_fixture()
+            def pause(x):
+                clock.pause(x)
+                if 1<=clock.t<3 and root.exists():root.rename(moved)
+                if clock.t>=3 and moved.exists():moved.rename(root)
+            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),30,rows,clock.now,pause)
+            self.assertTrue(q['startup_closed'],q);self.assertGreater(clock.t,3+OBSERVER['SETTLE_SECONDS'])
+            moved=Path(d)/'gone';root.rename(moved)
+            self.assertIsNone(OBSERVER['state_snapshot'](root))
+            self.assertFalse(OBSERVER['settle'](root,clock.now,clock.pause,clock.t+10))
+    def test_retained_phase_directories_do_not_count_toward_the_bound(self):
+        with tempfile.TemporaryDirectory(prefix='boat-v2-retained-') as d:
+            root,m=self.checkpoint_dir(d)
+            for n in range(200):(root/('qualification-op-%d-startup'%n)).mkdir()
+            self.assertEqual(set(OBSERVER['state_snapshot'](root)),{'bootstrap.lock','toolchain.json'})
+            clock=Clock();q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),5,proc_fixture_reader(),clock.now,clock.pause)
+            self.assertTrue(q['startup_closed'])
+            for n in range(OBSERVER['STATE_ENTRIES']+1):(root/('entry-%d'%n)).touch()
+            with self.assertRaises(OBSERVER['Refusal']):OBSERVER['state_snapshot'](root)
     def test_restore_that_never_settles_refuses_at_the_deadline_with_its_code(self):
         for target,code in [('tools.toml','startup_busy:state_restore_in_progress'),('bootstrap.lock','startup_busy:bootstrap_lock_replaced')]:
             with tempfile.TemporaryDirectory(prefix='boat-v2-restore-') as d:

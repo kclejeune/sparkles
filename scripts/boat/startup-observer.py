@@ -143,22 +143,31 @@ STATE_ENTRIES=64
 REPLACED_READS=('file replaced','public file changed')
 
 def state_snapshot(state):
-    names=os.listdir(state);need(len(names)<=STATE_ENTRIES+16,'state directory bound')
-    out={}
-    for name in sorted(names):
-        if name.startswith('qualification-'):continue
-        try:s=os.lstat(state/name)
-        except FileNotFoundError:continue
-        out[name]=(s.st_dev,s.st_ino,s.st_mode,s.st_nlink,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+    """The identity, size and times of the state directory's entries, or None while it is absent.
+
+    The phase directories this package keeps there are excluded and bounded apart
+    from the entries that are compared.
+    """
+    out={};seen=0
+    try:entries=os.scandir(state)
+    except FileNotFoundError:return None
+    with entries:
+        for entry in entries:
+            seen+=1;need(seen<=8192,'state directory bound')
+            if entry.name.startswith('qualification-'):continue
+            try:s=entry.stat(follow_symlinks=False)
+            except FileNotFoundError:continue
+            out[entry.name]=(s.st_dev,s.st_ino,s.st_mode,s.st_nlink,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+            need(len(out)<=STATE_ENTRIES,'state directory bound')
     return out
 
 def settle(state,clock,pause,deadline):
-    """Wait, within the deadline, until the state directory stays unchanged for SETTLE_SECONDS."""
+    """Wait, within the deadline, until the state directory is present and unchanged for SETTLE_SECONDS."""
     previous=state_snapshot(state);since=clock()
     while clock()<deadline:
-        pause(0.5);current=state_snapshot(state)
-        if current!=previous:previous,since=current,clock()
-        elif clock()-since>=SETTLE_SECONDS:return True
+        pause(min(0.5,max(0.0,deadline-clock())));current=state_snapshot(state)
+        if current is None or current!=previous:previous,since=current,clock()
+        elif clock()-since>=SETTLE_SECONDS:return clock()<deadline
     return False
 
 @contextlib.contextmanager
@@ -183,7 +192,9 @@ def checkpoint_at(state,uid,denied,launcher,probe_pid,expected_manifest,seconds,
     the directory to settle and observes again, and refuses only at the deadline,
     with the reason code of the last thing it saw.
     """
-    deadline=clock()+seconds;tracked=set();last='not observed';code='startup_unobserved';rows={};busy=[];unsettled=False
+    deadline=clock()+seconds;tracked=set()
+    last='not observed';code='startup_unobserved';rows={};busy=[];unsettled=False
+    def wait(n):pause(min(n,max(0.0,deadline-clock())))
     def changed(reason):
         nonlocal last,code,busy,unsettled
         last=reason;busy=[];unsettled=True
@@ -192,6 +203,7 @@ def checkpoint_at(state,uid,denied,launcher,probe_pid,expected_manifest,seconds,
         if unsettled:
             if not settle(state,clock,pause,deadline):break
             unsettled=False
+            if clock()>=deadline:break
         try:
             before=state_snapshot(state)
             with bootstrap_lock(state/'bootstrap.lock',uid,denied) as lock:
@@ -200,8 +212,8 @@ def checkpoint_at(state,uid,denied,launcher,probe_pid,expected_manifest,seconds,
                 # yet at its absence test it now skips bootstrap; a running
                 # bootstrap still owns fd9/flock until its waited children end.
                 rows=rows_reader();busy=foreign_startup(rows,launcher,probe_pid,tracked,manager_reader(rows))
-                if busy:last='live or unknown startup descendants';code='startup_busy:unallowed_processes';pause(0.5);continue
-                pause(0.5)
+                if busy:last='live or unknown startup descendants';code='startup_busy:unallowed_processes';wait(0.5);continue
+                wait(0.5)
                 rows=rows_reader();busy=foreign_startup(rows,launcher,probe_pid,tracked,manager_reader(rows))
                 current,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
                 if current!=manifest:raise StateChanged('startup manifest path/bytes changed')
@@ -209,10 +221,12 @@ def checkpoint_at(state,uid,denied,launcher,probe_pid,expected_manifest,seconds,
                 held=(state/'bootstrap.lock').lstat()
                 if (held.st_dev,held.st_ino)!=(lock['device'],lock['inode']):raise StateChanged('bootstrap lock changed during observation')
                 if state_snapshot(state)!=before:raise StateChanged('state directory changed during observation')
+                # A success observed after the deadline does not count.
+                if clock()>=deadline:break
                 return {'startup_closed':True,'installer_quiescent':True,'manifest_sha256':manifest['sha256'],'qualification_eligible':manifest['sha256']==expected_manifest,'bootstrap_lock':lock,'bootstrap_occurrence':'unknown','hook_terminal_observed':False,'closure_basis':'existing bootstrap fd9 lock, stable owned present manifest, a state directory unchanged across the attempt and repeated exact PID/start/descendant observations; any not-yet-entered pinned absence branch must skip bootstrap','unknown_or_live_descendants':[],'engine_or_job_started':False}
         except StateChanged as error:changed(str(error))
-        except BlockingIOError:last='bootstrap lock busy or manifest not yet present';code='startup_busy:bootstrap_lock_held';busy=[];pause(0.5)
-        except FileNotFoundError:last='bootstrap lock busy or manifest not yet present';code='startup_busy:lock_or_manifest_absent';busy=[];pause(0.5)
+        except BlockingIOError:last='bootstrap lock busy or manifest not yet present';code='startup_busy:bootstrap_lock_held';busy=[];wait(0.5)
+        except FileNotFoundError:last='bootstrap lock busy or manifest not yet present';code='startup_busy:lock_or_manifest_absent';busy=[];wait(0.5)
         except Refusal as error:
             if str(error) not in REPLACED_READS:raise
             changed(str(error))
