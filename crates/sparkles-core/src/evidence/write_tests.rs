@@ -300,9 +300,9 @@ fn reifiers_about_charges_the_identities_it_returns() {
         Ok(out)
     };
     assert_eq!(scan(16 << 20).unwrap().len(), 400);
-    // one scan keeps about 60 KiB of identities beside 64 KiB of rows, so it fits in
-    // 160 KiB, and two scans that keep the first one's identities do not
-    let one = Preparation::new(crate::task::Control::none(), 160 << 10).unwrap();
+    // one scan keeps about 75 KiB of identities beside 64 KiB of rows, so it fits in
+    // 176 KiB, and two scans that keep the first one's identities do not
+    let one = Preparation::new(crate::task::Control::none(), 176 << 10).unwrap();
     let mut reads = Reads::new(&one, &snap);
     let mut held = one.reserve(0).unwrap();
     assert!(
@@ -317,5 +317,27 @@ fn reifiers_about_charges_the_identities_it_returns() {
             .is_ok()
     );
     drop(held);
-    assert!(matches!(scan(160 << 10), Err(Error::BudgetExceeded(_))));
+    assert!(matches!(scan(176 << 10), Err(Error::BudgetExceeded(_))));
+}
+
+/// Each identity a `Reads` caches, found or not, is charged to its preparation.
+#[test]
+fn reads_charge_their_identity_cache() {
+    use crate::store::{Store, StoreOptions};
+    let s = Store::in_memory(StoreOptions::default());
+    let snap = s.snapshot();
+    let preparation = Preparation::new(crate::task::Control::none(), 1 << 20).unwrap();
+    let mut reads = Reads::new(&preparation, &snap);
+    let mut refused = false;
+    for i in 0..20_000 {
+        match reads.subject_triples(&format!("urn:c:{i:06}"), "urn:g", 1) {
+            Ok(n) => assert_eq!(n, 0),
+            Err(Error::BudgetExceeded(_)) => {
+                refused = true;
+                break;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert!(refused, "20,000 cached identities fit in 1 MiB uncharged");
 }

@@ -1098,12 +1098,13 @@ pub struct Reads<'a> {
 }
 
 /// The bytes a cached identity of [`Reads`] takes beside its IRI: the key's `String`,
-/// the value and the tree's per-entry share.
-const CACHE_ENTRY: u64 = 64;
+/// the value and the tree's per-entry share. A B-tree node is at least half full, which
+/// makes that share at most about 92 bytes on 64-bit targets, and the charge rounds up.
+const CACHE_ENTRY: u64 = 160;
 
-/// The bytes a returned claim identity takes beside its IRI, in the returned vector and
-/// in the caller's set of candidates.
-const IDENTITY_ENTRY: u64 = 64;
+/// The bytes a returned claim identity takes beside its IRI: its place in the returned
+/// vector at up to twice the vector's length, and its entry in the caller's B-tree set.
+const IDENTITY_ENTRY: u64 = 160;
 
 impl<'a> Reads<'a> {
     /// The preparation the reads are charged to.
