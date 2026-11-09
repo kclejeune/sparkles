@@ -6124,6 +6124,7 @@ dependencies = [
  "parking_lot",
  "pdf-inspector",
  "percent-encoding",
+ "quick-xml 0.37.5",
  "quick_cache",
  "rayon",
  "regex",

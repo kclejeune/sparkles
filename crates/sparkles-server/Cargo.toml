@@ -66,6 +66,7 @@ sha1.workspace = true
 uuid.workspace = true
 # the UI's Content Security Policy (hashes of inline scripts); API token hashes
 sha2.workspace = true
+quick-xml = "0.37"
 # native TLS (feature `tls`): rustls with the aws-lc-rs provider, already in the tree
 # through reqwest
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"], optional = true }

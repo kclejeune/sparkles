@@ -651,10 +651,17 @@ impl OutboundPolicy {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        let etag = body
+            .resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let status = body.resp.status();
         Ok(Response {
             status,
             content_type,
+            etag,
             body,
         })
     }
@@ -849,6 +856,48 @@ pub fn fetch_bytes(
     Ok((bytes, content_type))
 }
 
+/// A document [`fetch_document`] read.
+#[derive(Clone, Debug)]
+pub struct Document {
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+    /// the response's `ETag`
+    pub etag: Option<String>,
+}
+
+/// GET `url` through `policy` as [`fetch_bytes`] does, and return the body with its
+/// `Content-Type` and `ETag` (the explicit import fetch of spec U12).
+pub fn fetch_document(
+    policy: &OutboundPolicy,
+    budget: &Arc<RequestBudget>,
+    url: &str,
+    accept: &str,
+) -> crate::Result<Document> {
+    let failed = |m: String| crate::Error::invalid(format!("GET {url}: {m}"));
+    let resp = policy
+        .send(budget, url, policy.timeout, |client, u| {
+            client.get(u).header("Accept", accept)
+        })
+        .map_err(|f| f.into_error(&format!("GET <{url}>"), failed))?;
+    if !resp.status.is_success() {
+        return Err(failed(resp.status.to_string()));
+    }
+    let content_type = resp.content_type.clone();
+    let etag = resp.etag.clone();
+    let mut bytes = Vec::new();
+    let mut body = resp.body;
+    body.read_to_end(&mut bytes)
+        .map_err(|e| match crate::codec::io_error(e) {
+            crate::Error::Io(e) => failed(e.to_string()),
+            e => e,
+        })?;
+    Ok(Document {
+        bytes,
+        content_type,
+        etag,
+    })
+}
+
 /// GET `url` through `policy` with `headers` and return the status with the body as a
 /// stream, under the policy's response ceiling and `timeout` (at most the policy's). Any
 /// status is an answer; a refused destination or a network failure is a [`Failure`].
@@ -923,6 +972,8 @@ pub fn post_json(
 pub(crate) struct Response {
     pub status: reqwest::StatusCode,
     pub content_type: String,
+    /// the `ETag` header, when it is text
+    pub etag: Option<String>,
     pub body: Body,
 }
 

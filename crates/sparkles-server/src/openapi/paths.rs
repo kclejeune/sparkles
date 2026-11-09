@@ -1194,6 +1194,112 @@ fn ontology(p: &mut Paths) {
             )
             .errors(&[400, 403, 404, 408, 412, 422, 507]),
     );
+    let import_entry = json!({ "type": "object", "properties": {
+        "iri": { "type": "string", "description": "The import IRI or version IRI." },
+        "graph": { "type": "string" },
+        "source": { "type": "string", "enum": ["manual", "catalog", "fetch"] },
+        "file": { "type": "string", "description": "The catalog's path of the file loaded into the graph." },
+        "location": { "type": "string", "description": "The URL fetched." },
+        "branch": { "type": "string" },
+        "commit": { "type": "integer" },
+        "etag": { "type": "string" },
+        "digest": { "type": "string", "description": "`sha256:` and the hex digest of the bytes loaded." },
+        "fetched": { "type": "string", "format": "date-time" }
+    } });
+    let import_map = json!({ "application/json": { "schema": { "type": "object", "properties": {
+        "dataset": { "type": "string" },
+        "revision": { "type": "string", "description": "The map's entity tag, which a PATCH's `If-Match` names." },
+        "admin": { "type": "boolean", "description": "Whether the caller sees every entry." },
+        "maxEntries": { "type": "integer" },
+        "entries": { "type": "array", "items": import_entry.clone() }
+    } } } });
+    p.add(
+        read(op(GET, "/$/ontology/{ds}/imports", "getOntologyImportMap", "Ontology", "The import map"))
+            .doc("The dataset's import map, which sends an import IRI to a graph of the dataset before a read looks for the graph the IRI names. Every branch shares it. A caller with `admin` sees every entry, and another caller sees the entries whose graph holds triples it can read. The entity tag is the map's revision.")
+            .see("ontology")
+            .resp("200", "The map.", Some(import_map.clone()))
+            .errors(&[404]),
+    );
+    p.add(
+        op(PATCH, "/$/ontology/{ds}/imports", "patchOntologyImportMap", "Ontology", "Change the import map")
+            .doc("Sets and removes entries of the import map. Set entries are manual. The map holds at most 4,096 entries, and each IRI and graph is at most 4 KiB. An `If-Match` names the map's revision, and a stale one is `412`.")
+            .see("ontology")
+            .params(&["ifMatch"])
+            .body(
+                true,
+                "The change.",
+                json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "set": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Import IRI to graph." },
+                        "remove": { "type": "array", "items": { "type": "string" } }
+                    }
+                } } }),
+            )
+            .resp("200", "The map after the change.", Some(import_map))
+            .errors(&[400, 403, 404, 412]),
+    );
+    let mut o = op(POST, "/$/ontology/{ds}/imports/catalog", "loadOntologyImportCatalog", "Ontology", "Load an XML catalog")
+        .doc("Loads an OASIS XML catalog and the files it names in one commit on the branch, and writes its entries to the import map with source `catalog`. Each `uri` entry maps its `name` to a graph. A relative `uri` whose file is a part of the body replaces the graph named by `name`, and an absolute `uri` maps the name to that graph. Other entries, entries under an `xml:base` and missing files are listed in `skipped`. A document type or entity declaration is refused, and nothing outside the body is read. The catalog is at most 1 MiB with 1,000 entries.")
+        .see("ontology")
+        .params(&["ifMatch"])
+        .body(
+            true,
+            "The `catalog` part, and one part per file, named by the path the catalog gives.",
+            json!({ "multipart/form-data": { "schema": {
+                "type": "object",
+                "additionalProperties": { "type": "string", "contentMediaType": "application/octet-stream" },
+                "required": ["catalog"],
+                "properties": { "catalog": { "type": "string", "contentMediaType": "application/xml" } },
+            } } }),
+        )
+        .resp(
+            "200",
+            "What the upload loaded and mapped, with the receipt when asked for.",
+            Some(json!({ "application/json": { "schema": { "type": "object", "properties": {
+                "loaded": { "type": "array", "items": { "type": "object", "properties": {
+                    "graph": { "type": "string" }, "file": { "type": "string" }, "triples": { "type": "integer" }
+                } } },
+                "entries": { "type": "array", "items": import_entry.clone() },
+                "skipped": { "type": "array", "items": { "type": "object", "properties": {
+                    "entry": { "type": "string" }, "reason": { "type": "string" }
+                } } },
+                "changed": { "type": "boolean" },
+                "revision": { "type": "string" }
+            } } } })),
+        );
+    o = write_params(o);
+    p.add(o.errors(&[400, 403, 404, 412, 415]));
+    let o = op(POST, "/$/ontology/{ds}/imports/fetch", "fetchOntologyImport", "Ontology", "Fetch an import into a graph")
+        .doc("Fetches an import's document through the server's outbound policy and makes the graph hold it in one commit on the branch, then records the map entry with source `fetch`, the location, the branch and commit, the ETag, the SHA-256 digest and the time. The location defaults to the entry's and then to the IRI, and must be http or https. The graph defaults to the entry's and then to the IRI. A refresh is the same request, and a document without blank nodes that equals the graph makes no commit. A refused destination is `403`, and a document that does not parse is `422`.")
+        .see("ontology")
+        .params(&["ifMatch"])
+        .body(
+            true,
+            "The import.",
+            json!({ "application/json": { "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["iri"],
+                "properties": {
+                    "iri": { "type": "string" },
+                    "location": { "type": "string" },
+                    "graph": { "type": "string" }
+                }
+            } } }),
+        )
+        .resp(
+            "200",
+            "The entry written, with the receipt when asked for.",
+            Some(json!({ "application/json": { "schema": { "type": "object", "properties": {
+                "entry": import_entry,
+                "triples": { "type": "integer" },
+                "changed": { "type": "boolean" },
+                "revision": { "type": "string" }
+            } } } })),
+        );
+    p.add(write_params(o).errors(&[400, 403, 404, 408, 412, 422]));
     p.add(
         write_params(sel(op(DELETE, "/$/ontology/{ds}/entity", "removeOntologyEntity", "Ontology", "Remove an entity")))
             .doc("Removes an entity in one commit: its declarations, the axioms of the graphs read that mention it and the assertions about it that the store holds there. The ontology is read from the head under the writer lock. The answer is an edit's, and `removedAxioms` lists what the removal took. An IRI the ontology does not mention removes nothing and makes no commit.")

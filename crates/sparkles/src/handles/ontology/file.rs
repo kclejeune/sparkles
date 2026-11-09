@@ -297,6 +297,7 @@ impl OntologyFile {
             commit: COMMIT,
             graphs: &self.graphs,
             imports: &self.imports,
+            closure: &[],
             warnings: &self.warnings,
             inferences: NO_INFERENCES,
         }

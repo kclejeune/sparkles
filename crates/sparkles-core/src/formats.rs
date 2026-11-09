@@ -756,6 +756,8 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("graphrag.json", 1),
     ds("paths.json", 1),
     ds("forms.json", 1),
+    // the import map of the ontology editor (spec U12, import resolution)
+    ds("ontology-imports.json", 1),
     // the managed-graph registry and its owners' settings (see `crate::managed`)
     ds("managed.json", 3),
     ds("evidence.json", 1),

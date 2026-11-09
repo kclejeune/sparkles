@@ -686,3 +686,79 @@ fn f16_graph_major_visitation() {
         }
     }
 }
+
+/// The import map wins over the graph an import names, a vocabulary resource comes last,
+/// unreadable graphs count as absent, and the closure marks its cycles (spec U12).
+#[test]
+fn import_targets_and_closure() {
+    use sparkles_reasoner::inputs::{ImportTargets, Via, resolve_closure};
+    let s = Store::in_memory(StoreOptions::default());
+    ttl(
+        &s,
+        Some("urn:a"),
+        "<urn:a> owl:imports <urn:b>, <urn:mapped>, <http://v.org/ns>, <urn:missing>, <urn:hidden> .",
+    );
+    ttl(
+        &s,
+        Some("urn:b"),
+        "<urn:b> owl:imports <urn:a> . ex:B a owl:Class .",
+    );
+    ttl(&s, Some("urn:mapped"), "ex:Wrong a owl:Class .");
+    ttl(&s, Some("urn:local"), "ex:L a owl:Class .");
+    ttl(
+        &s,
+        Some("urn:v1"),
+        "<urn:v1> owl:imports <urn:missing> . ex:V1 a owl:Class .",
+    );
+    ttl(&s, Some("urn:v2"), "ex:V2 a owl:Class .");
+    ttl(&s, Some("urn:secret"), "ex:S a owl:Class .");
+    let mut t = ImportTargets::default();
+    t.map.insert("urn:mapped".into(), "urn:local".into());
+    t.map.insert("urn:hidden".into(), "urn:secret".into());
+    t.resources.insert(
+        "http://v.org/ns".into(),
+        vec!["urn:v1".into(), "urn:empty".into(), "urn:v2".into()],
+    );
+    let inputs = Inputs {
+        data_graphs: vec![GraphRef::Named("urn:a".into())],
+        ..Inputs::default()
+    };
+    let snap = s.snapshot();
+    let secret = snap.lookup_iri("urn:secret").unwrap();
+    let readable = |g: sparkles_core::id::Id| g != secret;
+    let (r, edges) = resolve_closure(&snap, &inputs, &readable, &t);
+    let mut names: Vec<&str> = r.graphs.iter().map(|g| g.as_str()).collect();
+    assert_eq!(names[0], "urn:a");
+    names.sort();
+    assert_eq!(names, ["urn:a", "urn:b", "urn:local", "urn:v1", "urn:v2"]);
+    let edge = |from: &str, iri: &str| {
+        edges
+            .iter()
+            .find(|e| e.from.as_str() == from && e.iri == iri)
+            .unwrap_or_else(|| panic!("no edge {from} → {iri}: {edges:?}"))
+    };
+    assert_eq!(edge("urn:a", "urn:b").via, Some(Via::Graph));
+    assert!(edge("urn:a", "urn:b").cycle);
+    assert!(edge("urn:b", "urn:a").cycle);
+    let m = edge("urn:a", "urn:mapped");
+    assert_eq!(
+        (m.graphs.as_slice(), m.via),
+        (&["urn:local".to_string()][..], Some(Via::Map))
+    );
+    assert!(!m.cycle);
+    // a second importer of an import already followed gets its own edge
+    assert!(edge("urn:v1", "urn:missing").graphs.is_empty());
+    let v = edge("urn:a", "http://v.org/ns");
+    assert_eq!(v.via, Some(Via::Resource));
+    assert_eq!(v.graphs, ["urn:v1", "urn:v2"]);
+    for iri in ["urn:missing", "urn:hidden"] {
+        let e = edge("urn:a", iri);
+        assert!(e.graphs.is_empty() && e.via.is_none(), "{e:?}");
+    }
+    assert!(!format!("{edges:?}{:?}", r.warnings).contains("secret"));
+    // without targets the read resolves as resolve_readable does
+    let plain = sparkles_reasoner::inputs::resolve_readable(&snap, &inputs, &readable);
+    let (same, _) = resolve_closure(&snap, &inputs, &readable, &ImportTargets::default());
+    assert_eq!(plain, same);
+    assert_ne!(t.digest(), ImportTargets::default().digest());
+}

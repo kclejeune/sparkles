@@ -2290,6 +2290,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ontology/{ds}/imports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The import map
+         * @description The dataset's import map, which sends an import IRI to a graph of the dataset before a read looks for the graph the IRI names. Every branch shares it. A caller with `admin` sees every entry, and another caller sees the entries whose graph holds triples it can read. The entity tag is the map's revision.
+         */
+        get: operations["getOntologyImportMap"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Change the import map
+         * @description Sets and removes entries of the import map. Set entries are manual. The map holds at most 4,096 entries, and each IRI and graph is at most 4 KiB. An `If-Match` names the map's revision, and a stale one is `412`.
+         */
+        patch: operations["patchOntologyImportMap"];
+        trace?: never;
+    };
+    "/$/ontology/{ds}/imports/catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Load an XML catalog
+         * @description Loads an OASIS XML catalog and the files it names in one commit on the branch, and writes its entries to the import map with source `catalog`. Each `uri` entry maps its `name` to a graph. A relative `uri` whose file is a part of the body replaces the graph named by `name`, and an absolute `uri` maps the name to that graph. Other entries, entries under an `xml:base` and missing files are listed in `skipped`. A document type or entity declaration is refused, and nothing outside the body is read. The catalog is at most 1 MiB with 1,000 entries.
+         */
+        post: operations["loadOntologyImportCatalog"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ontology/{ds}/imports/fetch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Fetch an import into a graph
+         * @description Fetches an import's document through the server's outbound policy and makes the graph hold it in one commit on the branch, then records the map entry with source `fetch`, the location, the branch and commit, the ETag, the SHA-256 digest and the time. The location defaults to the entry's and then to the IRI, and must be http or https. The graph defaults to the entry's and then to the IRI. A refresh is the same request, and a document without blank nodes that equals the graph makes no commit. A refused destination is `403`, and a document that does not parse is `422`.
+         */
+        post: operations["fetchOntologyImport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/ontology/{ds}/individuals": {
         parameters: {
             query?: never;
@@ -18674,6 +18738,346 @@ export interface operations {
             408: components["responses"]["Timeout"];
             409: components["responses"]["Conflict"];
             507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getOntologyImportMap: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
+                graph?: string;
+                /** @description Follow `owl:imports` to graphs of the dataset (the default). */
+                imports?: boolean;
+                /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
+                mode?: "lenient" | "strict";
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The map. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description Whether the caller sees every entry. */
+                        admin?: boolean;
+                        dataset?: string;
+                        entries?: {
+                            branch?: string;
+                            commit?: number;
+                            /** @description `sha256:` and the hex digest of the bytes loaded. */
+                            digest?: string;
+                            etag?: string;
+                            /** Format: date-time */
+                            fetched?: string;
+                            /** @description The catalog's path of the file loaded into the graph. */
+                            file?: string;
+                            graph?: string;
+                            /** @description The import IRI or version IRI. */
+                            iri?: string;
+                            /** @description The URL fetched. */
+                            location?: string;
+                            /** @enum {string} */
+                            source?: "manual" | "catalog" | "fetch";
+                        }[];
+                        maxEntries?: number;
+                        /** @description The map's entity tag, which a PATCH's `If-Match` names. */
+                        revision?: string;
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    patchOntologyImportMap: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The change. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    remove?: string[];
+                    /** @description Import IRI to graph. */
+                    set?: {
+                        [key: string]: string;
+                    };
+                };
+            };
+        };
+        responses: {
+            /** @description The map after the change. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description Whether the caller sees every entry. */
+                        admin?: boolean;
+                        dataset?: string;
+                        entries?: {
+                            branch?: string;
+                            commit?: number;
+                            /** @description `sha256:` and the hex digest of the bytes loaded. */
+                            digest?: string;
+                            etag?: string;
+                            /** Format: date-time */
+                            fetched?: string;
+                            /** @description The catalog's path of the file loaded into the graph. */
+                            file?: string;
+                            graph?: string;
+                            /** @description The import IRI or version IRI. */
+                            iri?: string;
+                            /** @description The URL fetched. */
+                            location?: string;
+                            /** @enum {string} */
+                            source?: "manual" | "catalog" | "fetch";
+                        }[];
+                        maxEntries?: number;
+                        /** @description The map's entity tag, which a PATCH's `If-Match` names. */
+                        revision?: string;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            412: components["responses"]["PreconditionFailed"];
+            default: components["responses"]["Error"];
+        };
+    };
+    loadOntologyImportCatalog: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Run the write as a preview and roll it back. `dryRun` with no value means true. */
+                dryRun?: components["parameters"]["dryRun"];
+                /** @description With `dryRun`: list up to this many changed quads. */
+                changes?: components["parameters"]["changes"];
+                /** @description Add a commit receipt to the body. */
+                receipt?: components["parameters"]["receipt"];
+                /** @description `false` skips write-time validation when the server allows it (`--allow-unvalidated-writes`). */
+                validate?: components["parameters"]["validate"];
+                /** @description The most validation results reported when a write is rejected. */
+                validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
+            };
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+                /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
+                "Sparkles-Commit-Message"?: components["parameters"]["commitMessage"];
+                /** @description `true` runs the write as a preview. */
+                "Sparkles-Dry-Run"?: components["parameters"]["dryRunHeader"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The `catalog` part, and one part per file, named by the path the catalog gives. */
+        requestBody: {
+            content: {
+                "multipart/form-data": {
+                    catalog: string;
+                } & {
+                    [key: string]: string;
+                };
+            };
+        };
+        responses: {
+            /** @description What the upload loaded and mapped, with the receipt when asked for. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        changed?: boolean;
+                        entries?: {
+                            branch?: string;
+                            commit?: number;
+                            /** @description `sha256:` and the hex digest of the bytes loaded. */
+                            digest?: string;
+                            etag?: string;
+                            /** Format: date-time */
+                            fetched?: string;
+                            /** @description The catalog's path of the file loaded into the graph. */
+                            file?: string;
+                            graph?: string;
+                            /** @description The import IRI or version IRI. */
+                            iri?: string;
+                            /** @description The URL fetched. */
+                            location?: string;
+                            /** @enum {string} */
+                            source?: "manual" | "catalog" | "fetch";
+                        }[];
+                        loaded?: {
+                            file?: string;
+                            graph?: string;
+                            triples?: number;
+                        }[];
+                        revision?: string;
+                        skipped?: {
+                            entry?: string;
+                            reason?: string;
+                        }[];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            412: components["responses"]["PreconditionFailed"];
+            415: components["responses"]["UnsupportedMediaType"];
+            default: components["responses"]["Error"];
+        };
+    };
+    fetchOntologyImport: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Run the write as a preview and roll it back. `dryRun` with no value means true. */
+                dryRun?: components["parameters"]["dryRun"];
+                /** @description With `dryRun`: list up to this many changed quads. */
+                changes?: components["parameters"]["changes"];
+                /** @description Add a commit receipt to the body. */
+                receipt?: components["parameters"]["receipt"];
+                /** @description `false` skips write-time validation when the server allows it (`--allow-unvalidated-writes`). */
+                validate?: components["parameters"]["validate"];
+                /** @description The most validation results reported when a write is rejected. */
+                validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
+            };
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+                /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
+                "Sparkles-Commit-Message"?: components["parameters"]["commitMessage"];
+                /** @description `true` runs the write as a preview. */
+                "Sparkles-Dry-Run"?: components["parameters"]["dryRunHeader"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The import. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    graph?: string;
+                    iri: string;
+                    location?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The entry written, with the receipt when asked for. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        changed?: boolean;
+                        entry?: {
+                            branch?: string;
+                            commit?: number;
+                            /** @description `sha256:` and the hex digest of the bytes loaded. */
+                            digest?: string;
+                            etag?: string;
+                            /** Format: date-time */
+                            fetched?: string;
+                            /** @description The catalog's path of the file loaded into the graph. */
+                            file?: string;
+                            graph?: string;
+                            /** @description The import IRI or version IRI. */
+                            iri?: string;
+                            /** @description The URL fetched. */
+                            location?: string;
+                            /** @enum {string} */
+                            source?: "manual" | "catalog" | "fetch";
+                        };
+                        revision?: string;
+                        triples?: number;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            412: components["responses"]["PreconditionFailed"];
+            422: components["responses"]["Unprocessable"];
             default: components["responses"]["Error"];
         };
     };

@@ -83,6 +83,10 @@ mod ontology {
     pub(super) use self::summary as remove_entity;
     pub(super) use self::summary as search;
     pub(super) use self::summary as term;
+    pub(super) use self::summary as imports_catalog;
+    pub(super) use self::summary as imports_fetch;
+    pub(super) use self::summary as imports_get;
+    pub(super) use self::summary as imports_patch;
 
     pub(super) async fn axioms() -> ApiResult {
         not_built()
@@ -218,6 +222,18 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(ontology::kept_classification),
         )
         .route("/$/ontology/{ds}/term", get(ontology::term))
+        .route(
+            "/$/ontology/{ds}/imports",
+            get(ontology::imports_get).patch(ontology::imports_patch),
+        )
+        .route(
+            "/$/ontology/{ds}/imports/catalog",
+            post(ontology::imports_catalog),
+        )
+        .route(
+            "/$/ontology/{ds}/imports/fetch",
+            post(ontology::imports_fetch),
+        )
         .route("/$/graph/{ds}/groups", post(graph::groups))
         .route("/$/graph/{ds}/facets", post(graph::facets))
         .route("/$/skos/shapes", get(skos_shapes))
