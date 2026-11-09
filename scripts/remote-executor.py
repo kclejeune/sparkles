@@ -98,6 +98,31 @@ def command(host, text):
     return [*SSH, host, text]
 
 
+def tool_check(profile):
+    """Resolve mbx and rustc through the job environment and refuse a pin mismatch by name."""
+    mbx,rust=profile['tool_versions']['mbx'],profile['tool_versions']['rust']
+    pinned=boat_environment.pinned_mbx(profile)
+    return """refuse(){{ printf 'ADMIT-REFUSAL: %s\\n' "$1"; exit 86; }}
+physical=$(command -v mbx) || refuse 'mbx is not on the job PATH'
+test "$physical" = {pinned} || refuse "mbx resolves to $physical, pinned {pinned_text}"
+version=$("$physical" --version 2>/dev/null | awk '{{print $2}}') || true
+test "$version" = {mbx} || refuse "mbx reports $version, pinned {mbx}"
+command -v rustc >/dev/null || refuse 'rustc is not on the job PATH'
+version=$(rustc --version 2>/dev/null | awk '{{print $2}}') || true
+test "$version" = {rust} || refuse "rustc reports $version, pinned {rust} (RUSTUP_TOOLCHAIN=${{RUSTUP_TOOLCHAIN:-unset}})"
+""".format(pinned=shlex.quote(pinned),pinned_text=pinned.replace('"','?').replace('$','?').replace('`','?').replace('\\','?'),
+           mbx=shlex.quote(mbx),rust=shlex.quote(rust))
+
+
+def refusal_reason(output):
+    """The worker's last refusal line, bounded and reduced to printable ASCII."""
+    reason=None
+    for line in output.decode('ascii','replace').splitlines():
+        if line.startswith('ADMIT-REFUSAL: '):
+            reason=''.join(c if ' '<=c<='~' else '?' for c in line.removeprefix('ADMIT-REFUSAL: '))[:200]
+    return reason
+
+
 def admit(host, minimum):
     data = admission(host, minimum)
     if data is None:
@@ -119,24 +144,21 @@ def admit(host, minimum):
     # setupStatus=null alone is no readiness evidence. The owner binds startup
     # quiescence and guard lifetime; these physical checks detect subsequent drift.
     probe = """set -euo pipefail
-test -f {envfile}
+""" + tool_check(data['_profile']) + """test -f {envfile}
 test "$(stat -c %a {envfile})" = 600
 test "$(sha256sum {envfile} | cut -d' ' -f1)" = {envhash}
 exec 8>{bootstrap}
 flock -n 8
 test "$(sha256sum {manifest} | cut -d' ' -f1)" = {digest}
-test "$(mbx --version | awk '{{print $2}}')" = 1.29.1
 shim=$(command -v cargo)
 test -f "$shim"
 test "$(sha256sum "$shim" | cut -d' ' -f1)" = 9cfafb636d06f397aa5c48a68ac7755865d424f7acafe075e6fce3bcaa723843
-physical=$(command -v mbx)
 target_record=$(dirname "$shim")/mbx-target
 test -f "$target_record" && test ! -L "$target_record"
 test "$(stat -c %s "$target_record")" -le 4096
 IFS= read -r child_mbx < "$target_record"
 test -f "$child_mbx"
 test "$(sha256sum "$child_mbx" | cut -d' ' -f1)" = 4b0c0fcfc9329a9d76fd6bdefc1ee34822580864f5f5ba2f0b47dcbbffce2eca
-test "$(rustc --version | awk '{{print $2}}')" = 1.99.1
 test -n "${{MBX_REMOTE_TOKEN_FILE:-}}"
 test -f "$MBX_REMOTE_TOKEN_FILE" && test ! -L "$MBX_REMOTE_TOKEN_FILE"
 test "$(stat -c %a "$MBX_REMOTE_TOKEN_FILE")" = 600
@@ -150,8 +172,9 @@ command -v systemd-run >/dev/null
            digest=shlex.quote(data['toolchain_manifest_sha256']))
     with tempfile.TemporaryFile(buffering=0) as result:
         code=exchange(command(host,probe),result,limit=65536,deadline=deadline)
+        result.seek(0);reason=refusal_reason(result.read(65536))
     if code:
-        fail('worker guard or physical toolchain check failed')
+        fail('worker refused admission: '+reason if code==86 and reason else 'worker guard or physical toolchain check failed')
     # Retain only bounded non-secret identities, never arbitrary provider metadata.
     # Version 2 records the original end pair so that a later runtime is taken
     # from both clocks. expires_at is recomputed after the probes.

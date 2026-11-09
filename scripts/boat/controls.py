@@ -61,6 +61,9 @@ class InertIO:
         assert name not in self.records,name
         self.records[name]=copy.deepcopy(value)
     def exists(self,n):return n in self.records
+    def names(self):return sorted(self.records)
+    def freeze_extensions(self):self.frozen=True;return True
+    def thaw_extensions(self):self.frozen=False
     def read(self,n):
         if n not in self.records:raise FileNotFoundError(n)
         return copy.deepcopy(self.records[n])
@@ -116,7 +119,7 @@ class InertIO:
         self.record('metadata-started.json',{})
         if self.closure:self.record('qualification-closed.json',{'metadata_closed':True})
         if self.qual_bad:raise Refusal('inert wrong caps/source')
-        self.record('qualification.json',{'qualified':True,'metadata_closed':True,'startup_closed':True,'engine_or_job_started':False,'actual_toolchain_manifest':{'path':profile()['worker_home']+'/.local/state/sparkles-boat/toolchain.json','sha256':manifest_sha()},'bootstrap_lock':{'path':profile()['worker_home']+'/.local/state/sparkles-boat/bootstrap.lock','held_during_checkpoint':True},'runtime_env_file':None});return {}
+        self.record('qualification.json',{'qualified':True,'metadata_closed':True,'startup_closed':True,'engine_or_job_started':False,'actual_toolchain_manifest':{'path':profile()['worker_home']+'/.local/state/sparkles-boat/toolchain.json','sha256':manifest_sha()},'bootstrap_lock':{'path':profile()['worker_home']+'/.local/state/sparkles-boat/bootstrap.lock','held_during_checkpoint':True},'runtime_env_file':None,'worker_boot_id':'87654321-4321-4321-4321-210987654321'});return {}
     def metadata_closed(self):
         if self.closure:self.record('qualification-closed.json',{'metadata_closed':True});return True
         return False
@@ -158,7 +161,7 @@ class LoadedGuardIO(InertIO):
         if not self.launched:return {'LoadState':'not-found','ActiveState':'inactive','MainPID':'0','InvocationID':''}
         expected=[str(Path(sys.executable).resolve()),'-I','-B',str(c.ROOT/'controller.py'),'guard','--operation','/tmp/boat-inert-qualification']
         if self.exec_wrong:expected[-1]='/tmp/other-operation'
-        row={'LoadState':'loaded','ActiveState':'active','InvocationID':'a'*32,'ControlGroup':'/inert/boat-owned-warm-qual-inert.service','MainPID':'123','MemoryMax':'536870912','MemorySwapMax':'0','KillMode':'control-group','RuntimeMaxUSec':'2h 58min 20s','OOMPolicy':'continue','ExecStart':'{ path='+expected[0]+' ; argv[]='+' '.join(expected)+' ; ignore_errors=no ; }'}
+        row={'LoadState':'loaded','ActiveState':'active','InvocationID':'a'*32,'ControlGroup':'/inert/boat-owned-warm-qual-inert.service','MainPID':'123','MemoryMax':'536870912','MemorySwapMax':'0','KillMode':'control-group','RuntimeMaxUSec':'12h 5min','OOMPolicy':'continue','ExecStart':'{ path='+expected[0]+' ; argv[]='+' '.join(expected)+' ; ignore_errors=no ; }'}
         row.update(self.loaded_override);return row
     @property
     def op(self):return Path('/tmp/boat-inert-qualification')
@@ -184,6 +187,14 @@ class Controls(unittest.TestCase):
                 r=fixture();r[section][key]=value;io=InertIO(r)
                 with self.assertRaises(Refusal):c.drive(r,io)
                 self.assertEqual(io.calls,[])
+    def test_qualification_without_current_overflow_needs_a_bound_maintainer_confirmation(self):
+        for changed in ({'purpose':'qualification'},{'purpose':'other','maintainer_confirmation_sha256':'9'*64},{'maintainer_confirmation_sha256':'9'*64},{'purpose':'qualification','maintainer_confirmation_sha256':'short'}):
+            with self.subTest(changed=changed):
+                r=fixture();r['local_first'].update(overflow_currently_needed=False,**changed);io=InertIO(r)
+                with self.assertRaises(Refusal):c.drive(r,io)
+                self.assertEqual(io.calls,[])
+        r=fixture();r['local_first'].update(overflow_currently_needed=False,purpose='qualification',maintainer_confirmation_sha256='9'*64)
+        self.assertIs(c.validate_release(r,1800000000),r)
     def test_stale_fact_refused(self):
         r=fixture();r['environment']['observed_unix']-=301
         with self.assertRaises(Refusal):c.drive(r,InertIO(r))
@@ -604,7 +615,9 @@ class Controls(unittest.TestCase):
     def test_job_environment_is_only_literal_nonsecret_paths(self):
         from job_environment import environment,environment_body,expected_environment
         p=synthetic_profile();values=environment(p)
-        self.assertEqual(set(values),{'PATH','MBX_REMOTE_TOKEN_FILE'})
+        self.assertEqual(set(values),{'PATH','RUSTUP_TOOLCHAIN','RUSTUP_AUTO_INSTALL','MBX_REMOTE_TOKEN_FILE'})
+        self.assertEqual(values['RUSTUP_TOOLCHAIN'],p['tool_versions']['rust']);self.assertEqual(values['RUSTUP_AUTO_INSTALL'],'0')
+        self.assertIn(p['worker_home']+'/.local/share/mise/installs/mr-boxington/'+p['tool_versions']['mbx'],values['PATH'].split(':'))
         self.assertEqual(values['MBX_REMOTE_TOKEN_FILE'],p['worker_home']+'/.config/mbx/remote-token')
         q={'safe_owner':{'operation_id':'boat-owned-warm-qual-inert'},'local_guard':{'unit':'boat-owned-warm-qual-inert.service'}}
         row=expected_environment(p,q)

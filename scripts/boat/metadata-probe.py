@@ -46,6 +46,47 @@ def validate_pressure(events,swap):
     need(all(int(v)==0 for v in events.values()),'metadata memory pressure')
     need(swap=='0','metadata swap peak')
 
+# A 12 GiB job, the 512 MiB metadata service and a 1 GiB host reserve.
+JOB_HEADROOM=12*2**30+512*2**20+2**30
+HOST_NONRECLAIMABLE=['AnonPages','Shmem','Unevictable','KernelStack','PageTables','SecPageTables','Percpu','SUnreclaim']
+
+def cgroup_nonreclaimable(stat_text):
+    """Charge a cgroup cannot give back without swap: anon, shmem, unevictable, kernel.
+
+    Page cache is reclaimable and does not count. The fields overlap a little, since
+    unevictable pages are also anon or file, so the sum errs on the side of refusal.
+    """
+    stat={}
+    for line in stat_text.splitlines():
+        key,_,value=line.partition(' ')
+        if value.strip().isdigit():stat[key]=int(value)
+    need('anon' in stat,'cgroup memory.stat incomplete')
+    if 'kernel' in stat:kernel=stat['kernel']-stat.get('slab_reclaimable',0)
+    else:kernel=sum(stat.get(k,0) for k in ['kernel_stack','pagetables','sec_pagetables','percpu','sock','vmalloc','slab_unreclaimable'])
+    return stat['anon']+stat.get('shmem',0)+stat.get('unevictable',0)+max(0,kernel)
+
+def memory_admission(meminfo,ancestors):
+    """Refuse unless the host and every limited ancestor cgroup have room for the job.
+
+    Room is the limit minus memory that cannot be reclaimed, so a worker whose usage
+    is mostly page cache admits and one full of anonymous memory refuses.
+    """
+    memory={};kb={}
+    for line in meminfo.splitlines():
+        k,_,v=line.partition(':')
+        if v.split() and v.split()[0].isdigit():kb[k]=int(v.split()[0])*1024
+    need('MemTotal' in kb and 'AnonPages' in kb,'host meminfo incomplete')
+    for k in ['MemTotal','MemAvailable','SwapTotal','SwapFree']:
+        if k in kb:memory[k]=kb[k]
+    host=sum(kb.get(k,0) for k in HOST_NONRECLAIMABLE);memory['host_nonreclaimable']=host
+    need(kb['MemTotal']-host>=JOB_HEADROOM,'insufficient host headroom for proposed12GiB job')
+    for row in ancestors:
+        if row.get('memory.max','max')=='max':continue
+        need('memory.stat' in row,'limited ancestor without memory.stat')
+        row['nonreclaimable']=cgroup_nonreclaimable(row['memory.stat'])
+        need(int(row['memory.max'])-row['nonreclaimable']>=JOB_HEADROOM,'ancestor memory headroom')
+    return memory
+
 def probe(payload):
     uid=os.getuid();home=Path.home();need(uid==profile()['worker_uid'] and home==Path(profile()['worker_home']),'worker user')
     pins=payload['pins'];s=payload['release']['snapshot_continuity'];tag=payload['operation_tag'];unit=tag+'-metadata.service'
@@ -91,17 +132,13 @@ def probe(payload):
     ancestors=[];ancestor=cg.parent
     while ancestor.is_relative_to(Path('/sys/fs/cgroup')):
         row={'path':str(ancestor)}
-        for name in ['memory.max','memory.current','memory.swap.max']:
+        for name in ['memory.max','memory.current','memory.swap.max','memory.stat']:
             if (ancestor/name).exists():row[name]=(ancestor/name).read_text().strip()
         ancestors.append(row)
         if ancestor==Path('/sys/fs/cgroup'):break
         ancestor=ancestor.parent
-    memory={}
-    for line in Path('/proc/meminfo').read_text().splitlines():
-        k,_,v=line.partition(':')
-        if k in ['MemTotal','MemAvailable','SwapTotal','SwapFree']:memory[k]=int(v.split()[0])*1024
-    need(memory['MemAvailable']>=14495514624,'insufficient headroom for proposed12GiB job')
-    need(all(row.get('memory.max','max')=='max' or int(row['memory.max'])-int(row.get('memory.current',0))>=14495514624 for row in ancestors),'ancestor memory headroom')
+    memory=memory_admission(Path('/proc/meminfo').read_text(),ancestors)
+    for row in ancestors:row.pop('memory.stat',None)
     disk={}
     for root in [home,home/'.local/share/mbx',Path(profile()['startup_repositories']['default']),Path(profile()['startup_repositories']['retained'])]:
         need(root.exists(),'normal shared MBX/source path absent');fs=os.statvfs(root);need(fs.f_bavail*fs.f_frsize>=40*2**30 and fs.f_favail>=114060,'disk/inode headroom')
@@ -117,7 +154,7 @@ def probe(payload):
     need(s.get('dev_read_only_scope') is True,'token scope receipt')
     events=dict(line.split() for line in (cg/'memory.events').read_text().splitlines())
     validate_pressure(events,(cg/'memory.swap.peak').read_text().strip())
-    return {'memory_events':events,'memory_peak':(cg/'memory.peak').read_text().strip(),'qualified':True,'engine_or_job_started':False,'memory_max':maxmem,'swap_max':maxswap,'manifest_unchanged':True,'saved_manifest_sha256':before['sha256'],'directories':directories,'bundle_records':bundle_records,'source_observations':sources,'checker_results':checks,'token_metadata':tm,'public_cache_config':public_config,'shared_cache_and_managed_targets_preserved':True,'private_cache_or_target_created':False,'memory_bytes':memory,'ancestor_limits':ancestors,'disk':disk,'loaded_properties':properties,'native_heavy_processes':heavy,'lease_basis':'Root previous native/lease closure + exclusive worker + no lease-acquiring operation in this controller; not a new MBX lease grant','private_credential_snapshot':True,'fresh_job_admission_still_required':True}
+    return {'memory_events':events,'memory_peak':(cg/'memory.peak').read_text().strip(),'qualified':True,'worker_boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'engine_or_job_started':False,'memory_max':maxmem,'swap_max':maxswap,'manifest_unchanged':True,'saved_manifest_sha256':before['sha256'],'directories':directories,'bundle_records':bundle_records,'source_observations':sources,'checker_results':checks,'token_metadata':tm,'public_cache_config':public_config,'shared_cache_and_managed_targets_preserved':True,'private_cache_or_target_created':False,'memory_bytes':memory,'ancestor_limits':ancestors,'disk':disk,'loaded_properties':properties,'native_heavy_processes':heavy,'lease_basis':'Root previous native/lease closure + exclusive worker + no lease-acquiring operation in this controller; not a new MBX lease grant','private_credential_snapshot':True,'fresh_job_admission_still_required':True}
 if __name__=='__main__':
     try:
         result=probe(json.loads(sys.argv[1]));print(json.dumps(result));raise SystemExit(0)

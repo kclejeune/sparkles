@@ -27,10 +27,19 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def pinned_mbx(profile):
+    """The physical MBX that mise installs for the pinned version."""
+    return profile['worker_home']+'/.local/share/mise/installs/mr-boxington/'+profile['tool_versions']['mbx']+'/mbx'
+
+
 def environment(profile):
+    # Jobs resolve the pinned MBX install directly and select the pinned Rust
+    # toolchain by name, so neither a missing shim nor the rustup default is used.
     home = profile['worker_home']
-    return {'PATH': ':'.join([home+'/.local/share/mbx/bin', home+'/.local/bin',
+    return {'PATH': ':'.join([home+'/.local/share/mbx/bin', pinned_mbx(profile).removesuffix('/mbx'), home+'/.local/bin',
                              home+'/.cargo/bin', '/usr/local/bin', '/usr/bin', '/bin']),
+            'RUSTUP_TOOLCHAIN': profile['tool_versions']['rust'],
+            'RUSTUP_AUTO_INSTALL': '0',
             'MBX_REMOTE_TOKEN_FILE': home+'/.config/mbx/remote-token'}
 
 
@@ -67,15 +76,19 @@ def context(profile_path, qualification_path, worker, now, guard_reader=None):
     require(qualification.get('profile_sha256')==digest(raw_profile), 'profile file changed')
     require(qualification==export_operation(path.parent, now, worker, profile), 'qualification operation changed')
     live = (local_guard if guard_reader is None else guard_reader)(qualification['local_guard']['unit'])
-    validate_admission(qualification, Path('/proc/sys/kernel/random/boot_id').read_text().strip(), live, now, profile)
+    # A stopping or closed operation admits nothing, even with an extension receipt.
+    for name in ('stop-trigger.json', 'stop-intent.json', 'closed.json', 'unresolved.json'):
+        require(not (path.parent/name).exists(), 'operation is stopping or closed')
+    # The lifetime includes any receipted extension of this same operation.
+    lifetime = operation_lifetime(path.parent, qualification)
+    validate_admission(qualification, Path('/proc/sys/kernel/random/boot_id').read_text().strip(), live, now, profile, lifetime['wall_end'])
     require(qualification['safe_owner']['uid']==os.getuid(), 'qualification local owner mismatch')
     release = json.loads(read_owned(path.parent/'release.json'))
     require(Path(release['operation'])==path.parent, 'operation directory mismatch')
     require(release['controller_packet_manifest_sha256']==qualification['controller_packet_sha256'], 'source binding mismatch')
     controller.verify_packet(qualification['controller_packet_sha256'])
     controller.verify_cli(release)
-    lifetime = operation_lifetime(path.parent, qualification)
-    require(lifetime_left(lifetime, now) > 0, 'original lifetime expired')
+    require(lifetime_left(lifetime, now) > 0, 'lifetime expired')
     return profile, qualification, raw, release, lifetime
 
 
