@@ -243,7 +243,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           shared-key: clippy-${{ matrix.platform }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
           # the binding crates are workspaces of their own that share the root target
           workspaces: |
             . -> target
@@ -334,7 +334,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           shared-key: tests
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lane/ci-speed-v2' }}
       # local mode: no remote cache, and no link cache, since the store is not kept
       - uses: jdx/mr-boxington-action@v1.7.3
         with:

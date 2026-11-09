@@ -1,0 +1,70 @@
+# Temporary measurement for the CI cache choice: the test build with mbx's local object
+# store carried by rust-cache instead of the Cargo target. Removed after measurement.
+name: CI cache experiment
+on:
+  push:
+    branches: [lane/ci-speed-v2]
+    paths: [.github/workflows/ci-cache-experiment.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  NEXTEST_VERSION: "0.9.146"
+  HEAVY_1: binary_id(/^(sparkles-core::(spill_join|power_loss|w3c|geo_join)|sparkles-fmt::w3c_turtle)$/)
+  HEAVY_2: binary_id(/^(sparkles-core::query_cursor|sparkles-reasoner::(explain_demand|demand)|sparkles-fmt::turtle_stream)$/)
+  TIMING_BINARIES: binary_id(/^(sparkles::nesting|sparkles-fmt)$/)
+  # the store carried between runs has to fit GitHub's 10 GB cache entry limit
+  MBX_GC_MAX_SIZE: 8GiB
+jobs:
+  store:
+    name: Build tests (mbx store cache)
+    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Free disk space
+        run: scripts/ci-free-disk.sh start
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
+      - name: Add swap
+        run: |
+          sudo fallocate -l 16G /swapfile-ci
+          sudo chmod 600 /swapfile-ci
+          sudo mkswap /swapfile-ci > /dev/null
+          sudo swapon /swapfile-ci
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          shared-key: exp-store
+          cache-targets: false
+          cache-directories: |
+            ~/.cache/mbx
+            !~/.cache/mbx/targets
+      - uses: jdx/mr-boxington-action@v1.7.3
+        with:
+          backend: local
+          version: 1.29.1
+          cache-links: false
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: Disk space before test archive
+        run: scripts/ci-free-disk.sh wait
+      - name: Build the test archives
+        run: |
+          mkdir -p "$RUNNER_TEMP/heavy"
+          # shellcheck disable=SC2016 # the inner shell expands the variables
+          PATH="$PWD/scripts:$PATH" mbx sparkles-task -- bash -euo pipefail -c '
+            mbx nextest archive --locked --workspace --zstd-level -7 --archive-file "$RUNNER_TEMP/raw.tar.zst"
+            mbx nextest archive --locked --workspace -E "$HEAVY_1 | $HEAVY_2 | $TIMING_BINARIES" --zstd-level 3 \
+              --archive-file "$RUNNER_TEMP/heavy/tests.tar.zst"
+          '
+      - name: Store size
+        run: |
+          mbx cache dir
+          du -sh "$(mbx cache dir)" "$(mbx cache dir)"/* || true
+          mbx gc || true
+          du -sh "$(mbx cache dir)" --exclude targets || true
+      - name: Disk space after test archive
+        if: ${{ always() }}
+        run: scripts/ci-free-disk.sh report
