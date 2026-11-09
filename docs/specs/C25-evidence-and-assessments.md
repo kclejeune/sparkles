@@ -2056,7 +2056,10 @@ parent's activity used stays in the reports graph, with its footprint, as a chil
 the parent cites does under C22's retention rule, so the parent's provenance resolves. A
 report that a linked report written under a policy revises stays as well, with its
 activity, so an edit's provenance resolves through `prov:wasRevisionOf` to the
-activity and the children of the report it edits.
+activity and the children of the report it edits. Only an edit, which has no activity,
+keeps the report it revises. A report that a run writes in place of another does not
+keep it, so a replaced report and its wider footprint leave the graph once nothing else
+holds them, and a principal that lost a grant gets reports it can be proven for.
 
 The rejected alternative sends each fact's claims to the model and lets it cite them.
 The claims of a fact are a function of the fact under the policy, so the server
@@ -2117,8 +2120,9 @@ format becomes version 3. This build reads version 2 states, whose reports recor
 policy, and a release that reads only version 2 refuses version 3 as a newer file. A run
 saves the state after its last commit, so a crash between commits can leave a community
 whose report in the reports graph is not the one the state names. Such a report, and
-one for which the state records no pairs, is rewritten by the next refresh, and the
-private check below finds it and starts that refresh.
+one for which the state records no complete list of pairs, is rewritten by the next
+refresh, and the private check below finds it and starts that refresh. An empty list is
+complete, since a report under a policy may read ordinary facts alone.
 
 A report is rewritten, whatever the fraction, when it does not record the run's policy
 and version, or records a policy that the run does not have, and when one of its
@@ -2151,10 +2155,15 @@ generation differs from the one it last checked, when the access policy is reloa
 when the server starts, and when C22 §5 would start a refresh because the principal's
 feed cannot list the changes. The check is a refresh's preparation and plan, read as the
 principal at the Head view, with no estimate, model call, commit, state change or task.
-When its plan keeps every report and changes no community, it starts nothing and changes
-nothing a reader can see, so a reader cannot tell that it ran. When the plan rewrites a
-report, the dataset is due, and the refresh rewrites what the plan found, as a manual
-refresh would. A check that fails is retried privately after the backoff of C22 §5 and
+The dataset is due only for a reason that comes from the inputs. One is a report that
+the plan rewrites because its facts changed past the fraction, a pair ended, its policy
+or version differs or the state does not match it. Another is a community that the plan
+adds, removes or gives other members or another parent, including a hierarchy that is
+now empty. Pending, failed and stale reports are not such a reason and keep C22's own
+daily retry, so a hidden change never brings a retry forward. When the plan finds no such
+reason, the check starts nothing and changes nothing a reader can see, so a reader cannot
+tell that it ran. When it finds one, the refresh rewrites what the plan found, as a
+manual refresh would. A check that fails is retried privately after the backoff of C22 §5 and
 starts nothing. The check costs a refresh's reads and its Leiden run, without model
 calls, after each debounced change of the policy's evidence, which is the price of
 finding the changes that the principal's feed cannot show.
