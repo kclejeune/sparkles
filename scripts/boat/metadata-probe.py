@@ -36,89 +36,12 @@ def command(argv,seconds=15,env=None,cwd=None):
 
 class SourceDrift(Refusal):
     """A checkout whose source identity differs, with every field recorded beside observed."""
-    def __init__(self,reason,repo,recorded,observed,worktree):
+    def __init__(self,reason,repo,recorded,observed):
         super().__init__(reason);r,o=source_fields(recorded),source_fields(observed)
         other=lambda row:{k:v for k,v in row.items() if k not in ('head','status_sha256','tracked_diff_sha256','inputs')} if isinstance(row,dict) else None
         inputs=lambda row:{k:v for k,v in row.get('inputs',{}).items() if k not in ('mise.toml','rust-toolchain.toml')} if isinstance(row,dict) and isinstance(row.get('inputs'),dict) else None
         self.source_drift=drift_evidence({'repository':str(repo),'fields':{k:{'recorded':r[k],'observed':o[k],'differs':r[k]!=o[k]} for k in SOURCE_FIELDS},
-                                          'other_fields_differ':other(recorded)!=other(observed) or inputs(recorded)!=inputs(observed),'worktree':worktree})
-# The worktree summary only runs on a drift, within SUMMARY_SECONDS in all, and ends
-# SUMMARY_RESERVE seconds before the metadata unit's runtime, so the refusal is always
-# published. Each git output is read in chunks and abandoned past SUMMARY_BYTES.
-SUMMARY_SECONDS=12
-SUMMARY_RESERVE=45
-SUMMARY_BYTES=4*1024*1024
-CLEANUP_SECONDS=2
-PROBE_STARTED=[]
-def bounded_output(argv,deadline,env=None,cwd=None,limit=SUMMARY_BYTES,clock=None):
-    """A command's stdout, refused past its byte limit or the deadline.
-
-    The command runs in its own process group, which is killed whatever happens, so no
-    descendant outlives it, and the cleanup waits at most CLEANUP_SECONDS."""
-    import selectors,signal,time as t
-    clock=clock or t.monotonic
-    child=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env,cwd=cwd,start_new_session=True)
-    sel=None
-    try:
-        sel=selectors.DefaultSelector();sel.register(child.stdout,selectors.EVENT_READ)
-        chunks=[];size=0
-        while True:
-            left=deadline-clock();need(left>0,'worktree summary deadline')
-            if not sel.select(min(left,1.0)):continue
-            data=os.read(child.stdout.fileno(),65536)
-            if not data:break
-            size+=len(data);need(size<=limit,'worktree summary output bound');chunks.append(data)
-        while child.poll() is None:
-            need(deadline-clock()>0,'worktree summary deadline');t.sleep(0.01)
-        need(child.returncode==0,'worktree summary command failed')
-        return b''.join(chunks)
-    finally:
-        for step in (lambda:sel is not None and sel.close(),lambda:os.killpg(child.pid,signal.SIGKILL),
-                     lambda:child.wait(CLEANUP_SECONDS),lambda:child.stdout.close()):
-            try:step()
-            except Exception:pass
-def summary_deadline(clock=None,runtime=240):
-    """The summary's end, or None when the metadata unit has too little time left."""
-    import time as t
-    now=(clock or t.monotonic)();started=PROBE_STARTED[0] if PROBE_STARTED else now
-    end=min(now+SUMMARY_SECONDS,started+runtime-SUMMARY_RESERVE)
-    return end if end-now>=3 else None
-def worktree_summary(repo,env=None,deadline=None):
-    """Counts of a checkout's porcelain entries, separating mode-only changes from content.
-
-    It runs within one deadline and returns None on any failure, so it never masks the
-    drift it describes. Paths are compared in memory and never kept."""
-    try:
-        deadline=summary_deadline() if deadline is None else deadline
-        if deadline is None:return None
-        # No repository hook or helper runs, so nothing the checkout configures starts.
-        git=lambda *a:bounded_output(['git','-C',str(repo),'-c','core.fsmonitor=false','-c','core.untrackedCache=false','-c','diff.external=','--no-optional-locks',*a],deadline,env,repo)
-        tokens=git('status','--porcelain=v1','-z').split(b'\0');counts=dict.fromkeys(WORKTREE_COUNTS,0);i=0
-        while i<len(tokens):
-            entry=tokens[i];i+=1
-            if len(entry)<4:continue
-            x,y=chr(entry[0]),chr(entry[1]);counts['entries']+=1
-            # A rename or copy in either column is followed by its original path.
-            if x in 'RC' or y in 'RC':i+=1
-            if x+y=='??':counts['untracked']+=1;continue
-            counts['staged']+=x not in ' ?';counts['unstaged']+=y not in ' ?'
-        # --raw -z is a header then one path per record without rename detection.
-        raw=git('diff','HEAD','--raw','-z','--no-renames').split(b'\0');modes={};i=0
-        while i+1<len(raw):
-            header,path=raw[i],raw[i+1];i+=2
-            fields=header[1:].split()
-            need(header.startswith(b':') and len(fields)==5,'raw diff record')
-            modes[path]=(fields[0],fields[1])
-        # --numstat -z is added, deleted and the path in one record.
-        changed=set()
-        for record in git('diff','HEAD','--numstat','-z','--no-renames').split(b'\0'):
-            if not record:continue
-            added,deleted,path=record.split(b'\t',2)
-            if (added,deleted)!=(b'0',b'0'):changed.add(path)
-        counts['content_changes']=len(changed)
-        counts['mode_changes']=sum(1 for path,(old,new) in modes.items() if old!=new and b'000000' not in (old,new) and path not in changed)
-        return counts
-    except Exception:return None
+                                          'other_fields_differ':other(recorded)!=other(observed) or inputs(recorded)!=inputs(observed)})
 def validate_runtime(unit,pid,cgline,maxmem,maxswap,properties,runtime_seconds=240):
     need(maxmem=='536870912' and maxswap=='0','effective metadata cap')
     need(properties.get('MemoryMax')==maxmem and properties.get('MemorySwapMax')=='0' and properties.get('KillMode')=='control-group' and properties.get('OOMPolicy')=='continue' and properties.get('MainPID')==str(pid),'loaded metadata properties')
@@ -173,7 +96,6 @@ def memory_admission(meminfo,ancestors):
     return memory
 
 def probe(payload):
-    import time as t;PROBE_STARTED[:]=[t.monotonic()]
     uid=os.getuid();home=Path.home();need(uid==profile()['worker_uid'] and home==Path(profile()['worker_home']),'worker user')
     pins=payload['pins'];s=payload['release']['snapshot_continuity'];tag=payload['operation_tag'];unit=tag+'-metadata.service'
     need(os.uname().machine=='x86_64','architecture')
@@ -208,11 +130,11 @@ def probe(payload):
     helper=str(new/'toolchain-state.py');sources={};checks={}
     for repo,expected in [(Path(profile()['startup_repositories']['default']),s['default_source']),(Path(profile()['startup_repositories']['retained']),s['retained_source'])]:
         first=json.loads(command(['/usr/bin/python3',helper,'source',str(repo)],30,env,repo))
-        if first!=expected:raise SourceDrift('existing source drift',repo,expected,first,worktree_summary(repo,env))
+        if first!=expected:raise SourceDrift('existing source drift',repo,expected,first)
         check=json.loads(command(['/bin/bash',str(new/'repository-start.sh'),str(repo)],55,env,repo))
         need(check['native_started'] is False and check['status']=='tools-ready-workload-admission-still-required' and check['uid']==uid,'checker outcome')
         last=json.loads(command(['/usr/bin/python3',helper,'source',str(repo)],30,env,repo))
-        if last!=first:raise SourceDrift('existing source changed during qualification',repo,first,last,worktree_summary(repo,env))
+        if last!=first:raise SourceDrift('existing source changed during qualification',repo,first,last)
         sources[str(repo)]={'before':first,'after':last};checks[str(repo)]={'status':check['status'],'installed_bindings':check['installed_bindings']}
     after,_=safe_file(state/'toolchain.json',uid,denied,1024*1024);need(after==before,'manifest changed during checker')
     # Check parent capacity, excluding the deliberately smaller metadata service.

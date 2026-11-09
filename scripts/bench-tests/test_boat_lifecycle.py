@@ -1491,27 +1491,30 @@ class SourceDriftRecord(unittest.TestCase):
         row=json.loads(json.dumps(self.RECORDED));row.update(change);return row
 
     def test_a_drift_names_exactly_the_differing_fields(self):
-        error=self.O['SourceDrift']('existing source drift','/home/worker-fixture/sparkles',self.RECORDED,self.observed(status_sha256='1'*64,tracked_diff_sha256='2'*64),{'entries':1,'untracked':0,'staged':0,'unstaged':1,'mode_changes':1,'content_changes':0})
+        error=self.O['SourceDrift']('existing source drift','/home/worker-fixture/sparkles',self.RECORDED,self.observed(status_sha256='1'*64,tracked_diff_sha256='2'*64))
         d=error.source_drift;self.assertEqual(str(error),'existing source drift')
         self.assertEqual(sorted(k for k,v in d['fields'].items() if v['differs']),['status_sha256','tracked_diff_sha256'])
         self.assertEqual(d['fields']['status_sha256'],{'recorded':'e'*64,'observed':'1'*64,'differs':True})
         self.assertEqual(d['fields']['head'],{'recorded':'8'*40,'observed':'8'*40,'differs':False})
-        self.assertEqual(d['worktree']['mode_changes'],1);self.assertFalse(d['other_fields_differ'])
+        self.assertFalse(d['other_fields_differ'])
+        # A row with a field outside the identity is flagged without its content.
+        extra=self.O['SourceDrift']('existing source drift','/home/worker-fixture/sparkles',self.RECORDED,dict(self.RECORDED,note='DO_NOT_COPY')).source_drift
+        self.assertTrue(extra['other_fields_differ']);self.assertNotIn('DO_NOT_COPY',json.dumps(extra))
 
     def test_the_phase_result_keeps_the_drift(self):
-        def qualify(payload):raise self.O['SourceDrift']('existing source drift','/home/worker-fixture/sparkles',self.RECORDED,self.observed(head='9'*40),None)
+        def qualify(payload):raise self.O['SourceDrift']('existing source drift','/home/worker-fixture/sparkles',self.RECORDED,self.observed(head='9'*40))
         result,closed=self.O['run_phase']({'phase':'metadata'},None,qualify)
         self.assertFalse(closed);self.assertEqual(result['reason_code'],'refusal:existing source drift')
         self.assertTrue(result['source_drift']['fields']['head']['differs'])
 
     def test_the_metadata_refusal_records_the_drift_bounded(self):
         r=controls.fixture();io=controls.InertIO(r);controller.bind_release_profile(r)
-        drift=self.O['SourceDrift']('existing source drift','/home/worker-fixture/sparkles',self.RECORDED,self.observed(head='9'*40),None).source_drift
-        drift['fields']['head']['observed']='$(rm -rf /)';drift['secret']='DO_NOT_COPY';drift['worktree']={'entries':2,'free_text':'DO_NOT_COPY'}
+        drift=self.O['SourceDrift']('existing source drift','/home/worker-fixture/sparkles',self.RECORDED,self.observed(head='9'*40)).source_drift
+        drift['fields']['head']['observed']='$(rm -rf /)';drift['secret']='DO_NOT_COPY';drift['repository']='DO NOT COPY; $(x)'
         controller.record_refusal(io,'metadata',controller.Refusal('metadata refused: probe_not_qualified'),{'qualified':False,'reason_code':'refusal:existing source drift','source_drift':drift},failed=['probe_not_qualified'])
         row=io.read('metadata-refused.json');self.assertNotIn('DO_NOT_COPY',json.dumps(row))
         self.assertEqual(row['source_drift']['fields']['head'],{'recorded':'8'*40,'observed':None,'differs':True})
-        self.assertEqual(row['source_drift']['worktree'],{'entries':2})
+        self.assertIsNone(row['source_drift']['repository']);self.assertEqual(set(row['source_drift']),{'repository','fields','other_fields_differ'})
 
     def git(self,repo,*args):
         import subprocess as sp;return sp.run(['git','-C',str(repo),*args],check=True,capture_output=True,timeout=30).stdout
@@ -1522,20 +1525,14 @@ class SourceDriftRecord(unittest.TestCase):
         self.git(repo,'add','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','commit','-qm','x')
         return repo
 
-    def test_the_worktree_summary_separates_mode_changes_from_content(self):
-        repo=self.repository();summary=self.O['worktree_summary']
-        self.assertEqual(summary(repo),{'entries':0,'untracked':0,'staged':0,'unstaged':0,'mode_changes':0,'content_changes':0})
-        (repo/'run.sh').chmod(0o644);(repo/'new.txt').write_text('n\n')
-        self.assertEqual(summary(repo),{'entries':2,'untracked':1,'staged':0,'unstaged':1,'mode_changes':1,'content_changes':0})
-
-    def test_new_inodes_and_mtimes_do_not_change_the_worktree(self):
+    def test_new_inodes_and_mtimes_leave_the_content_identity_unchanged(self):
         # Every resume so far gave the home filesystem a new device and new inodes. A
         # copy with new inodes and mtimes leaves the checkout's content identity clean.
         import shutil as sh;repo=self.repository();copy=repo.parent/'copy';sh.copytree(repo,copy,copy_function=sh.copy)
         for path in copy.rglob('*'):
             if '.git' not in path.parts and path.is_file():os.utime(path,(1577836800,1577836800))
         self.assertNotEqual(os.stat(repo/'a.txt').st_ino,os.stat(copy/'a.txt').st_ino)
-        self.assertEqual(self.O['worktree_summary'](copy)['entries'],0)
+        self.assertEqual(self.git(copy,'status','--porcelain=v1','-z'),b'')
         self.assertEqual(self.git(repo,'status','--porcelain=v1','-z'),self.git(copy,'status','--porcelain=v1','-z'))
         self.assertEqual(self.git(repo,'diff','HEAD','--binary'),self.git(copy,'diff','HEAD','--binary'))
 
@@ -1547,87 +1544,3 @@ class SourceDriftBounds(SourceDriftRecord):
             r=controls.fixture();io=controls.InertIO(r);controller.bind_release_profile(r)
             controller.record_refusal(io,'metadata',controller.Refusal('metadata refused: probe_not_qualified'),{'qualified':False,'reason_code':'refusal:'+reason},failed=['probe_not_qualified'])
             self.assertEqual(io.read('metadata-refused.json')['remote_reason_code'],'refusal:'+reason)
-
-    def test_a_late_drift_skips_the_summary_and_keeps_the_refusal(self):
-        import time as t
-        self.O['PROBE_STARTED'][:]=[t.monotonic()-200];self.addCleanup(self.O['PROBE_STARTED'].clear)
-        self.assertIsNone(self.O['summary_deadline']())
-        repo=self.repository();started=t.monotonic()
-        self.assertIsNone(self.O['worktree_summary'](repo));self.assertLess(t.monotonic()-started,1)
-
-    def test_the_summary_commands_stop_at_their_deadline_and_byte_bound(self):
-        import time as t,shutil as sh
-        started=t.monotonic()
-        with self.assertRaises(self.O['Refusal']):self.O['bounded_output']([sh.which('sleep'),'5'],t.monotonic()+0.5)
-        self.assertLess(t.monotonic()-started,3)
-        with self.assertRaises(self.O['Refusal']):self.O['bounded_output']([sh.which('head'),'-c','8000000','/dev/zero'],t.monotonic()+10,limit=1024*1024)
-
-    def outputs(self,status,raw,numstat):
-        def fake(argv,deadline,env=None,cwd=None,**k):
-            return status if 'status' in argv else (raw if '--raw' in argv else numstat)
-        return patch.dict(self.O,{'bounded_output':fake})
-
-    def test_a_rename_in_either_column_consumes_its_original_path(self):
-        import time as t
-        with self.outputs(b' R new\0long-old-name\0R  b\0a\0',b'',b''):
-            got=self.O['worktree_summary']('/repo',deadline=t.monotonic()+5)
-        self.assertEqual((got['entries'],got['staged'],got['unstaged']),(2,1,1))
-
-    def test_paths_that_look_like_headers_and_mode_cases(self):
-        import time as t
-        raw=(b':100644 100644 '+b'0'*40+b' '+b'0'*40+b' M\0:secret file\0'
-             b':000000 100644 '+b'0'*40+b' '+b'0'*40+b' A\0added\0'
-             b':100755 100644 '+b'0'*40+b' '+b'0'*40+b' M\0both\0'
-             b':100755 100644 '+b'0'*40+b' '+b'0'*40+b' M\0modeonly\0')
-        numstat=b'1\t0\t:secret file\0001\t0\tadded\0002\t1\tboth\0000\t0\tmodeonly\0'
-        with self.outputs(b' M :secret file\0A  added\0 M both\0 M modeonly\0',raw,numstat):
-            got=self.O['worktree_summary']('/repo',deadline=t.monotonic()+5)
-        self.assertEqual((got['content_changes'],got['mode_changes']),(3,1))
-
-    def test_real_git_mode_cases(self):
-        repo=self.repository()
-        (repo/'new.txt').write_text('n\n');self.git(repo,'add','new.txt');(repo/'a.txt').unlink()
-        (repo/'run.sh').write_text('false\n');(repo/'run.sh').chmod(0o644)
-        got=self.O['worktree_summary'](repo)
-        self.assertEqual((got['mode_changes'],got['content_changes']),(0,3))
-
-
-class SourceDriftCleanup(SourceDriftRecord):
-    """A summary command's whole process group ends with it, whatever fails."""
-    def started(self):
-        import subprocess as sp;made=[];real=sp.Popen
-        def popen(*a,**k):
-            child=real(*a,**k);made.append(child);return child
-        return made,patch.object(sp,'Popen',popen)
-
-    def gone(self,pid):
-        import time as t
-        end=t.monotonic()+3
-        while t.monotonic()<end:
-            try:
-                os.kill(pid,0)
-                status=Path('/proc/%d/stat'%pid).read_text().rsplit(')',1)[1].split()[0]
-                if status=='Z':return True
-            except (ProcessLookupError,FileNotFoundError):return True
-            t.sleep(0.05)
-        return False
-
-    def test_a_descendant_that_outlives_its_command_is_ended(self):
-        import time as t,shutil as sh
-        tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup);pidfile=Path(tmp.name)/'pid'
-        script='sleep 30 & echo $! > "$1"; wait'
-        with self.assertRaises(self.O['Refusal']):self.O['bounded_output']([sh.which('sh'),'-c',script,'sh',str(pidfile)],t.monotonic()+0.7)
-        self.assertTrue(self.gone(int(pidfile.read_text())))
-
-    def test_a_selector_failure_still_ends_the_child_and_closes_its_pipe(self):
-        import time as t,shutil as sh,selectors
-        made,popen=self.started()
-        with popen,patch.object(selectors,'DefaultSelector',side_effect=OSError('selector')):
-            with self.assertRaises(OSError):self.O['bounded_output']([sh.which('sleep'),'30'],t.monotonic()+5)
-        self.assertEqual(len(made),1);self.assertTrue(self.gone(made[0].pid));self.assertTrue(made[0].stdout.closed)
-
-    def test_the_summary_disables_repository_hooks(self):
-        import time as t;seen=[]
-        def fake(argv,deadline,env=None,cwd=None,**k):seen.append(argv);return b''
-        with patch.dict(self.O,{'bounded_output':fake}):self.O['worktree_summary']('/repo',deadline=t.monotonic()+5)
-        for argv in seen:self.assertIn('core.fsmonitor=false',argv)

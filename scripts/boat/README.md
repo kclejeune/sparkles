@@ -117,8 +117,10 @@ porcelain status and of the tracked diff against that commit, and the hashes of
 inodes, mtimes or the device, so those changes leave the identity unchanged, but it does
 track the executable bit. When the identity differs, the metadata refusal keeps a
 `source_drift` record with each field's recorded and observed value and whether it
-differs. It also counts the checkout's porcelain entries, untracked files, staged and
-unstaged entries, and mode-only and content changes against the commit.
+differs, and a flag for any field outside the identity. A changed status hash with an
+unchanged diff hash points to untracked files, and a changed diff hash to tracked
+content or modes. The probe runs no git command of its own for the record, so a
+repository's filters and hooks get no further chance to run.
 
 A refused qualification holds its stop trigger for at most 600 seconds when the resume
 was acknowledged and the worker was seen running. During the hold the controller runs
