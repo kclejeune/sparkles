@@ -251,9 +251,9 @@ def bounded_command(argv,limit,capture_stderr=False,cap=1024*1024):
     before its output is buffered. A refused or timed-out child is killed and
     reaped within ten seconds."""
     child=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL)
-    pipes=[child.stdout]+([child.stderr] if capture_stderr else []);chooser=None
+    chooser=None
     try:
-        out={id(x):bytearray() for x in pipes};chooser=selectors.DefaultSelector()
+        pipes=[child.stdout]+([child.stderr] if capture_stderr else []);out={id(x):bytearray() for x in pipes};chooser=selectors.DefaultSelector()
         for pipe in pipes:chooser.register(pipe,selectors.EVENT_READ)
         end=time.monotonic()+limit
         while chooser.get_map():
@@ -267,6 +267,9 @@ def bounded_command(argv,limit,capture_stderr=False,cap=1024*1024):
     except BaseException:
         child.kill();child.wait(10);raise
     finally:
+        # Cleanup reads the pipes from the child itself, so it needs nothing the
+        # setup above may not have built.
         if chooser is not None:chooser.close()
-        for pipe in pipes:pipe.close()
+        for pipe in (child.stdout,child.stderr):
+            if pipe is not None:pipe.close()
     return subprocess.CompletedProcess(argv,child.returncode,bytes(out[id(child.stdout)]),bytes(out[id(child.stderr)]) if capture_stderr else None)

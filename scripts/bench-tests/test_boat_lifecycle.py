@@ -777,6 +777,24 @@ class BoundedCommand(unittest.TestCase):
             with self.assertRaises(OSError):common.bounded_command([sys.executable,'-I','-c','import time;time.sleep(30)'],30,True)
         self.assertEqual(len(children),1);self.assertIsNotNone(children[0].returncode)
         self.assertTrue(children[0].stdout.closed and children[0].stderr.closed)
+    def test_a_failure_while_listing_the_pipes_kills_and_reaps_the_child(self):
+        import common,subprocess
+        children=[];actual=subprocess.Popen
+        class Child:
+            # The first read of stdout fails, as an allocation failure during setup would.
+            def __init__(self,child):self.child=child;self.reads=0
+            def __getattr__(self,name):return getattr(self.child,name)
+            @property
+            def stdout(self):
+                self.reads+=1
+                if self.reads==1:raise MemoryError()
+                return self.child.stdout
+        def launch(*a,**k):
+            child=Child(actual(*a,**k));children.append(child);return child
+        with patch.object(common.subprocess,'Popen',side_effect=launch):
+            with self.assertRaises(MemoryError):common.bounded_command([sys.executable,'-I','-c','import time;time.sleep(30)'],30,True)
+        self.assertEqual(len(children),1);self.assertIsNotNone(children[0].child.returncode)
+        self.assertTrue(children[0].child.stdout.closed and children[0].child.stderr.closed)
     def test_timeout_kills_the_child_and_output_is_returned(self):
         import common,subprocess,time
         started=time.monotonic()
