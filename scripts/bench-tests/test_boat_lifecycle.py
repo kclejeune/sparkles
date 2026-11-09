@@ -497,6 +497,22 @@ class LifetimeExtension(unittest.TestCase):
         self.assertEqual(controller.guard_deadlines(near,self.intent),(self.original['boot_end'],self.original['wall_end']))
         self.assertFalse((self.op/'lifetime-extension-0001-accepted.json').exists())
 
+    def test_an_acceptance_write_error_after_publication_is_vetoed(self):
+        self.extend(self.io(self.left-600),3600,accept=False)
+        guard=ExtendIO(self.f,self.f['now']+self.left-40,self.f['boot_now']+self.left-40);real=guard.record
+        def failing(name,value):
+            real(name,value)
+            if name.endswith('-accepted.json'):guard.t+=41;guard.w+=41;raise controller.Refusal('directory fsync failed')
+        guard.record=failing
+        for _ in range(2):
+            self.assertEqual(controller.guard_deadlines(guard,self.intent),(self.original['boot_end'],self.original['wall_end']))
+        self.assertTrue((self.op/'lifetime-extension-0001-vetoed.json').exists())
+        self.assertEqual(self.lifetime(),self.original)
+        # The guard loop stops at the original end and publishes the stop trigger.
+        with patch.object(controller,'reconcile_stop',return_value=True):
+            self.assertTrue(controller.guard_loop(self.f['release'],guard,self.intent))
+        self.assertTrue((self.op/'stop-trigger.json').exists())
+
     def test_acceptances_follow_each_other_in_order(self):
         self.extend(self.io(self.left-600),3600);second=self.extend(self.io(self.left-300),10500)
         path=self.op/'lifetime-extension-0001-accepted.json';first=json.loads(path.read_text())

@@ -413,8 +413,11 @@ def guard_deadlines(io,intent):
             now_wall,now_boot=io.wall(),io.mono()
             if not(now_wall+lifetime.CLOSURE_RESERVE<wall and now_boot+lifetime.CLOSURE_RESERVE<boot):return None
             row=lifetime.acceptance_record(number,e,identity,now_wall,now_boot)
-            io.record('lifetime-extension-%04d-accepted.json'%number,row)
-            if not(io.wall()<wall and io.mono()<boot):
+            # An error after publication, such as a failed directory fsync, leaves
+            # timely completion unknown, so it is vetoed like a late write.
+            try:io.record('lifetime-extension-%04d-accepted.json'%number,row);published=True
+            except Exception:published=False
+            if not published or not(io.wall()<wall and io.mono()<boot):
                 vetoed.add(number)
                 try:io.record('lifetime-extension-%04d-vetoed.json'%number,{'sequence':number,'receipt_sha256':row['receipt_sha256'],'observed_wall':io.wall(),'observed_boottime':io.mono()})
                 except Exception:pass
