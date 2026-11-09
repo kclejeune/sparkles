@@ -3511,11 +3511,12 @@ mod tests {
                     assert_eq!(run(&mut key, fail), expected);
                     assert_eq!((key.as_ptr(), key.capacity()), (ptr, cap));
                 }
-                // An empty buffer must reserve. The refusal still returns the buffer,
-                // and the same buffer then rebuilds the key.
-                let mut key = Vec::new();
+                // A small buffer must reserve. The refusal still returns the same
+                // allocation, and the buffer then grows and rebuilds the key.
+                let mut key = Vec::with_capacity(4);
+                let (ptr, cap) = (key.as_ptr(), key.capacity());
                 assert_eq!(run(&mut key, Some("reserve")), Err("reserve"));
-                assert_eq!(key.capacity(), 0);
+                assert_eq!((key.as_ptr(), key.capacity()), (ptr, cap));
                 assert_eq!(run(&mut key, Some("callback")), Err("callback"));
                 let (ptr, cap) = (key.as_ptr(), key.capacity());
                 assert!(cap >= want.len());
