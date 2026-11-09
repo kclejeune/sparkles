@@ -975,7 +975,7 @@ for them.
 
 ## Completed
 
-- **761.** Complete authenticated evidence configurations are retained and bound to the data publications they admitted. Activation records explicit coverage, evidence views select exact Head and committed configurations, and backups and identity-changing restores keep a stable closure and origin, with strict refusal of missing or foreign references. [C25](specs/C25-evidence-and-assessments.md#historical-configuration-for-evidence-views)
+- **761.** Complete authenticated evidence configurations are retained and bound to the data publications they admitted. Activation records explicit coverage, evidence views select exact Head and committed configurations, and backups and identity-preserving restores keep a stable closure, with strict refusal of missing or foreign references. New-identity restores and clones of activated stores remain refused under item 764. [C25](specs/C25-evidence-and-assessments.md#historical-configuration-for-evidence-views)
 
 - **617.** The Workbench's SHACL shapes page authors node and property shapes through a tree and forms, with Core targets and constraints, recursive property paths and severities. Each draft is previewed and committed as one exact graph patch pinned to the source branch UUID and commit, and committed edits are undone through reverts. Live sample checks run against the draft at that revision, and RDF the forms do not recognize is preserved beside the Turtle and SHACLC text validator. [U12](specs/U12-ontology-workbench/SPEC.md#visual-shacl-shape-editor)
 

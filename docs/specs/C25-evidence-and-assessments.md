@@ -1371,7 +1371,10 @@ refuse. Later own publications use a genuine destination generation, while old
 explicit revisions remain unavailable as native historical evidence of the new
 identity. Repeated identity changes retain earlier imported origins and add only
 new imported suffixes, without duplicating large WAL files. Rebuild clones have no
-old WAL history and establish their own destination root explicitly.
+old WAL history and establish their own destination root explicitly. The public
+restore keeps the identity of a dataset whose configuration history is activated. It
+refuses a new identity for such a dataset as `unsupported`, and roadmap item 764 adds
+that path.
 
 A clone of a dataset whose configuration history is activated is refused with an
 `unsupported` error before anything is captured or written, because a clone copies
@@ -1478,7 +1481,10 @@ Each occurrence reports one state under the named policy. `accepted`, `rejected`
 `needs-evidence` are the disposition of the occurrence's current decision under the
 policy, the one no later decision supersedes. `unreviewed` means that the policy has no
 current decision for it. `withdrawn` means that a withdrawal of the occurrence is
-recorded in any proposal graph, and it takes precedence over the decision. An
+recorded in any configured proposal graph, including those outside the policy's
+boundary, and it takes precedence over the decision. Only authenticated decisions,
+supersessions and withdrawals count, with the liveness rules that reviews and
+withdrawals use. An
 occurrence also reports its current decision's IRI and the policy version that decision
 was made under, so that a decision made under an earlier version is visible. Superseded
 decisions are not listed.
@@ -1500,6 +1506,16 @@ each occurrence has one line, such as
 `[c1] claim=<iri> state=accepted decision=<iri> decisionVersion=2 kind=reported polarity=positive source=<iri> by=<iri> proposition=<< s p o >>`.
 Every term is escaped as recall escapes terms today, so a claim's text cannot start a
 structural line or forge another citation.
+
+With `reviewPolicy`, two facts share a citation number only when their existing
+provenance and their lists of cited occurrences are equal. A fact's list names every
+occurrence of its live supports that the caller may see. Recall fills the claims
+section in order. The occurrences cited by the facts it keeps come first, each listed
+once, and the other occurrences about the result's entities fill the remaining room.
+When a fact's occurrences cannot all be listed within `maxClaims` or `maxBytes`, recall
+leaves that fact out and reports the result as truncated, as it does for a fact over
+`maxTriples`. Every claim identifier in a citation therefore names an occurrence in
+the section.
 
 In the JSON format, the result gains a `claims` member,
 `{version: 1, policy: {name, version}, occurrences: [...], truncated}`, and a citation
@@ -1544,7 +1560,13 @@ unusable until its first decision.
 
 Claim states and resolution maps are read from the `BoundEvidenceView` that the call's
 selection gives, whether that is Head, `atCommit`, `at` or a named snapshot. The
-policies are read from that view's configuration, never from the current settings. A
+policies are read from that view's configuration, never from the current settings.
+A call that names a policy selects that one view from its original selector, before
+any reduction of a time or snapshot to a commit number, and reads its facts, claims and
+map from the view's snapshot. Identity resolution uses the same view rather than a
+fresh head of the branch. Head and an explicit commit can therefore select different
+configurations at the same sequence, as the historical-configuration rules above
+describe. A
 call that names a policy on a store whose configuration history is not activated is
 refused with `409` and the new code `configuration-history-inactive`, at Head as well.
 A selected commit outside the activation coverage is refused as `evidence-unavailable`,
@@ -1558,30 +1580,55 @@ configuration of a view.
 
 #### Access
 
-A call that names a policy needs read grants on the policy's decisions, supports and
-output graphs, and a matching policy also on its maps graph. A caller without them is
-refused with the existing non-disclosing access response before anything is read. An
-occurrence in a graph the caller cannot read, or with any triple its view masks, is
-left out without a count, as a hidden record answers as a missing one. A fact's citation
-lists only the readable occurrences of its supports. Recall reads with the caller's
+A review policy needs read grants on its decisions, supports and output graphs. A
+matching policy needs read grants on its decisions, maps and output graphs and on the
+identity graphs of its boundary, as identity resolution does. A caller without them is
+refused before anything is read, with the same `400`, code and message as an unknown
+policy name. The refusal names the argument and neither the policy's graphs nor its
+version, so a caller cannot tell a hidden policy from a missing one.
+
+An occurrence's state is decided from the authenticated records of the unmasked view,
+and the occurrence is shown only when the caller's view holds every record that decides
+it. That means the claim itself, its current decision, any decision or withdrawal that
+supersedes or ends it, and the support that cites it. An occurrence that fails this
+check is left out without a count, as a hidden record answers as a missing one. An
+older decision never stands in for a hidden current one. Recall applies this filter
+before it orders, bounds or counts occurrences, so a hidden record takes no place in
+the section and does not change its truncated flag. A fact's citation lists only the
+occurrences that pass it. Recall reads with the caller's
 current grants and the source holds and protections in force, whatever configuration
 the view selects.
 
 #### Ask
 
 `POST /{ds}/ask` and the `ask_graph` tool accept the same two arguments and pass them
-to a new grounding stage, which calls `recall` with the policies for the linked entities at hop
-0. The claims section enters the model's context under the same structural label, and
-the answer may cite occurrences as `[c1]`. A cited occurrence must exist in that context,
-as a cited row or point must today. Ask does not rewrite its SPARQL query to read
-proposal graphs, so a result row cites claims only through that context.
+to a new grounding stage, which calls `recall` with the policies for the linked entities
+at hop 0. The claims section enters only the summary step's context, under the same
+structural label, and the summary may cite occurrences as `[c1]`. The query drafting,
+repair and escalation steps never receive it. The summary step already uses only
+providers that may receive rows under C18 §3.5. When no such provider remains, the
+summary is left out as it is today, and the response still carries the claims for the
+caller. A cited occurrence must exist in the context, as a cited row or point must
+today. Ask does not rewrite its SPARQL query to read proposal graphs, so a result row
+cites claims only through that context.
 
-An Ask selects its evidence view once and keeps it until it answers. Before a queued or
-streamed answer is published, Ask checks the caller's current grants on every cited
-occurrence and the policy's graphs. If one is no longer readable, the answer is withheld
-with the existing non-disclosing access response and the caller must ask again. A
-policy change after selection does not alter the answer, which reports the policy
-version of its view.
+The summary's JSON keeps its numeric `citations` for rows and gains `claimCitations`, a
+list of occurrence identifiers such as `"c1"`. The final answer event and the final JSON
+carry the `claims` member that recall's JSON format defines, with its version, policy
+and occurrences. No earlier event carries claim content.
+
+An Ask selects its evidence view once and keeps it until it answers. Before it emits
+the summary, Ask builds the claims section again at the same view with the caller's
+current grants, protections and source holds, and compares it with the section in the
+context. Any difference, including an occurrence the caller can no longer see, a
+changed resolution or a changed origin label, withholds the answer with the existing
+non-disclosing access response, and the caller must ask again. A policy change after
+selection does not alter the answer, which reports the policy version of its view.
+
+A kept answer stores its `claimCitations` and `claims` with its summary. The graphs that
+the claims section read join the answer's footprint under C18 §6.4. The list route
+withholds the answer from a reader who cannot read one of those graphs or whose view
+masks a triple in one of them.
 
 The rejected alternative maps each SPARQL result row to the acceptance supports of the
 triples that produced it. Ask has no row-to-triple provenance, and building it belongs
@@ -1590,8 +1637,8 @@ to F18's explanations.
 #### Source instructions
 
 An occurrence reports `origin=instructions` when its source revision or that revision's
-source is typed `mem:Instructions` in a graph the caller can read, and `origin=source`
-otherwise. Every claims section is labelled as source data whatever its origins, so a
+source is typed `mem:Instructions` by a triple in the caller's view, and
+`origin=source` otherwise. Every claims section is labelled as source data whatever its origins, so a
 missing label never grants authority. Neither the label nor any claim's text changes the
 caller's tools, grants, outbound permissions or execution policy, which acceptance case
 A10 requires.
@@ -1620,7 +1667,10 @@ decision made under an earlier policy version, a matching policy with no map rev
 a review policy named as a matching policy, a merge and its reversal, an unactivated
 store, a historical commit with a changed configuration, a claim from an instruction
 document whose text imitates a citation and a structural line, and an Ask whose cited
-occurrence becomes unreadable before its answer is published. A call that names no
+occurrence becomes unreadable before its answer is published. They also cover a hidden
+current decision behind a readable claim, two projected facts with different supports,
+more supporting occurrences than `maxClaims`, a hidden policy and an unknown one, a
+settings-only change at one sequence and a bound named snapshot. A call that names no
 policy matches today's output byte for byte in both formats.
 
 ### Scope changes
