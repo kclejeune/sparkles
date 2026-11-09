@@ -88,6 +88,6 @@ annotation that targets the thread. The annotations are kept in an ordinary name
 beside the graph they discuss, named by that graph's IRI under
 `urn:x-sparkles:discussions:`, and each comment, resolve or reopen
 is an ordinary commit. They therefore appear in history and exports, protected branches
-refuse them and writing needs `write`. Item 768 covers an optional separate store that
+refuse them and writing needs `write`. Item 769 covers an optional separate store that
 keeps comments outside versioning. Diff-line anchors, C21 notifications and the threads
 in Explore, forms and the review page remain open.

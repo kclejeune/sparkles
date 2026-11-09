@@ -615,7 +615,7 @@ therefore appear in the branch's history and in exports of the dataset like any 
 graph, a protected branch refuses them as it refuses every write, and writing one needs
 `write` on the dataset. Readers and visitors of a protected branch see the threads with
 no composer, reply, resolve or reopen. A caller whose grants cover only some graphs needs
-a grant on the discussion graph, or the server refuses the comment. Item 768 covers an
+a grant on the discussion graph, or the server refuses the comment. Item 769 covers an
 optional discussion store outside versioning.
 
 **Inferred** reveals the

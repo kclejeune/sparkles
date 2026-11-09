@@ -216,7 +216,7 @@ Unit tests run the writes and the SELECT against an in-memory store. Playwright 
 thread on the entity and one on an axiom, a mention, a reply, a resolve and a reopen as
 five commits, the ontology's tab, a reader and a protected branch against the mock, and a
 writer, a reader and a protected branch against a real server. Mentions are recorded but
-notify no one until the notifications of item 46 exist. Item 768 covers an optional
+notify no one until the notifications of item 46 exist. Item 769 covers an optional
 discussion store outside versioning, with comments allowed on protected branches and
 kept out of exports.
 
