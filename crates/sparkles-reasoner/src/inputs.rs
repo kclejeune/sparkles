@@ -517,14 +517,22 @@ pub fn resolve_closure(
                 });
                 continue;
             }
-            if stopped {
-                continue;
-            }
-            if r.imports.len() >= MAX_IMPORTS {
+            // an import past the bound keeps its edge, unresolved, and the warning says
+            // why it was not followed
+            if !stopped && r.imports.len() >= MAX_IMPORTS {
                 warnings.push(format!(
                     "more than {MAX_IMPORTS} imports: <{iri}> and later ones were not followed"
                 ));
                 stopped = true;
+            }
+            if stopped {
+                edges.push(ImportEdge {
+                    from: from.clone(),
+                    iri,
+                    graphs: Vec::new(),
+                    via: None,
+                    cycle: false,
+                });
                 continue;
             }
             let location = inputs.location_mapping.map(&iri);

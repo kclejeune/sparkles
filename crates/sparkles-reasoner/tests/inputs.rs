@@ -762,3 +762,37 @@ fn import_targets_and_closure() {
     assert_eq!(plain, same);
     assert_ne!(t.digest(), ImportTargets::default().digest());
 }
+
+/// An import past the traversal bound keeps its closure edge, unresolved, and the warning
+/// says it was not followed (spec U12).
+#[test]
+fn imports_past_the_bound_keep_their_edges() {
+    use sparkles_reasoner::inputs::{ImportTargets, MAX_IMPORTS, resolve_closure};
+    let s = Store::in_memory(StoreOptions::default());
+    let n = MAX_IMPORTS + 1;
+    let objects: Vec<String> = (0..n).map(|i| format!("<urn:i:{i}>")).collect();
+    ttl(
+        &s,
+        Some("urn:a"),
+        &format!("<urn:a> owl:imports {} .", objects.join(", ")),
+    );
+    let inputs = Inputs {
+        data_graphs: vec![GraphRef::Named("urn:a".into())],
+        ..Inputs::default()
+    };
+    let snap = s.snapshot();
+    let (r, edges) = resolve_closure(&snap, &inputs, &|_| true, &ImportTargets::default());
+    assert_eq!(edges.len(), n, "{edges:?}");
+    assert_eq!(r.imports.len(), MAX_IMPORTS);
+    let past: Vec<_> = edges
+        .iter()
+        .filter(|e| !r.imports.iter().any(|i| i.iri == e.iri))
+        .collect();
+    assert_eq!(past.len(), 1);
+    assert!(past[0].graphs.is_empty() && past[0].via.is_none());
+    assert!(
+        r.warnings.iter().any(|w| w.contains("were not followed")),
+        "{:?}",
+        r.warnings
+    );
+}

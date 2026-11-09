@@ -2309,7 +2309,7 @@ export interface paths {
         head?: never;
         /**
          * Change the import map
-         * @description Sets and removes entries of the import map. Set entries are manual. The map holds at most 4,096 entries, and each IRI and graph is at most 4 KiB. An `If-Match` names the map's revision, and a stale one is `412`.
+         * @description Sets and removes entries of the import map. A graph given as a string makes a manual entry, and an entry object, such as one that an `import-map-unwritten` answer lists, is kept as given. The map holds at most 4,096 entries, and each IRI and graph is at most 4 KiB. The `If-Match` header must name the map's revision. Without it, or with `*`, the change is `428`, and a stale revision is `412`.
          */
         patch: operations["patchOntologyImportMap"];
         trace?: never;
@@ -12733,6 +12733,15 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description The change must name the revision it starts from in `If-Match` (`code: precondition-required`). */
+        PreconditionRequired: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
         /** @description The results, negotiated with `Accept` or `format`: results for SELECT and ASK, RDF for CONSTRUCT and DESCRIBE. */
         QueryResults: {
             headers: {
@@ -18820,9 +18829,9 @@ export interface operations {
             content: {
                 "application/json": {
                     remove?: string[];
-                    /** @description Import IRI to graph. */
+                    /** @description Import IRI to graph or entry. */
                     set?: {
-                        [key: string]: string;
+                        [key: string]: string | Record<string, never>;
                     };
                 };
             };
@@ -18867,6 +18876,7 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             412: components["responses"]["PreconditionFailed"];
+            428: components["responses"]["PreconditionRequired"];
             default: components["responses"]["Error"];
         };
     };

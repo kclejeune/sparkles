@@ -255,6 +255,7 @@ fn error_response(status: u16) -> &'static str {
         413 => "PayloadTooLarge",
         415 => "UnsupportedMediaType",
         422 => "Unprocessable",
+        428 => "PreconditionRequired",
         429 => "TooManyRequests",
         501 => "NotImplemented",
         502 => "BadGateway",
@@ -453,6 +454,12 @@ fn error_responses() -> Map<String, J> {
     put(
         "PreconditionFailed",
         err("`If-Match` or `If-None-Match` failed (`code: precondition-failed`)."),
+    );
+    put(
+        "PreconditionRequired",
+        err(
+            "The change must name the revision it starts from in `If-Match` (`code: precondition-required`).",
+        ),
     );
     put("PayloadTooLarge", err("The body is over its ceiling."));
     put(

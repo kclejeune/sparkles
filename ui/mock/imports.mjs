@@ -140,15 +140,27 @@ export async function handleImports(req, res, url, seg, ctx) {
   }
   if (req.method === 'PATCH' && action === '') {
     const ifMatch = req.headers['if-match'];
-    if (ifMatch && ifMatch !== revision(m))
+    if (!ifMatch || ifMatch === '*')
+      return (
+        fail(res, 428, 'If-Match: name the revision of the import map', {
+          code: 'precondition-required',
+        }),
+        true
+      );
+    if (ifMatch !== revision(m))
       return (
         fail(res, 412, 'If-Match: the import map has changed', { code: 'precondition-failed' }),
         true
       );
     const b = JSON.parse(String(await readBody(req)) || '{}');
     for (const iri of b.remove ?? []) m.entries.delete(iri);
-    for (const [iri, graph] of Object.entries(b.set ?? {}))
-      m.entries.set(iri, { graph, source: 'manual' });
+    for (const [iri, v] of Object.entries(b.set ?? {})) {
+      if (typeof v === 'string') m.entries.set(iri, { graph: v, source: 'manual' });
+      else {
+        const { iri: _iri, ...entry } = v;
+        m.entries.set(iri, entry);
+      }
+    }
     m.seq++;
     send(res, 200, body(ds), 'application/json', { ETag: revision(m) });
     return true;

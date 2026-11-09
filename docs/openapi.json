@@ -780,6 +780,16 @@
         },
         "description": "`If-Match` or `If-None-Match` failed (`code: precondition-failed`)."
       },
+      "PreconditionRequired": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        },
+        "description": "The change must name the revision it starts from in `If-Match` (`code: precondition-required`)."
+      },
       "QueryResults": {
         "content": {
           "application/ld+json": {
@@ -40346,7 +40356,7 @@
         "x-sparkles-permission": "read"
       },
       "patch": {
-        "description": "Sets and removes entries of the import map. Set entries are manual. The map holds at most 4,096 entries, and each IRI and graph is at most 4 KiB. An `If-Match` names the map's revision, and a stale one is `412`.",
+        "description": "Sets and removes entries of the import map. A graph given as a string makes a manual entry, and an entry object, such as one that an `import-map-unwritten` answer lists, is kept as given. The map holds at most 4,096 entries, and each IRI and graph is at most 4 KiB. The `If-Match` header must name the map's revision. Without it, or with `*`, the change is `428`, and a stale revision is `412`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
         },
@@ -40373,9 +40383,22 @@
                   },
                   "set": {
                     "additionalProperties": {
-                      "type": "string"
+                      "oneOf": [
+                        {
+                          "description": "The graph, for a manual entry.",
+                          "type": "string"
+                        },
+                        {
+                          "description": "An entry of the map, with or without its `iri`.",
+                          "required": [
+                            "graph",
+                            "source"
+                          ],
+                          "type": "object"
+                        }
+                      ]
                     },
-                    "description": "Import IRI to graph.",
+                    "description": "Import IRI to graph or entry.",
                     "type": "object"
                   }
                 },
@@ -40475,6 +40498,9 @@
           },
           "412": {
             "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
           },
           "default": {
             "$ref": "#/components/responses/Error"

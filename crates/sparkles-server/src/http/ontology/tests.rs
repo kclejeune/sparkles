@@ -2352,6 +2352,28 @@ async fn the_import_map_resolves_imports_and_changes_the_tags() {
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(r.json()["entries"][0]["source"], "manual");
+    let current = r.headers[header::ETAG].to_str().unwrap().to_string();
+    // a change must name the revision it starts from: no If-Match, or *, is refused
+    for h in [None, Some("*")] {
+        let mut headers = vec![ct];
+        if let Some(h) = h {
+            headers.push(("if-match", h));
+        }
+        let r = send(
+            &s.app,
+            "PATCH",
+            "/$/ontology/t/imports",
+            &headers,
+            r#"{"remove": ["http://ex.org/lib"]}"#,
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            StatusCode::PRECONDITION_REQUIRED,
+            "{h:?}: {}",
+            r.text()
+        );
+    }
     // a stale revision is refused
     let r = send(
         &s.app,
@@ -2366,7 +2388,7 @@ async fn the_import_map_resolves_imports_and_changes_the_tags() {
         &s.app,
         "PATCH",
         "/$/ontology/t/imports",
-        &[ct],
+        &[ct, ("if-match", &current)],
         r#"{"set": {"http://ex.org/x": "not an iri"}}"#,
     )
     .await;
@@ -2427,7 +2449,7 @@ async fn the_import_map_resolves_imports_and_changes_the_tags() {
         &s.app,
         "PATCH",
         "/$/ontology/t/imports",
-        &[ct],
+        &[ct, ("if-match", &current)],
         r#"{"remove": ["http://ex.org/lib"]}"#,
     )
     .await;
@@ -2584,7 +2606,61 @@ async fn a_catalog_loads_its_files_and_maps_its_entries() {
     )
     .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    // so is a catalog cut off before its end, although its entries are usable
+    let truncated = CATALOG.replace("</catalog>", "");
+    let (ct4, body4) = multipart(&[
+        ("catalog", "c.xml", &truncated),
+        ("lib.ttl", "lib.ttl", "<urn:x> <urn:y> <urn:z> ."),
+    ]);
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/imports/catalog",
+        &[(header::CONTENT_TYPE.as_str(), &ct4)],
+        &body4,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
     assert_eq!(get(&s.app, "/$/ontology/t").await.json()["commit"], commit);
+    // an entry as the map gives it (and as an import-map-unwritten answer lists it) can be
+    // set again whole, keeping its source, file and digest
+    let r = get(&s.app, "/$/ontology/t/imports").await;
+    let rev = r.headers[header::ETAG].to_str().unwrap().to_string();
+    let lib_entry = r.json()["entries"][0].clone();
+    assert_eq!(lib_entry["iri"], "http://ex.org/lib");
+    let ct = (header::CONTENT_TYPE.as_str(), "application/json");
+    let r = send(
+        &s.app,
+        "PATCH",
+        "/$/ontology/t/imports",
+        &[ct, ("if-match", &rev)],
+        r#"{"remove": ["http://ex.org/lib"]}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let rev = r.headers[header::ETAG].to_str().unwrap().to_string();
+    let replay = json!({"set": {"http://ex.org/lib": lib_entry}}).to_string();
+    let r = send(
+        &s.app,
+        "PATCH",
+        "/$/ontology/t/imports",
+        &[ct, ("if-match", &rev)],
+        &replay,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["entries"][0], lib_entry);
+    // an entry object is validated like the map file
+    let rev = r.headers[header::ETAG].to_str().unwrap().to_string();
+    let r = send(
+        &s.app,
+        "PATCH",
+        "/$/ontology/t/imports",
+        &[ct, ("if-match", &rev)],
+        r#"{"set": {"http://ex.org/q": {"graph": "urn:g", "source": "fetch", "other": 1}}}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
 }
 
 #[tokio::test]

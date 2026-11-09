@@ -496,7 +496,8 @@ async fn individual_pages_preserve_graph_grants_and_read_only_access() {
 #[tokio::test]
 async fn the_import_map_needs_admin_and_shows_readers_their_graphs() {
     let (_dir, app) = server();
-    let set = json!({"set": {"http://ex/x": "http://ex/secret", "http://ex/y": "http://ex/open", "http://ex/secret": "http://ex/secret"}});
+    // http://ex/empty holds no triples on this branch, so only administrators see its entry
+    let set = json!({"set": {"http://ex/x": "http://ex/secret", "http://ex/y": "http://ex/open", "http://ex/secret": "http://ex/secret", "http://ex/z": "http://ex/empty"}});
     for user in ["ofull", "oopen", "oread"] {
         let r = as_user(&app, user, "PATCH", "/$/ontology/ont/imports", &set).await;
         assert_eq!(r.status, StatusCode::FORBIDDEN, "{user}: {}", r.text());
@@ -519,9 +520,29 @@ async fn the_import_map_needs_admin_and_shows_readers_their_graphs() {
         .await;
         assert_eq!(r.status, StatusCode::FORBIDDEN, "{user}: {}", r.text());
     }
-    let r = as_user(&app, "alice", "PATCH", "/$/ontology/ont/imports", &set).await;
+    let r = as_user(
+        &app,
+        "alice",
+        "GET",
+        "/$/ontology/ont/imports",
+        &json!(null),
+    )
+    .await;
+    let revision = r.json()["revision"].as_str().unwrap().to_string();
+    let r = call(
+        &app,
+        "PATCH",
+        "/$/ontology/ont/imports",
+        &[
+            ("authorization", &b("alice")),
+            ("content-type", "application/json"),
+            ("if-match", &revision),
+        ],
+        &set.to_string(),
+    )
+    .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    assert_eq!(r.json()["entries"].as_array().unwrap().len(), 3);
+    assert_eq!(r.json()["entries"].as_array().unwrap().len(), 4);
     let iris = |r: &R| -> Vec<String> {
         r.json()["entries"]
             .as_array()
@@ -540,7 +561,8 @@ async fn the_import_map_needs_admin_and_shows_readers_their_graphs() {
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(r.json()["admin"], false);
-    assert_eq!(iris(&r).len(), 3);
+    assert_eq!(iris(&r).len(), 3, "{}", r.text());
+    assert!(!r.text().contains("http://ex/empty"), "{}", r.text());
     let r = as_user(
         &app,
         "oopen",

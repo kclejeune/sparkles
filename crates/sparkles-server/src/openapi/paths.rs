@@ -1222,7 +1222,7 @@ fn ontology(p: &mut Paths) {
     );
     p.add(
         op(PATCH, "/$/ontology/{ds}/imports", "patchOntologyImportMap", "Ontology", "Change the import map")
-            .doc("Sets and removes entries of the import map. Set entries are manual. The map holds at most 4,096 entries, and each IRI and graph is at most 4 KiB. An `If-Match` names the map's revision, and a stale one is `412`.")
+            .doc("Sets and removes entries of the import map. A graph given as a string makes a manual entry, and an entry object, such as one that an `import-map-unwritten` answer lists, is kept as given. The map holds at most 4,096 entries, and each IRI and graph is at most 4 KiB. The `If-Match` header must name the map's revision. Without it, or with `*`, the change is `428`, and a stale revision is `412`.")
             .see("ontology")
             .params(&["ifMatch"])
             .body(
@@ -1232,13 +1232,16 @@ fn ontology(p: &mut Paths) {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "set": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Import IRI to graph." },
+                        "set": { "type": "object", "additionalProperties": { "oneOf": [
+                            { "type": "string", "description": "The graph, for a manual entry." },
+                            { "type": "object", "required": ["graph", "source"], "description": "An entry of the map, with or without its `iri`." }
+                        ] }, "description": "Import IRI to graph or entry." },
                         "remove": { "type": "array", "items": { "type": "string" } }
                     }
                 } } }),
             )
             .resp("200", "The map after the change.", Some(import_map))
-            .errors(&[400, 403, 404, 412]),
+            .errors(&[400, 403, 404, 412, 428]),
     );
     let mut o = op(POST, "/$/ontology/{ds}/imports/catalog", "loadOntologyImportCatalog", "Ontology", "Load an XML catalog")
         .doc("Loads an OASIS XML catalog and the files it names in one commit on the branch, and writes its entries to the import map with source `catalog`. Each `uri` entry maps its `name` to a graph. A relative `uri` whose file is a part of the body replaces the graph named by `name`, and an absolute `uri` maps the name to that graph. Other entries, entries under an `xml:base` and missing files are listed in `skipped`. A document type or entity declaration is refused, and nothing outside the body is read. The catalog is at most 1 MiB with 1,000 entries.")

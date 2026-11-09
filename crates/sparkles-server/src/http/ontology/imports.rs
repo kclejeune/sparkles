@@ -269,12 +269,12 @@ fn viewer(
         Some(a) => a.masked(&snap).ok(),
         None => Some(snap.clone()),
     };
-    let visible = move |g: &str| match (&access, &view) {
-        (None, _) => true,
-        (Some(a), Some(v)) => sparkles_reasoner::inputs::GraphRef::Named(g.to_string())
-            .id(v)
-            .is_some_and(|id| a.readable_id(&snap, id)),
-        (Some(_), None) => false,
+    let visible = move |g: &str| {
+        let Some(v) = &view else { return false };
+        let Some(id) = sparkles_reasoner::inputs::GraphRef::Named(g.to_string()).id(v) else {
+            return false;
+        };
+        access.as_ref().is_none_or(|a| a.readable_id(&snap, id))
     };
     (admin, visible)
 }
@@ -301,17 +301,29 @@ pub(in crate::http) async fn get_map(
 }
 
 /// Refuse a write whose `If-Match` names another revision of the map.
+/// The header is required and must name a revision: `*` would let a stale editor
+/// overwrite a newer map without noticing.
 fn check_revision(headers: &HeaderMap, m: &MapFile) -> ApiResult<()> {
     let Some(v) = headers.get(header::IF_MATCH) else {
-        return Ok(());
+        return Err(err_code(
+            StatusCode::PRECONDITION_REQUIRED,
+            "precondition-required",
+            "If-Match: name the revision of the import map that this change starts from",
+        ));
     };
     let v = v.to_str().unwrap_or("").trim();
+    if v == "*" {
+        return Err(err_code(
+            StatusCode::PRECONDITION_REQUIRED,
+            "precondition-required",
+            "If-Match: name the revision of the import map, not *",
+        ));
+    }
     let tag = m.etag();
-    let ok = v == "*"
-        || v.split(',').any(|t| {
-            let t = t.trim();
-            t.strip_prefix("W/").unwrap_or(t) == tag
-        });
+    let ok = v.split(',').any(|t| {
+        let t = t.trim();
+        t.strip_prefix("W/").unwrap_or(t) == tag
+    });
     if ok {
         Ok(())
     } else {
@@ -323,8 +335,9 @@ fn check_revision(headers: &HeaderMap, m: &MapFile) -> ApiResult<()> {
     }
 }
 
-/// `PATCH /$/ontology/{ds}/imports`: `{"set": {iri: graph}, "remove": [iri]}` with
-/// `admin`. Set entries are manual, and an `If-Match` names the map's revision.
+/// `PATCH /$/ontology/{ds}/imports`: `{"set": {iri: graph | entry}, "remove": [iri]}` with
+/// `admin` and an `If-Match` that names the map's revision. A graph given as a string
+/// makes a manual entry; an entry object is kept as it is given.
 pub(in crate::http) async fn patch_map(
     State(st): St,
     Path(name): Path<String>,
@@ -339,15 +352,30 @@ pub(in crate::http) async fn patch_map(
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let o = body_object(&bytes, &["set", "remove"])?;
-    let mut set: Vec<(String, String)> = Vec::new();
+    let mut set: Vec<(String, Entry)> = Vec::new();
     match o.get("set") {
         None | Some(J::Null) => {}
         Some(J::Object(m)) => {
             for (k, v) in m {
-                let Some(g) = v.as_str() else {
-                    return Err(bad(format!("set.{k}: the graph, as a string")));
+                let e = match v {
+                    J::String(g) => Entry::manual(g.clone()),
+                    // an entry as the map or an `import-map-unwritten` answer gives it,
+                    // which replays a catalog load or a fetch whose map write failed
+                    J::Object(o) => {
+                        let mut o = o.clone();
+                        if o.get("iri").is_some_and(|i| i.as_str() == Some(k.as_str())) {
+                            o.remove("iri");
+                        }
+                        serde_json::from_value::<Entry>(J::Object(o))
+                            .map_err(|e| bad(format!("set.{k}: {e}")))?
+                    }
+                    _ => {
+                        return Err(bad(format!(
+                            "set.{k}: the graph as a string, or an entry of the map"
+                        )));
+                    }
                 };
-                set.push((k.clone(), g.to_string()));
+                set.push((k.clone(), e));
             }
         }
         Some(_) => return Err(bad("set: an object from import IRI to graph")),
@@ -375,8 +403,8 @@ pub(in crate::http) async fn patch_map(
         for iri in &remove {
             m.map.remove(iri);
         }
-        for (iri, g) in set {
-            m.map.insert(iri, Entry::manual(g));
+        for (iri, e) in set {
+            m.map.insert(iri, e);
         }
         m.check().map_err(bad)?;
         write_map(&st, &ds, &m).map_err(internal)?;
@@ -421,6 +449,8 @@ pub(crate) fn parse_catalog(bytes: &[u8]) -> Result<Catalog, String> {
     // per open element: whether it is under an xml:base
     let mut stack: Vec<bool> = Vec::new();
     let mut root = false;
+    // every element under the root but groups, accepted or skipped
+    let mut counted = 0usize;
     let attr = |e: &BytesStart<'_>, key: &[u8]| -> Result<Option<String>, String> {
         for a in e.attributes() {
             let a = a.map_err(|e| format!("the catalog is not well-formed XML: {e}"))?;
@@ -448,7 +478,14 @@ pub(crate) fn parse_catalog(bytes: &[u8]) -> Result<Catalog, String> {
                 buf.clear();
                 continue;
             }
-            Event::Eof => break,
+            Event::Eof => {
+                if !stack.is_empty() {
+                    return Err(
+                        "the catalog is not well-formed XML: it ends inside an element".into(),
+                    );
+                }
+                break;
+            }
             _ => {
                 buf.clear();
                 continue;
@@ -465,6 +502,14 @@ pub(crate) fn parse_catalog(bytes: &[u8]) -> Result<Catalog, String> {
             }
             root = true;
         } else {
+            if local != "group" {
+                counted += 1;
+                if counted > MAX_CATALOG_ENTRIES {
+                    return Err(format!(
+                        "the catalog has more than {MAX_CATALOG_ENTRIES} entries"
+                    ));
+                }
+            }
             match local.as_str() {
                 "group" => {}
                 "uri" => {
@@ -476,11 +521,6 @@ pub(crate) fn parse_catalog(bytes: &[u8]) -> Result<Catalog, String> {
                             "an entry under an xml:base is not supported".into(),
                         )),
                         (Some(name), Some(uri)) => {
-                            if out.entries.len() >= MAX_CATALOG_ENTRIES {
-                                return Err(format!(
-                                    "the catalog has more than {MAX_CATALOG_ENTRIES} entries"
-                                ));
-                            }
                             out.entries.push(CatalogEntry { name, uri });
                         }
                         _ => out
@@ -592,27 +632,64 @@ fn parse_document(
     let mut src = sparkles::io::Source::from_bytes(bytes.to_vec(), syntax, Some(g.clone()));
     src.base = base.map(str::to_string);
     let (quads, _) = sparkles::io::parse_to_vec(&src).map_err(|e| e.to_string())?;
-    let rename = |b: &BlankNode| BlankNode::new_unchecked(format!("{tag}{}", b.as_str()));
     Ok(quads
         .into_iter()
         .map(|q| Quad {
-            subject: match q.subject {
-                NamedOrBlankNode::BlankNode(b) => NamedOrBlankNode::BlankNode(rename(&b)),
-                s => s,
-            },
+            subject: rename_subject(q.subject, tag),
             predicate: q.predicate,
-            object: match q.object {
-                oxrdf::Term::BlankNode(b) => oxrdf::Term::BlankNode(rename(&b)),
-                o => o,
-            },
+            object: rename_term(q.object, tag),
             graph_name: GraphName::NamedNode(g.clone()),
         })
         .collect())
 }
 
+fn rename_subject(s: NamedOrBlankNode, tag: &str) -> NamedOrBlankNode {
+    match s {
+        NamedOrBlankNode::BlankNode(b) => {
+            NamedOrBlankNode::BlankNode(BlankNode::new_unchecked(format!("{tag}{}", b.as_str())))
+        }
+        s => s,
+    }
+}
+
+/// A term with every blank node label in it prefixed with `tag`, also inside triple terms
+/// and composite literals.
+fn rename_term(t: oxrdf::Term, tag: &str) -> oxrdf::Term {
+    match t {
+        oxrdf::Term::BlankNode(b) => {
+            oxrdf::Term::BlankNode(BlankNode::new_unchecked(format!("{tag}{}", b.as_str())))
+        }
+        oxrdf::Term::Triple(tr) => {
+            let tr = *tr;
+            oxrdf::Term::Triple(Box::new(oxrdf::Triple::new(
+                rename_subject(tr.subject, tag),
+                tr.predicate,
+                rename_term(tr.object, tag),
+            )))
+        }
+        oxrdf::Term::Literal(l) => {
+            match sparkles::sparql::cdt::relabel_literal(&l, &mut |b| format!("{tag}{b}")) {
+                Some(l) => oxrdf::Term::Literal(l),
+                None => oxrdf::Term::Literal(l),
+            }
+        }
+        t => t,
+    }
+}
+
+fn term_has_blank(t: &oxrdf::Term) -> bool {
+    match t {
+        oxrdf::Term::BlankNode(_) => true,
+        oxrdf::Term::Triple(tr) => {
+            matches!(tr.subject, NamedOrBlankNode::BlankNode(_)) || term_has_blank(&tr.object)
+        }
+        oxrdf::Term::Literal(l) => sparkles::sparql::cdt::may_name_bnodes(l),
+        _ => false,
+    }
+}
+
 fn has_blank(q: &Quad) -> bool {
-    matches!(q.subject, NamedOrBlankNode::BlankNode(_))
-        || matches!(q.object, oxrdf::Term::BlankNode(_))
+    matches!(q.subject, NamedOrBlankNode::BlankNode(_)) || term_has_blank(&q.object)
 }
 
 /// Make graph `graph` hold exactly `quads` within `tx`. Without blank nodes on either
@@ -1101,6 +1178,71 @@ mod tests {
                 .contains("not <catalog>")
         );
         assert!(parse_catalog(b"not xml <").is_err());
+    }
+
+    #[test]
+    fn malformed_and_oversized_catalogs_are_refused() {
+        let truncated = br#"<catalog><uri name="urn:i" uri="i.ttl"/>"#;
+        assert!(
+            parse_catalog(truncated)
+                .unwrap_err()
+                .contains("ends inside an element")
+        );
+        let unclosed = br#"<catalog><group><uri name="urn:i" uri="i.ttl"/></catalog>"#;
+        assert!(parse_catalog(unclosed).is_err());
+        // skipped entries count toward the bound as well as accepted ones
+        let many = format!(
+            r#"<catalog><uri name="urn:i" uri="i.ttl"/>{}</catalog>"#,
+            r#"<rewriteURI uriStartString="urn:r/" rewritePrefix="r/"/>"#
+                .repeat(MAX_CATALOG_ENTRIES)
+        );
+        assert!(
+            parse_catalog(many.as_bytes())
+                .unwrap_err()
+                .contains("more than")
+        );
+        let incomplete = format!(
+            r#"<catalog><uri name="urn:i" uri="i.ttl"/>{}</catalog>"#,
+            r#"<uri name="urn:x"/>"#.repeat(MAX_CATALOG_ENTRIES)
+        );
+        assert!(parse_catalog(incomplete.as_bytes()).is_err());
+        let at_bound = format!(
+            "<catalog>{}</catalog>",
+            r#"<group><uri name="urn:i" uri="i.ttl"/></group>"#.repeat(MAX_CATALOG_ENTRIES)
+        );
+        assert!(parse_catalog(at_bound.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn blank_nodes_keep_identity_in_triple_terms() {
+        let doc = b"_:x <urn:p> <urn:o> .\n<urn:s> <urn:q> <<( _:x <urn:p> <urn:o> )>> .\n";
+        let nt = sparkles::io::RdfSyntax::Rdf(sparkles::io::RdfFormat::NTriples);
+        let a = parse_document(doc, nt, None, "urn:g:a", "a").unwrap();
+        let b = parse_document(doc, nt, None, "urn:g:b", "b").unwrap();
+        let outer = |q: &[Quad]| match &q[0].subject {
+            NamedOrBlankNode::BlankNode(b) => b.as_str().to_string(),
+            s => panic!("{s}"),
+        };
+        let nested = |q: &[Quad]| match &q[1].object {
+            oxrdf::Term::Triple(t) => match &t.subject {
+                NamedOrBlankNode::BlankNode(b) => b.as_str().to_string(),
+                s => panic!("{s}"),
+            },
+            o => panic!("{o}"),
+        };
+        assert_eq!(outer(&a), nested(&a));
+        assert_eq!(outer(&b), nested(&b));
+        assert_ne!(nested(&a), nested(&b));
+        assert!(has_blank(&a[1]));
+        let cdt = oxrdf::Term::Literal(oxrdf::Literal::new_typed_literal(
+            "[_:x]",
+            NamedNode::new_unchecked("http://w3id.org/awslabs/neptune/SPARQL-CDTs/List"),
+        ));
+        assert!(term_has_blank(&cdt));
+        match rename_term(cdt, "t") {
+            oxrdf::Term::Literal(l) => assert!(l.value().contains("_:tx"), "{}", l.value()),
+            o => panic!("{o}"),
+        }
     }
 
     #[test]
