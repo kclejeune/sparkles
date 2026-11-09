@@ -344,16 +344,27 @@ impl Preparation {
     /// descendant query controls and wait policy but its own allowance. Charges
     /// against it never reach this preparation's counter.
     pub(crate) fn temporary_with_controls(&self, memory_bytes: u64) -> Result<Self> {
-        let mut temporary = Self::new(self.inner.control.clone(), memory_bytes)?;
-        temporary.no_wait = self.no_wait;
-        match &self.query {
-            Some(query) => temporary.with_query_controls(
-                query.cancel.clone(),
-                query.cancellation.clone(),
-                query.deadline,
-            ),
-            None => Ok(temporary),
+        self.check()?;
+        if memory_bytes < CONTEXT_BYTES {
+            return Err(memory(memory_bytes));
         }
+        // Copy every root and descendant control. Only the allowance is new.
+        let temporary = Self {
+            inner: Shared::new(Inner {
+                control: self.inner.control.clone(),
+                limit: memory_bytes,
+                used: AtomicU64::new(CONTEXT_BYTES),
+                peak: AtomicU64::new(CONTEXT_BYTES),
+                grant: None,
+                context_bytes: CONTEXT_BYTES,
+                cancellation: self.inner.cancellation.clone(),
+                original_controls: self.inner.original_controls.clone(),
+            }),
+            no_wait: self.no_wait,
+            query: self.query.clone(),
+        };
+        temporary.check()?;
+        Ok(temporary)
     }
 
     /// Options that carry this preparation's descendant query controls, if it has
@@ -1791,6 +1802,44 @@ impl PreparedView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_temporary_preparation_keeps_every_root_and_descendant_control() {
+        let root_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let composed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let descendant = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let opts = crate::sparql::QueryOptions {
+            cancellation: Some(crate::task::Cancellation::from_flags([composed.clone()])),
+            ..Default::default()
+        };
+        let root = Preparation::for_query_controls(
+            &opts,
+            None,
+            Some(root_flag.clone()),
+            opts.cancellation.clone(),
+        )
+        .unwrap();
+        let child = root
+            .with_query_controls(Some(descendant.clone()), None, None)
+            .unwrap();
+        for flag in [&composed, &root_flag, &descendant] {
+            let temporary = child.temporary_with_controls(4096).unwrap();
+            temporary.check().unwrap();
+            flag.store(true, Ordering::Relaxed);
+            assert!(matches!(child.check(), Err(Error::Cancelled)));
+            assert!(matches!(temporary.check(), Err(Error::Cancelled)));
+            flag.store(false, Ordering::Relaxed);
+        }
+        let temporary = child.temporary_with_controls(4096).unwrap();
+        assert_eq!(temporary.inner_used(), CONTEXT_BYTES);
+        let before = child.inner_used();
+        drop(temporary.reserve(1024).unwrap());
+        assert_eq!(
+            child.inner_used(),
+            before,
+            "a temporary has its own allowance"
+        );
+    }
 
     #[test]
     fn neutral_work_stop_keeps_same_byte_parent_after_descendant_cancellation() {
