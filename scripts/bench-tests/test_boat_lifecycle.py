@@ -513,6 +513,41 @@ class LifetimeExtension(unittest.TestCase):
             self.assertTrue(controller.guard_loop(self.f['release'],guard,self.intent))
         self.assertTrue((self.op/'stop-trigger.json').exists())
 
+    def test_a_clock_error_after_the_acceptance_write_is_vetoed(self):
+        self.extend(self.io(self.left-600),3600,accept=False)
+        guard=ExtendIO(self.f,self.f['now']+self.left-40,self.f['boot_now']+self.left-40);real=guard.record;clock=guard.mono;state={'fail':False}
+        def record(name,value):
+            real(name,value)
+            # Only BOOTTIME crossed the end, so the check after the write reads that clock.
+            if name.endswith('-accepted.json'):state['fail']=True;guard.t+=41
+        def mono():
+            if state['fail']:state['fail']=False;raise OSError('clock unavailable')
+            return clock()
+        guard.record=record;guard.mono=mono
+        controller.guard_deadlines(guard,self.intent)
+        self.assertEqual(controller.guard_deadlines(guard,self.intent),(self.original['boot_end'],self.original['wall_end']))
+        self.assertEqual(self.lifetime(),self.original)
+
+    def test_stop_transition_errors_still_reach_reconciliation(self):
+        def broken(*a):raise OSError('too many open files')
+        for name,setup in {'deadline freeze':lambda io:setattr(io,'freeze_extensions',broken),
+                           'deadline trigger':lambda io:setattr(io,'trigger',broken),
+                           'explicit stop freeze':lambda io:(setattr(io,'freeze_extensions',broken),io.record('stop-trigger.json',{}))}.items():
+            with self.subTest(name):
+                trigger=self.op/'stop-trigger.json'
+                if trigger.exists():trigger.unlink()
+                io=self.io(self.left+60 if 'deadline' in name else 100);setup(io);seen=[]
+                with patch.object(controller,'reconcile_stop',side_effect=lambda r,io:seen.append(1) or True):
+                    self.assertTrue(controller.guard_loop(self.f['release'],io,self.intent))
+                self.assertEqual(seen,[1])
+        # A failed thaw after a valid extension keeps the guard running to the new end.
+        if (self.op/'stop-trigger.json').exists():(self.op/'stop-trigger.json').unlink()
+        receipt=self.extend(self.io(self.left-600),3600)
+        io=self.io(self.left+60);io.thaw_extensions=broken;seen=[]
+        with patch.object(controller,'reconcile_stop',side_effect=lambda r,io:seen.append(io.mono()) or True):
+            self.assertTrue(controller.guard_loop(self.f['release'],io,self.intent))
+        self.assertGreaterEqual(seen[0],receipt['boot_end'])
+
     def test_acceptances_follow_each_other_in_order(self):
         self.extend(self.io(self.left-600),3600);second=self.extend(self.io(self.left-300),10500)
         path=self.op/'lifetime-extension-0001-accepted.json';first=json.loads(path.read_text())

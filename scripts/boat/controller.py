@@ -389,6 +389,12 @@ def guard_deadlines(io,intent):
     lost or damaged evidence can only end the lifetime sooner.
     """
     original=(intent['deadline_mono'],intent['deadline_wall'])
+    try:return _guard_deadlines(io,intent,original)
+    except Exception:
+        base=getattr(io,'guard_base',None)
+        return original if base is None else base
+
+def _guard_deadlines(io,intent,original):
     # Once established, the conservative base is kept for the guard's life, so
     # later loss of the handoff receipts cannot restore the intent's later end.
     base=getattr(io,'guard_base',None)
@@ -413,11 +419,14 @@ def guard_deadlines(io,intent):
             now_wall,now_boot=io.wall(),io.mono()
             if not(now_wall+lifetime.CLOSURE_RESERVE<wall and now_boot+lifetime.CLOSURE_RESERVE<boot):return None
             row=lifetime.acceptance_record(number,e,identity,now_wall,now_boot)
-            # An error after publication, such as a failed directory fsync, leaves
-            # timely completion unknown, so it is vetoed like a late write.
-            try:io.record('lifetime-extension-%04d-accepted.json'%number,row);published=True
-            except Exception:published=False
-            if not published or not(io.wall()<wall and io.mono()<boot):
+            # Any error in the write or in the check after it, such as a failed
+            # directory fsync, leaves timely completion unknown, so it is vetoed
+            # like a late write.
+            try:
+                io.record('lifetime-extension-%04d-accepted.json'%number,row)
+                timely=io.wall()<wall and io.mono()<boot
+            except Exception:timely=False
+            if not timely:
                 vetoed.add(number)
                 try:io.record('lifetime-extension-%04d-vetoed.json'%number,{'sequence':number,'receipt_sha256':row['receipt_sha256'],'observed_wall':io.wall(),'observed_boottime':io.mono()})
                 except Exception:pass
@@ -433,12 +442,20 @@ def guard_loop(r,io,intent):
         if not(io.mono()<deadline_mono and io.wall()<deadline_wall):
             # Stop only while holding the extension lock, after reading the receipts
             # once more, so that no act publishes an extension after this decision.
-            if io.freeze_extensions():
+            # A failure in any of these steps still leads to the stop below.
+            try:frozen=io.freeze_extensions()
+            except Exception:frozen=False
+            if frozen:
                 deadline_mono,deadline_wall=guard_deadlines(io,intent)
-                if io.mono()<deadline_mono and io.wall()<deadline_wall:
-                    io.thaw_extensions();continue
+                try:extended=io.mono()<deadline_mono and io.wall()<deadline_wall
+                except Exception:extended=False
+                if extended:
+                    try:io.thaw_extensions()
+                    except Exception:pass
+                    continue
             # The stopping state is published before the stop, so admission refuses it.
-            io.trigger()
+            try:io.trigger()
+            except Exception:pass
             break
         if io.exists('no-ready-confirmed.json'):
             check=io.read('no-ready-confirmed.json');stopped(check['safe_info'])
@@ -447,7 +464,8 @@ def guard_loop(r,io,intent):
             io.record('closed-no-resume.json',{'no_resume_intent':True,'guard_may_exit':True});return True
         if io.exists('stop-trigger.json'):
             # An explicit stop also waits out and then excludes any extension act.
-            io.freeze_extensions()
+            try:io.freeze_extensions()
+            except Exception:pass
             if not io.exists('startup-closed.json'):
                 if min(deadline_mono-io.mono(),deadline_wall-io.wall())<=200:break
                 try:

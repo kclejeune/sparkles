@@ -16,9 +16,9 @@
       "sha256": "e25e6f2070a71461366145e3a4f126e5f46a7bfa97334ed56e074622eec18b08"
     },
     "controller.py": {
-      "bytes": 50267,
+      "bytes": 50900,
       "mode": 420,
-      "sha256": "7aee8d836c3fa9ad59473aec25d28e02a1c93198aa45a1a18d76f0f8df9e01c9"
+      "sha256": "292a5705de9482a088fdceab5e94d1d6efaa08d4fd7899ee06b9ff6af3658090"
     },
     "controls.py": {
       "bytes": 55951,
