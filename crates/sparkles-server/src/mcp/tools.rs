@@ -1298,10 +1298,8 @@ impl Tools<'_> {
         // belongs to the Ask outcome migration.
         let whole = full
             .then(|| {
-                let j = sparql::results::sparkles_json_with_commit(&r, Some(max_rows), snap.commit)
-                    .map_err(|e| ctx.engine(e))?;
-                serde_json::from_str::<Value>(j.as_str())
-                    .map_err(|e| ctx.engine(sparkles::Error::invalid(e.to_string())))
+                sparql::results::sparkles_json_application_value(&r, Some(max_rows), snap.commit)
+                    .map_err(|e| ctx.engine(e))
             })
             .transpose()?;
         let text = match r.kind {

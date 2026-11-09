@@ -2068,6 +2068,34 @@ pub fn sparkles_json_with_commit(
     sparkles_document(r, send, Some(commit))
 }
 
+/// The same document with an explicit commit as an independent application value.
+/// It holds no query credit, as `sparkles_json` did before results became retained
+/// owners. Use it only where a consumer still needs a `serde_json::Value`. It is
+/// built directly from the document's serializer on a grown stack, so nesting
+/// that the engine accepts is not cut off by a parser recursion limit.
+pub fn sparkles_json_application_value(
+    r: &QueryResult,
+    send: Option<usize>,
+    commit: u64,
+) -> Result<J> {
+    let failure = RefCell::new(None);
+    let value = super::depth::with_stack(crate::nesting::MAX_TRIPLE_TERMS, || {
+        serde_json::to_value(NativeJson {
+            r,
+            n: send.map_or(r.len(), |n| n.min(r.len())),
+            commit: Some(commit),
+            metadata: None,
+            started: Instant::now(),
+            sent: &Cell::new(0),
+            failure: &failure,
+        })
+    });
+    if let Some(error) = failure.into_inner() {
+        return Err(error);
+    }
+    value.map_err(|e| Error::invalid(e.to_string()))
+}
+
 fn sparkles_document(
     r: &QueryResult,
     send: Option<usize>,
@@ -2089,6 +2117,59 @@ fn sparkles_document(
         return Err(error);
     }
     document
+}
+
+#[cfg(test)]
+mod application_value_tests {
+    use super::*;
+
+    fn nested(depth: usize) -> QueryResult {
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut term = "<urn:a>".to_string();
+        for _ in 0..depth {
+            term = format!("<<( <urn:s> <urn:p> {term} )>>");
+        }
+        let data = format!("<urn:x> <urn:q> {term} .");
+        store
+            .load(&[crate::io::Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        crate::sparql::query(
+            store.snapshot(),
+            "SELECT ?t WHERE { ?x <urn:q> ?t }",
+            &Default::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn application_value_matches_the_retained_document() {
+        let r = nested(2);
+        let value = sparkles_json_application_value(&r, None, 7).unwrap();
+        let document = sparkles_json_with_commit(&r, None, 7).unwrap();
+        let parsed: J = serde_json::from_str(document.as_str()).unwrap();
+        let strip = |mut v: J| {
+            v["meta"]
+                .as_object_mut()
+                .unwrap()
+                .retain(|key, _| key != "timing" && key != "elapsedMs");
+            v
+        };
+        assert_eq!(strip(value), strip(parsed));
+    }
+
+    #[test]
+    fn deep_triple_terms_build_an_application_value_past_the_parser_limit() {
+        let r = nested(64);
+        let document = sparkles_json_with_commit(&r, None, 7).unwrap();
+        // A parser stops at its recursion limit for this accepted nesting.
+        assert!(serde_json::from_str::<J>(document.as_str()).is_err());
+        let value = sparkles_json_application_value(&r, None, 7).unwrap();
+        assert_eq!(value["meta"]["commit"], 7);
+    }
 }
 
 #[cfg(test)]
