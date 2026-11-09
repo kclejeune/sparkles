@@ -93,11 +93,41 @@ test('stops watching from the entity frame', async ({ page, request }) => {
   await expect(current).toContainText('Entity');
   await current.getByRole('button', { name: 'Stop watching' }).click();
   await expect(current).toBeHidden();
-  await dialog.getByRole('button', { name: 'Close' }).click();
+  await dialog.getByRole('button', { name: 'Done' }).click();
   await expect(page.getByRole('button', { name: 'Watch', exact: true })).toHaveAttribute(
     'aria-pressed',
     'false',
   );
+});
+
+test('a slow answer for one watch never shows under another', async ({ page, request }) => {
+  const branch = 'watch-race';
+  await newBranch(request, branch);
+  const ids: string[] = [];
+  for (const entity of [`${UNI}Professor`, `${UNI}Student`]) {
+    const r = await request.post('/$/watches', { data: { dataset: 'uni', branch, entity } });
+    ids.push((await r.json()).id);
+  }
+  for (const entity of ['Professor', 'Student']) {
+    const r = await request.post(`/uni@${branch}/update`, {
+      headers: { 'Content-Type': 'application/sparql-update' },
+      data: `INSERT DATA { <${UNI}${entity}> <http://www.w3.org/2000/01/rdf-schema#comment> "c" }`,
+    });
+    expect(r.ok(), await r.text()).toBe(true);
+  }
+  // the first watch's matches answer only after the second's
+  await page.route(`**/$/watches/${ids[0]}/matches*`, async (route) => {
+    await new Promise((r) => setTimeout(r, 1500));
+    await route.continue();
+  });
+  await page.goto('/ui/watches');
+  await page.getByRole('button', { name: `${UNI}Professor` }).click();
+  await page.getByRole('button', { name: `${UNI}Student` }).click();
+  const commits = page.getByRole('list', { name: 'Matched commits' });
+  await expect(commits.getByRole('link', { name: `${UNI}Student` })).toBeVisible();
+  await page.waitForTimeout(2000);
+  await expect(commits.getByRole('link', { name: `${UNI}Professor` })).toHaveCount(0);
+  await expect(commits.getByRole('listitem')).toHaveCount(1);
 });
 
 test('the Watches page fits a phone', async ({ page, request }) => {

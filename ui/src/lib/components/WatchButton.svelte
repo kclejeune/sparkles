@@ -171,7 +171,7 @@
     {#if error}<p class="error" role="alert">{error}</p>{/if}
   </div>
   {#snippet actions()}
-    <button class="btn" onclick={() => (open = false)}>Close</button>
+    <button class="btn" onclick={() => (open = false)}>Done</button>
     <button class="btn primary" disabled={busy || parsed === 'invalid'} onclick={watch}
       >Watch</button
     >

@@ -44,15 +44,28 @@
     }
   }
 
+  /** Counts the loads of matches, so only the latest one shows. */
+  let generation = 0;
+  let paging = $state(false);
+
   async function show(w: Watch, before?: number) {
-    openId = w.id;
+    const mine = ++generation;
+    if (!before) {
+      openId = w.id;
+      matches = [];
+      more = false;
+    }
     matchesError = null;
+    paging = true;
     try {
       const page = await watchMatches(w.id, { before, limit: 50 });
+      if (mine !== generation) return;
       matches = before ? [...matches, ...page.matches] : page.matches;
       more = page.more;
     } catch (e) {
-      matchesError = errorMessage(e);
+      if (mine === generation) matchesError = errorMessage(e);
+    } finally {
+      if (mine === generation) paging = false;
     }
   }
 
@@ -171,6 +184,8 @@
                 <td colspan="6">
                   {#if matchesError}
                     <div class="error-box">{matchesError}</div>
+                  {:else if !matches.length && paging}
+                    <p class="faint">Loading…</p>
                   {:else if !matches.length}
                     <p class="faint">No commit has changed it since you started watching.</p>
                   {:else}
@@ -202,8 +217,10 @@
                       {/each}
                     </ol>
                     {#if more}
-                      <button class="btn sm" onclick={() => show(w, matches.at(-1)?.commit)}
-                        >Older commits</button
+                      <button
+                        class="btn sm"
+                        disabled={paging}
+                        onclick={() => show(w, matches.at(-1)?.commit)}>Older commits</button
                       >
                     {/if}
                   {/if}

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 /// The event type of a delivery to a watch's owner.
 pub const EVENT: &str = crate::notify::config::WATCH_EVENT;
-/// The matched commits one batch holds; later ones are counted.
+/// The matched commits one batch holds; later ones are not mailed.
 const MAX_REFS: usize = 1_000;
 /// The commits one watch lists in a message; the rest are counted.
 const MAX_COMMITS: usize = 20;
@@ -37,8 +37,6 @@ pub struct Batch {
     pub owner: Owner,
     /// (watch id, commit), in the order they were matched
     pub refs: Vec<(String, u64)>,
-    /// matches beyond [`MAX_REFS`]
-    pub more: usize,
     due: Instant,
 }
 
@@ -89,13 +87,12 @@ impl Batches {
             let b = open.entry(key).or_insert_with(|| Batch {
                 owner,
                 refs: Vec::new(),
-                more: 0,
                 due: Instant::now() + window,
             });
+            // a match beyond the bound is shown in the UI and not mailed, since a count
+            // without its watch could not be authorized again
             if b.refs.len() < MAX_REFS {
                 b.refs.push((id, commit));
-            } else {
-                b.more += 1;
             }
         }
     }
@@ -215,10 +212,10 @@ pub(crate) fn build(
         .snapshot(st)
         .map_err(|_| "the watches file is refused".to_string())?;
     let mine: Vec<&Watch> = watches.iter().filter(|w| w.owner.same(&b.owner)).collect();
-    // the owner as last vouched for, which every watch of the owner holds
+    // the owner as its provider or proxy last vouched for it
     let owner = mine
         .first()
-        .map(|w| w.owner.clone())
+        .map(|w| st.watches.vouched_owner(&w.owner))
         .ok_or("the owner has no watches left")?;
     let to = address(st, &owner, cfg, now)?;
     let mut by_watch: Vec<(&str, Vec<u64>)> = Vec::new();
@@ -304,7 +301,7 @@ pub(crate) fn build(
         title,
         summary,
         link: Some("/ui/watches".into()),
-        data: json!({ "watches": items, "more": b.more }),
+        data: json!({ "watches": items }),
     };
     let mut env = crate::notify::envelope(cfg, &ev, now);
     env["id"] = json!(id);

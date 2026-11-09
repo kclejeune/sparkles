@@ -679,6 +679,10 @@ impl NotifySettings {
     /// key that matches it, each once, in name order.
     pub fn route(&self, event: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
+        // only the owners of watches are told of it, never the channels of a route
+        if event == WATCH_EVENT {
+            return out;
+        }
         for (key, chans) in &self.routes {
             let hit = key == "*"
                 || key == event

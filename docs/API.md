@@ -14546,7 +14546,8 @@ routes cannot then name it. The routes never carry a watch, and `entity.changed`
 window of `batchSecs`, and at its close one `entity.changed` message per channel goes to
 the owner's verified address, listing each watch with its entity, scope, branch, graph
 and up to 20 commits with their time, author, message and members. The owner's own
-commits are listed in the UI but not mailed.
+commits are listed in the UI but not mailed, and so are the matches of one window past
+the first 1,000.
 
 The address of a configured user is the `email` member of its `[[users]]` entry. The
 address of an OIDC account is the `email` claim of its sign-in when `email_verified` is

@@ -160,11 +160,17 @@ pub(crate) enum Place {
 }
 
 /// Find branch `bid`, last seen in dataset `dataset`. A dataset keeps its branches'
-/// ids through a rename, so every dataset of the catalog is searched; the branch is
-/// gone only when every one of them is open and none holds it, so a deletion or a
-/// rename that is still draining, and may yet fail, removes no watch.
+/// ids through a rename, so every dataset of the catalog is searched. The branch is
+/// gone only when the server is past its startup, every declared dataset is open,
+/// none is being deleted or renamed and none holds the branch, so a deletion or a
+/// rename that is still draining, and a dataset that has not opened or failed to,
+/// removes no watch.
 pub(crate) fn locate(st: &AppState, dataset: &str, bid: uuid::Uuid) -> Place {
-    let mut unsure = st.any_leaving();
+    // the catalog lists open datasets only: one that is still opening, held back by
+    // startup or kept closed after a failed open may hold the branch
+    let mut unsure = st.any_leaving()
+        || st.phase() == crate::obs::Phase::Starting
+        || !st.unavailable_datasets().is_empty();
     let mut names: Vec<String> = st.catalog.list().into_iter().map(|i| i.name).collect();
     // the last known dataset first, which holds the branch unless it was renamed
     names.sort_by_key(|n| n != dataset);
@@ -952,7 +958,8 @@ fn owner_principal(st: &AppState, owner: &Owner) -> Option<crate::auth::Principa
     #[cfg(feature = "auth")]
     {
         use crate::auth::{Access, Principal, PrincipalInfo, Scheme};
-        let who = owner.identity();
+        // the groups its provider or proxy last asserted, saved on the watch or not
+        let who = st.watches.vouched_owner(owner).identity();
         let grants = _auth.policy().identity_grants(&who)?;
         Some(
             Principal::new(owner.kind, &owner.name, Scheme::Session, Access::of(grants)).with_info(

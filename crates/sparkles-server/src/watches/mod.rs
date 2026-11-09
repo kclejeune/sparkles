@@ -286,6 +286,15 @@ struct Body {
 /// Every watch, the follower cursors by branch id, and the version they belong to.
 pub(crate) type Snapshot = (Vec<Watch>, BTreeMap<uuid::Uuid, u64>, u64);
 
+/// What a provider or proxy last vouched for about one owner.
+struct Vouch {
+    owner: Owner,
+    /// when it was last recorded on the owner's watches
+    written: Option<Instant>,
+    /// it changed since, or recording it failed
+    pending: bool,
+}
+
 /// The watches of the server (`AppState::watches`).
 #[derive(Default)]
 pub struct Watches {
@@ -293,9 +302,13 @@ pub struct Watches {
     /// what providers and proxies last vouched for each OIDC or proxy identity, by
     /// owner key, and when it was last written to the owner's watches; the lock is
     /// taken before `inner`, never after
-    vouched: Mutex<std::collections::HashMap<String, (Owner, Option<Instant>)>>,
+    vouched: Mutex<std::collections::HashMap<String, Vouch>>,
     /// the matches that wait to be mailed to their owners
     pub(crate) batches: deliver::Batches,
+    /// runs in `create` after the owner's vouched word is read (tests)
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) before_create: Mutex<Option<Box<dyn FnMut() + Send>>>,
     /// wakes the follower when the watches change
     wake: Condvar,
     /// counts every change of the set of watches, so the follower knows to rebuild
@@ -453,8 +466,10 @@ impl Watches {
 
     /// A provider or proxy vouched for `who` (see [`Owner::vouch`]): keep its word and,
     /// when the owner has watches, record it on them, at once when the groups or the
-    /// address changed and otherwise at most every [`VOUCH_SAVE`]. Changed groups make
-    /// the follower authorize the owner again.
+    /// address changed or an earlier record failed, and otherwise at most every
+    /// [`VOUCH_SAVE`]. The word kept in memory decides matching and mail at once, saved
+    /// or not (see [`Watches::vouched_owner`]). Changed groups make the follower
+    /// authorize the owner again.
     pub fn vouched(
         &self,
         st: &AppState,
@@ -469,27 +484,40 @@ impl Watches {
         let key = Owner::named(who.kind, &who.name).key();
         let mut m = self.vouched.lock();
         if !m.contains_key(&key) && m.len() >= VOUCHED_MAX {
-            m.clear();
+            // keep the words that are not on the watches yet
+            m.retain(|_, v| v.pending);
+            if m.len() >= VOUCHED_MAX {
+                m.clear();
+            }
         }
-        let (o, written) = m.entry(key).or_insert_with(|| {
+        let v = m.entry(key).or_insert_with(|| {
             // the owner's watches hold what was vouched before the server started
             let mut g = self.inner.lock();
-            let o = g
+            let owner = g
                 .body(st)
                 .ok()
                 .and_then(|b| b.watches.iter().find(|w| w.owner.same_identity(who)))
                 .map(|w| w.owner.clone())
                 .unwrap_or_else(|| Owner::named(who.kind, &who.name));
-            (o, None)
+            Vouch {
+                owner,
+                written: None,
+                pending: false,
+            }
         });
-        let changed = o.vouch(groups.then_some(&who.groups[..]), email, &now_text(now));
-        if !changed && written.is_some_and(|t| t.elapsed() < VOUCH_SAVE) {
+        if v.owner
+            .vouch(groups.then_some(&who.groups[..]), email, &now_text(now))
+        {
+            v.pending = true;
+        }
+        if !v.pending && v.written.is_some_and(|t| t.elapsed() < VOUCH_SAVE) {
             return;
         }
-        let o = o.clone();
+        let o = v.owner.clone();
         let mut g = self.inner.lock();
         let Ok(b) = g.body(st) else { return };
         if !b.watches.iter().any(|w| w.owner.same(&o)) {
+            v.pending = false;
             return;
         }
         let groups_changed = b
@@ -504,26 +532,30 @@ impl Watches {
         });
         match r {
             Ok(()) => {
-                if let Some((_, t)) = m.get_mut(&o.key()) {
-                    *t = Some(Instant::now());
-                }
+                v.written = Some(Instant::now());
+                v.pending = false;
                 if groups_changed {
                     self.bump(&g);
-                    drop(g);
-                    self.changed();
                 }
             }
             Err(e) => {
+                // matching and mail already follow the word kept in memory; the next
+                // vouching tries to record it again
                 tracing::warn!(target: "sparkles::watches", "cannot record the groups of {}: {e:?}", o.key());
+                self.bump(&g);
             }
         }
+        drop(g);
+        drop(m);
+        self.changed();
     }
 
-    /// `owner` with what its provider or proxy last vouched for since the start.
+    /// `owner` with what its provider or proxy last vouched for since the start, which
+    /// decides its matches and mail even when it could not be saved on its watches.
     pub(crate) fn vouched_owner(&self, owner: &Owner) -> Owner {
         let mut o = owner.clone();
-        if let Some((v, _)) = self.vouched.lock().get(&owner.key()) {
-            o.take_vouched(v);
+        if let Some(v) = self.vouched.lock().get(&owner.key()) {
+            o.take_vouched(&v.owner);
         }
         o
     }
@@ -536,12 +568,14 @@ impl Watches {
         n: NewWatch,
         now: DateTime<Utc>,
     ) -> Result<(Watch, bool), Refusal> {
-        // the provider's latest word on the owner, when it spoke since the start
-        let vouched = self
-            .vouched
-            .lock()
-            .get(&owner.key())
-            .map(|(o, _)| o.clone());
+        // the provider's latest word on the owner, when it spoke since the start; the
+        // lock is held until the watch is saved, so a vouching cannot come between
+        let m = self.vouched.lock();
+        let vouched = m.get(&owner.key()).map(|v| v.owner.clone());
+        #[cfg(test)]
+        if let Some(f) = self.before_create.lock().as_mut() {
+            f();
+        }
         let mut g = self.inner.lock();
         let out = g.change(st, |b| {
             let mut owner = owner.clone();
@@ -599,6 +633,7 @@ impl Watches {
             self.bump(&g);
         }
         drop(g);
+        drop(m);
         if out.1 {
             self.changed();
         }

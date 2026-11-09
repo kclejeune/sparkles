@@ -1109,6 +1109,118 @@ async fn groups_a_proxy_takes_away_end_mail_and_matches() {
     );
 }
 
+/// Review finding email-ui-r1 1: a dataset that has not opened yet may hold the branch.
+#[tokio::test]
+async fn a_watch_is_kept_while_a_dataset_has_not_opened() {
+    let mut s = server();
+    let w = s
+        .watch(
+            "bob",
+            json!({"dataset": "ds", "graph": G, "entity": "urn:a"}),
+        )
+        .await;
+    let id = w["id"].as_str().unwrap().to_string();
+    assert!(s.st.delete("ds").unwrap());
+    s.st.hold_for_startup("late", DbType::Persistent);
+    s.follow().await;
+    let kept = |s: &Srv| {
+        s.st.watches
+            .snapshot(&s.st)
+            .unwrap()
+            .0
+            .iter()
+            .any(|x| x.id == id)
+    };
+    assert!(kept(&s), "removed while a dataset had not opened");
+    s.st.release_startup();
+    s.follow().await;
+    assert!(!kept(&s));
+}
+
+/// Review finding email-ui-r1 2: a vouching that comes while a watch is made reaches the
+/// new watch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_vouching_during_creation_reaches_the_new_watch() {
+    let s = server();
+    s.proxied("/$/ping", "pam", "staff", Some("pam@example.org"))
+        .await;
+    let st = s.st.clone();
+    let handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+    let h = handle.clone();
+    *s.st.watches.before_create.lock() = Some(Box::new(move || {
+        let st = st.clone();
+        *h.lock() = Some(std::thread::spawn(move || {
+            let who = Identity {
+                kind: Kind::Proxy,
+                name: "pam".into(),
+                groups: vec!["others".into()],
+                display_name: None,
+            };
+            st.watches
+                .vouched(&st, &who, true, &EmailClaim::Unverified, Utc::now());
+        }));
+        std::thread::sleep(Duration::from_millis(200));
+    }));
+    let n = new_watch(&s, G, "urn:a");
+    let st = s.st.clone();
+    let (w, _) = tokio::task::spawn_blocking(move || {
+        st.watches
+            .create(&st, &Owner::named(Kind::Proxy, "pam"), n, Utc::now())
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    *s.st.watches.before_create.lock() = None;
+    let t = handle.lock().take().unwrap();
+    tokio::task::spawn_blocking(move || t.join().unwrap())
+        .await
+        .unwrap();
+    let (ws, _, _) = s.st.watches.snapshot(&s.st).unwrap();
+    let saved = ws.iter().find(|x| x.id == w.id).unwrap();
+    assert_eq!(saved.owner.groups, ["others"]);
+    assert_eq!(saved.owner.email, None);
+}
+
+/// Review finding email-ui-r1 3: a revocation that cannot be saved still ends mail at
+/// once, and the next vouching saves it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_revocation_that_cannot_be_saved_still_ends_mail() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut s = server();
+    mailing(&s, 9).await;
+    s.proxied("/$/ping", "pam", "staff", Some("pam@example.org"))
+        .await;
+    s.st.watches
+        .create(
+            &s.st,
+            &Owner::named(Kind::Proxy, "pam"),
+            new_watch(&s, G, "urn:a"),
+            Utc::now(),
+        )
+        .unwrap();
+    s.update("alice", "main", &label("urn:a", "A")).await;
+    s.follow().await;
+    let b = s.st.watches.batches.waiting().pop().unwrap();
+    assert!(build(&s, &b, Utc::now()).is_ok());
+    let dir = s.st.data_dir.clone();
+    let mode = |m| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o500);
+    s.proxied("/$/ping", "pam", "others", Some("pam@example.org"))
+        .await;
+    let e = build(&s, &b, Utc::now());
+    mode(0o700);
+    assert!(e.is_err(), "mailed under groups that were taken away");
+    let file = || std::fs::read_to_string(s.st.data_dir.join(FILE)).unwrap();
+    assert!(!file().contains("others"));
+    s.proxied("/$/ping", "pam", "others", Some("pam@example.org"))
+        .await;
+    assert!(
+        file().contains("others"),
+        "the revocation was not saved again"
+    );
+}
+
 #[test]
 fn routes_never_carry_watch_mail() {
     let check = |v: J| crate::notify::config::parse(&v).and_then(|c| c.validate());
@@ -1122,6 +1234,12 @@ fn routes_never_carry_watch_mail() {
                 .unwrap_err();
         assert!(e.contains("owners of watches"), "{e}");
     }
+    let all = crate::notify::config::parse(&json!({
+        "channels": {"w": ch(json!(["a@example.org"]))}, "routes": {"*": ["w"]}
+    }))
+    .unwrap();
+    assert_eq!(all.route("backup.failed"), ["w"]);
+    assert!(all.route("entity.changed").is_empty());
     let plain =
         json!({"type": "email", "host": "mail.example.org", "from": "s@example.org", "to": []});
     assert!(check(json!({"channels": {"p": plain}})).is_err());
