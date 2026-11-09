@@ -53,6 +53,11 @@ impl Preparation {
         self.inner.used.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_used_counter(&self) -> &AtomicU64 {
+        &self.inner.used
+    }
+
     /// The allowance not yet reserved. Other clones may reserve it at any moment, so
     /// this only sizes work; storage still needs a [`reserve`](Self::reserve).
     pub(crate) fn room(&self) -> u64 {
@@ -1192,40 +1197,167 @@ impl Exemptions {
 ///     Arc::clone(view.snapshot())
 /// }
 /// ```
+#[derive(Clone)]
 pub struct PreparedView {
+    inner: Arc<PreparedInner>,
+}
+
+// Payloads precede their final credit owner. Shallow handles keep the actual
+// policy/mask/snapshot allocation and its original Preparation alive together.
+struct PreparedInner {
     access: Arc<GraphAccess>,
     snapshot: Arc<Snapshot>,
     _held: Reservation,
 }
 
 impl PreparedView {
+    /// The existing fixed header admission covers both actual Arc backings.
+    /// This is reserved before GraphAccess or PreparedInner is allocated.
+    pub(crate) fn header_bytes() -> Result<u64> {
+        fn backing<T>() -> Result<u64> {
+            let counters = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>();
+            let (layout, _) = counters
+                .extend(std::alloc::Layout::new::<T>())
+                .map_err(|_| Error::invalid("prepared backing layout overflow"))?;
+            u64::try_from(layout.pad_to_align().size())
+                .map_err(|_| Error::invalid("prepared backing size overflow"))
+        }
+        backing::<PreparedInner>()?
+            .checked_add(backing::<GraphAccess>()?)
+            .map(|bytes| bytes.max(1024))
+            .ok_or_else(|| Error::invalid("prepared backing headers overflow"))
+    }
+
     pub(crate) fn new(
         access: Arc<GraphAccess>,
         snapshot: Arc<Snapshot>,
         held: Reservation,
-    ) -> Self {
-        Self {
-            access,
-            snapshot,
-            _held: held,
+        preparation: &Preparation,
+    ) -> Result<Self> {
+        preparation.check()?;
+        if !Arc::ptr_eq(&preparation.inner, &held.preparation.inner) {
+            return Err(Error::invalid(
+                "prepared view belongs to another preparation",
+            ));
         }
+        if held.bytes() < Self::header_bytes()? {
+            return Err(Error::invalid(
+                "prepared view lacks its admitted backing headers",
+            ));
+        }
+        Ok(Self {
+            inner: Arc::new(PreparedInner {
+                access,
+                snapshot,
+                _held: held,
+            }),
+        })
+    }
+
+    /// Retain this genuine prepared policy and physical source as one opaque
+    /// shallow owner. New result copies still need their receiving admission.
+    pub fn read_source(&self) -> crate::store::BoundReadSource {
+        crate::store::BoundReadSource::prepared(self.clone())
     }
 
     /// Bound policy to apply while consuming the physical snapshot.
     pub fn access(&self) -> &GraphAccess {
-        &self.access
+        &self.inner.access
     }
 
     /// Physical triple mask. Apply `access()` too; graph restrictions are not
-    /// enforced by this raw snapshot alone.
+    /// enforced by this raw snapshot alone. The opaque read-source factory is
+    /// the ownership boundary for checked consumers retaining this preparation.
     pub fn snapshot(&self) -> &Snapshot {
-        &self.snapshot
+        &self.inner.snapshot
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_read_source_keeps_real_prepared_backing_and_credit_until_last_clone() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let snapshot = store.snapshot();
+        let snapshot_owner = Arc::downgrade(&snapshot);
+        let preparation = Preparation::new(Control::none(), 1 << 20).unwrap();
+        let before = preparation.inner_used();
+        let view = GraphAccess::all()
+            .masked_controlled(&snapshot, &preparation)
+            .unwrap();
+        let backing = Arc::downgrade(&view.inner);
+        let charged = preparation.inner_used();
+        assert!(charged >= before + PreparedView::header_bytes().unwrap());
+        let pressure = preparation.reserve(preparation.room()).unwrap();
+        let source = view.read_source();
+        let last = source.clone();
+        drop(store);
+        drop(snapshot);
+        drop(view);
+        drop(source);
+        assert!(backing.upgrade().is_some());
+        assert!(snapshot_owner.upgrade().is_some());
+        assert!(matches!(
+            preparation.reserve(1),
+            Err(Error::BudgetExceeded(_))
+        ));
+        drop(pressure);
+        assert_eq!(preparation.inner_used(), charged);
+        drop(last);
+        assert!(backing.upgrade().is_none());
+        assert!(snapshot_owner.upgrade().is_none());
+        assert_eq!(preparation.inner_used(), before);
+    }
+
+    #[test]
+    fn prepared_backing_refuses_foreign_credit_and_cancellation_before_allocation() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let snapshot = store.snapshot();
+        drop(store);
+        let access = Arc::new(GraphAccess::all());
+        let expected = Preparation::new(Control::none(), 8192).unwrap();
+        let foreign = Preparation::new(Control::none(), 8192).unwrap();
+        let foreign_before = foreign.inner_used();
+        let held = foreign
+            .reserve(PreparedView::header_bytes().unwrap())
+            .unwrap();
+        assert!(PreparedView::new(access.clone(), snapshot.clone(), held, &expected).is_err());
+        assert_eq!(foreign.inner_used(), foreign_before);
+        assert_eq!(Arc::strong_count(&access), 1);
+        assert_eq!(Arc::strong_count(&snapshot), 1);
+        let control = Control::none();
+        let cancelled = Preparation::new(control.clone(), 8192).unwrap();
+        let before = cancelled.inner_used();
+        let held = cancelled
+            .reserve(PreparedView::header_bytes().unwrap())
+            .unwrap();
+        control.cancel.cancel();
+        assert!(matches!(
+            PreparedView::new(access.clone(), snapshot.clone(), held, &cancelled),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(cancelled.inner_used(), before);
+        assert_eq!(Arc::strong_count(&access), 1);
+        assert_eq!(Arc::strong_count(&snapshot), 1);
+    }
+
+    #[test]
+    fn prepared_backing_is_admitted_before_policy_or_source_ownership() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let snapshot = store.snapshot();
+        let limit = CONTEXT_BYTES + PreparedView::header_bytes().unwrap() - 1;
+        let preparation = Preparation::new(Control::none(), limit).unwrap();
+        let before = preparation.inner_used();
+        let owners = Arc::strong_count(&snapshot);
+        assert!(matches!(
+            GraphAccess::all().masked_controlled(&snapshot, &preparation),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(preparation.inner_used(), before);
+        assert_eq!(Arc::strong_count(&snapshot), owners);
+    }
 
     #[test]
     fn temporary_growth_releases_and_live_owners_share_one_allowance() {

@@ -62,6 +62,7 @@ fn ranges(
                     base: identity.value.commit,
                     folding: identity.value.origin == "baseline",
                     strict_from: identity.value.wal_strict_from,
+                    configuration: identity.value.configuration,
                 };
                 let end = generation_end(root, id, current.number, head, &generation, budget)?;
                 Some((generation.base.seq, end))

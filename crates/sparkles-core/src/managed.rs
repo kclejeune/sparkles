@@ -58,11 +58,11 @@ pub const READER: u32 = 6;
 /// `protections`. Format 1, which has none, is read as a registry whose graphs have no
 /// protection nonces, so they take no typed writes until their owner protects them
 /// again.
-pub const FORMAT: u32 = 2;
+pub const FORMAT: u32 = 3;
 
 /// Whether this build reads the `managed.json` format `f`.
 fn reads_format(f: u64) -> bool {
-    f == 1 || f == u64::from(FORMAT)
+    (1..=u64::from(FORMAT)).contains(&f)
 }
 
 /// The most graphs one owner may manage.
@@ -275,6 +275,11 @@ struct ManagedFile<'a> {
     format: u32,
     revision: u64,
     owners: BTreeMap<&'static str, &'a OwnerEntry>,
+    #[serde(
+        rename = "configurationHistory",
+        skip_serializing_if = "Option::is_none"
+    )]
+    configuration_history: Option<&'a crate::store::managed_history::Root>,
 }
 
 /// Why writes are refused: a stable code and the reason.
@@ -454,6 +459,9 @@ pub(crate) struct Installed {
     by_key: FxHashMap<Box<[u8]>, OwnerKind>,
     /// each owner's settings file, as recorded
     pub settings: BTreeMap<OwnerKind, Arc<[u8]>>,
+    /// Present only after a real configuration-history activation/publication.
+    pub configuration_history: Option<crate::store::managed_history::Root>,
+    pub history_memory: Option<Arc<crate::store::managed_history::MemoryHistory>>,
 }
 
 impl Installed {
@@ -478,6 +486,8 @@ impl Installed {
             graphs,
             by_key,
             settings,
+            configuration_history: None,
+            history_memory: None,
         })
     }
 
@@ -503,17 +513,60 @@ impl Installed {
 
     /// The bytes of `managed.json` for this registry.
     pub(crate) fn file_bytes(&self) -> Vec<u8> {
-        file_bytes(&self.graphs)
+        file_bytes_with_history(&self.graphs, self.configuration_history.as_ref())
     }
 }
 
+#[cfg(test)]
 pub(crate) fn file_bytes(graphs: &ManagedGraphs) -> Vec<u8> {
-    let file = ManagedFile {
-        format: FORMAT,
+    file_bytes_with_history(graphs, None)
+}
+
+fn managed_file<'a>(
+    graphs: &'a ManagedGraphs,
+    history: Option<&'a crate::store::managed_history::Root>,
+) -> ManagedFile<'a> {
+    ManagedFile {
+        // A legacy configuration change does not activate history or fabricate a
+        // coverage boundary. Only an anchored root writes the new primary form.
+        format: if history.is_some() { FORMAT } else { 2 },
         revision: graphs.revision,
         owners: graphs.owners.iter().map(|(o, e)| (o.as_str(), e)).collect(),
-    };
-    serde_json::to_vec_pretty(&file).expect("managed.json serializes")
+        configuration_history: history,
+    }
+}
+
+fn file_bytes_with_history(
+    graphs: &ManagedGraphs,
+    history: Option<&crate::store::managed_history::Root>,
+) -> Vec<u8> {
+    serde_json::to_vec_pretty(&managed_file(graphs, history)).expect("managed.json serializes")
+}
+
+impl Installed {
+    /// The length and SHA-256 of [`Installed::file_bytes`], streamed through the
+    /// hash so that no encoding of the registry is materialized.
+    pub(crate) fn file_pin(&self) -> (u64, [u8; 32]) {
+        use sha2::Digest;
+        struct Pin(sha2::Sha256, u64);
+        impl std::io::Write for Pin {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                self.1 += bytes.len() as u64;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut pin = Pin(sha2::Sha256::new(), 0);
+        serde_json::to_writer_pretty(
+            &mut pin,
+            &managed_file(&self.graphs, self.configuration_history.as_ref()),
+        )
+        .expect("managed.json serializes");
+        (pin.1, pin.0.finalize().into())
+    }
 }
 
 /// The capability to change one owner's managed graphs in one write transaction
@@ -662,6 +715,8 @@ struct RawFile {
     format: u64,
     revision: u64,
     owners: BTreeMap<String, serde_json::Value>,
+    #[serde(default, rename = "configurationHistory")]
+    configuration_history: Option<crate::store::managed_history::Root>,
 }
 
 fn one() -> u64 {
@@ -693,7 +748,7 @@ fn decode_inner(
         Some(Some(f)) => {
             return Err((
                 format!(
-                    "{FILE} has format {f}; Sparkles {} reads formats 1 and {FORMAT}. It was written by a newer release",
+                    "{FILE} has format {f}; Sparkles {} reads formats 1, 2 and {FORMAT}. It was written by a newer release",
                     crate::formats::SPARKLES_VERSION
                 ),
                 false,
@@ -703,6 +758,16 @@ fn decode_inner(
     }
     let raw: RawFile = serde_json::from_value(v).map_err(|e| (format!("{FILE}: {e}"), false))?;
     debug_assert!(reads_format(raw.format));
+    if (raw.format == 3) != raw.configuration_history.is_some() {
+        return Err((
+            format!("{FILE}: configuration history requires format 3 and its complete root"),
+            false,
+        ));
+    }
+    if let Some(root) = &raw.configuration_history {
+        root.validate()
+            .map_err(|error| (error.to_string(), false))?;
+    }
     let mut owners = BTreeMap::new();
     let mut settings = BTreeMap::new();
     for (name, value) in raw.owners {
@@ -753,14 +818,47 @@ fn decode_inner(
         settings.insert(owner, Arc::from(found));
         owners.insert(owner, entry);
     }
-    Installed::new(
+    let mut installed = Installed::new(
         ManagedGraphs {
             revision: raw.revision,
             owners,
         },
         settings,
     )
-    .map_err(|e| (e.to_string(), false))
+    .map_err(|e| (e.to_string(), false))?;
+    installed.configuration_history = raw.configuration_history;
+    if raw.format == 3 && installed.file_bytes() != bytes {
+        return Err((
+            format!("{FILE}: history registry is not its unique canonical encoding"),
+            false,
+        ));
+    }
+    Ok(installed)
+}
+
+/// Read only the explicit history root. It still requires full lineage and registry
+/// verification; parsing this reference never certifies a publication on its own.
+pub(crate) fn recorded_history(
+    bytes: &[u8],
+) -> Result<Option<crate::store::managed_history::Root>> {
+    #[derive(Deserialize)]
+    struct Envelope {
+        #[serde(default = "one")]
+        format: u64,
+        #[serde(default, rename = "configurationHistory")]
+        history: Option<crate::store::managed_history::Root>,
+    }
+    let envelope: Envelope = serde_json::from_slice(bytes)
+        .map_err(|_| Error::Corrupt("invalid managed history envelope".into()))?;
+    if !reads_format(envelope.format) || (envelope.format == 3) != envelope.history.is_some() {
+        return Err(Error::Unsupported(
+            "managed history envelope has an unsupported version or missing root".into(),
+        ));
+    }
+    if let Some(root) = &envelope.history {
+        root.validate()?;
+    }
+    Ok(envelope.history)
 }
 
 /// The owners a `managed.json` names, when this build reads its format and knows

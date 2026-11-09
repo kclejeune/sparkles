@@ -195,7 +195,8 @@ These read paths are tuned for queries over data that is not yet in memory
   dataset id with `forkedFrom`. A source with no changes since its last compaction is
   cloned by sharing its index files, by reflink where the file system supports it, by
   copy otherwise, or by hard link on request. A clone can copy only some graphs, can be an
-  in-memory dataset, and waits for one of the `--max-clones` slots.
+  in-memory dataset, and waits for one of the `--max-clones` slots. A dataset whose
+  configuration history is activated cannot be cloned, which is roadmap item 764.
 * `/$/backup` and dumps write N-Quads, compressed with zstd by default or with gzip, xz,
   bzip2, brotli or LZ4. Request and response bodies can be compressed with `zstd`, `br`
   or `gzip`. Incremental backup repositories are described under [Operations](../operations/README.md#backups).
@@ -375,6 +376,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Branch stores share their dataset's quota, which counts the zeros preallocated after
   each store's log and delta vocabulary as those of the store written last. With several
   branches written, the zeros of the others count as data. Roadmap item 560.
+* A clone refuses a dataset whose configuration history is activated, because the
+  clone would keep the registry's history root without the evidence-history files that
+  it names. A backup and a restore that keeps the identity copy such a dataset. Roadmap
+  item 764.
 * The drive of the benchmark hosts alternates between a fast state, in which a
   write-through write takes about 0.2 ms, and a slow state, in which every write-through
   write and every cache flush takes about 1.5 ms. Write-through fences are faster in both

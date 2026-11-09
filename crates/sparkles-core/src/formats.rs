@@ -164,7 +164,7 @@ pub const READABLE_INDEX_FORMATS: &[u32] = &[2, 3, 4];
 /// The write-ahead log version this build writes: a header record with the magic and
 /// this version starts every new `wal.log` (see [`crate::store::wal`]). Version 0 is a
 /// log without the header, written before it existed.
-pub const WAL_VERSION: u32 = 1;
+pub const WAL_VERSION: u32 = 2;
 
 /// `dataset.json`: the dataset id and the reader capabilities a database needs.
 pub const DATASET: FileKind = FileKind {
@@ -173,7 +173,7 @@ pub const DATASET: FileKind = FileKind {
     marker: "`format` 1, `minimumReader` (the reader capability the database needs) and `writtenBy`",
     class: Class::Primary,
     writes: crate::commit::DATASET_READER,
-    reads: &[1, 2, 3, 4, 5, 6, 7],
+    reads: &[1, 2, 3, 4, 5, 6, 7, 8],
 };
 
 /// A generation's index: `gen-*/meta.json` and the permutation and vocabulary files.
@@ -260,10 +260,47 @@ pub const DELTA_VOCAB: FileKind = FileKind {
 pub const WAL: FileKind = FileKind {
     id: "wal",
     files: "gen-*/wal.log",
-    marker: "a 33-byte header record (magic `\\x89SPKWAL\\n` and the version); version 0 is a log without it. Commit-record flag bits in byte 27 are added compatibly. A version 0 log is strictly framed from `walStrictFrom` of its generation's `commit.json`, an additive member",
+    marker: "a 33-byte header record (magic `\\x89SPKWAL\\n` and the version); version 0 is headerless. Version 2 seals a final configuration-reference record with commit flag 4. Headerless strict framing starts at walStrictFrom",
     class: Class::Primary,
     writes: WAL_VERSION,
-    reads: &[0, 1],
+    reads: &[0, 1, 2],
+};
+
+/// Primary configuration binding of a generation's base data revision.
+pub const GENERATION_COMMIT: FileKind = FileKind {
+    id: "generation-commit",
+    files: "gen-*/commit.json",
+    marker: "format; version 2 requires an explicit configurationBinding",
+    class: Class::Primary,
+    writes: 2,
+    reads: &[1, 2],
+};
+
+pub const CONFIGURATION_GENERATION: FileKind = FileKind {
+    id: "configuration-generation",
+    files: "evidence-history/LINEAGE/generations/SHA256.json",
+    marker: "format 1 and the digest of the unique canonical document",
+    class: Class::Primary,
+    writes: 1,
+    reads: &[1],
+};
+
+pub const CONFIGURATION_COVERAGE: FileKind = FileKind {
+    id: "configuration-coverage",
+    files: "evidence-history/LINEAGE/coverage.json",
+    marker: "format 1 and its digest anchored in managed.json",
+    class: Class::Primary,
+    writes: 1,
+    reads: &[1],
+};
+
+pub const CONFIGURATION_ORIGIN: FileKind = FileKind {
+    id: "configuration-origin",
+    files: "evidence-history/origin.json",
+    marker: "format 1 and the exact imported source prefix/identity closure",
+    class: Class::Primary,
+    writes: 1,
+    reads: &[1],
 };
 
 /// The commit catalog.
@@ -465,7 +502,7 @@ pub const BACKUP_DEFINITION: FileKind = FileKind {
 
 /// The features a backup manifest may require in `requires`, which this build reads.
 /// A manifest that requires another feature is refused before anything is written.
-pub const BACKUP_MANIFEST_FEATURES: &[&str] = &["definitions"];
+pub const BACKUP_MANIFEST_FEATURES: &[&str] = &["definitions", "evidence-configuration-history/1"];
 
 /// A kind of dataset-managed definition that backups and clones carry beside the data,
 /// at `DIR/NAME/FILE` under the dataset root. The file is the registered settings file
@@ -599,6 +636,10 @@ pub const KINDS: &[&FileKind] = &[
     &PLANNER_STATISTICS,
     &DELTA_VOCAB,
     &WAL,
+    &GENERATION_COMMIT,
+    &CONFIGURATION_GENERATION,
+    &CONFIGURATION_COVERAGE,
+    &CONFIGURATION_ORIGIN,
     &COMMITS,
     &CHANGE_LOG,
     &ANNOTATIONS,
@@ -691,9 +732,9 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("compaction.json", 1),
     ds("quota.json", 1),
     ds("changelog.json", 1),
-    ds("history.json", 1),
+    ds("history.json", 2),
     ds("branches.json", 2),
-    ds("branch.json", 1),
+    ds("branch.json", 2),
     ds("queries.json", 1),
     ds("mappings.json", 1),
     ds("algo.json", 2),
@@ -716,7 +757,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("paths.json", 1),
     ds("forms.json", 1),
     // the managed-graph registry and its owners' settings (see `crate::managed`)
-    ds("managed.json", 2),
+    ds("managed.json", 3),
     ds("evidence.json", 1),
     // durable source holds (see `crate::holds`)
     ds("holds.json", 1),
@@ -794,6 +835,7 @@ pub(crate) fn branch_directories(root: &std::path::Path) -> Result<Vec<std::path
 pub(crate) fn check_dataset_tree(root: &std::path::Path) -> Result<()> {
     crate::commit::check_dataset_compatibility(root)?;
     check_dataset_dir(root)?;
+    check_configuration_versions(root)?;
     for branch in branch_directories(root)? {
         crate::commit::check_dataset_compatibility(&branch).map_err(|e| match e {
             Error::Unsupported(message) => {
@@ -802,6 +844,7 @@ pub(crate) fn check_dataset_tree(root: &std::path::Path) -> Result<()> {
             e => e,
         })?;
         check_dataset_dir(&branch)?;
+        check_configuration_versions(&branch)?;
     }
     Ok(())
 }
@@ -838,7 +881,16 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             continue;
         };
-        match check_settings(s.name, &v) {
+        let checked = check_settings(s.name, &v).and_then(|found| {
+            if matches!(s.name, "history.json" | "branch.json")
+                && found >= 2
+                && let Some(reader) = recorded_reader(dir)
+            {
+                admit_configuration_version(reader, s.name, found)?;
+            }
+            Ok(found)
+        });
+        match checked {
             Ok(_) => {}
             Err(Error::Unsupported(m)) if fenced => {
                 out.push(Error::Unsupported(format!("{}: {m}", dir.display())))
@@ -941,6 +993,118 @@ fn settings_stamp_format(s: &SettingsFile, v: &serde_json::Value) -> u32 {
 /// The version of a settings file's JSON object, from its member: absent is 1. A
 /// version newer than this build writes is refused, since the file may mean something
 /// this build would misread.
+/// Refuse `version` of `what` in a dataset that records `recorded_reader` unless
+/// that is the reader of configuration history. Only activation writes the
+/// versions that need it (logs 2, generation `commit.json` 2, `managed.json` 3,
+/// `history.json` 2 and `branch.json` 2), and it raises the dataset reader first.
+/// A dataset that records an older reader holds none of them, so one there is a
+/// newer file that this dataset does not admit, refused as a newer release's is.
+/// Callers pass the reader they already read, and bounded readers do not call it.
+pub(crate) fn admit_configuration_version(
+    recorded_reader: u32,
+    what: &str,
+    version: u32,
+) -> Result<()> {
+    let reader = crate::store::managed_history::READER;
+    if recorded_reader < reader {
+        return Err(Error::Unsupported(format!(
+            "{what} has version {version}, which a dataset records only with configuration \
+             history (reader {reader}); this dataset records reader {recorded_reader}"
+        )));
+    }
+    Ok(())
+}
+
+/// The reader that the dataset in `dir` records, when it has a `dataset.json`.
+fn recorded_reader(dir: &std::path::Path) -> Option<u32> {
+    crate::commit::read_dataset_versions(dir)
+        .ok()
+        .flatten()
+        .map(|versions| versions.minimum_reader)
+}
+
+/// Refuse the generations of the store in `dir` that hold a log or `commit.json`
+/// version that its recorded reader does not admit (see
+/// [`admit_configuration_version`]). Open and reidentification check this before
+/// they read or change a generation. Reading the version takes a log's first
+/// record and a generation's small `commit.json`, as open reads them.
+pub(crate) fn check_configuration_versions(dir: &std::path::Path) -> Result<()> {
+    use std::io::Read;
+    let Some(reader) = recorded_reader(dir) else {
+        return Ok(());
+    };
+    if reader >= crate::store::managed_history::READER {
+        return Ok(());
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name
+            .strip_prefix("gen-")
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+        // open follows a symlinked generation, so this check follows it too
+        match std::fs::metadata(entry.path()) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        }
+        let generation = entry.path();
+        let wal = generation.join("wal.log");
+        let mut header = [0u8; 12];
+        match std::fs::File::open(&wal) {
+            Ok(file) => {
+                let mut read = 0;
+                let mut file = file.take(header.len() as u64);
+                loop {
+                    match file.read(&mut header[read..])? {
+                        0 => break,
+                        n => read += n,
+                    }
+                }
+                if read == header.len() && header[..8] == crate::store::wal::MAGIC {
+                    let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
+                    if version > crate::store::wal::PLAIN_VERSION {
+                        admit_configuration_version(reader, &wal.display().to_string(), version)?;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let commit = generation.join("commit.json");
+        match read_bounded(&commit, crate::store::managed_history::MAX_BYTES as u64) {
+            Ok(Some(bytes)) => {
+                if let Some(format) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .and_then(|value| value.get("format").and_then(serde_json::Value::as_u64))
+                    && format >= 2
+                {
+                    admit_configuration_version(
+                        reader,
+                        &commit.display().to_string(),
+                        u32::try_from(format).unwrap_or(u32::MAX),
+                    )?;
+                }
+            }
+            // its own reader reports a missing, oversized or unreadable file
+            Ok(None) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 pub fn check_settings(name: &str, v: &serde_json::Value) -> Result<u32> {
     let s = registered(name);
     let member = s.member;
@@ -1041,6 +1205,17 @@ pub fn report() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configuration_versions_are_admitted_only_by_the_configuration_reader() {
+        for reader in [1, 5, 6, 7] {
+            assert!(matches!(
+                admit_configuration_version(reader, "wal", 2),
+                Err(Error::Unsupported(_))
+            ));
+        }
+        admit_configuration_version(8, "wal", 2).unwrap();
+    }
+
     use super::*;
 
     #[test]
@@ -1157,7 +1332,7 @@ mod tests {
             e.contains("sparkles dump") && e.contains("Sparkles 0.1.0"),
             "{e}"
         );
-        assert_eq!(WAL.readable(), "0 and 1");
+        assert_eq!(WAL.readable(), "0, 1 and 2");
         assert_eq!(list(&[0, 1, 2]), "0, 1 and 2");
     }
 

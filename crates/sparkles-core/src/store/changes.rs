@@ -287,6 +287,9 @@ impl Store {
                             ddo.check()?;
                             local.clear();
                             for d in txn.as_chunks::<WAL_REC>().0 {
+                                if d[0] == WAL_CONFIGURATION {
+                                    continue;
+                                }
                                 match local.entry(wal::record_quad(d)) {
                                     Entry::Occupied(e) => {
                                         e.remove();

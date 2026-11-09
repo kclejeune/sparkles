@@ -434,7 +434,7 @@ pub(crate) fn parse_rfc3339_offset(s: &str) -> Option<i64> {
 /// vocabularies, see [`crate::vocab::delta`], 5: write-ahead logs with a header record,
 /// see [`crate::store::wal`], 6: protected managed graphs, `managed.json`, see
 /// [`crate::managed`], 7: durable source holds, `holds.json`, see [`crate::holds`]). [`crate::formats::DATASET`] lists them.
-pub const DATASET_READER: u32 = 7;
+pub const DATASET_READER: u32 = 8;
 fn legacy_reader() -> u32 {
     1
 }
@@ -505,12 +505,7 @@ pub(crate) fn read_dataset_file_controlled(
             }
             Err(error) => return Err(error),
         };
-        let raw: crate::store::cold::Loaded<serde_json::Value> = budget.json(&bytes)?;
-        check_dataset_value(&raw.value)?;
-        let parsed: DatasetFile = budget.value_fields(raw.value, DATASET_FIELDS)?;
-        let id = parsed.id;
-        drop(parsed);
-        budget.release(raw.charge);
+        let id = dataset_id_bytes_controlled(&bytes, budget)?;
         budget.drop_vec(bytes);
         budget.check()?;
         Ok(Some(id))
@@ -522,6 +517,30 @@ pub(crate) fn read_dataset_file_controlled(
         budget.check()?;
         Ok(value)
     })
+}
+
+/// Decode an already admitted original dataset document with the same version
+/// and field grammar as the named cold reader. Only a scalar identity escapes.
+pub(crate) fn dataset_id_bytes_controlled(
+    bytes: &[u8],
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+) -> Result<uuid::Uuid> {
+    budget.check()?;
+    let start = budget.used();
+    let result = (|| {
+        let raw: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
+        check_dataset_value(&raw.value)?;
+        let parsed: DatasetFile = budget.value_fields(raw.value, DATASET_FIELDS)?;
+        let id = parsed.id;
+        drop(parsed);
+        budget.release(raw.charge);
+        budget.check()?;
+        Ok(id)
+    })();
+    if result.is_err() {
+        budget.release(budget.used() - start);
+    }
+    result
 }
 
 /// Exercise the actual closed scalar reader with caller-attributed allocation
@@ -683,6 +702,8 @@ pub struct RestoredFrom {
 ///
 /// Used by restores whose identity rule mints a new id; the directory must not be open.
 pub fn reidentify(root: &Path, new_id: uuid::Uuid, forked_from: ForkedFrom) -> Result<()> {
+    // a generation version that this dataset does not admit refuses before any rewrite
+    crate::formats::check_configuration_versions(root)?;
     let mut ds = read_dataset(root)?
         .ok_or_else(|| Error::Invalid(format!("{} has no dataset.json", root.display())))?;
     let old_id = ds.id;
@@ -774,6 +795,63 @@ fn write_dataset(root: &Path, ds: &DatasetFile) -> Result<()> {
     )
 }
 
+/// Pure receiving-owned metadata for an unpublished imported destination. The
+/// closed producer separately supplies its genuine old owner and selected data
+/// sequence. These bytes grant no Store/source/replay or current permission.
+/// Reader9 is emitted explicitly; this build still refuses that destination
+/// until the complete physical producer/consumer feature is enabled together.
+pub(crate) fn reidentified_dataset_bytes(
+    bytes: &[u8],
+    old: uuid::Uuid,
+    new: uuid::Uuid,
+    seq: u64,
+    created_ms: i64,
+    preparation: &crate::access::Preparation,
+) -> Result<crate::store::managed_history::Bytes> {
+    use crate::store::{cold::ColdBudget, managed_history};
+    preparation.check()?;
+    if old.is_nil() || new.is_nil() {
+        return Err(Error::invalid(
+            "dataset identity transformation has a nil owner",
+        ));
+    }
+    if bytes.len() > managed_history::MAX_BYTES {
+        return Err(preparation.exhausted());
+    }
+    // Fixed replacement strings and encoder scratch precede all mutation/copy.
+    let _scratch = preparation.reserve(8192)?;
+    let allowance = preparation.room();
+    let mut held = preparation.reserve(allowance)?;
+    let options = crate::history::HistoryOptions {
+        cancel: Some(preparation.control().cancel.flag()),
+        deadline: preparation.control().deadline,
+    };
+    let mut budget = ColdBudget::new(crate::history::ReadLimit {
+        options: &options,
+        memory: Some(allowance),
+        held: 0,
+    })?;
+    let raw: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
+    check_dataset_value(&raw.value)?;
+    // Keep additive original fields. The scalar-only identity helper omits
+    // extensions intentionally, so it is not used to rewrite this document.
+    let mut file: DatasetFile = budget.value(raw.value)?;
+    if file.id != old {
+        return Err(Error::Corrupt(
+            "original dataset belongs to another logical source".into(),
+        ));
+    }
+    file.id = new;
+    file.origin = "restore".to_owned();
+    file.created = rfc3339_ms(created_ms);
+    file.forked_from = Some(ForkedFrom { id: old, seq });
+    file.written_by = Some(crate::formats::SPARKLES_VERSION.to_owned());
+    file.minimum_reader = file.minimum_reader.max(9);
+    held.release_to(budget.used());
+    preparation.check()?;
+    managed_history::encode_pretty(&file, preparation)
+}
+
 /// `forkedFrom` of `<root>/dataset.json`, if the database is a clone.
 pub(crate) fn read_forked_from(root: &Path) -> Result<Option<ForkedFrom>> {
     Ok(read_dataset(root)?.and_then(|f| f.forked_from))
@@ -850,6 +928,8 @@ struct GenCommitFile {
     /// files written before the member existed, and for logs with a header record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     wal_strict_from: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    configuration_binding: Option<crate::history::ConfigurationBinding>,
     /// Members this build does not know, added by a later release under the additive
     /// rule of X12 section 4.3. They are kept when the file is rewritten.
     #[serde(flatten)]
@@ -884,12 +964,17 @@ fn yes() -> bool {
 }
 
 pub(crate) fn gen_commit_bytes(dataset_id: uuid::Uuid, origin: &str, c: &CommitInfo) -> Vec<u8> {
-    serde_json::to_vec_pretty(&GenCommitFile {
+    serde_json::to_vec_pretty(&gen_commit_file(dataset_id, origin, c)).unwrap()
+}
+
+fn gen_commit_file(dataset_id: uuid::Uuid, origin: &str, c: &CommitInfo) -> GenCommitFile {
+    GenCommitFile {
         format: 1,
         dataset_id,
         base_seq: c.seq,
         origin: origin.to_string(),
         wal_strict_from: None,
+        configuration_binding: None,
         extra: Default::default(),
         commit: CommitJson {
             seq: c.seq,
@@ -906,13 +991,46 @@ pub(crate) fn gen_commit_bytes(dataset_id: uuid::Uuid, origin: &str, c: &CommitI
             unvalidated: c.unvalidated,
             extra: Default::default(),
         },
-    })
-    .unwrap()
+    }
+}
+
+/// A generation's `commit.json`: format 2 with `binding` in a store whose
+/// configuration history is activated, and the format 1 that older releases
+/// read in any other store.
+pub(crate) fn gen_commit_bytes_for(
+    dataset_id: uuid::Uuid,
+    origin: &str,
+    c: &CommitInfo,
+    activated: bool,
+    binding: crate::history::ConfigurationBinding,
+) -> Vec<u8> {
+    if activated {
+        gen_commit_bytes_with_binding(dataset_id, origin, c, binding)
+    } else {
+        gen_commit_bytes(dataset_id, origin, c)
+    }
+}
+
+pub(crate) fn gen_commit_bytes_with_binding(
+    dataset_id: uuid::Uuid,
+    origin: &str,
+    c: &CommitInfo,
+    binding: crate::history::ConfigurationBinding,
+) -> Vec<u8> {
+    let mut file = gen_commit_file(dataset_id, origin, c);
+    file.format = 2;
+    file.configuration_binding = Some(binding);
+    serde_json::to_vec_pretty(&file).expect("generation commit serializes")
 }
 
 /// The commit a generation's base index holds, from `gen-NNNN/commit.json`, with the
 /// dataset id and the file's origin (`create`, `baseline`, `bulk`, `compaction`).
 pub(crate) fn read_gen_commit(dir: &Path) -> Result<Option<(uuid::Uuid, CommitInfo, String)>> {
+    Ok(read_gen_commit_full(dir)?
+        .map(|physical| (physical.dataset_id, physical.commit, physical.origin)))
+}
+
+pub(crate) fn read_gen_commit_full(dir: &Path) -> Result<Option<RetainedGenerationCommit>> {
     let path = dir.join("commit.json");
     let b = match std::fs::read(&path) {
         Ok(b) => b,
@@ -920,8 +1038,7 @@ pub(crate) fn read_gen_commit(dir: &Path) -> Result<Option<(uuid::Uuid, CommitIn
         Err(e) => return Err(e.into()),
     };
     let f = parse_gen_commit(&path, &b)?;
-    let decoded = decode_gen_commit_file(f, &path)?;
-    Ok(Some((decoded.dataset_id, decoded.commit, decoded.origin)))
+    Ok(Some(decode_gen_commit_file(f, &path)?))
 }
 
 /// Physical generation identity decoded without opening or recovering a Store.
@@ -931,6 +1048,7 @@ pub(crate) struct RetainedGenerationCommit {
     pub(crate) commit: CommitInfo,
     pub(crate) origin: String,
     pub(crate) wal_strict_from: Option<u64>,
+    pub(crate) configuration: crate::history::ConfigurationBinding,
 }
 
 fn decode_gen_commit_file(f: GenCommitFile, path: &Path) -> Result<RetainedGenerationCommit> {
@@ -954,6 +1072,7 @@ fn decode_gen_commit_file(f: GenCommitFile, path: &Path) -> Result<RetainedGener
         },
         origin: f.origin,
         wal_strict_from: f.wal_strict_from,
+        configuration: f.configuration_binding.unwrap_or_default(),
     })
 }
 
@@ -972,11 +1091,32 @@ pub(crate) fn read_gen_commit_controlled(
             }
             Err(error) => return Err(error),
         };
-        let parsed: crate::store::cold::Loaded<serde_json::Value> = budget.json(&bytes)?;
-        check_gen_commit_value(&path, &parsed.value)?;
-        let file: GenCommitFile = budget.value(parsed.value)?;
+        let decoded = decode_gen_commit_bytes_controlled(&path, &bytes, budget)?;
         budget.drop_vec(bytes);
-        let value = decode_gen_commit_file(file, &path)?;
+        Ok(Some(decoded))
+    })();
+    if result.is_err() {
+        budget.release(budget.used() - start);
+    }
+    result
+}
+
+/// Decode the same historical codec from caller-admitted borrowed bytes. The
+/// path labels diagnostics only; this never opens or recovers a source. A caller
+/// retains its input owner/charge until this call returns. Neither decoded data
+/// nor successful parsing confers a physical source or imported replay identity.
+pub(crate) fn decode_gen_commit_bytes_controlled(
+    path: &Path,
+    bytes: &[u8],
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+) -> Result<crate::store::cold::Loaded<RetainedGenerationCommit>> {
+    let start = budget.used();
+    let result = (|| {
+        let parsed: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
+        check_gen_commit_value(path, &parsed.value)?;
+        let file: GenCommitFile = budget.value(parsed.value)?;
+        check_gen_binding(path, &file, bytes)?;
+        let value = decode_gen_commit_file(file, path)?;
         let charge =
             std::mem::size_of::<RetainedGenerationCommit>() as u64 + value.origin.capacity() as u64;
         if charge > parsed.charge {
@@ -985,10 +1125,10 @@ pub(crate) fn read_gen_commit_controlled(
             budget.release(parsed.charge - charge);
         }
         budget.check()?;
-        Ok(Some(crate::store::cold::Loaded { value, charge }))
+        Ok(crate::store::cold::Loaded { value, charge })
     })();
     if result.is_err() {
-        // Input and parse owners have dropped; preserve caller-held storage.
+        // Only this decoder's temporaries dropped; caller-held input survives.
         budget.release(budget.used() - start);
     }
     result
@@ -999,7 +1139,129 @@ fn parse_gen_commit(path: &Path, b: &[u8]) -> Result<GenCommitFile> {
     let value: serde_json::Value = serde_json::from_slice(b)
         .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
     check_gen_commit_value(path, &value)?;
-    serde_json::from_value(value).map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))
+    let file: GenCommitFile = serde_json::from_value(value)
+        .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
+    check_gen_binding(path, &file, b)?;
+    Ok(file)
+}
+
+/// Pure small-document transformation for a genuine closed import producer.
+/// Preserve every original field, including additive legacy fields and strict
+/// framing, while changing only the logical owner and native-binding tag. This
+/// codec alone supplies no physical source, publication or import authority.
+pub(crate) fn reidentified_generation_bytes(
+    bytes: &[u8],
+    old: uuid::Uuid,
+    new: uuid::Uuid,
+    preparation: &crate::access::Preparation,
+) -> Result<crate::store::managed_history::Bytes> {
+    use crate::store::{cold::ColdBudget, managed_history};
+    preparation.check()?;
+    if old.is_nil() || new.is_nil() {
+        return Err(Error::invalid(
+            "generation identity transformation has a nil owner",
+        ));
+    }
+    if bytes.len() > managed_history::MAX_BYTES {
+        return Err(preparation.exhausted());
+    }
+    let _canonical = preparation.reserve(
+        (bytes.len() as u64)
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(4096))
+            .ok_or_else(|| preparation.exhausted())?,
+    )?;
+    let allowance = preparation.room();
+    let mut held = preparation.reserve(allowance)?;
+    let options = crate::history::HistoryOptions {
+        cancel: Some(preparation.control().cancel.flag()),
+        deadline: preparation.control().deadline,
+    };
+    let mut budget = ColdBudget::new(crate::history::ReadLimit {
+        options: &options,
+        memory: Some(allowance),
+        held: 0,
+    })?;
+    let parsed: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
+    let label = Path::new("original-import/commit.json");
+    check_gen_commit_value(label, &parsed.value)?;
+    let mut file: GenCommitFile = budget.value(parsed.value)?;
+    check_gen_binding(label, &file, bytes)?;
+    if file.dataset_id != old {
+        return Err(Error::Corrupt(
+            "original generation belongs to another physical source".into(),
+        ));
+    }
+    if let Some(binding) = &mut file.configuration_binding {
+        let publisher = binding
+            .configuration()
+            .map_or(old, |identity| identity.dataset_id());
+        binding.validate(publisher)?;
+        if let crate::history::ConfigurationBinding::Known { configuration } = *binding {
+            *binding = crate::history::ConfigurationBinding::ImportedUnbound {
+                source: configuration,
+            };
+        }
+    }
+    file.dataset_id = new;
+    held.release_to(budget.used());
+    preparation.check()?;
+    managed_history::encode_pretty(&file, preparation)
+}
+
+/// Rewrite only an already validated captured catalog header. The producer
+/// streams the unchanged record suffix from its same retained descriptor.
+pub(crate) fn reidentified_catalog_header(
+    header: &[u8; REC],
+    old: uuid::Uuid,
+    new: uuid::Uuid,
+) -> Result<[u8; REC]> {
+    if &header[..8] == MAGIC && header[8..12] != 1u32.to_le_bytes() {
+        return Err(Error::Unsupported(
+            "original catalog header has an unknown format".into(),
+        ));
+    }
+    let (owner, first) = decode_header(header)
+        .ok_or_else(|| Error::Corrupt("original catalog header is invalid".into()))?;
+    if old.is_nil() || new.is_nil() || owner != old {
+        return Err(Error::Corrupt(
+            "original catalog belongs to another source".into(),
+        ));
+    }
+    Ok(encode_header(new, first))
+}
+
+fn check_gen_binding(path: &Path, file: &GenCommitFile, bytes: &[u8]) -> Result<()> {
+    if file.format == 1 {
+        if file.configuration_binding.is_some() {
+            return Err(Error::Corrupt(format!(
+                "{}: a legacy generation cannot certify configuration",
+                path.display()
+            )));
+        }
+        return Ok(());
+    }
+    // The new authority document has a small closed schema. Bound before an
+    // independent canonical copy, including on the controlled historical path.
+    if bytes.len() > 16 << 10
+        || file.base_seq != file.commit.seq
+        || file.configuration_binding.is_none()
+        || !file.extra.is_empty()
+        || !file.commit.extra.is_empty()
+        || file.origin.len() > 128
+        || file.commit.kind.len() > 64
+        || file.commit.generation.len() > 64
+        || file.commit.timestamp.len() > 64
+        || serde_json::to_vec_pretty(file)
+            .map_err(|_| Error::Corrupt("generation metadata does not encode".into()))?
+            != bytes
+    {
+        return Err(Error::Corrupt(format!(
+            "{}: invalid canonical generation configuration binding",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// A recognizable future version is refused before interpreting the supported
@@ -1009,13 +1271,14 @@ fn check_gen_commit_value(path: &Path, value: &serde_json::Value) -> Result<()> 
         .get("format")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| Error::Corrupt(format!("{}: format is not a version", path.display())))?;
-    if format != 1 {
+    if !crate::formats::GENERATION_COMMIT.reads(format as u32) || format > u32::MAX as u64 {
         return Err(Error::Unsupported(format!(
-            "{} has format {}; this release reads format 1",
+            "{} has format {}; this release reads formats 1 and 2",
             path.display(),
             format
         )));
     }
+
     Ok(())
 }
 
@@ -1596,6 +1859,9 @@ pub(crate) const WAL_FLAG_UNVALIDATED: u8 = 1;
 /// without its annotation (see `annotations`). Readers that predate it ignore the bit.
 pub(crate) const WAL_FLAG_ANNOTATED: u8 = 2;
 
+/// The commit seals exactly one final configuration reference data record.
+pub(crate) const WAL_FLAG_CONFIGURATION: u8 = 4;
+
 /// Fill bytes 9..33 of a WAL commit record (`rec[0]` = op, `rec[1..9]` = next blank
 /// node): seq, timestamp, kind, version, flags (byte 27) and a CRC over the
 /// transaction's data records followed by bytes 0..29 of this record. Byte 28 is zero,
@@ -1999,6 +2265,88 @@ mod tests {
     }
 
     #[test]
+    fn controlled_generation_commit_borrowed_bytes_preserve_caller_storage() {
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let id = uuid::Uuid::new_v4();
+        let commit = sample_commit(42);
+        let valid = gen_commit_bytes_with_binding(
+            id,
+            "compaction",
+            &commit,
+            crate::history::ConfigurationBinding::LegacyUnbound,
+        );
+        let mut noncanonical = valid.clone();
+        noncanonical.push(b'\n');
+        let mut future: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+        future["format"] = 99.into();
+        future["commit"] = false.into();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = HistoryOptions {
+            cancel: Some(cancel.clone()),
+            ..Default::default()
+        };
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(1 << 20),
+            held: 0,
+        })
+        .unwrap();
+        budget.charge(17).unwrap();
+        for (kind, fixture) in [
+            valid.clone(),
+            noncanonical,
+            serde_json::to_vec(&future).unwrap(),
+            valid.clone(),
+            valid,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let length = fixture.len() as u64;
+            let bytes = budget
+                .read_from(&mut std::io::Cursor::new(fixture), length)
+                .unwrap();
+            let pressure = if kind == 4 { budget.available() - 1 } else { 0 };
+            budget.charge(pressure).unwrap();
+            let before = budget.used();
+            cancel.store(kind == 3, Ordering::SeqCst);
+            let result = decode_gen_commit_bytes_controlled(
+                Path::new("diagnostic-only/commit.json"),
+                &bytes,
+                &mut budget,
+            );
+            match kind {
+                0 => {
+                    let loaded = result.unwrap();
+                    assert_eq!(loaded.value.dataset_id, id);
+                    assert_eq!(loaded.value.commit, commit);
+                    assert_eq!(loaded.value.origin, "compaction");
+                    assert_eq!(budget.used(), before + loaded.charge);
+                    drop(loaded.value);
+                    budget.release(loaded.charge);
+                }
+                1 => assert!(matches!(result, Err(Error::Corrupt(_)))),
+                2 => assert!(matches!(result, Err(Error::Unsupported(_)))),
+                3 => assert!(matches!(result, Err(Error::Cancelled))),
+                4 => assert!(matches!(result, Err(Error::BudgetExceeded(_)))),
+                _ => unreachable!(),
+            }
+            cancel.store(false, Ordering::SeqCst);
+            assert_eq!(budget.used(), before);
+            budget.release(pressure);
+            budget.drop_vec(bytes);
+            assert_eq!(budget.used(), 17);
+        }
+    }
+
+    #[test]
     fn controlled_catalog_streams_large_valid_prefix_without_retaining_the_catalog() {
         use crate::{
             history::{HistoryOptions, ReadLimit},
@@ -2175,5 +2523,252 @@ mod tests {
         let v = read();
         assert_eq!(v["minimumReader"], 5);
         assert_eq!(v["futureMember"], serde_json::json!({"a": 1}));
+    }
+    #[test]
+    fn controlled_generation_commit_reidentification_retains_binding_and_framing() {
+        use crate::{
+            access::Preparation,
+            history::{ConfigurationBinding, ConfigurationIdentity},
+            task::Control,
+        };
+        let old = uuid::Uuid::new_v4();
+        let new = uuid::Uuid::new_v4();
+        let identity = ConfigurationIdentity {
+            dataset_id: uuid::Uuid::new_v4(),
+            lineage_id: uuid::Uuid::new_v4(),
+            generation: crate::evidence::Sha256Digest::from_digest_bytes([7; 32]),
+        };
+        let commit = sample_commit(42);
+        let preparation = Preparation::new(Control::none(), 4 << 20).unwrap();
+        let room = preparation.room();
+        for binding in [
+            ConfigurationBinding::Known {
+                configuration: identity,
+            },
+            ConfigurationBinding::ImportedUnbound { source: identity },
+            ConfigurationBinding::LegacyUnbound,
+        ] {
+            let mut file = gen_commit_file(old, "compaction", &commit);
+            file.format = 2;
+            file.configuration_binding = Some(binding);
+            file.wal_strict_from = Some(crate::store::WAL_REC as u64 * 4);
+            let raw = serde_json::to_vec_pretty(&file).unwrap();
+            let before = raw.clone();
+            let result = reidentified_generation_bytes(&raw, old, new, &preparation).unwrap();
+            let decoded = parse_gen_commit(Path::new("diagnostic"), &result.value).unwrap();
+            assert_eq!(decoded.dataset_id, new);
+            assert_eq!(
+                decoded.wal_strict_from,
+                Some(crate::store::WAL_REC as u64 * 4)
+            );
+            assert_eq!(decoded.origin, "compaction");
+            assert_eq!(
+                decode_gen_commit_file(decoded, Path::new("diagnostic"))
+                    .unwrap()
+                    .commit,
+                commit
+            );
+            let decoded = parse_gen_commit(Path::new("diagnostic"), &result.value).unwrap();
+            let expected = match binding {
+                ConfigurationBinding::Known { configuration } => {
+                    ConfigurationBinding::ImportedUnbound {
+                        source: configuration,
+                    }
+                }
+                other => other,
+            };
+            assert_eq!(decoded.configuration_binding, Some(expected));
+            assert_eq!(raw, before);
+            drop(result);
+            assert_eq!(preparation.room(), room);
+        }
+    }
+
+    #[test]
+    fn controlled_generation_commit_reidentification_preserves_legacy_additions_and_catalog_suffix_contract()
+     {
+        use crate::{access::Preparation, task::Control};
+        let old = uuid::Uuid::new_v4();
+        let new = uuid::Uuid::new_v4();
+        let mut file = gen_commit_file(old, "baseline", &sample_commit(3));
+        file.wal_strict_from = Some(crate::store::WAL_REC as u64 * 32);
+        file.extra
+            .insert("laterRoot".to_owned(), serde_json::json!({"x":[1,2,3]}));
+        file.commit
+            .extra
+            .insert("laterCommit".to_owned(), serde_json::json!("retained"));
+        let raw = serde_json::to_vec(&file).unwrap();
+        let preparation = Preparation::new(Control::none(), 4 << 20).unwrap();
+        let room = preparation.room();
+        let output = reidentified_generation_bytes(&raw, old, new, &preparation).unwrap();
+        let parsed = parse_gen_commit(Path::new("diagnostic"), &output.value).unwrap();
+        assert_eq!(parsed.format, 1);
+        assert_eq!(parsed.configuration_binding, None);
+        assert_eq!(
+            parsed.wal_strict_from,
+            Some(crate::store::WAL_REC as u64 * 32)
+        );
+        assert_eq!(parsed.extra, file.extra);
+        assert_eq!(parsed.commit.extra, file.commit.extra);
+        assert_eq!(parsed.origin, file.origin);
+        let header = encode_header(old, 3);
+        let changed = reidentified_catalog_header(&header, old, new).unwrap();
+        assert_eq!(decode_header(&changed), Some((new, 3)));
+        assert_eq!(decode_header(&header), Some((old, 3)));
+        assert!(reidentified_catalog_header(&header, uuid::Uuid::new_v4(), new).is_err());
+        let mut invalid = header;
+        invalid[63] ^= 1;
+        assert!(reidentified_catalog_header(&invalid, old, new).is_err());
+        drop(output);
+        assert_eq!(preparation.room(), room);
+    }
+
+    #[test]
+    fn controlled_generation_commit_reidentification_refuses_before_delivery_and_keeps_credit() {
+        use crate::{access::Preparation, task::Control};
+        let old = uuid::Uuid::new_v4();
+        let new = uuid::Uuid::new_v4();
+        let raw = gen_commit_bytes_with_binding(
+            old,
+            "create",
+            &sample_commit(0),
+            crate::history::ConfigurationBinding::LegacyUnbound,
+        );
+        let preparation = Preparation::new(Control::none(), 4 << 20).unwrap();
+        let room = preparation.room();
+        assert!(
+            reidentified_generation_bytes(&raw, uuid::Uuid::new_v4(), new, &preparation).is_err()
+        );
+        assert!(reidentified_generation_bytes(&raw, old, uuid::Uuid::nil(), &preparation).is_err());
+        let mut future: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        future["format"] = 99.into();
+        future["commit"] = false.into();
+        assert!(matches!(
+            reidentified_generation_bytes(
+                &serde_json::to_vec(&future).unwrap(),
+                old,
+                new,
+                &preparation
+            ),
+            Err(Error::Unsupported(_))
+        ));
+        let mut noncanonical = raw.clone();
+        noncanonical.push(b'\n');
+        assert!(reidentified_generation_bytes(&noncanonical, old, new, &preparation).is_err());
+        assert_eq!(preparation.room(), room);
+        let control = Control::none();
+        let cancelled = Preparation::new(control.clone(), 4 << 20).unwrap();
+        let available = cancelled.room();
+        control.cancel.cancel();
+        assert!(matches!(
+            reidentified_generation_bytes(&raw, old, new, &cancelled),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(cancelled.room(), available);
+        let small = Preparation::new(Control::none(), 4096).unwrap();
+        let available = small.room();
+        assert!(matches!(
+            reidentified_generation_bytes(&raw, old, new, &small),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(small.room(), available);
+    }
+    #[test]
+    fn controlled_dataset_reidentification_keeps_original_extensions_and_reader_barrier() {
+        use crate::{access::Preparation, task::Control};
+        let old = uuid::Uuid::new_v4();
+        let new = uuid::Uuid::new_v4();
+        let preparation = Preparation::new(Control::none(), 4 << 20).unwrap();
+        let room = preparation.room();
+        let mut original = parse_dataset(&dataset_file_bytes(old, "restore", 1000)).unwrap();
+        original.minimum_reader = 8;
+        original.extra.insert(
+            "futureMetadata".to_owned(),
+            serde_json::json!({"retained":[1,2,3]}),
+        );
+        original.restored_from = Some(RestoredFrom {
+            repository: "old-repository".to_owned(),
+            backup: "old-backup".to_owned(),
+            dataset_id: uuid::Uuid::new_v4(),
+            seq: 7,
+        });
+        let raw = serde_json::to_vec_pretty(&original).unwrap();
+        let before = raw.clone();
+        for destination in [new, old] {
+            let output =
+                reidentified_dataset_bytes(&raw, old, destination, 42, 2000, &preparation).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&output.value).unwrap();
+            assert!(matches!(
+                check_dataset_value_as(&value, 8),
+                Err(Error::Unsupported(_))
+            ));
+            check_dataset_value_as(&value, 9).unwrap();
+            let found: DatasetFile = serde_json::from_slice(&output.value).unwrap();
+            assert_eq!(found.id, destination);
+            assert_eq!(found.minimum_reader, 9);
+            assert_eq!(found.format, 1);
+            assert_eq!(found.origin, "restore");
+            assert_eq!(found.created, rfc3339_ms(2000));
+            assert_eq!(found.forked_from, Some(ForkedFrom { id: old, seq: 42 }));
+            assert_eq!(found.restored_from, original.restored_from);
+            assert_eq!(found.extra, original.extra);
+            assert_eq!(
+                found.written_by.as_deref(),
+                Some(crate::formats::SPARKLES_VERSION)
+            );
+            drop(output);
+            assert_eq!(preparation.room(), room);
+        }
+        assert_eq!(raw, before);
+    }
+
+    #[test]
+    fn controlled_dataset_reidentification_refuses_source_versions_owner_and_receiving_controls() {
+        use crate::{access::Preparation, task::Control};
+        let old = uuid::Uuid::new_v4();
+        let new = uuid::Uuid::new_v4();
+        let raw = dataset_file_bytes(old, "create", 0);
+        let preparation = Preparation::new(Control::none(), 4 << 20).unwrap();
+        let room = preparation.room();
+        assert!(
+            reidentified_dataset_bytes(&raw, uuid::Uuid::new_v4(), new, 0, 0, &preparation)
+                .is_err()
+        );
+        assert!(
+            reidentified_dataset_bytes(&raw, old, uuid::Uuid::nil(), 0, 0, &preparation).is_err()
+        );
+        for future in [
+            serde_json::json!({"format":2,"id":false}),
+            serde_json::json!({"format":1,"minimumReader":u64::MAX,"id":false}),
+        ] {
+            assert!(matches!(
+                reidentified_dataset_bytes(
+                    &serde_json::to_vec(&future).unwrap(),
+                    old,
+                    new,
+                    0,
+                    0,
+                    &preparation
+                ),
+                Err(Error::Unsupported(_))
+            ));
+        }
+        assert_eq!(preparation.room(), room);
+        let control = Control::none();
+        let cancelled = Preparation::new(control.clone(), 4 << 20).unwrap();
+        let room = cancelled.room();
+        control.cancel.cancel();
+        assert!(matches!(
+            reidentified_dataset_bytes(&raw, old, new, 0, 0, &cancelled),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(cancelled.room(), room);
+        let small = Preparation::new(Control::none(), 4096).unwrap();
+        let room = small.room();
+        assert!(matches!(
+            reidentified_dataset_bytes(&raw, old, new, 0, 0, &small),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(small.room(), room);
     }
 }

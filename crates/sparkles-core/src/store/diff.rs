@@ -457,6 +457,9 @@ fn walk_wal(
         };
         if seq > after && seq <= through {
             for d in txn.as_chunks::<WAL_REC>().0 {
+                if d[0] == WAL_CONFIGURATION {
+                    continue;
+                }
                 f(d[0], super::wal::record_quad(d))?;
                 changes += 1;
                 if changes & 0xFFFF == 0 {
@@ -983,7 +986,8 @@ impl Store {
                     "generation {no} was collected while it was read; retry"
                 )));
             };
-            let generation = self.history_generation(&mut h, no, current, &live, &entry)?;
+            let generation =
+                self.history_generation(&mut h, no, current, &live, &entry, u64::MAX)?;
             let file = File::open(entry.dir.join("wal.log"))?;
             (generation, entry, file)
         };

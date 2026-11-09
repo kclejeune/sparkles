@@ -5,6 +5,22 @@ use super::*;
 use crate::history::{At, HistoryGone, NamedSnapshot, Pin, Retention};
 
 impl Store {
+    /// Store the admitted pair before its data snapshot becomes visible. This is
+    /// primary memory history, not certification from a current settings digest.
+    pub(super) fn note_configuration(
+        &self,
+        seq: u64,
+        binding: crate::history::ConfigurationBinding,
+    ) {
+        if let Some(mem) = &self.mem_history {
+            let mut history = mem.lock();
+            if binding.configuration().is_some() {
+                history.configurations.insert(seq, binding);
+            }
+            history.trim_configurations(seq);
+        }
+    }
+
     /// The `410` of an in-memory store's commit that no pin or window keeps.
     pub(super) fn mem_gone(
         &self,
@@ -81,20 +97,27 @@ impl Store {
         }
     }
 
-    pub(super) fn mem_create_snapshot(
+    pub(super) fn mem_create_snapshot_selected(
         &self,
         name: &str,
         at: &At,
         o: &crate::history::SnapshotOptions,
+        selected: Option<&crate::history::PinnedConfiguration>,
     ) -> Result<(NamedSnapshot, bool)> {
         let mem = self.mem_history.as_ref().expect("an in-memory store");
         let w = self.guarded_writer();
         let r = self.resolve_with(at, w.head)?;
         let seq = r.commit.seq;
         let live = self.snapshot();
-        let mut m = mem.lock();
+        let m = mem.lock();
         if let Some((p, _)) = m.pins.get(name) {
-            if p.seq == seq {
+            if p.seq == seq
+                && selected.is_none_or(|selected| {
+                    p.configuration
+                        .as_ref()
+                        .is_some_and(|existing| existing.binding == selected.binding)
+                })
+            {
                 return Ok((self.mem_named(name, p), false));
             }
             return Err(Error::Conflict(format!(
@@ -108,6 +131,16 @@ impl Store {
                 self.opts.max_snapshots
             )));
         }
+        drop(m);
+        let preparation = super::managed_history::administrative_preparation()?;
+        let configuration = match selected {
+            Some(selected) => {
+                selected.validate(self.owner_dataset_id())?;
+                Some(selected.clone())
+            }
+            None => self.pin_configuration_at(at, seq, &preparation)?,
+        };
+        let mut m = mem.lock();
         let snap = if seq == live.commit {
             Arc::new(past(&live))
         } else {
@@ -125,6 +158,7 @@ impl Store {
             note: o.note.clone(),
             expires_ms: o.expires_ms,
             warm: o.warm,
+            configuration,
         };
         m.pins.insert(name.to_string(), (pin.clone(), snap));
         Ok((self.mem_named(name, &pin), true))

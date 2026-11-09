@@ -189,7 +189,7 @@ impl Stats {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexMeta {
     pub format_version: u32,
     pub quads: u64,

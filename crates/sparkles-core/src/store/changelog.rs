@@ -989,6 +989,7 @@ impl ChangeLog {
         let file = match segs.last() {
             Some(s) if !s.sealed => Some(super::wal::open_for_append(
                 s.path.as_ref().expect("persistent"),
+                super::wal::PLAIN_VERSION,
             )?),
             _ => None,
         };
@@ -1887,6 +1888,7 @@ impl Store {
                                 .as_chunks::<WAL_REC>()
                                 .0
                                 .iter()
+                                .filter(|record| record[0] != WAL_CONFIGURATION)
                                 .map(|d| (d[0], super::wal::record_quad(d)))
                                 .collect();
                             log.push(Pending {

@@ -32,7 +32,9 @@ use crate::index::{
     BLOCK_ROWS, BlockMeta, Key, META_BYTES, Perm, SEG_ENTRY, decode_column, decode_frame_into,
     read_varint_checked, supported_segment_rows,
 };
-use crate::store::{Framing, WAL_COMMIT, WAL_DELETE, WAL_HEADER, WAL_INSERT, WAL_REC};
+use crate::store::{
+    Framing, WAL_COMMIT, WAL_CONFIGURATION, WAL_DELETE, WAL_HEADER, WAL_INSERT, WAL_REC,
+};
 use crate::vocab::{FC_BLOCK, parse_delta};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -329,6 +331,18 @@ impl Run {
     }
 }
 
+/// Authenticate a copied configuration-history closure and every complete
+/// primary reference without opening, recovering or modifying the dataset.
+pub fn configuration_history(
+    root: &Path,
+    required: bool,
+    control: &crate::task::Control,
+) -> Result<()> {
+    let preparation =
+        crate::store::managed_history::administrative_preparation_with(control.clone())?;
+    crate::store::configuration_history::validate_copy(root, required, &preparation)
+}
+
 /// Check the database at `root` without modifying it. Fails only when `root` is not a
 /// readable directory; everything else is reported in the [`CheckReport`].
 pub fn check(root: &Path, opts: &CheckOptions) -> Result<CheckReport> {
@@ -394,6 +408,13 @@ pub fn check(root: &Path, opts: &CheckOptions) -> Result<CheckReport> {
     }
     c.reasoning();
     c.branches();
+    let mut configuration = Run::new("configuration-history");
+    if let Err(error) = configuration_history(root, false, &crate::task::Control::none()) {
+        configuration.add(Issue::error(error.to_string()));
+    }
+    c.checks.push(
+        configuration.done("published configuration closure and accepted primary references"),
+    );
     // a compaction while checking: the files read may belong to different generations
     if let Some(before) = &c.current {
         let now = std::fs::read_to_string(root.join("CURRENT")).map(|s| s.trim().to_string());
@@ -1509,7 +1530,7 @@ impl Checker<'_> {
                                     .file(format!("{name}/commit.json")),
                                 );
                             }
-                            if v == 1 {
+                            if v >= 1 {
                                 framing = Framing::Strict { from: 1 };
                             }
                         }
@@ -1539,10 +1560,11 @@ impl Checker<'_> {
                         }
                     }
                 }
+                WAL_CONFIGURATION => {}
                 WAL_COMMIT => {
                     let data = &buf[txn_start * WAL_REC..i * WAL_REC];
                     let n = i - txn_start;
-                    let n = format!("{n} data record{}", if n == 1 { "" } else { "s" });
+                    let n = format!("{n} transaction record{}", if n == 1 { "" } else { "s" });
                     let meta = commit::open_wal_commit(rec, data);
                     if meta.is_none() && framing.strict_at(i) {
                         let suffix_torn = torn_at(i, prev_seq, framing);
@@ -1564,6 +1586,25 @@ impl Checker<'_> {
                             Issue::error(message)
                         };
                         run.add(issue.file(&file).offset(at).row(i as u64));
+                        torn = true;
+                        break;
+                    }
+                    if !matches!(meta, Some(Err(())))
+                        && let Err(error) = crate::store::wal::configuration_records(
+                            data,
+                            version,
+                            match &meta {
+                                Some(Ok((_, _, _, flags))) => *flags,
+                                _ => 0,
+                            },
+                        )
+                    {
+                        run.add(
+                            Issue::error(error.to_string())
+                                .file(&file)
+                                .offset(at)
+                                .row(i as u64),
+                        );
                         torn = true;
                         break;
                     }
