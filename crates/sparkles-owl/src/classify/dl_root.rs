@@ -907,4 +907,41 @@ mod tests {
         });
         assert!(d.bottom());
     }
+
+    #[test]
+    fn a_successor_in_a_singleton_sends_its_equality_and_ground_facts_back() {
+        // A ⊑ ∃r.B, B ⊑ {o}, B ⊑ G: B's context has x ≈ o and G(o), and A's context
+        // gets f(x) ≈ o and G(o), and through Eq r(x, o)
+        let mut s = Sig::new();
+        let no = s.ind("o");
+        let [a, b, g] = ["A", "B", "G"].map(|n| s.class(n));
+        let r = s.role("r");
+        let e = s.some(r, b);
+        s.sub(a, e);
+        s.sub(b, no);
+        s.sub(b, g);
+        let d = saturate_at(s, Some(a));
+        let o = c(no, &d.ix);
+        assert!(d.has(&[XLit::Eq(RTerm::Fx(e), o)]), "f(x) ≈ o");
+        assert!(d.has(&[XLit::Atom(g, o)]), "G(o)");
+        assert!(d.has(&[XLit::Role(r, RTerm::X, o)]), "r(x, o)");
+    }
+
+    #[test]
+    fn a_conditional_ground_fact_keeps_its_condition_through_pred() {
+        // A ⊑ ∃r.B, B ⊑ C ⊔ {o}, {o} ⊑ G: A's context has no G(o) alone
+        let mut s = Sig::new();
+        let no = s.ind("o");
+        let [a, b, cc, g] = ["A", "B", "C", "G"].map(|n| s.class(n));
+        let r = s.role("r");
+        let e = s.some(r, b);
+        s.sub(a, e);
+        s.dl.clauses.push((vec![b], vec![cc, no]));
+        s.sub(no, g);
+        let d = saturate_at(s, Some(a));
+        let o = c(no, &d.ix);
+        assert!(!d.has(&[XLit::Atom(g, o)]));
+        assert!(!d.has(&[XLit::Eq(RTerm::Fx(e), o)]));
+        assert!(!d.bottom());
+    }
 }

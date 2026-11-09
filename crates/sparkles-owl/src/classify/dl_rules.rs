@@ -36,7 +36,9 @@
 //! Every rule reads only its own context's state and sends conclusions to itself, to the
 //! successors it registered with or to the predecessors it holds, as the EL rules do.
 
-use super::dl_clause::{Clause, EQ, F, Lit, Lits, Made, NE, RL, RY, Store, Table, Term, X, XL, Y};
+use super::dl_clause::{
+    Clause, EQ, F, Lit, Lits, Made, NE, RL, RTerm, RY, Store, Table, Term, X, XL, Y,
+};
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Sink, State, flatten, table_bytes};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1699,6 +1701,40 @@ fn meets(ix: &Index, c: &Clause, r: Role) -> bool {
             .all(|l| ix.roles.sub(r, l.atom()))
 }
 
+/// Whether a literal of a rooted run is ground: its terms are constants.
+fn is_ground(v: super::dl_clause::XLit) -> bool {
+    let (ts, n) = super::dl_clause::terms_of(v);
+    ts[..n].iter().all(|t| matches!(t, RTerm::C(_)))
+}
+
+/// Whether a clause of a rooted run goes to the predecessors: its body holds atoms over x,
+/// role atoms `s(y, x)` and ground literals, and every head literal is an atom or role atom
+/// over y, a role atom between y and a constant, an equality or inequality of x, y and
+/// constants, or ground (Definition 4's predecessor triggers, with the ground literals that
+/// Pred carries unchanged).
+fn pred_ready(ix: &Index, dx: &DlIx, lits: &Lits, c: &Clause) -> bool {
+    use super::dl_clause::XLit;
+    let inv = |r: Role| dx.inv(ix, r);
+    let body = c.body().iter().all(|&l| match l.kind() {
+        X | RY => true,
+        XL => is_ground(lits.view(l, inv)),
+        _ => false,
+    });
+    body && c.head().iter().all(|&l| match l.kind() {
+        Y | RY => true,
+        XL => match lits.view(l, inv) {
+            XLit::Atom(_, t) => matches!(t, RTerm::C(_)),
+            XLit::Role(_, a, b) => {
+                matches!(a, RTerm::Y | RTerm::C(_)) && matches!(b, RTerm::Y | RTerm::C(_))
+            }
+            XLit::Eq(a, b) | XLit::Ne(a, b) => [a, b]
+                .iter()
+                .all(|t| matches!(t, RTerm::X | RTerm::Y | RTerm::C(_))),
+        },
+        _ => false,
+    })
+}
+
 /// The table id of a stored clause over the predecessor, `None` once it is dead.
 fn pred_id<S: Sink>(x: &mut DlSt, i: u32, out: &mut S) -> Option<u32> {
     let s = &mut x.store.clauses[i as usize];
@@ -1825,7 +1861,7 @@ pub fn pred_c<S: Sink>(ix: &Index, st: &mut State, v: Ex, cid: u32, out: &mut S)
     reaching(dix(ix), st, v, &mut es);
     let mut found = Found::default();
     for e in es {
-        pred(ix, st, e, &c, None, &mut found);
+        pred(ix, st, e, &c, None, &mut found, &out.dl().lits);
     }
     drain(ix, st, found, out);
     true
@@ -1836,8 +1872,59 @@ pub fn pred_c<S: Sink>(ix: &Index, st: &mut State, v: Ex, cid: u32, out: &mut S)
 /// maximal literal is a role below s over f(x), and the head's literals over y become
 /// literals over x and f(x). `fixed` is the premise that a new clause gives for one of
 /// these literals, which the inference must use at one of the places it fits.
-fn pred(ix: &Index, st: &State, f: Ex, c: &Clause, fixed: Option<(Lit, &Side)>, found: &mut Found) {
+fn pred(
+    ix: &Index,
+    st: &State,
+    f: Ex,
+    c: &Clause,
+    fixed: Option<(Lit, &Side)>,
+    found: &mut Found,
+    lits: &Lits,
+) {
     let dx = dix(ix);
+    // a rooted run's ground body literals stay in the body, and its head literals over y,
+    // x and constants are read over x, f(x) and the constants
+    let mut ground: Vec<Lit> = Vec::new();
+    let mut up: Vec<Lit> = Vec::new();
+    if dx.root.is_some() {
+        use super::dl_clause::XLit;
+        let inv = |r: Role| dx.inv(ix, r);
+        for &l in c.body() {
+            if l.kind() == XL {
+                if !is_ground(lits.view(l, inv)) {
+                    return;
+                }
+                ground.push(l);
+            }
+        }
+        for &l in c.head() {
+            if l.kind() != XL {
+                continue;
+            }
+            let v = lits.view(l, inv);
+            if is_ground(v) {
+                up.push(l);
+                continue;
+            }
+            let t = |t: RTerm| match t {
+                RTerm::Y => Some(RTerm::X),
+                RTerm::X => Some(RTerm::Fx(f)),
+                RTerm::C(_) => Some(t),
+                _ => None,
+            };
+            let w = match v {
+                XLit::Atom(a, b) => t(b).map(|b| XLit::Atom(a, b)),
+                XLit::Role(r, a, b) => t(a).zip(t(b)).map(|(a, b)| XLit::Role(r, a, b)),
+                XLit::Eq(a, b) => t(a).zip(t(b)).map(|(a, b)| XLit::Eq(a, b)),
+                XLit::Ne(a, b) => t(a).zip(t(b)).map(|(a, b)| XLit::Ne(a, b)),
+            };
+            match w.map(|w| lits.lit(w, inv)) {
+                Some(Made::Lit(m)) => up.push(m),
+                Some(Made::False) => {}
+                Some(Made::True) | None => return,
+            }
+        }
+    }
     // the premises' literals: an atom over f(x), or a role atom read through the hierarchy;
     // without counting f's one role over f(x) is the only role literal, and one premise of
     // it meets every role atom below it
@@ -1876,10 +1963,12 @@ fn pred(ix: &Index, st: &State, f: Ex, c: &Clause, fixed: Option<(Lit, &Side)>, 
         match l.kind() {
             Y => head.push(Lit::x(l.atom())),
             RY => head.push(Lit::rl(f, l.atom())),
+            XL if dx.root.is_some() => {}
             _ => return,
         }
     }
-    let base: Side = (Vec::new(), head);
+    head.extend(up);
+    let base: Side = (ground, head);
     let lists_free: Vec<Vec<Side>> = need
         .iter()
         .map(|&n| match n.kind() {
@@ -1961,7 +2050,13 @@ fn process<S: Sink>(
 ) {
     let roles = &ix.roles;
     let dx = dix(ix);
-    if max.is_empty() {
+    // in a rooted run a clause can go to the predecessors and still have maximal literals
+    let rooted = dx.root.is_some();
+    if if rooted {
+        pred_ready(ix, dx, &out.dl().lits, c)
+    } else {
+        max.is_empty()
+    } {
         // Pred: the clause goes to the predecessors whose role meets its role atoms
         let x = ds(st);
         let Some(cid) = pred_id(x, id, out) else {
@@ -1979,7 +2074,9 @@ fn process<S: Sink>(
                 }
             }
         }
-        return;
+        if !rooted || max.is_empty() {
+            return;
+        }
     }
     let mut found = Found::default();
     let mut ps: Vec<(Role, Ex)> = Vec::new();
@@ -2092,7 +2189,15 @@ fn process<S: Sink>(
                         .and_then(|x| x.pred_in.get(&v))
                         .map_or(&[][..], |v| v.as_slice());
                     for &cid in cids {
-                        pred(ix, st, e, table.get(cid), Some((l, &prem)), &mut found);
+                        pred(
+                            ix,
+                            st,
+                            e,
+                            table.get(cid),
+                            Some((l, &prem)),
+                            &mut found,
+                            &out.dl().lits,
+                        );
                     }
                 }
             }
