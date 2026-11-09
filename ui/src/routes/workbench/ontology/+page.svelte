@@ -98,6 +98,8 @@
   import OntoTree from '$components/OntoTree.svelte';
   import EditorHistory from '$components/EditorHistory.svelte';
   import EntityHistory from '$components/EntityHistory.svelte';
+  import Discussions from '$components/Discussions.svelte';
+  import { isDiscussionGraph } from '$lib/discussions';
   import TreeCrumbs from '$components/TreeCrumbs.svelte';
 
   import { ONTOLOGY_TABS, routes, type OntologyTab } from '$lib/routes';
@@ -107,6 +109,7 @@
     ['dlquery', 'DL Query'],
     ['header', 'Header'],
     ['history', 'History'],
+    ['discussions', 'Discussions'],
   ];
 
   type Tab = OntologyTab;
@@ -134,7 +137,7 @@
   const kindTab = $derived<EntityKind | null>(tab === 'tree' ? kind : null);
   const selected = $derived(q.get('iri'));
   const view = $derived(
-    q.get('view') === 'usage' ? 'usage' : q.get('view') === 'history' ? 'history' : 'frame',
+    (['usage', 'history', 'discussion'] as const).find((v) => v === q.get('view')) ?? 'frame',
   );
   const inferredOn = $derived(q.get('inferred') === '1');
   const inferredKind = $derived<InferredKind | null>(
@@ -335,7 +338,10 @@
     if (!ds) return;
     try {
       const rows = await api.select(onBranch(ds, branch), ONTOLOGY_GRAPHS, { nocache: true });
-      graphs = rows.map((r) => (r.g?.type === 'uri' ? r.g.value : '')).filter(Boolean);
+      // a discussion graph is not an ontology even if a comment's text were to declare one
+      graphs = rows
+        .map((r) => (r.g?.type === 'uri' ? r.g.value : ''))
+        .filter((g) => g && !isDiscussionGraph(g));
     } catch {
       graphs = [];
     }
@@ -1020,6 +1026,8 @@
   const canWrite = $derived(auth.can(name, 'write'));
   const protectedBranch = $derived(!!currentBranch?.protected);
   const readonly = $derived(!canWrite || protectedBranch);
+  /** The name a comment records as its creator. */
+  const commenter = $derived(auth.who?.principal?.name ?? auth.who?.principal?.kind ?? 'anonymous');
   let sessionError = $state<string | null>(null);
   async function startSession() {
     sessionError = null;
@@ -1059,6 +1067,14 @@
     },
     staleText: 'Another commit landed since the editor read the ontology.',
   });
+  /**
+   * A comment, resolve or reopen committed `seq`: an ordinary commit of the branch, which
+   * moves the head the next edit names, so the views read it again. Undo leaves it alone.
+   */
+  const discussed = (seq: number | null) => {
+    if (seq != null) session.own.add(seq);
+    void loadAll();
+  };
   const edit = (op: Op, label: string, after?: () => void, fromFrame: string | null = null) => {
     // an edit names the commit the summary read, which a large ontology's summary may still be reading
     if (readonly || !etag)
@@ -1479,6 +1495,21 @@
           />
         </div>
       </section>
+    {:else if tab === 'discussions' && summary}
+      <section class="panel" aria-label="Discussions">
+        <div class="panel-body">
+          <Discussions
+            {target}
+            {sel}
+            {readonly}
+            user={commenter}
+            name={nameOf}
+            refreshKey={summary.commit ?? 0}
+            oncommitted={discussed}
+            onopen={(iri) => nav({ tab: null, iri, view: 'discussion' })}
+          />
+        </div>
+      </section>
     {:else if tab === 'history' && summary}
       <section class="panel" aria-label="History">
         <div class="panel-body">
@@ -1796,6 +1827,10 @@
                 <button aria-pressed={view === 'history'} onclick={() => nav({ view: 'history' })}
                   >History</button
                 >
+                <button
+                  aria-pressed={view === 'discussion'}
+                  onclick={() => nav({ view: 'discussion' })}>Discussion</button
+                >
               </div>
             </div>
             <div class="panel-body">
@@ -1857,6 +1892,18 @@
                     />
                   {/if}
                 {/key}
+              {:else if view === 'discussion' && summary && selected}
+                <Discussions
+                  {target}
+                  {sel}
+                  iri={selected}
+                  {readonly}
+                  user={commenter}
+                  axioms={frameFor === selected ? frameItems.map((it) => it.ofn) : []}
+                  name={nameOf}
+                  refreshKey={summary.commit ?? 0}
+                  oncommitted={discussed}
+                />
               {:else if view === 'history' && summary}
                 <EntityHistory
                   {name}
