@@ -514,7 +514,7 @@ class Controls(unittest.TestCase):
         for pid in UNKNOWN_SESSION:del rows[pid]
         with tempfile.TemporaryDirectory(prefix='boat-v2-session-') as d:
             root=Path(d);(root/'bootstrap.lock').touch(mode=0o600);m=root/'toolchain.json';m.write_text('ASCII');m.chmod(0o600);clock=Clock()
-            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause,lambda rows:(1220,5))
+            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause,lambda rows,left:(1220,5))
             self.assertTrue(q['startup_closed']);self.assertTrue(q['qualification_eligible'])
             # Without the system manager's own user-manager identity none of its children is allowed.
             q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause)
@@ -523,7 +523,7 @@ class Controls(unittest.TestCase):
         rows=observed_session_rows()
         with tempfile.TemporaryDirectory(prefix='boat-v2-session-') as d:
             root=Path(d);(root/'bootstrap.lock').touch(mode=0o600);m=root/'toolchain.json';m.write_text('ASCII');m.chmod(0o600);clock=Clock()
-            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause,lambda rows:(1220,5))
+            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause,lambda rows,left:(1220,5))
         self.assertFalse(q['startup_closed']);self.assertEqual(q['reason_code'],'startup_busy:unallowed_processes')
         self.assertEqual({x['pid'] for x in q['unallowed']},UNKNOWN_SESSION|set(UNPARENTED));self.assertEqual(q['unallowed_count'],7)
         row={x['pid']:x for x in q['unallowed']}[8008]
@@ -640,6 +640,24 @@ class Controls(unittest.TestCase):
             moved=Path(d)/'gone';root.rename(moved)
             self.assertIsNone(OBSERVER['state_snapshot'](root))
             self.assertFalse(OBSERVER['settle'](root,clock.now,clock.pause,clock.t+10))
+    def test_an_absent_directory_at_both_snapshots_is_not_closure(self):
+        with tempfile.TemporaryDirectory(prefix='boat-v2-absent2-') as d:
+            root,m=self.checkpoint_dir(d);clock=Clock();real=OBSERVER['state_snapshot'];expected=digest(m.read_bytes())
+            # The directory is absent at both snapshot reads of every attempt.
+            with patch.dict(OBSERVER,{'state_snapshot':lambda state:None}):
+                q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,expected,10,proc_fixture_reader(),clock.now,clock.pause)
+            self.assertFalse(q['startup_closed']);self.assertEqual(q['reason_code'],'startup_busy:state_restore_in_progress')
+    def test_manager_and_slow_reads_stay_inside_the_deadline(self):
+        with tempfile.TemporaryDirectory(prefix='boat-v2-slow-') as d:
+            root,m=self.checkpoint_dir(d);clock=Clock();asked=[]
+            def manager(rows,left):
+                asked.append(left);clock.pause(min(10,left));return None
+            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),1,proc_fixture_reader(),clock.now,clock.pause,manager)
+            self.assertLessEqual(clock.t,1);self.assertTrue(all(0<x<=1 for x in asked),asked);self.assertFalse(q['startup_closed'])
+            calls=[]
+            with patch.dict(OBSERVER,{'command':lambda argv,seconds=15:(calls.append(seconds),b'MainPID=1\n')[1]}):
+                OBSERVER['user_manager'](observed_session_rows(),1000,3.5);OBSERVER['user_manager'](observed_session_rows(),1000,0)
+            self.assertEqual(calls,[3.5])
     def test_retained_phase_directories_do_not_count_toward_the_bound(self):
         with tempfile.TemporaryDirectory(prefix='boat-v2-retained-') as d:
             root,m=self.checkpoint_dir(d)

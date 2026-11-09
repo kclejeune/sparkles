@@ -84,9 +84,10 @@ def provider_session(pid,rows,manager=None,depth=0):
     parent=rows[row['ppid']]
     return parent['uid']!=uid or (manager is not None and (parent['pid'],parent['start'])==tuple(manager)) or provider_session(parent['pid'],rows,manager,depth+1)
 
-def user_manager(rows,uid):
-    """The worker's user manager by the system manager's own MainPID for user@UID.service."""
-    try:raw=command(['systemctl','show','user@%d.service'%uid,'--property=MainPID'],10).decode().strip()
+def user_manager(rows,uid,seconds=10):
+    """The worker's user manager by the system manager's own MainPID for user@UID.service, asked within ``seconds``."""
+    if seconds<=0:return None
+    try:raw=command(['systemctl','show','user@%d.service'%uid,'--property=MainPID'],min(10,seconds)).decode().strip()
     except Exception:return None
     if not re.fullmatch(r'MainPID=[0-9]{1,9}',raw):return None
     row=rows.get(int(raw.split('=',1)[1]))
@@ -184,7 +185,7 @@ def bootstrap_lock(path,uid,denied):
         if (after.st_dev,after.st_ino,after.st_nlink,after.st_size)!=(s.st_dev,s.st_ino,1,0):raise StateChanged('bootstrap lock changed during observation')
     finally:os.close(fd)
 
-def checkpoint_at(state,uid,denied,launcher,probe_pid,expected_manifest,seconds,rows_reader=process_rows,clock=time.monotonic,pause=time.sleep,manager_reader=lambda rows:None):
+def checkpoint_at(state,uid,denied,launcher,probe_pid,expected_manifest,seconds,rows_reader=process_rows,clock=time.monotonic,pause=time.sleep,manager_reader=lambda rows,left:None):
     """Observe startup until it is closed or the observation deadline passes.
 
     A replaced bootstrap lock or manifest, or a state directory that changes
@@ -195,6 +196,10 @@ def checkpoint_at(state,uid,denied,launcher,probe_pid,expected_manifest,seconds,
     deadline=clock()+seconds;tracked=set()
     last='not observed';code='startup_unobserved';rows={};busy=[];unsettled=False
     def wait(n):pause(min(n,max(0.0,deadline-clock())))
+    def scan():
+        # The manager query gets only the time left, and none once it is gone.
+        found=rows_reader();left=deadline-clock()
+        return found,foreign_startup(found,launcher,probe_pid,tracked,manager_reader(found,left) if left>0 else None)
     def changed(reason):
         nonlocal last,code,busy,unsettled
         last=reason;busy=[];unsettled=True
@@ -206,21 +211,24 @@ def checkpoint_at(state,uid,denied,launcher,probe_pid,expected_manifest,seconds,
             if clock()>=deadline:break
         try:
             before=state_snapshot(state)
+            if before is None:raise StateChanged('state directory changed during observation')
             with bootstrap_lock(state/'bootstrap.lock',uid,denied) as lock:
                 manifest,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
                 # The actual pinned hook has no manifest deletion branch. If not
                 # yet at its absence test it now skips bootstrap; a running
                 # bootstrap still owns fd9/flock until its waited children end.
-                rows=rows_reader();busy=foreign_startup(rows,launcher,probe_pid,tracked,manager_reader(rows))
+                rows,busy=scan()
                 if busy:last='live or unknown startup descendants';code='startup_busy:unallowed_processes';wait(0.5);continue
                 wait(0.5)
-                rows=rows_reader();busy=foreign_startup(rows,launcher,probe_pid,tracked,manager_reader(rows))
+                if clock()>=deadline:break
+                rows,busy=scan()
                 current,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
                 if current!=manifest:raise StateChanged('startup manifest path/bytes changed')
                 if busy:last='live or unknown startup descendants';code='startup_busy:unallowed_processes';continue
                 held=(state/'bootstrap.lock').lstat()
                 if (held.st_dev,held.st_ino)!=(lock['device'],lock['inode']):raise StateChanged('bootstrap lock changed during observation')
-                if state_snapshot(state)!=before:raise StateChanged('state directory changed during observation')
+                after=state_snapshot(state)
+                if after is None or after!=before:raise StateChanged('state directory changed during observation')
                 # A success observed after the deadline does not count.
                 if clock()>=deadline:break
                 return {'startup_closed':True,'installer_quiescent':True,'manifest_sha256':manifest['sha256'],'qualification_eligible':manifest['sha256']==expected_manifest,'bootstrap_lock':lock,'bootstrap_occurrence':'unknown','hook_terminal_observed':False,'closure_basis':'existing bootstrap fd9 lock, stable owned present manifest, a state directory unchanged across the attempt and repeated exact PID/start/descendant observations; any not-yet-entered pinned absence branch must skip bootstrap','unknown_or_live_descendants':[],'engine_or_job_started':False}
@@ -247,7 +255,7 @@ def run_phase(payload,observe,qualify,clock=time.monotonic):
 def startup_checkpoint(payload,seconds):
     home=Path.home();uid=os.getuid();need(uid==profile()['worker_uid'] and home==Path(profile()['worker_home']),'startup worker user')
     token=token_metadata(home/'.config/mbx/remote-token',uid);denied=(token['device'],token['inode']);state=home/'.local/state/sparkles-boat'
-    return checkpoint_at(state,uid,denied,payload['launcher_identity'],os.getpid(),payload['pins']['saved_toolchain_manifest_sha256'],seconds,manager_reader=lambda rows:user_manager(rows,uid))
+    return checkpoint_at(state,uid,denied,payload['launcher_identity'],os.getpid(),payload['pins']['saved_toolchain_manifest_sha256'],seconds,manager_reader=lambda rows,left:user_manager(rows,uid,left))
 
 def observe_startup(payload):
     seconds=payload['observation_seconds'];need(type(seconds)is int and 1<=seconds<=1950,'startup observation bound')

@@ -71,8 +71,9 @@ writes no completion marker. A bootstrap lock or manifest replaced during an att
 or a state directory whose entries change during it, therefore counts as startup still
 running. The observer then waits until the directory is present and its entries keep
 the same identity, size and times for five seconds, and observes again. The phase
-directories this package keeps there are left out of that comparison. Every wait ends at
-the observation deadline, and a closure seen after it does not count. The observer
+directories this package keeps there are left out of that comparison. An absent directory
+counts as a restore in progress. Every pause and the user-manager query are cut to the
+time left before the observation deadline, and a closure seen after it does not count. The observer
 refuses only when that deadline passes, with `startup_busy:bootstrap_lock_replaced` or
 `startup_busy:state_restore_in_progress` when that was the last thing it saw.
 
