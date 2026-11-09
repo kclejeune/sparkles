@@ -2,15 +2,18 @@
 
 This package qualifies one explicitly owned warm Boat worker and keeps an independent
 local deadline guard through normal stop. It starts no source job and never creates,
-forks, extends, force-stops or silently replaces a worker. Build, screen, partition and
-gate adapters keep their own source, resource, test and lease requirements.
+forks, force-stops or silently replaces a worker. It extends a running worker only
+through the [receipted extension](#lifetime-extension) below. Build, screen, partition
+and gate adapters keep their own source, resource, test and lease requirements.
 
 The maintained defaults refuse. `profile.FALSE.json`, `release.FALSE.json` and
 `job-closure.FALSE.json` contain no actual worker, account, environment or credential.
 Private operator-reviewed copies provide those bindings. The release also requires
 current local-first need, the shared start reservation and live account limits, exact
 CLI/profile/source reviews, environment exclusion, snapshot continuity and previous
-native/lease closure. An owned ledger alone does not establish account-wide usage.
+native/lease closure. An owned ledger alone does not establish account-wide usage. A
+qualification run may set `overflow_currently_needed` to false only with the
+`qualification` purpose and the SHA-256 of the maintainer's recorded confirmation.
 
 ## Qualification and source binding
 
@@ -33,7 +36,9 @@ python3 -I -B scripts/boat/controls.py
 ```
 
 The lifecycle requests one 10,800-second resume and arms a local guard at the earlier
-10,500-second wall/BOOTTIME deadline. It checks the live guard's boot, invocation,
+10,500-second wall/BOOTTIME deadline. The guard unit's own runtime limit is 43,500
+seconds, which covers the 12-hour extension cap, the wait for a running extension act
+and the stop margin. The provider TTL stays the worker's backstop. It checks the live guard's boot, invocation,
 loaded command, PID, cgroup and limits. Null, malformed or lost acknowledgements retain
 the start reservation and never authorize another resume. Provider readiness alone does
 not qualify the worker. The pinned provisioning hook may run its reviewed normal setup,
@@ -82,7 +87,7 @@ The original `qualified-worker-admission.json` remains unchanged and has
 `runtime_env_file:null`. `job_environment.py` validates that receipt with the shared
 `validate_admission` consumer and its exact private profile, operation, source seal,
 job review and live guard. It creates one bounded mode-0600 nonsecret environment file
-containing literal PATH and token FILE path only. Its separate job-admission record
+containing only literal PATH, pinned Rust toolchain and token FILE path values. Its separate job-admission record
 references the original qualification bytes and actual environment-file proof. It
 creates no extra authority or lifetime. Adapters pass the deterministic values
 literally and never source arbitrary shell values. An uncertain preparation is
@@ -94,6 +99,34 @@ reserve and refuses inadequate remaining time. The qualification receipt and loc
 guard stay bound to the same operation throughout. The transport's actual Boat quoting,
 workload correctness, cache reuse and interruption behavior still require real
 acceptance under roadmap item 762. Namespace remains the required screen fallback.
+
+## Lifetime extension
+
+A worker can serve another lane without a stop and resume. The lifecycle owner records
+a fresh environment fact, as for the post-resume check, and extends the same operation.
+
+```sh
+python3 -I -B scripts/boat/controller.py extend --operation "$OWNED_OPERATION" --seconds 7200 --environment-fact "$PRIVATE_ENV_FACT" --reason "next lane"
+```
+
+The act refuses a stopping or closed operation and a lifetime already inside the
+30-second closure reserve. It adopts the worker only when the local boot and the live
+guard's invocation and PID match the guard receipt, the worker's current boot id matches
+the one the metadata probe recorded, the provider reports the qualified environment
+version and the fact matches the environment, version and hook. The new end is the
+act's own observation plus at most 10,500 seconds on the wall clock and
+`CLOCK_BOOTTIME`, never shorter than the current end and never more than 12 hours after
+the controller intent. The act sets the provider TTL 300 seconds past the new end with
+`boat extend --ttl`, confirms `archiveAfter` through info and then publishes
+`lifetime-extension-NNNN.json`. A failure leaves only an attempt record, which grants
+nothing, and the provider lifetime may then be longer than the guard's deadline.
+
+One act runs at a time under the operation's extension lock. The guard takes the same
+lock before it stops at its deadline and reads the receipts again, so no extension is
+published after it decides to stop. Admission, job preparation and the guard accept
+only consecutive version-1 receipts for the same worker, operation, guard and worker
+boot, each recorded before the previous end. A job admitted before an extension keeps
+the deadline it started with.
 
 ## Closure and normal stop
 
