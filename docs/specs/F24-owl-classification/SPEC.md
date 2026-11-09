@@ -946,8 +946,13 @@ the [code layout results](../../benchmarks/el-classification/RESULTS.md#code-lay
 ### Nominals in the disjunctive rules
 
 This section is the design of item 603's sixth phase, which extends the disjunctive rules
-to nominals. Until that phase lands, the disjunctive rules refuse ontologies with
-individuals and nominals as the section above says.
+to nominals. The rules it describes are built, apart from keys and the universal property,
+which item 805 builds. They run only when the constant `ROOTED_RUNS` in `classify/mod.rs`
+is true, and it is false, because the rules do not finish on most of the phase's gate.
+The disjunctive rules therefore still refuse ontologies with individuals and nominals as
+the section above says, and every other run takes the paths it took before these rules
+existed. The measurements and the redesign that item 804 follows are at the end of this
+section.
 
 A run of the disjunctive rules with nominals uses the general rooted calculus of Tena
 Cucala, Cuenca Grau and Horrocks in the journal version, *Pay-As-You-Go Consequence-Based
@@ -1089,6 +1094,28 @@ off, on one and four threads, under both strategies, and must equal HermiT's tax
 consistency. Regressions with one disjunctive axiom added check that an irreflexive
 property beside a nominal is left out while the run takes the rest, and that a stopped rooted run reports its consistency
 as unknown.
+
+With the switch on, the rooted run finishes 132 of the 200 runs of the 50 `shoi` fixtures,
+on one and four threads under both strategies, within 5 s each in a debug build, and each
+taxonomy it finishes equals HermiT's. It times out at least once on 19 fixtures. The
+smallest case, three axioms reduced from `shoi-000`, gives no answer within 200 s. Two
+causes are measured. The first is the fifth condition of Definition 7, which leaves ground
+atoms of different predicates incomparable, so the root's resolution over ground
+disjunctions is unordered and r-Pred copies those disjunctions into the contexts. An
+order of every ground atom by predicate, which Definition 7 does not admit, classifies the
+small case in 0.4 s, and 39 fixtures then finish in every configuration with HermiT's
+taxonomies. Ordering only the unary atoms over one constant, which is what the nominal
+contexts of the journal's system Sequoia allow, classifies it in 5.2 s. The second cause
+remains with the order of every ground atom, with Eq blocked as the journal's Section 7.2.3 describes, with one
+query atom selected per clause as its Section 7.3.1 describes and without the ground
+markers to successors. The root then spends its work on clauses whose bodies join up to
+five r-Succ markers, which is the calculus's own conditional reasoning. A read-only
+consult found that the growth follows Tables 2 and 3 rather than a wrong inference, and
+recommended Sequoia's nominal contexts in place of the single root. Item 804 redesigns the
+rooted run to meet the gate. It may depart from the journal's rules, with Sequoia's nominal
+contexts, Eq blocking and query-atom order or an order of ground atoms across predicates,
+and this section is to record each departure with its rationale, its argument for
+soundness and completeness and its measured effect.
 
 ### ROBOT-compatible commands
 
