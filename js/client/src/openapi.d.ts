@@ -8119,11 +8119,22 @@ export interface components {
                     about?: string[];
                     /** @description Cited facts as N-Triples triple terms, reifiers, and cited child findings. */
                     cites?: string[];
+                    /** @description Under a review policy, the IRIs of the accepted claims behind the cited facts. */
+                    claims?: string[];
+                    /** @description Under a review policy, the IRIs of those claims' current decisions. */
+                    decisions?: string[];
                     text: string;
                     unmatchedNames?: string[];
                 }[];
                 iri: string;
                 rating?: number | null;
+                /** @description The review policy the report was read under. A report without one has no such member. */
+                reviewPolicy?: {
+                    /** @description The configuration history's lineage UUID and the SHA-256 of the selected generation, joined with a slash. */
+                    configuration?: string | null;
+                    iri: string;
+                    version?: number | null;
+                };
                 revisionOf?: string | null;
                 sourceCommit?: number | null;
                 /** @enum {string} */

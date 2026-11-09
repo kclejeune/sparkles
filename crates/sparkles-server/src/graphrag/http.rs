@@ -569,7 +569,7 @@ fn report_json(ds: &Dataset, opts: &QueryOptions, graph: &str, rep: &str) -> Api
         ds,
         opts,
         &format!(
-            "SELECT ?title ?summary ?status ?rating ?failure ?model ?in ?out ?at ?prev ?dc ?du ?commit WHERE {{ GRAPH <{graph}> {{ <{rep}> <{status}> ?status . OPTIONAL {{ <{rep}> <{label}> ?title }} OPTIONAL {{ <{rep}> <{summary}> ?summary }} OPTIONAL {{ <{rep}> <{rating}> ?rating }} OPTIONAL {{ <{rep}> <{failure}> ?failure }} OPTIONAL {{ <{rep}> <{prov}wasGeneratedBy> ?a . ?a <{spk}model> ?model ; <{spk}inputTokens> ?in ; <{spk}outputTokens> ?out ; <{prov}startedAtTime> ?at }} OPTIONAL {{ <{rep}> <{prov}wasRevisionOf> ?prev }} OPTIONAL {{ <{rep}> <{dc}> ?dc }} OPTIONAL {{ <{rep}> <{du}> ?du }} OPTIONAL {{ <{rep}> <{sc}> ?commit }} }} }}",
+            "SELECT ?title ?summary ?status ?rating ?failure ?model ?in ?out ?at ?prev ?dc ?du ?commit ?policy ?version ?configuration WHERE {{ GRAPH <{graph}> {{ <{rep}> <{status}> ?status . OPTIONAL {{ <{rep}> <{policy}> ?policy ; <{version}> ?version ; <{configuration}> ?configuration }} OPTIONAL {{ <{rep}> <{label}> ?title }} OPTIONAL {{ <{rep}> <{summary}> ?summary }} OPTIONAL {{ <{rep}> <{rating}> ?rating }} OPTIONAL {{ <{rep}> <{failure}> ?failure }} OPTIONAL {{ <{rep}> <{prov}wasGeneratedBy> ?a . ?a <{spk}model> ?model ; <{spk}inputTokens> ?in ; <{spk}outputTokens> ?out ; <{prov}startedAtTime> ?at }} OPTIONAL {{ <{rep}> <{prov}wasRevisionOf> ?prev }} OPTIONAL {{ <{rep}> <{dc}> ?dc }} OPTIONAL {{ <{rep}> <{du}> ?du }} OPTIONAL {{ <{rep}> <{sc}> ?commit }} }} }}",
             status = gr("status"),
             label = store::RDFS_LABEL,
             summary = gr("summary"),
@@ -580,6 +580,9 @@ fn report_json(ds: &Dataset, opts: &QueryOptions, graph: &str, rep: &str) -> Api
             dc = gr("droppedCitations"),
             du = gr("droppedUnsupported"),
             sc = gr("sourceCommit"),
+            policy = gr("reviewPolicy"),
+            version = gr("policyVersion"),
+            configuration = gr("evidenceConfiguration"),
         ),
     )?;
     let Some(r) = r.into_iter().next() else {
@@ -597,6 +600,16 @@ fn report_json(ds: &Dataset, opts: &QueryOptions, graph: &str, rep: &str) -> Api
         "droppedUnsupported": int(&r[11]),
         "sourceCommit": int(&r[12]),
     });
+    // a report read under a review policy names it (spec C25, "Reports on accepted
+    // evidence"); one without has no such member
+    let policy = iri(&r[13]);
+    if let Some(p) = &policy {
+        out["reviewPolicy"] = json!({
+            "iri": p,
+            "version": int(&r[14]),
+            "configuration": lit(&r[15]),
+        });
+    }
     if lit(&r[5]).is_some() {
         out["activity"] = json!({
             "model": lit(&r[5]),
@@ -610,29 +623,42 @@ fn report_json(ds: &Dataset, opts: &QueryOptions, graph: &str, rep: &str) -> Api
         ds,
         opts,
         &format!(
-            "SELECT ?n ?text ?p ?o WHERE {{ GRAPH <{graph}> {{ <{rep}> <{}> ?f . ?f <{}> ?n ; <{}> ?text . OPTIONAL {{ ?f ?p ?o FILTER(?p IN (<{}>, <{}>, <{}>)) }} }} }}",
+            "SELECT ?n ?text ?p ?o WHERE {{ GRAPH <{graph}> {{ <{rep}> <{}> ?f . ?f <{}> ?n ; <{}> ?text . OPTIONAL {{ ?f ?p ?o FILTER(?p IN (<{}>, <{}>, <{}>, <{}>, <{}>)) }} }} }}",
             gr("finding"),
             gr("order"),
             gr("text"),
             gr("about"),
             gr("cites"),
             gr("unmatchedName"),
+            gr("citesClaim"),
+            gr("citesDecision"),
         ),
     )? {
         let (Some(n), Some(text)) = (int(&f[0]), lit(&f[1])) else {
             continue;
         };
-        let e = findings.entry(n).or_insert_with(
-            || json!({ "text": text, "about": [], "cites": [], "unmatchedNames": [] }),
-        );
+        let e = findings.entry(n).or_insert_with(|| {
+            let mut v = json!({ "text": text, "about": [], "cites": [], "unmatchedNames": [] });
+            if policy.is_some() {
+                v["claims"] = json!([]);
+                v["decisions"] = json!([]);
+            }
+            v
+        });
         let key = match iri(&f[2]).as_deref() {
             Some(p) if p == gr("about") => "about",
             Some(p) if p == gr("cites") => "cites",
             Some(p) if p == gr("unmatchedName") => "unmatchedNames",
+            Some(p) if p == gr("citesClaim") && policy.is_some() => "claims",
+            Some(p) if p == gr("citesDecision") && policy.is_some() => "decisions",
             _ => continue,
         };
         let v = match &f[3] {
             Some(Term::Literal(l)) => Value::String(l.value().to_string()),
+            // claims and decisions are IRIs, as the evidence operations name them
+            Some(Term::NamedNode(n)) if matches!(key, "claims" | "decisions") => {
+                Value::String(n.as_str().to_string())
+            }
             Some(t) => Value::String(t.to_string()),
             None => continue,
         };

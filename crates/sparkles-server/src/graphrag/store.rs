@@ -98,6 +98,24 @@ pub struct NewReport {
     /// the report this one replaces
     pub revision_of: Option<String>,
     pub body: Body,
+    /// the review policy the report was read under, and what it read
+    pub evidence: Option<ReportEvidence>,
+}
+
+/// What a report read under a review policy records (spec C25, "Reports on accepted
+/// evidence").
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReportEvidence {
+    pub policy: String,
+    pub version: u32,
+    /// the configuration history's lineage and generation, joined with a slash
+    pub configuration: String,
+    /// for each item of the input, the claims of its fact and their current decisions
+    pub items: Vec<Vec<(String, String)>>,
+    /// every claim and decision behind the input, cited or not
+    pub used: Vec<(String, String)>,
+    /// the child reports the input read
+    pub children: Vec<String>,
 }
 
 /// What a report says.
@@ -220,8 +238,27 @@ pub fn report_quads(r: &NewReport, graph: &str) -> Vec<Quad> {
     if let Some(old) = &r.revision_of {
         o.add(id, &format!("{PROV}wasRevisionOf"), nn(old));
     }
+    if let Some(e) = &r.evidence {
+        o.add(id, &gr("reviewPolicy"), nn(&e.policy));
+        o.int(id, &gr("policyVersion"), e.version.into());
+        o.lit(id, &gr("evidenceConfiguration"), &e.configuration);
+    }
     if let Some(a) = &r.activity {
         let act = activity_iri(id);
+        // a failed report has no activity and records no claim
+        if let Some(e) = &r.evidence {
+            let mut used: Vec<&str> = Vec::new();
+            for (c, d) in &e.used {
+                used.push(c);
+                used.push(d);
+            }
+            used.extend(e.children.iter().map(String::as_str));
+            used.sort_unstable();
+            used.dedup();
+            for u in used {
+                o.add(&act, &format!("{PROV}used"), nn(u));
+            }
+        }
         o.add(id, &format!("{PROV}wasGeneratedBy"), nn(&act));
         o.add(&act, RDF_TYPE, nn(&format!("{PROV}Activity")));
         o.add(&act, &format!("{PROV}wasAssociatedWith"), nn(WRITER));
@@ -264,6 +301,28 @@ pub fn report_quads(r: &NewReport, graph: &str) -> Vec<Quad> {
                     if let Some(Term::NamedNode(n)) = parse_term(e) {
                         o.add(&fid, &gr("about"), n);
                     }
+                }
+                let mut claims: Vec<&str> = Vec::new();
+                let mut decisions: Vec<&str> = Vec::new();
+                for n in &f.cites {
+                    if let Some(e) = &r.evidence
+                        && let Some(pairs) = e.items.get(n - 1)
+                    {
+                        for (c, d) in pairs {
+                            claims.push(c);
+                            decisions.push(d);
+                        }
+                    }
+                }
+                claims.sort_unstable();
+                claims.dedup();
+                decisions.sort_unstable();
+                decisions.dedup();
+                for c in claims {
+                    o.add(&fid, &gr("citesClaim"), nn(c));
+                }
+                for d in decisions {
+                    o.add(&fid, &gr("citesDecision"), nn(d));
                 }
                 for n in &f.cites {
                     let Some(item) = input.items.get(n - 1) else {
@@ -318,16 +377,26 @@ pub fn delete_subjects(graph: &str, subjects: &[String]) -> Option<String> {
 }
 
 /// The SPARQL update that removes the reports of `graph` that no community links to and
-/// that no linked report reaches through one or more `gr:citesReport` links, with their
-/// findings and activities. A report a kept parent still cites, directly or through
-/// another cited report, stays until that parent is replaced, so its findings remain
-/// resolvable, and the history keeps every removed report.
+/// that no linked report reaches, with their findings and activities. A linked report
+/// reaches the reports it cites through `gr:citesReport` and the child reports its
+/// activity used. A linked report read under a review policy that a person edited, and
+/// so has no activity, also reaches the report it revises, back through earlier edits,
+/// and what that report reaches, so that the edit's provenance resolves (spec C25,
+/// "Reports on accepted evidence"). A report that a run wrote in place of another does
+/// not keep it. A report a kept parent still reaches stays until that parent is
+/// replaced, so its findings remain resolvable, and the history keeps every removed
+/// report.
 pub fn delete_unreachable_reports(graph: &str) -> String {
+    let step = format!(
+        "(<{cites}>|(<{PROV}wasGeneratedBy>/<{PROV}used>))",
+        cites = gr("citesReport")
+    );
     format!(
-        "DELETE {{ GRAPH <{graph}> {{ ?x ?p ?o }} }} WHERE {{ {{ SELECT DISTINCT ?r WHERE {{ GRAPH <{graph}> {{ ?r a <{report_t}> FILTER NOT EXISTS {{ ?c <{report}> ?r }} FILTER NOT EXISTS {{ ?c2 <{report}> ?r2 . ?r2 <{cites}>+ ?r }} }} }} }} GRAPH <{graph}> {{ ?x ?p ?o }} FILTER(?x = ?r || STRSTARTS(STR(?x), CONCAT(STR(?r), \"#\"))) }}",
+        "DELETE {{ GRAPH <{graph}> {{ ?x ?p ?o }} }} WHERE {{ {{ SELECT DISTINCT ?r WHERE {{ GRAPH <{graph}> {{ ?r a <{report_t}> FILTER NOT EXISTS {{ ?c <{report}> ?r }} FILTER NOT EXISTS {{ ?c2 <{report}> ?r2 . ?r2 {step}+ ?r }} FILTER NOT EXISTS {{ ?c3 <{report}> ?l . ?l <{policy}> ?pol ; <{rev}>+ ?root . FILTER NOT EXISTS {{ ?l <{rev}>* ?m . ?m <{rev}>+ ?root ; <{PROV}wasGeneratedBy> ?act }} ?root {step}* ?r }} }} }} }} GRAPH <{graph}> {{ ?x ?p ?o }} FILTER(?x = ?r || STRSTARTS(STR(?x), CONCAT(STR(?r), \"#\"))) }}",
         report_t = gr("Report"),
         report = gr("report"),
-        cites = gr("citesReport"),
+        policy = gr("reviewPolicy"),
+        rev = format!("{PROV}wasRevisionOf"),
     )
 }
 

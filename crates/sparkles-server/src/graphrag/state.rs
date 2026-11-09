@@ -15,8 +15,16 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// The state format this server reads and writes.
-pub const STATE_VERSION: u32 = 2;
+/// The state format this server writes. Version 3 adds the review policy of a build
+/// and the claim and decision pairs each report read under it (spec C25, "Reports on
+/// accepted evidence").
+pub const STATE_VERSION: u32 = 3;
+/// The older format this server still reads, whose reports record no policy.
+pub const STATE_VERSION_2: u32 = 2;
+/// The most claim and decision pairs the state may hold.
+pub const MAX_PAIRS: usize = 1_000_000;
+/// The most references to pairs over all communities.
+pub const MAX_PAIR_REFERENCES: usize = 32_000_000;
 /// The most communities the state may hold.
 pub const MAX_COMMUNITIES: usize = 200_000;
 /// The most member entries over all communities.
@@ -74,6 +82,14 @@ pub struct StoredCommunity {
     /// compares with the facts it reads (§5)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facts: Vec<u64>,
+    /// whether the report records a review policy, whichever it is
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub policy: bool,
+    /// the positions in [`BuildRecord::pairs`] of the claim and decision pairs the
+    /// report's input used, its children's included, when the report was read under the
+    /// build's policy and the list is complete; an empty list is complete
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairs: Option<Vec<u32>>,
 }
 
 /// The last completed build.
@@ -98,6 +114,21 @@ pub struct BuildRecord {
     pub reports_graph: String,
     #[serde(default)]
     pub footprint: String,
+    /// the review policy the build read under
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<StoredPolicy>,
+    /// the claim and decision pairs the communities name by position
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pairs: Vec<[String; 2]>,
+}
+
+/// The review policy of a build, as its view recorded it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct StoredPolicy {
+    pub name: String,
+    pub iri: String,
+    pub version: u32,
 }
 
 /// `graphrag/state.json`.
@@ -171,6 +202,40 @@ impl BuildState {
                 limit: MAX_COMMUNITIES,
             });
         }
+        if b.pairs.len() > MAX_PAIRS {
+            return Err(StateError::Bound {
+                what: "claim and decision pairs",
+                limit: MAX_PAIRS,
+            });
+        }
+        if b.pairs.iter().flatten().any(|t| t.len() > MAX_TERM_BYTES) {
+            return Err(StateError::Bound {
+                what: "bytes in a claim or decision IRI",
+                limit: MAX_TERM_BYTES,
+            });
+        }
+        if b.policy.is_none() && !b.pairs.is_empty() {
+            return Err(StateError::Corrupt(
+                "the state records pairs without a review policy".into(),
+            ));
+        }
+        let mut refs = 0usize;
+        for c in &b.communities {
+            let Some(p) = &c.pairs else { continue };
+            refs += p.len();
+            if refs > MAX_PAIR_REFERENCES {
+                return Err(StateError::Bound {
+                    what: "references to pairs",
+                    limit: MAX_PAIR_REFERENCES,
+                });
+            }
+            if b.policy.is_none() || p.iter().any(|&i| i as usize >= b.pairs.len()) {
+                return Err(StateError::Corrupt(format!(
+                    "community {} names a pair the state does not hold",
+                    c.iri
+                )));
+            }
+        }
         let mut entries = 0usize;
         let mut iris = std::collections::HashSet::new();
         for c in &b.communities {
@@ -224,12 +289,25 @@ impl BuildState {
         let probe: Probe =
             serde_json::from_slice(bytes).map_err(|e| StateError::Corrupt(e.to_string()))?;
         match probe.version.as_ref().and_then(|v| v.as_u64()) {
-            Some(v) if v == u64::from(STATE_VERSION) => {}
+            Some(v) if v == u64::from(STATE_VERSION) || v == u64::from(STATE_VERSION_2) => {}
             Some(v) => return Err(StateError::UnknownVersion(v)),
             None => return Err(StateError::Corrupt("the version is missing".into())),
         }
-        let s: BuildState =
+        let mut s: BuildState =
             serde_json::from_slice(bytes).map_err(|e| StateError::Corrupt(e.to_string()))?;
+        if s.version == STATE_VERSION_2 {
+            // a version 2 state records no policy, and the next write is version 3
+            if s.last_build.as_ref().is_some_and(|b| {
+                b.policy.is_some()
+                    || !b.pairs.is_empty()
+                    || b.communities.iter().any(|c| c.policy || c.pairs.is_some())
+            }) {
+                return Err(StateError::Corrupt(
+                    "a version 2 state records a review policy".into(),
+                ));
+            }
+            s.version = STATE_VERSION;
+        }
         s.check()?;
         Ok(s)
     }
@@ -323,6 +401,8 @@ mod tests {
             members: members.iter().map(|m| m.to_string()).collect(),
             report: Some("urn:uuid:r".into()),
             facts: vec![1, 2],
+            policy: false,
+            pairs: None,
         }
     }
 
@@ -337,6 +417,8 @@ mod tests {
                 tokens: 10,
                 reports_graph: "urn:x-sparkles:graphrag:reports".into(),
                 footprint: "urn:x-sparkles:graphrag:footprint:00".into(),
+                policy: None,
+                pairs: Vec::new(),
             }),
             ..BuildState::default()
         }
@@ -354,19 +436,65 @@ mod tests {
 
     #[test]
     fn unknown_versions_are_refused_before_their_members() {
-        let e = BuildState::parse(br#"{"version": 3, "whatever": [1]}"#).unwrap_err();
-        assert!(matches!(e, StateError::UnknownVersion(3)), "{e}");
+        let e = BuildState::parse(br#"{"version": 4, "whatever": [1]}"#).unwrap_err();
+        assert!(matches!(e, StateError::UnknownVersion(4)), "{e}");
         // version 1 had no record of the reports graph and footprint, and is refused
         let e = BuildState::parse(br#"{"version": 1}"#).unwrap_err();
         assert!(matches!(e, StateError::UnknownVersion(1)), "{e}");
         let e = BuildState::parse(br#"{"lastBuild": null}"#).unwrap_err();
         assert!(matches!(e, StateError::Corrupt(_)), "{e}");
-        let e = BuildState::parse(br#"{"version": 2, "extra": 1}"#).unwrap_err();
+        let e = BuildState::parse(br#"{"version": 3, "extra": 1}"#).unwrap_err();
         assert!(matches!(e, StateError::Corrupt(_)), "{e}");
         assert!(matches!(
             BuildState::parse(b"not json"),
             Err(StateError::Corrupt(_))
         ));
+    }
+
+    /// A version 2 state reads as a state without a policy, and is written as version
+    /// 3; a version 2 file that records a policy is refused.
+    #[test]
+    fn version_2_states_read_without_a_policy() {
+        let mut v = serde_json::to_value(state()).unwrap();
+        v["version"] = 2.into();
+        let s = BuildState::parse(v.to_string().as_bytes()).unwrap();
+        assert_eq!(s, state());
+        assert_eq!(s.version, STATE_VERSION);
+        v["lastBuild"]["policy"] =
+            serde_json::json!({ "name": "main", "iri": "urn:p", "version": 1 });
+        assert!(matches!(
+            BuildState::parse(v.to_string().as_bytes()),
+            Err(StateError::Corrupt(_))
+        ));
+    }
+
+    /// Pairs round-trip, an empty list is kept apart from none, and a position past the
+    /// table is refused.
+    #[test]
+    fn pairs_are_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = state();
+        let b = s.last_build.as_mut().unwrap();
+        b.policy = Some(StoredPolicy {
+            name: "main".into(),
+            iri: "urn:p".into(),
+            version: 1,
+        });
+        b.pairs = vec![["urn:c".into(), "urn:d".into()]];
+        b.communities[0].policy = true;
+        b.communities[0].pairs = Some(vec![0]);
+        let mut empty = b.communities[0].clone();
+        empty.iri = "urn:x-sparkles:graphrag:ds:0:b".into();
+        empty.pairs = Some(Vec::new());
+        b.communities.push(empty);
+        s.save(dir.path()).unwrap();
+        assert_eq!(BuildState::load(dir.path()).unwrap(), s);
+        let mut bad = s.clone();
+        bad.last_build.as_mut().unwrap().communities[0].pairs = Some(vec![1]);
+        assert!(matches!(bad.check(), Err(StateError::Corrupt(_))));
+        let mut bad = s.clone();
+        bad.last_build.as_mut().unwrap().policy = None;
+        assert!(matches!(bad.check(), Err(StateError::Corrupt(_))));
     }
 
     #[test]

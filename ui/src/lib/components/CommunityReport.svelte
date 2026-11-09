@@ -66,6 +66,11 @@
       <span class="badge {gr.statusClass(r.status)}">{r.status}</span>
       {#if r.rating != null}<span class="faint">importance {r.rating}/10</span>{/if}
       {#if r.revisionOf}<span class="faint">edited revision</span>{/if}
+      {#if r.reviewPolicy}<span class="faint"
+          >accepted evidence of {short(r.reviewPolicy.iri)}{r.reviewPolicy.version != null
+            ? `, version ${r.reviewPolicy.version}`
+            : ''}</span
+        >{/if}
       <span class="spacer"></span>
       {#if review && r.status !== 'failed'}
         <button
@@ -115,6 +120,19 @@
                 <ul class="cites">
                   {#each f.cites as c (c)}<li class="mono small">
                       {gr.citeText(c)}
+                    </li>{/each}
+                </ul>
+              </details>
+            {/if}
+            {#if f.claims?.length}
+              <details>
+                <summary class="small faint"
+                  >{f.claims.length} accepted claim{f.claims.length === 1 ? '' : 's'}</summary
+                >
+                <ul class="cites">
+                  {#each f.claims as c (c)}<li class="mono small">{c}</li>{/each}
+                  {#each f.decisions ?? [] as d (d)}<li class="mono small faint">
+                      decision {d}
                     </li>{/each}
                 </ul>
               </details>

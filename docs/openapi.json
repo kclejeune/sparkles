@@ -12233,6 +12233,20 @@
                       },
                       "type": "array"
                     },
+                    "claims": {
+                      "description": "Under a review policy, the IRIs of the accepted claims behind the cited facts.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "decisions": {
+                      "description": "Under a review policy, the IRIs of those claims' current decisions.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
                     "text": {
                       "type": "string"
                     },
@@ -12262,6 +12276,39 @@
                     "type": "null"
                   }
                 ]
+              },
+              "reviewPolicy": {
+                "description": "The review policy the report was read under. A report without one has no such member.",
+                "properties": {
+                  "configuration": {
+                    "description": "The configuration history's lineage UUID and the SHA-256 of the selected generation, joined with a slash.",
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "iri": {
+                    "type": "string"
+                  },
+                  "version": {
+                    "oneOf": [
+                      {
+                        "type": "integer"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "iri"
+                ],
+                "type": "object"
               },
               "revisionOf": {
                 "oneOf": [

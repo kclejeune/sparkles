@@ -96,7 +96,7 @@ pub(crate) fn fixture_with(
 }
 
 /// The model configuration of a fixture whose provider listens at `url`.
-fn models_for(url: &str, pair: &Value) -> Models {
+pub(crate) fn models_for(url: &str, pair: &Value) -> Models {
     let cfg = json!({
         "providers": { "p": { "kind": "openai", "endpoint": url, "requestTimeoutSecs": 5,
                               "allowedModels": ["m"], "structuredOutput": "json-schema" } },
@@ -169,6 +169,7 @@ impl Fixture {
             task: None,
             task_id: "t1".into(),
             cancel: Arc::new(AtomicBool::new(false)),
+            limits: Default::default(),
         })
     }
 
@@ -551,6 +552,7 @@ async fn runs_wait_for_confirmation() {
                 task: None,
                 task_id: format!("w{confirm}"),
                 cancel: Arc::new(AtomicBool::new(false)),
+                limits: Default::default(),
             })
         });
         let id = format!("w{confirm}");
@@ -677,6 +679,7 @@ impl Fixture {
                 task: None,
                 task_id: id2,
                 cancel: Arc::new(AtomicBool::new(false)),
+                limits: Default::default(),
             })
         });
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -958,6 +961,7 @@ async fn the_estimate_uses_the_pairs_output_limit() {
             task: None,
             task_id: "e".into(),
             cancel: Arc::new(AtomicBool::new(false)),
+            limits: Default::default(),
         };
         let (models, pairs, p) = r.admit().unwrap();
         let prep = r.prepare(&p, &BuildState::default()).unwrap();
@@ -994,6 +998,7 @@ async fn the_estimate_counts_the_cache_write_price() {
             task: None,
             task_id: "e".into(),
             cancel: Arc::new(AtomicBool::new(false)),
+            limits: Default::default(),
         };
         let estimate = |caching: Value| {
             let cfg = json!({
@@ -1135,6 +1140,7 @@ async fn branches_share_the_daily_ledger() {
             task: None,
             task_id: "b".into(),
             cancel: Arc::new(AtomicBool::new(false)),
+            limits: Default::default(),
         })
         .unwrap();
         assert!(o.tokens > 0, "{o:?}");
