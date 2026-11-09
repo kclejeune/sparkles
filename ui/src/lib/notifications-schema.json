@@ -122,7 +122,7 @@
         ]
       },
       "to": {
-        "description": "The recipients' mail addresses, 1 to 20.",
+        "description": "The recipients' mail addresses for the events the routes send, at most 20. A channel that carries watches may have none, and the routes cannot then name it.",
         "items": {
           "minLength": 1,
           "type": "string"
@@ -213,6 +213,15 @@
           "email"
         ],
         "x-sparkles-unset": "no authentication"
+      },
+      "watchers": {
+        "default": false,
+        "description": "The channel also mails the owners of watches on entities, each at the address that the auth configuration or the identity provider verified, never through the routes.",
+        "title": "Watchers",
+        "type": "boolean",
+        "x-sparkles-kinds": [
+          "email"
+        ]
       }
     },
     "required": [
@@ -236,7 +245,8 @@
       "username",
       "password",
       "from",
-      "to"
+      "to",
+      "watchers"
     ]
   },
   "NotificationsSettings": {

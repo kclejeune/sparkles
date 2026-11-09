@@ -82,6 +82,7 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
         "password",
         "from",
         "to",
+        "watchers",
     ];
     let props = json!({
         "type": titled(string_enum(&["webhook", "ntfy", "email"]), "Type", "How the channel delivers: a webhook POST, an ntfy publish or an email over SMTP."),
@@ -117,10 +118,11 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
         "password": types(unset(secret_ref("Password", "A secret that holds the SMTP password, sent with SASL PLAIN. It needs a user name.", "The secret that holds the password."), "no authentication"), EMAIL),
         "from": types(titled(string(), "From", "The sender's mail address."), EMAIL),
         "to": types({
-            let mut v = titled(strings(), "To", "The recipients' mail addresses, 1 to 20.");
+            let mut v = titled(strings(), "To", "The recipients' mail addresses for the events the routes send, at most 20. A channel that carries watches may have none, and the routes cannot then name it.");
             v["items"]["minLength"] = json!(1);
             v
         }, EMAIL),
+        "watchers": types(default(titled(boolean(), "Watchers", "The channel also mails the owners of watches on entities, each at the address that the auth configuration or the identity provider verified, never through the routes."), json!(false)), EMAIL),
     });
     let mut channel = ordered(&["type"], &order, props);
     channel["title"] = "Channel".into();

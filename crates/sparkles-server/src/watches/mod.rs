@@ -13,12 +13,13 @@
 //! that does not parse, is refused: the routes answer `503 watches-unavailable`, the
 //! follower matches nothing and the file is left as it is.
 
+pub mod deliver;
 pub mod follow;
 pub mod http;
 #[cfg(test)]
 mod tests;
 
-use crate::auth::{Identity, Kind, Principal};
+use crate::auth::{EmailClaim, Identity, Kind, Principal};
 use crate::state::AppState;
 use chrono::{DateTime, Utc};
 use parking_lot::{Condvar, Mutex};
@@ -43,6 +44,12 @@ pub const MAX_GRAPH_EDGES: usize = 2_000_000;
 pub const MATCH_MEMBERS: usize = 20;
 /// How long a cursor that moved without a match may wait before it is saved.
 const CURSOR_SAVE: Duration = Duration::from_secs(30);
+/// How long a provider's word on an owner that changed nothing but its time may wait
+/// before it is saved.
+const VOUCH_SAVE: Duration = Duration::from_secs(3600);
+/// The identities whose latest vouching is kept in memory before the record starts
+/// again.
+const VOUCHED_MAX: usize = 10_000;
 
 /// What a watch covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,9 +67,17 @@ pub enum Scope {
 pub struct Owner {
     pub kind: Kind,
     pub name: String,
-    /// the groups of an OIDC or proxy owner when it last used a watch route
+    /// the groups of an OIDC or proxy owner as its provider or proxy last asserted them
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<String>,
+    /// when the provider or proxy last vouched for an OIDC or proxy owner with these
+    /// groups (RFC 3339); mail stops once it is older than `identityMaxAgeDays`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups_at: Option<String>,
+    /// the address the provider or proxy verified for an OIDC or proxy owner; a
+    /// configured user's address is read from the auth configuration instead
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
 }
 
 impl Owner {
@@ -85,31 +100,74 @@ impl Owner {
             return Some(Owner::of_identity(o));
         }
         match p.kind {
-            Kind::Local => Some(Owner {
-                kind: Kind::Local,
-                name: String::new(),
-                groups: Vec::new(),
-            }),
-            Kind::User | Kind::Oidc | Kind::Proxy => Some(Owner {
-                kind: p.kind,
-                name: p.name.to_string(),
-                groups: Vec::new(),
-            }),
+            Kind::Local => Some(Owner::named(Kind::Local, "")),
+            Kind::User | Kind::Oidc | Kind::Proxy => Some(Owner::named(p.kind, &p.name)),
             Kind::Anonymous | Kind::Token => None,
         }
     }
 
     fn of_identity(i: &Identity) -> Owner {
         Owner {
-            kind: i.kind,
-            name: i.name.clone(),
             groups: i.groups.clone(),
+            ..Owner::named(i.kind, &i.name)
         }
+    }
+
+    /// An owner without groups, freshness or address.
+    pub fn named(kind: Kind, name: &str) -> Owner {
+        Owner {
+            kind,
+            name: name.to_string(),
+            groups: Vec::new(),
+            groups_at: None,
+            email: None,
+        }
+    }
+
+    /// Take what a provider or proxy said now when it vouched for this OIDC or proxy
+    /// owner. Asserted groups replace the owner's and make them fresh. Without them
+    /// the principal holds no groups, so the owner's groups are fresh only when it has
+    /// none. A verified address replaces the owner's, and an unverified one removes
+    /// it. `true` when the groups or the address changed.
+    fn vouch(&mut self, groups: Option<&[String]>, email: &EmailClaim, now: &str) -> bool {
+        let mut changed = false;
+        if let Some(g) = groups
+            && self.groups != g
+        {
+            self.groups = g.to_vec();
+            changed = true;
+        }
+        if groups.is_some() || self.groups.is_empty() {
+            self.groups_at = Some(now.to_string());
+        }
+        let email = match email {
+            EmailClaim::Verified(a) => Some(Some(a.clone())),
+            EmailClaim::Unverified => Some(None),
+            EmailClaim::Unknown => None,
+        };
+        if let Some(e) = email
+            && self.email != e
+        {
+            self.email = e;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Copy what was vouched for from `o`.
+    fn take_vouched(&mut self, o: &Owner) {
+        self.groups = o.groups.clone();
+        self.groups_at = o.groups_at.clone();
+        self.email = o.email.clone();
     }
 
     /// Whether `other` is the same owner (groups aside).
     pub fn same(&self, other: &Owner) -> bool {
         self.kind == other.kind && self.name == other.name
+    }
+
+    fn same_identity(&self, who: &Identity) -> bool {
+        self.kind == who.kind && self.name == who.name
     }
 
     pub fn identity(&self) -> Identity {
@@ -118,6 +176,23 @@ impl Owner {
             name: self.name.clone(),
             groups: self.groups.clone(),
             display_name: None,
+        }
+    }
+
+    /// Whether the provider or proxy vouched for an OIDC or proxy owner within
+    /// `days` of `now`; a configured user, whose grants the configuration holds, is
+    /// always current.
+    pub fn current(&self, days: u32, now: DateTime<Utc>) -> bool {
+        match self.kind {
+            Kind::User => true,
+            Kind::Oidc | Kind::Proxy => self
+                .groups_at
+                .as_deref()
+                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                .is_some_and(|t| {
+                    now - t.with_timezone(&Utc) <= chrono::TimeDelta::days(days.into())
+                }),
+            _ => false,
         }
     }
 }
@@ -215,6 +290,12 @@ pub(crate) type Snapshot = (Vec<Watch>, BTreeMap<uuid::Uuid, u64>, u64);
 #[derive(Default)]
 pub struct Watches {
     inner: Mutex<Inner>,
+    /// what providers and proxies last vouched for each OIDC or proxy identity, by
+    /// owner key, and when it was last written to the owner's watches; the lock is
+    /// taken before `inner`, never after
+    vouched: Mutex<std::collections::HashMap<String, (Owner, Option<Instant>)>>,
+    /// the matches that wait to be mailed to their owners
+    pub(crate) batches: deliver::Batches,
     /// wakes the follower when the watches change
     wake: Condvar,
     /// counts every change of the set of watches, so the follower knows to rebuild
@@ -359,9 +440,8 @@ impl Watches {
         Ok((b.watches.clone(), b.cursors.clone(), version))
     }
 
-    /// The watches of `owner`, after recording its current groups.
+    /// The watches of `owner`.
     pub fn list(&self, st: &AppState, owner: &Owner) -> Result<Vec<Watch>, Refusal> {
-        self.refresh_groups(st, owner)?;
         let mut g = self.inner.lock();
         let b = g.body(st)?;
         Ok(b.watches
@@ -371,30 +451,81 @@ impl Watches {
             .collect())
     }
 
-    /// Record `owner`'s groups on its watches when they changed, so that matching uses
-    /// the groups of its latest use.
-    fn refresh_groups(&self, st: &AppState, owner: &Owner) -> Result<(), Refusal> {
-        if !matches!(owner.kind, Kind::Oidc | Kind::Proxy) {
-            return Ok(());
+    /// A provider or proxy vouched for `who` (see [`Owner::vouch`]): keep its word and,
+    /// when the owner has watches, record it on them, at once when the groups or the
+    /// address changed and otherwise at most every [`VOUCH_SAVE`]. Changed groups make
+    /// the follower authorize the owner again.
+    pub fn vouched(
+        &self,
+        st: &AppState,
+        who: &Identity,
+        groups: bool,
+        email: &EmailClaim,
+        now: DateTime<Utc>,
+    ) {
+        if !matches!(who.kind, Kind::Oidc | Kind::Proxy) {
+            return;
         }
+        let key = Owner::named(who.kind, &who.name).key();
+        let mut m = self.vouched.lock();
+        if !m.contains_key(&key) && m.len() >= VOUCHED_MAX {
+            m.clear();
+        }
+        let (o, written) = m.entry(key).or_insert_with(|| {
+            // the owner's watches hold what was vouched before the server started
+            let mut g = self.inner.lock();
+            let o = g
+                .body(st)
+                .ok()
+                .and_then(|b| b.watches.iter().find(|w| w.owner.same_identity(who)))
+                .map(|w| w.owner.clone())
+                .unwrap_or_else(|| Owner::named(who.kind, &who.name));
+            (o, None)
+        });
+        let changed = o.vouch(groups.then_some(&who.groups[..]), email, &now_text(now));
+        if !changed && written.is_some_and(|t| t.elapsed() < VOUCH_SAVE) {
+            return;
+        }
+        let o = o.clone();
         let mut g = self.inner.lock();
-        let stale = g
-            .body(st)?
+        let Ok(b) = g.body(st) else { return };
+        if !b.watches.iter().any(|w| w.owner.same(&o)) {
+            return;
+        }
+        let groups_changed = b
             .watches
             .iter()
-            .any(|w| w.owner.same(owner) && w.owner.groups != owner.groups);
-        if stale {
-            g.change(st, |b| {
-                for w in b.watches.iter_mut().filter(|w| w.owner.same(owner)) {
-                    w.owner.groups = owner.groups.clone();
+            .any(|w| w.owner.same(&o) && w.owner.groups != o.groups);
+        let r = g.change(st, |b| {
+            for w in b.watches.iter_mut().filter(|w| w.owner.same(&o)) {
+                w.owner.take_vouched(&o);
+            }
+            Ok(())
+        });
+        match r {
+            Ok(()) => {
+                if let Some((_, t)) = m.get_mut(&o.key()) {
+                    *t = Some(Instant::now());
                 }
-                Ok(())
-            })?;
-            self.bump(&g);
-            drop(g);
-            self.changed();
+                if groups_changed {
+                    self.bump(&g);
+                    drop(g);
+                    self.changed();
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "sparkles::watches", "cannot record the groups of {}: {e:?}", o.key());
+            }
         }
-        Ok(())
+    }
+
+    /// `owner` with what its provider or proxy last vouched for since the start.
+    pub(crate) fn vouched_owner(&self, owner: &Owner) -> Owner {
+        let mut o = owner.clone();
+        if let Some((v, _)) = self.vouched.lock().get(&owner.key()) {
+            o.take_vouched(v);
+        }
+        o
     }
 
     /// Create a watch, or answer the same watch of the same owner (`false`: it existed).
@@ -405,9 +536,21 @@ impl Watches {
         n: NewWatch,
         now: DateTime<Utc>,
     ) -> Result<(Watch, bool), Refusal> {
-        self.refresh_groups(st, owner)?;
+        // the provider's latest word on the owner, when it spoke since the start
+        let vouched = self
+            .vouched
+            .lock()
+            .get(&owner.key())
+            .map(|(o, _)| o.clone());
         let mut g = self.inner.lock();
         let out = g.change(st, |b| {
+            let mut owner = owner.clone();
+            if let Some(v) = &vouched {
+                owner.take_vouched(v);
+            } else if let Some(w) = b.watches.iter().find(|w| w.owner.same(&owner)) {
+                owner.take_vouched(&w.owner);
+            }
+            let owner = &owner;
             if let Some(w) = b.watches.iter().find(|w| {
                 w.owner.same(owner)
                     && w.dataset == n.dataset
@@ -569,6 +712,7 @@ impl Watches {
             }
             return true;
         }
+        let mut told: Vec<(Owner, String, String, u64)> = Vec::new();
         let r = g.change(st, |b| {
             if b.watches.iter().any(|w| w.branch_id == branch_id) {
                 let c = b.cursors.entry(branch_id).or_insert(cursor);
@@ -588,6 +732,9 @@ impl Watches {
                 if m.commit <= w.since || w.matches.iter().any(|x| x.commit == m.commit) {
                     continue;
                 }
+                if !m.own {
+                    told.push((w.owner.clone(), w.dataset.clone(), w.id.clone(), m.commit));
+                }
                 let at = w.matches.partition_point(|x| x.commit < m.commit);
                 w.matches.insert(at, m);
                 while w.matches.len() > MAX_MATCHES {
@@ -597,8 +744,12 @@ impl Watches {
             }
             Ok(())
         });
+        drop(g);
         match r {
-            Ok(()) => true,
+            Ok(()) => {
+                self.batches.add(st, told);
+                true
+            }
             Err(e) => {
                 tracing::warn!(target: "sparkles::watches", "cannot record matches, so the commits are read again: {e:?}");
                 false
@@ -650,7 +801,24 @@ impl Watches {
     }
 }
 
-/// Start the follower thread.
+/// Start the follower thread, and follow what providers and proxies vouch for.
 pub fn spawn(st: &Arc<AppState>) {
+    install(st);
     follow::spawn(Arc::downgrade(st));
+}
+
+/// Record on the watches what providers and proxies vouch for (see
+/// [`Watches::vouched`]).
+pub fn install(st: &Arc<AppState>) {
+    #[cfg(feature = "auth")]
+    if let Some(a) = &st.auth {
+        let weak = Arc::downgrade(st);
+        a.on_vouched(Arc::new(move |who, groups, email| {
+            if let Some(st) = weak.upgrade() {
+                st.watches.vouched(&st, who, groups, email, Utc::now());
+            }
+        }));
+    }
+    #[cfg(not(feature = "auth"))]
+    let _ = st;
 }

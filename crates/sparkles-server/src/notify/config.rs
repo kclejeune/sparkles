@@ -46,6 +46,8 @@ pub const NTFY_SH: &str = "https://ntfy.sh";
 /// The most channels the kind holds. Each channel has a delivery thread of its own,
 /// so the cap bounds the threads.
 pub const MAX_CHANNELS: usize = 32;
+/// The event that tells the owner of a watch about changes; no route carries it.
+pub const WATCH_EVENT: &str = "entity.changed";
 
 /// The shortest repeat interval, in days (one minute).
 const MIN_REPEAT_DAYS: f64 = 1.0 / 1440.0;
@@ -128,14 +130,22 @@ impl Channel {
                 (None, None) => String::new(),
             },
             Channel::Ntfy(n) => format!("{}/{}", n.server.trim_end_matches('/'), n.topic),
-            Channel::Email(e) => format!(
-                "{} port {} ({}) to {}",
-                e.host,
-                e.port(),
-                e.tls.as_str(),
-                e.to.join(", ")
-            ),
+            Channel::Email(e) => {
+                let mut to = e.to.join(", ");
+                if e.watchers {
+                    if !to.is_empty() {
+                        to.push_str(" and ");
+                    }
+                    to.push_str("the owners of watches");
+                }
+                format!("{} port {} ({}) to {to}", e.host, e.port(), e.tls.as_str())
+            }
         }
+    }
+
+    /// Whether the channel mails the owners of watches.
+    pub fn carries_watches(&self) -> bool {
+        matches!(self, Channel::Email(e) if e.watchers)
     }
 
     /// The secrets the channel names.
@@ -226,7 +236,14 @@ pub struct Email {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<SecretRef>,
     pub from: String,
+    /// the recipients of the events the routes send; a channel that only carries
+    /// watches has none
+    #[serde(default)]
     pub to: Vec<String>,
+    /// the channel also mails the owners of watches on entities, each at its own
+    /// verified address (spec U12)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub watchers: bool,
 }
 
 impl Email {
@@ -544,8 +561,10 @@ impl NotifySettings {
                         return Err(at("port: a port from 1 to 65535".into()));
                     }
                     check_address(&e.from).map_err(|m| at(format!("from: {m}")))?;
-                    if e.to.is_empty() || e.to.len() > MAX_RECIPIENTS {
-                        return Err(at(format!("to: 1 to {MAX_RECIPIENTS} mail addresses")));
+                    if (e.to.is_empty() && !e.watchers) || e.to.len() > MAX_RECIPIENTS {
+                        return Err(at(format!(
+                            "to: 1 to {MAX_RECIPIENTS} mail addresses, or none when the channel carries watches"
+                        )));
                     }
                     for t in &e.to {
                         check_address(t).map_err(|m| at(format!("to: {m}")))?;
@@ -611,9 +630,20 @@ impl NotifySettings {
                     "routes: {key:?} is not an event type, a prefix such as backup.* or *"
                 ));
             }
+            if key == WATCH_EVENT || key == "entity.*" {
+                return Err(format!(
+                    "routes: {WATCH_EVENT} goes only to the owners of watches, through email channels with watchers"
+                ));
+            }
             for c in chans {
-                if !self.channels.contains_key(c) {
-                    return Err(format!("routes.{key}: no channel named {c:?}"));
+                match self.channels.get(c) {
+                    None => return Err(format!("routes.{key}: no channel named {c:?}")),
+                    Some(Channel::Email(e)) if e.to.is_empty() => {
+                        return Err(format!(
+                            "routes.{key}: channel {c:?} has no recipients of its own; it only carries watches"
+                        ));
+                    }
+                    Some(_) => {}
                 }
             }
         }

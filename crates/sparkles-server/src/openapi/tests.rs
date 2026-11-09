@@ -464,6 +464,7 @@ fn notification_settings_schema_matches_the_configuration() {
         } else {
             match m["type"].as_str() {
                 Some("integer") => json!(2),
+                Some("boolean") => json!(true),
                 Some("array") => json!(["x@y.z"]),
                 _ => json!("https://x.example"),
             }

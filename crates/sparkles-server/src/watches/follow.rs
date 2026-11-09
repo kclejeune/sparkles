@@ -58,6 +58,7 @@ pub fn spawn(weak: Weak<AppState>) {
                 let Some(st) = weak.upgrade() else { return };
                 let v = st.watches.version();
                 f.step(&st);
+                super::deliver::flush(&st);
                 st.watches.wait(v, TICK);
             }
         });

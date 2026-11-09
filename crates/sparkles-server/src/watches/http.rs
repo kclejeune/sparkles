@@ -135,7 +135,13 @@ async fn list(
             .map(watch_json)
             .collect();
         let unread: usize = out.iter().filter_map(|w| w["unread"].as_u64()).sum::<u64>() as usize;
-        Ok(Json(json!({ "watches": out, "unread": unread })))
+        let owner = ws
+            .first()
+            .map(|w| w.owner.clone())
+            .unwrap_or_else(|| st.watches.vouched_owner(&o));
+        Ok(Json(
+            json!({ "watches": out, "unread": unread, "mail": super::deliver::mail_json(&st, &owner) }),
+        ))
     })
     .await
 }

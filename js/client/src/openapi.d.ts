@@ -9948,7 +9948,7 @@ export interface components {
             tls: "starttls" | "tls";
             /**
              * To
-             * @description The recipients' mail addresses, 1 to 20.
+             * @description The recipients' mail addresses for the events the routes send, at most 20. A channel that carries watches may have none, and the routes cannot then name it.
              */
             to?: string[];
             /**
@@ -9995,6 +9995,12 @@ export interface components {
              * @description The SASL PLAIN user name. It needs a password.
              */
             username?: string;
+            /**
+             * Watchers
+             * @description The channel also mails the owners of watches on entities, each at the address that the auth configuration or the identity provider verified, never through the routes.
+             * @default false
+             */
+            watchers: boolean;
         };
         /** @description Whether notifications are on, each channel's last success and failure, the conditions notified and the recent deliveries. */
         NotificationStatus: {
@@ -12920,6 +12926,15 @@ export interface components {
         };
         /** @description The caller's watches on graphs it can read now. */
         WatchList: {
+            /** @description Whether the caller's matches are also mailed, and where. */
+            mail: {
+                /** @description The caller's verified address that matches are mailed to. */
+                address?: string;
+                /** @description Whether notifications are on and an email channel carries watches. */
+                channels: boolean;
+                /** @description Why matches are not mailed to the caller. */
+                why?: string;
+            };
             /** @description The unread matches of every watch listed. */
             unread: number;
             watches: components["schemas"]["Watch"][];

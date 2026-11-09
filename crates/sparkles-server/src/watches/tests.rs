@@ -36,6 +36,7 @@ server = ["server-admin"]
 [[users]]
 name = "bob"
 password = "{}"
+email = "bob@example.org"
 
 [[users.grants]]
 dataset = "ds"
@@ -64,6 +65,19 @@ name = "pat"
 password = "{}"
 datasets = {{ pds = "read" }}
 
+[roles.readers]
+datasets = {{ ds = "read" }}
+
+[external]
+allowed_groups = ["staff"]
+group_roles = {{ staff = ["readers"] }}
+
+[proxy]
+trusted = ["127.0.0.3/32"]
+user_header = "X-User"
+groups_header = "X-Groups"
+verified_email_header = "X-Email"
+
 [[protections]]
 name = "hidden"
 dataset = "pds"
@@ -91,7 +105,11 @@ fn server() -> Srv {
         crate::auth::Auth::open(&cfg, dir.path()).unwrap().0,
     ));
     crate::settings::server::start(&mut st, None, &Default::default()).unwrap();
+    // mail goes to a local test server whose certificate the test CA signs
+    st.outbound.allow_private = true;
+    st.outbound.tls.extra_roots_pem = Some(crate::notify::tests::TEST_CA.to_vec());
     let st = Arc::new(st);
+    super::install(&st);
     st.create("ds", DbType::Persistent).unwrap();
     st.create("pds", DbType::Persistent).unwrap();
     st.set_phase(crate::obs::Phase::Ready);
@@ -136,6 +154,45 @@ impl Srv {
             .await
             .unwrap();
         (s, serde_json::from_slice(&b).unwrap_or(J::Null))
+    }
+
+    /// A request through the trusted proxy as account `user` with `groups`, and with
+    /// the verified address `email` when there is one.
+    async fn proxied(
+        &self,
+        uri: &str,
+        user: &str,
+        groups: &str,
+        email: Option<&str>,
+    ) -> StatusCode {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .extension(ConnectInfo(Peer::Tcp("127.0.0.3:1".parse().unwrap())))
+            .header("x-user", user)
+            .header("x-groups", groups);
+        if let Some(e) = email {
+            req = req.header("x-email", e);
+        }
+        let res = self
+            .app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        res.status()
+    }
+
+    /// Run the follower once.
+    async fn follow(&mut self) {
+        let st = self.st.clone();
+        let mut f = std::mem::take(&mut self.f);
+        self.f = tokio::task::spawn_blocking(move || {
+            f.step(&st);
+            f
+        })
+        .await
+        .unwrap();
     }
 
     /// Run a SPARQL update on `branch` as `user`, which the commit records as its author.
@@ -493,11 +550,7 @@ async fn access_decides_what_can_be_watched_and_listed() {
         .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
     // a watch of an owner that no longer exists matches nothing
-    let ghost = Owner {
-        kind: Kind::User,
-        name: "ghost".into(),
-        groups: vec![],
-    };
+    let ghost = Owner::named(Kind::User, "ghost");
     let ds = s.st.datasets()["ds"].clone();
     let (gw, _) =
         s.st.watches
@@ -585,11 +638,7 @@ fn new_watch(s: &Srv, graph: &str, entity: &str) -> NewWatch {
 }
 
 fn user(name: &str) -> Owner {
-    Owner {
-        kind: Kind::User,
-        name: name.into(),
-        groups: vec![],
-    }
+    Owner::named(Kind::User, name)
 }
 
 #[tokio::test]
@@ -832,4 +881,248 @@ async fn a_file_without_its_format_is_refused() {
     let (st, _) = s.call("GET", "/$/watches", "bob", J::Null).await;
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(std::fs::read_to_string(&p).unwrap(), r#"{"watches": []}"#);
+}
+
+// ------------------------------------------------------------- mail to owners ------
+
+/// Notifications on, with an email channel to the local server `port` that carries
+/// watches and is also the target of every route.
+async fn mailing(s: &Srv, port: u16) {
+    let (st, v) = s
+        .call(
+            "PATCH",
+            "/$/server/settings/notifications",
+            "alice",
+            json!({
+                "enabled": true,
+                "channels": {"mail": {
+                    "type": "email", "host": "127.0.0.1", "port": port, "tls": "starttls",
+                    "from": "sparkles@example.org", "to": ["ops@example.org"], "watchers": true
+                }},
+                "routes": {"*": ["mail"]},
+                "delivery": {"attempts": 2, "backoffSecs": 0.05, "maxBackoffSecs": 1, "timeoutSecs": 5},
+            }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+}
+
+fn build(s: &Srv, b: &deliver::Batch, now: DateTime<Utc>) -> Result<(J, String), String> {
+    deliver::build(&s.st, &crate::notify::settings(&s.st), b, "id-1", now)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_is_mailed_to_its_owner_alone() {
+    use crate::notify::tests::{FakeSmtp, SmtpMode};
+    let smtp = FakeSmtp::start(SmtpMode::Starttls, vec![]);
+    let mut s = server();
+    mailing(&s, smtp.port).await;
+    let a = s
+        .watch(
+            "bob",
+            json!({"dataset": "ds", "graph": G, "entity": "urn:a"}),
+        )
+        .await;
+    let b = s
+        .watch(
+            "bob",
+            json!({"dataset": "ds", "graph": G, "entity": "urn:b"}),
+        )
+        .await;
+    s.update("alice", "main", &label("urn:a", "A")).await;
+    let first = s.head();
+    // bob's own commit is listed in the feed but not mailed
+    s.update("bob", "main", &label("urn:b", "B")).await;
+    s.update("alice", "main", &label("urn:b", "B2")).await;
+    let third = s.head();
+    s.follow().await;
+    let waiting = s.st.watches.batches.waiting();
+    assert_eq!(waiting.len(), 1, "one batch per owner and dataset");
+    assert_eq!(
+        waiting[0].refs,
+        vec![
+            (a["id"].as_str().unwrap().to_string(), first),
+            (b["id"].as_str().unwrap().to_string(), third)
+        ]
+    );
+    s.st.watches.batches.close_all();
+    deliver::flush(&s.st);
+    let got = tokio::task::spawn_blocking(move || smtp.wait(1))
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].to, ["bob@example.org"]);
+    let d = &got[0].data;
+    assert!(d.contains("To: bob@example.org\r\n"), "{d}");
+    assert!(!d.contains("ops@example.org"), "{d}");
+    assert!(
+        d.contains("Subject: Changes to 2 watched entities in ds\r\n"),
+        "{d}"
+    );
+    assert!(d.contains("Event: entity.changed\r\n"), "{d}");
+    assert!(d.contains("urn:a") && d.contains("urn:b"), "{d}");
+    assert!(
+        !d.contains(&format!("\"commit\": {}", third - 1)),
+        "own commit mailed: {d}"
+    );
+}
+
+#[tokio::test]
+async fn nothing_waits_while_no_channel_carries_watches() {
+    let mut s = server();
+    let a = s
+        .watch(
+            "bob",
+            json!({"dataset": "ds", "graph": G, "entity": "urn:a"}),
+        )
+        .await;
+    s.update("alice", "main", &label("urn:a", "A")).await;
+    assert_eq!(s.matched("bob", a["id"].as_str().unwrap()).await.len(), 1);
+    assert!(s.st.watches.batches.waiting().is_empty());
+}
+
+#[tokio::test]
+async fn a_batch_is_built_again_from_the_watches_at_each_attempt() {
+    let mut s = server();
+    mailing(&s, 9).await;
+    let a = s
+        .watch(
+            "bob",
+            json!({"dataset": "ds", "graph": G, "entity": "urn:a"}),
+        )
+        .await;
+    let id = a["id"].as_str().unwrap().to_string();
+    s.update("alice", "main", &label("urn:a", "A")).await;
+    s.follow().await;
+    let b = s.st.watches.batches.waiting().pop().unwrap();
+    let (env, to) = build(&s, &b, Utc::now()).unwrap();
+    assert_eq!(to, "bob@example.org");
+    assert_eq!(env["type"], "entity.changed");
+    assert_eq!(env["id"], "id-1");
+    assert_eq!(env["dataset"], "ds");
+    assert_eq!(env["data"]["watches"][0]["entity"], "urn:a");
+    // the watch is removed before the attempt: nothing is left to send
+    let (st, _) = s
+        .call("DELETE", &format!("/$/watches/{id}"), "bob", J::Null)
+        .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert!(build(&s, &b, Utc::now()).is_err());
+}
+
+#[tokio::test]
+async fn a_user_without_an_address_is_not_mailed() {
+    let mut s = server();
+    mailing(&s, 9).await;
+    // rita reads only dev and has no address in the configuration
+    let main = s.st.datasets()["ds"].clone();
+    main.store
+        .create_branch("dev", &Default::default())
+        .unwrap();
+    let mut n = new_watch(&s, G, "urn:a");
+    n.branch = "dev".into();
+    n.branch_id = main.store.branch_id_of("dev").unwrap();
+    s.st.watches
+        .create(&s.st, &user("rita"), n, Utc::now())
+        .unwrap();
+    s.update("alice", "dev", &label("urn:a", "A")).await;
+    s.follow().await;
+    let b = s.st.watches.batches.waiting().pop().unwrap();
+    let e = build(&s, &b, Utc::now()).unwrap_err();
+    assert!(e.contains("no email"), "{e}");
+}
+
+#[tokio::test]
+async fn a_proxy_account_is_mailed_only_at_a_verified_address_while_it_is_current() {
+    let mut s = server();
+    mailing(&s, 9).await;
+    // the proxy vouches for pam, in staff, with a verified address
+    assert_eq!(
+        s.proxied("/$/ping", "pam", "staff", Some("pam@example.org"))
+            .await,
+        StatusCode::OK
+    );
+    let (w, _) =
+        s.st.watches
+            .create(
+                &s.st,
+                &Owner::named(Kind::Proxy, "pam"),
+                new_watch(&s, G, "urn:a"),
+                Utc::now(),
+            )
+            .unwrap();
+    assert_eq!(w.owner.groups, ["staff"]);
+    assert_eq!(w.owner.email.as_deref(), Some("pam@example.org"));
+    s.update("alice", "main", &label("urn:a", "A")).await;
+    s.follow().await;
+    let b = s.st.watches.batches.waiting().pop().unwrap();
+    let now = Utc::now();
+    assert_eq!(build(&s, &b, now).unwrap().1, "pam@example.org");
+    // not confirmed within identityMaxAgeDays (30)
+    let e = build(&s, &b, now + chrono::TimeDelta::days(31)).unwrap_err();
+    assert!(e.contains("30 days"), "{e}");
+    // a request without the address header: no verified address any more
+    s.proxied("/$/ping", "pam", "staff", None).await;
+    let e = build(&s, &b, now).unwrap_err();
+    assert!(e.contains("no verified address"), "{e}");
+    // an account name that looks like an address is never used
+    s.proxied("/$/ping", "pam", "staff", Some("not an address"))
+        .await;
+    assert!(build(&s, &b, now).is_err());
+}
+
+/// Server review finding 7: groups that a request on another route takes away are
+/// recorded on the watches at once, so they authorize neither a waiting mail nor
+/// later matches.
+#[tokio::test]
+async fn groups_a_proxy_takes_away_end_mail_and_matches() {
+    let mut s = server();
+    mailing(&s, 9).await;
+    s.proxied("/$/ping", "pam", "staff", Some("pam@example.org"))
+        .await;
+    let (w, _) =
+        s.st.watches
+            .create(
+                &s.st,
+                &Owner::named(Kind::Proxy, "pam"),
+                new_watch(&s, G, "urn:a"),
+                Utc::now(),
+            )
+            .unwrap();
+    s.update("alice", "main", &label("urn:a", "A")).await;
+    s.follow().await;
+    let b = s.st.watches.batches.waiting().pop().unwrap();
+    assert!(build(&s, &b, Utc::now()).is_ok());
+    // pam leaves staff, as a request to an unrelated route asserts
+    s.proxied("/$/ping", "pam", "others", Some("pam@example.org"))
+        .await;
+    let e = build(&s, &b, Utc::now()).unwrap_err();
+    assert!(e.contains("readable"), "{e}");
+    s.update("alice", "main", &label("urn:a", "A2")).await;
+    s.follow().await;
+    let (ws, _, _) = s.st.watches.snapshot(&s.st).unwrap();
+    let w = ws.iter().find(|x| x.id == w.id).unwrap();
+    assert_eq!(w.owner.groups, ["others"]);
+    assert_eq!(
+        w.matches.len(),
+        1,
+        "a match under groups that were taken away"
+    );
+}
+
+#[test]
+fn routes_never_carry_watch_mail() {
+    let check = |v: J| crate::notify::config::parse(&v).and_then(|c| c.validate());
+    let ch = |to: J| json!({"type": "email", "host": "mail.example.org", "from": "s@example.org", "to": to, "watchers": true});
+    assert!(check(json!({"channels": {"w": ch(json!([]))}})).is_ok());
+    let e = check(json!({"channels": {"w": ch(json!([]))}, "routes": {"*": ["w"]}})).unwrap_err();
+    assert!(e.contains("only carries watches"), "{e}");
+    for key in ["entity.changed", "entity.*"] {
+        let e =
+            check(json!({"channels": {"w": ch(json!(["a@example.org"]))}, "routes": {key: ["w"]}}))
+                .unwrap_err();
+        assert!(e.contains("owners of watches"), "{e}");
+    }
+    let plain =
+        json!({"type": "email", "host": "mail.example.org", "from": "s@example.org", "to": []});
+    assert!(check(json!({"channels": {"p": plain}})).is_err());
 }

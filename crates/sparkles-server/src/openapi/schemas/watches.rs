@@ -65,10 +65,18 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
         "WatchList",
         doc(
             obj(
-                &["watches", "unread"],
+                &["watches", "unread", "mail"],
                 json!({
                     "watches": array(sref("Watch")),
                     "unread": with_desc(int(), "The unread matches of every watch listed."),
+                    "mail": with_desc(obj(
+                        &["channels"],
+                        json!({
+                            "channels": with_desc(boolean(), "Whether notifications are on and an email channel carries watches."),
+                            "address": with_desc(string(), "The caller's verified address that matches are mailed to."),
+                            "why": with_desc(string(), "Why matches are not mailed to the caller."),
+                        }),
+                    ), "Whether the caller's matches are also mailed, and where."),
                 }),
             ),
             "The caller's watches on graphs it can read now.",
