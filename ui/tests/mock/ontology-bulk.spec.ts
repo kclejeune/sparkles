@@ -26,7 +26,7 @@ async function openBulk(page: Page, branch: string) {
 
 /** The functional-style text of the branch's axioms of `type`. */
 async function axioms(request: APIRequestContext, branch: string, type: string) {
-  const r = await request.get(`/$/ontology/uni@${branch}/axioms?type=${type}&limit=10000`);
+  const r = await request.get(`/$/ontology/uni/axioms?branch=${branch}&type=${type}&limit=10000`);
   expect(r.ok(), await r.text()).toBe(true);
   return ((await r.json()).axioms as { ofn: string }[]).map((a) => a.ofn);
 }
@@ -142,7 +142,7 @@ INSERT DATA { [] a owl:Axiom ; owl:annotatedSource <${UNI}GraduateStudent> ;
     await expect(preview(page).locator('.axioms.ins')).toContainText('[1 annotation]');
     await commitPreview(page);
     const r = await request.get(
-      `/$/ontology/uni@${branch}/axioms?type=AnnotationAssertion&about=${encodeURIComponent(`${UNI}GraduateStudent`)}&limit=100`,
+      `/$/ontology/uni/axioms?branch=${branch}&type=AnnotationAssertion&about=${encodeURIComponent(`${UNI}GraduateStudent`)}&limit=100`,
     );
     const label = ((await r.json()).axioms as { axiom: Record<string, unknown> }[]).find(
       (a) => (a.axiom.value as { '@value'?: string })?.['@value'] === 'Graduate learner',
@@ -180,15 +180,17 @@ test('sets and removes an annotation on the entities of the list', async ({ page
       .getByRole('button', { name: 'Set annotation' })
       .click();
     const form = page.getByRole('form', { name: 'Set an annotation' });
-    await form.getByRole('textbox', { name: 'Annotation property' }).fill('skos:editorialNote');
+    await form.getByRole('combobox', { name: 'Annotation property' }).fill('skos:editorialNote');
     await form.getByRole('textbox', { name: 'Value' }).fill('Reviewed');
     await form.getByRole('button', { name: 'List the changes' }).click();
     await expect(changes(page)).toContainText('Set skos:editorialNote on 2 entities');
     await changes(page).getByRole('button', { name: 'Preview the edit' }).click();
     await commitPreview(page);
     const set = await axioms(request, branch, 'AnnotationAssertion');
+    const reviewed = set.filter((x) => x.includes('"Reviewed"@en'));
+    expect(reviewed, set.join('\n')).toHaveLength(2);
     for (const e of ['Student', 'Employee'])
-      expect(set).toContain(`AnnotationAssertion(skos:editorialNote uni:${e} "Reviewed"@en)`);
+      expect(reviewed.some((x) => x.includes('editorialNote') && x.includes(e))).toBe(true);
 
     // a second run finds nothing left to set
     await form.getByRole('button', { name: 'List the changes' }).click();
@@ -200,7 +202,7 @@ test('sets and removes an annotation on the entities of the list', async ({ page
       .getByRole('button', { name: 'Remove annotation' })
       .click();
     const rm = page.getByRole('form', { name: 'Remove an annotation' });
-    await rm.getByRole('textbox', { name: 'Annotation property' }).fill('skos:editorialNote');
+    await rm.getByRole('combobox', { name: 'Annotation property' }).fill('skos:editorialNote');
     await rm.getByRole('button', { name: 'List the changes' }).click();
     await expect(changes(page)).toContainText('Remove skos:editorialNote from 2 entities');
     await changes(page).getByRole('button', { name: 'Preview the edit' }).click();
@@ -223,18 +225,18 @@ test('moves classes under a new parent and refuses a cycle', async ({ page, requ
       .click();
     // Person and its subtree, then a parent below Person: a cycle
     await page.getByRole('combobox', { name: 'Add a class and its subclasses' }).fill('uni:Person');
-    await page.getByRole('option').first().click();
+    await page.getByRole('listbox').getByRole('option').first().click();
     await page.getByRole('button', { name: 'Add subtree' }).click();
     await expect(list(page).getByRole('listitem')).toHaveCount(5);
     const form = page.getByRole('form', { name: 'Move classes' });
     await form.getByRole('combobox', { name: 'New parent class' }).fill('uni:Course');
-    await page.getByRole('option').first().click();
+    await page.getByRole('listbox').getByRole('option').first().click();
     await form.getByRole('button', { name: 'List the changes' }).click();
     await expect(changes(page)).toContainText('Move 5 classes under Course');
     await page.getByRole('button', { name: 'Clear the list' }).click();
     await pasteEntities(page, 'uni:Person');
     await form.getByRole('combobox', { name: 'New parent class' }).fill('uni:Student');
-    await page.getByRole('option').first().click();
+    await page.getByRole('listbox').getByRole('option').first().click();
     await form.getByRole('button', { name: 'List the changes' }).click();
     await expect(changes(page).getByRole('alert')).toContainText(
       'Student is below Person, so the move would make a cycle.',
@@ -245,7 +247,7 @@ test('moves classes under a new parent and refuses a cycle', async ({ page, requ
     await page.getByRole('button', { name: 'Clear the list' }).click();
     await pasteEntities(page, 'uni:GraduateStudent uni:Professor');
     await form.getByRole('combobox', { name: 'New parent class' }).fill('uni:Agent');
-    await page.getByRole('option').first().click();
+    await page.getByRole('listbox').getByRole('option').first().click();
     await form.getByRole('button', { name: 'List the changes' }).click();
     await expect(changes(page)).toContainText('Move 2 classes under Agent');
     await changes(page).getByRole('button', { name: 'Preview the edit' }).click();
@@ -366,7 +368,7 @@ test('changing a field or the list while the graph is read drops the stale answe
     await expect(page.getByRole('group', { name: 'Bulk edit' })).toBeVisible({ timeout: 30_000 });
     held = new Promise<void>((done) => (release = done));
     await page.getByRole('combobox', { name: 'Add a class and its subclasses' }).fill('uni:Person');
-    await page.getByRole('option').first().click();
+    await page.getByRole('listbox').getByRole('option').first().click();
     await page.getByRole('button', { name: 'Add subtree' }).click();
     await expect(page.getByRole('button', { name: 'Reading…' })).toBeVisible();
     await pasteEntities(page, 'uni:Course');
@@ -456,7 +458,7 @@ test('a protected branch offers no preview and refuses the edit', async ({ page,
     await expect(changes(page)).toContainText('Set rdfs:comment on 1 entity');
     await expect(changes(page).getByRole('button', { name: 'Preview the edit' })).toHaveCount(0);
     // the edit the list describes is a write the protected branch refuses
-    const r = await request.post(`/$/ontology/uni@${branch}/axioms`, {
+    const r = await request.post(`/$/ontology/uni/axioms?branch=${branch}`, {
       data: {
         add: [
           {

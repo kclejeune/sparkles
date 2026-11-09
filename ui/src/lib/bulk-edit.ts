@@ -308,7 +308,7 @@ export function changesOp(changes: readonly Change[]): Op {
     if (c.before) remove.push(c.before);
     if (c.after) add.push(c.after);
   }
-  return { kind: 'axioms', add, remove, declare: false };
+  return { kind: 'axioms', add, remove };
 }
 
 // --- moving classes ------------------------------------------------------------------------
@@ -420,7 +420,7 @@ export function planMove(
       ok: false,
       reason: `The move would change ${fmt(add.length + remove.length)} SubClassOf axioms, more than the ${fmt(BULK_AXIOM_LIMIT)} that one bulk edit may change. Move fewer classes at once.`,
     };
-  return { ok: true, op: { kind: 'axioms', add, remove, declare: false }, moved, unchanged };
+  return { ok: true, op: { kind: 'axioms', add, remove }, moved, unchanged };
 }
 
 // --- the entity list ----------------------------------------------------------------------

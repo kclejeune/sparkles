@@ -162,7 +162,7 @@ open('a move drops an annotated parent, and undo restores it', async ({ page, re
   await pasteEntities(page, `<${UNI}GraduateStudent> <${UNI}Professor>`);
   const form = page.getByRole('form', { name: 'Move classes' });
   await form.getByRole('combobox', { name: 'New parent class' }).fill(`<${UNI}Agent>`);
-  await page.getByRole('option').first().click();
+  await page.getByRole('listbox').getByRole('option').first().click();
   await form.getByRole('button', { name: 'List the changes' }).click();
   await expect(changes(page)).toContainText('Move 2 classes under', { timeout: 30_000 });
   await changes(page).getByRole('button', { name: 'Preview the edit' }).click();
@@ -178,6 +178,30 @@ open('a move drops an annotated parent, and undo restores it', async ({ page, re
   await expect.poll(() => count(request, target, reified)).toBe(1);
   expect(await count(request, target, inGraph('?s ?p ?o'))).toBe(before);
 });
+
+open(
+  'sets an annotation with an undeclared property on listed entities',
+  async ({ page, request }) => {
+    const target = `${DS}@${BRANCH}`;
+    const note = 'http://www.w3.org/2004/02/skos/core#editorialNote';
+    await openBulk(page, DS, BRANCH);
+    await pasteEntities(page, `<${UNI}Student> <${UNI}Employee>`);
+    await page
+      .getByRole('group', { name: 'Bulk edit' })
+      .getByRole('button', { name: 'Set annotation' })
+      .click();
+    const form = page.getByRole('form', { name: 'Set an annotation' });
+    await form.getByRole('combobox', { name: 'Annotation property' }).fill(`<${note}>`);
+    await form.getByRole('textbox', { name: 'Value' }).fill('Reviewed');
+    await form.getByRole('button', { name: 'List the changes' }).click();
+    await expect(changes(page)).toContainText('on 2 entities', { timeout: 30_000 });
+    await changes(page).getByRole('button', { name: 'Preview the edit' }).click();
+    await commitPreview(page);
+    await expect.poll(() => count(request, target, inGraph(`?s <${note}> "Reviewed"@en`))).toBe(2);
+    // the property is declared with the edit, and the subjects are not redeclared
+    expect(await count(request, target, inGraph(`<${note}> a <${OWL}AnnotationProperty>`))).toBe(1);
+  },
+);
 
 open('an edit above the bound is refused', async ({ page, request }) => {
   const target = `${DS}@${BRANCH}`;
@@ -237,7 +261,7 @@ anonymous.describe('under auth', () => {
 
   anonymous(
     'a reader lists changes without a preview and is refused the write',
-    async ({ page }) => {
+    async ({ page, request }) => {
       const login = await page.request.post('/$/auth/login', {
         data: { user: READER, password: PASSWORD },
       });
@@ -254,7 +278,7 @@ anonymous.describe('under auth', () => {
         },
       });
       expect([401, 403]).toContain(w.status());
-      expect(await count(page.request, BULK_AUTH, inGraph(`?s <${RDFS}comment> "x"`))).toBe(0);
+      expect(await count(request, BULK_AUTH, inGraph(`?s <${RDFS}comment> "x"`), admin())).toBe(0);
     },
   );
 });

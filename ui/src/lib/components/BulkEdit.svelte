@@ -425,7 +425,7 @@
 </script>
 
 <div class="bulk">
-  <div class="segmented sm" role="group" aria-label="Bulk edit">
+  <div class="segmented sm ops" role="group" aria-label="Bulk edit">
     <button aria-pressed={mode === 'replace'} onclick={() => (mode = 'replace')}
       >Find and replace</button
     >
@@ -445,297 +445,305 @@
     </p>
   {/if}
 
-  <section class="list" aria-labelledby="bulk-list-h">
-    <h3 id="bulk-list-h">
-      Entity list {#if entities.length}<span class="count-badge">{fmtInt(entities.length)}</span
-        >{/if}
-    </h3>
-    <p class="faint small">
-      Set, remove and move act on these entities, and a find can keep to them. The list holds at
-      most {fmtInt(BULK_ENTITY_LIMIT)}.
-    </p>
-    <div class="adders">
-      <div class="adder">
-        <EntityPicker
-          id="bulk-add-entity"
-          label="Add an entity"
-          ds={target}
-          {prefixes}
-          bind:value={picked}
-          search={searchKind}
-          onpicked={() => {
-            if (picked?.term.type === 'uri' && addEntities([picked.term.value])) picked = null;
-          }}
-        />
-      </div>
-      <div class="adder row">
-        <EntityPicker
-          id="bulk-subtree"
-          label="Add a class and its subclasses"
-          ds={target}
-          {prefixes}
-          bind:value={subtreeOf}
-          search={searchClasses}
-        />
-        <button class="btn sm" disabled={!subtreeOf || listBusy} onclick={addSubtree}
-          >{listBusy ? 'Reading…' : 'Add subtree'}</button
-        >
-      </div>
-      <label class="f">
-        <span>Paste IRIs or prefixed names</span>
-        <textarea class="input mono" rows="2" bind:value={paste}></textarea>
-      </label>
-      <div class="row">
-        <button class="btn sm" disabled={!paste.trim()} onclick={addPasted}>Add pasted</button>
-        {#if entities.length}
-          <button
-            class="btn ghost sm"
-            onclick={() => {
-              entities = [];
-              invalidate();
-              dropSubtreeRead();
-            }}>Clear the list</button
-          >
-        {/if}
-      </div>
-    </div>
-    {#if pasteBad.length}
-      <p class="warn-text small">
-        Not an IRI or a prefixed name: {pasteBad.slice(0, 5).join(', ')}{pasteBad.length > 5
-          ? ` and ${pasteBad.length - 5} more`
-          : ''}.
-      </p>
-    {/if}
-    {#if listError}<p class="error-box" role="alert">{listError}</p>{/if}
-    {#if entities.length}
-      <ul class="chips" aria-label="Entities in the list">
-        {#each entities.slice(0, 100) as e (e)}
-          <li>
-            <span title={e}>{name(e)}</span>
-            <button
-              class="btn icon ghost sm"
-              aria-label="Remove {name(e)} from the list"
-              onclick={() => {
-                entities = entities.filter((x) => x !== e);
-                invalidate();
-              }}><Icon name="x" size={12} /></button
+  <div class="cols">
+    <div class="main">
+      <form
+        class="form"
+        aria-label={mode === 'replace'
+          ? 'Find and replace'
+          : mode === 'set'
+            ? 'Set an annotation'
+            : mode === 'remove'
+              ? 'Remove an annotation'
+              : 'Move classes'}
+        onsubmit={(e) => {
+          e.preventDefault();
+          void compute();
+        }}
+      >
+        {#if mode === 'replace'}
+          <div class="two">
+            <label class="f grow"
+              ><span>Find</span><input class="input" bind:value={find} required /></label
             >
-          </li>
-        {/each}
-        {#if entities.length > 100}<li class="faint">
-            and {fmtInt(entities.length - 100)} more
-          </li>{/if}
-      </ul>
-    {/if}
-  </section>
-
-  <form
-    class="form"
-    aria-label={mode === 'replace'
-      ? 'Find and replace'
-      : mode === 'set'
-        ? 'Set an annotation'
-        : mode === 'remove'
-          ? 'Remove an annotation'
-          : 'Move classes'}
-    onsubmit={(e) => {
-      e.preventDefault();
-      void compute();
-    }}
-  >
-    {#if mode === 'replace'}
-      <div class="two">
-        <label class="f grow"
-          ><span>Find</span><input class="input" bind:value={find} required /></label
-        >
-        <label class="f grow"
-          ><span>Replace with</span><input class="input" bind:value={replace} /></label
-        >
-      </div>
-      <div class="row wrap">
-        <label class="check"
-          ><input type="checkbox" bind:checked={regex} /> Regular expression</label
-        >
-        <label class="check"
-          ><input type="checkbox" bind:checked={caseSensitive} /> Match case</label
-        >
-      </div>
-      <div class="row wrap">
-        <label class="f">
-          <span>In</span>
-          <select class="input" bind:value={propKind}>
-            <option value="labels">Labels</option>
-            <option value="all">All annotations</option>
-            <option value="one">One property</option>
-          </select>
-        </label>
-        {#if propKind === 'one'}
-          <label class="f grow">
-            <span>Property</span>
-            <input class="input mono" list="bulk-props" bind:value={propText} />
-          </label>
-        {/if}
-        <label class="f">
-          <span>Scope</span>
-          <select class="input" bind:value={scope}>
-            <option value="graph">The whole graph</option>
-            <option value="list">The entity list</option>
-          </select>
-        </label>
-      </div>
-    {:else if mode === 'set' || mode === 'remove'}
-      <label class="f">
-        <span>Annotation property</span>
-        <input class="input mono" list="bulk-props" bind:value={property} required />
-      </label>
-      {#if mode === 'set'}
-        <div class="row wrap">
-          <label class="f grow"
-            ><span>Value</span><input class="input" bind:value={valueText} /></label
-          >
-          {#if !valueIri}
-            <label class="f lang"
-              ><span>Language</span><input class="input" bind:value={valueLang} /></label
+            <label class="f grow"
+              ><span>Replace with</span><input class="input" bind:value={replace} /></label
             >
-            {#if !valueLang.trim()}
-              <label class="f">
-                <span>Datatype</span>
-                <select class="input" bind:value={valueType}>
-                  <option value="">string</option>
-                  {#each LITERAL_TYPES.slice(1) as t (t)}<option value={t}
-                      >{shorten(t, prefixes) ?? t}</option
-                    >{/each}
-                </select>
+          </div>
+          <div class="row wrap">
+            <label class="check"
+              ><input type="checkbox" bind:checked={regex} /> Regular expression</label
+            >
+            <label class="check"
+              ><input type="checkbox" bind:checked={caseSensitive} /> Match case</label
+            >
+          </div>
+          <div class="row wrap">
+            <label class="f">
+              <span>In</span>
+              <select class="input" bind:value={propKind}>
+                <option value="labels">Labels</option>
+                <option value="all">All annotations</option>
+                <option value="one">One property</option>
+              </select>
+            </label>
+            {#if propKind === 'one'}
+              <label class="f grow">
+                <span>Property</span>
+                <input class="input mono" list="bulk-props" bind:value={propText} />
               </label>
             {/if}
-          {/if}
-        </div>
-        <div class="row wrap">
-          <label class="check"
-            ><input type="checkbox" bind:checked={valueIri} /> The value is an IRI</label
-          >
-          <label class="check"
-            ><input
-              type="checkbox"
-              checked={setMode === 'replace'}
-              onchange={(e) => (setMode = e.currentTarget.checked ? 'replace' : 'add')}
-            />
-            Replace the values the entities hold{valueIri ? '' : ' in this language'}</label
-          >
-        </div>
-      {:else}
-        <div class="row wrap">
+            <label class="f">
+              <span>Scope</span>
+              <select class="input" bind:value={scope}>
+                <option value="graph">The whole graph</option>
+                <option value="list">The entity list</option>
+              </select>
+            </label>
+          </div>
+        {:else if mode === 'set' || mode === 'remove'}
           <label class="f">
-            <span>Remove</span>
-            <select class="input" bind:value={removeKind}>
-              <option value="any">Every value</option>
-              <option value="lang">Values in a language</option>
-              <option value="value">One value</option>
-            </select>
+            <span>Annotation property</span>
+            <input class="input mono" list="bulk-props" bind:value={property} required />
           </label>
-          {#if removeKind === 'value'}
-            <label class="f grow"
-              ><span>Value</span><input class="input" bind:value={valueText} /></label
-            >
-            <label class="check"><input type="checkbox" bind:checked={valueIri} /> An IRI</label>
+          {#if mode === 'set'}
+            <div class="row wrap">
+              <label class="f grow"
+                ><span>Value</span><input class="input" bind:value={valueText} /></label
+              >
+              {#if !valueIri}
+                <label class="f lang"
+                  ><span>Language</span><input class="input" bind:value={valueLang} /></label
+                >
+                {#if !valueLang.trim()}
+                  <label class="f">
+                    <span>Datatype</span>
+                    <select class="input" bind:value={valueType}>
+                      <option value="">string</option>
+                      {#each LITERAL_TYPES.slice(1) as t (t)}<option value={t}
+                          >{shorten(t, prefixes) ?? t}</option
+                        >{/each}
+                    </select>
+                  </label>
+                {/if}
+              {/if}
+            </div>
+            <div class="row wrap">
+              <label class="check"
+                ><input type="checkbox" bind:checked={valueIri} /> The value is an IRI</label
+              >
+              <label class="check"
+                ><input
+                  type="checkbox"
+                  checked={setMode === 'replace'}
+                  onchange={(e) => (setMode = e.currentTarget.checked ? 'replace' : 'add')}
+                />
+                Replace the values the entities hold{valueIri ? '' : ' in this language'}</label
+              >
+            </div>
+          {:else}
+            <div class="row wrap">
+              <label class="f">
+                <span>Remove</span>
+                <select class="input" bind:value={removeKind}>
+                  <option value="any">Every value</option>
+                  <option value="lang">Values in a language</option>
+                  <option value="value">One value</option>
+                </select>
+              </label>
+              {#if removeKind === 'value'}
+                <label class="f grow"
+                  ><span>Value</span><input class="input" bind:value={valueText} /></label
+                >
+                <label class="check"><input type="checkbox" bind:checked={valueIri} /> An IRI</label
+                >
+              {/if}
+            </div>
           {/if}
+        {:else}
+          <div class="row wrap">
+            <div class="adder grow">
+              <EntityPicker
+                id="bulk-parent"
+                label="New parent class"
+                ds={target}
+                {prefixes}
+                bind:value={parent}
+                search={searchClasses}
+                disabled={toTop}
+              />
+            </div>
+          </div>
+          <div class="row wrap">
+            <label class="check"
+              ><input type="checkbox" bind:checked={toTop} /> Move to the top</label
+            >
+            <label class="check"
+              ><input type="checkbox" bind:checked={keepParents} disabled={toTop} /> Keep the old parents</label
+            >
+          </div>
+        {/if}
+        {#if mode === 'replace' || (mode === 'remove' && removeKind === 'lang')}
+          <div class="row wrap">
+            <label class="f">
+              <span>Language</span>
+              <select class="input" bind:value={langKind}>
+                <option value="any">Any language</option>
+                <option value="none">No language tag</option>
+                <option value="tag">One language</option>
+              </select>
+            </label>
+            {#if langKind === 'tag'}
+              <label class="f lang"
+                ><span>Tag</span><input class="input" bind:value={langTag} /></label
+              >
+            {/if}
+          </div>
+        {/if}
+        <div class="row">
+          <button class="btn" type="submit" disabled={busy || commit == null}>
+            {busy ? 'Reading…' : mode === 'replace' ? 'Find' : 'List the changes'}
+          </button>
         </div>
+      </form>
+      <datalist id="bulk-props">
+        {#each propertyOptions as p (p)}<option value={p}></option>{/each}
+      </datalist>
+
+      {#if error}<p class="error-box" role="alert">{error}</p>{/if}
+      {#if plan}
+        <section class="plan" aria-label="Changes">
+          {#if plan.refusal}
+            <p class="error-box" role="alert">{plan.refusal}</p>
+          {:else}
+            <p>
+              <strong>{plan.label}.</strong>
+              {#if plan.rows.length > ROWS_SHOWN}The first {fmtInt(ROWS_SHOWN)} are listed.{/if}
+            </p>
+          {/if}
+          {#each plan.notes as n, i (i)}<p class="faint small">{n}</p>{/each}
+          {#if plan.rows.length}
+            <div class="table-wrap">
+              <table class="tbl">
+                <thead>
+                  <tr>
+                    <th>Entity</th>
+                    <th>{plan.mode === 'move' ? 'Parents' : 'Property'}</th>
+                    <th>Before</th>
+                    <th>After</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each plan.rows.slice(0, ROWS_SHOWN) as r, i (i)}
+                    <tr>
+                      <td title={r.subject}>{name(r.subject)}</td>
+                      <td>{plan.mode === 'move' ? '' : name(r.property)}</td>
+                      <td class="del">{r.before ?? ''}</td>
+                      <td class="ins">{r.after ?? (plan.mode === 'move' ? 'the top' : '')}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+          {/if}
+          {#if !current}
+            <p class="warn-text">
+              The ontology changed since these changes were listed. List them again.
+            </p>
+          {:else if plan.op && !readonly}
+            <button
+              class="btn primary"
+              onclick={() => plan?.op && plan.mode === mode && onedit(plan.op, plan.label)}
+              >Preview the edit</button
+            >
+          {/if}
+        </section>
       {/if}
-    {:else}
-      <div class="row wrap">
-        <div class="adder grow">
+    </div>
+    <section class="list" aria-labelledby="bulk-list-h">
+      <h3 id="bulk-list-h">
+        Entity list {#if entities.length}<span class="count-badge">{fmtInt(entities.length)}</span
+          >{/if}
+      </h3>
+      <p class="faint small">
+        Set, remove and move act on these entities, and a find can keep to them. The list holds at
+        most {fmtInt(BULK_ENTITY_LIMIT)}.
+      </p>
+      <div class="adders">
+        <div class="adder">
           <EntityPicker
-            id="bulk-parent"
-            label="New parent class"
+            id="bulk-add-entity"
+            label="Add an entity"
             ds={target}
             {prefixes}
-            bind:value={parent}
-            search={searchClasses}
-            disabled={toTop}
+            bind:value={picked}
+            search={searchKind}
+            onpicked={() => {
+              if (picked?.term.type === 'uri' && addEntities([picked.term.value])) picked = null;
+            }}
           />
         </div>
-      </div>
-      <div class="row wrap">
-        <label class="check"><input type="checkbox" bind:checked={toTop} /> Move to the top</label>
-        <label class="check"
-          ><input type="checkbox" bind:checked={keepParents} disabled={toTop} /> Keep the old parents</label
-        >
-      </div>
-    {/if}
-    {#if mode === 'replace' || (mode === 'remove' && removeKind === 'lang')}
-      <div class="row wrap">
-        <label class="f">
-          <span>Language</span>
-          <select class="input" bind:value={langKind}>
-            <option value="any">Any language</option>
-            <option value="none">No language tag</option>
-            <option value="tag">One language</option>
-          </select>
-        </label>
-        {#if langKind === 'tag'}
-          <label class="f lang"><span>Tag</span><input class="input" bind:value={langTag} /></label>
-        {/if}
-      </div>
-    {/if}
-    <div class="row">
-      <button class="btn" type="submit" disabled={busy || commit == null}>
-        {busy ? 'Reading…' : mode === 'replace' ? 'Find' : 'List the changes'}
-      </button>
-    </div>
-  </form>
-  <datalist id="bulk-props">
-    {#each propertyOptions as p (p)}<option value={p}></option>{/each}
-  </datalist>
-
-  {#if error}<p class="error-box" role="alert">{error}</p>{/if}
-  {#if plan}
-    <section class="plan" aria-label="Changes">
-      {#if plan.refusal}
-        <p class="error-box" role="alert">{plan.refusal}</p>
-      {:else}
-        <p>
-          <strong>{plan.label}.</strong>
-          {#if plan.rows.length > ROWS_SHOWN}The first {fmtInt(ROWS_SHOWN)} are listed.{/if}
-        </p>
-      {/if}
-      {#each plan.notes as n, i (i)}<p class="faint small">{n}</p>{/each}
-      {#if plan.rows.length}
-        <div class="table-wrap">
-          <table class="tbl">
-            <thead>
-              <tr>
-                <th>Entity</th>
-                <th>{plan.mode === 'move' ? 'Parents' : 'Property'}</th>
-                <th>Before</th>
-                <th>After</th>
-              </tr>
-            </thead>
-            <tbody>
-              {#each plan.rows.slice(0, ROWS_SHOWN) as r, i (i)}
-                <tr>
-                  <td title={r.subject}>{name(r.subject)}</td>
-                  <td>{plan.mode === 'move' ? '' : name(r.property)}</td>
-                  <td class="del">{r.before ?? ''}</td>
-                  <td class="ins">{r.after ?? (plan.mode === 'move' ? 'the top' : '')}</td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
+        <div class="adder row">
+          <EntityPicker
+            id="bulk-subtree"
+            label="Add a class and its subclasses"
+            ds={target}
+            {prefixes}
+            bind:value={subtreeOf}
+            search={searchClasses}
+          />
+          <button class="btn sm" disabled={!subtreeOf || listBusy} onclick={addSubtree}
+            >{listBusy ? 'Reading…' : 'Add subtree'}</button
+          >
         </div>
-      {/if}
-      {#if !current}
-        <p class="warn-text">
-          The ontology changed since these changes were listed. List them again.
+        <label class="f">
+          <span>Paste IRIs or prefixed names</span>
+          <textarea class="input mono" rows="2" bind:value={paste}></textarea>
+        </label>
+        <div class="row">
+          <button class="btn sm" disabled={!paste.trim()} onclick={addPasted}>Add pasted</button>
+          {#if entities.length}
+            <button
+              class="btn ghost sm"
+              onclick={() => {
+                entities = [];
+                invalidate();
+                dropSubtreeRead();
+              }}>Clear the list</button
+            >
+          {/if}
+        </div>
+      </div>
+      {#if pasteBad.length}
+        <p class="warn-text small">
+          Not an IRI or a prefixed name: {pasteBad.slice(0, 5).join(', ')}{pasteBad.length > 5
+            ? ` and ${pasteBad.length - 5} more`
+            : ''}.
         </p>
-      {:else if plan.op && !readonly}
-        <button
-          class="btn primary"
-          onclick={() => plan?.op && plan.mode === mode && onedit(plan.op, plan.label)}
-          >Preview the edit</button
-        >
+      {/if}
+      {#if listError}<p class="error-box" role="alert">{listError}</p>{/if}
+      {#if entities.length}
+        <ul class="chips" aria-label="Entities in the list">
+          {#each entities.slice(0, 100) as e (e)}
+            <li>
+              <span title={e}>{name(e)}</span>
+              <button
+                class="btn icon ghost sm"
+                aria-label="Remove {name(e)} from the list"
+                onclick={() => {
+                  entities = entities.filter((x) => x !== e);
+                  invalidate();
+                }}><Icon name="x" size={12} /></button
+              >
+            </li>
+          {/each}
+          {#if entities.length > 100}<li class="faint">
+              and {fmtInt(entities.length - 100)} more
+            </li>{/if}
+        </ul>
       {/if}
     </section>
-  {/if}
+  </div>
 </div>
 
 <style>
@@ -744,6 +752,25 @@
     gap: 12px;
     min-width: 0;
   }
+  /* four operations do not fit a phone's width in one row */
+  @media (max-width: 560px) {
+    .ops {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .cols {
+    display: grid;
+    gap: 16px;
+    min-width: 0;
+  }
+  @media (min-width: 1100px) {
+    .cols {
+      grid-template-columns: minmax(0, 1fr) minmax(260px, 340px);
+      align-items: start;
+    }
+  }
+  .main,
   .list,
   .form,
   .plan {
@@ -817,9 +844,18 @@
     max-width: 100%;
     overflow-wrap: anywhere;
   }
+  .plan > .btn {
+    justify-self: start;
+  }
   .table-wrap {
     overflow: auto;
     max-height: 360px;
+  }
+  table {
+    width: 100%;
+  }
+  th {
+    text-align: left;
   }
   td {
     overflow-wrap: anywhere;
