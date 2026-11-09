@@ -17478,6 +17478,249 @@
         ],
         "type": "object"
       },
+      "NotificationChannelSettings": {
+        "additionalProperties": false,
+        "description": "One channel of the `notifications` kind. `type` decides the members it takes, and `x-sparkles-kinds` lists the types each member applies to. A credential is always named by a secret reference and never held inline.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#notifications"
+        },
+        "properties": {
+          "from": {
+            "description": "The sender's mail address.",
+            "title": "From",
+            "type": "string",
+            "x-sparkles-kinds": [
+              "email"
+            ]
+          },
+          "host": {
+            "description": "The SMTP server's host name or IP address. It passes the outbound policy's host check.",
+            "title": "Host",
+            "type": "string",
+            "x-sparkles-kinds": [
+              "email"
+            ]
+          },
+          "password": {
+            "additionalProperties": false,
+            "description": "A secret that holds the SMTP password, sent with SASL PLAIN. It needs a user name.",
+            "properties": {
+              "secret": {
+                "description": "The secret that holds the password.",
+                "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$",
+                "title": "Password",
+                "type": "string",
+                "x-sparkles-secret": true
+              }
+            },
+            "required": [
+              "secret"
+            ],
+            "title": "Password",
+            "type": "object",
+            "x-sparkles-kinds": [
+              "email"
+            ],
+            "x-sparkles-unset": "no authentication"
+          },
+          "port": {
+            "description": "The SMTP server's port.",
+            "maximum": 65535.0,
+            "minimum": 1.0,
+            "title": "Port",
+            "type": "integer",
+            "x-sparkles-kinds": [
+              "email"
+            ],
+            "x-sparkles-unset": "587 with STARTTLS, 465 with TLS"
+          },
+          "priority": {
+            "description": "The ntfy priority from 1 to 5.",
+            "maximum": 5.0,
+            "minimum": 1.0,
+            "title": "Priority",
+            "type": "integer",
+            "x-sparkles-kinds": [
+              "ntfy"
+            ],
+            "x-sparkles-unset": "4 for warnings, 5 for critical events, else 3"
+          },
+          "server": {
+            "default": "https://ntfy.sh",
+            "description": "The ntfy server's base URL.",
+            "format": "uri",
+            "title": "Server",
+            "type": "string",
+            "x-sparkles-kinds": [
+              "ntfy"
+            ]
+          },
+          "signingSecret": {
+            "additionalProperties": false,
+            "description": "A secret that holds the key of the Standard Webhooks signature. Without it, requests are not signed.",
+            "properties": {
+              "secret": {
+                "description": "The secret that holds the signing key. A value that starts with whsec_ is decoded from Base64.",
+                "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$",
+                "title": "Signing secret",
+                "type": "string",
+                "x-sparkles-secret": true
+              }
+            },
+            "required": [
+              "secret"
+            ],
+            "title": "Signing secret",
+            "type": "object",
+            "x-sparkles-kinds": [
+              "webhook"
+            ],
+            "x-sparkles-unset": "not signed"
+          },
+          "tags": {
+            "description": "Tags added to the event type's own tag, at most 10 of 1 to 64 characters without commas.",
+            "items": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array",
+            "x-sparkles-kinds": [
+              "ntfy"
+            ]
+          },
+          "tls": {
+            "default": "starttls",
+            "description": "STARTTLS on the submission port, or TLS from the first byte. A connection without TLS is refused.",
+            "enum": [
+              "starttls",
+              "tls"
+            ],
+            "title": "TLS",
+            "type": "string",
+            "x-sparkles-kinds": [
+              "email"
+            ]
+          },
+          "to": {
+            "description": "The recipients' mail addresses, 1 to 20.",
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "To",
+            "type": "array",
+            "x-sparkles-kinds": [
+              "email"
+            ]
+          },
+          "token": {
+            "additionalProperties": false,
+            "description": "A secret that holds an ntfy access token, sent as a bearer token.",
+            "properties": {
+              "secret": {
+                "description": "The secret that holds the token.",
+                "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$",
+                "title": "Access token",
+                "type": "string",
+                "x-sparkles-secret": true
+              }
+            },
+            "required": [
+              "secret"
+            ],
+            "title": "Access token",
+            "type": "object",
+            "x-sparkles-kinds": [
+              "ntfy"
+            ],
+            "x-sparkles-unset": "no token"
+          },
+          "topic": {
+            "description": "The topic to publish to, 1 to 64 letters, digits, - and _. Anyone who guesses a topic on a public server can read it, so use a token with a reserved topic or a server of your own.",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$",
+            "title": "Topic",
+            "type": "string",
+            "x-sparkles-kinds": [
+              "ntfy"
+            ]
+          },
+          "type": {
+            "description": "How the channel delivers: a webhook POST, an ntfy publish or an email over SMTP.",
+            "enum": [
+              "webhook",
+              "ntfy",
+              "email"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "url": {
+            "description": "The http or https URL the envelope is posted to. A URL that carries a user name, a password, a query or a fragment is refused, so name such a URL with the URL secret instead. A private address requires --outbound-allow-private.",
+            "format": "uri",
+            "title": "URL",
+            "type": "string",
+            "x-sparkles-kinds": [
+              "webhook"
+            ],
+            "x-sparkles-unset": "the URL secret"
+          },
+          "urlSecret": {
+            "additionalProperties": false,
+            "description": "A secret that holds the whole URL, for a URL that carries a credential, in place of URL.",
+            "properties": {
+              "secret": {
+                "description": "The secret that holds the URL. Set either URL or this.",
+                "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$",
+                "title": "URL secret",
+                "type": "string",
+                "x-sparkles-secret": true
+              }
+            },
+            "required": [
+              "secret"
+            ],
+            "title": "URL secret",
+            "type": "object",
+            "x-sparkles-kinds": [
+              "webhook"
+            ]
+          },
+          "username": {
+            "description": "The SASL PLAIN user name. It needs a password.",
+            "title": "User name",
+            "type": "string",
+            "x-sparkles-kinds": [
+              "email"
+            ],
+            "x-sparkles-unset": "no authentication"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "Channel",
+        "type": "object",
+        "x-sparkles-order": [
+          "type",
+          "url",
+          "urlSecret",
+          "signingSecret",
+          "server",
+          "topic",
+          "token",
+          "priority",
+          "tags",
+          "host",
+          "port",
+          "tls",
+          "username",
+          "password",
+          "from",
+          "to"
+        ]
+      },
       "NotificationStatus": {
         "description": "Whether notifications are on, each channel's last success and failure, the conditions notified and the recent deliveries.",
         "externalDocs": {
@@ -17728,6 +17971,129 @@
           "latencyMs"
         ],
         "type": "object"
+      },
+      "NotificationsSettings": {
+        "additionalProperties": false,
+        "description": "The `notifications` kind of `/$/server/settings/notifications` and of the settings file's `server.notifications`: whether events are delivered, the channels, the routes from event types to channels, the repeat interval and the retries. The web UI builds its form from this schema.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#notifications"
+        },
+        "properties": {
+          "baseUrl": {
+            "description": "The URL the web UI is reached at, which makes the links in notifications absolute.",
+            "format": "uri",
+            "title": "Base URL",
+            "type": "string",
+            "x-sparkles-unset": "relative links"
+          },
+          "channels": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/NotificationChannelSettings"
+            },
+            "description": "Channels by name, at most 32. Names can contain only letters, digits and the characters _ - .",
+            "propertyNames": {
+              "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$"
+            },
+            "title": "Channels",
+            "type": "object"
+          },
+          "delivery": {
+            "additionalProperties": false,
+            "description": "The retries and timeout of each delivery.",
+            "properties": {
+              "attempts": {
+                "default": 5,
+                "description": "Attempts of one delivery, the first included.",
+                "maximum": 10.0,
+                "minimum": 1.0,
+                "title": "Attempts",
+                "type": "integer"
+              },
+              "backoffSecs": {
+                "default": 30,
+                "description": "The wait before the second attempt, which doubles for each later one.",
+                "exclusiveMinimum": 0,
+                "maximum": 86400.0,
+                "title": "Backoff",
+                "type": "number",
+                "x-sparkles-unit": "seconds"
+              },
+              "maxBackoffSecs": {
+                "default": 1800,
+                "description": "The longest wait between two attempts, at least the backoff.",
+                "exclusiveMinimum": 0,
+                "maximum": 86400.0,
+                "title": "Longest backoff",
+                "type": "number",
+                "x-sparkles-unit": "seconds"
+              },
+              "timeoutSecs": {
+                "default": 10,
+                "description": "How long one attempt may take.",
+                "exclusiveMinimum": 0,
+                "maximum": 300.0,
+                "title": "Timeout",
+                "type": "number",
+                "x-sparkles-unit": "seconds"
+              }
+            },
+            "title": "Delivery",
+            "type": "object",
+            "x-sparkles-order": [
+              "attempts",
+              "backoffSecs",
+              "maxBackoffSecs",
+              "timeoutSecs"
+            ]
+          },
+          "enabled": {
+            "default": false,
+            "description": "Deliver events to the channels the routes name. A test send works either way.",
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "repeatEvery": {
+            "default": "1d",
+            "description": "The shortest time between two notifications about one lasting condition, as a duration of at least 1m such as 12h or 1d.",
+            "pattern": "^[0-9]+(\\.[0-9]+)?[smhdwy]$",
+            "title": "Repeat every",
+            "type": "string"
+          },
+          "routes": {
+            "additionalProperties": {
+              "description": "The channels this route sends to.",
+              "items": {
+                "type": "string"
+              },
+              "title": "Channels",
+              "type": "array"
+            },
+            "description": "The channels each event type goes to. A key is an event type, a prefix ending in .* or *, and an event goes to the union of the channels of every key that matches it. Each route is one field.",
+            "propertyNames": {
+              "pattern": "^(\\*|[a-z0-9-]+(\\.[a-z0-9-]+)*(\\.\\*)?)$"
+            },
+            "title": "Routes",
+            "type": "object"
+          },
+          "server": {
+            "description": "The server's name in each notification.",
+            "maxLength": 200,
+            "title": "Server name",
+            "type": "string",
+            "x-sparkles-unset": "the host name"
+          }
+        },
+        "title": "Notification configuration",
+        "type": "object",
+        "x-sparkles-order": [
+          "enabled",
+          "server",
+          "baseUrl",
+          "repeatEvery",
+          "channels",
+          "routes",
+          "delivery"
+        ]
       },
       "OAuthError": {
         "properties": {
@@ -22617,7 +22983,7 @@
           },
           "effective": {
             "additionalProperties": true,
-            "description": "The effective object. For `models` it is a `ModelsSettings`: `providers`, `roles` and `routing`, from the built-in defaults, `--model-config` and the runtime layer, with the locked fields from the declared configuration.",
+            "description": "The effective object. For `models` it is a `ModelsSettings`: `providers`, `roles` and `routing`, from the built-in defaults, `--model-config` and the runtime layer, with the locked fields from the declared configuration. For `notifications` it is a `NotificationsSettings`.",
             "type": "object"
           },
           "etag": {

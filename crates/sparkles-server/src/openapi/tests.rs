@@ -403,6 +403,80 @@ fn model_settings_schema_matches_the_configuration() {
     assert_eq!(names(roles), all);
 }
 
+/// The schema of the `notifications` kind names every member the kind takes, so the web
+/// UI's form offers each of them, and each channel member applies to exactly the channel
+/// types whose configuration accepts it.
+#[test]
+fn notification_settings_schema_matches_the_configuration() {
+    let doc = doc();
+    let schemas = &doc["components"]["schemas"];
+    let names = |o: &J| -> BTreeSet<String> {
+        o["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    };
+    let order = |o: &J| -> BTreeSet<String> {
+        o["x-sparkles-order"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    };
+    let set = |m: &[&str]| -> BTreeSet<String> { m.iter().map(|s| s.to_string()).collect() };
+    let kind = &schemas["NotificationsSettings"];
+    assert_eq!(names(kind), set(crate::notify::config::MEMBERS));
+    assert_eq!(order(kind), names(kind));
+    let delivery = &kind["properties"]["delivery"];
+    assert_eq!(
+        names(delivery),
+        set(crate::notify::config::DELIVERY_MEMBERS)
+    );
+    let channel = &schemas["NotificationChannelSettings"];
+    assert_eq!(order(channel), names(channel));
+    // a minimal valid channel of each type, to which one member is added
+    let base = |t: &str| match t {
+        "webhook" => json!({"type": "webhook", "urlSecret": {"secret": "u"}}),
+        "ntfy" => json!({"type": "ntfy", "topic": "t"}),
+        _ => json!({"type": "email", "host": "h", "from": "a@b.c", "to": ["d@e.f"]}),
+    };
+    for (member, m) in channel["properties"].as_object().unwrap() {
+        if member == "type" {
+            continue;
+        }
+        let kinds: BTreeSet<String> = m["x-sparkles-kinds"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{member} names no channel types"))
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let sample = if m["required"] == json!(["secret"]) {
+            json!({"secret": "s"})
+        } else if m["enum"].is_array() {
+            m["enum"][0].clone()
+        } else {
+            match m["type"].as_str() {
+                Some("integer") => json!(2),
+                Some("array") => json!(["x@y.z"]),
+                _ => json!("https://x.example"),
+            }
+        };
+        for t in ["webhook", "ntfy", "email"] {
+            let mut c = base(t);
+            c[member] = sample.clone();
+            let parsed = crate::notify::config::parse(&json!({ "channels": { "c": c } }));
+            assert_eq!(
+                parsed.is_ok(),
+                kinds.contains(t),
+                "{member} on a {t} channel: {parsed:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn entailment_contracts_preserve_distinct_explanation_requests_and_typed_supports() {
     let doc = doc();
