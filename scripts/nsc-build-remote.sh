@@ -68,7 +68,7 @@ if [ "${1:-}" = --run ]; then
   # store. A rebuild at a new path takes the latest predictions of the same command, which
   # name another revision's crates when revisions alternate, and the crates it then
   # compiles embed the new path, so their dependents miss as well.
-  key=$(basename "$dir")
+  key=${dir##*/}
   key=${key%.*}
   [ "$#" = 0 ] || key=$key-$(printf '%s
 ' "$@" | sha256sum | cut -c1-16)
@@ -77,7 +77,7 @@ if [ "${1:-}" = --run ]; then
   finish() {
     local code=$?
     # The tree goes back to DIR, so each build keeps its own source as before.
-    if [ -d "$work/src" ] && [ ! -e "$dir/src" ]; then mv -T "$work/src" "$dir/src" && rmdir "$work" 2> /dev/null; fi
+    if [ -d "$work/src" ] && [ ! -e "$dir/src" ]; then mv -T "$work/src" "$dir/src" && rm -d -- "$work"; fi
     echo "$code" > "$dir/exit.tmp"
     mv "$dir/exit.tmp" "$dir/exit"
   }
