@@ -409,8 +409,8 @@ impl Clause {
         subset(self.body(), other.body()) && subset(self.head(), other.head())
     }
     /// The maximal literals of the head under the order of a rooted run: each literal that
-    /// no other literal of the head is above, without those over y alone, in the head's
-    /// order. Empty when no literal of the head but those over y is maximal.
+    /// no other literal of the head is above, without the atoms over y alone, in the head's
+    /// order. Empty when no literal of the head but those atoms is maximal.
     pub fn maximal_rooted(&self, o: &Rooted, out: &mut Vec<Lit>) {
         out.clear();
         let head = self.head();
@@ -665,15 +665,11 @@ impl Rooted<'_> {
         !ra.is_empty() && rb.iter().all(|&t| ra.iter().any(|&s| self.t_gt(s, t)))
     }
 
-    /// Whether a literal is over y alone, which only Pred reads: an atom of the y group or an
-    /// equality or inequality of x and y.
+    /// Whether a literal is an atom over y alone, which only Pred reads: no rule selects
+    /// it, and Eq never rewrites its y. An equality or inequality of x and y can be
+    /// selected, since Eq rewrites its x.
     pub fn over_y(l: XLit) -> bool {
-        match l {
-            XLit::Atom(..) | XLit::Role(..) => Rooted::group(l) == Group::Y,
-            XLit::Eq(a, b) | XLit::Ne(a, b) => {
-                matches!((a, b), (RTerm::X, RTerm::Y) | (RTerm::Y, RTerm::X))
-            }
-        }
+        matches!(l, XLit::Atom(..) | XLit::Role(..)) && Rooted::group(l) == Group::Y
     }
 }
 
@@ -955,10 +951,13 @@ impl Store {
                 match l.kind() {
                     X => self.by_x.entry(l.atom()).or_default().push(id),
                     XL => {
+                        let table = table_bytes(self.by_xl.capacity(), 32);
                         let v = self.by_xl.entry(l).or_default();
                         let cap = v.capacity();
                         v.push(id);
-                        self.grown += (v.capacity() - cap) * 4 + 32;
+                        let list = (v.capacity() - cap) * 4;
+                        self.grown +=
+                            table_bytes(self.by_xl.capacity(), 32).saturating_sub(table) + list;
                     }
                     RL => {
                         self.by_f.entry(l.fun()).or_default().push(id);
@@ -1571,6 +1570,65 @@ mod tests {
         let c = Clause::new(vec![], vec![Lit::y(a), Lit::ry(4), l(XLit::Eq(X, Y))]);
         c.maximal_rooted(&o, &mut max);
         assert!(max.is_empty(), "{max:?}");
+    }
+
+    #[test]
+    fn an_inequality_and_an_equality_of_x_and_y_can_be_maximal() {
+        use RTerm::*;
+        let (ix, [a, ..]) = ranked();
+        let lits = Lits::default();
+        let o = Rooted {
+            ix: &ix,
+            lits: &lits,
+            inv: &inv,
+        };
+        let mut max = Vec::new();
+        for x in [XLit::Ne(X, Y), XLit::Eq(X, Y)] {
+            let Made::Lit(l) = lits.lit(x, inv) else {
+                panic!()
+            };
+            // Eq rewrites x in both with x ≈ u, and x ≉ y is no predecessor trigger
+            Clause::new(vec![Lit::x(a)], vec![l]).maximal_rooted(&o, &mut max);
+            assert_eq!(max, vec![l], "{x:?}");
+        }
+    }
+
+    #[test]
+    fn the_index_by_interned_literal_is_counted_by_what_it_holds() {
+        use RTerm::*;
+        let (ix, [a, ..]) = ranked();
+        let lits = Lits::default();
+        let o = Rooted {
+            ix: &ix,
+            lits: &lits,
+            inv: &inv,
+        };
+        let Made::Lit(g) = lits.lit(XLit::Atom(a, C(0)), inv) else {
+            panic!()
+        };
+        let held = |s: &Store| {
+            table_bytes(s.by_xl.capacity(), 32)
+                + s.by_xl.values().map(|v| v.capacity() * 4).sum::<usize>()
+        };
+        let mut s = Store::default();
+        let mut max = Vec::new();
+        let mut counted = 0;
+        for i in 0..2000 {
+            s.add(Clause::new(vec![Lit::x(1000 + i)], vec![g]));
+            s.next(&ix, Some(&o), &mut max);
+            counted += s.take_grown();
+            assert!(
+                counted >= held(&s),
+                "{counted} counted for {} held",
+                held(&s)
+            );
+        }
+        // one key holds every clause, so what is counted grows with the list alone
+        assert!(
+            counted <= 2 * held(&s) + 64,
+            "{counted} counted for {} held",
+            held(&s)
+        );
     }
 
     #[test]
