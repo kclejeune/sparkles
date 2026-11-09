@@ -1478,9 +1478,11 @@ caller can learn only that a readable graph is that large. Each candidate passes
 visibility check of the claim states below before it counts toward the bound of
 10,000 claims, so a hidden claim takes no place in it. A claim whose own decisions,
 withdrawals or supports exceed the record bound of 10,000 that review applies is read
-as a hidden occurrence, and a projected fact whose supports exceed it cites no claim,
-so hidden records never surface as a refusal. The identities the scan finds stay
-charged to the read's preparation until their occurrences are read.
+as a hidden occurrence, and a projected fact whose supports exceed it cites no claim.
+A support whose own records exceed it is left out while the fact keeps its other
+citations. Hidden records therefore never surface as a refusal. The identities the scan
+finds, and every identity the read looks up, stay charged to the read's preparation
+until the read ends.
 
 The rejected alternative cites only the supports of accepted projected facts. That
 cannot show unreviewed observations, hypotheses, denials or conflicting occurrences,
@@ -1650,7 +1652,9 @@ read and withholds the answer too. The claims go to the provider and the answer 
 published only while the authority the caller's grants were read under still holds, so
 an access policy reload or a revoked or expired credential withholds the answer in the
 same way. Ask checks that authority before every attempt of the summary call, its
-retries and escalations included, and an attempt refused there is never sent.
+retries and escalations included, and an attempt refused there is never sent. Such an
+attempt follows no redirect, since a redirect would send the claims again without that
+check, so a provider that redirects fails the attempt.
 
 A kept answer stores its `claimCitations` with its summary and the occurrences they
 cite under `claims`. Its footprint under C18 §6.4 already covers every graph the

@@ -86,6 +86,10 @@ impl crate::models::admission::Admission for AuthorityFence<'_> {
         }
         Ok(crate::models::admission::Ticket::new(Box::new(Unmetered)))
     }
+
+    fn follows_redirects(&self) -> bool {
+        false
+    }
 }
 
 /// The settlement of an attempt that no budget meters.

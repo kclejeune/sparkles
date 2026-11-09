@@ -574,7 +574,7 @@ async fn claim_bounds_never_leave_dangling_citations() {
 
 /// Claims read for an Ask summary are sent and published only under the authority they
 /// were read with. A policy reload while the summary is written withholds the answer,
-/// and a reload before a provider retry stops the retry from being sent.
+/// and a reload before a provider retry or a redirect stops it from being sent.
 #[cfg(feature = "mcp")]
 #[tokio::test(flavor = "multi_thread")]
 async fn ask_withholds_claims_when_authority_changes() {
@@ -588,7 +588,8 @@ async fn ask_withholds_claims_when_authority_changes() {
         .unwrap();
     let c = propose(&ds, "advisory", affected(), Polarity::Positive);
     accept(&ds, &c);
-    // 0 answers, 1 reloads and answers, 2 reloads and answers 429 once
+    // 0 answers, 1 reloads and answers, 2 reloads and answers 429 once, 3 reloads and
+    // redirects
     let reload = Arc::new(AtomicU8::new(0));
     let summaries = Arc::new(AtomicUsize::new(0));
     let auth = s.auth();
@@ -608,9 +609,13 @@ async fn ask_withholds_claims_when_authority_changes() {
             match flag.swap(0, Ordering::SeqCst) {
                 0 => {}
                 1 => auth.reload().map(|_| ()).unwrap(),
-                _ => {
+                2 => {
                     auth.reload().unwrap();
                     return (429, json!({ "error": { "message": "slow down" } }));
+                }
+                _ => {
+                    auth.reload().unwrap();
+                    return (307, json!({ "location": "/redirected" }));
                 }
             }
             return (
@@ -667,7 +672,7 @@ async fn ask_withholds_claims_when_authority_changes() {
     };
     let r = ask().await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    for mode in [1, 2] {
+    for mode in [1, 2, 3] {
         reload.store(mode, Ordering::SeqCst);
         summaries.store(0, Ordering::SeqCst);
         let r = ask().await;
@@ -678,4 +683,5 @@ async fn ask_withholds_claims_when_authority_changes() {
         // no attempt after the reload carries the claims to a provider
         assert_eq!(summaries.load(Ordering::SeqCst), 1, "{mode}");
     }
+    assert!(m.requests().iter().all(|r| r.path != "/redirected"));
 }

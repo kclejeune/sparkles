@@ -300,9 +300,9 @@ fn reifiers_about_charges_the_identities_it_returns() {
         Ok(out)
     };
     assert_eq!(scan(16 << 20).unwrap().len(), 400);
-    // one scan keeps about 50 KiB of identities beside 64 KiB of rows, so it fits in
-    // 140 KiB, and two scans that keep the first one's identities do not
-    let one = Preparation::new(crate::task::Control::none(), 140 << 10).unwrap();
+    // one scan keeps about 60 KiB of identities beside 64 KiB of rows, so it fits in
+    // 160 KiB, and two scans that keep the first one's identities do not
+    let one = Preparation::new(crate::task::Control::none(), 160 << 10).unwrap();
     let mut reads = Reads::new(&one, &snap);
     let mut held = one.reserve(0).unwrap();
     assert!(
@@ -317,5 +317,5 @@ fn reifiers_about_charges_the_identities_it_returns() {
             .is_ok()
     );
     drop(held);
-    assert!(matches!(scan(140 << 10), Err(Error::BudgetExceeded(_))));
+    assert!(matches!(scan(160 << 10), Err(Error::BudgetExceeded(_))));
 }

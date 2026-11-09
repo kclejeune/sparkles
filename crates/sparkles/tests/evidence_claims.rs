@@ -724,3 +724,40 @@ fn publish_map(ds: &Dataset) {
     )
     .unwrap();
 }
+
+/// A claim whose own records exceed the record bound reads as hidden, and the other
+/// claims that support the same triple keep their citations.
+#[test]
+fn records_beyond_the_bound_hide_only_their_claim() {
+    let ds = configured();
+    let a = claim(&ds, "advisory");
+    let b = claim(&ds, "mirror");
+    review(&ds, &a, Disposition::Accepted, None);
+    review(&ds, &b, Disposition::Accepted, None);
+    // raw withdrawals of b, past the bound, in a graph then added as a proposal graph
+    const EXTRA: &str = "urn:ev:extra";
+    let mut update = format!("INSERT DATA {{ GRAPH <{EXTRA}> {{");
+    for i in 0..=evidence::MAX_CLAIMS {
+        update.push_str(&format!(
+            " <urn:w:{i}> <urn:x-sparkles:evidence:withdraws> <{}> .",
+            b.0.as_str()
+        ));
+    }
+    update.push_str(" } }");
+    ds.update(&update).unwrap();
+    let mut s = settings(1);
+    s.proposals.push(EXTRA.into());
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    ds.compact().unwrap();
+    let big = Preparation::new(Control::none(), 1 << 30).unwrap();
+    let v = ds.store().evidence_view(&At::Head, &big).unwrap();
+    assert_eq!(
+        states(&v, &[&a.0, &b.0], all()),
+        vec![Some(ClaimState::Accepted), None]
+    );
+    let supports = evidence::with_policy_claims(&v, "main", all(), &Control::none(), |c| {
+        c.supports(&[affected()])
+    })
+    .unwrap();
+    assert_eq!(supports, vec![vec![a.0.clone()]]);
+}

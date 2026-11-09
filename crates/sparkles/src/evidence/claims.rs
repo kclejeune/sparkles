@@ -466,37 +466,46 @@ impl PolicyClaims<'_> {
         let mut out = Vec::with_capacity(triples.len());
         for t in triples {
             self.control.check()?;
-            out.push(match self.supports_of(t) {
-                // a triple whose supports exceed the record bound cites none
-                Err(e) if beyond_record_bound(&e) => Vec::new(),
-                r => r?,
-            });
+            out.push(self.supports_of(t)?);
         }
         Ok(out)
     }
 
+    /// The claims of `t`'s live supports the caller sees. A triple whose supports
+    /// exceed the record bound cites none, and a support whose own records, or its
+    /// claim's, exceed it is left out without affecting the others.
     fn supports_of(&mut self, t: &Triple) -> Result<Vec<NamedNode>> {
         let supports = self.graphs.supports.clone();
-        {
-            let mut claims = BTreeSet::new();
-            for s in self.state.subjects(
-                &ev("supportedTriple"),
-                &Term::Triple(Box::new(t.clone())),
-                &supports,
-                "supports",
-            )? {
-                if self.state.supported(&s, &self.graphs)?.as_ref() != Some(t)
-                    || !self.state.live(&s, &self.graphs)?
-                    || self.state.masked(&s, &supports.0)?
-                {
-                    continue;
-                }
-                if let Some(c) = self.state.iri(&s, &ev("claim"), &supports)? {
-                    claims.insert(c);
-                }
+        let listed = match self.state.subjects(
+            &ev("supportedTriple"),
+            &Term::Triple(Box::new(t.clone())),
+            &supports,
+            "supports",
+        ) {
+            Err(e) if beyond_record_bound(&e) => return Ok(Vec::new()),
+            r => r?,
+        };
+        let mut claims = BTreeSet::new();
+        for s in listed {
+            self.control.check()?;
+            match self.support_claim(&s, t) {
+                Err(e) if beyond_record_bound(&e) => {}
+                r => claims.extend(r?),
             }
-            Ok(claims.into_iter().collect())
         }
+        Ok(claims.into_iter().collect())
+    }
+
+    /// The claim of the support `s` when it is live, projects `t` and is not hidden.
+    fn support_claim(&mut self, s: &NamedNode, t: &Triple) -> Result<Option<NamedNode>> {
+        let supports = self.graphs.supports.clone();
+        if self.state.supported(s, &self.graphs)?.as_ref() != Some(t)
+            || !self.state.live(s, &self.graphs)?
+            || self.state.masked(s, &supports.0)?
+        {
+            return Ok(None);
+        }
+        self.state.iri(s, &ev("claim"), &supports)
     }
 
     /// The occurrences the caller may see in the readable proposal graphs of the

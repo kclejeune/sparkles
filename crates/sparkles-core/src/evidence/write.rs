@@ -1093,7 +1093,17 @@ pub struct Reads<'a> {
     preparation: &'a Preparation,
     snap: &'a Snapshot,
     ids: BTreeMap<String, Option<Id>>,
+    /// the storage of `ids`, charged to the preparation for the reads' lifetime
+    cached: Option<Reservation>,
 }
+
+/// The bytes a cached identity of [`Reads`] takes beside its IRI: the key's `String`,
+/// the value and the tree's per-entry share.
+const CACHE_ENTRY: u64 = 64;
+
+/// The bytes a returned claim identity takes beside its IRI, in the returned vector and
+/// in the caller's set of candidates.
+const IDENTITY_ENTRY: u64 = 64;
 
 impl<'a> Reads<'a> {
     /// The preparation the reads are charged to.
@@ -1106,6 +1116,7 @@ impl<'a> Reads<'a> {
             preparation,
             snap,
             ids: BTreeMap::new(),
+            cached: None,
         }
     }
 
@@ -1114,6 +1125,12 @@ impl<'a> Reads<'a> {
             return Ok(*id);
         }
         let id = self.preparation.lookup_iri(self.snap, iri)?;
+        // a cached identity stays charged until the reads end
+        let entry = iri.len() as u64 + CACHE_ENTRY;
+        match self.cached.as_mut() {
+            Some(r) => r.grow_by(entry)?,
+            None => self.cached = Some(self.preparation.reserve(entry)?),
+        }
         self.ids.insert(iri.to_string(), id);
         Ok(id)
     }
@@ -1370,8 +1387,9 @@ impl<'a> Reads<'a> {
     /// The IRI subjects in `g` that reify, through `p`, a triple term whose subject or
     /// object is one of `entities`, in subject order. At most `scan` quads of `g` are
     /// read. The rows read are charged to the preparation while the scan runs, and each
-    /// identity returned is charged to `held` before it is copied, so the caller keeps
-    /// it charged for as long as it keeps `held`. Returns whether `g` holds more than
+    /// identity returned is charged to `held` before it is copied, with room for the
+    /// returned vector and one set the caller keeps it in, so the caller keeps it
+    /// charged for as long as it keeps `held`. Returns whether `g` holds more than
     /// `scan` quads, in which case the list is incomplete.
     pub fn reifiers_about(
         &mut self,
@@ -1427,9 +1445,7 @@ impl<'a> Reads<'a> {
             if let Some(n) = self.preparation.with_term(self.snap, s, |t| {
                 Ok(match t {
                     Some(Term::NamedNode(n)) => {
-                        held.grow_by(
-                            n.as_str().len() as u64 + std::mem::size_of::<NamedNode>() as u64,
-                        )?;
+                        held.grow_by(n.as_str().len() as u64 + IDENTITY_ENTRY)?;
                         Some(n.as_str().to_string())
                     }
                     _ => None,
