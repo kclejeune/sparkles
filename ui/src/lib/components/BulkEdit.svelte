@@ -125,6 +125,21 @@
     return r?.kinds ?? [];
   }
   const OWL_THING = 'http://www.w3.org/2002/07/owl#Thing';
+  /** The entities of `iris` that the ontology knows as something other than a class. */
+  async function knownNotClasses(iris: readonly string[]): Promise<[string, EntityKind[]][]> {
+    const out: [string, EntityKind[]][] = [];
+    const queue = [...iris];
+    // a few reads at a time; the server keeps the mapped ontology of the commit between them
+    await Promise.all(
+      Array.from({ length: Math.min(8, queue.length) }, async () => {
+        for (let i = queue.shift(); i !== undefined; i = queue.shift()) {
+          const kinds = await kindsOf(i);
+          if (kinds.length && !kinds.includes('Class')) out.push([i, kinds]);
+        }
+      }),
+    );
+    return out.sort(([a], [b]) => iris.indexOf(a) - iris.indexOf(b));
+  }
   /** Kinds as a phrase: `a data property and an individual`. */
   const kindWords = (kinds: EntityKind[]) =>
     kinds
@@ -429,6 +444,17 @@
             : `${name(to)} is not a class of this ontology or its imports.`,
         );
     }
+    // a known entity that is not a class would become one through its SubClassOf
+    const notClasses = await knownNotClasses(ents);
+    if (notClasses.length)
+      return refuse(
+        `${notClasses
+          .slice(0, 5)
+          .map(([i, k]) => `${name(i)} is ${kindWords(k)}`)
+          .join(
+            ', ',
+          )}${notClasses.length > 5 ? ` and ${notClasses.length - 5} more are not classes` : ''}. Only classes, or IRIs the ontology does not know, can be moved.`,
+      );
     const mv = planMove(ents, to, await read('SubClassOf'), keep, name);
     if (!mv.ok) return { ...refuse(mv.reason), count: ents.length };
     const op = mv.op.kind === 'axioms' ? mv.op : null;

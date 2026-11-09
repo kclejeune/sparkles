@@ -233,7 +233,11 @@ its values read back as annotations, and the subjects of annotation assertions a
 declared. Setting a property that the ontology or its imports declare as another kind, such
 as a data property, is refused before the preview, since its declaration as an annotation
 property would change how the existing assertions read. A move declares nothing, and its new
-parent must be a class of the ontology or its imports, or `owl:Thing`. It reads and writes the graph
+parent must be a class of the ontology or its imports, or `owl:Thing`. Each moved entity
+must be a class or an IRI the ontology does not know, since a `SubClassOf` would otherwise
+turn a property or an individual into a class. The kinds are read through
+`GET /$/ontology/{ds}/entity` at the shown commit, eight at a time, which the server answers
+from the commit's mapped ontology. It reads and writes the graph
 without its imports, as it was planned, so an imported copy of a new value does not stop the
 server from adding that value to the edited graph.
 

@@ -255,6 +255,17 @@ test('moves classes under a new parent and refuses a cycle', async ({ page, requ
     await form.getByRole('button', { name: 'List the changes' }).click();
     await expect(changes(page).getByRole('alert')).toContainText('not a class');
 
+    // a listed property or individual is not a class and cannot be moved
+    await page.getByRole('button', { name: 'Clear the list' }).click();
+    await pasteEntities(page, 'uni:Student uni:teaches uni:ada');
+    await form.getByRole('combobox', { name: 'New parent class' }).fill('uni:Agent');
+    await page.getByRole('listbox').getByRole('option').first().click();
+    await form.getByRole('button', { name: 'List the changes' }).click();
+    const refusal = changes(page).getByRole('alert');
+    await expect(refusal).toContainText('is an object property');
+    await expect(refusal).toContainText('is an individual');
+    await expect(refusal).not.toContainText('Student');
+
     // two classes, one with an annotated SubClassOf, move under Agent
     await page.getByRole('button', { name: 'Clear the list' }).click();
     await pasteEntities(page, 'uni:GraduateStudent uni:Professor');
