@@ -1708,11 +1708,11 @@ fn is_ground(v: super::dl_clause::XLit) -> bool {
 }
 
 /// Whether a clause of a rooted run goes to the predecessors: its body holds atoms over x,
-/// role atoms `s(y, x)` and ground literals, and every head literal is an atom or role atom
-/// over y, a role atom between y and a constant, an equality or inequality of x, y and
-/// constants, or ground (Definition 4's predecessor triggers, with the ground literals that
-/// Pred carries unchanged).
-fn pred_ready(ix: &Index, dx: &DlIx, lits: &Lits, c: &Clause) -> bool {
+/// role atoms `s(y, x)` and ground literals, and every head literal is a predecessor
+/// trigger of the journal's Definition 4: an atom over y or a constant, a role atom between
+/// x and y or between two constants, or an equality of x, y and constants. An inequality is
+/// none.
+pub(super) fn pred_ready(ix: &Index, dx: &DlIx, lits: &Lits, c: &Clause) -> bool {
     use super::dl_clause::XLit;
     let inv = |r: Role| dx.inv(ix, r);
     let body = c.body().iter().all(|&l| match l.kind() {
@@ -1724,12 +1724,11 @@ fn pred_ready(ix: &Index, dx: &DlIx, lits: &Lits, c: &Clause) -> bool {
         Y | RY => true,
         XL => match lits.view(l, inv) {
             XLit::Atom(_, t) => matches!(t, RTerm::C(_)),
-            XLit::Role(_, a, b) => {
-                matches!(a, RTerm::Y | RTerm::C(_)) && matches!(b, RTerm::Y | RTerm::C(_))
-            }
-            XLit::Eq(a, b) | XLit::Ne(a, b) => [a, b]
+            XLit::Role(_, a, b) => matches!((a, b), (RTerm::C(_), RTerm::C(_))),
+            XLit::Eq(a, b) => [a, b]
                 .iter()
                 .all(|t| matches!(t, RTerm::X | RTerm::Y | RTerm::C(_))),
+            XLit::Ne(..) => false,
         },
         _ => false,
     })
@@ -2077,6 +2076,9 @@ fn process<S: Sink>(
         if !rooted || max.is_empty() {
             return;
         }
+        // the predecessors that register later replay the clauses over the predecessor,
+        // which the store lists only when they have no maximal literal
+        ds(st).store.preds.push(id);
     }
     let mut found = Found::default();
     let mut ps: Vec<(Role, Ex)> = Vec::new();

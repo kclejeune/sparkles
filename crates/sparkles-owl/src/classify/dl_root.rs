@@ -538,7 +538,18 @@ mod tests {
     /// Saturates as [`saturate_at`] does, with the root's store holding the clauses of
     /// `seed`, as body and head in general form, in place of its start.
     fn saturate_seeded(
+        s: Sig,
+        at: Option<Ex>,
+        seed: impl FnOnce(&Index, &mut Interner) -> Vec<(Vec<XLit>, Vec<XLit>)>,
+    ) -> Done {
+        saturate_after(s, &[], at, seed)
+    }
+
+    /// Saturates as [`saturate_seeded`] does, after saturating the contexts of `before`
+    /// one at a time.
+    fn saturate_after(
         mut s: Sig,
+        before: &[Ex],
         at: Option<Ex>,
         seed: impl FnOnce(&Index, &mut Interner) -> Vec<(Vec<XLit>, Vec<XLit>)>,
     ) -> Done {
@@ -584,6 +595,9 @@ mod tests {
             }
         }
         let root = at.unwrap_or(root);
+        for &e in before {
+            saturate(&ix, &ctx, &[e], &[], &[], &bounds).unwrap();
+        }
         saturate(&ix, &ctx, &[root], &[], &[], &bounds).unwrap();
         Done { ix, ctx, root, run }
     }
@@ -989,5 +1003,64 @@ mod tests {
             "growth {grown} covers {}",
             st.bytes() - before
         );
+    }
+
+    #[test]
+    fn a_predecessor_that_comes_later_gets_the_clauses_with_maxima() {
+        // B ⊑ {o}, B ⊑ G, A ⊑ ∃r.B, with B's context saturated before A reaches it
+        let mut s = Sig::new();
+        let no = s.ind("o");
+        let [a, b, g] = ["A", "B", "G"].map(|n| s.class(n));
+        let r = s.role("r");
+        let e = s.some(r, b);
+        s.sub(a, e);
+        s.sub(b, no);
+        s.sub(b, g);
+        let d = saturate_after(s, &[b], Some(a), |_, _| Vec::new());
+        let o = c(no, &d.ix);
+        assert!(d.has(&[XLit::Eq(RTerm::Fx(e), o)]), "f(x) ≈ o");
+        assert!(d.has(&[XLit::Atom(g, o)]), "G(o)");
+    }
+
+    #[test]
+    fn only_predecessor_triggers_go_to_the_predecessor() {
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let nb = s.ind("b");
+        let bb = s.class("B");
+        let r = s.role("r");
+        let root = s.it.fresh_class();
+        s.dl.root = Some(root);
+        s.ax.dl = Some(Box::new(std::mem::take(&mut s.dl)));
+        let ix = Index::build(&s.ax, &mut s.it, None, &|| false).unwrap();
+        let dx = dix(&ix);
+        let lits = super::super::dl_clause::Lits::default();
+        let inv = inv_of(&ix, dx);
+        let (ua, ub) = (c(na, &ix), c(nb, &ix));
+        let l = |v: XLit| match lits.lit(v, inv) {
+            Made::Lit(l) => l,
+            _ => panic!(),
+        };
+        let ready = |h: Vec<XLit>| {
+            super::super::dl_rules::pred_ready(
+                &ix,
+                dx,
+                &lits,
+                &Clause::new(Vec::new(), h.into_iter().map(l).collect()),
+            )
+        };
+        assert!(ready(vec![XLit::Atom(bb, RTerm::Y)]));
+        assert!(ready(vec![XLit::Atom(bb, ua)]));
+        assert!(ready(vec![XLit::Role(r, ua, ub)]));
+        assert!(ready(vec![XLit::Eq(RTerm::X, ua)]));
+        assert!(ready(vec![XLit::Eq(RTerm::Y, ua)]));
+        assert!(ready(vec![XLit::Eq(RTerm::X, RTerm::Y)]));
+        assert!(ready(vec![XLit::Eq(ua, ub)]));
+        assert!(!ready(vec![XLit::Role(r, RTerm::Y, ua)]));
+        assert!(!ready(vec![XLit::Role(r, ua, RTerm::Y)]));
+        assert!(!ready(vec![XLit::Role(r, RTerm::Y, RTerm::Y)]));
+        assert!(!ready(vec![XLit::Ne(RTerm::Y, ua)]));
+        assert!(!ready(vec![XLit::Ne(ua, ub)]));
+        assert!(!ready(vec![XLit::Atom(bb, RTerm::X)]));
     }
 }
