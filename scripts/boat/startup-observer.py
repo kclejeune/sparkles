@@ -241,6 +241,20 @@ def checkpoint_at(state,uid,denied,launcher,probe_pid,expected_manifest,seconds,
     return {'startup_closed':False,'installer_quiescent':False,'qualification_eligible':False,'bootstrap_occurrence':'unknown','reason':last,'reason_code':code,
             'unallowed':unallowed_inventory(rows,busy),'unallowed_count':len(busy),'engine_or_job_started':False}
 
+def own_cgroup_memory(unit,proc_cgroup=Path('/proc/self/cgroup'),root=Path('/sys/fs/cgroup')):
+    """The phase unit's memory and swap peaks, read from its own cgroup just before it exits.
+
+    systemd unloads a finished transient unit and then reports no peaks, so the
+    launcher takes them from here. The kernel's memory and swap limits still bound
+    the few writes that follow this read."""
+    try:
+        line=proc_cgroup.read_text().strip();need(line.startswith('0::'),'phase cgroup')
+        cg=root/line[3:].lstrip('/');need(cg.name==unit,'phase unit cgroup')
+        peak=(cg/'memory.peak').read_text().strip();swap=(cg/'memory.swap.peak').read_text().strip()
+        need(peak.isdigit() and swap.isdigit(),'phase memory peaks')
+        return {'source':'cgroup','cgroup':line[3:],'memory_peak':int(peak),'swap_peak':int(swap)}
+    except Exception as error:return {'source':'unavailable','reason_code':reason_code(error)}
+
 def run_phase(payload,observe,qualify,clock=time.monotonic):
     """One remote phase's result. Every refusal carries a bounded reason code."""
     started=clock()

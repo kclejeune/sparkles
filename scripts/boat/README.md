@@ -77,6 +77,24 @@ time left before the observation deadline, and a closure seen after it does not 
 refuses only when that deadline passes, with `startup_busy:bootstrap_lock_replaced` or
 `startup_busy:state_restore_in_progress` when that was the last thing it saw.
 
+## Phase unit health
+
+The startup, metadata and stop-check phases each run in a transient 512-MiB, zero-swap
+unit, and the launcher accepts a phase only when its unit ended with status 0 inside
+those limits. systemd unloads a transient unit as soon as it ends successfully, and an
+unloaded unit reports default values, which are result `success`, status 0 and no memory
+peaks. Each phase therefore reads its own cgroup's `memory.peak` and `memory.swap.peak`
+just before it writes its result, and records them with the cgroup path. The launcher
+takes the peaks from that record. When the phase could not read them, it takes them from
+the summary that `systemd-run --wait` prints, rounding each size up to the next tenth
+that systemd's truncated text can stand for. For an unloaded unit, the status comes only
+from the exit code of `systemd-run --wait`, which is the unit's own. A unit that is still
+loaded must also report success and status 0, and any peaks it reports must also be
+within the limits. A unit that reports no peaks and has neither source is refused with
+`unit_unhealthy:memory_peak_unavailable`. A recovered phase whose unit is already
+unloaded has no exit code and is refused with `unit_unhealthy:unloaded:status_unknown`.
+The kernel limits still bound the few writes that follow the cgroup read.
+
 Every refusal records a bounded reason code. A refusal of this package keeps its literal
 reason, and any other exception records only its type and the function and line where it
 was raised, never its text. The controller keeps a remote code only in one of these

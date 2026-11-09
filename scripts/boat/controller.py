@@ -49,6 +49,7 @@ def remote_reason(code):
     if code in FIXED_REASONS:return code
     if re.fullmatch(r'(launcher:)?unexpected:[A-Za-z_][A-Za-z0-9_]{0,63}(:[A-Za-z_<>][A-Za-z0-9_<>]{0,63}:[0-9]{1,7})?',code):return code
     if re.fullmatch(r'unit_unhealthy:(open|[a-z-]{1,32}:[0-9a-z]{1,12})',code):return code
+    if re.fullmatch(r'unit_unhealthy:(memory_peak_unavailable|memory_peak_over_cap|swap_used|unloaded:status_unknown|unloaded:exit-([0-9]{1,3}|unknown))',code):return code
     m=re.fullmatch(r'(launcher:)?refusal:(.{1,150})',code)
     if m and m[2] in {bounded_text('refusal:'+x)[len('refusal:'):] for x in packet_refusals()}:return code
     return 'malformed'
@@ -327,6 +328,7 @@ if __name__=='__main__':
         bind_profile(x['pins']);return observe_startup(x) if x['phase']!='metadata' else qualify_with_startup_lock(x)
     result,closed=run_phase(payload,bound,bound)
     result.update({'program_sha256':payload['program_sha256'],'phase':payload['phase'],'unit':payload['operation_tag']+'-'+payload['phase']+'.service'})
+    result['phase_memory']=own_cgroup_memory(result['unit'])
     write_new(Path(payload['result_directory']),'probe-result.json',result)
     print(json.dumps(result))
     raise SystemExit(0 if closed else 1)

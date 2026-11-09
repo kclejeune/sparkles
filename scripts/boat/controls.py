@@ -795,6 +795,7 @@ class Controls(unittest.TestCase):
                     with patch('builtins.print'):
                         with case.assertRaises(SystemExit)as status:exec(compile(ast.Module(body=[entry],type_ignores=[]),'actual-generated-entry','exec'),ns)
                     case.assertEqual(status.exception.code,0);result=load(Path(d)/'probe-result.json');case.assertEqual(result['phase'],'startup');case.assertTrue(result['startup_closed'])
+                    case.assertIn(result['phase_memory']['source'],('cgroup','unavailable'))
                 return {'exit':0,'error':None,'body':{'startup_closed':True,'phase_closed':True}}
         io=Capture(fixture());self.assertTrue(io.phase('startup',10)['startup_closed'])
     def test_live_limits_actual_projection_and_negatives(self):
@@ -924,6 +925,96 @@ class Controls(unittest.TestCase):
         for row in [{'url':'https://user:password@cache.invalid','namespace':'fixture/dev','mode':'read-only'},{'url':'https://cache.invalid','namespace':'fixture/dev','mode':'write'}]:
             p=synthetic_profile();p['mbx_remote_config']=row
             with self.assertRaises(ValueError):validate_profile(p)
+
+    # The startup unit's properties exactly as the worker's systemd 255 reported them
+    # after op-3's probe exited (receipts/probe-op3.json): the transient unit was unloaded.
+    OP3_UNLOADED="MainPID=0\nResult=success\nExecMainStatus=0\nMemoryCurrent=[not set]\nMemoryPeak=[not set]\nMemorySwapPeak=[not set]\nMemoryAccounting=yes\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nActiveEnterTimestampMonotonic=0\nInactiveEnterTimestampMonotonic=0\n"
+    def run_generated_launcher(self,phase,phase_memory,summary=b'',run_exit=0,shown=None,recover=False):
+        """Run the actual generated launcher for one phase with the host boundary faked."""
+        case=self;out={}
+        class Capture(InertIO):
+            phase_fn=c.RealIO.phase
+            def boat(self,args,seconds,input_bytes,json_mode=False):
+                with tempfile.TemporaryDirectory(prefix='boat-launcher-') as d:
+                    home=Path(d).resolve()/'home';(home/'.local/state/sparkles-boat').mkdir(parents=True)
+                    source=input_bytes.decode().replace('/home/worker-fixture',str(home))
+                    calls=[]
+                    def run(argv,**kw):
+                        calls.append(argv[0])
+                        if argv[0]=='systemctl':
+                            text='LoadState=not-found\nActiveState=inactive\nMainPID=0\n' if calls.count('systemctl')==1 and not recover else (shown if shown is not None else case.OP3_UNLOADED)
+                            return __import__('subprocess').CompletedProcess(argv,0,text.encode(),None)
+                        case.assertEqual(argv[0],'systemd-run');payload=json.loads(argv[-1])
+                        body={'program_sha256':payload['program_sha256'],'phase':payload['phase'],'unit':payload['operation_tag']+'-'+payload['phase']+'.service','startup_closed':True,'qualified':True,'engine_or_job_started':False}
+                        if phase_memory is not None:body['phase_memory']=phase_memory
+                        write_new(Path(payload['result_directory']),'probe-result.json',body)
+                        return __import__('subprocess').CompletedProcess(argv,run_exit,b'{}',summary)
+                    printed=[]
+                    with patch('subprocess.run',side_effect=run),patch('os.getuid',return_value=1000),patch('pathlib.Path.home',return_value=home),patch('builtins.print',side_effect=lambda x:printed.append(x)):
+                        if recover:
+                            tag=json.loads(ast.literal_eval([n.value for n in ast.parse(source).body if isinstance(n,ast.Assign) and n.targets[0].id=='PAYLOAD'][0]))['operation_tag']
+                            op=home/'.local/state/sparkles-boat'/('qualification-'+tag+'-'+phase);op.mkdir(mode=0o700)
+                            program=__import__('base64').b64decode(ast.literal_eval([n.value for n in ast.parse(source).body if isinstance(n,ast.Assign) and n.targets[0].id=='CODE'][0]))
+                            write_new(op,'probe-result.json',{'program_sha256':digest(program),'phase':phase,'unit':tag+'-'+phase+'.service','startup_closed':True,'qualified':True,'phase_memory':phase_memory})
+                        exec(compile(source,'actual-generated-launcher','exec'),{'__name__':'__main__'})
+                    out['body']=json.loads(printed[-1]);out['calls']=calls
+                    return {'exit':0,'error':None,'body':out['body']}
+        io=Capture(fixture());io.phase_fn('startup',10) if phase=='startup' else io.phase_fn(phase)
+        return out
+    def test_op3_unloaded_unit_with_cgroup_peaks_is_healthy_in_every_phase(self):
+        for phase in ('startup','metadata','stopcheck'):
+            tag='boat-owned-warm-qual-inert-'+phase+'.service'
+            body=self.run_generated_launcher(phase,{'source':'cgroup','cgroup':'/user.slice/app.slice/'+tag,'memory_peak':23278387,'swap_peak':0})['body']
+            self.assertNotIn('reason_code',body,phase);self.assertTrue(body['startup_closed'],phase);self.assertTrue(body['phase_closed'],phase)
+            self.assertEqual(body['terminal_evidence'],{'source':'cgroup','memory_peak':23278387,'swap_peak':0,'terminal_source':'systemd_run_exit'},phase)
+    def test_op3_unloaded_unit_falls_back_to_the_systemd_run_summary(self):
+        summary=b'          Finished with result: success\nMain processes terminated with: code=exited, status=0/SUCCESS\n               Service runtime: 11.786s\n                   Memory peak: 22.2M (swap: 0B)\n'
+        for phase in ('startup','metadata','stopcheck'):
+            body=self.run_generated_launcher(phase,{'source':'unavailable','reason_code':'refusal:phase unit cgroup'},summary)['body']
+            self.assertNotIn('reason_code',body,phase);self.assertEqual(body['terminal_evidence']['source'],'systemd_run_summary')
+            self.assertEqual(body['terminal_evidence']['memory_peak'],223*1024*1024//10)
+    def test_op3_unloaded_unit_without_either_source_still_refuses(self):
+        for phase in ('startup','metadata','stopcheck'):
+            for memory,summary in [(None,b''),({'source':'unavailable','reason_code':'refusal:phase memory peaks'},b'Memory peak: 22.2M\n'),({'source':'cgroup','cgroup':'/x','memory_peak':'1','swap_peak':0},b'')]:
+                body=self.run_generated_launcher(phase,memory,summary)['body']
+                self.assertEqual(body['reason_code'],'unit_unhealthy:memory_peak_unavailable',phase);self.assertFalse(body['startup_closed']);self.assertFalse(body.get('qualified',False))
+                self.assertEqual(c.remote_reason(body['reason_code']),body['reason_code'])
+    def test_unloaded_unit_status_comes_only_from_systemd_run(self):
+        good={'source':'cgroup','cgroup':'/x/boat-owned-warm-qual-inert-startup.service','memory_peak':1,'swap_peak':0}
+        body=self.run_generated_launcher('startup',good,run_exit=1)['body'];self.assertEqual(body['reason_code'],'unit_unhealthy:unloaded:exit-1')
+        body=self.run_generated_launcher('startup',good,recover=True)['body'];self.assertEqual(body['reason_code'],'unit_unhealthy:unloaded:status_unknown')
+        for code in ('unit_unhealthy:unloaded:exit-1','unit_unhealthy:unloaded:status_unknown','unit_unhealthy:swap_used','unit_unhealthy:memory_peak_over_cap'):self.assertEqual(c.remote_reason(code),code)
+    def test_terminal_health_peaks_bounds_and_loaded_units(self):
+        unloaded=c.props(self.OP3_UNLOADED);cg={'source':'cgroup','cgroup':'/a/u.service','memory_peak':MEMORY,'swap_peak':0}
+        self.assertTrue(terminal_health({'phase_memory':cg},unloaded,True,0)[0])
+        self.assertEqual(terminal_health({'phase_memory':dict(cg,memory_peak=MEMORY+1)},unloaded,True,0)[1],'unit_unhealthy:memory_peak_over_cap')
+        self.assertEqual(terminal_health({'phase_memory':dict(cg,swap_peak=4096)},unloaded,True,0)[1],'unit_unhealthy:swap_used')
+        self.assertEqual(terminal_health({'phase_memory':cg},unloaded,False,0)[1],'unit_unhealthy:open')
+        # systemd truncates to one decimal, so 512.0M may stand for more than the cap.
+        self.assertEqual(terminal_health({},unloaded,True,0,'Memory peak: 512.0M (swap: 0B)')[1],'unit_unhealthy:memory_peak_over_cap')
+        self.assertTrue(terminal_health({},unloaded,True,0,'Memory peak: 511.9M (swap: 0B)')[0])
+        self.assertEqual(terminal_health({},unloaded,True,0,'Memory peak: 1.0M (swap: 0.1K)')[1],'unit_unhealthy:swap_used')
+        self.assertEqual(terminal_health({},unloaded,True,0,'Memory peak: 3.5B (swap: 0B)')[1],'unit_unhealthy:memory_peak_unavailable')
+        # The last summary line counts, and a cgroup read wins over the summary.
+        self.assertEqual(terminal_health({},unloaded,True,0,'Memory peak: 1.0M (swap: 0B)\nMemory peak: 600.0M (swap: 0B)')[1],'unit_unhealthy:memory_peak_over_cap')
+        self.assertTrue(terminal_health({'phase_memory':dict(cg,memory_peak=1)},unloaded,True,0,'Memory peak: 600.0M (swap: 0B)')[0])
+        loaded={'LoadState':'loaded','ActiveState':'inactive','MainPID':'0','ControlGroup':'/a/u.service','Result':'success','ExecMainStatus':'0','MemoryPeak':'1000','MemorySwapPeak':'0'}
+        ok,code,evidence=terminal_health({'phase_memory':dict(cg,memory_peak=10)},loaded,True,None);self.assertTrue(ok);self.assertEqual(evidence['terminal_source'],'unit')
+        self.assertEqual(terminal_health({'phase_memory':dict(cg,memory_peak=10)},dict(loaded,MemoryPeak=str(MEMORY+1)),True,None)[1],'unit_unhealthy:memory_peak_over_cap')
+        self.assertEqual(terminal_health({'phase_memory':dict(cg,memory_peak=10)},dict(loaded,MemorySwapPeak='1'),True,None)[1],'unit_unhealthy:swap_used')
+        self.assertEqual(terminal_health({'phase_memory':cg},dict(loaded,Result='exit-code',ExecMainStatus='1'),True,0)[1],'unit_unhealthy:exit-code:1')
+        # A cgroup read bound to another cgroup than the loaded unit's does not count.
+        self.assertEqual(terminal_health({'phase_memory':dict(cg,cgroup='/other.service')},dict(loaded,MemoryPeak='[not set]'),True,None)[1],'unit_unhealthy:memory_peak_unavailable')
+    def test_own_cgroup_memory_reads_the_phase_unit_only(self):
+        f=OBSERVER['own_cgroup_memory']
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)/'cg';unit=root/'user.slice/x-startup.service';unit.mkdir(parents=True);proc=Path(d)/'cgroup'
+            proc.write_text('0::/user.slice/x-startup.service\n');(unit/'memory.peak').write_text('23278387\n');(unit/'memory.swap.peak').write_text('0\n')
+            self.assertEqual(f('x-startup.service',proc,root),{'source':'cgroup','cgroup':'/user.slice/x-startup.service','memory_peak':23278387,'swap_peak':0})
+            self.assertEqual(f('y-startup.service',proc,root),{'source':'unavailable','reason_code':'refusal:phase unit cgroup'})
+            (unit/'memory.swap.peak').write_text('max\n');self.assertEqual(f('x-startup.service',proc,root)['reason_code'],'refusal:phase memory peaks')
+            (unit/'memory.swap.peak').unlink();self.assertRegex(f('x-startup.service',proc,root)['reason_code'],'^unexpected:FileNotFoundError:')
+            proc.write_text('1:name=x:/\n');self.assertEqual(f('x-startup.service',proc,root)['reason_code'],'refusal:phase cgroup')
 
     def test_final_runtime_source_map(self):
         path=Path(__file__).with_name('runtime-sources.json')

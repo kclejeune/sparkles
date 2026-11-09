@@ -186,3 +186,58 @@ def positive_resume_ack(result,contract):
     b=result.get('body');need(contract.get('verified_by_Root') is True and sha(contract.get('receipt_sha256')),'ack schema unbound')
     if not isinstance(b,dict):return False
     return contract.get('kind')=='cli_accepted_resuming' and b.get('event')=='accepted' and b.get('id')==worker_id() and b.get('status')=='resuming'
+
+UNITS={'B':1,'K':1024,'M':1024**2,'G':1024**3,'T':1024**4}
+SUMMARY_PEAK=re.compile(r'Memory peak: ([0-9]{1,6})(?:\.([0-9]))?([BKMGT]) \(swap: ([0-9]{1,6})(?:\.([0-9]))?([BKMGT])\)')
+def summary_bound(whole,tenth,unit):
+    """The largest byte count systemd's one-decimal size text can stand for."""
+    if unit=='B':
+        need(tenth is None,'phase memory summary');return int(whole)
+    return (int(whole)*10+int(tenth or 0)+1)*UNITS[unit]//10
+def summary_peaks(text):
+    """Upper bounds of the memory and swap peaks in a `systemd-run --wait` summary.
+
+    systemd truncates each size to one decimal place, so the bound is the next
+    tenth. The summary is the last matching line. The peaks are unknown when no
+    line names both values."""
+    if not isinstance(text,str):return None
+    rows=[SUMMARY_PEAK.fullmatch(line.strip()) for line in text.splitlines()[-64:]]
+    rows=[m for m in rows if m]
+    if not rows:return None
+    m=rows[-1]
+    try:return {'source':'systemd_run_summary','memory_peak':summary_bound(*m.group(1,2,3)),'swap_peak':summary_bound(*m.group(4,5,6))}
+    except Refusal:return None
+def cgroup_peaks(result,loaded):
+    """The peaks the phase read from its own cgroup, when they are bound to this unit."""
+    row=result.get('phase_memory') if isinstance(result,dict) else None
+    if not isinstance(row,dict) or row.get('source')!='cgroup':return None
+    if type(row.get('memory_peak'))is not int or type(row.get('swap_peak'))is not int or row['memory_peak']<0 or row['swap_peak']<0:return None
+    cg=loaded.get('ControlGroup','')
+    if cg and cg!=row.get('cgroup'):return None
+    return {'source':'cgroup','memory_peak':row['memory_peak'],'swap_peak':row['swap_peak']}
+def terminal_health(result,loaded,closed,run_exit=None,summary=None):
+    """Whether a finished phase unit ended healthy, with a bounded reason and its evidence.
+
+    The unit must have closed with status 0, a memory peak within the cap and no
+    swap. The memory peaks come from the phase's own cgroup read before it
+    exited, and otherwise from the `systemd-run --wait` summary. systemd unloads a
+    finished transient unit, and an unloaded unit reports default values: Result
+    success, status 0 and no peaks. Its status therefore comes only from
+    systemd-run's exit code, which is the unit's own. Peaks that the unit still
+    reports must also be within the cap."""
+    if not closed:return False,'unit_unhealthy:open',{}
+    unloaded=loaded.get('LoadState')=='not-found'
+    if unloaded:
+        if run_exit is None:return False,'unit_unhealthy:unloaded:status_unknown',{}
+        if run_exit!=0:return False,'unit_unhealthy:unloaded:exit-%d'%run_exit if type(run_exit)is int and 0<=run_exit<256 else 'unit_unhealthy:unloaded:exit-unknown',{}
+    elif loaded.get('Result')!='success' or loaded.get('ExecMainStatus')!='0':
+        return False,'unit_unhealthy:'+bounded_text(loaded.get('Result','unknown'),32)+':'+bounded_text(loaded.get('ExecMainStatus','unknown'),12),{}
+    peaks=cgroup_peaks(result,loaded) or summary_peaks(summary)
+    if peaks is None:return False,'unit_unhealthy:memory_peak_unavailable',{}
+    evidence=dict(peaks,terminal_source='systemd_run_exit' if unloaded else 'unit')
+    for key,value in (('MemoryPeak',peaks['memory_peak']),('MemorySwapPeak',peaks['swap_peak'])):
+        own=loaded.get(key,'')
+        if own.isdigit():evidence['unit_'+key]=int(own)
+    if max(peaks['memory_peak'],evidence.get('unit_MemoryPeak',0))>MEMORY:return False,'unit_unhealthy:memory_peak_over_cap',evidence
+    if max(peaks['swap_peak'],evidence.get('unit_MemorySwapPeak',0))!=0:return False,'unit_unhealthy:swap_used',evidence
+    return True,None,evidence
