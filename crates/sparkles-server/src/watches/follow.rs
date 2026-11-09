@@ -153,7 +153,8 @@ pub(crate) enum Place {
     /// open, in this dataset under this branch name
     Found(Arc<crate::state::Dataset>, String),
     /// not known now: a dataset that could hold the branch is opening, failed to open,
-    /// is being deleted or renamed, or has its store swapped by a restore
+    /// is being deleted or renamed, has its store swapped by a restore, or was left
+    /// closed by a rename or restore whose recovery failed
     Unknown,
     /// no dataset of the catalog holds the branch
     Gone,
@@ -171,10 +172,12 @@ pub(crate) fn locate(st: &AppState, dataset: &str, bid: uuid::Uuid) -> Place {
     // dataset out of the catalog while it is read, which the count tells
     let lives = st.lifecycle();
     // the catalog lists open datasets only: one that is still opening, held back by
-    // startup or kept closed after a failed open may hold the branch
+    // startup, kept closed after a failed open, or closed by a swap or a rename,
+    // including one whose recovery failed, may hold the branch
     let mut unsure = st.any_leaving()
         || st.phase() == crate::obs::Phase::Starting
-        || !st.unavailable_datasets().is_empty();
+        || !st.unavailable_datasets().is_empty()
+        || !st.catalog.closed().is_empty();
     #[cfg(test)]
     if let Some(f) = st.watches.before_scan.lock().as_mut() {
         f();

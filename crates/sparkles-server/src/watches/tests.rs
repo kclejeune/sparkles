@@ -1304,7 +1304,8 @@ async fn a_retried_record_reaches_the_follower_once() {
     s.follow().await;
     let dir = s.st.data_dir.clone();
     let mode = |m| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
-    let file = || std::fs::read_to_string(s.st.data_dir.join(FILE)).unwrap();
+    let path = s.st.data_dir.join(FILE);
+    let file = || std::fs::read_to_string(&path).unwrap();
     mode(0o500);
     let v0 = s.st.watches.version();
     s.proxied("/$/ping", "pam", "others", Some("pam@example.org"))
@@ -1428,7 +1429,8 @@ async fn a_restore_in_place_removes_no_watch() {
             .any(|x| x.id == id)
     };
     {
-        let _swap = s.st.swapping();
+        let st = s.st.clone();
+        let _swap = st.swapping();
         s.follow().await;
         assert!(kept(&s), "removed while a store was swapped");
     }

@@ -722,9 +722,9 @@ next attempt at once, and the time of that vouching is checked against
 `watches.identityMaxAgeDays`. The latest word takes effect from memory even when it
 cannot be saved on the watches, and it stays in memory until a later vouching saves it
 or the owner has no watches left. The follower keeps a watch whose branch it cannot
-find while a dataset is opening, failed to open, is being deleted or renamed, or has
-its store swapped by a restore in place, including one that starts while it reads the
-catalog. The tests in `crates/sparkles-server/src/watches/tests.rs`
+find while a dataset is opening, failed to open, is being deleted or renamed, has its
+store swapped by a restore in place, including one that starts while it reads the
+catalog, or was left closed by a rename or restore whose recovery failed. The tests in `crates/sparkles-server/src/watches/tests.rs`
 send a batch through the test mail server to the owner alone while `*` routes to the same
 channel, and cover a removed watch, a user without an address, a proxy account whose
 address header is missing or malformed, an identity older than the bound, groups taken

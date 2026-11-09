@@ -1422,6 +1422,12 @@ impl Catalog {
             .collect()
     }
     /// Why the registered dataset `name` is kept closed, if it is.
+    /// The datasets the registry names that are not open now: one closed for a swap or
+    /// a rename, and one left closed by a rename or restore whose recovery failed until
+    /// the catalog opens again. [`list`](Self::list) leaves them out.
+    pub fn closed(&self) -> Vec<String> {
+        self.inner.detached.lock().keys().cloned().collect()
+    }
     pub fn refusal(&self, name: &str) -> Option<Refusal> {
         self.inner.refused.lock().get(name).cloned()
     }
