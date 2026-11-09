@@ -117,9 +117,17 @@ class Admission(unittest.TestCase):
         # So bash -c receives the script itself, never a quoted copy of it.
         # Bash run over ssh reads ~/.bashrc even with -c, and the worker's prepends
         # /usr/local/cargo/bin to PATH (observed on bx_gy2ytgh8), so no shell reads it.
-        words=result[result.index('--')+1:];self.assertEqual(words[:4],['/bin/bash','--norc','--noprofile','-c']);self.assertEqual(len(words),5)
-        script=words[4];self.assertFalse(script.startswith(("'",'"')),script[:20])
-        self.assertIn("'/bin/bash' --norc --noprofile -c ",script.replace("/bin/bash --norc","'/bin/bash' --norc"))
+        # An inherited BASH_ENV or ENV would still run startup code, so both are cleared.
+        words=result[result.index('--')+1:]
+        self.assertEqual(words[:9],['/usr/bin/env','-u','BASH_ENV','-u','ENV','/bin/bash','--norc','--noprofile','-c']);self.assertEqual(len(words),10)
+        script=words[9];self.assertFalse(script.startswith(("'",'"')),script[:20])
+        self.assertIn('exec env -u BASH_ENV -u ENV ',script);self.assertIn(' /bin/bash --norc --noprofile -c ',script)
+        import shutil as sh,subprocess,os,tempfile as tf
+        with tf.TemporaryDirectory() as t:
+            marker=Path(t)/'ran';startup=Path(t)/'startup';startup.write_text('touch '+shlex.quote(str(marker))+'\n')
+            local=[sh.which('env'),*words[1:5],sh.which('bash'),*words[6:9],'echo ok']
+            out=subprocess.run(local,env={'PATH':os.environ['PATH'],'BASH_ENV':str(startup),'ENV':str(startup)},capture_output=True,text=True,timeout=10)
+            self.assertEqual(out.stdout,'ok\n');self.assertFalse(marker.exists())
         self.assertIn("a;$(bad)",script);self.assertNotIn('; . ',script)
         import subprocess as sp
         self.assertEqual(sp.run(['bash','-n','-c',script],capture_output=True,timeout=10).returncode,0)
