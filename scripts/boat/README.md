@@ -132,9 +132,8 @@ startup checkout it lists up to 200 untracked paths that git does not ignore, re
 to the checkout, with each path's kind, size, mode and mtime from `lstat`. An untracked
 directory is one entry. A path with any component that looks like a credential is left
 out and only counted. A component looks like one when it contains a stem such as
-`token`, `secret`, `netrc`, `id_rsa` or `.pem` anywhere, which also catches backup and
-editor copies, or when it is a dot directory such as `.env`, `.ssh` or `.aws` with or
-without a suffix. Git's listing is read up to 4 MiB. It reads no
+`token`, `secret`, `netrc`, `id_rsa`, `.pem`, `.env`, `.ssh` or `.aws` anywhere, which
+also catches backup and editor copies. Git's listing is read up to 4 MiB. It reads no
 other file, so the token and the content of the repository are never opened. It
 opens each directory by name under its parent and never through a symbolic link, accepts
 only private directories of the worker, and reads a result only when it is a private

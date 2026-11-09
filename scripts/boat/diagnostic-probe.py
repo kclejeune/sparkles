@@ -157,18 +157,14 @@ UNTRACKED_MAX=200
 UNTRACKED_REPOS_MAX=4
 UNTRACKED_BYTES=4*1024*1024
 # A component is credential-like when it contains one of these stems anywhere, so backup,
-# editor and archive copies such as `.netrc.bak`, `#.env#` or `secrets.tar.gz` match too,
-# or when it is one of the dot directories below, alone or with a suffix. Every component
-# of a path is checked, so a credential-like parent hides its children. Matching is
-# case-insensitive and treats newlines as ordinary characters.
+# editor and archive copies such as `.netrc.bak`, `#.env#`, `backup.env` or
+# `secrets.tar.gz` match too. Every component of a path is checked, so a credential-like
+# parent hides its children. Matching ignores case, and a newline is an ordinary character.
 CREDENTIAL_STEMS=('credential','secret','token','passw','apikey','api-key','api_key','private','netrc','npmrc','pypirc','pgpass',
-                  'id_rsa','id_dsa','id_ecdsa','id_ed25519','.pem','.key','.p12','.pfx','.jks','keystore','.kdbx','.gpg','.asc','.ovpn')
-CREDENTIAL_DIRECTORIES=re.compile(r'(^|[^a-z0-9])(\.env|\.ssh|\.gnupg|\.aws|\.docker|\.kube)([^a-z0-9]|$)',re.I|re.S)
+                  'id_rsa','id_dsa','id_ecdsa','id_ed25519','.pem','.key','.p12','.pfx','.jks','keystore','.kdbx','.gpg','.asc','.ovpn',
+                  '.env','.ssh','.gnupg','.aws','.docker','.kube')
 def credential_like(name):
-    for part in name.split('/'):
-        lowered=part.lower()
-        if part and (any(stem in lowered for stem in CREDENTIAL_STEMS) or CREDENTIAL_DIRECTORIES.search(part)):return True
-    return False
+    return any(part and any(stem in part.lower() for stem in CREDENTIAL_STEMS) for part in name.split('/'))
 def bounded_git(argv,limit,seconds):
     """Git's stdout up to limit bytes, and whether it was cut there; the child is always reaped."""
     import selectors,time

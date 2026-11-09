@@ -1685,3 +1685,15 @@ class UntrackedRoundThree(unittest.TestCase):
             self.assertTrue(d.credential_like(name),repr(name))
         for name in ('plain.txt','.mise/state','src/main.rs','.venv/','__pycache__/','environment.md'):
             self.assertFalse(d.credential_like(name),repr(name))
+
+
+class UntrackedRoundFour(UntrackedDiagnostics):
+    """Every name that carries a credential dot-name anywhere is omitted and counted."""
+    def test_env_names_anywhere_are_omitted(self):
+        d=diagnostic_module()
+        for name in ('.envrc','backup.env','backup.env.bak','x/.envrc/y','old.ssh/config','prod.aws.json'):
+            self.assertTrue(d.credential_like(name),repr(name))
+        repo=self.repository()
+        for name in ('.envrc','backup.env','backup.env.bak','plain.txt'):(repo/name).write_text('DO_NOT_COPY')
+        row=d.untracked([str(repo)])[str(repo)]
+        self.assertEqual(([p['path'] for p in row['paths']],row['omitted_credential_like']),(['plain.txt'],3))
