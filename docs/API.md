@@ -14173,14 +14173,17 @@ endpoints and secrets here, unlike a dataset's settings, but never a key's value
 `overrides` names, for example, a budget changed at runtime with the budget of
 `--model-config`, and a declared provider removed at runtime as
 `{"path": "providers.local", "declared": {...}, "runtime": null}`.
-`sparkles settings --global` and the **Models** section of the UI use these routes.
+`sparkles settings --global` and the **Models** and **Notifications** sections of the UI
+use these routes.
 
 The `ModelsSettings` schema of the OpenAPI description gives each member of `models` with
 its type, bounds and description, and the UI builds its form from it. Its extensions
 `x-sparkles-order`, `x-sparkles-kinds`, `x-sparkles-secret`, `x-sparkles-unset` and
 `x-sparkles-section` give the order of the members, the provider kinds a member applies
 to, the strings that name a secret, what an unset member means and the heading it belongs
-under. A write of `models` that leaves the configuration invalid is a `400` with
+under. The `NotificationsSettings` and `NotificationChannelSettings` schemas describe the
+`notifications` kind in the same way, and `x-sparkles-kinds` on a channel member lists the
+channel types it applies to. A write of `models` that leaves the configuration invalid is a `400` with
 `bad-settings`, and when the failed check concerns one field, `field` names it as a
 dotted path:
 

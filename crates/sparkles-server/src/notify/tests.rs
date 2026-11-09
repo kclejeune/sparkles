@@ -557,6 +557,46 @@ async fn backup_failures_repeat_and_clear() {
 }
 
 /// A6, A7: locks from the settings file, inline credentials and unknown channels.
+/// The Notifications section switches a declared webhook from its URL to a URL secret
+/// with a `PUT` of the whole configuration, since a merge patch cannot remove the declared
+/// `url` (C21 §11).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_put_switches_a_declared_webhook_to_a_url_secret() {
+    let f = fixture(
+        Some(json!({"server": {"notifications": {
+            "channels": {"ops": {"type": "webhook", "url": "https://hooks.example.org/x"}},
+            "routes": {"*": ["ops"]}
+        }}})),
+        true,
+    );
+    // emptying the declared member in a merge patch only drops a runtime value
+    let (s, v) = f
+        .patch(json!({"channels": {"ops": {"url": null, "urlSecret": {"secret": "hook-url"}}}}))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let (_, v) = f
+        .send("GET", "/$/server/settings/notifications", None)
+        .await;
+    let mut body = v["effective"].clone();
+    let ops = body["channels"]["ops"].as_object_mut().unwrap();
+    ops.remove("url");
+    ops.insert("urlSecret".into(), json!({"secret": "hook-url"}));
+    let (s, v) = f
+        .send("PUT", "/$/server/settings/notifications", Some(body))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["effective"]["channels"]["ops"]["urlSecret"]["secret"],
+        "hook-url"
+    );
+    assert!(
+        v["effective"]["channels"]["ops"].get("url").is_none(),
+        "{v}"
+    );
+    assert_eq!(v["runtime"]["channels"]["ops"]["url"], Value::Null, "{v}");
+    assert_eq!(v["effective"]["routes"]["*"], json!(["ops"]));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_settings_kind_has_layers_and_locks() {
     let f = fixture(

@@ -2515,6 +2515,15 @@ sparkles settings set --global notifications.enabled=true \
 sparkles secrets set hook-signing < hook-signing.key
 ```
 
+A server administrator can do the same on the UI's server page. Its Notifications
+section lists each channel with its target, its secrets, the routes that reach it and
+its last delivery, sends a test to a channel, and adds and removes channels and routes.
+Below it, the recent deliveries and the conditions that were notified are listed, and
+the configuration panel edits every field with its source and lock, as the Models
+section does for the model configuration.
+
+![The Notifications section of the server page with three channels, their routes and recent deliveries](images/notifications-settings.png)
+
 A webhook receives the notification as a JSON body. With `signingSecret`, the request
 carries the `webhook-id`, `webhook-timestamp` and `webhook-signature` headers of
 Standard Webhooks, and the libraries of that specification verify them. A webhook URL

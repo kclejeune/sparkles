@@ -9732,6 +9732,122 @@ export interface components {
             /** @description Kept materialized. */
             warm: boolean;
         };
+        /**
+         * Channel
+         * @description One channel of the `notifications` kind. `type` decides the members it takes, and `x-sparkles-kinds` lists the types each member applies to. A credential is always named by a secret reference and never held inline.
+         */
+        NotificationChannelSettings: {
+            /**
+             * From
+             * @description The sender's mail address.
+             */
+            from?: string;
+            /**
+             * Host
+             * @description The SMTP server's host name or IP address. It passes the outbound policy's host check.
+             */
+            host?: string;
+            /**
+             * Password
+             * @description A secret that holds the SMTP password, sent with SASL PLAIN. It needs a user name.
+             */
+            password?: {
+                /**
+                 * Password
+                 * @description The secret that holds the password.
+                 */
+                secret: string;
+            };
+            /**
+             * Port
+             * @description The SMTP server's port.
+             */
+            port?: number;
+            /**
+             * Priority
+             * @description The ntfy priority from 1 to 5.
+             */
+            priority?: number;
+            /**
+             * Server
+             * Format: uri
+             * @description The ntfy server's base URL.
+             * @default https://ntfy.sh
+             */
+            server: string;
+            /**
+             * Signing secret
+             * @description A secret that holds the key of the Standard Webhooks signature. Without it, requests are not signed.
+             */
+            signingSecret?: {
+                /**
+                 * Signing secret
+                 * @description The secret that holds the signing key. A value that starts with whsec_ is decoded from Base64.
+                 */
+                secret: string;
+            };
+            /**
+             * Tags
+             * @description Tags added to the event type's own tag, at most 10 of 1 to 64 characters without commas.
+             */
+            tags?: string[];
+            /**
+             * TLS
+             * @description STARTTLS on the submission port, or TLS from the first byte. A connection without TLS is refused.
+             * @default starttls
+             * @enum {string}
+             */
+            tls: "starttls" | "tls";
+            /**
+             * To
+             * @description The recipients' mail addresses, 1 to 20.
+             */
+            to?: string[];
+            /**
+             * Access token
+             * @description A secret that holds an ntfy access token, sent as a bearer token.
+             */
+            token?: {
+                /**
+                 * Access token
+                 * @description The secret that holds the token.
+                 */
+                secret: string;
+            };
+            /**
+             * Topic
+             * @description The topic to publish to, 1 to 64 letters, digits, - and _. Anyone who guesses a topic on a public server can read it, so use a token with a reserved topic or a server of your own.
+             */
+            topic?: string;
+            /**
+             * Type
+             * @description How the channel delivers: a webhook POST, an ntfy publish or an email over SMTP.
+             * @enum {string}
+             */
+            type: "webhook" | "ntfy" | "email";
+            /**
+             * URL
+             * Format: uri
+             * @description The http or https URL the envelope is posted to. A URL that carries a user name, a password, a query or a fragment is refused, so name such a URL with the URL secret instead. A private address requires --outbound-allow-private.
+             */
+            url?: string;
+            /**
+             * URL secret
+             * @description A secret that holds the whole URL, for a URL that carries a credential, in place of URL.
+             */
+            urlSecret?: {
+                /**
+                 * URL secret
+                 * @description The secret that holds the URL. Set either URL or this.
+                 */
+                secret: string;
+            };
+            /**
+             * User name
+             * @description The SASL PLAIN user name. It needs a password.
+             */
+            username?: string;
+        };
         /** @description Whether notifications are on, each channel's last success and failure, the conditions notified and the recent deliveries. */
         NotificationStatus: {
             active: {
@@ -9802,6 +9918,79 @@ export interface components {
             status: number;
             /** @enum {string} */
             type: "webhook" | "ntfy" | "email";
+        };
+        /**
+         * Notification configuration
+         * @description The `notifications` kind of `/$/server/settings/notifications` and of the settings file's `server.notifications`: whether events are delivered, the channels, the routes from event types to channels, the repeat interval and the retries. The web UI builds its form from this schema.
+         */
+        NotificationsSettings: {
+            /**
+             * Base URL
+             * Format: uri
+             * @description The URL the web UI is reached at, which makes the links in notifications absolute.
+             */
+            baseUrl?: string;
+            /**
+             * Channels
+             * @description Channels by name, at most 32. Names can contain only letters, digits and the characters _ - .
+             */
+            channels?: {
+                [key: string]: components["schemas"]["NotificationChannelSettings"];
+            };
+            /**
+             * Delivery
+             * @description The retries and timeout of each delivery.
+             */
+            delivery?: {
+                /**
+                 * Attempts
+                 * @description Attempts of one delivery, the first included.
+                 * @default 5
+                 */
+                attempts: number;
+                /**
+                 * Backoff
+                 * @description The wait before the second attempt, which doubles for each later one.
+                 * @default 30
+                 */
+                backoffSecs: number;
+                /**
+                 * Longest backoff
+                 * @description The longest wait between two attempts, at least the backoff.
+                 * @default 1800
+                 */
+                maxBackoffSecs: number;
+                /**
+                 * Timeout
+                 * @description How long one attempt may take.
+                 * @default 10
+                 */
+                timeoutSecs: number;
+            };
+            /**
+             * Enabled
+             * @description Deliver events to the channels the routes name. A test send works either way.
+             * @default false
+             */
+            enabled: boolean;
+            /**
+             * Repeat every
+             * @description The shortest time between two notifications about one lasting condition, as a duration of at least 1m such as 12h or 1d.
+             * @default 1d
+             */
+            repeatEvery: string;
+            /**
+             * Routes
+             * @description The channels each event type goes to. A key is an event type, a prefix ending in .* or *, and an event goes to the union of the channels of every key that matches it. Each route is one field.
+             */
+            routes?: {
+                [key: string]: string[];
+            };
+            /**
+             * Server name
+             * @description The server's name in each notification.
+             */
+            server?: string;
         };
         OAuthError: {
             /**
@@ -11284,7 +11473,7 @@ export interface components {
             declared: {
                 [key: string]: unknown;
             };
-            /** @description The effective object. For `models` it is a `ModelsSettings`: `providers`, `roles` and `routing`, from the built-in defaults, `--model-config` and the runtime layer, with the locked fields from the declared configuration. */
+            /** @description The effective object. For `models` it is a `ModelsSettings`: `providers`, `roles` and `routing`, from the built-in defaults, `--model-config` and the runtime layer, with the locked fields from the declared configuration. For `notifications` it is a `NotificationsSettings`. */
             effective: {
                 [key: string]: unknown;
             };

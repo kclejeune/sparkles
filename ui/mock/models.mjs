@@ -7,6 +7,8 @@
 // 400 with `bad-settings` and the `field` it names. `DELETE /$/server/settings/models`
 // clears the runtime layer, which the tests use to start from the declared state.
 
+import { channelSecretUsers } from './notifications.mjs';
+
 const DECLARED = {
   providers: {
     local: {
@@ -48,7 +50,7 @@ const REPORTED = { local: ['llama3.3:70b', 'qwen3:8b'], gateway: ['gpt-5-mini', 
 let runtime = {};
 let version = 1;
 /** Stored keys by secret name. */
-const stored = new Set(['gateway']);
+const stored = new Set(['gateway', 'hook-signing']);
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const clone = (v) => (v === undefined ? v : JSON.parse(JSON.stringify(v)));
@@ -289,6 +291,8 @@ function secrets() {
   const names = new Map();
   for (const [name, p] of Object.entries(eff.providers))
     if (p.apiKey?.secret) names.set(p.apiKey.secret, [...(names.get(p.apiKey.secret) ?? []), name]);
+  const channels = channelSecretUsers();
+  for (const s of channels.keys()) if (!names.has(s)) names.set(s, []);
   for (const s of stored) if (!names.has(s)) names.set(s, []);
   return {
     storage: 'sealed',
@@ -305,6 +309,7 @@ function secrets() {
         setAt: runtimeSet ? '2026-10-24T09:00:00Z' : null,
         overridden: false,
         providers,
+        channels: channels.get(name) ?? [],
       };
     }),
   };

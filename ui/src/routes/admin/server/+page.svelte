@@ -10,6 +10,7 @@
   import { poll } from '$lib/poll';
   import Icon from '$components/Icon.svelte';
   import ModelsSettings from '$components/ModelsSettings.svelte';
+  import NotificationsSettings from '$components/NotificationsSettings.svelte';
   import TaskList from '$components/TaskList.svelte';
 
   /** Delta or write-ahead log size past which the Readiness panel offers compaction. */
@@ -486,9 +487,11 @@
     </section>
   {/if}
 
-  <!-- the model configuration and its keys: server administrators only, once the caller is known -->
+  <!-- the model configuration and its keys, and the notifications: server administrators
+       only, once the caller is known -->
   {#if auth.loaded && auth.hasServer('server-admin')}
     <ModelsSettings />
+    <NotificationsSettings />
   {/if}
 
   <section class="panel">

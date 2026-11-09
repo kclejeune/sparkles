@@ -24,7 +24,7 @@ pub const MEMBERS: &[&str] = &[
     "delivery",
 ];
 
-const DELIVERY_MEMBERS: &[&str] = &["attempts", "backoffSecs", "maxBackoffSecs", "timeoutSecs"];
+pub const DELIVERY_MEMBERS: &[&str] = &["attempts", "backoffSecs", "maxBackoffSecs", "timeoutSecs"];
 
 /// The members of a channel that name a secret.
 const SECRET_MEMBERS: &[&str] = &["token", "urlSecret", "signingSecret", "password"];
