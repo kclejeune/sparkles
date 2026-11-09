@@ -194,8 +194,8 @@ pub fn model_budgets(st: &Arc<AppState>, now: DateTime<Utc>) {
 }
 
 /// The end of a backup policy run (§3.1): `backup.failed` for a failed or partial run,
-/// held back for `repeatEvery` per policy, and the condition cleared by a successful
-/// run.
+/// or for a run whose backups succeeded but whose retention failed, held back for
+/// `repeatEvery` per policy, and the condition cleared by a run that succeeded in full.
 #[cfg_attr(not(feature = "backup"), allow(dead_code))]
 pub fn backup_run(
     st: &Arc<AppState>,
@@ -207,13 +207,16 @@ pub fn backup_run(
     now: DateTime<Utc>,
 ) -> Option<Raised> {
     let key = format!("backup.failed/{policy}");
-    match result {
-        "ok" => {
+    let retention_error = run["retention"]["error"].as_str().filter(|e| !e.is_empty());
+    match (result, retention_error) {
+        ("ok", None) => {
             clear(st, &key);
             clear(st, &format!("backup.overdue/{policy}"));
             return None;
         }
-        "failed" | "partial" => {}
+        // the backups are there, so the policy is not overdue
+        ("ok", Some(_)) => clear(st, &format!("backup.overdue/{policy}")),
+        ("failed" | "partial", _) => {}
         _ => return None,
     }
     let failed: Vec<Value> = run["datasets"]
@@ -241,14 +244,24 @@ pub fn backup_run(
         } else {
             Severity::Warning
         },
-        title: format!("Backup policy {policy} {result}"),
-        summary: if names.is_empty() {
-            format!("The run of backup policy {policy} ended {result}.")
+        title: if result == "ok" {
+            format!("Backup policy {policy}: retention failed")
         } else {
-            format!(
-                "The run of backup policy {policy} ended {result}. It did not back up {}.",
-                names.join(", ")
-            )
+            format!("Backup policy {policy} {result}")
+        },
+        summary: {
+            let mut t = if names.is_empty() {
+                format!("The run of backup policy {policy} ended {result}.")
+            } else {
+                format!(
+                    "The run of backup policy {policy} ended {result}. It did not back up {}.",
+                    names.join(", ")
+                )
+            };
+            if let Some(e) = retention_error {
+                t.push_str(&format!(" Its retention failed: {e}"));
+            }
+            t
         },
         link: Some("/ui/backups".into()),
         data: json!({
@@ -260,6 +273,10 @@ pub fn backup_run(
             "consecutiveFailures": consecutive_failures,
         }),
     };
+    let mut ev = ev;
+    if let Some(e) = retention_error {
+        ev.data["retentionError"] = e.into();
+    }
     let repeat = settings(st).repeat();
     Some(raise(
         st,
@@ -315,6 +332,13 @@ pub fn backup_failure(st: &Arc<AppState>, f: BackupFailure, now: DateTime<Utc>) 
 /// The condition key of a backup started by hand of `dataset` into `repository`.
 pub fn manual_backup_key(repository: &str, dataset: &str) -> String {
     format!("backup.failed/manual/{repository}/{dataset}")
+}
+
+/// A backup of `dataset` into `repository` succeeded, whether started by hand or by a
+/// policy: the condition of a failed backup of it started by hand clears.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub fn backup_created(st: &AppState, dataset: &str, repository: &str) {
+    clear(st, &manual_backup_key(repository, dataset));
 }
 
 /// The end of a backup started by hand: `backup.failed` with `trigger: "manual"` when
@@ -381,23 +405,79 @@ pub fn backup_policy_error(
     )
 }
 
-/// The end of a verification of `repository`: `backup.verify.failed` when it failed or
-/// found a backup in error, keyed per repository. A verification of the whole
-/// repository without errors clears the condition, and one of chosen backups does not,
-/// since other backups may still be in error.
+/// The order of verification levels: a check at a level also checks what the lower
+/// ones do.
+fn verify_rank(level: &str) -> u8 {
+    match level {
+        "exists" => 0,
+        "data" => 1,
+        _ => 2,
+    }
+}
+
+/// The end of a verification of `repository` at `level` (`whole`: of the whole
+/// repository, which lists every backup in `checked`): `backup.verify.failed`, keyed
+/// per repository, when it failed (`error`) or found backups in error (`broken`).
+///
+/// Each problem is also kept as a condition of its own that sends nothing,
+/// `backup.verify.failed/{repository}/{backup}@{level}`, or `…/*@{level}` for a
+/// verification that failed. A backup's problems clear when a verification at the
+/// same or a higher level finds it ok, and those of a backup that a whole verification
+/// no longer lists clear too, since it was deleted. A failed verification clears when
+/// a later one at the same or a higher level succeeds. The repository's condition
+/// clears once none of its problems is left.
 #[cfg_attr(not(feature = "backup"), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 pub fn backup_verify(
     st: &Arc<AppState>,
     repository: &str,
     whole: bool,
     level: &str,
+    checked: &[String],
     broken: &[String],
     error: Option<&str>,
     now: DateTime<Utc>,
 ) -> Option<Raised> {
     let key = format!("backup.verify.failed/{repository}");
+    let prefix = format!("{key}/");
+    let rank = verify_rank(level);
+    if error.is_none() {
+        let ok: std::collections::HashSet<&str> = checked
+            .iter()
+            .map(String::as_str)
+            .filter(|b| !broken.iter().any(|x| x == b))
+            .collect();
+        super::clear_where(st, |k| {
+            let Some(rest) = k.strip_prefix(&prefix) else {
+                return false;
+            };
+            let Some((backup, at)) = rest.rsplit_once('@') else {
+                return false;
+            };
+            if verify_rank(at) > rank {
+                return false;
+            }
+            backup == "*" || ok.contains(backup) || (whole && !checked.iter().any(|c| c == backup))
+        });
+    }
+    for b in broken {
+        super::mark(
+            st,
+            &format!("{prefix}{b}@{level}"),
+            "backup.verify.failed",
+            now,
+        );
+    }
+    if error.is_some() {
+        super::mark(
+            st,
+            &format!("{prefix}*@{level}"),
+            "backup.verify.failed",
+            now,
+        );
+    }
     if error.is_none() && broken.is_empty() {
-        if whole {
+        if super::keys_with_prefix(st, &prefix).is_empty() {
             clear(st, &key);
         }
         return None;
@@ -429,19 +509,23 @@ pub fn backup_verify(
     ))
 }
 
-/// The end of a GC of `repository`, or a GC that a policy could not start:
-/// `backup.gc.failed` keyed per repository, cleared by a GC that succeeds.
+/// The end of a GC of `repository` (`dry_run`: one that deletes nothing), or a GC that
+/// a policy could not start: `backup.gc.failed` keyed per repository, cleared by a GC
+/// that deletes and succeeds, since a dry run does not take the lock or sweep.
 #[cfg_attr(not(feature = "backup"), allow(dead_code))]
 pub fn backup_gc(
     st: &Arc<AppState>,
     repository: &str,
     stage: &str,
+    dry_run: bool,
     error: Option<&str>,
     now: DateTime<Utc>,
 ) -> Option<Raised> {
     let key = format!("backup.gc.failed/{repository}");
     let Some(e) = error else {
-        clear(st, &key);
+        if !dry_run {
+            clear(st, &key);
+        }
         return None;
     };
     Some(backup_failure(
@@ -458,24 +542,31 @@ pub fn backup_gc(
     ))
 }
 
-/// `backup.overdue` for an enabled policy whose last success is older than twice the
-/// interval of its schedule, held back for `repeatEvery` and cleared once the policy
-/// is not overdue. A policy without a success yet is told about by its failures.
+/// `backup.overdue` for an enabled policy that has missed two scheduled instants since
+/// its last success: `second` is the second instant of its schedule after the last
+/// success, and the policy is overdue once `now` is past it while no run of the policy
+/// is going on. Held back for `repeatEvery` and cleared once the policy is not overdue.
+/// A policy without a success yet (`second` is `None`) is told about by its failures.
 #[cfg_attr(not(feature = "backup"), allow(dead_code))]
 pub fn backup_overdue(
     st: &Arc<AppState>,
     policy: &str,
     repository: &str,
     last_success: Option<DateTime<Utc>>,
-    interval: Option<TimeDelta>,
+    second: Option<DateTime<Utc>>,
+    running: bool,
     now: DateTime<Utc>,
 ) -> Option<Raised> {
     let key = format!("backup.overdue/{policy}");
-    let (Some(last), Some(interval)) = (last_success, interval) else {
+    if running {
+        // the run may be the one that succeeds
+        return None;
+    }
+    let (Some(last), Some(second)) = (last_success, second) else {
         clear(st, &key);
         return None;
     };
-    if interval <= TimeDelta::zero() || now - last <= interval * 2 {
+    if now <= second {
         clear(st, &key);
         return None;
     }
@@ -485,16 +576,15 @@ pub fn backup_overdue(
         severity: Severity::Warning,
         title: format!("Backup policy {policy} is overdue"),
         summary: format!(
-            "Backup policy {policy} last succeeded {} ago, more than twice its schedule's interval of {}.",
-            days_text(now - last),
-            days_text(interval)
+            "Backup policy {policy} last succeeded {} ago and has missed at least two scheduled runs since.",
+            days_text(now - last)
         ),
         link: Some("/ui/backups".into()),
         data: json!({
             "policy": policy,
             "repository": repository,
             "lastSuccess": super::rfc3339(last),
-            "intervalSecs": interval.num_seconds(),
+            "missedSince": super::rfc3339(second),
         }),
     };
     let repeat = settings(st).repeat();
@@ -507,4 +597,15 @@ pub fn backup_overdue(
         }),
         now,
     ))
+}
+
+/// The conditions of policies that are gone, which no later run can clear.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub fn backup_policies_present(st: &AppState, policies: &[&str]) {
+    super::clear_where(st, |k| {
+        ["backup.overdue/", "backup.failed/"].iter().any(|p| {
+            k.strip_prefix(p)
+                .is_some_and(|name| !name.starts_with("manual/") && !policies.contains(&name))
+        })
+    });
 }

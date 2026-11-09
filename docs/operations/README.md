@@ -70,8 +70,8 @@ callers and records the selected numeric user in its receipt.
   settings API, the Settings tab or Fuseki's `/{ds}/prefixes`. Loaded data never replaces
   a declared prefix.
 * The server pushes signed Standard Webhooks, ntfy and email notifications when memory review
-  waits too long, a backup policy run fails, or a provider's daily token budget is used
-  up ([C21](../specs/C21-outbound-notifications.md), [API.md](../API.md#notifications),
+  waits too long, a backup, policy run, verification or GC fails, a policy is overdue,
+  or a provider's daily token budget is used up ([C21](../specs/C21-outbound-notifications.md), [API.md](../API.md#notifications),
   [USAGE.md](../USAGE.md#sending-notifications)). Channels and routes are a server settings
   kind, failures are retried with backoff, each channel delivers from its own queue so
   that a slow channel delays no other, and `sparkles notify status` and

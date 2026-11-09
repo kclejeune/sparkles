@@ -608,28 +608,39 @@ impl Policies {
         next
     }
 
-    /// `backup.overdue` for each policy (spec C21): an enabled policy whose last
-    /// success is older than twice the longest gap between its next eight instants.
+    /// `backup.overdue` for each policy (spec C21): an enabled policy that has missed
+    /// two scheduled instants since its last success while no run of it goes on. The
+    /// conditions of policies that are gone are cleared.
     fn check_overdue(&self, st: &Arc<AppState>, policies: &[PolicyConfig], now: DateTime<Utc>) {
         for p in policies {
-            let interval =
+            let (last, running) = {
+                let inner = self.inner.lock();
+                let last = inner
+                    .state
+                    .policies
+                    .get(&p.name)
+                    .and_then(|x| x.last_success.as_deref())
+                    .and_then(parse_time);
+                (last, inner.running.contains_key(&p.name))
+            };
+            let second = last.and_then(|last| {
                 policy::check_policy(p)
                     .ok()
                     .filter(|_| p.enabled)
-                    .and_then(|(s, tz)| {
-                        let runs = policy::next_runs(&s, tz, now, 8);
-                        runs.windows(2).map(|w| w[1] - w[0]).max()
-                    });
-            let last = self
-                .inner
-                .lock()
-                .state
-                .policies
-                .get(&p.name)
-                .and_then(|x| x.last_success.as_deref())
-                .and_then(parse_time);
-            crate::notify::events::backup_overdue(st, &p.name, &p.repository, last, interval, now);
+                    .and_then(|(s, tz)| policy::next_runs(&s, tz, last, 2).get(1).copied())
+            });
+            crate::notify::events::backup_overdue(
+                st,
+                &p.name,
+                &p.repository,
+                last,
+                second,
+                running,
+                now,
+            );
         }
+        let names: Vec<&str> = policies.iter().map(|p| p.name.as_str()).collect();
+        crate::notify::events::backup_policies_present(st, &names);
     }
 }
 
@@ -888,7 +899,14 @@ impl Run<'_> {
             Err(e) => {
                 tracing::warn!(target: "sparkles::backup", repository = repo.as_str(),
                     "gc after retention not started: {}", e.message());
-                crate::notify::events::backup_gc(self.st, repo, "start", Some(e.message()), now);
+                crate::notify::events::backup_gc(
+                    self.st,
+                    repo,
+                    "start",
+                    false,
+                    Some(e.message()),
+                    now,
+                );
                 None
             }
         }

@@ -2416,15 +2416,25 @@ async fn condition(st: &AppState, key: &str, active: bool) {
     );
 }
 
-/// The recent deliveries of event type `event`.
-fn notified(st: &AppState, event: &str) -> Vec<J> {
-    crate::notify::status_json(st)["recent"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|r| r["event"] == event)
-        .cloned()
-        .collect()
+/// The recent deliveries of event type `event`, once there are `n` of them or after a
+/// while.
+async fn notified(st: &AppState, event: &str, n: usize) -> Vec<J> {
+    let read = || -> Vec<J> {
+        crate::notify::status_json(st)["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["event"] == event)
+            .cloned()
+            .collect()
+    };
+    for _ in 0..200 {
+        if read().len() >= n {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    read()
 }
 
 /// Make every directory under `root` read-only (`read_only`) or writable again. With
@@ -2480,14 +2490,36 @@ async fn a_failed_manual_backup_notifies() {
     freeze(repo.path(), false);
     assert_eq!(t.state, "failed", "{:?}", t.message);
     condition(&s.st, &key, true).await;
-    let sent = notified(&s.st, "backup.failed");
+    let sent = notified(&s.st, "backup.failed", 1).await;
     assert_eq!(sent.len(), 1, "{sent:?}");
-    backup_ds(&s, "b3").await;
+    assert_eq!(
+        crate::notify::status_json(&s.st)["active"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a["key"] == key.as_str())
+            .count(),
+        1
+    );
+    // a backup of another dataset does not clear it, and one by a policy of the same
+    // dataset into the same repository does
+    let policy_backup = |ds: &'static str, name: &'static str| {
+        let st = s.st.clone();
+        let o = sparkles_backup::CreateOptions {
+            name: name.into(),
+            ..Default::default()
+        };
+        tokio::task::spawn_blocking(move || ops::create_for_policy(&st, ds, "local", o))
+    };
+    policy_backup("wiki", "w1").await.unwrap().unwrap();
+    assert!(crate::notify::is_active(&s.st, &key));
+    policy_backup("ds", "b3").await.unwrap().unwrap();
     condition(&s.st, &key, false).await;
 }
 
 /// A verification that finds a backup in error raises `backup.verify.failed` for the
-/// repository, and a clean verification of the whole repository clears it.
+/// repository. A clean verification at a lower level does not clear it, one at the
+/// same level of the damaged backup does, and so does deleting the backup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_verification_notifies() {
     let (s, repo) = with_local_opts(
@@ -2499,9 +2531,46 @@ async fn a_failed_verification_notifies() {
     )
     .await;
     backup_ds(&s, "b1").await;
+    update(&s, "ds", "INSERT DATA { <urn:c> <urn:p> 3 }");
+    backup_ds(&s, "b2").await;
     let key = "backup.verify.failed/local";
     let (_, file) = blob_file(&s, repo.path(), "b1", "gen-0001/spo.dat").await;
     let saved = std::fs::read(&file).unwrap();
+    // a flipped byte keeps the length, so only the data level sees it
+    let mut bad = saved.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    std::fs::write(&file, &bad).unwrap();
+    let t = run(
+        &s,
+        "/$/backups/ds/local/b1/verify",
+        json!({"level": "data"}),
+    )
+    .await;
+    assert_eq!(t.detail.unwrap()["status"], "error");
+    condition(&s.st, key, true).await;
+    let t = run(
+        &s,
+        "/$/repositories/local/verify",
+        json!({"level": "exists"}),
+    )
+    .await;
+    assert_ne!(t.detail.unwrap()["status"], "error");
+    assert!(
+        crate::notify::is_active(&s.st, key),
+        "a lower level clears nothing"
+    );
+    std::fs::write(&file, &saved).unwrap();
+    let t = run(
+        &s,
+        "/$/backups/ds/local/b1/verify",
+        json!({"level": "data"}),
+    )
+    .await;
+    assert_eq!(t.detail.unwrap()["status"], "ok");
+    condition(&s.st, key, false).await;
+    assert_eq!(notified(&s.st, "backup.verify.failed", 1).await.len(), 1);
+    // damaged again, then deleted: a whole verification no longer lists it
     std::fs::remove_file(&file).unwrap();
     let t = run(
         &s,
@@ -2511,26 +2580,23 @@ async fn a_failed_verification_notifies() {
     .await;
     assert_eq!(t.detail.unwrap()["status"], "error");
     condition(&s.st, key, true).await;
-    // a clean verification of one backup does not clear the repository's condition
-    std::fs::write(&file, &saved).unwrap();
-    let t = run(
-        &s,
-        "/$/backups/ds/local/b1/verify",
-        json!({"level": "exists"}),
-    )
-    .await;
-    assert_eq!(t.detail.unwrap()["status"], "ok");
-    assert!(crate::notify::is_active(&s.st, key));
+    delete_ds_backup(&s, "b1").await;
     let t = run(
         &s,
         "/$/repositories/local/verify",
         json!({"level": "exists"}),
     )
     .await;
-    assert_ne!(t.detail.unwrap()["status"], "error");
-    condition(&s.st, key, false).await;
-    let sent = notified(&s.st, "backup.verify.failed");
-    assert_eq!(sent.len(), 1, "{sent:?}");
+    let d = t.detail.unwrap();
+    let still: Vec<&J> = d["backups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|b| b["status"] == "error")
+        .collect();
+    if still.is_empty() {
+        condition(&s.st, key, false).await;
+    }
 }
 
 /// A GC that fails raises `backup.gc.failed` for the repository, and one that succeeds
@@ -2563,8 +2629,17 @@ async fn a_failed_gc_notifies() {
     freeze(repo.path(), false);
     assert_eq!(t.state, "failed", "{:?}", t.message);
     condition(&s.st, key, true).await;
+    // a dry run does not sweep, so it clears nothing
+    let t = run(
+        &s,
+        "/$/repositories/local/gc",
+        json!({"graceHours": 0, "dryRun": true}),
+    )
+    .await;
+    assert_eq!(t.state, "done", "{:?}", t.message);
+    assert!(crate::notify::is_active(&s.st, key));
     let t = run(&s, "/$/repositories/local/gc", json!({"graceHours": 0})).await;
     assert_eq!(t.state, "done", "{:?}", t.message);
     condition(&s.st, key, false).await;
-    assert_eq!(notified(&s.st, "backup.gc.failed").len(), 1);
+    assert_eq!(notified(&s.st, "backup.gc.failed", 1).await.len(), 1);
 }

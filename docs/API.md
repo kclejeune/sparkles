@@ -14382,10 +14382,10 @@ server-wide events, and new members may appear in later versions.
 | Event | Fires when | `data` |
 |---|---|---|
 | `memory.review.pending` | The oldest open review branch of a dataset is older than the dataset's `memory.review.notifyAfter`. Repeats at most every `memory.review.repeatEvery`, or the kind's `repeatEvery`, until no review branch is open. | `open`, `oldest` with `branch`, `kind` and `created`, `branches` (at most 10), `notifyAfter`, `repeatEvery` |
-| `backup.failed` | A backup policy run ends `failed` or `partial`, stops on an error, or cannot start when it is due, or a backup started by hand fails. Repeats at most every `repeatEvery` per policy, or per repository and dataset for a backup started by hand, until a run of the policy or a backup of the dataset succeeds. | For a policy run, `policy`, `run`, `result`, `repository`, `failedDatasets` with `dataset` and `reason`, and `consecutiveFailures`. For a run that stopped or did not start, `policy`, `repository`, `stage` (`run` or `start`) and `error`. For a backup started by hand, `trigger: "manual"`, `dataset`, `repository` and `error`. |
-| `backup.verify.failed` | A verification fails or finds a backup in error. Repeats at most every `repeatEvery` per repository, until a verification of the whole repository finds no error. | `repository`, `level`, `backups` in error, and `error` when the verification itself failed |
-| `backup.gc.failed` | A GC of a repository fails, or a policy cannot start its GC after retention. Repeats at most every `repeatEvery` per repository, until a GC of the repository succeeds. | `repository`, `stage` (`run` or `start`) and `error` |
-| `backup.overdue` | An enabled policy's last success is older than twice the longest gap between its next eight scheduled instants. Repeats at most every `repeatEvery` per policy, until the policy succeeds. A policy that has never succeeded is reported by its failures instead. | `policy`, `repository`, `lastSuccess`, `intervalSecs` |
+| `backup.failed` | A backup policy run ends `failed` or `partial`, ends `ok` with a failed retention, stops on an error, or cannot start when it is due, or a backup started by hand fails. Repeats at most every `repeatEvery` per policy, or per repository and dataset for a backup started by hand. A policy's condition clears when a run of it succeeds in full, and a backup started by hand clears when any backup of the dataset into the repository succeeds. | For a policy run, `policy`, `run`, `result`, `repository`, `failedDatasets` with `dataset` and `reason`, `consecutiveFailures`, and `retentionError` when retention failed. For a run that stopped or did not start, `policy`, `repository`, `stage` (`run` or `start`) and `error`. For a backup started by hand, `trigger: "manual"`, `dataset`, `repository` and `error`. |
+| `backup.verify.failed` | A verification fails or finds a backup in error. Repeats at most every `repeatEvery` per repository. It clears once every damaged backup has passed a verification at the same or a higher level or has been deleted, and every failed verification has been followed by one that succeeded at the same or a higher level. | `repository`, `level`, `backups` in error, and `error` when the verification itself failed |
+| `backup.gc.failed` | A GC of a repository fails, or a policy cannot start its GC after retention. Repeats at most every `repeatEvery` per repository, until a GC of the repository that deletes succeeds. A dry run clears nothing. | `repository`, `stage` (`run` or `start`) and `error` |
+| `backup.overdue` | An enabled policy has missed two scheduled instants since its last success and no run of it is going on. Repeats at most every `repeatEvery` per policy, until the policy succeeds. A policy that has never succeeded is reported by its failures instead. | `policy`, `repository`, `lastSuccess`, `missedSince` |
 | `models.budget.exceeded` | A provider's tokens counted today reach its `budget.tokensPerDay`. Once per provider and day. | `provider`, `tokensPerDay`, `usedToday` |
 | `notification.test` | A test send. | `channel` |
 
@@ -14400,7 +14400,11 @@ with commits that `main` does not have. A dataset sends no memory review event w
 Both durations are at least `1h`. The server checks the memory review and budget
 conditions once a minute, sends a backup event when a backup, a policy run, a
 verification or a GC ends, and checks for overdue policies each time the backup
-scheduler runs. A cancelled backup, policy run, verification or GC sends nothing. When a condition
+scheduler runs. A cancelled backup, policy run, verification or GC sends nothing. The
+conditions of a policy that is removed are cleared. A damaged backup and a failed
+verification are also listed in `active` as conditions of their own, with keys such as
+`backup.verify.failed/local/b1@data`, which send nothing and let the repository's
+condition clear when the last of them does. When a condition
 was notified less than its repeat interval ago, the event is held back and counted. The
 conditions that were notified are kept in `<dataDir>/notifications-state.json`, so a
 restart does not repeat them.

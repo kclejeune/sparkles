@@ -179,6 +179,10 @@ fn create_now(
     let r = create_in(b, ds, repo, a, st.limits.min_free_disk_bytes, &tmp, ctl);
     count(st, b, repo, Operation::Create, &r, t0);
     log_end(&what, &r, t0);
+    if r.is_ok() {
+        // a backup by hand or by a policy clears a failed one by hand (spec C21)
+        crate::notify::events::backup_created(st, &ds.name, repo);
+    }
     b.refresh_later(repo);
     r.map(|(s, _)| s)
 }
@@ -413,11 +417,13 @@ pub fn verify(
                 names.is_empty(),
                 &level_name,
                 &[],
+                &[],
                 Some(e.message()),
                 chrono::Utc::now(),
             );
         }
         Ok((v, _)) => {
+            let checked: Vec<String> = v.backups.iter().map(|b| b.name.clone()).collect();
             let broken: Vec<String> = v
                 .backups
                 .iter()
@@ -429,6 +435,7 @@ pub fn verify(
                 repo,
                 names.is_empty(),
                 &level_name,
+                &checked,
                 &broken,
                 None,
                 chrono::Utc::now(),
@@ -515,7 +522,14 @@ pub fn gc(
         Err(e) if e.is_cancelled() => {}
         r => {
             let msg = r.as_ref().err().map(|e| e.message().to_string());
-            crate::notify::events::backup_gc(st, repo, "run", msg.as_deref(), chrono::Utc::now());
+            crate::notify::events::backup_gc(
+                st,
+                repo,
+                "run",
+                dry_run,
+                msg.as_deref(),
+                chrono::Utc::now(),
+            );
         }
     }
     if let Ok((report, _)) = &r
