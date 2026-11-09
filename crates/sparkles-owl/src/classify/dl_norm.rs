@@ -21,13 +21,6 @@
 //! OWL 2 EL, self restrictions and the role axioms beyond the hierarchy, inverses, symmetry,
 //! transitivity and chains stay left out and reported.
 //!
-//! The data restrictions of OWL 2 EL, `∃d.E` and `∃d.{v}` on one data property, are atoms
-//! of the EL index in either position, as in the Horn normalization. Without functional data
-//! properties a data restriction's consequences are its told subsumers: an empty one gives
-//! `owl:Nothing`, and one gives the negative restrictions it meets, since every value space
-//! of the profile is infinite and the values of different data successors are independent,
-//! so no case analysis needs more of them.
-//!
 //! The role hierarchy is closed under inverses. A universal restriction on a role that a
 //! chain or transitivity reaches, a negative existential restriction over one and a range of
 //! one are unfolded by the role's automaton (Horrocks, Kutz and Sattler, *The Even More
@@ -73,29 +66,28 @@ impl DlAx {
 type Why = &'static str;
 
 /// Whether the EL part of a run lets Tier D take the axioms outside OWL 2 EL: no
-/// individuals, top or bottom properties, functional data properties, self restrictions or
-/// reflexive roles, whose rules this phase does not have. The data properties, ranges and
-/// restrictions of OWL 2 EL are told subsumers of the index without a functional data
-/// property, which the clauses read as they read any atom.
+/// individuals, top or bottom properties, data properties, self restrictions or reflexive
+/// roles, whose rules this phase does not have.
 pub fn eligible(it: &Interner, ax: &Axioms) -> bool {
     it.individuals.is_empty()
         && ax.functional.is_empty()
         && ax.reflexive.is_empty()
+        && ax.data_ranges.is_empty()
+        && it.vals.is_empty()
         && !it.roles.iter().any(|r| match r {
-            RoleName::Data(p) => matches!(
-                p.as_str(),
-                vocab::OWL_TOP_DATA_PROPERTY | vocab::OWL_BOTTOM_DATA_PROPERTY
-            ),
+            RoleName::Data(_) => true,
             RoleName::Object(p) => matches!(
                 p.as_str(),
                 vocab::OWL_TOP_OBJECT_PROPERTY | vocab::OWL_BOTTOM_OBJECT_PROPERTY
             ),
             _ => false,
         })
-        && !it
-            .nodes
-            .iter()
-            .any(|n| matches!(n, Node::SelfLoop(_) | Node::Nominal(_) | Node::AtMost1(..)))
+        && !it.nodes.iter().any(|n| {
+            matches!(
+                n,
+                Node::SelfLoop(_) | Node::Nominal(_) | Node::DataSome(..) | Node::AtMost1(..)
+            )
+        })
 }
 
 /// What one axiom adds, kept apart until the whole axiom is normalized.
@@ -217,16 +209,6 @@ impl Norm<'_> {
         }
     }
 
-    /// An expression of the EL index, for the data restrictions of OWL 2 EL: an atom with
-    /// the told subsumers the index gives it, in either position. One the classifier may
-    /// miss consequences of, such as an opaque literal, leaves its axiom out.
-    fn el(&mut self, c: &ClassExpression) -> Result<Ex, Why> {
-        match super::index::class_expression(c, self.it, 0)? {
-            (e, None) => Ok(e),
-            (_, Some(why)) => Err(why),
-        }
-    }
-
     /// `x` with `x ⊑ c`.
     fn pos(&mut self, c: &ClassExpression, depth: usize) -> Result<Ex, Why> {
         use ClassExpression as C;
@@ -321,8 +303,7 @@ impl Norm<'_> {
             }
             C::ObjectOneOf(_) | C::ObjectHasValue(..) => return Err("individuals"),
             C::ObjectHasSelf(_) => return Err("self restrictions"),
-            C::DataSomeValuesFrom(..) | C::DataHasValue(..) => self.el(c)?,
-            _ => return Err("a data restriction outside OWL 2 EL"),
+            _ => return Err("data restrictions"),
         })
     }
 
@@ -544,8 +525,7 @@ impl Norm<'_> {
             }
             C::ObjectOneOf(_) | C::ObjectHasValue(..) => return Err("individuals"),
             C::ObjectHasSelf(_) => return Err("self restrictions"),
-            C::DataSomeValuesFrom(..) | C::DataHasValue(..) => self.el(c)?,
-            _ => return Err("a data restriction outside OWL 2 EL"),
+            _ => return Err("data restrictions"),
         })
     }
 
