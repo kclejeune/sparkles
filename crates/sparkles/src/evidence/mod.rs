@@ -97,12 +97,16 @@ pub use propose::{
     AuthorityFence, Options as ProposeOptions, Proposed, ProposedRecord, operation_recorded,
     propose, reconcile_operation_holds,
 };
+pub use review::claims::{
+    self, ClaimOccurrence, ClaimOrigin, ClaimState, MAX_CLAIM_SCAN, MAX_CLAIMS, MEM_INSTRUCTIONS,
+    PolicyClaims, PolicyRef, check_matching_policy, claim_states, with_policy_claims,
+};
 pub use review::dependents::{
     self, Dependence, Dependent, Dependents, MAX_CHANGED, dependents as find_dependents,
 };
 pub use review::identity::{
     self, EntityResolution, MAX_MEMBERS, MAX_RESOLVE, RESOLVES_TO, ResolvedEntity,
-    resolve as resolve_entities,
+    resolve as resolve_entities, resolve_at as resolve_entities_at,
 };
 pub use review::{
     Changed, Decided, MapChange, Options as ReviewOptions, ProjectionChange, Reviewed, Withdrawn,

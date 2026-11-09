@@ -336,28 +336,42 @@ pub enum ManagedErrorKind {
     /// A review of identity proposals would put two entities that an accepted
     /// separation keeps apart into one cluster of its resolution map.
     IdentityConflict,
+    /// A read that needs historical evidence configuration found a store whose
+    /// configuration history is not activated.
+    ConfigurationHistoryInactive,
 }
 
-/// An error of the managed-graph boundary, with its stable code. Nothing was written.
-#[derive(Clone, Debug)]
-pub struct ManagedError {
-    pub kind: ManagedErrorKind,
-    /// `profile-managed-graph`, `managed-unavailable`, `unsupported-profile`,
-    /// `hold-conflict`, `holds-limit`, `holds-unavailable` or one of the evidence
-    /// resolution codes, `evidence-unavailable`, `incomplete-evidence`,
-    /// `unanchored-evidence`, `span-mismatch`, `origin-not-reproduced` and
-    /// `immutable-record-conflict`, and the typed-write codes `head-changed`,
-    /// `idempotency-conflict` and `authority-changed`, and the review codes
-    /// `policy-changed`, `target-changed`, `decision-superseded`, `target-withdrawn`,
-    /// `evidence-conflict`, `projection-unavailable` and `identity-conflict`
-    pub code: &'static str,
-    pub message: String,
-}
+impl ManagedErrorKind {
+    /// Every kind, in declaration order.
+    pub const ALL: [ManagedErrorKind; 23] = [
+        ManagedErrorKind::Protected,
+        ManagedErrorKind::Unavailable,
+        ManagedErrorKind::UnsupportedProfile,
+        ManagedErrorKind::HoldConflict,
+        ManagedErrorKind::HoldsLimit,
+        ManagedErrorKind::HoldsUnavailable,
+        ManagedErrorKind::EvidenceUnavailable,
+        ManagedErrorKind::IncompleteEvidence,
+        ManagedErrorKind::UnanchoredEvidence,
+        ManagedErrorKind::SpanMismatch,
+        ManagedErrorKind::OriginNotReproduced,
+        ManagedErrorKind::ImmutableRecordConflict,
+        ManagedErrorKind::HeadChanged,
+        ManagedErrorKind::IdempotencyConflict,
+        ManagedErrorKind::AuthorityChanged,
+        ManagedErrorKind::PolicyChanged,
+        ManagedErrorKind::TargetChanged,
+        ManagedErrorKind::DecisionSuperseded,
+        ManagedErrorKind::TargetWithdrawn,
+        ManagedErrorKind::EvidenceConflict,
+        ManagedErrorKind::ProjectionUnavailable,
+        ManagedErrorKind::IdentityConflict,
+        ManagedErrorKind::ConfigurationHistoryInactive,
+    ];
 
-impl ManagedError {
-    /// The error of `kind`, with the kind's code.
-    pub fn error(kind: ManagedErrorKind, message: impl Into<String>) -> Error {
-        let code = match kind {
+    /// The stable code of the kind.
+    pub fn code(self) -> &'static str {
+        match self {
             ManagedErrorKind::Protected => "profile-managed-graph",
             ManagedErrorKind::Unavailable => "managed-unavailable",
             ManagedErrorKind::UnsupportedProfile => "unsupported-profile",
@@ -380,7 +394,48 @@ impl ManagedError {
             ManagedErrorKind::EvidenceConflict => "evidence-conflict",
             ManagedErrorKind::ProjectionUnavailable => "projection-unavailable",
             ManagedErrorKind::IdentityConflict => "identity-conflict",
-        };
+            ManagedErrorKind::ConfigurationHistoryInactive => "configuration-history-inactive",
+        }
+    }
+
+    /// The kind whose code is `code`.
+    pub fn from_code(code: &str) -> Option<ManagedErrorKind> {
+        Self::ALL.into_iter().find(|k| k.code() == code)
+    }
+
+    /// The HTTP status of an error of the kind.
+    pub fn status(self) -> u16 {
+        ManagedError {
+            kind: self,
+            code: self.code(),
+            message: String::new(),
+        }
+        .status()
+    }
+}
+
+/// An error of the managed-graph boundary, with its stable code. Nothing was written.
+#[derive(Clone, Debug)]
+pub struct ManagedError {
+    pub kind: ManagedErrorKind,
+    /// `profile-managed-graph`, `managed-unavailable`, `unsupported-profile`,
+    /// `hold-conflict`, `holds-limit`, `holds-unavailable` or one of the evidence
+    /// resolution codes, `evidence-unavailable`, `incomplete-evidence`,
+    /// `unanchored-evidence`, `span-mismatch`, `origin-not-reproduced` and
+    /// `immutable-record-conflict`, and the typed-write codes `head-changed`,
+    /// `idempotency-conflict` and `authority-changed`, and the review codes
+    /// `policy-changed`, `target-changed`, `decision-superseded`, `target-withdrawn`,
+    /// `evidence-conflict`, `projection-unavailable` and `identity-conflict`, and
+    /// `configuration-history-inactive` for a historical evidence read of a store
+    /// without activated configuration history
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl ManagedError {
+    /// The error of `kind`, with the kind's code.
+    pub fn error(kind: ManagedErrorKind, message: impl Into<String>) -> Error {
+        let code = kind.code();
         Error::Managed(Box::new(ManagedError {
             kind,
             code,
@@ -410,7 +465,8 @@ impl ManagedError {
             | ManagedErrorKind::DecisionSuperseded
             | ManagedErrorKind::TargetWithdrawn
             | ManagedErrorKind::EvidenceConflict
-            | ManagedErrorKind::IdentityConflict => 409,
+            | ManagedErrorKind::IdentityConflict
+            | ManagedErrorKind::ConfigurationHistoryInactive => 409,
             ManagedErrorKind::AuthorityChanged | ManagedErrorKind::ProjectionUnavailable => 503,
         }
     }

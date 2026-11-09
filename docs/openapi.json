@@ -1780,6 +1780,10 @@
             "description": "Explore the data once after a draft without a query or with an empty result. Over the dataset's `repairs.explore`.",
             "type": "boolean"
           },
+          "matchingPolicy": {
+            "description": "A matching policy of the dataset's evidence settings, which resolves the linked entities for the claims the summary reads. Not with `mode` `global`.",
+            "type": "string"
+          },
           "maxRows": {
             "description": "The rows returned in `result`, 1000 by default.",
             "type": "integer"
@@ -1803,6 +1807,10 @@
           },
           "reasoning": {
             "type": "boolean"
+          },
+          "reviewPolicy": {
+            "description": "A review policy of the dataset's evidence settings. The summary reads the claim occurrences about the linked entities with their state under the policy and may cite them in `claimCitations`. Not with `mode` `global`.",
+            "type": "string"
           },
           "reviewedOnly": {
             "description": "Hide the agent memory graphs of the dataset from the query, and use only reviewed community reports.",
@@ -1851,6 +1859,11 @@
               "type": "object"
             },
             "type": "array"
+          },
+          "claims": {
+            "additionalProperties": true,
+            "description": "With `reviewPolicy`, the claim occurrences the summary read, in the `claims` form of `recall`: `version` 1, `policy`, `occurrences` and `truncated`.",
+            "type": "object"
           },
           "clarify": {
             "additionalProperties": true,
@@ -1956,6 +1969,11 @@
             },
             "type": "array"
           },
+          "resolution": {
+            "additionalProperties": true,
+            "description": "With `matchingPolicy`, the map revision read, in the `resolution` form of `recall`.",
+            "type": "object"
+          },
           "result": {
             "additionalProperties": true,
             "description": "The checked query with `explanation`, `assumptions`, `terms`, `graph`, `commit`, `attempt`, `verdict` and `results` in the `application/x-sparkles+json` form.",
@@ -1966,6 +1984,13 @@
               "citations": {
                 "items": {
                   "type": "integer"
+                },
+                "type": "array"
+              },
+              "claimCitations": {
+                "description": "With `reviewPolicy`, the claim occurrences the text cites, such as `c1`.",
+                "items": {
+                  "type": "string"
                 },
                 "type": "array"
               },
@@ -19705,7 +19730,15 @@
           "includeSuperseded": {
             "type": "boolean"
           },
+          "matchingPolicy": {
+            "description": "A matching policy of the dataset's evidence settings. Entities name their representative under its resolution map, and the other members of each seed's cluster are read too.",
+            "type": "string"
+          },
           "maxBytes": {
+            "type": "integer"
+          },
+          "maxClaims": {
+            "description": "The claim occurrences listed at most, 1 to 200, 50 by default. Needs `reviewPolicy`.",
             "type": "integer"
           },
           "maxTriples": {
@@ -19721,6 +19754,10 @@
           },
           "recency": {
             "description": "A half-life such as `90d` (units s, m, h, d, w, y). Found seeds rank by the age of their newest fact and by how many graphs assert their facts.",
+            "type": "string"
+          },
+          "reviewPolicy": {
+            "description": "A review policy of the dataset's evidence settings. Accepted facts cite the claim occurrences of their supports, and `claims` lists the occurrences about the entities returned with their state under the policy.",
             "type": "string"
           },
           "seedLimit": {
@@ -19776,6 +19813,13 @@
                 "by": {
                   "type": "string"
                 },
+                "claims": {
+                  "description": "With `reviewPolicy`, the identifiers of the claim occurrences of the facts' live supports.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
                 "confidence": {
                   "type": "string"
                 },
@@ -19809,6 +19853,129 @@
               "type": "object"
             },
             "type": "array"
+          },
+          "claims": {
+            "description": "With `reviewPolicy`, the claim occurrences the result cites or that are about its entities.",
+            "properties": {
+              "occurrences": {
+                "items": {
+                  "properties": {
+                    "by": {
+                      "type": "string"
+                    },
+                    "claim": {
+                      "type": "string"
+                    },
+                    "decision": {
+                      "type": "string"
+                    },
+                    "decisionVersion": {
+                      "type": "integer"
+                    },
+                    "id": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "enum": [
+                        "reported",
+                        "observation",
+                        "hypothesis",
+                        "preference"
+                      ],
+                      "type": "string"
+                    },
+                    "origin": {
+                      "description": "`instructions` when the source is an instruction document. Every claim is source data either way.",
+                      "enum": [
+                        "instructions",
+                        "source"
+                      ],
+                      "type": "string"
+                    },
+                    "polarity": {
+                      "enum": [
+                        "positive",
+                        "negative",
+                        "uncertain"
+                      ],
+                      "type": "string"
+                    },
+                    "proposition": {
+                      "properties": {
+                        "o": {
+                          "type": "string"
+                        },
+                        "p": {
+                          "type": "string"
+                        },
+                        "s": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "s",
+                        "p",
+                        "o"
+                      ],
+                      "type": "object"
+                    },
+                    "source": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "enum": [
+                        "accepted",
+                        "rejected",
+                        "needs-evidence",
+                        "unreviewed",
+                        "withdrawn"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "claim",
+                    "state",
+                    "kind",
+                    "polarity",
+                    "origin",
+                    "proposition"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "policy": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "version": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "name",
+                  "version"
+                ],
+                "type": "object"
+              },
+              "truncated": {
+                "type": "boolean"
+              },
+              "version": {
+                "description": "1. A client must recognize the version before it reads the member.",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "version",
+              "policy",
+              "occurrences",
+              "truncated"
+            ],
+            "type": "object"
           },
           "commit": {
             "type": "integer"
@@ -19959,6 +20126,29 @@
                 "label": {
                   "type": "string"
                 },
+                "resolution": {
+                  "description": "With `matchingPolicy`, the entity's cluster when the map names it.",
+                  "properties": {
+                    "members": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "membersComplete": {
+                      "type": "boolean"
+                    },
+                    "representative": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "representative",
+                    "members",
+                    "membersComplete"
+                  ],
+                  "type": "object"
+                },
                 "seed": {
                   "type": "integer"
                 },
@@ -19982,6 +20172,33 @@
           "prefixes": {
             "additionalProperties": true,
             "description": "The prefixes the compact terms use.",
+            "type": "object"
+          },
+          "resolution": {
+            "description": "With `matchingPolicy`, the map revision read.",
+            "properties": {
+              "number": {
+                "type": "integer"
+              },
+              "policy": {
+                "type": "string"
+              },
+              "revision": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "policy",
+              "version",
+              "revision",
+              "number"
+            ],
             "type": "object"
           },
           "superseded": {
