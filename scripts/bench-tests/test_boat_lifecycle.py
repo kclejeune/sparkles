@@ -210,6 +210,71 @@ class ControllerTransportCleanup(unittest.TestCase):
                 self.assertFalse(Path('/proc',path.read_text()).exists())
 
 
+def metadata_probe():
+    import importlib.util
+    spec=importlib.util.spec_from_file_location('metadata_probe',Path(__file__).resolve().parents[1]/'boat'/'metadata-probe.py')
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+
+
+# Recorded on bx_gy2ytgh8 at 2026-11-09T03:12Z (qualification/facts-1.json, facts-2.txt).
+# Only anon, file and inactive_file of user.slice were recorded. The other memory.stat
+# fields are a conservative assumption: all remaining charge is non-reclaimable kernel.
+OBSERVED_USER_SLICE_MAX=16230907904
+OBSERVED_USER_SLICE_CURRENT=7504871424
+OBSERVED_ANON=140820480
+OBSERVED_FILE=6671233024
+OBSERVED_INACTIVE_FILE=6345027584
+OBSERVED_MEMINFO={'MemTotal':16375784,'MemFree':3600000,'MemAvailable':14003500,'Buffers':398148,'Cached':9667500,
+                  'AnonPages':1700000,'Shmem':1200,'Unevictable':0,'KernelStack':20000,'PageTables':30000,
+                  'SecPageTables':0,'Percpu':10000,'SReclaimable':400000,'SUnreclaim':150000,'SwapTotal':2097148,'SwapFree':2097148}
+
+
+def meminfo_text(values):
+    return ''.join(f'{k}: {v} kB\n' for k,v in values.items())
+
+
+def cgroup_stat(anon,file,inactive_file,shmem=0,unevictable=0,kernel=None,slab_reclaimable=0,current=None):
+    kernel=(current-anon-file) if kernel is None else kernel
+    rows={'anon':anon,'file':file,'kernel':kernel,'shmem':shmem,'file_mapped':0,'inactive_file':inactive_file,
+          'active_file':file-inactive_file,'unevictable':unevictable,'slab_reclaimable':slab_reclaimable,'slab_unreclaimable':kernel-slab_reclaimable}
+    return '\n'.join(f'{k} {v}' for k,v in rows.items())
+
+
+class MemoryAdmission(unittest.TestCase):
+    def ancestors(self,**kw):
+        current=kw.pop('current',OBSERVED_USER_SLICE_CURRENT)
+        stat=cgroup_stat(kw.pop('anon',OBSERVED_ANON),kw.pop('file',OBSERVED_FILE),kw.pop('inactive_file',OBSERVED_INACTIVE_FILE),current=current,**kw)
+        return [{'path':'/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service','memory.max':'max','memory.current':'122740736'},
+                {'path':'/sys/fs/cgroup/user.slice/user-1000.slice','memory.max':'max','memory.current':'388714496'},
+                {'path':'/sys/fs/cgroup/user.slice','memory.max':str(OBSERVED_USER_SLICE_MAX),'memory.current':str(current),'memory.stat':stat},
+                {'path':'/sys/fs/cgroup'}]
+
+    def test_observed_worker_with_page_cache_admits(self):
+        mp=metadata_probe()
+        memory=mp.memory_admission(meminfo_text(OBSERVED_MEMINFO),self.ancestors())
+        self.assertEqual(memory['MemTotal'],OBSERVED_MEMINFO['MemTotal']*1024)
+
+    def test_anon_full_worker_refuses(self):
+        mp=metadata_probe();anon=8*2**30;file=500*2**20
+        with self.assertRaises(mp.Refusal):
+            mp.memory_admission(meminfo_text(OBSERVED_MEMINFO),self.ancestors(anon=anon,file=file,inactive_file=file,current=anon+file+200*2**20))
+        host=dict(OBSERVED_MEMINFO,AnonPages=9*2**20,Cached=200000,MemAvailable=6000000)
+        with self.assertRaises(mp.Refusal):mp.memory_admission(meminfo_text(host),self.ancestors())
+
+    def test_shmem_unevictable_and_unreclaimable_kernel_count(self):
+        mp=metadata_probe();gib=2**30
+        # 2 GiB of tmpfs and 1 GiB of mlocked pages in the cache still leave too little room.
+        for extra in ({'shmem':2*gib,'unevictable':0},{'shmem':0,'unevictable':2*gib},{'kernel':2*gib+100*2**20,'slab_reclaimable':0}):
+            with self.subTest(extra=sorted(extra)),self.assertRaises(mp.Refusal):
+                mp.memory_admission(meminfo_text(OBSERVED_MEMINFO),self.ancestors(anon=gib,**extra))
+        # Reclaimable slab does not count.
+        mp.memory_admission(meminfo_text(OBSERVED_MEMINFO),self.ancestors(kernel=2*gib,slab_reclaimable=2*gib-10*2**20))
+
+    def test_missing_stat_on_a_limited_ancestor_refuses(self):
+        mp=metadata_probe();rows=self.ancestors();rows[2].pop('memory.stat')
+        with self.assertRaises(mp.Refusal):mp.memory_admission(meminfo_text(OBSERVED_MEMINFO),rows)
+
+
 class Finish(unittest.TestCase):
     def test_finish_waits_for_original_guard_and_verified_stop_not_submission(self):
         with tempfile.TemporaryDirectory()as tmp:
