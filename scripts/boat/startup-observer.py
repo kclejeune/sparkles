@@ -3,19 +3,40 @@ import fcntl,time,contextlib
 
 INFRASTRUCTURE={'systemd','(sd-pam)','dbus-daemon'}
 # Persistent processes of the provider's desktop session, which start with the
-# first SSH connection and stay. Each entry names a process of the worker's uid
-# and its parent, taken from the listing observed on the admitted large worker
-# bx_gy2ytgh8 (environment v8). SESSION_UNDER_INIT holds children of pid 1 as
-# root. SESSION_UNDER_MANAGER holds children of the worker's own user manager,
-# the MainPID that the system manager reports for user@UID.service. The pairs in
-# SESSION_UNDER_PROCESS hold children of another allowed process of the worker's
-# uid. A process outside these tables, or one under another parent, still counts
-# as startup work, and so does any descendant of tracked startup work.
-SESSION_UNDER_INIT=frozenset(['pulseaudio','ascii-agent-sup','ibus-daemon','ibus-x11','sunshine','dbus-launch','at-spi-bus-laun','at-spi2-registr'])
-SESSION_UNDER_MANAGER=frozenset(['pipewire','wireplumber','pipewire-pulse','gvfsd','gvfsd-fuse','at-spi-bus-laun','xdg-desktop-por',
-    'xdg-document-po','xdg-permission-','cua-driver','dconf-service','ibus-portal','at-spi2-registr','gnome-keyring-d'])
-SESSION_UNDER_PROCESS=frozenset([('ascii-agents-se','ascii-agent-sup'),('ibus-memconf','ibus-daemon'),('ibus-ui-gtk3','ibus-daemon'),
-    ('ibus-extension-','ibus-daemon'),('ibus-engine-sim','ibus-daemon'),('ascii-desktop','dbus-run-sessio'),('openbox','ascii-desktop')])
+# first SSH connection and stay. Each entry names a process of the worker's uid and
+# the full chains of ancestors it may have, from its parent up to pid 1, as observed
+# on the admitted large worker bx_gy2ytgh8 (environment v8) in the run-1 listing and
+# the op-2 process tree. An ancestor is INIT, pid 1 as root, MANAGER, the worker's
+# user manager that the system manager reports for user@UID.service, or a name with
+# 'worker' or 'root' for its uid. An ancestor of the worker's uid must itself be an
+# allowed session process. A process outside this table, or with any other chain,
+# still counts as startup work, and so does any descendant of tracked startup work.
+INIT=('init',);MANAGER=('manager',)
+def _w(name):return (name,'worker')
+def _r(name):return (name,'root')
+_AGENT=((_w('ascii-agents-se'),INIT),(_w('ascii-agents-se'),_w('ascii-agent-sup'),INIT))
+_LIGHTDM=(_r('lightdm'),_r('lightdm'),INIT)
+SESSION_CHAINS={}
+for _name in ['pulseaudio','ascii-agent-sup','ibus-daemon','ibus-x11','sunshine','dbus-launch','at-spi-bus-laun','at-spi2-registr','ascii-agents-se']:
+    SESSION_CHAINS.setdefault(_name,set()).add((INIT,))
+for _name in ['pipewire','wireplumber','pipewire-pulse','gvfsd','gvfsd-fuse','at-spi-bus-laun','xdg-desktop-por','xdg-document-po',
+              'xdg-permission-','cua-driver','dconf-service','ibus-portal','at-spi2-registr','gnome-keyring-d',
+              'obexd','gvfs-udisks2-vo','gvfs-gphoto2-vo','gvfs-afc-volume','gvfs-goa-volume','gvfs-mtp-volume','gvfsd-metadata',
+              'goa-daemon','goa-identity-se','evolution-sourc','evolution-calen','evolution-addre']:
+    SESSION_CHAINS.setdefault(_name,set()).add((MANAGER,INIT))
+SESSION_CHAINS['ascii-agents-se'].add((_w('ascii-agent-sup'),INIT))
+for _name in ['ibus-memconf','ibus-ui-gtk3','ibus-extension-','ibus-engine-sim']:SESSION_CHAINS.setdefault(_name,set()).add((_w('ibus-daemon'),INIT))
+SESSION_CHAINS['gvfsd-trash']={(_w('gvfsd'),MANAGER,INIT)}
+SESSION_CHAINS['fusermount3']={(_w('xdg-document-po'),MANAGER,INIT)}
+SESSION_CHAINS['dbus-run-sessio']={_LIGHTDM}
+SESSION_CHAINS['ascii-desktop']={(_w('dbus-run-sessio'),)+_LIGHTDM}
+SESSION_CHAINS['openbox']={(_w('ascii-desktop'),_w('dbus-run-sessio'))+_LIGHTDM}
+SESSION_CHAINS['sudo']=set(_AGENT);SESSION_CHAINS['bash']=set(_AGENT)
+SESSION_CHAINS={k:frozenset(v) for k,v in SESSION_CHAINS.items()}
+# The children these session processes may have. The agent's shell must have none,
+# because a shell is also what a startup installer runs, and its sudo may run only
+# the agent's root process logger.
+SESSION_CHILDREN={'bash':frozenset(),'sudo':frozenset([_r('ascii-proclog')])}
 UNALLOWED_MAX=32
 INSTALLER={'bash','sh','dash','sudo','apt','apt-get','dpkg','dpkg-deb','dpkg-preconfigu','needrestart','perl','curl','wget','minisign','rustup','mise','mbx','cargo','rustc','python','python3','python3.12','python3.13'}
 
@@ -31,21 +52,37 @@ def process_rows(proc=Path('/proc')):
         except (FileNotFoundError,ProcessLookupError,PermissionError):continue
     return rows
 
+def ancestor_chain(pid,rows,manager):
+    """The process's ancestors from its parent to pid 1, or None when the chain is broken."""
+    uid=profile()['worker_uid'];out=[];seen={pid};current=rows[pid]['ppid']
+    while len(out)<16:
+        row=rows.get(current)
+        if row is None or current in seen:return None
+        if current==1:return tuple(out)+(INIT,) if row['uid']==0 and row['comm']=='systemd' else None
+        if manager is not None and (current,row['start'])==tuple(manager):
+            if row['uid']!=uid or row['ppid']!=1:return None
+            out.append(MANAGER)
+        else:out.append((row['comm'],'worker' if row['uid']==uid else ('root' if row['uid']==0 else 'other')))
+        seen.add(current);current=row['ppid']
+    return None
+
 def provider_session(pid,rows,manager=None,depth=0):
-    """Whether this process is an allowed session process under an allowed parent.
+    """Whether this process is an allowed session process with an allowed ancestor chain.
 
     ``manager`` is the (pid, start) of the worker's user manager as the system
     manager reports it, or None when that is unknown, which allows none of its
-    children. A parent's name never stands in for pid 1 or the manager.
+    children. A name never stands in for pid 1 or the manager.
     """
     row=rows.get(pid);uid=profile()['worker_uid']
-    if row is None or row['uid']!=uid or depth>8:return False
-    parent=rows.get(row['ppid'])
-    if parent is None:return False
-    if parent['pid']==1:return parent['uid']==0 and parent['comm']=='systemd' and row['comm'] in SESSION_UNDER_INIT
-    if manager is not None and (parent['pid'],parent['start'])==tuple(manager):
-        return parent['uid']==uid and parent['ppid']==1 and row['comm'] in SESSION_UNDER_MANAGER
-    return (row['comm'],parent['comm']) in SESSION_UNDER_PROCESS and provider_session(parent['pid'],rows,manager,depth+1)
+    if row is None or row['uid']!=uid or depth>16:return False
+    chain=ancestor_chain(pid,rows,manager)
+    if chain is None or chain not in SESSION_CHAINS.get(row['comm'],()):return False
+    if row['comm'] in SESSION_CHILDREN:
+        allowed=SESSION_CHILDREN[row['comm']]
+        for child in rows.values():
+            if child['ppid']==pid and (child['comm'],'worker' if child['uid']==uid else ('root' if child['uid']==0 else 'other')) not in allowed:return False
+    parent=rows[row['ppid']]
+    return parent['uid']!=uid or (manager is not None and (parent['pid'],parent['start'])==tuple(manager)) or provider_session(parent['pid'],rows,manager,depth+1)
 
 def user_manager(rows,uid):
     """The worker's user manager by the system manager's own MainPID for user@UID.service."""
@@ -94,22 +131,69 @@ def foreign_startup(rows,launcher,probe_pid,tracked,manager=None):
                 tracked.add((pid,row['start']));changed=True
     return [rows[pid] for pid,start in sorted(tracked) if pid in rows and rows[pid]['start']==start and pid not in excluded]
 
+class StateChanged(Refusal):
+    """A state file was replaced or the state directory changed while it was observed."""
+
+# A restore of the state directory, or an overlay copy-up of a file on its first
+# open for writing, gives the same names new inodes. The setup hook writes no
+# completion marker, so the observer waits until the directory's entries keep the
+# same identity, size and times for SETTLE_SECONDS and then observes again.
+SETTLE_SECONDS=5
+STATE_ENTRIES=64
+REPLACED_READS=('file replaced','public file changed')
+
+def state_snapshot(state):
+    names=os.listdir(state);need(len(names)<=STATE_ENTRIES+16,'state directory bound')
+    out={}
+    for name in sorted(names):
+        if name.startswith('qualification-'):continue
+        try:s=os.lstat(state/name)
+        except FileNotFoundError:continue
+        out[name]=(s.st_dev,s.st_ino,s.st_mode,s.st_nlink,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+    return out
+
+def settle(state,clock,pause,deadline):
+    """Wait, within the deadline, until the state directory stays unchanged for SETTLE_SECONDS."""
+    previous=state_snapshot(state);since=clock()
+    while clock()<deadline:
+        pause(0.5);current=state_snapshot(state)
+        if current!=previous:previous,since=current,clock()
+        elif clock()-since>=SETTLE_SECONDS:return True
+    return False
+
 @contextlib.contextmanager
 def bootstrap_lock(path,uid,denied):
     s=path.lstat();need(stat.S_ISREG(s.st_mode) and s.st_uid==uid and s.st_nlink==1 and stat.S_IMODE(s.st_mode)==0o600 and s.st_size==0,'bootstrap lock ownership')
     need((s.st_dev,s.st_ino)!=denied,'bootstrap lock token alias')
     fd=os.open(path,os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK)
     try:
-        current=os.fstat(fd);need((current.st_dev,current.st_ino,current.st_uid,current.st_mode,current.st_nlink,current.st_size)==(s.st_dev,s.st_ino,s.st_uid,s.st_mode,s.st_nlink,s.st_size),'bootstrap lock replaced')
+        current=os.fstat(fd)
+        if (current.st_dev,current.st_ino,current.st_uid,current.st_mode,current.st_nlink,current.st_size)!=(s.st_dev,s.st_ino,s.st_uid,s.st_mode,s.st_nlink,s.st_size):raise StateChanged('bootstrap lock replaced')
         fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
         yield {'path':str(path),'device':s.st_dev,'inode':s.st_ino,'uid':uid,'mode':0o600,'held_during_checkpoint':True,'released_after_checkpoint':True}
-        after=path.lstat();need((after.st_dev,after.st_ino,after.st_nlink,after.st_size)==(s.st_dev,s.st_ino,1,0),'bootstrap lock changed during observation')
+        after=path.lstat()
+        if (after.st_dev,after.st_ino,after.st_nlink,after.st_size)!=(s.st_dev,s.st_ino,1,0):raise StateChanged('bootstrap lock changed during observation')
     finally:os.close(fd)
 
 def checkpoint_at(state,uid,denied,launcher,probe_pid,expected_manifest,seconds,rows_reader=process_rows,clock=time.monotonic,pause=time.sleep,manager_reader=lambda rows:None):
-    deadline=clock()+seconds;tracked=set();last='not observed';code='startup_unobserved';rows={};busy=[]
+    """Observe startup until it is closed or the observation deadline passes.
+
+    A replaced bootstrap lock or manifest, or a state directory that changes
+    during an attempt, means startup is still running. The observer then waits for
+    the directory to settle and observes again, and refuses only at the deadline,
+    with the reason code of the last thing it saw.
+    """
+    deadline=clock()+seconds;tracked=set();last='not observed';code='startup_unobserved';rows={};busy=[];unsettled=False
+    def changed(reason):
+        nonlocal last,code,busy,unsettled
+        last=reason;busy=[];unsettled=True
+        code='startup_busy:bootstrap_lock_replaced' if 'bootstrap lock' in reason else 'startup_busy:state_restore_in_progress'
     while clock()<deadline:
+        if unsettled:
+            if not settle(state,clock,pause,deadline):break
+            unsettled=False
         try:
+            before=state_snapshot(state)
             with bootstrap_lock(state/'bootstrap.lock',uid,denied) as lock:
                 manifest,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
                 # The actual pinned hook has no manifest deletion branch. If not
@@ -120,11 +204,18 @@ def checkpoint_at(state,uid,denied,launcher,probe_pid,expected_manifest,seconds,
                 pause(0.5)
                 rows=rows_reader();busy=foreign_startup(rows,launcher,probe_pid,tracked,manager_reader(rows))
                 current,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
-                need(current==manifest,'startup manifest path/bytes changed')
+                if current!=manifest:raise StateChanged('startup manifest path/bytes changed')
                 if busy:last='live or unknown startup descendants';code='startup_busy:unallowed_processes';continue
-                return {'startup_closed':True,'installer_quiescent':True,'manifest_sha256':manifest['sha256'],'qualification_eligible':manifest['sha256']==expected_manifest,'bootstrap_lock':lock,'bootstrap_occurrence':'unknown','hook_terminal_observed':False,'closure_basis':'existing bootstrap fd9 lock, stable owned present manifest and repeated exact PID/start/descendant observations; any not-yet-entered pinned absence branch must skip bootstrap','unknown_or_live_descendants':[],'engine_or_job_started':False}
+                held=(state/'bootstrap.lock').lstat()
+                if (held.st_dev,held.st_ino)!=(lock['device'],lock['inode']):raise StateChanged('bootstrap lock changed during observation')
+                if state_snapshot(state)!=before:raise StateChanged('state directory changed during observation')
+                return {'startup_closed':True,'installer_quiescent':True,'manifest_sha256':manifest['sha256'],'qualification_eligible':manifest['sha256']==expected_manifest,'bootstrap_lock':lock,'bootstrap_occurrence':'unknown','hook_terminal_observed':False,'closure_basis':'existing bootstrap fd9 lock, stable owned present manifest, a state directory unchanged across the attempt and repeated exact PID/start/descendant observations; any not-yet-entered pinned absence branch must skip bootstrap','unknown_or_live_descendants':[],'engine_or_job_started':False}
+        except StateChanged as error:changed(str(error))
         except BlockingIOError:last='bootstrap lock busy or manifest not yet present';code='startup_busy:bootstrap_lock_held';busy=[];pause(0.5)
         except FileNotFoundError:last='bootstrap lock busy or manifest not yet present';code='startup_busy:lock_or_manifest_absent';busy=[];pause(0.5)
+        except Refusal as error:
+            if str(error) not in REPLACED_READS:raise
+            changed(str(error))
     return {'startup_closed':False,'installer_quiescent':False,'qualification_eligible':False,'bootstrap_occurrence':'unknown','reason':last,'reason_code':code,
             'unallowed':unallowed_inventory(rows,busy),'unallowed_count':len(busy),'engine_or_job_started':False}
 

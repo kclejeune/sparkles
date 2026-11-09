@@ -34,7 +34,7 @@ WATCH_ACCEPT=15
 WATCH_DECISION=90
 # A remote phase's reason code is kept only in one of these forms. A refusal
 # code must name one of the packet's own literal refusal reasons.
-FIXED_REASONS=frozenset({'startup_unobserved','startup_busy:unallowed_processes','startup_busy:bootstrap_lock_held','startup_busy:lock_or_manifest_absent','existing_phase_pending','unreported'})
+FIXED_REASONS=frozenset({'startup_unobserved','startup_busy:unallowed_processes','startup_busy:bootstrap_lock_held','startup_busy:lock_or_manifest_absent','startup_busy:bootstrap_lock_replaced','startup_busy:state_restore_in_progress','existing_phase_pending','unreported'})
 def packet_refusals():
     found=set()
     for name in ('common.py','config_schema.py','metadata-probe.py','startup-observer.py','remote-launcher.py'):

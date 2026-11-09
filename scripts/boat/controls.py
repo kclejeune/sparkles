@@ -207,6 +207,9 @@ def observed_session_rows(unparented=True):
     return rows
 UNKNOWN_SESSION={8008,8096,8097,8101}
 
+def proc_fixture_reader():
+    return lambda:proc_fixture()
+
 class LoadedGuardIO(InertIO):
     # Exercise the actual RealIO.arm gate with entirely inert systemd methods.
     arm=c.RealIO.arm
@@ -572,14 +575,53 @@ class Controls(unittest.TestCase):
             root=Path(d);(root/'bootstrap.lock').touch(mode=0o600);m=root/'toolchain.json';m.write_text('ASCII');m.chmod(0o600);rows=proc_fixture();rows[20]={'pid':20,'ppid':1,'uid':1000,'comm':'bash','start':1,'group':20};clock=Clock()
             q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,lambda:rows,clock.now,clock.pause)
             self.assertFalse(q['startup_closed']);self.assertFalse(q['qualification_eligible'])
-    def test_manifest_replaced_during_checkpoint_refused(self):
-        with tempfile.TemporaryDirectory(prefix='boat-v2-manifest-race-') as d:
-            root=Path(d);(root/'bootstrap.lock').touch(mode=0o600);m=root/'toolchain.json';m.write_text('ASCII');m.chmod(0o600);clock=Clock();calls=[0]
+    def checkpoint_dir(self,d):
+        root=Path(d);(root/'bootstrap.lock').touch(mode=0o600);m=root/'toolchain.json';m.write_text('ASCII');m.chmod(0o600)
+        return root,m
+    def replace(self,path,text=''):
+        # A copy-up or restore gives the same name a new inode, possibly with the same bytes.
+        new=path.with_name('.restore-'+path.name);new.write_text(text);new.chmod(0o600);os.replace(new,path)
+    def test_manifest_replaced_during_checkpoint_settles_then_observes_again(self):
+        for text,eligible in [('ASCII',True),('CHANGED',False)]:
+            with tempfile.TemporaryDirectory(prefix='boat-v2-manifest-race-') as d:
+                root,m=self.checkpoint_dir(d);clock=Clock();calls=[0];expected=digest(m.read_bytes())
+                def rows():
+                    calls[0]+=1
+                    if calls[0]==2:self.replace(m,text)
+                    return proc_fixture()
+                q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,expected,30,rows,clock.now,clock.pause)
+                self.assertTrue(q['startup_closed'],q);self.assertEqual(q['qualification_eligible'],eligible)
+                self.assertGreaterEqual(clock.t,OBSERVER['SETTLE_SECONDS'])
+    def test_bootstrap_lock_replaced_during_observation_settles_then_observes_again(self):
+        with tempfile.TemporaryDirectory(prefix='boat-v2-lock-race-') as d:
+            root,m=self.checkpoint_dir(d);clock=Clock();calls=[0]
             def rows():
                 calls[0]+=1
-                if calls[0]==2:m.unlink();m.write_text('CHANGED');m.chmod(0o600)
+                if calls[0]==1:self.replace(root/'bootstrap.lock')
                 return proc_fixture()
-            with self.assertRaises(OBSERVER['Refusal']):OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),2,rows,clock.now,clock.pause)
+            q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),30,rows,clock.now,clock.pause)
+            self.assertTrue(q['startup_closed'],q);self.assertTrue(q['qualification_eligible'])
+    def test_lock_copied_up_by_its_own_open_settles(self):
+        # The first open of a lower-layer file for writing gives it a new inode.
+        with tempfile.TemporaryDirectory(prefix='boat-v2-copy-up-') as d:
+            root,m=self.checkpoint_dir(d);clock=Clock();real=os.open;first=[True]
+            def copy_up(path,flags,*a):
+                if first[0] and str(path).endswith('bootstrap.lock') and flags&os.O_RDWR:
+                    first[0]=False;self.replace(Path(path))
+                return real(path,flags,*a)
+            with patch.dict(OBSERVER['os'].__dict__,{'open':copy_up}):
+                q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),30,proc_fixture_reader(),clock.now,clock.pause)
+            self.assertTrue(q['startup_closed'],q)
+    def test_restore_that_never_settles_refuses_at_the_deadline_with_its_code(self):
+        for target,code in [('tools.toml','startup_busy:state_restore_in_progress'),('bootstrap.lock','startup_busy:bootstrap_lock_replaced')]:
+            with tempfile.TemporaryDirectory(prefix='boat-v2-restore-') as d:
+                root,m=self.checkpoint_dir(d);clock=Clock();(root/'tools.toml').write_text('x');(root/'tools.toml').chmod(0o600)
+                n=[0]
+                def pause(x):
+                    clock.pause(x);n[0]+=1;self.replace(root/target,str(n[0]))
+                q=OBSERVER['checkpoint_at'](root,os.getuid(),(-1,-1),{'pid':11,'start':1},12,digest(m.read_bytes()),30,proc_fixture_reader(),clock.now,pause)
+                self.assertFalse(q['startup_closed']);self.assertEqual(q['reason_code'],code)
+                self.assertGreaterEqual(clock.t,30)
     def test_startup_phase_more_than900_and_finite1950(self):
         r=fixture();io=PhaseIO(r);intent={'mono':100,'wall':io.wall()};io.delay=1000
         self.assertTrue(io.startup(intent,True));self.assertGreater(io.mono(),1000);self.assertEqual(io.read('startup-closed.json')['bootstrap_occurrence'],'unknown')
