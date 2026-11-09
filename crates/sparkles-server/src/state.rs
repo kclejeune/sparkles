@@ -1236,9 +1236,16 @@ impl AppState {
         self.catalog.attach_expected(name, source)?;
         Ok(self.get(name).expect("attached"))
     }
-    /// Whether `name` is being deleted or renamed now.
-    pub fn is_leaving(&self, name: &str) -> bool {
-        self.leaving.lock().contains(name)
+
+    /// Whether any dataset is being deleted or renamed now.
+    pub fn any_leaving(&self) -> bool {
+        !self.leaving.lock().is_empty()
+    }
+
+    /// Hold `name` as leaving, as a deletion that is draining does (tests).
+    #[cfg(test)]
+    pub(crate) fn leave_for_tests(&self, name: &str) -> impl Drop + '_ {
+        self.leave(name).unwrap()
     }
 
     /// Mark `name` as leaving until the guard drops. A second delete or rename of the

@@ -253,16 +253,9 @@ async fn create(
 /// The current dataset and branch names of watch `w`'s branch, which a rename may have
 /// changed since the follower last recorded them; `None` when the branch is gone.
 fn current(st: &AppState, w: &Watch) -> Option<(String, String)> {
-    let found = |d: &Arc<crate::state::Dataset>| {
-        d.store
-            .listed_branch_name(w.branch_id, &Default::default())
-            .ok()
-            .flatten()
-            .map(|b| (d.name.clone(), b))
-    };
-    match st.lookup(&w.dataset) {
-        crate::state::Lookup::Open(d) => found(&d),
-        _ => st.datasets().values().find_map(found),
+    match super::follow::locate(st, &w.dataset, w.branch_id) {
+        super::follow::Place::Found(d, b) => Some((d.name.clone(), b)),
+        _ => None,
     }
 }
 

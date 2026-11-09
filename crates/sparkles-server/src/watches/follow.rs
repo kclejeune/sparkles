@@ -73,6 +73,12 @@ pub struct Followers {
 }
 
 impl Followers {
+    /// The names every follower keeps (tests).
+    #[cfg(test)]
+    pub(crate) fn names(&self) -> usize {
+        self.by_branch.values().map(Follower::names).sum()
+    }
+
     /// Read every watched branch's new commits and record the matches.
     pub fn step(&mut self, st: &Arc<AppState>) {
         let Ok((watches, cursors, version)) = st.watches.snapshot(st) else {
@@ -87,39 +93,15 @@ impl Followers {
         self.by_branch.retain(|id, _| groups.contains_key(id));
         let mut gone: Vec<uuid::Uuid> = Vec::new();
         for (bid, ws) in groups {
-            let mut dataset = ws[0].dataset.clone();
-            let main = match st.lookup(&dataset) {
-                crate::state::Lookup::Open(ds) => ds,
-                crate::state::Lookup::Missing if st.is_leaving(&dataset) => continue,
-                crate::state::Lookup::Missing => {
-                    // a renamed dataset keeps its branches' ids
-                    let moved = st.datasets().into_values().find(|d| {
-                        matches!(
-                            d.store.listed_branch_name(bid, &Default::default()),
-                            Ok(Some(_))
-                        )
-                    });
-                    match moved {
-                        Some(d) => {
-                            dataset = d.name.clone();
-                            d
-                        }
-                        None => {
-                            gone.push(bid);
-                            continue;
-                        }
-                    }
-                }
-                crate::state::Lookup::Unavailable(_) => continue,
-            };
-            let name = match main.store.listed_branch_name(bid, &Default::default()) {
-                Ok(Some(n)) => n,
-                Ok(None) => {
+            let (main, name) = match locate(st, &ws[0].dataset, bid) {
+                Place::Found(d, n) => (d, n),
+                Place::Unknown => continue,
+                Place::Gone => {
                     gone.push(bid);
                     continue;
                 }
-                Err(_) => continue,
             };
+            let dataset = main.name.clone();
             let ds = match st.branch_dataset(&main, &name) {
                 Ok(ds) if ds.store.branch_id() == bid => ds,
                 _ => continue,
@@ -132,6 +114,11 @@ impl Followers {
                 .by_branch
                 .entry(bid)
                 .or_insert_with(|| Follower::new(cursor));
+            if f.bloated() {
+                // names of hierarchy nodes and watches that are gone: start again from
+                // the follower's cursor, reading the hierarchy there
+                *f = Follower::new(f.cursor);
+            }
             if f.version != version {
                 f.sync(ws, version, cursor);
             }
@@ -158,6 +145,40 @@ impl Followers {
             }
         }
     }
+}
+
+/// Where a watch's branch is now.
+pub(crate) enum Place {
+    /// open, in this dataset under this branch name
+    Found(Arc<crate::state::Dataset>, String),
+    /// not known now: a dataset that could hold the branch is opening, failed to open,
+    /// or is being deleted or renamed
+    Unknown,
+    /// no dataset of the catalog holds the branch
+    Gone,
+}
+
+/// Find branch `bid`, last seen in dataset `dataset`. A dataset keeps its branches'
+/// ids through a rename, so every dataset of the catalog is searched; the branch is
+/// gone only when every one of them is open and none holds it, so a deletion or a
+/// rename that is still draining, and may yet fail, removes no watch.
+pub(crate) fn locate(st: &AppState, dataset: &str, bid: uuid::Uuid) -> Place {
+    let mut unsure = st.any_leaving();
+    let mut names: Vec<String> = st.catalog.list().into_iter().map(|i| i.name).collect();
+    // the last known dataset first, which holds the branch unless it was renamed
+    names.sort_by_key(|n| n != dataset);
+    for name in names {
+        let Some(d) = st.get(&name) else {
+            unsure = true;
+            continue;
+        };
+        match d.store.listed_branch_name(bid, &Default::default()) {
+            Ok(Some(b)) => return Place::Found(d, b),
+            Ok(None) => {}
+            Err(_) => unsure = true,
+        }
+    }
+    if unsure { Place::Unknown } else { Place::Gone }
 }
 
 /// What one run of a follower found.
@@ -272,6 +293,8 @@ struct Binding {
 
 /// The most ids [`Binding::unknown`] keeps before it starts again.
 const UNKNOWN: usize = 1 << 20;
+/// The names a follower keeps beyond four times those it uses before it starts again.
+const NAMES_FLOOR: usize = if cfg!(test) { 64 } else { 1 << 16 };
 
 pub(crate) struct Follower {
     cursor: u64,
@@ -302,6 +325,24 @@ impl Follower {
             binding: Binding::default(),
             sub: None,
         }
+    }
+
+    /// Whether the follower keeps many more names than its hierarchies and watches use,
+    /// which hierarchy nodes and watches that came and went leave behind.
+    fn bloated(&self) -> bool {
+        let used: usize = self
+            .graphs
+            .values()
+            .map(|h| h.parents.len() + h.edges)
+            .sum::<usize>()
+            + self.watches.len();
+        self.names.iris.len() > NAMES_FLOOR.max(4 * used)
+    }
+
+    /// The names the follower keeps (tests).
+    #[cfg(test)]
+    pub(crate) fn names(&self) -> usize {
+        self.names.iris.len()
     }
 
     /// Read again from commit `cursor`, with the hierarchy read at it.

@@ -446,7 +446,9 @@ impl Watches {
                 overflow: false,
                 truncated: false,
             };
-            b.cursors.entry(w.branch_id).or_insert(n.head);
+            // a follower that passed the head this request read reads from it again
+            let c = b.cursors.entry(w.branch_id).or_insert(n.head);
+            *c = (*c).min(n.head);
             b.watches.push(w.clone());
             Ok((w, true))
         })?;

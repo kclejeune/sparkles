@@ -140,9 +140,13 @@ impl Srv {
 
     /// Run a SPARQL update on `branch` as `user`, which the commit records as its author.
     async fn update(&self, user: &str, branch: &str, u: &str) {
+        self.update_in("ds", user, branch, u).await;
+    }
+
+    async fn update_in(&self, ds: &str, user: &str, branch: &str, u: &str) {
         let req = Request::builder()
             .method("POST")
-            .uri(format!("/ds/update?branch={branch}"))
+            .uri(format!("/{ds}/update?branch={branch}"))
             .extension(ConnectInfo(Peer::Tcp("127.0.0.2:1".parse().unwrap())))
             .header("authorization", basic(user))
             .header("content-type", "application/sparql-update")
@@ -641,6 +645,8 @@ async fn a_graph_made_after_its_watch_is_followed() {
         )
         .await;
     let id = w["id"].as_str().unwrap().to_string();
+    // a commit the follower reads binds the generation before the graph exists
+    s.update("alice", "main", &label("urn:z", "Z2")).await;
     assert!(s.matched("bob", &id).await.is_empty());
     s.update(
         "alice",
@@ -650,6 +656,134 @@ async fn a_graph_made_after_its_watch_is_followed() {
     .await;
     let made = s.head();
     assert_eq!(commits(&s.matched("bob", &id).await), vec![made]);
+}
+
+#[tokio::test]
+async fn the_first_hierarchy_edge_after_a_subtree_watch_is_followed() {
+    let mut s = server();
+    s.update("alice", "main", &label("urn:root", "Root")).await;
+    let w = s
+        .watch(
+            "bob",
+            json!({"dataset": "ds", "graph": G, "entity": "urn:root", "scope": "subtree"}),
+        )
+        .await;
+    let id = w["id"].as_str().unwrap().to_string();
+    s.update("alice", "main", &label("urn:z", "Z")).await;
+    assert!(s.matched("bob", &id).await.is_empty());
+    // the store has no subClassOf until now
+    s.update("alice", "main", &sub("urn:c", "urn:root")).await;
+    let edge = s.head();
+    s.update("alice", "main", &label("urn:c", "C")).await;
+    let below = s.head();
+    assert_eq!(commits(&s.matched("bob", &id).await), vec![edge, below]);
+}
+
+#[tokio::test]
+async fn a_watch_made_from_an_older_head_reads_the_commits_after_it() {
+    let mut s = server();
+    let a = s
+        .watch(
+            "bob",
+            json!({"dataset": "ds", "graph": G, "entity": "urn:a"}),
+        )
+        .await;
+    let a = a["id"].as_str().unwrap().to_string();
+    // the request that makes the second watch read the head before this commit
+    let n = new_watch(&s, G, "urn:b");
+    s.update("alice", "main", &label("urn:b", "B")).await;
+    let named = s.head();
+    let _ = s.matched("bob", &a).await;
+    let (_, cursors, _) = s.st.watches.snapshot(&s.st).unwrap();
+    assert_eq!(cursors[&n.branch_id], named);
+    let (b, _) =
+        s.st.watches
+            .create(&s.st, &user("bob"), n, Utc::now())
+            .unwrap();
+    assert_eq!(commits(&s.matched("bob", &b.id).await), vec![named]);
+}
+
+#[tokio::test]
+async fn a_dataset_that_is_draining_after_a_rename_keeps_its_watches() {
+    let mut s = server();
+    let w = s
+        .watch(
+            "alice",
+            json!({"dataset": "ds", "graph": G, "entity": "urn:a"}),
+        )
+        .await;
+    let id = w["id"].as_str().unwrap().to_string();
+    s.st.rename("ds", "ds2").unwrap();
+    {
+        // a deletion of ds2 that waits for its holders, and may yet fail
+        let _leaving = s.st.leave_for_tests("ds2");
+        let st = s.st.clone();
+        let mut f = std::mem::take(&mut s.f);
+        s.f = tokio::task::spawn_blocking(move || {
+            f.step(&st);
+            f
+        })
+        .await
+        .unwrap();
+    }
+    let (ws, _, _) = s.st.watches.snapshot(&s.st).unwrap();
+    assert!(ws.iter().any(|x| x.id == id), "the watch was removed");
+    // a new dataset under the old name does not hold the branch
+    s.st.create("ds", DbType::Persistent).unwrap();
+    s.update_in("ds2", "alice", "main", &label("urn:a", "A"))
+        .await;
+    let named = s.st.datasets()["ds2"].store.snapshot().commit;
+    let st = s.st.clone();
+    let mut f = std::mem::take(&mut s.f);
+    s.f = tokio::task::spawn_blocking(move || {
+        f.step(&st);
+        f
+    })
+    .await
+    .unwrap();
+    let (ws, _, _) = s.st.watches.snapshot(&s.st).unwrap();
+    let w = ws.iter().find(|x| x.id == id).expect("kept");
+    assert_eq!(w.dataset, "ds2");
+    assert_eq!(commits_of(w), vec![named]);
+}
+
+#[tokio::test]
+async fn names_of_hierarchy_nodes_that_come_and_go_are_let_go() {
+    let mut s = server();
+    let w = s
+        .watch(
+            "bob",
+            json!({"dataset": "ds", "graph": G, "entity": "urn:root", "scope": "subtree"}),
+        )
+        .await;
+    let id = w["id"].as_str().unwrap().to_string();
+    for i in 0..100 {
+        s.update(
+            "alice",
+            "main",
+            &sub(&format!("urn:n{i}"), &format!("urn:x{i}")),
+        )
+        .await;
+        s.update(
+            "alice",
+            "main",
+            &sub(&format!("urn:n{i}"), &format!("urn:x{i}")).replace("INSERT", "DELETE"),
+        )
+        .await;
+        if i % 10 == 9 {
+            assert!(s.matched("bob", &id).await.is_empty());
+        }
+    }
+    assert!(s.matched("bob", &id).await.is_empty());
+    assert!(s.f.names() <= 64, "{} names kept", s.f.names());
+    s.update("alice", "main", &sub("urn:c", "urn:root")).await;
+    s.update("alice", "main", &label("urn:c", "C")).await;
+    let below = s.head();
+    assert_eq!(commits(&s.matched("bob", &id).await).last(), Some(&below));
+}
+
+fn commits_of(w: &Watch) -> Vec<u64> {
+    w.matches.iter().map(|m| m.commit).collect()
 }
 
 #[tokio::test]
