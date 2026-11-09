@@ -59,6 +59,7 @@
 mod data;
 mod dl;
 mod dl_clause;
+mod dl_eq;
 mod dl_norm;
 mod dl_root;
 mod dl_rules;

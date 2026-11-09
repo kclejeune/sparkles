@@ -492,7 +492,7 @@ impl Rooted<'_> {
     }
 
     /// `s ≻ t` on a-terms.
-    fn a_gt(s: RTerm, t: RTerm) -> bool {
+    pub fn a_gt(s: RTerm, t: RTerm) -> bool {
         use RTerm::*;
         match (s, t) {
             (Fx(f), Fx(g)) => f > g,
@@ -792,6 +792,8 @@ pub struct Store {
     multi: FxHashMap<u32, Box<[Lit]>>,
     /// in a rooted run, the processed clauses by each of their maximal interned literals
     pub by_xl: FxHashMap<Lit, Vec<u32>>,
+    /// in a rooted run, the processed clauses by the terms of their maximal literals
+    pub terms: Option<Box<ByTerm>>,
     /// every clause by each literal of its head, for the clauses a new one subsumes
     by_lit: FxHashMap<Lit, Vec<u32>>,
     /// every clause by the last literal of its head, which is the most specific, for
@@ -821,6 +823,7 @@ impl Store {
             + self.multi.values().map(|m| m.len() * 8).sum::<usize>()
             + table_bytes(self.by_xl.capacity(), 32)
             + self.by_xl.values().map(|v| v.capacity() * 4).sum::<usize>()
+            + self.terms.as_ref().map_or(0, |t| t.bytes())
     }
 
     pub fn is_idle(&self) -> bool {
@@ -954,6 +957,14 @@ impl Store {
                     }
                 }
             }
+            if let Some(o) = rooted {
+                let t = self.terms.get_or_insert_with(Box::default);
+                let before = t.bytes();
+                for &l in max.iter() {
+                    t.index(o.view(l), id);
+                }
+                self.grown += t.bytes().saturating_sub(before);
+            }
             if let Some(l) = self.max_of(id, |l| l.kind() == F)
                 && !ix.disjoint_of(ix.head(l.atom())).is_empty()
             {
@@ -1061,6 +1072,51 @@ impl Store {
                 self.max_of(i, |l| matches!(l.kind(), F | RL | EQ | NE) && l.fun() == f)
                     .map(|l| (i, l))
             })
+    }
+}
+
+/// The processed clauses of a rooted run's store by the terms of their maximal literals,
+/// which the Eq rule reads: every clause by each term of a maximal literal, a constant
+/// inside `f(u)` included, and the clauses with a maximal equality by each of its terms.
+#[derive(Default, Clone)]
+pub struct ByTerm {
+    pub any: FxHashMap<RTerm, Vec<u32>>,
+    pub eqs: FxHashMap<RTerm, Vec<u32>>,
+}
+
+impl ByTerm {
+    pub fn bytes(&self) -> usize {
+        let map = |m: &FxHashMap<RTerm, Vec<u32>>| {
+            table_bytes(m.capacity(), 40) + m.values().map(|v| v.capacity() * 4).sum::<usize>()
+        };
+        std::mem::size_of::<ByTerm>() + map(&self.any) + map(&self.eqs)
+    }
+
+    fn index(&mut self, l: XLit, id: u32) {
+        let add = |m: &mut FxHashMap<RTerm, Vec<u32>>, t: RTerm| {
+            let v = m.entry(t).or_default();
+            if v.last() != Some(&id) {
+                v.push(id);
+            }
+        };
+        let (ts, n) = terms_of(l);
+        for &t in &ts[..n] {
+            add(&mut self.any, t);
+            if let RTerm::Fc(_, u) = t {
+                add(&mut self.any, RTerm::C(u));
+            }
+            if matches!(l, XLit::Eq(..)) {
+                add(&mut self.eqs, t);
+            }
+        }
+    }
+}
+
+/// The terms of a literal at its top positions.
+pub fn terms_of(l: XLit) -> ([RTerm; 2], usize) {
+    match l {
+        XLit::Atom(_, a) => ([a, a], 1),
+        XLit::Role(_, a, b) | XLit::Eq(a, b) | XLit::Ne(a, b) => ([a, b], 2),
     }
 }
 

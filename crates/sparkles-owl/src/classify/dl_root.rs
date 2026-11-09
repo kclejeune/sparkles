@@ -16,10 +16,11 @@
 //! universal restriction meets the role atoms over `f_e(u)` in the root. The empty clause
 //! makes the root unsatisfiable, which makes the ontology inconsistent.
 //!
-//! The root's other rules wait for the later steps of the phase: Succ on the literals over
-//! `f_e(u)`, Eq, Ineq and Factor on the equalities of constants, Join on ground body
-//! literals, and the clauses over y that r-Succ's markers bring. The at-most restrictions
-//! and the qualified roles of counting are not read in the root.
+//! The equality rules are those of [`super::dl_eq`], which rewrite a constant everywhere in
+//! a root literal. The root's other rules wait for the later steps of the phase: Succ on
+//! the literals over `f_e(u)`, Join on ground body literals, and the clauses over y that
+//! r-Succ's markers bring. The at-most restrictions and the qualified roles of counting
+//! are not read in the root.
 
 use super::dl_clause::{Clause, Lit, Made, RTerm, Rooted, XLit};
 use super::dl_rules::{DlIx, Found, Side, alls, dix, dl, drain_with, ds, merge, side, unit, with};
@@ -33,7 +34,8 @@ use std::sync::atomic::Ordering;
 pub struct RootSt {
     /// the processed clauses with a maximal ground atom `B(u)`, by u
     by_const: FxHashMap<u32, Vec<u32>>,
-    /// the processed clauses with a maximal role atom `s(u, f_e(u))`, by u
+    /// the processed clauses with a maximal role atom that has the constant u at an end,
+    /// by u
     roles_of: FxHashMap<u32, Vec<u32>>,
 }
 
@@ -136,8 +138,12 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
         for &l in &max {
             match out.dl().lits.view(l, inv) {
                 XLit::Atom(_, RTerm::C(u)) => grown += RootSt::push(&mut r.by_const, u, id),
-                XLit::Role(_, RTerm::C(u), RTerm::Fc(_, v)) if u == v => {
-                    grown += RootSt::push(&mut r.roles_of, u, id);
+                XLit::Role(_, a, b) => {
+                    for t in [a, b] {
+                        if let RTerm::C(u) = t {
+                            grown += RootSt::push(&mut r.roles_of, u, id);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -161,12 +167,21 @@ fn process<S: Sink>(ix: &Index, st: &mut State, c: &Clause, max: &[Lit], out: &m
     let mut found = Found::default();
     for &l in max {
         let prem = side(c, l);
+        let q = super::dl_eq::Eqs {
+            ix,
+            dx,
+            lits: &out.dl().lits,
+            root: true,
+        };
+        q.on_max(st, l, &prem, &mut found);
         match out.dl().lits.view(l, inv_of(ix, dx)) {
             XLit::Atom(d, RTerm::C(u)) => hyper_at(ix, st, out, d, u, &prem, &mut found),
-            XLit::Role(s, RTerm::C(u), RTerm::Fc(e, v)) if u == v => {
-                on_role(ix, st, out, s, u, e, &prem, &mut found);
+            v @ XLit::Role(..) => {
+                for (u, s, t) in from(v, inv_of(ix, dx)) {
+                    on_role(ix, st, out, s, u, t, &prem, &mut found);
+                }
             }
-            // Succ, Eq and Join come with the later steps of the phase
+            // Succ and Join come with the later steps of the phase
             _ => {}
         }
     }
@@ -232,6 +247,16 @@ fn hyper_at<S: Sink>(
         }
         _ => {}
     }
+    // M(x) → f_i(x) ≉ f_j(x) of a minimum's holder
+    if let Some(es) = dx.ne_of.get(&d) {
+        for (i, &a) in es.iter().enumerate() {
+            for &b in &es[i + 1..] {
+                if let Made::Lit(n) = lit(ix, out, XLit::Ne(RTerm::Fc(a, u), RTerm::Fc(b, u))) {
+                    found.push(with(prem, n));
+                }
+            }
+        }
+    }
     for &t in ix.told_of(h) {
         found.push(with(prem, at(t)));
     }
@@ -266,7 +291,7 @@ fn hyper_at<S: Sink>(
             found.products(lists, base);
         }
     }
-    // the universals d stands for, over the role atoms of u's successor terms
+    // the universals d stands for, over the role atoms from u
     let mut ps = Vec::new();
     alls(ix, d, &mut ps);
     if ps.is_empty() {
@@ -281,25 +306,41 @@ fn hyper_at<S: Sink>(
             continue;
         }
         for &l in x.store.maxima(i) {
-            let XLit::Role(t, RTerm::C(w), f @ RTerm::Fc(_, v)) = out.dl().lits.view(l, inv) else {
-                continue;
-            };
-            if w != u || v != u {
-                continue;
-            }
-            for &(a, b) in &ps {
-                if dx.sub(ix, t, a)
-                    && let Made::Lit(m) = lit(ix, out, XLit::Atom(b, f))
-                {
-                    found.push(with(&merge(prem, &side(&s.c, l)), m));
+            for (w, t, f) in from(out.dl().lits.view(l, inv), inv) {
+                if w != u {
+                    continue;
+                }
+                for &(a, b) in &ps {
+                    if dx.sub(ix, t, a)
+                        && let Made::Lit(m) = lit(ix, out, XLit::Atom(b, f))
+                    {
+                        found.push(with(&merge(prem, &side(&s.c, l)), m));
+                    }
                 }
             }
         }
     }
 }
 
-/// Hyper on a new premise `prem` of the role atom `s(u, f_e(u))`: the universals of the
-/// holders of u, `owl:Thing` included, and the disjoint roles.
+/// The role atom `v` read from each constant u at one of its ends: `(u, s, t)` for
+/// `s(u, t)`, by the inverse role when u is its second term.
+fn from(v: XLit, inv: impl Fn(Role) -> Option<Role>) -> Vec<(u32, Role, RTerm)> {
+    let mut out = Vec::new();
+    if let XLit::Role(s, a, b) = v {
+        if let RTerm::C(u) = a {
+            out.push((u, s, b));
+        }
+        if let RTerm::C(u) = b
+            && let Some(i) = inv(s)
+        {
+            out.push((u, i, a));
+        }
+    }
+    out
+}
+
+/// Hyper on a new premise `prem` of the role atom `s(u, f)`: the universals of the holders
+/// of u, `owl:Thing` included, and the disjoint roles.
 #[allow(clippy::too_many_arguments)]
 fn on_role<S: Sink>(
     ix: &Index,
@@ -307,13 +348,12 @@ fn on_role<S: Sink>(
     out: &S,
     s: Role,
     u: u32,
-    e: Ex,
+    f: RTerm,
     prem: &Side,
     found: &mut Found,
 ) {
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
-    let f = RTerm::Fc(e, u);
     let mut ps = Vec::new();
     let over = |b: Ex, q: &Side, ps: &mut Vec<(Role, Ex)>, found: &mut Found| {
         alls(ix, b, ps);
@@ -351,12 +391,10 @@ fn on_role<S: Sink>(
                     continue;
                 }
                 for &l in x.store.maxima(i) {
-                    if let XLit::Role(t, RTerm::C(w), g) = out.dl().lits.view(l, inv)
-                        && w == u
-                        && g == f
-                        && dx.sub(ix, t, b)
-                    {
-                        found.push(merge(prem, &side(&c.c, l)));
+                    for (w, t, g) in from(out.dl().lits.view(l, inv), inv) {
+                        if w == u && g == f && dx.sub(ix, t, b) {
+                            found.push(merge(prem, &side(&c.c, l)));
+                        }
                     }
                 }
             }
@@ -450,7 +488,8 @@ mod tests {
         }
     }
 
-    /// The root's state after a saturation of the root alone.
+    /// The state after a saturation of one context, the root unless the test names
+    /// another, as `root` here.
     struct Done {
         ix: Index,
         ctx: Contexts,
@@ -487,7 +526,22 @@ mod tests {
         }
     }
 
-    fn saturate_root(mut s: Sig) -> Done {
+    fn saturate_root(s: Sig) -> Done {
+        saturate_at(s, None)
+    }
+
+    /// Saturates the context of `at`, or of the root.
+    fn saturate_at(s: Sig, at: Option<Ex>) -> Done {
+        saturate_seeded(s, at, |_, _| Vec::new())
+    }
+
+    /// Saturates as [`saturate_at`] does, with the root's store holding the clauses of
+    /// `seed`, as body and head in general form, in place of its start.
+    fn saturate_seeded(
+        mut s: Sig,
+        at: Option<Ex>,
+        seed: impl FnOnce(&Index, &mut Interner) -> Vec<(Vec<XLit>, Vec<XLit>)>,
+    ) -> Done {
         let root = s.it.fresh_class();
         s.dl.root = Some(root);
         for set in &mut s.ax.disjoint {
@@ -509,6 +563,27 @@ mod tests {
             dl: Some(&run),
             partial: false,
         };
+        let seeds = seed(&ix, &mut s.it);
+        if !seeds.is_empty() {
+            let dx = dix(&ix);
+            let inv = inv_of(&ix, dx);
+            let l = |v: &XLit| match run.lits.lit(*v, inv) {
+                Made::Lit(l) => l,
+                _ => panic!("a literal"),
+            };
+            let c = ctx[root as usize].get_or_init(Box::default);
+            let mut st = c.st.lock();
+            st.init = true;
+            let x = ds(&mut st);
+            x.root.get_or_insert_with(Box::default);
+            for (b, h) in &seeds {
+                x.store.add(Clause::new(
+                    b.iter().map(l).collect(),
+                    h.iter().map(l).collect(),
+                ));
+            }
+        }
+        let root = at.unwrap_or(root);
         saturate(&ix, &ctx, &[root], &[], &[], &bounds).unwrap();
         Done { ix, ctx, root, run }
     }
@@ -659,5 +734,177 @@ mod tests {
         let (ua, ub) = (c(na, &d.ix), c(nb, &d.ix));
         assert!(d.has(&[XLit::Eq(ua.min(ub), ua.max(ub))]));
         assert!(!d.bottom());
+    }
+
+    fn k(u: RTerm) -> u32 {
+        match u {
+            RTerm::C(k) => k,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn an_equality_of_constants_moves_the_greater_constants_facts() {
+        // {a} ⊑ {b}, A(a), B(b): A and B hold of the smaller constant
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let nb = s.ind("b");
+        let [a, b] = ["A", "B"].map(|n| s.class(n));
+        s.sub(na, nb);
+        s.sub(na, a);
+        s.sub(nb, b);
+        let d = saturate_root(s);
+        let (ua, ub) = (c(na, &d.ix), c(nb, &d.ix));
+        let lo = ua.min(ub);
+        assert!(d.has(&[XLit::Atom(a, lo)]));
+        assert!(d.has(&[XLit::Atom(b, lo)]));
+        assert!(!d.bottom());
+    }
+
+    #[test]
+    fn different_individuals_made_equal_clash() {
+        // {a} ⊑ {b}, and a and b are different
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let nb = s.ind("b");
+        s.sub(na, nb);
+        s.ax.disjoint.push(vec![na, nb]);
+        let d = saturate_root(s);
+        assert!(d.bottom());
+    }
+
+    #[test]
+    fn an_equality_in_a_disjunction_keeps_its_case() {
+        // {a} ⊑ {b} ⊔ C, B(b), with a and b different only under D: B(a) ∨ C(a)
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let nb = s.ind("b");
+        let [b, cc] = ["B", "C"].map(|n| s.class(n));
+        s.sub(nb, b);
+        s.dl.clauses.push((vec![na], vec![nb, cc]));
+        let d = saturate_root(s);
+        let (ua, ub) = (c(na, &d.ix), c(nb, &d.ix));
+        let lo = ua.min(ub);
+        let hi = ua.max(ub);
+        // B holds of a when a is b, so B(lo) ∨ C(a) when a is the smaller
+        assert!(
+            d.clauses().iter().any(|(bd, h)| bd.is_empty()
+                && h.contains(&XLit::Eq(lo, hi))
+                && h.contains(&XLit::Atom(cc, ua))),
+            "a ≈ b ∨ C(a)"
+        );
+        assert!(!d.has(&[XLit::Atom(b, ua)]) || ua == ub);
+        assert!(!d.bottom());
+    }
+
+    #[test]
+    fn a_minimum_s_successors_differ_in_the_root() {
+        // {a} ⊑ M, M ⊑ ∃r.B1 ⊓ ∃r.B2 with f1(a) ≉ f2(a)
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let [m, b1, b2] = ["M", "B1", "B2"].map(|n| s.class(n));
+        let r = s.role("r");
+        let e1 = s.some(r, b1);
+        let e2 = s.some(r, b2);
+        s.sub(na, m);
+        s.sub(m, e1);
+        s.sub(m, e2);
+        s.dl.ne.push((m, vec![e1, e2]));
+        s.dl.counting = true;
+        let d = saturate_root(s);
+        let u = k(c(na, &d.ix));
+        let (f1, f2) = (RTerm::Fc(e1, u), RTerm::Fc(e2, u));
+        assert!(d.has(&[XLit::Ne(f1.min(f2), f1.max(f2))]));
+    }
+
+    #[test]
+    fn a_context_in_a_singleton_holds_its_facts_of_the_constant() {
+        // A ⊑ {o}, A ⊑ B ⊔ C: in A's context A(o), and B(o) ∨ C(x), B(x) ∨ C(o)
+        let mut s = Sig::new();
+        let no = s.ind("o");
+        let [a, b, cc] = ["A", "B", "C"].map(|n| s.class(n));
+        s.sub(a, no);
+        s.dl.clauses.push((vec![a], vec![b, cc]));
+        let d = saturate_at(s, Some(a));
+        let o = c(no, &d.ix);
+        assert!(d.has(&[XLit::Eq(RTerm::X, o)]), "x ≈ o");
+        assert!(d.has(&[XLit::Atom(a, o)]), "A(o)");
+        assert!(d.has(&[XLit::Atom(no, o)]), "N_o(o)");
+        assert!(d.has(&[XLit::Atom(b, o), XLit::Atom(cc, RTerm::X)]));
+        assert!(d.has(&[XLit::Atom(b, RTerm::X), XLit::Atom(cc, o)]));
+        assert!(!d.has(&[XLit::Atom(b, o)]));
+    }
+
+    #[test]
+    fn a_clause_over_x_is_rewritten_at_each_maximal_atom() {
+        // A ⊑ {o} and ⊤ → B(x) ∨ C(x): in A's context x ≈ o rewrites each of the two
+        // incomparable atoms, and then the other, to B(o) ∨ C(o)
+        let mut s = Sig::new();
+        let no = s.ind("o");
+        let [a, b, cc] = ["A", "B", "C"].map(|n| s.class(n));
+        s.sub(a, no);
+        s.dl.clauses.push((vec![], vec![b, cc]));
+        let d = saturate_at(s, Some(a));
+        let o = c(no, &d.ix);
+        assert!(d.has(&[XLit::Atom(b, RTerm::X), XLit::Atom(cc, RTerm::X)]));
+        assert!(d.has(&[XLit::Atom(b, o), XLit::Atom(cc, o)]));
+    }
+
+    #[test]
+    fn a_universal_meets_a_role_atom_between_constants_from_either_end() {
+        // ⊤ → r(a, b), ⊤ → (∀r.B)(a), ⊤ → (∀r⁻.C)(b): B(b) and C(a), in both arrival
+        // orders of the role atom and the universal
+        for role_first in [true, false] {
+            let mut s = Sig::new();
+            let na = s.ind("a");
+            let nb = s.ind("b");
+            let [b, cc] = ["B", "C"].map(|n| s.class(n));
+            let r = s.role("r");
+            let ri = s.it.role(RoleName::Inverse(ObjectProperty::new("urn:t:r")));
+            let all_b = s.all(r, b);
+            let all_c = s.all(ri, cc);
+            let d = saturate_seeded(s, None, |ix, _| {
+                let (ua, ub) = (c(na, ix), c(nb, ix));
+                let role = (vec![], vec![XLit::Role(r, ua, ub)]);
+                let alls = [
+                    (vec![], vec![XLit::Atom(all_b, ua)]),
+                    (vec![], vec![XLit::Atom(all_c, ub)]),
+                ];
+                let mut v = Vec::new();
+                if role_first {
+                    v.push(role.clone());
+                }
+                v.extend(alls);
+                if !role_first {
+                    v.push(role);
+                }
+                v
+            });
+            let (ua, ub) = (c(na, &d.ix), c(nb, &d.ix));
+            assert!(d.has(&[XLit::Atom(b, ub)]), "B(b), role first {role_first}");
+            assert!(
+                d.has(&[XLit::Atom(cc, ua)]),
+                "C(a), role first {role_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn disjoint_roles_clash_between_constants() {
+        // ⊤ → r(a, b), ⊤ → s(b, a)... with s⁻ below t, r and t disjoint
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let nb = s.ind("b");
+        let r = s.role("r");
+        let t = s.role("t");
+        s.dl.rdis.push((r, t));
+        let d = saturate_seeded(s, None, |ix, _| {
+            let (ua, ub) = (c(na, ix), c(nb, ix));
+            vec![
+                (vec![], vec![XLit::Role(r, ua, ub)]),
+                (vec![], vec![XLit::Role(t, ua, ub)]),
+            ]
+        });
+        assert!(d.bottom());
     }
 }

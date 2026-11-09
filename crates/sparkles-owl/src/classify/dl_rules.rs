@@ -36,7 +36,7 @@
 //! Every rule reads only its own context's state and sends conclusions to itself, to the
 //! successors it registered with or to the predecessors it holds, as the EL rules do.
 
-use super::dl_clause::{Clause, EQ, F, Lit, Lits, Made, NE, RL, RY, Store, Table, Term, X, Y};
+use super::dl_clause::{Clause, EQ, F, Lit, Lits, Made, NE, RL, RY, Store, Table, Term, X, XL, Y};
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Sink, State, flatten, table_bytes};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -92,6 +92,9 @@ pub struct DlIx {
     pub root: Option<Ex>,
     /// in a rooted run, each constant with its singleton class `N_u`, by constant
     pub consts: Vec<(u32, Ex)>,
+    /// in a rooted run with counting, the existential restrictions of each minimum's
+    /// holder, whose successor terms differ
+    pub ne_of: FxHashMap<Ex, Vec<Ex>>,
 }
 
 impl DlIx {
@@ -102,6 +105,7 @@ impl DlIx {
             of_hyp: dl.hyp.iter().map(|(&e, &h)| (h, e)).collect(),
             counting: dl.counting,
             root: dl.root,
+            ne_of: dl.ne.iter().cloned().collect(),
             ..DlIx::default()
         };
         for (b, h) in &dl.clauses {
@@ -319,6 +323,13 @@ impl DlIx {
             + self.rdis.capacity() * 8
             + self.carry.capacity()
             + self.consts.capacity() * 8
+            + table_bytes(self.ne_of.capacity(), 32)
+            + self.ne_of.values().map(|v| v.capacity() * 4).sum::<usize>()
+    }
+
+    /// The core of the successor that the EL rules give e.
+    pub(super) fn core(&self, e: Ex) -> &[Ex] {
+        self.cores.get(&e).map_or(&[][..], |c| c)
     }
 
     /// Whether `me` is the root of a rooted run.
@@ -931,6 +942,20 @@ fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: 
     if holds {
         return;
     }
+    // a rooted run's interned atoms of owl:Thing and owl:Nothing, over constants
+    if dx.root.is_some() {
+        use super::dl_clause::XLit;
+        let lits = &out.dl().lits;
+        let inv = |r: Role| dx.inv(ix, r);
+        let is = |l: Lit, a: Ex| {
+            l.kind() == XL && matches!(lits.view(l, inv), XLit::Atom(b, _) if b == a)
+        };
+        body.retain(|&l| !is(l, TOP));
+        if head.iter().any(|&l| is(l, TOP)) {
+            return;
+        }
+        head.retain(|&l| !is(l, BOTTOM));
+    }
     body.sort_unstable();
     body.dedup();
     head.sort_unstable();
@@ -1528,7 +1553,7 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
     // premises in place
     if let Node::Exist(r, _) = h.node {
         on_rl(ix, st, d, r, &unit, &mut found);
-        if dx.counting {
+        if dx.counting && dx.root.is_none() {
             let mut us = Vec::new();
             unit_lits(ix, dx, st, d, &mut us);
             for &l in &us {
@@ -1536,7 +1561,77 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
             }
         }
     }
+    if dx.root.is_some() {
+        rooted_unit(ix, st, d, &mut found, &out.dl().lits);
+    }
     drain(ix, st, found, out);
+}
+
+/// The rules of a rooted run on a new premise `prem` whose maximal literal is `l` in a
+/// context other than the root: `N_u(x) → x ≈ u`, the differing successor terms of a
+/// minimum's holder, and the equality rules.
+fn rooted_max(ix: &Index, st: &State, l: Lit, prem: &Side, found: &mut Found, lits: &Lits) {
+    let dx = dix(ix);
+    if l.kind() == X {
+        rooted_hyper(ix, l.atom(), prem, found, lits);
+    }
+    let q = super::dl_eq::Eqs {
+        ix,
+        dx,
+        lits,
+        root: false,
+    };
+    q.on_max(st, l, prem, found);
+}
+
+/// The rules of a rooted run on a new unit `d(x)`, as [`rooted_max`] has them, with the
+/// unit's literals in place: the atom, and an existential restriction's role and core.
+fn rooted_unit(ix: &Index, st: &State, d: Ex, found: &mut Found, lits: &Lits) {
+    use super::dl_clause::{RTerm, XLit};
+    let dx = dix(ix);
+    rooted_hyper(ix, d, &unit(), found, lits);
+    let q = super::dl_eq::Eqs {
+        ix,
+        dx,
+        lits,
+        root: false,
+    };
+    q.on_unit(st, XLit::Atom(d, RTerm::X), found);
+    if let Node::Exist(r, _) = ix.head(d).node {
+        let f = RTerm::Fx(d);
+        q.on_unit(
+            st,
+            XLit::Role(r, RTerm::X, f).canon(|s| dx.inv(ix, s)),
+            found,
+        );
+        for &a in dx.core(d) {
+            if a != TOP {
+                q.on_unit(st, XLit::Atom(a, f), found);
+            }
+        }
+    }
+}
+
+/// Hyper of a rooted run's own clauses on a premise of `d(x)`: `N_u(x) → x ≈ u`, and
+/// `M(x) → f_i(x) ≉ f_j(x)` for a minimum's holder M.
+fn rooted_hyper(ix: &Index, d: Ex, prem: &Side, found: &mut Found, lits: &Lits) {
+    use super::dl_clause::{RTerm, XLit};
+    let dx = dix(ix);
+    let inv = |r: Role| dx.inv(ix, r);
+    if let Node::Nominal(u) = ix.head(d).node
+        && let Made::Lit(e) = lits.lit(XLit::Eq(RTerm::X, RTerm::C(u)), inv)
+    {
+        found.push(with(prem, e));
+    }
+    if let Some(es) = dx.ne_of.get(&d) {
+        for (i, &a) in es.iter().enumerate() {
+            for &b in &es[i + 1..] {
+                if let Made::Lit(n) = Lit::ne(Term::Fun(a), Term::Fun(b)) {
+                    found.push(with(prem, n));
+                }
+            }
+        }
+    }
 }
 
 /// The context became unsatisfiable: its registered predecessors learn it.
@@ -1824,7 +1919,19 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
         let Some(x) = st.extra.as_mut().and_then(|x| x.dl.as_deref_mut()) else {
             break;
         };
-        let Some(id) = x.store.next(ix, None, &mut max) else {
+        let dx = dix(ix);
+        let id = if dx.root.is_some() {
+            let inv = |r: Role| dx.inv(ix, r);
+            let o = super::dl_clause::Rooted {
+                ix,
+                lits: &out.dl().lits,
+                inv: &inv,
+            };
+            x.store.next(ix, Some(&o), &mut max)
+        } else {
+            x.store.next(ix, None, &mut max)
+        };
+        let Some(id) = id else {
             break;
         };
         let grown = x.store.take_grown();
@@ -1879,6 +1986,9 @@ fn process<S: Sink>(
     let mut es: Vec<Ex> = Vec::new();
     for &l in max {
         let prem = side(c, l);
+        if dx.root.is_some() {
+            rooted_max(ix, st, l, &prem, &mut found, &out.dl().lits);
+        }
         match l.kind() {
             X => {
                 let d = l.atom();
@@ -1956,7 +2066,8 @@ fn process<S: Sink>(
                 if dx.counting && l.kind() == F {
                     again(ix, st, id, c, &mut found);
                 }
-                if dx.counting {
+                // a rooted run has its own equality rules
+                if dx.counting && dx.root.is_none() {
                     if l.kind() == EQ {
                         on_eq(ix, st, Some(id), l, &prem, &mut found);
                     } else {
