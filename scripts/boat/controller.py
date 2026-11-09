@@ -8,7 +8,7 @@ identity_check=identity
 import qualified_worker_admission as lifetime
 from qualified_worker_admission import make_admission
 import owned_group
-import argparse,ast,fcntl,math,secrets,selectors,signal,subprocess,time,shlex,base64
+import argparse,ast,fcntl,importlib.util,math,secrets,selectors,signal,subprocess,time,shlex,base64
 
 # An extension act publishes within EXTEND_ACT_MAX seconds of its start, and the
 # guard waits up to FREEZE_WAIT for it before it stops at its deadline. The guard
@@ -86,7 +86,7 @@ def phase_evidence(result):
     for name in ('terminal_evidence','phase_memory'):
         x=result.get(name)
         if isinstance(x,dict):
-            evidence[name]={k:bounded_int(x.get(k)) for k in ('memory_peak','swap_peak') if k in x}
+            evidence[name]={k:bounded_int(x.get(k)) for k in ('memory_peak','swap_peak','unit_MemoryPeak','unit_MemorySwapPeak') if k in x}
             for k in ('source','terminal_source'):
                 if isinstance(x.get(k),str) and re.fullmatch(r'[a-z_]{1,32}',x[k]):evidence[name][k]=x[k]
             if 'reason_code' in x:evidence[name]['reason_code']=remote_reason(x['reason_code'])
@@ -402,6 +402,11 @@ if __name__=='__main__':
         need(r['exit']==0 and isinstance(r['body'],dict),'remote phase invocation failed')
         return r['body']
     def startup(self,intent,allow_qualification):
+        state={}
+        try:return self._startup(intent,allow_qualification,state)
+        except Exception as error:
+            record_refusal(self,'startup',error,state.get('result'));raise
+    def _startup(self,intent,allow_qualification,state):
         if self.exists('startup-closed.json'):
             result=self.read('startup-closed.json')
             if allow_qualification:need(result.get('qualification_eligible')is True,'allowed startup produced unadopted manifest')
@@ -412,7 +417,7 @@ if __name__=='__main__':
         if not self.exists('startup-started.json'):self.record('startup-started.json',{'unit':self.r['guard_unit']+'-startup.service','seconds':seconds,'bootstrap_occurrence':'unknown'})
         # Existing remote operation only reads its atomic receipt/unit; no second
         # observer/installer invocation, even after foreground disconnect.
-        result=self.phase('startup',seconds)
+        result=state['result']=self.phase('startup',seconds)
         if result.get('startup_closed')is not True or result.get('phase_closed')is not True:
             self.startup_refused(result);return False
         self.record('startup-closed.json',result)
@@ -525,6 +530,18 @@ HOLD_RESERVE=300
 HOLD_DEADLINE_RESERVE=600
 DIAGNOSE_SECONDS=120
 DIAGNOSE_RETRY=15
+# The transport's own teardown may take a few seconds after its window, so each
+# read ends DIAGNOSE_CLEANUP seconds before the hold does.
+DIAGNOSE_CLEANUP=15
+RECEIPT_MAX=1024*1024-4096
+def fit_diagnostics(body):
+    """The diagnostics trimmed until their receipt, as write_new serializes it, fits its bound."""
+    spec=importlib.util.spec_from_file_location('diagnostic_probe',ROOT/'diagnostic-probe.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    need(isinstance(body.get('state'),dict) and isinstance(body['state'].get('phases'),dict) and isinstance(body['state'].get('entries'),list)
+         and isinstance(body.get('processes'),dict) and isinstance(body['processes'].get('rows'),list),'diagnostics malformed')
+    body=module.fit(body,RECEIPT_MAX,lambda x:len(json.dumps(x,sort_keys=True,indent=2)))
+    need(len(json.dumps(body,sort_keys=True,indent=2))<=RECEIPT_MAX,'diagnostics over the receipt bound')
+    return body
 def diagnostic_hold(io,intent):
     """Read the worker's processes, state and phase results once after a refused qualification.
 
@@ -539,12 +556,12 @@ def diagnostic_hold(io,intent):
         start=io.mono();end=min(start+HOLD_MAX,intent['mono']+CONTROLLER_RUNTIME-HOLD_RESERVE,intent['deadline_mono']-HOLD_DEADLINE_RESERVE)
         io.record('diagnostic-hold.json',{'started_boottime':start,'end_boottime':end,'seconds':max(0,end-start),'started_wall':io.wall(),'qualification_only':True})
         attempt=0
-        while end-io.mono()>=10:
+        while end-io.mono()>=DIAGNOSE_CLEANUP+10:
             attempt+=1
             try:
-                body=io.diagnose(min(DIAGNOSE_SECONDS,end-io.mono()))
+                body=io.diagnose(min(DIAGNOSE_SECONDS,end-io.mono()-DIAGNOSE_CLEANUP))
                 need(isinstance(body,dict) and body.get('schema')==1,'diagnostics malformed')
-                io.record('diagnostics.json',dict(body,observed_wall=io.wall(),attempt=attempt));break
+                io.record('diagnostics.json',dict(fit_diagnostics(body),observed_wall=io.wall(),attempt=attempt));break
             except Exception as error:
                 io.record('diagnostics-failed-%04d.json'%attempt,{'reason_code':reason_code(error),'observed_wall':io.wall()})
             pause(io,min(DIAGNOSE_RETRY,max(0,end-io.mono())))

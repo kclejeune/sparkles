@@ -135,6 +135,7 @@ class DiskIO(InertIO):
 
 class PhaseIO(InertIO):
     startup=c.RealIO.startup
+    _startup=c.RealIO._startup
     startup_refused=c.RealIO.startup_refused
     def __init__(self,r):super().__init__(r);self.phase_calls=[];self.pending=False;self.bad_manifest=False;self.delay=0
     def phase(self,phase,seconds=0):
@@ -1045,7 +1046,7 @@ class Controls(unittest.TestCase):
                 if isinstance(body,Exception):raise body
                 return copy.deepcopy(body)
             def diagnose(self,seconds):
-                self.diagnosed.append((self.mono(),seconds));return {'schema':1,'processes':{'count':1,'rows':[]}}
+                self.diagnosed.append((self.mono(),seconds));return {'schema':1,'processes':{'count':0,'rows':[]},'state':{'entries':[],'phases':{}}}
         return MetaIO(fixture())
     OP4_LIKE={'qualified':False,'startup_closed':False,'metadata_closed':True,'phase_closed':True,'engine_or_job_started':False,'reason_code':'refusal:insufficient host headroom for proposed12GiB job',
               'elapsed_seconds':4.2,'terminal_properties':{'Result':'success','ExecMainStatus':'0','LoadState':'not-found','ActiveState':'inactive','MemoryPeak':'[not set]'},
@@ -1086,7 +1087,7 @@ class Controls(unittest.TestCase):
             io.diagnose=diagnose
             with self.assertRaises(Refusal):c.drive(io.r,io)
             hold=io.read('diagnostic-hold.json');self.assertEqual(hold['seconds'],c.HOLD_MAX)
-            self.assertTrue(all(t+s<=hold['end_boottime'] for t,s in io.diagnosed));self.assertGreater(len(io.diagnosed),1)
+            self.assertTrue(all(t+s+c.DIAGNOSE_CLEANUP<=hold['end_boottime'] for t,s in io.diagnosed));self.assertGreater(len(io.diagnosed),1)
             self.assertLessEqual(io.read('diagnostic-hold-ended.json')['ended_boottime'],hold['end_boottime']+c.DIAGNOSE_RETRY)
             self.assertFalse(io.read('diagnostic-hold-ended.json')['captured']);self.assertTrue(io.exists('stop-trigger.json'))
             self.assertTrue(io.exists('diagnostics-failed-0001.json'))
@@ -1125,7 +1126,7 @@ class Controls(unittest.TestCase):
         self.assertEqual(callers,['drive'])
     def test_an_unbound_handoff_records_an_admission_refusal(self):
         r=fixture();r.update(useful_job_ready=True,separate_Root_handoff={})
-        io=InertIO(r);io.diagnose=lambda s:{'schema':1}
+        io=InertIO(r);io.diagnose=lambda s:{'schema':1,'processes':{'count':0,'rows':[]},'state':{'entries':[],'phases':{}}}
         with self.assertRaises(Refusal):c.drive(r,io)
         self.assertEqual(io.read('admission-refused.json')['reason_code'],'refusal:unbound useful job handoff');self.assertTrue(io.exists('diagnostics.json'))
     def test_a_stopcheck_refusal_keeps_its_remote_reason(self):
@@ -1149,6 +1150,7 @@ class Controls(unittest.TestCase):
             token=home/'.config/mbx/remote-token';token.write_text('SECRET-TOKEN-CONTENT');os.chmod(token,0o600)
             (state/'toolchain.json').write_text('{"tool":"SECRET-TOOL-CONTENT"}')
             def phase(name,body,mode=0o600):
+                body=dict(body,phase='metadata',program_sha256='a'*64)
                 (state/name).mkdir();f=state/name/'probe-result.json';f.write_text(json.dumps(body));os.chmod(f,mode)
             phase('qualification-a-metadata',{'qualified':False,'reason_code':'refusal:insufficient host headroom for proposed12GiB job'})
             phase('qualification-a-startup',{'startup_closed':True},0o644)
@@ -1167,6 +1169,52 @@ class Controls(unittest.TestCase):
             with patch.object(d,'units',return_value={'rows':[]}):body=d.collect(home,os.getuid())
             self.assertLessEqual(len(json.dumps(body)),d.OUTPUT_MAX);self.assertIn('result',body['state']['phases']['qualification-a-metadata'])
             self.assertTrue(any(v.get('unread')=='dropped to fit the output bound' for v in body['state']['phases'].values()))
+
+    def test_diagnostics_never_follow_a_redirected_state_root_or_result(self):
+        spec=importlib.util.spec_from_file_location('diagnostic_probe',Path(__file__).with_name('diagnostic-probe.py'));d=importlib.util.module_from_spec(spec);spec.loader.exec_module(d)
+        body={'phase':'metadata','program_sha256':'a'*64,'secret':'REPOSITORY-CONTENT'}
+        with tempfile.TemporaryDirectory() as t:
+            home=Path(t)/'home';repo=Path(t)/'repo';(home/'.local/state').mkdir(parents=True);(repo/'qualification-x-metadata').mkdir(parents=True)
+            f=repo/'qualification-x-metadata/probe-result.json';f.write_text(json.dumps(body));os.chmod(f,0o600)
+            (home/'.local/state/sparkles-boat').symlink_to(repo)
+            with patch.object(d,'units',return_value={'rows':[]}):out=d.collect(home,os.getuid())
+            self.assertFalse(out['state']['present']);self.assertNotIn('REPOSITORY',json.dumps(out))
+            # A phase directory or a result that is a link is not followed either.
+            (home/'.local/state/sparkles-boat').unlink();state=home/'.local/state/sparkles-boat';state.mkdir()
+            (state/'qualification-y-metadata').symlink_to(repo/'qualification-x-metadata')
+            (state/'qualification-z-metadata').mkdir();(state/'qualification-z-metadata/probe-result.json').symlink_to(f)
+            (state/'qualification-w-metadata').mkdir();g=state/'qualification-w-metadata/probe-result.json';g.write_text(json.dumps({'not':'a phase result'}));os.chmod(g,0o600)
+            with patch.object(d,'units',return_value={'rows':[]}):out=d.collect(home,os.getuid())
+            phases=out['state']['phases'];self.assertNotIn('REPOSITORY',json.dumps(out))
+            self.assertIn('unread',phases['qualification-y-metadata']);self.assertIn('unread',phases['qualification-z-metadata']);self.assertEqual(phases['qualification-w-metadata']['unread'],'not a phase result')
+            # A world-writable state directory is refused.
+            os.chmod(state,0o777)
+            with patch.object(d,'units',return_value={'rows':[]}):out=d.collect(home,os.getuid())
+            self.assertFalse(out['state']['present'])
+    def test_diagnostics_receipt_fits_its_bound_and_trimming_ends(self):
+        result={'phase':'metadata','program_sha256':'a'*64,'directories':[{'path':'/home/user/x','uid':1000,'mode':448,'device':1,'inode':n} for n in range(8)]}
+        body={'schema':1,'processes':{'count':0,'rows':[]},'state':{'entries':[],'phases':{'qualification-%04d'%n:{'entries':['probe-result.json'],'result':copy.deepcopy(result)} for n in range(1200)}}}
+        fitted=c.fit_diagnostics(copy.deepcopy(body));self.assertLessEqual(len(json.dumps(fitted,sort_keys=True,indent=2)),c.RECEIPT_MAX)
+        self.assertTrue(any('result' in v for v in fitted['state']['phases'].values()))
+        # A body with nothing left to trim refuses instead of looping.
+        huge={'schema':1,'processes':{'count':0,'rows':[]},'state':{'entries':[],'phases':{}},'units':{'rows':[{'unit':'x'*128}]*20000}}
+        with self.assertRaises(Refusal):c.fit_diagnostics(huge)
+        with self.assertRaises(Refusal):c.fit_diagnostics({'schema':1})
+        io=self.metadata_io(self.OP4_LIKE);io.diagnose=lambda s:copy.deepcopy(body)
+        with self.assertRaises(Refusal):c.drive(io.r,io)
+        self.assertLessEqual(len(json.dumps(io.read('diagnostics.json'),sort_keys=True,indent=2)),1024*1024)
+    def test_every_startup_refusal_uses_the_shared_record(self):
+        intent={'mono':100,'wall':1800000000.}
+        io=PhaseIO(fixture());io.phase=lambda phase,seconds=0:(_ for _ in ()).throw(Refusal('remote phase invocation failed'))
+        with self.assertRaises(Refusal):io.startup(intent,True)
+        self.assertEqual(io.read('startup-refused.json')['reason_code'],'refusal:remote phase invocation failed')
+        io=PhaseIO(fixture());io.bad_manifest=True
+        with self.assertRaises(Refusal):io.startup(intent,True)
+        q=io.read('startup-refused.json');self.assertEqual(q['reason_code'],'refusal:allowed startup produced unadopted manifest');self.assertTrue(q['phase_closed'])
+    def test_refusal_evidence_keeps_the_units_own_peaks(self):
+        q=c.phase_evidence({'terminal_evidence':{'source':'cgroup','memory_peak':1,'swap_peak':0,'unit_MemoryPeak':MEMORY+1,'unit_MemorySwapPeak':0,'terminal_source':'unit'}})
+        self.assertEqual(q['evidence']['terminal_evidence'],{'source':'cgroup','memory_peak':1,'swap_peak':0,'unit_MemoryPeak':MEMORY+1,'unit_MemorySwapPeak':0,'terminal_source':'unit'})
+        self.assertIsNone(c.phase_evidence({'terminal_evidence':{'unit_MemoryPeak':'SECRET'}})['evidence']['terminal_evidence']['unit_MemoryPeak'])
 
     def test_final_runtime_source_map(self):
         path=Path(__file__).with_name('runtime-sources.json')

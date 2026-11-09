@@ -116,11 +116,16 @@ was acknowledged and the worker was seen running. During the hold the controller
 `diagnostic-probe.py` on the worker and keeps its output in `diagnostics.json`. The
 program reads the process table, the package's state directory listing and every phase's
 `probe-result.json`, the host memory summary, free disk space and the package's user
-units. It reads no other file, so the token and the repository are never opened. A failed
-read is kept in `diagnostics-failed-NNNN.json` and retried after 15 seconds. The hold ends
-300 seconds before the controller unit's 2,700-second runtime limit and 600 seconds
-before the guard's deadline, and any error ends it, so the controller always writes the
-stop trigger and the guard then stops the worker normally. The hold applies only to
+units. It reads no other file, so the token and the repository are never opened. It
+opens each directory by name under its parent and never through a symbolic link, accepts
+only private directories of the worker, and reads a result only when it is a private
+single-link regular file shaped as a phase result. Results, then process rows, then
+listings are dropped until the output fits the transport bound and the receipt fits its
+1 MiB bound. A failed read is kept in `diagnostics-failed-NNNN.json` and retried after 15
+seconds. The hold ends 300 seconds before the controller unit's 2,700-second runtime limit
+and 600 seconds before the guard's deadline. Each read ends 15 seconds before the hold, so
+the transport's own teardown fits inside it too. Any error ends the hold, so the
+controller always writes the stop trigger and the guard then stops the worker normally. The hold applies only to
 qualification, before a Root handoff, and never to a job, an extension, a closure watch
 or a finish.
 
