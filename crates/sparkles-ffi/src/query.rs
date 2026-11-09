@@ -199,7 +199,7 @@ impl FfiQuery {
             QueryKind::Construct => FfiQueryKind::Construct,
             QueryKind::Describe => FfiQueryKind::Describe,
         };
-        let variables = r.vars.clone();
+        let variables = r.variables().to_vec();
         let boolean = r.boolean;
         let rows = match r.kind {
             QueryKind::Ask => {
@@ -214,12 +214,14 @@ impl FfiQuery {
             }
             QueryKind::Select => Rows::Select(Box::new(r), TermTable::new(self.term_cache)),
             QueryKind::Construct | QueryKind::Describe => {
+                // The binding keeps application copies of the result's graph.
                 let mut q: Vec<(Option<Term>, [Term; 3])> = r
-                    .triples
-                    .into_iter()
+                    .triples()
+                    .iter()
+                    .cloned()
                     .map(|t| (None, [t.subject.into(), t.predicate.into(), t.object]))
                     .collect();
-                q.extend(r.quads.into_iter().map(|q| {
+                q.extend(r.quads().iter().cloned().map(|q| {
                     let g: Option<Term> = match q.graph_name {
                         oxrdf::GraphName::DefaultGraph => None,
                         oxrdf::GraphName::NamedNode(n) => Some(n.into()),
@@ -231,7 +233,7 @@ impl FfiQuery {
             }
         };
         let mut st = State { rows, pos: 0 };
-        let batch = self.batch(&mut st, first_rows);
+        let batch = self.batch(&mut st, first_rows)?;
         let done = !Self::remaining(&st);
         if !done {
             *self.state.lock() = Some(st);
@@ -246,28 +248,45 @@ impl FfiQuery {
         })
     }
 
-    fn batch(&self, st: &mut State, max: u32) -> Vec<u8> {
+    fn batch(&self, st: &mut State, max: u32) -> FfiResult<Vec<u8>> {
         let max = max.clamp(1, MAX_ROWS) as usize;
         self.labels.with(|_, label| match &mut st.rows {
             Rows::Select(r, table) => {
-                let cols = r.table.cols.len();
-                let n = r.table.len();
+                let view = r.table();
+                let cols = view.width();
+                let n = view.len();
                 let mut w = RowWriter::new(table, cols as u16);
                 let mut row = vec![0u32; cols];
+                // A decoding refusal, such as the result's memory budget or its
+                // cancellation, ends the batch with that error.
+                let mut failed = None;
                 while st.pos < n && (w.rows() as usize) < max && w.bytes() < MAX_BATCH_BYTES {
                     let i = st.pos;
                     for (c, cell) in row.iter_mut().enumerate() {
-                        let id = r.table.cols[c][i];
+                        let id = view.get(i, c)?;
                         *cell = if id.is_undef() {
                             0
                         } else {
-                            w.cell(id.0, || r.term(id), label)
+                            w.cell(
+                                id.0,
+                                || match r.term(id) {
+                                    Ok(term) => term.map(|t| t.as_term().clone()),
+                                    Err(error) => {
+                                        failed = Some(error);
+                                        None
+                                    }
+                                },
+                                label,
+                            )
                         };
+                        if let Some(error) = failed.take() {
+                            return Err(error.into());
+                        }
                     }
                     w.push_row(&row);
                     st.pos += 1;
                 }
-                w.finish()
+                Ok(w.finish())
             }
             Rows::Quads(quads, table) => {
                 let mut w = RowWriter::new(table, 4);
@@ -286,16 +305,16 @@ impl FfiQuery {
                     w.push_row(&[gc, sc, pc, oc]);
                     st.pos += 1;
                 }
-                w.finish()
+                Ok(w.finish())
             }
             // next_batch reads a cursor itself
-            Rows::Cursor(..) => encode::empty_batch(0),
+            Rows::Cursor(..) => Ok(encode::empty_batch(0)),
         })
     }
 
     fn remaining(st: &State) -> bool {
         match &st.rows {
-            Rows::Select(r, _) => st.pos < r.table.len(),
+            Rows::Select(r, _) => st.pos < r.table().len(),
             Rows::Quads(q, _) => st.pos < q.len(),
             Rows::Cursor(..) => true,
         }
@@ -456,7 +475,13 @@ impl FfiQuery {
             }
             return batch;
         }
-        let batch = self.batch(st, max_rows);
+        let batch = match self.batch(st, max_rows) {
+            Ok(batch) => batch,
+            Err(error) => {
+                *guard = None;
+                return Err(error);
+            }
+        };
         let done = !Self::remaining(st);
         if done {
             *guard = None;

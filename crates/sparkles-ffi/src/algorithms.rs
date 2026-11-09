@@ -57,11 +57,11 @@ fn stats(
     let prefixes: Vec<_> = prefixes.into_iter().collect();
     let (query, _) = sparkles::sparql::algorun::query_text(&req, &prefixes, true)?;
     let result = sparkles::sparql::query(snap, &query, &options(ds, opts, op))?;
-    let text = result
-        .rows()
-        .into_iter()
+    let rows = result.rows()?;
+    let text = rows
+        .iter()
         .next()
-        .and_then(|row| row.into_iter().next().flatten())
+        .and_then(|row| row.values().first().cloned().flatten())
         .map(|term| match term {
             oxrdf::Term::Literal(l) => l.value().to_string(),
             t => t.to_string(),
@@ -246,7 +246,10 @@ mod tests {
             .ds
             .query("SELECT (COUNT(*) AS ?n) { GRAPH <urn:out> { ?s <urn:rank> ?o } }")
             .unwrap();
-        result.rows()[0][0].as_ref().unwrap().to_string()
+        result.rows().unwrap().row(0).unwrap().values()[0]
+            .as_ref()
+            .unwrap()
+            .to_string()
     }
     #[test]
     fn stats_honours_dataset_override_of_standard_prefix() {
@@ -272,11 +275,12 @@ mod tests {
                 .contains("<urn:p>")
         );
         let expected: serde_json::Value = serde_json::from_str(
-            &ds.inner
+            ds.inner
                 .ds
                 .algorithms()
                 .stats(&req, &QueryOptions::default())
-                .unwrap(),
+                .unwrap()
+                .as_str(),
         )
         .unwrap();
         assert_eq!(expected["nodes"], 5);

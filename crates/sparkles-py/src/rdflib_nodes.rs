@@ -259,7 +259,7 @@ impl PyRdflibNodes {
         py: Python<'py>,
         solutions: &PyQuerySolutions,
     ) -> PyResult<Option<Bound<'py, PyList>>> {
-        let batch = solutions.take_batch(py);
+        let batch = solutions.take_batch(py)?;
         if batch.is_empty() {
             return Ok(None);
         }

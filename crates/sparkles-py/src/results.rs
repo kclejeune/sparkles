@@ -247,23 +247,24 @@ pub struct PyQuerySolutions {
 impl PyQuerySolutions {
     /// The next batch of rows, empty once all have been handed out (`sparkles.rdflib`
     /// converts whole batches).
-    pub(crate) fn take_batch(&self, py: Python<'_>) -> Vec<Vec<Option<Term>>> {
+    pub(crate) fn take_batch(&self, py: Python<'_>) -> PyResult<Vec<Vec<Option<Term>>>> {
         {
             let mut st = self.state.lock().unwrap();
             if !st.buf.is_empty() {
-                return st.buf.drain(..).collect();
+                return Ok(st.buf.drain(..).collect());
             }
         }
         py.detach(|| {
             let mut st = self.state.lock().unwrap();
-            fill_solutions(&mut st);
-            st.buf.drain(..).collect()
+            fill_solutions(&mut st)?;
+            Ok(st.buf.drain(..).collect())
         })
+        .py(py)
     }
 
     pub fn new(result: QueryResult) -> PyQuerySolutions {
         PyQuerySolutions {
-            vars: result.vars.clone().into(),
+            vars: result.variables().to_vec().into(),
             state: Mutex::new(SolState {
                 result: Some(result),
                 row: 0,
@@ -288,24 +289,26 @@ impl PyQuerySolutions {
         slf
     }
 
-    fn __next__(&self, py: Python<'_>) -> Option<PyQuerySolution> {
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyQuerySolution>> {
         // as for quads, only a refill gives up the GIL
         let ready = self.state.lock().unwrap().buf.pop_front();
         if let Some(values) = ready {
-            return Some(PyQuerySolution {
+            return Ok(Some(PyQuerySolution {
                 vars: self.vars.clone(),
                 values,
-            });
+            }));
         }
-        let values = py.detach(|| {
-            let mut st = self.state.lock().unwrap();
-            fill_solutions(&mut st);
-            st.buf.pop_front()
-        })?;
-        Some(PyQuerySolution {
+        let values = py
+            .detach(|| {
+                let mut st = self.state.lock().unwrap();
+                fill_solutions(&mut st)?;
+                Ok(st.buf.pop_front())
+            })
+            .py(py)?;
+        Ok(values.map(|values| PyQuerySolution {
             vars: self.vars.clone(),
             values,
-        })
+        }))
     }
 
     /// Write the solutions as SPARQL results in `format` (`json`, `xml`, `csv` or `tsv`,
@@ -346,20 +349,19 @@ impl PyQuerySolutions {
 }
 
 /// Decode the next batch of rows into an empty buffer.
-fn fill_solutions(st: &mut SolState) {
+/// The rows are decoded under the result's own memory budget, which can refuse.
+fn fill_solutions(st: &mut SolState) -> sparkles::Result<()> {
     if st.buf.is_empty()
         && let Some(r) = &st.result
     {
-        let end = (st.row + BATCH).min(r.table.len());
-        for i in st.row..end {
-            st.buf.push_back(
-                (0..r.table.width())
-                    .map(|c| r.term(r.table.get(i, c)))
-                    .collect(),
-            );
+        let end = (st.row + BATCH).min(r.table().len());
+        let rows = r.rows_range(st.row..end)?;
+        for i in 0..rows.len() {
+            st.buf.push_back(rows.row(i)?.values().to_vec());
         }
         st.row = end;
     }
+    Ok(())
 }
 
 /// One solution: a tuple of terms (`None` for unbound variables) that also maps

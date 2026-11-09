@@ -893,9 +893,9 @@ fn quad_pattern(v: &Value) -> sparkles::Result<QuadPattern> {
 /// The rows `query_result_row` gives for a result.
 fn query_result_len(r: &QueryResult) -> usize {
     if r.kind == QueryKind::Select {
-        r.table.len()
+        r.table().len()
     } else {
-        r.triples.len() + r.quads.len()
+        r.triples().len() + r.quads().len()
     }
 }
 /// A quad as the four cells of a wire row: subject, predicate, object and graph.
@@ -913,21 +913,24 @@ fn quad_cells(q: oxrdf::Quad) -> Vec<Option<Cell>> {
     ]
 }
 
-fn query_result_row(r: &QueryResult, pos: usize) -> Option<Vec<Option<Cell>>> {
-    if r.kind == QueryKind::Select {
-        if pos < r.table.len() {
+/// A SELECT row is decoded under the result's own memory budget, which can refuse.
+/// Graph rows are application copies of the result's triples and quads.
+fn query_result_row(r: &QueryResult, pos: usize) -> sparkles::Result<Option<Vec<Option<Cell>>>> {
+    let triples = r.triples();
+    Ok(if r.kind == QueryKind::Select {
+        if pos < r.table().len() {
             Some(
-                r.table
-                    .row(pos)
+                r.row(pos)?
+                    .values()
                     .iter()
-                    .map(|id| r.term(*id).map(Cell::Term))
+                    .map(|term| term.clone().map(Cell::Term))
                     .collect(),
             )
         } else {
             None
         }
-    } else if pos < r.triples.len() {
-        let t = &r.triples[pos];
+    } else if pos < triples.len() {
+        let t = &triples[pos];
         Some(quad_cells(oxrdf::Quad::new(
             t.subject.clone(),
             t.predicate.clone(),
@@ -935,10 +938,10 @@ fn query_result_row(r: &QueryResult, pos: usize) -> Option<Vec<Option<Cell>>> {
             oxrdf::GraphName::DefaultGraph,
         )))
     } else {
-        r.quads
-            .get(pos - r.triples.len())
+        r.quads()
+            .get(pos - triples.len())
             .map(|q| quad_cells(q.clone()))
-    }
+    })
 }
 
 /// One batch of a result in the binary form of `wire`, or `None` once it is drained.
@@ -1024,8 +1027,9 @@ fn pull(
                     Some(batch) => {
                         let row = batch
                             .row(state.row)?
-                            .into_iter()
-                            .map(|term| term.map(Cell::Term))
+                            .values()
+                            .iter()
+                            .map(|term| term.clone().map(Cell::Term))
                             .collect();
                         state.row += 1;
                         Some(row)
@@ -1054,8 +1058,8 @@ fn pull(
                 None
             }
             Rows::Scan(_) => unreachable!("scans are read above"),
-            Rows::Query(r) => query_result_row(r, c.pos),
-            Rows::Collected(r) => query_result_row(r.result(), c.pos),
+            Rows::Query(r) => query_result_row(r, c.pos)?,
+            Rows::Collected(r) => query_result_row(r.result(), c.pos)?,
         };
         let Some(row) = row else {
             drained = true;
@@ -1216,11 +1220,11 @@ impl NativeResult {
         };
         let metadata = json!({
             "type": kind,
-            "variables": result.vars,
+            "variables": result.variables(),
             "size": result.len(),
             "value": result.boolean,
             "timing": result.timing,
-            "plan": result.plan,
+            "plan": result.plan(),
             "memoryPeakBytes": result.mem_peak_bytes.to_string(),
             "rowsProduced": result.rows_produced.to_string(),
         })
@@ -1254,7 +1258,7 @@ impl NativeResult {
                     } else {
                         "quads"
                     },
-                    r.vars.clone(),
+                    r.variables().to_vec(),
                     (r.kind == QueryKind::Ask).then_some(r.boolean),
                 )
             }
