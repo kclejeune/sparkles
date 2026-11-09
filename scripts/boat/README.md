@@ -85,7 +85,8 @@ those limits. systemd unloads a transient unit as soon as it ends successfully, 
 unloaded unit reports default values, which are result `success`, status 0 and no memory
 peaks. Each phase therefore reads its own cgroup's `memory.peak` and `memory.swap.peak`
 just before it writes its result, and records them with the cgroup path. The launcher
-takes the peaks from that record. When the phase could not read them, it takes them from
+takes the peaks from that record only when it names the phase unit's own cgroup and, for
+a unit that is still loaded, the cgroup that unit reports. When the phase could not read them, it takes them from
 the summary that `systemd-run --wait` prints, rounding each size up to the next tenth
 that systemd's truncated text can stand for. For an unloaded unit, the status comes only
 from the exit code of `systemd-run --wait`, which is the unit's own. A unit that is still
@@ -93,7 +94,9 @@ loaded must also report success and status 0, and any peaks it reports must also
 within the limits. A unit that reports no peaks and has neither source is refused with
 `unit_unhealthy:memory_peak_unavailable`. A recovered phase whose unit is already
 unloaded has no exit code and is refused with `unit_unhealthy:unloaded:status_unknown`.
-The kernel limits still bound the few writes that follow the cgroup read.
+The kernel limits still bound the few writes that follow the cgroup read. The launcher
+reads at most 1 MiB from each output stream of a command as it reads it, and kills and
+reaps a command that writes more or outlives its time limit.
 
 Every refusal records a bounded reason code. A refusal of this package keeps its literal
 reason, and any other exception records only its type and the function and line where it

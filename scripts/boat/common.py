@@ -1,6 +1,6 @@
 """Narrow qualification primitives; imports perform no actions."""
 from pathlib import Path
-import hashlib,json,os,re,stat,time
+import hashlib,json,os,re,stat,time,selectors,subprocess
 
 _PROFILE=None
 def bind_profile(p):
@@ -212,8 +212,10 @@ def cgroup_peaks(result,loaded):
     row=result.get('phase_memory') if isinstance(result,dict) else None
     if not isinstance(row,dict) or row.get('source')!='cgroup':return None
     if type(row.get('memory_peak'))is not int or type(row.get('swap_peak'))is not int or row['memory_peak']<0 or row['swap_peak']<0:return None
-    cg=loaded.get('ControlGroup','')
-    if cg and cg!=row.get('cgroup'):return None
+    # The record names the phase unit's own cgroup, and a unit that is still loaded
+    # must report that same cgroup.
+    if not isinstance(row.get('cgroup'),str) or row['cgroup'].rsplit('/',1)[-1]!=result.get('unit'):return None
+    if loaded.get('LoadState')!='not-found' and loaded.get('ControlGroup')!=row['cgroup']:return None
     return {'source':'cgroup','memory_peak':row['memory_peak'],'swap_peak':row['swap_peak']}
 def terminal_health(result,loaded,closed,run_exit=None,summary=None):
     """Whether a finished phase unit ended healthy, with a bounded reason and its evidence.
@@ -241,3 +243,29 @@ def terminal_health(result,loaded,closed,run_exit=None,summary=None):
     if max(peaks['memory_peak'],evidence.get('unit_MemoryPeak',0))>MEMORY:return False,'unit_unhealthy:memory_peak_over_cap',evidence
     if max(peaks['swap_peak'],evidence.get('unit_MemorySwapPeak',0))!=0:return False,'unit_unhealthy:swap_used',evidence
     return True,None,evidence
+
+def bounded_command(argv,limit,capture_stderr=False,cap=1024*1024):
+    """Run one command for at most ``limit`` seconds, reading at most ``cap`` bytes per pipe.
+
+    The bound holds while the pipes are read, so a child that writes more is killed
+    before its output is buffered. A refused or timed-out child is killed and
+    reaped within ten seconds."""
+    child=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL)
+    pipes=[child.stdout]+([child.stderr] if capture_stderr else []);out={id(x):bytearray() for x in pipes};chooser=selectors.DefaultSelector()
+    try:
+        for pipe in pipes:chooser.register(pipe,selectors.EVENT_READ)
+        end=time.monotonic()+limit
+        while chooser.get_map():
+            left=end-time.monotonic()
+            if left<=0:raise subprocess.TimeoutExpired(argv,limit)
+            for key,_ in chooser.select(left):
+                chunk=os.read(key.fd,65536)
+                if not chunk:chooser.unregister(key.fileobj);continue
+                need(len(out[id(key.fileobj)])+len(chunk)<=cap,'output bound');out[id(key.fileobj)]+=chunk
+        child.wait(max(0.001,end-time.monotonic()))
+    except BaseException:
+        child.kill();child.wait(10);raise
+    finally:
+        chooser.close()
+        for pipe in pipes:pipe.close()
+    return subprocess.CompletedProcess(argv,child.returncode,bytes(out[id(child.stdout)]),bytes(out[id(child.stderr)]) if capture_stderr else None)

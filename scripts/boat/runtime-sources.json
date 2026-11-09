@@ -1,14 +1,14 @@
 {
   "files": {
     "README.md": {
-      "bytes": 18074,
+      "bytes": 18349,
       "mode": 420,
-      "sha256": "c5d7b63477f94de99d2e2357b1fe3313179722af2072b73368e56db9d89a7493"
+      "sha256": "f095b5751c784d82645983616224b92b2b18e03b77c3746c0ece743e7df5c933"
     },
     "common.py": {
-      "bytes": 17998,
+      "bytes": 19781,
       "mode": 420,
-      "sha256": "7ffa528eccb8fb177897ee53f210c27146cf5a21bfc5c3f1d587f05480e4ba82"
+      "sha256": "afd9f785862b57be5a94133ec263a5eb6d11968d0ccd838c36bf7a46f87ab04e"
     },
     "config_schema.py": {
       "bytes": 3632,
@@ -21,9 +21,9 @@
       "sha256": "3bf5c538ebc95c18c70abf29d33e140348d1297f83d322131b38ba8ec2b5508f"
     },
     "controls.py": {
-      "bytes": 89222,
+      "bytes": 91008,
       "mode": 420,
-      "sha256": "3f0a538266944f47488d96d6e8e2ce8b06345dc86d5d745c0742b2e9a3fb03fd"
+      "sha256": "d19b231d9975ecae4259c6077ff47f9093816ebce4f36d8cdef2784344690712"
     },
     "job-closure.FALSE.json": {
       "bytes": 269,
@@ -61,9 +61,9 @@
       "sha256": "6fb62c219ef554409e319fe061bf1bf4deef683f4b14e9b331cf4500c4777385"
     },
     "remote-launcher.py": {
-      "bytes": 4725,
+      "bytes": 4517,
       "mode": 420,
-      "sha256": "7d61fb6f964a30f8f43da73fa831530aa565ba1a0bb4c02fd434136038834e01"
+      "sha256": "b7eb00539172fb14a961fa442ce1325393d0ca1a781f96a4d43f3d7bffc42ea5"
     },
     "startup-observer.py": {
       "bytes": 19932,

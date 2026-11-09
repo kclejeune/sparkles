@@ -939,18 +939,25 @@ class Controls(unittest.TestCase):
                     home=Path(d).resolve()/'home';(home/'.local/state/sparkles-boat').mkdir(parents=True)
                     source=input_bytes.decode().replace('/home/worker-fixture',str(home))
                     calls=[]
-                    def run(argv,**kw):
-                        calls.append(argv[0])
-                        if argv[0]=='systemctl':
-                            text='LoadState=not-found\nActiveState=inactive\nMainPID=0\n' if calls.count('systemctl')==1 and not recover else (shown if shown is not None else case.OP3_UNLOADED)
-                            return __import__('subprocess').CompletedProcess(argv,0,text.encode(),None)
-                        case.assertEqual(argv[0],'systemd-run');payload=json.loads(argv[-1])
-                        body={'program_sha256':payload['program_sha256'],'phase':payload['phase'],'unit':payload['operation_tag']+'-'+payload['phase']+'.service','startup_closed':True,'qualified':True,'engine_or_job_started':False}
-                        if phase_memory is not None:body['phase_memory']=phase_memory
-                        write_new(Path(payload['result_directory']),'probe-result.json',body)
-                        return __import__('subprocess').CompletedProcess(argv,run_exit,b'{}',summary)
+                    class Child:
+                        # Real pipes carry the faked output through the launcher's bounded reader.
+                        def __init__(self,argv,stdin=None,stdout=None,stderr=None):
+                            calls.append(argv[0])
+                            if argv[0]=='systemctl':
+                                text='LoadState=not-found\nActiveState=inactive\nMainPID=0\n' if calls.count('systemctl')==1 and not recover else (shown if shown is not None else case.OP3_UNLOADED)
+                                out,err,self.code=text.encode(),b'',0
+                            else:
+                                case.assertEqual(argv[0],'systemd-run');payload=json.loads(argv[-1])
+                                body={'program_sha256':payload['program_sha256'],'phase':payload['phase'],'unit':payload['operation_tag']+'-'+payload['phase']+'.service','startup_closed':True,'qualified':True,'engine_or_job_started':False}
+                                if phase_memory is not None:body['phase_memory']=phase_memory
+                                write_new(Path(payload['result_directory']),'probe-result.json',body);out,err,self.code=b'{}',summary,run_exit
+                            self.stdout=self.pipe(out);self.stderr=self.pipe(err) if stderr==__import__('subprocess').PIPE else None;self.returncode=None
+                        def pipe(self,data):
+                            r,w=os.pipe();os.write(w,data);os.close(w);return os.fdopen(r,'rb')
+                        def wait(self,timeout=None):self.returncode=self.code;return self.code
+                        def kill(self):pass
                     printed=[]
-                    with patch('subprocess.run',side_effect=run),patch('os.getuid',return_value=1000),patch('pathlib.Path.home',return_value=home),patch('builtins.print',side_effect=lambda x:printed.append(x)):
+                    with patch('subprocess.Popen',Child),patch('os.getuid',return_value=1000),patch('pathlib.Path.home',return_value=home),patch('builtins.print',side_effect=lambda x:printed.append(x)):
                         if recover:
                             tag=json.loads(ast.literal_eval([n.value for n in ast.parse(source).body if isinstance(n,ast.Assign) and n.targets[0].id=='PAYLOAD'][0]))['operation_tag']
                             op=home/'.local/state/sparkles-boat'/('qualification-'+tag+'-'+phase);op.mkdir(mode=0o700)
@@ -973,6 +980,11 @@ class Controls(unittest.TestCase):
             body=self.run_generated_launcher(phase,{'source':'unavailable','reason_code':'refusal:phase unit cgroup'},summary)['body']
             self.assertNotIn('reason_code',body,phase);self.assertEqual(body['terminal_evidence']['source'],'systemd_run_summary')
             self.assertEqual(body['terminal_evidence']['memory_peak'],223*1024*1024//10)
+    def test_loaded_unit_with_empty_or_missing_cgroup_does_not_take_a_record(self):
+        good={'source':'cgroup','cgroup':'/x/boat-owned-warm-qual-inert-startup.service','memory_peak':1,'swap_peak':0}
+        for shown in ['LoadState=loaded\nActiveState=inactive\nMainPID=0\nControlGroup=\nResult=success\nExecMainStatus=0\nMemoryPeak=[not set]\nMemorySwapPeak=[not set]\n',
+                      'LoadState=loaded\nActiveState=inactive\nMainPID=0\nResult=success\nExecMainStatus=0\nMemoryPeak=[not set]\nMemorySwapPeak=[not set]\n']:
+            body=self.run_generated_launcher('startup',good,shown=shown)['body'];self.assertEqual(body['reason_code'],'unit_unhealthy:memory_peak_unavailable')
     def test_op3_unloaded_unit_without_either_source_still_refuses(self):
         for phase in ('startup','metadata','stopcheck'):
             for memory,summary in [(None,b''),({'source':'unavailable','reason_code':'refusal:phase memory peaks'},b'Memory peak: 22.2M\n'),({'source':'cgroup','cgroup':'/x','memory_peak':'1','swap_peak':0},b'')]:
@@ -986,25 +998,31 @@ class Controls(unittest.TestCase):
         for code in ('unit_unhealthy:unloaded:exit-1','unit_unhealthy:unloaded:status_unknown','unit_unhealthy:swap_used','unit_unhealthy:memory_peak_over_cap'):self.assertEqual(c.remote_reason(code),code)
     def test_terminal_health_peaks_bounds_and_loaded_units(self):
         unloaded=c.props(self.OP3_UNLOADED);cg={'source':'cgroup','cgroup':'/a/u.service','memory_peak':MEMORY,'swap_peak':0}
-        self.assertTrue(terminal_health({'phase_memory':cg},unloaded,True,0)[0])
-        self.assertEqual(terminal_health({'phase_memory':dict(cg,memory_peak=MEMORY+1)},unloaded,True,0)[1],'unit_unhealthy:memory_peak_over_cap')
-        self.assertEqual(terminal_health({'phase_memory':dict(cg,swap_peak=4096)},unloaded,True,0)[1],'unit_unhealthy:swap_used')
-        self.assertEqual(terminal_health({'phase_memory':cg},unloaded,False,0)[1],'unit_unhealthy:open')
+        real=terminal_health
+        def health(result,*rest):return real(dict(result,unit='u.service'),*rest)
+        self.assertTrue(health({'phase_memory':cg},unloaded,True,0)[0])
+        self.assertEqual(health({'phase_memory':dict(cg,memory_peak=MEMORY+1)},unloaded,True,0)[1],'unit_unhealthy:memory_peak_over_cap')
+        self.assertEqual(health({'phase_memory':dict(cg,swap_peak=4096)},unloaded,True,0)[1],'unit_unhealthy:swap_used')
+        self.assertEqual(health({'phase_memory':cg},unloaded,False,0)[1],'unit_unhealthy:open')
         # systemd truncates to one decimal, so 512.0M may stand for more than the cap.
-        self.assertEqual(terminal_health({},unloaded,True,0,'Memory peak: 512.0M (swap: 0B)')[1],'unit_unhealthy:memory_peak_over_cap')
-        self.assertTrue(terminal_health({},unloaded,True,0,'Memory peak: 511.9M (swap: 0B)')[0])
-        self.assertEqual(terminal_health({},unloaded,True,0,'Memory peak: 1.0M (swap: 0.1K)')[1],'unit_unhealthy:swap_used')
-        self.assertEqual(terminal_health({},unloaded,True,0,'Memory peak: 3.5B (swap: 0B)')[1],'unit_unhealthy:memory_peak_unavailable')
+        self.assertEqual(health({},unloaded,True,0,'Memory peak: 512.0M (swap: 0B)')[1],'unit_unhealthy:memory_peak_over_cap')
+        self.assertTrue(health({},unloaded,True,0,'Memory peak: 511.9M (swap: 0B)')[0])
+        self.assertEqual(health({},unloaded,True,0,'Memory peak: 1.0M (swap: 0.1K)')[1],'unit_unhealthy:swap_used')
+        self.assertEqual(health({},unloaded,True,0,'Memory peak: 3.5B (swap: 0B)')[1],'unit_unhealthy:memory_peak_unavailable')
         # The last summary line counts, and a cgroup read wins over the summary.
-        self.assertEqual(terminal_health({},unloaded,True,0,'Memory peak: 1.0M (swap: 0B)\nMemory peak: 600.0M (swap: 0B)')[1],'unit_unhealthy:memory_peak_over_cap')
-        self.assertTrue(terminal_health({'phase_memory':dict(cg,memory_peak=1)},unloaded,True,0,'Memory peak: 600.0M (swap: 0B)')[0])
+        self.assertEqual(health({},unloaded,True,0,'Memory peak: 1.0M (swap: 0B)\nMemory peak: 600.0M (swap: 0B)')[1],'unit_unhealthy:memory_peak_over_cap')
+        self.assertTrue(health({'phase_memory':dict(cg,memory_peak=1)},unloaded,True,0,'Memory peak: 600.0M (swap: 0B)')[0])
         loaded={'LoadState':'loaded','ActiveState':'inactive','MainPID':'0','ControlGroup':'/a/u.service','Result':'success','ExecMainStatus':'0','MemoryPeak':'1000','MemorySwapPeak':'0'}
-        ok,code,evidence=terminal_health({'phase_memory':dict(cg,memory_peak=10)},loaded,True,None);self.assertTrue(ok);self.assertEqual(evidence['terminal_source'],'unit')
-        self.assertEqual(terminal_health({'phase_memory':dict(cg,memory_peak=10)},dict(loaded,MemoryPeak=str(MEMORY+1)),True,None)[1],'unit_unhealthy:memory_peak_over_cap')
-        self.assertEqual(terminal_health({'phase_memory':dict(cg,memory_peak=10)},dict(loaded,MemorySwapPeak='1'),True,None)[1],'unit_unhealthy:swap_used')
-        self.assertEqual(terminal_health({'phase_memory':cg},dict(loaded,Result='exit-code',ExecMainStatus='1'),True,0)[1],'unit_unhealthy:exit-code:1')
-        # A cgroup read bound to another cgroup than the loaded unit's does not count.
-        self.assertEqual(terminal_health({'phase_memory':dict(cg,cgroup='/other.service')},dict(loaded,MemoryPeak='[not set]'),True,None)[1],'unit_unhealthy:memory_peak_unavailable')
+        ok,code,evidence=health({'phase_memory':dict(cg,memory_peak=10)},loaded,True,None);self.assertTrue(ok);self.assertEqual(evidence['terminal_source'],'unit')
+        self.assertEqual(health({'phase_memory':dict(cg,memory_peak=10)},dict(loaded,MemoryPeak=str(MEMORY+1)),True,None)[1],'unit_unhealthy:memory_peak_over_cap')
+        self.assertEqual(health({'phase_memory':dict(cg,memory_peak=10)},dict(loaded,MemorySwapPeak='1'),True,None)[1],'unit_unhealthy:swap_used')
+        self.assertEqual(health({'phase_memory':cg},dict(loaded,Result='exit-code',ExecMainStatus='1'),True,0)[1],'unit_unhealthy:exit-code:1')
+        # A cgroup read bound to another cgroup than the loaded unit's does not count,
+        # nor does one when the loaded unit reports no cgroup, nor one naming another unit.
+        for row,shown in [(dict(cg,cgroup='/other.service'),dict(loaded,MemoryPeak='[not set]')),(dict(cg,cgroup='/another-unit.service'),dict(loaded,ControlGroup='',MemoryPeak='[not set]')),
+                          (cg,{k:v for k,v in loaded.items() if k not in ('ControlGroup','MemoryPeak')}),(dict(cg,cgroup='/a/other.service'),unloaded),(dict(cg,cgroup=None),unloaded)]:
+            self.assertEqual(health({'phase_memory':row},shown,True,0)[1],'unit_unhealthy:memory_peak_unavailable',row)
+        self.assertEqual(real({'phase_memory':cg},unloaded,True,0)[1],'unit_unhealthy:memory_peak_unavailable')
     def test_own_cgroup_memory_reads_the_phase_unit_only(self):
         f=OBSERVER['own_cgroup_memory']
         with tempfile.TemporaryDirectory() as d:

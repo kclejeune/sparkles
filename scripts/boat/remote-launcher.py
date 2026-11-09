@@ -13,9 +13,7 @@ def launch():
     parent=Path.home()/'.local/state/sparkles-boat';need(parent.resolve()==parent,'remote state directory')
     operation=parent/('qualification-'+tag+'-'+phase)
     program=base64.b64decode(CODE).decode();program_sha=digest(program.encode())
-    def command(argv,limit=15,summary=False):
-        r=subprocess.run(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE if summary else subprocess.DEVNULL,timeout=limit)
-        need(len(r.stdout)<=1024*1024 and len(r.stderr or b'')<=1024*1024,'output bound');return r
+    def command(argv,limit=15,summary=False):return bounded_command(argv,limit,summary)
     def show():
         r=command(['systemctl','--user','show',unit,'--property=LoadState,ActiveState,MainPID,ControlGroup,InvocationID,ExecMainStatus,MemoryPeak,MemorySwapPeak,Result'])
         need(r.returncode==0,'unit metadata unavailable')

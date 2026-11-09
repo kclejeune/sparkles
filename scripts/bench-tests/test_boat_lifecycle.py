@@ -756,6 +756,28 @@ class JobClosureProgram(unittest.TestCase):
         lock.unlink();env.release_job_locks()
 
 
+class BoundedCommand(unittest.TestCase):
+    """The launcher's command reader with real local children."""
+    def test_output_over_the_cap_is_refused_before_the_child_finishes(self):
+        import common,subprocess,time
+        with tempfile.TemporaryDirectory() as d:
+            done=Path(d)/'finished'
+            script="import os,sys\nfor _ in range(256):os.write(2,b'x'*65536)\nopen(%r,'w').close()"%str(done)
+            started=time.monotonic()
+            with self.assertRaises(common.Refusal) as caught:common.bounded_command([sys.executable,'-I','-c',script],30,True)
+            self.assertEqual(str(caught.exception),'output bound');self.assertLess(time.monotonic()-started,15)
+            time.sleep(0.2);self.assertFalse(done.exists())
+            with self.assertRaises(common.Refusal):common.bounded_command([sys.executable,'-I','-c',"import os\nfor _ in range(32):os.write(1,b'y'*65536)"],30)
+    def test_timeout_kills_the_child_and_output_is_returned(self):
+        import common,subprocess,time
+        started=time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):common.bounded_command([sys.executable,'-I','-c','import time;time.sleep(30)'],1,True)
+        self.assertLess(time.monotonic()-started,12)
+        r=common.bounded_command([sys.executable,'-I','-c',"import sys;sys.stdout.write('out');sys.stderr.write('Memory peak: 2.2M (swap: 0B)');raise SystemExit(3)"],30,True)
+        self.assertEqual((r.returncode,r.stdout,r.stderr),(3,b'out',b'Memory peak: 2.2M (swap: 0B)'))
+        r=common.bounded_command([sys.executable,'-I','-c',"import sys;sys.stderr.write('ignored')"],30);self.assertIsNone(r.stderr)
+
+
 class ProviderSessionTrees(unittest.TestCase):
     """The session allowance against the trees observed on bx_gy2ytgh8."""
     def setUp(self):
