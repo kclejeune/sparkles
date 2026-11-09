@@ -1434,46 +1434,62 @@ preparation. Guarded Dataset queries and U02 readers still adopt them under item
 
 ### Ingestion into claim proposals
 
-This section is the recommended contract for roadmap item 651 and awaits the
-maintainer's approval. Nothing in it is implemented. C18 §7 defines ingestion only into
-asserted memory, and this specification does not say how an ingestion becomes an
-evidence batch, so each decision below states the recommended behaviour and the
-strongest alternative that was rejected. The current modes of C18 §7.7 keep their
-behaviour, and `branch` stays the default.
+This section is the contract for roadmap item 651. C18 §7 defines ingestion only into
+asserted memory, and this specification did not say how an ingestion becomes an
+evidence batch, so each decision below states the adopted behaviour and the strongest
+alternative that was rejected. The current modes of C18 §7.7 keep their behaviour, and
+`branch` stays the default.
 
 #### Mode and arguments
 
 `POST /$/ingest/{ds}` and `sparkles ingest --mode` accept a fifth mode, `claims`. A
-claims ingestion converts the document, extracts and links its facts as the other
-modes do, and publishes everything it records through one call of
-`sparkles::evidence::propose` on the selected branch. It creates no review branch and
-merges nothing, because the review policy decides what is projected. The `branch`
-option names an existing branch for the proposal, and `main` is used when it is
-absent. The `source` option still extracts a registered source instead of a document.
+claims ingestion converts and registers the document as the other modes do, extracts
+and links its facts, and publishes the registration and the evidence batch in one
+commit. The extracted facts become claim proposals instead of asserted memory. The
+mode creates no review branch and merges nothing, because the review policy decides
+what is projected. The `branch` option names an existing branch for the commit, and
+`main` is used when it is absent. The `source` option still extracts a registered
+source instead of a document.
 
 Two new options, `sourceGraph` and `proposalGraph`, choose the evidence graphs when
-the settings name several, as `POST /{ds}/claims` does. The `graph` option names an
-ordinary source graph and is refused with `bad-argument` in claims mode. The mode needs
-no `admin` grant, unlike `auto`, because it asserts nothing.
+the settings name several, as `POST /{ds}/claims` does. The `graph` option names the
+ordinary source graph of C18 §7.2, as in the other modes, and a graph that the
+managed-graph registry protects is refused with `profile-managed-graph`. The mode needs
+no `admin` grant, unlike `auto`, because it asserts no extracted fact.
 
 The rejected alternative is a `claims` flag that combines with `branch`, `preview` and
 `auto`. A review branch and its merge preview would review the batch a second time,
 and the confidence threshold of `auto` would decide admission in place of the policy.
 
-#### One batch and nothing else
+#### One commit for the source and the batch
 
-A claims ingestion writes exactly one commit, the evidence owner's commit of the batch.
-It writes no C18 source graph, chunk, branch or `assert_facts` call. A refusal at any
-step therefore leaves nothing behind except the orphan hold that the proposal writer
-already reconciles. A document ingested this way is consequently not reached by
-`read_chunks`, full-text search or embeddings, and recall reaches its occurrences only
-through the claims section that item 650 defines. A `source` run reads a source that
-is already registered, so that source keeps its C18 records.
+A claims ingestion still writes the C18 source graph of §7.2, with its source,
+rendition and chunks under the same `keepText` rules as asserted mode, so the document
+stays visible to `read_chunks`, full-text search and embeddings. Only the extracted
+facts change their form. The registration and the evidence batch publish in the same
+commit, so a reader sees either both or neither.
 
-The rejected alternative registers the document with `register_converted` in an
-ordinary graph and then proposes the claims. That takes two commits, so a refused batch
-would leave the registration behind, and the chunks would put unreviewed source text
-into the graphs that ordinary recall reads as memory.
+The pipeline plans the registration at the branch head without writing it, which gives
+its inserted and deleted quads and the head they were read at. `propose` then takes
+those quads as ordinary changes of its own transaction, with `ifHead` set to that head,
+the caller's write view and the dataset's guard. It refuses ordinary changes in any
+graph that the managed-graph registry protects, for any owner, before it publishes, so
+the evidence owner's capability cannot carry a write into another owner's graph or into
+an evidence graph outside the typed records. When the head has moved, the registration
+is planned again at the new head, up to three times, and the run then answers
+`head-changed`. Planning reads no model, so a retry costs no tokens. An idempotent
+replay of the batch writes nothing, because its first publication carried the
+registration. When the same text is already registered, as after an asserted
+ingestion of the same document, the registration has no changes and the commit holds
+the batch alone.
+
+A `source` run reads a source that is already registered, so its commit holds the batch
+alone, and the source keeps its C18 records.
+
+The rejected alternative writes the registration and the batch in two commits, in either
+order. Between them a reader could see a registered source without its proposals or
+proposals whose source text is missing, and a crash or a refusal of the second commit
+would leave that state behind until a retry repaired it.
 
 #### Records of the batch
 
@@ -1482,23 +1498,27 @@ references, the claims and one evidence link per claim.
 
 | Record | Content |
 |---|---|
-| Source revision | The source is the request's `iri`, its http or https URL, or for a `source` run the registered source's IRI. Otherwise it is a name-based UUID of the dataset and the document's digest, so that the same document names the same source. The content is the original bytes' digest, metadata only, and an http or https URL is a locator. |
-| Rendition | The converted, normalized text, with the conversion recorded as a method named by the format and the server version. A `source` run uses the text of the source's current rendition. |
-| Passage and reference | One passage per distinct span of the extracted facts, with its text digest and the quote that asserted mode would write, and one evidence reference to it. |
+| Source revision | Its source is the IRI that the registration gives the C18 source, or for a `source` run the registered source's IRI. Its content is the digest of the original bytes, metadata only, and an http or https URL is a locator. |
+| Rendition | Its occurrence key is the C18 rendition IRI, and the conversion is a method named by the format and the server version. The batch carries the converted text so that the passages are verified, and the record keeps only the text's digest. A `source` run uses the text of the source's current rendition. |
+| Passage and reference | One passage per distinct span of the extracted facts, quoting the exact selected text, and one evidence reference to it. |
 | Claim | One `ev:Reported`, `ev:Positive` occurrence per extracted fact, attributed to the source and derived from the revision. A reported confidence becomes `ev:extractionConfidence` on the zero-to-one scale, evaluated by the extraction model. |
 | Evidence link | `ev:Supports` from the fact's passage reference to its claim, attributed to the extraction model. |
 
-The passages are verified against the batch's own rendition text, which avoids the
-`incomplete-evidence` answer of proposal decision 1. A dataset whose ingestion settings
-set `keepText: false` refuses claims mode with `bad-argument`, because its passages
-could not be verified without the text. The extraction model and the converter remain
-attributed metadata, and the authenticated caller is the operation's principal, as §5
-requires.
+`sparkles_core::evidence::RenditionContent` gains a `VerifiedText` variant for this
+rendition. Preparation verifies the batch's passages against its text exactly as it does
+for normalized text, and the writer records it as a metadata-only rendition with the
+text's digest, so its record and its record digest equal those of a metadata-only
+rendition. The text therefore lives only in the C18 chunks, and only when `keepText`
+keeps it. A dataset with `keepText: false` still verifies every passage in the batch.
+Only a `source` run of such a dataset cannot read any text, and it answers `no-text` as
+the other modes do. The extraction model and the converter remain attributed metadata,
+and the authenticated caller is the operation's principal, as §5 requires.
 
-The rejected alternative retains the original bytes in the revision. A 10 MiB PDF then
-becomes about 13 MiB of base64 beside its text, which would exceed the 16 MiB batch
-bound of §8 together with the rendition, and C18's `keepText` already governs the text
-alone.
+The rejected alternative records the rendition with `ev:normalizedText`. It would keep
+a second copy of up to 2 MiB of text beside the chunks, and with `keepText: false` it
+would retain the text that the dataset's setting excludes. Retaining the original bytes
+in the revision was rejected too. A 10 MiB PDF becomes about 13 MiB of base64, which
+would exceed the 16 MiB batch bound of §8.
 
 #### Entities
 
@@ -1518,16 +1538,20 @@ That needs a second commit and asserts extracted content before any review.
 
 The profile's term checks and the span check of C18 §7.6 run as they do for asserted
 facts, and a fact that fails them is reported in `failed` and left out of the batch.
-The guard dry run of C18 §7.7 is not run, because no fact is asserted, and the result
-reports `guard: "not-run"`. The rejected alternative runs `assert_facts` as a dry run
-for advisory guard findings. That needs update grants on an ordinary graph that the
-ingestion never writes.
+The commit passes the dataset's guard as a registration does in the other modes. The
+guard dry run of the extracted facts in C18 §7.7 is not run, because no fact is
+asserted, and the result reports `factGuard: "not-run"`. The rejected alternative runs
+`assert_facts` as a dry run of the facts against the source graph. Its findings would
+describe triples that are never asserted, and a reader could take them for findings of
+a later projection.
 
 #### Grants and settings
 
 Before conversion or any model call, the pipeline checks from the grants alone that the
-caller has `write` on the dataset or branch and update grants on the source-record and
-proposal graphs it will write, and that the evidence settings are enabled. A caller
+caller has `write` on the dataset or branch and update grants on the C18 source graph
+and on the source-record and proposal graphs it will write, and that the evidence
+settings are enabled. A claims ingestion also needs a provider in the `extract` role,
+and without one it answers `no-model` before anything is converted. A caller
 without them is refused as `POST /{ds}/claims` refuses it, and no tokens are spent.
 `propose` checks again at publication.
 
@@ -1539,12 +1563,18 @@ after the extraction's model calls had been spent.
 Every claims ingestion carries the idempotency key
 `ingest-claims:<revision digest>:<rendition digest>:<profile>`. Before extraction the
 pipeline derives the operation IRI of that key for the caller with `operation_iri` and
-looks for it in the record graphs. When it is found, the result is `already-proposed`
-with the first receipt, and no model is called. A model's extraction is not
+looks for it in the record graphs of the selected branch. When it is found, the result
+is `already-proposed` with the first operation, and nothing is extracted or written, so
+no model is called. The C18 chunks of that first ingestion are already present, since
+they published in its commit. A model's extraction is not
 deterministic, so without this check a second run would send another payload under the
 same key and answer `idempotency-conflict`. Two concurrent runs of the same revision can
 still both extract, and the second then answers `idempotency-conflict` and writes
 nothing.
+
+A document whose chunks exist because an asserted ingestion registered the same text
+has no such operation. Its claims ingestion extracts the facts and publishes the batch,
+and the registration contributes no change to that commit.
 
 The rejected alternative omits the key and relies on deterministic record identities
 and the writer's `existing` flag. A second extraction that differs would add new
@@ -1596,8 +1626,10 @@ typing triple already supplies.
 The task result has `outcome` set to `proposed`, `already-proposed` or `no-facts`, and
 `mode` set to `claims`. A proposed result carries the operation, commit, branch, first
 availability and hold of the receipt, the revision and rendition IRIs, the counts of
-records by kind, the records of the receipt, and the `failed` and `flagged` lists. A run
-that extracts no fact writes nothing and answers `no-facts`. OpenAPI gains the mode, the
+records by kind, the records of the receipt, and the `failed` and `flagged` lists, with
+the registration's members that the other modes report. A run that extracts no fact
+still publishes the registration with a batch of its revision and rendition alone, and
+answers `no-facts`, so that a repeat of it finds its operation. OpenAPI gains the mode, the
 two options and the result schema.
 
 MCP has no tool that starts an ingestion, since `register_converted` is internal and
@@ -1608,7 +1640,9 @@ modes, so the bindings are unchanged.
 #### Acceptance
 
 Router and pipeline tests with a scripted extraction cover a refusal at each step that
-leaves no record, branch or source graph, a caller without `write` or without an update
+leaves no record, branch or source graph, a refusal of the batch at publication that
+also leaves the registration and chunks unwritten, a claims ingestion of a document
+whose chunks an asserted ingestion already wrote, a caller without `write` or without an update
 grant on either evidence graph that spends no model call, a repeated ingestion of the
 same revision that answers `already-proposed` without a model call, a changed revision
 that keeps the earlier occurrences, a `source` run of an instructions document whose
