@@ -27,10 +27,19 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def pinned_mbx(profile):
+    """The physical MBX that mise installs for the pinned version."""
+    return profile['worker_home']+'/.local/share/mise/installs/mr-boxington/'+profile['tool_versions']['mbx']+'/mbx'
+
+
 def environment(profile):
+    # Jobs resolve the pinned MBX install directly and select the pinned Rust
+    # toolchain by name, so neither a missing shim nor the rustup default is used.
     home = profile['worker_home']
-    return {'PATH': ':'.join([home+'/.local/share/mbx/bin', home+'/.local/bin',
+    return {'PATH': ':'.join([home+'/.local/share/mbx/bin', pinned_mbx(profile).removesuffix('/mbx'), home+'/.local/bin',
                              home+'/.cargo/bin', '/usr/local/bin', '/usr/bin', '/bin']),
+            'RUSTUP_TOOLCHAIN': profile['tool_versions']['rust'],
+            'RUSTUP_AUTO_INSTALL': '0',
             'MBX_REMOTE_TOKEN_FILE': home+'/.config/mbx/remote-token'}
 
 

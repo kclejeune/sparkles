@@ -604,7 +604,9 @@ class Controls(unittest.TestCase):
     def test_job_environment_is_only_literal_nonsecret_paths(self):
         from job_environment import environment,environment_body,expected_environment
         p=synthetic_profile();values=environment(p)
-        self.assertEqual(set(values),{'PATH','MBX_REMOTE_TOKEN_FILE'})
+        self.assertEqual(set(values),{'PATH','RUSTUP_TOOLCHAIN','RUSTUP_AUTO_INSTALL','MBX_REMOTE_TOKEN_FILE'})
+        self.assertEqual(values['RUSTUP_TOOLCHAIN'],p['tool_versions']['rust']);self.assertEqual(values['RUSTUP_AUTO_INSTALL'],'0')
+        self.assertIn(p['worker_home']+'/.local/share/mise/installs/mr-boxington/'+p['tool_versions']['mbx'],values['PATH'].split(':'))
         self.assertEqual(values['MBX_REMOTE_TOKEN_FILE'],p['worker_home']+'/.config/mbx/remote-token')
         q={'safe_owner':{'operation_id':'boat-owned-warm-qual-inert'},'local_guard':{'unit':'boat-owned-warm-qual-inert.service'}}
         row=expected_environment(p,q)

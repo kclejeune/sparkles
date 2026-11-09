@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import sys
 import subprocess
@@ -191,6 +192,54 @@ class Admission(unittest.TestCase):
             text=(ROOT/name).read_text()
             with self.subTest(name=name):
                 self.assertNotIn('["expires_at"]-time.time()',text);self.assertIn('rx_runtime',text)
+
+    def fake_worker(self,mbx_version='1.29.1',rustc_version='1.99.1',install_mbx=True):
+        """A fake worker home whose tools are tiny scripts, with the job environment's PATH."""
+        profile=dict(self.fixtures['profile'],worker_home=str(self.root/'home'))
+        home=Path(profile['worker_home']);cargo=home/'.cargo/bin';cargo.mkdir(parents=True)
+        # rustup's proxy reports the pinned toolchain only when RUSTUP_TOOLCHAIN selects it.
+        (cargo/'rustc').write_text('#!/bin/sh\nif [ "$RUSTUP_TOOLCHAIN" = 1.99.1 ]; then echo "rustc '+rustc_version+' (fixture)"; else echo "rustc 1.97.1 (fixture default)"; fi\n')
+        (cargo/'rustc').chmod(0o755)
+        if install_mbx:
+            pinned=home/'.local/share/mise/installs/mr-boxington/1.29.1';pinned.mkdir(parents=True)
+            (pinned/'mbx').write_text('#!/bin/sh\necho "mbx '+mbx_version+'"\n');(pinned/'mbx').chmod(0o755)
+        env=dict(RX.boat_environment.environment(profile),HOME=str(home))
+        # Keep the job's home entries and replace the system ones with awk alone,
+        # so a host-installed mbx or rustc cannot satisfy the check.
+        tools=self.root/'tools';tools.mkdir();(tools/'awk').symlink_to(shutil.which('awk'))
+        env['PATH']=':'.join([d for d in env['PATH'].split(':') if d.startswith(str(home))]+[str(tools)])
+        return profile,env
+
+    def run_tool_check(self,profile,env):
+        # Bash sources a startup file when its stdin is a socket, so the check reads /dev/null.
+        return subprocess.run(['/bin/bash','-c',RX.tool_check(profile)],env=env,stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=10,cwd=env['HOME'])
+
+    def test_job_environment_resolves_pinned_mbx_and_rust(self):
+        profile,env=self.fake_worker()
+        self.assertIn(profile['worker_home']+'/.local/share/mise/installs/mr-boxington/1.29.1',env['PATH'].split(':'))
+        self.assertEqual(env['RUSTUP_TOOLCHAIN'],'1.99.1')
+        result=self.run_tool_check(profile,env);self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+
+    def test_admit_tool_check_refuses_missing_mbx_and_wrong_rustc_clearly(self):
+        cases=[({'install_mbx':False},'mbx is not on the job PATH'),
+               ({'mbx_version':'1.28.0'},'mbx reports 1.28.0, pinned 1.29.1'),
+               ({'rustc_version':'1.97.1'},'rustc reports 1.97.1, pinned 1.99.1')]
+        for kwargs,reason in cases:
+            with self.subTest(reason=reason),tempfile.TemporaryDirectory()as tmp:
+                self.root=Path(tmp);profile,env=self.fake_worker(**kwargs)
+                result=self.run_tool_check(profile,env)
+                self.assertEqual(result.returncode,86,result.stdout+result.stderr)
+                self.assertIn('ADMIT-REFUSAL: '+reason,result.stdout,result.stderr)
+        # Without RUSTUP_TOOLCHAIN the rustup default is reported and refused, never used.
+        with tempfile.TemporaryDirectory()as tmp:
+            self.root=Path(tmp);profile,env=self.fake_worker();env.pop('RUSTUP_TOOLCHAIN')
+            result=self.run_tool_check(profile,env)
+            self.assertIn('ADMIT-REFUSAL: rustc reports 1.97.1, pinned 1.99.1',result.stdout,result.stderr)
+
+    def test_admit_reports_the_worker_refusal_reason(self):
+        self.assertEqual(RX.refusal_reason(b'noise\nADMIT-REFUSAL: mbx is not on the job PATH\n'),'mbx is not on the job PATH')
+        self.assertEqual(RX.refusal_reason(b'ADMIT-REFUSAL: \x1b[31mbad\n'),'?[31mbad')
+        self.assertIsNone(RX.refusal_reason(b'nothing here'))
 
     def test_unsafe_selectors_refuse_before_execution(self):
         for host in ('boat:current','boat:bx_test;echo','-oProxyCommand=bad','h x','a:12'):

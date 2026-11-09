@@ -35,7 +35,7 @@ class EnvironmentAdmission(unittest.TestCase):
         original=self.f['qualified_path'].read_bytes()
         self.assertEqual(hashlib.sha256(original).hexdigest(),self.f['job']['qualification']['sha256'])
         self.assertIsNone(json.loads(original)['runtime_env_file'])
-        self.assertEqual(set(env.environment(p)),{'PATH','MBX_REMOTE_TOKEN_FILE'})
+        self.assertEqual(set(env.environment(p)),{'PATH','RUSTUP_TOOLCHAIN','RUSTUP_AUTO_INSTALL','MBX_REMOTE_TOKEN_FILE'})
 
     def test_changed_qualification_bytes_or_env_proof_does_not_grant_authority(self):
         original=self.f['qualified_path'].read_bytes()
