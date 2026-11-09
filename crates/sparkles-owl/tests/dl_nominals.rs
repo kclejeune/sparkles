@@ -82,6 +82,8 @@ fn check(body: &str, yes: &[(&str, &str)], no: &[(&str, &str)]) {
             out.taxonomy.is_subclass(&c(a), &c(b)),
             "{a} ⊑ {b} is missing"
         );
+        // a subsumption that holds because its class is wrongly empty proves nothing
+        assert!(!out.taxonomy.is_unsatisfiable(&c(a)), "{a} is satisfiable");
     }
     for (a, b) in no {
         assert!(
@@ -147,6 +149,38 @@ fn an_equality_of_individuals_carries_their_classes() {
 
 #[test]
 #[ignore = "needs the rooted run of item 603 phase 6"]
+fn an_equality_of_individuals_carries_their_role_facts() {
+    check(
+        "SameIndividual(:a :b)
+         ObjectPropertyAssertion(:s :a :c)
+         ClassAssertion(:B :c)
+         SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:b)))
+         SubClassOf(ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s :B)) :C)",
+        &[("A", "C")],
+        &[("C", "A")],
+    );
+}
+
+#[test]
+#[ignore = "needs the rooted run of item 603 phase 6"]
+fn a_key_makes_two_individuals_with_a_shared_named_value_one() {
+    // a and b are K and share the p-value c, so the key makes them one and b is a G
+    check(
+        "HasKey(:K (:p) ())
+         ClassAssertion(:K :a)
+         ClassAssertion(:K :b)
+         ObjectPropertyAssertion(:p :a :c)
+         ObjectPropertyAssertion(:p :b :c)
+         ClassAssertion(:G :a)
+         SubClassOf(:D ObjectSomeValuesFrom(:r ObjectOneOf(:b)))
+         SubClassOf(ObjectSomeValuesFrom(:r :G) :H)",
+        &[("D", "H")],
+        &[("H", "D")],
+    );
+}
+
+#[test]
+#[ignore = "needs the rooted run of item 603 phase 6"]
 fn a_has_value_restriction_is_an_existential_to_the_nominal() {
     check(
         "SubClassOf(:A ObjectHasValue(:r :o))
@@ -202,6 +236,17 @@ fn contradictory_assertions_make_the_ontology_inconsistent() {
 
 #[test]
 #[ignore = "needs the rooted run of item 603 phase 6"]
+fn a_negative_property_assertion_meets_the_edge_a_class_gives() {
+    inconsistent(
+        "NegativeObjectPropertyAssertion(:r :a :o)
+         ClassAssertion(:B :a)
+         SubClassOf(:B ObjectHasValue(:r :o))
+         SubClassOf(:A :C)",
+    );
+}
+
+#[test]
+#[ignore = "needs the rooted run of item 603 phase 6"]
 fn individuals_both_the_same_and_different_are_inconsistent() {
     inconsistent(
         "SameIndividual(:a :b)
@@ -227,15 +272,31 @@ fn a_disjunctive_fact_about_an_individual_closes_on_its_assertions() {
 #[test]
 #[ignore = "needs the rooted run of item 603 phase 6"]
 fn a_minimum_of_two_into_one_nominal_needs_counting() {
-    let body = "SubClassOf(:A ObjectMinCardinality(2 :r ObjectOneOf(:o)))";
-    // with counting A is empty
+    // read as ∃r.{o}, the minimum would make A a C
+    let body = "SubClassOf(:A ObjectMinCardinality(2 :r ObjectOneOf(:o)))
+                ClassAssertion(:B :o)
+                SubClassOf(ObjectSomeValuesFrom(:r :B) :C)";
+    // with counting A is empty in a consistent ontology
     let out = rooted(body, true, &[("A", "Nothing")]);
+    assert_eq!(out.consistency, Consistency::Consistent);
     assert!(out.taxonomy.is_unsatisfiable(&c("A")));
-    // without it the minimum is left out and reported, not read as an existential
+    // without it the minimum alone is left out and reported, and not read as an
+    // existential, while Tier D takes the rest
     let mut k = Classifier::of(&axioms(body));
     let out = k.classify(&Limits::default()).unwrap();
-    assert!(!k.excluded().is_empty(), "the minimum is reported");
+    let left: Vec<String> = k
+        .excluded()
+        .iter()
+        .map(|e| format!("{:?}", e.axiom))
+        .collect();
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].contains("MinCardinality"), "{left:?}");
+    assert!(out.stats.clauses > 0, "Tier D took no clause");
     assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+    assert!(
+        !out.taxonomy.is_subclass(&c("A"), &c("C")),
+        "the minimum was weakened"
+    );
 }
 
 #[test]
