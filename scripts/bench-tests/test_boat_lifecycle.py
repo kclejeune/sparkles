@@ -1729,3 +1729,50 @@ class UntrackedRoundFour(UntrackedDiagnostics):
         for name in ('.envrc','backup.env','backup.env.bak','plain.txt'):(repo/name).write_text('DO_NOT_COPY')
         row=d.untracked([str(repo)])[str(repo)]
         self.assertEqual(([p['path'] for p in row['paths']],row['omitted_credential_like']),(['plain.txt'],3))
+
+
+class ResumeReply(unittest.TestCase):
+    """Item 777. The resume outcome keeps a bounded, credential-free part of the reply."""
+    def test_a_reply_summary_keeps_shape_and_enumerated_fields_only(self):
+        s=controller.reply_summary
+        good=json.dumps({'event':'accepted','id':'bx_gy2ytgh8','status':'resuming'}).encode()
+        self.assertEqual(s(good),{'bytes':len(good),'lines':1,'parsed':'json','objects':[{'keys':['event','id','status'],'fields':{'event':'accepted','id':'bx_gy2ytgh8','status':'resuming'}}]})
+        # Two JSON lines do not parse as one document, and the summary still shows both.
+        stream=b'{"event":"accepted","id":"bx_gy2ytgh8"}\n{"event":"resuming","status":"resuming","url":"https://x/?token=DO_NOT_COPY"}\n'
+        row=s(stream);self.assertEqual(row['parsed'],'json_lines');self.assertEqual(row['lines'],2)
+        self.assertEqual(row['objects'][1]['fields'],{'event':'resuming','status':'resuming'});self.assertIn('url',row['objects'][1]['keys'])
+        secret={'ok':False,'code':'quota','error':{'code':'rate_limited','message':'DO_NOT_COPY'},'token':'DO_NOT_COPY','status':'Bearer DO_NOT_COPY','id':'DO_NOT_COPY'}
+        row=s(json.dumps(secret).encode());self.assertNotIn('DO_NOT_COPY',json.dumps(row))
+        self.assertEqual(row['objects'][0]['fields'],{'ok':False,'code':'quota','error_code':'rate_limited','status':None,'id':None})
+        self.assertEqual(s(b'not json DO_NOT_COPY'),{'bytes':20,'lines':1,'parsed':'unparsed','objects':[]})
+        self.assertEqual(s(b''),{'bytes':0,'lines':0,'parsed':'empty','objects':[]})
+        big=b'\n'.join(json.dumps({'k%d'%i:i for i in range(80)}).encode() for _ in range(20))
+        row=s(big);self.assertLessEqual(len(row['objects']),4);self.assertLessEqual(len(row['objects'][0]['keys']),24)
+
+    def test_an_uncertain_resume_records_its_reply(self):
+        r=controls.fixture();io=controls.InertIO(r);original=io.boat
+        reply=b'{"event":"queued","id":"bx_other","note":"DO_NOT_COPY"}'
+        def queued(args,*a,**k):
+            out=original(args,*a,**k)
+            return dict(out,body=json.loads(reply),reply=controller.reply_summary(reply)) if args[0]=='resume' else out
+        io.boat=queued
+        with self.assertRaises(controller.Refusal):controller.drive(r,io)
+        row=io.read('resume-outcome.json');self.assertTrue(row['uncertain_acceptance'])
+        self.assertEqual(row['reply']['objects'][0]['fields'],{'event':'queued','id':'bx_other'});self.assertNotIn('DO_NOT_COPY',json.dumps(row))
+        # A reply from an adapter that kept no raw bytes is summarized from its body.
+        r=controls.fixture();io=controls.InertIO(r);original=io.boat
+        io.boat=lambda args,*a,**k:dict(original(args,*a,**k),body={'event':'queued'}) if args[0]=='resume' else original(args,*a,**k)
+        with self.assertRaises(controller.Refusal):controller.drive(r,io)
+        self.assertEqual(io.read('resume-outcome.json')['reply']['objects'][0]['fields'],{'event':'queued'})
+
+    def test_the_real_adapter_summarizes_only_the_resume_reply(self):
+        code='print(\'{"event":"accepted","id":"bx_a1"}\');print(\'{"event":"resuming","status":"resuming"}\')'
+        result=controller.bounded([sys.executable,'-I','-c',code],10,reply=True)
+        self.assertIsNone(result['body']);self.assertEqual(result['reply']['parsed'],'json_lines')
+        self.assertEqual([o['fields'].get('event') for o in result['reply']['objects']],['accepted','resuming'])
+        self.assertNotIn('reply',controller.bounded([sys.executable,'-I','-c',code],10))
+        seen=[]
+        with patch.object(controller,'bounded',lambda argv,seconds,input_bytes=None,reply=False:seen.append(reply) or {'exit':0,'error':None,'body':{}}):
+            io=controller.RealIO.__new__(controller.RealIO);io.boat_path='/bin/false'
+            io.boat(['resume','bx_a1']);io.boat(['info','bx_a1'])
+        self.assertEqual(seen,[True,False])

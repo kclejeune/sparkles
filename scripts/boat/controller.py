@@ -134,8 +134,10 @@ if __name__=='__main__':
                       'processes':unallowed_inventory(rows,busy),'process_count':len(busy),'boot_id':open('/proc/sys/kernel/random/boot_id').read().strip()}))
 '''
 
-def bounded(argv,seconds,input_bytes=None,limit=None):
+def bounded(argv,seconds,input_bytes=None,limit=None,reply=False):
     """Only Root's real adapter calls this. Kill only this new process group.
+
+    ``reply`` adds a bounded summary of the raw reply, as ``reply_summary`` keeps it.
 
     ``limit``, when given, returns the seconds left before an outer end, such as
     the original wall and BOOTTIME lifetime. It is checked with the monotonic
@@ -191,6 +193,7 @@ def bounded(argv,seconds,input_bytes=None,limit=None):
                 try:body=json.loads(data)
                 except (ValueError,UnicodeError):body=None
                 result={'exit':code,'error':None,'body':body}
+                if reply:result['reply']=reply_summary(bytes(data))
     except BaseException as error:
         failure=error;raise
     finally:
@@ -269,7 +272,8 @@ class RealIO:
         return r['body']['boot_id']
     def boat(self,args,seconds=20,input_bytes=None,json_mode=True):
         prefix=[self.boat_path,'--no-update']+(['--json'] if json_mode else [])
-        return bounded(prefix+args,seconds,input_bytes)
+        # Only the resume keeps a summary of its reply, for an unacknowledged resume.
+        return bounded(prefix+args,seconds,input_bytes,reply=args[:1]==['resume'])
     def info(self):
         r=self.boat(['info',worker_id()]);need(r['exit']==0 and r['body'] is not None,'info unavailable')
         return safe_info(r['body'])
@@ -467,6 +471,44 @@ if __name__=='__main__':
         self.record('qualification.json',q);return q
 
 
+# The resume reply keeps its shape and a few enumerated fields, never free text: key
+# names, the acknowledgement fields and the error code, each value an identifier-shaped
+# word, and the worker ID only in its provider form. Messages, URLs and every other
+# value are left out, so no credential or provider text reaches the record.
+REPLY_WORD=re.compile(r'[a-z][a-z0-9_]{0,31}')
+REPLY_KEY=re.compile(r'[A-Za-z0-9_]{1,32}')
+REPLY_OBJECTS=4
+REPLY_KEYS=24
+def reply_object(x):
+    if not isinstance(x,dict):return {'keys':[],'fields':{},'kind':type(x).__name__ if x is None or isinstance(x,(list,str,int,float,bool)) else 'other'}
+    word=lambda v:v if isinstance(v,str) and REPLY_WORD.fullmatch(v) else None
+    fields={}
+    for k in ('event','status','state','code'):
+        if k in x:fields[k]=word(x[k])
+    if 'ok' in x:fields['ok']=x['ok'] if isinstance(x['ok'],bool) else None
+    if isinstance(x.get('error'),dict) and 'code' in x['error']:fields['error_code']=word(x['error']['code'])
+    if 'id' in x:fields['id']=x['id'] if isinstance(x['id'],str) and re.fullmatch(r'bx_[a-z0-9]{1,32}',x['id']) else None
+    return {'keys':sorted(k for k in x if isinstance(k,str) and REPLY_KEY.fullmatch(k))[:REPLY_KEYS],'fields':fields}
+def reply_summary(data):
+    """A bounded, credential-free summary of a provider reply's raw bytes."""
+    lines=[l for l in data.split(b'\n') if l.strip()]
+    row={'bytes':len(data),'lines':len(lines),'parsed':'empty' if not lines else 'unparsed','objects':[]}
+    if not lines:return row
+    try:
+        body=json.loads(data);row['parsed']='json'
+        row['objects']=[reply_object(x) for x in (body if isinstance(body,list) else [body])[:REPLY_OBJECTS]]
+        return row
+    except (ValueError,UnicodeError):pass
+    try:docs=[json.loads(l) for l in lines[:64]]
+    except (ValueError,UnicodeError):return row
+    row['parsed']='json_lines';row['objects']=[reply_object(x) for x in docs[:REPLY_OBJECTS]]
+    return row
+def recorded_reply(result):
+    """The reply summary of a result, from its raw bytes when the adapter kept them."""
+    if isinstance(result.get('reply'),dict):return result['reply']
+    body=result.get('body')
+    return {'bytes':None,'lines':None,'parsed':'body' if body is not None else 'none','objects':[] if body is None else [reply_object(x) for x in (body if isinstance(body,list) else [body])[:REPLY_OBJECTS]]}
+
 def no_ready(result):
     b=result.get('body')
     return result.get('exit') not in (0,None) and isinstance(b,dict) and b.get('ok') is False and b.get('code')=='no_ready_machine' and isinstance(b.get('error'),dict) and b['error'].get('code')=='no_ready_machine'
@@ -487,7 +529,7 @@ def drive(r,io):
     io.record('resume-intent.json',{'worker':worker_id(),'wall':io.wall(),'mono':io.mono(),'argv':['resume',worker_id(),'--environment',profile()['future_environment']['name'],'--type','large','--ttl','10800','--fail-fast','--no-wait']})
     try:
         result=io.boat(['resume',worker_id(),'--environment',profile()['future_environment']['name'],'--type','large','--ttl','10800','--fail-fast','--no-wait'])
-        io.record('resume-outcome.json',{'exit':result['exit'],'transport_error':result['error'],'no_ready_machine':no_ready(result),'acceptance':'positive' if positive_resume_ack(result,r['provider_contract']['resume_ack']) else ('no_ready_candidate' if no_ready(result) else 'uncertain'),'uncertain_acceptance':not positive_resume_ack(result,r['provider_contract']['resume_ack']) and not no_ready(result)})
+        io.record('resume-outcome.json',{'exit':result['exit'],'transport_error':result['error'],'no_ready_machine':no_ready(result),'acceptance':'positive' if positive_resume_ack(result,r['provider_contract']['resume_ack']) else ('no_ready_candidate' if no_ready(result) else 'uncertain'),'uncertain_acceptance':not positive_resume_ack(result,r['provider_contract']['resume_ack']) and not no_ready(result),'reply':recorded_reply(result)})
         if no_ready(result):
             after=io.info();stopped(after)
             need(after['environmentVersion'] in (r['snapshot_continuity']['pre_resume_environment_version'],profile()['future_environment']['version']) and after['snapshotCompletedAt']==before['snapshotCompletedAt'] and after['stoppedAt']==before['stoppedAt'],'no-ready state drift')
