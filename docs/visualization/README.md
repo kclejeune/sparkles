@@ -898,7 +898,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   read-only, 611. For the same reason the thesaurus editor's notes and members forms are
   read-only on branches other than main when authentication is on. Undo and redo revert commits, which needs write access to the
   whole branch, so a caller whose grants cover some graphs only can edit but not undo.
-  A revert from the entity frame's History view has the same requirement.
+  A revert from the entity frame's History view has the same requirement. The view reads
+  graph restrictions from the main branch's grants, so on another branch it offers a
+  revert that the preview's dry run refuses when that branch's grants cover only some
+  graphs, 611.
 * The entity frame's History view lists the commits that changed a triple naming the
   entity, so a commit that changed only the blank nodes of a restriction or an annotated
   axiom is not listed, 765. Each opened commit reads the editor's graph twice to compare

@@ -312,9 +312,12 @@
               </p>
             {:else if d}
               <p class="msg">
-                Mapping draft ({d.drafted === 'model' ? 'by the model' : 'default'}): {fmtInt(
+                Mapping draft ({d.drafted === 'model' ? 'by the model' : 'default'}): {fmtCount(
                   d.rows ?? 0,
-                )} rows become {fmtInt(d.triples ?? 0)} triples.
+                  'row',
+                )}
+                {(d.rows ?? 0) === 1 ? 'becomes' : 'become'}
+                {fmtCount(d.triples ?? 0, 'triple')}.
               </p>
               <label class="small"
                 >Mapping (CSVW)
@@ -351,7 +354,11 @@
               {/each}
               {#if d.preview?.triples.length}
                 <details>
-                  <summary class="small">Triples of the first {d.preview.rows} rows</summary>
+                  <summary class="small"
+                    >Triples of the first {d.preview.rows === 1
+                      ? 'row'
+                      : fmtCount(d.preview.rows, 'row')}</summary
+                  >
                   <pre class="mono small">{d.preview.triples.slice(0, 30).join('\n')}</pre>
                 </details>
               {/if}
