@@ -158,11 +158,22 @@ jobs:
       - name: Disk space after build
         if: ${{ always() }}
         run: df -h "$GITHUB_WORKSPACE"
+      - name: Experiment analyze addon
+        run: |
+          mbx stats || true
+          mbx analyze --manifest-path crates/sparkles-node/Cargo.toml 2>&1 | head -80 || true
+          mbx explain --manifest-path crates/sparkles-node/Cargo.toml 2>&1 | head -80 || true
       - run: pnpm --dir js build
       # The remote client's real-server test runs on one runner, against a debug server.
       - name: Build the server for the remote client test
         if: matrix.platform == 'linux-x64'
         run: mbx build --locked -p sparkles-server --bin sparkles
+      - name: Experiment analyze server
+        if: matrix.platform == 'linux-x64'
+        run: |
+          mbx stats || true
+          mbx analyze 2>&1 | head -80 || true
+          mbx explain 2>&1 | head -80 || true
       - name: Collect the mbx store to its size limit
         if: ${{ github.ref == 'refs/heads/lane/ci-packaging-773' }}
         run: |

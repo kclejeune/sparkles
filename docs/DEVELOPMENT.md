@@ -352,8 +352,9 @@ Reuse workers and prepared snapshots to reduce setup work and sandbox starts, wi
 the account's shared daily and rate limits.
 
 Development environments and CI runners have separate setup and authentication. Inject
-development credentials into owned development sandboxes, and keep Actions OIDC authentication
-for the workflows that use the remote cache. Reusable dev and CI seeds are separate and contain no credentials or live leases.
+development credentials into owned development sandboxes. The CI workflows build with
+GitHub's own caches and hold no cache credentials. Reusable dev and CI seeds are separate
+and contain no credentials or live leases.
 Verify snapshot and credential behavior before treating a seed as reusable. Tool setup
 alone does not qualify a compiler workload or snapshot lifecycle.
 
@@ -1137,15 +1138,14 @@ system refuses one, the job warns and continues. On a large runner the server ca
 container keeps its process limit and drops its 4 CPU and 14 GB limits, and Cargo runs one
 compiler job for each CPU instead of two in total.
 
-The binding workflows and the server candidate build authenticate to the remote mbx cache
-with the GitHub OIDC token of the job, and `ci.yml` uses no remote cache. GitHub issues
-that token to jobs on self-hosted runners as it does on its own, and neither provider below
-documents a restriction. Both providers bill per second of runner time, while GitHub's
-standard runners are free for this public repository.
+No workflow uses a remote build cache, so a build job needs no OIDC token. Every job keeps
+its caches in GitHub Actions, which serves self-hosted runners as it serves its own. Both
+providers below bill per second of runner time, while GitHub's standard runners are free for
+this public repository.
 
 Boat runs each job in a fresh Ubuntu 24.04 virtual machine with Docker, passwordless
-`sudo` and 4 GB of swap. Its machines are in Germany, Finland and France, so a job that
-downloads the remote cache from a server elsewhere may wait longer for it. Its CI needs
+`sudo` and 4 GB of swap. Its machines are in Germany, Finland and France, so a job may wait longer for
+GitHub's cache to restore and save. Its CI needs
 the $20 plan, and the `boat-xlarge` size needs the $100 plan. The $20 plan starts 12 jobs
 a minute, 60 an hour and 200 a day. A job over the minute limit waits, and a job over the
 day limit fails. To set it up, the owner of the repository runs these steps.
