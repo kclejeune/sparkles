@@ -26,14 +26,33 @@ A lifecycle owner must establish startup quiescence, actual tool and source iden
 cache authentication, available memory and disk, worker exclusivity and a finite
 lifetime before handing over a worker. A ready provider state or `setupStatus: null`
 does not establish tool readiness. The worker's bootstrap lock must be idle and its
-current toolchain manifest must match the handoff. MBX 1.29.1 and the matching child
+current toolchain manifest must match the handoff. The provider's own desktop-session
+processes are allowed by exact name and parent, and any other process of the worker's
+user still holds startup open. Every refusal records a bounded reason code, as the
+[startup closure](../scripts/boat/README.md#startup-closure) section describes. MBX 1.29.1 and the matching child
 Cargo shim use the shared host cache and each source directory's managed target.
+
+The memory check counts only memory that the kernel cannot reclaim. On the host this is
+anonymous, shared, unevictable and unreclaimable kernel memory. For every ancestor
+cgroup with a limit it is the cgroup's anonymous, shared, unevictable and unreclaimable
+kernel memory from `memory.stat`. Each limit must leave room for a 12-GiB job, the
+512-MiB metadata service and a 1-GiB host reserve. Page cache does not count, so a
+worker whose slice holds several gigabytes of cache is admitted, and a slice that
+exposes no `memory.stat` is refused.
+
+`admit` resolves `mbx` and `rustc` through the same environment that jobs receive. That
+environment puts the pinned mise MBX install on PATH, selects the pinned Rust toolchain
+with `RUSTUP_TOOLCHAIN` and turns off automatic toolchain installation. A missing `mbx`,
+an `mbx` found elsewhere or at another version, and a `rustc` at a version other than
+the pin each refuse admission with the reason named, rather than running with the
+rustup default.
 
 Development credentials stay on the owned development worker. They are excluded from
 source packets, result manifests and reusable snapshot seeds. GitHub Actions retains
 its separate OIDC authentication. A mode-0600 worker environment file contains only
-literal PATH and `MBX_REMOTE_TOKEN_FILE` assignments. The latter names a file and never
-contains a token. Admission binds the environment file by digest.
+literal PATH, `RUSTUP_TOOLCHAIN`, `RUSTUP_AUTO_INSTALL` and `MBX_REMOTE_TOKEN_FILE`
+assignments. The last names a file and never contains a token. Admission binds the
+environment file by digest.
 
 ## Qualification and job admission
 
@@ -72,8 +91,21 @@ reserve, so a wall clock moved backward cannot lengthen the lifetime and a suspe
 counts even when the wall clock misses it. A different boot refuses the admission.
 A warm worker reused across many jobs and lanes keeps that one original end, since
 every job-admission record references the same qualification and receipts. No call,
-job environment or lane renews it. Only a new qualification by the lifecycle owner,
-with its own recorded intent, guard and handoff receipts, gives a worker more time.
+job environment, lane or wall-clock change renews it.
+
+The lifecycle owner can lengthen the lifetime of the same running worker with an
+explicit extension, which is its own receipted act. The act adopts the worker only when
+the local boot, the live guard invocation, the worker's boot recorded at qualification,
+the provider environment version and a fresh environment and hook fact all match. It
+sets a new end of at most 10,500 seconds after its own observation on both clocks, and
+no end may fall more than 12 hours after the original controller intent. The provider
+lifetime is set past the new end and confirmed before the act publishes a numbered
+`sparkles.boat.lifetime-extension` version-1 receipt in the operation directory.
+Admission and the guard apply only a consecutive chain of valid receipts that the
+running guard accepted, by its own clocks, before the previous end. A malformed or unknown receipt refuses admission and
+leaves the guard on the conservative original deadline. The guard holds the extension
+lock when it decides to stop and records the stop trigger, and admission refuses a
+stopping operation.
 `admit --minimum` uses this measure. Environment preparation and each operation
 also check both ends while they run, so a suspend during a transfer is counted.
 `admit` prints a version-2 `sparkles.boat.adapter-observation` that records the
@@ -111,6 +143,24 @@ and gates at least 7200 through `SPARKLES_REMOTE_MIN_LIFETIME`. Partitions reque
 `TEST_PARTITION_TIMEOUT` and check again after archive transfer. Boat caps follow the
 original qualification deadline. The legacy `--duration` screen option controls
 Namespace instance lifetime.
+
+A worker kept warm past its jobs runs `boat:closure-watch`, which checks the jobs'
+closure shortly before the guard's present end and finishes the operation, so the
+guard's stop does not depend on the provider TTL. The
+[scheduled closure](../scripts/boat/README.md#scheduled-closure) section describes it.
+
+A Boat screen builds both revisions on the worker with mbx, because binaries built on a
+host with a newer glibc do not run there. The executor does not choose the build host,
+so the screen names the worker as its build host and passes two revisions rather than
+binary paths.
+
+```sh
+mise run bench:remote --executor "$worker" --build-host "$worker" origin/main HEAD
+```
+
+A Boat screen and a Namespace screen of the same revisions therefore run different
+binaries, and the Boat screen is judged by its ratios and noise against Namespace rather
+than by identical binaries.
 
 The operator establishes actual native/cgroup/lease closure before supplying the fresh
 job-closure receipt. `boat:finish` validates that evidence and observes the guard's
