@@ -48,7 +48,8 @@ const CURSOR_SAVE: Duration = Duration::from_secs(30);
 /// before it is saved.
 const VOUCH_SAVE: Duration = Duration::from_secs(3600);
 /// The identities whose latest vouching is kept in memory before the ones already
-/// recorded on their watches are forgotten. Words not recorded yet are never forgotten.
+/// recorded on their watches, and the ones of identities without watches, are
+/// forgotten.
 const VOUCHED_MAX: usize = 10_000;
 
 /// What a watch covers.
@@ -488,10 +489,16 @@ impl Watches {
         let key = Owner::named(who.kind, &who.name).key();
         let mut m = self.vouched.lock();
         if !m.contains_key(&key) && m.len() >= VOUCHED_MAX {
-            // a word that is not on the watches yet is kept past the bound, since
-            // dropping it would give the owner back what the watches still hold; there
-            // are at most as many as owners of watches
-            m.retain(|_, v| v.pending);
+            // a word that is not on its owner's watches yet is kept past the bound,
+            // since dropping it would give the owner back what the watches still hold,
+            // so at most one more word is kept for each owner of watches
+            let owners: std::collections::HashSet<String> = self
+                .inner
+                .lock()
+                .body(st)
+                .map(|b| b.watches.iter().map(|w| w.owner.key()).collect())
+                .unwrap_or_default();
+            m.retain(|k, v| v.pending && owners.contains(k));
         }
         let v = m.entry(key).or_insert_with(|| {
             // the owner's watches hold what was vouched before the server started
@@ -526,31 +533,40 @@ impl Watches {
             v.pending = false;
             return;
         }
+        // the follower falls back on the watches' groups once the word is forgotten
+        let regrouped = b
+            .watches
+            .iter()
+            .any(|w| w.owner.same(&o) && w.owner.groups != o.groups);
         let r = g.change(st, |b| {
             for w in b.watches.iter_mut().filter(|w| w.owner.same(&o)) {
                 w.owner.take_vouched(&o);
             }
             Ok(())
         });
-        match r {
+        let saved = match r {
             Ok(()) => {
                 v.written = Some(Instant::now());
                 v.pending = false;
+                true
             }
             Err(e) => {
                 // matching and mail already follow the word kept in memory, which is
                 // kept until the next vouching records it
                 tracing::warn!(target: "sparkles::watches", "cannot record the groups of {}: {e:?}", o.key());
                 v.pending = true;
+                false
             }
-        }
-        // a retry of the same word changes nothing the follower reads
-        if regroup {
+        };
+        // the follower reads again when the groups in memory change and when new
+        // groups reach the watches; a failed retry of the same word changes neither
+        let wake = regroup || (saved && regrouped);
+        if wake {
             self.bump(&g);
         }
         drop(g);
         drop(m);
-        if regroup {
+        if wake {
             self.changed();
         }
     }

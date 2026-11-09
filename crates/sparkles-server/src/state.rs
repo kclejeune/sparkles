@@ -356,6 +356,16 @@ impl Drop for Leaving<'_> {
     }
 }
 
+/// Counts a store swap in progress on [`AppState`] until dropped.
+pub(crate) struct Swapping<'a>(&'a AppState);
+
+impl Drop for Swapping<'_> {
+    fn drop(&mut self) {
+        self.0.swapping.fetch_sub(1, Ordering::SeqCst);
+        self.0.lifecycle.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 pub struct AppState {
     pub data_dir: PathBuf,
     pub catalog: sparkles::Catalog,
@@ -374,9 +384,11 @@ pub struct AppState {
     /// Datasets being deleted or renamed. Lookups do not find them, so no request can
     /// take a handle that would make the delete or rename fail.
     leaving: Mutex<BTreeSet<String>>,
-    /// Counts the starts and ends of deletions and renames, so a reader of the catalog
-    /// can tell that one came while it read.
+    /// Counts the starts and ends of deletions, renames and store swaps, so a reader of
+    /// the catalog can tell that one came while it read.
     lifecycle: AtomicU64,
+    /// Store swaps in progress, such as in-place restores.
+    swapping: std::sync::atomic::AtomicUsize,
     /// Kept independently so completed workers release server ownership before
     /// publishing their terminal task status.
     pub tasks: Arc<Mutex<Vec<Task>>>,
@@ -764,6 +776,7 @@ impl AppState {
             routing: Mutex::new(BTreeMap::new()),
             leaving: Mutex::new(BTreeSet::new()),
             lifecycle: AtomicU64::new(0),
+            swapping: Default::default(),
             tasks: Arc::new(Mutex::new(Vec::new())),
             task_counter: AtomicU64::new(1),
             started: Instant::now(),
@@ -844,6 +857,7 @@ impl AppState {
             routing: Mutex::new(BTreeMap::new()),
             leaving: Mutex::new(BTreeSet::new()),
             lifecycle: AtomicU64::new(0),
+            swapping: Default::default(),
             tasks: Arc::new(Mutex::new(Vec::new())),
             task_counter: AtomicU64::new(1),
             started: Instant::now(),
@@ -1244,16 +1258,26 @@ impl AppState {
         Ok(self.get(name).expect("attached"))
     }
 
-    /// Whether any dataset is being deleted or renamed now.
+    /// Whether any dataset is being deleted or renamed now, or has its store swapped
+    /// by an in-place restore, any of which can take it out of the catalog for a while.
     pub fn any_leaving(&self) -> bool {
-        !self.leaving.lock().is_empty()
+        self.swapping.load(Ordering::SeqCst) > 0 || !self.leaving.lock().is_empty()
     }
 
-    /// How many deletions and renames started or ended since the server started. A
-    /// reader that sees the same count before and after reading the catalog read it
-    /// with no deletion or rename moving a dataset meanwhile.
+    /// How many deletions, renames and store swaps started or ended since the server
+    /// started. A reader that sees the same count before and after reading the catalog
+    /// read it with no dataset taken out of it meanwhile.
     pub fn lifecycle(&self) -> u64 {
         self.lifecycle.load(Ordering::SeqCst)
+    }
+
+    /// Count a swap of a dataset's store, such as an in-place restore, until the guard
+    /// drops, so that [`Self::any_leaving`] and [`Self::lifecycle`] tell of it.
+    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
+    pub(crate) fn swapping(&self) -> Swapping<'_> {
+        self.swapping.fetch_add(1, Ordering::SeqCst);
+        self.lifecycle.fetch_add(1, Ordering::SeqCst);
+        Swapping(self)
     }
 
     /// Hold `name` as leaving, as a deletion that is draining does (tests).

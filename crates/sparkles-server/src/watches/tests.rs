@@ -1281,23 +1281,27 @@ async fn an_unrecorded_revocation_outlasts_a_full_memory() {
     assert!(file.contains("others"), "the revocation was not recorded");
 }
 
-/// Review finding email-ui-r2 3: retrying a record that failed does not make the
-/// follower authorize again.
+/// Review findings email-ui-r2 3 and email-ui-r3 2: retrying a record that failed
+/// does not make the follower authorize again, the record that succeeds does, and a
+/// forgotten word then leaves the follower with the recorded groups.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_retried_record_leaves_the_follower_alone() {
+async fn a_retried_record_reaches_the_follower_once() {
     use std::os::unix::fs::PermissionsExt;
-    let s = server();
+    let mut s = server();
     s.proxied("/$/ping", "pam", "staff", Some("pam@example.org"))
         .await;
-    s.st.watches
-        .create(
-            &s.st,
-            &Owner::named(Kind::Proxy, "pam"),
-            new_watch(&s, G, "urn:a"),
-            Utc::now(),
-        )
-        .unwrap();
+    let (w, _) =
+        s.st.watches
+            .create(
+                &s.st,
+                &Owner::named(Kind::Proxy, "pam"),
+                new_watch(&s, G, "urn:a"),
+                Utc::now(),
+            )
+            .unwrap();
+    s.update("alice", "main", &label("urn:a", "A")).await;
+    s.follow().await;
     let dir = s.st.data_dir.clone();
     let mode = |m| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
     let file = || std::fs::read_to_string(s.st.data_dir.join(FILE)).unwrap();
@@ -1309,13 +1313,137 @@ async fn a_retried_record_leaves_the_follower_alone() {
     assert!(v1 > v0, "the follower did not hear of new groups");
     s.proxied("/$/ping", "pam", "others", Some("pam@example.org"))
         .await;
-    assert_eq!(s.st.watches.version(), v1, "a retry woke the follower");
+    assert_eq!(
+        s.st.watches.version(),
+        v1,
+        "a failed retry woke the follower"
+    );
     assert!(!file().contains("others"));
+    s.follow().await;
     mode(0o700);
     s.proxied("/$/ping", "pam", "others", Some("pam@example.org"))
         .await;
     assert!(file().contains("others"), "the record was not retried");
-    assert_eq!(s.st.watches.version(), v1, "a retry woke the follower");
+    let v2 = s.st.watches.version();
+    assert!(v2 > v1, "the follower kept the groups recorded before");
+    s.proxied("/$/ping", "pam", "others", Some("pam@example.org"))
+        .await;
+    assert_eq!(
+        s.st.watches.version(),
+        v2,
+        "a recorded word woke the follower"
+    );
+    // the word is forgotten, as a full memory forgets recorded words
+    s.st.watches
+        .vouched
+        .lock()
+        .remove(&Owner::named(Kind::Proxy, "pam").key());
+    s.update("alice", "main", &label("urn:a", "A2")).await;
+    s.follow().await;
+    let (ws, _, _) = s.st.watches.snapshot(&s.st).unwrap();
+    let w = ws.iter().find(|x| x.id == w.id).unwrap();
+    assert_eq!(
+        w.matches.len(),
+        1,
+        "a match under groups that were taken away"
+    );
+}
+
+/// Review finding email-ui-r3 3: the memory keeps unrecorded words only for owners of
+/// watches, so neither a refused file nor owners who removed their watches grow it.
+#[cfg(unix)]
+#[tokio::test]
+async fn unrecorded_words_are_kept_only_for_owners_of_watches() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = server();
+    s.proxied("/$/ping", "pam", "staff", Some("pam@example.org"))
+        .await;
+    let (w, _) =
+        s.st.watches
+            .create(
+                &s.st,
+                &Owner::named(Kind::Proxy, "pam"),
+                new_watch(&s, G, "urn:a"),
+                Utc::now(),
+            )
+            .unwrap();
+    let dir = s.st.data_dir.clone();
+    let mode = |m| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o500);
+    s.proxied("/$/ping", "pam", "others", Some("pam@example.org"))
+        .await;
+    mode(0o700);
+    let pam = Owner::named(Kind::Proxy, "pam").key();
+    assert!(s.st.watches.vouched.lock()[&pam].pending);
+    // pam's last watch goes, and the memory fills
+    s.st.watches.remove_where(&s.st, |x| x.id == w.id);
+    let who = |n: usize| Identity {
+        kind: Kind::Proxy,
+        name: format!("p{n}"),
+        groups: vec!["staff".into()],
+        display_name: None,
+    };
+    for n in 0..VOUCHED_MAX + 10 {
+        s.st.watches
+            .vouched(&s.st, &who(n), true, &EmailClaim::Unknown, Utc::now());
+    }
+    let m = s.st.watches.vouched.lock();
+    assert!(
+        !m.contains_key(&pam),
+        "the word of an owner without watches was kept"
+    );
+    assert!(m.len() <= VOUCHED_MAX, "{}", m.len());
+    drop(m);
+
+    // a refused file: every word would be pending
+    let r = server();
+    std::fs::write(r.st.data_dir.join(FILE), r#"{"format": 99, "watches": []}"#).unwrap();
+    for n in 0..VOUCHED_MAX + 10 {
+        r.st.watches
+            .vouched(&r.st, &who(n), true, &EmailClaim::Unknown, Utc::now());
+    }
+    let n = r.st.watches.vouched.lock().len();
+    assert!(n <= VOUCHED_MAX, "{n}");
+}
+
+/// Review finding email-ui-r3 1: a restore in place swaps a dataset's store while it
+/// is out of the catalog, and removes no watch meanwhile.
+#[tokio::test]
+async fn a_restore_in_place_removes_no_watch() {
+    let mut s = server();
+    let w = s
+        .watch(
+            "bob",
+            json!({"dataset": "ds", "graph": G, "entity": "urn:a"}),
+        )
+        .await;
+    let id = w["id"].as_str().unwrap().to_string();
+    assert!(s.st.delete("ds").unwrap());
+    let kept = |s: &Srv| {
+        s.st.watches
+            .snapshot(&s.st)
+            .unwrap()
+            .0
+            .iter()
+            .any(|x| x.id == id)
+    };
+    {
+        let _swap = s.st.swapping();
+        s.follow().await;
+        assert!(kept(&s), "removed while a store was swapped");
+    }
+    let st = s.st.clone();
+    let mut once = true;
+    *s.st.watches.before_scan.lock() = Some(Box::new(move || {
+        if std::mem::take(&mut once) {
+            drop(st.swapping());
+        }
+    }));
+    s.follow().await;
+    assert!(kept(&s), "removed while a swap came and went");
+    s.follow().await;
+    *s.st.watches.before_scan.lock() = None;
+    assert!(!kept(&s));
 }
 
 /// Review finding email-ui-r2 2: a deletion or rename that starts while the follower

@@ -153,7 +153,7 @@ pub(crate) enum Place {
     /// open, in this dataset under this branch name
     Found(Arc<crate::state::Dataset>, String),
     /// not known now: a dataset that could hold the branch is opening, failed to open,
-    /// or is being deleted or renamed
+    /// is being deleted or renamed, or has its store swapped by a restore
     Unknown,
     /// no dataset of the catalog holds the branch
     Gone,
@@ -162,12 +162,13 @@ pub(crate) enum Place {
 /// Find branch `bid`, last seen in dataset `dataset`. A dataset keeps its branches'
 /// ids through a rename, so every dataset of the catalog is searched. The branch is
 /// gone only when the server is past its startup, every declared dataset is open,
-/// no deletion or rename is under way or starts while the catalog is read, and none
-/// holds the branch, so a deletion or a rename that is still draining, and a dataset
-/// that has not opened or failed to, removes no watch.
+/// no deletion, rename or restore in place is under way or starts while the catalog
+/// is read, and none holds the branch, so a deletion or a rename that is still
+/// draining, a restore, and a dataset that has not opened or failed to, removes no
+/// watch.
 pub(crate) fn locate(st: &AppState, dataset: &str, bid: uuid::Uuid) -> Place {
-    // a deletion or rename that starts after the check below can take a dataset out
-    // of the catalog while it is read, which the count tells
+    // a deletion, rename or restore that starts after the check below can take a
+    // dataset out of the catalog while it is read, which the count tells
     let lives = st.lifecycle();
     // the catalog lists open datasets only: one that is still opening, held back by
     // startup or kept closed after a failed open may hold the branch
