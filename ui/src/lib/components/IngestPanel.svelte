@@ -7,7 +7,7 @@
   import { base } from '$app/paths';
   import * as api from '$lib/api';
   import { toasts } from '$lib/app.svelte';
-  import { fmtInt } from '$lib/format';
+  import { fmtCount, fmtInt } from '$lib/format';
   import { INGEST_STATUS, pageList, reviewHref } from '$lib/review';
   import * as review from '$lib/review-api';
   import { chooseCandidate, chosen } from '$lib/lookup';
@@ -161,7 +161,7 @@
       const commit = (r as { commit?: { inserted?: number } }).commit;
       const n =
         typeof r === 'object' ? (commit?.inserted ?? r.tables?.[0]?.triples ?? r.count ?? 0) : 0;
-      if (dry) dryRun = `The dry run would add ${fmtInt(n)} triples.`;
+      if (dry) dryRun = `The dry run would add ${fmtCount(n, 'triple')}.`;
       else {
         toasts.push('success', 'Uploaded the table with its mapping');
         dryRun = null;

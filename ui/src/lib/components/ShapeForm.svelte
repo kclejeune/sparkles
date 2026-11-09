@@ -13,7 +13,7 @@
   import { auth } from '$lib/auth.svelte';
   import { MAIN, onBranch } from '$lib/branches';
   import { LABEL_IRIS } from '$lib/explore';
-  import { fmtInt } from '$lib/format';
+  import { fmtCount, fmtInt } from '$lib/format';
   import {
     blocking,
     changeCount,
@@ -821,10 +821,7 @@
       {#if editable && m.fields.some((f) => f.editable)}
         <div class="bar">
           <span class="counts small" aria-live="polite">
-            {problemCount === 1 ? '1 problem' : `${fmtInt(problemCount)} problems`} · {nChanges ===
-            1
-              ? '1 change'
-              : `${fmtInt(nChanges)} changes`}
+            {fmtCount(problemCount, 'problem')} · {fmtCount(nChanges, 'change')}
             {#if rejected}<span class="problem"> · the guard would reject it</span>{/if}
           </span>
           <label class="msg small">

@@ -27,7 +27,7 @@
   import { graphRestricted } from '$lib/auth';
   import { branchParam, MAIN, onBranch } from '$lib/branches';
   import { EditSession, startSessionBranch } from '$lib/edit-session.svelte';
-  import { fmtInt } from '$lib/format';
+  import { fmtCount, fmtInt } from '$lib/format';
   import { fetchHierarchy, fetchIndividuals, type Name, type TreeKind } from '$lib/browse';
   import { searchEntities } from '$lib/entity-search';
   import { IndividualTree, isGroup, groupIri } from '$lib/individual-tree.svelte';
@@ -1213,7 +1213,7 @@
     const uses = frameFor === iri ? frameItems.length : null;
     edit(
       { kind: 'removeEntity', iri },
-      `Delete ${nameOf(iri)}${uses != null ? ` and the ${fmtInt(uses)} axioms that mention it` : ''}`,
+      `Delete ${nameOf(iri)}${uses != null ? ` and the ${fmtCount(uses, 'axiom')} that mention${uses === 1 ? 's' : ''} it` : ''}`,
       () => {
         if (selected === iri) void nav({ iri: null, view: null });
       },

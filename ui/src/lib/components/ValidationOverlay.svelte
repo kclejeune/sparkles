@@ -41,6 +41,7 @@
     type VResult,
     type WritePreview,
   } from '$lib/validation-overlay';
+  import DiffLines from './DiffLines.svelte';
   import Icon from './Icon.svelte';
 
   type SourceKind = 'guard' | 'graph' | 'editor';
@@ -541,16 +542,13 @@
               <p>{fmtInt(p.commit.inserted)} added, {fmtInt(p.commit.deleted)} removed.</p>
             {/if}
             {#if p.changes?.quads.length}
-              <ul class="mono">
-                {#each p.changes.quads as q, qi (qi)}
-                  <li class={q.op === '+' ? 'added' : 'removed'}>
-                    {q.op}
-                    {q.subject}
-                    {q.predicate}
-                    {q.object}
-                  </li>
-                {/each}
-              </ul>
+              <DiffLines
+                quads={p.changes.quads}
+                total={p.changes.total}
+                label="Changes the update would make"
+                maxHeight={180}
+                {ds}
+              />
             {/if}
             <p class="resolution">
               {#if fixResolution === 'resolved'}
@@ -659,18 +657,6 @@
     width: 100%;
     box-sizing: border-box;
     font-size: var(--fs-xs);
-  }
-  .vo-preview ul {
-    padding-left: 0;
-    list-style: none;
-    font-size: var(--fs-xs);
-    overflow-wrap: anywhere;
-  }
-  .vo-preview li.added {
-    color: var(--added);
-  }
-  .vo-preview li.removed {
-    color: var(--removed);
   }
   .danger {
     color: var(--danger);
