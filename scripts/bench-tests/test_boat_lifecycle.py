@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from boat_fixtures import fixture,ExtendIO,environment_fact,WORKER_BOOT_ID
+import controls
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'boat'))
 import controller
 import job_environment as env
@@ -819,6 +820,77 @@ class BoundedCommand(unittest.TestCase):
         r=common.bounded_command([sys.executable,'-I','-c',"import sys;sys.stdout.write('out');sys.stderr.write('Memory peak: 2.2M (swap: 0B)');raise SystemExit(3)"],30,True)
         self.assertEqual((r.returncode,r.stdout,r.stderr),(3,b'out',b'Memory peak: 2.2M (swap: 0B)'))
         r=common.bounded_command([sys.executable,'-I','-c',"import sys;sys.stderr.write('ignored')"],30);self.assertIsNone(r.stderr)
+
+
+class TickIO(controls.InertIO):
+    """An inert operation whose clocks advance a microsecond on every reading, as real clocks do."""
+    def __init__(self,r):super().__init__(r);self.ticks=0
+    def wall(self):self.ticks+=1;return self.w+self.ticks*1e-6
+    def mono(self):self.ticks+=1;return self.t+self.ticks*1e-6
+
+
+def handoff_release():
+    r=controls.fixture()
+    r.update(useful_job_ready=True,separate_Root_handoff={'job_release_sha256':'a'*64,'different_job_review_sha256':'b'*64,'Root_owns_job_and_deadline_closure':True,'finite_job_and_closure_seconds':600})
+    return r
+
+
+def guard_row(io):
+    loaded={'Id':io.r['guard_unit']+'.service','ActiveState':'active','MainPID':'123','InvocationID':'a'*32}
+    row={'pid':123,'uid':os.getuid(),'observed_wall':io.wall(),'observed_boottime':io.mono(),'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'loaded':loaded}
+    io.record('guard-admission.json',row);return row
+
+
+class AdmissionClocks(unittest.TestCase):
+    """Admission against the clock receipts op-5 wrote on bx_gy2ytgh8, and clocks that move."""
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.f=fixture(Path(self.tmp.name))
+        self.op5=json.loads((Path(__file__).parent/'fixtures/boat-admission-clocks-op5.json').read_text())
+
+    def inputs(self):
+        op=self.f['operation'];read=lambda n:json.loads((op/n).read_text())
+        intent=read('controller-intent.json');guard=read('guard-admission.json');handoff=read('root-handoff.json')
+        intent.update(self.op5['intent']);guard.update(self.op5['guard']);handoff['deadline_wall']=self.op5['handoff_deadline_wall']
+        return self.f['release'],intent,read('qualification.json'),read('startup-closed.json'),guard,handoff
+
+    def test_admission_accepts_the_op5_clock_receipts(self):
+        r,intent,q,startup,guard,handoff=self.inputs()
+        row=controller.make_admission(r,intent,q,startup,guard,handoff,guard['observed_wall']+1)
+        wall,_=controller.lifetime.original_ends(intent,guard,handoff)
+        self.assertGreater(wall,intent['wall']+10500);self.assertLessEqual(wall,intent['deadline_wall'])
+        self.assertTrue(row['expires_at'].startswith('2026-11-09T11:57:00'))
+        # A deadline later than the reading by more than the clock skew still refuses.
+        intent['deadline_wall']=intent['wall']+10501;handoff['deadline_wall']=intent['deadline_wall']
+        with self.assertRaises(ValueError):controller.make_admission(r,intent,q,startup,guard,handoff,guard['observed_wall']+1)
+
+    def test_the_controller_reads_each_clock_once_for_its_deadlines(self):
+        r=handoff_release();io=TickIO(r);io.guard_for_admission=lambda:guard_row(io)
+        self.assertEqual(controller.drive(r,io),'QUALIFIED_ROOT_HANDOFF_GUARD_ACTIVE')
+        intent=io.read('controller-intent.json')
+        self.assertEqual((intent['deadline_wall'],intent['deadline_mono']),(intent['wall']+10500,intent['mono']+10500))
+        admission=io.read('qualified-worker-admission.json');self.assertEqual(admission['worker'],controller.worker_id())
+
+    def test_a_failed_admission_after_the_handoff_stops_the_worker_normally(self):
+        r=handoff_release();io=controls.InertIO(r)
+        def broken():raise ValueError('earlier effective deadline')
+        io.guard_for_admission=broken
+        io.diagnose=lambda seconds:{'schema':1,'processes':{'count':0,'rows':[]},'state':{'entries':[],'phases':{}}}
+        with self.assertRaises(ValueError):controller.drive(r,io)
+        self.assertTrue(io.exists('root-handoff.json'));self.assertFalse(io.exists('qualified-worker-admission.json'))
+        self.assertTrue(io.exists('root-handoff-withdrawn.json'));self.assertTrue(io.exists('stop-trigger.json'))
+        self.assertTrue(io.exists('diagnostics.json'))
+        # Without the withdrawal the guard would wait for a job closure that can never
+        # exist, record unresolved.json and leave the worker to the provider TTL.
+        self.assertTrue(controller.guard_loop(r,io,io.read('controller-intent.json')))
+        self.assertTrue(io.exists('closed.json'));self.assertFalse(io.exists('unresolved.json'))
+        self.assertEqual([x[0] for x in io.calls],['resume','stop'])
+
+    def test_a_withdrawn_handoff_admits_nothing(self):
+        op=self.f['operation'];(op/'root-handoff-withdrawn.json').write_text('{}\n');(op/'root-handoff-withdrawn.json').chmod(0o600)
+        with self.assertRaises(ValueError) as caught:controller.lifetime.export_operation(op,self.f['now'],self.f['profile']['worker'],self.f['profile'])
+        self.assertEqual(str(caught.exception),'Root handoff withdrawn')
+        # A withdrawal that comes after an admission receipt does not cancel the handoff.
+        io=controls.DiskIO(self.f['release'],op);self.assertTrue(controller.handoff_active(io))
 
 
 class Op4PhaseReplay(unittest.TestCase):

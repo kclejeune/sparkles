@@ -1114,13 +1114,18 @@ class Controls(unittest.TestCase):
         io.info=lambda:dict(real(),state='stopped') if io.started else real()
         with self.assertRaises(Refusal):c.drive(io.r,io)
         self.assertFalse(io.exists('diagnostic-hold.json'))
-        # After a handoff the controller is no longer qualifying, so a refusal never holds.
+        # A handoff whose admission failed is withdrawn, so the refusal holds and stops.
         r=fixture();r.update(useful_job_ready=True,separate_Root_handoff={'job_release_sha256':'a'*64,'different_job_review_sha256':'b'*64,'Root_owns_job_and_deadline_closure':True,'finite_job_and_closure_seconds':7200})
-        io=InertIO(r);io.diagnose=lambda s:self.fail('hold after handoff')
+        io=InertIO(r);io.diagnose=lambda s:{'schema':1,'processes':{'count':0,'rows':[]},'state':{'entries':[],'phases':{}}}
         io.guard_for_admission=lambda:(_ for _ in ()).throw(Refusal('guard not live at handoff'))
         with self.assertRaises(Refusal):c.drive(r,io)
-        self.assertTrue(io.exists('root-handoff.json'));self.assertFalse(io.exists('diagnostic-hold.json'))
+        self.assertTrue(io.exists('root-handoff-withdrawn.json'));self.assertTrue(io.exists('diagnostics.json'));self.assertTrue(io.exists('stop-trigger.json'))
         q=io.read('admission-refused.json');self.assertEqual((q['phase'],q['reason_code']),('admission','refusal:guard not live at handoff'))
+        # A standing handoff, with its admission receipt, never holds.
+        io=InertIO(r);io.diagnose=lambda s:self.fail('hold after handoff');io.guard_for_admission=lambda:InertIO.guard_for_admission(io)
+        self.assertEqual(c.drive(r,io),'QUALIFIED_ROOT_HANDOFF_GUARD_ACTIVE')
+        c.diagnostic_hold(io,io.read('controller-intent.json'));self.assertFalse(io.exists('diagnostic-hold.json'))
+        io.record('root-handoff-withdrawn.json',{});c.diagnostic_hold(io,io.read('controller-intent.json'));self.assertFalse(io.exists('diagnostic-hold.json'))
         # The hold has one call site, the controller's qualification.
         callers=[f.name for f in ast.walk(ast.parse(Path(c.__file__).read_text())) if isinstance(f,ast.FunctionDef) and any(isinstance(n,ast.Call) and getattr(n.func,'id',None)=='diagnostic_hold' for n in ast.walk(f))]
         self.assertEqual(callers,['drive'])

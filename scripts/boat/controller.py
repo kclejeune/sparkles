@@ -460,7 +460,9 @@ def drive(r,io):
     validate_release(r,io.wall())
     before=io.info();stopped(before);need(before['environmentVersion']==r['snapshot_continuity']['pre_resume_environment_version'],'unexpected pre-resume environment')
     need(before['snapshotCompletedAt']==r['snapshot_continuity']['snapshot_completed_at'],'snapshot continuity drift')
-    intent={'worker':worker_id(),'wall':io.wall(),'mono':io.mono(),'deadline_mono':io.mono()+10500,'deadline_wall':io.wall()+10500,'ttl':10800,'resume_count':1}
+    # Each clock is read once, so both deadlines are exactly 10,500 seconds after their readings.
+    wall,mono=io.wall(),io.mono()
+    intent={'worker':worker_id(),'wall':wall,'mono':mono,'deadline_mono':mono+10500,'deadline_wall':wall+10500,'ttl':10800,'resume_count':1}
     io.record('controller-intent.json',intent)
     try:io.arm(intent)
     except Exception:
@@ -508,7 +510,12 @@ def drive(r,io):
                 admission=make_admission(r,intent,io.read('qualification.json'),io.read('startup-closed.json'),io.guard_for_admission(),io.read('root-handoff.json'),io.wall())
                 io.record('qualified-worker-admission.json',admission)
             except Exception as error:
-                record_refusal(io,'admission',error);raise
+                record_refusal(io,'admission',error)
+                # No job can be admitted without the admission receipt, so a handoff
+                # that never produced one is withdrawn and the worker stops normally.
+                if io.exists('root-handoff.json') and not io.exists('qualified-worker-admission.json'):
+                    io.record(lifetime.HANDOFF_WITHDRAWN,{'worker':worker_id(),'reason_code':reason_code(error),'qualified_worker_admission_absent':True,'observed_wall':io.wall()})
+                raise
             return 'QUALIFIED_ROOT_HANDOFF_GUARD_ACTIVE'
         return 'QUALIFIED_STOP_REQUESTED'
     except Exception as error:
@@ -516,7 +523,7 @@ def drive(r,io):
         diagnostic_hold(io,intent)
         raise
     finally:
-        if not io.exists('no-ready-confirmed.json') and not io.exists('root-handoff.json'):io.trigger()
+        if not io.exists('no-ready-confirmed.json') and not handoff_active(io):io.trigger()
 
 
 # After a refused qualification, the controller holds its stop trigger for at most
@@ -550,7 +557,7 @@ def diagnostic_hold(io,intent):
     closure. It returns before the controller writes its stop trigger, and every
     error ends the hold, so the trigger is never lost."""
     try:
-        if not isinstance(intent,dict) or io.exists('root-handoff.json') or io.exists('no-ready-confirmed.json'):return
+        if not isinstance(intent,dict) or handoff_active(io) or io.exists('no-ready-confirmed.json'):return
         if not io.exists('resume-outcome.json') or io.read('resume-outcome.json').get('acceptance')!='positive':return
         if not any(n.startswith('info-') and io.read(n).get('state') in ('ready','idle','running') for n in io.names()):return
         start=io.mono();end=min(start+HOLD_MAX,intent['mono']+CONTROLLER_RUNTIME-HOLD_RESERVE,intent['deadline_mono']-HOLD_DEADLINE_RESERVE)
@@ -568,6 +575,12 @@ def diagnostic_hold(io,intent):
         io.record('diagnostic-hold-ended.json',{'ended_boottime':io.mono(),'attempts':attempt,'captured':io.exists('diagnostics.json')})
     except Exception:return
 
+def handoff_active(io):
+    """Whether a Root handoff stands, so that a normal stop needs the job closure.
+
+    A handoff withdrawn before any admission receipt existed admitted no job."""
+    return io.exists('root-handoff.json') and not (io.exists(lifetime.HANDOFF_WITHDRAWN) and not io.exists('qualified-worker-admission.json'))
+
 def matching_root_job_closed(r,io,closed):
     freshness(closed,io.wall())
     handoff=io.read('root-handoff.json');admission=io.read('qualified-worker-admission.json')
@@ -583,7 +596,7 @@ def reconcile_stop(r,io):
             need(io.stop_quiescent(),'startup closure unknown')
         if io.exists('metadata-started.json') and not io.exists('qualification-closed.json'):
             need(io.metadata_closed(), 'owned metadata closure unavailable')
-        if io.exists('root-handoff.json'):
+        if handoff_active(io):
             closed=io.read('root-job-closed.json');matching_root_job_closed(r,io,closed)
     except Exception as error:
         io.record('unresolved.json',{'worker':worker_id(),'stop_submitted':False,'ownership_retained_by_Root':True,'reason_code':reason_code(error),'action':'Root must establish owned metadata/job/lease closure before normal stop; providerTTL remains finite; retain guard evidence.'})
@@ -610,7 +623,7 @@ def reconcile_stop(r,io):
             need(timestamp(status.get('requestedAt'))>=request-2 and timestamp(status.get('endedAt'))>=request-2,'stop status is not this fresh request')
             stop_complete(info,op,request,r['snapshot_continuity']['snapshot_completed_at'],r['provider_contract']['snapshot_policy'])
             need(io.exists('qualification-closed.json') or not io.exists('metadata-started.json'),'owned metadata closure absent')
-            if io.exists('root-handoff.json'):
+            if handoff_active(io):
                 closed=io.read('root-job-closed.json')
                 matching_root_job_closed(r,io,closed)
             io.record('closed.json',{'worker':worker_id(),'stop_operation':op,'safe_info':info,'stopped_confirmed':True,'snapshot_available':True,'owned_metadata_closed':True,'private_credential_snapshot':True,'guard_may_exit':True})
@@ -876,7 +889,7 @@ def finish_operation(op,job_closure=None,seconds=180):
         record_refusal(io,'closure',error);raise
 
 def _finish(r,io,job_closure,seconds):
-    if io.exists('root-handoff.json'):
+    if handoff_active(io):
         if job_closure is not None:
             closed=load(job_closure);matching_root_job_closed(r,io,closed)
             if io.exists('root-job-closed.json'):need(io.read('root-job-closed.json')==closed,'closure replacement refused')
@@ -1053,7 +1066,7 @@ def main():
             result=finish_operation(op,None if a.job_closure is None else Path(a.job_closure).absolute());print(json.dumps(result));return 0
         r=bind_release_profile(load(op/'release.json'));verify_packet(r['controller_packet_manifest_sha256']);io=RealIO(r,op)
         need(not io.exists('closed.json') and io.exists('guard-ready.json'),'operation not active')
-        if io.exists('root-handoff.json'):
+        if handoff_active(io):
             closed=io.read('root-job-closed.json');matching_root_job_closed(r,io,closed)
         io.trigger();return 0
     except Exception as error:
