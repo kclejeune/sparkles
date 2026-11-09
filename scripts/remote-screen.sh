@@ -8,6 +8,23 @@ SCREEN_UNIT=
 SCREEN_LOCK=
 SCREEN_RUN=0
 
+# screen_expiry: the Unix time by which a Boat screen's units have stopped, their stop
+# included. It is 960 seconds before the admitted lifetime ends, ahead of the closure watch's
+# 900-second lead, so that a unit that its cleanup cannot reach is gone when the watch checks
+# closure. The worker enforces it on its own clock, which must agree with this one.
+screen_expiry() {
+  local left
+  left=$(rx_runtime "$OUT/admission.json" --reserve 960) || return
+  echo $(($(date +%s) + left))
+}
+
+# screen_expiry_guard UNIT EXPIRY: shell text that a unit runs first. It refuses with 75 when
+# the unit begins within 30 seconds of EXPIRY, and otherwise leaves a watchdog in the unit
+# that stops it 30 seconds before EXPIRY, however late the unit began.
+screen_expiry_guard() {
+  echo "left=\$(($2 - 30 - \$(date +%s))); if [ \"\$left\" -le 0 ]; then echo 'the unit $1 began after its expiry' >&2; exit 75; fi; setsid bash -c 'sleep \"\$1\"; systemctl --user stop --no-block \"\$2\"' watchdog \"\$left\" $1 < /dev/null > /dev/null 2>&1 &"
+}
+
 screen_check() {
   case $EXECUTOR in
     nsc) command -v nsc > /dev/null || die 'nsc is not on PATH' ;;
@@ -20,7 +37,7 @@ screen_check() {
 }
 
 screen_create() {
-  local purpose=$1 ttl token dir
+  local purpose=$1 ttl token dir expiry
   if [ "$EXECUTOR" = nsc ]; then
     nsc create --bare --machine_type "$MACHINE" --duration "$DURATION" --purpose "$purpose" \
       --cidfile "$OUT/instance.id" --output_json_to "$OUT/instance.json" > "$OUT/logs/create.log" 2>&1 || {
@@ -31,7 +48,14 @@ screen_create() {
     return
   fi
   rx_admit "$EXECUTOR" --minimum "${SPARKLES_REMOTE_MIN_LIFETIME:-1800}" > "$OUT/admission.json" || return
-  ttl=$(rx_runtime "$OUT/admission.json" --reserve 60) || return
+  # The lock ends by the screen's expiry (screen_expiry). Its RuntimeMaxSec bounds it from
+  # its activation. When it begins, the lock refuses within 30 seconds of the expiry and
+  # otherwise starts a watchdog that stops it 30 seconds before the expiry, before it opens
+  # the readiness FIFO, whose writes are bounded, so it ends in time however late it began
+  # and whether or not anyone reads its answer.
+  expiry=$(screen_expiry) || return
+  ttl=$((expiry - 30 - $(date +%s)))
+  [ "$ttl" -gt 0 ] || return
   token=$(python3 -c 'import secrets;print(secrets.token_hex(12))')
   SCREEN_LOCK=sparkles-screen-lock-$token
   ID=${EXECUTOR#boat:}
@@ -44,8 +68,8 @@ screen_create() {
     mkdir -p \"\$HOME/lanes/remote-screens\"
     d=\$(mktemp -d \"\$HOME/lanes/remote-screens/$token.XXXXXXXX\")
     mkfifo \"\$d/ready\"
-    systemd-run --user --unit=$SCREEN_LOCK --collect -q -p RuntimeMaxSec=$ttl \
-      bash -c 'exec 9>\"\$HOME/lanes/.heavy.lock\"; if ! flock -n 9; then echo busy > \"\$1/ready\"; exit 75; fi; echo ready > \"\$1/ready\"; exec sleep \"\$2\"' bash \"\$d\" $ttl
+    systemd-run --user --unit=$SCREEN_LOCK --collect -q -p RuntimeMaxSec=$ttl -p TimeoutStopSec=30 \
+      bash -c 'left=\$((\$2 - 30 - \$(date +%s))); [ \$left -gt 0 ] || exit 75; setsid bash -c \"sleep \\\$1; systemctl --user stop --no-block \\\$2\" watchdog \$left \$3 < /dev/null > /dev/null 2>&1 & exec 9>\"\$HOME/lanes/.heavy.lock\"; if ! flock -n 9; then timeout 15 tee \"\$1/ready\" > /dev/null <<< busy; exit 75; fi; timeout 15 tee \"\$1/ready\" > /dev/null <<< ready || exit 75; exec sleep \$left' bash \"\$d\" $expiry $SCREEN_LOCK
     test \"\$(timeout 15 cat \"\$d/ready\")\" = ready
     rm \"\$d/ready\"
     printf '%s\\n' \"\$d\"") || return
@@ -86,7 +110,7 @@ PY
 }
 # Start once. A lost response is uncertain acceptance, never a reason to relaunch.
 screen_launch() {
-  local script=$1 logfile=$2 prepare=${3:-:} text
+  local script=$1 logfile=$2 prepare=${3:-:} text expiry
   text="cd $REMOTE && $prepare && exec bash $script > $logfile 2>&1"
   if [ "$EXECUTOR" = nsc ]; then
     screen_exec "cd $REMOTE && $prepare && setsid nohup bash $script > $logfile 2>&1 < /dev/null &"
@@ -94,10 +118,14 @@ screen_launch() {
     SCREEN_RUN=$((SCREEN_RUN + 1))
     SCREEN_UNIT=${SCREEN_LOCK/lock-/run-}-$SCREEN_RUN
     printf '%s\n' "$SCREEN_UNIT" >> "$OUT/workload-units"
-    # An empty RuntimeMaxSec would mean no limit, so an exhausted lifetime stops here.
+    # An empty RuntimeMaxSec would mean no limit, so an exhausted lifetime stops here. The
+    # unit's guard holds it to the screen's expiry however late it began.
     local runtime
-    runtime=$(rx_runtime "$OUT/admission.json" --reserve 60) || return
-    screen_exec "systemd-run --user --unit=$SCREEN_UNIT --collect -q -p MemoryMax=12G -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec=$runtime bash -c $(printf '%q' "$text")"
+    expiry=$(screen_expiry) || return
+    runtime=$((expiry - 30 - $(date +%s)))
+    [ "$runtime" -gt 0 ] || return
+    text="$(screen_expiry_guard "$SCREEN_UNIT" "$expiry") $text"
+    screen_exec "systemd-run --user --unit=$SCREEN_UNIT --collect -q -p MemoryMax=12G -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec=$runtime -p TimeoutStopSec=30 bash -c $(printf '%q' "$text")"
   fi
 }
 screen_destroy() {

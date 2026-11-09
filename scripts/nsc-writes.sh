@@ -186,7 +186,7 @@ binary() (
   else
     sha=$(git -C "$ROOT" rev-parse --verify --quiet "$ref^{commit}") || die "$ref is neither a file nor a commit"
     args_hash=$(printf '%s' "$CARGO_ARGS" | sha256sum | cut -d' ' -f1)
-    key=$sha-$args_hash
+    key=$sha-$args_hash$(bh_entry_key_suffix)
     entry=$WRITE_CACHE/bin/$key
     exec {build_lock}> "$WRITE_CACHE/locks/$key.lock"
     flock "$build_lock"
