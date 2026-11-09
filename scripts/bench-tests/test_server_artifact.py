@@ -820,7 +820,8 @@ esac
         self.assertNotIn("packages: write", workflow)
         self.assertNotIn("CARGO_TARGET_DIR", workflow)
         self.assertNotIn("--target-dir", workflow)
-        self.assertIn("github-cache-mode: objects", workflow)
+        self.assertIn("backend: local", workflow)
+        self.assertNotIn("id-token", workflow)
         self.assertIn("version: 1.29.1", workflow)
 
 
