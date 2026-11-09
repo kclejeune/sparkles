@@ -431,7 +431,7 @@ struct ResultParts {
 impl ResultParts {
     /// Publish the parts as a shared result. Only a graph result's term scan grows with
     /// the answer, so only a graph result times this into its execution, and the only
-    /// check follows the header's admission. A SELECT or ASK result reads no clock here.
+    /// check follows the header's admission. A SELECT or ASK result takes no timing here.
     fn freeze(self) -> Result<QueryResult> {
         let started = (!self.triples.is_empty() || !self.quads.is_empty()).then(Instant::now);
         fn levels(plan: &PlanInfo) -> usize {

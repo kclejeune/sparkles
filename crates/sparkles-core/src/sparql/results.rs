@@ -2188,34 +2188,24 @@ mod buffered_tests {
     use super::*;
 
     /// The writers of a small answer check only memory failures, so the prefetch entry
-    /// is where a query cancelled after it ran is refused before it serializes.
+    /// is where a query cancelled after it ran is refused before it serializes. The test
+    /// calls it directly, because the I/O hints that enable it are process-wide.
     #[test]
     fn small_answer_cancelled_after_execution_refuses_to_serialize() {
-        crate::index::set_io_hints(true);
         let store = crate::store::Store::in_memory(Default::default());
-        for native in [false, true] {
-            let r = crate::sparql::query(
-                store.snapshot(),
-                "SELECT ?s WHERE { VALUES ?s { <urn:a> <urn:b> } }",
-                &Default::default(),
-            )
-            .unwrap();
-            assert_eq!(r.len(), 2);
-            r.inner
-                .ctx
-                .cancel
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            let mut out = Vec::new();
-            let result = if native {
-                write_native_json(&r, &mut out, None, None)
-            } else {
-                write_solutions(&r, SolutionsFormat::Tsv, &mut out, None)
-            };
-            assert!(
-                matches!(result, Err(Error::Cancelled)),
-                "native {native}: {result:?}"
-            );
-        }
+        let r = crate::sparql::query(
+            store.snapshot(),
+            "SELECT ?s WHERE { VALUES ?s { <urn:a> <urn:b> } }",
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(r.len(), 2);
+        assert!(prefetch_answer(&r, 2).is_ok());
+        r.inner
+            .ctx
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(prefetch_answer(&r, 2), Err(Error::Cancelled)));
     }
 
     /// A writer that takes `room` bytes and refuses the write that would pass them, as
