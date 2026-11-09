@@ -259,6 +259,8 @@
       ? (shortForms.get(iri) ?? iriName(iri, prefixes))
       : null;
 
+  // the summary on screen was read before the imports changed, and its next read is due
+  let summaryStale = $state(false);
   async function loadAll() {
     const t = target;
     const s = sel;
@@ -273,6 +275,7 @@
       // first summary of a scope arrives beside, such as the labels of the tree, is kept
       if (loadedTarget === t && shown !== r.summary.commit) resetLazy();
       summary = r.summary;
+      summaryStale = false;
       etag = r.etag;
       shown = r.summary.commit;
       loadedTarget = t;
@@ -304,7 +307,7 @@
    * names as they are typed. The labels of the kinds read come in one query.
    */
   async function ensureKinds(kinds: EntityKind[]) {
-    if (!summary) return;
+    if (!summary || summaryStale) return;
     const want = kinds.filter((k) => !listed.has(k));
     if (!want.length) return;
     const my = listSeq;
@@ -385,6 +388,7 @@
   function rereadImports() {
     // the summary stays on screen until its next read lands, so the Imports tab keeps its
     // form state; the reset below forgets what the views read
+    summaryStale = true;
     loadedTarget = null;
     resetLazy();
     for (const lt of levelTrees.values()) lt.drop();
@@ -696,7 +700,9 @@
     const key = `${selected ?? ''}\u0000${tab}\u0000${createOpen}`;
     const missing = PICKER_KINDS.some((k) => !listed.has(k));
     const failed = listFailed;
-    const ready = !!summary;
+    // a summary kept on screen while the imports are read again has the old counts, which
+    // must not decide which kinds are too large to list
+    const ready = !!summary && !summaryStale;
     untrack(() => {
       // another need is a new try
       if (key !== needKey) {
