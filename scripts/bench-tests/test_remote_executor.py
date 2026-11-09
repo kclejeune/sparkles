@@ -112,9 +112,28 @@ class Admission(unittest.TestCase):
     def test_exact_warm_identity_and_binary_safe_command(self):
         result=RX.command('boat:bx_fixture',"printf '%s' 'a;$(bad)' && cat")
         self.assertEqual(result[:4],[self.fixtures['release']['boat']['path'],'--no-update','ssh','bx_fixture'])
-        decoded=shlex.split(result[-1]);self.assertEqual(len(decoded),1)
-        self.assertIn("a;$(bad)",decoded[0]);self.assertNotIn('; . ',decoded[0])
+        # The provider passes each word after -- to the worker as one argument, quoting
+        # it there (observed on bx_gy2ytgh8: `-- echo 'a  b' '$HOME'` printed `a  b $HOME`).
+        # So bash -c receives the script itself, never a quoted copy of it.
+        # Bash run over ssh reads ~/.bashrc even with -c, and the worker's prepends
+        # /usr/local/cargo/bin to PATH (observed on bx_gy2ytgh8), so no shell reads it.
+        # An inherited BASH_ENV or ENV would still run startup code, so both are cleared.
+        words=result[result.index('--')+1:]
+        self.assertEqual(words[:9],['/usr/bin/env','-u','BASH_ENV','-u','ENV','/bin/bash','--norc','--noprofile','-c']);self.assertEqual(len(words),10)
+        script=words[9];self.assertFalse(script.startswith(("'",'"')),script[:20])
+        self.assertIn('exec env -u BASH_ENV -u ENV ',script);self.assertIn(' /bin/bash --norc --noprofile -c ',script)
+        import shutil as sh,subprocess,os,tempfile as tf
+        with tf.TemporaryDirectory() as t:
+            marker=Path(t)/'ran';startup=Path(t)/'startup';startup.write_text('touch '+shlex.quote(str(marker))+'\n')
+            local=[sh.which('env'),*words[1:5],sh.which('bash'),*words[6:9],'echo ok']
+            out=subprocess.run(local,env={'PATH':os.environ['PATH'],'BASH_ENV':str(startup),'ENV':str(startup)},capture_output=True,text=True,timeout=10)
+            self.assertEqual(out.stdout,'ok\n');self.assertFalse(marker.exists())
+        self.assertIn("a;$(bad)",script);self.assertNotIn('; . ',script)
+        import subprocess as sp
+        self.assertEqual(sp.run(['bash','-n','-c',script],capture_output=True,timeout=10).returncode,0)
         self.assertFalse(any(action in result for action in ('create','resume','stop','snapshot')))
+        # The session leaves the provider's landing directory before it runs anything.
+        self.assertTrue(script.startswith('set -e; cd '+shlex.quote(self.fixtures['profile']['worker_home'])+'; '),script[:80])
 
     def test_identity_expiry_unknown_schema_and_guard_replacement_refuse(self):
         for changed in (dict(worker='bx_other'),dict(version=2),dict(unexpected='NOT_A_SECRET')):
@@ -309,7 +328,13 @@ class Admission(unittest.TestCase):
         (cargo/'rustc').chmod(0o755)
         if install_mbx:
             pinned=home/'.local/share/mise/installs/mr-boxington/1.29.1';pinned.mkdir(parents=True)
-            (pinned/'mbx').write_text('#!/bin/sh\necho "mbx '+mbx_version+'"\n');(pinned/'mbx').chmod(0o755)
+            # The fake answers `settings get` the way mbx does: an environment variable
+            # wins over the worker's configuration, which names the read-only remote cache.
+            (pinned/'mbx').write_text('#!/bin/sh\nif [ "$1" = settings ] && [ "$2" = get ]; then\n case "$3" in\n'
+                                      '  remote.url) echo "${MBX_REMOTE_URL-https://cache.invalid}" ;;\n'
+                                      '  gc.max_total_size) echo "${MBX_GC_MAX_TOTAL_SIZE-}" ;;\n'
+                                      '  gc.min_free_size) echo "${MBX_GC_MIN_FREE_SIZE-}" ;;\n  *) exit 2 ;;\n esac\n exit 0\nfi\n'
+                                      'echo "mbx '+mbx_version+'"\n');(pinned/'mbx').chmod(0o755)
         env=dict(RX.boat_environment.environment(profile),HOME=str(home))
         # Keep the job's home entries and replace the system ones with awk alone,
         # so a host-installed mbx or rustc cannot satisfy the check.
@@ -342,6 +367,62 @@ class Admission(unittest.TestCase):
             self.root=Path(tmp);profile,env=self.fake_worker();env.pop('RUSTUP_TOOLCHAIN')
             result=self.run_tool_check(profile,env)
             self.assertIn('ADMIT-REFUSAL: rustc reports 1.97.1, pinned 1.99.1',result.stdout,result.stderr)
+
+    def test_job_environment_is_local_only(self):
+        """Boat jobs build with mbx in local-only mode and a local budget, and name no token."""
+        profile=self.fixtures['profile'];values=RX.boat_environment.environment(profile)
+        self.assertEqual(values['MBX_REMOTE_URL'],'')
+        self.assertFalse([k for k in values if 'TOKEN' in k])
+        self.assertEqual(values['MBX_GC_MAX_TOTAL_SIZE'],'64GiB');self.assertEqual(values['MBX_GC_MIN_FREE_SIZE'],'45GiB')
+        self.assertNotIn('MBX_CACHE_DIR',values)
+        body=RX.boat_environment.environment_body(profile).decode()
+        self.assertIn("MBX_REMOTE_URL=''\n",body);self.assertNotIn('token',body.lower())
+        # Every Boat job shell drops an inherited token setting before it runs.
+        script=RX.command('boat:bx_fixture','true')[-1]
+        self.assertIn('exec env -u BASH_ENV -u ENV -u MBX_REMOTE_TOKEN_FILE -u MBX_REMOTE_TOKEN ',script)
+        self.assertIn(' MBX_REMOTE_URL= ',script)
+
+    def test_environment_preparation_needs_no_token_on_the_worker(self):
+        """The worker-side preparation writes the environment file in a home without a token."""
+        home=self.root/'prep-home';state=home/'.local/state/sparkles-boat';state.mkdir(parents=True,mode=0o700)
+        profile=dict(self.fixtures['profile'],worker_home=str(home),worker_uid=os.getuid())
+        q={'safe_owner':{'operation_id':'boat-owned-warm-qual-inert'},'local_guard':{'unit':'boat-owned-warm-qual-inert.service'}}
+        expected=RX.boat_environment.expected_environment(profile,q)
+        payload={'home':str(home),'uid':os.getuid(),'file':expected,'body':RX.boat_environment.environment_body(profile).decode(),'check':False}
+        self.assertFalse((home/'.config/mbx/remote-token').exists())
+        out=subprocess.run([sys.executable,'-I','-B','-c',RX.boat_environment.REMOTE,json.dumps(payload)],env={'HOME':str(home),'PATH':os.environ['PATH']},
+                           capture_output=True,text=True,timeout=20)
+        self.assertEqual(out.returncode,0,out.stderr);self.assertEqual(json.loads(out.stdout),expected)
+        self.assertEqual(Path(expected['path']).read_bytes(),RX.boat_environment.environment_body(profile))
+        out=subprocess.run([sys.executable,'-I','-B','-c',RX.boat_environment.REMOTE,json.dumps({**payload,'check':True})],env={'HOME':str(home),'PATH':os.environ['PATH']},
+                           capture_output=True,text=True,timeout=20)
+        self.assertEqual(out.returncode,0,out.stderr)
+
+    def test_admit_tool_check_refuses_a_remote_cache_or_token(self):
+        """Admission asks the pinned mbx for its effective settings and refuses anything but local-only."""
+        cases=[(lambda e:e.pop('MBX_REMOTE_URL'),'mbx resolves a remote cache URL, not local-only mode'),
+               (lambda e:e.update(MBX_REMOTE_URL='https://other.invalid'),'mbx resolves a remote cache URL, not local-only mode'),
+               (lambda e:e.update(MBX_REMOTE_TOKEN_FILE='/nonexistent'),'the job environment names an mbx remote token'),
+               (lambda e:e.update(MBX_GC_MAX_TOTAL_SIZE='5GiB'),'mbx local budget is 5GiB, pinned 64GiB'),
+               (lambda e:e.pop('MBX_GC_MIN_FREE_SIZE'),'mbx free-space floor is , pinned 45GiB')]
+        for change,reason in cases:
+            with self.subTest(reason=reason),tempfile.TemporaryDirectory()as tmp:
+                self.root=Path(tmp);profile,env=self.fake_worker();change(env)
+                result=self.run_tool_check(profile,env)
+                self.assertEqual(result.returncode,86,result.stdout+result.stderr)
+                self.assertIn('ADMIT-REFUSAL: '+reason,result.stdout,result.stderr)
+
+    def test_gate_unit_forwards_the_local_only_job_settings(self):
+        """A gate's service unit starts empty, so every job setting but PATH is forwarded when set."""
+        text=(ROOT/'scripts/gate/remote/gate-start.sh').read_text()
+        line=next(l for l in text.splitlines() if l.startswith('for n in MBX_REMOTE_URL'))
+        names=set(line.removeprefix('for n in ').removesuffix('; do').split())
+        self.assertEqual(set(RX.boat_environment.environment(self.fixtures['profile']))-{'PATH'},names)
+        self.assertIn('[ -z "${!n+x}" ] || forward+=("--setenv=$n=${!n}")',text)
+        self.assertIn('systemd-run --user --unit "$unit" --collect -q "${forward[@]}"',text)
+        build=(ROOT/'scripts/nsc-build-remote.sh').read_text()
+        self.assertNotIn('MBX_REMOTE_TOKEN_FILE=',build)
+        self.assertIn('MBX_REMOTE_URL MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE; do',build)
 
     def test_admit_renders_its_probe_and_names_a_missing_worker_tool(self):
         """The admit probe parses as shell, carries its formatted values, and checks every worker tool."""

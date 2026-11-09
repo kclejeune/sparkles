@@ -156,7 +156,14 @@ mode=selected
 [ "$all_checks" = 0 ] || mode="every check with --force"
 echo "$(date -u +%FT%TZ) queued $full part=$part jobs=$jobs cargo_jobs=$cargo_jobs memory=$mem base=${base:-none} checks=$mode host=$(hostname)" >> "$out/progress.log"
 
-systemd-run --user --unit "$unit" --collect -q \
+# A service unit starts with an empty environment. A Boat job's environment builds with
+# mbx in local-only mode, so its mbx and Rust settings are forwarded when the caller set
+# them, even to an empty value. An ssh host sets none of them and keeps its own mode.
+forward=()
+for n in MBX_REMOTE_URL MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE RUSTUP_TOOLCHAIN RUSTUP_AUTO_INSTALL; do
+  [ -z "${!n+x}" ] || forward+=("--setenv=$n=${!n}")
+done
+systemd-run --user --unit "$unit" --collect -q "${forward[@]}" \
   -p MemoryMax="$mem" -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec="$runtime" \
   --setenv=HOME="$HOME" --setenv=USER="$USER" --setenv=PATH="$PATH" \
   --setenv=MBX_REMOTE_TOKEN_FILE="${MBX_REMOTE_TOKEN_FILE:-}" --setenv=SPARKLES_REMOTE_EXECUTOR="$executor" \

@@ -216,6 +216,16 @@ def observer_sources():
 def props(text):
     return dict(line.split('=',1) for line in text.splitlines() if '=' in line)
 
+def remote_entry(home=None):
+    """The remote command of every provider session: Python on stdin, started from the
+    worker's home, so nothing a session runs lands in a startup checkout.
+
+    The home always exists, unlike the state directory before provisioning, so a
+    diagnostic can still report an absent state directory."""
+    home=profile()['worker_home'] if home is None else home
+    need(isinstance(home,str) and re.fullmatch('/[A-Za-z0-9_./+-]+',home) is not None,'remote working directory')
+    return ['/usr/bin/env','-C',home,'/usr/bin/python3','-I','-B','-']
+
 class RealIO:
     def __init__(self,r,op):self.r=r;self.op=Path(op);self.boat_path=r['boat']['path']
     def wall(self):return time.time()
@@ -246,10 +256,10 @@ class RealIO:
         program and its arguments travel as stdin bytes, as the phase launcher's do.
         """
         source=('import sys\nsys.argv=[\'remote\']+'+repr([str(a) for a in args])+'\n'+program).encode()
-        return self.boat(['ssh',worker_id(),'--','/usr/bin/python3','-I','-B','-'],seconds,source,json_mode=False)
+        return self.boat(['ssh',worker_id(),'--',*remote_entry()],seconds,source,json_mode=False)
     def diagnose(self,seconds):
         """Run the maintained read-only diagnostic program on the worker."""
-        r=self.remote_python((ROOT/'diagnostic-probe.py').read_text(),[],seconds)
+        r=self.remote_python((ROOT/'diagnostic-probe.py').read_text(),sorted(set(profile()['startup_repositories'].values())),seconds)
         need(r['exit']==0 and isinstance(r['body'],dict),'diagnostics unavailable')
         return r['body']
     def worker_boot_id(self):
@@ -403,7 +413,7 @@ if __name__=='__main__':
         source=(ROOT/'remote-launcher.py').read_text().replace('COMMON_SOURCE_LITERAL',repr(common)).replace('PAYLOAD_JSON_LITERAL',repr(json.dumps(payload))).replace('PROBE_BASE64_LITERAL',repr(base64.b64encode(program).decode())).encode()
         need(len(source)<262144,'remote phase stdin bound')
         seconds=330 if phase=='metadata' else (45 if phase=='stopcheck' else observation_seconds+85)
-        r=self.boat(['ssh',worker_id(),'--','/usr/bin/python3','-I','-B','-'],seconds,source,False)
+        r=self.boat(['ssh',worker_id(),'--',*remote_entry()],seconds,source,False)
         need(r['exit']==0 and isinstance(r['body'],dict),'remote phase invocation failed')
         return r['body']
     def startup(self,intent,allow_qualification):
