@@ -352,8 +352,9 @@ Reuse workers and prepared snapshots to reduce setup work and sandbox starts, wi
 the account's shared daily and rate limits.
 
 Development environments and CI runners have separate setup and authentication. Inject
-development credentials into owned development sandboxes, and keep Actions OIDC authentication
-for the workflows that use the remote cache. Reusable dev and CI seeds are separate and contain no credentials or live leases.
+development credentials into owned development sandboxes. The CI workflows build with
+GitHub's own caches and hold no cache credentials. Reusable dev and CI seeds are separate
+and contain no credentials or live leases.
 Verify snapshot and credential behavior before treating a seed as reusable. Tool setup
 alone does not qualify a compiler workload or snapshot lifecycle.
 
@@ -1137,15 +1138,14 @@ system refuses one, the job warns and continues. On a large runner the server ca
 container keeps its process limit and drops its 4 CPU and 14 GB limits, and Cargo runs one
 compiler job for each CPU instead of two in total.
 
-The binding workflows and the server candidate build authenticate to the remote mbx cache
-with the GitHub OIDC token of the job, and `ci.yml` uses no remote cache. GitHub issues
-that token to jobs on self-hosted runners as it does on its own, and neither provider below
-documents a restriction. Both providers bill per second of runner time, while GitHub's
-standard runners are free for this public repository.
+No workflow uses a remote build cache, so a build job needs no OIDC token. Every job keeps
+its caches in GitHub Actions, which serves self-hosted runners as it serves its own. Both
+providers below bill per second of runner time, while GitHub's standard runners are free for
+this public repository.
 
 Boat runs each job in a fresh Ubuntu 24.04 virtual machine with Docker, passwordless
-`sudo` and 4 GB of swap. Its machines are in Germany, Finland and France, so a job that
-downloads the remote cache from a server elsewhere may wait longer for it. Its CI needs
+`sudo` and 4 GB of swap. Its machines are in Germany, Finland and France, so a job may wait longer for
+GitHub's cache to restore and save. Its CI needs
 the $20 plan, and the `boat-xlarge` size needs the $100 plan. The $20 plan starts 12 jobs
 a minute, 60 an hour and 200 a day. A job over the minute limit waits, and a job over the
 day limit fails. To set it up, the owner of the repository runs these steps.
@@ -1181,8 +1181,8 @@ to `ubuntu-24.04` unless the pull request's head repository is this one.
 GitHub Actions installs the pinned `jdx/mr-boxington-action` after the toolchain from
 `rust-toolchain.toml`.
 
-`ci.yml` runs Boxington in the action's local mode, with no remote cache and no OIDC
-token. `MBX_TARGET_VIEWS` is 0, so the target is a plain directory in the checkout. Two
+Every workflow runs Boxington in the action's local mode, with no remote cache and no OIDC
+token. In `ci.yml`, `MBX_TARGET_VIEWS` is 0, so the target is a plain directory in the checkout. Two
 caches carry the build between runs, and each covers what the other cannot.
 
 `Swatinem/rust-cache` saves the Cargo registry and the target directory without the
@@ -1214,29 +1214,31 @@ Each commit adds a test store of 0.3 to 0.6 GB and a Clippy store of 0.2 to 0.5 
 10 GB repository cache drops the least recently used entries first, so it keeps the
 stores of the last several main commits next to the other workflows' caches.
 
-The binding workflows and the server candidate build keep Boxington's remote cache. Main
-pushes, same-repository pull requests, release tags and manual runs use the remote cache
-in the `kclejeune/sparkles` namespace. The cache server uses GitHub OIDC and grants writes
-to main pushes, same-repository pull requests and tag pushes. The binding workflows enable
-tag writes only for their release-tag prefixes. The server matches claims exactly, so its
-tag grant covers every tag push in the repository. Manual runs read the remote cache
-without publishing. Fork pull requests use GitHub Actions cache instead, since they cannot
-request the OIDC token. This is a backend selection at job start, not automatic failover
-if the remote cache becomes unavailable.
+The binding workflows and the server candidate build use the same two caches. Their keys
+also name the platform and the build profile. The JVM natives and the Node addon build on
+the runner and keep a rust-cache entry for each platform and profile, whose cleanup keeps
+the binding workspace's dependencies. The JVM jars and compatibility jobs restore the Linux
+x86_64 dev natives' caches without saving, since they build the dev bindings generator on
+that platform. The Linux wheels, the Alpine addons and the server candidate build in
+containers, so they keep only the object store. A binding workflow saves only on a push to
+`main`, which builds the dev profile on Linux x86_64. Release tags and manual runs build the
+release profile and every platform from an empty store. `MBX_GC_MAX_SIZE` is 2 GiB for the
+bindings and 3 GiB for the server candidate.
 
-Cache-backed checkouts fetch two commits so Boxington can borrow predictions from the base
-commit of a pull request when the lockfile changes. Native build commands and shell build
-scripts call `mbx` directly. Maturin and napi builds use the supported Cargo shim because
-those tools invoke Cargo themselves. The GitHub cache fallback carries a Cargo target
-payload for root-workspace jobs and an object payload for binding workspaces or explicit
-targets. The target payload includes Cargo downloads, while object jobs let Cargo download
-dependencies again.
+On GitHub's runner, a cold run of these jobs took 15 min for the Linux wheel, 27 min for
+the Node addon, 21 min for the JVM natives and 40 min for the server candidate. With both
+caches restored and no Rust change, the wheel took 4 min, the JVM natives 4 min and the
+server candidate 21 min. The Node addon still took 14 min, since its addon and server
+builds reuse little of the restored caches. Each main push adds a store of about 0.35 GB
+for the wheel, 0.55 GB for the addon, 0.45 GB for the natives and 2.7 GB for the server
+candidate, and the addon's and the natives' target entries are about 0.9 and 0.6 GB. With
+`ci.yml`'s entries, one main push's set is close to the 10 GB limit, so GitHub evicts the
+older commits' stores first. The server candidate's save takes 3 to 5 min of its job.
 
-The remote cache uses Boxington's versioned protocol rather than requiring the client
-and server application versions to match. CI keeps its tested client version pinned,
-including checksum-verified container downloads. When changing it, verify remote cache
-access and use matching local compiler shims and agents. Other client versions may miss
-cache entries or lack features used by these build scripts.
+Native build commands and shell build scripts call `mbx` directly. Maturin and napi builds
+use the supported Cargo shim because those tools invoke Cargo themselves. CI keeps its
+tested Boxington version pinned, including checksum-verified container downloads. Other
+client versions may miss cache entries or lack features used by these build scripts.
 
 The **Build tests** job holds the target lease while `mbx nextest archive` builds and
 writes its archive under `RUNNER_TEMP`. Recompression and artifact upload read that
@@ -1244,18 +1246,15 @@ archive outside the target directory, so collection after the command cannot rem
 upload.
 
 The Linux wheel and Alpine addon containers install the pinned Boxington version from
-checksum-verified portable binaries. They mount their host job's store and use a separate
-compiler-shim directory. The Linux wheel forwards the remote settings and OIDC credentials
-when its job uses the remote cache. The Alpine addon uses the remote cache for release and
-manual runs. Container-built files are returned to the runner's ownership before any GitHub
-cache export. Alpine keeps separate Rustup and pnpm download caches.
+checksum-verified portable binaries. They keep the store under `.cache/mbx` in the
+checkout, use a separate compiler-shim directory and turn the link cache off. Container-built
+files are returned to the runner's ownership before the runner's Boxington collects the
+wheel's store and saves it. Alpine keeps separate Rustup and pnpm download caches.
 
 Local builds use Boxington's default learned incremental reuse and managed targets.
 CI uses Boxington's CI defaults, which disable learned and Cargo incremental reuse
 unless eager reuse is explicitly selected. No eager policy is forced for disposable
-runners. The target payload disables managed placement so it can archive the actual
-Cargo target tree. The object payload can represent explicit or managed targets.
-Production profiles, compiler optimization and linker selection stay unchanged.
+runners. Production profiles, compiler optimization and linker selection stay unchanged.
 
 Mise tasks that use compiled outputs after a build internally wrap the downstream
 command with a small Cargo subcommand, `sparkles-task`. It keeps the workspace's
