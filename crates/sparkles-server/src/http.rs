@@ -1379,6 +1379,33 @@ fn update_timeout(st: &AppState, params: &Params) -> Option<Duration> {
 
 /// A cancellation flag and the guard that sets it when dropped: kept in a handler's
 /// future, it stops the engine work of a request whose client disconnected.
+/// A streamed response body that holds its request's cancel guard, so that the
+/// producer keeps running while the body is read and stops once the body is dropped.
+struct CancelBody {
+    inner: axum::body::Body,
+    _cancel: CancelOnDrop,
+}
+
+impl http_body::Body for CancelBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 pub(crate) fn cancel_on_drop() -> (Arc<AtomicBool>, CancelOnDrop) {
     let cancel = Arc::new(AtomicBool::new(false));
     (cancel.clone(), CancelOnDrop(cancel))
@@ -2052,11 +2079,10 @@ pub(crate) async fn run_query(
     let sent_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let rows_written = sent_rows.clone();
     // The retained answer decodes under the query's own cancel flag, so the request's
-    // cancel guard lives as long as the writer does, as a cursor's guard does. A
-    // client that leaves still cancels it, when the aborted body drops the writer.
+    // cancel guard must outlive the handler while a streamed body is written. The
+    // response body holds it, so a client that leaves still cancels the writer.
     let cancel_guard = _cancel_on_drop;
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
-        let _guard = &cancel_guard;
         let ts = std::time::Instant::now();
         let sent = std::cell::Cell::new(0);
         let written = if thrift {
@@ -2139,6 +2165,10 @@ pub(crate) async fn run_query(
         }
         stream::Serialized::Streamed(body) | stream::Serialized::Timed { body, .. } => {
             QUICK.record(quick_key, f64::INFINITY);
+            let body = axum::body::Body::new(CancelBody {
+                inner: body,
+                _cancel: cancel_guard,
+            });
             (body, report, Some(deferred))
         }
     };
