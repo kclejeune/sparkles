@@ -57,6 +57,9 @@ The workbench edits entities, axioms and annotations through the axiom model of
 
 * Every edit is a previewed commit through the existing write path, with the same
   access checks and conflict handling as other writes.
+  The [import resolution](#import-resolution) catalog upload and fetch are the
+  exceptions. They are confirmed actions with the same access checks and conflict
+  handling, because their content comes from files or the network.
 * Round trips through the axiom model leave unrelated triples unchanged.
 
 ## Non-goals
@@ -71,94 +74,132 @@ The ontology-editing exclusions of U02 §1 and U07 §1 are lifted for this spec.
 
 Item 624 resolves `owl:imports` within the dataset. Imported content is always an
 ordinary named graph of the dataset, so history, exports, backups, grants and protected
-branches treat it like any other graph, and no read fetches anything. The maintainer
-chose this design over a server-wide store of pinned source versions that would load
-imports on demand into a cached layer outside the branch's history. That alternative
-keeps imported copies out of exports and shares them across datasets, but it needs the
-C30 source store, the durable jobs of item 339 and a cache format of its own.
+branches treat it like any other graph, and no read fetches anything. A server-wide
+store of pinned source versions, loaded on demand into a cached layer outside the
+branch's history, was set aside. It would keep imported copies out of exports and share
+them across datasets, but it needs the C30 source store, the durable jobs of item 339
+and a cache format of its own.
 
-**The import map.** Each dataset has an import map, the `imports` settings kind of
-[C19](../C19-layered-settings.md), kept in the dataset's `imports.json` with a format version. Its
-`map` member maps an import IRI, or a version IRI that an `owl:imports` names, to one
-named graph of the dataset. Each entry records its source, which is `manual`, `catalog`
-or `fetch`. A fetched entry also records the location fetched, the response's ETag, the
-SHA-256 digest of the bytes and the time of the fetch. The map belongs to the dataset,
-so every branch shares it, and a read of an earlier commit uses the current map. The
-settings routes read it with `read` and change it with `admin` and `If-Match`, as they do
-for the other kinds, and an operator can declare entries in the settings file. A map
-holds at most 4,096 entries, and each IRI and graph name is at most 4 KiB.
+### Import map
 
-**Resolution order.** A read with imports takes each `owl:imports` IRI of the graphs it
-reads and tries three sources in turn.
+Each dataset keeps an import map in its `ontology-imports.json`, a settings file with a
+format version that a reader refuses when the version is newer than it knows. The map
+sends an import IRI, or a version IRI that an `owl:imports` names, to one named graph of
+the dataset. Each entry records its source, which is `manual`, `catalog` or `fetch`. A
+fetched entry also records the location fetched, the branch and commit that the fetch
+wrote, the response's ETag, the SHA-256 digest of the bytes and the time of the fetch.
+The map belongs to the dataset, so every branch shares it, and a read of an earlier
+commit uses the current map. A map holds at most 4,096 entries, and each IRI and graph
+name is at most 4 KiB.
+
+The map is not a C19 settings kind, because the settings routes answer every reader
+with the whole object. `GET /$/ontology/{ds}/imports` answers the map with an entity
+tag of its revision. A caller with `admin` on the dataset sees every entry, and any
+other caller sees only the entries whose graph the caller can read.
+`PATCH /$/ontology/{ds}/imports` sets and removes entries with `admin` and an `If-Match`
+that names the map's revision. Every write of the map holds the dataset's import-map
+lock, so map writes are serialized.
+
+### Resolution order
+
+A read with imports takes each `owl:imports` IRI of the graphs it reads and tries three
+sources in turn.
 
 1. The import map's entry for the IRI resolves it to the entry's graph.
 2. A graph of the dataset named by the IRI resolves it, as F21 reads did before.
-3. A C30 vocabulary resource resolves it when one of its namespaces is the IRI, or the
-   IRI followed by `#` or `/`. The import then resolves to every graph the resource
-   lists in this dataset.
+3. The C30 vocabulary resources resolve it when one of their namespaces is the IRI, or
+   the IRI followed by `#` or `/`. Several resources can match, and the import then
+   resolves to every graph they list in this dataset, each once, in the order of the
+   resources' ids.
 
 A candidate graph counts only when it holds triples and the caller can read it. An
 import that no source resolves is unresolved, and an answer never names a graph the
-caller cannot read. The read follows the imports of every graph it adds, up to the 100
-imports F21 allows, and a graph is read once however many imports lead to it. Without
-any map entries or vocabulary resources, a read resolves exactly as before. Reasoning
+caller cannot read. The server reads the resource catalog for this lookup itself, and an
+answer shows only the resolved graphs, never a resource or another dataset's
+locations. The read follows the imports of every graph it adds, up to the 100 imports
+F21 allows, and a graph is read once however many imports lead to it. Without map
+entries or matching vocabulary resources, a read resolves exactly as before. Reasoning
 runs keep their own `locationMapping` and do not consult the map.
 
-**The closure.** The ontology summary gains a `closure` member with one edge for each
-`owl:imports` triple of a graph read. An edge names the importing graph, the import
-IRI, the graphs it resolved to and the source that resolved it (`map`, `graph` or
-`resource`). It also says whether it closes a cycle, which it does when one of its
-graphs is the importing graph or imports that graph through other edges. An unresolved
-edge names no graph. A change to the map or to the vocabulary resources changes what a
-read resolves without a commit, so the summary's entity tag adds a digest of the entries
-the read could use, and an edit's `If-Match` still names its commit.
+### Closure and caching
 
-**XML catalogs.** `POST /$/ontology/{ds}/imports/catalog` takes a multipart body. Its
-`catalog` part is an OASIS XML Catalog, such as the `catalog-v001.xml` that Protégé
-writes, and each further part is a local file that the catalog names, keyed by the path
-the catalog gives. Each `uri` entry, at the top of the catalog or in a `group`, maps its
-`name` to a graph. When the entry's `uri` is a relative path and its file is part of the
-body, the file replaces the graph named by the entry's `name`. The file's syntax comes
-from its media type or its extension. When the entry's `uri` is an absolute IRI, the
-name maps to the graph of that IRI and nothing is loaded. The files load in one commit
-on the branch the request names, with `If-Match` and a commit message, and the entries
-are written to the map with source `catalog` after the commit. The answer lists the
-entries it skipped and why. These include `rewriteURI`, `nextCatalog` and other entry
-types, an entry under an `xml:base`, and a relative `uri` whose file is not in the body.
-A catalog that is not well-formed XML, or that has no usable entry, is refused before
-anything changes. The catalog is at most 1 MiB with at most 1,000 entries, and the whole
-body stays within the server's upload limit.
+The ontology summary gains a `closure` member with one edge for each `owl:imports`
+triple of a graph read. An edge names the importing graph, the import IRI, the graphs it
+resolved to and the source that resolved it, which is `map`, `graph` or `resource`. It
+also says whether it closes a cycle, which it does when one of its graphs is the
+importing graph or imports that graph through other edges. An unresolved edge names no
+graph.
 
-**Fetch into graph.** `POST /$/ontology/{ds}/imports/fetch` takes the import IRI, and
-optionally a location and a graph. The location defaults to the map entry's location
-and then to the IRI, and it must be an `http` or `https` URL. The graph defaults to the
-map entry's graph and then to the IRI. The server fetches the document through its
-outbound policy, under the policy's destinations, timeout and response ceiling, and
-replaces the graph with the parsed document in one commit on the branch. It then writes
-the map entry with source `fetch`, the location, the ETag, the digest and the time. A
-refresh is the same action. It sends the recorded ETag as `If-None-Match`, and a `304`
-answer or an unchanged digest leaves the graph and the branch as they are and only
-updates the time. A refused destination, a timeout or a document that does not parse
-changes nothing. Reads still never fetch, and item 559 keeps fetching on read.
+A change to the map or to the vocabulary resources changes what a read resolves
+without a commit. Every read therefore takes the map and resource entries it could use
+as part of its request. The ontology cache keys a kept read by a digest of those
+entries, and the entity tags of the summary, the hierarchy and the term reads add the
+digest after the format, as in `owl.<digest>`. A tag that names the commit still
+satisfies an edit's `If-Match` whatever its digest, because an edit checks the commit.
 
-**Grants.** The catalog upload and the fetch change the map, so they need `admin` on the
-dataset. They also follow the branch's write rules, so a protected branch refuses them
-before anything changes. If the map write fails after the commit, the answer says so,
-the loaded graphs stay, and repeating the request writes the entries.
+### XML catalogs
 
-**The editor.** The ontology editor gains an **Imports** tab. It draws the closure as a
-tree from the selected graph, marks cycles and unresolved imports plainly with their
-IRIs, and lists the map with each entry's source, location, ETag, digest and time. An
-administrator adds and removes entries, uploads a catalog with its files and fetches or
-refreshes an import. A catalog upload and a fetch are confirmed actions rather than
-previews, since their content comes from files or the network, and their commits show
-in the history and the diff like any other. Readers and protected branches see the
-closure and the map without the actions.
+`POST /$/ontology/{ds}/imports/catalog` takes a multipart body. Its `catalog` part is an
+OASIS XML Catalog, such as the `catalog-v001.xml` that Protégé writes, and each further
+part is a local file that the catalog names, keyed by the path the catalog gives. The
+server parses the catalog without resolving anything outside the body. A document type
+declaration or an entity declaration is refused, element nesting is bounded at 32
+levels, and a relative path names a part of the body and nothing else.
 
-**Imported axioms in views.** A toolbar switch includes or excludes imported axioms in
-the editor's trees, frames, usage, metrics and DL queries, by sending `imports=true` or
-`imports=false` on every read, and the page keeps the choice in its URL. Imported axioms
-are included by default, as before. Edits keep writing to the selected graph.
+Each `uri` entry, at the top of the catalog or in a `group`, maps its `name` to a graph.
+When the entry's `uri` is a relative path and its file is part of the body, the file
+replaces the graph named by the entry's `name`. The file's syntax comes from its media
+type or its extension. When the entry's `uri` is an absolute IRI, the name maps to the
+graph of that IRI and nothing is loaded. The answer lists the entries it skipped and
+why. These include `rewriteURI`, `nextCatalog` and other entry types, an entry under an
+`xml:base`, and a relative `uri` whose file is not in the body. A catalog that is not
+well-formed XML, or that has no usable entry, is refused before anything changes. The
+catalog is at most 1 MiB with at most 1,000 entries, and the whole body stays within the
+server's upload limit.
+
+### Fetch into graph
+
+`POST /$/ontology/{ds}/imports/fetch` takes the import IRI, and optionally a location
+and a graph. The location defaults to the map entry's location and then to the IRI, and
+it must be an `http` or `https` URL. The graph defaults to the map entry's graph and
+then to the IRI. The server fetches the document through its outbound policy, under the
+policy's destinations, timeout and response ceiling, and replaces the graph with the
+parsed document in one commit on the branch. It then writes the map entry with source
+`fetch`, the location, the branch and commit, the ETag, the digest and the time.
+
+A refresh is the same action, and it always downloads the document again without a
+conditional request, since the recorded ETag belongs to one branch and one location.
+When the parsed document equals the graph's current triples on the requested branch,
+no commit is made, and only the entry's ETag, digest and time are updated. A refused
+destination, a timeout or a document that does not parse changes nothing. Reads still
+never fetch, and item 559 keeps fetching on read.
+
+### Writes, grants and failures
+
+The catalog upload and the fetch change the map, so they need `admin` on the dataset.
+They follow the branch's write rules, so a protected branch refuses them before anything
+changes, and they take an optional `If-Match` that names the branch's head commit, as
+other writes do. Each one holds the import-map lock from before its commit until its map
+write ends. It checks the new entries against the map's bounds before the commit. If the
+map write still fails after the commit, the answer carries the commit and the entries it
+did not write, the loaded graphs stay, and a `PATCH` of the map with those entries
+finishes the work.
+
+### Editor
+
+The ontology editor gains an **Imports** tab. It draws the closure as a tree from the
+selected graph, marks cycles and unresolved imports plainly with their IRIs, and lists
+the map with each entry's source, location, ETag, digest and time. An administrator adds
+and removes entries, uploads a catalog with its files and fetches or refreshes an
+import. A catalog upload and a fetch are confirmed actions rather than previews, since
+their content comes from files or the network, and their commits show in the history
+and the diff like any other. Readers and protected branches see the closure and the map
+without the actions.
+
+A toolbar switch includes or excludes imported axioms in the editor's trees, frames,
+usage, metrics and DL queries, by sending `imports=true` or `imports=false` on every
+read, and the page keeps the choice in its URL. Imported axioms are included by
+default, as before. Edits keep writing to the selected graph.
 
 ## Provenance
 
