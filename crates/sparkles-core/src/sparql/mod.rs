@@ -2189,9 +2189,18 @@ fn template_variable(
     if id.is_undef() {
         return Ok(None);
     }
-    held.add(ctx.decoded_bytes(id)?)?;
+    // Admit the conservative decode bound before decoding, then keep only the
+    // decoded term's actual graph bytes. A literal's lexical form is one copy.
+    let estimate = ctx.decoded_bytes(id)?;
+    held.add(estimate)?;
     graph_allocation(ctx, "construct-decode")?;
-    ctx.reserved_batch_term(id)
+    let term = ctx.reserved_batch_term(id)?;
+    let actual = term
+        .as_ref()
+        .map_or(0, |term| graph_term_bytes(term.as_ref()))
+        .min(estimate);
+    held.resize(held.bytes() - estimate + actual)?;
+    Ok(term)
 }
 #[allow(clippy::too_many_arguments)]
 fn template_term(

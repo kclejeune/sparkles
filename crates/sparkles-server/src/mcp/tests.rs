@@ -2514,7 +2514,9 @@ fn real_request_preparation_survives_branch_continuation_and_aggregate_refusal()
         preparation: None,
     };
     server.prepare_call(&mut call).unwrap();
-    assert_eq!(grant.used(), 1024);
+    // The request root charges the layouts it allocates.
+    let root = grant.used();
+    assert!(root > 0 && root < 1024, "{root}");
     let mut args = serde_json::json!({"branch":"review"})
         .as_object()
         .unwrap()
@@ -2526,7 +2528,7 @@ fn real_request_preparation_survives_branch_continuation_and_aggregate_refusal()
     server.prepare_call(&mut branch).unwrap();
     assert_eq!(
         grant.used(),
-        1024,
+        root,
         "continuation initialization allocates no second root"
     );
     let one = NativeBudget::from_preparation(call.preparation.as_ref().unwrap()).unwrap();

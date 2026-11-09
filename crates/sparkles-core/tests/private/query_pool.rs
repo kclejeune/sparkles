@@ -364,7 +364,14 @@ fn algorithm_sorted_cursor_batches_survive_early_close_and_cancellation() {
             drop(cursor);
             if let Some(batch) = &retained {
                 assert!(grant.used() > 0);
-                assert!(batch.row(0).unwrap().values().iter().all(Option::is_some));
+                // A retained batch keeps its payload and credit after the cursor
+                // closes. Decoding it is work of the query, so a cancelled query
+                // refuses to decode it.
+                if cancel_after_first {
+                    assert!(matches!(batch.row(0), Err(Error::Cancelled)));
+                } else {
+                    assert!(batch.row(0).unwrap().values().iter().all(Option::is_some));
+                }
             }
             drop(retained);
             assert_eq!(grant.used(), 0);
@@ -538,7 +545,11 @@ fn retained_eager_construct_graphs_cover_their_lexical_payload() {
         let result = query(s.snapshot(), q, &opts).unwrap();
         assert_eq!(result.len(), 300);
         assert!(result.mem_peak_bytes >= 30_000_000);
-        assert!(pool.granted() >= result.mem_peak_bytes);
+        // The pool keeps what the result retains, its graph credit, and not the
+        // duplicate set that construction freed.
+        let retained = result.inner._graph_credit.as_ref().unwrap().bytes();
+        assert!(retained >= 30_000_000);
+        assert!(pool.granted() >= retained);
         let kept = result.clone();
         assert!(std::sync::Arc::ptr_eq(&kept.inner, &result.inner));
         drop(result);
@@ -578,7 +589,9 @@ fn retained_eager_graphs_add_on_one_grant_and_release_in_different_orders() {
     )
     .unwrap();
     let two = query(s.snapshot(), "DESCRIBE ?s WHERE {?s <urn:p> ?o}", &opts).unwrap();
-    let sum = one.mem_peak_bytes + two.mem_peak_bytes;
+    // Each result keeps its own retained graph credit on the shared grant.
+    let credit = |r: &crate::sparql::QueryResult| r.inner._graph_credit.as_ref().unwrap().bytes();
+    let sum = credit(&one) + credit(&two);
     assert!(grant.used() >= sum);
     let context = two.clone();
     assert!(std::sync::Arc::ptr_eq(&context.inner, &two.inner));
@@ -589,7 +602,7 @@ fn retained_eager_graphs_add_on_one_grant_and_release_in_different_orders() {
         matches!(&context.triples()[0].object, oxrdf::Term::Literal(l) if l.value().len() == 100_000)
     );
     drop(context);
-    assert!(grant.used() >= one.mem_peak_bytes);
+    assert!(grant.used() >= credit(&one));
     assert_eq!(one.len(), 300);
     drop(one);
     assert_eq!(grant.used(), 0);
@@ -759,15 +772,18 @@ fn raw_context_does_not_retain_a_freed_result_graph_contribution() {
     assert!(graph_bytes >= 30_000_000);
     let ctx = result.inner.ctx.clone();
     let backing = std::sync::Arc::downgrade(&result.inner);
-    let before = ctx.grant().unwrap().used();
+    let before = ctx.live_bytes();
     assert!(before >= graph_bytes);
+    assert!(ctx.grant().unwrap().used() >= graph_bytes);
     drop(result);
     assert!(backing.upgrade().is_none());
-    let after = ctx.grant().unwrap().used();
+    let after = ctx.live_bytes();
     assert!(
         before - after >= graph_bytes,
         "freed graph credit {graph_bytes} must leave the raw context account: {before} -> {after}"
     );
+    // X14 stage 4 keeps an eager context's pool contribution at its admitted
+    // high point until the context goes, so only dropping it returns the grant.
     drop(ctx);
     assert_eq!(pool.granted(), 0);
 }

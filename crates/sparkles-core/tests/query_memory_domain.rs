@@ -203,6 +203,9 @@ fn a_grant_parent_retains_only_its_actual_grant_owner_and_returns_direct_usage()
     assert!(weak.upgrade().is_some());
     assert_eq!(pool.granted(), 12 * MB);
     drop(lease);
+    // The parent handle and every lease retain the grant owner.
+    assert!(weak.upgrade().is_some());
+    drop(parent);
     assert!(weak.upgrade().is_none());
     assert_eq!(pool.granted(), 0);
 }

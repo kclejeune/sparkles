@@ -1927,20 +1927,22 @@ fn memory_budget_fails_the_query_and_releases_its_charges() {
     use crate::error::{BudgetKind, Error};
     let s = store();
     let snap = s.snapshot();
+    // The retained result's own backing, its variables and its final table are
+    // charged, so even a one-row answer needs more than 1 KiB.
     let o = QueryOptions {
-        max_memory_bytes: Some(1024),
+        max_memory_bytes: Some(4096),
         ..Default::default()
     };
     match query(snap.clone(), "SELECT * { ?a ?b ?c . ?d ?e ?f }", &o) {
         Err(Error::BudgetExceeded(b)) => {
-            assert_eq!((b.kind, b.limit), (BudgetKind::Memory, 1024));
-            assert!(b.requested > 1024);
+            assert_eq!((b.kind, b.limit), (BudgetKind::Memory, 4096));
+            assert!(b.requested > 4096);
             let msg = Error::BudgetExceeded(b).to_string();
             assert!(
                 msg.starts_with("query exceeds its memory budget: needs about "),
                 "{msg}"
             );
-            assert!(msg.ends_with("limit 1.0 KiB"), "{msg}");
+            assert!(msg.ends_with("limit 4.0 KiB"), "{msg}");
         }
         r => panic!("{:?}", r.map(|r| r.len())),
     }

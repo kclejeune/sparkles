@@ -35,6 +35,8 @@ fn reasoner_child_release_preserves_executor_ownership() {
     assert_eq!((ctx.live_bytes(), grant.used()), before);
     drop(executor);
     assert_eq!(ctx.live_bytes(), 0);
+    // The parent handle retains its child account and the query ledger.
+    drop(parent);
     drop(ctx);
     assert_eq!(pool.granted(), 0);
 }
@@ -80,6 +82,9 @@ fn child_parent_final_drop_retires_its_zero_account() {
         assert_eq!(ctx.memory().lock().owners.len(), baseline + 1);
         let lease = child.reserve(1).unwrap();
         drop(lease);
+        // A lease and the handle both retain the child account.
+        assert_eq!(ctx.memory().lock().owners.len(), baseline + 1);
+        drop(child);
         assert_eq!(ctx.memory().lock().owners.len(), baseline);
     }
 }
@@ -159,6 +164,7 @@ fn nested_exact_child_credit_has_no_second_reservation_step() {
     assert_eq!(outer.grant().unwrap().used(), (5 << 20) + 37);
     drop(lease);
     assert_eq!((nested.live_bytes(), outer.live_bytes()), (0, 5 << 20));
+    drop(child);
     drop(nested);
     drop(executor);
     drop(outer);

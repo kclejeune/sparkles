@@ -303,23 +303,26 @@ fn controlled_streaming_and_term_decoding_match_all_legacy_terms_and_permutation
 }
 
 #[test]
-fn patterns_explicitly_refuse_without_approximating_legacy_visibility() {
+fn patterns_prepare_under_the_controlled_preparation() {
     let store = fixture();
     let mut p = protection();
     p.pattern = Some("FILTER(?user = \"alice\")".into());
     let view = access(vec![(p, Graphs::none())], Graphs::All);
     let legacy = view.masked(&store.snapshot()).unwrap();
-    // Preserve the actual legacy scope of this nested FILTER pattern. The bounded
-    // path must refuse its unsupported planning, never substitute point checks.
+    // The legacy mask hides part of the data for this nested FILTER pattern. The
+    // controlled path runs the same pattern under its preparation. The crate's
+    // own test compares the hidden quads of both paths for several callers.
     assert!(!legacy.mask.as_ref().unwrap().hidden.is_empty());
     assert!(legacy.len() < store.snapshot().len());
-    let result = view.masked_controlled(
-        &store.snapshot(),
-        &Preparation::new(Control::none(), 16 << 20).unwrap(),
-    );
-    assert!(
-        matches!(result, Err(Error::Unsupported(ref message)) if message.contains("pattern planning"))
-    );
+    let preparation = Preparation::new(Control::none(), 16 << 20).unwrap();
+    view.masked_controlled(&store.snapshot(), &preparation)
+        .unwrap();
+    // A preparation too small for the pattern's query refuses on memory.
+    let small = Preparation::new(Control::none(), 512).unwrap();
+    assert!(matches!(
+        view.masked_controlled(&store.snapshot(), &small),
+        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+    ));
 }
 
 #[test]

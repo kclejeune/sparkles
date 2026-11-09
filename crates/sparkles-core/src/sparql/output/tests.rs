@@ -645,7 +645,7 @@ fn receiving_root_headers_refuse_before_allocation_and_faults_refund_real_pool()
         None,
     );
     assert!(
-        matches!(SnapshotOutputRoot::new(store.snapshot(),&super::super::QueryOptions { pool:Some(pool.clone()),max_memory_bytes:Some(512),..Default::default() }),Err(Error::BudgetExceeded(b)) if b.kind==BudgetKind::Memory && b.limit==512 && b.requested==1024)
+        matches!(SnapshotOutputRoot::new(store.snapshot(),&super::super::QueryOptions { pool:Some(pool.clone()),max_memory_bytes:Some(64),..Default::default() }),Err(Error::BudgetExceeded(b)) if b.kind==BudgetKind::Memory && b.limit==64 && b.requested > 64 && b.requested < 1024)
     );
     drop(hook);
     assert_eq!(calls.load(Ordering::Relaxed), 0);

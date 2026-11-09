@@ -210,8 +210,8 @@ impl Preparation {
         if deadline.is_some_and(|end| std::time::Instant::now() >= end) {
             return Err(Error::Timeout);
         }
-        // Includes Inner/control, the optional new grant, and alignment/Arc headers.
-        let bytes = 1024u64;
+        // Charge the actual layouts of Inner and its control, the optional new
+        // grant and the cancel flag, with their Arc headers and alignment.
         let layouts = [
             (std::mem::size_of::<Inner>(), std::mem::align_of::<Inner>()),
             (
@@ -231,9 +231,8 @@ impl Preparation {
                     .checked_add(2 * align)
             })
             .ok_or_else(|| Error::invalid("receiving root header size overflow"))?;
-        if fixed as u64 > bytes {
-            return Err(Error::invalid("receiving root header exceeds admission"));
-        }
+        let bytes = u64::try_from(fixed)
+            .map_err(|_| Error::invalid("receiving root header size overflow"))?;
         let limit = opts.max_memory_bytes.unwrap_or(u64::MAX);
         if bytes > limit {
             return Err(Error::BudgetExceeded(Budget {
@@ -1888,7 +1887,8 @@ mod tests {
         let same = child.checked_for_query(&opts).unwrap();
         assert!(root.inner.same(&child.inner));
         assert!(child.inner.same(&same.inner));
-        assert_eq!(grant.used(), 1024);
+        assert_eq!(grant.used(), root.inner_used());
+        assert!(root.inner_used() < 1024);
         let first = NativeBudget::from_preparation(&child)
             .unwrap()
             .text(&"x".repeat(64 << 10))

@@ -206,8 +206,9 @@ async fn check_terms() {
 /// pattern with two unbound ends does not fail the whole diagnosis.
 #[tokio::test(flavor = "multi_thread")]
 async fn why_empty_over_budget_is_unknown() {
+    // The request root fits, and the checks do not.
     let cfg = McpConfig {
-        query_memory_bytes: Some(1),
+        query_memory_bytes: Some(512),
         ..McpConfig::default()
     };
     let mut c = Client::start(org(cfg));
@@ -230,7 +231,8 @@ async fn why_empty_over_budget_is_unknown() {
 #[test]
 fn why_empty_past_the_pool_is_unknown() {
     let server = org(McpConfig::default());
-    let pool = sparkles::sparql::pool::QueryPool::new(1);
+    // The request root fits in the pool, and the checks do not.
+    let pool = sparkles::sparql::pool::QueryPool::new(512);
     let mut call = Call {
         arrived: Instant::now(),
         cancel: Arc::new(AtomicBool::new(false)),

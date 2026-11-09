@@ -27,6 +27,16 @@ pub(super) fn run(s: &Store, text: &str, opt: Optimizations) -> QueryResult {
 }
 
 /// Solutions as exact RDF terms, sorted (a multiset).
+/// Sorted rows of dictionary ids, read without decoding application copies.
+fn id_solutions(r: &QueryResult) -> Vec<Vec<crate::id::Id>> {
+    let table = r.test_table();
+    let mut rows: Vec<Vec<_>> = (0..table.len())
+        .map(|row| (0..table.width()).map(|col| table.get(row, col)).collect())
+        .collect();
+    rows.sort();
+    rows
+}
+
 pub(super) fn solutions(r: &QueryResult) -> Vec<String> {
     let mut v: Vec<String> = r
         .test_application_rows()
@@ -1784,7 +1794,9 @@ fn optimized_operators_obey_the_memory_budget() {
         assert!(peak > 0, "{q}");
         let exact =
             query(s.snapshot(), &text, &budget(Some(peak))).unwrap_or_else(|e| panic!("{q}: {e}"));
-        assert_eq!(solutions(&exact), solutions(&full), "{q}");
+        // Decoding application copies is charged under the result's own memory
+        // limit, so the run at exactly its execution peak is compared by its ids.
+        assert_eq!(id_solutions(&exact), id_solutions(&full), "{q}");
         assert_eq!(exact.mem_peak_bytes, peak, "{q}");
         match query(s.snapshot(), &text, &budget(Some(peak - 1))) {
             Err(crate::Error::BudgetExceeded(b)) => {
