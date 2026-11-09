@@ -742,7 +742,6 @@ fn prefetch_answer(r: &QueryResult, n: usize) -> Result<()> {
         })
     };
     let ctx = &r.inner.ctx;
-    ctx.check()?;
     let vocab = &ctx.snap.generation.vocab;
     if n < PREFETCH_BLOCKS_BELOW && vocab.prefetch_would_skip(ids()) {
         return Ok(());
@@ -751,6 +750,7 @@ fn prefetch_answer(r: &QueryResult, n: usize) -> Result<()> {
     if count == 0 {
         return Ok(());
     }
+    ctx.check()?;
     let scratch = ctx.charge(0)?;
     if n < PREFETCH_BLOCKS_BELOW {
         let held = ctx

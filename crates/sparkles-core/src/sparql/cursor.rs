@@ -229,6 +229,11 @@ pub(super) fn arc_backing_bytes<T>(ctx: &Ctx) -> Result<u64> {
     u64::try_from(layout.pad_to_align().size()).map_err(|_| ctx.memory_exceeded(u64::MAX))
 }
 
+/// How many steps of the bounded per-variable loops in [`Variables::new`] run between
+/// cancellation checks. A check can read the clock, which costs far more than a step on
+/// some virtual machines, so a query with few variables makes one check, after admission.
+const CHECK_EVERY: usize = 1024;
+
 impl Variables {
     pub(super) fn new(
         ctx: &Arc<Ctx>,
@@ -254,7 +259,9 @@ impl Variables {
             let mut bytes = 0usize;
             let mut longest = 0usize;
             for index in 0..count {
-                ctx.check()?;
+                if index > 0 && index.is_multiple_of(CHECK_EVERY) {
+                    ctx.check()?;
+                }
                 let name = match projected {
                     Some(variables) => variables[index].as_str(),
                     None => names
@@ -267,9 +274,7 @@ impl Variables {
             }
             (bytes, longest)
         };
-        ctx.check()?;
         let star = super::is_select_star(query);
-        ctx.check()?;
         // Existing star ordering may retain its order and cached keys together,
         // plus two pattern strings. No transient names/IDs are cloned here.
         let workspace = if star {
@@ -315,7 +320,9 @@ impl Variables {
             // Drop this read guard before any charge can retire or notify a parent.
             let original = ctx.var_names.read();
             for index in 0..count {
-                ctx.check()?;
+                if index > 0 && index.is_multiple_of(CHECK_EVERY) {
+                    ctx.check()?;
+                }
                 let (id, text) = match projected {
                     Some(variables) => {
                         let text = variables[index].as_str();
@@ -341,7 +348,7 @@ impl Variables {
                     return Err(Error::invalid("cursor name capacity exceeds admission"));
                 }
                 for (at, character) in text.chars().enumerate() {
-                    if at.is_multiple_of(1024) {
+                    if at > 0 && at.is_multiple_of(CHECK_EVERY) {
                         ctx.check()?;
                     }
                     copied.push(character);
@@ -354,11 +361,14 @@ impl Variables {
             && let Some(mut order) =
                 super::select_star_columns_checked(query, &names, || ctx.check())?
         {
+            let mut steps = 0usize;
             for first in 0..order.len() {
-                ctx.check()?;
                 let mut at = first;
                 while order[at] != at {
-                    ctx.check()?;
+                    steps += 1;
+                    if steps.is_multiple_of(CHECK_EVERY) {
+                        ctx.check()?;
+                    }
                     let next = order[at];
                     order[at] = at;
                     if next == first {
@@ -370,7 +380,6 @@ impl Variables {
                 }
             }
         }
-        ctx.check()?;
         let variables = Arc::new(Self {
             names,
             ids,
@@ -5715,6 +5724,34 @@ mod retained_variable_tests {
                 assert!(matches!(result, Err(Error::Invalid(_))));
             }
             assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    /// A check can read the clock, which a virtual machine may make costly, so the
+    /// bounded variable copy of a small query makes one check, after its admission.
+    #[test]
+    fn small_projection_variables_make_one_check() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut context = Ctx::new(store.snapshot());
+        let ids: Vec<_> = ["p", "n", "a", "k"]
+            .iter()
+            .map(|v| context.var(v))
+            .collect();
+        context.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(600));
+        let ctx = Arc::new(context);
+        for query in ["SELECT ?p ?n ?a ?k WHERE {}", "SELECT * WHERE {}"] {
+            let pattern = spargebra::algebra::GraphPattern::Bgp {
+                patterns: Vec::new(),
+            };
+            let before = super::super::ctx::CHECKS.with(|n| n.get());
+            let variables = Variables::new(&ctx, &pattern, &ids, query).unwrap();
+            let checks = super::super::ctx::CHECKS.with(|n| n.get()) - before;
+            assert_eq!(variables.names, ["p", "n", "a", "k"]);
+            if query.contains('*') {
+                assert_eq!(checks, 2, "{query}");
+            } else {
+                assert_eq!(checks, 1, "{query}");
+            }
         }
     }
 

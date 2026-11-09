@@ -429,14 +429,14 @@ struct ResultParts {
     _graph_credit: Option<ctx::OutputCredit>,
 }
 impl ResultParts {
+    /// Publish the parts as a shared result. Its work is constant apart from the plan
+    /// walk, so it is not timed, and its only check follows the header's admission.
     fn freeze(self) -> Result<QueryResult> {
-        let started = Instant::now();
         fn levels(plan: &PlanInfo) -> usize {
             stacker::maybe_grow(exec::PLAN_RED_ZONE, exec::PLAN_STACK_SEGMENT, || {
                 1 + plan.children.iter().map(levels).max().unwrap_or(0)
             })
         }
-        self.ctx.check()?;
         let header = self
             .ctx
             .charge(cursor::arc_backing_bytes::<ResultBacking>(&self.ctx)?)?
@@ -458,7 +458,7 @@ impl ResultParts {
             .unwrap_or(0);
         let depth = levels(&self.plan).max(graph_depth);
         self.ctx.check()?;
-        let mut result = QueryResult {
+        let result = QueryResult {
             kind: self.kind,
             boolean: self.boolean,
             timing: self.timing,
@@ -478,9 +478,6 @@ impl ResultParts {
                 _header: header,
             }),
         };
-        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
-        result.timing.exec_ms += elapsed;
-        result.timing.total_ms += elapsed;
         Ok(result)
     }
 }
@@ -1283,10 +1280,10 @@ pub fn query_with_plan(
 /// order of first appearance in the query text. [`query`] applies this; callers of
 /// [`execute_query`] apply it themselves.
 pub fn select_star_order(q: &str, r: &mut QueryResult) -> Result<()> {
-    r.inner.ctx.check()?;
     if !is_select_star(q) {
         return Ok(());
     }
+    r.inner.ctx.check()?;
     if Arc::strong_count(&r.inner) != 1
         || r.inner
             .variables
@@ -1353,7 +1350,8 @@ fn select_star_columns_checked(
     vars: &[String],
     mut check: impl FnMut() -> Result<()>,
 ) -> Result<Option<Vec<usize>>> {
-    check()?;
+    // Callers have just checked. Each key scans the query text, so a long sort checks
+    // every 64 keys, and a short one only once at the end.
     if !is_select_star(q) {
         return Ok(None);
     }
@@ -1372,11 +1370,17 @@ fn select_star_columns_checked(
     };
     let mut order: Vec<usize> = (0..vars.len()).collect();
     let mut failure = None;
+    let mut keys = 0usize;
     let mut position = |&i: &usize| {
         if failure.is_some() {
             return usize::MAX;
         }
-        match check() {
+        keys += 1;
+        match if keys.is_multiple_of(64) {
+            check()
+        } else {
+            Ok(())
+        } {
             Ok(()) => pos(&vars[i]),
             Err(error) => {
                 failure = Some(error);
@@ -1726,12 +1730,13 @@ fn execute_prepared_parts(
             drop(materialized);
         }
     }
+    let exec_ms = t2.elapsed().as_secs_f64() * 1000.0;
     result.timing = Timing {
         parse_ms,
         plan_ms,
-        exec_ms: t2.elapsed().as_secs_f64() * 1000.0,
+        exec_ms,
         serialize_ms: 0.0,
-        total_ms: parse_ms + plan_ms + t2.elapsed().as_secs_f64() * 1000.0,
+        total_ms: parse_ms + plan_ms + exec_ms,
     };
     result.mem_peak_bytes = ctx.mem_peak();
     result.rows_produced = ctx.rows_produced();
@@ -2580,6 +2585,15 @@ mod result_backing_tests {
             }
             assert_eq!(ctx.live_bytes(), 0);
         }
+    }
+
+    #[test]
+    fn freezing_a_result_makes_one_check() {
+        let ctx = context(u64::MAX);
+        let before = ctx::CHECKS.with(|n| n.get());
+        let result = parts(ctx.clone()).freeze().unwrap();
+        assert_eq!(ctx::CHECKS.with(|n| n.get()) - before, 1);
+        drop(result);
     }
 
     #[test]
