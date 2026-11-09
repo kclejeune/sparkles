@@ -651,8 +651,8 @@ them. Readers and
 protected branches can list changes but get no preview. An annotation property that the
 ontology does not declare is declared with the edit, and a property of another kind, such as a
 data property, is refused. A move's new parent must be a class of the ontology or its imports,
-each moved entity must be a class or an IRI the ontology does not know, and the move
-declares nothing. The cycle check follows only the graph's own named `SubClassOf` axioms.
+each moved entity that the graphs type as something else is refused, and the move declares
+nothing. The cycle check follows only the graph's own named `SubClassOf` axioms.
 Item 770 covers bulk edits of larger ontologies.
 
 **Inferred** reveals the

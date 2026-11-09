@@ -37,6 +37,7 @@
     KIND_SINGULAR,
     LITERAL_TYPES,
     ontologyAxioms,
+    ontologyEntity,
     type EntityKind,
     resolveInput,
     type AnnValue,
@@ -84,7 +85,10 @@
   const cache = new Map<string, Promise<AxiomItem[]>>();
   let cacheKey = '';
   const ctl = new AbortController();
-  onDestroy(() => ctl.abort());
+  onDestroy(() => {
+    ctl.abort();
+    invalidate();
+  });
 
   /** Every axiom of `type` in the edited graph without its imports, or an error to show. */
   function read(type: 'AnnotationAssertion' | 'SubClassOf'): Promise<AxiomItem[]> {
@@ -138,6 +142,20 @@
       for (const [s, ks] of kindsOfTypes(typed)) out.set(s, ks);
     }
     return out;
+  }
+  /**
+   * The kinds the ontology gives one IRI, its imports included, at the shown commit, as its
+   * own lenient read decides them, or none when it does not know the IRI.
+   */
+  async function kindsOf(iri: string, signal: AbortSignal): Promise<EntityKind[]> {
+    const r = await ontologyEntity(
+      target,
+      { graph, imports: true },
+      iri,
+      signal,
+      commit != null ? `commit:${commit}` : undefined,
+    );
+    return r?.kinds ?? [];
   }
   const OWL_THING = 'http://www.w3.org/2002/07/owl#Thing';
   /** Kinds as a phrase: `a data property and an individual`. */
@@ -398,7 +416,7 @@
             valueIri ? 'Name the value as a prefixed name or an IRI.' : 'Type the value to set.',
           );
         const how = setMode;
-        const kinds = (await kindsOfAll([p], signal)).get(p) ?? [];
+        const kinds = await kindsOf(p, signal);
         if (kinds.length && !kinds.includes('AnnotationProperty'))
           return refuse(
             `${name(p)} is ${kindWords(kinds)} in this ontology, not an annotation property, so its values cannot be set as annotations.`,
@@ -442,7 +460,7 @@
     if (to === undefined) return refuse('Pick the new parent class, or move to the top.');
     const keep = keepParents && !toTop;
     if (to !== null && to !== OWL_THING) {
-      const kinds = (await kindsOfAll([to], signal)).get(to) ?? [];
+      const kinds = await kindsOf(to, signal);
       if (!kinds.includes('Class'))
         return refuse(
           kinds.length

@@ -235,11 +235,16 @@ as a data property, is refused before the preview, since its declaration as an a
 property would change how the existing assertions read. A move declares nothing, and its new
 parent must be a class of the ontology or its imports, or `owl:Thing`. Each moved entity
 must be a class or an IRI the ontology does not know, since a `SubClassOf` would otherwise
-turn a property or an individual into a class. The kinds come from the `rdf:type`
-values of the listed IRIs in the graphs the ontology reads, its imports included, at the
-shown commit, through one SPARQL query for each 200 IRIs. An OWL or RDFS declaration type
-gives its kind and any other type an individual, as the lenient read does, and a
-calculation that a new input supersedes aborts its queries. It reads and writes the graph
+turn a property or an individual into a class. The kinds of the set
+property and of the new parent come from `GET /$/ontology/{ds}/entity` at the shown commit
+with imports, so they follow the ontology's lenient read. The kinds of the moved entities,
+up to 1,000, come from their `rdf:type` values in the graphs the ontology reads, through one
+SPARQL query for each 200 IRIs, since an entity report for each would map the ontology's
+axioms again for each IRI. A declaration type gives its kind, a property characteristic or
+`rdf:Property` a property, and any other type an individual. An entity that the lenient read
+knows only from its use, such as an untyped subject of a data property assertion, is not
+caught by this check, and item 771 covers a batched kinds read. A calculation that a new
+input or leaving the tab supersedes aborts its queries. It reads and writes the graph
 without its imports, as it was planned, so an imported copy of a new value does not stop the
 server from adding that value to the edited graph.
 

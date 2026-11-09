@@ -486,15 +486,18 @@ const TYPE_KIND: Record<string, EntityKind | null> = {
   [OWL + 'AnnotationProperty']: 'AnnotationProperty',
   [RDFS + 'Datatype']: 'Datatype',
   [OWL + 'NamedIndividual']: 'NamedIndividual',
-  // characteristics and other vocabulary types say nothing beyond the declarations above
-  [RDF + 'Property']: null,
-  [OWL + 'FunctionalProperty']: null,
-  [OWL + 'InverseFunctionalProperty']: null,
-  [OWL + 'TransitiveProperty']: null,
-  [OWL + 'SymmetricProperty']: null,
-  [OWL + 'AsymmetricProperty']: null,
-  [OWL + 'ReflexiveProperty']: null,
-  [OWL + 'IrreflexiveProperty']: null,
+  [OWL + 'OntologyProperty']: 'AnnotationProperty',
+  // the characteristics that only an object property can have
+  [OWL + 'InverseFunctionalProperty']: 'ObjectProperty',
+  [OWL + 'TransitiveProperty']: 'ObjectProperty',
+  [OWL + 'SymmetricProperty']: 'ObjectProperty',
+  [OWL + 'AsymmetricProperty']: 'ObjectProperty',
+  [OWL + 'ReflexiveProperty']: 'ObjectProperty',
+  [OWL + 'IrreflexiveProperty']: 'ObjectProperty',
+  // a property of either kind, which is not a class either
+  [RDF + 'Property']: 'ObjectProperty',
+  [OWL + 'FunctionalProperty']: 'ObjectProperty',
+  // vocabulary types that say nothing about an entity's kind
   [OWL + 'Ontology']: null,
   [OWL + 'DeprecatedClass']: null,
   [OWL + 'DeprecatedProperty']: null,
@@ -510,12 +513,25 @@ export const DEFAULT_GRAPH_IRI = 'urn:x-arq:DefaultGraph';
  * ontology read with `default` for the stored default graph.
  */
 export function typesQuery(iris: readonly string[], graphs: readonly string[]): string {
-  const gs = graphs.map((g) => sparqlIri(g === 'default' ? DEFAULT_GRAPH_IRI : g)).join(' ');
+  const named = graphs.filter((g) => g !== 'default').map((g) => sparqlIri(g));
+  const parts = [
+    // the stored default graph by its own name, which also reads it under a union default
+    ...(graphs.includes('default')
+      ? [`{ GRAPH ${sparqlIri(DEFAULT_GRAPH_IRI)} { ?s a ?t } }`]
+      : []),
+    ...(named.length ? [`{ VALUES ?g { ${named.join(' ')} } GRAPH ?g { ?s a ?t } }`] : []),
+  ];
+  if (!parts.length) parts.push('{ FILTER(false) }');
   const ss = iris.map((i) => sparqlIri(i)).join(' ');
-  return `SELECT DISTINCT ?s ?t WHERE { VALUES ?g { ${gs} } VALUES ?s { ${ss} } GRAPH ?g { ?s a ?t } FILTER(isIRI(?t)) }`;
+  return `SELECT DISTINCT ?s ?t WHERE { VALUES ?s { ${ss} } ${parts.join(' UNION ')} FILTER(isIRI(?t)) }`;
 }
 
-/** The kinds that `rdf:type` values give each subject, as the ontology's lenient read does. */
+/**
+ * The kinds that `rdf:type` values give each subject. A property type without a kind of its
+ * own, such as `rdf:Property` or `owl:FunctionalProperty`, counts as an object property, since
+ * the check needs only to know that the entity is a property and not a class. Kinds that the
+ * ontology's lenient read infers from use alone are not found, which item 771 covers.
+ */
 export function kindsOfTypes(rows: { s: string; t: string }[]): Map<string, EntityKind[]> {
   const out = new Map<string, Set<EntityKind>>();
   for (const { s, t } of rows) {
