@@ -498,9 +498,11 @@ class LifetimeExtension(unittest.TestCase):
         self.assertFalse((self.op/'lifetime-extension-0001-accepted.json').exists())
 
     def test_acceptances_follow_each_other_in_order(self):
-        self.extend(self.io(self.left-600),3600);second=self.extend(self.io(self.left+1000),10500)
+        self.extend(self.io(self.left-600),3600);second=self.extend(self.io(self.left-300),10500)
         path=self.op/'lifetime-extension-0001-accepted.json';first=json.loads(path.read_text())
-        moved=dict(first,accepted_boottime=second['observed_boottime']+1,accepted_wall=second['observed_wall']+1)
+        # Acceptance one now claims a time after act two was observed, still before its own end.
+        moved=dict(first,accepted_boottime=second['observed_boottime']+100,accepted_wall=second['observed_wall']+100)
+        self.assertLess(moved['accepted_boottime']+30,self.original['boot_end'])
         path.write_text(json.dumps(moved));path.chmod(0o600)
         with self.assertRaises(ValueError):self.lifetime()
 
