@@ -880,18 +880,9 @@ fn analysis_cancellation_interrupts_geometry_during_its_input_scan() {
     assert_eq!(s.snapshot().commit, 1);
 }
 
-/// Roadmap item 798. Deleting a few edges of a symmetric and transitive property whose
-/// closure is one clique must stay within the memory of a full run of the same data,
-/// whether the run maintains the closure or falls back to a full run. The full run of 600
-/// people fits in 256 MiB, and the run after deleting 24 of the 1,200 edges exceeds it.
-/// OWL2Bench(1) shows the case at scale. Its `hasSameHomeTownWith` closure is a clique of
-/// about 1,100 people, a full run needs less than 800 MiB, and deleting 1% of the data triples grew
-/// to 14.1 GiB before the out-of-memory killer ended it.
-#[test]
-#[ignore = "roadmap item 798: maintenance after a deletion in a clique exceeds a full run's memory"]
-fn deleting_edges_of_a_clique_stays_within_a_full_runs_memory() {
-    const LIMIT: usize = 256 << 20;
-    let n = 600;
+/// The edges of a symmetric and transitive `ex:near` among `n` people, whose closure is
+/// one clique, and the Turtle that states them.
+fn clique(n: usize) -> (Vec<Triple>, String) {
     let mut text = String::from("ex:near a owl:SymmetricProperty, owl:TransitiveProperty .\n");
     let mut edges = Vec::new();
     for i in 0..n {
@@ -909,16 +900,29 @@ fn deleting_edges_of_a_clique_stays_within_a_full_runs_memory() {
     for e in &edges {
         text += &format!("{} {} {} .\n", e.subject, e.predicate, e.object);
     }
+    (edges, text)
+}
+
+/// Roadmap item 798. Deleting a few edges of a symmetric and transitive property whose
+/// closure is one clique must stay within the memory of a full run of the same data.
+/// Every fact of the clique follows through every member, and the searches for other
+/// proofs of the removed edges reach most of the closure through each of them, so the
+/// deletion passes its bound and the run materializes in full. The full run of 600 people
+/// fits in 256 MiB. Without the bound, the run after deleting 24 of the 1,200 edges
+/// exceeded it, and without a limit it visited 184 million rule instances and held 5 GB.
+/// OWL2Bench(1) shows the case at scale. Its `hasSameHomeTownWith` closure is a clique of
+/// about 1,100 people, a full run needs less than 800 MiB, and deleting 1% of the data
+/// triples grew to 14.1 GiB before the out-of-memory killer ended it.
+#[test]
+fn deleting_edges_of_a_clique_stays_within_a_full_runs_memory() {
+    const LIMIT: usize = 256 << 20;
+    let (edges, text) = clique(600);
     // the closure is read back from the dataset, as `sparkles infer` reads it
     let (_d, s) = persistent();
     ttl(&s, &text);
     let p = Profile::OwlRl;
     let opts = ReasonOptions {
-        max_memory: if std::env::var_os("PROBE798_NOMEM").is_some() {
-            None
-        } else {
-            Some(LIMIT)
-        }, // PROBE-798
+        max_memory: Some(LIMIT),
         ..ReasonOptions::default()
     };
     let go = |since| {
@@ -935,15 +939,26 @@ fn deleting_edges_of_a_clique_stays_within_a_full_runs_memory() {
     let since = Some(full.receipt.as_ref().unwrap().commit.seq);
     let del: Vec<Triple> = edges.iter().step_by(50).cloned().collect();
     change(&s, &[], &del);
-    let t0 = std::time::Instant::now(); // PROBE-798
     let r = go(since).unwrap_or_else(|e| panic!("the run after the deletion: {e:#}"));
-    eprintln!(
-        "PROBE798 full peak={} after: method={:?} fallback={:?} peak={} secs={:.3}",
-        full.peak_bytes,
-        r.method,
-        r.fallback,
-        r.peak_bytes,
-        t0.elapsed().as_secs_f64()
-    ); // PROBE-798
     check(&s, &p, &r, "after deleting edges of the clique");
+    assert_eq!(r.method, Method::Full);
+    let why = r.fallback.as_deref().unwrap_or_default();
+    assert!(why.starts_with("the deletion "), "{why}");
+}
+
+/// The bound of roadmap item 798 leaves the deletion of an edge of a small clique to
+/// incremental maintenance, whose searches cost far less than a full run there.
+#[test]
+fn deleting_an_edge_of_a_small_clique_stays_incremental() {
+    let (edges, text) = clique(40);
+    let (_d, s) = persistent();
+    ttl(&s, &text);
+    let p = Profile::OwlRl;
+    let cache = Cache::default();
+    let full = run(&s, &p, None, Some(&cache));
+    check(&s, &p, &full, "the full run");
+    change(&s, &[], &edges[..2]);
+    let r = run(&s, &p, Some(full.receipt.unwrap().commit.seq), Some(&cache));
+    check(&s, &p, &r, "after deleting edges of the clique");
+    assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
 }

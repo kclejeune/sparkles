@@ -1591,7 +1591,12 @@ fn update_closure(
         derived: added.len() as u64,
         source: prev.source.to_string(),
     };
-    tracing::debug!(?changes, visited = up.visited, "incremental update");
+    tracing::debug!(
+        ?changes,
+        visited = up.visited,
+        held_beside = up.held_beside,
+        "incremental update"
+    );
     if !generalized.is_empty() {
         warnings.push(format!(
             "{} derived generalized triples (literal subjects or non-IRI predicates) were not written",

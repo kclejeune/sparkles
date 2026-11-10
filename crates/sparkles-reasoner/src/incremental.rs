@@ -39,7 +39,7 @@ use sparkles_core::id::Id;
 use sparkles_core::store::Snapshot;
 use std::mem::size_of;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// A run that cannot be maintained incrementally and must materialize in full.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -47,62 +47,110 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub(crate) struct Fallback(pub String);
 
 /// The rule instances that the deletion of an update may visit for each fact of the
-/// closure before the run gives up the update and materializes in full (see [`Visits`]).
+/// closure before the run gives up the update and materializes in full (see [`Bound`]).
 const VISITS_PER_FACT: u64 = 4;
 
 /// The fewest rule instances that the deletion of an update may visit, so that a small
 /// closure is not materialized in full for a deletion of ordinary cost.
 const MIN_VISITS: u64 = 1 << 20;
 
-/// The rule instances a search counts on its own before it adds them to [`Visits`].
+/// The fewest bytes that the deletion of an update may hold beyond what the run held
+/// when it started, so that a small closure is not materialized in full for a deletion
+/// of ordinary cost (see [`Bound`]).
+const MIN_HELD: usize = 64 << 20;
+
+/// The rule instances a search counts on its own before it adds them to [`Bound`] and
+/// compares the run's memory with it.
 const VISIT_BATCH: u64 = 1 << 10;
 
-/// The rule instances that the deletion of one update has visited, in its searches for
-/// other proofs and in the steps that find the consequences of deleted facts, and the
-/// bound on them.
+/// The cost of the deletion of one update and its bound, past which the update gives
+/// way to a full run.
 ///
-/// A full run derives every fact of the closure at least once, so its cost grows at least
-/// with the size of the closure. The searches can cost far more. In a clique of a
-/// symmetric and transitive property each fact has a derivation through every member, and
-/// a search for another proof of a removed edge visits most of the closure through each
-/// of them. Past the bound the update stops with a [`Fallback`], its state is dropped, and
-/// the run materializes in full. With the same number of threads an update counts the
-/// same visits on every run, so whether it reaches the bound does not depend on timing.
-pub(crate) struct Visits {
-    done: AtomicU64,
-    limit: u64,
+/// The deletion counts the rule instances it visits, in its searches for other proofs
+/// and in the steps that find the consequences of deleted facts, and it compares the
+/// memory the run holds with what the run held when the deletion started. A full run
+/// derives every fact of the closure at least once and holds the closure, so its cost
+/// grows at least with the size of the closure. The searches can cost far more. In a
+/// clique of a symmetric and transitive property each fact has a derivation through
+/// every member, and a search for another proof of a removed edge reaches most of the
+/// closure through each of them, keeping a node for every fact it reaches and a record
+/// for every instance.
+///
+/// The deletion may visit [`VISITS_PER_FACT`] instances for each fact of the closure, and
+/// at least [`MIN_VISITS`]. It may hold as many bytes beyond its start as the closure's
+/// own heap, and at least [`MIN_HELD`], so that an update holds at most about twice the
+/// closure while it deletes. Past either bound the update stops with a [`Fallback`], its
+/// state is dropped, and the run materializes in full, which gives the same closure.
+/// With the same number of threads an update counts the same visits on every run. The
+/// memory of the parallel searches of one round depends on how they interleave, so near
+/// the bound on memory one run can fall back where another does not.
+pub(crate) struct Bound {
+    visits: AtomicU64,
+    max_visits: u64,
+    budget: Arc<Budget>,
+    /// what the run held when the deletion started
+    base: usize,
+    max_held: usize,
+    /// the most the deletion held beyond `base` when it compared
+    peak_held: AtomicUsize,
 }
 
-impl Visits {
-    /// The bound for an update of `c`, before the update changes it.
-    pub(crate) fn for_closure(c: &Closure) -> Visits {
+impl Bound {
+    /// The bound for the deletion of an update of `c`, charged to `budget`, as it starts.
+    pub(crate) fn for_closure(c: &Closure, budget: &Arc<Budget>) -> Bound {
         let facts = c.graph.offset() as u64 + c.graph.live() as u64;
-        Visits::new(facts.saturating_mul(VISITS_PER_FACT).max(MIN_VISITS))
+        Bound::new(
+            budget,
+            facts.saturating_mul(VISITS_PER_FACT).max(MIN_VISITS),
+            c.heap_bytes().max(MIN_HELD),
+        )
     }
 
-    pub(crate) fn new(limit: u64) -> Visits {
-        Visits {
-            done: AtomicU64::new(0),
-            limit,
+    pub(crate) fn new(budget: &Arc<Budget>, max_visits: u64, max_held: usize) -> Bound {
+        Bound {
+            visits: AtomicU64::new(0),
+            max_visits,
+            budget: budget.clone(),
+            base: budget.used(),
+            max_held,
+            peak_held: AtomicUsize::new(0),
         }
     }
 
     /// The rule instances visited so far.
-    pub(crate) fn done(&self) -> u64 {
-        self.done.load(Ordering::Relaxed)
+    pub(crate) fn visits(&self) -> u64 {
+        self.visits.load(Ordering::Relaxed)
     }
 
-    /// Count `n` more visits, and give way to a full run when they pass the bound.
+    /// The most the deletion was seen to hold beyond what the run held at its start.
+    pub(crate) fn peak_held(&self) -> usize {
+        self.peak_held.load(Ordering::Relaxed)
+    }
+
+    /// Count `n` more visits, and give way to a full run when the visits or the memory
+    /// held pass the bound.
     fn add(&self, n: u64) -> Result<(), Fallback> {
-        let done = self.done.fetch_add(n, Ordering::Relaxed).saturating_add(n);
-        if done <= self.limit {
-            return Ok(());
+        let done = self
+            .visits
+            .fetch_add(n, Ordering::Relaxed)
+            .saturating_add(n);
+        if done > self.max_visits {
+            return Err(Fallback(format!(
+                "the deletion visited more than {} rule instances, {VISITS_PER_FACT} for each \
+                 fact of the closure, which costs more than a full run",
+                self.max_visits
+            )));
         }
-        Err(Fallback(format!(
-            "the deletion visited more than {} rule instances, {VISITS_PER_FACT} for each fact of \
-             the closure, which costs more than a full run",
-            self.limit
-        )))
+        let held = self.budget.used().saturating_sub(self.base);
+        self.peak_held.fetch_max(held, Ordering::Relaxed);
+        if held > self.max_held {
+            return Err(Fallback(format!(
+                "the deletion held more than {} bytes beside the closure, more than a full \
+                 run holds",
+                self.max_held
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -485,8 +533,10 @@ pub(crate) struct Update {
     pub added_from: u32,
     /// facts whose provability was searched for
     pub checked: u64,
-    /// rule instances the deletion visited (see [`Visits`])
+    /// rule instances the deletion visited (see [`Bound`])
     pub visited: u64,
+    /// the most the deletion was seen to hold beside what the run held when it started
+    pub held_beside: usize,
     /// semi-naive iterations of the insertion
     pub iterations: usize,
     /// the charge of the update's buffers that remain, `deleted` among them
@@ -557,16 +607,6 @@ pub(crate) fn update(
     // before they are used, also when nothing is inserted
     budget.check()?;
     let mut held = Held::new(budget);
-    let visits = Visits::for_closure(c);
-    // PROBE-798
-    let probe = std::env::var_os("PROBE798").is_some();
-    let visits = if std::env::var_os("PROBE798_NOLIMIT").is_some() {
-        Visits::new(u64::MAX)
-    } else {
-        visits
-    };
-    let probe_facts = c.graph.offset() as u64 + c.graph.live() as u64;
-    let probe_t0 = std::time::Instant::now();
 
     // the inserted facts the derived tier holds are explicit from the start, as the base
     // tier's copies of them are
@@ -596,6 +636,8 @@ pub(crate) fn update(
     if !queue.is_empty() {
         let plans = Plans::new(&mut c.graph, rules)?;
         held.try_grow(plans.bytes)?;
+        // after the plans, which a full run needs too
+        let bound = Bound::for_closure(c, budget);
         let mut search = Search::new(budget);
         let abort = AtomicBool::new(false);
         // the facts removed so far, charged as their buffer grows, and the queue
@@ -622,7 +664,7 @@ pub(crate) fn update(
                     &plans,
                     &abort,
                     limits,
-                    &visits,
+                    &bound,
                     &mut search,
                     &facts,
                 )?;
@@ -634,7 +676,7 @@ pub(crate) fn update(
                     abort: &abort,
                     cancel: limits.cancel.as_deref(),
                     budget,
-                    visits: &visits,
+                    bound: &bound,
                     known: None,
                 };
                 for t in queue.drain(..) {
@@ -651,7 +693,7 @@ pub(crate) fn update(
             if dead.is_empty() {
                 break;
             }
-            let (next, next_held) = consequences(c, rules, &plans, &dead, limits, Some(&visits))?;
+            let (next, next_held) = consequences(c, rules, &plans, &dead, limits, Some(&bound))?;
             queue = next;
             step.absorb(next_held);
             for t in &dead {
@@ -676,19 +718,8 @@ pub(crate) fn update(
         }
         drop(queue_held);
         out.checked = search.checked;
-        out.visited = visits.done();
-        if probe {
-            eprintln!(
-                "PROBE798 facts={probe_facts} visited={} ratio={:.4} removed={} checked={} deleted={} secs={:.3} peak={}",
-                out.visited,
-                out.visited as f64 / probe_facts as f64,
-                removed.len(),
-                out.checked,
-                out.deleted.len(),
-                probe_t0.elapsed().as_secs_f64(),
-                budget.peak()
-            );
-        }
+        out.visited = bound.visits();
+        out.held_beside = bound.peak_held();
         held.absorb(deleted);
         if cancelled(limits) {
             anyhow::bail!("reasoning cancelled");
@@ -899,14 +930,14 @@ impl Plans {
 }
 
 /// The heads (in the closure) of the rule instances with a body atom in `dead`, whose
-/// rows are still live. Each instance counts as a visit of `visits`.
+/// rows are still live. Each instance counts as a visit of `bound`.
 fn consequences(
     c: &Closure,
     rules: &[CRule],
     plans: &Plans,
     dead: &[Triple],
     limits: &Limits,
-    visits: Option<&Visits>,
+    bound: Option<&Bound>,
 ) -> anyhow::Result<(Vec<Triple>, Held)> {
     let g = &c.graph;
     let rows: Vec<u32> = dead.iter().filter_map(|t| g.position(t)).collect();
@@ -961,11 +992,12 @@ fn consequences(
             (out, h, ev.err.take())
         })
         .collect();
+    // an error of an evaluation comes before the bound, which counts what it found
     if let Some(e) = heads.iter_mut().find_map(|h| h.2.take()) {
         return Err(e);
     }
     let n: usize = heads.iter().map(|h| h.0.len()).sum();
-    if let Some(v) = visits {
+    if let Some(v) = bound {
         v.add(n as u64)?;
     }
     // the heads, deduplicated
@@ -974,10 +1006,8 @@ fn consequences(
     )?;
     let mut seen: FxHashSet<Triple> = FxHashSet::with_capacity_and_hasher(n, Default::default());
     let mut out = Vec::with_capacity(n);
-    for (h, hh, err) in heads {
-        if let Some(e) = err {
-            return Err(e);
-        }
+    // the errors were taken above
+    for (h, hh, _) in heads {
         out.extend(h.into_iter().filter(|t| seen.insert(*t)));
         drop(hh);
     }
@@ -1010,7 +1040,7 @@ fn prove_all(
     plans: &Plans,
     abort: &AtomicBool,
     limits: &Limits,
-    visits: &Visits,
+    bound: &Bound,
     search: &mut Search,
     facts: &[Triple],
 ) -> anyhow::Result<Vec<Triple>> {
@@ -1027,7 +1057,7 @@ fn prove_all(
             abort,
             cancel: limits.cancel.as_deref(),
             budget,
-            visits,
+            bound,
             known: Some(&*search),
         };
         facts
@@ -1051,22 +1081,23 @@ fn prove_all(
             .collect()
     };
     let mut dead = Vec::new();
-    let mut first_err = None;
+    let mut first_err: Option<anyhow::Error> = None;
     for (ch, (found, mut s)) in facts.chunks(chunk).zip(parts) {
         if let Some(e) = s.err.take() {
-            first_err.get_or_insert(e);
+            // a search past the bound gives way to a full run, also when another search
+            // of the round failed first, which the full run may avoid
+            if first_err
+                .as_ref()
+                .is_none_or(|f| f.downcast_ref::<Fallback>().is_none() && e.is::<Fallback>())
+            {
+                first_err = Some(e);
+            }
             continue;
         }
         dead.extend(ch.iter().zip(&found).filter(|x| !*x.1).map(|x| *x.0));
         search.absorb(s)?;
     }
     if let Some(e) = first_err {
-        eprintln!(
-            "PROBE798 prove_all err visits={} used={} peak={} err={e:#}",
-            visits.done(),
-            budget.used(),
-            budget.peak()
-        ); // PROBE-798
         return Err(e);
     }
     if cancelled(limits) {
@@ -1110,8 +1141,8 @@ struct Cx<'a> {
     abort: &'a AtomicBool,
     cancel: Option<&'a AtomicBool>,
     budget: &'a Arc<Budget>,
-    /// the deletion's visits of rule instances and their bound
-    visits: &'a Visits,
+    /// the deletion's cost and its bound
+    bound: &'a Bound,
     /// what the searches of earlier rounds learned, when this search is one of a round's
     /// parallel ones
     known: Option<&'a Search>,
@@ -1135,7 +1166,7 @@ struct Search {
     /// the first refusal, the first error of an evaluation, or the [`Fallback`] of a
     /// deletion past its bound
     err: Option<anyhow::Error>,
-    /// the rule instances visited and not yet added to [`Cx::visits`]
+    /// the rule instances visited and not yet added to [`Cx::bound`]
     pending: u64,
     /// the base-tier blocks the search's evaluations read last, lent to each in turn:
     /// the blocks of a snapshot do not change, and the evaluations of one search read
@@ -1184,7 +1215,7 @@ impl Search {
     /// Add the visits counted on their own to the deletion's; false when they pass its
     /// bound, and the search stops with the [`Fallback`].
     fn flush(&mut self, cx: &Cx<'_>) -> bool {
-        match cx.visits.add(std::mem::take(&mut self.pending)) {
+        match cx.bound.add(std::mem::take(&mut self.pending)) {
             Ok(()) => true,
             Err(f) => {
                 self.err.get_or_insert(f.into());
@@ -1589,6 +1620,37 @@ pub(crate) mod tests {
     pub(crate) const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
     pub(crate) const OWL: &str = "http://www.w3.org/2002/07/owl#";
     pub(crate) const EX: &str = "http://ex.org/";
+
+    #[test]
+    fn the_bound_counts_visits() {
+        let budget = Budget::unlimited();
+        let b = Bound::new(&budget, 10, usize::MAX);
+        b.add(4).unwrap();
+        b.add(6).unwrap();
+        assert_eq!(b.visits(), 10);
+        let f = b.add(1).unwrap_err();
+        assert!(
+            f.0.contains("visited more than 10 rule instances"),
+            "{}",
+            f.0
+        );
+    }
+
+    #[test]
+    fn the_bound_counts_memory_from_its_start() {
+        let budget = Budget::new(Some(1 << 20));
+        // held before the deletion starts, which does not count
+        let _before = Held::try_new(&budget, 1_000).unwrap();
+        let b = Bound::new(&budget, u64::MAX, 500);
+        let mut h = Held::try_new(&budget, 400).unwrap();
+        b.add(1).unwrap();
+        h.try_grow(200).unwrap();
+        let f = b.add(1).unwrap_err();
+        assert!(f.0.contains("held more than 500 bytes"), "{}", f.0);
+        assert!(b.peak_held() > 500, "{}", b.peak_held());
+        h.shrink(600);
+        b.add(1).unwrap();
+    }
 
     /// xorshift64*
     pub(crate) struct Rng(pub(crate) u64);
