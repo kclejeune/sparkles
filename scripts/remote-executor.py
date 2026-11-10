@@ -192,6 +192,12 @@ def admit(host, minimum):
         fail('worker is not ready')
     if worker.get('setupStatus') in ('failed', 'error') or worker.get('setupError'):
         fail('worker setup failed')
+    # A resume runs on a new machine and downloads the snapshot's files in the
+    # background. A file whose content arrives during a build changes under the
+    # compiler, and mbx then discards the result and fails the build, so no job is
+    # admitted until the provider reports every file downloaded.
+    if worker.get('hydrated') is not True:
+        fail('worker is still restoring its files after a resume; wait for hydrated')
     # setupStatus=null alone is no readiness evidence. The owner binds startup
     # quiescence and guard lifetime; these physical checks detect subsequent drift.
     probe = """set -euo pipefail

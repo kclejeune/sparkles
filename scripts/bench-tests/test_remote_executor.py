@@ -287,7 +287,7 @@ class Admission(unittest.TestCase):
         out=io.StringIO()
         with self.clocks(wall,boot),patch.object(RX.boat_environment.controller,'bounded',return_value={'exit':0,'error':None,'body':{'sandbox':{
                 'id':'bx_fixture','environment':self.fixtures['qualified']['environment']['name'],
-                'environmentVersion':self.fixtures['qualified']['environment']['version'],'type':'large','vcpu':8,'memoryGB':16,'state':'ready'}}}),\
+                'environmentVersion':self.fixtures['qualified']['environment']['version'],'type':'large','vcpu':8,'memoryGB':16,'state':'ready','hydrated':True}}}),\
              patch.object(RX,'exchange',return_value=0),patch('sys.stdout',out):
             RX.admit('boat:bx_fixture',60)
         return json.loads(out.getvalue())
@@ -442,7 +442,7 @@ class Admission(unittest.TestCase):
               'worker_env_path':profile['worker_home']+'/.config/sparkles-boat/job.env','worker_env_sha256':'e'*64,
               'bootstrap_lock_path':profile['worker_home']+'/.local/state/sparkles-boat/bootstrap.lock','toolchain_manifest_path':profile['worker_home']+'/.local/state/sparkles-boat/toolchain.json',
               'toolchain_manifest_sha256':'f'*64,'_lifetime':{'wall_end':time.time()+7200,'boot_end':RX.boat_clock.boottime()+7200,'boot_id':boot}}
-        info={'sandbox':{'id':'bx_fixture','environment':'fixture-environment','environmentVersion':3,'type':'large','vcpu':8,'memoryGB':16,'state':'idle'}}
+        info={'sandbox':{'id':'bx_fixture','environment':'fixture-environment','environmentVersion':3,'type':'large','vcpu':8,'memoryGB':16,'state':'idle','hydrated':True}}
         seen=[]
         with patch.object(RX,'admission',return_value=data),patch.object(RX.boat_environment.controller,'bounded',return_value={'exit':0,'body':info}),\
              patch.object(RX,'command',side_effect=lambda host,text:seen.append(text) or ['true']),patch.object(RX,'exchange',return_value=0),patch('builtins.print'):
@@ -462,6 +462,23 @@ class Admission(unittest.TestCase):
         missing=[n for n in RX.WORKER_TOOLS if not (shutil.which(n) if '/' in n else (tools/n).exists())]
         result=sp.run(['/bin/bash','-c',script],env={'PATH':str(tools)},stdin=sp.DEVNULL,capture_output=True,text=True,timeout=10)
         self.assertEqual(result.returncode,86 if missing else 0,(missing,result.stdout))
+
+    def test_admit_refuses_a_worker_that_is_still_restoring_its_files(self):
+        """A resumed worker downloads its files in the background, and a build that runs meanwhile
+        sees its inputs change and fails, so admission waits for the provider's hydrated flag."""
+        profile,env=self.fake_worker()
+        boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        data={'worker':'bx_fixture','environment':'fixture-environment','environment_version':3,'_cli':{'path':'/inert/boat'},'_profile':profile,
+              '_lifetime':{'wall_end':time.time()+7200,'boot_end':RX.boat_clock.boottime()+7200,'boot_id':boot}}
+        base={'id':'bx_fixture','environment':'fixture-environment','environmentVersion':3,'type':'large','vcpu':8,'memoryGB':16,'state':'idle'}
+        for extra in ({'hydrated':False,'hydration':{'entriesDone':348576,'entriesTotal':375191,'percent':92,'phase':'hydrating'}},
+                      {'hydrated':False,'hydration':None},{'hydrated':None},{}):
+            with self.subTest(extra=extra):
+                info={'sandbox':dict(base,**extra)};seen=[]
+                with patch.object(RX,'admission',return_value=data),patch.object(RX.boat_environment.controller,'bounded',return_value={'exit':0,'body':info}),\
+                     patch.object(RX,'command',side_effect=lambda host,text:seen.append(text) or ['true']),patch.object(RX,'exchange',return_value=0),patch('builtins.print'):
+                    with self.assertRaises(ValueError) as raised:RX.admit('boat:bx_fixture',1800)
+                self.assertIn('still restoring its files',str(raised.exception));self.assertEqual(seen,[])
 
     def test_admission_checks_every_command_the_worker_scripts_run(self):
         """Each external command of the worker-side scripts and remote strings is checked at admission."""
