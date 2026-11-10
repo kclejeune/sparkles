@@ -1698,3 +1698,45 @@ fn a_wide_redundant_product_is_charged_to_the_memory_budget() {
         ),
     }
 }
+
+#[test]
+fn a_short_product_with_wide_conclusions_is_charged_before_its_record_is_dropped() {
+    // eight body atoms, seven under two disjunctions and one under one, and a head of a
+    // thousand classes: the product has 128 distinct conclusions, fewer than the choices
+    // between two checks of the bounds, each as wide as the head, all redundant since A
+    // is T, so the record alone passes a megabyte and must be charged before the product
+    // ends (item 728)
+    let n = 8;
+    let mut body = String::new();
+    for i in 0..n {
+        body += &format!("SubClassOf(:A ObjectUnionOf(ObjectMaxCardinality(1 :p{i}) :Z{i}))\n");
+        if i < n - 1 {
+            body += &format!("SubClassOf(:A ObjectUnionOf(ObjectMaxCardinality(1 :q{i}) :Z{i}))\n");
+        }
+    }
+    let zs: Vec<String> = (0..n).map(|i| format!(":Z{i}")).collect();
+    let us: Vec<String> = (0..1024).map(|i| format!(":U{i}")).collect();
+    body += &format!(
+        "SubClassOf(:A :T)
+         SubClassOf(ObjectIntersectionOf({}) ObjectUnionOf(:T {}))",
+        zs.join(" "),
+        us.join(" ")
+    );
+    let ax = axioms(&body);
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&Limits {
+        threads: 1,
+        max_memory: Some(1_000_000),
+        dl_work: Some(1 << 28),
+        partial: true,
+        ..counting()
+    });
+    match out {
+        Err(e) => eprintln!("stopped: {e}"),
+        Ok(out) => assert!(
+            !out.complete || out.stats.peak_memory >= 1_000_000,
+            "the run finished under the budget with a peak of {} bytes",
+            out.stats.peak_memory
+        ),
+    }
+}

@@ -871,7 +871,14 @@ impl Sink for Out<'_, '_> {
         self.run.halt(STOP_MEMORY);
     }
     fn release_data(&mut self, bytes: usize) {
-        self.run.memory.fetch_sub(bytes, Ordering::Relaxed);
+        // a caller releases what it reserved, and a reservation the overflow check refused
+        // before it added anything is released as well, so the count stops at zero
+        let _ = self
+            .run
+            .memory
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+                Some(m.saturating_sub(bytes))
+            });
     }
 
     #[inline]

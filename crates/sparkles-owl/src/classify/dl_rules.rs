@@ -1003,6 +1003,10 @@ fn prune(l: &mut Vec<Side>) {
 /// The choices of a product between two checks of the run's bounds.
 const PRODUCT_POLL: usize = 256;
 
+/// The most bytes of a product's record of its conclusions that may go uncharged when the
+/// product ends between two checks of the bounds; a larger tail is charged at the end.
+const RECORD_SLACK: usize = 64 * 1024;
+
 /// Derives what the rules found: the single conclusions, then each product's choices in
 /// the order of their lists, the last list fastest. The run's bounds are checked after
 /// every [`PRODUCT_POLL`] choices the context derives, counted across calls, and a stop of
@@ -1085,10 +1089,12 @@ pub(super) fn drain_with<S: Sink>(
                 fresh = seen.insert(key);
                 if fresh {
                     // charged at the next check of the bounds, so that the record adds
-                    // no checks of its own
+                    // no checks of its own within a product, with the table's buckets
+                    // counted as the other tables are
+                    let key_size = std::mem::size_of::<(Vec<Lit>, Vec<Lit>)>();
                     pending += bytes
-                        + (seen.capacity() - cap)
-                            * (std::mem::size_of::<(Vec<Lit>, Vec<Lit>)>() + 1);
+                        + table_bytes(seen.capacity(), key_size)
+                            .saturating_sub(table_bytes(cap, key_size));
                 }
             }
             if fresh {
@@ -1132,6 +1138,18 @@ pub(super) fn drain_with<S: Sink>(
                     break;
                 }
                 at[k] = 0;
+            }
+        }
+        // the record's tail since the last check is charged while the record is live when
+        // it is large, so that a short product with wide conclusions meets the budget too,
+        // and a small tail is left uncharged rather than add a check of the bounds to
+        // every product, which bounds what one product holds unseen by RECORD_SLACK
+        if pending >= RECORD_SLACK {
+            charged += pending;
+            if !out.reserve_data(std::mem::take(&mut pending)) {
+                ds(st).store.interrupted = true;
+                out.release_data(charged);
+                return;
             }
         }
         out.release_data(charged);
