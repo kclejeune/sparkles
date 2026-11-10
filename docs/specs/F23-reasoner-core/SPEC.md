@@ -163,6 +163,38 @@ operators, and with them a 28 GiB limit on a development host. Where that memory
 has not been profiled, and roadmap item 522 covers it.
 [The reasoning results](../../benchmarks/reasoning/RESULTS.md#owl2bench) give every run.
 
+### Bounded incremental deletion
+
+Roadmap item 798 bounds the maintenance after a deletion by the cost of a full run,
+until item 521 gives the incremental core closure operators. `incremental::Bound` counts
+the rule instances that the deletion's backward searches and its consequence steps
+match, and compares the charges of the run with their total when the deletion started.
+Past four instances for each fact of the closure, at least 2^20, or past as many bytes
+as the closure's own heap, at least 64 MiB, the update stops with a fallback and the run
+materializes in full, which gives the same closure. The searches compare once every
+1,024 instances and the consequence evaluations count their instances as they match
+them, so the bound is a heuristic on sampled charges.
+
+In a clique of a symmetric and transitive property every fact follows through every
+member. Before the bound, deleting 24 of the 1,200 edges of a clique of 600 people
+visited 184 million rule instances for 24 checked facts and held 5 GB of charges, where
+the full run peaks at 79 MB. The deletion now stops after about 360,000 instances and
+falls back, at an update peak of 101 MB. The consequences of deleted facts now keep
+each head once, since a rule whose head does not depend on the deleted atom has one
+head for millions of instances, and a builtin that binds many values, such as
+`listMember`, ends its loop when the bound, a memory refusal or a cancellation stops its
+evaluation.
+
+On OWL2Bench(1), deleting 1% of the data triples, 18 of them edges of the
+`hasSameHomeTownWith` clique of about 1,100 people, grew to 14.1 GiB before the
+out-of-memory killer ended it. With the bound the deletion falls back on memory and the
+run finishes in 1.4 to 3.4 s at 808 to 866 MiB of RSS on a development laptop, with a
+closure equal to Nemo's, where a full run takes 1.7 to 4.0 s and 556 to 641 MiB
+([deletion record](../../benchmarks/reasoning/runs/2026-11-09-item-798-delete-stanley/commands.txt)).
+
+Item 815 brings the witnesses' preparation for a deletion under the bound, and item 816
+reports the peak of an update that falls back.
+
 ### OWL 2 RL rules
 
 `rules/owl-rl.rules` gained `prp-key` for keys of 1 and 2 properties, `cls-maxqc4`,

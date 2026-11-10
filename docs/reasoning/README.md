@@ -50,9 +50,15 @@ request or on every write, and the schema report counts what the data holds.
 * Any later run, whether a re-run, an automatic run or `sparkles infer`, updates the
   previous materialization incrementally with the backward/forward algorithm and writes
   what a full run would. A run is full when rules are not monotonic or create blank nodes,
-  when deletions are large, or when the set of input graphs changed. The kept closure
-  holds only the derived facts, which takes 41% to 47% of the memory of a closure with the
-  explicit facts on LUBM-style data.
+  when deletions are large, or when the set of input graphs changed. A deletion also runs
+  in full when its maintenance passes an allowance set by the size of the closure, which
+  approximates the cost of a full run. The allowance is four matched rule instances for
+  each fact of the closure and as much memory beyond what the run held when the deletion
+  started as the closure's own heap, with floors of about a million instances and 64 MiB.
+  The maintenance compares its count and the run's charges with the allowance every 1,024
+  instances, so it can pass the allowance by a few batches before it stops. The kept
+  closure holds only the derived facts, which takes 41% to 47% of the memory of a closure
+  with the explicit facts on LUBM-style data.
 * A materialization reads the default graph unless data and ontology graphs are named,
   and follows `owl:imports` to graphs of the dataset through a Jena-style location
   mapping ([API.md](../API.md#input-graphs-and-imports)). With `imports: fetch`, missing
@@ -652,6 +658,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap item 520.
 * Closure operators serve full materialization only. Incremental updates and query-time
   reasoning evaluate transitive and equivalence rules as joins. Roadmap item 521.
+* A deletion in a large clique of a symmetric and transitive property, where every fact
+  follows through every member, passes the bound on maintenance and runs in full. The
+  bound leaves out the witness preparation of a deletion, which is roadmap item 815. A run
+  that falls back reports the full run's peak memory and not the higher peak of the update
+  it abandoned, which is roadmap item 816.
 * Inference is forward materialization, RDFS on read and derivation on demand.
   Derivation on demand has no cost-based choice against a materialization, no OWL 2 QL
   rewriting, no reuse of tables across commits and no dataset setting, and Jena's hybrid

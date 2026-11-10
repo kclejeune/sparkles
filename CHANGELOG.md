@@ -1793,6 +1793,18 @@ it waits for the main writer. The periodic history collector takes the writer an
 the branch table, so a branch listing that ran during a collection could deadlock both,
 and the server stopped answering dataset and branch requests until it restarted.
 
+Roadmap item 798 bounds incremental maintenance after a deletion by the cost of a full
+run. The deletion counts the rule instances its backward searches and its consequence
+steps match and compares the run's memory with what it held when the deletion started.
+Past four instances for each fact of the closure, at least 2^20, or past the closure's own
+heap, at least 64 MiB, the run materializes in full and gives the same closure. Deleting
+1% of OWL2Bench(1)'s data triples, whose `hasSameHomeTownWith` closure is a clique, grew
+to 14.1 GiB before. It now falls back and finishes at 808 to 866 MiB of RSS, equal to
+Nemo's closure. The consequences of deleted facts keep each head once, and a builtin
+that binds many values, such as `listMember`, stops when its evaluation is stopped by the
+bound, a memory refusal or cancellation. Items 815 and 816 follow up the witness
+preparation of a deletion and the peak that a run that falls back reports.
+
 Classification recounts retained index and context estimates consistently for fresh and
 reused state. A requested partial classification preserves its tier when final retained
 or taxonomy admission refuses memory, reports the original memory error and leaves
