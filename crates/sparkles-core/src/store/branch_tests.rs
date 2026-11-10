@@ -2660,7 +2660,7 @@ fn main_branch_info_releases_the_table_before_it_waits_for_the_writer() {
     let names: Vec<_> = s.branches().unwrap().into_iter().map(|b| b.name).collect();
     assert_eq!(names, [MAIN, "dev"]);
     s.history_tick().unwrap();
-    assert!(has(&s, "writer"));
+    assert!(has(s, "writer"));
     assert!(has(&dev, "on-dev"));
     assert_eq!(dev.head_commit().seq, dev_receipt.commit.seq);
     let dev_info = s.branch_info("dev").unwrap();
