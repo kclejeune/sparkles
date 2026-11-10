@@ -22,6 +22,10 @@
 # one, halved, from 2 to 8, which gives 6 at a 13G cap and 8 at a 24G cap. A Rust test build
 # at 4 jobs peaked at about 9 GiB of process memory.
 set -euo pipefail
+# The worktree, the out directory and everything the run writes are private to the user, as
+# on a laptop with the usual umask. A host whose login umask is 002 would otherwise create
+# group-writable files, which the Boat package's receipt reader refuses in its tests.
+umask 022
 full=$1
 shift
 name=${full:0:8}
@@ -164,7 +168,7 @@ for n in MBX_REMOTE_URL MBX_CACHE_DIR MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE
   [ -z "${!n+x}" ] || forward+=("--setenv=$n=${!n}")
 done
 systemd-run --user --unit "$unit" --collect -q "${forward[@]}" \
-  -p MemoryMax="$mem" -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec="$runtime" \
+  -p MemoryMax="$mem" -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec="$runtime" -p UMask=0022 \
   --setenv=HOME="$HOME" --setenv=USER="$USER" --setenv=PATH="$PATH" \
   --setenv=MBX_REMOTE_TOKEN_FILE="${MBX_REMOTE_TOKEN_FILE:-}" --setenv=SPARKLES_REMOTE_EXECUTOR="$executor" \
   --setenv=GATE_CARGO_JOBS="$cargo_jobs" --setenv=GATE_BASE="$base" --setenv=GATE_FULL="$all_checks" \
