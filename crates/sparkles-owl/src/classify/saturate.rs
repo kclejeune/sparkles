@@ -2636,3 +2636,290 @@ mod numeric_resource_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod horn_delivery_tests {
+    //! The delivery orders behind the review of roadmap item 692 (F24, "The Horn rules
+    //! with individuals"): a Horn successor made after its source became real, a member
+    //! registering after its individual has loops and Horn successors, and the filler of
+    //! a counted loop arriving last. A saturation's order of activation does not pin these
+    //! down, so each test delivers the conclusions to one context in a chosen order and
+    //! checks what the context sends, against the other orders of the same conclusions.
+    use super::*;
+    use crate::classify::horn;
+    use crate::classify::index::{self, Axioms, Interner, RoleName};
+    use crate::model::{AxiomKind, Class, ObjectProperty};
+
+    const EX: &str = "http://ex.org/delivery#";
+
+    struct Fixture {
+        ix: Index,
+        it: Interner,
+    }
+
+    impl Fixture {
+        /// The index of an ontology, through the EL normalization and then the Horn
+        /// normalization of what it left out, as the classifier builds it.
+        fn new(body: &str) -> Fixture {
+            let doc = crate::ofn_read::parse(&format!(
+                "Prefix(:=<{EX}>)\nPrefix(owl:=<http://www.w3.org/2002/07/owl#>)\nOntology(\n{body}\n)"
+            ))
+            .unwrap();
+            let mut it = Interner::new();
+            let mut ax = Axioms::default();
+            let mut outside: Vec<&AxiomKind> = Vec::new();
+            for a in &doc.axioms {
+                if index::normalize(&a.kind, &mut it, &mut ax).is_some() {
+                    outside.push(&a.kind);
+                }
+            }
+            let taken = horn::normalize(&outside, &mut it, &mut ax, None, &|| false).unwrap();
+            assert!(taken.iter().all(|t| *t), "the Horn rules take every axiom");
+            ax.classes.extend(it.met_classes());
+            let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+            assert!(ix.horn.is_some(), "the index has the Horn rules");
+            Fixture { ix, it }
+        }
+
+        fn class(&self, name: &str) -> Ex {
+            self.it
+                .class_ex(&Class::new(format!("{EX}{name}")))
+                .unwrap()
+        }
+
+        fn role(&self, name: &str) -> Role {
+            self.it
+                .role_id(&RoleName::Object(ObjectProperty::new(format!(
+                    "{EX}{name}"
+                ))))
+                .unwrap()
+        }
+
+        /// The at-most restriction among the told subsumers of `e`, with its role and its
+        /// filler as the index holds them.
+        fn at_most_of(&self, e: Ex) -> (Ex, Role, Ex) {
+            let h = self.ix.head(e);
+            for &d in self.ix.told_of(h) {
+                if let Node::AtMost1(s, b) = self.ix.head(d).node {
+                    return (d, s, b);
+                }
+            }
+            panic!("no at-most restriction among the told subsumers");
+        }
+
+        fn nominal(&self) -> Ex {
+            let mut noms = self.it.nominals();
+            let n = noms.next().expect("one individual");
+            assert!(noms.next().is_none(), "one individual");
+            n
+        }
+    }
+
+    #[derive(Default)]
+    struct Recording {
+        sent: Vec<(Ex, Concl)>,
+        local: Vec<Concl>,
+    }
+
+    impl Sink for Recording {
+        fn send(&mut self, to: Ex, c: Concl) {
+            self.sent.push((to, c));
+        }
+        fn me(&mut self, c: Concl) {
+            self.local.push(c);
+        }
+        /// every context here stands for one named expression
+        fn core(&self, _ix: &Index, e: Ex, out: &mut Vec<Ex>) {
+            out.push(e);
+        }
+    }
+
+    /// Delivers the conclusions to the context in order and returns what each one made the
+    /// context send.
+    fn deliver(f: &Fixture, me: Ex, seq: &[Concl]) -> Vec<Recording> {
+        let mut st = State::default();
+        seq.iter()
+            .map(|&c| {
+                let mut out = Recording::default();
+                apply_rules::<_, HornFull>(&f.ix, me, &mut st, c, &mut out);
+                out
+            })
+            .collect()
+    }
+
+    fn sent_to(outs: &[Recording], to: Ex, c: Concl) -> usize {
+        outs.iter()
+            .flat_map(|o| o.sent.iter())
+            .filter(|&&(t, d)| t == to && d == c)
+            .count()
+    }
+
+    fn local(outs: &[Recording], c: Concl) -> usize {
+        outs.iter()
+            .flat_map(|o| o.local.iter())
+            .filter(|&&d| d == c)
+            .count()
+    }
+
+    /// Finding 2 of the implementation review: a Horn successor that R3, R5 or R6 makes
+    /// after its source became real learns that the source is real, as a successor made
+    /// before does when the source becomes real.
+    #[test]
+    fn a_horn_successor_of_a_real_source_learns_the_source_is_real_in_either_order() {
+        let f = Fixture::new(
+            "SubClassOf(:M ObjectSomeValuesFrom(:r :N))
+             SubClassOf(:N ObjectAllValuesFrom(:s :N))
+             SubObjectPropertyOf(ObjectInverseOf(:r) :s)
+             ClassAssertion(:M :a)",
+        );
+        let (m, n, r) = (f.class("M"), f.class("N"), f.role("r"));
+        let real_first = [Concl::Real, Concl::Succ(r, n)];
+        let succ_first = [Concl::Succ(r, n), Concl::Real];
+        for (name, seq) in [
+            ("real first", &real_first),
+            ("successor first", &succ_first),
+        ] {
+            let outs = deliver(&f, m, seq);
+            assert_eq!(sent_to(&outs, n, Concl::Back(m, r)), 1, "{name}: the link");
+            assert_eq!(
+                sent_to(&outs, n, Concl::Real),
+                1,
+                "{name}: the successor is real"
+            );
+            assert_eq!(
+                sent_to(&outs, n, Concl::RealBack(m)),
+                1,
+                "{name}: the successor learns the source is real"
+            );
+            // the message comes with the step that completes the pair
+            assert_eq!(
+                sent_to(&outs[..1], n, Concl::RealBack(m)),
+                0,
+                "{name}: not before"
+            );
+        }
+    }
+
+    /// Finding 3 of the implementation review: a context that registers as a member of an
+    /// individual after the individual's context has loops and Horn successors takes
+    /// them, as a member registered before takes them as they come.
+    #[test]
+    fn a_member_that_registers_late_takes_the_loops_and_horn_successors() {
+        let f = Fixture::new(
+            "ClassAssertion(:C :a)
+             SubClassOf(:C ObjectHasSelf(:l))
+             SubClassOf(:C ObjectSomeValuesFrom(:r :N))
+             SubObjectPropertyOf(ObjectInverseOf(:r) :s)",
+        );
+        let (a, k, n) = (f.nominal(), f.class("C"), f.class("N"));
+        let (l, r) = (f.role("l"), f.role("r"));
+        let member_last = [Concl::Loop(l), Concl::Succ(r, n), Concl::Nom(k)];
+        let member_first = [Concl::Nom(k), Concl::Loop(l), Concl::Succ(r, n)];
+        for (name, seq) in [
+            ("member last", &member_last),
+            ("member first", &member_first),
+        ] {
+            let outs = deliver(&f, a, seq);
+            assert_eq!(sent_to(&outs, k, Concl::Loop(l)), 1, "{name}: the loop");
+            assert_eq!(
+                sent_to(&outs, k, Concl::Succ(r, n)),
+                1,
+                "{name}: the successor"
+            );
+        }
+        // the late member takes both in the step it registers
+        let outs = deliver(&f, a, &member_last);
+        assert_eq!(sent_to(&outs[..2], k, Concl::Loop(l)), 0);
+        assert_eq!(sent_to(&outs[..2], k, Concl::Succ(r, n)), 0);
+    }
+
+    /// Finding 4 of the implementation review: a loop that an at-most restriction of a
+    /// singular context counts, beside a real predecessor the restriction counts, makes R7
+    /// identify the predecessor with the context, whichever of the filler, the loop and
+    /// the restriction the context learns last. The filler last is the order the round-1
+    /// probe did not reach.
+    #[test]
+    fn r7_identifies_a_real_predecessor_with_a_counted_loop_whatever_comes_last() {
+        let f = Fixture::new(
+            "SubClassOf(:M ObjectMaxCardinality(1 :s :B))
+             SubClassOf(:M ObjectHasSelf(:l))
+             SubObjectPropertyOf(:l :s)
+             SubObjectPropertyOf(ObjectInverseOf(:r) :s)
+             SubClassOf(:P ObjectSomeValuesFrom(:r :M))
+             ClassAssertion(:B :a)",
+        );
+        let (m, p) = (f.class("M"), f.class("P"));
+        let (r, l) = (f.role("r"), f.role("l"));
+        let (at_most, _, b) = f.at_most_of(m);
+        assert!(
+            f.ix.horn.as_ref().unwrap().is(b, HornIx::FILLER),
+            "the filler is marked"
+        );
+        let filler_last = [
+            Concl::Singular,
+            Concl::Sub(at_most),
+            Concl::Back(p, r),
+            Concl::PredIn(p, b),
+            Concl::RealBack(p),
+            Concl::Loop(l),
+            Concl::Sub(b),
+        ];
+        let loop_last = [
+            Concl::Singular,
+            Concl::Sub(at_most),
+            Concl::Back(p, r),
+            Concl::PredIn(p, b),
+            Concl::RealBack(p),
+            Concl::Sub(b),
+            Concl::Loop(l),
+        ];
+        let restriction_last = [
+            Concl::Singular,
+            Concl::Back(p, r),
+            Concl::PredIn(p, b),
+            Concl::RealBack(p),
+            Concl::Loop(l),
+            Concl::Sub(b),
+            Concl::Sub(at_most),
+        ];
+        for (name, seq) in [
+            ("filler last", &filler_last),
+            ("loop last", &loop_last),
+            ("restriction last", &restriction_last),
+        ] {
+            let outs = deliver(&f, m, seq);
+            let before = &outs[..seq.len() - 1];
+            assert_eq!(
+                sent_to(before, p, Concl::Same(m)),
+                0,
+                "{name}: nothing before the last step"
+            );
+            assert_eq!(
+                local(before, Concl::Same(p)),
+                0,
+                "{name}: nothing before the last step"
+            );
+            assert_eq!(
+                sent_to(&outs, p, Concl::Same(m)),
+                1,
+                "{name}: the predecessor is told"
+            );
+            assert_eq!(
+                local(&outs, Concl::Same(p)),
+                1,
+                "{name}: the context is told"
+            );
+            // R6 also makes the predecessor the instance, with the loops
+            assert_eq!(
+                sent_to(&outs, p, Concl::Loop(l)),
+                1,
+                "{name}: R6 gives the loop"
+            );
+            assert_eq!(
+                sent_to(&outs, p, Concl::Sub(m)),
+                1,
+                "{name}: R6 gives the conjunction"
+            );
+        }
+    }
+}
