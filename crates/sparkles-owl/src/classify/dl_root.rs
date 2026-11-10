@@ -1639,10 +1639,12 @@ mod tests {
 
     #[test]
     fn a_universal_over_a_disjunction_keeps_its_case() {
-        // {a} ⊑ ∃r.E, {a} ⊑ A ⊔ B, A ⊑ ∀r.H: A(a) ∨ B(a) gives H(f(a)) ∨ B(a)
+        // {a} ⊑ ∃r.E, {a} ⊑ A ⊔ B, A ⊑ ∀r.H: A(a) ∨ B(a) gives H(f(a)) ∨ B(a), with A
+        // declared after B so that A(a) is the maximal literal under the shared ground
+        // order of item 804
         let mut s = Sig::new();
         let na = s.ind("a");
-        let [e, a, b, h] = ["E", "A", "B", "H"].map(|n| s.class(n));
+        let [e, b, a, h] = ["E", "B", "A", "H"].map(|n| s.class(n));
         let r = s.role("r");
         let some = s.some(r, e);
         let all_h = s.all(r, h);
@@ -1724,27 +1726,39 @@ mod tests {
     }
 
     #[test]
-    fn an_equality_in_a_disjunction_keeps_its_case() {
-        // {a} ⊑ {b} ⊔ C, B(b), with a and b different only under D: B(a) ∨ C(a)
-        let mut s = Sig::new();
-        let na = s.ind("a");
-        let nb = s.ind("b");
-        let [b, cc] = ["B", "C"].map(|n| s.class(n));
-        s.sub(nb, b);
-        s.dl.clauses.push((vec![na], vec![nb, cc]));
-        let d = saturate_root(s);
-        let (ua, ub) = (c(na, &d.ix), c(nb, &d.ix));
-        let lo = ua.min(ub);
-        let hi = ua.max(ub);
-        // B holds of a when a is b, so B(lo) ∨ C(a) when a is the smaller
-        assert!(
-            d.clauses().iter().any(|(bd, h)| bd.is_empty()
-                && h.contains(&XLit::Eq(lo, hi))
-                && h.contains(&XLit::Atom(cc, ua))),
-            "a ≈ b ∨ C(a)"
-        );
-        assert!(!d.has(&[XLit::Atom(b, ua)]) || ua == ub);
-        assert!(!d.bottom());
+    fn an_equality_below_a_ground_atom_waits_for_the_atom() {
+        // {a} ⊑ {b} ⊔ C, B(b): under the shared ground order of item 804 the atom C(a) is
+        // above a ≈ b, so a ≈ b ∨ C(a) stands, and once C ⊑ ⊥ resolves C(a) away the unit
+        // a ≈ b rewrites B(b) to B of the smaller constant
+        for bottom in [false, true] {
+            let mut s = Sig::new();
+            // B and C before the individuals, so that N_b(a) is maximal beside C(a)
+            let [b, cc] = ["B", "C"].map(|n| s.class(n));
+            let na = s.ind("a");
+            let nb = s.ind("b");
+            s.sub(nb, b);
+            if bottom {
+                s.sub(cc, BOTTOM);
+            }
+            s.dl.clauses.push((vec![na], vec![nb, cc]));
+            let d = saturate_root(s);
+            let (ua, ub) = (c(na, &d.ix), c(nb, &d.ix));
+            let lo = ua.min(ub);
+            let hi = ua.max(ub);
+            if !bottom {
+                assert!(
+                    d.clauses().iter().any(|(bd, h)| bd.is_empty()
+                        && h.contains(&XLit::Eq(lo, hi))
+                        && h.contains(&XLit::Atom(cc, ua))),
+                    "a ≈ b ∨ C(a)"
+                );
+                assert!(!d.bottom());
+                continue;
+            }
+            assert!(d.has(&[XLit::Eq(lo, hi)]));
+            assert!(d.has(&[XLit::Atom(b, lo)]));
+            assert!(!d.bottom());
+        }
     }
 
     #[test]
@@ -2091,7 +2105,8 @@ mod tests {
         for head_first in [true, false] {
             let mut s = Sig::new();
             let no = s.ind("o");
-            let [b, cc, dd, ee] = ["B", "C", "D", "E"].map(|n| s.class(n));
+            // E before B, so that B(o) is maximal beside E(o) under the shared ground order
+            let [ee, b, cc, dd] = ["E", "B", "C", "D"].map(|n| s.class(n));
             let d = saturate_seeded(s, None, |ix, _| {
                 let o = c(no, ix);
                 let at = |a: Ex| XLit::Atom(a, o);

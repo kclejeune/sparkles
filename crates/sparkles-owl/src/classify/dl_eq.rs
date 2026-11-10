@@ -5,9 +5,11 @@
 //! An equality `s₁ ≈ t₁` that is maximal in its clause, read in either direction for which
 //! `t₁` is not above `s₁` and which is not `x ≈ y` or `y ≈ u`, rewrites an occurrence of
 //! `s₁` in a maximal literal `s₂ ⋈ t₂` of another clause, where `t₂` is not above `s₂`. An
-//! occurrence that is x must be in a side that holds no successor term and no y. In the root
-//! a constant is rewritten everywhere in the side, inside `f(u)` included, and elsewhere one
-//! position at a time. The run's literals hold no `t ≉ t`, since [`Lits::lit`] makes it
+//! occurrence that is x must be in a side that holds no successor term and no y. A constant
+//! is rewritten everywhere in the side, inside `f(u)` included, in every context, as Table 2
+//! has the root do, so that `S(u, f(u))` rewritten by `u ≈ v` is `S(v, f(v))` (F24, item
+//! 804's departures), and a successor term is rewritten one position at a time. The run's
+//! literals hold no `t ≉ t`, since [`Lits::lit`] makes it
 //! false, which is the Ineq rule. Factor takes two equalities with one left side in a head.
 //!
 //! The premises in place of a context other than the root are its units: the atoms `B(x)`
@@ -51,8 +53,8 @@ impl Eqs<'_> {
     /// The literals `v` rewrites to with `s₁ ↦ t₁`, one for each position the rule allows.
     fn rewrites(&self, v: XLit, s1: RTerm, t1: RTerm, out: &mut Vec<Made>) {
         use RTerm::*;
-        // in the root, a constant everywhere in the side, inside f(u) too
-        let everywhere = self.root && matches!(s1, C(_));
+        // a constant everywhere in the side, inside f(u) too, in every context
+        let everywhere = matches!(s1, C(_));
         let sub = |t: RTerm| -> RTerm {
             match (t, s1, t1) {
                 _ if t == s1 => t1,
@@ -193,9 +195,7 @@ impl Eqs<'_> {
         let mut made = Vec::new();
         for &t in &ts[..n] {
             let mut look = vec![t];
-            if let RTerm::Fc(_, u) = t
-                && self.root
-            {
+            if let RTerm::Fc(_, u) = t {
                 look.push(RTerm::C(u));
             }
             for s1 in look {
