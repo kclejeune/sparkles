@@ -9,6 +9,8 @@ properties, in one saturation with the EL rules of individuals, with two rules o
 predecessors of a context that stands for one element and a fact for a universal
 restriction on the top property. The disjunctive rules keep their condition. An at-least
 restriction above one beside individuals is left out and reported (roadmap item 692).
+On the development files with individuals the rules take 1.2 to 1.6 times the time of
+the EL rules alone, and more on assertion-heavy files, which roadmap item 869 follows.
 
 ### Compatibility
 

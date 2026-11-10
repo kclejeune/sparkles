@@ -1028,31 +1028,44 @@ long rules do. `Stats` gains no count of the witnesses and the worlds, since the
 compatibility check guards the struct, and item 868 adds the count it needs. An ontology without
 individuals, functional data properties or top properties runs the code it ran before,
 which the EL identity gate checks byte for byte, and the Horn files without individuals of
-the development set are checked the same way. The Horn files with individuals are
-measured against the run that left their Horn axioms out, on the laptop or on `wally` in
-interleaved rounds, and the measurement is reported with its host.
+the development set are checked the same way. The Horn files with individuals were
+measured against the build that left their Horn axioms out, in interleaved rounds on
+`atlas`, which the gate paragraph below and the
+[benchmark report](../../benchmarks/el-classification/RESULTS.md#horn-individuals) give.
 
-**Gate.** The lane's gate is the Horn files with individuals, functional data properties
-or top properties of the ORE 2015 DL development set, which are the files the comparison
-marks sound today for that reason, 46 at the last comparison. The lane pins their names
-and reference taxonomies in its record, and each must come back equal to HermiT's taxonomy
-with no difference and with no axiom left out or used in part beyond the omissions above,
-which the record lists for each file. Hand cases cover each rule above, on one and eight
-threads, each with HermiT's answer. They are the simplest case of R7, a cascade of three
-singular contexts, a loop that an at-most restriction counts at a nominal, the two
-examples of R8 and their forms through a context that derives the individual and through
-two contexts R7 identified, R5 and R6 with a nominal on either side and with a nominal
-acquired by a merge, a universal restriction on the top property held by a real context
-and by one that is not, a functional data property beside a universal restriction, a key
-beside an inverse functional property, a Horn class assertion, a conjunction context that
-a world creates, an at-least restriction of two with a nominal filler, and a world whose
-first new conclusion is `Real`. A differential run of a few hundred generated small Horn
-ontologies with nominals, inverse roles, functionality, universals and disjoint and
-asymmetric roles against HermiT, on one and eight threads, adds cases the hand cases do
-not foresee. The 300 EL files of the EL identity gate, GO and the Horn files without
-individuals of the development set keep their taxonomies byte for byte, the disjunctive
-rules keep every refusal of individuals, data properties and top properties, and the
-`dl_*` suites and the `sparkles-owl` library tests pass.
+**Gate.** The gate is the Horn stratum of the ORE 2015 DL development set, 73 files, of
+which HermiT 1.4.5.519 classifies 68 within 1200 s, and among them the 47 files with
+individuals, functional data properties or top properties, whose Horn axioms the
+comparison before this item left out. On four threads the classifier's taxonomy equals
+HermiT's on 34 files and is sound on 33, with no difference against HermiT on any file,
+where the build before the item was equal on 23 and sound on 44. Every axiom the 33 files
+still leave out is outside the Horn rules' scope: anonymous individuals in 29 files, and
+datatypes outside OWL 2 EL or data cardinalities in 4. The reader refuses `ore_ont_9881`
+for an invalid IRI in both builds. The 25 Horn files without individuals and the 298 EL
+files of the EL identity gate keep their taxonomies byte for byte, on one and eight
+threads for the EL files, and the disjunctive rules keep every refusal of individuals,
+data properties and top properties. Hand cases cover each rule above, on one and eight
+threads, each with HermiT's answer: the simplest case of R7, a cascade of three singular
+contexts, a loop that an at-most restriction counts at a nominal, the two examples of R8
+and their forms through a context that derives the individual and through two contexts
+R7 identified, R5 and R6 with a nominal on either side and with a nominal acquired by a
+merge, a universal restriction on the top property and on its inverse held by a real
+context and by one that is not, a functional data property beside a universal
+restriction, a key beside an inverse functional property, a Horn class assertion, a
+conjunction context that a world creates, an at-least restriction of two with a nominal
+filler, and a world whose first new conclusion is `Real`. Three unit tests deliver the
+conclusions of one context in each order a saturation can produce them, for a Horn
+successor made after its source became real, a member registering after its individual
+has loops and Horn successors, and the filler of a counted loop arriving last. A
+differential run of 300 generated Horn ontologies with nominals, inverse roles,
+functionality, universals, self restrictions and disjoint and asymmetric roles, written by
+the dl603 fixture generator with a family of its own and seed 692, equals HermiT's
+taxonomy on every file on one and eight threads, where the build before the item left
+axioms out on 290 of them. The `dl_*` suites and the `sparkles-owl` library tests pass.
+The [record](../../benchmarks/el-classification/runs/2026-11-10-horn-individuals-atlas-0f944b5c/record.json)
+holds the judgements, the exclusions, the generator and the timings, which the
+[benchmark report](../../benchmarks/el-classification/RESULTS.md#horn-individuals)
+discusses.
 
 **Out of scope.** Enumerations of several individuals in a positive position need case
 analysis and stay with the rooted run. At-least restrictions above one beside

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# gate.sh BIN TAG LIST THREADS: classifies each file of LIST (a tsv whose first column
+# names files under data/dev-files or data/el-files) with the el_classify binary BIN,
+# writes taxonomies and reports under data/out/TAG, and judges each file that has a HermiT
+# reference with scripts/elk-compare/ours-compare.py.
+set -u
+BIN=$1 TAG=$2 LIST=$3 THREADS=${4:-4}
+W=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-individuals-692
+L=$W/.artifacts/lanes/horn-individuals-692/data
+OUT=$L/out/$TAG-t$THREADS
+mkdir -p "$OUT"
+: > "$OUT/judge.jsonl"
+while IFS=$'\t' read -r f _; do
+  [ -z "$f" ] || [ "$f" = file ] && continue
+  n=${f%.owl}
+  src=$L/dev-files/$f
+  [ -f "$src" ] || src=$L/el-files/$f
+  start=$(date +%s)
+  timeout 900 systemd-run --user --scope -q -p MemoryMax=10G -p MemorySwapMax=1G -p OOMPolicy=continue \
+    "$BIN" --threads "$THREADS" --taxonomy "$OUT/$n.tax" "$src" > "$OUT/$n.json" 2> "$OUT/$n.err"
+  status=$?
+  echo "$n status=$status seconds=$(( $(date +%s) - start ))" >> "$OUT/log.txt"
+  if [ -s "$L/hermit/$n.txt" ]; then
+    python3 -I "$W/scripts/elk-compare/ours-compare.py" --status "$status" --name "$n" \
+      --hermit "$L/hermit/$n.txt" --konclude "" --report "$OUT/$n.json" --stderr "$OUT/$n.err" \
+      --taxonomy "$OUT/$n.tax" >> "$OUT/judge.jsonl" 2>> "$OUT/judge.err"
+  fi
+done < "$LIST"
+echo GATE-DONE >> "$OUT/log.txt"
