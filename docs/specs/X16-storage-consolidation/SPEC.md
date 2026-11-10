@@ -94,7 +94,8 @@ which phases run at the same time.
 ### Phase 1. First-release format cutoff (item 479)
 
 The cutoff removes every reader of a form that no current writer produces, and keeps
-every form that a current writer still produces. It follows item 343, as the roadmap
+every form that a current writer still produces, with two exceptions that mark the cutoff
+itself, the dataset file's `format` and the index format. It follows item 343, as the roadmap
 orders, unless the maintainer takes [open decision 2](#open-decisions).
 
 The table gives each kind's decision. Every refusal goes through `FileKind::refuse`, which
@@ -110,7 +111,7 @@ dataset file gains `format` 2 and the index gains format 5.
 | `vocab-index` | Every build writes `vocab.idx`, but a reader opens a generation without one, and `add_vocab_index` writes it for a generation an older build left bare. | Index format 5 requires it, and a format 5 generation without one is corrupt. | Make `Sparse` a required field of the vocabulary, delete `add_vocab_index`, and add a refusal test for a format 4 generation and a corruption test for a format 5 generation without the file. |
 | `wal` | It reads 0, 1 and 2. A plain store writes 1 and an activated store writes 2. | It reads 1 and 2 and writes them as today. | Delete `Framing::Mixed`, `fold_legacy`, `walStrictFrom` in `commit.json`, the headerless branches of `WalCursor`, `WalIndex::scan`, `apply_backward`, `probe.rs`, `history_limited.rs`, `backup.rs` and `diff.rs`. |
 | `delta-vocab` | It reads 1 and 2, with a `migrate` step from 1. | It reads and writes 2. | Delete `convert_legacy_file`, the step and the legacy parser of `vocab/delta.rs`. |
-| `dataset` | It reads `format` 1 with readers 1 to 8. A new plain store writes reader 5 and an activated store reader 8. | It reads and writes `format` 2 with readers 5 to 8, and `minimumReader` keeps its meaning. | Write `format` 2 from `dataset_file_bytes`, refuse `format` 1 with the dump-and-reload message in `check_dataset_value`, and delete the branches that handle readers below 5, which are a dataset without branches, relinked generations, framed deltas or log headers. The branches for `managed.json` and `holds.json` stay, since a plain store still lacks both. |
+| `dataset` | It reads `format` 1 with readers 1 to 8. A new plain store writes reader 5 and an activated store reader 8. | It reads and writes `format` 2 with readers 5 to 8, and `minimumReader` keeps its meaning. | Write `format` 2 from both dataset writers, `dataset_file_bytes` and `clone_dataset_file_bytes`, which `Store::clone_to` uses, refuse `format` 1 with the dump-and-reload message in `check_dataset_value`, and delete the branches that handle readers below 5, which are a dataset without branches, relinked generations, framed deltas or log headers. The branches for `managed.json` and `holds.json` stay, since a plain store still lacks both. |
 | `generation-commit` and `link` | They read 1 and 2. A plain store writes `commit.json` 1 and an activated store 2, and a branch writes `link.json` 1 without an overlay and 2 with one. | They stay as they are. | Both forms are current, so nothing is removed. |
 | `backup-slots` | It reads 1 and 2 and writes 2. | It reads and writes 2. | Pre-release repositories follow the same window as databases. |
 | Derived kinds | `view-state` and `internal-circuit-state` read several versions. | They stay as they are. | A derived file never needs a cutoff, since an unread version is rebuilt. |
@@ -125,7 +126,8 @@ has no store constructor, writes `minimumReader` 9 for an imported destination, 
 test asserts that a reader-8 build refuses those bytes. That is a compatibility decision
 for the lane that wires the import, which then raises `DATASET_READER` and the registry
 together, and the cutoff does not change it. The acceptance cases of the phase are a
-plain store created, written, reopened, branched and compacted, an activated store doing
+plain store created, written, reopened, branched, cloned and compacted, with the clone
+reopened and carrying `format` 2 with its own reader requirement, an activated store doing
 the same, and a backup and restore of each, all writing `format` 2 and index format 5
 and reading only the retained forms, together with the refusal of a `format` 1 dataset,
 a format 4 generation and a headerless log.
@@ -265,13 +267,13 @@ estimate from `estimated_quads`, a batch length or a stream probe against a byte
 whether every source is a small reader, whether the write is restricted to some graphs
 through `WriteOptions::graphs`, whether the transaction checks triple-level write
 protections, which `requested` records, whether it carries a managed admission, whether
-the patch has deleted anything, and `bulk_threshold`. The table below is the current
+the patch has met a delete row, and `bulk_threshold`. The table below is the current
 behaviour, which the first commit of the phase encodes as a table test before any rule
 changes, and the second commit unifies the rules by the decisions it records.
 
 | Entry point | Bulk when | Threshold test | Cases it lacks |
 |---|---|---|---|
-| `load_with` | The write is unrestricted, the sources are not small streams, and the head is empty or the estimate is above the threshold. Small streams means an empty head, at least one source, every source a reader, and the readers under `SMALL_STREAM_BYTES` of 8 MiB when read ahead. | The estimate is strictly above. | It has no probe of large streams against the threshold. |
+| `load_with` | The write is unrestricted, the sources are not small streams, and the head is empty or the estimate is above the threshold. Small streams means an empty head, at least one source, every source a reader, and the readers holding at most `SMALL_STREAM_BYTES`, 8 MiB, of decompressed bytes in total when read ahead. | The estimate is strictly above. | It has no probe of large streams against the threshold. |
 | `replace_with` | The write is unrestricted and the estimate is above the threshold or the streams exceed eighty bytes per threshold quad. | The estimate is strictly above. | It has no empty-head case. |
 | `insert_bulk` | The batch reaches the threshold, and the transaction checks no triple protections and carries no managed admission. | The length is at or above. | It has no size estimate and no small-reader case. |
 | `patch_apply` | The patch has met no delete row, whether or not the row deleted anything, and its additions reach the threshold, after which `insert_bulk` applies its own rule. | The length is at or above. | It has no estimate and no restriction input of its own. |
