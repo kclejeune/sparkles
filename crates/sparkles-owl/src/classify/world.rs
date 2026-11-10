@@ -721,6 +721,30 @@ struct WorldSink<'b> {
     ctx_len: usize,
     dynamic: Option<&'b Dynamic>,
     table: std::sync::Arc<Dynamic>,
+    /// the messages pushed in this activation, and the bytes charged for them so far,
+    /// which the activation's end releases before the checkpoint counts them as waiting
+    grown: &'b Cell<usize>,
+    charged: &'b Cell<isize>,
+}
+
+/// The messages a world's sink pushes between two charges of their bytes.
+const CHARGE_EVERY: usize = 1024;
+
+impl WorldSink<'_> {
+    /// A message was pushed: every [`CHARGE_EVERY`] messages their bytes are charged to
+    /// the bound, so that a rule whose one inference sends many messages, such as R7 of
+    /// the Horn rules with individuals, is admitted as it grows.
+    fn grew(&self) {
+        let g = self.grown.get() + 1;
+        self.grown.set(g);
+        if g.is_multiple_of(CHARGE_EVERY) {
+            let bytes = (CHARGE_EVERY * std::mem::size_of::<(Ex, Concl)>()) as isize;
+            self.charged.set(self.charged.get() + bytes);
+            if !(self.bound)(bytes) {
+                self.halted.set(true);
+            }
+        }
+    }
 }
 
 impl Sink for WorldSink<'_> {
@@ -758,9 +782,11 @@ impl Sink for WorldSink<'_> {
         } else {
             self.out.push((to, c));
         }
+        self.grew();
     }
     fn me(&mut self, c: Concl) {
         self.local.push(c);
+        self.grew();
     }
 
     fn core(&self, ix: &Index, e: Ex, out: &mut Vec<Ex>) {
@@ -1062,6 +1088,8 @@ impl<'a> World<'a> {
             let data_growth = Cell::new(0isize);
             let data_halted = Cell::new(false);
             let data_overflow = Cell::new(false);
+            let grown = Cell::new(0usize);
+            let charged = Cell::new(0isize);
             {
                 let core = self.conjunction_core(e).map(|c| c.to_vec());
                 let mut sink = WorldSink {
@@ -1075,6 +1103,8 @@ impl<'a> World<'a> {
                     ctx_len: self.ctx.len(),
                     dynamic: self.dynamic,
                     table: self.local.clone(),
+                    grown: &grown,
+                    charged: &charged,
                 };
                 if !st.init {
                     let all: Vec<Ex> = self
@@ -1117,6 +1147,11 @@ impl<'a> World<'a> {
                         break;
                     }
                 }
+            }
+            // the messages charged as they were pushed are released here, and the
+            // checkpoint below counts those still waiting
+            if charged.get() != 0 {
+                (self.bound)(-charged.get());
             }
             self.held = self.held.saturating_add_signed(data_growth.get());
             self.reported = self.reported.saturating_add_signed(data_growth.get());

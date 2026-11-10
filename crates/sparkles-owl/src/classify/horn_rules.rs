@@ -616,20 +616,38 @@ fn clash(ix: &Index, r1: Role, r2: Role) -> bool {
 /// and the contexts that stand for the context's individual.
 pub fn spread<S: Sink>(st: &State, c: Concl, noms: bool, members: bool, out: &mut S) {
     let Some(x) = &st.extra else { return };
+    let mut work = 0usize;
+    let mut poll = |out: &mut S| {
+        work += 1;
+        !work.is_multiple_of(POLL) || out.go_on()
+    };
     for &k in &x.horn.same.list {
         out.send(k, c);
+        if !poll(out) {
+            return;
+        }
     }
     if noms {
         for &n in &x.noms {
             out.send(n, c);
+            if !poll(out) {
+                return;
+            }
         }
     }
     if members {
         for &m in &x.members.list {
             out.send(m, c);
+            if !poll(out) {
+                return;
+            }
         }
     }
 }
+
+/// The messages or scanned pairs between two polls of the run's bounds in the rules of
+/// individuals, whose one inference can send many messages.
+const POLL: usize = 256;
 
 /// A new subsumer goes to the partners R7 identified; the rules of individuals give it
 /// to the context's individuals and the contexts that stand for them.
@@ -641,17 +659,31 @@ pub fn spread_sub<S: Sink>(st: &State, d: Ex, out: &mut S) {
 /// element: each link, whether its source holds each at-most filler and whether the
 /// source is real.
 fn send_links<S: Sink>(st: &State, to: Ex, out: &mut S) {
+    let mut work = 0usize;
+    let mut poll = |out: &mut S| {
+        work += 1;
+        !work.is_multiple_of(POLL) || out.go_on()
+    };
     for (r, srcs) in &st.back {
         for &e in &srcs.list {
             out.send(to, Concl::Back(e, *r));
+            if !poll(out) {
+                return;
+            }
         }
     }
     let Some(x) = &st.extra else { return };
     for &(m, b) in &x.horn.pred_in.list {
         out.send(to, Concl::PredIn(m, b));
+        if !poll(out) {
+            return;
+        }
     }
     for &m in &x.horn.real_preds.list {
         out.send(to, Concl::RealBack(m));
+        if !poll(out) {
+            return;
+        }
     }
 }
 
@@ -663,8 +695,11 @@ pub fn send_own<S: Sink>(st: &State, to: Ex, out: &mut S) {
         out.send(to, Concl::Loop(l));
     }
     if let Some(x) = &st.extra {
-        for &(r, n) in &x.horn.succ.list {
+        for (i, &(r, n)) in x.horn.succ.list.iter().enumerate() {
             out.send(to, Concl::Succ(r, n));
+            if (i + 1).is_multiple_of(POLL) && !out.go_on() {
+                return;
+            }
         }
     }
 }
@@ -712,9 +747,14 @@ pub fn singular<S: Sink>(ix: &Index, me: Ex, st: &mut State, counted: bool, out:
     propagate_singular(ix, st, out);
     r7(ix, me, st, None, out);
     let links: Vec<(Role, Small<Ex>)> = st.back.iter().map(|(r, s)| (*r, s.clone())).collect();
+    let mut work = 0usize;
     for (r, srcs) in links {
         for &m in &srcs.list {
             r8_back(ix, me, st, m, r, out);
+            work += 1;
+            if work.is_multiple_of(64) && !out.go_on() {
+                return;
+            }
         }
     }
 }
@@ -775,6 +815,10 @@ fn r7<S: Sink>(ix: &Index, me: Ex, st: &mut State, only: Option<Ex>, out: &mut S
                 out.me(Concl::Same(m1));
             }
             for &(m2, r2) in &real {
+                work += 1;
+                if work.is_multiple_of(64) && !out.go_on() {
+                    return;
+                }
                 if m2 == m1 || (only.is_none() && m2 > m1) {
                     continue;
                 }
@@ -784,10 +828,6 @@ fn r7<S: Sink>(ix: &Index, me: Ex, st: &mut State, only: Option<Ex>, out: &mut S
                 } else {
                     out.send(m1, Concl::Same(m2));
                     out.send(m2, Concl::Same(m1));
-                }
-                work += 1;
-                if work.is_multiple_of(64) && !out.go_on() {
-                    return;
                 }
             }
         }
@@ -857,7 +897,7 @@ pub fn same<S: Sink>(_ix: &Index, me: Ex, st: &mut State, k: Ex, out: &mut S) ->
     }
     for (i, &s) in st.subs.iter().enumerate() {
         out.send(k, Concl::Sub(s));
-        if (i + 1).is_multiple_of(256) && out.stopped() {
+        if (i + 1).is_multiple_of(POLL) && !out.go_on() {
             return true;
         }
     }
