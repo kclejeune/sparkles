@@ -1461,25 +1461,29 @@ maintained, and `HAVING` follows the aggregates it reads.
 
 - The group operator of `incr/ops/group.rs` keeps the values of a `MIN`, `MAX`,
   `GROUP_CONCAT` or `SAMPLE` as an ordered multiset: a vector of the group's distinct
-  values in the order of `ORDER BY`, then by id for values the order does not tell
-  apart, each with its count, 16 bytes per distinct value and 40 bytes per group. One
-  state serves the four aggregates with and without `DISTINCT`. Adding or removing a
-  value finds its place with a binary search that decodes about the logarithm of the
-  group's distinct values and shifts the entries after it. `MIN` and `MAX` read the
-  ends, so removing the extreme value costs the same as any other. A hash map of counts
-  would take the same memory and make removing the extreme value scan the group, which
-  the vector trades for the shift of its entries. A group of ten thousand distinct
-  values costs about fourteen decodes and a move of at most 160 KiB per changed value.
+  values in the order of `ORDER BY`, each with its count, 16 bytes per distinct value
+  and 40 bytes per group. Values the order does not tell apart, such as
+  `"01"^^xsd:integer` and `"1"^^xsd:integer`, form a run in the order they entered the
+  group, which a checkpoint and a generation switch keep because the order depends on
+  the terms and not on their ids. One state serves the four aggregates with and without
+  `DISTINCT`. Adding or removing a value finds its place with a binary search that
+  decodes about the logarithm of the group's distinct values and shifts the entries
+  after it. `MIN` and `MAX` read the ends, so removing the extreme value costs the same
+  as any other. A hash map of counts would take the same memory and make removing the
+  extreme value scan the group, which the vector trades for the shift of its entries. A
+  group of ten thousand distinct values costs about fourteen decodes and a move of at
+  most 160 KiB per changed value.
 - `MIN` and `MAX` leave out an unbound or failed argument, as the engine's running
-  aggregates do. `GROUP_CONCAT` joins the group's values again for each changed group,
+  aggregates do, and among values the order does not tell apart both report the one that
+  entered the group first, as the engine keeps the first of equal values. `GROUP_CONCAT` joins the group's values again for each changed group,
   which is the recompute per changed group that §4.2 allows, in the multiset's order,
   each value as often as the group holds it or once with `DISTINCT`. The engine joins
   the values in the order its rows arrive, so a view's string and a one-off query's
   hold the same parts in a possibly different order, and item 905 tracks one order for
   both. An unbound or failed argument, or a value without a lexical form, makes it
   unbound, as in a one-off evaluation. `SAMPLE` keeps the value it reported while the
-  group holds it and then takes the smallest, so a group's sample changes only when its
-  value leaves.
+  group holds it after the pass, so a replacement of its row within one commit keeps it,
+  and then takes the smallest.
 - `HAVING` is a filter over the group's rows, which the compiler maintained already for
   `COUNT`, `SUM` and `AVG`, so a `HAVING` over `MIN` or `MAX` is maintained now too.
 - A correlated `EXISTS`, which reads an outer variable that no join key carries, such as
@@ -1488,16 +1492,21 @@ maintained, and `HAVING` follows the aggregates it reads.
   compile to the operator of `incr/ops/exists.rs`, which the plan names `ExistsFilter`.
   It keeps each input row with its weight and the condition's last answer. It evaluates
   the condition with the query engine, with the row's bindings substituted as a one-off
-  query substitutes them, so the answer is the engine's own and reads what the
-  circuit's principal reads. A pass whose changes miss the condition's footprint keeps
-  every answer. A pass inside it matches each changed quad against the condition's
-  triple patterns, and a match binds the outer variables the pattern names, so only
-  rows with those bindings, or without them, are evaluated again. A pattern without an
-  outer variable, a property path, `SERVICE` or an extension sends every row to the
-  engine again, which the plan reports as `every row on a change`. The variables of a
-  subquery inside the condition count as outer only when the subquery projects them,
-  as the engine substitutes them. Finding the rows a change touches scans the
-  operator's rows, and item 906 indexes them when a measurement asks for it.
+  query substitutes them, so the answer is the engine's own. The expression context of
+  a pass reads the snapshot as the circuit's principal reads it, through the same grant
+  binding, masking and dataset restriction as a one-off query, and keeps the pass's
+  deadline, cancellation and memory budget. A pass whose changes miss the condition's
+  footprint keeps every answer. A pass inside it matches each changed quad against the
+  condition's triple patterns, and a match binds the outer variables the pattern names,
+  so only rows with those bindings, or without them, are evaluated again. A pattern
+  without an outer variable, a property path, a property function, one of ARQ's special
+  graphs, a `GRAPH` whose body reads no triple or that holds another `GRAPH`, `SERVICE`
+  or an extension sends every row to the engine again, which the plan reports as `every
+  row on a change`. The variables of a subquery inside the condition count as outer only
+  when the subquery projects them, as the engine substitutes them, and the expressions
+  of aggregates and `ORDER BY` inside the condition are read for nested `EXISTS`.
+  Finding the rows a change touches scans the operator's rows, and item 906 indexes
+  them when a measurement asks for it.
 - An `EXISTS` in a `BIND`, in an `OPTIONAL` filter or in an aggregate's argument, and a
   correlated `EXISTS` under `GRAPH`, are still `recompute` nodes, which item 904 tracks.
   Rows a correlated `EXISTS` keeps carry unknown derivations under a provenance setting,
