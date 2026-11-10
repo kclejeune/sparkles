@@ -84,6 +84,12 @@ pub struct DlIx {
     atmost: FxHashMap<Ex, (u32, Role)>,
     /// the holders, bounds and roles of the at-most restrictions
     atmosts: Vec<(Ex, u32, Role)>,
+    /// item 728's clauses of a cardinality in a negative position, without a holder: the
+    /// bound the at-most rule counts to, the qualified role and the head's atoms over x
+    lazy: Vec<(u32, Role, Box<[Ex]>)>,
+    /// for each expression, whether it is an at-least conjunction that the order of a run
+    /// without the root ranks below every class, item 728
+    low: Vec<bool>,
     /// the pairs of disjoint roles, closed under inverses and order
     pub(super) rdis: Vec<(Role, Role)>,
     /// with counting, for each role and qualified role t, whether a role literal below t
@@ -141,7 +147,12 @@ impl DlIx {
                 }
             }
         }
-        for &(_, _, s, b) in &dl.atmost {
+        for (s, b) in dl
+            .atmost
+            .iter()
+            .map(|&(_, _, s, b)| (s, b))
+            .chain(dl.lazy.iter().map(|&(_, s, b, _)| (s, b)))
+        {
             let r = if b == TOP { Some(s) } else { ix.roles.inv(s) };
             if let Some(w) = r.and_then(|r| wanted.get_mut(r as usize)) {
                 *w = true;
@@ -202,8 +213,8 @@ impl DlIx {
         // flips its last bit
         d.base = (n as Role + 1) & !1;
         let mut qual: FxHashMap<(Role, Ex), Role> = FxHashMap::default();
-        for &(m, k, s, b) in &dl.atmost {
-            let q = if b == TOP {
+        let mut qualified = |d: &mut DlIx, s: Role, b: Ex| {
+            if b == TOP {
                 s
             } else {
                 *qual.entry((s, b)).or_insert_with(|| {
@@ -212,9 +223,22 @@ impl DlIx {
                     d.quals_of.entry(b).or_default().push(q);
                     q
                 })
-            };
+            }
+        };
+        for &(m, k, s, b) in &dl.atmost {
+            let q = qualified(&mut d, s, b);
             d.atmost.insert(m, (k, q));
             d.atmosts.push((m, k, q));
+        }
+        for (k, s, b, head) in &dl.lazy {
+            let q = qualified(&mut d, *s, *b);
+            d.lazy.push((*k, q, head.clone().into_boxed_slice()));
+        }
+        d.low = vec![false; nodes];
+        for &h in &dl.low {
+            if let Some(x) = d.low.get_mut(h as usize) {
+                *x = true;
+            }
         }
         for &(a, b) in &dl.rdis {
             let mut add = |x: Role, y: Role| {
@@ -332,6 +356,14 @@ impl DlIx {
     /// The core of the successor that the EL rules give e.
     pub(super) fn core(&self, e: Ex) -> &[Ex] {
         self.cores.get(&e).map_or(&[][..], |c| c)
+    }
+
+    /// Whether `a` is an at-least conjunction of item 728's clauses that the order of a
+    /// run without the root ranks below every class, which `SPARKLES_DL_LOW_H=1` asks for
+    /// and is off by default until [`low_h`]'s measurement.
+    #[inline]
+    pub fn is_low(&self, a: Ex) -> bool {
+        self.root.is_none() && low_h() && self.low.get(a as usize).copied().unwrap_or(false)
     }
 
     /// Whether `me` is the root of a rooted run.
@@ -792,6 +824,15 @@ pub fn promote() -> bool {
 
 /// Whether a context other than the root selects the ground literals in its bodies, item
 /// 804's selection (F24). `SPARKLES_ROOTED_SELECT_GROUND=0` turns it off, for measurement.
+/// Whether the at-least conjunctions of item 728's clauses rank below every class, which
+/// `SPARKLES_DL_LOW_H=1` turns on. It is off until its measurement, since with it
+/// `sriq-010` of the counting fixtures passes a bound of 8 million conclusions on one
+/// thread where the present rank finishes it.
+pub fn low_h() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_DL_LOW_H").is_some_and(|v| v == "1"))
+}
+
 pub fn select_ground() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_SELECT_GROUND").is_none_or(|v| v != "0"))
@@ -1412,9 +1453,10 @@ fn at_most(
     q: Role,
     holder: Vec<Side>,
     fixed: Option<(Ex, &Side)>,
+    extra: &[Ex],
     found: &mut Found,
 ) {
-    found.rule = "atmost";
+    found.rule = if extra.is_empty() { "atmost" } else { "lazy" };
     let dx = dix(ix);
     if holder.is_empty() {
         return;
@@ -1461,7 +1503,7 @@ fn at_most(
     loop {
         if must.is_none_or(|m| pick.contains(&m)) {
             let mut lists: Vec<Vec<Side>> = vec![holder.clone()];
-            let mut eqs: Vec<Lit> = Vec::new();
+            let mut eqs: Vec<Lit> = extra.iter().map(|&a| Lit::x(a)).collect();
             for (a, &i) in pick.iter().enumerate() {
                 lists.push(cands[i].1.clone());
                 for &j in &pick[a + 1..] {
@@ -1532,7 +1574,13 @@ fn on_rl(ix: &Index, st: &State, f: Ex, s: Role, prem: &Side, found: &mut Found)
     }
     for &(m, n, q) in &dx.atmosts {
         if dx.sub(ix, s, q) {
-            at_most(ix, st, n, q, partners_x(st, m), Some((f, prem)), found);
+            at_most(ix, st, n, q, partners_x(st, m), Some((f, prem)), &[], found);
+        }
+    }
+    // item 728's clauses, with the new premise fixed in the product
+    for (n, q, head) in &dx.lazy {
+        if dx.sub(ix, s, *q) {
+            at_most(ix, st, *n, *q, vec![unit()], Some((f, prem)), head, found);
         }
     }
     for (k, &(r, b)) in dx.quals.iter().enumerate() {
@@ -1765,9 +1813,18 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
     }
     if dx.counting {
         if let Some(&(n, q)) = dx.atmost.get(&d) {
-            at_most(ix, st, n, q, vec![unit.clone()], None, &mut found);
+            at_most(ix, st, n, q, vec![unit.clone()], None, &[], &mut found);
         }
         on_filler(ix, st, d, &unit, &mut found);
+        // item 728's clauses for one neighbour, once at the context's start, for the
+        // predecessor alone when the context carries the inverse of the qualified role
+        if d == TOP {
+            for (n, q, head) in &dx.lazy {
+                if *n == 0 {
+                    at_most(ix, st, 0, *q, vec![unit.clone()], None, head, &mut found);
+                }
+            }
+        }
     }
     // an existential restriction: its role and core over the new successor term are
     // premises in place
@@ -2486,7 +2543,7 @@ fn process<S: Sink>(
                 }
                 if dx.counting {
                     if let Some(&(n, q)) = dx.atmost.get(&d) {
-                        at_most(ix, st, n, q, vec![prem.clone()], None, &mut found);
+                        at_most(ix, st, n, q, vec![prem.clone()], None, &[], &mut found);
                     }
                     on_filler(ix, st, d, &prem, &mut found);
                 }

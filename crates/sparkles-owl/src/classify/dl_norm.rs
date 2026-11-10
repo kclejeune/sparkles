@@ -54,6 +54,14 @@ pub struct DlAx {
     /// in a rooted run with counting, the minimum restrictions: a holder M and the
     /// existential restrictions whose successor terms differ, `M(x) → f_i(x) ≉ f_j(x)`
     pub ne: Vec<(Ex, Vec<Ex>)>,
+    /// item 728's clauses for an exact or minimum cardinality in a negative position,
+    /// `r_B(x, z_1) ∧ … ∧ r_B(x, z_n) → head ⊔ ⋁ z_i ≈ z_j`: the bound `n - 1` that the
+    /// at-most rule counts to, the role, the filler's negative form B, ⊤ when unqualified,
+    /// and the head's atoms over x, `y` with the at-least conjunction `H` of an exact one
+    pub lazy: Vec<(u32, Role, Ex, Vec<Ex>)>,
+    /// the at-least conjunctions `H` that a cardinality in a negative position makes,
+    /// which the order of a run without the root ranks below every class
+    pub low: Vec<Ex>,
 }
 
 impl DlAx {
@@ -117,6 +125,10 @@ struct Out {
     irreflexive: Vec<Role>,
     /// the minimum restrictions of a rooted run with counting, as [`DlAx::ne`]
     ne: Vec<(Ex, Vec<Ex>)>,
+    /// item 728's clauses of a cardinality in a negative position, as [`DlAx::lazy`]
+    lazy: Vec<(u32, Role, Ex, Vec<Ex>)>,
+    /// the at-least conjunctions ranked lowest, as [`DlAx::low`]
+    low: Vec<Ex>,
     /// whether an inverse property occurs, which a symmetric or inverse functional
     /// property also makes
     inverse: bool,
@@ -134,6 +146,8 @@ impl Out {
         self.rdis.extend(o.rdis);
         self.irreflexive.extend(o.irreflexive);
         self.ne.extend(o.ne);
+        self.lazy.extend(o.lazy);
+        self.low.extend(o.low);
         self.inverse |= o.inverse;
     }
 }
@@ -483,7 +497,17 @@ impl Norm<'_> {
                 let mut head = Vec::new();
                 for c in moved {
                     let dual = self.dual(c).expect("a conjunct with a dual");
-                    head.push(self.pos(&dual, d)?);
+                    let h = self.pos(&dual, d)?;
+                    // with counting the at-least conjunction of a moved maximum ranks
+                    // lowest, item 728
+                    if self.counting
+                        && matches!(c, C::ObjectMaxCardinality(n, ..) if *n >= 1)
+                        && h != TOP
+                        && h != BOTTOM
+                    {
+                        self.out.low.push(h);
+                    }
+                    head.push(h);
                 }
                 if head.contains(&TOP) || body.contains(&BOTTOM) {
                     return Ok(BOTTOM);
@@ -544,9 +568,19 @@ impl Norm<'_> {
             C::ObjectMinCardinality(0, ..) => TOP,
             C::ObjectMinCardinality(1, p, f) => self.neg_some(p, f.as_deref(), d)?,
             C::ObjectMinCardinality(n, p, f) if self.counting => {
-                // ≥n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f
-                let m = self.pos(&C::ObjectMaxCardinality(n - 1, p.clone(), f.clone()), d)?;
-                self.global_or(m)?
+                // ≥n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f, written as the paper's at-most clause
+                // itself, `p_B(x, z_1) ∧ … ∧ p_B(x, z_n) → y ⊔ ⋁ z_i ≈ z_j`, item 728
+                let r = self.role(p)?;
+                let b = match f {
+                    Some(f) => self.neg(f, d)?,
+                    None => TOP,
+                };
+                if b == BOTTOM {
+                    return Ok(BOTTOM);
+                }
+                let y = self.it.fresh_class();
+                self.out.lazy.push((n - 1, r, b, vec![y]));
+                y
             }
             C::ObjectMinCardinality(..) => {
                 return Err("a minimum cardinality above one in a negative position");
@@ -572,6 +606,10 @@ impl Norm<'_> {
                     None => *n,
                 };
                 let m = self.pos(&C::ObjectMinCardinality(n1, p.clone(), f.clone()), d)?;
+                // with counting the at-least conjunction of ≥(n+1) ranks lowest, item 728
+                if self.counting && *n >= 1 && m != TOP && m != BOTTOM {
+                    self.out.low.push(m);
+                }
                 self.global_or(m)?
             }
             C::ObjectExactCardinality(0, p, f) => {
@@ -579,22 +617,29 @@ impl Norm<'_> {
                 self.global_or(m)?
             }
             C::ObjectExactCardinality(n, p, f) if self.counting => {
-                // =n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f ⊔ ≥(n+1) p.f
-                let lo = self.pos(&C::ObjectMaxCardinality(n - 1, p.clone(), f.clone()), d)?;
-                let n1 = n.checked_add(1).ok_or("a cardinality too large")?;
-                let hi = self.pos(&C::ObjectMinCardinality(n1, p.clone(), f.clone()), d)?;
-                if lo == TOP || hi == TOP {
+                // =n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f ⊔ ≥(n+1) p.f, written as the paper's
+                // at-most clause itself, `p_B(x, z_1) ∧ … ∧ p_B(x, z_n) → y ⊔ H ⊔ ⋁ z_i ≈ z_j`
+                // with H the at-least conjunction, which the order ranks lowest, item 728
+                let r = self.role(p)?;
+                let b = match f {
+                    Some(f) => self.neg(f, d)?,
+                    None => TOP,
+                };
+                if b == BOTTOM {
                     return Ok(BOTTOM);
                 }
-                let mut head: Vec<Ex> = [lo, hi].into_iter().filter(|&e| e != BOTTOM).collect();
-                let y = self.it.fresh_class();
-                head.push(y);
-                head.sort_unstable();
-                head.dedup();
-                if head.len() == 1 {
-                    return Ok(TOP);
+                let n1 = n.checked_add(1).ok_or("a cardinality too large")?;
+                let hi = self.pos(&C::ObjectMinCardinality(n1, p.clone(), f.clone()), d)?;
+                if hi == TOP {
+                    return Ok(BOTTOM);
                 }
-                self.out.clauses.push((Vec::new(), head));
+                let y = self.it.fresh_class();
+                let mut head = vec![y];
+                if hi != BOTTOM {
+                    head.push(hi);
+                    self.out.low.push(hi);
+                }
+                self.out.lazy.push((n - 1, r, b, head));
                 y
             }
             C::ObjectExactCardinality(..) => {
@@ -1091,6 +1136,8 @@ pub fn normalize(
         rdis: all.rdis,
         counting,
         ne: all.ne,
+        lazy: all.lazy,
+        low: all.low,
         ..DlAx::default()
     };
     // the hypothetical successor of each existential restriction

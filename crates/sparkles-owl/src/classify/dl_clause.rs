@@ -354,14 +354,19 @@ fn packed_pair(kind: u64, a: RTerm, b: RTerm) -> Option<Lit> {
     }
 }
 
-/// The key of the total order on the atoms over x: the fresh classes of the normalization
-/// first, then the named classes, then the other expressions, each by id.
+/// The key of the total order on the atoms over x: the at-least conjunctions of item
+/// 728's clauses first, so that a context resolves the fresh class and the defined class
+/// before it expands them, then the fresh classes of the normalization, then the named
+/// classes, then the other expressions, each by id.
 #[inline]
 pub fn rank(ix: &Index, a: Ex) -> (u8, Ex) {
+    if ix.dl.as_deref().is_some_and(|d| d.is_low(a)) {
+        return (0, a);
+    }
     let r = match ix.head(a).node {
-        Node::Fresh(_) => 0,
-        Node::Class(_) => 1,
-        _ => 2,
+        Node::Fresh(_) => 1,
+        Node::Class(_) => 2,
+        _ => 3,
     };
     (r, a)
 }
@@ -625,10 +630,11 @@ impl Rooted<'_> {
     fn x_key(&self, p: XLit) -> Option<(u8, Ex)> {
         match p {
             XLit::Atom(b, _) => {
+                // a rooted run ranks no atom lowest, so the ranks are 1, 2 and 3
                 let (r, b) = rank(self.ix, b);
-                (r != 1).then_some((r, b))
+                (r != 2).then_some((r, b))
             }
-            XLit::Role(s, ..) => Some((3, s)),
+            XLit::Role(s, ..) => Some((4, s)),
             _ => None,
         }
     }
