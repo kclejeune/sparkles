@@ -278,8 +278,22 @@ fn merge_joins_on_two_keys_count_only_compatible_pairs_against_the_row_limit() {
     l.sorted = vec![k, x];
     let joined = super::exec::join_tables(&ctx, &l, &r, &[k], true).unwrap();
     assert_eq!(joined.len(), 3);
-    let optional = left_join(&ctx, &l, &r, None, &mut None).unwrap();
-    assert_eq!(optional.len(), 3);
+    // The merge OPTIONAL shares the key alone, so every pair of the long run is a match
+    // and the run is expanded a piece at a time within a limit above its product.
+    let y = ctx.var("y");
+    ctx.max_rows = 200_000;
+    let mut r = Table::new(vec![k, y]);
+    for i in 0..long {
+        r.push_row(&[Id(7), Id(100 + i as u64)]);
+    }
+    r.sorted = vec![k, y];
+    let mut note = None;
+    let optional = left_join(&ctx, &l, &r, None, &mut note).unwrap();
+    assert_eq!(optional.len(), 3 * long);
+    assert!(
+        note.as_deref().is_some_and(|n| n.starts_with("[merge on")),
+        "{note:?}"
+    );
 }
 
 /// The zippers of merge left joins and anti joins, alone, side by side over parts of the

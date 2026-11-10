@@ -339,8 +339,17 @@ mod tests {
         );
         assert!(matches!(stopped, Err(Error::Cancelled)), "{stopped:?}");
         assert!(tested.get() <= 10 + POLL, "{}", tested.get());
+        // the same from a run expanded alone, with the cancellation cleared first
+        ctx.cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        tested.set(0);
         let stopped = expand_run(&ctx, 0, 0..rk.len(), rk.len(), cancelling, &mut l, &mut r);
         assert!(matches!(stopped, Err(Error::Cancelled)), "{stopped:?}");
+        assert!(
+            tested.get() >= 10 && tested.get() <= 10 + POLL,
+            "{}",
+            tested.get()
+        );
     }
 
     #[test]
