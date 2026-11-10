@@ -151,9 +151,9 @@ assigns its stable configuration UUID and writes settings format 2 atomically. N
 existing report is rewritten or reviewed during migration, and migration cannot trigger
 new model calls. Unnamed routes retain their behavior through that explicit default.
 
-The current format registry records GraphRAG state version 2 and ledger version 1.
-Reports on accepted evidence, roadmap item 652, take state version 3 for the evidence
-pairs that C25 describes. This extension registers state version 4 and ledger version 2,
+The current format registry records GraphRAG state version 3 and ledger version 1.
+State version 3 holds the evidence pairs of reports on accepted evidence, which C25
+describes, and version 2 states are still read. This extension registers state version 4 and ledger version 2,
 with configuration identity in every new record and each configuration's evidence pairs
 kept in its own state. Migration stages and verifies the new files before
 publishing the settings and state pointer under the dataset's management lock. A
