@@ -495,16 +495,16 @@ fn a_join_against_a_constant_restriction_is_estimated_from_the_predicates_domain
         let a = query(s.snapshot(), q, &off).unwrap();
         let b = query(s.snapshot(), q, &on).unwrap();
         assert_eq!(a.len(), b.len(), "{q}");
-        let (ea, eb) = (join_qerror(&a.plan), join_qerror(&b.plan));
+        let (ea, eb) = (join_qerror(a.plan()), join_qerror(b.plan()));
         assert!(
             ea >= worst_off,
             "{q}: the largest join q-error from distinct values alone is {ea:.3}\n{:#?}",
-            a.plan
+            a.plan()
         );
         assert!(
             eb <= 2.5 && eb < ea,
             "{q}: the largest join q-error with the domain is {eb:.3} against {ea:.3}\n{:#?}",
-            b.plan
+            b.plan()
         );
     }
 }
@@ -537,10 +537,10 @@ fn a_restricted_scans_domain_is_seen_at_any_depth() {
     };
     let top_est = |q: &str| {
         let r = query(s.snapshot(), q, &o).unwrap();
-        let join = nodes(&r.plan)
+        let join = nodes(r.plan())
             .into_iter()
             .find(|n| n.operator.contains("Join"))
-            .unwrap_or_else(|| panic!("{q}\n{:#?}", r.plan));
+            .unwrap_or_else(|| panic!("{q}\n{:#?}", r.plan()));
         (r.len(), join.estimated_rows)
     };
     // two joins take the DP, sixteen the greedy path
