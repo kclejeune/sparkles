@@ -100,28 +100,35 @@ orders, unless the maintainer takes [open decision 2](#open-decisions).
 The table gives each kind's decision. Every refusal goes through `FileKind::refuse`, which
 already names `sparkles dump` from the release that wrote the file and `sparkles load`.
 The forms that stay are the ones that `wal::version_for`, `gen_commit_bytes_for` and the
-branch creation of `branching.rs` choose between today, so the cutoff changes no writer.
+branch creation of `branching.rs` choose between today, so the cutoff changes no log,
+commit or link writer. It changes two writers, both to mark the cutoff itself. The
+dataset file gains `format` 2 and the index gains format 5.
 
 | Kind | Today | After the cutoff | How |
 |---|---|---|---|
-| `index` | It reads 2, 3 and 4, and writes 3 without features and 4 with them. | It reads and writes 4, and the `features` list is always present. | Drop the format 2 unsegmented layout from `PermIndex::open_format`, `index.rs` and `cold.rs`, and `PLAIN_FORMAT_VERSION` from `builder.rs`, subject to open decision 3. |
-| `vocab-index` | Every build writes `vocab.idx`, and `add_vocab_index` writes one for a generation that lacks it. | Every readable generation has one, which the cutoff reader guarantees. | Make `Sparse` a required field of the vocabulary and delete `add_vocab_index`. |
+| `index` | It reads 2, 3 and 4, and writes 3 without features and 4 with them. | It reads and writes 5. Format 5 is format 4 with the `features` list always present and `vocab.idx` required. | Drop the format 2 unsegmented layout from `PermIndex::open_format`, `index.rs` and `cold.rs`, and `PLAIN_FORMAT_VERSION` from `builder.rs`. Add format 5 to `READABLE_INDEX_FORMATS` alone and move `builder::FORMAT_VERSION` to it, subject to open decision 3. |
+| `vocab-index` | Every build writes `vocab.idx`, but a reader opens a generation without one, and `add_vocab_index` writes it for a generation an older build left bare. | Index format 5 requires it, and a format 5 generation without one is corrupt. | Make `Sparse` a required field of the vocabulary, delete `add_vocab_index`, and add a refusal test for a format 4 generation and a corruption test for a format 5 generation without the file. |
 | `wal` | It reads 0, 1 and 2. A plain store writes 1 and an activated store writes 2. | It reads 1 and 2 and writes them as today. | Delete `Framing::Mixed`, `fold_legacy`, `walStrictFrom` in `commit.json`, the headerless branches of `WalCursor`, `WalIndex::scan`, `apply_backward`, `probe.rs`, `history_limited.rs`, `backup.rs` and `diff.rs`. |
 | `delta-vocab` | It reads 1 and 2, with a `migrate` step from 1. | It reads and writes 2. | Delete `convert_legacy_file`, the step and the legacy parser of `vocab/delta.rs`. |
-| `dataset` | It admits readers 1 to 8. | It admits one reader, the cutoff reader. | Refuse a `minimumReader` below it with the dump-and-reload message, and delete the branches that handle a dataset without framed deltas, log headers, `managed.json` or `holds.json`. |
+| `dataset` | It reads `format` 1 with readers 1 to 8. A new plain store writes reader 5 and an activated store reader 8. | It reads and writes `format` 2 with readers 5 to 8, and `minimumReader` keeps its meaning. | Write `format` 2 from `dataset_file_bytes`, refuse `format` 1 with the dump-and-reload message in `check_dataset_value`, and delete the branches that handle readers below 5, which are a dataset without branches, relinked generations, framed deltas or log headers. The branches for `managed.json` and `holds.json` stay, since a plain store still lacks both. |
 | `generation-commit` and `link` | They read 1 and 2. A plain store writes `commit.json` 1 and an activated store 2, and a branch writes `link.json` 1 without an overlay and 2 with one. | They stay as they are. | Both forms are current, so nothing is removed. |
 | `backup-slots` | It reads 1 and 2 and writes 2. | It reads and writes 2. | Pre-release repositories follow the same window as databases. |
 | Derived kinds | `view-state` and `internal-circuit-state` read several versions. | They stay as they are. | A derived file never needs a cutoff, since an unread version is rebuilt. |
 
-The cutoff pins the dataset reader at `DATASET_READER`, which is 8. The private import
-transport of `store/backup/transport.rs`, which no production path wires and whose
-staged destination has no store constructor, writes `minimumReader` 9 for an imported
-destination, and its test asserts that a reader-8 build refuses those bytes. That is a
-compatibility decision for the lane that wires the import, which then raises
-`DATASET_READER` and the registry together, and the cutoff does not change it. The
-acceptance cases of the phase are a plain store created, written, reopened, branched and
-compacted, an activated store doing the same, and a backup and restore of each, all
-reading only the retained forms.
+The cutoff marker is therefore `format` 2 of `dataset.json`, which every store of the
+first release writes, and not `minimumReader`, because a plain store writes reader 5 and
+`managed_history::activation_recorded` reads a reader of 8 or more as a recorded
+activation. The reader stays what it is, a capability requirement that activation and
+the managed and held files raise. The private import transport of
+`store/backup/transport.rs`, which no production path wires and whose staged destination
+has no store constructor, writes `minimumReader` 9 for an imported destination, and its
+test asserts that a reader-8 build refuses those bytes. That is a compatibility decision
+for the lane that wires the import, which then raises `DATASET_READER` and the registry
+together, and the cutoff does not change it. The acceptance cases of the phase are a
+plain store created, written, reopened, branched and compacted, an activated store doing
+the same, and a backup and restore of each, all writing `format` 2 and index format 5
+and reading only the retained forms, together with the refusal of a `format` 1 dataset,
+a format 4 generation and a headerless log.
 
 A fixture labelled with the cutoff commit is written with `scripts/format-fixture.sh` and
 committed under `testsuite/formats/`. The two pre-release fixtures `8dd019da` and
@@ -166,9 +173,12 @@ changelog commit and announces no delta, and it calls `guard.rekey` between
 stays where it is, since the group path pushes it under the writer lock before it
 enqueues and the serial path under the same lock, and a tail that runs after the fence
 would change that contract. The serial and group paths disagree on whether the write
-guard learns of a commit before or after the snapshot is stored. The implementer settles
-the order with a test that shows what a guard reading the head sees in each case, and
-records the decision in this section. The in-memory-only steps `forget_annotations` and
+guard learns of a commit before or after the snapshot is stored. The shared tail adopts
+the group's order and notifies the guard before `current.store`, because a writer that
+waits for the publication of commit N and then validates must check against the state
+that N left, which the group path guarantees and the serial path does not. The
+regression case is a serial writer that waits on `commits` for N and validates at once,
+which must see the guard's state of N. The in-memory-only steps `forget_annotations` and
 `remember_past` become conditional on the store having no log, so the group path keeps
 omitting them for the right reason.
 
@@ -261,15 +271,17 @@ changes, and the second commit unifies the rules by the decisions it records.
 
 | Entry point | Bulk when | Threshold test | Cases it lacks |
 |---|---|---|---|
-| `load_with` | The write is unrestricted, the sources are not small readers, and the head is empty or the estimate is above the threshold. | The estimate is strictly above. | It has no stream-length probe above a byte bound. |
+| `load_with` | The write is unrestricted, the sources are not small streams, and the head is empty or the estimate is above the threshold. Small streams means an empty head, at least one source, every source a reader, and the readers under `SMALL_STREAM_BYTES` of 8 MiB when read ahead. | The estimate is strictly above. | It has no probe of large streams against the threshold. |
 | `replace_with` | The write is unrestricted and the estimate is above the threshold or the streams exceed eighty bytes per threshold quad. | The estimate is strictly above. | It has no empty-head case. |
 | `insert_bulk` | The batch reaches the threshold, and the transaction checks no triple protections and carries no managed admission. | The length is at or above. | It has no size estimate and no small-reader case. |
-| `patch_apply` | The patch has deleted nothing and its additions reach the threshold, after which `insert_bulk` applies its own rule. | The length is at or above. | It has no estimate and no restriction input of its own. |
+| `patch_apply` | The patch has met no delete row, whether or not the row deleted anything, and its additions reach the threshold, after which `insert_bulk` applies its own rule. | The length is at or above. | It has no estimate and no restriction input of its own. |
 
-The unified rule takes the strict test everywhere, keeps the empty-head case for
-`load_with` and `replace_with`, keeps the stream probe where a stream is the input,
-and treats a graph restriction, a triple protection, a managed admission and a deletion as
-reasons for the transactional path in every entry point. The group admission's
+The unified rule takes the strict test everywhere, gives `replace_with` the empty-head
+case and the small-stream exception of `load_with`, gives `load_with` the large-stream
+probe of `replace_with`, and treats a graph restriction, a triple protection, a managed
+admission and a delete row as reasons for the transactional path in every entry point. The
+table test includes a patch whose delete row removes nothing and still takes the
+transactional path. The group admission's
 `Fallback::Bulk` reads the same plan. SPARQL `LOAD` keeps inserting per quad unless the
 [open decisions](#open-decisions) say otherwise.
 
@@ -308,8 +320,7 @@ The long-term half of the publish tail removes the serial path. Every commit enc
 through `wal::encode_txn`, enqueues, and is written and published by the leader of its
 fence, which is itself when the queue is otherwise idle. The leader already writes the
 prefix's records and terms through the write-through handles when they fit, as item 446
-built, and falls back to buffered writes with `fdatasync` otherwise, so a group of one
-makes the same writes in the same order as `publish_log` does today.
+built, and falls back to buffered writes with `fdatasync` otherwise.
 
 The durability contract of the result is the group's, not the serial path's, and the
 phase says so rather than claiming equivalence. The fence synchronizes the same three
@@ -362,8 +373,8 @@ partitioned vocabulary removes the full-build fallback for new terms. This is th
 X17 uploads.
 
 Both are kind 3 changes, read and rewritten at compaction, so `READABLE_INDEX_FORMATS`
-gains format 5 and `builder::FORMAT_VERSION` moves to it, and the first release's format
-4 stays readable for one window. The phase begins with a measurement item, since the C13
+gains format 6 and `builder::FORMAT_VERSION` moves to it, and the first release's format
+5 stays readable for one window. The phase begins with a measurement item, since the C13
 sketch asks for the lookup cost of spaced ids before any decision, and the design is
 settled in its own spec section before implementation. Its gates are the X14 forge gate,
 the two-hop-count query at 5,000 changes falling from 8.6 ms toward its compacted 5.1 ms,
@@ -472,9 +483,10 @@ maintainer takes it.
    roadmap's Release and Sequencing sections keep the current order until this is taken.
 3. **One index format.** The first release could keep writing format 3 for a generation
    without features and 4 with them, as X11 §7.2 chose to keep pre-release readers
-   working. The recommendation is to write format 4 always, since a reader that
-   understands 4 reads 3 as a subset and the second write form serves nobody after the
-   cutoff.
+   working, and keep the sparse index optional. The recommendation is one format, 5,
+   which is format 4 with the `features` list always present and `vocab.idx` required,
+   since a second write form and an optional file serve nobody after the cutoff and the
+   mandatory index then has a version of its own.
 4. **SPARQL `LOAD` and the load plan.** `LOAD` inserts per quad today whatever its size.
    Letting it take the bulk plan when it is the only operation of its request would make
    a large `LOAD` as fast as `sparkles load`, but changes which path an update takes and
