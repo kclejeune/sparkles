@@ -725,6 +725,8 @@ struct Out<'r, 'a> {
     outbox: &'r mut Outbox,
     /// where the context's lists stood at the last flush of its link products
     marks: &'r mut Marks,
+    /// whether a rule stored a link or propagation since the last flush
+    pending: bool,
     /// the messages sent to other contexts since the last check
     sent: usize,
 }
@@ -881,8 +883,9 @@ pub trait Sink {
     /// whether the sink sends the products of the context's backward links with its
     /// forward links and propagations itself, once the activation's to-do list is empty
     /// ([`Run::flush_links`]), so that the rules of `Back`, `Fwd` and the existential
-    /// subsumers leave them out
-    fn defers(&self) -> bool {
+    /// subsumers leave them out. A rule calls it when it has stored such a link or
+    /// propagation, so that the sink knows a flush has work.
+    fn defer(&mut self) -> bool {
         false
     }
     /// whether the run goes on, after a check of its bounds, for rules whose one
@@ -978,7 +981,8 @@ impl Sink for Out<'_, '_> {
     }
 
     #[inline]
-    fn defers(&self) -> bool {
+    fn defer(&mut self) -> bool {
+        self.pending = true;
         true
     }
 
@@ -1215,6 +1219,10 @@ impl<'a> Run<'a> {
     /// 818). Says whether the run goes on, after the checks of the bounds a long flush
     /// makes, and leaves the marks at the lists' ends.
     fn flush_links(&self, st: &State, out: &mut Out<'_, '_>, tally: &mut Tally) -> bool {
+        if !out.pending {
+            return true;
+        }
+        out.pending = false;
         let roles = &self.ix.roles;
         let mut marks = std::mem::take(out.marks);
         marks.back.resize(st.back.len(), 0);
@@ -1598,6 +1606,7 @@ impl<'a> Run<'a> {
             woke: mine,
             outbox,
             marks,
+            pending: false,
             sent: 0,
         };
         if !st.init {
@@ -1863,7 +1872,7 @@ fn apply_rules<S: Sink, R: Rules>(
             }
             for &(s, x) in ix.exist_of(h) {
                 st.props.push((s, x));
-                if !out.defers() {
+                if !out.defer() {
                     for (r, srcs) in &st.back {
                         if roles.sub(*r, s) {
                             for &e in &srcs.list {
@@ -1904,7 +1913,7 @@ fn apply_rules<S: Sink, R: Rules>(
                 out.send(e, Concl::Sub(BOTTOM));
                 return true;
             }
-            if !out.defers() {
+            if !out.defer() {
                 for &(s, x) in &st.props {
                     if roles.sub(r, s) {
                         out.send(e, Concl::Sub(x));
@@ -1931,7 +1940,7 @@ fn apply_rules<S: Sink, R: Rules>(
             if !st.fwd.insert((r2, f)) {
                 return false;
             }
-            if !out.defers() {
+            if !out.defer() {
                 for (r1, srcs) in &st.back {
                     for &t in roles.comp(*r1, r2) {
                         for &e in &srcs.list {
@@ -2572,6 +2581,7 @@ mod horn_accounting_tests {
             woke: &mut woke,
             outbox: &mut outbox,
             marks: &mut marks,
+            pending: true,
             sent: 0,
         };
         let mut tally = Tally::default();
@@ -2610,6 +2620,7 @@ mod horn_accounting_tests {
             woke: &mut woke,
             outbox: &mut outbox,
             marks: &mut marks,
+            pending: true,
             sent: 0,
         };
         assert!(run.flush_links(&st, &mut out, &mut tally));
