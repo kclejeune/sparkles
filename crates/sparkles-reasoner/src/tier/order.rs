@@ -12,7 +12,7 @@
 //! so those ranges meet whole runs.
 
 use super::Cands;
-use super::run::Run;
+use super::run::{Run, SKETCH, sketch_estimate};
 use crate::budget::{MemoryExceeded, Meter};
 use std::ops::Range;
 
@@ -66,10 +66,23 @@ impl Order {
         self.len
     }
 
-    /// Distinct first keys, summed over the runs: exact for one run and otherwise an
-    /// upper bound.
+    /// Distinct first keys: exact for one run, and for several runs an estimate of
+    /// their union from the runs' sketches, between the largest run's count and the sum.
     pub fn distinct(&self) -> usize {
-        self.runs.iter().map(|r| r.distinct() as usize).sum()
+        match self.runs.as_slice() {
+            [] => 0,
+            [r] => r.distinct() as usize,
+            runs => {
+                let mut s = [0u8; SKETCH];
+                let (mut max, mut sum) = (0usize, 0usize);
+                for r in runs {
+                    r.sketch_into(&mut s);
+                    max = max.max(r.distinct() as usize);
+                    sum += r.distinct() as usize;
+                }
+                sketch_estimate(&s).clamp(max, sum)
+            }
+        }
     }
 
     pub fn heap_bytes(&self) -> usize {
@@ -209,6 +222,27 @@ mod tests {
             at += n;
         }
         assert_eq!(o.compaction(u32::MAX, false), Some(6..9));
+    }
+
+    /// An order of several runs over the same keys counts them about once, not once per
+    /// run.
+    #[test]
+    fn distinct_spans_the_runs() {
+        let key = |id: u32| (id % 100) as u64;
+        let mut o = Order::default();
+        for r in [0..1000u32, 1000..2000, 2000..3000] {
+            let mut ids: Vec<u32> = r.collect();
+            ids.sort_by_key(|&id| (key(id), id));
+            o.push(Run::new(ids, &key));
+        }
+        assert_eq!(o.runs().len(), 3);
+        let d = o.distinct();
+        assert!((100..=115).contains(&d), "{d}");
+        let mut o = Order::default();
+        o.push(Run::new((0..100).collect(), &|id| id as u64));
+        o.push(Run::new((100..200).collect(), &|id| id as u64));
+        let d = o.distinct();
+        assert!((190..=200).contains(&d), "{d}");
     }
 
     #[test]

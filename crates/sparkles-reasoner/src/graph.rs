@@ -1272,8 +1272,8 @@ mod tests {
         assert_eq!(rows(g.cands(Some(1), None, None, 0, 3)), [0, 1]);
         g.add([1, 12, 4]);
         assert_eq!(rows(g.cands(Some(1), None, None, 0, 4)), [0, 1, 3]);
-        // distinct counts are summed over the runs, two here, so an upper bound
-        assert_eq!(g.pstats(10), (2, 2));
+        // two runs hold the facts of predicate 10, with one subject between them
+        assert_eq!(g.pstats(10), (1, 2));
         assert_eq!(g.count_p(10, 1, 4), 1);
         assert_eq!(
             g.facts().collect::<Vec<_>>(),

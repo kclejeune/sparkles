@@ -12,10 +12,13 @@ use std::ops::Range;
 pub(crate) const FENCE: usize = 8;
 /// Fence keys between two coarse fence keys.
 pub(crate) const COARSE: usize = 64;
+/// Registers of a run's sketch of its distinct keys.
+pub(crate) const SKETCH: usize = 256;
 
 /// A sorted run. The ids are sorted by `(key1, id)` of their facts, and the run keeps
 /// the first key of every [`FENCE`]-th entry, every [`COARSE`]-th of those again, the
-/// interval of its ids and the number of distinct first keys.
+/// interval of its ids, the number of distinct first keys and a sketch of them, from
+/// which an order of several runs estimates the distinct keys of their union.
 pub(crate) struct Run {
     ids: Vec<u32>,
     fence: Vec<u64>,
@@ -25,6 +28,48 @@ pub(crate) struct Run {
     lo: u32,
     hi: u32,
     distinct: u32,
+    /// a HyperLogLog sketch of the distinct first keys, see [`sketch_add`]
+    sketch: [u8; SKETCH],
+}
+
+/// Add key `k` to a sketch: the top bits of a mix of the key pick a register, which keeps
+/// the longest run of leading zeros, plus one, of the bits after them.
+#[inline]
+fn sketch_add(s: &mut [u8; SKETCH], k: u64) {
+    // the finalizer of splitmix64, a mix other than the hashers of the tables
+    let mut h = k;
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    let i = (h >> 56) as usize;
+    let rank = ((h << 8) | 0x80).leading_zeros() as u8 + 1;
+    if rank > s[i] {
+        s[i] = rank;
+    }
+}
+
+/// The distinct keys a sketch has seen, by HyperLogLog, with linear counting for the
+/// small range.
+pub(crate) fn sketch_estimate(s: &[u8; SKETCH]) -> usize {
+    let m = SKETCH as f64;
+    let mut sum = 0.0;
+    let mut zeros = 0usize;
+    for &r in s {
+        sum += 2f64.powi(-i32::from(r));
+        if r == 0 {
+            zeros += 1;
+        }
+    }
+    let alpha = 0.7213 / (1.0 + 1.079 / m);
+    let e = alpha * m * m / sum;
+    let e = if e <= 2.5 * m && zeros > 0 {
+        m * (m / zeros as f64).ln()
+    } else {
+        e
+    };
+    e.round() as usize
 }
 
 impl Run {
@@ -41,6 +86,7 @@ impl Run {
         let mut ids = Vec::with_capacity(n);
         let mut fence = Vec::with_capacity(n.div_ceil(FENCE));
         let mut coarse = Vec::with_capacity(n.div_ceil(FENCE * COARSE));
+        let mut sketch = [0u8; SKETCH];
         let (mut lo, mut hi, mut distinct) = (u32::MAX, 0u32, 0u32);
         let mut prev = None;
         for (i, (k, id)) in entries.enumerate() {
@@ -52,6 +98,7 @@ impl Run {
             }
             if prev != Some(k) {
                 distinct += 1;
+                sketch_add(&mut sketch, k);
                 prev = Some(k);
             }
             lo = lo.min(id);
@@ -66,6 +113,14 @@ impl Run {
             lo,
             hi,
             distinct,
+            sketch,
+        }
+    }
+
+    /// Join the run's sketch into `s`, register by register.
+    pub fn sketch_into(&self, s: &mut [u8; SKETCH]) {
+        for (a, &b) in s.iter_mut().zip(&self.sketch) {
+            *a = (*a).max(b);
         }
     }
 
@@ -233,6 +288,33 @@ mod tests {
             assert_eq!(r.range(k, &key).start, keys.partition_point(|&x| x < k));
             assert!(r.range(k + 100_000, &key).is_empty());
         }
+    }
+
+    /// Two runs over the same keys count them once, disjoint runs count both, and the
+    /// estimate stays within a tenth over several thousand keys.
+    #[test]
+    fn sketches_estimate_the_union() {
+        let key = |id: u32| (id % 5000) as u64;
+        let a = Run::new((0..5000).collect(), &key);
+        let b = Run::new((5000..10000).collect(), &key);
+        let c = Run::new((10000..15000).map(|i| i + 5000).collect(), &|id| id as u64);
+        let union = |runs: &[&Run]| {
+            let mut s = [0u8; SKETCH];
+            for r in runs {
+                r.sketch_into(&mut s);
+            }
+            sketch_estimate(&s)
+        };
+        assert_eq!(a.distinct(), 5000);
+        let same = union(&[&a, &b]);
+        assert!((4500..=5500).contains(&same), "same keys: {same}");
+        let both = union(&[&a, &c]);
+        assert!((9000..=11000).contains(&both), "disjoint keys: {both}");
+        // the small range is linear counting, exact for a few keys
+        let one = Run::new(vec![7], &|_| 42);
+        let two = Run::new(vec![8], &|_| 43);
+        assert_eq!(union(&[&one, &one]), 1);
+        assert_eq!(union(&[&one, &two]), 2);
     }
 
     #[test]
