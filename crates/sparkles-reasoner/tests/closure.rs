@@ -349,6 +349,32 @@ fn batched_closures_keep_the_facts_and_their_order() {
     assert_eq!(ours, rules);
 }
 
+/// An equivalence operator that meets two literals of equal value in a class gives its
+/// rules back before it emits a pair, so a clean class before that one is not merged
+/// first: with a batch of one pair, which would merge each pair at once, the run derives
+/// the same facts in the same order as with the default batch.
+#[test]
+fn a_fallback_merges_nothing_first() {
+    let s = store(
+        "ex:s1 owl:sameAs ex:s2 . ex:s2 owl:sameAs ex:s3 . ex:s3 owl:sameAs ex:s4 .
+ex:l1 owl:sameAs \"1\"^^xsd:integer . ex:l1 owl:sameAs \"01\"^^xsd:integer .
+ex:x a ex:C .\n",
+    );
+    let p = Profile::OwlRl;
+    let (whole, _) = infer(s.snapshot(), &p, &options(true)).unwrap();
+    sparkles_reasoner::set_closure_batch(1);
+    let single = infer(s.snapshot(), &p, &options(true));
+    sparkles_reasoner::set_closure_batch(0);
+    let (single, _) = single.unwrap();
+    assert_eq!(
+        single, whole,
+        "the batch of one merges a class before the fallback"
+    );
+    let rules: BTreeSet<String> = facts(&s, &p, false);
+    let ours: BTreeSet<String> = whole.iter().map(|t| t.to_string()).collect();
+    assert_eq!(ours, rules);
+}
+
 /// A rule program with `noValue` keeps the ordinary evaluation, whose result depends on
 /// the order of derivation.
 #[test]

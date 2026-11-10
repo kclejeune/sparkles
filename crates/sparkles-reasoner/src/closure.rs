@@ -154,16 +154,18 @@ impl<'g> Sink<'g> {
             return Err(Overflow.into());
         }
         if self.out.len() == self.out.capacity() {
-            // at most a batch, and at most what the room still allows
+            // at most a batch, and at most what the room still allows; the new buffer is
+            // charged beside the old one, which a moving growth copies from
             let left = self.room - self.total + self.out.len();
             let before = self.out.capacity();
             let cap = (before * 2).max(1024).min(self.batch).min(left);
-            self.held.try_grow((cap - before) * size_of::<Triple>())?;
+            self.held.try_grow(cap * size_of::<Triple>())?;
             self.out.reserve_exact(cap - self.out.len());
             if self.out.capacity() > cap {
                 self.held
                     .try_grow((self.out.capacity() - cap) * size_of::<Triple>())?;
             }
+            self.held.shrink(before * size_of::<Triple>());
         }
         self.out.push(t);
         self.total += 1;
@@ -180,8 +182,9 @@ impl<'g> Sink<'g> {
         Ok(self.total)
     }
 
-    /// Drop the buffered pairs, which are not merged, and index the predicate's new
-    /// facts, which follow from the rules.
+    /// Drop the buffered pairs, which are not merged, and index what was merged, which
+    /// is nothing when the operator gives its rules back, since it decides that before it
+    /// emits a pair.
     fn discard(mut self) -> anyhow::Result<()> {
         self.out = Vec::new();
         self.held = Held::new(self.budget());
@@ -515,15 +518,38 @@ impl Closures {
             let mut done: Vec<u64> = Vec::new();
             let mut total = 0usize;
             let mut back = false;
-            for q in preds {
-                poll.tick(1)?;
+            // the row from which a predicate has new edges, or None without any
+            let fresh = |op: &Op, g: &Graph, q: u64| -> Option<u32> {
                 let mark = match op.marks.get(&q) {
                     Some(&m) => m,
                     None => op.initial(g, q, start),
                 };
-                if mark >= now || g.count_p(q, mark, now) == 0 {
-                    continue;
+                (mark < now && g.count_p(q, mark, now) > 0).then_some(mark)
+            };
+            // a guarded operator with a `notEqual` filter gives its rules back when any of
+            // its predicates has a literal subject, before it merges a pair of any of
+            // them, as it did when it held every pair until the step was done
+            if op.irreflexive && matches!(op.over, Over::Guarded(..)) {
+                for &q in &preds {
+                    poll.tick(1)?;
+                    let Some(mark) = fresh(op, g, q) else {
+                        continue;
+                    };
+                    let local = Local::build(g, q, mark, now, op.shape, budget, cancel)?;
+                    if local.literal_subject(terms) {
+                        back = true;
+                        break;
+                    }
                 }
+            }
+            for q in preds {
+                if back {
+                    break;
+                }
+                poll.tick(1)?;
+                let Some(mark) = fresh(op, g, q) else {
+                    continue;
+                };
                 let local = Local::build(g, q, mark, now, op.shape, budget, cancel)?;
                 let mut sink = Sink::new(g, budget, total, max_out);
                 let closed = match op.shape {
@@ -544,8 +570,7 @@ impl Closures {
                 match closed {
                     Ok(true) => {}
                     Ok(false) => {
-                        // the pairs not merged yet are dropped; those merged already
-                        // follow from the rules
+                        // nothing was merged: the check comes before the first pair
                         sink.discard()?;
                         back = true;
                         break;
@@ -1205,9 +1230,9 @@ impl Local {
 
     /// The pairs `(x, y)` of the classes of the symmetric and transitive closure, for the
     /// nodes that emit, that are not edges, without `x = y` when `irreflexive`, into
-    /// `sink`. `false` when a class holds two literals with distinct ids and equal values,
-    /// where the rules' `notEqual` differs from a comparison of ids: the pairs of the
-    /// classes before it, which the check passed, may have been merged already.
+    /// `sink`. `false`, before any pair is emitted, when a class holds two literals with
+    /// distinct ids and equal values, where the rules' `notEqual` differs from a
+    /// comparison of ids.
     fn equivalence(
         &self,
         q: u64,
@@ -1255,12 +1280,14 @@ impl Local {
             fill[r as usize] += 1;
         }
         drop(fill);
-        for r in 0..n {
-            poll.tick(1)?;
+        let classes = (0..n).filter_map(|r| {
             let class = &members[moff[r] as usize..moff[r + 1] as usize];
-            if class.len() < 2 || !class.iter().any(|&x| self.emits(x)) {
-                continue;
-            }
+            (class.len() >= 2 && class.iter().any(|&x| self.emits(x))).then_some(class)
+        });
+        // every class's literals are checked before a pair is emitted, so that a class
+        // the rules' `notEqual` treats differently leaves nothing of the predicate merged
+        for class in classes.clone() {
+            poll.tick(1)?;
             let mut literals: Vec<u64> = Vec::new();
             for &x in class {
                 let id = self.ids[x as usize];
@@ -1276,6 +1303,9 @@ impl Local {
                     return Ok(false);
                 }
             }
+        }
+        for class in classes {
+            poll.tick(1)?;
             // members are in ascending local order, as the adjacency is
             for &x in class {
                 if !self.emits(x) {
@@ -1299,5 +1329,35 @@ impl Local {
             }
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A growth of the sink's buffer charges the new buffer beside the old one, which a
+    /// moving growth copies from: the growth from 1,024 to 2,048 pairs holds 3,072 pairs
+    /// of 24 bytes, 73,728, so a budget one byte short refuses it, where a charge of the
+    /// difference alone admitted 49,152.
+    #[test]
+    fn buffer_growth_charges_both_buffers() {
+        let budget = Budget::new(Some(3072 * size_of::<Triple>() - 1));
+        let mut g = Graph::default();
+        let mut sink = Sink::new(&mut g, &budget, 0, usize::MAX);
+        for i in 0..1024u64 {
+            sink.emit([i, 1, 2]).expect("the first buffer fits");
+        }
+        let e = sink
+            .emit([1024, 1, 2])
+            .expect_err("the growth does not fit");
+        assert!(e.is::<MemoryExceeded>(), "{e:#}");
+        let budget = Budget::new(Some(3072 * size_of::<Triple>()));
+        let mut g = Graph::default();
+        let mut sink = Sink::new(&mut g, &budget, 0, usize::MAX);
+        for i in 0..1025u64 {
+            sink.emit([i, 1, 2]).expect("both buffers fit");
+        }
+        assert_eq!(sink.held.bytes(), 2048 * size_of::<Triple>());
     }
 }
