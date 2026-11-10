@@ -668,14 +668,20 @@ impl<'ctx> Materialized<'ctx> {
         values: &[T],
     ) -> crate::Result<Vec<T>> {
         let mut copy = Self::allocate(name, values.len())?;
-        for part in values.chunks(1024) {
-            ctx.check()?;
+        // Callers check before they copy, so the copy polls between its chunks only.
+        for (index, part) in values.chunks(1024).enumerate() {
+            if index > 0 {
+                ctx.check()?;
+            }
             copy.extend_from_slice(part);
         }
         Ok(copy)
     }
 
     /// Clone only after paying the receiving allocation, independently of its source.
+    /// It stays out of line, so a VALUES operator's run does not spread its checks
+    /// across the executor's code.
+    #[inline(never)]
     pub(super) fn clone_fast(ctx: &'ctx super::ctx::Ctx, source: &Table) -> crate::Result<Self> {
         use crate::algo::memory::{bytes, sum};
         ctx.check()?;
