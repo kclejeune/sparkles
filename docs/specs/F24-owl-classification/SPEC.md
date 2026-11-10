@@ -1711,9 +1711,7 @@ deterministic calculus derives every branch's conclusion as a clause of its own,
 spellings of one hypothesis give two clauses with different bodies that Definition 4's
 syntactic subset does not relate, and two orders of the same premises give the same clause
 twice as two attempts the store merges. An equality between two successor terms takes part
-in the Eq rule when it is the maximal literal of its clause, which it is once the role and
-class literals over the larger term are resolved, since Definition 3 puts every `f(x)`
-above `x`, and the rule then rewrites each clause whose maximal literal is over the larger
+in the Eq rule when it is the maximal literal of its clause, and the rule then rewrites each clause whose maximal literal is over the larger
 term into the equality's clause, each with the union of the two bodies and heads, and the
 rewritten clauses are premises of the at-most products and of the next equality. The
 hypertableau takes the same equality in one branch as the ≈-rule, which merges `s` into
@@ -1741,16 +1739,25 @@ ontology has the same models over the original signature once the fresh names ar
 the conjunctions, and Theorems 8 and 9 give soundness and completeness as they do for the
 Table 1 translation, since only the set of DL-clauses changes and the rules do not. The
 case restrictions are conditional in the predecessor, since the clause that holds them is
-`k - 1` literals wider than the clause it replaces, so each lies in `K_2` of the Succ rule
-and not in `K_1`, and its successor is a hypothetical successor context as the engine makes
-today for a conditional existential restriction, with an empty core and the filler, the
-case and the union as markers. What changes is which contexts exist and what they hold.
-Each case restriction has a hypothetical successor of its own, so no context holds the
-existential restrictions of two cases of one restriction or resolves one case's markers
-against another's, and the union clause `F → C_1 ⊔ … ⊔ C_k` in a case's context is
-conditional on `F`'s marker and meets one case marker, so it resolves once against the
-disjointness certificate of that case and the other cases stay in its head with no partner
-that makes them maximal. The predecessor's clause carries the `k` alternatives, and the
+`k - 1` literals wider than the clause it replaces, so each lies in `K_2` of the Succ rule,
+and in `K_1` only where a context supports it as a unit, and its successor is a
+hypothetical successor context as the engine makes today for a conditional existential
+restriction, with an empty core and the filler, the case and the union as markers. What
+changes is which contexts exist and what each is sent. Each case restriction has a
+hypothetical successor of its own, and the distributed clause itself sends it the filler,
+its own case and the union and never another case's existential restrictions. The Succ
+rule still sends every marker of `K_2` that holds of the term, from every predecessor that
+reaches the context and from the universal restrictions they carry, so a case's context
+can receive another case's marker from a predecessor whose universal restriction puts the
+successor in that case, or an exclusion marker that is disjoint with one of the cases, and
+the union clause `F → C_1 ⊔ … ⊔ C_k`, conditional on `F`'s marker, can then resolve more
+than once against disjointness certificates, each resolvent with the exclusion markers in
+its body and not redundant against the marker clause of the case. The saving of the part
+is therefore a measured hypothesis and not a guarantee, that the case contexts of the
+three files hold fewer cases' restrictions and resolve the union fewer times than the
+shared successor does, and the regressions include a restriction with two predecessors of
+which one sends another case through a universal restriction and one sends a marker
+disjoint with a case. The predecessor's clause carries the `k` alternatives, and the
 Succ rule makes up to `k` successor terms for the restriction, one per case, whose
 qualified-role literals are candidates of the at-most products. A product over two terms
 of two cases of one restriction is redundant under this lemma. If the two qualified-role
@@ -1758,16 +1765,22 @@ premises both descend from one occurrence of the `k`-way clause `Γ_0 → Δ_0 �
 if each keeps in its head the alternatives of the clause other than its own case, and if
 each keeps `Γ_0` in its body, then the product's head holds `Δ_0` and every `E_i` and its
 body holds `Γ_0`, so the product contains the `k`-way clause up to redundancy by
-Definition 4 and the Elim rule drops it. The at-most rule skips a subset of candidates when
-the lemma applies to two of them, which it checks on the premises' bodies and heads
-against the `k`-way clause recorded on the case restrictions, before the bounds on the
-widest clause, the subsets and the payload count the subset, since a redundant product
-costs work and adds nothing. Every other product keeps its equality reasoning. In
-particular a case restriction that a context supports independently, as a unit or under a
-strengthened premise that has dropped the alternatives, is not covered, and neither are
+Definition 4 and the Elim rule drops it. A candidate of the at-most rule is a term with a
+list of supporting premises, and the products enumerate every combination of the
+candidates' supports, so the lemma certifies one combination and not a subset. The rule
+drops a subset before the bounds on the widest clause, the subsets and the payload count
+it only when two of its candidates have every pair of their supports covered by the lemma,
+with an occurrence of the `k`-way clause in the context's store as the witness of the
+redundancy, since then every product of the subset is redundant on arrival. A subset with
+a support outside the lemma, such as an independent conditional support `A → r_B(x, f_1)`
+beside the source-derived one, stays with its accounting, and only the individual
+conclusions the lemma covers are skipped. Every other product keeps its equality
+reasoning. In particular a case restriction that a context supports independently, as a
+unit or under a premise that has dropped the alternatives, is not covered, and neither are
 two cases of two different restrictions whose classes overlap, so an equality between
 terms of different cases can still be derived and the Eq, Ineq and Factor rules take it as
-before. The part applies in runs that count and without the root, since those are the runs
+before, and a regression holds source-derived and independent conditional supports of
+one candidate together. The part applies in runs that count and without the root, since those are the runs
 whose witnesses and hypothetical successors carry union fillers, and it applies to a union
 of pairwise disjoint classes and to any other union alike, since the identity does not
 need the disjointness. The witnesses of one restriction keep their pairwise disjoint
