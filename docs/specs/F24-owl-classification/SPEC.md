@@ -532,7 +532,9 @@ and the ontology has no individuals, functional data properties or top propertie
 not at all under `Limits::el_only`, the ELK mode, which leaves every axiom outside OWL 2
 EL out as ELK does and gives ELK's taxonomy. With
 any of these the axioms outside OWL 2 EL stay left out and reported, and Horn reasoning
-with individuals is item 692. So do axioms that are not Horn, property hierarchies
+with individuals is item 692, whose design is the section
+[The Horn rules with individuals](#the-horn-rules-with-individuals) below. So do axioms
+that are not Horn, property hierarchies
 that are not regular, automata of more than 65,536 states and data restrictions outside
 OWL 2 EL. `Stats::tier` says which rules a run needed, `Stats::outside_el` counts the
 axioms outside OWL 2 EL and those taken, and `Stats::conjunctions` counts the contexts
@@ -776,6 +778,197 @@ second equivalence follows from the first, so Konclude's answer stands for both.
 The functional-syntax reader refuses a document with a SWRL rule. A read with
 `ofn_read::Options::skip_rules` passes over the rules and counts them, which the
 classification comparison uses to report them as left out.
+
+### The Horn rules with individuals
+
+This section is the design of item 692, which runs the Horn rules on ontologies with
+individuals, functional data properties and top properties. The rules it describes are
+not built yet, and until they are the Horn rules refuse such an ontology as the section
+above says. The design keeps two promises. The answers equal HermiT's on the Horn files
+with individuals of the ORE 2015 DL sample, and an ontology that the Horn rules do not
+touch, which includes every ontology without individuals, functional data properties or
+top properties, classifies byte for byte as before.
+
+A Horn ontology with individuals classifies by default with the Horn rules, in the same
+run as the EL rules of individuals. Nothing changes for an ontology without individuals,
+functional data properties or top properties, whose run takes the code it took before,
+and nothing changes under `Limits::el_only`. The disjunctive rules keep their own
+condition, which refuses an ontology with individuals, data properties or top properties
+unless `Limits::rooted` asks for the rooted run, since they share no rule with the EL
+rules of individuals. When the disjunctive rules decline an ontology, the Horn rules take
+every Horn axiom of it, with its individuals, and only the axioms that need case analysis
+stay left out and reported.
+
+**One saturation.** Kazakov's rules read a context as the set of instances of its
+conjunction, and every conclusion of a context holds of each of its instances. The EL
+rules of individuals read a context the same way, so the two rule sets run in one
+saturation. The saturation gets a fourth instantiation of its rules, with the rules of
+individuals, universal roles and functional data roles beside the Horn rules, which it
+chooses when the index has the Horn rules and is not plain. The Horn instantiation
+without them and the other three stay as they are. The Horn normalization takes a
+singleton `ObjectOneOf` and an `ObjectHasValue` wherever it takes a class, as the EL
+index's nominal and the existential restriction to it, and an enumeration of several
+individuals in a negative position as one axiom per individual. An enumeration of several
+individuals in a positive position is not Horn and stays with the disjunctive rules. The
+assertions are EL axioms already. A positive at-least restriction with a nominal filler
+unfolds as the paper's Lemma 2 does, and its pairwise disjoint fresh fillers meet in the
+individual's context, which makes the restriction unsatisfiable wherever the context
+that holds it has an instance.
+
+Three mechanisms of the EL rules of individuals have to reach the links and contexts of
+the Horn rules.
+
+- A real context's successors are real. The rule for an existential restriction sends
+  `Real` to the EL successor, and the Horn rules send it to the successors they create
+  too, which are the conjunction that R3 extends a successor to, the conjunction that
+  R5 merges successors into and the successor that R6 gives a predecessor. A context
+  that becomes real tells its Horn successors as well as its EL ones.
+- A real context that derives an individual stands for the individual, and the two
+  exchange their subsumers today. In a run with the Horn rules they exchange their
+  backward links and loops as well, because the rules below read pairs of backward links
+  at one context. A link from `P` by `r` to a context that stands for `a` is a link from
+  `P` to `a`, a loop of the context is a loop of `a`, and the links and loops of `a` are
+  the context's, all because the context's one instance is `a`. The exchange runs while
+  the context is real, as the exchange of subsumers does today, and carries the
+  conclusions that come later as well as those held.
+- A universal restriction `∀t.A` on a universal role `t` held by a real context is a
+  fact that holds everywhere, as a negative `∃t.F ⊑ x` whose `F` is real is today. The
+  index lists the restriction among the facts of universal roles, the rounds between
+  saturations and the worlds apply it as they apply the negative restrictions, and the
+  Horn rules pass over it, since R3 and R4 would only spread `A` along links. An at-most
+  or self restriction on a universal role, which OWL 2 DL forbids because the property
+  is not simple, is left out and reported. The universal role is its own inverse in the
+  role box. The top data property needs nothing new, since its rules are the EL index's,
+  and so do the functional data properties, whose rule is local to a context and runs in
+  the conjunction contexts as in any other.
+
+**Singular contexts.** A context is singular when all its instances are one element. A
+context that derives an individual is singular. A context `M` that links by `r` to a
+singular context `N` holding `≤1 S.B`, with `r⁻` under `S`, and that holds `B` is
+singular too, since every instance of `M` is an `S`-neighbour in `B` of `N`'s one
+element. An empty context is singular, and the predecessors of an empty singular context
+are empty, so singularity needs no instance. A context keeps the flag and tells each
+predecessor that one of its at-most restrictions counts, which are the predecessors R6
+reads, that it is singular, when it becomes singular and when such a predecessor or
+at-most restriction comes later.
+
+**R7, the predecessors of a singular context.** Kazakov's rules have no rule over two
+predecessors of one context, because without nominals the contexts of a Horn ontology
+unravel into trees in which every element has one predecessor, and R5 and R6 cover the
+successors and the predecessor of each element. A nominal is one element with any number
+of predecessors, and so is every context that singularity reaches from it. This is the
+interaction that HermiT's NI rule and the Nom rule of the rooted calculus handle, and the
+earlier design work on this item recorded its simplest case, `A ⊑ ∃r.{a}`, `B ⊑ ∃r.{a}`,
+an inverse functional `r` and `B(b)`, which entail `A ⊑ {b}` and which no rule above
+derives. R7 closes it. At a singular context `N` holding `≤1 S.B`, two real
+predecessors `M_1` and `M_2` that the restriction counts, linked by roles whose inverses
+are under `S` and holding `B`, have one element each and the two elements are one, since
+both are the `S`-neighbour in `B` of `N`'s element. The two contexts exchange their
+subsumers, backward links and loops, now and as they come, and the two roles are checked
+against the disjoint and asymmetric roles, as R5 checks the roles of merged successors.
+A loop of `N` by a role under `S` counts `N` itself among the neighbours when `N` holds
+`B`, which the loop case of R6 covers for one predecessor and `N`. R7 creates no context
+and no fresh individual. It identifies contexts that exist, so a run with it ends when a
+run without it does. A context learns that a predecessor is real from the predecessor,
+through a conclusion beside `Real` that a real context sends to each successor it links
+to and that a context sends to its successors when it becomes real. Only the fourth
+instantiation sends it.
+
+The soundness of the three additions follows the reading of a context. The exchange
+between a real context and its individual, and between two contexts R7 identifies, moves
+conclusions between two contexts whose one instance is the same element, and each
+conclusion is a statement about that element or about the predecessors that link to it.
+A backward link `P ⊑ ∃r.M` moves to the partner `M'` because the element is an instance
+of `M'`, which is why the partner has to be real. Singularity propagates along a link
+into a singular context through an at-most restriction, and the argument above is the
+whole of it. R7 needs both predecessors real because `M_1 ⊑ X` for a subsumer `X` of
+`M_2` holds only when `M_2` has the instance that every instance of `M_1` equals.
+
+**Witnesses and worlds.** The reachability condition of the EL rules of individuals stays
+the mechanism that makes conclusions about individuals hold only where a class has an
+instance. A context that is not real, derives an individual and knows more than the
+individual is a witness, as before, and a run with the Horn rules and individuals has two
+more kinds of witness. A context that is not real and that an at-most restriction of a
+singular context counts as a predecessor is one, since R7 identifies it with another
+predecessor only where it has an instance, and that identification can give the context
+subsumers and the classes that reach it conclusions. A context that is not real, derives
+an individual, has a predecessor or a loop, and whose individual's context holds an
+at-most restriction is one, since its links and loops reach the individual only where it
+has an instance and can make the individual's at-most restriction count them. The simplest
+case above shows the first kind, since `A` is not real in the global saturation, derives
+no individual and reaches no context that does, so without the new kind it would get no
+world and `A ⊑ {b}` would be missed. A run with the Horn rules marks the real contexts
+whenever the ontology has individuals, where a run of the EL rules does so only after a
+merge, a key or a universal role, because R7 needs the real predecessors of the global
+state before the worlds start.
+
+Each named class whose context reaches a witness is classified again in a world, as
+before, and the worlds extend to the conjunction contexts. The global table of
+conjunctions outlives the saturation, which it does today for the statistics, the views
+over the contexts include its contexts, and the witnesses and the classes reaching them
+are found over them too. A world has a table of its own for the conjunctions that its
+rules create, whose ids lie above the global table's. The world's sink looks a
+conjunction up in the global table first, which no world changes, and then in its own,
+and reads a conjunction's core from whichever table holds it. The world's copies, its
+table and the states of its own contexts count against the world budget beside the
+saturated state, as the copies do today. The world runs the fourth instantiation of the
+rules on one thread, keeps only the conclusions the global state lacks and reaches the
+same fixpoint in any order, since every rule is monotone in the conclusions it reads, and
+the worlds of different classes run in parallel as they do now. The facts of universal
+roles and the merges of keys apply in a world between its saturations as before, and in a
+run with the Horn rules a key merge exchanges the two individuals' backward links and
+loops with their subsumers, through the exchange above, since each individual's context
+derives the other and is real.
+
+**Completeness.** The argument is Kazakov's with three identifications, and this
+section states it as an argument and not as a proof. For a world, or for the global
+saturation and the classes that need no world, build a model from the real contexts.
+Each individual is one element, which every real context that derives the individual
+stands for, and these contexts hold one state by the exchange. Each real singular context
+that derives no individual has one element, which the contexts R7 identified it with
+share, and they hold one state too. Every other real context is unravelled into trees
+from these elements, as the paper's construction does, each element taking the subsumers
+of its context and a successor for each link of its context, where the link of an
+existential restriction goes to the context that R3 and R5 made of it. The told axioms
+hold at each element by the paper's argument for the axioms without nominals. A nominal
+`{a}` holds at `a`'s element alone, and every context that derives it maps there. An
+at-most restriction `≤1 S.B` at an element counts its successors, which R5 merged into
+one, its predecessor in a tree, which R6 identified with the successors, its loops, and,
+at a singular element, every predecessor, all of which are real and which R7 identified
+pairwise, so they are one element. A universal restriction holds through R3, R4 and the
+automata as before, and one on a universal role holds everywhere through its fact. The
+data restrictions hold by the EL rules' argument, and the keys by the rounds. A class
+whose context reaches no witness takes its subsumers from the global saturation, where
+every real predecessor of a singular context is known, and a class whose context reaches
+a witness takes them from its world, where every context the class reaches is real. The
+gate below checks the argument where a proof would, on the ORE 2015 DL sample against
+HermiT.
+
+**Cost.** The two new kinds of witness give worlds to classes that had none, and R7 and
+the exchange add messages only at singular contexts with real predecessors. An ontology
+without individuals, functional data properties or top properties runs the code it ran
+before, which the EL identity gate checks byte for byte, and the Horn files without
+individuals of the development set are checked the same way. The Horn files with
+individuals are measured against the run that left their Horn axioms out, on the laptop
+or on `wally` in interleaved rounds, and the measurement is reported with its host.
+
+**Gate.** The lane's gate is the Horn files with individuals, functional data properties
+or top properties of the ORE 2015 DL development set, 46 files that the comparison marks
+sound today, which must come back equal to HermiT's taxonomy with no difference, together
+with hand cases for each rule above. The hand cases are the simplest case of R7, a
+cascade of two singular contexts, a loop that an at-most restriction counts at a nominal,
+a universal restriction on the top property held by a real context and by one that is
+not, a functional data property beside a universal restriction, a key beside an inverse
+functional property, a conjunction context that a world creates, and an at-least
+restriction with a nominal filler. Each runs on one and eight threads and must equal
+HermiT. The 300 EL files of the EL identity gate, GO and the Horn files without
+individuals of the development set keep their taxonomies byte for byte, and the `dl_*`
+suites and the `sparkles-owl` library tests pass.
+
+**Out of scope.** Enumerations of several individuals in a positive position need case
+analysis and stay with the rooted run. Anonymous individuals stay with the reader's
+rules. Data cardinalities and keys over data properties beside the disjunctive rules stay
+with item 768, counting with item 728 and incremental runs after a change with item 753.
 
 ### The disjunctive rules
 
