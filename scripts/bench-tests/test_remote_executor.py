@@ -329,12 +329,13 @@ class Admission(unittest.TestCase):
         if install_mbx:
             pinned=home/'.local/share/mise/installs/mr-boxington/1.29.1';pinned.mkdir(parents=True)
             # The fake answers `settings get` the way mbx does: an environment variable
-            # wins over the worker's configuration, which names the read-only remote cache.
+            # wins over the worker's configuration, which names the read-only remote cache,
+            # and an unset cache directory prints nothing.
             (pinned/'mbx').write_text('#!/bin/sh\nif [ "$1" = settings ] && [ "$2" = get ]; then\n case "$3" in\n'
                                       '  remote.url) echo "${MBX_REMOTE_URL-https://cache.invalid}" ;;\n'
                                       '  gc.max_total_size) echo "${MBX_GC_MAX_TOTAL_SIZE-}" ;;\n'
                                       '  gc.min_free_size) echo "${MBX_GC_MIN_FREE_SIZE-}" ;;\n'
-                                      '  cache_dir) echo "${MBX_CACHE_DIR-$HOME/.cache/mbx}" ;;\n  *) exit 2 ;;\n esac\n exit 0\nfi\n'
+                                      '  cache_dir) echo "${MBX_CACHE_DIR-}" ;;\n  *) exit 2 ;;\n esac\n exit 0\nfi\n'
                                       'echo "mbx '+mbx_version+'"\n');(pinned/'mbx').chmod(0o755)
         env=dict(RX.boat_environment.environment(profile),HOME=str(home))
         # Keep the job's home entries and replace the system ones with awk alone,
@@ -411,7 +412,7 @@ class Admission(unittest.TestCase):
                (lambda e:e.update(MBX_REMOTE_TOKEN_FILE='/nonexistent'),'the job environment names an mbx remote token'),
                (lambda e:e.update(MBX_GC_MAX_TOTAL_SIZE='5GiB'),'mbx local budget is 5GiB, pinned 64GiB'),
                (lambda e:e.pop('MBX_GC_MIN_FREE_SIZE'),'mbx free-space floor is , pinned 45GiB'),
-               (lambda e:e.pop('MBX_CACHE_DIR'),'mbx cache directory is {home}/.cache/mbx, pinned {home}/.local/share/mbx-cache'),
+               (lambda e:e.pop('MBX_CACHE_DIR'),'mbx cache directory is , pinned {home}/.local/share/mbx-cache'),
                (lambda e:e.update(MBX_CACHE_DIR=e['HOME']+'/private'),'mbx cache directory is {home}/private, pinned {home}/.local/share/mbx-cache')]
         for change,reason in cases:
             with self.subTest(reason=reason),tempfile.TemporaryDirectory()as tmp:

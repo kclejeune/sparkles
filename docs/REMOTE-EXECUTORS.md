@@ -51,20 +51,20 @@ Development credentials stay on the owned development worker. They are excluded 
 source packets, result manifests and reusable snapshot seeds. GitHub Actions retains
 its separate OIDC authentication. A mode-0600 worker environment file contains only
 literal PATH, `RUSTUP_TOOLCHAIN`, `RUSTUP_AUTO_INSTALL`, `MBX_REMOTE_URL`,
-`MBX_GC_MAX_TOTAL_SIZE` and `MBX_GC_MIN_FREE_SIZE` assignments. Admission binds the
-environment file by digest.
+`MBX_CACHE_DIR`, `MBX_GC_MAX_TOTAL_SIZE` and `MBX_GC_MIN_FREE_SIZE` assignments.
+Admission binds the environment file by digest.
 
 Boat jobs build with MBX in local-only mode. The empty `MBX_REMOTE_URL` overrides the
 worker's configured remote cache, and the job shell drops any inherited token setting.
-The local store stays in MBX's default cache directory in the worker home. The normal
-stop's snapshot keeps the worker's checkouts and build directories but not that cache
-directory, so each resume starts with an empty store and its first build is a cold one.
-Later builds in the same lifetime reuse that build's entries. Roadmap item 812 covers a store location that the snapshot keeps. Within
-one lifetime the store keeps every build warm. Its 64 GiB budget holds two release
-builds and the workspace test builds, and its 45 GiB free-space floor keeps the disk
-headroom that qualification requires. `admit` asks the pinned `mbx` for these effective
-settings and refuses a remote URL, a token setting or another budget. Laptops, gate
-hosts and other ssh hosts keep their own MBX configuration.
+The provider's snapshot saves the worker home but not `~/.cache`, so MBX's default cache
+directory would be empty after every resume. Every job therefore sets `MBX_CACHE_DIR` to
+`~/.local/share/mbx-cache`, which holds the worker's single shared store with its managed
+targets and incremental state, and the normal stop's snapshot keeps it. Its 64 GiB budget
+holds two release builds and the workspace test builds, and its 45 GiB free-space floor
+keeps the disk headroom that qualification requires. `admit` asks the pinned `mbx` for
+these effective settings and refuses a remote URL, a token setting, another cache
+directory or another budget. Laptops, gate hosts and other ssh hosts keep their own MBX
+configuration.
 
 ## Qualification and job admission
 
