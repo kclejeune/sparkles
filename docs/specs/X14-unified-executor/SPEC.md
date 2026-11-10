@@ -676,7 +676,9 @@ slices, a cursor test checks that the OPTIONAL over sorted inputs honours the sw
 names its algorithm in both plans, and a spill test runs an eager MINUS under a budget
 its hash table does not fit and expects the eager answer. The hash table of the smaller
 side is charged in eager execution, which it was not before, and the eager OPTIONAL
-builds on its right side as the cursor does rather than on the smaller side. The
+builds on its right side as the cursor does rather than on the smaller side. An eager
+MINUS, semi join or anti join on one bound key now builds the kernel's table with its
+grouped rows, about twice the memory of the id set it used, which item 852 follows. The
 conditional OPTIONAL of item 570 is measured in both modes on the benchmark worker as
 the plan describes, and item 570 records the result.
 

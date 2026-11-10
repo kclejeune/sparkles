@@ -713,7 +713,7 @@ fn a_limit_below_an_order_free_grouping_keeps_its_input_order() {
 fn an_eager_join_whose_build_does_not_fit_spills_instead_of_failing() {
     let s = store(30_000, false);
     let tmp = tempfile::tempdir().unwrap();
-    let q = "SELECT ?a ?v { ?a <urn:v> ?v . ?a <urn:p> ?k MINUS { ?b <urn:q> ?k } }";
+    let q = "SELECT ?a ?v { ?a <urn:x1> ?v MINUS { { ?b <urn:x2> ?v } UNION { ?b <urn:x3> ?v } } }";
     let expected = eager(&s, q);
     assert!(expected.len() > 1000, "{}", expected.len());
     let options = |spill| QueryOptions {
@@ -745,6 +745,7 @@ fn an_eager_join_whose_build_does_not_fit_spills_instead_of_failing() {
     assert!(leftovers(tmp.path()).is_empty());
 }
 
-/// A budget the hash table of the MINUS's right input, about 28,000 keys, does not fit
-/// beside the two inputs of about 1.1 MiB, while the output of 1,500 rows does.
-const EAGER_BUILD_MEMORY: u64 = 2 << 20;
+/// A budget the hash table of the MINUS's right input, 60,000 rows of about 50,000 keys,
+/// does not fit beside the two inputs of about 1.4 MiB, while the output of 10,000
+/// rows does.
+const EAGER_BUILD_MEMORY: u64 = 3 << 20;
