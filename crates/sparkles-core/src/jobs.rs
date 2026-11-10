@@ -57,6 +57,14 @@ pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 /// The longest definition name, in bytes.
 pub const MAX_NAME_BYTES: usize = 128;
 
+/// The most runs one dataset keeps in one state that dispatch reads exactly: the bound
+/// on `maxQueued`, on the leases every definition may hold at once, and on the runs a
+/// claim or a listing scans per state.
+pub const MAX_RUNS_PER_STATE: u32 = 4096;
+
+/// The most input commits one submission pins.
+pub const MAX_INPUTS: usize = 4096;
+
 /// The registered kind whose typed result is bounded insert and delete quads in the
 /// definition's graphs, with an opaque source checkpoint. It is the generic kind of an
 /// external collector.
@@ -80,8 +88,9 @@ pub struct Settings {
     pub format: u32,
     pub profile: u32,
     pub enabled: bool,
-    /// The most runs that may wait in `queued` or `retry-wait` at once. Admission past
-    /// this bound is refused without storing a run.
+    /// The most runs that may wait in `queued` or `retry-wait` at once, at most
+    /// [`MAX_RUNS_PER_STATE`]. Admission past this bound is refused without storing a
+    /// run.
     #[serde(default = "default_max_queued")]
     pub max_queued: u32,
     /// The registered definitions by name.
@@ -289,11 +298,20 @@ impl Settings {
                 "{FILE} registers more than {MAX_DEFINITIONS} definitions"
             )));
         }
-        if self.max_queued == 0 {
-            return Err(Error::invalid(format!("{FILE}: maxQueued is 0")));
+        if self.max_queued == 0 || self.max_queued > MAX_RUNS_PER_STATE {
+            return Err(Error::invalid(format!(
+                "{FILE}: maxQueued is 0 or more than {MAX_RUNS_PER_STATE}"
+            )));
         }
+        let mut leases: u64 = 0;
         for (name, d) in &self.definitions {
             d.validate(name)?;
+            leases += u64::from(d.concurrency);
+        }
+        if leases > u64::from(MAX_RUNS_PER_STATE) {
+            return Err(Error::invalid(format!(
+                "{FILE}: the definitions' concurrency adds up to {leases} leases, more than {MAX_RUNS_PER_STATE}"
+            )));
         }
         Ok(())
     }
@@ -307,13 +325,13 @@ impl Settings {
         out
     }
 
-    /// The graphs the owner manages: the ledger graph while enabled.
+    /// The graphs the owner manages once jobs were configured: the ledger graph, also
+    /// while the settings are disabled, so that disabling jobs stops admission and
+    /// claims without lifting the ledger's write fence, showing it to readers or changing
+    /// its protection nonce. A run accepted before jobs were disabled is dispatched again
+    /// once they are enabled.
     pub fn managed_graphs(&self) -> Vec<String> {
-        if self.enabled {
-            vec![LEDGER_GRAPH.to_string()]
-        } else {
-            Vec::new()
-        }
+        vec![LEDGER_GRAPH.to_string()]
     }
 }
 
@@ -397,13 +415,21 @@ pub fn backoff_ms(attempt: u32, cap_ms: u64) -> u64 {
     (base - quarter + jitter).max(1)
 }
 
+/// The operation kinds that scope an idempotency key (spec C26 §3).
+pub const OPERATION_SUBMIT: &str = "submit";
+pub const OPERATION_RETRY: &str = "retry";
+
 /// The UUID of a job operation derived from its scope: a UUID version 5 over a
-/// versioned, length-framed tuple of the dataset, the branch, the principal, the
-/// definition revision and the idempotency key (spec C26 §3).
+/// versioned, length-framed tuple of the dataset, the branch, the operation kind, the
+/// principal, the definition's name and revision and the idempotency key (spec C26 §3).
+/// Two definitions with equal content under different names, and a submission and a
+/// retry under one key, are separate scopes.
 pub fn operation_id(
     dataset: uuid::Uuid,
     branch: uuid::Uuid,
+    kind: &str,
     principal: &str,
+    definition: &str,
     revision: &str,
     key: &str,
 ) -> uuid::Uuid {
@@ -411,8 +437,8 @@ pub fn operation_id(
     let mut hash = sha1::Sha1::new();
     hash.update(dataset.as_bytes());
     hash.update(branch.as_bytes());
-    hash.update(b"sparkles-jobs-operation-v1\0");
-    for field in [principal, revision, key] {
+    hash.update(b"sparkles-jobs-operation-v2\0");
+    for field in [kind, principal, definition, revision, key] {
         hash.update((field.len() as u64).to_be_bytes());
         hash.update(field.as_bytes());
     }
@@ -497,13 +523,53 @@ mod tests {
         assert!(!token.contains('='));
         let d = uuid::Uuid::new_v4();
         let b1 = uuid::Uuid::new_v4();
-        let id = operation_id(d, b1, "urn:p", "sha256:x", "k");
-        assert_eq!(id, operation_id(d, b1, "urn:p", "sha256:x", "k"));
-        assert_ne!(id, operation_id(d, b1, "urn:p", "sha256:x", "k2"));
+        let op = |kind, principal, definition, revision, key| {
+            operation_id(d, b1, kind, principal, definition, revision, key)
+        };
+        let id = op(OPERATION_SUBMIT, "urn:p", "collect", "sha256:x", "k");
+        assert_eq!(
+            id,
+            op(OPERATION_SUBMIT, "urn:p", "collect", "sha256:x", "k")
+        );
         assert_ne!(
             id,
-            operation_id(d, uuid::Uuid::new_v4(), "urn:p", "sha256:x", "k")
+            op(OPERATION_SUBMIT, "urn:p", "collect", "sha256:x", "k2")
         );
+        // equal definitions under other names, and a retry, are other scopes
+        assert_ne!(
+            id,
+            op(OPERATION_SUBMIT, "urn:p", "collect2", "sha256:x", "k")
+        );
+        assert_ne!(id, op(OPERATION_RETRY, "urn:p", "collect", "sha256:x", "k"));
+        assert_ne!(
+            id,
+            operation_id(
+                d,
+                uuid::Uuid::new_v4(),
+                OPERATION_SUBMIT,
+                "urn:p",
+                "collect",
+                "sha256:x",
+                "k"
+            )
+        );
+    }
+
+    #[test]
+    fn waiting_and_lease_bounds_are_exact_and_the_ledger_stays_managed_when_disabled() {
+        let mut s = enabled();
+        s.max_queued = MAX_RUNS_PER_STATE;
+        s.validate().unwrap();
+        s.max_queued = MAX_RUNS_PER_STATE + 1;
+        assert!(s.validate().is_err());
+        let mut s = enabled();
+        s.definitions.get_mut("collect").unwrap().concurrency = MAX_RUNS_PER_STATE;
+        s.validate().unwrap();
+        s.definitions
+            .insert("more".into(), Definition::quads(vec!["urn:h".into()]));
+        assert!(s.validate().is_err());
+        let off = Settings::default();
+        assert_eq!(off.managed_graphs(), vec![LEDGER_GRAPH.to_string()]);
     }
 
     #[test]

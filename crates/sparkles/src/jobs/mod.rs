@@ -25,10 +25,10 @@
 //! # Ok::<_, sparkles::Error>(())
 //! ```
 //!
-//! The ledger graph is write-protected and, in this phase, visible to readers of the
-//! dataset under their grants. It stores no secrets: a lease token is never written,
-//! only its SHA-256 verifier, and failure diagnostics are bounded and redacted by the
-//! worker before they are recorded.
+//! The ledger graph is write-protected and hidden: it leaves every caller's read view,
+//! and only the typed inspection of this module renders it. It stores no secrets: a
+//! lease token is never written, only its SHA-256 verifier, and failure diagnostics are
+//! bounded and redacted by the worker before they are recorded.
 
 mod ledger;
 mod ops;
@@ -249,6 +249,12 @@ impl Jobs {
     /// is refused. A configuration that races with another change of the registry is
     /// refused with a conflict.
     ///
+    /// Once configured, the ledger graph stays protected and hidden under its nonce
+    /// while jobs are disabled, so a submission that commits between the check of active
+    /// runs and the disabling registry change leaves a queued run that no ordinary write
+    /// can touch, that no claim takes while jobs are disabled, and that is dispatched
+    /// again once they are enabled.
+    ///
     /// Editing a definition changes its revision. An accepted run keeps the revision it
     /// was accepted under, and a claim of a run whose definition revision is no longer
     /// registered is refused, so the run waits until the definition is restored or the
@@ -274,10 +280,13 @@ impl Jobs {
             }
             return status_from(snapshot.as_ref().map(|s| &s.graphs), None);
         }
-        if current.is_some() && !settings.enabled && self.has_active_runs()? {
-            return Err(Error::Conflict(
-                "jobs cannot be disabled while runs are queued, leased or waiting to retry; cancel them first".into(),
-            ));
+        if current.is_some() && !settings.enabled {
+            if self.has_active_runs()? {
+                return Err(Error::Conflict(
+                    "jobs cannot be disabled while runs are queued, leased or waiting to retry; cancel them first".into(),
+                ));
+            }
+            store.failpoint("jobs-before-disable");
         }
         if settings.enabled && store.root().is_some() {
             // The reader rises before the first ledger byte can be written, and the

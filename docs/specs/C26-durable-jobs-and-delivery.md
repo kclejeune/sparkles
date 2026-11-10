@@ -501,22 +501,36 @@ Phase 1 shipped for the `quads` kind. The jobs owner `OwnerKind::Jobs` of the
 managed-graph registry protects one hidden control graph, `urn:x-sparkles:jobs:ledger`, and
 keeps its definitions in `jobs.json` at format 1 and profile 1. Enabling jobs raises the
 dataset reader to 9 through `require_reader` before `jobs.json` and `managed.json` are
-written. `Dataset::jobs()` submits with an idempotency key scoped as §3 says, claims with
-a lease generation, a boot epoch and a bearer token whose SHA-256 verifier is the only
-durable trace, renews, publishes the business quads with the publication record, the
-checkpoint and the completion state in one transaction, fails with bounded exponential
-backoff and jitter, cancels, retries and inspects. The HTTP routes of §6 except
+written. `Dataset::jobs()` submits with an idempotency key scoped to the dataset, the branch,
+the principal, the definition's name and revision and the operation kind, over a digest of
+the canonical payload, the checkpoint, the sorted input references and the retried run, as
+§3 says. It claims with a lease generation, a boot epoch and a bearer token whose SHA-256
+verifier is the only durable trace, renews, publishes the business quads with the
+publication record, the checkpoint and the completion state in one transaction, fails with
+bounded exponential backoff and jitter within the remaining horizon, cancels, retries and
+inspects. Every leased transition rechecks under the writer that the definition exists, is
+enabled, keeps the run's revision and admits the worker, and an expired lease enters the
+retry policy before another worker takes the run over, as §4.2 requires. A submission
+revalidates its definition against the settings admitted under the writer, pins at most
+4096 inputs, and takes its source hold for publication inside the commit so a
+reconciliation cannot release it under a run that commits. `maxQueued` and the sum of the
+definitions' concurrency are bounded to the 4096 runs one scan reads exactly, and a scan
+that is cut short refuses admission and dispatch instead of undercounting. A disabled
+configuration keeps the ledger graph protected and hidden under its nonce. The HTTP routes of §6 except
 `deliveries` and `recover` are served, and the OpenAPI description, the auth route table
 and the API reference describe them. A run's definition revision is the digest of the
 definition's canonical JSON, and a run whose definition changed is not claimed. Input
-commits are pinned by a source hold under the run's id and released at the terminal state.
+commits are pinned by a source hold under the run's id and released at the terminal state,
+also when a restart or a claim ends the run, and kept while the run waits to retry.
 A restart records a new epoch in the ledger before the process admits its first claim,
 renewal or publication, and interrupts attempts of earlier epochs into the retry policy.
 
-Tests cover A1, A4, A6, A9 and A12 in one process, and A2, A3, A5 and A7 with failpoint
-crashes before and after the submission, claim and publication commits, each reopening
-the dataset and checking the business quads and the ledger together. The ordering argument
-is §7.1.
+Tests cover A1, A4, A6, A9 and A12 in one process. The crash tests for A2, A3, A5 and A7
+stop the process at failpoints before and after the submission, claim and publication
+commits, reopen the dataset and check the business quads and the ledger together. They are
+reopen tests around the commit boundary and rest on the store's write-ahead log for what
+happens at a synchronization error or a power loss, which they do not inject. The ordering
+argument is §7.1.
 
 The ledger graph is the first owner graph with the `hidden` visibility of §2.3. The
 registry lists the hidden graphs of its owners, and they leave every graph view a request
@@ -526,16 +540,19 @@ the view of every SPARQL query it runs, including a caller's explicit all-graphs
 Only the typed inspection of the jobs handle reads the ledger. A registry this build cannot
 enforce still hides the graphs its file names as hidden.
 
-Not in this phase. The library's Graph Store, history, diff and dump handles apply a
-caller's view when one is given but do not subtract hidden graphs on their own, which
-item 902 covers with the dispatch follow-ups. The dispatcher scans the committed ledger by state with a bound of 4096 runs per state
-instead of keeping a ready-time index, inspection has no cursor, quotas are per dataset,
-a server shutdown does not fence claims, and the authority fence between a publication's
-preparation and its commit is the next request's recheck (item 902). Current task records
-and the C21 delivery queue remain process-local. The outbox, recurring definitions, the
-restore and clone recovery and the `deliveries` and `recover` routes are Phase 2 of item
-339, the analysis and batch kinds are items 899 and 900, and the bindings, MCP and UI are
-item 901.
+Several parts of the design wait for later items. The library's Graph Store, history,
+diff and dump handles apply a caller's view when one is given but do not subtract hidden
+graphs on their own, which item 902 covers with the dispatch follow-ups. The dispatcher
+scans the committed ledger by state within the bound of 4096 runs per state instead of
+keeping a ready-time index, inspection has no cursor, quotas are per dataset, a server
+shutdown does not fence claims, and the authority fence between a publication's
+preparation and its commit is the next request's recheck, all under item 902. A
+submission is refused when the submitter's own view cannot write a definition graph, but
+the submitter's effective grants are not recorded and intersected with the worker's at
+claim and publication, which item 903 adds. Current task records and the C21 delivery
+queue remain process-local. The outbox, recurring definitions, the restore and clone
+recovery and the `deliveries` and `recover` routes are Phase 2 of item 339, the analysis
+and batch kinds are items 899 and 900, and the bindings, MCP and UI are item 901.
 
 The shared managed-write boundary of §2.3 and §7 is available from C25 Phase 2. Dataset
 reader 6 marks `managed.json`, a registry of owners whose graphs ordinary writes cannot
@@ -543,8 +560,8 @@ change, and a `ManagedWrite` capability admits an owner's typed transaction. Job
 register as a second owner kind with its own settings file in the same registry, and
 enabling them raises the dataset reader to 9 as §7 requires, since a build that knows
 only the registry would still render the control graphs on its read surfaces. They use
-the reserved `hidden` visibility and `exclude` merge values that the earlier build
-refused. No commit kind code is allocated by that boundary.
+the `hidden` visibility that the earlier build reserved and refused, and keep the `refuse`
+merge policy. No commit kind code is allocated by that boundary.
 
 ### Roadmap follow-ups
 

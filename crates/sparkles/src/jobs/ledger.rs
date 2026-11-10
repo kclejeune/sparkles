@@ -13,14 +13,16 @@ use crate::store::{Snapshot, WriteTxn};
 use crate::{Error, Result};
 use oxrdf::{GraphName, Literal, NamedNode, Quad, Term};
 use sparkles_core::evidence::write::Reads;
-use sparkles_core::jobs::{LEDGER_GRAPH, NAMESPACE};
+use sparkles_core::jobs::{LEDGER_GRAPH, MAX_INPUTS, MAX_RUNS_PER_STATE, NAMESPACE};
 use uuid::Uuid;
 
 /// The memory a ledger read may use for its lookups.
 pub(super) const READS_BYTES: u64 = 16 << 20;
 
-/// The most runs one scan of a state reads.
-pub(super) const MAX_SCAN: usize = 4096;
+/// The most runs one scan of a state reads. Settings validation bounds the waiting runs
+/// and the leases a dataset can hold to this number, so a scan that is cut short
+/// reports it instead of passing an undercount off as exact.
+pub(super) const MAX_SCAN: usize = MAX_RUNS_PER_STATE as usize;
 
 /// The most characters of a failure diagnostic that are kept.
 pub(super) const MAX_DIAGNOSTIC_CHARS: usize = 512;
@@ -347,6 +349,14 @@ fn corrupt(what: &str, s: &str) -> Error {
     ))
 }
 
+/// The runs one scan of a state found.
+pub(super) struct Scan {
+    pub ids: Vec<Uuid>,
+    /// Whether the ledger holds more runs in the state than [`MAX_SCAN`], so the ids
+    /// are a prefix and their count is not the state's count.
+    pub truncated: bool,
+}
+
 /// Reads of the ledger graph at one snapshot.
 pub(super) struct Ledger<'a> {
     reads: Reads<'a>,
@@ -442,18 +452,34 @@ impl<'a> Ledger<'a> {
             .subjects_up_to(&job(p).into_string(), o, LEDGER_GRAPH, limit)
     }
 
-    /// The ids of the runs in `state`, up to [`MAX_SCAN`].
-    pub fn runs_in(&mut self, state: State) -> Result<Vec<Uuid>> {
-        let (subjects, _) = self.subjects("state", &string(state.as_str()), MAX_SCAN)?;
+    /// The ids of the runs in `state`, up to [`MAX_SCAN`], and whether the ledger holds
+    /// more of them than the scan read.
+    pub fn runs_in(&mut self, state: State) -> Result<Scan> {
+        let (subjects, truncated) = self.subjects("state", &string(state.as_str()), MAX_SCAN)?;
         let prefix = format!("{NAMESPACE}run:");
-        Ok(subjects
-            .iter()
-            .filter_map(|s| s.as_str().strip_prefix(&prefix))
-            .filter_map(|id| Uuid::parse_str(id).ok())
-            .collect())
+        Ok(Scan {
+            ids: subjects
+                .iter()
+                .filter_map(|s| s.as_str().strip_prefix(&prefix))
+                .filter_map(|id| Uuid::parse_str(id).ok())
+                .collect(),
+            truncated,
+        })
     }
 
+    /// The complete record of run `id`, with its payload and inputs.
     pub fn run(&mut self, id: Uuid) -> Result<Option<Run>> {
+        self.read_run(id, true)
+    }
+
+    /// The record of run `id` without its payload and inputs, which a scheduling
+    /// decision over many runs does not need and must not retain. `payload` is empty
+    /// and `inputs` holds nothing in the result.
+    pub fn run_header(&mut self, id: Uuid) -> Result<Option<Run>> {
+        self.read_run(id, false)
+    }
+
+    fn read_run(&mut self, id: Uuid, complete: bool) -> Result<Option<Run>> {
         let iri = run_iri(id);
         let s = iri.as_str();
         if !self.is_a(s, "Run")? {
@@ -464,20 +490,31 @@ impl<'a> Ledger<'a> {
         let principal = self
             .iri(s, "principal")?
             .ok_or_else(|| corrupt("principal is missing", s))?;
-        let inputs = self
-            .objects(s, "input", 4096)?
-            .iter()
-            .filter_map(text)
-            .map(|v| {
-                let (b, seq) = v
-                    .split_once('@')
-                    .ok_or_else(|| corrupt("input is not branch@seq", s))?;
-                Ok(CommitRef {
-                    branch_id: Uuid::parse_str(b).map_err(|_| corrupt("input branch", s))?,
-                    seq: seq.parse().map_err(|_| corrupt("input seq", s))?,
+        let (payload, inputs) = if complete {
+            let inputs = self.objects(s, "input", MAX_INPUTS + 1)?;
+            if inputs.len() > MAX_INPUTS {
+                return Err(corrupt(
+                    &format!("more than {MAX_INPUTS} inputs are recorded"),
+                    s,
+                ));
+            }
+            let inputs = inputs
+                .iter()
+                .filter_map(text)
+                .map(|v| {
+                    let (b, seq) = v
+                        .split_once('@')
+                        .ok_or_else(|| corrupt("input is not branch@seq", s))?;
+                    Ok(CommitRef {
+                        branch_id: Uuid::parse_str(b).map_err(|_| corrupt("input branch", s))?,
+                        seq: seq.parse().map_err(|_| corrupt("input seq", s))?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?;
+            (self.required_str(s, "payload")?, inputs)
+        } else {
+            (String::new(), Vec::new())
+        };
         let operation = self
             .uuid(s, "operation")?
             .ok_or_else(|| corrupt("operation is missing", s))?;
@@ -488,7 +525,7 @@ impl<'a> Ledger<'a> {
             kind: self.required_str(s, "kind")?,
             kind_version: self.required_int(s, "kindVersion")? as u32,
             principal,
-            payload: self.required_str(s, "payload")?,
+            payload,
             payload_digest: self.required_str(s, "payloadDigest")?,
             checkpoint: self.str(s, "sourceCheckpoint")?,
             inputs,
@@ -560,7 +597,7 @@ impl<'a> Ledger<'a> {
         }))
     }
 
-    /// The run and payload digest a submission operation recorded.
+    /// The run and the normalized request digest a submission operation recorded.
     pub fn operation(&mut self, id: Uuid) -> Result<Option<(Uuid, String)>> {
         let iri = operation_iri(id);
         let s = iri.as_str();
@@ -570,7 +607,7 @@ impl<'a> Ledger<'a> {
         let run = self
             .uuid(s, "run")?
             .ok_or_else(|| corrupt("run is missing", s))?;
-        let digest = self.required_str(s, "payloadDigest")?;
+        let digest = self.required_str(s, "requestDigest")?;
         Ok(Some((run, digest)))
     }
 

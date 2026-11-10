@@ -674,13 +674,16 @@ delete quads in the definition's graphs with an opaque source checkpoint. The fi
 configuration raises the dataset reader to 9, so a release that does not know the ledger
 refuses to open the dataset.
 
-A submission carries an idempotency key scoped to the dataset, the branch, the caller and
-the definition revision. The same key with the same payload returns the existing run, and
-another payload is a conflict. A worker claims the first submitted eligible run of its
+A submission carries an idempotency key scoped to the dataset, the branch, the caller,
+the definition's name and revision and the operation kind. The same key with the same
+payload, checkpoint, input set and retried run returns the existing run, and another
+request under the key is a conflict. A worker claims the first submitted eligible run of its
 permitted definitions and receives a bearer lease token, which the ledger never records
 beyond its SHA-256 verifier. Every claim raises the run's lease generation, and the
 process that granted a lease has a boot epoch, so a token whose generation was superseded,
-whose lease expired or whose process restarted fails with `lease-lost`. A publication
+whose lease expired, whose process restarted or whose definition no longer admits the
+run or the worker fails with `lease-lost`. An expired lease follows the run's retry
+policy before another worker takes the run over. A publication
 commits the quads, the publication record, the checkpoint and the run's completion
 together, and a repeated publication operation returns the original receipt even after
 the lease ended, so a retry after a lost response never duplicates its effects. A
@@ -692,9 +695,12 @@ In Rust, `Dataset::jobs()` configures, submits, claims, renews, publishes, fails
 retries and inspects. Over HTTP the routes are under `/$/jobs/{ds}`, described in
 [the API reference](../API.md#durable-jobs). The ledger graph leaves every caller's
 query, Graph Store, listing and history view, whatever the caller's grants say, and only
-the jobs inspection renders its records. Delivery through an outbox, recurring definitions
-and recovery after a restore or clone are roadmap item 339, and the analysis and batch
-kinds are items 899 and 900.
+the jobs inspection renders its records. Once configured, the ledger stays protected and
+hidden while jobs are disabled. A submitter's own grants must reach the definition's
+graphs, but a worker's publication is not intersected with the submitter's grants as they
+stand at publication, which item 903 covers. Delivery through an outbox, recurring
+definitions and recovery after a restore or clone are roadmap item 339, and the analysis
+and batch kinds are items 899 and 900.
 
 ## Known gaps
 

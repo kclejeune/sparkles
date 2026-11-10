@@ -13,13 +13,14 @@ use super::{Caller, Jobs, managed};
 use crate::access::Preparation;
 use crate::branch::CommitRef;
 use crate::managed::{ManagedErrorKind, OwnerKind};
-use crate::store::WriteTxn;
+use crate::store::{HoldPublication, WriteTxn};
 use crate::task::Control;
 use crate::{Error, Result};
-use oxrdf::{GraphName, Quad, Term};
+use oxrdf::{GraphName, NamedNode, Quad, Term};
 use sparkles_core::jobs::{
-    Definition, LEDGER_GRAPH, MAX_IDEMPOTENCY_KEY_BYTES, Settings, backoff_ms, canonical_json,
-    digest_hex, new_token, operation_id, token_matches,
+    Definition, LEDGER_GRAPH, MAX_IDEMPOTENCY_KEY_BYTES, MAX_INPUTS, OPERATION_RETRY,
+    OPERATION_SUBMIT, Settings, backoff_ms, canonical_json, digest_hex, new_token, operation_id,
+    token_matches,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -60,6 +61,63 @@ impl Submission {
             inputs: Vec::new(),
             message: None,
             retry_of: None,
+        }
+    }
+
+    /// The operation kind the idempotency key is scoped to (spec C26 §3).
+    fn operation_kind(&self) -> &'static str {
+        if self.retry_of.is_some() {
+            OPERATION_RETRY
+        } else {
+            OPERATION_SUBMIT
+        }
+    }
+
+    /// The input references, sorted and without repeats: the order a caller lists them
+    /// in is not part of the request.
+    fn normalized_inputs(&self) -> Vec<CommitRef> {
+        let mut inputs = self.inputs.clone();
+        inputs.sort_unstable();
+        inputs.dedup();
+        inputs
+    }
+
+    /// `sha256:` and the digest of the normalized request: the canonical payload, the
+    /// starting checkpoint, the sorted input references and the retried run, each
+    /// length-framed and an absent member marked as absent, so that a changed
+    /// checkpoint, input set or predecessor under a known key is a conflict and not a
+    /// replay (spec C26 §3). JSON whitespace and member order do not change it.
+    pub fn digest(&self) -> String {
+        let mut bytes = b"sparkles-jobs-submission-v1\0".to_vec();
+        frame(&mut bytes, &canonical_json(&self.payload));
+        optional(
+            &mut bytes,
+            self.checkpoint.as_ref().map(|c| c.as_bytes().to_vec()),
+        );
+        let inputs = self.normalized_inputs();
+        bytes.extend_from_slice(&(inputs.len() as u64).to_be_bytes());
+        for i in &inputs {
+            frame(&mut bytes, format!("{}@{}", i.branch_id, i.seq).as_bytes());
+        }
+        optional(&mut bytes, self.retry_of.map(|r| r.as_bytes().to_vec()));
+        digest_hex(&bytes)
+    }
+}
+
+/// Append `field` with its length first, so two fields cannot be confused for one.
+fn frame(bytes: &mut Vec<u8>, field: &[u8]) {
+    bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(field);
+}
+
+/// Append an optional field: a discriminant and, when present, the framed field, so that
+/// an absent member and an empty one differ.
+fn optional(bytes: &mut Vec<u8>, field: Option<Vec<u8>>) {
+    match field {
+        None => bytes.push(0),
+        Some(f) => {
+            bytes.push(1);
+            frame(bytes, &f);
         }
     }
 }
@@ -133,7 +191,8 @@ impl Publication {
     }
 
     /// `sha256:` and the digest of the publication's content: its sorted insert and
-    /// delete quads and its checkpoint. Order does not change it.
+    /// delete quads and its checkpoint, an absent checkpoint being another content than
+    /// an empty one. Quad order does not change it.
     pub fn digest(&self) -> String {
         let mut lines: Vec<String> = self
             .insert
@@ -142,11 +201,12 @@ impl Publication {
             .chain(self.delete.iter().map(|q| format!("-{q}")))
             .collect();
         lines.sort();
-        let mut bytes = lines.join("\n").into_bytes();
-        bytes.push(0);
-        if let Some(c) = &self.checkpoint {
-            bytes.extend_from_slice(c.as_bytes());
-        }
+        let mut bytes = b"sparkles-jobs-publication-v1\0".to_vec();
+        frame(&mut bytes, lines.join("\n").as_bytes());
+        optional(
+            &mut bytes,
+            self.checkpoint.as_ref().map(|c| c.as_bytes().to_vec()),
+        );
         digest_hex(&bytes)
     }
 }
@@ -212,7 +272,17 @@ fn preparation() -> Result<Preparation> {
     Preparation::new(Control::none(), ledger::READS_BYTES)
 }
 
-/// The retry decision after a failed or interrupted attempt.
+/// The time the retries of `run` end under `def` (spec C26 §4.4).
+fn retry_horizon(run: &Run, def: &Definition) -> i64 {
+    run.submitted_ms
+        .saturating_add(i64::try_from(def.retry_horizon_ms).unwrap_or(i64::MAX))
+}
+
+/// The retry decision after a failed, expired or interrupted attempt (spec C26 §4.4): the
+/// run ends when the failure is permanent, its definition is gone, its attempts are
+/// used up, its horizon passed or the requested delay does not fit in what is left of the
+/// horizon, and otherwise waits for the later of the exponential backoff and the
+/// requested delay.
 fn after_failure(
     run: &Run,
     def: Option<&Definition>,
@@ -220,30 +290,36 @@ fn after_failure(
     transient: bool,
     retry_after_ms: Option<u64>,
 ) -> (State, Option<i64>, Option<String>) {
+    let failed = |why: String| (State::Failed, None, Some(why));
     if !transient {
         return (State::Failed, None, None);
     }
     let Some(def) = def else {
-        return (
-            State::Failed,
-            None,
-            Some("the definition is no longer registered".into()),
-        );
+        return failed("the definition is no longer registered".into());
     };
     if run.attempts >= def.attempts {
-        return (
-            State::Failed,
-            None,
-            Some(format!("{} attempts were exhausted", def.attempts)),
-        );
+        return failed(format!("{} attempts were exhausted", def.attempts));
     }
-    let delay = backoff_ms(run.attempts, MAX_BACKOFF_MS).max(retry_after_ms.unwrap_or(0));
-    let next = now.saturating_add(delay as i64);
-    let horizon = run
-        .submitted_ms
-        .saturating_add(def.retry_horizon_ms.min(i64::MAX as u64) as i64);
+    let horizon = retry_horizon(run, def);
+    let remaining = horizon.saturating_sub(now);
+    if remaining < 0 {
+        return failed("the retry horizon passed".into());
+    }
+    let requested = match retry_after_ms {
+        None => 0,
+        Some(ms) => match i64::try_from(ms) {
+            Ok(v) if v <= remaining => v,
+            _ => {
+                return failed(format!(
+                    "the requested delay of {ms} ms passes the retry horizon"
+                ));
+            }
+        },
+    };
+    let backoff = i64::try_from(backoff_ms(run.attempts, MAX_BACKOFF_MS)).unwrap_or(i64::MAX);
+    let next = now.saturating_add(backoff.max(requested));
     if next > horizon {
-        return (State::Failed, None, Some("the retry horizon passed".into()));
+        return failed("the retry horizon passed".into());
     }
     (State::RetryWait, Some(next), None)
 }
@@ -256,12 +332,76 @@ struct Begun<'s> {
     protection: Uuid,
 }
 
+/// What a submission checked before it took the writer.
+struct Staging<'a> {
+    s: &'a Submission,
+    caller: &'a Caller,
+    def: &'a Definition,
+    payload: &'a str,
+    inputs: &'a [CommitRef],
+    digest: &'a str,
+    revision: &'a str,
+    op: Uuid,
+    run: Uuid,
+}
+
+/// A submission under the writer: its staged transaction, or the receipt of the run
+/// another submission of the key recorded.
+enum Staged<'s> {
+    Ready(WriteTxn<'s>),
+    Replayed(Submitted),
+}
+
+thread_local! {
+    /// The source holds the submissions this thread is committing have taken for
+    /// publication. The guard is not `Send`, and the publish hook runs on the committing
+    /// thread, so the slot lives there.
+    static HELD: std::cell::RefCell<Vec<HoldPublication>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Releases the publication guards a submission pushed into this thread's slot, also
+/// when the commit unwinds, so that no guard outlives its commit.
+struct HeldForPublication(usize);
+
+impl HeldForPublication {
+    fn mark() -> HeldForPublication {
+        HeldForPublication(HELD.with(|h| h.borrow().len()))
+    }
+}
+
+impl Drop for HeldForPublication {
+    fn drop(&mut self) {
+        let released = HELD.try_with(|h| {
+            h.try_borrow_mut()
+                .map(|mut h| {
+                    let at = self.0.min(h.len());
+                    h.split_off(at)
+                })
+                .unwrap_or_default()
+        });
+        drop(released);
+    }
+}
+
 impl Jobs {
     fn begin<'s>(
         &'s self,
         operation: Uuid,
         write: Option<Arc<crate::access::GraphAccess>>,
         message: Option<String>,
+    ) -> Result<Begun<'s>> {
+        self.begin_with(operation, write, message, None)
+    }
+
+    /// [`begin`](Self::begin) with a hook that runs inside the commit, right before it
+    /// publishes.
+    fn begin_with<'s>(
+        &'s self,
+        operation: Uuid,
+        write: Option<Arc<crate::access::GraphAccess>>,
+        message: Option<String>,
+        before_publish: Option<crate::guard::PublishHook>,
     ) -> Result<Begun<'s>> {
         let ds = self.main()?;
         let (settings, bytes) = self.enabled_settings()?;
@@ -286,6 +426,7 @@ impl Jobs {
         let opts = crate::guard::WriteOptions {
             message: message.map(Arc::from),
             graphs: None,
+            before_publish,
             ..Default::default()
         };
         let mut t = store.try_write_with(crate::commit::CommitKind::Transaction, opts)?;
@@ -347,8 +488,13 @@ impl Jobs {
         let now = now_ms();
         let mut ch = Changes::default();
         let mut interrupted = Vec::new();
-        for id in l.runs_in(State::Leased)? {
-            let Some(run) = l.run(id)? else { continue };
+        let mut ended = Vec::new();
+        // A leased run beyond a cut scan keeps its old epoch, which every leased
+        // transition and the next claim refuse, so recovery stays possible.
+        for id in l.runs_in(State::Leased)?.ids {
+            let Some(run) = l.run_header(id)? else {
+                continue;
+            };
             self.authentic(&run, protection)?;
             let Some(attempt) = run.current_attempt else {
                 continue;
@@ -376,6 +522,9 @@ impl Jobs {
             let (state, next, reason) = after_failure(&run, def, now, true, None);
             self.transition(&mut ch, &mut l, &run, state, next, reason)?;
             rt.revoke(run.id);
+            if state.terminal() {
+                ended.push(run.id);
+            }
             interrupted.push(run.id);
         }
         let e = epoch_iri();
@@ -385,9 +534,8 @@ impl Jobs {
         ch.apply(&mut t)?;
         t.commit()?;
         rt.mark_installed();
-        for id in &interrupted {
-            self.maybe_release_hold(*id);
-        }
+        // A run that waits to retry still needs its pinned inputs.
+        self.release_holds_of(&ended);
         Ok(Recovered {
             epoch: rt.epoch(),
             installed: true,
@@ -425,22 +573,50 @@ impl Jobs {
         }
     }
 
+    /// Release the source holds of runs that ended. A hold that was never acquired is
+    /// ignored by the store.
+    fn release_holds_of(&self, ended: &[Uuid]) {
+        if ended.is_empty() {
+            return;
+        }
+        if let Err(e) = self.ds.store().release_holds(OwnerKind::Jobs, ended) {
+            tracing::warn!(target: "sparkles::jobs", "the source holds of ended runs were not released: {e}");
+        }
+    }
+
     /// Whether any run is queued, leased or waiting to retry.
     pub(super) fn has_active_runs(&self) -> Result<bool> {
         let snap = self.main()?.store().snapshot();
         let prep = preparation()?;
         let mut l = Ledger::new(&prep, &snap);
         for st in [State::Queued, State::Leased, State::RetryWait] {
-            if !l.runs_in(st)?.is_empty() {
+            if !l.runs_in(st)?.ids.is_empty() {
                 return Ok(true);
             }
         }
         Ok(false)
     }
 
-    /// Submit a run. The same key with the same payload returns the existing run, a
-    /// different payload is `idempotency-conflict`, and admission past the dataset's
-    /// bound on queued runs is `jobs-overloaded` without storing a run.
+    /// The number of runs in `state`, or `jobs-overloaded` when the ledger holds more
+    /// than one scan reads, since an undercount must not admit work past the bound.
+    fn exact_count(l: &mut Ledger<'_>, state: State) -> Result<usize> {
+        let scan = l.runs_in(state)?;
+        if scan.truncated {
+            return Err(managed(
+                ManagedErrorKind::JobsOverloaded,
+                format!(
+                    "more than {} runs are {}; no run was stored",
+                    ledger::MAX_SCAN,
+                    state.as_str()
+                ),
+            ));
+        }
+        Ok(scan.ids.len())
+    }
+
+    /// Submit a run. The same key with the same normalized request returns the existing
+    /// run, a different request is `idempotency-conflict`, and admission past the
+    /// dataset's bound on waiting runs is `jobs-overloaded` without storing a run.
     pub fn submit(&self, s: &Submission, caller: &Caller) -> Result<Submitted> {
         let ds = self.main()?;
         self.ensure_epoch()?;
@@ -472,6 +648,16 @@ impl Jobs {
                 s.definition
             )));
         }
+        // A submitter whose own grants do not reach a definition graph cannot have
+        // work published there on its behalf (C26 §4.2).
+        if let Some(access) = &caller.write {
+            for g in &def.graphs {
+                let term = Term::NamedNode(NamedNode::new_unchecked(g));
+                if !access.writable(Some(&term)) {
+                    return Err(crate::access::GraphAccess::refused(Some(&term)));
+                }
+            }
+        }
         let payload = canonical_json(&s.payload);
         if payload.len() as u64 > def.max_input_bytes {
             return Err(Error::invalid(format!(
@@ -480,13 +666,21 @@ impl Jobs {
             )));
         }
         let payload = String::from_utf8(payload).expect("JSON is UTF-8");
-        let digest = digest_hex(payload.as_bytes());
+        let inputs = s.normalized_inputs();
+        if inputs.len() > MAX_INPUTS {
+            return Err(Error::invalid(format!(
+                "a submission pins at most {MAX_INPUTS} input commits"
+            )));
+        }
+        let digest = s.digest();
         let revision = def.revision();
         let store = ds.store();
         let op = operation_id(
             ds.dataset_id(),
             store.branch_id(),
+            s.operation_kind(),
             caller.principal.as_str(),
+            &s.definition,
             &revision,
             key,
         );
@@ -500,9 +694,10 @@ impl Jobs {
             }
         }
         let run = Uuid::new_v4();
-        if !s.inputs.is_empty() {
+        let held = !inputs.is_empty();
+        if held {
             store
-                .acquire_hold(OwnerKind::Jobs, run, &s.inputs)
+                .acquire_hold(OwnerKind::Jobs, run, &inputs)
                 .map_err(|e| match e {
                     Error::HistoryGone(_) => Error::Conflict(
                         "an input commit is no longer retained, so the run cannot pin it".into(),
@@ -511,19 +706,101 @@ impl Jobs {
                 })?;
             store.failpoint("jobs-held");
         }
+        // The hold is taken for publication inside the commit, right before it
+        // publishes, and kept in this thread's slot until the commit returns, so a
+        // reconciliation that chose the hold as an orphan before this point cannot
+        // release it under a run that then commits, and one that released it already
+        // refuses the commit. The hook runs on this thread, inside `commit`.
+        let release = HeldForPublication::mark();
+        let hook = held.then(|| {
+            let held_by = ds.clone();
+            let inputs = inputs.clone();
+            crate::guard::PublishHook::new(move || {
+                let guard = held_by
+                    .store()
+                    .hold_publication(OwnerKind::Jobs, run, &inputs)?;
+                HELD.with(|h| h.borrow_mut().push(guard));
+                Ok(())
+            })
+        });
+        let staged = self.stage_submission(
+            Staging {
+                s,
+                caller,
+                def,
+                payload: &payload,
+                inputs: &inputs,
+                digest: &digest,
+                revision: &revision,
+                op,
+                run,
+            },
+            hook,
+        );
+        let t = match staged {
+            Ok(Staged::Ready(t)) => t,
+            Ok(Staged::Replayed(r)) => {
+                // the run this submission would have made is not recorded
+                if held {
+                    self.maybe_release_hold(run);
+                }
+                return Ok(r);
+            }
+            Err(e) => {
+                // nothing was committed, so the hold under the new run is an orphan
+                if held {
+                    self.maybe_release_hold(run);
+                }
+                return Err(e);
+            }
+        };
+        store.failpoint("jobs-before-commit");
+        // A commit whose outcome is uncertain keeps its hold: the run may be durable.
+        let receipt = t.commit()?;
+        drop(release);
+        store.failpoint("jobs-committed");
+        Ok(Submitted {
+            run,
+            version: 1,
+            commit: receipt.commit.seq,
+            replayed: false,
+            state: State::Queued,
+        })
+    }
+
+    /// Take the writer and stage the run of a submission, or answer a key that another
+    /// submission recorded in the meantime. Nothing is committed.
+    fn stage_submission<'s>(
+        &'s self,
+        st: Staging<'_>,
+        hook: Option<crate::guard::PublishHook>,
+    ) -> Result<Staged<'s>> {
+        let ds = self.main()?;
+        let store = ds.store();
         let Begun {
             mut t,
             settings,
             protection,
-        } = self.begin(op, None, s.message.clone())?;
+        } = self.begin_with(st.op, None, st.s.message.clone(), hook)?;
+        // The definition the request was checked against must be the one the admitted
+        // settings hold, or a change between the two reads could revoke the submitter,
+        // disable the definition or shrink its bounds under a run that still commits.
+        if settings.definitions.get(&st.s.definition) != Some(st.def) {
+            return Err(Error::Conflict(format!(
+                "definition {:?} changed while the submission was prepared; retry",
+                st.s.definition
+            )));
+        }
         let base = t.base().clone();
         let prep = preparation()?;
         let mut l = Ledger::new(&prep, &base);
-        if let Some(found) = l.operation(op)? {
-            return self.replay(&mut l, found, &digest, base.commit);
+        if let Some(found) = l.operation(st.op)? {
+            return self
+                .replay(&mut l, found, st.digest, base.commit)
+                .map(Staged::Replayed);
         }
-        let mut waiting = l.runs_in(State::Queued)?.len();
-        waiting += l.runs_in(State::RetryWait)?.len();
+        let waiting = Self::exact_count(&mut l, State::Queued)?
+            + Self::exact_count(&mut l, State::RetryWait)?;
         if waiting >= settings.max_queued as usize {
             return Err(managed(
                 ManagedErrorKind::JobsOverloaded,
@@ -535,29 +812,43 @@ impl Jobs {
         }
         let (seq, time_ms) = t.managed_stamp()?;
         let mut ch = Changes::default();
-        let o = operation_iri(op);
+        let o = operation_iri(st.op);
         ch.add_type(&o, "Operation");
-        ch.add(&o, "run", string(&run.to_string()));
-        ch.add(&o, "payloadDigest", string(&digest));
-        ch.add(&o, "idempotencyKey", string(key));
-        ch.add(&o, "principal", Term::NamedNode(caller.principal.clone()));
-        ch.add(&o, "definitionRevision", string(&revision));
+        ch.add(&o, "run", string(&st.run.to_string()));
+        ch.add(&o, "requestDigest", string(st.digest));
+        ch.add(&o, "idempotencyKey", string(&st.s.idempotency_key));
+        ch.add(&o, "operationKind", string(st.s.operation_kind()));
+        ch.add(
+            &o,
+            "principal",
+            Term::NamedNode(st.caller.principal.clone()),
+        );
+        ch.add(&o, "definition", string(&st.s.definition));
+        ch.add(&o, "definitionRevision", string(st.revision));
         ch.add(&o, "graphProtection", string(&protection.to_string()));
-        let r = run_iri(run);
+        let r = run_iri(st.run);
         ch.add_type(&r, "Run");
-        ch.add(&r, "definition", string(&s.definition));
-        ch.add(&r, "definitionRevision", string(&revision));
-        ch.add(&r, "kind", string(&def.kind));
-        ch.add(&r, "kindVersion", integer(u64::from(def.version)));
-        ch.add(&r, "principal", Term::NamedNode(caller.principal.clone()));
+        ch.add(&r, "definition", string(&st.s.definition));
+        ch.add(&r, "definitionRevision", string(st.revision));
+        ch.add(&r, "kind", string(&st.def.kind));
+        ch.add(&r, "kindVersion", integer(u64::from(st.def.version)));
+        ch.add(
+            &r,
+            "principal",
+            Term::NamedNode(st.caller.principal.clone()),
+        );
         ch.add(&r, "datasetId", string(&ds.dataset_id().to_string()));
         ch.add(&r, "branchId", string(&store.branch_id().to_string()));
-        ch.add(&r, "payload", string(&payload));
-        ch.add(&r, "payloadDigest", string(&digest));
-        if let Some(c) = &s.checkpoint {
+        ch.add(&r, "payload", string(st.payload));
+        ch.add(
+            &r,
+            "payloadDigest",
+            string(&digest_hex(st.payload.as_bytes())),
+        );
+        if let Some(c) = &st.s.checkpoint {
             ch.add(&r, "sourceCheckpoint", string(c));
         }
-        for i in &s.inputs {
+        for i in st.inputs {
             ch.add(&r, "input", string(&format!("{}@{}", i.branch_id, i.seq)));
         }
         ch.add(&r, "submittedAtMs", ms(time_ms));
@@ -566,23 +857,14 @@ impl Jobs {
         ch.add(&r, "version", integer(1));
         ch.add(&r, "attempts", integer(0));
         ch.add(&r, "generation", integer(0));
-        ch.add(&r, "operation", string(&op.to_string()));
-        if let Some(of) = s.retry_of {
+        ch.add(&r, "operation", string(&st.op.to_string()));
+        if let Some(of) = st.s.retry_of {
             ch.add(&r, "retryOf", string(&of.to_string()));
         }
         ch.add(&r, "graphProtection", string(&protection.to_string()));
         drop(l);
         ch.apply(&mut t)?;
-        store.failpoint("jobs-before-commit");
-        let receipt = t.commit()?;
-        store.failpoint("jobs-committed");
-        Ok(Submitted {
-            run,
-            version: 1,
-            commit: receipt.commit.seq,
-            replayed: false,
-            state: State::Queued,
-        })
+        Ok(Staged::Ready(t))
     }
 
     fn replay(
@@ -595,7 +877,7 @@ impl Jobs {
         if recorded != digest {
             return Err(managed(
                 ManagedErrorKind::IdempotencyConflict,
-                "the idempotency key was used before with another payload",
+                "the idempotency key was used before with another payload, checkpoint, input set or retried run",
             ));
         }
         let Some(run) = l.run(run)? else {
@@ -614,8 +896,10 @@ impl Jobs {
 
     /// Claim one eligible run of the caller's permitted definitions, `definitions`
     /// restricting them further when it is not empty. Eligible runs are taken first
-    /// submitted first. A run whose lease expired is taken over with a later
-    /// generation, and one whose attempts are exhausted by that fails instead.
+    /// submitted first. A run whose lease expired is first scheduled under its retry
+    /// policy, like an interrupted attempt (spec C26 §4.2), and is claimed with a later
+    /// generation once it is due. A waiting run whose horizon passed, and one whose
+    /// attempts ran out, fails instead. Every such change commits with the claim.
     pub fn claim(&self, definitions: &[String], caller: &Caller) -> Result<Option<Claimed>> {
         let ds = self.main()?;
         self.ensure_epoch()?;
@@ -635,31 +919,89 @@ impl Jobs {
                 && (def.workers.is_empty()
                     || def.workers.iter().any(|w| w == caller.principal.as_str()))
         };
+        // The scan reads each run's scheduling members only; the chosen run's payload
+        // and inputs are read once below, so a claim retains no payload it does not
+        // return.
+        let mut ch = Changes::default();
         let mut candidates: Vec<Run> = Vec::new();
+        let mut ended: Vec<Uuid> = Vec::new();
         let mut leased_by_definition: std::collections::HashMap<String, u32> = Default::default();
         for st in [State::Queued, State::RetryWait, State::Leased] {
-            for id in l.runs_in(st)? {
-                let Some(run) = l.run(id)? else { continue };
+            let scan = l.runs_in(st)?;
+            if scan.truncated {
+                return Err(managed(
+                    ManagedErrorKind::JobsOverloaded,
+                    format!(
+                        "more than {} runs are {}; dispatch is refused until runs are cancelled",
+                        ledger::MAX_SCAN,
+                        st.as_str()
+                    ),
+                ));
+            }
+            for id in scan.ids {
+                let Some(run) = l.run_header(id)? else {
+                    continue;
+                };
                 self.authentic(&run, protection)?;
-                let eligible = match run.state {
-                    State::Queued => true,
-                    State::RetryWait => run.next_eligible_ms.is_none_or(|n| n <= now),
+                let def = settings.definitions.get(&run.definition);
+                match run.state {
+                    State::Queued => {}
+                    State::RetryWait => {
+                        if run.next_eligible_ms.is_some_and(|n| n > now) {
+                            continue;
+                        }
+                        // a retry that comes due after its horizon is over
+                        if let Some(def) = def
+                            && def.revision() == run.revision
+                            && now > retry_horizon(&run, def)
+                        {
+                            self.transition(
+                                &mut ch,
+                                &mut l,
+                                &run,
+                                State::Failed,
+                                None,
+                                Some("the retry horizon passed".into()),
+                            )?;
+                            ended.push(run.id);
+                            continue;
+                        }
+                    }
                     State::Leased => {
-                        if rt.lease_expired(run.id) {
-                            true
-                        } else {
+                        if !rt.lease_expired(run.id) {
                             *leased_by_definition
                                 .entry(run.definition.clone())
                                 .or_default() += 1;
-                            false
+                            continue;
                         }
+                        // An expired attempt may have had an external effect, so the
+                        // run follows the retry policy instead of being taken at once.
+                        if let Some(a) = run.current_attempt
+                            && let Some(a) = l.attempt(a)?
+                            && a.state == AttemptState::Active
+                        {
+                            ch.set(
+                                &mut l,
+                                &attempt_iri(a.id),
+                                "attemptState",
+                                Some(string(AttemptState::Expired.as_str())),
+                            )?;
+                        }
+                        let (state, next, reason) = after_failure(&run, def, now, true, None);
+                        let reason = Some(match reason {
+                            Some(why) => format!("the lease expired ({why})"),
+                            None => "the lease expired".into(),
+                        });
+                        self.transition(&mut ch, &mut l, &run, state, next, reason)?;
+                        rt.revoke(run.id);
+                        if state.terminal() {
+                            ended.push(run.id);
+                        }
+                        continue;
                     }
-                    _ => false,
-                };
-                if !eligible {
-                    continue;
+                    _ => continue,
                 }
-                let Some(def) = settings.definitions.get(&run.definition) else {
+                let Some(def) = def else {
                     continue;
                 };
                 if def.revision() != run.revision || !permitted(def, &run.definition) {
@@ -669,23 +1011,11 @@ impl Jobs {
             }
         }
         candidates.sort_by_key(|r| r.submitted_commit);
-        let mut ch = Changes::default();
         let mut chosen = None;
         for run in candidates {
             let def = &settings.definitions[&run.definition];
             if run.attempts >= def.attempts {
-                // an expired lease or a stale retry whose attempts ran out ends here
-                if let Some(a) = run.current_attempt
-                    && let Some(a) = l.attempt(a)?
-                    && a.state == AttemptState::Active
-                {
-                    ch.set(
-                        &mut l,
-                        &attempt_iri(a.id),
-                        "attemptState",
-                        Some(string(AttemptState::Expired.as_str())),
-                    )?;
-                }
+                // a waiting run whose definition now allows fewer attempts ends here
                 self.transition(
                     &mut ch,
                     &mut l,
@@ -694,7 +1024,7 @@ impl Jobs {
                     None,
                     Some(format!("{} attempts were exhausted", def.attempts)),
                 )?;
-                rt.revoke(run.id);
+                ended.push(run.id);
                 continue;
             }
             let leased = leased_by_definition
@@ -704,28 +1034,21 @@ impl Jobs {
             if leased >= def.concurrency {
                 continue;
             }
-            chosen = Some((run, def.clone()));
+            chosen = Some((run.id, def.clone()));
             break;
         }
-        let Some((run, def)) = chosen else {
+        let Some((chosen, def)) = chosen else {
             drop(l);
             if !ch.is_empty() {
                 ch.apply(&mut t)?;
                 t.commit()?;
+                self.release_holds_of(&ended);
             }
             return Ok(None);
         };
-        if let Some(previous) = run.current_attempt
-            && let Some(previous) = l.attempt(previous)?
-            && previous.state == AttemptState::Active
-        {
-            ch.set(
-                &mut l,
-                &attempt_iri(previous.id),
-                "attemptState",
-                Some(string(AttemptState::Expired.as_str())),
-            )?;
-        }
+        let run = l
+            .run(chosen)?
+            .ok_or_else(|| Error::Corrupt(format!("run {chosen} vanished under the writer")))?;
         let attempt = Uuid::new_v4();
         let (token, verifier) = new_token();
         let generation = run.generation + 1;
@@ -766,6 +1089,7 @@ impl Jobs {
             rt.revoke(run.id);
             return Err(e);
         }
+        self.release_holds_of(&ended);
         let payload: serde_json::Value = serde_json::from_str(&run.payload).map_err(|e| {
             Error::Corrupt(format!("the payload of run {} is not JSON: {e}", run.id))
         })?;
@@ -787,16 +1111,20 @@ impl Jobs {
         }))
     }
 
-    /// The run and its active attempt when `token` is the live lease of `run` held by
-    /// the caller, or `lease-lost`.
+    /// The run, its active attempt and its definition when `token` is the live lease of
+    /// `run` held by the caller and the definition still admits the run and the worker,
+    /// or `lease-lost`. A definition that was removed, disabled or edited since the
+    /// claim, or that no longer lists the worker, fences the lease like an expiry (spec
+    /// C26 §4.2 and §4.3).
     fn check_lease(
         &self,
         l: &mut Ledger<'_>,
+        settings: &Settings,
         run: Uuid,
         token: &str,
         caller: &Caller,
         protection: Uuid,
-    ) -> Result<(Run, Attempt)> {
+    ) -> Result<(Run, Attempt, Definition)> {
         let rt = self.runtime();
         let Some(run) = l.run(run)? else {
             return Err(not_found(run));
@@ -833,7 +1161,21 @@ impl Jobs {
         if rt.lease_expired(run.id) {
             return Err(lease_lost("the lease expired"));
         }
-        Ok((run, attempt))
+        let Some(def) = settings.definitions.get(&run.definition) else {
+            return Err(lease_lost("the definition is no longer registered"));
+        };
+        if !def.enabled {
+            return Err(lease_lost("the definition is disabled"));
+        }
+        if def.revision() != run.revision {
+            return Err(lease_lost(
+                "the definition changed since the run was accepted",
+            ));
+        }
+        if !def.workers.is_empty() && !def.workers.iter().any(|w| w == caller.principal.as_str()) {
+            return Err(lease_lost("the definition no longer admits the worker"));
+        }
+        Ok((run, attempt, def.clone()))
     }
 
     fn expect_version(run: &Run, expected: Option<u64>) -> Result<()> {
@@ -867,12 +1209,9 @@ impl Jobs {
         let base = t.base().clone();
         let prep = preparation()?;
         let mut l = Ledger::new(&prep, &base);
-        let (run, attempt) = self.check_lease(&mut l, run, token, caller, protection)?;
+        let (run, attempt, def) =
+            self.check_lease(&mut l, &settings, run, token, caller, protection)?;
         Self::expect_version(&run, expected_version)?;
-        let def = settings
-            .definitions
-            .get(&run.definition)
-            .ok_or_else(|| lease_lost("the definition is no longer registered"))?;
         let extend = extend_ms
             .unwrap_or(def.lease_ms)
             .min(def.max_lease_extension_ms)
@@ -942,12 +1281,9 @@ impl Jobs {
         if let Some(found) = l.publication(p.operation)? {
             return Self::replay_publication(&mut l, &found, run_id, token, caller, &digest);
         }
-        let (run, attempt) = self.check_lease(&mut l, run_id, token, caller, protection)?;
+        let (run, attempt, def) =
+            self.check_lease(&mut l, &settings, run_id, token, caller, protection)?;
         Self::expect_version(&run, p.expected_version)?;
-        let def = settings
-            .definitions
-            .get(&run.definition)
-            .ok_or_else(|| lease_lost("the definition is no longer registered"))?;
         let count = (p.insert.len() + p.delete.len()) as u64;
         if count > def.max_output_quads {
             return Err(Error::invalid(format!(
@@ -1114,11 +1450,12 @@ impl Jobs {
         let base = t.base().clone();
         let prep = preparation()?;
         let mut l = Ledger::new(&prep, &base);
-        let (run, attempt) = self.check_lease(&mut l, run_id, token, caller, protection)?;
+        let (run, attempt, def) =
+            self.check_lease(&mut l, &settings, run_id, token, caller, protection)?;
         Self::expect_version(&run, expected_version)?;
         let now = now_ms();
-        let def = settings.definitions.get(&run.definition);
-        let (state, next, why) = after_failure(&run, def, now, f.transient, f.retry_after_ms);
+        let (state, next, why) =
+            after_failure(&run, Some(&def), now, f.transient, f.retry_after_ms);
         let diagnostic = ledger::redacted(&f.reason);
         let mut ch = Changes::default();
         let a = attempt_iri(attempt.id);
@@ -1294,7 +1631,7 @@ impl Jobs {
             .clamp(1, MAX_LIST_LIMIT);
         let mut out = Vec::new();
         for st in states {
-            for id in l.runs_in(st)? {
+            for id in l.runs_in(st)?.ids {
                 let Some(run) = l.run(id)? else { continue };
                 if let Some(d) = &filter.definition
                     && &run.definition != d
@@ -1325,12 +1662,15 @@ impl Jobs {
     /// hold and the submission commit. Returns the released hold ids.
     pub fn reconcile_holds(&self, grace_ms: i64) -> Result<Vec<Uuid>> {
         let ds = self.main()?;
-        let snap = ds.store().snapshot();
         let prep = preparation()?;
-        let mut l = Ledger::new(&prep, &snap);
+        // Each question reads the committed head of its moment: the store asks again
+        // under the lock every publication takes, and that answer must see a run whose
+        // commit published after the first question.
         ds.store()
             .reconcile_holds(OwnerKind::Jobs, grace_ms, &mut |hold| {
-                Ok(l.run(hold.id)?.is_some_and(|r| !r.state.terminal()))
+                let snap = ds.store().snapshot();
+                let mut l = Ledger::new(&prep, &snap);
+                Ok(l.run_header(hold.id)?.is_some_and(|r| !r.state.terminal()))
             })
     }
 }

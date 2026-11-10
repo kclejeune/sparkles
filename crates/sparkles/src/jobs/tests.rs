@@ -290,6 +290,18 @@ fn a4_an_expired_worker_cannot_renew_publish_or_fail_after_another_claims() {
         "the lease is live"
     );
     expire(&ds, ca.run);
+    // the expired attempt may have had an effect, so the run follows its retry policy
+    // before another worker takes it over (C26 §4.2)
+    assert!(ds.jobs().claim(&[], &b).unwrap().is_none());
+    let view = ds.jobs().get(ca.run, &admin()).unwrap().unwrap();
+    assert_eq!(view.state, State::RetryWait);
+    assert_eq!(
+        view.attempt.as_ref().unwrap().state,
+        ledger::AttemptState::Expired
+    );
+    assert!(view.reason.unwrap().contains("the lease expired"));
+    assert!(view.next_eligible_ms.unwrap() > ledger::now_ms() - 1_000);
+    force_eligible(&ds, ca.run);
     let cb = claim(&ds, &b);
     assert_eq!(cb.run, ca.run);
     assert_eq!(cb.generation, 2);
@@ -571,6 +583,325 @@ fn a_changed_definition_stops_claims_and_a_worker_grant_restricts_them() {
 }
 
 #[test]
+fn a_removed_disabled_or_edited_definition_fences_the_lease() {
+    let ds = Dataset::memory();
+    let mut s = settings();
+    s.definitions.get_mut("collect").unwrap().workers = vec![principal("w").as_str().into()];
+    ds.jobs().configure(&s).unwrap();
+    submit(&ds, "k1");
+    let w = worker("w");
+    let f = Failure {
+        transient: true,
+        reason: "stalled".into(),
+        retry_after_ms: None,
+    };
+    let fenced = |c: &Claimed| {
+        let head = ds.store().head_commit().seq;
+        assert_eq!(
+            code(ds.jobs().renew(c.run, &c.token, None, None, &w)),
+            "lease-lost"
+        );
+        assert_eq!(
+            code(
+                ds.jobs()
+                    .publish(c.run, &c.token, &publication(Uuid::new_v4(), 1), &w)
+            ),
+            "lease-lost"
+        );
+        assert_eq!(
+            code(ds.jobs().fail(c.run, &c.token, &f, None, &w)),
+            "lease-lost"
+        );
+        assert!(!has(&ds, 1));
+        assert_eq!(
+            ds.store().head_commit().seq,
+            head,
+            "refusals commit nothing"
+        );
+        let view = ds.jobs().get(c.run, &admin()).unwrap().unwrap();
+        assert_eq!(view.state, State::Leased);
+    };
+    // the worker is removed from the definition
+    let c = claim(&ds, &w);
+    let mut revoked = s.clone();
+    revoked.definitions.get_mut("collect").unwrap().workers =
+        vec![principal("other").as_str().into()];
+    ds.jobs().configure(&revoked).unwrap();
+    fenced(&c);
+    // restoring the definition restores the lease, and disabling it fences again
+    ds.jobs().configure(&s).unwrap();
+    ds.jobs().renew(c.run, &c.token, None, None, &w).unwrap();
+    let mut disabled = s.clone();
+    disabled.definitions.get_mut("collect").unwrap().enabled = false;
+    ds.jobs().configure(&disabled).unwrap();
+    fenced(&c);
+    // an edit of the definition's bounds is another revision
+    let mut edited = s.clone();
+    edited
+        .definitions
+        .get_mut("collect")
+        .unwrap()
+        .graphs
+        .push("urn:h".into());
+    ds.jobs().configure(&edited).unwrap();
+    fenced(&c);
+    // and its removal
+    let mut removed = s.clone();
+    removed.definitions.clear();
+    ds.jobs().configure(&removed).unwrap();
+    fenced(&c);
+    ds.jobs().configure(&s).unwrap();
+    ds.jobs()
+        .publish(c.run, &c.token, &publication(Uuid::new_v4(), 1), &w)
+        .unwrap();
+    assert!(has(&ds, 1));
+}
+
+#[test]
+fn equal_definitions_and_retries_have_separate_operation_scopes() {
+    let ds = Dataset::memory();
+    let mut s = settings();
+    let same = s.definitions["collect"].clone();
+    s.definitions.insert("collect2".into(), same);
+    ds.jobs().configure(&s).unwrap();
+    let a = submit(&ds, "k1");
+    let b = ds
+        .jobs()
+        .submit(
+            &Submission::new("collect2", serde_json::json!({"page": 1}), "k1"),
+            &admin(),
+        )
+        .unwrap();
+    assert!(
+        !b.replayed,
+        "an equal definition under another name is another scope"
+    );
+    assert_ne!(a.run, b.run);
+    // a retry under the predecessor's key is a new run, not the predecessor's receipt
+    ds.jobs().cancel(a.run, &admin()).unwrap();
+    let r = ds.jobs().retry(a.run, "k1", &admin()).unwrap();
+    assert!(!r.replayed);
+    assert_ne!(r.run, a.run);
+    assert_eq!(r.state, State::Queued);
+    let again = ds.jobs().retry(a.run, "k1", &admin()).unwrap();
+    assert!(again.replayed);
+    assert_eq!(again.run, r.run);
+    // a retry of another predecessor of the same definition under the same key is a
+    // conflict, not a replay
+    let a2 = submit(&ds, "k2");
+    ds.jobs().cancel(a2.run, &admin()).unwrap();
+    assert_eq!(
+        code(ds.jobs().retry(a2.run, "k1", &admin())),
+        "idempotency-conflict"
+    );
+    // and another definition's retry is another scope
+    ds.jobs().cancel(b.run, &admin()).unwrap();
+    assert!(!ds.jobs().retry(b.run, "k1", &admin()).unwrap().replayed);
+}
+
+#[test]
+fn a_changed_checkpoint_or_input_set_under_a_known_key_conflicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    ds.update("INSERT DATA { <urn:a> <urn:b> <urn:c> }")
+        .unwrap();
+    ds.update("INSERT DATA { <urn:a> <urn:b> <urn:d> }")
+        .unwrap();
+    configured(&ds);
+    let branch = ds.store().branch_id();
+    let input = |seq| crate::branch::CommitRef {
+        branch_id: branch,
+        seq,
+    };
+    let mut sub = Submission::new("collect", serde_json::json!({"page": 1}), "k1");
+    sub.checkpoint = Some("cursor-0".into());
+    sub.inputs = vec![input(2), input(1)];
+    let first = ds.jobs().submit(&sub, &admin()).unwrap();
+    // the input order is not part of the request
+    let mut reordered = sub.clone();
+    reordered.inputs = vec![input(1), input(2), input(2)];
+    let again = ds.jobs().submit(&reordered, &admin()).unwrap();
+    assert!(again.replayed);
+    assert_eq!(again.run, first.run);
+    let mut other_checkpoint = sub.clone();
+    other_checkpoint.checkpoint = Some("cursor-1".into());
+    assert_eq!(
+        code(ds.jobs().submit(&other_checkpoint, &admin())),
+        "idempotency-conflict"
+    );
+    let mut no_checkpoint = sub.clone();
+    no_checkpoint.checkpoint = None;
+    assert_eq!(
+        code(ds.jobs().submit(&no_checkpoint, &admin())),
+        "idempotency-conflict"
+    );
+    let mut empty_checkpoint = sub.clone();
+    empty_checkpoint.checkpoint = Some(String::new());
+    assert_eq!(
+        code(ds.jobs().submit(&empty_checkpoint, &admin())),
+        "idempotency-conflict"
+    );
+    let mut fewer_inputs = sub.clone();
+    fewer_inputs.inputs = vec![input(1)];
+    assert_eq!(
+        code(ds.jobs().submit(&fewer_inputs, &admin())),
+        "idempotency-conflict"
+    );
+    // refused submissions leave no hold under a run that does not exist
+    let holds = ds.store().source_holds().unwrap();
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].id, first.run);
+    // a publication's absent checkpoint is not an empty one
+    let mut absent = Publication::new(Uuid::new_v4());
+    absent.insert.push(quad(1));
+    let mut empty = absent.clone();
+    empty.checkpoint = Some(String::new());
+    assert_ne!(absent.digest(), empty.digest());
+    // more inputs than a run may pin are refused before anything is held
+    let mut many = Submission::new("collect", serde_json::json!({}), "k-many");
+    many.inputs = (0..=sparkles_core::jobs::MAX_INPUTS as u64)
+        .map(|i| crate::branch::CommitRef {
+            branch_id: Uuid::new_v4(),
+            seq: i,
+        })
+        .collect();
+    assert!(matches!(
+        ds.jobs().submit(&many, &admin()),
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(ds.store().source_holds().unwrap().len(), 1);
+}
+
+#[test]
+fn a_submitter_whose_view_cannot_write_a_definition_graph_is_refused() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    use crate::access::{GraphAccess, GraphRule, Graphs};
+    let only = |g: &str| {
+        Arc::new(GraphAccess::graphs(
+            Graphs::All,
+            Graphs::Only(GraphRule::new([g], &[])),
+        ))
+    };
+    let mut restricted = Caller::user(principal("narrow"));
+    restricted.write = Some(only("urn:other"));
+    assert!(matches!(
+        ds.jobs().submit(
+            &Submission::new("collect", serde_json::json!({}), "k1"),
+            &restricted
+        ),
+        Err(Error::NotPermitted(_))
+    ));
+    restricted.write = Some(only(G));
+    ds.jobs()
+        .submit(
+            &Submission::new("collect", serde_json::json!({}), "k1"),
+            &restricted,
+        )
+        .unwrap();
+}
+
+#[test]
+fn an_expired_lease_and_an_overdue_retry_end_at_the_horizon() {
+    let ds = Dataset::memory();
+    let mut s = settings();
+    s.definitions.get_mut("collect").unwrap().retry_horizon_ms = 1_500;
+    ds.jobs().configure(&s).unwrap();
+    let w = worker("w");
+    // a transient failure waits within the horizon, and a claim after the horizon ends
+    // the run instead of taking it
+    submit(&ds, "k1");
+    let c = claim(&ds, &w);
+    let f = Failure {
+        transient: true,
+        reason: String::new(),
+        retry_after_ms: None,
+    };
+    let view = ds.jobs().fail(c.run, &c.token, &f, None, &w).unwrap();
+    assert_eq!(view.state, State::RetryWait);
+    force_eligible(&ds, c.run);
+    std::thread::sleep(Duration::from_millis(1_600));
+    assert!(ds.jobs().claim(&[], &w).unwrap().is_none());
+    let view = ds.jobs().get(c.run, &admin()).unwrap().unwrap();
+    assert_eq!(view.state, State::Failed);
+    assert!(view.reason.unwrap().contains("horizon"));
+    // an expired lease past the horizon ends the run too
+    submit(&ds, "k2");
+    let c2 = claim(&ds, &w);
+    std::thread::sleep(Duration::from_millis(1_600));
+    expire(&ds, c2.run);
+    assert!(ds.jobs().claim(&[], &w).unwrap().is_none());
+    let view = ds.jobs().get(c2.run, &admin()).unwrap().unwrap();
+    assert_eq!(view.state, State::Failed);
+    assert_eq!(view.attempt.unwrap().state, ledger::AttemptState::Expired);
+}
+
+#[test]
+fn a_requested_delay_past_the_horizon_fails_instead_of_scheduling_in_the_past() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    let w = worker("w");
+    for delay in [
+        u64::MAX,
+        i64::MAX as u64 + 1,
+        i64::MAX as u64,
+        48 * 3_600_000,
+    ] {
+        let s = submit(&ds, &format!("k-{delay}"));
+        let c = claim(&ds, &w);
+        assert_eq!(c.run, s.run);
+        let f = Failure {
+            transient: true,
+            reason: "slow".into(),
+            retry_after_ms: Some(delay),
+        };
+        let view = ds.jobs().fail(c.run, &c.token, &f, None, &w).unwrap();
+        assert_eq!(view.state, State::Failed, "delay {delay}");
+        assert!(view.next_eligible_ms.is_none());
+        assert!(view.reason.unwrap().contains("passes the retry horizon"));
+    }
+    // a delay within the horizon is honored
+    let s = submit(&ds, "k-fine");
+    let c = claim(&ds, &w);
+    assert_eq!(c.run, s.run);
+    let f = Failure {
+        transient: true,
+        reason: String::new(),
+        retry_after_ms: Some(3_600_000),
+    };
+    let view = ds.jobs().fail(c.run, &c.token, &f, None, &w).unwrap();
+    assert_eq!(view.state, State::RetryWait);
+    assert!(view.next_eligible_ms.unwrap() >= ledger::now_ms() + 3_599_000);
+}
+
+#[test]
+fn a_run_header_carries_no_payload_or_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    ds.update("INSERT DATA { <urn:a> <urn:b> <urn:c> }")
+        .unwrap();
+    configured(&ds);
+    let mut sub = Submission::new("collect", serde_json::json!({"big": "x"}), "k1");
+    sub.inputs.push(crate::branch::CommitRef {
+        branch_id: ds.store().branch_id(),
+        seq: ds.store().head_commit().seq,
+    });
+    let s = ds.jobs().submit(&sub, &admin()).unwrap();
+    let snap = ds.store().snapshot();
+    let prep =
+        crate::access::Preparation::new(crate::task::Control::none(), ledger::READS_BYTES).unwrap();
+    let mut l = ledger::Ledger::new(&prep, &snap);
+    let header = l.run_header(s.run).unwrap().unwrap();
+    assert!(header.payload.is_empty());
+    assert!(header.inputs.is_empty());
+    assert_eq!(header.state, State::Queued);
+    let full = l.run(s.run).unwrap().unwrap();
+    assert_eq!(full.payload, r#"{"big":"x"}"#);
+    assert_eq!(full.inputs.len(), 1);
+    assert_eq!(full.payload_digest, header.payload_digest);
+}
+
+#[test]
 fn inputs_are_held_until_the_run_is_terminal() {
     let dir = tempfile::tempdir().unwrap();
     let ds = Dataset::open(dir.path()).unwrap();
@@ -697,6 +1028,245 @@ mod crashes {
         assert!(ds.store().source_holds().unwrap().is_empty());
     }
 
+    fn held_submission(ds: &Dataset, key: &str) -> Submission {
+        let mut sub = Submission::new("collect", serde_json::json!({}), key);
+        sub.inputs.push(crate::branch::CommitRef {
+            branch_id: ds.store().branch_id(),
+            seq: ds.store().head_commit().seq,
+        });
+        sub
+    }
+
+    /// Run `f` once, the first time the failpoint `at` is reached.
+    fn once_at(ds: &Dataset, at: &'static str, f: impl Fn() + Send + Sync + 'static) {
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        ds.store().set_failpoint(
+            at,
+            Some(Arc::new(move |_| {
+                if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    f();
+                }
+            })),
+        );
+    }
+
+    #[test]
+    fn a_restart_keeps_the_source_hold_of_a_retryable_run_and_releases_an_ended_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        ds.update("INSERT DATA { <urn:a> <urn:b> <urn:c> }")
+            .unwrap();
+        configured(&ds);
+        let s = ds
+            .jobs()
+            .submit(&held_submission(&ds, "k1"), &admin())
+            .unwrap();
+        let w = worker("w");
+        let c = claim(&ds, &w);
+        assert_eq!(c.run, s.run);
+        drop(ds);
+        let ds = Dataset::open(dir.path()).unwrap();
+        let recovered = ds.jobs().recover().unwrap();
+        assert_eq!(recovered.interrupted, vec![s.run]);
+        let view = ds.jobs().get(s.run, &admin()).unwrap().unwrap();
+        assert_eq!(view.state, State::RetryWait);
+        let holds = ds.store().source_holds().unwrap();
+        assert_eq!(holds.len(), 1, "a run that will retry keeps its inputs");
+        assert_eq!(holds[0].id, s.run);
+        // the next attempt still reads the pinned inputs
+        force_eligible(&ds, s.run);
+        let c2 = claim(&ds, &w);
+        assert_eq!(c2.inputs.len(), 1);
+        // a run whose attempts ran out at a claim releases its hold
+        let mut s2 = settings();
+        s2.definitions.get_mut("collect").unwrap().attempts = 2;
+        ds.jobs().configure(&s2).unwrap();
+        let cancelled = ds.jobs().cancel(s.run, &admin()).unwrap();
+        assert_eq!(cancelled.state, State::Cancelled);
+        assert!(ds.store().source_holds().unwrap().is_empty());
+        let s3 = ds
+            .jobs()
+            .submit(&held_submission(&ds, "k3"), &admin())
+            .unwrap();
+        let c3 = claim(&ds, &w);
+        assert_eq!(c3.run, s3.run);
+        expire(&ds, c3.run);
+        assert!(ds.jobs().claim(&[], &w).unwrap().is_none());
+        assert_eq!(ds.store().source_holds().unwrap().len(), 1);
+        force_eligible(&ds, s3.run);
+        let c4 = claim(&ds, &w);
+        assert_eq!(c4.number, 2);
+        expire(&ds, c4.run);
+        assert!(ds.jobs().claim(&[], &w).unwrap().is_none());
+        let view = ds.jobs().get(s3.run, &admin()).unwrap().unwrap();
+        assert_eq!(view.state, State::Failed);
+        assert!(view.reason.unwrap().contains("exhausted"));
+        assert!(ds.store().source_holds().unwrap().is_empty());
+        // a restart that ends a run releases its hold too
+        let mut s4 = settings();
+        s4.definitions.get_mut("collect").unwrap().attempts = 1;
+        ds.jobs().configure(&s4).unwrap();
+        let s5 = ds
+            .jobs()
+            .submit(&held_submission(&ds, "k5"), &admin())
+            .unwrap();
+        claim(&ds, &w);
+        drop(ds);
+        let ds = Dataset::open(dir.path()).unwrap();
+        assert_eq!(ds.jobs().recover().unwrap().interrupted, vec![s5.run]);
+        assert_eq!(
+            ds.jobs().get(s5.run, &admin()).unwrap().unwrap().state,
+            State::Failed
+        );
+        assert!(ds.store().source_holds().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reconciliation_cannot_drop_the_hold_of_a_submission_that_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        ds.update("INSERT DATA { <urn:a> <urn:b> <urn:c> }")
+            .unwrap();
+        configured(&ds);
+        // A reconciliation that runs between the hold and the commit, with no grace,
+        // sees no run and releases the hold. The commit then finds its hold gone and
+        // refuses, so no run exists without its inputs pinned.
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        {
+            let ds = ds.clone();
+            let seen = seen.clone();
+            once_at(&ds.clone(), "jobs-before-commit", move || {
+                seen.lock()
+                    .push(ds.jobs().reconcile_holds(0).unwrap().len());
+            });
+        }
+        let r = ds.jobs().submit(&held_submission(&ds, "k1"), &admin());
+        assert_eq!(code(r), "hold-conflict");
+        assert_eq!(*seen.lock(), vec![1]);
+        assert!(ds.store().source_holds().unwrap().is_empty());
+        assert!(
+            ds.jobs()
+                .list(&ListFilter::default(), &admin())
+                .unwrap()
+                .is_empty()
+        );
+        ds.store().set_failpoint("jobs-before-commit", None);
+        // A reconciliation right after the commit reads the committed run and keeps the
+        // hold.
+        {
+            let ds = ds.clone();
+            let seen = seen.clone();
+            once_at(&ds.clone(), "jobs-committed", move || {
+                seen.lock()
+                    .push(ds.jobs().reconcile_holds(0).unwrap().len());
+            });
+        }
+        let s = ds
+            .jobs()
+            .submit(&held_submission(&ds, "k1"), &admin())
+            .unwrap();
+        assert_eq!(*seen.lock(), vec![1, 0]);
+        let holds = ds.store().source_holds().unwrap();
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].id, s.run);
+        ds.store().set_failpoint("jobs-committed", None);
+    }
+
+    #[test]
+    fn a_submission_is_revalidated_against_the_settings_admitted_under_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        ds.update("INSERT DATA { <urn:a> <urn:b> <urn:c> }")
+            .unwrap();
+        configured(&ds);
+        // the submitter is revoked after the request was checked and before the writer
+        {
+            let ds = ds.clone();
+            once_at(&ds.clone(), "jobs-held", move || {
+                let mut s = settings();
+                s.definitions.get_mut("collect").unwrap().submitters =
+                    vec![principal("someone-else").as_str().into()];
+                ds.jobs().configure(&s).unwrap();
+            });
+        }
+        let r = ds.jobs().submit(&held_submission(&ds, "k1"), &admin());
+        assert!(matches!(r, Err(Error::Conflict(_))), "{r:?}");
+        assert!(
+            ds.jobs()
+                .list(&ListFilter::default(), &admin())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            ds.store().source_holds().unwrap().is_empty(),
+            "a refused submission leaves no hold"
+        );
+        ds.store().set_failpoint("jobs-held", None);
+        assert!(matches!(
+            ds.jobs().submit(&held_submission(&ds, "k1"), &admin()),
+            Err(Error::NotPermitted(_))
+        ));
+    }
+
+    #[test]
+    fn disabling_jobs_keeps_the_ledger_protected_under_a_run_that_slipped_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        configured(&ds);
+        let nonce = |ds: &Dataset| {
+            ds.store()
+                .managed_snapshot()
+                .unwrap()
+                .unwrap()
+                .graphs
+                .owners[&OwnerKind::Jobs]
+                .protections[LEDGER_GRAPH]
+        };
+        let before = nonce(&ds);
+        // a submission commits after the check of active runs and before the registry
+        // change that disables jobs
+        let slipped = Arc::new(parking_lot::Mutex::new(None));
+        {
+            let ds = ds.clone();
+            let slipped = slipped.clone();
+            once_at(&ds.clone(), "jobs-before-disable", move || {
+                *slipped.lock() = Some(submit(&ds, "k1").run);
+            });
+        }
+        let mut off = settings();
+        off.enabled = false;
+        let status = ds.jobs().configure(&off).unwrap();
+        ds.store().set_failpoint("jobs-before-disable", None);
+        let run = slipped.lock().unwrap();
+        assert!(!status.settings.enabled);
+        assert!(status.protected, "disabling never lifts the write fence");
+        assert_eq!(nonce(&ds), before, "the nonce is kept");
+        assert_eq!(
+            ds.store().hidden_graphs(),
+            vec![LEDGER_GRAPH.to_string()],
+            "and the ledger stays hidden"
+        );
+        assert_eq!(
+            code(ds.update(&format!(
+                "INSERT DATA {{ GRAPH <{LEDGER_GRAPH}> {{ <urn:x> <urn:y> <urn:z> }} }}"
+            ))),
+            "profile-managed-graph"
+        );
+        // nothing is admitted or claimed while jobs are disabled, and the run waits
+        assert_eq!(code(submit_result(&ds, "k2")), "unsupported-profile");
+        assert_eq!(
+            code(ds.jobs().claim(&[], &worker("w"))),
+            "unsupported-profile"
+        );
+        // enabling again dispatches the run under the same protection
+        configured(&ds);
+        assert_eq!(nonce(&ds), before);
+        let view = ds.jobs().get(run, &admin()).unwrap().unwrap();
+        assert_eq!(view.state, State::Queued);
+        let c = claim(&ds, &worker("w"));
+        assert_eq!(c.run, run);
+    }
+
     #[test]
     fn a3_a7_a_publication_that_stops_around_its_commit_is_all_or_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -761,6 +1331,27 @@ mod crashes {
             ),
             "publication-conflict"
         );
+    }
+
+    #[test]
+    fn a_claim_that_stops_before_its_commit_leaves_the_run_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        configured(&ds);
+        let s = submit(&ds, "k1");
+        let w = worker("w");
+        crash(&ds, "jobs-before-claim-commit", || ds.jobs().claim(&[], &w));
+        drop(ds);
+        let ds = Dataset::open(dir.path()).unwrap();
+        let view = ds.jobs().get(s.run, &admin()).unwrap().unwrap();
+        assert_eq!(view.state, State::Queued);
+        assert_eq!(view.attempts, 0);
+        assert_eq!(view.generation, 0);
+        assert!(view.attempt.is_none());
+        let c = claim(&ds, &w);
+        assert_eq!(c.run, s.run);
+        assert_eq!(c.generation, 1);
+        assert_eq!(c.number, 1);
     }
 
     #[test]

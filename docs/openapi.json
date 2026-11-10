@@ -37379,7 +37379,7 @@
         "x-sparkles-permission": "read"
       },
       "post": {
-        "description": "Needs `write` on the dataset through the update endpoint, and to be among the definition's submitters when it names any. Records the run in the dataset's job ledger as one commit and answers `202` with its `Location` once that commit is durable. The same `idempotencyKey` with the same payload answers `200` with the existing run and `replayed`; whitespace and member order do not change the payload's digest. Refusals write nothing: `400` for a malformed submission, `404` for an unknown definition, `409 idempotency-conflict` for a known key with another payload, `409` for a disabled definition and `429 jobs-overloaded` when the dataset's bound on waiting runs is reached.",
+        "description": "Needs `write` on the dataset through the update endpoint, and to be among the definition's submitters when it names any. Records the run in the dataset's job ledger as one commit and answers `202` with its `Location` once that commit is durable. The key is scoped to the dataset, the branch, the caller, the definition's name and revision and the operation kind. The same `idempotencyKey` with the same payload, `checkpoint`, `inputs` and retried run answers `200` with the existing run and `replayed`; JSON whitespace, member order and the order of `inputs` do not change the request's digest. Refusals write nothing: `400` for a malformed submission or more than 4096 `inputs`, `403` when the caller's own grants do not reach a graph of the definition, `404` for an unknown definition, `409 idempotency-conflict` for a known key with another request, `409` for a disabled definition or one that changed while the submission was prepared, and `429 jobs-overloaded` when the dataset's bound on waiting runs is reached.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
         },
@@ -37481,7 +37481,7 @@
     },
     "/$/jobs/{ds}/claim": {
       "post": {
-        "description": "Needs `write` on the dataset through the update endpoint, and to be among a definition's workers when it names any. Leases the first submitted eligible run of the caller's permitted definitions, raising its lease generation, and answers the payload with a bearer lease token that is returned once and never recorded. A run whose lease expired is taken over with a later generation, and the earlier worker's token fails from then on. `204` when nothing is eligible.",
+        "description": "Needs `write` on the dataset through the update endpoint, and to be among a definition's workers when it names any. Leases the first submitted eligible run of the caller's permitted definitions, raising its lease generation, and answers the payload with a bearer lease token that is returned once and never recorded. A run whose lease expired is scheduled under its retry policy, as an interrupted attempt is, and is claimed with a later generation once it is due, from which point the earlier worker's token fails; a run whose horizon passed or whose attempts ran out ends as `failed` instead. `204` when nothing is eligible.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
         },
@@ -37606,7 +37606,7 @@
         "x-sparkles-permission": "admin"
       },
       "put": {
-        "description": "Needs `admin` on the dataset. Records complete settings, protects the ledger graph `urn:x-sparkles:jobs:ledger` and raises the dataset reader to 9 durably on the first configuration. Editing a definition changes its revision, and a run accepted under an older revision is not claimed until the definition is restored. Disabling jobs while runs are queued, leased or waiting to retry is a `409` that writes nothing, as is a configuration that races with another change of the registry.",
+        "description": "Needs `admin` on the dataset. Records complete settings, protects the ledger graph `urn:x-sparkles:jobs:ledger` and raises the dataset reader to 9 durably on the first configuration. Editing a definition changes its revision, and a run accepted under an older revision is not claimed until the definition is restored. Disabling jobs while runs are queued, leased or waiting to retry is a `409` that writes nothing, as is a configuration that races with another change of the registry. A disabled configuration keeps the ledger graph protected and hidden under the same nonce, so a run that was admitted as jobs were disabled waits, untouched, until they are enabled. `maxQueued` is at most 4096 and the definitions' `concurrency` adds up to at most 4096.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
         },
@@ -37806,7 +37806,7 @@
     },
     "/$/jobs/{ds}/{id}/fail": {
       "post": {
-        "description": "Needs `write` through the update endpoint and the lease token in `Sparkles-Job-Lease`. A transient failure enters `retry-wait` with exponential backoff and jitter, honoring `retryAfterMs`, within the definition's attempts and retry horizon; any other failure, or an exhausted policy, ends the run as `failed` with the redacted reason. `409 lease-lost`, `412 precondition-failed` and `401 lease-missing` as for a renewal.",
+        "description": "Needs `write` through the update endpoint and the lease token in `Sparkles-Job-Lease`. A transient failure enters `retry-wait` with exponential backoff and jitter, honoring `retryAfterMs`, within the definition's attempts and retry horizon; any other failure, an exhausted policy or a `retryAfterMs` that does not fit in the remaining horizon ends the run as `failed` with the redacted reason. `409 lease-lost`, `412 precondition-failed` and `401 lease-missing` as for a renewal.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
         },
@@ -37998,7 +37998,7 @@
     },
     "/$/jobs/{ds}/{id}/renew": {
       "post": {
-        "description": "Needs `write` through the update endpoint and the lease token in `Sparkles-Job-Lease`. Extends the lease by `extendMs`, at most the definition's largest extension. `409 lease-lost` for a token whose generation was superseded, whose lease expired, whose process restarted or whose run is no longer leased, `412 precondition-failed` for another `expectedVersion`, and `401 lease-missing` without the header.",
+        "description": "Needs `write` through the update endpoint and the lease token in `Sparkles-Job-Lease`. Extends the lease by `extendMs`, at most the definition's largest extension. `409 lease-lost` for a token whose generation was superseded, whose lease expired, whose process restarted, whose run is no longer leased or whose definition was removed, disabled, edited or no longer lists the worker, `412 precondition-failed` for another `expectedVersion`, and `401 lease-missing` without the header.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
         },

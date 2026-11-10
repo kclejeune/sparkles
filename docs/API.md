@@ -13499,15 +13499,24 @@ marks the ledger graph hidden in the managed-graph registry.
 the dataset. A definition's revision is the digest of its canonical JSON. A run keeps the
 revision it was accepted under, and a run whose definition changed is not claimed until
 the definition is restored or the run is cancelled. Jobs cannot be disabled while runs are
-queued, leased or waiting to retry.
+queued, leased or waiting to retry. A disabled configuration keeps the ledger graph
+protected and hidden under the same protection nonce, so a run admitted as jobs were being
+disabled waits until they are enabled again. `maxQueued` is at most 4096, and the
+definitions' `concurrency` adds up to at most 4096, so that dispatch counts waiting runs
+and leases exactly.
 
 `POST /$/jobs/{ds}` submits a run with `definition`, a JSON `payload`, an
 `idempotencyKey` of at most 256 bytes, an optional `checkpoint` and optional `inputs`,
-commits that a source hold pins until the run is terminal. It needs `write` on the dataset
-through the update endpoint. The server answers `202` with the run's `Location` once the
-submission's commit is durable. The key is scoped to the dataset, the branch, the caller
-and the definition revision, and the same key with the same payload answers `200` with
-the existing run and `replayed: true`, while another payload is `409 idempotency-conflict`.
+commits that a source hold pins until the run is terminal, at most 4096 of them. It needs
+`write` on the dataset through the update endpoint, and the caller's own grants must reach
+every graph of the definition. The server answers `202` with the run's `Location` once the
+submission's commit is durable. The key is scoped to the dataset, the branch, the caller,
+the definition's name and revision and the operation kind, a submission or a retry. The
+same key with the same payload, checkpoint, input set and retried run answers `200` with
+the existing run and `replayed: true`, while another request under the key is `409
+idempotency-conflict`. JSON whitespace, member order and the order of the inputs do not
+change the request's digest. A definition that changes between the check of the request
+and the commit is `409`, and nothing is stored.
 A dataset whose bound on waiting runs is reached answers `429 jobs-overloaded` and stores
 nothing.
 
@@ -13516,14 +13525,17 @@ permitted definitions, optionally restricted by `definitions`, and answers its p
 inputs, checkpoint, graphs and a bearer lease token. The token is returned once and never
 recorded, since the ledger keeps only its SHA-256 verifier. Nothing eligible is `204`. A
 lease has a generation that every claim raises, and the process that granted it has a
-boot epoch. A run whose lease expired is taken over by the next claim with a later
-generation, and a worker whose attempts are exhausted that way ends the run as `failed`.
+boot epoch. A run whose lease expired is scheduled under its retry policy, as an
+interrupted attempt is, and is taken over with a later generation once it is due. A
+waiting run whose horizon passed, or whose attempts ran out, ends as `failed` instead.
 
 `POST /$/jobs/{ds}/{id}/renew`, `publish` and `fail` carry the token in the
 `Sparkles-Job-Lease` header, which no log records, and may carry `expectedVersion`, which
 refuses another version with `412`. A token whose generation was superseded, whose lease
-expired, whose process restarted or whose run is no longer leased is `409 lease-lost`. A
-renewal extends the lease by `extendMs`, at most the definition's largest extension. A
+expired, whose process restarted or whose run is no longer leased is `409 lease-lost`, and
+so is a lease whose definition was removed, disabled or edited since the claim or no
+longer lists the worker. A renewal extends the lease by `extendMs`, at most the
+definition's largest extension. A
 publication names its `operation`, a UUID the worker keeps across retries, and its
 `insert` and `delete` quads as N-Quads lines in the definition's graphs, with an optional
 `checkpoint`. The same operation with the same quads and checkpoint answers the original
@@ -13531,7 +13543,8 @@ receipt with `replayed: true`, even after the lease ended, and another result un
 same operation is `409 publication-conflict`, so a retry after a lost response can never
 duplicate its effects. A failure is `transient`, which enters `retry-wait` with
 exponential backoff and jitter and honors `retryAfterMs` within the definition's attempts
-and horizon, or permanent, which ends the run.
+and horizon, or permanent, which ends the run. A `retryAfterMs` that does not fit in the
+remaining horizon ends the run too.
 
 `POST /$/jobs/{ds}/{id}/cancel` durably ends a run and fences its active attempt. Work
 already committed stays committed, and the reason records that an external request
@@ -13540,7 +13553,8 @@ a failed or cancelled one under a new key and links it to the old run, which sta
 evidence. `GET /$/jobs/{ds}` and `GET /$/jobs/{ds}/{id}` inspect the runs the caller may
 see, every run for an administrator and the runs another caller submitted or works on,
 with `state`, `definition` and `limit` filters. An unknown run and an invisible run share
-the same `404`, and no response carries a token or its verifier.
+the same `404`. The claim response returns the token once, and no inspection response
+carries a token or its verifier.
 
 A restart installs a new boot epoch before the process admits any claim, renewal or
 publication. Attempts of an earlier epoch are interrupted, their runs return to their
