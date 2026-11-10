@@ -1131,7 +1131,7 @@ fn aggregate_pass_against_recompute() {
         );
         let info = rt.get(&s, name).unwrap();
         assert!(
-            !info.plan.has_recompute(),
+            !info.plan.as_ref().is_some_and(|p| p.has_recompute()),
             "{name} has a recompute node: {:#?}",
             info.plan
         );
