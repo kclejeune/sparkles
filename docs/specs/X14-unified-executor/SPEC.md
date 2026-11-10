@@ -44,9 +44,9 @@ before the duplication itself goes. A stage lands only when the gates below pass
    the only eager API, and the admission layer, the eager memory retry and the server's
    mode routing go. The in-place quick runner stays as a scheduling choice.
 
-The [plan](PLAN.md) orders the work of stages 5 and 6 into lanes, records what the audit
+The [plan](PLAN.md) orders the work of stages 5 and 6 into phases, records what the audit
 of the code against this design found, and lists the decisions that are open. Items 825
-to 829 are its first lanes.
+to 829 are its first phases.
 
 Phases that touch a single area, such as the CLI's remote mode and the Python
 transaction worker, are scheduled when other work changes that area.
