@@ -1036,7 +1036,8 @@ measured against the build that left their Horn axioms out, in interleaved round
 **Gate.** The gate is the Horn stratum of the ORE 2015 DL development set, 73 files, of
 which HermiT 1.4.5.519 classifies 68 within 1200 s, and among them the 47 files with
 individuals, functional data properties or top properties, whose Horn axioms the
-comparison before this item left out. On four threads the classifier's taxonomy equals
+comparison before this item left out, 44 of which have a reference. On four threads the
+classifier's taxonomy equals
 HermiT's on 34 files and is sound on 33, with no difference against HermiT on any file,
 where the build before the item was equal on 23 and sound on 44. Every axiom the 33 files
 still leave out is outside the Horn rules' scope: anonymous individuals in 29 files, and

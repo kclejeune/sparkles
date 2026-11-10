@@ -576,7 +576,9 @@ properties and top properties, which the rules of item 603 left out, as
 [F24](../../specs/F24-owl-classification/SPEC.md#the-horn-rules-with-individuals)
 describes. Its gate is the Horn stratum of the ORE 2015 DL development set, 73 files, of
 which HermiT 1.4.5.519 classifies 68 within 1200 s on the laptop, and the 47 files among
-them with individuals, functional data properties or top properties. On four threads the
+them with individuals, functional data properties or top properties, 44 of which have a
+reference, since `ore_ont_11311`, `ore_ont_16744` and `ore_ont_8737` are among the five
+without one. On four threads the
 classifier's taxonomy equals HermiT's on 34 files and is sound on 33, with no taxonomy
 difference against HermiT on any file, where the build before the item was equal on 23
 and sound on 44. The 33 files that stay sound leave out only axioms outside the Horn
@@ -596,7 +598,8 @@ the item's build in turn with the order alternating by round, one process of thr
 classifications each, under the host's heavy lock in a 13 GiB scope, with the load average
 at 5.7 when the run started and 5.4 when it ended. The build before the item left every
 Horn axiom of these files out, so the comparison sets the Horn rules' work against the EL
-rules alone on the same files, as the comparison of item 603 did. The table gives the
+rules alone on the same files, as the comparison of item 603 did, except on
+`ore_ont_2775`, whose one inverse property axiom the build before the item took. The table gives the
 median over the rounds of each process's median classification for the files above 40 ms
 and the two assertion-heavy files below, and the
 [record](runs/2026-11-10-horn-individuals-atlas-0f944b5c/record.json) holds every file
@@ -607,18 +610,18 @@ more, and eight take more than 1.6 times. Three of the eight finish under 6 ms, 
 against 0.5. Four files with 7,856 to 114,957 property assertions, `ore_ont_4510`,
 `ore_ont_12901`, `ore_ont_14375` and `ore_ont_10951`, take 2.5 to 3.6 times the base and
 stay under half a second: the rules create 3,147 to 42,249 conjunction contexts and derive
-eight to ten times the conclusions, which roadmap item 869 follows. The eighth,
+6.6 to 9.6 times the conclusions, which roadmap item 869 follows. The eighth,
 `ore_ont_16744`, has 3.3 million axioms with RO relations and names the top property in two
 tautological property inclusions, which made the build before the item refuse its two Horn
 axioms. The item's build takes them, and the Horn rules derive 3.8 billion conclusions in
-43 s with a peak resident set of 11.5 GiB, against 546 million in 5.9 s with 3.8 GiB for
+43 s with a peak resident set of 11.0 GiB, against 546 million in 5.9 s with 3.7 GiB for
 the EL rules. On `ore_ont_8737`, 2.7 million axioms of the same kind, the Horn rules pass
 their budget and the run finishes by the EL rules in 34 s against 25 s. The build before
 the item classifies `ore_ont_16744` without the two inclusions in 51 s on the laptop, so
 this cost is the Horn rules' on large OBO files, which item 693 owns, and not the rules of
 individuals. Both files keep their taxonomies. The files whose axioms with anonymous
 individuals the reader leaves out, such as `ore_ont_5481` with 457,662 of them, spend 0.12
-to 0.25 s more in the index stage, where the Horn normalization now reads each of them
+to 0.27 s more in the index stage, where the Horn normalization now reads each of them
 before it refuses it, and item 869 follows this too.
 
 | Ontology | EL rules ms | Item 692 ms | Ratio | Conclusions before | Conclusions after |
