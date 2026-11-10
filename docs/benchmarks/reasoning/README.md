@@ -101,8 +101,8 @@ five universities passes the command's own default of 50 million derived triples
 memory limit of each run's scope bounds the run instead. `rl_terms.py` sorts each decoded
 closure and each side of a comparison on disk with GNU sort, which has a buffer of 1 GiB,
 and merges the sorted files, so it holds no closure in memory. What it still holds grows
-with the encoded literals and blank nodes of the input and with the differences it counts,
-not with the size of the closure.
+with the encoded literals and blank nodes of the input and with the distinct predicates of
+the differences, not with the size of the closure.
 
 The runner writes every run to `results/rl-reference.json` and the medians to
 `results/summary.md` in its working directory.
