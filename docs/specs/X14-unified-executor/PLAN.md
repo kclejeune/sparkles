@@ -518,11 +518,14 @@ input, builds over the input's batches as the hash kernel of item 825 does. An
 index-order top-k without the heap takes the heap of `cursor/topk.rs` with its runtime
 fallback.
 
-After the phase, every kind has a cursor, so an EXISTS pattern builds under the strict
-policy as well, and `exists_streams`, which builds each pattern without a LIMIT of its
-own and turns a construction refusal into a fallback, can then refuse only a pattern
-whose leaf the strict policy refuses. Whether such a leaf exists depends on the
-maintainer's answer about materialized leaves. If the strict policy admits every leaf, or
+After the phase, every kind has a cursor, so an EXISTS pattern that plans builds under
+the strict policy as well. `exists_streams` plans each pattern without a LIMIT of its
+own and turns every planning or construction error other than cancellation, a timeout
+and a budget failure into a fallback, so after the phase it can still answer a fallback
+for a pattern that does not plan, such as one over an embedding provider that is not
+configured, which fails in eager execution too, and for a pattern whose leaf the strict
+policy refuses. Whether such a leaf exists depends on the maintainer's answer about
+materialized leaves. If the strict policy admits every leaf, or
 admits a leaf inside an EXISTS pattern whatever its bound, `State::Fallback` goes in this
 phase. If the strict policy refuses an unbounded materialized leaf inside an EXISTS
 pattern, the fallback remains for that one shape, an EXISTS over a SERVICE or search
