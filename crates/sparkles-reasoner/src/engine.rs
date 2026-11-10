@@ -629,12 +629,21 @@ pub(crate) enum First<'a> {
     Base(BaseRange),
 }
 
+/// Told how many rule instances an evaluation of [`Mode::Existing`] matched since it was
+/// last told, every [`VISIT_BATCH`] instances; an error stops the evaluation with it.
+pub(crate) type Visit<'s> = dyn Fn(u64) -> anyhow::Result<()> + Sync + 's;
+
+/// The instances an evaluation of [`Mode::Existing`] matches before it tells its
+/// [`Visit`].
+pub(crate) const VISIT_BATCH: u64 = 1 << 10;
+
 /// What an evaluation emits.
 pub(crate) enum Mode<'s> {
     /// heads not in the graph yet (forward chaining)
     New,
-    /// heads in the graph (the consequences of deleted facts)
-    Existing,
+    /// heads in the graph, each once (the consequences of deleted facts), with what is
+    /// told of the instances matched
+    Existing { visit: Option<&'s Visit<'s>> },
     /// the instances whose head number `head` is `target`
     Instances {
         head: usize,
@@ -665,10 +674,13 @@ pub(crate) struct Eval<'a> {
     /// facts read by builtins of the current partial instance ([`Mode::Instances`])
     pub implicit: smallvec::SmallVec<[Triple; 2]>,
     stop: bool,
-    /// heads emitted so far ([`Mode::New`]), so that each goes out once
+    /// heads emitted so far ([`Mode::New`] and [`Mode::Existing`]), so that each goes
+    /// out once
     seen: FxHashSet<Triple>,
     /// the first error of a base-tier scan
     pub err: Option<anyhow::Error>,
+    /// the instances matched and not yet told ([`Mode::Existing`])
+    pub visits: u64,
     /// per plan step: the base-tier blocks it read last, made at the first read of the
     /// base tier (most evaluations of a backward search read none)
     memos: Vec<Memo>,
@@ -757,6 +769,7 @@ impl<'a> Eval<'a> {
             stop: false,
             seen: FxHashSet::default(),
             err: None,
+            visits: 0,
             memos: Vec::new(),
             looked: Vec::new(),
             scratch: Vec::new(),
@@ -840,6 +853,28 @@ impl<'a> Eval<'a> {
         self.abort.store(true, Ordering::Relaxed);
     }
 
+    /// Count a matched instance of [`Mode::Existing`], and tell the batch; false when
+    /// that fails, and the evaluation stops with the error.
+    #[inline]
+    fn visited(&mut self) -> bool {
+        self.visits += 1;
+        if self.visits < VISIT_BATCH {
+            return true;
+        }
+        let Mode::Existing { visit: Some(v) } = self.mode else {
+            return true;
+        };
+        match v(std::mem::take(&mut self.visits)) {
+            Ok(()) => true,
+            Err(e) => {
+                self.err.get_or_insert(e);
+                self.stop = true;
+                self.abort.store(true, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
     /// Add a candidate to the output, charging the buffer's growth first (the new
     /// allocation while the old one is alive); false when it does not fit, and the
     /// evaluation stops.
@@ -896,6 +931,12 @@ impl<'a> Eval<'a> {
     pub fn exists(&mut self, s: Option<u64>, p: Option<u64>, o: Option<u64>) -> bool {
         let g = self.g;
         g.exists(&mut self.bmemo, s, p, o, self.end)
+    }
+
+    /// Whether the evaluation has stopped, for good.
+    #[inline]
+    pub fn stopped(&self) -> bool {
+        self.stop
     }
 
     /// Whether the evaluation reports rule instances (and so tracks their bodies).
@@ -1180,6 +1221,11 @@ impl<'a> Eval<'a> {
 
     /// Continue with a variable bound to `value` (or check it if already bound).
     pub fn bind_and_continue(&mut self, slot: Slot, value: u64, k: usize, b: &mut [u64]) {
+        // a builtin that binds many values, such as `listMember`, calls this for each, and
+        // its loop ends with the evaluation
+        if self.aborted() {
+            return;
+        }
         match slot {
             Slot::Var(v) if b[v] == 0 => {
                 b[v] = value;
@@ -1262,13 +1308,21 @@ impl<'a> Eval<'a> {
         {
             return;
         }
-        let existing = matches!(self.mode, Mode::Existing);
+        let existing = matches!(self.mode, Mode::Existing { .. });
+        if existing && !self.visited() {
+            return;
+        }
         for h in &rule.head {
             match h {
                 CHead::Triple(s, p, o) => {
                     let t = [self.val(*s, b), self.val(*p, b), self.val(*o, b)];
+                    // many instances can have one head, which goes out once
                     let emit = if existing {
                         self.g.contains(&t)
+                            && match self.see(t) {
+                                Some(new) => new,
+                                None => return,
+                            }
                     } else if self.g.known(&t) {
                         false
                     } else {

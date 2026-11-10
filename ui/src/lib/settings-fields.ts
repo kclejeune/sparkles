@@ -271,6 +271,16 @@ export const GRAPHRAG_FIELDS: readonly FieldDef[] = [
     help: 'Graph IRIs or patterns with *, one per line. Resources in these graphs are grouped into communities.',
   },
   {
+    path: 'reviewPolicy',
+    group: 'Build',
+    label: 'Review policy',
+    type: 'text',
+    optional: true,
+    maxLength: 256,
+    placeholder: 'a review policy name',
+    help: "Read the policy's accepted evidence and cite its claims and decisions. Needs activated configuration history.",
+  },
+  {
     path: 'projection.exclude',
     group: 'Build',
     label: 'Predicates left out',

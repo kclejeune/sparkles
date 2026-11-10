@@ -10,6 +10,7 @@
   import { auth } from '$lib/auth.svelte';
   import { poll } from '$lib/poll';
   import { reviewCounts } from '$lib/review-count.svelte';
+  import { watchCount } from '$lib/watch-count.svelte';
   import NavLinks from '$components/NavLinks.svelte';
   import Toasts from '$components/Toasts.svelte';
   import TopBar from '$components/TopBar.svelte';
@@ -25,6 +26,13 @@
     const ds = app.current;
     if (!ds || bare) return;
     const p = poll(() => reviewCounts.refresh(ds), { interval: 60_000 });
+    return () => p.stop();
+  });
+
+  // the unread matches of the caller's watches, on the top bar, at most once a minute
+  $effect(() => {
+    if (bare) return;
+    const p = poll(() => watchCount.refresh(), { interval: 60_000 });
     return () => p.stop();
   });
 

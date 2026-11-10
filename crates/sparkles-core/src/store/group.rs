@@ -684,40 +684,23 @@ impl Store {
         if let Some(staged) = p.text.take() {
             staged.apply(&p.snapshot);
         }
-        let generation = &p.snapshot.generation;
-        self.wal_end.store(p.wal_end, Ordering::Release);
-        if let Some(ix) = generation.wal_index.lock().as_mut() {
-            ix.note(wal::WalPoint {
-                seq: c.seq,
-                offset: p.wal_end,
-            });
-        }
-        if let Some(log) = self.changelog.as_ref().filter(|l| l.is_enabled()) {
-            log.push(changelog::Pending {
-                commit: changelog::ChangeCommit::of(
-                    &c,
-                    p.author.clone(),
-                    p.annotation.message.clone(),
-                ),
-                body: changelog::PendingBody::Log {
-                    generation: generation.clone(),
-                    changes: p.changes.clone(),
-                },
-            });
-        }
-        self.catalog.lock().append(c);
+        let change = self.change_of_log(
+            &c,
+            p.author.clone(),
+            p.annotation.message.clone(),
+            &p.snapshot.generation,
+            &p.changes,
+        );
         self.compaction.committed(c.timestamp_ms);
-        // The guard learns of the commit before anyone can see it published, so a writer
-        // that waited for the publication checks against the state this commit left.
-        if p.validation.is_some() {
-            self.guard_committed(c.seq);
-        }
-        self.deltas.noted(c.seq, generation, &p.changes);
-        self.note_configuration(c.seq, p.configuration);
-        self.current.store(p.snapshot.clone());
-        self.commits.send_replace(c.seq);
-        // after the publication: a worker that takes these pairs reads this state
-        self.embed_noted(&p.snapshot, &p.changes, c.seq, c.kind);
+        self.publish_committed(Publication::Commit(Committed {
+            info: c,
+            snapshot: p.snapshot.clone(),
+            configuration: p.configuration,
+            log_end: Some(p.wal_end),
+            changes: Some(&p.changes),
+            change,
+            validated: p.validation.is_some(),
+        }));
     }
 }
 
@@ -754,25 +737,9 @@ impl WriteTxn<'_> {
         let reserved = store.quota.reserve(bytes + terms + ann_bytes);
         self.check_storage_for(self.net_ins > 0, 0)?;
         let c = self.next_commit(validation.as_deref());
-        let mut snapshot = Snapshot {
-            cacheable: true,
-            dataset_id: self.base.dataset_id,
-            generation: generation.clone(),
-            delta: std::mem::take(&mut self.delta),
-            version: self.base.version + 1,
-            cache: self.base.cache.clone(),
-            results: self.base.results.clone(),
-            dvocab_len: generation.dvocab.len(),
-            commit: c.seq,
-            text: self.base.text.clone(),
-            geo: self.base.geo.clone(),
-            union_default_graph: self.base.union_default_graph,
-            geo_op_vertices: self.base.geo_op_vertices,
-            counts: Default::default(),
-            mask: None,
-            historical: false,
-            change_log: self.base.change_log.clone(),
-        };
+        let mut snapshot = SnapshotBuilder::after(&self.base, c.seq)
+            .delta(std::mem::take(&mut self.delta))
+            .build();
         // The index state of the speculative snapshot (X09 section 17.4, step 1). The
         // spatial view is a value computed from the base's, which a failed fence drops
         // with the snapshot. The full-text changes are only staged here, and nothing of
@@ -828,38 +795,24 @@ impl WriteTxn<'_> {
         let (annotation, ann) = store.annotate_queued(&c, message, || Some(self.change_lines()))?;
         let family = self.guard.family.clone();
         let w = &mut **self.guard;
-        let mut data = Vec::with_capacity(bytes as usize);
-        let mut rec = [0u8; WAL_REC];
-        for (op, q) in &self.log {
-            rec[0] = *op;
-            for j in 0..4 {
-                rec[1 + j * 8..9 + j * 8].copy_from_slice(&q[j].0.to_le_bytes());
-            }
-            data.extend_from_slice(&rec);
-        }
-        let configuration_flags = wal::append_configuration(&mut data, self.configuration)?;
-        rec[0] = WAL_COMMIT;
-        rec[1..9].copy_from_slice(&w.next_bnode.to_le_bytes());
-        commit::seal_wal_commit_unfenced(
-            &mut rec,
-            c.seq,
-            c.timestamp_ms,
-            c.kind,
-            configuration_flags
-                | (if c.unvalidated {
-                    commit::WAL_FLAG_UNVALIDATED
-                } else {
-                    0
-                })
-                | (if ann.is_some() {
-                    commit::WAL_FLAG_ANNOTATED
-                } else {
-                    0
-                }),
-            unfenced,
-            &data,
+        // The record says an annotation is expected when one is queued, so replay treats
+        // a flagged tail commit without its annotation as torn.
+        let annotated = if ann.is_some() {
+            commit::WAL_FLAG_ANNOTATED
+        } else {
+            0
+        };
+        let data = wal::encode_txn(
+            &self.log,
+            self.configuration,
+            w.next_bnode,
+            wal::Seal::of(&c, annotated, unfenced),
+        )?;
+        debug_assert_eq!(
+            data.len() as u64,
+            bytes,
+            "the queued bytes are the records'"
         );
-        data.extend_from_slice(&rec);
         // The records are not written here: the leader of the commit's fence writes them
         // with the rest of its prefix (X09 item 446). From here on the commit holds its
         // number and its place in the log, and a failure poisons the writer.

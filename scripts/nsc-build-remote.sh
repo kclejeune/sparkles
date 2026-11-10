@@ -153,7 +153,7 @@ if [ "${1:-}" = --run ]; then
   rustc -vV > "$dir/out/rustc.txt"
   cargo -V > "$dir/out/cargo.txt"
   for n in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTUP_TOOLCHAIN CARGO_BUILD_TARGET RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER \
-    MBX_REMOTE_URL MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE; do
+    MBX_REMOTE_URL MBX_CACHE_DIR MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE; do
     [ -z "${!n+x}" ] || printf '%s=%s\n' "$n" "${!n}"
   done > "$dir/out/env.txt"
   sha256sum "$dir/out/sparkles" | cut -d' ' -f1 > "$dir/out/sha256"

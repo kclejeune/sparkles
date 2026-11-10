@@ -2,11 +2,9 @@
 //! disjunctive rules (F24, "Nominals in the disjunctive rules"). Each case adds one
 //! disjunctive axiom that no other axiom meets, so that the rooted run takes it, and runs
 //! with counting off unless it says otherwise, on one and four threads under both
-//! expansion strategies.
-//!
-//! These are the regressions that the phase's plan writes before its code. They are
-//! ignored until the rooted run exists, since runs with individuals take the EL and Horn
-//! paths today and leave the disjunctive axiom out.
+//! expansion strategies. Every run asks for the rooted run with `Limits::rooted`, which
+//! is off by default, since item 804 lands it as an option: without it, a run with
+//! individuals takes the EL path and leaves the disjunctive axiom out.
 
 use sparkles_owl::classify::{Classification, Classifier, Consistency, Expansion, Limits, Tier};
 use sparkles_owl::model::*;
@@ -51,6 +49,7 @@ fn rooted(body: &str, counting: bool, asked: &[(&str, &str)]) -> Classification 
                 threads,
                 expansion,
                 counting,
+                rooted: true,
                 ..Limits::default()
             })
             .unwrap();
@@ -94,7 +93,6 @@ fn check(body: &str, yes: &[(&str, &str)], no: &[(&str, &str)]) {
 }
 
 #[test]
-#[ignore = "needs the rooted run of item 603 phase 6"]
 fn a_nominal_filler_takes_its_class_from_a_class_axiom() {
     check(
         "SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:o)))
@@ -106,7 +104,6 @@ fn a_nominal_filler_takes_its_class_from_a_class_axiom() {
 }
 
 #[test]
-#[ignore = "needs the rooted run of item 603 phase 6"]
 fn two_paths_meet_at_one_nominal_and_combine_their_cases() {
     // the cases B and C of o meet D of o, which the second path gives, so o is an E
     check(
@@ -121,7 +118,6 @@ fn two_paths_meet_at_one_nominal_and_combine_their_cases() {
 }
 
 #[test]
-#[ignore = "needs the rooted run of item 603 phase 6"]
 fn a_fact_one_class_gives_a_nominal_stays_conditional() {
     // A makes o a B only when A has an instance, so E, which also reaches o, is not an F
     check(
@@ -135,7 +131,6 @@ fn a_fact_one_class_gives_a_nominal_stays_conditional() {
 }
 
 #[test]
-#[ignore = "needs the rooted run of item 603 phase 6"]
 fn an_equality_of_individuals_carries_their_classes() {
     check(
         "SameIndividual(:a :b)
@@ -148,7 +143,6 @@ fn an_equality_of_individuals_carries_their_classes() {
 }
 
 #[test]
-#[ignore = "needs the rooted run of item 603 phase 6"]
 fn an_equality_of_individuals_carries_their_role_facts() {
     check(
         "SameIndividual(:a :b)
@@ -162,7 +156,7 @@ fn an_equality_of_individuals_carries_their_role_facts() {
 }
 
 #[test]
-#[ignore = "needs the rooted run of item 603 phase 6"]
+#[ignore = "needs the key reduction of item 805"]
 fn a_key_makes_two_individuals_with_a_shared_named_value_one() {
     // a and b are K and share the p-value c, so the key makes them one and b is a G
     check(
@@ -180,7 +174,6 @@ fn a_key_makes_two_individuals_with_a_shared_named_value_one() {
 }
 
 #[test]
-#[ignore = "needs the rooted run of item 603 phase 6"]
 fn a_has_value_restriction_is_an_existential_to_the_nominal() {
     check(
         "SubClassOf(:A ObjectHasValue(:r :o))
@@ -192,7 +185,6 @@ fn a_has_value_restriction_is_an_existential_to_the_nominal() {
 }
 
 #[test]
-#[ignore = "needs the rooted run of item 603 phase 6"]
 fn an_enumeration_is_a_case_analysis_over_its_individuals() {
     // every member of {a, b} is a D, so a class below the enumeration is too
     check(
@@ -214,7 +206,6 @@ fn inconsistent(body: &str) {
 }
 
 #[test]
-#[ignore = "needs the rooted run of item 603 phase 6"]
 fn a_singleton_in_a_class_and_its_complement_is_inconsistent() {
     inconsistent(
         "SubClassOf(ObjectOneOf(:o) :B)
@@ -224,7 +215,6 @@ fn a_singleton_in_a_class_and_its_complement_is_inconsistent() {
 }
 
 #[test]
-#[ignore = "needs the rooted run of item 603 phase 6"]
 fn contradictory_assertions_make_the_ontology_inconsistent() {
     // every class is satisfiable on its own, but a cannot be both
     inconsistent(
@@ -235,7 +225,6 @@ fn contradictory_assertions_make_the_ontology_inconsistent() {
 }
 
 #[test]
-#[ignore = "needs the rooted run of item 603 phase 6"]
 fn a_negative_property_assertion_meets_the_edge_a_class_gives() {
     inconsistent(
         "NegativeObjectPropertyAssertion(:r :a :o)
@@ -246,7 +235,6 @@ fn a_negative_property_assertion_meets_the_edge_a_class_gives() {
 }
 
 #[test]
-#[ignore = "needs the rooted run of item 603 phase 6"]
 fn individuals_both_the_same_and_different_are_inconsistent() {
     inconsistent(
         "SameIndividual(:a :b)
@@ -256,7 +244,6 @@ fn individuals_both_the_same_and_different_are_inconsistent() {
 }
 
 #[test]
-#[ignore = "needs the rooted run of item 603 phase 6"]
 fn a_disjunctive_fact_about_an_individual_closes_on_its_assertions() {
     // a is a B or a C, and C is closed for a, so a is a B, and so is the A that reaches it
     check(
@@ -270,7 +257,6 @@ fn a_disjunctive_fact_about_an_individual_closes_on_its_assertions() {
 }
 
 #[test]
-#[ignore = "needs the rooted run of item 603 phase 6"]
 fn a_minimum_of_two_into_one_nominal_needs_counting() {
     // read as ∃r.{o}, the minimum would make A a C
     let body = "SubClassOf(:A ObjectMinCardinality(2 :r ObjectOneOf(:o)))
@@ -283,7 +269,12 @@ fn a_minimum_of_two_into_one_nominal_needs_counting() {
     // without it the minimum alone is left out and reported, and not read as an
     // existential, while Tier D takes the rest
     let mut k = Classifier::of(&axioms(body));
-    let out = k.classify(&Limits::default()).unwrap();
+    let out = k
+        .classify(&Limits {
+            rooted: true,
+            ..Limits::default()
+        })
+        .unwrap();
     let left: Vec<String> = k
         .excluded()
         .iter()
@@ -300,7 +291,6 @@ fn a_minimum_of_two_into_one_nominal_needs_counting() {
 }
 
 #[test]
-#[ignore = "needs the rooted run of item 603 phase 6"]
 fn minimum_fillers_are_not_coloured_across_individuals() {
     // three sources each with two successors from a different pair of three individuals:
     // satisfiable, though globally disjoint fillers would ask to two-colour a triangle
@@ -320,7 +310,6 @@ fn minimum_fillers_are_not_coloured_across_individuals() {
 /// An irreflexive property beside a nominal is left out and reported, and the rooted run
 /// takes the rest, as it does with a minimum above one when counting is off.
 #[test]
-#[ignore = "needs the rooted run of item 603 phase 6"]
 fn an_irreflexive_property_beside_a_nominal_is_left_out() {
     // r(a, a) closes a loop that the rules check only on simple properties without loops
     let ax = axioms(
@@ -330,7 +319,12 @@ fn an_irreflexive_property_beside_a_nominal_is_left_out() {
          SubClassOf(ObjectSomeValuesFrom(:r :B) :C)",
     );
     let mut k = Classifier::of(&ax);
-    let out = k.classify(&Limits::default()).unwrap();
+    let out = k
+        .classify(&Limits {
+            rooted: true,
+            ..Limits::default()
+        })
+        .unwrap();
     let left: Vec<_> = k.excluded().into_iter().map(|e| e.axiom).collect();
     assert!(
         matches!(left[..], [AxiomKind::IrreflexiveObjectProperty(_)]),
@@ -339,4 +333,126 @@ fn an_irreflexive_property_beside_a_nominal_is_left_out() {
     assert_eq!(out.stats.tier, Tier::Disjunctive);
     assert!(out.stats.clauses > 0, "the rooted run takes the rest");
     assert!(out.taxonomy.is_subclass(&c("A"), &c("C")));
+}
+
+/// A rooted run without counting has a bound on its derived conclusions, `Limits::dl_work`.
+/// A run that passes it classifies again without the rooted rules, which leaves the
+/// disjunctive axioms out and reports them, as a run without the option does, and says so
+/// in `Stats::dl_rooted_over`.
+#[test]
+fn a_rooted_run_past_its_bound_answers_without_the_rooted_rules() {
+    // a is a B, since it is a B or a C and not a C, so the A that reaches it is a D; the
+    // EL rules alone leave the union and the complement out and do not find it
+    let body = "ClassAssertion(ObjectUnionOf(:B :C) :a)
+                ClassAssertion(ObjectComplementOf(:C) :a)
+                SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:a)))
+                SubClassOf(ObjectSomeValuesFrom(:r :B) :D)";
+    let ax = axioms(body);
+    let mut plain = Classifier::of(&ax);
+    let want = plain.classify(&Limits::default()).unwrap();
+    assert!(!want.taxonomy.is_subclass(&c("A"), &c("D")));
+    let left = plain.excluded().len();
+    assert!(left > 0, "the EL path leaves the disjunctive axioms out");
+    for threads in [1, 4] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                rooted: true,
+                dl_work: Some(1),
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(
+            out.stats.dl_rooted_over,
+            "{threads} threads: the bound did not fall back"
+        );
+        assert!(out.stats.dl_over_budget);
+        assert!(!out.stats.dl_counting_over);
+        assert!(out.complete);
+        assert_eq!(out.consistency, Consistency::Consistent);
+        assert_eq!(k.excluded().len(), left, "{:#?}", k.excluded());
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
+        assert_eq!(out.stats.tier, want.stats.tier);
+    }
+    // within the bound the rooted run answers in full
+    let out = rooted(body, false, &[("A", "D")]);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+    assert!(!out.stats.dl_rooted_over);
+    assert!(!out.stats.dl_over_budget);
+}
+
+/// The bound's stop is the run's own, not the caller's, so a run that may answer in part
+/// still falls back to the default answer, complete, instead of a partial answer.
+#[test]
+fn a_rooted_run_past_its_bound_falls_back_though_it_may_answer_in_part() {
+    let body = "ClassAssertion(ObjectUnionOf(:B :C) :a)
+                ClassAssertion(ObjectComplementOf(:C) :a)
+                SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:a)))
+                SubClassOf(ObjectSomeValuesFrom(:r :B) :D)";
+    let ax = axioms(body);
+    for threads in [1, 4] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                rooted: true,
+                partial: true,
+                dl_work: Some(1),
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(out.stats.dl_rooted_over, "{threads} threads");
+        assert!(out.stats.dl_over_budget);
+        assert!(
+            out.complete,
+            "{threads} threads: a partial answer instead of the fallback"
+        );
+        assert!(out.incomplete.is_empty());
+        assert_eq!(out.consistency, Consistency::Consistent);
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
+        assert!(!k.excluded().is_empty());
+    }
+}
+
+/// A rooted run that counts keeps the counting bound: past it the run starts again
+/// without counting, with the rooted bound, and past that one without the rooted rules.
+#[test]
+fn a_rooted_run_that_counts_falls_back_twice_past_a_tiny_bound() {
+    let body = "ClassAssertion(ObjectUnionOf(:B :C) :a)
+                ClassAssertion(ObjectComplementOf(:C) :a)
+                SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:a)))
+                SubClassOf(:A ObjectMaxCardinality(1 :r))
+                SubClassOf(ObjectSomeValuesFrom(:r :B) :D)";
+    let ax = axioms(body);
+    for (threads, partial) in [(1, false), (4, false), (1, true), (4, true)] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                rooted: true,
+                counting: true,
+                partial,
+                dl_work: Some(1),
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(
+            out.stats.dl_counting_over,
+            "{threads} threads, partial {partial}"
+        );
+        assert!(
+            out.stats.dl_rooted_over,
+            "{threads} threads, partial {partial}"
+        );
+        assert!(out.stats.dl_over_budget);
+        assert!(out.complete);
+        assert_eq!(out.consistency, Consistency::Consistent);
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
+        assert!(!k.excluded().is_empty());
+    }
+    // with a bound the run finishes within, it answers in full with counting
+    let out = rooted(body, true, &[("A", "D")]);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+    assert!(!out.stats.dl_over_budget);
 }

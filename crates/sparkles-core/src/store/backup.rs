@@ -2096,7 +2096,9 @@ impl Store {
     /// pass changed a circuit in memory, before any checkpoint, and
     /// `view-checkpoint-written` once a checkpoint is synced under its temporary name,
     /// before the rename. Both run with the view's state locked, so their hooks must
-    /// not call the views.
+    /// not call the views. `branch-info-main-captured` runs in `branch_info("main")`
+    /// after it copied the branch table's fields and released the table, before it
+    /// reads the head.
     #[cfg(any(test, feature = "failpoints"))]
     #[doc(hidden)]
     pub fn set_failpoint(&self, name: &'static str, hook: Option<Failpoint>) {

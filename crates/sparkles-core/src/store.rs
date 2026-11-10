@@ -79,10 +79,14 @@ mod preflight_tests;
 mod preparation;
 mod preview;
 pub mod prewarm;
+mod publish;
+#[cfg(test)]
+mod publish_tests;
 mod quota;
 mod replay;
 mod schedule;
 mod simulation;
+mod snapshot;
 #[cfg(feature = "text")]
 pub(crate) mod text_recovery;
 // the geometry tests are the only users
@@ -92,6 +96,8 @@ mod vector;
 pub(crate) use diff::QuadKey;
 pub(crate) use embed::embed_query_text;
 pub use embed::embed_texts;
+use publish::{Committed, Publication};
+use snapshot::{Shared, SnapshotBuilder};
 pub(crate) mod wal;
 pub use backup::{
     BackupBranch, BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard,
@@ -2010,7 +2016,6 @@ impl Store {
     ) -> Store {
         let cache = Store::block_cache_for(&opts);
         let results = Store::result_cache_for(&opts);
-        let dvocab_len = gen_.dvocab.len();
         let mut limits = Store::log_limits(&opts);
         if limits.default_max_bytes == 0 || limits.default_max_bytes > 64 << 20 {
             limits.default_max_bytes = 64 << 20;
@@ -2020,25 +2025,21 @@ impl Store {
             root: None,
             group: None,
             commit_stats: Default::default(),
-            current: Arc::new(ArcSwap::from_pointee(Snapshot {
-                cacheable: true,
-                dataset_id,
-                generation: gen_,
-                delta: Delta::default(),
-                version: 0,
-                cache: cache.clone(),
-                results: results.clone(),
-                dvocab_len,
-                commit: root.seq,
-                text: None,
-                geo: None,
-                union_default_graph: opts.union_default_graph,
-                geo_op_vertices: opts.geo_op_vertices,
-                counts: Default::default(),
-                mask: None,
-                historical: false,
-                change_log: changelog.clone(),
-            })),
+            current: Arc::new(ArcSwap::from_pointee(
+                SnapshotBuilder::of_generation(
+                    Shared {
+                        dataset_id,
+                        cache: &cache,
+                        results: &results,
+                        union_default_graph: opts.union_default_graph,
+                        geo_op_vertices: opts.geo_op_vertices,
+                        change_log: changelog.clone(),
+                    },
+                    gen_,
+                    root.seq,
+                )
+                .build(),
+            )),
             writer: Arc::new(Mutex::new(WriterState {
                 wal: None,
                 wal_len: 0,
@@ -2453,7 +2454,6 @@ impl Store {
         gen_.dvocab.settle()?;
         #[cfg(test)]
         open_step("vocab-settled");
-        let dvocab_len = gen_.dvocab.len();
         *gen_.wal_index.lock() = Some(wal_index);
         let mut history = open_history(root, dataset_id, gen_no, head.seq, true, &catalog)?;
         // the dataset's source holds, which its branches share, before anything is
@@ -2517,28 +2517,26 @@ impl Store {
                 .group_commit
                 .then(|| Arc::new(group::Coordinator::default())),
             commit_stats: Default::default(),
-            current: Arc::new(ArcSwap::from_pointee(Snapshot {
-                cacheable: true,
-                dataset_id: branching
-                    .ident
-                    .as_ref()
-                    .map_or(dataset_id, |i| i.dataset_id),
-                generation: gen_,
-                delta,
-                version,
-                cache: cache.clone(),
-                results: results.clone(),
-                dvocab_len,
-                commit: head.seq,
-                text: None,
-                geo: None,
-                union_default_graph: opts.union_default_graph,
-                geo_op_vertices: opts.geo_op_vertices,
-                counts: Default::default(),
-                mask: None,
-                historical: false,
-                change_log: changelog.clone(),
-            })),
+            current: Arc::new(ArcSwap::from_pointee(
+                SnapshotBuilder::of_generation(
+                    Shared {
+                        dataset_id: branching
+                            .ident
+                            .as_ref()
+                            .map_or(dataset_id, |i| i.dataset_id),
+                        cache: &cache,
+                        results: &results,
+                        union_default_graph: opts.union_default_graph,
+                        geo_op_vertices: opts.geo_op_vertices,
+                        change_log: changelog.clone(),
+                    },
+                    gen_,
+                    head.seq,
+                )
+                .delta(delta)
+                .version(version)
+                .build(),
+            )),
             writer: Arc::new(Mutex::new(WriterState {
                 wal: Some(BufWriter::new(wal)),
                 wal_len,
@@ -3092,25 +3090,14 @@ impl Store {
         } else {
             generation.dvocab.len()
         };
-        let snap = Arc::new(Snapshot {
-            cacheable: true,
-            dataset_id: self.owner_dataset_id(),
-            generation,
-            delta,
-            version: 0,
-            cache: self.cache.clone(),
-            results: self.results.clone(),
-            dvocab_len,
-            commit: seq,
-            text: None,
-            geo: self.historical_geo(),
-            union_default_graph: self.opts.union_default_graph,
-            geo_op_vertices: self.opts.geo_op_vertices,
-            counts: Default::default(),
-            mask: None,
-            historical: true,
-            change_log: self.changelog.clone(),
-        });
+        let snap = Arc::new(
+            self.snapshot_of(generation, seq)
+                .delta(delta)
+                .dvocab_len(dvocab_len)
+                .geo(self.historical_geo())
+                .historical(true)
+                .build(),
+        );
         if memory.is_some() {
             Self::cache_limited_snapshot(
                 &mut h,
@@ -5525,26 +5512,14 @@ impl Store {
             w.next_bnode = w.next_bnode.max(meta.next_bnode);
         }
         let head_seq = w.head.seq;
+        // not a committed state: its result cache is its own and empty
         let candidate = || {
-            Arc::new(Snapshot {
-                cacheable: false,
-                dataset_id: self.owner_dataset_id(),
-                generation: gen_.clone(),
-                delta: Delta::default(),
-                version: 0,
-                cache: self.cache.clone(),
-                results: Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)),
-                dvocab_len: gen_.dvocab.len(),
-                commit: head_seq,
-                text: None,
-                geo: None,
-                union_default_graph: self.opts.union_default_graph,
-                geo_op_vertices: self.opts.geo_op_vertices,
-                counts: Default::default(),
-                mask: None,
-                historical: false,
-                change_log: self.changelog.clone(),
-            })
+            Arc::new(
+                self.snapshot_of(gen_.clone(), head_seq)
+                    .cacheable(false)
+                    .results(Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)))
+                    .build(),
+            )
         };
         // the bulk commit is validated on the built generation, before anything is published
         let validation = match self.run_guard(snap, candidate, bulk.kind, changes, o, head_seq) {
@@ -5658,36 +5633,18 @@ impl Store {
         // the switch is the commit point: a failure after it leaves the published state
         // behind the durable one, so later writes are refused
         w.head = head;
-        self.catalog.lock().append(head);
-        self.forget_annotations();
-        self.compaction
-            .bulk_committed(head.seq, head.timestamp_ms, started.elapsed());
         if let Err(e) = self.add_prefixes(meta.prefixes.clone()) {
             w.poisoned = true;
             return Err(e);
         }
+        self.compaction
+            .bulk_committed(head.seq, head.timestamp_ms, started.elapsed());
         let old = snap.generation.dir.clone();
         let old_name = snap.generation.name.clone();
-        let dvocab_len = gen_.dvocab.len();
-        let mut new_snap = Snapshot {
-            cacheable: true,
-            dataset_id: self.owner_dataset_id(),
-            generation: gen_,
-            delta: Delta::default(),
-            version: snap.version + 1,
-            cache: self.cache.clone(),
-            results: self.results.clone(),
-            dvocab_len,
-            commit: head.seq,
-            text: None,
-            geo: None,
-            union_default_graph: self.opts.union_default_graph,
-            geo_op_vertices: self.opts.geo_op_vertices,
-            counts: Default::default(),
-            mask: None,
-            historical: false,
-            change_log: self.changelog.clone(),
-        };
+        let mut new_snap = self
+            .snapshot_of(gen_, head.seq)
+            .version(snap.version + 1)
+            .build();
         self.rebuild_text_locked(&mut new_snap, &prior);
         // the bulk commit's changes, while the state before it is at hand
         let txn_log: &[(u8, [Id; 4])] = match changes {
@@ -5701,7 +5658,7 @@ impl Store {
             log: txn_log,
             bulk: extra_quads,
         });
-        self.log_bulk_commit(
+        let change = self.bulk_change(
             &head,
             message.clone(),
             o.author.clone(),
@@ -5711,10 +5668,17 @@ impl Store {
         );
         // a new generation needs its own spatial base
         self.rebuild_geo_locked(&mut new_snap, snap);
-        self.remember_past(head.seq);
-        self.note_configuration(head.seq, configuration);
-        self.current.store(Arc::new(new_snap));
-        self.commits.send_replace(head.seq);
+        // The bulk commit has no change list, so the tail announces no delta, and it
+        // schedules its own index work below.
+        self.publish_committed(Publication::Commit(Committed {
+            info: head,
+            snapshot: Arc::new(new_snap),
+            configuration,
+            log_end: None,
+            changes: None,
+            change,
+            validated: validation.is_some(),
+        }));
         // and its own vector indexes, built in the background
         self.vectors_switched(snap);
         // a bulk commit has no log to schedule embeddings from
@@ -5752,9 +5716,6 @@ impl Store {
                     let _ = std::fs::remove_dir_all(old);
                 }
             }
-        }
-        if validation.is_some() {
-            self.guard_committed(head.seq);
         }
         // a linked branch that rebuilt no longer reads its upstream's files
         self.release_link_if_rebuilt();
@@ -6493,31 +6454,19 @@ impl WriteTxn<'_> {
     /// result cache. Its data differs from that committed identity, so result and
     /// projection caches must neither be read nor populated through this view.
     pub fn view(&self) -> Snapshot {
-        Snapshot {
-            cacheable: false,
-            dataset_id: self.base.dataset_id,
-            generation: self.base.generation.clone(),
-            delta: self.delta.clone(),
-            version: self.base.version,
-            cache: self.base.cache.clone(),
-            results: Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)),
-            dvocab_len: self.base.generation.dvocab.len(),
-            commit: self.base.commit,
+        SnapshotBuilder::of_base(&self.base)
+            .cacheable(false)
+            .results(Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)))
+            .delta(self.delta.clone())
             // the full-text index does not cover this transaction's changes either, and
             // a search has no plan without it: refused once there are changes
-            text: match &self.base.text {
+            .text(match &self.base.text {
                 Some(t) if self.is_dirty() => Some(Arc::new(t.with_uncommitted_changes())),
                 t => t.clone(),
-            },
+            })
             // the index does not cover this transaction's changes: plans without it
-            geo: self.base.geo.as_ref().map(|v| Arc::new(v.for_txn())),
-            union_default_graph: self.base.union_default_graph,
-            geo_op_vertices: self.base.geo_op_vertices,
-            counts: Default::default(),
-            mask: None,
-            historical: false,
-            change_log: self.base.change_log.clone(),
-        }
+            .geo(self.base.geo.as_ref().map(|v| Arc::new(v.for_txn())))
+            .build()
     }
 
     pub fn base(&self) -> &Arc<Snapshot> {
@@ -7049,26 +6998,6 @@ impl WriteTxn<'_> {
         }
         let w = &mut **self.guard;
         if let Some(wal) = w.wal.as_mut() {
-            let mut data = Vec::with_capacity(
-                (self.log.len() + 1 + usize::from(self.configuration_expected)) * WAL_REC,
-            );
-            let mut rec = [0u8; WAL_REC];
-            for (op, q) in &self.log {
-                rec[0] = *op;
-                for j in 0..4 {
-                    rec[1 + j * 8..9 + j * 8].copy_from_slice(&q[j].0.to_le_bytes());
-                }
-                data.extend_from_slice(&rec);
-            }
-            let configuration_flags = wal::append_configuration(&mut data, self.configuration)?;
-            rec[0] = WAL_COMMIT;
-            rec[1..9].copy_from_slice(&next_bnode.to_le_bytes());
-            let flags = configuration_flags
-                | if c.unvalidated {
-                    commit::WAL_FLAG_UNVALIDATED
-                } else {
-                    0
-                };
             // the record says no earlier commit may be missing from disk, so a fence
             // that is still running would make that untrue
             debug_assert!(
@@ -7079,8 +7008,14 @@ impl WriteTxn<'_> {
                     && w.head.seq == self.store.current.load().commit,
                 "an ordinary commit while group commit has commits in flight"
             );
-            commit::seal_wal_commit(&mut rec, c.seq, c.timestamp_ms, c.kind, flags, &data);
-            data.extend_from_slice(&rec);
+            // The records carry no `WAL_FLAG_ANNOTATED`: the annotation above is durable
+            // before them, so replay never has to tell a torn one from a missing one.
+            let data = wal::encode_txn(
+                &self.log,
+                self.configuration,
+                next_bnode,
+                wal::Seal::of(&c, 0, 0),
+            )?;
             // once the first byte is written, a failure leaves the WAL in an unknown
             // state: refuse further writes, so a seq can never be written twice
             let tail = w.tail.clone();
@@ -7179,14 +7114,11 @@ impl WriteTxn<'_> {
             self.store
                 .quota
                 .set_vocab_preallocated(gen_.dvocab.preallocated());
-            self.store.wal_end.store(w.wal_len, Ordering::Relaxed);
-            if let Some(ix) = gen_.wal_index.lock().as_mut() {
-                ix.note(wal::WalPoint {
-                    seq: c.seq,
-                    offset: w.wal_len,
-                });
-            }
         }
+        // the commit's records end where the log ends now, when it has a log
+        let log_end = w.wal.is_some().then_some(w.wal_len);
+        // The tap takes the commit under the writer lock, as the group path does before
+        // it enqueues, so a compaction that is building carries it over.
         if let Some(tap) = self.guard.tap.as_mut() {
             if tap.active.load(Ordering::Acquire) {
                 tap.commits.push(compaction::TapCommit {
@@ -7199,63 +7131,35 @@ impl WriteTxn<'_> {
                 self.guard.tap = None;
             }
         }
-        if let Some(log) = self.store.changelog.as_ref().filter(|l| l.is_enabled()) {
-            // the background writer turns the ids into keys
-            log.push(changelog::Pending {
-                commit: changelog::ChangeCommit::of(
-                    &c,
-                    self.opts.author.clone(),
-                    annotation.message.clone(),
-                ),
-                body: changelog::PendingBody::Log {
-                    generation: gen_.clone(),
-                    changes: self.log.clone(),
-                },
-            });
-        }
+        let change = self.store.change_of_log(
+            &c,
+            self.opts.author.clone(),
+            annotation.message.clone(),
+            gen_,
+            &self.log,
+        );
         self.guard.head = c;
-        self.store.catalog.lock().append(c);
-        self.store.forget_annotations();
         self.store.compaction.committed(c.timestamp_ms);
         if let Some(m) = self.merge
             && let Some(set) = self.store.branching.set()
         {
             set.note_merges(self.store.dataset_id, &[m], false);
         }
-        let version = self.base.version + 1;
-        let mut snap = Snapshot {
-            cacheable: true,
-            dataset_id: self.base.dataset_id,
-            generation: gen_.clone(),
-            delta: std::mem::take(&mut self.delta),
-            version,
-            cache: self.base.cache.clone(),
-            results: self.base.results.clone(),
-            dvocab_len: gen_.dvocab.len(),
-            commit: c.seq,
-            text: self.base.text.clone(),
-            geo: self.base.geo.clone(),
-            union_default_graph: self.base.union_default_graph,
-            geo_op_vertices: self.base.geo_op_vertices,
-            counts: Default::default(),
-            mask: None,
-            historical: false,
-            change_log: self.base.change_log.clone(),
-        };
+        let mut snap = SnapshotBuilder::after(&self.base, c.seq)
+            .delta(std::mem::take(&mut self.delta))
+            .build();
         self.store.maintain_text(&mut snap, &self.log);
         self.store.maintain_geo(&mut snap, &self.base, &self.log);
-        self.store.remember_past(c.seq);
         let snap = Arc::new(snap);
-        // before the publication: a view runtime woken by it finds the changes
-        self.store.deltas.noted(c.seq, gen_, &self.log);
-        self.store.note_configuration(c.seq, self.configuration);
-        self.store.current.store(snap.clone());
-        self.store.commits.send_replace(c.seq);
-        // after the publication: a worker that takes these pairs reads this state
-        self.store.embed_noted(&snap, &self.log, c.seq, self.kind);
-        if validation.is_some() {
-            self.store.guard_committed(c.seq);
-        }
+        self.store.publish_committed(Publication::Commit(Committed {
+            info: c,
+            snapshot: snap,
+            configuration: self.configuration,
+            log_end,
+            changes: Some(&self.log),
+            change,
+            validated: validation.is_some(),
+        }));
         Ok(Receipt {
             dataset_id: self.store.owner_dataset_id(),
             committed: true,
@@ -7942,25 +7846,23 @@ pub(crate) fn replay_wal(
     // whether each quad a transaction changes was present when it began (for the
     // commit's net counts), from its first change in the transaction
     let mut start: rustc_hash::FxHashMap<Key, bool> = Default::default();
-    let probe = Snapshot {
-        cacheable: false,
-        dataset_id: uuid::Uuid::nil(),
-        generation: from.generation.clone(),
-        delta: Delta::default(),
-        version: 0,
-        cache: cache.clone(),
-        results: from.results.clone(),
-        dvocab_len: u64::MAX,
-        commit: 0,
-        text: None,
-        geo: None,
-        union_default_graph: false,
-        geo_op_vertices: StoreOptions::default().geo_op_vertices,
-        counts: Default::default(),
-        mask: None,
-        historical: false,
-        change_log: None,
-    };
+    // a probe of the generation alone, for the counts: it belongs to no dataset, is no
+    // committed state and reads every term of the delta vocabulary
+    let probe = SnapshotBuilder::of_generation(
+        Shared {
+            dataset_id: uuid::Uuid::nil(),
+            cache,
+            results: from.results,
+            union_default_graph: false,
+            geo_op_vertices: StoreOptions::default().geo_op_vertices,
+            change_log: None,
+        },
+        from.generation.clone(),
+        0,
+    )
+    .cacheable(false)
+    .dvocab_len(u64::MAX)
+    .build();
     // the quads of the base, then of each replayed commit
     let mut quads = (from.generation.meta.quads + from.start.inserts() as u64)
         .saturating_sub(from.start.deletes() as u64);

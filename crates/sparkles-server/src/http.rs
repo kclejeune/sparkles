@@ -429,6 +429,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let app = app.merge(crate::resources::http::routes());
     // outbound notifications: status and test sends (C21)
     let app = app.merge(crate::notify::http::routes());
+    let app = app.merge(crate::watches::http::routes());
     // assistant settings, ask history and usage (C18 §3.5, §5.5, §6.4)
     let app = app.merge(crate::assistant::routes());
     // the asking pipeline (C18 §5)

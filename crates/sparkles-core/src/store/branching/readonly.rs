@@ -804,26 +804,26 @@ impl Store {
             settings,
             &mut budget,
         )?;
-        let snapshot = Arc::new(Snapshot {
-            dataset_id: set.dataset_id,
-            generation,
-            delta,
-            version: 0,
-            cache: self.cache.clone(),
-            results: self.results.clone(),
-            cacheable: true,
-            dvocab_len: terms,
-            commit: metadata.seq,
-            // Ordinary past snapshots deliberately have no live full-text index.
-            text: None,
-            geo,
-            union_default_graph: set.opts.union_default_graph,
-            geo_op_vertices: set.opts.geo_op_vertices,
-            historical: true,
-            counts: Default::default(),
-            mask: None,
-            change_log: Some(log.value),
-        });
+        // Ordinary past snapshots deliberately have no live full-text index.
+        let snapshot = Arc::new(
+            SnapshotBuilder::of_generation(
+                Shared {
+                    dataset_id: set.dataset_id,
+                    cache: &self.cache,
+                    results: &self.results,
+                    union_default_graph: set.opts.union_default_graph,
+                    geo_op_vertices: set.opts.geo_op_vertices,
+                    change_log: Some(log.value),
+                },
+                generation,
+                metadata.seq,
+            )
+            .delta(delta)
+            .dvocab_len(terms)
+            .geo(geo)
+            .historical(true)
+            .build(),
+        );
         budget.check()?;
         Ok(OriginRead::View(
             snapshot,

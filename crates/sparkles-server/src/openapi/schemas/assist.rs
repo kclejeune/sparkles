@@ -2756,11 +2756,18 @@ fn graphrag(put: &mut dyn FnMut(&str, J)) {
                         "droppedUnsupported": or_null(int()),
                         "sourceCommit": or_null(int()),
                         "activity": obj(&[], json!({ "model": string(), "inputTokens": int(), "outputTokens": int(), "startedAt": string() })),
+                        "reviewPolicy": with_desc(obj(&["iri"], json!({
+                            "iri": string(),
+                            "version": or_null(int()),
+                            "configuration": with_desc(or_null(string()), "The configuration history's lineage UUID and the SHA-256 of the selected generation, joined with a slash."),
+                        })), "The review policy the report was read under. A report without one has no such member."),
                         "findings": array(obj(&["text"], json!({
                             "text": string(),
                             "about": strings(),
                             "cites": with_desc(strings(), "Cited facts as N-Triples triple terms, reifiers, and cited child findings."),
                             "unmatchedNames": strings(),
+                            "claims": with_desc(strings(), "Under a review policy, the IRIs of the accepted claims behind the cited facts."),
+                            "decisions": with_desc(strings(), "Under a review policy, the IRIs of those claims' current decisions."),
                         }))),
                     })),
                 }),

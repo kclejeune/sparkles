@@ -1,10 +1,11 @@
 # X16: Storage consolidation
 
-> **Status:** planned. The plan below is ordered and audited against the code.
+> **Status:** in progress. The plan below is ordered and audited against the code, and
+> phase 2 has shipped.
 >
-> **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 479, 484 and 830 to 833
-> hold the phases that are ready to start, and each is named in its phase. The later
-> candidate phases get their numbers when their prerequisites land.
+> **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 479 and 830 to 833
+> hold the phases that are ready to start, and each is named in its phase. Item 484 is
+> complete. The later candidate phases get their numbers when their prerequisites land.
 
 The design covers a first-release format cutoff, budgeted readers through one Control
 trait, a shared commit publish tail, one load plan, partitioned vocabularies with
@@ -95,8 +96,8 @@ which phases run at the same time.
 
 The cutoff removes every reader of a form that no current writer produces, and keeps
 every form that a current writer still produces, with two exceptions that mark the cutoff
-itself, the dataset file's `format` and the index format. It follows item 343, as the roadmap
-orders, unless the maintainer takes [open decision 2](#open-decisions).
+itself, the dataset file's `format` and the index format. It does not wait for item 343,
+as [decision 2](#decisions) records.
 
 The table gives each kind's decision. Every refusal goes through `FileKind::refuse`, which
 already names `sparkles dump` from the release that wrote the file and `sparkles load`.
@@ -285,8 +286,8 @@ probe of `replace_with`, and treats a graph restriction, a triple protection, a 
 admission and a delete row as reasons for the transactional path in every entry point. The
 table test includes a patch whose delete row removes nothing and still takes the
 transactional path. The group admission's
-`Fallback::Bulk` reads the same plan. SPARQL `LOAD` keeps inserting per quad unless the
-[open decisions](#open-decisions) say otherwise.
+`Fallback::Bulk` reads the same plan. SPARQL `LOAD` keeps inserting per quad, as
+[decision 4](#decisions) records.
 
 The gate is the load benchmark of [docs/benchmarks](../../benchmarks/README.md) at 1.05M
 and 10.5M with no load slower, and the table test, which records the plan each entry
@@ -465,11 +466,10 @@ times the table size on disk.
 lag objectives, region-aware read routing and WAN write forwarding. F10 has no region
 concept. Phase 3 write forwarding is the nearest piece. It depends on item 66.
 
-## Open decisions
+## Decisions
 
-These go to the maintainer. The plan recommends an answer for each. Where a decision
-would change the roadmap's order or scope, the roadmap's current order stands until the
-maintainer takes it.
+The maintainer took the recommended answer to each question below, and the roadmap
+follows them.
 
 1. **Dump and reload for every pre-release form.** The alternative is one `migrate`
    step that compacts a pre-release generation into the first-release format, as X12
@@ -482,8 +482,7 @@ maintainer takes it.
    pre-release readers does not depend on that, and a later settings change follows the
    ordinary format rules. The recommendation is to start Phase 1 now with a fixture
    labelled by its commit, and to keep the dependency only for the release fixture job
-   of the format-policy phase, which writes the `0.1.0` fixture after item 343. The
-   roadmap's Release and Sequencing sections keep the current order until this is taken.
+   of the format-policy phase, which writes the `0.1.0` fixture after item 343.
 3. **One index format.** The first release could keep writing format 3 for a generation
    without features and 4 with them, as X11 §7.2 chose to keep pre-release readers
    working, and keep the sparse index optional. The recommendation is one format, 5,
@@ -494,12 +493,14 @@ maintainer takes it.
    Letting it take the bulk plan when it is the only operation of its request would make
    a large `LOAD` as fast as `sparkles load`, but changes which path an update takes and
    therefore its memory and lock profile. The recommendation is to leave `LOAD` alone in
-   Phase 4 and record the choice in the load plan's table.
+   Phase 4 and record the choice in the load plan's table. Item 846 takes the bulk plan
+   for a large `LOAD` with its own memory and lock measurement.
 5. **The import transport's reader.** The unwired import transport writes `minimumReader`
    9 for an imported destination while the build reads up to 8. The recommendation is to
    leave it to the lane that wires the import, which raises `DATASET_READER` and the
    registry together once the capability has a contract, and not to widen the registry
-   to make staged bytes open before then.
+   to make staged bytes open before then. Item 61, which wires the import, names the
+   mismatch.
 
 ## Dependencies
 
@@ -509,9 +510,8 @@ maintainer takes it.
   Phase 7.
 * Item 409 settles the cost of controlled preparation before the vocabulary scanners move
   to the Control trait in stage 2 of item 830.
-* Item 343 lands before the format cutoff, item 479, which lands before the release
-  artifacts of items 58 and 59. Open decision 2 proposes to narrow the first dependency
-  to the release fixture.
+* Item 343 lands before the `0.1.0` release fixture of the format-policy phase, and the
+  format cutoff of item 479 lands before the release artifacts of items 58 and 59.
 * Fragment composition in [X18](../X18-fragment-composition/README.md) follows this
   workstream.
 
@@ -581,7 +581,28 @@ and a full key check of `vocab.idx` at open. The gates were the format fixture t
 `tests/power_loss.rs`, `group_runs`, the `sparkles-core` lib tests and the review rounds
 recorded in the lane's audit directory.
 
-[Item 455](../../ROADMAP.md) tracks the remaining phases. The plan above replaced
+Phase 2 is built. `wal::encode_txn` in `store/wal.rs` encodes a transaction's records for
+the serial, group and compaction writers, which pass their own flags and unfenced count
+through a `Seal`, and the compaction writer passes translated ids. `SnapshotBuilder` in
+`store/snapshot.rs` replaced the twelve full `Snapshot` literals with two starts, an
+opened generation and the previous snapshot, and the seven struct-update literals stay.
+`Store::publish_committed` in `store/publish.rs` takes a logical commit from the serial
+path, the group leader and the bulk rebuild, and a generation switch from the compaction
+switch, which calls `guard.rekey` between `current.store` and `send_replace`. The tail
+notifies the guard of a logical commit before `current.store`, which the group path did
+and the serial and bulk paths did after, and a regression test holds a serial committer
+and a bulk committer right after their publication while a waiter woken through
+`commits` reads what the guard knows. The compaction tap stays under the writer lock in
+each path, and the quota accounting stays with each path's write, since the serial path
+counts the growth of its files and the group leader settles a prefix's reservations. No
+write that makes a commit durable moved, and no synchronization changed order. The
+bookkeeping around the publication did change places. The compaction clock and the
+writer head move before the catalog append on the serial and group paths, and the bulk
+path writes the generation's prefixes before the tail appends its catalog entry, so a
+failed prefix write leaves the catalog and the snapshot in step. No on-disk format
+changed.
+
+[Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the
 code, which found about 114 twin readers rather than 80, three publish paths with a
 compaction writer rather than three paths alone, a 17-field snapshot rather than 20, and

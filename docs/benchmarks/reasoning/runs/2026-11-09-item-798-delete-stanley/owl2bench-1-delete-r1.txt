@@ -1,0 +1,1 @@
+1359259 inferred triples (152 rules, 1279 ms; full, 6 iterations, because the deletion held more than 129533104 bytes beside the closure, more than a full run holds; inferred graph +8 -41437) → graph <urn:x-sparkles:inferred>

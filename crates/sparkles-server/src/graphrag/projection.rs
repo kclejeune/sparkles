@@ -69,11 +69,40 @@ fn esc_iri(iri: &str) -> Option<String> {
     oxrdf::NamedNode::new(iri).ok().map(|n| n.to_string())
 }
 
+/// What a run under a review policy reads besides the projection's graphs: the
+/// policy's output graph, and never a graph of another evidence role (spec C25,
+/// "Reports on accepted evidence").
+#[derive(Clone, Debug, Default)]
+pub struct Extra<'a> {
+    pub output: Option<&'a str>,
+    pub excluded: Option<&'a BTreeSet<String>>,
+}
+
+impl Extra<'_> {
+    /// Whether a run reads graph `g`.
+    pub fn reads(&self, settings: &GraphragSettings, g: &str) -> bool {
+        !is_guarded(g)
+            && (named(settings, g) || self.output == Some(g))
+            && self.excluded.is_none_or(|x| !x.contains(g))
+    }
+}
+
 /// Read the projection at `snap` with the principal's options.
 pub fn read(
     snap: Arc<Snapshot>,
     opts: &QueryOptions,
     settings: &GraphragSettings,
+    ctl: &Control,
+) -> Result<Projection, String> {
+    read_with(snap, opts, settings, &Extra::default(), ctl)
+}
+
+/// Read the projection at `snap` with the principal's options and `extra`'s graphs.
+pub fn read_with(
+    snap: Arc<Snapshot>,
+    opts: &QueryOptions,
+    settings: &GraphragSettings,
+    extra: &Extra<'_>,
     ctl: &Control,
 ) -> Result<Projection, String> {
     if settings.projection.weight.is_some() {
@@ -94,7 +123,7 @@ pub fn read(
             Some(Term::NamedNode(n)) => Some(n.into_string()),
             _ => None,
         })
-        .filter(|g| !is_guarded(g) && named(settings, g))
+        .filter(|g| extra.reads(settings, g))
         .collect();
     graphs.sort();
     graphs.dedup();

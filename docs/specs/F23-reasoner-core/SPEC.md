@@ -5,7 +5,9 @@
 >
 > **Roadmap:** [item 456](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered
-> are named in their phase.
+> are named in their phase. The [implementation plan](PLAN.md) orders the remaining
+> phases, fixes the representation and maintenance decisions and gives each phase its
+> files, gates and routine and judgment portions.
 
 The design covers specialized closure operators, complete OWL 2 RL rules, cost-based rule planning, a columnar derived tier, compact provenance, a native n-ary Datalog core, rule frontends and one incremental-maintenance core shared with views.
 
@@ -29,10 +31,11 @@ facts, and shares one maintenance core with views.
 Three quick fixes come first and need no structural change. These are the closure
 operators, item 485, the missing OWL 2 RL rules, item 486, and cost-based rule-body
 planning, item 487. The core then moves to a columnar derived tier with merge-join rule
-evaluation and compact provenance. A native n-ary Datalog core with the rule frontends
-follows. The shared incremental-maintenance core comes last, after item 417's LUBM
-measurements. RDFS on read becomes one rule profile only at measured parity with the
-current rewrite.
+evaluation and derivation records as its compact provenance, and the shared
+incremental-maintenance core follows them, after item 547's LUBM measurements. The rule
+frontends and the native n-ary Datalog core come after the tier, as the
+[plan](PLAN.md#phases) orders them. RDFS on read becomes one rule profile only at
+measured parity with the current rewrite.
 
 The phases of [F16](../F16-materialization-at-scale.md#outcome) and
 [F17](../F17-query-time-reasoning.md#outcome) that stay with those specs are listed in
@@ -52,15 +55,15 @@ their Roadmap follow-ups. OWL classification is a separate engine in
 
 ### Core
 
-**Columnar sorted derived tier with merge-join rule evaluation.** Replace the reasoner's row table and hash lists with immutable sorted per-predicate column runs plus a small mutable delta, and evaluate rule steps with merge or galloping joins. Derived facts cost about 135 bytes each and use u32 row ids, which caps the tier at about 4.29B rows. RDFox reaches about 40 to 60 bytes per fact. It depends on item 9.
+**Columnar sorted derived tier with merge-join rule evaluation.** Replace the reasoner's row table and hash lists with immutable sorted per-predicate column runs plus a small mutable delta, and evaluate rule steps with merge or galloping joins. Derived facts cost about 135 bytes each and use u32 row ids, which caps the tier at about 4.29B rows. RDFox reaches about 40 to 60 bytes per fact. The [plan](PLAN.md#the-derived-tier-is-columnar-and-sorted) fixes its layout and proposes that item 9 Phase 2's derived layer be written from the tier's sorted runs, which the maintainer decides. Roadmap item 835 holds this phase.
 
-**Compact provenance with derivation counts and bounded witnesses.** Store a derivation count and one or a few witnesses per derived fact in columnar form, enabling fast deletion in non-recursive strata, Why answers and reviewed-only visibility without re-derivation. Explanations are re-derived on demand. F13 §4.3 rules out counts for recursive maintenance because a fact in a cycle can support itself, so counts apply to non-recursive strata only. It depends on items 18, 285, 415 and 416.
+**Compact provenance with derivation records and bounded witnesses.** Store one derivation record per derived fact, the rule and the body facts of the instance that first derived it, in columnar form, enabling deletion that checks only broken records, Why answers and reviewed-only visibility without re-derivation. Explanations are re-derived on demand. F13 §4.3 rules out counts for recursive maintenance because a fact in a cycle can support itself, and the [plan](PLAN.md#provenance-is-a-derivation-record-per-fact-with-counts-only-where-measured) keeps counts out of the design unless a measurement on non-recursive strata shows them faster than the record check. It depends on items 18, 285, 415 and 416, and roadmap item 836 holds this phase.
 
 **Compiled or specialized rule kernels.** Generate native kernels for the fixed RDFS and OWL RL profiles, or JIT rule plans, to remove interpretive Step dispatch. Rules run through the interpreted Eval walk. Typical gains are 2 to 5 times per rule. It depends on item 9.
 
-**Native n-ary Datalog core with existential rules and aggregates in recursion.** Make a general Datalog IR with n-ary IDB predicates, a restricted chase with MFA or joint-acyclicity checks, stratified negation and monotonic aggregates in recursion, with Jena rules as one frontend. Aggregates arrive in phases, with stratified aggregates first and monotone aggregates in recursion second, both after the columnar derived tier (*columnar sorted derived tier with merge-join rule evaluation*). The reasoner has one ternary relation (`demand.rs`:6). C24 §6.4 to §6.5 already plans n-ary relations encoded through makeSkolem tuple nodes and weakly acyclic existentials, so the remaining gap is a native n-ary representation, the restricted chase and recursive aggregates. It depends on item 72.
+**Native n-ary Datalog core with existential rules and aggregates in recursion.** Make a general Datalog IR with n-ary IDB predicates, a restricted chase with MFA or joint-acyclicity checks, stratified negation and monotonic aggregates in recursion, with Jena rules as one frontend. Aggregates arrive in phases, with stratified aggregates first and monotone aggregates in recursion second, both after the columnar derived tier (*columnar sorted derived tier with merge-join rule evaluation*). The reasoner has one ternary relation (`demand.rs`:6). C24 §6.4 to §6.5 already plans n-ary relations encoded through makeSkolem tuple nodes and weakly acyclic existentials, so the remaining gap is a native n-ary representation, the restricted chase and recursive aggregates. The tier's runs are fixed-width tuples, so an n-ary relation is an order over more columns, and item 72's surface syntax is one frontend of the IR rather than a prerequisite. Roadmap item 839 holds this phase.
 
-**SHACL-AF rules, SPIN translation, N3 rules and SWRL import.** Run `sh:TripleRule` and `sh:SPARQLRule` with `sh:order` and `sh:condition` as materialization with incremental maintenance, translate SPIN to SHACL-AF, and translate N3 and the DL-safe SWRL subset into the rule IR. SHACL-AF rules run natively. SWRL is limited to DL-safe rules, and SWRL, SPIN and N3 are translated to the rule engine rather than evaluated by their own engines. SHACL-AF and SPIN are absent from code and docs. TopBraid users depend on SHACL rules and Jena supports them. SWRL is common in bio ontology projects. It depends on items 71 and 72.
+**SHACL-AF rules, SPIN translation, N3 rules and SWRL import.** Run `sh:TripleRule` and `sh:SPARQLRule` with `sh:order` and `sh:condition` as materialization with incremental maintenance, translate SPIN to SHACL-AF, and translate N3 and the DL-safe SWRL subset into the rule IR. SHACL-AF rules run natively. SWRL is limited to DL-safe rules, and SWRL, SPIN and N3 are translated to the rule engine rather than evaluated by their own engines. SHACL-AF and SPIN are absent from code and docs. TopBraid users depend on SHACL rules and Jena supports them. SWRL is common in bio ontology projects. SHACL-AF, SPIN and N3 need only the triple relation and follow the tier, and the SWRL import depends on item 71. Roadmap item 838 holds the SHACL-AF and SPIN phase.
 
 ### Convergence
 
@@ -70,16 +73,17 @@ their Roadmap follow-ups. OWL classification is a separate engine in
 
 **Entailment analysis in memory.** Diagnose over the derived tier plus the base in memory instead of copying inputs to a private store and materializing again. `analysis.rs` calls its own path the full-closure fallback. Wait for item 18 Phase 3 or F22 evidence that the cost matters. It depends on items 18 and 340.
 
-**One incremental-maintenance core for rules and views.** Run materialization as a recursive Z-set circuit on item 417's fixed-point operator with iteration timestamps, make the reasoner's backward/forward maintenance the circuit's deletion mode, and share one Footprint type, so noValue, lists, aggregates and blank-node rules are maintained instead of falling back to a full run. The reasoner's BFDR and the 12.9k-line incr core are separate frameworks with recompute fallbacks on both sides. Footprints are computed four times. F13 §4.3 plans the reasoner plug-in. It depends on items 221, 415, 417 and 418.
+**One incremental-maintenance core for rules and views.** Make the reasoner's rule engine over the derived tier a `Program` of item 417's fixed-point operator, which is a record-based backward/forward maintainer rather than a timestamped circuit, maintain the closure operators' relations inside it, emit the tier's change as a Z-set that views read, and share one Footprint type, so rules that read lists, and stratified noValue once the full run's negation semantics are decided, are maintained instead of falling back to a full run. The reasoner's backward/forward maintenance and the incr core are separate frameworks with recompute fallbacks on both sides, and footprints are computed four times. F13 §4.3 plans the reasoner plug-in. It depends on items 415, 417 and 547 and on the derivation records, and item 221 builds on its Z-set output. The [plan](PLAN.md#one-maintenance-core-is-the-record-based-backwardforward-maintainer) gives the design and the correctness argument, and roadmap item 837 holds this phase.
 
 ## Dependencies
 
 * The gates of items 469 to 473, in particular the demand and RDFS-on-read benchmark of
   item 472, exist before the quick fixes land.
-* Item 9 supplies the derived-fact layer and canonical equality that the closure
-  operators and the columnar tier build on.
-* Item 417's fixed-point operator and its LUBM measurements come before the shared
-  maintenance core, which also needs items 415, 418 and 221.
+* The plan proposes writing item 9's derived layer from the columnar tier, and item 9's
+  representatives supply the canonical equality that the equality rules read.
+* Item 417's fixed-point operator and item 547's LUBM measurements come before the shared
+  maintenance core, which also needs item 415 and the derivation records. Item 221 reads
+  the core's Z-set output, and item 418's aggregates are maintained by the views side.
 * Item 72 defines the Datalog surface syntax that the n-ary core evaluates, and item 71
   supplies the axiom model that the SWRL import reads.
 * Item 190's forge measurements come before the RDFS profile merge.
@@ -113,7 +117,10 @@ are translated to the rule engine.
 
 ## Provenance
 
-This design derives from Sparkles' existing specs and code. Its phases also draw on the published papers, standards and public documentation of these sources: Differential Dataflow (McSherry et al. CIDR 2013), DBSP (Budiu et al. VLDB 2023), DDlog, RDFox transitive closure handling, Souffle eqrel, GraphDB sameAs optimization, Nuutila TC, VLog (Urbani et al. AAAI 2016), Nemo (Ivliev et al. KR 2022), Souffle B-tree and brie, Nemo, VLog, RDFox Datalog extensions, Souffle, RDFox dynamic planning, Souffle profile-guided scheduling, Green, Karvounarakis and Tannen PODS 2007, ProvSQL, RDFox counting, TopBraid SHACL-AF, EYE reasoner, W3C SWRL submission, Souffle (Jordan et al. CAV 2016) and Carac. No code from another project is copied.
+This design derives from Sparkles' existing specs and code. Its phases also draw on the published papers, standards and public documentation of these sources: Differential Dataflow (McSherry et al. CIDR 2013), DBSP (Budiu et al. VLDB 2023), DDlog, RDFox transitive closure handling, Souffle eqrel, GraphDB sameAs optimization, Nuutila TC, VLog (Urbani et al. AAAI 2016), Nemo (Ivliev et al. KR 2022), Souffle B-tree and brie, Nemo, VLog, RDFox Datalog extensions, Souffle, RDFox dynamic planning, Souffle profile-guided scheduling, Green, Karvounarakis and Tannen PODS 2007, ProvSQL, RDFox counting, TopBraid SHACL-AF, EYE reasoner, W3C SWRL submission, Souffle (Jordan et al. CAV 2016) and Carac. The [plan](PLAN.md) also draws on the
+backward/forward algorithm of Motik, Nenov, Piro and Horrocks (AAAI 2015), on Nemo's
+public program conventions through item 791, and on the W3C SHACL Advanced Features note.
+No code from another project is copied.
 
 ## Outcome
 
@@ -155,6 +162,38 @@ takes 5.0 to 5.3 s against 53 s. OWL2Bench with 10 universities exceeded the 14 
 operators, and with them a 28 GiB limit on a development host. Where that memory goes
 has not been profiled, and roadmap item 522 covers it.
 [The reasoning results](../../benchmarks/reasoning/RESULTS.md#owl2bench) give every run.
+
+### Bounded incremental deletion
+
+Roadmap item 798 bounds the maintenance after a deletion by the cost of a full run,
+until item 521 gives the incremental core closure operators. `incremental::Bound` counts
+the rule instances that the deletion's backward searches and its consequence steps
+match, and compares the charges of the run with their total when the deletion started.
+Past four instances for each fact of the closure, at least 2^20, or past as many bytes
+as the closure's own heap, at least 64 MiB, the update stops with a fallback and the run
+materializes in full, which gives the same closure. The searches compare once every
+1,024 instances and the consequence evaluations count their instances as they match
+them, so the bound is a heuristic on sampled charges.
+
+In a clique of a symmetric and transitive property every fact follows through every
+member. Before the bound, deleting 24 of the 1,200 edges of a clique of 600 people
+visited 184 million rule instances for 24 checked facts and held 5 GB of charges, where
+the full run peaks at 79 MB. The deletion now stops after about 360,000 instances and
+falls back, at an update peak of 101 MB. The consequences of deleted facts now keep
+each head once, since a rule whose head does not depend on the deleted atom has one
+head for millions of instances, and a builtin that binds many values, such as
+`listMember`, ends its loop when the bound, a memory refusal or a cancellation stops its
+evaluation.
+
+On OWL2Bench(1), deleting 1% of the data triples, 18 of them edges of the
+`hasSameHomeTownWith` clique of about 1,100 people, grew to 14.1 GiB before the
+out-of-memory killer ended it. With the bound the deletion falls back on memory and the
+run finishes in 1.4 to 3.4 s at 808 to 866 MiB of RSS on a development laptop, with a
+closure equal to Nemo's, where a full run takes 1.7 to 4.0 s and 556 to 641 MiB
+([deletion record](../../benchmarks/reasoning/runs/2026-11-09-item-798-delete-stanley/commands.txt)).
+
+Item 815 brings the witnesses' preparation for a deletion under the bound, and item 816
+reports the peak of an update that falls back.
 
 ### OWL 2 RL rules
 

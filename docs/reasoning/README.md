@@ -47,11 +47,18 @@ request or on every write, and the schema report counts what the data holds.
   `serve --reason-max-inferred`, a request's `maxInferred` and the bindings change the
   limit. A run past the limit fails with the code `inferred-limit` and commits nothing.
   `ReasonOptions::max_memory` bounds the estimated heap of the whole run.
-* Re-runs, automatic runs and `sparkles infer` update the previous materialization
-  incrementally with the backward/forward algorithm, and write what a full run would.
-  Rules that are not monotonic or create blank nodes, large deletions and a changed set of
-  input graphs run in full. The kept closure holds only the derived facts, which takes 41%
-  to 47% of the memory of a closure with the explicit facts on LUBM-style data.
+* Any later run, whether a re-run, an automatic run or `sparkles infer`, updates the
+  previous materialization incrementally with the backward/forward algorithm and writes
+  what a full run would. A run is full when rules are not monotonic or create blank nodes,
+  when deletions are large, or when the set of input graphs changed. A deletion also runs
+  in full when its maintenance passes an allowance set by the size of the closure, which
+  approximates the cost of a full run. The allowance is four matched rule instances for
+  each fact of the closure and as much memory beyond what the run held when the deletion
+  started as the closure's own heap, with floors of about a million instances and 64 MiB.
+  The maintenance compares its count and the run's charges with the allowance every 1,024
+  instances, so it can pass the allowance by a few batches before it stops. The kept
+  closure holds only the derived facts, which takes 41% to 47% of the memory of a closure
+  with the explicit facts on LUBM-style data.
 * A materialization reads the default graph unless data and ontology graphs are named,
   and follows `owl:imports` to graphs of the dataset through a Jena-style location
   mapping ([API.md](../API.md#input-graphs-and-imports)). With `imports: fetch`, missing
@@ -83,17 +90,17 @@ request or on every write, and the schema report counts what the data holds.
   alive after eviction, so retained-cache estimates are not allocator usage or RSS.
   The estimator counts 24 bytes per fact, 64 bytes per chunk, each local term's
   byte length plus 40 bytes, and 64 bytes per table. It omits spare vector capacity,
-  cache-key strings, hash-table capacity and exact allocator metadata. Item 757
-  covers measuring and calibrating these allowances.
+  cache-key strings, hash-table capacity and exact allocator metadata. Measuring and
+  calibrating these allowances is planned. Roadmap item 757.
   Derivation and replay still use the query's own memory budget, and the host-derived
   query pool leaves out this configured cache beside the storage caches.
 * The library names the reasoning of a query with `sparkles::reasoning::ReasoningMode`,
   which is `Off`, `Materialized`, `Demand` with a profile and a limit, or `Auto`.
   `Dataset::inference_view` turns a mode into an `InferenceView`, which gives the query
   options that read the selected data, the inferred data that incremental views read and
-  the source of an explanation. The `reasoning` parameter of the HTTP endpoints, the
-  `--reasoning` flag of `sparkles query` and the `reasoning` argument of the MCP tools are
-  read into a mode. `Auto` is refused until a cost-based choice exists.
+  the source of an explanation. A mode is read from the `reasoning` parameter of the HTTP
+  endpoints, the `--reasoning` flag of `sparkles query` and the `reasoning` argument of
+  the MCP tools. `Auto` is refused until a cost-based choice exists.
 * `POST /$/reason/{ds}/explain` returns derivation trees from materialized inferences,
   RDFS on read or the demand engine ([API.md](../API.md#explanations),
   [F18](../specs/F18-explanations-and-entailment-diffs.md#outcome)). A tree has well-founded
@@ -130,9 +137,9 @@ LUBM with 10 universities took about ten times as long to materialize under RDFS
 about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.75 GiB
 ([results](../benchmarks/reasoning/RESULTS.md#reasoner-witnesses)).
 * Sparkles records the commit at which inferences were made, and only a later change to a
-  graph the run read makes them stale. `GET /$/reason/{ds}`, dataset info, `/$/stats` and
-  the `Sparkles-Inferences` header report freshness. Automatic re-runs are opt-in with
-  `serve --auto-reason` or `PUT /$/reason/{ds}/auto`.
+  graph the run read makes them stale. Freshness is reported by `GET /$/reason/{ds}`,
+  dataset info, `/$/stats` and the `Sparkles-Inferences` header. Automatic re-runs are
+  opt-in with `serve --auto-reason` or `PUT /$/reason/{ds}/auto`.
 * `GET /$/reason/{ds}/diagnostics` and `sparkles infer --check` run 17 inconsistency
   checks that cover every OWL 2 RL rule with a `false` conclusion, in JSON or Turtle.
   `literal-not-in-datatype` finds ill-typed literals for the datatypes whose value spaces
@@ -141,8 +148,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
 ### SHACL
 
 * `sparkles-shacl` validates SHACL Core and SHACL-SPARQL in parallel over the indexes.
-* `sparkles lint`, `POST /$/lint`, the MCP `lint` tool and the shapes editor check a
-  shapes graph before it runs. They lint the SPARQL in `sh:select`, `sh:ask`,
+* Sparkles checks a shapes graph before it runs, through `sparkles lint`, `POST /$/lint`,
+  the MCP `lint` tool and the shapes editor. It lints the SPARQL in `sh:select`, `sh:ask`,
   `sh:construct` and `sh:update` literals with the prefixes of `sh:prefixes` and
   `sh:declare` and with SHACL's pre-bound variables, such as `$this`, `$value` and
   `$currentShape`, counted as bound. A finding is placed inside the literal. Turtle,
@@ -188,11 +195,11 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   documents, and its functional-style reader reads them. The `ontology` cargo feature,
   which is on by default in the server, builds it into the library and the server.
 * An OWL 2 functional-style document loads as the triples its axioms map to, one axiom
-  at a time. `sparkles load`, `sparkles ontology check FILE`, the library's and the
-  bindings' file loaders, SPARQL `LOAD` and the configuration's data files read a
-  `.ofn` file, compressed or not, and Graph Store writes and uploads read a body sent as
-  `text/owl-functional`. The predefined prefixes `owl:`, `rdf:`, `rdfs:` and `xsd:`
-  need no declaration, and a literal typed `rdf:PlainLiteral` reads as the plain or
+  at a time. A `.ofn` file, compressed or not, is read by `sparkles load`,
+  `sparkles ontology check FILE`, the library's and the bindings' file loaders, SPARQL
+  `LOAD` and the configuration's data files. Graph Store writes and uploads also read a
+  body sent as `text/owl-functional`. The predefined prefixes `owl:`, `rdf:`, `rdfs:` and
+  `xsd:` need no declaration, and a literal typed `rdf:PlainLiteral` reads as the plain or
   language-tagged literal it stands for. A syntax error names the file, the line and the
   column. The document is held in memory while it is read. Sparkles does not write the
   syntax as a dataset dump, and the axiom listings render it.
@@ -214,8 +221,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   literals require balanced content with QName components, scoped namespace bindings
   and unique expanded attribute names. Normalized namespace names must be URI
   references, with relative references accepted and their spelling preserved. The
-  check retains noncanonical spellings, and
-  full XML canonical lexical and value semantics remain in item 663. Namespace
+  check retains noncanonical spellings. Full XML canonical lexical and value semantics
+  are not implemented. Roadmap item 663. Namespace
   checking uses scratch proportional to active declarations, element depth and the
   current tag's attributes, including decoded namespace strings. The standalone
   lexical checker does not charge this scratch to a caller-provided memory budget.
@@ -297,7 +304,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   left incomplete in `incomplete`, and a consistency of consistent, inconsistent or
   unknown, which leaves every class incomplete when unknown. The same rules can count, but
   counting is off by default, since it finishes on none of the ORE 2015 DL development
-  files and only delays their answer, item 728. `Limits::counting` turns it on.
+  files and only delays their answer. `Limits::counting` turns it on. Roadmap item 728.
   Number restrictions, functional and inverse functional properties, disjoint properties
   and asymmetric properties then take equalities of successors, and a run that counts has
   a bound of 262,144 derived conclusions, `Limits::dl_work`. Without it those axioms are
@@ -305,17 +312,27 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   again without counting, leaves the axioms that need counting out and reports them, and
   sets `Stats::dl_counting_over` and `Stats::dl_over_budget`. Near the bound the thread
   schedule can decide whether a run answers in full or falls back, and the fallback is
-  always reported and never a different complete answer, item 727. Any other axiom
-  outside OWL 2 EL, such as nominals, is left out and reported with its rule, and Horn
-  reasoning with individuals is item 692. An axiom with a literal or datatype that the
-  classifier cannot compare, such as an XML literal, an ill-typed literal or a datatype
-  outside the OWL 2 datatype map, or with a property chain through the top object
-  property, is used as far as the calculus goes and reported as partial. Every answer is entailed, and it is complete for named classes
-  when nothing is reported. For eligible EL additions and removals, the classifier
-  keeps its contexts and saturates again only those the changes can reach. Horn and
-  disjunctive classifications rebuild after edits. Their incremental maintenance is
-  planned in item 753 under item 603. A change to the property hierarchy, chains,
-  reflexivity or ranges, to an axiom
+  always reported and never a different complete answer. Roadmap item 727. In an
+  ontology with individuals or nominals, `Limits::rooted` lets the disjunctive rules take
+  nominals, class and property assertions, equalities and inequalities of individuals and
+  negative assertions through a root context where the individuals' facts meet, with the
+  four departures from the published calculus that F24 records. It is off by default,
+  since the completeness of the departed calculus is not proved, and every answer it gives
+  is entailed. A rooted run without counting has a bound of 524,288 derived conclusions,
+  `Limits::dl_work`, past which it classifies again without the rooted rules, gives the
+  default answer and sets `Stats::dl_rooted_over` and `Stats::dl_over_budget`. It refuses
+  an ontology with keys, a top property or a functional data property, which take the
+  default paths. Roadmap items 805, 822 and 823. Without the option, any other axiom
+  outside OWL 2 EL, such as a nominal, is left out and reported with its rule. Horn
+  reasoning with individuals is not supported. Roadmap item 692. An axiom with a literal
+  or datatype that the classifier cannot compare, such as an XML literal, an ill-typed
+  literal or a datatype outside the OWL 2 datatype map, or with a property chain through
+  the top object property, is used as far as the calculus goes and reported as partial.
+  Every answer is entailed, and it is complete for named classes when nothing is reported.
+  For eligible EL additions and removals, the classifier keeps its contexts and saturates
+  again only those the changes can reach. Horn and disjunctive classifications rebuild
+  after edits. Their incremental maintenance is planned. Roadmap item 753 under item 603.
+  A change to the property hierarchy, chains, reflexivity or ranges, to an axiom
   with an individual, a data property, a datatype or a key, and any change after a run
   that took that step or an axiom outside OWL 2 EL, saturates everything again. A run stops at its deadline, its
   memory budget or a cancellation, which it checks while it indexes, builds the property
@@ -328,7 +345,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   DL paths, rather than making the value opaque or reporting a completed fallback.
   XML namespace validation retains lexical spellings and does not establish canonical
   XML value equality. Its standalone scratch is not charged by the numeric budget.
-  Full XML semantics remain in item 663 and shared hierarchical ownership in item 675.
+  Full XML semantics and shared hierarchical ownership remain open. Roadmap items 663
+  and 675.
   `Stats::memory` recounts retained index
   and context storage when saturation ends, using the same estimates for fresh and
   unchanged reused state. This adds a traversal of the retained tables. The final
@@ -346,10 +364,10 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   2015 EL ontologies on one and eight threads. GO's `InverseObjectProperties(part_of
   has_part)` takes the Horn rules, which add the 14 subsumptions that Konclude and HermiT
   entail and ELK misses and make GO 12% slower to classify on one thread than with the EL
-  rules alone, item 693. The classifier's direct hierarchy of GO is the one GO's release
-  publishes with those 7 direct edges added, and its taxonomy of ChEBI entails every subsumption ChEBI asserts and
-  gives no direct subsumption that ChEBI does not assert
-  ([results](../benchmarks/el-classification/RESULTS.md)).
+  rules alone. Roadmap item 693. The classifier's direct hierarchy of GO is the one GO's
+  release publishes with those 7 direct edges added, and its taxonomy of ChEBI entails
+  every subsumption ChEBI asserts and gives no direct subsumption that ChEBI does not
+  assert ([results](../benchmarks/el-classification/RESULTS.md)).
 * `ds.ontology().classify()`, `POST /$/ontology/{ds}/classify`, `sparkles ontology
   classify` and the bindings' `classify` run it on an open ontology. The answer says
   whether the ontology is consistent and complete and lists the unsatisfiable classes,
@@ -359,10 +377,10 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   header. The dataset keeps its last classification of an ontology for callers who read
   every graph, so a compatible same-commit call can reuse a retained result. At a later
   commit, eligible EL additions and removals reuse affected contexts. Horn and
-  disjunctive runs rebuild after edits, with affected-module reuse planned in item 753
-  under item 603. EL individual, merge, key and world invalidation remains under item
-  664. Same-commit reuse is separate from incremental reclassification.
-  That kept state holds the classifier's contexts, index
+  disjunctive runs rebuild after edits, and affected-module reuse is planned. Roadmap
+  item 753 under item 603. Finer invalidation for EL individual, merge, key and world
+  changes is open. Roadmap item 664. Same-commit reuse is separate from incremental
+  reclassification. That kept state holds the classifier's contexts, index
   and taxonomy in memory while the dataset is open and reads the axioms of the open
   ontology in place. It is about 74 MB for GO by the estimate, which a counted heap
   matches, and it trades that memory for fast reclassification. `sparkles ontology classify FILE` classifies a file without a
@@ -379,19 +397,20 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   share this cache, and a retained result cannot resurrect pruned history.
   The new JVM read and frame-projection conveniences refuse pinned dataset wrappers
   and active transactions before native work. Use a live dataset with `OntologyRead.at`
-  for retained committed history; wrapper-source integration remains in item 588.
+  for retained committed history. Wrapper-source integration is open. Roadmap item 588.
 * An explicit classify request with `projection: "frame"` returns bounded clause and
   diagnostic samples with totals, outcome and actual source identity. Missing/null
   projection keeps legacy output. False nodes, zero/null offset and null target defaults
   are harmless, while effective nodes, offset, target or OFN output are incompatible.
   An isolated restricted result remains useful but advertises no shared continuation.
   General entity/axiom reads with classification, property/individual entailments and
-  justifications remain in items 588, 622, 609 and F24's later phases.
+  justifications are not available. Roadmap items 588, 622 and 609, and F24's later
+  phases.
 * Retention counts auxiliary source/exclusion metadata and a published taxonomy alongside
   a DL query's newer saturation. Readers and an active replacement can keep an older
   publication alive. This memory tradeoff means the between-run one-gigabyte estimate
   does not cap combined live RSS. Bounded pages limit output/name buffers, not server
-  scans or arbitrary scalar sizes. [API.md](../API.md#ontology) specifies the read states,
+  scans or arbitrary scalar sizes. See [API.md](../API.md#ontology) for the read states,
   typed sources, pins and projection selectors.
 * Every classification answer gives `tier`, the rules the axioms need, and `consistency`,
   which is `consistent`, `inconsistent` or `unknown`. `partial` on the request, `--partial`
@@ -436,10 +455,10 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   is outside a profile it names.
 * `sparkles ontology reason`, `reduce` and `relax` do what ROBOT 1.9.11's commands of the
   same names do in OBO release pipelines, with ROBOT's options, values and defaults.
-  `reason` writes the whole ontology with the inferred axioms and, by default, without
-  the asserted subclass axioms that are not direct. `reduce` removes the subclass axioms
-  that other subclass axioms entail, between named classes and existential restrictions
-  alike, and `relax` adds the subclass axioms that equivalences with intersections and
+  `reason` writes the whole ontology with the inferred axioms and, by default, without the
+  asserted subclass axioms that are not direct. `reduce` removes the subclass axioms that
+  other subclass axioms entail, between named classes and existential restrictions alike,
+  and `relax` adds the subclass axioms that equivalences with intersections and
   existential restrictions imply. They read a file with `--input` and no database, as
   `sparkles ontology classify FILE` does, or a database with `--loc`, and write the
   ontology with `--output` as functional-style syntax (`.ofn`), RDF/XML (`.owl`), Turtle
@@ -453,16 +472,16 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   such as GO's inverse properties, so `reason` adds the subsumptions they entail.
   `--reasoner ELK`, which `materialize` takes by default as ROBOT's does, and `emr`, which
   ROBOT builds on ELK, run the OWL 2 EL rules alone and leave those axioms out, as ELK
-  does, so the output is ROBOT's with ELK. `hermit`, `jfact`, `whelk`
-  and `structural` run the default classifier with a warning. The library has the same
-  switch as `ClassifyRequest::el_only` and `Limits::el_only`. The queries ELK does not
-  answer, such as the disjoint classes and the property hierarchy, add no axioms, as they
-  add none in ROBOT. Errors and the exit
-  status 1 follow ROBOT's, and a malformed command line exits with status 2, as every
-  `sparkles` command does. With `--reasoner ELK` the outputs equal ROBOT's axiom for axiom
-  on GO and ChEBI lite ([ROBOT comparison](../benchmarks/el-classification/RESULTS.md#robot)). The commands
-  read no `--server`, which item 685 follows, write no OWL/XML, Manchester, OBO
-  or OBO Graphs JSON, item 686, and refuse `--prevent-invalid-references true`,
+  does, so the output is ROBOT's with ELK. `hermit`, `jfact`, `whelk` and `structural` run
+  the default classifier with a warning. The library has the same switch as
+  `ClassifyRequest::el_only` and `Limits::el_only`. The queries ELK does not answer, such
+  as the disjoint classes and the property hierarchy, add no axioms, as they add none in
+  ROBOT. Errors and the exit status 1 follow ROBOT's, and a malformed command line exits
+  with status 2, as every `sparkles` command does. With `--reasoner ELK` the outputs equal
+  ROBOT's axiom for axiom on GO and ChEBI lite
+  ([ROBOT comparison](../benchmarks/el-classification/RESULTS.md#robot)). The commands
+  read no `--server`. Roadmap item 685. They write no OWL/XML, Manchester, OBO or OBO
+  Graphs JSON. Roadmap item 686. They refuse `--prevent-invalid-references true`. Roadmap
   item 687.
 * `sparkles ontology materialize` does what `robot materialize` does. It asserts each
   class's direct superclasses of the form `ObjectSomeValuesFrom(p C)` for the properties
@@ -500,8 +519,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   caller's transaction.
 * `GET /$/ontology/{ds}/search?q=` finds entities by label, synonym, short form and
   definition with typos tolerated, ranked for a typeahead, and the bindings' ontology
-  handles call it as `search`. The [search guide](../search/README.md#entity-search)
-  describes its matching, ranking and index.
+  handles call it as `search`. See [entity search](../search/README.md#entity-search) for
+  its matching, ranking and index.
 * `GET /$/ontology/{ds}/diff?from=&to=` lists the axioms that differ between two
   commits, with the graph of each, as JSON or as `+` and `-` lines. The terminology of
   each state is read as the summary reads it and the two axiom sets are compared. With
@@ -599,8 +618,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
 
 Editing forms also edit declared nested blank-node children, SHACL 1.2 lists and
 `sh:or` or `sh:xone` value alternatives, and save each form's changes as one guarded
-commit. The [forms guide](../visualization/README.md#nested-form-read-models) describes
-the nested model, its allowances and the editors.
+commit. See the [nested form model](../visualization/README.md#nested-form-read-models)
+for its allowances and the editors.
 
 ### Schema discovery and drafted shapes
 
@@ -643,12 +662,17 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 ### Reasoning and validation
 
-* The `owl-rl` profile has property chains of 2 and 3 properties and keys of 1 and 2,
-  roadmap item 517, and leaves out `eq-ref`, `dt-type2`, `dt-eq` and `dt-diff`,
-  roadmap item 518. Its rule tests follow the Profiles tables rather than the
-  OWL 2 test cases, roadmap item 520.
+* The `owl-rl` profile has property chains of 2 and 3 properties and keys of 1 and 2.
+  Roadmap item 517. It leaves out `eq-ref`, `dt-type2`, `dt-eq` and `dt-diff`. Roadmap
+  item 518. Its rule tests follow the Profiles tables rather than the OWL 2 test cases.
+  Roadmap item 520.
 * Closure operators serve full materialization only. Incremental updates and query-time
-  reasoning evaluate transitive and equivalence rules as joins, roadmap item 521.
+  reasoning evaluate transitive and equivalence rules as joins. Roadmap item 521.
+* A deletion in a large clique of a symmetric and transitive property, where every fact
+  follows through every member, passes the bound on maintenance and runs in full. The
+  bound leaves out the witness preparation of a deletion, which is roadmap item 815. A run
+  that falls back reports the full run's peak memory and not the higher peak of the update
+  it abandoned, which is roadmap item 816.
 * Inference is forward materialization, RDFS on read and derivation on demand.
   Derivation on demand has no cost-based choice against a materialization, no OWL 2 QL
   rewriting, no reuse of tables across commits and no dataset setting, and Jena's hybrid
@@ -663,8 +687,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   tiny positive feedback view, but can retain more intermediate facts than selective
   evaluation.
   Structural list terms, negation and term-generating rules exclude this route.
-  The facts of the equality stages, which do not depend on the query, are kept once per
-  view in the derived-table cache. This trades memory for time, since the table can hold
+  The equality stages keep their facts, which do not depend on the query, once per view
+  in the derived-table cache. This trades memory for time, since the table can hold
   many more facts than a selective query derives.
   On small views where `owl:sameAs` relates classes and properties, a demand can take
   much longer than materializing the view, because equality is read through the
@@ -672,15 +696,18 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap item 190 covers these costs and matched Forge measurement. The
   [recorded demand measurements](../specs/F17-query-time-reasoning.md#outcome) identify
   their source revision and do not establish current-head performance.
-* DESCRIBE is refused under derivation on demand, item 193. Hierarchical budgeting
-  that links reasoning, incremental views and the query pool remains item 675.
-* Provenance-based inferred visibility, which reads the reasoner's witnesses, remains
-  roadmap item 18. Witness builds and updates take much longer than the closure, item
-  555, and their memory and their rebuild after the closure is read back from the
-  dataset are item 556. Every fact of a program with `noValue`, `listNotContains`,
-  default geometries, head actions or a list that is not plain is always truncated,
-  item 557. Query result cells do not offer a Why? action, item 285. `why_empty` adds hypotheses for a grounded failing intensional pattern.
-  Abduction for patterns with unbound target variables remains item 286.
+* DESCRIBE is refused under derivation on demand. Roadmap item 193. Hierarchical
+  budgeting that links reasoning, incremental views and the query pool is not built.
+  Roadmap item 675.
+* Provenance-based inferred visibility, which reads the reasoner's witnesses, is not
+  available. Roadmap item 18. Witness builds and updates take much longer than the
+  closure. Roadmap item 555. Their memory and their rebuild after the closure is read back
+  from the dataset are further costs. Roadmap item 556. Every fact of a program with
+  `noValue`, `listNotContains`, default geometries, head actions or a list that is not
+  plain is always truncated. Roadmap item 557. Query result cells do not offer a Why?
+  action. Roadmap item 285. `why_empty` adds hypotheses for a grounded failing
+  intensional pattern. Abduction for patterns with unbound target variables is not
+  available. Roadmap item 286.
 * Derived facts use the ordinary inferred graph. A separate derived-fact layer and
   canonical `owl:sameAs` representatives are not built. Roadmap item 9.
 * Incremental maintenance does not cover rules with `noValue`, `now` or new blank nodes,
@@ -690,8 +717,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap items 9 and 53.
 * Because the kept closure holds only derived facts, changes of 100 triples at 16 threads
   over it take 1.6 to 2.3 times as long as with a closure that also holds the explicit
-  facts, and undos at 1 thread take 1.3 to 1.8 times, on LUBM-style data. Roadmap item
-  113.
+  facts, and undos at 1 thread take 1.3 to 1.8 times, on LUBM-style data. Roadmap
+  item 113.
 * Write-time validation validates recursive SHACL shapes, and SHACL-SPARQL constraints not
   anchored at the focus node, in full on every write. Roadmap item 78.
 * ShEx keeps no typing when the process is killed or exits without closing the store, so
@@ -722,24 +749,29 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * GO's inverse properties take the Horn rules, which classify it 12% slower than the EL
   rules on one thread and raise its peak resident set from 196 to 223 MiB. Two
   Uberon-based ontologies of the ORE 2015 DL sample classify with the Horn rules in 2.2
-  and 4.0 seconds on one thread, against 0.7 and 0.8 for the EL rules alone. Roadmap item
-  693.
+  and 4.0 seconds on one thread, against 0.7 and 0.8 for the EL rules alone. Roadmap
+  item 693.
 * The EL saturation of one ORE 2015 DL ontology with 2.5 million existential
-  restrictions peaks at 7.5 GiB on four threads and 9.4 GiB on one, since most of its
-  waiting messages repeat what their contexts hold and take about nine times the memory
-  of the conclusions it keeps. Roadmap item 721.
-* A small ontology's classification on several threads starts its helper threads after
-  0.5 ms of work, which makes warm runs of some small files about 0.5 ms slower on eight
-  threads. Roadmap item 720.
+  restrictions takes 28 s on four threads and peaks at 6.8 to 7.9 GiB, since many of its
+  waiting messages repeat what their contexts hold and wait while another thread holds
+  the context. Konclude 0.7.0 classifies it in 11 s. Its run on one thread peaks at 5.9
+  GiB. Roadmap item 818.
+* A small ontology's first classification in a process on several threads starts its
+  helper threads after 0.5 ms of work, and later ones after as long as the last start of
+  the helpers took. Warm runs of some small files on eight threads take up to 0.2 ms
+  longer than a start at once would. Roadmap item 819.
 * The ELK mode, which classifies by the OWL 2 EL rules alone, is an option of the Rust
   library and the ROBOT-compatible commands only, and HTTP, the other CLI commands and
   the bindings always take the Horn axioms. Roadmap item 694.
-* Axioms outside OWL 2 EL that need nominals, and axioms that need case analysis or
-  counting in an ontology with individuals or data properties, are left out, and an
-  external DL reasoner bridge is planned. Roadmap item 603. The disjunctive rules need a
+* By default, axioms outside OWL 2 EL that need nominals, and axioms that need case
+  analysis or counting in an ontology with individuals, are left out, since the rooted run
+  that takes them is an option whose completeness is not proved, and five of the 50
+  nominal fixtures of its gate pass its work bound. Roadmap items 822 and 823. Axioms that
+  need case analysis in an ontology with data properties are left out, and an external DL
+  reasoner bridge is planned. Roadmap item 603. The disjunctive rules need a
   datatype checker with data cardinalities before they take data properties, and 10 of
-  the 97 disjunctive development files of the ORE 2015 DL sample wait on it. Roadmap item
-  768.
+  the 97 disjunctive development files of the ORE 2015 DL sample wait on it. Roadmap
+  item 768.
 * Counting is off by default. With it on, it passes its bound of derived conclusions on
   the five counting files of the ORE 2015 DL development set that the disjunctive rules
   take, so those files get the answer without counting. ore_ont_6485 spends 205 ms on the
@@ -756,19 +788,20 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   or incomplete classes. Roadmap item 719.
 * Cold retained-snapshot preparation polls primary cancellation and deadlines. Additional
   composed cancellation is checked around preparation, and during strict materialization
-  freshness queries and later index/hash work. Item 539 covers propagation through all
-  cold resolution, cache, decoding and replay work and its request/server admission.
-  Historical reads remain available, with this interruption limitation.
-* No MCP tool classifies, roadmap item 586. Bounded kept reads supply named-class
+  freshness queries and later index/hash work. Propagation through all cold resolution,
+  cache, decoding and replay work and its request/server admission is planned. Roadmap
+  item 539. Historical reads remain available, with this interruption limitation.
+* No MCP tool classifies. Roadmap item 586. Bounded kept reads supply named-class
   roots, direct parents and children, equivalence and unsatisfiability. General entity
-  accessors, inferred axiom listings and subclasses of a class expression remain under
-  item 588. Browser materialized views are separate recorded-profile facts and do not
-  answer from the class-only classifier or establish arbitrary-axiom proofs.
+  accessors, inferred axiom listings and subclasses of a class expression are not
+  available. Roadmap item 588. Browser materialized views are separate recorded-profile
+  facts and do not answer from the class-only classifier or establish arbitrary-axiom
+  proofs.
 * A classification runs within one request's deadline and is not kept up to date as
   commits land. Roadmap item 589.
 * Native Horn and disjunctive classifications rebuild after axiom insertions and
   deletions. Incremental maintenance with safe full fallback and measured edit latency
-  and retained memory is planned in [item 753](../ROADMAP.md) under item 603.
+  and retained memory is planned. Roadmap [item 753](../ROADMAP.md) under item 603.
 * A classification with the assertions saturates everything on each run, since the
   dataset keeps only classifications of the terminology. Roadmap item 590.
 

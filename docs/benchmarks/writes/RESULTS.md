@@ -1,7 +1,6 @@
 # Writes and updates results
 
-This report was imported from the manually maintained benchmark page. Its tables and
-qualifications are preserved, and are not regenerated from the JSON records. Read the
+This is a [manual report](../README.md#evidence-and-generated-reports). Read the
 [reference setup and answer rules](../reference/README.md) with each result.
 
 ## Comparison summary

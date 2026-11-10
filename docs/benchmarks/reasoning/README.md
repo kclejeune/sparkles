@@ -2,16 +2,12 @@
 
 The LUBM measurements cover query timing over a materialized closure and the cost of producing it. The report also covers larger materializations and incremental reasoning under their separate contracts.
 
-Read the [results](RESULTS.md), [run catalog](RUNS.json) and
-[shared reference setup](../reference/README.md). The
-[harness guide](../../BENCHMARKING.md) documents commands and output formats.
+The [results](RESULTS.md) are a
+[manual report](../README.md#evidence-and-generated-reports). Read them with the
+[run catalog](RUNS.json) and the [shared reference setup](../reference/README.md).
+Commands and output formats are in the [harness guide](../../BENCHMARKING.md).
 
 The reasoning gate of the [rewrite gates](../../BENCHMARKING.md#rewrite-gates) records its baseline in [the results](RESULTS.md#query-time-reasoning-latency). A change to the reasoner's query path, derivation on demand or RDFS on read runs `mise run bench:reasoning-latency` on forge and compares the record with that baseline through `scripts/bench-gate.py compare`.
-
-The result report is a manual import. A linked raw record supports only the measurements
-and metadata it contains. Missing build revisions, host details, durability settings or
-answer evidence remain unknown and must be supplied by a new run before a broader claim
-is generated. Existing raw records retain their original bytes and paths.
 
 ## The OWL 2 RL reference
 
@@ -97,6 +93,16 @@ then times both engines for `--runs` rounds.
   no process of a run outlives it. Sparkles' time starts from a loaded store and includes
   writing the derived graph to it. Nemo's time includes reading the encoded N-Triples and
   writing the derived triples, and its own report gives the reasoning time apart.
+
+Every `sparkles infer` of the comparison and of the timed runs takes its `--max-inferred`
+from the task's `--max-inferred` flag, which the scripts read as the `MAX_INFERRED`
+environment variable. Its default of 0 sets no limit, because the closure of OWL2Bench at
+five universities passes the command's own default of 50 million derived triples, and the
+memory limit of each run's scope bounds the run instead. `rl_terms.py` sorts each decoded
+closure and each side of a comparison on disk with GNU sort, which has a buffer of 1 GiB,
+and merges the sorted files, so it holds no closure in memory. What it still holds grows
+with the encoded literals and blank nodes of the input and with the distinct predicates of
+the differences, not with the size of the closure.
 
 The runner writes every run to `results/rl-reference.json` and the medians to
 `results/summary.md` in its working directory.

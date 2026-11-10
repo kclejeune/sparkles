@@ -5453,6 +5453,19 @@ facts changed by at least `refresh.minChangedFraction`. With `"refresh": {"mode"
 changed enough facts and `refresh.debounceSeconds` have passed without a new commit,
 without asking for a confirmation and within `budget.tokensPerDay`.
 
+Reports can read reviewed evidence instead of raw graph content. `graphrag.reviewPolicy`
+names a review policy of the dataset's evidence settings, and the store needs activated
+configuration history. The build then reads the policy's output graph with the projection's
+graphs, and an accepted fact enters a report only when the principal may see the claim
+that supports it. Each finding cites the claims and decisions behind its facts, and the
+report records the policy and its version. Withdrawing or reversing a claim rewrites the
+reports that read it at the next refresh. A projection that names no graph reads the
+accepted evidence alone.
+
+```sh
+sparkles settings set org graphrag.reviewPolicy=main 'graphrag.projection.graphs=[]'
+```
+
 With `--loc DB` the command opens a database directory in the process and reads the
 model configuration from `--model-config`, as `serve` does.
 
