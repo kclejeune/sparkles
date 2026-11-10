@@ -2,7 +2,7 @@
 
 > **Status:** planned. The plan below is ordered and audited against the code.
 >
-> **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 479, 484 and 830 to 834
+> **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 479, 484 and 830 to 833
 > hold the phases that are ready to start, and each is named in its phase. The later
 > candidate phases get their numbers when their prerequisites land.
 
@@ -16,14 +16,18 @@ The workspace has not had a release, yet the store reads every pre-release form 
 files. The registry in `crates/sparkles-core/src/formats.rs` records the following
 readable windows. The generation index reads formats 2, 3 and 4 and writes 3 or
 4, where format 2 is the unsegmented layout and format 3 is format 4 without a `features`
-list. The write-ahead log reads versions 0, 1 and 2, where version 0 is headerless and
-carries the `walStrictFrom` and `Framing::Mixed` machinery that tells a legacy commit from
-a torn one. `delta.vocab` reads versions 1 and 2, and the one registered `migrate::STEPS`
-entry rewrites version 1. `dataset.json` admits readers 1 to 8, `commit.json` formats 1
-and 2, `link.json` formats 1 and 2 and backup key slots formats 1 and 2. The sparse
-vocabulary index `vocab.idx` is still optional and written on demand when a generation
-lacks one. About 124 lines in the WAL, replay, history, backup and commit modules branch
-on legacy framing alone.
+list. The write-ahead log reads versions 0, 1 and 2. Version 0 is headerless and carries
+the `walStrictFrom` and `Framing::Mixed` machinery that tells a legacy commit from a torn
+one, and versions 1 and 2 are both current, since a store without configuration history
+writes version 1 and an activated store writes version 2. `delta.vocab` reads versions 1
+and 2, and the one registered `migrate::STEPS` entry rewrites version 1. `dataset.json`
+admits readers 1 to 8. `commit.json` and `link.json` read formats 1 and 2, and both
+formats are current, since format 2 of `commit.json` belongs to activated stores and
+format 2 of `link.json` to branches with a base overlay. Backup key slots read formats 1
+and 2. The sparse vocabulary index `vocab.idx` is written by every build but remains
+optional on read, and `add_vocab_index` writes it for a generation an older build left
+without one. About 124 lines in the WAL, replay, history, backup and commit modules
+branch on legacy framing alone.
 
 About 114 readers exist as twins of an ordinary reader in `_limited`, `_controlled`,
 `_checked`, `_prepared` and read-only forms, so every reader fix is made more than once.
@@ -31,12 +35,15 @@ They split into 42 in the history and changelog stacks, of which `history_limite
 `changelog/readonly.rs` and `branching/readonly.rs` hold 3,753 lines of mirrors, 37 in
 the vocabulary scanners, 13 in the cold open and commit readers, 8 in the index readers,
 6 in WAL replay and 8 elsewhere. Four carriers express the budget, `ReadLimit`,
-`ColdBudget`, `Preparation` and ad hoc reserve closures, and the unlimited form is a
-runtime `memory: None` or one of 92 `|| Ok(())` closures, neither of which compiles away.
-Two readers, `snapshot_at_inner` and `WalCursor::next_inner`, fork at run time on
-whether a limit is present, the first in fifteen places. The only zero-cost form is the
-`Meter` trait of `store/keyset.rs`, whose `()` implementation removes the metering at
-monomorphization.
+`ColdBudget`, `Preparation` and ad hoc reserve closures. `ReadLimit` checks cancellation
+and the deadline on every call and its memory cap only when one is set, so an unlimited
+read still pays the runtime test of `memory`. The 92 `|| Ok(())` closures that stand for
+no control are generic and do compile away where the callee is generic, but each one is
+a second call site to keep in step with the controlled one. Two readers,
+`snapshot_at_inner` and `WalCursor::next_inner`, fork at run time on whether a limit is
+present, the first in fifteen places. The only form that removes the control at
+monomorphization is the `Meter` trait of `store/keyset.rs`, whose `()` implementation
+compiles to nothing.
 
 Three publish paths and a compaction writer encode WAL records and build the snapshot.
 The serial path `WriteTxn::publish_log`, the group path `publish_grouped`, `write_prefix`
@@ -50,13 +57,15 @@ annotations and remembers past heads, which the group path can omit only because
 serves an in-memory store.
 
 Four rules decide bulk loading, all keyed on `StoreOptions::bulk_threshold` of 250,000
-quads. `load_with` builds when the store is empty or the estimate exceeds the threshold
-and no graph is named and the sources are not small readers. `replace_with` builds when
-the estimate or the stream length exceeds the threshold, with no empty-store case.
-`WriteTxn::insert_bulk` stages a rebuild when the batch reaches the threshold and names
-no graph and no managed admission, and `patch_apply` repeats that rule for additions.
-SPARQL `LOAD` never builds. Compaction and large updates rebuild the whole generation,
-and new terms need a full rebuild to be sorted.
+quads. `load_with` builds when the write is not restricted to some graphs, the sources
+are not small readers, and the store is empty or the estimate exceeds the threshold.
+`replace_with` builds when the write is unrestricted and the estimate or the stream
+length exceeds the threshold, with no empty-store case. `WriteTxn::insert_bulk` stages a
+rebuild when the batch reaches the threshold and the transaction has neither triple-level
+write protections to check nor a managed admission, and `patch_apply` repeats that rule
+for a patch of additions with no deletion. SPARQL `LOAD` never builds. A compaction
+rewrites only the touched blocks when the delta adds no term and copies the rest, but it
+still writes a whole generation, and a delta with new terms forces a full build.
 
 The goal is one implementation per reader, one commit publish path, one load plan and a
 storage layout whose maintenance cost follows the size of a change.
@@ -68,7 +77,7 @@ trait would otherwise have to unify. The budgeted readers start with the history
 changelog stacks and then move to the vocabulary scanners under the instruction-count
 screen of item 473. The shared publish tail has two halves. The short-term half, item
 484, extracts the WAL encoder, a snapshot builder and the shared tail now. The long-term
-half, item 834, makes a group of one the ordinary commit, since items 446 and 447 have
+half, item 833, makes a group of one the ordinary commit, since items 446 and 447 have
 landed and the leader already writes through the direct handles. Partitioned
 vocabularies and per-range generations follow item 14's per-block located deltas.
 
@@ -84,33 +93,35 @@ which phases run at the same time.
 
 ### Phase 1. First-release format cutoff (item 479)
 
-The cutoff fixes the formats the first release writes as the only formats it reads, and
-removes every reader of a pre-release form. The dependency on item 343 holds only for the
-release fixture, as the [open decisions](#open-decisions) explain.
+The cutoff removes every reader of a form that no current writer produces, and keeps
+every form that a current writer still produces. It follows item 343, as the roadmap
+orders, unless the maintainer takes [open decision 2](#open-decisions).
 
 The table gives each kind's decision. Every refusal goes through `FileKind::refuse`, which
 already names `sparkles dump` from the release that wrote the file and `sparkles load`.
+The forms that stay are the ones that `wal::version_for`, `gen_commit_bytes_for` and the
+branch creation of `branching.rs` choose between today, so the cutoff changes no writer.
 
 | Kind | Today | After the cutoff | How |
 |---|---|---|---|
-| `index` | Reads 2, 3 and 4. Writes 3 without features and 4 with them. | Reads and writes 4. A `features` list is always present, possibly empty. | Drop the format 2 unsegmented layout from `PermIndex::open_format`, `index.rs` and `cold.rs`, and `PLAIN_FORMAT_VERSION` from `builder.rs`. |
-| `vocab-index` | Optional. `store.rs` writes a missing `vocab.idx` on demand. | Mandatory. A generation without one is corrupt. | Make `Sparse` a required field of the vocabulary and delete the on-demand writer. |
-| `wal` | Reads 0, 1 and 2. Writes 2. | Reads and writes 2. | Delete `Framing::Mixed`, `fold_legacy`, `walStrictFrom` in `commit.json`, the headerless branches of `WalCursor`, `WalIndex::scan`, `apply_backward`, `probe.rs`, `history_limited.rs`, `backup.rs` and `diff.rs`. |
-| `delta-vocab` | Reads 1 and 2, with a `migrate` step from 1. | Reads and writes 2. | Delete `convert_legacy_file`, the step and the legacy parser of `vocab/delta.rs`. |
-| `dataset` | Readers 1 to 8. | One reader, the cutoff reader. | Refuse a `minimumReader` below it with the dump-and-reload message, and delete the branches that handle a dataset without framed deltas, log headers, `managed.json` or `holds.json`. |
-| `generation-commit` and `link` | Read 1 and 2. | Read and write 2. | Require `configurationBinding` and the base overlay member. |
-| `backup-slots` | Read 1 and 2. | Read and write 2. | Pre-release repositories follow the same window as databases. |
-| Derived kinds | `view-state` and `internal-circuit-state` read several versions. | Unchanged. | A derived file never needs a cutoff, since an unread version is rebuilt. |
+| `index` | It reads 2, 3 and 4, and writes 3 without features and 4 with them. | It reads and writes 4, and the `features` list is always present. | Drop the format 2 unsegmented layout from `PermIndex::open_format`, `index.rs` and `cold.rs`, and `PLAIN_FORMAT_VERSION` from `builder.rs`, subject to open decision 3. |
+| `vocab-index` | Every build writes `vocab.idx`, and `add_vocab_index` writes one for a generation that lacks it. | Every readable generation has one, which the cutoff reader guarantees. | Make `Sparse` a required field of the vocabulary and delete `add_vocab_index`. |
+| `wal` | It reads 0, 1 and 2. A plain store writes 1 and an activated store writes 2. | It reads 1 and 2 and writes them as today. | Delete `Framing::Mixed`, `fold_legacy`, `walStrictFrom` in `commit.json`, the headerless branches of `WalCursor`, `WalIndex::scan`, `apply_backward`, `probe.rs`, `history_limited.rs`, `backup.rs` and `diff.rs`. |
+| `delta-vocab` | It reads 1 and 2, with a `migrate` step from 1. | It reads and writes 2. | Delete `convert_legacy_file`, the step and the legacy parser of `vocab/delta.rs`. |
+| `dataset` | It admits readers 1 to 8. | It admits one reader, the cutoff reader. | Refuse a `minimumReader` below it with the dump-and-reload message, and delete the branches that handle a dataset without framed deltas, log headers, `managed.json` or `holds.json`. |
+| `generation-commit` and `link` | They read 1 and 2. A plain store writes `commit.json` 1 and an activated store 2, and a branch writes `link.json` 1 without an overlay and 2 with one. | They stay as they are. | Both forms are current, so nothing is removed. |
+| `backup-slots` | It reads 1 and 2 and writes 2. | It reads and writes 2. | Pre-release repositories follow the same window as databases. |
+| Derived kinds | `view-state` and `internal-circuit-state` read several versions. | They stay as they are. | A derived file never needs a cutoff, since an unread version is rebuilt. |
 
-The cutoff pins the dataset reader. Before it does, the plan settles the inconsistency the
-audit found. `reidentified_dataset_bytes` in `commit.rs` raises `minimumReader` to 9 for a
-restored destination, and the transport test asserts that value, while `DATASET_READER`
-is 8 and `formats::DATASET` reads 1 to 8. A destination that the backup transport
-captures therefore carries a reader this build refuses to open. Item 833 reproduces this
-by opening a captured destination, decides whether reader 9 is a capability the registry
-should list or the restore should write 8, and fixes it with the registry test
-`the_table_matches_the_modules` extended to cover every `minimum_reader` write. Phase 1
-then takes the settled reader as the cutoff reader.
+The cutoff pins the dataset reader at `DATASET_READER`, which is 8. The private import
+transport of `store/backup/transport.rs`, which no production path wires and whose
+staged destination has no store constructor, writes `minimumReader` 9 for an imported
+destination, and its test asserts that a reader-8 build refuses those bytes. That is a
+compatibility decision for the lane that wires the import, which then raises
+`DATASET_READER` and the registry together, and the cutoff does not change it. The
+acceptance cases of the phase are a plain store created, written, reopened, branched and
+compacted, an activated store doing the same, and a backup and restore of each, all
+reading only the retained forms.
 
 A fixture labelled with the cutoff commit is written with `scripts/format-fixture.sh` and
 committed under `testsuite/formats/`. The two pre-release fixtures `8dd019da` and
@@ -143,30 +154,41 @@ snapshot or from an opened generation and sets only what the path changes, so a 
 is added once, with a default, instead of in a dozen places. The 7 struct-update literals
 stay, since they already copy from a base.
 
-`Store::publish_committed` is the shared tail that the serial path, the group leader, the
-bulk rebuild and the compaction switch call after their durable write returns. It performs
-the bookkeeping that today sits in each path in a different order: the WAL index and quota
-update, the compaction tap, the changelog push, the catalog append, `deltas.noted`,
-`note_configuration`, `current.store`, `commits.send_replace` and `embed_noted`. The
-serial and group paths disagree on whether the write guard learns of the commit before or
-after the snapshot is stored, and the implementer settles the order with a test that shows
-what a guard reading the head sees in each case. The in-memory-only steps
-`forget_annotations` and `remember_past` become conditional on the store having no log,
-so the group path keeps omitting them for the right reason.
+`Store::publish_committed` is the shared tail that the serial path, the group leader and
+the bulk rebuild call after their durable write returns, and it takes two inputs. A
+logical commit, which the serial, group and bulk paths publish, performs the WAL index
+and quota update, the changelog push, the catalog append, `deltas.noted`,
+`note_configuration`, `current.store`, `commits.send_replace` and `embed_noted`. A
+generation switch, which the compaction switch publishes, republishes the commit the
+store already has after `switch_generation`, so it appends no catalog entry, pushes no
+changelog commit and announces no delta, and it calls `guard.rekey` between
+`current.store` and `send_replace` as `compact_inner` does today. The compaction tap
+stays where it is, since the group path pushes it under the writer lock before it
+enqueues and the serial path under the same lock, and a tail that runs after the fence
+would change that contract. The serial and group paths disagree on whether the write
+guard learns of a commit before or after the snapshot is stored. The implementer settles
+the order with a test that shows what a guard reading the head sees in each case, and
+records the decision in this section. The in-memory-only steps `forget_annotations` and
+`remember_past` become conditional on the store having no log, so the group path keeps
+omitting them for the right reason.
 
 The durability argument is that this phase moves no write. Each path still performs its
 synchronization as section 17.4 of [X09](../X09-group-commit-by-default.md) and the
-module documentation of `wal.rs` describe. In the buffered path the terms are flushed
-before the records and both are synchronized together by `sync_commit_reused`. In the
-direct path the records and the terms go through the `O_DIRECT | O_DSYNC` handles in
-parallel from `commit_direct`, and the commit record's seal and `unfenced` count let the
-replay tell a complete transaction from a torn one, so the order between the two writes
-does not matter. Annotations are written before the records in the serial path and in
-parallel with them in the group path, and a crash between them is covered by
-`crash_images_keep_every_acknowledged_commit`. The shared tail runs only after the write
-that makes the commit durable has returned, so no snapshot is published for a commit that
-a crash could lose, and `send_replace` follows `current.store` so a waiter never sees a
-commit number whose snapshot is not yet current.
+module documentation of `wal.rs` describe. In the serial and group buffered paths the
+terms are flushed before the records and both are synchronized together by
+`sync_commit_reused`. The compaction catch-up flushes its records before its terms, and
+its safety comes from synchronizing the whole candidate before `CURRENT` switches to it,
+which the shared tail does not touch. In the direct path the records and the terms go
+through the `O_DIRECT | O_DSYNC` handles in parallel from `commit_direct`, and the commit
+record's seal, its check of the delta term count and its `unfenced` count let the replay
+tell a complete transaction from a torn one, so the order between the two writes does
+not matter. Annotations are written before the records in the serial path, whose records
+carry no `WAL_FLAG_ANNOTATED`, and in parallel with them in the group path, whose records
+carry the flag so that replay treats a flagged tail commit without its annotation as torn.
+`wal::encode_txn` takes the flags from its caller and changes neither contract. The
+shared tail runs only after the write that makes the commit durable has returned, so no
+snapshot is published for a commit that a crash could lose, and `send_replace` follows
+`current.store` so a waiter never sees a commit number whose snapshot is not yet current.
 
 The gates are `scripts/nsc-writes.sh` with and without `--no-group-commit`,
 `bench-indexed-commit.py`, `power-loss.sh`, `tests/power_loss.rs`, `group_runs.rs` and
@@ -190,10 +212,14 @@ pub(crate) trait Control {
 `Unlimited` implements it with `CHECKS` false and empty inlined methods, so a reader
 generic over `C: Control` compiles to the ordinary reader when called with `Unlimited`,
 as `Meter for ()` does in `keyset.rs`. `ReadLimit`, `ColdBudget`, `Preparation` and
-`WriteOptions` implement it, and the 92 `|| Ok(())` closures disappear. A `Stride<N>`
-helper replaces the hard-coded 16, 1,024, 4,096, 65,536 and 64 KiB intervals with one
-place per reader that says how often it checks, and the stride is a const generic so that
-`Unlimited` removes the counter too.
+`WriteOptions` implement it, and the 92 `|| Ok(())` closures disappear. `Unlimited`
+replaces only the call sites that pass no control at all today. A read whose `ReadLimit`
+has no memory cap still checks cancellation and the deadline, so it keeps a `ReadLimit`
+whose memory member is absent, and the regression tests of each stage include a
+cancelled and a timed-out read with no memory cap. A `Stride<N>` helper replaces the
+hard-coded 16, 1,024, 4,096, 65,536 and 64 KiB intervals with one place per reader that
+says how often it checks, and the stride is a const generic so that `Unlimited` removes
+the counter too.
 
 The stacks move in three stages, each a lane of its own with the same gate.
 
@@ -223,20 +249,34 @@ check.
 
 ### Phase 4. One load plan (item 831)
 
-`LoadPlan::choose` in `store.rs` takes what the four rules read today, the head's
-emptiness, the quad estimate of `estimated_quads` or the batch length, whether the
-sources are small readers, the named graphs, the managed admission and
-`bulk_threshold`, and returns `Bulk` or `Transactional`. `load_with`, `replace_with`,
-`WriteTxn::insert_bulk` and `patch_apply` call it, so the empty-store case that only
-`load_with` has today and the stream-length case that only `replace_with` has today
-apply everywhere or nowhere by one decision. The group admission's `Fallback::Bulk`
-reads the same plan. SPARQL `LOAD` keeps inserting per quad unless the
+`LoadPlan::choose` in `store.rs` takes the inputs the four rules read today and returns
+`Bulk` or `Transactional`. The inputs are the head's emptiness, the size as a quad
+estimate from `estimated_quads`, a batch length or a stream probe against a byte bound,
+whether every source is a small reader, whether the write is restricted to some graphs
+through `WriteOptions::graphs`, whether the transaction checks triple-level write
+protections, which `requested` records, whether it carries a managed admission, whether
+the patch has deleted anything, and `bulk_threshold`. The table below is the current
+behaviour, which the first commit of the phase encodes as a table test before any rule
+changes, and the second commit unifies the rules by the decisions it records.
+
+| Entry point | Bulk when | Threshold test | Cases it lacks |
+|---|---|---|---|
+| `load_with` | The write is unrestricted, the sources are not small readers, and the head is empty or the estimate is above the threshold. | The estimate is strictly above. | It has no stream-length probe above a byte bound. |
+| `replace_with` | The write is unrestricted and the estimate is above the threshold or the streams exceed eighty bytes per threshold quad. | The estimate is strictly above. | It has no empty-head case. |
+| `insert_bulk` | The batch reaches the threshold, and the transaction checks no triple protections and carries no managed admission. | The length is at or above. | It has no size estimate and no small-reader case. |
+| `patch_apply` | The patch has deleted nothing and its additions reach the threshold, after which `insert_bulk` applies its own rule. | The length is at or above. | It has no estimate and no restriction input of its own. |
+
+The unified rule takes the strict test everywhere, keeps the empty-head case for
+`load_with` and `replace_with`, keeps the stream probe where a stream is the input,
+and treats a graph restriction, a triple protection, a managed admission and a deletion as
+reasons for the transactional path in every entry point. The group admission's
+`Fallback::Bulk` reads the same plan. SPARQL `LOAD` keeps inserting per quad unless the
 [open decisions](#open-decisions) say otherwise.
 
 The gate is the load benchmark of [docs/benchmarks](../../benchmarks/README.md) at 1.05M
-and 10.5M with no load slower, and a table test that records the plan each entry point
-chooses for the boundary inputs, so a later change to the rule is visible in one place.
-The phase is routine, with the plan's table as its specification.
+and 10.5M with no load slower, and the table test, which records the plan each entry
+point chooses for every row and boundary above, so a later change to the rule is visible
+in one place. The phase is routine, with the table as its specification.
 
 ### Phase 5. Smaller storage duplicates (item 832)
 
@@ -250,8 +290,11 @@ The phase is routine, with the plan's table as its specification.
   dependency leaves `Cargo.toml`.
 * Test scaffolding leaves production code. The ungated `#[doc(hidden)]` hooks
   `set_clock`, `wal_direct_active`, `vocab_direct_active` and the vector pause hooks
-  move behind `cfg(test)` or the `failpoints` feature, and the `ordinary_sync_probe`
-  blocks inside `publish_log` move to the shared tail of Phase 2 as one probe point.
+  move behind `cfg(test)` or the `failpoints` feature. The `ordinary_sync_probe` points
+  inside `publish_log` are already behind `cfg(test)` and observe three distinct moments,
+  the choice of the direct or buffered branch, the capture after synchronization and the
+  observation after the writer is released, so they stay at those boundaries and only
+  their scaffolding is shared.
 * `parse_source` and `parse_source_into` in `io.rs` share one ladder, since the second
   is a prefix of the first.
 * History reconstruction waits for items 23 and 52 and stays out of this phase.
@@ -259,7 +302,7 @@ The phase is routine, with the plan's table as its specification.
 Each item is routine and small, and the phase lands as separate commits. Its gate is
 `scripts/ci.sh --fast --changed` plus the measurements the first two bullets name.
 
-### Phase 6. A group of one is the ordinary commit (item 834)
+### Phase 6. A group of one is the ordinary commit (item 833)
 
 The long-term half of the publish tail removes the serial path. Every commit encodes
 through `wal::encode_txn`, enqueues, and is written and published by the leader of its
@@ -268,19 +311,31 @@ prefix's records and terms through the write-through handles when they fit, as i
 built, and falls back to buffered writes with `fdatasync` otherwise, so a group of one
 makes the same writes in the same order as `publish_log` does today.
 
-The argument that durability is unchanged rests on three points. The fence synchronizes
-the same three files, the log, `delta.vocab` and `annotations.bin`, that the serial path
-synchronizes. The commit record of a group of one carries an `unfenced` count of zero,
-which is what the serial path writes, so replay treats it identically. And publication
-stays in commit order because only the leader publishes and the next fence publishes
-after the last one has. What changes is latency, which item 448 measured at about 1,000
-user instructions for the admission checks a serial commit makes today. The phase keeps
-`commit_direct` for the leader and removes the idle-path admission, so the serial cost
-can only fall. The in-memory store, which has no log, keeps a short path that builds the
-snapshot and calls `publish_committed`.
+The durability contract of the result is the group's, not the serial path's, and the
+phase says so rather than claiming equivalence. The fence synchronizes the same three
+files, the log, `delta.vocab` and `annotations.bin`, that the serial path synchronizes,
+but it writes the annotation in parallel with the records instead of before them, and its
+records carry `WAL_FLAG_ANNOTATED` so that replay treats a flagged tail commit whose
+annotation is missing as torn, as `replay_wal` does today for grouped commits. A commit
+that today takes the serial path, with its annotation durable first and no flag, would
+after this phase recover under the flag rule instead. That rule is already the one
+`crash_images_keep_every_acknowledged_commit` and `power-loss.sh` prove for grouped
+writers, and the phase adds the direct and buffered cases of a group of one with a
+missing annotation to those tests before it removes the serial path. The `unfenced` count
+of a group of one is the speculative head less the published head, which is zero only
+when no earlier commit is still unpublished, so the phase keeps the count as the group
+computes it and does not assume zero. Publication stays in commit order because only the
+leader publishes and the next fence publishes after the last one has. The in-memory
+store, which has no log, keeps a short path that builds the snapshot and calls
+`publish_committed`.
+
+The latency hypothesis is that serial cost falls, because the idle-path admission that
+item 448 measured at about 1,000 user instructions goes and the leader keeps
+`commit_direct`. It is a hypothesis until the writes benchmark measures it, and a
+measured slowdown that the screen accepts gets a follow-up item in the same change.
 
 The gates are those of Phase 2 with the writes benchmark of
-[docs/benchmarks/writes](../../benchmarks/writes/README.md) on the benchmark host before
+[docs/benchmarks/writes](../../benchmarks/writes/README.md) on a benchmark worker before
 the phase reports, since its goal is a single path at no cost in serial latency. Items
 446, 447, 448 and Phase 2 land first. This is concurrency and WAL-ordering work, and its
 planner implements it.
@@ -297,10 +352,14 @@ the ranges. A compaction that adds terms rewrites only the partitions whose rang
 terms fall in, and the spaced ids of the C13 sketch keep every untouched index block
 valid. A lookup from id to key uses the per-partition id array the sketch names.
 
-The generations become leveled. A compaction rewrites only the predicate or id ranges that
-the located deltas touch, and `meta.json` lists the segments of each permutation with the
-generation that wrote them, so a reader opens a permutation as a sequence of segments
-from several builds. This is the layout X17 uploads.
+The generations become leveled. Partial compaction in `store/partial.rs` already rewrites
+only the touched blocks when the delta adds no term, but it copies every untouched block
+into a new generation and falls back to a full build as soon as the delta names a new
+term. The leveled layout lets a compaction leave untouched ranges where they are.
+`meta.json` lists the segments of each permutation with the generation that wrote them,
+so a reader opens a permutation as a sequence of segments from several builds, and the
+partitioned vocabulary removes the full-build fallback for new terms. This is the layout
+X17 uploads.
 
 Both are kind 3 changes, read and rewritten at compaction, so `READABLE_INDEX_FORMATS`
 gains format 5 and `builder::FORMAT_VERSION` moves to it, and the first release's format
@@ -313,11 +372,16 @@ fixtures. The whole phase needs judgment.
 
 ### Phase 8. Bounded-memory index build
 
-The external-sort budget of `builder.rs` becomes an option and the permutation
-construction streams its runs, so bulk-load peak memory is configurable. It waits for
-item 40 and is independent of the other phases. The gate is the load benchmark with a
-recorded peak RSS at each budget. It is judgment work in the builder, with routine
-option plumbing.
+`BuildOptions::sort_mem_quads` already bounds the quads sorted in memory, store callers
+set it through `StoreOptions::build`, and runs beyond the budget are merged into the
+permutations by `merge_runs`. The peak of a bulk load is nevertheless 2.9 times QLever's
+on the LUBM closure, so some allocations escape the bound. The phase begins by measuring
+which ones, with the vocabulary batches, the hot-key table, the run merge buffers and the
+decoded columns of the catch-up as the candidates, and then bounds the ones that matter
+under one build budget that the caller sets. Its acceptance criterion is a measured peak
+RSS within a stated factor of that budget at 1.05M and 10.5M, not a recorded RSS alone.
+It waits for item 40 and is independent of the other phases. It is judgment work in the
+builder, with routine option plumbing.
 
 ### Parallelism
 
@@ -389,8 +453,9 @@ concept. Phase 3 write forwarding is the nearest piece. It depends on item 66.
 
 ## Open decisions
 
-These go to the maintainer. The plan recommends an answer for each and proceeds on it
-unless told otherwise.
+These go to the maintainer. The plan recommends an answer for each. Where a decision
+would change the roadmap's order or scope, the roadmap's current order stands until the
+maintainer takes it.
 
 1. **Dump and reload for every pre-release form.** The alternative is one `migrate`
    step that compacts a pre-release generation into the first-release format, as X12
@@ -403,7 +468,8 @@ unless told otherwise.
    pre-release readers does not depend on that, and a later settings change follows the
    ordinary format rules. The recommendation is to start Phase 1 now with a fixture
    labelled by its commit, and to keep the dependency only for the release fixture job
-   of the format-policy phase, which writes the `0.1.0` fixture after item 343.
+   of the format-policy phase, which writes the `0.1.0` fixture after item 343. The
+   roadmap's Release and Sequencing sections keep the current order until this is taken.
 3. **One index format.** The first release could keep writing format 3 for a generation
    without features and 4 with them, as X11 §7.2 chose to keep pre-release readers
    working. The recommendation is to write format 4 always, since a reader that
@@ -414,22 +480,23 @@ unless told otherwise.
    a large `LOAD` as fast as `sparkles load`, but changes which path an update takes and
    therefore its memory and lock profile. The recommendation is to leave `LOAD` alone in
    Phase 4 and record the choice in the load plan's table.
-5. **Item 833 and the dataset reader.** Whether a restored destination needs a reader
-   capability of its own, which the registry should then list as 9, or whether the
-   restore should stop raising the reader. The recommendation is to decide from the
-   reproduction in item 833 before Phase 1 pins the cutoff reader.
+5. **The import transport's reader.** The unwired import transport writes `minimumReader`
+   9 for an imported destination while the build reads up to 8. The recommendation is to
+   leave it to the lane that wires the import, which raises `DATASET_READER` and the
+   registry together once the capability has a contract, and not to widen the registry
+   to make staged bytes open before then.
 
 ## Dependencies
 
 * Items 446 and 447 have landed. Item 448 and Phase 2 land before the group-of-one
-  commit of item 834.
+  commit of item 833.
 * Items 4 and 14 settle cold reads and per-block deltas before the layout changes of
   Phase 7.
 * Item 409 settles the cost of controlled preparation before the vocabulary scanners move
   to the Control trait in stage 2 of item 830.
-* The format cutoff, item 479, lands before the release artifacts of items 58 and 59.
-  Item 343 lands before the release fixture, as open decision 2 describes.
-* Item 833 settles the dataset reader before item 479 pins it.
+* Item 343 lands before the format cutoff, item 479, which lands before the release
+  artifacts of items 58 and 59. Open decision 2 proposes to narrow the first dependency
+  to the release fixture.
 * Fragment composition in [X18](../X18-fragment-composition/README.md) follows this
   workstream.
 
@@ -451,6 +518,10 @@ unless told otherwise.
   `index.rs` or the cursor readers, which are Phases 3 and 5.
 * Binary size and the compile time of `sparkles-core` are recorded for each stage of
   Phase 3, and a growth above 5% gets a follow-up item.
+* Every measured slowdown that a gate or screen accepts, including one judged to be
+  noise, gets a roadmap follow-up item in the change that accepts it, as the engineering
+  rules require. Effects under about 5% and the codegen-sensitive changes of Phases 3 and
+  5 are measured on an Intel host.
 
 ## Non-goals
 
