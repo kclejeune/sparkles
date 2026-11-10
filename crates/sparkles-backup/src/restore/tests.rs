@@ -163,7 +163,7 @@ async fn unsupported_dataset_metadata_is_refused_even_without_integrity_checks()
     let repo = fixture::memory_repo().await;
     let original = std::fs::read(source.join("dataset.json")).unwrap();
     for (field, value) in [
-        ("format", 2),
+        ("format", sparkles_core::commit::DATASET_FORMAT + 1),
         ("minimumReader", sparkles_core::commit::DATASET_READER + 1),
     ] {
         let mut capture = crate::Source::from_closed_dir(&source).unwrap();
@@ -204,7 +204,7 @@ async fn unsupported_dataset_metadata_is_refused_even_without_integrity_checks()
             assert!(
                 error
                     .message()
-                    .contains("Open the database with a newer release"),
+                    .contains("written by a newer release: open it with that release"),
                 "{error}"
             );
             assert!(!destination.exists());
@@ -1000,31 +1000,18 @@ fn swap_dir_rejects_a_lock_from_the_previous_root() {
     fixture::make_db(&target);
     std::fs::create_dir(&restored).unwrap();
     std::fs::write(restored.join("sentinel"), b"restored copy").unwrap();
-    let store = Store::open(&target, StoreOptions::default()).unwrap();
-    let vocab = target
-        .join(&store.snapshot().generation.name)
-        .join("delta.vocab");
-    drop(store);
-    let bytes = std::fs::read(&vocab).unwrap();
-    let parsed = sparkles_core::vocab::delta::parse_delta(&bytes).unwrap();
-    let mut legacy = Vec::new();
-    for key in parsed.keys {
-        legacy.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        legacy.extend_from_slice(key);
-    }
-    assert!(!legacy.is_empty());
-    std::fs::write(vocab, legacy).unwrap();
     let expected = nquads(&target);
-    let migrate_target = target.clone();
+    // An offline migration replaces the root by two renames once its copy passed the
+    // check (see `sparkles_core::migrate`). This release registers no step, so the hook
+    // performs the renames itself with a copy of the database, after `swap_dir` opened
+    // the lock file of the root that the renames move aside.
+    let (copy, previous) = (dir.path().join("db.copy"), dir.path().join("db.previous"));
+    copy_dir(&target, &copy);
+    let swapped = target.clone();
     AFTER_LOCK_OPEN.with(|h| {
         *h.borrow_mut() = Some(Box::new(move || {
-            let migrated = sparkles_core::migrate::migrate(&migrate_target, true).unwrap();
-            assert_eq!(migrated.steps.len(), 1);
-            assert!(
-                sparkles_core::migrate::pending(&migrate_target)
-                    .unwrap()
-                    .is_none()
-            );
+            std::fs::rename(&swapped, &previous).unwrap();
+            std::fs::rename(&copy, &swapped).unwrap();
         }));
     });
     let result = swap_dir(&target, &restored, false);
@@ -1037,6 +1024,21 @@ fn swap_dir_rejects_a_lock_from_the_previous_root() {
         std::fs::read(restored.join("sentinel")).unwrap(),
         b"restored copy"
     );
+}
+
+/// Copy the directory `from` to the new directory `to`, with its subdirectories.
+#[cfg(unix)]
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let destination = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &destination);
+        } else {
+            std::fs::copy(entry.path(), destination).unwrap();
+        }
+    }
 }
 
 /// A child forked from this process and held before exec, so that it shares every
