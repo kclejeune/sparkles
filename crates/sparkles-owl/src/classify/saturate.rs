@@ -69,12 +69,8 @@ pub enum Concl {
     /// Tier D: the successor sent a clause over its predecessor, by its id in the run's
     /// table
     PredC(Ex, u32),
-    /// Tier D in a rooted run: the source context sends the root the marker of a root
-    /// successor trigger, by its id in the run's literals, and registers with the root for
-    /// each of its constants (r-Succ)
-    RHyp(Ex, u32),
-    /// Tier D in a rooted run: the root sent a clause, by its id in the run's table
-    /// (r-Pred)
+    /// Tier D in a rooted run: the root sent a processed clause with an empty body over
+    /// one of the constants the context registered for, by its id in the run's table
     RPred(u32),
     /// Tier D in a rooted run: the marker of a ground literal that a predecessor holds as
     /// a maximal literal, by its id in the run's literals (Succ)
@@ -82,6 +78,10 @@ pub enum Concl {
     /// Tier D in a rooted run: the source context registers with the root for the
     /// constant, which a ground literal in one of its bodies mentions
     REdge(Ex, u32),
+    /// Tier D in a rooted run: a hypothetical successor derived a clause with an empty
+    /// body over constants and their successor terms, a fact of the root, by its id in
+    /// the run's table
+    RFact(u32),
 }
 
 // a conclusion takes three words, so that the to-do lists and outboxes keep their size
@@ -392,10 +392,10 @@ impl State {
             | Concl::Succ(..)
             | Concl::DEdge(..)
             | Concl::PredC(..)
-            | Concl::RHyp(..)
             | Concl::RPred(..)
             | Concl::HypL(..)
-            | Concl::REdge(..) => false,
+            | Concl::REdge(..)
+            | Concl::RFact(..) => false,
         }
     }
 
@@ -456,7 +456,14 @@ pub type Contexts = Vec<OnceLock<Box<Ctx>>>;
 pub enum Stop {
     Cancelled,
     Timeout,
-    Memory { used: usize },
+    Memory {
+        used: usize,
+    },
+    /// Tier D derived more conclusions than its bound, which is the run's own stop and
+    /// not the caller's
+    Work {
+        used: usize,
+    },
 }
 
 /// What bounds a saturation.
@@ -486,6 +493,7 @@ const STOP_NONE: u8 = 0;
 const STOP_CANCEL: u8 = 1;
 const STOP_TIMEOUT: u8 = 2;
 const STOP_MEMORY: u8 = 3;
+const STOP_WORK: u8 = 4;
 
 /// The conclusions a worker applies between checks of the bounds.
 const CHECK_EVERY: usize = 4096;
@@ -697,6 +705,7 @@ pub fn saturate_counted(
         STOP_TIMEOUT => Some(Stop::Timeout),
         // the most counted, waiting messages included, which is what passed the limit
         STOP_MEMORY => Some(Stop::Memory { used: peak }),
+        STOP_WORK => Some(Stop::Work { used: peak }),
         _ => None,
     };
     (totals, stop)
@@ -1339,9 +1348,14 @@ impl<'a> Run<'a> {
         let grown = used.saturating_sub(before);
         if b.max_memory.is_some_and(|m| used > m)
             || b.charge.is_some_and(|f| grown > 0 && !f(grown))
-            || b.dl.is_some_and(|d| d.over_work())
         {
             self.halt(STOP_MEMORY);
+            return false;
+        }
+        // the work bound is its own reason, so that the first stop published decides
+        // whether the run falls back or answers in part
+        if b.dl.is_some_and(|d| d.over_work()) {
+            self.halt(STOP_WORK);
             return false;
         }
         if b.deadline.is_some_and(|d| Instant::now() >= d) {
@@ -1753,24 +1767,18 @@ fn apply_rules<S: Sink, R: Rules>(
         }
         Concl::Hyp(a) if R::DISJ => dl_rules::hyp(st, a, out),
         Concl::DEdge(u, e) if R::DISJ => dl_rules::dedge(ix, me, st, u, e, out),
-        Concl::PredC(v, c) if R::DISJ => {
-            if ix.dl.as_deref().is_some_and(|d| d.is_root(me)) {
-                dl_root::pred_c(ix, st, v, c, out)
-            } else {
-                dl_rules::pred_c(ix, st, v, c, out)
-            }
-        }
-        Concl::RHyp(v, l) if R::DISJ => dl_root::rhyp(ix, st, v, l, out),
+        Concl::PredC(v, c) if R::DISJ => dl_rules::pred_c(ix, me, st, v, c, out),
         Concl::RPred(c) if R::DISJ => dl_root::rpred_c(ix, st, c, out),
         Concl::HypL(l) if R::DISJ => dl_root::hyp_l(st, l, out),
-        Concl::REdge(v, u) if R::DISJ => dl_root::redge(ix, st, v, u, out),
+        Concl::REdge(v, u) if R::DISJ => dl_root::redge(st, v, u, out),
+        Concl::RFact(c) if R::DISJ => dl_root::rfact(ix, st, c, out),
         Concl::Hyp(_)
         | Concl::DEdge(..)
         | Concl::PredC(..)
-        | Concl::RHyp(..)
         | Concl::RPred(..)
         | Concl::HypL(..)
-        | Concl::REdge(..) => {
+        | Concl::REdge(..)
+        | Concl::RFact(..) => {
             unreachable!("a conclusion of Tier D in a saturation without it")
         }
     }

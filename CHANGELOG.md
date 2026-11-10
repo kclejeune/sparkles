@@ -165,13 +165,18 @@ language list, saved in the browser. Query tables batch label lookups for visibl
 at the result's branch and commit. Missing labels and failed lookups keep a prefixed
 name or the complete IRI visible, and copying keeps the original RDF term.
 
-The disjunctive classification rules have rules for nominals and the object assertions
-of individuals, as F24's design for the sixth phase of roadmap item 603 describes, but
-they stay behind a switch that is off. With it on they time out on 19 of the 50 nominal
-fixtures of the phase's gate, so ontologies with individuals or nominals are still
-refused by the disjunctive rules and every classification gives the taxonomy it gave
-before. Roadmap item 804 redesigns the rules to meet the gate, and item 805 adds keys
-and the universal property.
+The disjunctive classification rules take ontologies with individuals and nominals
+through the rooted run of F24's sixth phase when `Limits::rooted` asks for it, which is
+off by default (roadmap item 804). The run departs from the journal calculus of Tena
+Cucala and others in four recorded ways, and F24 gives each its rationale, its soundness
+argument and its measured effect. Its completeness is not proved, and every answer it
+gives is entailed. A rooted run without counting stops at 524,288 derived conclusions,
+which `Limits::dl_work` changes, and classifies again without the rooted rules, which
+gives the answer a run without the option gives and sets `dl_rooted_over` and
+`dl_over_budget`. With the option on, 45 of the 50 nominal fixtures of the phase's gate
+give HermiT's taxonomy and the other five fall back to their default answer. Those five
+are item 822, the default is item 823, and keys and the universal property are item 805.
+Without the option every classification gives the taxonomy it gave before.
 
 The disjunctive classification rules can count, and `Limits::counting` turns it on. It is
 off by default, because counting finishes on no real ontology of the ORE 2015 DL

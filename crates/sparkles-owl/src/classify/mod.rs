@@ -27,7 +27,10 @@
 //! datatype that the classifier cannot compare, or with a property chain through the top
 //! property, is used as far as the calculus goes and reported as partial. Every
 //! subsumption the classifier answers is entailed. It derives every entailed subsumption
-//! between named classes when no axiom is reported as partial or left out.
+//! between named classes when no axiom is reported as partial or left out, except in a
+//! rooted run ([`Limits::rooted`], off by default), whose calculus departs from the
+//! published rules and whose completeness is not proved, so that its finished answer and
+//! `complete` say only that the run ended and left nothing out.
 //!
 //! [`Saturation`] keeps the saturated contexts between runs over axioms that the caller
 //! keeps, such as those of an open ontology, and reads them in place on each run.
@@ -117,10 +120,12 @@ fn drawing_on(
     })
 }
 
-/// Whether Tier D takes ontologies with individuals and nominals through the root of a
-/// rooted run (F24, "Nominals in the disjunctive rules"). It stays off until the rooted
-/// rules are complete, so that such an ontology takes the paths it took before.
-const ROOTED_RUNS: bool = false;
+/// The most conclusions a rooted run of Tier D without counting derives before it passes
+/// its bound and the run starts again without the rooted rules, which leaves the axioms
+/// outside OWL 2 EL out and reports them, as a run without [`Limits::rooted`] does.
+/// Of the 50 `shoi` fixtures, 45 finish within 190,000 conclusions on one and on four
+/// threads, and the other five derive millions, as F24's measured effect records.
+const ROOTED_WORK_BOUND: usize = 1 << 19;
 
 /// The most conclusions a run of Tier D with counting derives, kept or redundant, before
 /// it passes its bound and the run starts again without counting.
@@ -177,10 +182,13 @@ pub struct Limits {
     /// the expansion strategy of Tier D's Succ rule
     pub expansion: Expansion,
     /// the most conclusions, kept or redundant, that a run of Tier D with counting derives
-    /// before the run starts again without counting. `None` takes a bound of
-    /// [`DL_WORK_BOUND`] conclusions. It applies only with [`counting`](Limits::counting).
-    /// A run of Tier D without counting has no such bound, except the run that starts again
-    /// after this one passed it, whose bound is 4 million.
+    /// before the run starts again without counting, and that a rooted run without
+    /// counting derives before the run starts again without the rooted rules. `None`
+    /// takes a bound of [`DL_WORK_BOUND`] conclusions for a run that counts and
+    /// [`ROOTED_WORK_BOUND`] for a rooted run. It applies only with
+    /// [`counting`](Limits::counting) or [`rooted`](Limits::rooted). A run of Tier D
+    /// with neither has no such bound, except the run that starts again after a run
+    /// that counted passed it, whose bound is 4 million.
     pub dl_work: Option<usize>,
     /// whether Tier D counts, which is off by default. A run that counts takes number
     /// restrictions, functional and inverse functional properties, disjoint properties and
@@ -189,6 +197,19 @@ pub struct Limits {
     /// a run that does not count leaves those axioms out and reports them, as the
     /// classifier did before it counted, and costs what that run costs.
     pub counting: bool,
+    /// whether Tier D takes an ontology with individuals or nominals through the root of a
+    /// rooted run (F24, "Nominals in the disjunctive rules"), which is off by default. A
+    /// rooted run takes nominals, class and property assertions, equalities and
+    /// inequalities of individuals and negative assertions into the case analysis, and its
+    /// run without counting has a bound of [`dl_work`](Limits::dl_work) conclusions, past
+    /// which the run starts again without the rooted rules and reports the axioms outside
+    /// OWL 2 EL as it does by default, with [`Stats::dl_rooted_over`] set. Every answer
+    /// of a rooted run is entailed, and its completeness is not proved: F24 records the
+    /// calculus's departures from the published rules and the fixtures it finishes.
+    /// A rooted run refuses an ontology with keys, a top property or a functional data
+    /// property, which take the default paths, and the option changes nothing for an
+    /// ontology without individuals.
+    pub rooted: bool,
 }
 
 /// Which context the Succ rule of Tier D (roadmap item 603) gives a successor. Both
@@ -282,6 +303,10 @@ pub struct Stats {
     /// Tier D with counting passed its bound on derived conclusions, so the run
     /// classified again without counting and left the axioms that need it out
     pub dl_counting_over: bool,
+    /// a rooted run of Tier D ([`Limits::rooted`]) passed its bound on derived
+    /// conclusions, so the run classified again without the rooted rules and left the
+    /// axioms outside OWL 2 EL out, as a run without the option does
+    pub dl_rooted_over: bool,
     /// the candidate subsumers that Tier D tested in contexts of their own
     pub dl_tests: usize,
     /// the tested candidates that hold
@@ -291,7 +316,9 @@ pub struct Stats {
     /// Tier D passed its memory budget, so the run classified with the Horn rules and
     /// left the disjunctive axioms out, or Tier D with counting passed its bound on
     /// derived conclusions and the run classified without counting
-    /// ([`dl_counting_over`](Stats::dl_counting_over))
+    /// ([`dl_counting_over`](Stats::dl_counting_over)), or a rooted run passed its bound
+    /// and the run classified without the rooted rules
+    /// ([`dl_rooted_over`](Stats::dl_rooted_over))
     pub dl_over_budget: bool,
 }
 
@@ -432,6 +459,13 @@ pub struct Saturation {
     /// set while a run classifies again without counting, past Tier D's bound on derived
     /// conclusions, which leaves the axioms that need counting out
     no_counting: bool,
+    /// set while a run classifies again without the rooted rules, past a rooted run's
+    /// bound on derived conclusions, which leaves the axioms outside OWL 2 EL out
+    no_rooted: bool,
+    /// whether the current run of Tier D is rooted and whether it counts, for the
+    /// fallback its bound on derived conclusions takes
+    dl_rooted: bool,
+    dl_counted: bool,
     /// set by a run of Tier D that passed its bound on derived conclusions
     dl_worked: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// set when a Tier D classification requesting partial answers cannot fit its
@@ -778,6 +812,9 @@ impl Saturation {
             dl_tried: false,
             skip_dl: false,
             no_counting: false,
+            no_rooted: false,
+            dl_rooted: false,
+            dl_counted: false,
             dl_worked: Default::default(),
             partial_over: false,
             numeric_halt: false,
@@ -898,6 +935,7 @@ impl Saturation {
             && !self.partial_over
             && !self.numeric_halt
             && self.dl_worked.load(Ordering::Relaxed)
+            && (self.dl_counted || !self.dl_rooted)
         {
             // Tier D with counting passed its bound on derived conclusions, which a run
             // without counting never does: the run starts again with the axioms that need
@@ -925,6 +963,44 @@ impl Saturation {
             r = self.run(axioms, None, held_bytes, &without, with_taxonomy);
             self.no_counting = false;
             counting_over = Some(counted);
+        }
+        let mut rooted_over = None;
+        if let Err(Error::Memory { used, .. }) = r
+            && self.dl_tried
+            && !limits.el_only
+            && !self.partial_over
+            && !self.numeric_halt
+            && self.dl_worked.load(Ordering::Relaxed)
+            && self.dl_rooted
+            && !self.dl_counted
+        {
+            // A rooted run without counting passed its bound on derived conclusions: the
+            // run starts again without the rooted rules, so that the ontology takes the
+            // paths it takes without the option and the axioms outside OWL 2 EL are left
+            // out and reported, before it falls back further. Its charges draw first on
+            // what the pool admitted.
+            self.reset();
+            self.dl_worked.store(false, Ordering::Relaxed);
+            self.no_rooted = true;
+            let a = admitted.clone();
+            let counting = limits.charge.clone().map(|f| {
+                let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
+                    std::sync::Arc::new(move |bytes: usize| {
+                        let ok = f(bytes);
+                        if ok {
+                            a.fetch_add(bytes, Ordering::Relaxed);
+                        }
+                        ok
+                    });
+                drawing_on(admitted.load(Ordering::Relaxed), f)
+            });
+            let unrooted = Limits {
+                charge: counting,
+                ..limits.clone()
+            };
+            r = self.run(axioms, None, held_bytes, &unrooted, with_taxonomy);
+            self.no_rooted = false;
+            rooted_over = Some(used);
         }
         let mut dl_over = None;
         if let Err(Error::Memory { used, .. }) = r
@@ -1005,6 +1081,14 @@ impl Saturation {
             // the high-water mark of the run that counted, which the retry's may not reach
             stats.peak_memory = stats.peak_memory.max(counted);
             stats.dl_counting_over = true;
+            stats.dl_over_budget = true;
+        }
+        if let Some(used) = rooted_over
+            && let Ok((_, _, stats)) = &mut r
+        {
+            // the high-water mark of the rooted run, which the retry's may not reach
+            stats.peak_memory = stats.peak_memory.max(used);
+            stats.dl_rooted_over = true;
             stats.dl_over_budget = true;
         }
         r
@@ -1230,12 +1314,13 @@ impl Saturation {
         // Tier D takes them instead when one is disjunctive and the EL part has nothing
         // that its rules leave out
         let mut dl_taken = false;
+        let rooted = limits.rooted && !self.no_rooted;
         if !candidates.is_empty()
             && !limits.el_only
             && !self.skip_dl
-            && (self.horn_allowed(&ax) || ROOTED_RUNS && self.rooted_allowed(&ax))
+            && (self.horn_allowed(&ax) || rooted && self.rooted_allowed(&ax))
             && candidates.iter().any(|k| !dl::shape(k).horn)
-            && dl_norm::eligible(&self.interner, &ax, ROOTED_RUNS)
+            && dl_norm::eligible(&self.interner, &ax, rooted)
         {
             self.dl_tried = true;
             if let Some((flags, d)) = dl_norm::normalize(
@@ -1245,7 +1330,7 @@ impl Saturation {
                 limits.max_memory,
                 &stop,
                 limits.counting && !self.no_counting,
-                ROOTED_RUNS,
+                rooted,
             )
             .map_err(halt)?
             {
@@ -1508,13 +1593,19 @@ impl Saturation {
         // The Horn rules' contexts of conjunctions can need far more memory than the EL
         // rules on the same ontology, so a run with them has a budget of its own, past
         // which it classifies by the EL rules alone (run_with).
+        self.dl_rooted = rooted.is_some();
+        self.dl_counted = ax.dl.as_ref().is_some_and(|d| d.counting);
         if let Some(d) = &dl_run {
             // a run that counts has the bound of the limits, and the run that starts again
             // without counting after it passed that bound has the larger one of a run that
-            // cannot expect to finish soon, before the Horn rules take over
-            if self.no_counting {
+            // cannot expect to finish soon, before the Horn rules take over; a rooted run
+            // without counting has its own bound, past which the run starts again without
+            // the rooted rules
+            if self.dl_rooted && !self.dl_counted {
+                d.set_work_limit(limits.dl_work.unwrap_or(ROOTED_WORK_BOUND).max(1));
+            } else if self.no_counting {
                 d.set_work_limit(DL_RETRY_WORK);
-            } else if ax.dl.as_ref().is_some_and(|d| d.counting) {
+            } else if self.dl_counted {
                 d.set_work_limit(limits.dl_work.unwrap_or(DL_WORK_BOUND).max(1));
             }
         }
@@ -1550,22 +1641,33 @@ impl Saturation {
         let stopped = |stop: Stop| match stop {
             Stop::Cancelled => Error::Cancelled,
             Stop::Timeout => Error::Timeout,
-            Stop::Memory { used } => Error::Memory {
+            // the bound on derived conclusions goes back as the memory error that the
+            // fallback chain of `run_with` takes
+            Stop::Memory { used } | Stop::Work { used } => Error::Memory {
                 limit: limits.max_memory.unwrap_or(usize::MAX),
                 used,
             },
         };
         // a run that answers in part keeps the reason it stopped and goes on to the answer
         let mut halted: Option<Error> = None;
+        // whether the stop that won was Tier D's bound on derived conclusions, which the
+        // fallback chain reads in `dl_worked`: a check that saw the bound passed but lost
+        // the stop to the caller's deadline, cancellation or memory refusal does not count
+        let mut over_work = false;
         let partial = bounds.partial;
         let mut totals = match saturate::saturate_counted(&ix, &self.ctx, &roots, &[], &[], &bounds)
         {
             (t, None) => t,
             (t, Some(s)) if partial => {
+                over_work = matches!(s, Stop::Work { .. });
                 halted = Some(stopped(s));
                 t
             }
-            (_, Some(s)) => return Err(stopped(s)),
+            (_, Some(s)) => {
+                self.dl_worked
+                    .store(matches!(s, Stop::Work { .. }), Ordering::Relaxed);
+                return Err(stopped(s));
+            }
         };
         // the candidates whose tests ended without a contradiction
         let mut refuted: FxHashSet<(Ex, Ex)> = FxHashSet::default();
@@ -1599,7 +1701,7 @@ impl Saturation {
                     peak: totals.peak.max(more.peak),
                     merged: false,
                 };
-                stop.map_or(Ok(()), |s| Err(stopped(s)))
+                stop.map_or(Ok(()), Err)
             };
             loop {
                 if let Err(e) = poll(limits) {
@@ -1625,8 +1727,9 @@ impl Saturation {
                     .iter()
                     .map(|(x, bs)| dl_rules::test(d, *x, bs))
                     .collect();
-                if let Err(e) = round(&[], &ids, &mut totals) {
-                    halted = Some(e);
+                if let Err(s) = round(&[], &ids, &mut totals) {
+                    over_work = matches!(s, Stop::Work { .. });
+                    halted = Some(stopped(s));
                     break;
                 }
                 let mut seeds: Vec<Ex> = Vec::new();
@@ -1651,14 +1754,22 @@ impl Saturation {
                 }
                 seeds.sort_unstable();
                 seeds.dedup();
-                if let Err(e) = round(&seeds, &[], &mut totals) {
-                    halted = Some(e);
+                if let Err(s) = round(&seeds, &[], &mut totals) {
+                    over_work = matches!(s, Stop::Work { .. });
+                    halted = Some(stopped(s));
                     break;
                 }
             }
             stats.dl_testing = tests_start.elapsed();
         }
-        if !partial && let Some(h) = halted.take() {
+        // A stop at Tier D's bound on derived conclusions is the run's own and not the
+        // caller's, so it is not a partial answer: it goes back as the error that the
+        // fallback chain of `run_with` takes to the run that starts again, with counting
+        // or the rooted rules left out, and the caller gets that run's answer.
+        self.dl_worked.store(over_work, Ordering::Relaxed);
+        if (!partial || over_work)
+            && let Some(h) = halted.take()
+        {
             return Err(h);
         }
         // the dependency record of a partial answer: the classes it leaves open and the
@@ -2401,6 +2512,72 @@ fn poll(limits: &Limits) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    /// A check that sees Tier D's bound passed sets `dl_worked` before it publishes its
+    /// stop, and the caller's cancellation, deadline or memory refusal can win the stop
+    /// instead. The run then follows the stop that won: the partial answer the caller
+    /// asked for, and no fallback past the bound.
+    #[test]
+    fn a_caller_stop_that_wins_over_a_passed_bound_keeps_the_partial_answer() {
+        let doc = crate::ofn_read::parse(
+            "Prefix(:=<http://ex.org/>)
+             Ontology(
+             ClassAssertion(ObjectUnionOf(:B :C) :a)
+             ClassAssertion(ObjectComplementOf(:C) :a)
+             SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:a)))
+             SubClassOf(ObjectSomeValuesFrom(:r :B) :D)
+             )",
+        )
+        .unwrap();
+        for threads in [1, 4] {
+            // The cancellation holds from its n-th poll on. The polls before the
+            // saturation fail the run as cancelled, so the first n whose run answers is
+            // a cancellation the saturation saw, and the answer is partial.
+            let mut answered = false;
+            for n in 0..64 {
+                let mut k = Classifier::of(&doc.axioms);
+                // the cancellation sets the losing check's flag as it is published, as
+                // the check that saw the bound passed did before it lost the stop
+                let worked = k.sat.dl_worked.clone();
+                let polls = Arc::new(AtomicUsize::new(0));
+                let p = polls.clone();
+                let out = k.classify(&Limits {
+                    threads,
+                    rooted: true,
+                    partial: true,
+                    cancelled: Some(Arc::new(move || {
+                        if p.fetch_add(1, Ordering::Relaxed) >= n {
+                            worked.store(true, Ordering::Relaxed);
+                            true
+                        } else {
+                            false
+                        }
+                    })),
+                    ..Limits::default()
+                });
+                match out {
+                    Err(Error::Cancelled) => continue,
+                    Err(e) => panic!("{threads} threads, poll {n}: {e:?}"),
+                    Ok(out) => {
+                        assert!(
+                            !out.complete,
+                            "{threads} threads, poll {n}: the saturation was not cancelled"
+                        );
+                        assert_eq!(out.consistency, Consistency::Unknown);
+                        assert!(!out.stats.dl_rooted_over);
+                        assert!(!out.stats.dl_over_budget);
+                        assert!(!k.sat.dl_worked.load(Ordering::Relaxed));
+                        answered = true;
+                        break;
+                    }
+                }
+            }
+            assert!(
+                answered,
+                "{threads} threads: no poll reached the saturation"
+            );
+        }
+    }
+
     #[test]
     fn a_refused_charge_gives_back_the_credit_it_took() {
         // a pool with nothing left, and 100 bytes it admitted for an earlier run
