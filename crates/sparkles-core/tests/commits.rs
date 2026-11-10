@@ -186,10 +186,10 @@ fn an_unknown_wal_record_before_the_last_commit_is_not_a_torn_tail() {
     }
     let path = wal(&root);
     let good = std::fs::read(&path).unwrap();
-    // a damaged record type in the first transaction: truncating there would silently
-    // drop the second, acknowledged, commit
+    // a damaged record type in the first transaction, after the header record:
+    // truncating there would silently drop the second, acknowledged, commit
     let mut bad = good.clone();
-    bad[0] = 0x7f;
+    bad[33] = 0x7f;
     std::fs::write(&path, &bad).unwrap();
     let e = Store::open(&root, StoreOptions::default()).err().unwrap();
     assert!(e.to_string().contains("unknown record type"), "{e}");
@@ -807,20 +807,12 @@ fn compaction_keeps_the_head_and_bulk_writes_are_commits() {
     assert_eq!(upd(&s, "INSERT DATA { <urn:z> <urn:p> 1 }").commit.seq, 6);
 }
 
+/// A database as a pre-release build left it, with headerless commit records and no
+/// `dataset.json`, `commit.json` or catalog, is refused with the dump-and-reload message
+/// instead of getting a baseline commit, by the open and by `check`, and the refusal
+/// changes no file. Each missing file is refused on its own as well.
 #[test]
-fn databases_from_older_versions_get_a_baseline_commit() {
-    let preserved_payload = |s: &Store| {
-        for (pattern, expected) in [("<urn:x> <urn:p> 1", 1), ("<urn:a0> <urn:p> 0", 0)] {
-            let rows = sparkles_core::sparql::query(
-                s.snapshot(),
-                &format!("SELECT * {{ {pattern} }}"),
-                &QueryOptions::default(),
-            )
-            .unwrap()
-            .len();
-            assert_eq!(rows, expected, "legacy payload {pattern}");
-        }
-    };
+fn databases_from_older_versions_are_refused_with_dump_and_reload() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");
     {
@@ -829,51 +821,56 @@ fn databases_from_older_versions_get_a_baseline_commit() {
         upd(&s, "INSERT DATA { <urn:x> <urn:p> 1 }");
         upd(&s, "DELETE DATA { <urn:a0> <urn:p> 0 }");
     }
-    // make it look like an older version's database: legacy WAL commit records, no
-    // dataset.json, commit.json or catalog
     let path = wal(&root);
-    let checked = sparkles_core::check::check(&root, &Default::default()).unwrap();
-    assert_eq!(checked.status, sparkles_core::check::Status::Ok);
-    let mut w = std::fs::read(&path).unwrap();
-    assert!(w.len() >= 33);
+    let cur = std::fs::read_to_string(root.join("CURRENT")).unwrap();
+    let gen_dir = root.join(cur.trim());
+    let good_wal = std::fs::read(&path).unwrap();
+    let good_commit = std::fs::read(gen_dir.join("commit.json")).unwrap();
+    let good_dataset = std::fs::read(root.join("dataset.json")).unwrap();
+    let refuse = |expect: &str| {
+        let before = walkdir(&root);
+        let e = Store::open(&root, StoreOptions::default()).err().unwrap();
+        assert!(e.to_string().contains(expect), "{e}");
+        assert!(e.to_string().contains("sparkles dump"), "{e}");
+        assert_eq!(walkdir(&root), before, "the refusal changed a file");
+        let checked = sparkles_core::check::check(&root, &Default::default()).unwrap();
+        assert_eq!(checked.status, sparkles_core::check::Status::Error);
+        assert!(
+            checked.to_text().contains("sparkles dump"),
+            "{}",
+            checked.to_text()
+        );
+    };
+    // the generation without its commit.json
+    std::fs::remove_file(gen_dir.join("commit.json")).unwrap();
+    refuse("commit.json is missing");
+    std::fs::write(gen_dir.join("commit.json"), &good_commit).unwrap();
+    // the database without its dataset.json
+    std::fs::remove_file(root.join("dataset.json")).unwrap();
+    refuse("dataset.json is missing");
+    std::fs::write(root.join("dataset.json"), &good_dataset).unwrap();
+    // a headerless log with commit records without metadata
+    let mut w = good_wal.clone();
     assert_eq!(&w[..8], b"\x89SPKWAL\n");
-    assert_eq!(u32::from_le_bytes(w[8..12].try_into().unwrap()), 1);
-    assert!(w[12..33].iter().all(|b| *b == 0));
     w.drain(..33);
-    assert_ne!(w[0], 0x89, "the legacy fixture is headerless");
     for rec in w.as_chunks_mut::<33>().0 {
         if rec[0] == 3 {
             rec[9..].fill(0);
         }
     }
     std::fs::write(&path, &w).unwrap();
-    let cur = std::fs::read_to_string(root.join("CURRENT")).unwrap();
-    std::fs::remove_file(root.join(cur.trim()).join("commit.json")).unwrap();
+    refuse("wal version 0");
+    // all of them at once, as such a database is found
+    std::fs::remove_file(gen_dir.join("commit.json")).unwrap();
     std::fs::remove_file(root.join("dataset.json")).unwrap();
     std::fs::remove_file(root.join("commits.bin")).unwrap();
-    let checked = sparkles_core::check::check(&root, &Default::default()).unwrap();
-    assert_ne!(
-        checked.status,
-        sparkles_core::check::Status::Error,
-        "{checked:?}"
-    );
-    let id;
-    {
-        let s = Store::open(&root, StoreOptions::default()).unwrap();
-        let h = s.head_commit();
-        assert_eq!(
-            (h.seq, h.kind, h.inserted, h.quads),
-            (0, CommitKind::Baseline, 3, 3)
-        );
-        preserved_payload(&s);
-        id = s.dataset_id();
-        assert_eq!(upd(&s, "INSERT DATA { <urn:y> <urn:p> 1 }").commit.seq, 1);
-    }
+    refuse("sparkles dump");
+    // the database as it was opens again
+    std::fs::write(&path, &good_wal).unwrap();
+    std::fs::write(gen_dir.join("commit.json"), &good_commit).unwrap();
+    std::fs::write(root.join("dataset.json"), &good_dataset).unwrap();
     let s = Store::open(&root, StoreOptions::default()).unwrap();
-    preserved_payload(&s);
-    assert_eq!(s.dataset_id(), id);
-    assert_eq!(seqs(&s), [1, 0]);
-    assert_eq!(s.commit(0).unwrap().kind, CommitKind::Baseline);
+    assert_eq!(s.head_commit().seq, 3);
 }
 
 #[test]

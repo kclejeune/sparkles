@@ -40,7 +40,7 @@ fn all_fixtures() -> Vec<(PathBuf, bool)> {
     assert!(!out.is_empty(), "no fixtures in {}", dir.display());
     out.into_iter()
         .map(|p| {
-            let inside = dataset_format(&p) == sparkles_core::commit::DATASET_FORMAT;
+            let inside = dataset_format(&p) == sparkles::commit::DATASET_FORMAT;
             (p, inside)
         })
         .collect()

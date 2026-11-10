@@ -658,12 +658,16 @@ impl Checker<'_> {
         }
         match commit::read_dataset_file(root) {
             Ok(Some(id)) => self.dataset_id = Some(id),
-            Ok(None) => run.add(
-                Issue::warning(
-                    "dataset.json is missing: a database from an older version, which gets a dataset id and a baseline commit when opened",
-                )
+            // only a database written before the first release lacks the file, and
+            // open refuses it instead of giving it a baseline commit
+            Ok(None) if self.current.is_some() => run.add(
+                Issue::error(format!(
+                    "dataset.json is missing, which only a database written before the first release lacks: open refuses the database. {}",
+                    crate::formats::dump_and_reload(None)
+                ))
                 .file("dataset.json"),
             ),
+            Ok(None) => {}
             Err(e) => run.add(Issue::error(e.to_string()).file("dataset.json")),
         }
         if let Some(name) = &self.current {
@@ -683,11 +687,13 @@ impl Checker<'_> {
                     self.base = Some(c);
                     self.origin = Some(origin);
                 }
-                Ok(None) if self.dataset_id.is_some() => run.add(
-                    Issue::warning("missing: open records the generation as a baseline commit")
-                        .file(&file),
+                Ok(None) => run.add(
+                    Issue::error(format!(
+                        "missing, which only a generation written before the first release lacks: open refuses the database. {}",
+                        crate::formats::dump_and_reload(commit::read_written_by(root).as_deref())
+                    ))
+                    .file(&file),
                 ),
-                Ok(None) => {}
                 Err(e) => run.add(Issue::error(e.to_string()).file(&file)),
             }
         }

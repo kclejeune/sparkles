@@ -204,10 +204,23 @@ fn every_pre_release_fixture_is_refused_with_dump_and_reload() {
 fn each_removed_form_is_refused_from_a_minimal_file() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("db");
-    drop(Store::open(&root, StoreOptions::default()).unwrap());
+    {
+        // a commit, so that the log holds records after its header
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        update(
+            &s,
+            "INSERT DATA { <http://ex.org/s> <http://ex.org/p> 1 }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+    }
     let dataset = root.join("dataset.json");
     let original = std::fs::read(&dataset).unwrap();
-    let refusal = |root: &Path| Store::open(root, StoreOptions::default()).err().unwrap();
+    let refusal = |root: &Path| {
+        Store::open(root, StoreOptions::default())
+            .err()
+            .expect("the removed form opened")
+    };
     let edit_dataset = |f: &dyn Fn(&mut serde_json::Value)| {
         let mut v: serde_json::Value = serde_json::from_slice(&original).unwrap();
         f(&mut v);
@@ -299,8 +312,8 @@ fn each_removed_form_is_refused_from_a_minimal_file() {
     let wal = gen_dir.join("wal.log");
     let original_wal = std::fs::read(&wal).unwrap();
     assert!(
-        original_wal.len() >= 33,
-        "the log starts with its header record"
+        original_wal.len() > 33,
+        "the log holds records after its header"
     );
     std::fs::write(&wal, &original_wal[33..]).unwrap();
     let e = refusal(&root).to_string();
@@ -383,13 +396,12 @@ fn a_newer_pattern_file_is_not_used() {
 
 // ---------------------------------------------------------- refused datasets ------
 
-/// A closed database whose `dataset.json` an older release wrote: `minimumReader` 1 and
-/// no `writtenBy`. A write-open by this build would change it.
+/// A closed database whose `dataset.json` another release of this format wrote, without
+/// a `writtenBy`. A write-open by this build would change it.
 fn old_stamped_database(root: &Path) {
     drop(Store::open(root, StoreOptions::default()).unwrap());
     let path = root.join("dataset.json");
     let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    v["minimumReader"] = 1.into();
     v.as_object_mut().unwrap().remove("writtenBy");
     std::fs::write(&path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
 }
@@ -517,7 +529,7 @@ fn a_newer_index_meta_in_a_new_shape_is_unsupported() {
     two_generation_database(&root);
     for p in &find_files(&root, "meta.json") {
         let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
-        v["format_version"] = 5.into();
+        v["format_version"] = 6.into();
         v.as_object_mut().unwrap().remove("created");
         v.as_object_mut().unwrap().remove("quads");
         std::fs::write(p, serde_json::to_vec(&v).unwrap()).unwrap();
