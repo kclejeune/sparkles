@@ -211,8 +211,9 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds with item
 479 of stage 2. Stage 4's accounting model and mode-neutral kernels have shipped, and the
-hierarchical budget of item 675 and the decoding twins of item 678 remain.
-[Item 453](../../ROADMAP.md) tracks the rest of the work.
+hierarchical budget of item 675 and the decoding twins of item 678 remain. Stage 5's
+join-kernel library has shipped, and its other phases follow the
+[plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
 
 Native SELECT output and standard solution responses of at most 65,536 rows admit and
 decode a complete row before serializing its cells. Row storage and decoded terms keep
@@ -635,6 +636,49 @@ result cache and sampled filters stay off for cursors, since they are planning c
 that stage 6 makes independent of the mode. Item 678 holds the two decoding twins
 that remain, the string floors and the dictionary pre-decode of a cursor batch, which
 `decode_for` does not yet serve.
+
+### One join-kernel library
+
+The module `sparql/join` of `sparkles-core` holds one kernel per join algorithm, and
+neither kernel knows the mode that runs it. The hash kernel owns the flat table of build
+rows grouped by key, which the cursor's `HashIndex` was, with the eager `KeyGroups`'
+partitioned parallel build above 65,536 rows, and one probe loop in the five modes,
+inner, OPTIONAL, semi, anti and MINUS, that takes a range of probe rows and an output
+room and returns pairs or verdicts. The keyed kernel owns the `EqualityIndex` of a join
+keyed on the equality of its condition. The merge kernel takes the lower bounds of the
+left keys in the right column from the zipper, which now gallops over the larger side
+whichever side that is, and expands, counts or filters the runs without a branch per
+row. The galloping search of the merge joins, the zipper and the index join is one
+function with a predicate.
+
+The eager executor hands each kernel its whole input tables as one batch and probes in
+parallel pieces of 32,768 rows, checking the pairs of all pieces against the output
+limits as they grow, and the cursor hands the kernels the batches it pulls and resumes
+where the room ran out. The eager hash join, OPTIONAL, keyed join, semi join, anti join
+and MINUS, the eager merge join, merge OPTIONAL, merge count and merge anti join, the
+cursor's binary operator and the rows a loaded right batch decides in the cursor's merge
+operator all run through the kernels. The cursor's merge operator keeps its runs across
+batch boundaries and the spooling of long runs, and the ripple join and the index join
+stay as they were.
+
+An OPTIONAL condition is tested once over the gathered candidate rows of a chunk in both
+modes, so the generic conditional OPTIONAL over two inputs that share no variable no
+longer materializes their product. The `merge_left_join` switch selects the merge
+OPTIONAL in both modes, and EXPLAIN names the algorithm that ran, `[merge on ?k]` or
+`[hash join]`, in both. An eager join whose hash table does not fit the memory budget of
+a query that may spill runs again as the cursor's partitioned hash join over its two
+input tables, whose Grace partitioning wraps the same kernel, and its plan notes
+`[build did not fit: partitioned to disk]`. The eager memory retry still covers the
+operators that do not spill.
+
+A unit test checks the galloping search against `partition_point` on random sorted
+slices, a cursor test checks that the OPTIONAL over sorted inputs honours the switch and
+names its algorithm in both plans, and a spill test runs an eager MINUS under a budget
+its hash table does not fit and expects the eager answer. The hash table of the smaller
+side is charged in eager execution, which it was not before, and the eager OPTIONAL
+builds on its right side as the cursor does rather than on the smaller side. The
+conditional OPTIONAL of item 570 is measured in both modes on the benchmark worker as
+the plan describes, and item 570 records the result.
 
 ### Measurements of stage 1
 
