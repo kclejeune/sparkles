@@ -55,7 +55,7 @@ their Roadmap follow-ups. OWL classification is a separate engine in
 
 ### Core
 
-**Columnar sorted derived tier with merge-join rule evaluation.** Replace the reasoner's row table and hash lists with immutable sorted per-predicate column runs plus a small mutable delta, and evaluate rule steps with merge or galloping joins. Derived facts cost about 135 bytes each and use u32 row ids, which caps the tier at about 4.29B rows. RDFox reaches about 40 to 60 bytes per fact. The derived layer of item 9 Phase 2 is written from the tier's sorted runs, so the tier comes first. The [plan](PLAN.md#the-derived-tier-is-columnar-and-sorted-and-the-derived-layer-is-written-from-it) fixes its layout, and roadmap item 835 holds this phase.
+**Columnar sorted derived tier with merge-join rule evaluation.** Replace the reasoner's row table and hash lists with immutable sorted per-predicate column runs plus a small mutable delta, and evaluate rule steps with merge or galloping joins. Derived facts cost about 135 bytes each and use u32 row ids, which caps the tier at about 4.29B rows. RDFox reaches about 40 to 60 bytes per fact. The [plan](PLAN.md#the-derived-tier-is-columnar-and-sorted) fixes its layout and proposes that item 9 Phase 2's derived layer be written from the tier's sorted runs, which the maintainer decides. Roadmap item 835 holds this phase.
 
 **Compact provenance with derivation records and bounded witnesses.** Store one derivation record per derived fact, the rule and the body facts of the instance that first derived it, in columnar form, enabling deletion that checks only broken records, Why answers and reviewed-only visibility without re-derivation. Explanations are re-derived on demand. F13 §4.3 rules out counts for recursive maintenance because a fact in a cycle can support itself, and the [plan](PLAN.md#provenance-is-a-derivation-record-per-fact-with-counts-only-where-measured) keeps counts out of the design unless a measurement on non-recursive strata shows them faster than the record check. It depends on items 18, 285, 415 and 416, and roadmap item 836 holds this phase.
 
@@ -73,14 +73,14 @@ their Roadmap follow-ups. OWL classification is a separate engine in
 
 **Entailment analysis in memory.** Diagnose over the derived tier plus the base in memory instead of copying inputs to a private store and materializing again. `analysis.rs` calls its own path the full-closure fallback. Wait for item 18 Phase 3 or F22 evidence that the cost matters. It depends on items 18 and 340.
 
-**One incremental-maintenance core for rules and views.** Make the reasoner's rule engine over the derived tier a `Program` of item 417's fixed-point operator, which is a record-based backward/forward maintainer rather than a timestamped circuit, maintain the closure operators' relations inside it, emit the tier's change as a Z-set that views read, and share one Footprint type, so stratified noValue, lists and makeSkolem rules are maintained instead of falling back to a full run. The reasoner's backward/forward maintenance and the incr core are separate frameworks with recompute fallbacks on both sides, and footprints are computed four times. F13 §4.3 plans the reasoner plug-in. It depends on items 415, 417 and 547 and on the derivation records, and item 221 builds on its Z-set output. The [plan](PLAN.md#one-maintenance-core-is-the-record-based-backwardforward-maintainer) gives the design and the correctness argument, and roadmap item 837 holds this phase.
+**One incremental-maintenance core for rules and views.** Make the reasoner's rule engine over the derived tier a `Program` of item 417's fixed-point operator, which is a record-based backward/forward maintainer rather than a timestamped circuit, maintain the closure operators' relations inside it, emit the tier's change as a Z-set that views read, and share one Footprint type, so rules that read lists, and stratified noValue once the full run's negation semantics are decided, are maintained instead of falling back to a full run. The reasoner's backward/forward maintenance and the incr core are separate frameworks with recompute fallbacks on both sides, and footprints are computed four times. F13 §4.3 plans the reasoner plug-in. It depends on items 415, 417 and 547 and on the derivation records, and item 221 builds on its Z-set output. The [plan](PLAN.md#one-maintenance-core-is-the-record-based-backwardforward-maintainer) gives the design and the correctness argument, and roadmap item 837 holds this phase.
 
 ## Dependencies
 
 * The gates of items 469 to 473, in particular the demand and RDFS-on-read benchmark of
   item 472, exist before the quick fixes land.
-* Item 9's derived layer is written from the columnar tier, and its representatives
-  supply the canonical equality that the equality rules read.
+* The plan proposes writing item 9's derived layer from the columnar tier, and item 9's
+  representatives supply the canonical equality that the equality rules read.
 * Item 417's fixed-point operator and item 547's LUBM measurements come before the shared
   maintenance core, which also needs item 415 and the derivation records. Item 221 reads
   the core's Z-set output, and item 418's aggregates are maintained by the views side.

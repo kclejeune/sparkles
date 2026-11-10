@@ -11,54 +11,59 @@ workstream, and the numbered items below are its phases.
 The inventory below is the state the plan starts from. File paths are under
 `crates/sparkles-reasoner/src` unless another crate is named.
 
-**Rules.** `parser.rs` reads Jena rules into `Rule`, `Clause` and `Node`, and `engine.rs`
-compiles them to `CRule` with `Atom` over three `Slot`s and `CBuiltin`. Every atom is a
-pattern over one ternary relation of triples, and n-ary relations exist only through the
-tuple nodes that C24 §6.4 makes with `makeSkolem`. `engine::plan_with` orders a body
-greedily by `estimate`, which reads per-predicate counts and distinct subjects and objects.
-`engine::run_observed` runs the semi-naive iteration, splits work into chunks of 2,048
-derived or 4,096 base rows, and stops at a candidate limit derived from `max_inferred`.
+The rules come from `parser.rs`, which reads Jena rules into `Rule`, `Clause` and `Node`,
+and `engine.rs` compiles them to `CRule` with `Atom` over three `Slot`s and `CBuiltin`.
+Every atom is a pattern over one ternary relation of triples, and n-ary relations exist
+only through the tuple nodes that C24 §6.4 makes with `makeSkolem`. `engine::plan_with`
+orders a body greedily by `estimate`, which reads per-predicate counts and distinct
+subjects and objects. `engine::run_observed` runs the semi-naive iteration, splits work
+into chunks of 2,048 derived or 4,096 base rows, and stops at a candidate limit derived
+from `max_inferred`.
 
-**Facts.** `facts.rs` is the base tier, which reads the snapshot's permutations and never
-copies the input. `graph.rs` is the derived tier. A derived fact is a `[u64; 3]` row in
-`triples`, numbered by a `u32` row id from the base tier's size on. The row is found by
-triple through 64 sharded `HashTable<u32>`s and by predicate, by predicate and subject and
-by predicate and object through `FxHashMap`s of `SmallVec<[u32; 4]>` row lists, with
-optional per-subject and per-object lists built on demand. The row, its hash slot and the
-three list entries come to about 135 bytes when most `(p, s)` and `(p, o)` keys are
-distinct, which is the figure the docs cite. Deletion marks a row dead in a bitmap, and
-`incremental::Closure` adds one bit per row that marks a derived row as explicit. The base
-tier takes row ids too, so an input of more than `u32::MAX / 2` triples is refused.
+The facts live in two tiers. `facts.rs` is the base tier, which reads the snapshot's
+permutations and never copies the input. `graph.rs` is the derived tier. A derived fact is
+a `[u64; 3]` row in `triples`, numbered by a `u32` row id from the base tier's size on.
+The row is found by triple through 64 sharded `HashTable<u32>`s and by predicate, by
+predicate and subject and by predicate and object through `FxHashMap`s of `SmallVec<[u32;
+4]>` row lists, with optional per-subject and per-object lists built on demand. The row,
+its hash slot and the three list entries come to about 135 bytes when most `(p, s)` and
+`(p, o)` keys are distinct, which is the figure the docs cite. Deletion marks a row dead
+in a bitmap, and `incremental::Closure` adds one bit per row that marks a derived row as
+explicit. The base tier takes row ids too, so an input of more than `u32::MAX / 2` triples
+is refused.
 
-**Closure operators.** `closure.rs` detects transitive rules, the guarded `prp-trp` and a
-symmetric rule paired with a transitive one, and evaluates them after each merge with
+The closure operators in `closure.rs` detect transitive rules, the guarded `prp-trp` and a
+symmetric rule paired with a transitive one, and evaluate them after each merge with
 Tarjan's condensation, reachability sets and union-find. `lib.rs:431` enables them only in
 a full run. Incremental updates, query sessions, witness builds and analysis evaluate the
 rules as joins. The operators keep no provenance.
 
-**Maintenance.** `incremental.rs` is backward/forward maintenance after Motik, Nenov, Piro
+Maintenance in `incremental.rs` is backward/forward maintenance after Motik, Nenov, Piro
 and Horrocks. A deleted explicit fact is a candidate, `Search::prove` looks for another
 derivation depth first through every rule instance that derives it, and only facts without
 a proof are deleted. No fact carries a derivation record, so a candidate's proof search
-starts from nothing. On a transitive clique that search visits about 510 rule instances per
-fact, which roadmap item 798 bounds by the cost of a full run. Insertion appends the new
-explicit facts as flagged delta rows and runs the semi-naive engine from them. Any rule with
-`noValue`, `now`, `makeTemp`, `makeSkolem`, a head action, a blank node in its head or an
-uncovered `listForAll` makes every update a full run, as do changed lists, changed rules,
-changed input graphs and a deletion of more than one explicit fact in twenty. The kept
-closure, `maintain::Cache`, holds the derived tier in memory and rebuilds it from the
-inferred graph after a restart.
+starts from nothing. On a transitive clique that search visits many rule instances per
+checked fact, so deleting 462 triples from OWL2Bench(1) grew past 14 GiB where a full run
+needs less than 800 MiB, and roadmap item 798 bounds the search by the cost of a full run.
+Insertion appends the new explicit facts as flagged delta rows and runs the semi-naive
+engine from them. Any rule with `noValue`, `now`, `makeTemp`, `makeSkolem`, a head action,
+a blank node in its head or an uncovered `listForAll` makes every update a full run, as do
+a changed or derived list when the rules read lists, changed rules, changed input graphs
+and, with at least 10,000 explicit facts, a deletion of more than one in twenty of them.
+The kept closure, `maintain::Cache`, holds the derived tier in memory and rebuilds it from
+the inferred graph after a restart.
 
-**Query-time reasoning.** `demand.rs` builds magic-set programs with sideways information
-passing in up to three stages, with a cap of 50,000 rules, and `query.rs` runs them on a
-`Graph` over the snapshot with a per-view table cache. A compact session evaluates the
-original rules to closure when the view is small and the rule constants fit in 128 terms.
+Query-time reasoning builds its programs in `demand.rs`, magic-set programs with sideways
+information passing in up to three stages, with a cap of 50,000 rules, and `query.rs` runs
+them on a `Graph` over the snapshot with a per-view table cache. A compact session
+evaluates the original rules to closure when the view is small and the rule constants fit
+in 128 terms.
 
-**Witnesses.** `witness.rs` computes bounded minimal supports per derived fact after the
+`witness.rs` computes bounded minimal supports per derived fact after the
 closure, from the rule instances that the backward plans find, with F13's `prov` types.
 `explain.rs` and `whynot.rs` do not read them and derive their answers again.
 
-**The incremental core.** `crates/sparkles-core/src/incr` maintains views as Z-set
+The incremental core, `crates/sparkles-core/src/incr`, maintains views as Z-set
 circuits whose operators probe the store's permutations at the old and new snapshots. Its
 fixed-point operator, `incr/fixpoint.rs`, is not a timestamped recursive circuit. It is a
 worklist over a hash set of facts driven by a `Program` trait with `axioms`,
@@ -74,18 +79,20 @@ RDFS on read, and as the reasoner's watched graphs and schema-read analyses, wit
 type. A view over a dataset with inferences is one `recompute` node, so no circuit reads
 the derived tier incrementally, which roadmap item 221 covers.
 
-**The reference.** Item 791's Nemo program, `scripts/rl-reference/owl2rl.rls`, derives the
-same closure as `owl-rl` triple for triple on LUBM(1), OWL2Bench(1) and 66 W3C OWL 2 RL
-cases, and `mise run test:rl-reference` and `bench:rl-reference` check and time it. On the
-development laptop Sparkles materialized LUBM(1) in 0.25 s against Nemo's 1.83 s and
-OWL2Bench(1) in 1.44 s against 14.88 s, both on one thread, but its peak resident set on
-OWL2Bench(1) was 462 MiB against 129 MiB, about 330 bytes per derived fact against about
-90. Nemo runs on one thread and has no incremental maintenance. Speed is therefore not where
-the reasoner loses to its reference, and memory per derived fact is.
+The reference is item 791's Nemo program. `scripts/rl-reference/owl2rl.rls` writes the OWL
+2 RL rules, and aligned with `sparkles-extensions.rls` and without the reflexive
+equivalence cases it derives the same closure as `owl-rl` triple for triple on LUBM(1),
+OWL2Bench(1) and 66 W3C OWL 2 RL cases, while the W3C rules alone derive a subset that
+`owl-rl` contains. `mise run test:rl-reference` and `bench:rl-reference` check and time
+it. On the development laptop Sparkles materialized LUBM(1) in 0.25 s against Nemo's 1.83
+s and OWL2Bench(1) in 1.44 s against 14.88 s, both on one thread, but its peak resident
+set on OWL2Bench(1) was 462 MiB against 129 MiB, about 346 bytes per derived fact against
+about 97. Nemo runs on one thread and has no incremental maintenance. Speed is therefore
+not where the reasoner loses to its reference, and memory per derived fact is.
 
 ## Decisions
 
-### The derived tier is columnar and sorted, and the derived layer is written from it
+### The derived tier is columnar and sorted
 
 The tier becomes, per predicate, two sorted orders of the facts, by subject then object
 and by object then subject. Each order is a list of immutable sorted runs plus one mutable
@@ -105,25 +112,34 @@ demand as the per-subject and per-object lists are today.
 
 The semi-naive ranges of `engine::run_observed` keep their meaning, since the runs of one
 iteration are the delta and the fact id bounds give the visible end that `noValue` and the
-list builtins read. The two orders cost 32 bytes per fact, the fact id column 4 and the
-position table 8, which gives 44 bytes before provenance, within the 40 to 60 bytes that
-RDFox reports and a third of today's figure. The base tier no longer takes row ids, so the
-`u32::MAX / 2` cap on the input goes and the `u32` fact id caps only the derived facts.
-A second layout, a dense fact table by fact id with the two orders holding fact ids alone,
-costs 32 bytes but pays an indirection per comparison, and the phase measures both before
-it keeps one.
+list builtins read. Each order costs 20 bytes per fact for its two ids and the fact id,
+and the position table 8, which gives 48 bytes before provenance, with two bits of bitmaps
+and the run headers on top, within the 40 to 60 bytes that RDFox reports and about a third
+of today's figure. A compaction holds the old and new runs of one order at once, so the
+peak adds that order's size while it runs, and an order over the whole tier that a
+variable-predicate rule builds on demand adds 20 bytes per fact while it exists. The base
+tier no longer takes row ids, so the `u32::MAX / 2` cap on the input goes and the `u32`
+fact id caps only the derived facts. A second layout, a dense fact table by fact id with
+the two orders holding fact ids alone, costs 32 bytes but pays an indirection per
+comparison, and the phase measures both before it keeps one.
 
 The columnar tier reverses a dependency that the spec stated. F16 §5's derived layer, item
 9 Phase 2, writes sorted permutations of derived triples to disk, and the tier's subject
-order sorted by `(p, s, o)` is that input. The tier therefore comes first, and the layer
-serializes it. The layer does not need to exist before the tier, and nothing in the tier
-waits for item 9.
+order sorted by `(p, s, o)` is that input. The plan proposes that the tier come first and
+the layer serialize it, since nothing in the tier waits for item 9, and the maintainer
+decides the order below.
 
 ### Provenance is a derivation record per fact, with counts only where measured
 
-Every derived fact keeps a record, the rule and the fact ids of the body facts of the
-instance that first derived it, in a column keyed by fact id with a `u32` offset into a
-premise pool. A record costs 6 bytes plus 4 per premise, about 18 to 22 bytes on OWL 2 RL.
+Every derived fact keeps a record, the rule and the variable bindings of the instance that
+first derived it, as `RuleProgram::Record` holds them today. The bindings name the body
+facts by instantiating the rule's atoms, so a premise in the base tier, which has no fact
+id, and one in the derived tier are addressed the same way. The records are a column keyed
+by fact id that holds a `u16` rule index and a `u32` offset into a pool of `u64` bindings,
+so a record costs 6 bytes plus 8 per rule variable, between 22 and 46 bytes on the `owl-rl`
+rules, whose bodies bind two to five variables. A deletion finds the broken facts without a
+reverse index, as the operator does. The instances that read a removed fact are enumerated
+over the old closure, and a head is broken when its record is that instance.
 The record is the same object as the fixed-point operator's `Record`, and it is well
 founded for the same reason, since a merge records an instance only over facts that held
 before the iteration. A fact of a closure relation records its predecessor on the path, as
@@ -182,19 +198,25 @@ computes the least fixpoint of its rules over its edge relation, so replacing th
 the operator inside the iteration is chaotic iteration of monotone operators, which
 converges to the program's least fixpoint by Knaster and Tarski, and recomputing the
 operator over the remaining edges after a deletion gives the facts a full run would derive
-for that relation. Non-monotonic rules are outside this argument. A program whose `noValue`
-atoms read only predicates that no rule of the same or a later stratum derives is
-maintained stratum by stratum, with the lower strata's changes as its deletions and
-insertions, and any other non-monotonic program still runs in full. `makeSkolem` is a
-function of its inputs and is maintained. `now`, `makeTemp` and blank nodes in heads are
-not, and keep the full run. The gates below check the argument on random histories against
+for that relation. Non-monotonic rules are outside this argument. The full run evaluates
+`noValue` against the facts visible when the rule fires, as Jena's forward engine does, so
+a negated rule can fire before another rule derives its blocker, and `tests/demand.rs`
+records a program where the stratified answer differs. Maintenance stratum by stratum
+gives the stratified answer, so it can equal a full run only once the full run evaluates
+stratifiable programs by strata too, which changes results and is a decision for the
+maintainer below. Until then every program with `noValue` runs in full. `makeSkolem` is a
+function of its inputs within one run, but its node is written as a fresh blank node, so a
+maintained run would keep nodes a fresh run does not name, and rules with `makeSkolem`,
+`now`, `makeTemp` or blank nodes in heads keep the full run until the identity decision
+below. The gates below check the argument on random histories against
 a full run, on the clique and chain cases, and against Nemo's closure of the changed data.
 
 ### Memory bounds
 
 A full run's memory is the tier, the records, the term table, the iteration's candidate
 buffers and the operators' workspace. The tier and records are bounded above by the bytes
-per fact stated in the two decisions above, the candidate buffers by the candidate limit
+per fact stated in the two decisions above, with one order's size added while a compaction
+runs, the candidate buffers by the candidate limit
 that `max_inferred` derives, and the operators charge their reachability sets before they
 grow, as today. A deletion adds the candidates and the proof searches, which item 798's
 visit bound keeps below a multiple of the full run's cost, and the maintainer falls back to
@@ -218,11 +240,13 @@ counts. The Datalog surface syntax stays item 72 and is a frontend of the same I
 
 ### Rule frontends translate to the IR
 
-`sh:TripleRule` compiles to a rule whose body is the `sh:condition` conformance, as a
-builtin over the SHACL validator, and whose head is the triple of its node expressions.
+`sh:TripleRule` compiles to a forward rule in the engine's current form, and to the IR once
+Phase 6 defines it, whose body is the `sh:condition` conformance, as a builtin over the
+SHACL validator, and whose head is the triple of its node expressions.
 `sh:SPARQLRule` runs its CONSTRUCT query through the query engine over the base and the
 derived tier, deduplicated as a set, and is maintained natively when its body is a basic
-graph pattern with filters and otherwise as a recompute stratum of the shared core. Rules
+graph pattern with filters and otherwise as a recompute stratum of the shared core, which
+Phase 4 supplies. Rules
 run in `sh:order`, and the rules of one order iterate to a fixed point before the next
 order starts, with a one-pass option, which is an open decision below. SPIN rules translate
 to `sh:SPARQLRule` textually. N3 rules take the subset of `{ } => { }` without nested
@@ -245,22 +269,23 @@ on atlas, and effects under 5% need atlas.
 
 ### Phase 0, measurements that the plan reads
 
-**Item 547, the rule plug-in on LUBM.** Measure `RuleProgram` on `incr/fixpoint.rs`
-against `incremental::update` on LUBM(1) and LUBM(10) with the insertions and deletions of
-`examples/incremental.rs`, on atlas. The plan reads two numbers from it, the cost of a
-record-based deletion against a record-free search and the operator's 40 bytes per fact
-in a hash map against the tier. It is routine, and it runs beside the first phase.
+Item 547 measures `RuleProgram` on `incr/fixpoint.rs` against `incremental::update` on
+LUBM(1) and LUBM(10) with the insertions and deletions of `examples/incremental.rs`, on
+atlas. The plan reads two numbers from it, the cost of a record-based deletion against a
+record-free search and the plug-in's about 144 bytes per fact, its key, record, slot and
+three index entries, against the tier's. It is routine, and it runs beside the first
+phase.
 
-**Item 791, published reference numbers.** Run `bench:rl-reference lubm 100` and
-`owl2bench 1` to `5` on atlas and then forge and publish them in the reasoning results, so
+Item 791's published numbers come from `bench:rl-reference lubm 100` and
+`owl2bench 1` to `5` on atlas and then forge, published in the reasoning results, so
 every later phase has a baseline per scale. It is routine.
 
-**Item 798, bounded deletion.** It lands first, so every maintained run has a cost bound
+Item 798's bounded deletion lands first, so every maintained run has a cost bound
 and a full-run fallback before the tier changes under it.
 
 ### Phase 1, the columnar derived tier, item 835
 
-New module `tier/` with `run.rs` for the sorted columns, `order.rs` for the runs of one
+A new module `tier/` holds `run.rs` for the sorted columns, `order.rs` for the runs of one
 order with galloping and merge probes, `compact.rs` for the merge of runs and the
 position table, and `mod.rs` for the `Tier` with its per-predicate relations, bitmaps and
 counts. `graph.rs` becomes a thin front over it in the first step and goes in the last.
@@ -275,15 +300,15 @@ routine. The probe interface, the compaction policy, the merge-join step and the
 derivation-order guarantees are judgment work. The phase first profiles OWL2Bench(5)
 where item 522 asks, so that the gate below has a measured peak to halve.
 
-The gates of this phase are these. The closure of every existing test equals the one before, and the fact ids give the
-same order of first occurrence, which the compact sessions' round boundaries and the
-non-monotonic tests depend on. The measured bytes per derived fact fall below 135 and are
-recorded beside RDFox's 40 to 60. LUBM(100) and OWL2Bench(1), (2) and (5) under `owl-rl`
-and `rdfs` are no slower than the build before on atlas at one thread and all threads,
-and the peak heap per derived fact at OWL2Bench(5) is at most half. OWL2Bench(10)
-completes within 32 GiB or the phase records where the memory goes. The small incremental
-runs of `examples/incremental.rs` and the reasoning latency gate of item 472 show no
-regression beyond 5%, since query sessions share the tier.
+The gates of this phase are these. The closure of every existing test equals the one
+before, and the fact ids give the same order of first occurrence, which the compact
+sessions' round boundaries and the non-monotonic tests depend on. The measured bytes per
+derived fact fall below 135 and are recorded beside RDFox's 40 to 60. LUBM(100) and
+OWL2Bench(1), (2) and (5) under `owl-rl` and `rdfs` are no slower than the build before on
+atlas at one thread and all threads, and the peak heap per derived fact at OWL2Bench(5) is
+at most half. OWL2Bench(10) completes within 32 GiB or the phase records where the memory
+goes. The small incremental runs of `examples/incremental.rs` and the reasoning latency
+gate of item 472 show no regression beyond 5%, since query sessions share the tier.
 
 ### Phase 2, closure operators in demand programs, item 521's first half
 
@@ -296,13 +321,13 @@ so it runs beside Phase 1, and it touches `closure.rs` only in a new mode.
 It is judgment work in the seeding and in the equivalence case, where a seed's class must
 be closed before the `eq-rep` rules read it, and routine in the session plumbing.
 
-The gates of this phase are these. The four OWL2Bench(1) queries that took 77 to 87 s each return the same rows faster,
-every demand test returns the rows a materialized run returns, and the reasoning latency
-gate shows no query slower.
+The gates of this phase are these. The four OWL2Bench(1) queries that took 77 to 87 s each
+return the same rows faster, every demand test returns the rows it returns today, and the
+reasoning latency gate shows no query slower.
 
 ### Phase 3, derivation records and compact provenance, item 836
 
-`tier/records.rs` adds the record column and the premise pool. `engine::run_observed`
+`tier/records.rs` adds the record column and the bindings pool. `engine::run_observed`
 records the first instance of each new fact in the merge, `closure.rs` records the
 predecessor on a path, `incremental.rs` finds the candidates of a deletion through records
 and consults `Search::prove` only for broken facts, `witness.rs` takes the record as the
@@ -316,12 +341,12 @@ The record column, pool and tests are routine. The candidate set through records
 equality of its results with the record-free search and the operator records are judgment
 work.
 
-The gates of this phase are these. The differential deletion tests equal a full run on random histories and on the
-clique of item 798, whose test must pass within the full run's memory, with the item 798
-bound only as the last resort. Every witness in `tests/witnesses.rs` and every `Why` answer
-derives its triple. Records add at most 6 bytes plus 4 per premise per fact, measured. The
-deletion time of the LUBM small incremental runs falls, and the full runs are no slower
-than Phase 1 on atlas.
+The gates of this phase are these. The differential deletion tests equal a full run on
+random histories and on the clique of item 798, whose test must pass within the full run's
+memory, with the item 798 bound only as the last resort. Every witness in
+`tests/witnesses.rs` and every `Why` answer derives its triple. Records add at most 6
+bytes plus 8 per rule variable per fact, measured. The deletion time of the LUBM small
+incremental runs falls, and the full runs are no slower than Phase 1 on atlas.
 
 ### Phase 4, the shared maintenance core, item 837
 
@@ -333,8 +358,9 @@ becomes that program's `prove` and `consequences`, `lib.rs::update_closure` call
 become operator-maintained relations of the program, which is item 521's second half.
 `incr/footprint.rs`'s `Footprint` replaces the reasoner's watched graphs in `inputs.rs`
 and the schema reads of `demand.rs` and `query.rs`, and `InferredFootprint` goes.
-Stratified `noValue`, the per-list tracking of F16 §7.3 and maintained `makeSkolem` each
-remove a full-run fallback and can be their own routine lanes once the core lands. The
+The per-list tracking of F16 §7.3 removes a full-run fallback and can be its own routine
+lane once the core lands, and stratified `noValue` follows it once the maintainer decides
+the full run's negation semantics below. The
 `LARGE_DELETION` threshold gives way to the cost estimate of F16 §7.3 using the visit
 bound of item 798. The pass emits the tier's change as a Z-set so a view can read the
 inferred graph, which item 221 then builds on.
@@ -343,12 +369,13 @@ The trait changes, the program and the operator-maintained relations are judgmen
 and stay with their planner. The footprint merge and the three fallback removals are
 routine against the differential tests.
 
-The gates of this phase are these. Every differential test of both frameworks passes, including `fixpoint_tests.rs`
-for path views. The maintained closures after insertion and deletion on LUBM(1) and
-OWL2Bench(1) equal Nemo's. The small incremental runs and `bench:lubm`'s incremental runs
-are no slower than Phase 3 on atlas, and the deletion of the item 798 clique stays
-incremental. No full-run fallback remains for stratified `noValue`, changed lists or
-`makeSkolem`, each with a test that fell back before.
+The gates of this phase are these. Every differential test of both frameworks passes,
+including `fixpoint_tests.rs` for path views. The maintained closures after insertion and
+deletion on LUBM(1) and OWL2Bench(1) equal Nemo's. The small incremental runs and
+`bench:lubm`'s incremental runs are no slower than Phase 3 on atlas, and the deletion of
+the item 798 clique stays incremental. No full-run fallback remains for changed lists, nor
+for stratified `noValue` once its decision is taken, each with a test that fell back
+before.
 
 ### Phase 5, rule frontends, item 838
 
@@ -356,15 +383,17 @@ A `shacl-af` reasoning profile reads a shapes graph among the inputs, `sh:Triple
 compiles to the IR through a `shConforms` builtin that calls the SHACL validator,
 `sh:SPARQLRule` compiles to a query stratum, SPIN translates to `sh:SPARQLRule`, and the
 Fuseki configuration maps TopBraid's rule settings. N3 rules get a parser for the subset
-above into the same IR. SWRL waits for item 71. The frontends need only the triple
-relation, so they run beside Phases 3 and 4 and before the n-ary core.
+above into the same rule form. SWRL waits for item 71. `sh:TripleRule`, the SPIN
+translation and N3 target the engine's current rule form and need only Phase 1, so they
+run beside Phases 3 and 4. A `sh:SPARQLRule` whose body is not a basic graph pattern needs
+the recompute stratum of Phase 4, so that half follows it.
 
 The translations and their conformance tests are routine. The semi-naive form of a
 `sh:SPARQLRule` body and the iteration semantics within an order are judgment work.
 
-The gates of this phase are these. The TopBraid SHACL-AF test cases pass for triple and SPARQL rules, a maintained
-`shacl-af` run equals a full run on the differential histories, and the W3C and Nemo gates
-are unchanged.
+The gates of this phase are these. The TopBraid SHACL-AF test cases pass for triple and
+SPARQL rules, a maintained `shacl-af` run equals a full run on the differential histories,
+and the W3C and Nemo gates are unchanged.
 
 ### Phase 6, the native n-ary Datalog core, item 839
 
@@ -380,10 +409,11 @@ The IR, the frontend and item 517 are routine against the Nemo program, which al
 takes lists of any length. The planner over relations, the chase and the aggregates are
 judgment work.
 
-The gates of this phase are these. Chains of four and more properties and keys of three and more derive the same
-facts as Nemo on test ontologies and the W3C cases. The demand programs of `owl-rl` shrink
-below the 50,000 cap with the length rules removed, measured. Full runs are no slower on
-atlas, and ChaseBench's open scenarios are the acceptance set for existential rules.
+The gates of this phase are these. Chains of four and more properties and keys of three
+and more derive the same facts as Nemo on test ontologies and the W3C cases. The demand
+programs of `owl-rl` shrink below the 50,000 cap with the length rules removed, measured.
+Full runs are no slower on atlas, and ChaseBench's open scenarios are the acceptance set
+for existential rules.
 
 ### Phase 7, convergence and optional kernels
 
@@ -399,30 +429,38 @@ that the interpretive dispatch is not the dominant cost it was assumed to be.
 Phases 0, 1 and 2 start together, since item 547 and the reference numbers are
 measurements, Phase 2 changes the demand engine and a new operator mode, and Phase 1
 changes the tier under the engine. Phase 3 follows Phase 1. Phase 4 follows Phase 3 and
-the measurement of item 547. Phase 5 can start after Phase 1 and runs beside Phases 3 and
-4. Phase 6's IR can start after Phase 1 and its evaluation after Phase 4. Items 518 and
-520 are independent routine lanes at any time. A lane that touches `engine.rs` and
-`graph.rs` does not run beside Phase 1, and one that touches `incremental.rs` does not run
-beside Phase 3 or 4.
+the measurement of item 547. Phase 5's triple rules, SPIN and N3 can start after Phase 1
+and run beside Phases 3 and 4, and its general `sh:SPARQLRule` bodies follow Phase 4.
+Phase 6's IR can start after Phase 1 and its evaluation after Phase 4. Items 518 and 520
+are independent routine lanes at any time. A lane that touches `engine.rs` and `graph.rs`
+does not run beside Phase 1, and one that touches `incremental.rs` does not run beside
+Phase 3 or 4.
 
 ## Open decisions for the maintainer
 
-1. The memory gate against the reference. The plan asks for half the peak heap per
-   derived fact at OWL2Bench(5). Nemo's resident set per derived fact at OWL2Bench(1) is
-   about a quarter of Sparkles'. The maintainer decides whether parity with Nemo's
-   resident set at OWL2Bench(5) and LUBM(100) is the gate or a stated stretch goal.
-2. The order of the tier and the derived layer. The plan builds the tier before item 9's
-   Phase 2 and writes the layer from it, which reverses the dependency the spec stated and
-   leaves `storage: "layer"` waiting on Phase 1.
-3. `sh:SPARQLRule` iteration within one `sh:order`. The plan iterates each order to a
-   fixed point before the next order and offers one pass as an option. The SHACL-AF note
-   allows both readings, and the choice is visible in results.
-4. Maintained `makeSkolem`. The plan maintains rules with `makeSkolem` heads
-   incrementally, since their nodes are a function of their inputs, where today they force
-   a full run. This changes which updates are incremental and nothing in the results.
-5. Records as the only provenance. The plan drops derivation counts from the design unless
-   the Phase 3 measurement shows them faster. F13 §5 lists counts among its annotations, and
-   the maintainer may want them kept for views regardless of the reasoner's result.
+The plan recommends an answer to each question but does not take it, and the phases that
+depend on an answer say so.
+
+1. Is the memory gate half the peak heap per derived fact at OWL2Bench(5), as the plan
+   proposes, or parity with Nemo's resident set at OWL2Bench(5) and LUBM(100)? Nemo's
+   resident set per derived fact at OWL2Bench(1) is about a quarter of Sparkles'.
+2. Does the columnar tier come before item 9's derived layer, with the layer written from
+   the tier's runs, as the plan proposes? The spec stated the reverse dependency, and the
+   proposal leaves `storage: "layer"` waiting on Phase 1.
+3. Does a `sh:SPARQLRule` order iterate to a fixed point before the next `sh:order`, as the
+   plan proposes with one pass as an option, or run once? The SHACL-AF note allows both
+   readings, and the choice is visible in results.
+4. Should the full run evaluate a stratifiable `noValue` program by strata, as the demand
+   engine does? It changes the result of a program whose negated rule fires before its
+   blocker is derived, and it is what lets Phase 4 maintain such programs. The plan
+   recommends it as an option that the maintained profiles turn on.
+5. Should `makeSkolem` nodes get a stable identity, a skolem IRI from a hash of the rule
+   and its arguments as F13 §4.6 gives CONSTRUCT views, so that rules with `makeSkolem`
+   heads can be maintained? Each run writes fresh blank nodes today. The plan recommends the
+   stable identity under a new option and keeps the full run until then.
+6. Are derivation records the only provenance, with counts dropped unless Phase 3's
+   measurement shows them faster? F13 §5 lists counts among its annotations, and the
+   maintainer may want them kept for views regardless of the reasoner's result.
 
 ## The first implementation lane
 
