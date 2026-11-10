@@ -877,7 +877,15 @@ impl Dataset {
     /// options as given, because the defaults change only what queries read.
     pub fn with_query_defaults<'o>(&self, opts: &'o QueryOptions) -> Cow<'o, QueryOptions> {
         if opts.defaults_applied {
-            return Cow::Borrowed(opts);
+            // The hidden graphs are an invariant of every execution, not a default:
+            // options made before an owner hid a graph, or whose view was replaced
+            // since, still leave it out.
+            if self.inner.store.hidden_graphs().is_empty() {
+                return Cow::Borrowed(opts);
+            }
+            let mut o = opts.clone();
+            o.graphs = self.hide_owner_graphs(o.graphs.take());
+            return Cow::Owned(o);
         }
         let defaults = self.query_options();
         let mut o = opts.clone();

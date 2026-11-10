@@ -162,16 +162,29 @@ impl Store {
     /// The managed graphs that leave every caller's read view: those of owners whose
     /// visibility is `hidden`. Empty without a registry. A registry this build cannot
     /// enforce answers the graphs its file still names as hidden, when the file reads,
-    /// so that a damaged registry does not disclose them.
+    /// together with the graphs that every owner whose settings file is present always
+    /// hides, so that a damaged or unreadable registry does not disclose them.
     pub fn hidden_graphs(&self) -> Vec<String> {
         match self.managed_state().as_deref() {
             None => Vec::new(),
             Some(ManagedState::Installed(i)) => i.graphs.hidden_graphs(),
-            Some(ManagedState::Unavailable { .. }) => self
-                .managed_root()
-                .and_then(|root| std::fs::read(root.join(crate::managed::FILE)).ok())
-                .and_then(|bytes| crate::managed::hidden_graphs_of_file(&bytes))
-                .unwrap_or_default(),
+            Some(ManagedState::Unavailable { .. }) => {
+                let Some(root) = self.managed_root() else {
+                    return Vec::new();
+                };
+                let mut hidden = std::fs::read(root.join(crate::managed::FILE))
+                    .ok()
+                    .and_then(|bytes| crate::managed::hidden_graphs_of_file(&bytes))
+                    .unwrap_or_default();
+                for owner in OwnerKind::ALL {
+                    if root.join(owner.settings_file()).is_file() {
+                        hidden.extend(owner.always_hidden_graphs());
+                    }
+                }
+                hidden.sort_unstable();
+                hidden.dedup();
+                hidden
+            }
         }
     }
 

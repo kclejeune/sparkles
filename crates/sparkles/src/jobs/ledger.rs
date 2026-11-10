@@ -187,6 +187,10 @@ pub(super) struct Run {
     pub state: State,
     pub version: u64,
     pub attempts: u32,
+    /// The attempts and the retry horizon the run was accepted with: its retry policy
+    /// stays the one of its definition revision whatever the definition says now.
+    pub attempts_allowed: u32,
+    pub retry_horizon_ms: u64,
     pub generation: u64,
     pub current_attempt: Option<Uuid>,
     pub next_eligible_ms: Option<i64>,
@@ -472,9 +476,9 @@ impl<'a> Ledger<'a> {
         self.read_run(id, true)
     }
 
-    /// The record of run `id` without its payload and inputs, which a scheduling
-    /// decision over many runs does not need and must not retain. `payload` is empty
-    /// and `inputs` holds nothing in the result.
+    /// The record of run `id` without its payload, checkpoint and inputs, which a
+    /// scheduling decision over many runs does not need and must not retain. `payload`
+    /// is empty, `checkpoint` is `None` and `inputs` holds nothing in the result.
     pub fn run_header(&mut self, id: Uuid) -> Result<Option<Run>> {
         self.read_run(id, false)
     }
@@ -527,13 +531,19 @@ impl<'a> Ledger<'a> {
             principal,
             payload,
             payload_digest: self.required_str(s, "payloadDigest")?,
-            checkpoint: self.str(s, "sourceCheckpoint")?,
+            checkpoint: if complete {
+                self.str(s, "sourceCheckpoint")?
+            } else {
+                None
+            },
             inputs,
             submitted_ms: self.required_ms(s, "submittedAtMs")?,
             submitted_commit: self.required_int(s, "submittedCommit")?,
             state,
             version: self.required_int(s, "version")?,
             attempts: self.required_int(s, "attempts")? as u32,
+            attempts_allowed: self.required_int(s, "attemptsAllowed")? as u32,
+            retry_horizon_ms: self.required_int(s, "retryHorizonMs")?,
             generation: self.required_int(s, "generation")?,
             current_attempt: self.uuid(s, "currentAttempt")?,
             next_eligible_ms: self.ms(s, "nextEligibleAtMs")?,
@@ -609,6 +619,21 @@ impl<'a> Ledger<'a> {
             .ok_or_else(|| corrupt("run is missing", s))?;
         let digest = self.required_str(s, "requestDigest")?;
         Ok(Some((run, digest)))
+    }
+
+    /// Whether `principal` worked on any attempt of run `run`, current or earlier.
+    pub fn worked_on(&mut self, run: Uuid, principal: &NamedNode) -> Result<bool> {
+        let (subjects, _) = self.subjects("run", &string(&run.to_string()), MAX_SCAN)?;
+        let prefix = format!("{NAMESPACE}attempt:");
+        for s in &subjects {
+            if !s.as_str().starts_with(&prefix) {
+                continue;
+            }
+            if self.iri(s.as_str(), "worker")?.as_ref() == Some(principal) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The boot epoch the ledger records, if any process recorded one.

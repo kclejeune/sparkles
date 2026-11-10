@@ -121,6 +121,18 @@ impl OwnerKind {
         }
     }
 
+    /// The graphs this owner hides from every caller's read view whenever it is
+    /// configured, known without reading its registry entry, so that a registry that
+    /// cannot be read still hides them.
+    pub fn always_hidden_graphs(self) -> Vec<String> {
+        match self {
+            OwnerKind::Jobs => vec![crate::jobs::LEDGER_GRAPH.to_string()],
+            OwnerKind::Evidence => Vec::new(),
+            #[cfg(test)]
+            OwnerKind::Test => Vec::new(),
+        }
+    }
+
     /// Why this build cannot read the owner's settings `bytes` for `profile`, if it
     /// cannot: the settings file's envelope, its `format` and `profile` members, must
     /// be ones this build reads.

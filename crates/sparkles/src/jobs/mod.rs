@@ -16,7 +16,7 @@
 //! let mut settings = Settings { enabled: true, ..Settings::default() };
 //! settings.definitions.insert("collect".into(), Definition::quads(vec!["urn:g".into()]));
 //! ds.jobs().configure(&settings)?;
-//! let caller = Caller::admin(oxrdf::NamedNode::new("urn:x-sparkles:principal:ops")?);
+//! let caller = Caller::admin(oxrdf::NamedNode::new_unchecked("urn:x-sparkles:principal:ops"));
 //! let submitted = ds.jobs().submit(
 //!     &Submission::new("collect", serde_json::json!({"page": 1}), "advisory-2026-001"),
 //!     &caller,
@@ -57,7 +57,15 @@ pub struct Runtime {
     epoch: uuid::Uuid,
     installed: AtomicBool,
     installing: parking_lot::Mutex<()>,
-    leases: parking_lot::Mutex<HashMap<uuid::Uuid, Instant>>,
+    leases: parking_lot::Mutex<HashMap<uuid::Uuid, Lease>>,
+    grants: std::sync::atomic::AtomicU64,
+}
+
+/// One installed deadline, identified by the grant that installed it.
+#[derive(Clone, Copy, Debug)]
+struct Lease {
+    grant: u64,
+    deadline: Instant,
 }
 
 impl Default for Runtime {
@@ -67,6 +75,46 @@ impl Default for Runtime {
             installed: AtomicBool::new(false),
             installing: parking_lot::Mutex::new(()),
             leases: parking_lot::Mutex::new(HashMap::new()),
+            grants: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+/// A deadline installed before its commit. Dropped without [`keep`](Grant::keep), as
+/// after a refused or unwinding commit, it puts back what the run had before, and only
+/// when the run's entry is still this grant's, so a claim that committed in the
+/// meantime keeps its deadline and an uncommitted extension does not survive.
+#[must_use]
+pub(crate) struct Grant<'r> {
+    rt: &'r Runtime,
+    run: uuid::Uuid,
+    id: u64,
+    previous: Option<Lease>,
+    kept: bool,
+}
+
+impl Grant<'_> {
+    /// The commit published: the deadline stays.
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for Grant<'_> {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        let mut leases = self.rt.leases.lock();
+        if leases.get(&self.run).is_some_and(|l| l.grant == self.id) {
+            match self.previous {
+                Some(p) => {
+                    leases.insert(self.run, p);
+                }
+                None => {
+                    leases.remove(&self.run);
+                }
+            }
         }
     }
 }
@@ -92,15 +140,31 @@ impl Runtime {
         self.leases
             .lock()
             .get(&run)
-            .is_none_or(|deadline| *deadline <= Instant::now())
+            .is_none_or(|l| l.deadline <= Instant::now())
     }
 
-    fn grant(&self, run: uuid::Uuid, ms: u64) {
-        self.leases
-            .lock()
-            .insert(run, Instant::now() + std::time::Duration::from_millis(ms));
+    /// Install a deadline `ms` from now for `run`, before the commit that grants or
+    /// extends the lease publishes. The returned guard undoes it unless it is kept.
+    fn grant(&self, run: uuid::Uuid, ms: u64) -> Grant<'_> {
+        let id = self
+            .grants
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let lease = Lease {
+            grant: id,
+            deadline: Instant::now() + std::time::Duration::from_millis(ms),
+        };
+        let previous = self.leases.lock().insert(run, lease);
+        Grant {
+            rt: self,
+            run,
+            id,
+            previous,
+            kept: false,
+        }
     }
 
+    /// Forget the deadline of `run`, after a commit ended its lease.
     fn revoke(&self, run: uuid::Uuid) {
         self.leases.lock().remove(&run);
     }

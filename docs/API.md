@@ -13497,8 +13497,9 @@ marks the ledger graph hidden in the managed-graph registry.
 
 `GET` and `PUT /$/jobs/{ds}/settings` read and record the settings and need `admin` on
 the dataset. A definition's revision is the digest of its canonical JSON. A run keeps the
-revision it was accepted under, and a run whose definition changed is not claimed until
-the definition is restored or the run is cancelled. Jobs cannot be disabled while runs are
+revision it was accepted under, with the attempts and retry horizon of that revision, and
+a run whose definition changed or was removed is not claimed, and not ended by an expired
+lease or a restart either, until the definition is restored or the run is cancelled. Jobs cannot be disabled while runs are
 queued, leased or waiting to retry. A disabled configuration keeps the ledger graph
 protected and hidden under the same protection nonce, so a run admitted as jobs were being
 disabled waits until they are enabled again. `maxQueued` is at most 4096, and the
@@ -13534,7 +13535,8 @@ waiting run whose horizon passed, or whose attempts ran out, ends as `failed` in
 refuses another version with `412`. A token whose generation was superseded, whose lease
 expired, whose process restarted or whose run is no longer leased is `409 lease-lost`, and
 so is a lease whose definition was removed, disabled or edited since the claim or no
-longer lists the worker. A renewal extends the lease by `extendMs`, at most the
+longer lists the worker. A caller that is neither an administrator, the submitter nor a
+worker of one of the run's attempts gets the `404` of an unknown run instead. A renewal extends the lease by `extendMs`, at most the
 definition's largest extension. A
 publication names its `operation`, a UUID the worker keeps across retries, and its
 `insert` and `delete` quads as N-Quads lines in the definition's graphs, with an optional

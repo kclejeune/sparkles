@@ -82,11 +82,13 @@ fn publication(op: Uuid, k: u32) -> Publication {
 
 /// Make the lease this process granted for `run` expire now.
 fn expire(ds: &Dataset, run: Uuid) {
-    ds.jobs()
-        .runtime()
-        .leases
-        .lock()
-        .insert(run, Instant::now() - Duration::from_millis(1));
+    ds.jobs().runtime().leases.lock().insert(
+        run,
+        Lease {
+            grant: 0,
+            deadline: Instant::now() - Duration::from_millis(1),
+        },
+    );
 }
 
 #[test]
@@ -148,7 +150,35 @@ fn the_ledger_graph_leaves_every_query_view_while_typed_inspection_reads_it() {
         !r.boolean,
         "an explicit all-graphs view still leaves the ledger out"
     );
+    // options with the defaults applied, and a replaced view, are no way around it
+    let mut applied = ds.query_options();
+    applied.graphs = Some(Arc::new(crate::access::GraphAccess::all()));
+    assert!(applied.defaults_applied);
+    let ask = format!("ASK {{ GRAPH <{LEDGER_GRAPH}> {{ ?s ?p ?o }} }}");
+    assert!(!ds.query_with(&ask, &applied).unwrap().boolean);
     assert!(ds.jobs().get(s.run, &admin()).unwrap().is_some());
+    // options made before the ledger existed leave it out once it does
+    let fresh = Dataset::memory();
+    let early = fresh.query_options();
+    configured(&fresh);
+    submit(&fresh, "k1");
+    assert!(!fresh.query_with(&ask, &early).unwrap().boolean);
+}
+
+#[test]
+fn a_registry_that_does_not_read_still_hides_the_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    configured(&ds);
+    submit(&ds, "k1");
+    drop(ds);
+    std::fs::write(dir.path().join("managed.json"), b"{").unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    assert_eq!(ds.store().hidden_graphs(), vec![LEDGER_GRAPH.to_string()]);
+    let ask = format!("ASK {{ GRAPH <{LEDGER_GRAPH}> {{ ?s ?p ?o }} }}");
+    let visible = ds.query(&ask).map(|r| r.boolean).unwrap_or(false);
+    assert!(!visible, "a damaged registry made the ledger visible");
+    assert!(!ds.ask("ASK { GRAPH ?g { ?s ?p ?o } }").unwrap());
 }
 
 #[test]
@@ -249,15 +279,23 @@ fn claim_publish_and_replay_commit_business_quads_checkpoint_and_state_together(
     let other = ds.jobs().publish(c.run, &c.token, &publication(op, 2), &w);
     assert_eq!(code(other), "publication-conflict");
     assert!(!has(&ds, 2));
-    // the receipt is the worker's own: a stranger with the operation id, a wrong token
-    // or another run learns nothing
+    // the receipt is the worker's own: a stranger with the operation id learns nothing,
+    // as for an unknown run, the worker with a wrong token learns that its lease is
+    // lost, and a run the worker never worked on is unknown to it
     let stranger = worker("stranger");
     assert_eq!(
         code(
             ds.jobs()
                 .publish(c.run, &c.token, &publication(op, 1), &stranger)
         ),
-        "lease-lost"
+        "not-found"
+    );
+    assert_eq!(
+        code(
+            ds.jobs()
+                .publish(Uuid::new_v4(), &c.token, &publication(op, 1), &stranger)
+        ),
+        "not-found"
     );
     assert_eq!(
         code(ds.jobs().publish(c.run, "wrong", &publication(op, 1), &w)),
@@ -266,7 +304,16 @@ fn claim_publish_and_replay_commit_business_quads_checkpoint_and_state_together(
     let s2 = submit(&ds, "k2");
     assert_eq!(
         code(ds.jobs().publish(s2.run, &c.token, &publication(op, 1), &w)),
-        "lease-lost"
+        "not-found"
+    );
+    assert_eq!(
+        code(ds.jobs().renew(s2.run, &c.token, None, None, &stranger)),
+        "not-found"
+    );
+    assert_eq!(
+        code(ds.jobs().renew(s2.run, &c.token, None, None, &admin())),
+        "lease-lost",
+        "the submitter learns the state"
     );
     // a new operation under the finished lease is fenced
     let late = ds
@@ -884,6 +931,7 @@ fn a_run_header_carries_no_payload_or_inputs() {
         .unwrap();
     configured(&ds);
     let mut sub = Submission::new("collect", serde_json::json!({"big": "x"}), "k1");
+    sub.checkpoint = Some("c".repeat(1024));
     sub.inputs.push(crate::branch::CommitRef {
         branch_id: ds.store().branch_id(),
         seq: ds.store().head_commit().seq,
@@ -896,11 +944,206 @@ fn a_run_header_carries_no_payload_or_inputs() {
     let header = l.run_header(s.run).unwrap().unwrap();
     assert!(header.payload.is_empty());
     assert!(header.inputs.is_empty());
+    assert!(header.checkpoint.is_none());
     assert_eq!(header.state, State::Queued);
     let full = l.run(s.run).unwrap().unwrap();
     assert_eq!(full.payload, r#"{"big":"x"}"#);
     assert_eq!(full.inputs.len(), 1);
+    assert_eq!(full.checkpoint.as_deref().map(str::len), Some(1024));
     assert_eq!(full.payload_digest, header.payload_digest);
+}
+
+/// A commit guard that refuses the first commit it checks with a conflict.
+struct RefuseOnce(std::sync::atomic::AtomicBool);
+
+impl crate::guard::CommitGuard for RefuseOnce {
+    fn check(&self, _: &crate::guard::Candidate<'_>) -> Result<crate::guard::ValidationSummary> {
+        if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Conflict("refused once".into()));
+        }
+        Ok(crate::guard::ValidationSummary::empty(
+            crate::guard::GuardStatus::Passed,
+            crate::guard::GuardMode::Reject,
+            crate::guard::Severity::Violation,
+        ))
+    }
+    fn describe(&self) -> String {
+        "refuse once".into()
+    }
+}
+
+/// A commit guard that unwinds.
+struct PanicGuard;
+
+impl crate::guard::CommitGuard for PanicGuard {
+    fn check(&self, _: &crate::guard::Candidate<'_>) -> Result<crate::guard::ValidationSummary> {
+        panic!("the guard unwinds")
+    }
+    fn describe(&self) -> String {
+        "panic".into()
+    }
+}
+
+fn refuse_once() -> Arc<dyn crate::guard::CommitGuard> {
+    Arc::new(RefuseOnce(std::sync::atomic::AtomicBool::new(true)))
+}
+
+#[test]
+fn a_refused_or_unwinding_lease_commit_leaves_the_deadlines_of_committed_leases() {
+    // the runtime by itself: a grant that is not kept puts back what it replaced, and
+    // only while the entry is still its own
+    let rt = Runtime::default();
+    let run = Uuid::new_v4();
+    let a = rt.grant(run, 60_000);
+    let b = rt.grant(run, 60_000);
+    b.keep();
+    drop(a);
+    assert!(!rt.lease_expired(run), "a's rollback left b's deadline");
+    let before = rt.leases.lock()[&run];
+    let c = rt.grant(run, 120_000);
+    drop(c);
+    assert_eq!(rt.leases.lock()[&run].deadline, before.deadline);
+    let d = rt.grant(Uuid::new_v4(), 60_000);
+    let other = d.run;
+    drop(d);
+    assert!(
+        rt.lease_expired(other),
+        "a fresh grant that is not kept is gone"
+    );
+    // a claim whose commit is refused leaves no deadline, and the next claim takes
+    // the run with a live lease
+    let ds = Dataset::memory();
+    configured(&ds);
+    submit(&ds, "k1");
+    ds.store().set_guard(Some(refuse_once()));
+    assert!(matches!(
+        ds.jobs().claim(&[], &worker("a")),
+        Err(Error::Conflict(_))
+    ));
+    ds.store().set_guard(None);
+    let cb = claim(&ds, &worker("b"));
+    assert_eq!(cb.generation, 1);
+    ds.jobs()
+        .renew(cb.run, &cb.token, None, None, &worker("b"))
+        .unwrap();
+    // a renewal that unwinds does not extend the lease
+    let ds = Dataset::memory();
+    let mut s = settings();
+    s.definitions.get_mut("collect").unwrap().lease_ms = 200;
+    ds.jobs().configure(&s).unwrap();
+    submit(&ds, "k1");
+    let w = worker("w");
+    let c = claim(&ds, &w);
+    ds.store().set_guard(Some(Arc::new(PanicGuard)));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ds.jobs().renew(c.run, &c.token, Some(60_000), None, &w)
+    }));
+    assert!(r.is_err());
+    ds.store().set_guard(None);
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        code(ds.jobs().renew(c.run, &c.token, None, None, &w)),
+        "lease-lost",
+        "the uncommitted extension did not survive"
+    );
+    // and a refused renewal keeps the previous deadline
+    submit(&ds, "k2");
+    let c2 = claim(&ds, &w);
+    ds.store().set_guard(Some(refuse_once()));
+    assert!(matches!(
+        ds.jobs().renew(c2.run, &c2.token, Some(60_000), None, &w),
+        Err(Error::Conflict(_))
+    ));
+    ds.store().set_guard(None);
+    ds.jobs().renew(c2.run, &c2.token, None, None, &w).unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        code(ds.jobs().renew(c2.run, &c2.token, None, None, &w)),
+        "lease-lost"
+    );
+}
+
+#[test]
+fn an_expired_run_keeps_the_retry_policy_it_was_accepted_with() {
+    let ds = Dataset::memory();
+    let mut original = settings();
+    original.definitions.get_mut("collect").unwrap().workers = vec![principal("w").as_str().into()];
+    ds.jobs().configure(&original).unwrap();
+    let r = submit(&ds, "k1");
+    let w = worker("w");
+    let c = claim(&ds, &w);
+    assert_eq!(c.run, r.run);
+    // the definition now allows one attempt, which the accepted run does not adopt
+    let mut edited = original.clone();
+    edited.definitions.get_mut("collect").unwrap().attempts = 1;
+    ds.jobs().configure(&edited).unwrap();
+    expire(&ds, r.run);
+    assert!(
+        ds.jobs()
+            .claim(&["other".into()], &worker("unadmitted"))
+            .unwrap()
+            .is_none()
+    );
+    let view = ds.jobs().get(r.run, &admin()).unwrap().unwrap();
+    assert_eq!(view.state, State::RetryWait, "{view:?}");
+    assert_eq!(view.attempts, 1);
+    // a removed definition leaves the run waiting too, and restoring it lets it go on
+    let mut removed = original.clone();
+    removed.definitions.clear();
+    ds.jobs().configure(&removed).unwrap();
+    force_eligible(&ds, r.run);
+    assert!(ds.jobs().claim(&[], &w).unwrap().is_none());
+    assert_eq!(
+        ds.jobs().get(r.run, &admin()).unwrap().unwrap().state,
+        State::RetryWait
+    );
+    ds.jobs().configure(&original).unwrap();
+    let c2 = claim(&ds, &w);
+    assert_eq!(c2.run, r.run);
+    assert_eq!(c2.number, 2);
+    // a restart under a removed definition waits as well
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    ds.jobs().configure(&original).unwrap();
+    let r = submit(&ds, "k1");
+    claim(&ds, &w);
+    ds.jobs().configure(&removed).unwrap();
+    drop(ds);
+    let ds = Dataset::open(dir.path()).unwrap();
+    assert_eq!(ds.jobs().recover().unwrap().interrupted, vec![r.run]);
+    assert_eq!(
+        ds.jobs().get(r.run, &admin()).unwrap().unwrap().state,
+        State::RetryWait
+    );
+}
+
+#[test]
+fn a_refused_submission_commit_releases_its_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    ds.update("INSERT DATA { <urn:a> <urn:b> <urn:c> }")
+        .unwrap();
+    configured(&ds);
+    let mut sub = Submission::new("collect", serde_json::json!({}), "k1");
+    sub.inputs.push(crate::branch::CommitRef {
+        branch_id: ds.store().branch_id(),
+        seq: ds.store().head_commit().seq,
+    });
+    ds.store().set_guard(Some(refuse_once()));
+    assert!(matches!(
+        ds.jobs().submit(&sub, &admin()),
+        Err(Error::Conflict(_))
+    ));
+    ds.store().set_guard(None);
+    assert!(ds.store().source_holds().unwrap().is_empty());
+    assert!(
+        ds.jobs()
+            .list(&ListFilter::default(), &admin())
+            .unwrap()
+            .is_empty()
+    );
+    let s = ds.jobs().submit(&sub, &admin()).unwrap();
+    assert_eq!(ds.store().source_holds().unwrap()[0].id, s.run);
 }
 
 #[test]
@@ -1354,6 +1597,30 @@ mod crashes {
         assert_eq!(c.run, s.run);
         assert_eq!(c.generation, 1);
         assert_eq!(c.number, 1);
+    }
+
+    #[test]
+    fn a_claim_that_stops_after_its_commit_holds_a_lease_the_restart_interrupts() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        configured(&ds);
+        let s = submit(&ds, "k1");
+        let w = worker("w");
+        crash(&ds, "jobs-claim-committed", || ds.jobs().claim(&[], &w));
+        drop(ds);
+        let ds = Dataset::open(dir.path()).unwrap();
+        let view = ds.jobs().get(s.run, &admin()).unwrap().unwrap();
+        assert_eq!(view.state, State::Leased, "the claim committed");
+        assert_eq!(view.attempts, 1);
+        assert_eq!(view.generation, 1);
+        let recovered = ds.jobs().recover().unwrap();
+        assert_eq!(recovered.interrupted, vec![s.run]);
+        let view = ds.jobs().get(s.run, &admin()).unwrap().unwrap();
+        assert_eq!(view.state, State::RetryWait);
+        assert_eq!(
+            view.attempt.unwrap().state,
+            ledger::AttemptState::Interrupted
+        );
     }
 
     #[test]

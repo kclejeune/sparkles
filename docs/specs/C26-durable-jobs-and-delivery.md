@@ -510,7 +510,11 @@ publication record, the checkpoint and the completion state in one transaction, 
 bounded exponential backoff and jitter within the remaining horizon, cancels, retries and
 inspects. Every leased transition rechecks under the writer that the definition exists, is
 enabled, keeps the run's revision and admits the worker, and an expired lease enters the
-retry policy before another worker takes the run over, as §4.2 requires. A submission
+retry policy before another worker takes the run over, as §4.2 requires. A run records
+the attempts and retry horizon it was accepted with and keeps that policy when its
+definition is edited or removed, so an expiry or a restart never ends accepted work under
+another revision. A lease operation by a caller with no part in the run answers as for an
+unknown run. A submission
 revalidates its definition against the settings admitted under the writer, pins at most
 4096 inputs, and takes its source hold for publication inside the commit so a
 reconciliation cannot release it under a run that commits. `maxQueued` and the sum of the
@@ -526,10 +530,11 @@ A restart records a new epoch in the ledger before the process admits its first 
 renewal or publication, and interrupts attempts of earlier epochs into the retry policy.
 
 Tests cover A1, A4, A6, A9 and A12 in one process. The crash tests for A2, A3, A5 and A7
-stop the process at failpoints before and after the submission, claim and publication
-commits, reopen the dataset and check the business quads and the ledger together. They are
-reopen tests around the commit boundary and rest on the store's write-ahead log for what
-happens at a synchronization error or a power loss, which they do not inject. The ordering
+unwind the operation at failpoints before and after the submission, claim and publication
+commits, drop the dataset handle, reopen the dataset and check the business quads and the
+ledger together. They are reopen tests around the commit boundary in one process and rest
+on the store's write-ahead log for what happens at a synchronization error or a power
+loss, which they do not inject. The ordering
 argument is §7.1.
 
 The ledger graph is the first owner graph with the `hidden` visibility of §2.3. The
@@ -537,8 +542,10 @@ registry lists the hidden graphs of its owners, and they leave every graph view 
 or a library query runs under: the server's authentication middleware subtracts them from
 the principal's view for every route of the dataset, and the library subtracts them from
 the view of every SPARQL query it runs, including a caller's explicit all-graphs view.
-Only the typed inspection of the jobs handle reads the ledger. A registry this build cannot
-enforce still hides the graphs its file names as hidden.
+Of the surfaces that take a view, only the typed inspection of the jobs handle reads the
+ledger. A registry this build cannot enforce still hides the graphs its file names as
+hidden, and one whose file does not read hides the graphs that every configured owner
+always hides.
 
 Several parts of the design wait for later items. The library's Graph Store, history,
 diff and dump handles apply a caller's view when one is given but do not subtract hidden

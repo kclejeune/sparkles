@@ -268,24 +268,46 @@ fn not_found(id: Uuid) -> Error {
     Error::NotFound(format!("run {id} is not known or not visible"))
 }
 
+/// Whether `e` is a refusal that wrote nothing, as opposed to an error after which the
+/// commit's outcome is uncertain.
+fn refused(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::Conflict(_)
+            | Error::PreconditionFailed(_)
+            | Error::NotPermitted(_)
+            | Error::Invalid(_)
+            | Error::Rejected(_)
+            | Error::GuardMissing(_)
+            | Error::BudgetExceeded(_)
+            | Error::NotFound(_)
+            | Error::Unsupported(_)
+            | Error::DryRun(_)
+            | Error::Cancelled
+            | Error::Timeout
+            | Error::WriterBusy
+    )
+}
+
 fn preparation() -> Result<Preparation> {
     Preparation::new(Control::none(), ledger::READS_BYTES)
 }
 
-/// The time the retries of `run` end under `def` (spec C26 §4.4).
-fn retry_horizon(run: &Run, def: &Definition) -> i64 {
+/// The time the retries of `run` end under the policy it was accepted with (spec C26
+/// §4.4).
+fn retry_horizon(run: &Run) -> i64 {
     run.submitted_ms
-        .saturating_add(i64::try_from(def.retry_horizon_ms).unwrap_or(i64::MAX))
+        .saturating_add(i64::try_from(run.retry_horizon_ms).unwrap_or(i64::MAX))
 }
 
-/// The retry decision after a failed, expired or interrupted attempt (spec C26 §4.4): the
-/// run ends when the failure is permanent, its definition is gone, its attempts are
-/// used up, its horizon passed or the requested delay does not fit in what is left of the
-/// horizon, and otherwise waits for the later of the exponential backoff and the
-/// requested delay.
+/// The retry decision after a failed, expired or interrupted attempt (spec C26 §4.4),
+/// under the attempts and horizon the run was accepted with, so that an edited or removed
+/// definition does not reinterpret accepted work: the run ends when the failure is
+/// permanent, its attempts are used up, its horizon passed or the requested delay does
+/// not fit in what is left of the horizon, and otherwise waits for the later of the
+/// exponential backoff and the requested delay.
 fn after_failure(
     run: &Run,
-    def: Option<&Definition>,
     now: i64,
     transient: bool,
     retry_after_ms: Option<u64>,
@@ -294,13 +316,10 @@ fn after_failure(
     if !transient {
         return (State::Failed, None, None);
     }
-    let Some(def) = def else {
-        return failed("the definition is no longer registered".into());
-    };
-    if run.attempts >= def.attempts {
-        return failed(format!("{} attempts were exhausted", def.attempts));
+    if run.attempts >= run.attempts_allowed {
+        return failed(format!("{} attempts were exhausted", run.attempts_allowed));
     }
-    let horizon = retry_horizon(run, def);
+    let horizon = retry_horizon(run);
     let remaining = horizon.saturating_sub(now);
     if remaining < 0 {
         return failed("the retry horizon passed".into());
@@ -471,7 +490,7 @@ impl Jobs {
         let begun = self.begin(Uuid::new_v4(), None, Some("jobs: boot epoch".into()))?;
         let Begun {
             mut t,
-            settings,
+            settings: _,
             protection,
         } = begun;
         let base = t.base().clone();
@@ -518,8 +537,7 @@ impl Jobs {
                 "diagnostic",
                 Some(string("interrupted by a restart of the dataset's process")),
             )?;
-            let def = settings.definitions.get(&run.definition);
-            let (state, next, reason) = after_failure(&run, def, now, true, None);
+            let (state, next, reason) = after_failure(&run, now, true, None);
             self.transition(&mut ch, &mut l, &run, state, next, reason)?;
             rt.revoke(run.id);
             if state.terminal() {
@@ -755,9 +773,21 @@ impl Jobs {
             }
         };
         store.failpoint("jobs-before-commit");
-        // A commit whose outcome is uncertain keeps its hold: the run may be durable.
-        let receipt = t.commit()?;
+        let committed = t.commit();
+        // the publication guard goes first, since a release waits for every publication
         drop(release);
+        let receipt = match committed {
+            Ok(r) => r,
+            Err(e) => {
+                // A refusal wrote nothing, so the hold under the new run is an orphan. An
+                // error whose outcome is uncertain keeps it, since the run may be
+                // durable, and reconciliation decides later.
+                if held && refused(&e) {
+                    self.maybe_release_hold(run);
+                }
+                return Err(e);
+            }
+        };
         store.failpoint("jobs-committed");
         Ok(Submitted {
             run,
@@ -856,6 +886,8 @@ impl Jobs {
         ch.add(&r, "state", string(State::Queued.as_str()));
         ch.add(&r, "version", integer(1));
         ch.add(&r, "attempts", integer(0));
+        ch.add(&r, "attemptsAllowed", integer(u64::from(st.def.attempts)));
+        ch.add(&r, "retryHorizonMs", integer(st.def.retry_horizon_ms));
         ch.add(&r, "generation", integer(0));
         ch.add(&r, "operation", string(&st.op.to_string()));
         if let Some(of) = st.s.retry_of {
@@ -951,10 +983,7 @@ impl Jobs {
                             continue;
                         }
                         // a retry that comes due after its horizon is over
-                        if let Some(def) = def
-                            && def.revision() == run.revision
-                            && now > retry_horizon(&run, def)
-                        {
+                        if now > retry_horizon(&run) {
                             self.transition(
                                 &mut ch,
                                 &mut l,
@@ -987,7 +1016,7 @@ impl Jobs {
                                 Some(string(AttemptState::Expired.as_str())),
                             )?;
                         }
-                        let (state, next, reason) = after_failure(&run, def, now, true, None);
+                        let (state, next, reason) = after_failure(&run, now, true, None);
                         let reason = Some(match reason {
                             Some(why) => format!("the lease expired ({why})"),
                             None => "the lease expired".into(),
@@ -1014,15 +1043,15 @@ impl Jobs {
         let mut chosen = None;
         for run in candidates {
             let def = &settings.definitions[&run.definition];
-            if run.attempts >= def.attempts {
-                // a waiting run whose definition now allows fewer attempts ends here
+            if run.attempts >= run.attempts_allowed {
+                // a waiting run that was recorded with its attempts used up ends here
                 self.transition(
                     &mut ch,
                     &mut l,
                     &run,
                     State::Failed,
                     None,
-                    Some(format!("{} attempts were exhausted", def.attempts)),
+                    Some(format!("{} attempts were exhausted", run.attempts_allowed)),
                 )?;
                 ended.push(run.id);
                 continue;
@@ -1084,11 +1113,10 @@ impl Jobs {
         // The monotonic deadline exists before the commit publishes, while this
         // transaction still holds the writer, so no claim can read the new attempt
         // without its deadline and take it over as expired.
-        rt.grant(run.id, def.lease_ms);
-        if let Err(e) = t.commit() {
-            rt.revoke(run.id);
-            return Err(e);
-        }
+        let grant = rt.grant(run.id, def.lease_ms);
+        t.commit()?;
+        grant.keep();
+        ds.store().failpoint("jobs-claim-committed");
         self.release_holds_of(&ended);
         let payload: serde_json::Value = serde_json::from_str(&run.payload).map_err(|e| {
             Error::Corrupt(format!("the payload of run {} is not JSON: {e}", run.id))
@@ -1130,6 +1158,12 @@ impl Jobs {
             return Err(not_found(run));
         };
         self.authentic(&run, protection)?;
+        // A caller that is not an administrator, the submitter or a worker of one of the
+        // run's attempts learns nothing: an invisible run answers as an unknown one. The
+        // worker of a superseded attempt still learns that its lease is lost.
+        if !Self::may_act_on(l, &run, caller)? {
+            return Err(not_found(run.id));
+        }
         if run.state != State::Leased {
             return Err(lease_lost(&format!("the run is {}", run.state.as_str())));
         }
@@ -1176,6 +1210,13 @@ impl Jobs {
             return Err(lease_lost("the definition no longer admits the worker"));
         }
         Ok((run, attempt, def.clone()))
+    }
+
+    /// Whether `caller` may learn the state of `run` through a lease operation.
+    fn may_act_on(l: &mut Ledger<'_>, run: &Run, caller: &Caller) -> Result<bool> {
+        Ok(caller.admin
+            || run.principal == caller.principal
+            || l.worked_on(run.id, &caller.principal)?)
     }
 
     fn expect_version(run: &Run, expected: Option<u64>) -> Result<()> {
@@ -1233,14 +1274,10 @@ impl Jobs {
         )?;
         drop(l);
         ch.apply(&mut t)?;
-        self.runtime().grant(run.id, extend);
-        if let Err(e) = t.commit() {
-            // the previous deadline is gone with the failed renewal; the lease is
-            // treated as expired, which is the safe side for a worker whose renewal
-            // did not commit
-            self.runtime().revoke(run.id);
-            return Err(e);
-        }
+        // A renewal that does not commit, or unwinds, puts the previous deadline back.
+        let grant = self.runtime().grant(run.id, extend);
+        t.commit()?;
+        grant.keep();
         Ok(Renewed {
             run: run.id,
             version: run.version + 1,
@@ -1408,9 +1445,17 @@ impl Jobs {
                 && token_matches(token, &a.verifier)
         });
         if !owner {
-            return Err(lease_lost(
-                "the token does not match the attempt that published",
-            ));
+            // the run's own workers and submitter learn that the token is wrong, anyone
+            // else that nothing is known
+            let visible = match l.run_header(run_id)? {
+                Some(run) => Self::may_act_on(l, &run, caller)?,
+                None => false,
+            };
+            return Err(if visible {
+                lease_lost("the token does not match the attempt that published")
+            } else {
+                not_found(run_id)
+            });
         }
         if found.digest != digest {
             return Err(managed(
@@ -1450,12 +1495,11 @@ impl Jobs {
         let base = t.base().clone();
         let prep = preparation()?;
         let mut l = Ledger::new(&prep, &base);
-        let (run, attempt, def) =
+        let (run, attempt, _def) =
             self.check_lease(&mut l, &settings, run_id, token, caller, protection)?;
         Self::expect_version(&run, expected_version)?;
         let now = now_ms();
-        let (state, next, why) =
-            after_failure(&run, Some(&def), now, f.transient, f.retry_after_ms);
+        let (state, next, why) = after_failure(&run, now, f.transient, f.retry_after_ms);
         let diagnostic = ledger::redacted(&f.reason);
         let mut ch = Changes::default();
         let a = attempt_iri(attempt.id);
