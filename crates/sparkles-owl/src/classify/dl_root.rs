@@ -179,6 +179,8 @@ pub fn init<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
     st.init = true;
     root_of(ds(st), out);
     let mut found = Found::default();
+    found.root = true;
+    found.rule = "init";
     for &(u, n) in &dix(ix).consts {
         found.push((Vec::new(), vec![atom(ix, out, n, u)]));
         hyper_at(ix, st, out, TOP, u, &unit(), &mut found, false);
@@ -264,6 +266,15 @@ fn process<S: Sink>(ix: &Index, st: &mut State, c: &Clause, max: &[Lit], out: &m
     let dx = dix(ix);
     let me = dx.root.expect("a rooted run");
     let mut found = Found::default();
+    found.root = true;
+    if super::dl_rules::tracing() {
+        let lits = &out.dl().lits;
+        eprintln!(
+            "TR P R - {} -> {}",
+            super::dl_rules::tr(ix, lits, c.body()),
+            super::dl_rules::tr(ix, lits, c.head())
+        );
+    }
     join_body(ix, st, c, &mut found, &out.dl().lits);
     for &l in max {
         let prem = side(c, l);
@@ -328,8 +339,112 @@ fn at_consts<S: Sink>(
             for (u, s, t) in from(v, inv_of(ix, dx)) {
                 on_role(ix, st, out, s, u, t, prem, found, sel);
             }
+            if let Some((s, u)) = to_const(v, inv_of(ix, dx)) {
+                univ_to_const(ix, st, out, s, u, prem, found);
+            }
         }
         _ => {}
+    }
+}
+
+/// The role atom `v` read from `x` to a constant: `(s, u)` for `s(x, u)`, by the inverse
+/// role when x is its second term.
+fn to_const(v: XLit, inv: impl Fn(Role) -> Option<Role>) -> Option<(Role, u32)> {
+    match v {
+        XLit::Role(s, RTerm::X, RTerm::C(u)) => Some((s, u)),
+        XLit::Role(s, RTerm::C(u), RTerm::X) => inv(s).map(|i| (i, u)),
+        _ => None,
+    }
+}
+
+/// Hyper on a new premise `prem` of the role atom `s(x, u)` with the universal restrictions
+/// that the holders of `x` stand for: `∀t.C(x) ∧ s(x, u) → C(u)` for `s ⊑ t`, with the
+/// unit holders and the clauses whose maximal literal is a holder over `x`. The inference
+/// is local to the context, since no predecessor sees `s(x, u)`, so a selected premise
+/// takes part.
+fn univ_to_const<S: Sink>(
+    ix: &Index,
+    st: &State,
+    out: &S,
+    s: Role,
+    u: u32,
+    prem: &Side,
+    found: &mut Found,
+) {
+    found.rule = "univc";
+    let dx = dix(ix);
+    let mut ps = Vec::new();
+    let mut over = |b: Ex, q: &Side, found: &mut Found| {
+        alls(ix, b, &mut ps);
+        for &(t, c) in ps.iter() {
+            if dx.sub(ix, s, t)
+                && let Made::Lit(m) = lit(ix, out, XLit::Atom(c, RTerm::C(u)))
+            {
+                found.push(with(&merge(prem, q), m));
+            }
+        }
+    };
+    over(TOP, &unit(), found);
+    for &b in &st.subs {
+        if b != TOP {
+            over(b, &unit(), found);
+        }
+    }
+    let Some(d) = dl(st) else { return };
+    let mut holders: Vec<Ex> = d.store.by_x.keys().copied().collect();
+    holders.sort_unstable();
+    for b in holders {
+        if st.subs.contains(&b) {
+            continue;
+        }
+        for i in d.store.with_x(b) {
+            let p = side(&d.store.clauses[i as usize].c, Lit::x(b));
+            over(b, &p, found);
+        }
+    }
+}
+
+/// Hyper on a new premise `prem` of a holder `d(x)` of universal restrictions with the
+/// processed role atoms from `x` to a constant: `∀t.C(x) ∧ s(x, u) → C(u)` for `s ⊑ t`,
+/// the other arrival order of [`univ_to_const`].
+pub(super) fn univ_from_x(
+    ix: &Index,
+    st: &State,
+    lits: &super::dl_clause::Lits,
+    d: Ex,
+    prem: &Side,
+    found: &mut Found,
+) {
+    found.rule = "univx";
+    let dx = dix(ix);
+    let mut ps = Vec::new();
+    alls(ix, d, &mut ps);
+    if ps.is_empty() {
+        return;
+    }
+    let Some(x) = dl(st) else { return };
+    let Some(r) = x.root.as_deref() else { return };
+    let inv = inv_of(ix, dx);
+    let mut ids: Vec<u32> = r.roles_of.values().flatten().copied().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    for i in ids {
+        let c = &x.store.clauses[i as usize];
+        if c.dead {
+            continue;
+        }
+        for &l in x.store.maxima(i) {
+            let Some((s, u)) = to_const(lits.view(l, inv), inv) else {
+                continue;
+            };
+            for &(t, b) in &ps {
+                if dx.sub(ix, s, t)
+                    && let Made::Lit(m) = lits.lit(XLit::Atom(b, RTerm::C(u)), inv)
+                {
+                    found.push(with(&merge(prem, &side(&c.c, l)), m));
+                }
+            }
+        }
     }
 }
 
@@ -384,6 +499,7 @@ fn hyper_at<S: Sink>(
     found: &mut Found,
     sel: bool,
 ) {
+    found.rule = "hyperc";
     let dx = dix(ix);
     if sel {
         hyper_roles(ix, st, out, d, u, prem, found, sel);
@@ -473,6 +589,7 @@ fn hyper_roles<S: Sink>(
     found: &mut Found,
     sel: bool,
 ) {
+    found.rule = "hyperr";
     let dx = dix(ix);
     let mut ps = Vec::new();
     alls(ix, d, &mut ps);
@@ -540,6 +657,7 @@ fn on_role<S: Sink>(
     found: &mut Found,
     sel: bool,
 ) {
+    found.rule = "onrole";
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
     let ground = matches!(f, RTerm::C(_) | RTerm::Fc(..));
@@ -662,6 +780,7 @@ pub(super) fn join_head(
     lits: &super::dl_clause::Lits,
     sel: bool,
 ) {
+    found.rule = "joinh";
     if is_marker(c) || sel {
         return;
     }
@@ -692,6 +811,7 @@ pub(super) fn join_body(
     found: &mut Found,
     lits: &super::dl_clause::Lits,
 ) {
+    found.rule = "joinb";
     if is_marker(c) {
         return;
     }
@@ -772,8 +892,30 @@ pub fn rpred_c<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bo
     let c = out.dl().table.get(cid);
     debug_assert!(c.body().is_empty(), "the root sends its facts");
     let mut found = Found::default();
+    found.rule = "rpred";
     found.push((Vec::new(), c.head().to_vec()));
+    ds(st).taking_fact = true;
     drain(ix, st, found, out);
+    ds(st).taking_fact = false;
+    true
+}
+
+/// The root takes a fact that a hypothetical successor derived, a clause with an empty
+/// body whose literals hold neither `x` nor `y`: the successor has the empty core and no
+/// assumption, so its clauses hold of every element, and this one holds in every model of
+/// the ontology. The root derives it as its own, and the redundancy of its store leaves out
+/// one that it holds already.
+pub fn rfact<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool {
+    if st.bottom {
+        return false;
+    }
+    let c = out.dl().table.get(cid);
+    debug_assert!(c.body().is_empty(), "a promoted fact has no body");
+    let mut found = Found::default();
+    found.root = true;
+    found.rule = "rfact";
+    found.push((Vec::new(), c.head().to_vec()));
+    drain_with(ix, st, found, out, derive);
     true
 }
 
@@ -1038,6 +1180,7 @@ fn succ_at<S: Sink>(
     found: &mut Found,
     out: &mut S,
 ) -> Ex {
+    found.rule = "succ";
     let dx = dix(ix);
     let w = dx.hyp.get(&e).copied().unwrap_or(TOP);
     let r = rst(st, out);
@@ -1093,6 +1236,7 @@ pub(super) fn root_pred(
     found: &mut Found,
     lits: &super::dl_clause::Lits,
 ) {
+    found.rule = "rpredc";
     use super::dl_clause::{RY, X as KX};
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
@@ -2342,6 +2486,130 @@ mod tests {
         s.sub(ff, BOTTOM);
         let d = saturate_root(s);
         assert!(d.bottom());
+    }
+
+    #[test]
+    fn a_hypothetical_successor_s_unconditional_ground_fact_goes_to_the_root() {
+        // the hypothetical successor of ∃r.D holds ⊤ → t(x, b) ∨ E(x) and ⊤ → t(x, b) under
+        // ⊤ ⊑ ∀t.G: the clause with E(x) gives ⊤ → G(b) ∨ E(x), which the context keeps,
+        // and the other gives the fact ⊤ → G(b), which goes to the root and is not kept
+        let mut s = Sig::new();
+        let nb = s.ind("b");
+        let [dd, ee, g] = ["D", "E", "G"].map(|n| s.class(n));
+        let r = s.role("r");
+        let t = s.role("t");
+        let er = s.some_h(r, dd);
+        let ag = s.all(t, g);
+        s.sub(TOP, ag);
+        let (ix, root) = probe_ix(s);
+        let h = dix(&ix).hyp[&er];
+        let run = DlRun::new(false, Default::default());
+        let mut out = Probe {
+            run: &run,
+            sent: Vec::new(),
+            mine: Vec::new(),
+        };
+        let ub = c(nb, &ix);
+        let inv = inv_of(&ix, dix(&ix));
+        let l = |w: XLit| match run.lits.lit(w, inv) {
+            Made::Lit(l) => l,
+            _ => panic!("a literal"),
+        };
+        let mut st = State {
+            init: true,
+            ..State::default()
+        };
+        st.subs.insert(TOP);
+        st.subs.insert(ag);
+        let tb = l(XLit::Role(t, RTerm::X, ub));
+        let gb = l(XLit::Atom(g, ub));
+        let kept = |st: &State, head: &[Lit]| {
+            dl(st).unwrap().store.clauses.iter().any(|c| {
+                !c.dead && c.c.body().is_empty() && {
+                    let mut h = c.c.head().to_vec();
+                    h.sort_unstable();
+                    let mut w = head.to_vec();
+                    w.sort_unstable();
+                    h == w
+                }
+            })
+        };
+        ds(&mut st)
+            .store
+            .add(Clause::new(Vec::new(), vec![tb, Lit::x(ee)]));
+        super::super::dl_rules::flush(&ix, h, &mut st, &mut out, 100);
+        assert!(kept(&st, &[gb, Lit::x(ee)]), "⊤ → G(b) ∨ E(x) is kept");
+        assert!(
+            !out.sent.iter().any(|(_, c)| matches!(c, Concl::RFact(_))),
+            "a clause over x stays: {:?}",
+            out.sent
+        );
+        ds(&mut st).store.add(Clause::new(Vec::new(), vec![tb]));
+        super::super::dl_rules::flush(&ix, h, &mut st, &mut out, 100);
+        let facts: Vec<&Clause> = out
+            .sent
+            .iter()
+            .filter_map(|(to, c)| match c {
+                Concl::RFact(cid) if *to == root => Some(run.table.get(*cid)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(facts.len(), 1, "one fact to the root: {:?}", out.sent);
+        assert!(
+            facts[0].body().is_empty() && facts[0].head() == [gb],
+            "⊤ → G(b)"
+        );
+        assert!(!kept(&st, &[gb]), "the fact is not kept");
+    }
+
+    #[test]
+    fn an_inconsistency_a_hypothetical_successor_finds_without_assumptions_reaches_the_root() {
+        // {a} ⊑ ∃r.D, ⊤ ⊑ ∃t.{b}, ⊤ ⊑ ∀t.E, E ⊑ ⊥: every element has b as a t-successor, so
+        // b is in E and the ontology is inconsistent, which the root's successor for f(a)
+        // finds as the empty clause with an empty body
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let nb = s.ind("b");
+        let [dd, ee] = ["D", "E"].map(|n| s.class(n));
+        let r = s.role("r");
+        let t = s.role("t");
+        let er = s.some_h(r, dd);
+        let et = s.some_h(t, nb);
+        let ae = s.all(t, ee);
+        s.sub(na, er);
+        s.sub(TOP, et);
+        s.sub(TOP, ae);
+        s.sub(ee, BOTTOM);
+        let d = saturate_root(s);
+        assert!(d.bottom());
+    }
+
+    #[test]
+    fn a_selected_clause_headed_by_an_atom_over_x_still_takes_the_hyper_over_x() {
+        // Q ⊑ ∃s.D, Q ⊑ ∃t.{a}, Q ⊑ ∀t.∀r.A, D ⊑ ∃r⁻.{a}, A ⊑ ⊥: a Q has ∀r.A at a and a D
+        // reached from a by r, which is in A, so Q is unsatisfiable. The D context holds
+        // the marker of ∀r.A(a) and the local role atom r(a, x), whose Hyper gives the
+        // selected clause ∀r.A(a) → A(x), which Pred cannot carry, so the context itself
+        // takes the Hyper over x to ∀r.A(a) → ⊥
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let [q, dd, aa] = ["Q", "D", "A"].map(|n| s.class(n));
+        let r = s.role("r");
+        let t = s.role("t");
+        let sr = s.role("s");
+        let ri = s.it.role(RoleName::Inverse(ObjectProperty::new("urn:t:r")));
+        let es = s.some_h(sr, dd);
+        let et = s.some_h(t, na);
+        let ara = s.all(r, aa);
+        let atra = s.all(t, ara);
+        let eri = s.some_h(ri, na);
+        s.sub(q, es);
+        s.sub(q, et);
+        s.sub(q, atra);
+        s.sub(dd, eri);
+        s.sub(aa, BOTTOM);
+        let d = saturate_at(s, Some(q));
+        assert!(d.bottom(), "Q ⊑ ⊥");
     }
 
     /// The index and a probe over a signature whose root is made here.

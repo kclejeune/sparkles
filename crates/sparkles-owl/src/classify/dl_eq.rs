@@ -197,6 +197,7 @@ impl Eqs<'_> {
     /// premise, `sel`, takes only the inferences local to its context, those on a literal
     /// that [`super::dl_rules::local`] admits, and so does a selected stored premise.
     pub fn on_max(&self, st: &State, l: Lit, prem: &Side, found: &mut Found, sel: bool) {
+        found.rule = "eqmax";
         let v = self.view(l);
         let mut made = Vec::new();
         let mut ts = Vec::new();
@@ -209,6 +210,7 @@ impl Eqs<'_> {
                 if !sel || local(v) {
                     self.factor(prem, l, s1, t1, found);
                 }
+                found.rule = "eq";
                 if !Eqs::orients(s1, t1) {
                     continue;
                 }
@@ -232,11 +234,13 @@ impl Eqs<'_> {
     /// A new premise in place `prem` of `v`, a unit of a context other than the root: the
     /// stored equalities of its terms rewrite it.
     pub fn on_unit(&self, st: &State, v: XLit, found: &mut Found) {
+        found.rule = "equnit";
         self.into(st, v, &unit(), found, false);
     }
 
     /// The stored equalities whose side is a term of `v` rewrite `prem`'s `v`.
     fn into(&self, st: &State, v: XLit, prem: &Side, found: &mut Found, sel: bool) {
+        found.rule = "eqinto";
         let Some(d) = dl(st) else { return };
         let Some(by) = d.store.terms.as_deref() else {
             return;
@@ -289,6 +293,7 @@ impl Eqs<'_> {
     /// Factor: `Γ → Δ ∨ s ≈ t₀ ∨ s ≈ t₁`, with `s ≈ t₁` maximal and read as `s ↦ t₁`,
     /// gives `Γ → Δ ∨ t₀ ≉ t₁ ∨ s ≈ t₁`.
     fn factor(&self, prem: &Side, l: Lit, s: RTerm, t1: RTerm, found: &mut Found) {
+        found.rule = "factor";
         for &o in &prem.1 {
             let XLit::Eq(a, b) = self.view(o) else {
                 continue;

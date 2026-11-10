@@ -78,6 +78,10 @@ pub enum Concl {
     /// Tier D in a rooted run: the source context registers with the root for the
     /// constant, which a ground literal in one of its bodies mentions
     REdge(Ex, u32),
+    /// Tier D in a rooted run: a hypothetical successor derived a clause with an empty
+    /// body over constants and their successor terms, a fact of the root, by its id in
+    /// the run's table
+    RFact(u32),
 }
 
 // a conclusion takes three words, so that the to-do lists and outboxes keep their size
@@ -390,7 +394,8 @@ impl State {
             | Concl::PredC(..)
             | Concl::RPred(..)
             | Concl::HypL(..)
-            | Concl::REdge(..) => false,
+            | Concl::REdge(..)
+            | Concl::RFact(..) => false,
         }
     }
 
@@ -1691,12 +1696,14 @@ fn apply_rules<S: Sink, R: Rules>(
         Concl::RPred(c) if R::DISJ => dl_root::rpred_c(ix, st, c, out),
         Concl::HypL(l) if R::DISJ => dl_root::hyp_l(st, l, out),
         Concl::REdge(v, u) if R::DISJ => dl_root::redge(st, v, u, out),
+        Concl::RFact(c) if R::DISJ => dl_root::rfact(ix, st, c, out),
         Concl::Hyp(_)
         | Concl::DEdge(..)
         | Concl::PredC(..)
         | Concl::RPred(..)
         | Concl::HypL(..)
-        | Concl::REdge(..) => {
+        | Concl::REdge(..)
+        | Concl::RFact(..) => {
             unreachable!("a conclusion of Tier D in a saturation without it")
         }
     }
