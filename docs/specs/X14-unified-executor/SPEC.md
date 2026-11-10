@@ -4,7 +4,7 @@
 >
 > **Roadmap:** [item 453](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered
-> are named in their phase.
+> are named in their phase. The [plan](PLAN.md) orders the remaining phases.
 
 The design covers one morsel-driven pull executor in which eager execution is a consumption policy, with one memory-accounting model, one kernel per join and grouping algorithm, and one execution-policy function for every entry point.
 
@@ -43,6 +43,10 @@ before the duplication itself goes. A stage lands only when the gates below pass
    pull demand, the remaining fallback kinds get native leaf cursors, `collect()` becomes
    the only eager API, and the admission layer, the eager memory retry and the server's
    mode routing go. The in-place quick runner stays as a scheduling choice.
+
+The [plan](PLAN.md) orders the work of stages 5 and 6 into lanes, records what the audit
+of the code against this design found, and lists the decisions that are open. Items 825
+to 829 are its first lanes.
 
 Phases that touch a single area, such as the CLI's remote mode and the Python
 transaction worker, are scheduled when other work changes that area.
