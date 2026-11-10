@@ -125,9 +125,8 @@ comparison, and the phase measures both before it keeps one.
 
 The columnar tier reverses a dependency that the spec stated. F16 §5's derived layer, item
 9 Phase 2, writes sorted permutations of derived triples to disk, and the tier's subject
-order sorted by `(p, s, o)` is that input. The plan proposes that the tier come first and
-the layer serialize it, since nothing in the tier waits for item 9, and the maintainer
-decides the order below.
+order sorted by `(p, s, o)` is that input. The tier comes first and the layer serializes
+it, since nothing in the tier waits for item 9, as [decision 2](#decisions) records.
 
 ### Provenance is a derivation record per fact, with counts only where measured
 
@@ -205,12 +204,13 @@ for that relation. Non-monotonic rules are outside this argument. The full run e
 a negated rule can fire before another rule derives its blocker, and `tests/demand.rs`
 records a program where the stratified answer differs. Maintenance stratum by stratum
 gives the stratified answer, so it can equal a full run only once the full run evaluates
-stratifiable programs by strata too, which changes results and is a decision for the
-maintainer below. Until then every program with `noValue` runs in full. `makeSkolem` is a
+stratifiable programs by strata too, which changes results. [Decision 4](#decisions)
+makes that an option of the maintained profiles, and without it every program with
+`noValue` runs in full. `makeSkolem` is a
 function of its inputs within one run, but its node is written as a fresh blank node, so a
 maintained run would keep nodes a fresh run does not name, and rules with `makeSkolem`,
-`now`, `makeTemp` or blank nodes in heads keep the full run until the identity decision
-below. The gates below check the argument on random histories against
+`now`, `makeTemp` or blank nodes in heads keep the full run, except that `makeSkolem`
+heads are maintained under the stable identity of [decision 5](#decisions). The gates below check the argument on random histories against
 a full run, on the clique and chain cases, and against Nemo's closure of the changed data.
 
 ### Memory bounds
@@ -250,7 +250,8 @@ derived tier, deduplicated as a set, and is maintained natively when its body is
 graph pattern with filters and otherwise as a recompute stratum of the shared core, which
 Phase 4 supplies. Rules
 run in `sh:order`, and the rules of one order iterate to a fixed point before the next
-order starts, with a one-pass option, which is an open decision below. SPIN rules translate
+order starts, with a one-pass option, as [decision 3](#decisions) records. A round cap
+ends a run that reaches it with an error that names the order, rather than truncating it. SPIN rules translate
 to `sh:SPARQLRule` textually. N3 rules take the subset of `{ } => { }` without nested
 formulas and with the `log:` and `math:` builtins that have Jena counterparts. SWRL imports
 the DL-safe subset from F21's axiom model once item 71 lands. None of them gets an engine
@@ -361,8 +362,8 @@ become operator-maintained relations of the program, which is item 521's second 
 `incr/footprint.rs`'s `Footprint` replaces the reasoner's watched graphs in `inputs.rs`
 and the schema reads of `demand.rs` and `query.rs`, and `InferredFootprint` goes.
 The per-list tracking of F16 §7.3 removes a full-run fallback and can be its own routine
-lane once the core lands, and stratified `noValue` follows it once the maintainer decides
-the full run's negation semantics below. The
+lane once the core lands, and stratified `noValue` follows it under the option of
+[decision 4](#decisions). The
 `LARGE_DELETION` threshold gives way to the cost estimate of F16 §7.3 using the visit
 bound of item 798. The pass emits the tier's change as a Z-set so a view can read the
 inferred graph, which item 221 then builds on.
@@ -376,7 +377,7 @@ including `fixpoint_tests.rs` for path views. The maintained closures after inse
 deletion on LUBM(1) and OWL2Bench(1) equal Nemo's. The small incremental runs and
 `bench:lubm`'s incremental runs are no slower than Phase 3 on atlas, and the deletion of
 the item 798 clique stays incremental. No full-run fallback remains for changed lists, nor
-for stratified `noValue` once its decision is taken, each with a test that fell back
+for stratified `noValue` under its option, each with a test that fell back
 before.
 
 ### Phase 5, rule frontends, item 838
@@ -439,31 +440,30 @@ are independent routine lanes at any time. A lane that touches `engine.rs` and `
 does not run beside Phase 1, and one that touches `incremental.rs` does not run beside
 Phase 3 or 4.
 
-## Open decisions for the maintainer
+## Decisions
 
-The plan recommends an answer to each question but does not take it, and the phases that
-depend on an answer say so.
+The maintainer took these answers, and the phases that depend on them follow them.
 
-1. Is the memory gate half the peak heap per derived fact at OWL2Bench(5), as the plan
-   proposes, or parity with Nemo's resident set at OWL2Bench(5) and LUBM(100)? Nemo's
-   resident set per derived fact at OWL2Bench(1) is about a quarter of Sparkles'.
-2. Does the columnar tier come before item 9's derived layer, with the layer written from
-   the tier's runs, as the plan proposes? The spec stated the reverse dependency, and the
-   proposal leaves `storage: "layer"` waiting on Phase 1.
-3. Does a `sh:SPARQLRule` order iterate to a fixed point before the next `sh:order`, as the
-   plan proposes with one pass as an option, or run once? The SHACL-AF note allows both
-   readings, and the choice is visible in results.
-4. Should the full run evaluate a stratifiable `noValue` program by strata, as the demand
-   engine does? It changes the result of a program whose negated rule fires before its
-   blocker is derived, and it is what lets Phase 4 maintain such programs. The plan
-   recommends it as an option that the maintained profiles turn on.
-5. Should `makeSkolem` nodes get a stable identity, a skolem IRI from a hash of the rule
-   and its arguments as F13 §4.6 gives CONSTRUCT views, so that rules with `makeSkolem`
-   heads can be maintained? Each run writes fresh blank nodes today. The plan recommends the
-   stable identity under a new option and keeps the full run until then.
-6. Are derivation records the only provenance, with counts dropped unless Phase 3's
-   measurement shows them faster? F13 §5 lists counts among its annotations, and the
-   maintainer may want them kept for views regardless of the reasoner's result.
+1. The memory gate of Phase 1 is half the peak heap per derived fact at OWL2Bench(5).
+   Parity with Nemo's resident set is a target under item 845 and not a gate, because
+   Nemo's resident set and Sparkles' heap are not measured the same way and Phase 3 adds
+   the records' bytes. Item 845 measures both engines' resident sets at OWL2Bench(5) and
+   LUBM(100) after item 836.
+2. The columnar tier comes before item 9's derived layer, which is written from the
+   tier's runs, so `storage: "layer"` waits on Phase 1.
+3. A `sh:SPARQLRule` order iterates to a fixed point before the next `sh:order` by
+   default, with one pass as an option. A round cap ends a run that reaches it with an
+   error, so a rule that keeps making new nodes cannot run without end or lose facts in
+   silence.
+4. Evaluating a stratifiable `noValue` program by strata is an option that the maintained
+   profiles turn on, and the full run keeps its current default. The default is
+   reconsidered before the first release.
+5. `makeSkolem` nodes get a stable identity, a namespaced skolem IRI from a full-length
+   hash of the rule and its arguments as F13 §4.6 gives CONSTRUCT views, under a new
+   option that the maintained profiles turn on from the start.
+6. Derivation records are the reasoner's only provenance, and counts are kept only if
+   Phase 3's measurement shows them faster. The decision covers the reasoner only, and
+   F13's views keep their own counts.
 
 ## The first implementation lane
 

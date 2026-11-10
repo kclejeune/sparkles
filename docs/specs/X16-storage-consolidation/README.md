@@ -5,6 +5,6 @@ This spec covers a first-release format cutoff, budgeted readers through one Con
 the phases that are ready to start.
 
 Read the [design](SPEC.md), its ordered [plan](SPEC.md#plan), its later
-[candidate phases](SPEC.md#candidate-phases), its [open decisions](SPEC.md#open-decisions)
+[candidate phases](SPEC.md#candidate-phases), its [decisions](SPEC.md#decisions)
 and its [acceptance gates](SPEC.md#acceptance-gates). Its [Provenance](SPEC.md#provenance)
 records the design sources.
