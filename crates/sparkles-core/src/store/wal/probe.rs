@@ -360,7 +360,7 @@ mod tests {
         let headerless = &wire[WAL_REC..];
         std::fs::write(&path, headerless).unwrap();
         let mut reader = budget.buffered(&path).unwrap().value;
-        let error = prove_prefix(
+        let Err(error) = prove_prefix(
             &mut reader,
             headerless.len() as u64,
             10,
@@ -369,9 +369,9 @@ mod tests {
             None,
             &path,
             &budget,
-        )
-        .err()
-        .expect("a headerless log is refused");
+        ) else {
+            panic!("a headerless log is refused");
+        };
         assert!(matches!(error, Error::Unsupported(_)), "{error}");
         assert!(error.to_string().contains("wal version 0"), "{error}");
         assert!(error.to_string().contains("sparkles dump"), "{error}");

@@ -3137,34 +3137,33 @@ mod tests {
         };
         let options = HistoryOptions::default();
         let keys = run_keys();
-        let (dir3, normal3, _dir2, _normal2) = both_layouts(&keys);
-        for (directory, normal) in [(dir3.path(), &normal3)] {
-            let limit = ReadLimit {
-                options: &options,
-                memory: Some(1 << 20),
-                held: 0,
-            };
-            let mut budget = ColdBudget::new(limit).unwrap();
-            let loaded = PermIndex::open_controlled(directory, Perm::Spo, &mut budget).unwrap();
-            assert_eq!(loaded.value.rows, normal.rows);
-            assert_eq!(loaded.value.blocks.len(), normal.blocks.len());
-            assert_eq!(loaded.value.segmented(), normal.segmented());
-            assert_eq!(budget.used(), loaded.charge);
-            let cache = BlockCache::new(1 << 20);
-            assert!(loaded.value.contains(&cache, &keys[12_345]).unwrap());
-            drop(loaded.value);
-            budget.release(loaded.charge);
-            assert_eq!(budget.used(), 0);
-            let mut low = ColdBudget::new(ReadLimit {
-                memory: Some(16),
-                ..limit
-            })
-            .unwrap();
-            assert!(matches!(
-                PermIndex::open_controlled(directory, Perm::Spo, &mut low),
-                Err(Error::BudgetExceeded(_))
-            ));
-        }
+        let (dir3, normal, _dir2, _normal2) = both_layouts(&keys);
+        let directory = dir3.path();
+        let limit = ReadLimit {
+            options: &options,
+            memory: Some(1 << 20),
+            held: 0,
+        };
+        let mut budget = ColdBudget::new(limit).unwrap();
+        let loaded = PermIndex::open_controlled(directory, Perm::Spo, &mut budget).unwrap();
+        assert_eq!(loaded.value.rows, normal.rows);
+        assert_eq!(loaded.value.blocks.len(), normal.blocks.len());
+        assert_eq!(loaded.value.segmented(), normal.segmented());
+        assert_eq!(budget.used(), loaded.charge);
+        let cache = BlockCache::new(1 << 20);
+        assert!(loaded.value.contains(&cache, &keys[12_345]).unwrap());
+        drop(loaded.value);
+        budget.release(loaded.charge);
+        assert_eq!(budget.used(), 0);
+        let mut low = ColdBudget::new(ReadLimit {
+            memory: Some(16),
+            ..limit
+        })
+        .unwrap();
+        assert!(matches!(
+            PermIndex::open_controlled(directory, Perm::Spo, &mut low),
+            Err(Error::BudgetExceeded(_))
+        ));
     }
 
     /// Keys of runs of 1 to 40 rows per subject, with large id gaps, over five blocks.

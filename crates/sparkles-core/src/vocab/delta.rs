@@ -1343,7 +1343,7 @@ mod tests {
             DeltaVocab::open_read_only(&path).map(|_| ()),
             file_version(&path).and_then(|v| crate::formats::DELTA_VOCAB.check("x", v, None)),
         ] {
-            let error = result.err().expect("an unframed file is refused");
+            let error = result.expect_err("an unframed file is refused");
             assert!(matches!(error, Error::Unsupported(_)), "{error}");
             assert!(error.to_string().contains("sparkles dump"), "{error}");
             assert!(error.to_string().contains("version 1"), "{error}");

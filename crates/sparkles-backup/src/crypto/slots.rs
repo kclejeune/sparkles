@@ -615,7 +615,9 @@ mod tests {
         legacy.ct = STANDARD.encode(
             primitive::seal(&[8; 32], nonce, &legacy.aad(repo), master.master.as_ref()).unwrap(),
         );
-        let refused = Slot::parse(&serde_json::to_vec(&legacy).unwrap()).unwrap_err();
+        let Err(refused) = Slot::parse(&serde_json::to_vec(&legacy).unwrap()) else {
+            panic!("a format 1 slot is refused");
+        };
         assert!(
             refused.to_string().contains("backup-slots version 1"),
             "{refused}"
@@ -623,7 +625,9 @@ mod tests {
         assert!(refused.to_string().contains("sparkles dump"), "{refused}");
         let mut newer = slot.clone();
         newer.format = SLOT_FORMAT + 1;
-        let refused = Slot::parse(&serde_json::to_vec(&newer).unwrap()).unwrap_err();
+        let Err(refused) = Slot::parse(&serde_json::to_vec(&newer).unwrap()) else {
+            panic!("a slot of a newer format is refused");
+        };
         assert!(refused.to_string().contains("newer release"), "{refused}");
     }
     #[test]
