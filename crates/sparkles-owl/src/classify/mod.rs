@@ -2787,7 +2787,8 @@ mod tests {
     /// A saturation records its start of the helper threads as soon as they start, so
     /// that a saturation that starts while it runs waits as long (roadmap item 720). The
     /// cancellation hook, which the helpers poll at their checks of the bounds, looks at
-    /// the record while they run, and holds the first worker until a helper has looked.
+    /// the record while they run, and a bounded handshake makes a helper look after the
+    /// record is written.
     /// The steps outside the saturation run on the calling thread for so small an
     /// ontology.
     #[test]
@@ -2807,22 +2808,33 @@ mod tests {
             Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
         let seen = Arc::new(AtomicBool::new(false));
         let caller = std::thread::current().id();
+        // a handshake, bounded so that a failure ends: another thread that looks before
+        // the record waits for it once, and the first worker waits once for a helper to
+        // have seen it
+        thread_local! {
+            static WAITED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        let wait = |ready: &dyn Fn() -> bool, limit: Duration| {
+            let until = Instant::now() + limit;
+            while !ready() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let caller_waited = Arc::new(AtomicBool::new(false));
         let hook = {
             let seen = seen.clone();
             move || {
-                let on = started.load(std::sync::atomic::Ordering::Relaxed) > 0;
+                let on = || started.load(std::sync::atomic::Ordering::Relaxed) > 0;
+                let relaxed = std::sync::atomic::Ordering::Relaxed;
                 if std::thread::current().id() != caller {
-                    if on {
-                        seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if !on() && !WAITED.replace(true) {
+                        wait(&on, Duration::from_millis(250));
                     }
-                } else if on {
-                    // the first worker waits for a helper to look, which the helpers do
-                    // at their checks of the bounds as they take roots of their own
-                    let until = Instant::now() + std::time::Duration::from_secs(5);
-                    while !seen.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < until
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    if on() {
+                        seen.store(true, relaxed);
                     }
+                } else if on() && !caller_waited.swap(true, relaxed) {
+                    wait(&|| seen.load(relaxed), Duration::from_secs(2));
                 }
                 false
             }
