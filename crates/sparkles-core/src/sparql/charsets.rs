@@ -298,9 +298,6 @@ pub(super) struct StarVar {
     rest: Option<(f64, Vec<(f64, f64)>)>,
     /// mask → (rows, holders) of its star
     memo: FxHashMap<u64, (f64, f64)>,
-    /// (mask, mask) → the shares of [`factor`] for a join of the two, kept for the
-    /// candidate plans that join the same two sides of a group again
-    pairs: FxHashMap<(u64, u64), Option<(f64, f64)>>,
     /// for a node-family variable, its outgoing items over the subject sets and the bit
     /// there of each of its bits (`u8::MAX` for an incoming item); made when a restricted
     /// join first needs it
@@ -502,7 +499,6 @@ fn fill(sv: &mut StarVar, stats: &crate::builder::Stats, idx: &CharIndex, remain
     });
     sv.groups = Some(fam.groups(sets, &sv.preds, sv.usable));
     sv.memo.clear();
-    sv.pairs.clear();
     sv.outgoing = None;
 }
 
@@ -721,19 +717,13 @@ fn star_factor(sv: &mut StarVar, qa: u64, qb: u64) -> Option<(f64, f64)> {
     if (qa | qb) & !sv.usable != 0 {
         return None;
     }
-    if let Some(&x) = sv.pairs.get(&(qa, qb)) {
-        return x;
-    }
     let (ra, da) = sv.star(qa);
     let (rb, db) = sv.star(qb);
     let (r, d) = sv.star(qa | qb);
-    let x = if ra <= 0.0 || rb <= 0.0 || da <= 0.0 || db <= 0.0 {
-        None
-    } else {
-        Some((r / (ra * rb), d / (da * db)))
-    };
-    sv.pairs.insert((qa, qb), x);
-    x
+    if ra <= 0.0 || rb <= 0.0 || da <= 0.0 || db <= 0.0 {
+        return None;
+    }
+    Some((r / (ra * rb), d / (da * db)))
 }
 
 /// The distinct values of the join variable after a join whose inputs have `da` and `db`

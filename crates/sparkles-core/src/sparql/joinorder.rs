@@ -420,8 +420,20 @@ impl Models {
             .collect()
     }
 
-    /// How a join on variable `v` of sides that hold `a` and `b` on it (see [`Models::held`])
-    /// is estimated, the same way as [`plan::join_est_with`] estimates it.
+    /// How a join on join variable `j` (variable `v`) of the inputs `a` and `b` is
+    /// estimated, the same way as [`plan::join_est_with`] estimates it.
+    fn of<I: Iterator<Item = usize> + Clone>(
+        &self,
+        ctx: &Ctx,
+        v: VarId,
+        j: u32,
+        a: I,
+        b: I,
+    ) -> Option<JoinModel> {
+        self.of_held(ctx, v, self.held(j, a), self.held(j, b))
+    }
+
+    /// [`Models::of`] for sides that hold `a` and `b` on the variable.
     fn of_held(&self, ctx: &Ctx, v: VarId, a: Held, b: Held) -> Option<JoinModel> {
         let probe = || {
             if !self.probed {
@@ -1288,33 +1300,11 @@ struct Dp {
     fsel: Vec<Option<f64>>,
     /// how the joins are estimated when not from distinct values
     models: Models,
-    /// what each input holds on each join variable, `jvar.len()` rows of `n` (see
-    /// [`held_table`]): a split's sides are merged from here instead of from the
-    /// inputs' lists, which every split of every subset would scan again
-    held: Vec<Held>,
     ents: Vec<Ent>,
     dval: Vec<f64>,
     /// beside `dval`, each entry's domain of each join variable it binds (see
     /// [`plan::domain`]), the larger of its inputs'
     ddom: Vec<f64>,
-}
-
-/// The table of [`Dp::held`]: row `j` holds, per input, its star mask and side on join
-/// variable `j`, so that what a set of inputs holds is the merge of its entries. An input
-/// without an entry holds the default, which merges as nothing.
-fn held_table(models: &Models, n: usize, jn: usize) -> Vec<Held> {
-    let mut held = vec![Held::default(); n * jn];
-    for (i, xs) in models.stars.iter().enumerate().take(n) {
-        for &(j, star) in xs {
-            held[j as usize * n + i].star = star;
-        }
-    }
-    for (i, xs) in models.sides.iter().enumerate().take(n) {
-        for &(j, side) in xs {
-            held[j as usize * n + i].side = side;
-        }
-    }
-    held
 }
 
 /// One round's tables, per subset of the parts.
@@ -1408,7 +1398,6 @@ impl Dp {
             .map(|(j, &v)| (v, j as u32))
             .collect();
         let fsel = fl.iter().map(|fi| fi.sel).collect();
-        let held = held_table(&g.models, n, jvar.len());
         Some(Dp {
             n,
             jm,
@@ -1419,19 +1408,10 @@ impl Dp {
             cached,
             fsel,
             models: g.models.clone(),
-            held,
             ents: Vec::new(),
             dval: Vec::new(),
             ddom: Vec::new(),
         })
-    }
-
-    /// What the inputs `bits` hold on join variable `j`, as [`Models::held`] tells it,
-    /// merged from the table of [`held_table`].
-    #[inline]
-    fn held(&self, j: u32, bits: u32) -> Held {
-        let row = &self.held[j as usize * self.n..][..self.n];
-        bits_of(bits).fold(Held::default(), |h, i| h.merge(row[i]))
     }
 
     /// The join variables of the inputs `m` that inputs outside them share.
@@ -1721,12 +1701,7 @@ impl Dp {
         let model = if sh.count_ones() == 1 {
             let j = sh.trailing_zeros();
             self.models
-                .of_held(
-                    ctx,
-                    self.jvar[j as usize],
-                    self.held(j, ia),
-                    self.held(j, ib),
-                )
+                .of(ctx, self.jvar[j as usize], j, bits_of(ia), bits_of(ib))
                 .map(|m| (j, m))
         } else {
             None
@@ -2046,71 +2021,4 @@ fn dp_filter_vars(filters: &[Expr]) -> Vec<Vec<VarId>> {
             }
         })
         .collect()
-}
-
-#[cfg(test)]
-mod held_table_tests {
-    use super::*;
-
-    /// The table of what each input holds gives, for every set of inputs and every join
-    /// variable, what merging the inputs' lists gives.
-    #[test]
-    fn table_merges_as_the_lists_do() {
-        let (n, jn) = (7usize, 5usize);
-        let mut x = 0x2545_f491_4f6c_dd1du64;
-        let mut next = move || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x
-        };
-        let mut models = Models::default();
-        for _ in 0..n {
-            let mut stars = Vec::new();
-            let mut sides = Vec::new();
-            for j in 0..jn as u32 {
-                let r = next();
-                if r & 1 == 1 {
-                    // a few bits, sometimes BAD or RESTRICTED, so that merges mark overlaps
-                    let mut mask = (r >> 8) & 0b1111;
-                    if (r >> 16) & 7 == 0 {
-                        mask |= crate::sparql::charsets::BAD;
-                    }
-                    if (r >> 20) & 7 == 0 {
-                        mask |= crate::sparql::charsets::RESTRICTED;
-                    }
-                    if mask != 0 {
-                        stars.push((j, mask));
-                    }
-                }
-                if (r >> 1) & 1 == 1 {
-                    sides.push((
-                        j,
-                        Side {
-                            source: (r >> 24) & 1 == 1,
-                            target: ((r >> 25) & 1 == 1).then_some(((r >> 26) & 3) as u32),
-                            other: (r >> 28) & 1 == 1,
-                        },
-                    ));
-                }
-            }
-            models.stars.push(stars);
-            models.sides.push(sides);
-        }
-        models.starred = true;
-        models.probed = true;
-        let table = held_table(&models, n, jn);
-        let held = |j: u32, bits: u32| {
-            let row = &table[j as usize * n..][..n];
-            bits_of(bits).fold(Held::default(), |h, i| h.merge(row[i]))
-        };
-        for bits in 0..1u32 << n {
-            for j in 0..jn as u32 {
-                let want = models.held(j, bits_of(bits));
-                let got = held(j, bits);
-                assert_eq!(got.star, want.star, "star of inputs {bits:b} on {j}");
-                assert_eq!(got.side, want.side, "side of inputs {bits:b} on {j}");
-            }
-        }
-    }
 }
