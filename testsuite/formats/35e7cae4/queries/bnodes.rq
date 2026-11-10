@@ -1,0 +1,1 @@
+SELECT (COUNT(DISTINCT ?b) AS ?n) WHERE { { ?b ?p ?o } UNION { GRAPH ?g { ?b ?p ?o } } FILTER(isBlank(?b)) }

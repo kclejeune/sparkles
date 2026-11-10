@@ -1,0 +1,4 @@
+PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/>
+PREFIX ex: <http://ex.org/> SELECT ?b WHERE { ?b geo:hasGeometry/geo:asWKT ?w
+  FILTER(geof:sfWithin(?w, 'POLYGON((0 40, 20 40, 20 60, 0 60, 0 40))'^^geo:wktLiteral)) } ORDER BY ?b
