@@ -196,8 +196,11 @@ accurate estimate leads the planner to a 704-key index join that the cost model 
 too low. A cost term for keys spread at random brought their base plan back, but the 64
 queries whose plans it changed took 1.15 times as long, since keys close together cost a
 third of what spread keys cost and the planner cannot tell them apart. The
-[experiment](../../PERFORMANCE-EXPERIMENTS.md#query-execution) is recorded, and item
-701 prices probes by how their keys spread. Planning takes 1 to 90 microseconds
+[experiment](../../PERFORMANCE-EXPERIMENTS.md#query-execution) is recorded. Item 701
+found that the two `S4` plans tie on estimated cost because the estimate of a join
+against a constant-object restriction divides by the input's distinct keys, so the base
+plan's last probe is estimated at 666 keys where it probes 4, and item 874 changes that
+estimate. Planning takes 1 to 90 microseconds
 longer on WatDiv `F4` and on short synthetic, WatDiv and DBpedia queries, 5% to 10% of
 their time, which item 702 follows up. Two synthetic queries with unchanged plans
 run 1.06 and 1.11 times as long in execution in eight rounds, and item 703 follows
