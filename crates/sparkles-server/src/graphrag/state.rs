@@ -451,6 +451,21 @@ mod tests {
         ));
     }
 
+    /// The format registry, which checks a dataset's files when it opens, reads the
+    /// version this build writes and refuses the next one.
+    #[test]
+    fn the_format_registry_reads_the_written_version() {
+        let check = |v: u32| {
+            sparkles::formats::check_settings(
+                "graphrag/state.json",
+                &serde_json::json!({ "version": v }),
+            )
+        };
+        assert_eq!(check(STATE_VERSION).unwrap(), STATE_VERSION);
+        assert!(check(STATE_VERSION_2).is_ok());
+        assert!(check(STATE_VERSION + 1).is_err());
+    }
+
     /// A version 2 state reads as a state without a policy, and is written as version
     /// 3; a version 2 file that records a policy is refused.
     #[test]

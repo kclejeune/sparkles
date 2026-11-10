@@ -765,7 +765,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("holds.json", 1),
     // a view's definition, `views/NAME/view.json`: format 2 is a paused one
     ds("view.json", 2),
-    named(ds("graphrag/state.json", 2), "version"),
+    named(ds("graphrag/state.json", 3), "version"),
     named(ds("graphrag/ledger.json", 1), "version"),
     // the data directory
     server("config.json", 1),
