@@ -1615,15 +1615,18 @@ fn execute_prepared(
 #[inline(never)]
 fn select_output(
     ctx: &Arc<Ctx>,
-    pattern: &GraphPattern,
+    variables: Arc<cursor::Variables>,
     bound: &[(table::VarId, Id)],
     materialized: table::Materialized<'_>,
     result: &mut ResultParts,
 ) -> Result<()> {
-    let variables = cursor::Variables::new(ctx, pattern, &materialized.table.vars, "")?;
-    let retained = materialized
-        .project(ctx, &variables.ids)?
-        .into_retained(ctx)?;
+    // A table already in the projection's column order keeps its owner unchanged.
+    let projected = if materialized.table.vars == variables.ids {
+        materialized
+    } else {
+        materialized.project(ctx, &variables.ids)?
+    };
+    let retained = projected.into_retained(ctx)?;
     result.variables = Some(variables);
     result.table = retained.table;
     result._table_credit = retained.credit;
@@ -1652,6 +1655,26 @@ fn execute_prepared_parts(
         plan_depth: _,
     } = prepared;
     let (_, dataset, _) = split(parsed);
+    // A SELECT result's variables follow from the prepared query alone, so they are
+    // built and admitted before execution, as a cursor builds them when it opens. Their
+    // time counts toward the planning time.
+    let mut plan_ms = plan_ms;
+    let variables = match parsed {
+        Query::Select { .. } => {
+            let started = Instant::now();
+            let variables =
+                cursor::Variables::new(&ctx, &pattern, &node.vars, "").map_err(|error| {
+                    let mut plan = ctx.failed_plan();
+                    if let Some(p) = &mut plan {
+                        p.warnings = ctx.warnings();
+                    }
+                    Box::new(Failed { error, plan })
+                })?;
+            plan_ms += started.elapsed().as_secs_f64() * 1000.0;
+            Some(variables)
+        }
+        _ => None,
+    };
     let t2 = Instant::now();
     if kind == QueryKind::Ask {
         unionpush::order_ask(&ctx, &mut node);
@@ -1699,7 +1722,8 @@ fn execute_prepared_parts(
     };
     match parsed {
         Query::Select { .. } => {
-            select_output(&ctx, &pattern, &bound, materialized, &mut result)
+            let variables = variables.expect("SELECT result variables");
+            select_output(&ctx, variables, &bound, materialized, &mut result)
                 .map_err(|error| failed(error, None, None))?;
         }
         Query::Ask { .. } => {
