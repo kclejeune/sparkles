@@ -15,14 +15,14 @@ index is a set of QLever-style sorted and compressed permutations.
   `xsd:boolean`, `xsd:dateTime` and `xsd:date` values are stored inline when their
   lexical form is canonical.
 * The index holds 7 permutations (SPO, SOP, PSO, POS, OSP, OPS and GSPO) in compressed
-  blocks of 32k rows. Index format 3 splits each block column into frames of 2,048 rows
-  with a directory of their first keys, so a point lookup, a short range scan or an index
-  join decodes only the frames that can hold its rows. Stores in format 2 open as they
-  are and are rewritten at the next compaction.
+  blocks of 32k rows. Each block column is split into frames of 2,048 rows with a
+  directory of their first keys, so a point lookup, a short range scan or an index join
+  decodes only the frames that can hold its rows. Every generation records its index
+  format and the features its blocks use in `meta.json`.
 * The base vocabulary is sorted, front-coded and memory-mapped, and an append-only delta
   vocabulary holds the terms added since. With `--vocab-codec fsst`, a load or compaction
   also compresses each key's suffix with FSST, which shrinks `vocab.dat` by about 30% and
-  writes generation index format 4. FSST is off by default because it slows queries that
+  is recorded among the generation's features. FSST is off by default because it slows queries that
   decode many strings
   ([X11](../specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads)).
 * A numeric column beside the base vocabulary, `vocab.num`, holds the exact value of
@@ -353,6 +353,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 * The largest measured dataset is English DBpedia, 1.24 billion triples on one machine.
   Nothing larger, such as Wikidata, has been tried. Roadmap item 1.
+* Databases and backups written before the first release are refused with a message that
+  names `sparkles dump` from the release that wrote them and `sparkles load`. There is no
+  upgrade step for them, and `sparkles migrate --check` reports the files that are too
+  old ([X16](../specs/X16-storage-consolidation/SPEC.md#phase-1-first-release-format-cutoff-item-479)).
 * FSST vocabulary compression is off by default. With it, a DBpedia export takes 1.05
   times as long as with front coding, and warm queries that decode many strings run 4% to
   12% slower. Single-term lookups are the follow-up in roadmap item 160.
@@ -361,8 +365,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   each existing generation's recorded format.
 * The first query that arrives about 2 s after a start is slower than one that arrives at
   once, because the server's idle threads and cores wake up for it. Roadmap item 572.
-* Cold `export-1m` at 1.01B takes 1,293 ms in index format 3, 4% above the earlier format 2
-  measurement, and 17 times as long with `SPARKLES_IO_HINTS=off`. Roadmap item 573.
+* Cold `export-1m` at 1.01B takes 1,293 ms with framed block columns, 4% above the
+  measurement of the earlier unframed layout, and 17 times as long with
+  `SPARKLES_IO_HINTS=off`. Roadmap item 573.
 * Warm point lookups run 1.6% to 2.5% more instructions per request for the index join's
   check of cold segments. Roadmap item 516.
 * The prewarm restores the block cache and the pages of the generation's files. It does

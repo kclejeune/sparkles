@@ -13,9 +13,13 @@ versions 1 and 2 and refuses a headerless log, version 0. The delta vocabulary r
 framed version 2 and refuses the pre-release file of the entries alone, and the
 `sparkles migrate` step that rewrote it is gone, so no step is registered. Backup key
 slots read format 2 alone. `sparkles vocab-index` no longer writes `vocab.idx`, which
-every generation has, and still adds the numeric column. The two pre-release fixtures
-stay in `testsuite/formats/` for their refusal tests, and a fixture written at the
-cutoff commit joins them.
+every generation has, and still adds the numeric column. The legacy framing of the
+write-ahead log, which told a pre-release commit record from a torn one through
+`walStrictFrom` in `commit.json`, is gone with the headerless reader, `sparkles check`
+reports every log and index form that open refuses, and the open syncs a generation's
+directory after it creates the log, so a crash after the first commits of a new log
+cannot lose it. The two pre-release fixtures stay in `testsuite/formats/` for their
+refusal tests, and a fixture written at the cutoff commit joins them.
 
 ### Compatibility
 

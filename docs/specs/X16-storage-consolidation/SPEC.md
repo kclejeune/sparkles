@@ -559,7 +559,26 @@ No code from another project is copied.
 
 ## Outcome
 
-Nothing is built. [Item 455](../../ROADMAP.md) tracks the work. The plan above replaced
+Phase 1, the first-release format cutoff of item 479, is built. `dataset.json` is
+written as `format` 2 with reader 5 or more, the generation index as format 5 with its
+feature list and a required `vocab.idx`, and every pre-release form is refused with the
+dump-and-reload message: a `format` 1 dataset or a reader below 5, index formats 2 to 4,
+a generation without `vocab.idx`, the headerless write-ahead log, delta vocabulary
+version 1 and backup key slot format 1. No `migrate` step is registered, and the tests
+exercise the migration machinery through a synthetic step. The legacy framing of the log,
+`Framing::Mixed`, `fold_legacy`, `walStrictFrom` and the folding of legacy commits, is
+deleted, and the replay, `sparkles check` and the read-only prefix prover apply one
+first-record rule: a header record, or the zeros of a header that a crash tore at the
+log's creation, which the open reads as an empty log and creates again, with the
+generation directory synced before the writer starts. The fixture
+`testsuite/formats/35e7cae4` was written at the cutoff commit, and the two pre-release
+fixtures stay for their refusal tests in the engine and through the command line. Items
+847 and 848 record the follow-ups, a required `Segments` and `Sparse` without an `Option`
+and a full key check of `vocab.idx` at open. The gates were the format fixture tests,
+`tests/power_loss.rs`, `group_runs`, the `sparkles-core` lib tests and the review rounds
+recorded in the lane's audit directory.
+
+[Item 455](../../ROADMAP.md) tracks the remaining phases. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the
 code, which found about 114 twin readers rather than 80, three publish paths with a
 compaction writer rather than three paths alone, a 17-field snapshot rather than 20, and
