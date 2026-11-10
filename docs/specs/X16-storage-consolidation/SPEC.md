@@ -578,8 +578,11 @@ the prover refuses it, a conservative difference for a read-only reader. The fix
 fixtures stay for their refusal tests in the engine and through the command line. Items
 847 and 848 record the follow-ups, a required `Segments` and `Sparse` without an `Option`
 and a full key check of `vocab.idx` at open. The gates were the format fixture tests,
-`tests/power_loss.rs`, `group_runs`, the `sparkles-core` lib tests and the review rounds
-recorded in the lane's audit directory.
+`tests/power_loss.rs`, `group_runs`, the `sparkles-core` lib tests, the `bench:insn`
+instruction screen and the review rounds recorded in the lane's audit directory. The
+screen compared the cutoff with its base on 17 metrics and flagged none, with the WAL
+replay and the open of 2000 commits within 0.1 percent of the base and every
+vocabulary case within 1 percent.
 
 Phase 2 is built. `wal::encode_txn` in `store/wal.rs` encodes a transaction's records for
 the serial, group and compaction writers, which pass their own flags and unfenced count
