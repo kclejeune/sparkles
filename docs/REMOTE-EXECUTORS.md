@@ -166,7 +166,9 @@ mise run boat:finish --operation "$OWNED_OPERATION" --job-closure "$PRIVATE_JOB_
 The Jena example requires prepared bindings. Gates require the explicit setup command
 once per worker seed to copy public suites and prepare pytest. Boat jobs retain pinned
 tools without implicit reinstall. Screens/builds request at least 1800 remaining seconds
-and gates at least 7200 through `SPARKLES_REMOTE_MIN_LIFETIME`. Partitions request
+and gates at least 7200 through `SPARKLES_REMOTE_MIN_LIFETIME`. A gate unit's runtime ends
+`GATE_BOAT_RESERVE` seconds before the admitted end, 1200 by default, so the closure watch,
+which checks the worker from 900 seconds before the end, finds the gate closed. Partitions request
 `TEST_PARTITION_TIMEOUT` and check again after archive transfer. Boat caps follow the
 original qualification deadline. The legacy `--duration` screen option controls
 Namespace instance lifetime.

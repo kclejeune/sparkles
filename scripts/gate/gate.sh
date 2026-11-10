@@ -53,6 +53,10 @@
 # hosts. Without any of these, each host derives them from its gate memory cap
 # (scripts/gate/remote/gate-start.sh).
 #
+# A gate on a Boat worker needs SPARKLES_REMOTE_MIN_LIFETIME (default 7200) seconds of
+# admitted lifetime, and its unit's runtime ends GATE_BOAT_RESERVE (default 1200) seconds
+# before the admitted end, so the closure watch finds it closed.
+#
 # These settings may also live in ~/.config/sparkles/gate.env (or $SPARKLES_GATE_CONFIG)
 # as KEY=VALUE lines, and the environment takes precedence.
 # Swapping the benchmark role from forge to atlas is SPARKLES_BENCH_HOST=atlas there, after
@@ -273,7 +277,10 @@ start_on() {
   args="--name $n --part $p --jobs $jobs"
   case $h in boat:*)
     local runtime
-    runtime=$(rx_runtime "$statedir/admission-$n.json" --reserve 60) || return
+    # The unit's runtime ends GATE_BOAT_RESERVE seconds before the admitted end, so the
+    # closure watch, which checks the worker from 900 seconds before the end, finds the
+    # gate closed and the worker stops normally at its deadline.
+    runtime=$(rx_runtime "$statedir/admission-$n.json" --reserve "${GATE_BOAT_RESERVE:-1200}") || return
     args+=" --executor boat --runtime $runtime"
     ;;
   esac
