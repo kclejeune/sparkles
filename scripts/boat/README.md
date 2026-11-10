@@ -233,14 +233,18 @@ directory is empty after every resume. The job environment therefore sets `MBX_C
 `~/.local/share/mbx-cache`, and every job on the worker uses that one directory. It holds
 the worker's single shared store with its managed targets and incremental state, and the
 normal stop's snapshot keeps it, so a later resume starts with the store warm. A resume
-runs on a new machine and downloads the snapshot's files in the background, and a build
-that reads a store object before its download ends waits for that object. `admit` asks
-the pinned `mbx` for its effective cache directory and refuses any other, and a gate's
-unit forwards the setting with the others. `MBX_GC_MAX_TOTAL_SIZE` is 64 GiB,
-which holds two release builds and the workspace test builds in one budget for the store,
-managed targets and incremental state. `MBX_GC_MIN_FREE_SIZE` is 45 GiB, which keeps the
-40 GiB of free disk that the metadata probe requires at the next qualification.
-`remote-executor.py admit` asks the pinned `mbx` for its effective `remote.url`,
+runs on a new machine and downloads the snapshot's files in the background, and a source
+file whose content arrives during a build changes under the compiler, so mbx discards the
+result and the build fails. `admit` therefore refuses a worker until `boat info` reports
+it `hydrated`.
+
+`MBX_GC_MAX_TOTAL_SIZE` is 64 GiB, which holds two release builds and the workspace test
+builds in one budget for the store, managed targets and incremental state.
+`MBX_GC_MIN_FREE_SIZE` is 45 GiB, which keeps the 40 GiB of free disk that the metadata
+probe requires at the next qualification. The snapshot now holds the store, and the
+provider restores at most 111 GB of a large worker's own files, so a full store leaves
+about 40 GB for checkouts and build directories. Roadmap item 858 covers keeping the
+saved files under that limit. `remote-executor.py admit` asks the pinned `mbx` for its effective `remote.url`,
 `cache_dir`, `gc.max_total_size` and `gc.min_free_size` through the job environment and
 refuses a remote URL, a token setting, another cache directory or another budget by
 name. A gate's service unit starts

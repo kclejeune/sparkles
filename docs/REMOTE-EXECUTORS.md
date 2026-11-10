@@ -66,6 +66,21 @@ these effective settings and refuses a remote URL, a token setting, another cach
 directory or another budget. Laptops, gate hosts and other ssh hosts keep their own MBX
 configuration.
 
+A cold server build on the 8-vCPU worker takes about 29 minutes, and the store then holds
+about 5 GiB of objects and a 5 GiB managed target. After a normal stop and a
+resume onto a new machine, the store comes back unchanged, and a rebuild of the same
+commit at its stable path takes about 4 minutes with no misses and gives the same binary.
+The snapshot holds the store's files, so a full 64 GiB store takes most of the 111 GB of
+own files that the provider restores on a large worker, and roadmap item 858 covers
+keeping the saved files under that limit.
+
+A resume runs on a new machine and downloads the snapshot's files in the background. A
+file whose content arrives while a build reads it changes under the compiler, and mbx
+then discards the result and fails the build. `admit` therefore refuses a worker until
+the provider reports it `hydrated`, which took about 90 seconds for a 45 GB snapshot. A
+job started sooner is refused, and its caller admits it again once the worker is
+hydrated.
+
 ## Qualification and job admission
 
 The tracked [owned-worker package](../scripts/boat/README.md) supplies the stable
