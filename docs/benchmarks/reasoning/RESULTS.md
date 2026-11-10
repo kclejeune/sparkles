@@ -229,11 +229,14 @@ each comparison's counts.*
 The test cases are those of the approved W3C OWL 2 test cases that list the RL profile and
 have an RDF/XML premise and no imports, 66 of 70. The closures that incremental
 maintenance left after inserting and after deleting a change of 1% of LUBM(1)'s data
-triples equal the reference's closures of the same data, and so does the closure after
-inserting the change into OWL2Bench(1). Deleting the change from OWL2Bench(1) grew to
-14.1 GiB in 136 s until the out-of-memory killer ended it, against less than 800 MiB for a
-full run, and [roadmap](../../ROADMAP.md) item 798 covers it. Those memory figures come
-from the development laptop and are not benchmark measurements.
+triples equal the reference's closures of the same data, and so do the closures after
+inserting the change into OWL2Bench(1) and after deleting it. The deletion passes the
+bound on incremental maintenance, because its `hasSameHomeTownWith` closure is a clique of
+about 1,100 people, and the run materializes in full. In three rounds on 16 threads it
+took 1.4 to 3.4 s at a peak RSS of 808 to 866 MiB, against 1.7 to 4.0 s and 556 to
+641 MiB for a full run. The [deletion record](runs/2026-11-09-item-798-delete-stanley/commands.txt)
+holds the runs. They come from the development laptop while it ran other builds, and are
+not benchmark measurements.
 
 ## Query-time reasoning latency
 

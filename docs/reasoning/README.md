@@ -50,8 +50,12 @@ request or on every write, and the schema report counts what the data holds.
 * Re-runs, automatic runs and `sparkles infer` update the previous materialization
   incrementally with the backward/forward algorithm, and write what a full run would.
   Rules that are not monotonic or create blank nodes, large deletions and a changed set of
-  input graphs run in full. The kept closure holds only the derived facts, which takes 41%
-  to 47% of the memory of a closure with the explicit facts on LUBM-style data.
+  input graphs run in full. A deletion whose maintenance would cost more than a full run
+  also runs in full. Its maintenance stops once it has matched four rule instances for
+  each fact of the closure, or holds more memory than the closure itself, with floors of
+  about a million instances and 64 MiB for small closures. The kept closure holds only
+  the derived facts, which takes 41% to 47% of the memory of a closure with the explicit
+  facts on LUBM-style data.
 * A materialization reads the default graph unless data and ontology graphs are named,
   and follows `owl:imports` to graphs of the dataset through a Jena-style location
   mapping ([API.md](../API.md#input-graphs-and-imports)). With `imports: fetch`, missing
@@ -648,7 +652,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   roadmap item 518. Its rule tests follow the Profiles tables rather than the
   OWL 2 test cases, roadmap item 520.
 * Closure operators serve full materialization only. Incremental updates and query-time
-  reasoning evaluate transitive and equivalence rules as joins, roadmap item 521.
+  reasoning evaluate transitive and equivalence rules as joins, roadmap item 521. A
+  deletion in a large clique of a symmetric and transitive property, where every fact
+  follows through every member, therefore passes the bound on maintenance and runs in
+  full. The bound leaves out the witness preparation of a deletion, roadmap item 815,
+  and a run that falls back reports the full run's peak memory and not the higher peak
+  of the update it abandoned, roadmap item 816.
 * Inference is forward materialization, RDFS on read and derivation on demand.
   Derivation on demand has no cost-based choice against a materialization, no OWL 2 QL
   rewriting, no reuse of tables across commits and no dataset setting, and Jena's hybrid

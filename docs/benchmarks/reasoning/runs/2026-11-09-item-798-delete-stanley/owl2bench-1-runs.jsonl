@@ -1,0 +1,18 @@
+{"run": "sparkles-full", "round": 1, "threads": 1, "status": "ok", "seconds": 1.99, "max_rss_kib": 558092, "derived_triples": 1400688}
+{"run": "sparkles-full", "round": 1, "threads": 16, "status": "ok", "seconds": 1.66, "max_rss_kib": 656076, "derived_triples": 1400688}
+{"run": "nemo-full", "round": 1, "threads": 1, "status": "ok", "seconds": 21.13, "max_rss_kib": 127396, "nemo_import_seconds": 1.478, "nemo_reasoning_seconds": 16.248, "nemo_export_seconds": 3.392}
+{"run": "nemo-minus", "round": 1, "threads": 1, "status": "ok", "seconds": 19.47, "max_rss_kib": 130144, "nemo_import_seconds": 1.768, "nemo_reasoning_seconds": 15.97, "nemo_export_seconds": 1.721}
+{"run": "sparkles-insert", "round": 1, "threads": 16, "status": "ok", "seconds": 0.69, "max_rss_kib": 480716, "derived_triples": 1400688}
+{"run": "sparkles-delete", "round": 1, "threads": 16, "status": "ok", "seconds": 1.39, "max_rss_kib": 886260, "derived_triples": 1359259}
+{"run": "sparkles-full", "round": 2, "threads": 1, "status": "ok", "seconds": 4.23, "max_rss_kib": 465512, "derived_triples": 1400688}
+{"run": "sparkles-full", "round": 2, "threads": 16, "status": "ok", "seconds": 3.95, "max_rss_kib": 618804, "derived_triples": 1400688}
+{"run": "nemo-full", "round": 2, "threads": 1, "status": "ok", "seconds": 37.86, "max_rss_kib": 131408, "nemo_import_seconds": 2.681, "nemo_reasoning_seconds": 33.865, "nemo_export_seconds": 1.288}
+{"run": "nemo-minus", "round": 2, "threads": 1, "status": "ok", "seconds": 34.78, "max_rss_kib": 127260, "nemo_import_seconds": 2.655, "nemo_reasoning_seconds": 31.104, "nemo_export_seconds": 1.006}
+{"run": "sparkles-insert", "round": 2, "threads": 16, "status": "ok", "seconds": 2.25, "max_rss_kib": 349592, "derived_triples": 1400688}
+{"run": "sparkles-delete", "round": 2, "threads": 16, "status": "ok", "seconds": 3.35, "max_rss_kib": 844764, "derived_triples": 1359259}
+{"run": "sparkles-full", "round": 3, "threads": 1, "status": "ok", "seconds": 5.84, "max_rss_kib": 394332, "derived_triples": 1400688}
+{"run": "sparkles-full", "round": 3, "threads": 16, "status": "ok", "seconds": 3.75, "max_rss_kib": 569092, "derived_triples": 1400688}
+{"run": "nemo-full", "round": 3, "threads": 1, "status": "ok", "seconds": 38.88, "max_rss_kib": 131220, "nemo_import_seconds": 3.263, "nemo_reasoning_seconds": 34.493, "nemo_export_seconds": 1.115}
+{"run": "nemo-minus", "round": 3, "threads": 1, "status": "ok", "seconds": 31.34, "max_rss_kib": 128600, "nemo_import_seconds": 2.674, "nemo_reasoning_seconds": 27.932, "nemo_export_seconds": 0.723}
+{"run": "sparkles-insert", "round": 3, "threads": 16, "status": "ok", "seconds": 1.49, "max_rss_kib": 448304, "derived_triples": 1400688}
+{"run": "sparkles-delete", "round": 3, "threads": 16, "status": "ok", "seconds": 2.91, "max_rss_kib": 827588, "derived_triples": 1359259}

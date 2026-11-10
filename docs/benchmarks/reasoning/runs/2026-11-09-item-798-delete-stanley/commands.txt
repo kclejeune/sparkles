@@ -1,0 +1,13 @@
+# Roadmap item 798. The OWL2Bench(1) reference run, from the lane's checkout at 204ce412,
+# under the host's heavy lock.
+MEM_MAX=8G RUNS=3 mise run bench:rl-reference owl2bench 1
+
+# owl2bench-1-summary.md and owl2bench-1-runs.jsonl are bench.sh's summary and record.
+# owl2bench-1-after-delete.json and owl2bench-1-after-insert.json compare the closures
+# that the runs after deleting and after inserting the change of 462 triples left with
+# Nemo's closures of the same data, and both have no difference. owl2bench-1-delete-r*.txt
+# are the output of `sparkles infer` after the deletion in each round. Each run passed the
+# deletion's bound on memory, 129,533,104 bytes, the closure's heap, and materialized in
+# full. The *.time files are GNU time's reports of the deletion runs and of the full runs
+# on 16 threads. The host ran other builds during the rounds, so their times vary by a
+# factor of two between rounds.
