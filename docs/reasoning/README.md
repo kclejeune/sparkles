@@ -306,8 +306,18 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   again without counting, leaves the axioms that need counting out and reports them, and
   sets `Stats::dl_counting_over` and `Stats::dl_over_budget`. Near the bound the thread
   schedule can decide whether a run answers in full or falls back, and the fallback is
-  always reported and never a different complete answer. Roadmap item 727. Any other
-  axiom outside OWL 2 EL, such as nominals, is left out and reported with its rule. Horn
+  always reported and never a different complete answer. Roadmap item 727. In an
+  ontology with individuals or nominals, `Limits::rooted` lets the disjunctive rules take
+  nominals, class and property assertions, equalities and inequalities of individuals and
+  negative assertions through a root context where the individuals' facts meet, with the
+  four departures from the published calculus that F24 records. It is off by default,
+  since the completeness of the departed calculus is not proved, and every answer it gives
+  is entailed. A rooted run without counting has a bound of 524,288 derived conclusions,
+  `Limits::dl_work`, past which it classifies again without the rooted rules, gives the
+  default answer and sets `Stats::dl_rooted_over` and `Stats::dl_over_budget`. It refuses
+  an ontology with keys, a top property or a functional data property, which take the
+  default paths. Roadmap items 805, 822 and 823. Without the option, any other axiom
+  outside OWL 2 EL, such as a nominal, is left out and reported with its rule. Horn
   reasoning with individuals is not supported. Roadmap item 692. An axiom with a literal
   or datatype that the classifier cannot compare, such as an XML literal, an ill-typed
   literal or a datatype outside the OWL 2 datatype map, or with a property chain through
@@ -742,9 +752,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * The ELK mode, which classifies by the OWL 2 EL rules alone, is an option of the Rust
   library and the ROBOT-compatible commands only, and HTTP, the other CLI commands and
   the bindings always take the Horn axioms. Roadmap item 694.
-* Axioms outside OWL 2 EL that need nominals, and axioms that need case analysis or
-  counting in an ontology with individuals or data properties, are left out, and an
-  external DL reasoner bridge is planned. Roadmap item 603. The disjunctive rules need a
+* By default, axioms outside OWL 2 EL that need nominals, and axioms that need case
+  analysis or counting in an ontology with individuals, are left out, since the rooted run
+  that takes them is an option whose completeness is not proved, and five of the 50
+  nominal fixtures of its gate pass its work bound. Roadmap items 822 and 823. Axioms that
+  need case analysis in an ontology with data properties are left out, and an external DL
+  reasoner bridge is planned. Roadmap item 603. The disjunctive rules need a
   datatype checker with data cardinalities before they take data properties, and 10 of
   the 97 disjunctive development files of the ORE 2015 DL sample wait on it. Roadmap
   item 768.

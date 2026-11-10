@@ -94,6 +94,15 @@ Canonical XML values, ill-typed literal semantics, datatypes outside the support
 and chains through the top object property remain in item 663. Horn reasoning with
 individuals remains in item 692, and the shared hierarchical budget remains in item 675.
 
+Item 804 delivers the sixth phase's rooted run as the option `Limits::rooted`, off by
+default, as [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rules) and
+[item 804's departures](#item-804s-departures-from-the-journals-rules) describe. With it,
+ontologies with individuals and nominals take the case analysis through a root context,
+with four recorded departures from the journal's rules, a work bound past which the run
+gives its default answer, and 45 of the 50 `shoi` fixtures exact against HermiT. The five
+fixtures that pass the bound are item 822, the default is item 823, and keys and the
+universal property are item 805.
+
 The bounded named-class read phase of items 588 and 622, and the availability route
 of item 726, publish an immutable completed result beside the incremental saturation.
 `GET /$/ontology/{ds}/classification` and the Rust, Python, Node.js and JVM read adapters
@@ -973,14 +982,15 @@ the [code layout results](../../benchmarks/el-classification/RESULTS.md#code-lay
 
 This section is the design of item 603's sixth phase, which extends the disjunctive rules
 to nominals. The rules it describes are built, apart from keys and the universal property,
-which item 805 builds. They run only when the constant `ROOTED_RUNS` in `classify/mod.rs`
-is true, and it is false, because with the journal's rules as first built 19 of the 50
-`shoi` fixtures of the phase's gate time out.
-The disjunctive rules therefore still refuse ontologies with individuals and nominals as
-the section above says, and every other run takes the paths it took before these rules
-existed. The measurements of the journal's rules are at the end of this section, and the
-departures of item 804 that follow them are the design the run now follows where this
-section says so.
+which item 805 builds. They run when `Limits::rooted` asks for them, and it is off by
+default, because the completeness of the calculus as item 804 departed from the journal's
+rules is not proved and five of the 50 `shoi` fixtures of the phase's gate pass the work
+bound of a rooted run, which item 822 follows. Without the option the disjunctive rules
+refuse ontologies with individuals and nominals as the section above says, and every run
+takes the paths it took before these rules existed. The option changes nothing for an
+ontology without individuals. The measurements of the journal's rules are at the end of
+this section, and the departures of item 804 that follow them are the design the run
+follows where this section says so.
 
 A run of the disjunctive rules with nominals uses the general rooted calculus of Tena
 Cucala, Cuenca Grau and Horrocks in the journal version, *Pay-As-You-Go Consequence-Based
@@ -1129,7 +1139,7 @@ consistency. Regressions with one disjunctive axiom added check that an irreflex
 property beside a nominal is left out while the run takes the rest, and that a stopped rooted run reports its consistency
 as unknown.
 
-With the switch on, the rooted run finishes 132 of the 200 runs of the 50 `shoi` fixtures,
+With the journal's rules as first built, the rooted run finishes 132 of the 200 runs of the 50 `shoi` fixtures,
 on one and four threads under both strategies, within 5 s each in a debug build, and each
 taxonomy it finishes equals HermiT's. It times out at least once on 19 fixtures. The
 smallest case, three axioms reduced from `shoi-000`, gives no answer within 200 s. Two
@@ -1385,7 +1395,7 @@ before.
 **Measured effect.** The measurements are on a debug build on the laptop under load, with
 one thread unless noted, and the counts of conclusions come from the derivation trace
 (`DLTRACE`), which labels each conclusion by context and rule before normalization and
-each processed clause. With the journal's rules and the switch on, the smallest case gives
+each processed clause. With the journal's rules, the smallest case gives
 no answer in 200 s and 19 of 50 `shoi` fixtures time out. With the first three departures,
 the smallest case answers in 2.9 ms, and 44 of 50 `shoi` fixtures give HermiT's taxonomy
 in every one of the four configurations, one and four threads under both strategies, in 5
@@ -1410,10 +1420,30 @@ inferences in the same context, since the successor's `x ≈ u` reaches the pred
 constant and keep the journal's markers, so they do not touch this context's work. A
 restriction that leaves these inferences out needs an argument that the knowledge about
 `f(x)` reaches the constant another way, and the run has none yet, so the five fixtures
-stay open under item 804 and the switch stays off by default. The share of the work that
-the duplication of ground reasoning across contexts costs will be measured on
-ore_ont_15803 with its two top-property axioms removed, since the file itself waits on
-item 805.
+go to item 822 with this attribution and the candidate restrictions, which are to treat
+`f(x) ≈ u` like `x ≈ u` under the third departure with another route for the successor's
+knowledge to the constant, to order the literals over `f(x)` below the ground literals of
+a mixed clause so that it processes on its ground part first, which changes the lifting of
+Pred and Succ, and demodulation where `f(x) ≈ u` is a unit under the hypotheses, which the
+disjunctive equalities here do not give.
+
+**The landed run.** Item 804 lands the rooted run as the option `Limits::rooted`, off by
+default, under the policy that it becomes the default only after 0 taxonomy differences on
+the ORE 2015 DL sample, several thousand generated fixtures against HermiT and the `shoi`
+and nominal fixtures, which item 823 holds. A rooted run without counting has a bound of
+524,288 derived conclusions, which `Limits::dl_work` changes, since the 45 fixtures that
+finish derive under 190,000 on one and on four threads and the five that do not derive
+millions. A run that passes it classifies again without the rooted rules, which leaves the
+axioms outside OWL 2 EL out and reports them as a run without the option does, and sets
+`Stats::dl_rooted_over` and `dl_over_budget`, so an ontology that the run cannot finish
+gets its default answer after the bound's work. A rooted run that counts keeps the
+counting bound and its retry without counting, which then has the rooted bound. Over the
+50 `shoi` fixtures with the option on, 45 give HermiT's taxonomy in every configuration
+and the other five fall back to their default answer, with 0 wrong, which the `dl_fixtures`
+suite checks on one thread under the cautious strategy and four threads under the eager
+one. The share of the work that the duplication of ground reasoning across contexts
+costs will be measured on ore_ont_15803 with its two top-property axioms removed, since
+the file itself waits on item 805.
 
 ### ROBOT-compatible commands
 
