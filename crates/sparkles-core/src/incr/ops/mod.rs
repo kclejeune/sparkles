@@ -7,6 +7,7 @@
 
 pub mod bgp;
 pub mod distinct;
+pub mod exists;
 pub mod group;
 pub mod join;
 pub mod linear;
@@ -72,6 +73,7 @@ pub enum Op {
     Join(Box<join::Join>),
     Match(Box<matching::MatchOp>),
     Distinct(Box<distinct::Distinct>),
+    Exists(Box<exists::ExistsOp>),
     Group(Box<group::Group>),
     Recompute(Box<recompute::Recompute>),
     Template(Box<template::Template>),
@@ -92,6 +94,7 @@ impl Node {
             Op::Join(o) => o.init(p),
             Op::Match(o) => o.init(p),
             Op::Distinct(o) => o.init(p),
+            Op::Exists(o) => o.init(p),
             Op::Group(o) => o.init(p),
             Op::Recompute(o) => o.init(p, &schema),
             Op::Template(o) => o.init(p),
@@ -112,6 +115,7 @@ impl Node {
             Op::Join(o) => o.delta(p),
             Op::Match(o) => o.delta(p),
             Op::Distinct(o) => o.delta(p),
+            Op::Exists(o) => o.delta(p),
             Op::Group(o) => o.delta(p),
             Op::Recompute(o) => o.delta(p, &schema),
             Op::Template(o) => o.delta(p),
@@ -134,6 +138,7 @@ impl Node {
             Op::Join(o) => o.init_a(p),
             Op::Match(o) => o.init_a(p),
             Op::Distinct(o) => o.init_a(p),
+            Op::Exists(o) => o.init_a(p),
             Op::Group(o) => o.init_a(p),
             Op::Recompute(o) => o.init_a(p, &schema),
             Op::Template(o) => o.init_a(p),
@@ -156,6 +161,7 @@ impl Node {
             Op::Join(o) => o.delta_a(p),
             Op::Match(o) => o.delta_a(p),
             Op::Distinct(o) => o.delta_a(p),
+            Op::Exists(o) => o.delta_a(p),
             Op::Group(o) => o.delta_a(p),
             Op::Recompute(o) => o.delta_a(p, &schema),
             Op::Template(o) => o.delta_a(p),
@@ -170,6 +176,7 @@ impl Node {
         match &mut self.op {
             Op::Join(o) => o.enable_prov(mode),
             Op::Path(o) => o.enable_prov(mode),
+            Op::Exists(o) => o.enable_prov(mode),
             Op::Match(o) if mode.is_none() => o.enable_prov(mode, u32::MAX),
             Op::Group(o) if mode.is_none() => o.enable_prov(mode, u32::MAX),
             Op::Match(o) => {
@@ -253,6 +260,7 @@ impl Node {
             Op::Join(o) => vec![&o.left, &o.right],
             Op::Match(o) => vec![&o.left, &o.right],
             Op::Distinct(o) => vec![&o.inner],
+            Op::Exists(o) => vec![&o.inner],
             Op::Group(o) => vec![&o.inner],
             Op::Template(o) => vec![&o.inner],
         }
@@ -268,6 +276,7 @@ impl Node {
             Op::Join(o) => vec![&mut o.left, &mut o.right],
             Op::Match(o) => vec![&mut o.left, &mut o.right],
             Op::Distinct(o) => vec![&mut o.inner],
+            Op::Exists(o) => vec![&mut o.inner],
             Op::Group(o) => vec![&mut o.inner],
             Op::Template(o) => vec![&mut o.inner],
         }
@@ -279,6 +288,7 @@ impl Node {
             Op::Join(o) => o.bytes(),
             Op::Match(o) => o.bytes(),
             Op::Distinct(o) => o.bytes(),
+            Op::Exists(o) => o.bytes(),
             Op::Group(o) => o.bytes(),
             Op::Recompute(o) => o.bytes(self.schema.len()),
             Op::Template(o) => o.bytes(),
@@ -294,6 +304,7 @@ impl Node {
             Op::Join(o) => o.save(w)?,
             Op::Match(o) => o.save(w)?,
             Op::Distinct(o) => o.save(w)?,
+            Op::Exists(o) => o.save(w)?,
             Op::Group(o) => o.save(w)?,
             Op::Recompute(o) => o.save(w)?,
             Op::Template(o) => o.save(w)?,
@@ -312,6 +323,7 @@ impl Node {
             Op::Join(o) => o.load(r)?,
             Op::Match(o) => o.load(r)?,
             Op::Distinct(o) => o.load(r)?,
+            Op::Exists(o) => o.load(r)?,
             Op::Group(o) => o.load(r)?,
             Op::Recompute(o) => o.load(r)?,
             Op::Template(o) => o.load(r)?,
@@ -359,6 +371,19 @@ impl Node {
                 Mode::Incremental,
             ),
             Op::Distinct(_) => ("Distinct", None, Mode::Incremental),
+            Op::Exists(o) => (
+                "ExistsFilter",
+                Some(format!(
+                    "{}{}",
+                    o.expr,
+                    if o.scoped() {
+                        ""
+                    } else {
+                        " (every row on a change)"
+                    }
+                )),
+                Mode::Incremental,
+            ),
             Op::Group(o) => ("Group", Some(o.describe(vars)), Mode::Incremental),
             Op::Recompute(o) => ("Recompute", Some(o.reason.clone()), Mode::Recompute),
             Op::Template(_) => ("Template", None, Mode::Incremental),

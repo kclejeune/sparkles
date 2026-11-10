@@ -3883,12 +3883,15 @@ ignored. Operators that the circuit cannot maintain run as
 subtract the previous output. A property path with `+` or `*` over a step of IRIs,
 inverses, sequences and alternatives is maintained by a fixed-point operator, which the
 plan names `FixedPoint`. Other property paths with `*`, `+` or `?`, `LIMIT` and
-`OFFSET`, a dataset clause, a `GRAPH` inside another `GRAPH`, and `MINUS`, aggregates,
-`DISTINCT`, `VALUES` and subqueries under `GRAPH ?g` are recompute nodes. A `FILTER EXISTS`
-or `FILTER NOT EXISTS` whose `*`, `?` or `{0,n}` path ends at a variable of the outer rows
-is a recompute node together with the group it filters, since the empty path matches a
-substituted term that the graph does not hold. The plan in `GET /$/views/{ds}/{name}` marks each
-operator `incremental` or `recompute`, with the reason.
+`OFFSET`, a dataset clause, a `GRAPH` inside another `GRAPH`, custom aggregates, an
+`EXISTS` in a `BIND`, in an `OPTIONAL` filter or in an aggregate's argument, a
+correlated `EXISTS` under `GRAPH`, and `MINUS`, aggregates, `DISTINCT`, `VALUES` and
+subqueries under `GRAPH ?g` are recompute nodes. A `FILTER` with a correlated `EXISTS`,
+one inside an expression, or one whose `*`, `?` or `{0,n}` path ends at a variable of the
+outer rows is maintained by the operator the plan names `ExistsFilter`, which evaluates
+the condition with the query engine for the rows a commit can have changed. The plan in
+`GET /$/views/{ds}/{name}` marks each operator `incremental` or `recompute`, with the
+reason.
 
 | Method | Path | Needs | Description |
 |---|---|---|---|

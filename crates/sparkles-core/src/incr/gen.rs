@@ -1,15 +1,16 @@
 //! A grammar-driven generator of queries, histories and protections for the
 //! differential tests (spec F13 §11). Test only.
 //!
-//! The queries come from the incremental fragment of spec F13 §4.1 (basic graph
-//! patterns, `GRAPH`, `FILTER`, `BIND`, `UNION`, `OPTIONAL`, `MINUS`, `EXISTS`, `VALUES`,
-//! `DISTINCT`, `REDUCED`, projection, subqueries and `GROUP BY` with `COUNT`, `SUM` and
-//! `AVG`) and from the operators that compile to `recompute` nodes (`MIN`, `MAX`,
-//! `HAVING`, `ORDER BY` with `LIMIT`, and paths with `+` and `*`). They read the
-//! vocabulary the histories write, so most commits touch most queries. Each query is
-//! deterministic: it has one answer per snapshot, so the circuit and the engine can be
-//! compared row for row. `SAMPLE`, `GROUP_CONCAT` and an `ORDER BY` that leaves ties
-//! under its `LIMIT` are left out, since the engine may answer them either way.
+//! The queries come from the incremental fragment of spec F13 §4.1 and §4.2 (basic graph
+//! patterns, `GRAPH`, `FILTER`, `BIND`, `UNION`, `OPTIONAL`, `MINUS`, `EXISTS` with and
+//! without correlation, `VALUES`, `DISTINCT`, `REDUCED`, projection, subqueries,
+//! `GROUP BY` with `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`, `HAVING` and paths with `+`
+//! and `*`) and from the operators that compile to `recompute` nodes (`ORDER BY` with
+//! `LIMIT`). They read the vocabulary the histories write, so most commits touch most
+//! queries. Each query is deterministic: it has one answer per snapshot, so the circuit
+//! and the engine can be compared row for row. `SAMPLE`, `GROUP_CONCAT` and an
+//! `ORDER BY` that leaves ties under its `LIMIT` are left out, since the engine may
+//! answer them either way.
 //!
 //! The text uses the prefixes `:` (`http://ex/`) and `rdfs:`, which the tests declare.
 //! Everything is drawn from one seeded generator, so a seed names a case.
@@ -310,8 +311,16 @@ impl<'a> QueryGen<'a> {
                 let a = self.pattern(d, scope);
                 let b = self.pattern(d, &a.vars);
                 let not = if self.chance(0.5) { "NOT " } else { "" };
+                // at times a correlated filter inside the pattern, over the variables of
+                // both sides
+                let inner = if self.chance(0.3) && !a.vars.is_empty() {
+                    let c = self.condition(&union(&a.vars, &b.vars));
+                    format!("{} FILTER({c})", b.text)
+                } else {
+                    b.text
+                };
                 Pat {
-                    text: format!("{} FILTER {not}EXISTS {{ {} }}", a.text, b.text),
+                    text: format!("{} FILTER {not}EXISTS {{ {inner} }}", a.text),
                     vars: a.vars,
                 }
             }
@@ -428,7 +437,7 @@ impl<'a> QueryGen<'a> {
                 format!("CONSTRUCT {{ {s} :out {o} .{extra} }} WHERE {{ {body} }}")
             }
             3..=6 => {
-                // grouped, with the aggregates of §4.1 and a few recomputed ones
+                // grouped, with the aggregates of §4.1 and §4.2 that have one answer
                 let k = pick(self.rng, &vars).clone();
                 let x = pick(self.rng, &vars).clone();
                 let mut aggs = vec!["(COUNT(*) AS ?n)".to_string()];

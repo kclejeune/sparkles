@@ -10,6 +10,7 @@
 use super::footprint::{Entry, FGraph, Footprint};
 use super::ops::bgp::{Bgp, GSlot, Pat, Slot};
 use super::ops::distinct::Distinct;
+use super::ops::exists::{ExistsOp, Probes, exists_patterns};
 use super::ops::group::{AggKind, AggSpec, Group};
 use super::ops::join::Join;
 use super::ops::linear::{Extend, Filter, Project, Union, Values};
@@ -190,7 +191,7 @@ fn refused_expr(e: &Expression, found: &mut Option<String>) {
 
 /// Whether `iri` names a property function, which computes its answers instead of
 /// matching stored triples.
-fn property_function(iri: &str) -> bool {
+pub(super) fn property_function(iri: &str) -> bool {
     iri == crate::sparql::arqpf::RDFS_MEMBER
         || crate::sparql::catalog::property_functions()
             .iter()
@@ -548,9 +549,13 @@ fn footprint_of(gp: &GP, scope: &Scope, fp: &mut Footprint) {
             };
             let before = (fp.entries.len(), fp.all);
             footprint_of(inner, &s, fp);
-            // a group that reads no triple still depends on which graphs exist, and so
-            // does a group whose triples a GRAPH inside it reads from other graphs
-            if (fp.entries.len(), fp.all) == before || nested_graph(inner) {
+            // a group that reads no triple, or can match without one, still depends on
+            // which graphs exist, and so does a group whose triples a GRAPH inside it
+            // reads from other graphs
+            if (fp.entries.len(), fp.all) == before
+                || nested_graph(inner)
+                || super::ops::exists::matches_without_quads(inner)
+            {
                 any_quad(&s, fp);
             }
             // the special graphs of ARQ read other graphs
@@ -602,8 +607,24 @@ fn footprint_of(gp: &GP, scope: &Scope, fp: &mut Footprint) {
             inner, aggregates, ..
         } => {
             for (_, a) in aggregates {
-                if let AggregateExpression::FunctionCall { expr: e, .. } = a {
-                    expr(e, scope, fp);
+                match a {
+                    AggregateExpression::FunctionCall { expr: e, .. } => expr(e, scope, fp),
+                    AggregateExpression::Fold {
+                        expr: e,
+                        value,
+                        order,
+                        ..
+                    } => {
+                        expr(e, scope, fp);
+                        if let Some(v) = value {
+                            expr(v, scope, fp);
+                        }
+                        for o in order {
+                            let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
+                            expr(e, scope, fp);
+                        }
+                    }
+                    AggregateExpression::CountSolutions { .. } => {}
                 }
             }
             footprint_of(inner, scope, fp);
@@ -1563,6 +1584,9 @@ impl C {
         conjuncts(expr, &mut cs);
         let mut plain: Vec<Expression> = Vec::new();
         let mut exists: Vec<(GP, MatchMode)> = Vec::new();
+        // conjuncts evaluated by substitution: a correlated EXISTS, and an EXISTS inside
+        // an expression
+        let mut correlated: Vec<Expression> = Vec::new();
         for c in cs {
             match &c {
                 Expression::Exists(p) => exists.push(((**p).clone(), MatchMode::Exists)),
@@ -1573,7 +1597,15 @@ impl C {
                     exists.push(((**p).clone(), MatchMode::NotExists));
                 }
                 e if has_exists(e) => {
-                    return self.recompute(gp, scope, "EXISTS inside an expression", None);
+                    if !matches!(scope, Scope::Default) {
+                        return self.recompute(
+                            gp,
+                            scope,
+                            "EXISTS inside an expression under GRAPH",
+                            None,
+                        );
+                    }
+                    correlated.push(c);
                 }
                 _ => plain.push(c),
             }
@@ -1610,24 +1642,55 @@ impl C {
             let free_outer = all.iter().any(|v| !own.contains(v) && outer.contains(v));
             let mut ends = Vec::new();
             nullable_ends(&p, &mut ends);
-            if ends.iter().any(|v| outer.contains(v)) {
-                return self.recompute(
-                    gp,
-                    scope,
-                    "an EXISTS whose empty path starts at an outer variable",
-                    None,
-                );
-            }
+            let nullable_outer = ends.iter().any(|v| outer.contains(v));
             let right = self.compile(&p, scope);
             let shared_ok = right.schema.iter().all(|v| {
                 !node.schema.contains(v) || (node.certain.contains(v) && right.certain.contains(v))
             });
-            if free_outer || !shared_ok || right.has_recompute() && matches!(scope, Scope::Var(_)) {
-                return self.recompute(gp, scope, "a correlated EXISTS (Phase 2)", None);
+            if free_outer
+                || !shared_ok
+                || nullable_outer
+                || right.has_recompute() && matches!(scope, Scope::Var(_))
+            {
+                // substitution semantics: the engine evaluates the pattern per row
+                if !matches!(scope, Scope::Default) {
+                    return self.recompute(gp, scope, "a correlated EXISTS under GRAPH", None);
+                }
+                let e = Expression::Exists(Box::new(p));
+                correlated.push(match mode {
+                    MatchMode::Exists => e,
+                    _ => Expression::Not(Box::new(e)),
+                });
+                continue;
             }
             let (schema, certain) = (node.schema.clone(), node.certain.clone());
             node = Node {
                 op: Op::Match(Box::new(MatchOp::new(mode, node, right, None))),
+                schema,
+                certain,
+            };
+        }
+        if let Some(first) = correlated.first().cloned() {
+            let e = correlated[1..]
+                .iter()
+                .cloned()
+                .fold(first, |a, b| Expression::And(Box::new(a), Box::new(b)));
+            let mut patterns: Vec<&GP> = Vec::new();
+            exists_patterns(&e, &mut patterns);
+            let mut fp = Footprint::default();
+            for p in &patterns {
+                footprint_of(p, scope, &mut fp);
+            }
+            let outer: Vec<String> = node
+                .schema
+                .iter()
+                .map(|&v| self.vars[v as usize].clone())
+                .collect();
+            let owned: Vec<GP> = patterns.into_iter().cloned().collect();
+            let probes = Probes::of(&owned, &outer);
+            let (schema, certain) = (node.schema.clone(), node.certain.clone());
+            node = Node {
+                op: Op::Exists(Box::new(ExistsOp::new(node, e, fp, probes))),
                 schema,
                 certain,
             };
@@ -1646,30 +1709,31 @@ impl C {
         if matches!(scope, Scope::Var(_)) {
             return self.recompute(gp, scope, "GROUP BY under GRAPH ?g", None);
         }
-        let mut specs: Vec<(Variable, AggKind, bool, Option<Expression>)> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut specs: Vec<(Variable, AggKind, bool, Option<Expression>, Option<String>)> =
+            Vec::new();
         for (v, a) in aggregates {
             match a {
                 AggregateExpression::CountSolutions { distinct } => {
-                    specs.push((v.clone(), AggKind::CountAll, *distinct, None))
+                    specs.push((v.clone(), AggKind::CountAll, *distinct, None, None))
                 }
                 AggregateExpression::FunctionCall {
                     name,
                     expr,
                     distinct,
                 } => {
+                    let mut separator = None;
                     let kind = match name {
                         AggregateFunction::Count => AggKind::Count,
                         AggregateFunction::Sum => AggKind::Sum,
                         AggregateFunction::Avg => AggKind::Avg,
-                        AggregateFunction::Min | AggregateFunction::Max => {
-                            return self.recompute(gp, scope, "MIN and MAX (Phase 2)", None);
+                        AggregateFunction::Min => AggKind::Min,
+                        AggregateFunction::Max => AggKind::Max,
+                        AggregateFunction::GroupConcat { separator: s } => {
+                            separator = s.clone();
+                            AggKind::Concat
                         }
-                        AggregateFunction::GroupConcat { .. } => {
-                            return self.recompute(gp, scope, "GROUP_CONCAT (Phase 2)", None);
-                        }
-                        AggregateFunction::Sample => {
-                            return self.recompute(gp, scope, "SAMPLE (Phase 2)", None);
-                        }
+                        AggregateFunction::Sample => AggKind::Sample,
                         AggregateFunction::Custom(_) => {
                             return self.recompute(gp, scope, "a custom aggregate", None);
                         }
@@ -1677,7 +1741,7 @@ impl C {
                     if has_exists(expr) {
                         return self.recompute(gp, scope, "EXISTS in an aggregate", None);
                     }
-                    specs.push((v.clone(), kind, *distinct, Some(expr.clone())));
+                    specs.push((v.clone(), kind, *distinct, Some(expr.clone()), separator));
                 }
                 AggregateExpression::Fold { .. } => {
                     return self.recompute(gp, scope, "FOLD", None);
@@ -1697,7 +1761,7 @@ impl C {
             .copied()
             .collect();
         let mut aggs = Vec::new();
-        for (v, kind, distinct, expr) in specs {
+        for (v, kind, distinct, expr, separator) in specs {
             let var = self.var(v.as_str());
             schema.push(var);
             if matches!(kind, AggKind::CountAll | AggKind::Count) {
@@ -1715,6 +1779,7 @@ impl C {
                 distinct,
                 expr,
                 column,
+                separator,
             });
         }
         let implicit = variables.is_empty();
