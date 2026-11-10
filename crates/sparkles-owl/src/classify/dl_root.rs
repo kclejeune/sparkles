@@ -269,6 +269,7 @@ fn process<S: Sink>(ix: &Index, st: &mut State, c: &Clause, max: &[Lit], out: &m
             dx,
             lits: &out.dl().lits,
             root: true,
+            query: None,
         };
         q.on_max(st, l, &prem, &mut found);
         join_head(st, c, l, &prem, &mut found);
@@ -1794,9 +1795,66 @@ mod tests {
         assert!(d.has(&[XLit::Eq(RTerm::X, o)]), "x ≈ o");
         assert!(d.has(&[XLit::Atom(a, o)]), "A(o)");
         assert!(d.has(&[XLit::Atom(no, o)]), "N_o(o)");
-        assert!(d.has(&[XLit::Atom(b, o), XLit::Atom(cc, RTerm::X)]));
-        assert!(d.has(&[XLit::Atom(b, RTerm::X), XLit::Atom(cc, o)]));
+        // with the blocking of item 804's third departure x ≈ o rewrites the core unit
+        // A(x) only, and the disjunction over x stays over x
+        let mixed = d.has(&[XLit::Atom(b, o), XLit::Atom(cc, RTerm::X)])
+            && d.has(&[XLit::Atom(b, RTerm::X), XLit::Atom(cc, o)]);
+        assert_eq!(mixed, !super::super::dl_eq::eq_block());
         assert!(!d.has(&[XLit::Atom(b, o)]));
+    }
+
+    #[test]
+    fn a_root_fact_of_a_named_class_is_rewritten_back_over_x_in_a_query_context() {
+        // A ⊑ {o}, and the root holds B(o) and F(o) for a fresh F: A's context takes both
+        // and rewrites B(o) to the unit B(x) with o ↦ x. With the blocking, the fresh atom
+        // stays over o, since only a named-class atom is rewritten back.
+        let mut s = Sig::new();
+        let no = s.ind("o");
+        let [a, b] = ["A", "B"].map(|n| s.class(n));
+        let f = s.it.fresh_class();
+        s.sub(a, no);
+        let d = saturate_after(s, &[ROOT], Some(a), |ix, _| {
+            let o = c(no, ix);
+            vec![
+                (vec![], vec![XLit::Atom(b, o)]),
+                (vec![], vec![XLit::Atom(f, o)]),
+            ]
+        });
+        let o = c(no, &d.ix);
+        assert!(d.has(&[XLit::Atom(a, o)]), "A(o)");
+        assert!(d.has(&[XLit::Atom(b, o)]), "B(o) reached A's context");
+        assert!(d.has(&[XLit::Atom(f, o)]), "F(o) reached A's context");
+        assert!(d.subs(b), "B(x)");
+        assert_eq!(d.subs(f), !super::super::dl_eq::eq_block());
+    }
+
+    #[test]
+    fn a_hypothetical_successor_rewrites_nothing_with_an_equality_to_a_constant() {
+        // A ⊑ ∃r.B ⊔ C, B ⊑ {o}, B ⊑ G: the hypothetical successor of ∃r.B holds the
+        // marker B(x) → B(x), B(x) → x ≈ o and B(x) → G(x). With the blocking, x ≈ o
+        // rewrites nothing there, since the successor is no query context; without it,
+        // B(x) → G(o) and B(x) → B(o) follow.
+        let mut s = Sig::new();
+        let no = s.ind("o");
+        let [a, b, cc, g] = ["A", "B", "C", "G"].map(|n| s.class(n));
+        let r = s.role("r");
+        let e = s.some_h(r, b);
+        s.dl.clauses.push((vec![a], vec![e, cc]));
+        s.sub(b, no);
+        s.sub(b, g);
+        let d = saturate_at(s, Some(a));
+        let h = dix(&d.ix).hyp[&e];
+        let o = c(no, &d.ix);
+        let cs = d.clauses_of(h);
+        let bx = XLit::Atom(b, RTerm::X);
+        let has = |head: XLit| {
+            cs.iter()
+                .any(|(bd, hd)| bd == &vec![bx] && hd == &vec![head])
+        };
+        assert!(has(XLit::Eq(RTerm::X, o)), "B(x) → x ≈ o in {cs:?}");
+        assert!(has(XLit::Atom(g, RTerm::X)), "B(x) → G(x)");
+        let ground = has(XLit::Atom(g, o)) || has(XLit::Atom(b, o));
+        assert_eq!(ground, !super::super::dl_eq::eq_block(), "{cs:?}");
     }
 
     #[test]

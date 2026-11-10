@@ -1574,7 +1574,7 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
         }
     }
     if dx.root.is_some() {
-        rooted_unit(ix, st, d, &mut found, &out.dl().lits);
+        rooted_unit(ix, me, st, d, &mut found, &out.dl().lits);
         // the EL successor of a unit existential restriction takes the ground markers
         if let Node::Exist(..) = h.node {
             super::dl_root::new_succ(st, h.succ, out);
@@ -1586,7 +1586,7 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
 /// The rules of a rooted run on a new premise `prem` whose maximal literal is `l` in a
 /// context other than the root: `N_u(x) → x ≈ u`, the differing successor terms of a
 /// minimum's holder, and the equality rules.
-fn rooted_max(ix: &Index, st: &State, l: Lit, prem: &Side, found: &mut Found, lits: &Lits) {
+fn rooted_max(ix: &Index, me: Ex, st: &State, l: Lit, prem: &Side, found: &mut Found, lits: &Lits) {
     let dx = dix(ix);
     if l.kind() == X {
         rooted_hyper(ix, l.atom(), prem, found, lits);
@@ -1596,13 +1596,20 @@ fn rooted_max(ix: &Index, st: &State, l: Lit, prem: &Side, found: &mut Found, li
         dx,
         lits,
         root: false,
+        query: query_of(ix, me),
     };
     q.on_max(st, l, prem, found);
 }
 
+/// The named class whose context `me` is, which is a query context of the journal with that
+/// class as its core atom, or `None` for a hypothetical successor or the root.
+fn query_of(ix: &Index, me: Ex) -> Option<Ex> {
+    matches!(ix.head(me).node, Node::Class(_)).then_some(me)
+}
+
 /// The rules of a rooted run on a new unit `d(x)`, as [`rooted_max`] has them, with the
 /// unit's literals in place: the atom, and an existential restriction's role and core.
-fn rooted_unit(ix: &Index, st: &State, d: Ex, found: &mut Found, lits: &Lits) {
+fn rooted_unit(ix: &Index, me: Ex, st: &State, d: Ex, found: &mut Found, lits: &Lits) {
     use super::dl_clause::{RTerm, XLit};
     let dx = dix(ix);
     rooted_hyper(ix, d, &unit(), found, lits);
@@ -1611,6 +1618,7 @@ fn rooted_unit(ix: &Index, st: &State, d: Ex, found: &mut Found, lits: &Lits) {
         dx,
         lits,
         root: false,
+        query: query_of(ix, me),
     };
     q.on_unit(st, XLit::Atom(d, RTerm::X), found);
     if let Node::Exist(r, _) = ix.head(d).node {
@@ -2122,7 +2130,7 @@ fn process<S: Sink>(
     for &l in max {
         let prem = side(c, l);
         if dx.root.is_some() {
-            rooted_max(ix, st, l, &prem, &mut found, &out.dl().lits);
+            rooted_max(ix, me, st, l, &prem, &mut found, &out.dl().lits);
         }
         match l.kind() {
             X => {

@@ -12,22 +12,39 @@
 //! literals hold no `t ≉ t`, since [`Lits::lit`] makes it
 //! false, which is the Ineq rule. Factor takes two equalities with one left side in a head.
 //!
+//! The equality `x ≈ u` as the rewriting equality is blocked outside query contexts (F24,
+//! item 804's third departure, behind `SPARKLES_ROOTED_EQ_BLOCK`): it rewrites `x` to `u`
+//! only in the unit of a core atom of the context of a named class, and `u` to `x` only
+//! in a named-class atom over `u` in such a context, the two forms the journal's Lemmas 21
+//! and 22 use. The equality is still a rewritten literal, so `u ≈ v` turns `x ≈ u` into
+//! `x ≈ v`, and Factor takes it as any equality.
+//!
 //! The premises in place of a context other than the root are its units: the atoms `B(x)`
 //! of its subsumers, and the role atom and core of a unit existential restriction over its
 //! successor term.
 
-use super::dl_clause::{Lit, Lits, Made, RTerm, Rooted, XLit, terms_of};
+use super::dl_clause::{Lit, Lits, Made, RTerm, Rooted, XLit, rank, terms_of};
 use super::dl_rules::{DlIx, Found, Side, dl, merge, side, unit, with};
 use super::index::{Ex, Index, Role, TOP};
 use super::saturate::State;
+use std::sync::OnceLock;
+
+/// Whether `x ≈ u` rewrites only in the two forms of a query context, item 804's third
+/// departure. `SPARKLES_ROOTED_EQ_BLOCK=0` turns the blocking off, for measurement.
+pub fn eq_block() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_EQ_BLOCK").is_none_or(|v| v != "0"))
+}
 
 /// What the equality rules read beside a context's state: the index, the run's literals,
-/// and whether the context is the root.
+/// whether the context is the root, and the named class of a query context, which is its
+/// core atom.
 pub(super) struct Eqs<'a> {
     pub ix: &'a Index,
     pub dx: &'a DlIx,
     pub lits: &'a Lits,
     pub root: bool,
+    pub query: Option<Ex>,
 }
 
 impl Eqs<'_> {
@@ -48,6 +65,28 @@ impl Eqs<'_> {
     fn orients(s1: RTerm, t1: RTerm) -> bool {
         use RTerm::*;
         !Rooted::a_gt(t1, s1) && !matches!((s1, t1), (X, Y) | (Y, X) | (Y, C(_)) | (C(_), Y))
+    }
+
+    /// Whether Eq with `s₁ ↦ t₁` may rewrite the literal `v` of the premise `prem` (the
+    /// premise without v). An equality other than `x ≈ u` always may. `x ↦ u` rewrites the
+    /// unit of a query context's core atom, and `u ↦ x` a named-class atom over u in a
+    /// query context, and nothing else when the blocking is on.
+    fn admits(&self, s1: RTerm, t1: RTerm, v: XLit, prem: &Side) -> bool {
+        use RTerm::*;
+        match (s1, t1) {
+            (X, C(_)) => {
+                !eq_block()
+                    || self.query.is_some_and(|me| {
+                        prem.0.is_empty() && prem.1.is_empty() && v == XLit::Atom(me, X)
+                    })
+            }
+            (C(u), X) => {
+                !eq_block()
+                    || self.query.is_some()
+                        && matches!(v, XLit::Atom(b, C(w)) if w == u && rank(self.ix, b).0 == 1)
+            }
+            _ => true,
+        }
     }
 
     /// The literals `v` rewrites to with `s₁ ↦ t₁`, one for each position the rule allows.
@@ -166,7 +205,7 @@ impl Eqs<'_> {
                 }
                 self.targets(st, s1, &mut ts);
                 for (c2, v2) in &ts {
-                    if *v2 == v && c2 == prem {
+                    if *v2 == v && c2 == prem || !self.admits(s1, t1, *v2, c2) {
                         continue;
                     }
                     made.clear();
@@ -214,6 +253,9 @@ impl Eqs<'_> {
                         };
                         let t1 = if a == s1 { b } else { a };
                         if (a != s1 && b != s1) || !Eqs::orients(s1, t1) {
+                            continue;
+                        }
+                        if !self.admits(s1, t1, v, prem) {
                             continue;
                         }
                         let c1 = side(&s.c, e);
