@@ -755,25 +755,9 @@ impl WriteTxn<'_> {
         let reserved = store.quota.reserve(bytes + terms + ann_bytes);
         self.check_storage_for(self.net_ins > 0, 0)?;
         let c = self.next_commit(validation.as_deref());
-        let mut snapshot = Snapshot {
-            cacheable: true,
-            dataset_id: self.base.dataset_id,
-            generation: generation.clone(),
-            delta: std::mem::take(&mut self.delta),
-            version: self.base.version + 1,
-            cache: self.base.cache.clone(),
-            results: self.base.results.clone(),
-            dvocab_len: generation.dvocab.len(),
-            commit: c.seq,
-            text: self.base.text.clone(),
-            geo: self.base.geo.clone(),
-            union_default_graph: self.base.union_default_graph,
-            geo_op_vertices: self.base.geo_op_vertices,
-            counts: Default::default(),
-            mask: None,
-            historical: false,
-            change_log: self.base.change_log.clone(),
-        };
+        let mut snapshot = SnapshotBuilder::after(&self.base, c.seq)
+            .delta(std::mem::take(&mut self.delta))
+            .build();
         // The index state of the speculative snapshot (X09 section 17.4, step 1). The
         // spatial view is a value computed from the base's, which a failed fence drops
         // with the snapshot. The full-text changes are only staged here, and nothing of

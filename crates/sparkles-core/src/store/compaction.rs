@@ -1410,26 +1410,15 @@ impl Store {
             w.poisoned = true;
             return Err(e);
         }
-        let dvocab_len = gen_.dvocab.len();
-        let mut new_snap = Snapshot {
-            cacheable: true,
-            dataset_id: self.owner_dataset_id(),
-            generation: gen_,
-            delta: std::mem::take(&mut cu.delta),
-            version: view.version + 1,
-            cache: self.cache.clone(),
-            results: self.results.clone(),
-            dvocab_len,
-            commit: view.commit,
-            text: view.text.clone(),
-            geo: None,
-            union_default_graph: self.opts.union_default_graph,
-            geo_op_vertices: self.opts.geo_op_vertices,
-            counts: Default::default(),
-            historical: false,
-            mask: None,
-            change_log: self.changelog.clone(),
-        };
+        // The new generation at the commit the store already has, with the carried
+        // commits in its delta and the full-text view as it was. The switch below gives
+        // it its spatial view.
+        let mut new_snap = self
+            .snapshot_of(gen_, view.commit)
+            .delta(std::mem::take(&mut cu.delta))
+            .version(view.version + 1)
+            .text(view.text.clone())
+            .build();
         #[cfg(feature = "text")]
         if let Some(job) = self.text_recovery.load_full().filter(|j| j.pending()) {
             job.changed_generation();
@@ -1674,25 +1663,10 @@ impl Store {
     /// A snapshot of `gen_` alone, with an empty delta, at commit `seq` (what a
     /// compaction's new generation holds before the commits carried over).
     pub(super) fn base_snapshot(&self, gen_: &Arc<Generation>, seq: u64) -> Snapshot {
-        Snapshot {
-            cacheable: true,
-            dataset_id: self.owner_dataset_id(),
-            generation: gen_.clone(),
-            delta: gen_.base_delta(),
-            version: 0,
-            cache: self.cache.clone(),
-            results: self.results.clone(),
-            dvocab_len: gen_.dvocab.len(),
-            commit: seq,
-            text: None,
-            geo: None,
-            union_default_graph: self.opts.union_default_graph,
-            geo_op_vertices: self.opts.geo_op_vertices,
-            counts: Default::default(),
-            historical: false,
-            mask: None,
-            change_log: None,
-        }
+        self.snapshot_of(gen_.clone(), seq)
+            .delta(gen_.base_delta())
+            .change_log(None)
+            .build()
     }
 
     /// What stops or paces a compaction's build: its cancel flag, the free-space reserve,
