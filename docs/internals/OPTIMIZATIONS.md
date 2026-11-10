@@ -231,7 +231,9 @@ implementation and always apply. EXPLAIN shows which ones ran.
   `nationality` at 666 for 4. A join on a variable that a pattern binds with the predicate
   and the other column fixed to a constant other than a class now divides by the
   predicate's distinct subjects or objects at least, on the pattern and on the joins above
-  it, which gives 117 and 2 for those joins. Classes stay with the characteristic sets.
+  it. `S4-2` then merges the `artist` and `nationality` scans, estimated at 122 rows for 21,
+  and probes `age` and `familyName` with the 21 keys instead of probing `familyName` with
+  704. Classes stay with the characteristic sets.
 * **Join estimates from probed values** (`probed_keys`). When one input of a group is
   small, a VALUES table or a pattern of at most 1,024 rows, the planner reads up to 32 of
   its values, spread over them in order, and counts the rows each has in every other

@@ -209,6 +209,32 @@ them up. Interleaved runs on atlas, an Intel host like forge, found the same slo
 [engine results](../../benchmarks/engine/RESULTS.md#estimation-timing-on-forge) list every
 changed plan.
 
+Item 874 divides a join against a pattern that a constant restricts by the predicate's
+distinct subjects or objects at least, on the pattern and on the joins above it, since the
+pattern's keys are a sample of the predicate's values and not a superset of the other
+side's. The switch is `domain_estimates`. Classes stay with the characteristic sets. On
+WatDiv at scale 100, `S4-2` and `S4-4` then take a third plan. The `artist` and
+`nationality` scans merge, estimated at 122 rows where 21 come, and a 21-key star probe
+of `age` and `familyName` follows, estimated at 15 rows where 4 come, at 21,874 cost units
+against 66,034 for the 704-key probe plan. Over the 88 WatDiv queries the geometric mean of
+the join q-error falls from 3.98 to 2.40, the median from 2.00 to 1.67 and the 90th
+percentile from 59 to 6.1. The largest error of `S4-1` and `S4-3` falls from 666 to 1.6
+and 2.0, of `F1-1` from 103 to 14, of `F4-4` from 196 to 9 and of the `L2` and `L5`
+queries from about 15 to 3. The synthetic workload keeps every estimate. On the DBpedia
+slice the geometric mean falls from 1.96 to 1.80 and the largest error, on
+`outlink-classes-2`, from 78 to 31. Every answer matches the base build's, and item 702
+alone changes no estimate on the three workloads. The plans of 32 WatDiv queries change,
+and the largest join error of nine of them rises. The five `F5` queries, `S1-3` and
+`S1-4` fuse another pair of patterns into the star over `<Retailer> gr:offers ?v0`, and
+the estimate of that star without a set that fits, 19 rows where 73 come, carries through
+the probes above it, where the earlier pair happened to estimate 21 rows for 23. `S5-1`
+joins `rdf:type` with `schema:language` first and estimates 487 rows for none, where the
+earlier order estimated 106 for none, because the 5,504 subjects of `language` are 5,000
+websites and 504 products and the domain of one predicate cannot separate the two. `F4-1`
+estimates 3 rows where 9 come for the `language` restriction on 17 websites, of which
+1,238 in 5,000 have the language and 9 of these 17 do, and the five joins above keep that
+factor, to 9 rows where 72 come.
+
 The first query of a fresh server over a store that holds the correlation statistics pays
 for them once. On atlas at 1.05M triples, with one thread, the first run of the synthetic
 `expr-bind-group` took a median of 1.19 ms of server time over five fresh servers,
