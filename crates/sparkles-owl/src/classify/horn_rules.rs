@@ -753,9 +753,15 @@ pub fn singular<S: Sink>(ix: &Index, me: Ex, st: &mut State, counted: bool, out:
     propagate_singular(ix, st, out);
     r7(ix, me, st, None, out);
     let links: Vec<(Role, Small<Ex>)> = st.back.iter().map(|(r, s)| (*r, s.clone())).collect();
+    // the scans inside poll when they are long, and the calls poll when they are many
+    let mut work = 0usize;
     for (r, srcs) in links {
         for &m in &srcs.list {
             if !r8_back(ix, me, st, m, r, out) {
+                return;
+            }
+            work += 1;
+            if work.is_multiple_of(64) && !out.go_on() {
                 return;
             }
         }

@@ -1098,7 +1098,9 @@ impl<'a> World<'a> {
             let data_growth = Cell::new(0isize);
             let data_halted = Cell::new(false);
             let data_overflow = Cell::new(false);
-            let grown = Cell::new(0usize);
+            // the incoming messages were reported as waiting, so the charge for the
+            // buffers starts above them
+            let grown = Cell::new(todo.len());
             let charged = Cell::new(0isize);
             {
                 let core = self.conjunction_core(e).map(|c| c.to_vec());
