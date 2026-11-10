@@ -3526,18 +3526,27 @@ mod tests {
 
     /// A log whose header a crash tore is removed and created again at the open. The
     /// file's sync does not make its directory entry durable, so the open syncs the
-    /// generation's directory with the new log in it before the writer starts, or a
-    /// power loss after the first commits would lose the log with them.
+    /// generation's directory with the log in it before the writer starts, or a power
+    /// loss after the first commits would lose the log with them. Every writable open
+    /// syncs it, a plain reopen included, since an open that failed after creating the
+    /// log leaves the entry unsynced for the open that follows it.
     #[cfg(unix)]
     #[test]
     fn a_recreated_log_is_durable_in_its_directory_before_the_first_commit() {
-        for torn in [&[][..], &[0u8; WAL_REC][..], &wal::MAGIC[..5]] {
+        for torn in [
+            None,
+            Some(&[][..]),
+            Some(&[0u8; WAL_REC][..]),
+            Some(&wal::MAGIC[..5]),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().join("db");
             drop(Store::open(&root, options()).unwrap());
             let path = wal_path(&root);
             let gen_dir = path.parent().unwrap().to_path_buf();
-            std::fs::write(&path, torn).unwrap();
+            if let Some(torn) = torn {
+                std::fs::write(&path, torn).unwrap();
+            }
             crate::fsutil::take_dir_syncs();
             let store = Store::open(&root, options()).unwrap();
             let syncs = crate::fsutil::take_dir_syncs();
