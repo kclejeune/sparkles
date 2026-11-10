@@ -420,3 +420,91 @@ fn correlation_estimates_raise_the_error_of_no_recorded_plan() {
     }
     assert!(better >= 3, "{better} plans estimated better");
 }
+
+/// `n` users with a group of eight, a country of fifty and, for about one in 73, an
+/// artist, drawn independently from a hash of the user, so that a constant restricts the
+/// users to a sample of the predicate's subjects.
+fn users(n: usize) -> String {
+    let mut d = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..n {
+        let h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        d.push_str(&format!(
+            "ex:u{i} ex:name \"n{i}\" ; ex:group ex:g{} ; ex:country ex:c{} .\n",
+            (h >> 20) % 8,
+            (h >> 40) % 50
+        ));
+        if (h >> 8) % 73 == 0 {
+            d.push_str(&format!("ex:u{i} ex:artist ex:a{} .\n", (h >> 50) % 5));
+        }
+    }
+    d
+}
+
+/// A join against a pattern that a constant restricts, such as WatDiv `S4`'s `?v0 age
+/// AgeGroup5` beside `?v0 artist ?v1`, divides by the predicate's distinct subjects: the
+/// pattern's subjects are a sample of all users, not a superset of the artists (item
+/// 874). Dividing by the pattern's own distinct keys takes every artist to be in the
+/// group, about eight times too many rows here.
+#[test]
+fn a_join_against_a_constant_restriction_is_estimated_from_the_predicates_domain() {
+    let s = store_with(&users(4000), StoreOptions::default());
+    // the key probes and the characteristic sets estimate a join before the distinct
+    // values do, and a store this small lets them; the estimate from distinct values is
+    // what a join falls back to at scale, as WatDiv `S4`'s do
+    let fallback = Optimizations {
+        probed_keys: false,
+        characteristic_sets: false,
+        node_sets: false,
+        set_remainders: false,
+        ..Optimizations::ALL
+    };
+    let off = QueryOptions {
+        optimizations: Some(Optimizations {
+            domain_estimates: false,
+            ..fallback
+        }),
+        no_cache: true,
+        ..opts()
+    };
+    let on = QueryOptions {
+        optimizations: Some(fallback),
+        no_cache: true,
+        ..opts()
+    };
+    // each query with the least q-error that dividing by the pattern's own keys leaves:
+    // 55 artists against 500 of the group give 39 rows where 6 come, the `S4` shape
+    // compounds that through its country, and two constants both restrict
+    let queries = [
+        (
+            "SELECT * WHERE { ?u ex:artist ?a . ?u ex:group ex:g3 }",
+            6.0,
+        ),
+        (
+            "SELECT * WHERE { ?u ex:artist ?a ; ex:name ?n ; ex:group ex:g3 ; ex:country ex:c7 }",
+            25.0,
+        ),
+        (
+            "SELECT * WHERE { ?u ex:group ex:g3 . ?u ex:country ex:c7 }",
+            3.0,
+        ),
+    ];
+    for (q, worst_off) in queries {
+        for o in [&off, &on] {
+            query(s.snapshot(), q, o).unwrap();
+        }
+        let a = query(s.snapshot(), q, &off).unwrap();
+        let b = query(s.snapshot(), q, &on).unwrap();
+        assert_eq!(a.len(), b.len(), "{q}");
+        let (ea, eb) = (join_qerror(&a.plan), join_qerror(&b.plan));
+        assert!(
+            ea >= worst_off,
+            "{q}: the largest join q-error from distinct values alone is {ea:.3}\n{:#?}",
+            a.plan
+        );
+        assert!(
+            eb <= 2.5 && eb < ea,
+            "{q}: the largest join q-error with the domain is {eb:.3} against {ea:.3}\n{:#?}",
+            b.plan
+        );
+    }
+}
