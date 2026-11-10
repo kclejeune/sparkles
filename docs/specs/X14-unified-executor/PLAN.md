@@ -519,13 +519,20 @@ index-order top-k without the heap takes the heap of `cursor/topk.rs` with its r
 fallback.
 
 After the phase, every kind has a cursor, so an EXISTS pattern builds under the strict
-policy as well and `exists_streams` can fail only on a budget, cancellation or timeout
-error. `State::Fallback` therefore goes in this phase, and
-`mise run test:w3c:streaming` records no eager fallback for the W3C query suites. The
-EXISTS shapes that automatic execution keeps eager through `streams_natively`, an EXISTS
-deeper than four levels, a LeftJoin condition with EXISTS and an EXISTS inside a larger
-expression, are item 7's remaining work and an admission choice rather than a fallback,
-and the merge removes the admission with the mode.
+policy as well, and `exists_streams`, which builds each pattern without a LIMIT of its
+own and turns a construction refusal into a fallback, can then refuse only a pattern
+whose leaf the strict policy refuses. Whether such a leaf exists depends on the
+maintainer's answer about materialized leaves. If the strict policy admits every leaf, or
+admits a leaf inside an EXISTS pattern whatever its bound, `State::Fallback` goes in this
+phase. If the strict policy refuses an unbounded materialized leaf inside an EXISTS
+pattern, the fallback remains for that one shape, an EXISTS over a SERVICE or search
+without a bound, as a maintained limitation that the streaming record names, and the
+merge removes it with the eager executor. In both cases
+`mise run test:w3c:streaming` records no eager fallback for the W3C query suites, which
+hold no such shape. The EXISTS shapes that automatic execution keeps eager through
+`streams_natively`, an EXISTS deeper than four levels, a LeftJoin condition with EXISTS
+and an EXISTS inside a larger expression, are item 7's remaining work and an admission
+choice rather than a fallback, and the merge removes the admission with the mode.
 
 The regression tests that fail before the change are a test in `tests/query_cursor.rs`
 that a streaming request over each former fallback form returns a cursor plan without a
@@ -545,11 +552,14 @@ phase first gives them an `EXECUTION` setting that their server requests carry, 
 `scripts/nsc-bench-remote.sh` has, carried by their timing requests and their
 correctness requests alike, and then runs each at its standard scale with 12 threads and
 with one, in both modes, with the forge rule's 5% as its threshold on wall time, since
-the leaves write while they read. The text and geo scripts check their answers against
-fixed expectations, and the vector script measures each run's recall against exact
-answers it computes itself, so the phase adds a fingerprint of the exact answers that the
-base, the tip and both modes must share before a timing counts. The matrix has no query
-of these kinds, so this comparison is the phase's evidence.
+the leaves write while they read. None of the three scripts checks answers against a
+fixed expectation. The text script takes its reference from the agreement of the engines
+it compares, the geo script compares its index and rewrite variants and reports a
+disagreement without failing, and the vector script measures each run's recall against
+exact answers it computes itself. The phase therefore gives each script a fingerprint of
+its answers, the exact answers for the vector script, that the base, the tip and both
+modes must share, and a disagreement invalidates the timings of that run. The matrix has
+no query of these kinds, so this comparison is the phase's evidence.
 
 ### The reference evaluator, item 512
 
@@ -639,7 +649,10 @@ time and a wall time of a few milliseconds still counts. The baselines are the f
 record after stage 4, `docs/benchmarks/synthetic/runs/2026-11-02-executor-matrix-forge-9d086646`,
 for the 12-thread cells, and the record of
 `docs/benchmarks/synthetic/runs/2026-11-02-executor-matrix-forge-e52937ca` for the
-one-thread cells, until a later stage's record replaces them. The two records differ in
+one-thread cells, until a later stage's record replaces them. The record of e52937ca
+holds the 12-thread cells as well, so the comparison with it qualifies its keys by cell,
+`--keys '^1\.05m-1t/.*/exec$'` and the like for each one-thread cell, and the comparison
+with the record of 9d086646 uses the suffix patterns above. The two records differ in
 their run settings and in the digest of Boxington's policy, so a comparison with either
 passes `--allow-different`, lists the differences it accepted beside the result, and
 keeps every answer check, and a new baseline recorded after a stage removes the need.
