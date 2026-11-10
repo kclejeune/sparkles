@@ -533,6 +533,13 @@ fn lazy_start() -> Duration {
 /// The activations between the first worker's checks of [`lazy_start`].
 const LAZY_EVERY: u32 = 16;
 
+#[cfg(test)]
+thread_local! {
+    /// Makes the saturations this thread starts count as congested from the start, so
+    /// that the tests reach the delivery of congested runs.
+    pub(super) static ALWAYS_CONGESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 struct Run<'a> {
     ix: &'a Index,
     ctx: &'a Contexts,
@@ -573,6 +580,8 @@ struct Run<'a> {
     disj: bool,
     dynamic: Option<&'a Dynamic>,
     bounds: &'a Bounds<'a>,
+    #[cfg(test)]
+    always_congested: bool,
 }
 
 /// What a worker counted since it last added to the totals.
@@ -646,6 +655,8 @@ pub fn saturate_counted(
         disj: ix.dl.is_some() && bounds.dl.is_some(),
         dynamic: bounds.dynamic,
         bounds,
+        #[cfg(test)]
+        always_congested: ALWAYS_CONGESTED.get(),
     };
     {
         let mut q = run.queue.lock();
@@ -1101,6 +1112,10 @@ impl<'a> Run<'a> {
     /// Whether the messages waiting in to-do lists and outboxes take more than the stored
     /// conclusions and [`CONGESTED_BYTES`], as of the workers' last checks.
     fn congested(&self) -> bool {
+        #[cfg(test)]
+        if self.always_congested {
+            return true;
+        }
         let waiting = self.queued.load(Ordering::Relaxed).max(0) as usize;
         waiting * std::mem::size_of::<Concl>()
             > self.memory.load(Ordering::Relaxed).max(CONGESTED_BYTES)
@@ -2219,6 +2234,7 @@ mod horn_accounting_tests {
             disj: false,
             dynamic: None,
             bounds,
+            always_congested: false,
         }
     }
 

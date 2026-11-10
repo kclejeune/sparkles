@@ -2784,6 +2784,45 @@ mod tests {
         })
     }
 
+    /// A saturation counts as congested only with hundreds of megabytes of waiting
+    /// messages, so the test makes every saturation congested from its start. The
+    /// answers are those of an ordinary run on every thread count, and a run on one
+    /// thread, which sends through its outbox once congested, drops repeated messages
+    /// (roadmap item 721).
+    #[test]
+    fn congested_runs_drop_repeated_messages_and_keep_the_answer() {
+        for seed in [3, 11, 29] {
+            let axioms = mixed_axioms(1500, seed);
+            let kinds: Vec<&AxiomKind> = axioms.iter().collect();
+            let run = |threads: usize, congested: bool| {
+                saturate::ALWAYS_CONGESTED.set(congested);
+                let out = Saturation::new().classify(
+                    &kinds,
+                    None,
+                    &Limits {
+                        threads,
+                        ..Limits::default()
+                    },
+                );
+                saturate::ALWAYS_CONGESTED.set(false);
+                out.unwrap()
+            };
+            let a = run(1, false);
+            for threads in [1, 4] {
+                let b = run(threads, true);
+                assert_eq!(a.consistent, b.consistent, "seed {seed}, {threads} threads");
+                assert_eq!(a.taxonomy, b.taxonomy, "seed {seed}, {threads} threads");
+            }
+            let b = run(1, true);
+            assert!(
+                b.stats.conclusions < a.stats.conclusions,
+                "seed {seed}: {} conclusions congested, {} not",
+                b.stats.conclusions,
+                a.stats.conclusions
+            );
+        }
+    }
+
     #[test]
     fn a_parallel_normalization_keeps_functional_data_roles() {
         let mut axioms = mixed_axioms(400, 7);
