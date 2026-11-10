@@ -368,8 +368,10 @@ impl State {
         self.extra.as_ref().map_or(&[], |x| x.noms.as_slice())
     }
 
-    /// Whether the state already holds a conclusion, so that a world over it can drop
-    /// the conclusion: the rules have applied to it.
+    /// Whether the state already holds a conclusion, so that a world over it or a
+    /// congested delivery can drop the conclusion: the rules have applied to it, and
+    /// every rule returns at once from a conclusion its state holds. A kind this does
+    /// not answer is never held.
     pub fn holds(&self, c: &Concl) -> bool {
         match *c {
             Concl::Sub(d) => self.bottom || self.subs.contains(&d),
@@ -1101,7 +1103,9 @@ impl<'a> Run<'a> {
 
     /// Delivers to a context the messages it does not already hold, and says whether it
     /// could look, which it cannot while another worker holds the context (roadmap item
-    /// 695).
+    /// 695). A held conclusion is one the rules have applied, and applying it again does
+    /// nothing, so dropping it here is the same as applying it later, for every kind that
+    /// [`State::holds`] answers, forward links and loops included (roadmap item 818).
     #[cold]
     #[inline(never)]
     fn deliver_new(&self, ctx: &Ctx, msgs: &[(Ex, Concl)]) -> bool {
@@ -1113,11 +1117,7 @@ impl<'a> Run<'a> {
         }
         let mut t = ctx.todo.lock();
         let before = t.len();
-        t.extend(
-            msgs.iter()
-                .map(|&(_, c)| c)
-                .filter(|c| !(matches!(c, Concl::Sub(_) | Concl::Back(..)) && st.holds(c))),
-        );
+        t.extend(msgs.iter().map(|&(_, c)| c).filter(|c| !st.holds(c)));
         let dropped = msgs.len() - (t.len() - before);
         if dropped > 0 {
             self.queued.fetch_sub(dropped as isize, Ordering::Relaxed);
@@ -2243,6 +2243,55 @@ mod horn_accounting_tests {
             started: &STARTED_NS,
             always_congested: false,
         }
+    }
+
+    /// A congested delivery drops every kind of conclusion the context holds, the forward
+    /// links and loops of chains included, and keeps the ones it does not (roadmap item
+    /// 818).
+    #[test]
+    fn a_congested_delivery_drops_the_forward_links_and_loops_a_context_holds() {
+        let f = fixture();
+        let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+        let root = ctx[f.root as usize].get_or_init(Box::default);
+        {
+            let mut st = root.st.lock();
+            st.init = true;
+            st.fwd.insert((f.r, f.targets[0]));
+            st.loops.push(f.r);
+            st.back_by(f.s).insert(f.targets[1]);
+        }
+        let bounds = Bounds {
+            threads: 1,
+            deadline: None,
+            max_memory: None,
+            cancelled: None,
+            charge: None,
+            base_memory: 0,
+            peak_memory: 0,
+            dynamic: None,
+            dl: None,
+            partial: false,
+        };
+        let run = run(&f.ix, &ctx, &bounds);
+        let msgs = [
+            (f.root, Concl::Fwd(f.r, f.targets[0])),
+            (f.root, Concl::Loop(f.r)),
+            (f.root, Concl::Back(f.targets[1], f.s)),
+            (f.root, Concl::Fwd(f.r, f.targets[1])),
+            (f.root, Concl::Loop(f.s)),
+            (f.root, Concl::Back(f.targets[0], f.s)),
+        ];
+        run.queued.store(msgs.len() as isize, Ordering::Relaxed);
+        assert!(run.deliver_new(root, &msgs));
+        assert_eq!(
+            *root.todo.lock(),
+            vec![
+                Concl::Fwd(f.r, f.targets[1]),
+                Concl::Loop(f.s),
+                Concl::Back(f.targets[0], f.s)
+            ]
+        );
+        assert_eq!(run.queued.load(Ordering::Relaxed), 3);
     }
 
     #[test]
