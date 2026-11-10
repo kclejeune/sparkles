@@ -1740,11 +1740,14 @@ the conjunctions, and Theorems 8 and 9 give soundness and completeness as they d
 Table 1 translation, since only the set of DL-clauses changes and the rules do not. The
 case restrictions are conditional in the predecessor, since the clause that holds them is
 `k - 1` literals wider than the clause it replaces, so each lies in `K_2` of the Succ rule,
-and in `K_1` only where a context supports it as a unit, and its successor is a
-hypothetical successor context as the engine makes today for a conditional existential
-restriction, with an empty core and the filler, the case and the union as markers. What
-changes is which contexts exist and what each is sent. Each case restriction has a
-hypothetical successor of its own, and the distributed clause itself sends it the filler,
+and in `K_1` only where a context supports it as a unit, and its successor is what the
+engine's `target` makes today for the restriction. Under the cautious strategy a
+conditional case restriction gets a hypothetical successor context with an empty core and
+the filler, the case and the union as markers, a case restriction that a context supports
+as a unit gets its EL successor, and the eager strategy may give the context a core of the
+atoms that are certain, with the markers of `K_2` outside the core sent as they are today.
+What changes is which contexts exist and what each is sent. Each conditional case
+restriction has a hypothetical successor of its own, and the distributed clause itself sends it the filler,
 its own case and the union and never another case's existential restrictions. The Succ
 rule still sends every marker of `K_2` that holds of the term, from every predecessor that
 reaches the context and from the universal restrictions they carry, so a case's context
