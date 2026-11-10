@@ -1675,6 +1675,156 @@ the calculus change for the equality reasoning that remains, from published calc
 with the hypertableau's merging of equated terms and Kazakov and Klinov's exploration as
 the candidates named above, and its design precedes its code.
 
+#### Item 894's cases and merging for counting
+
+This subsection is the design of item 894, written before its code. It decides how a run
+that counts, without the root of a rooted run, takes the case analysis that a union filler
+puts into a successor and the equalities between two successor terms that an at-most clause
+derives, so that ore_ont_6485, ore_ont_6952 and ore_ont_10140 classify with counting on.
+Rooted runs keep their rules, their order and their terms, and nothing here changes them.
+The design cites the calculus of Bate and others (JAIR 2018), the hypertableau calculus of
+Motik, Shearer and Horrocks (*Hypertableau Reasoning for Description Logics*, JAIR 2009),
+the nondeterministic consequence-based procedure of Kazakov and Klinov (*Bridging the Gap
+between Tableau and Consequence-Based Reasoning*, DL 2014) and the Horn-SHIQ calculus of
+Kazakov (IJCAI 2009), which [the Horn rules](#the-horn-rules) of this spec implement.
+
+The cost that remains after item 728, in the calculus's own terms. The trace of the
+counting attempt on ore_ont_6485 at the bound of 262,144 conclusions, with item 728's
+clauses, derives 274,640 conclusions of which the contexts store 73,403, since the others
+are subsumed on arrival or repeat a stored clause. The hypothetical successor of
+`∃hasSingleBondWith.HeteroAtom`, which fourteen predecessors share, derives 140,889 of them
+and stores 19,921. Of its derivations 109,560 resolve a case of the `HeteroAtom` union
+against a disjointness certificate of another case, in clauses whose bodies hold four to six
+marker atoms, among them the role atoms of three bond properties and the hypothesis
+`HeteroAtom` in two spellings, as the class and as the conjunction that unfolds to it, and
+whose heads hold six to nine literals, the union's remaining cases beside the literals over
+the predecessor. At the bound of four million conclusions, with the hypothetical successor
+keyed by its predecessor so that no context combines predecessors' markers, one EL
+successor context, the successor of a witness `∃r.b_i` whose fresh filler lies below the
+union, derives 1.9 million paramodulations and 1.7 million at-most products over eighteen
+conditional successor terms, the existential restrictions of the union's cases. The two
+costs have one shape. A context clause's body names the hypotheses under which its head
+holds, so a clause is the conclusion of one branch of a case analysis, and its head is the
+disjunction of the branches not yet taken. The deterministic calculus derives every branch's
+conclusion as a clause of its own and keeps them all, and two spellings of one hypothesis
+or two orders of the same cases double them, since Definition 4's redundancy is the
+syntactic subset. An equality between two successor terms is the maximal literal of its
+clause, since conditions 1 and 2 of Definition 3 put every `f(x)` above the atoms over `x`,
+so the Eq rule rewrites every clause over the larger term into every clause that holds the
+equality, each with the union of the two bodies and heads, and the rewritten clauses are
+premises of the at-most products and of the next equality. The hypertableau takes the
+same equality in one branch as the ≈-rule, which merges `s` into `t` by replacing `s` with
+`t` in every assertion after pruning `s`'s descendants, a rewrite of a few unit assertions.
+Kazakov and Klinov explore the branches of one context one at a time, with units on each
+branch and the common conclusions of all open branches as the entailed ones, and their
+Theorem 2 shows that a split of a disjunction into branches is sound for each element
+separately. Kazakov's Horn-SHIQ calculus takes two successors that an at-most restriction
+identifies as one successor whose filler is the conjunction of theirs, and never writes an
+equality. The decision below has three parts, the cases, the merge and the witnesses'
+context, and each part is a choice the calculus of the paper leaves open or an equivalent
+set of DL-clauses, so that Theorems 8 and 9 carry over where the text says they do.
+
+The first part puts the case into the successor's core. With counting, an existential
+restriction `∃r.F` in a positive position whose filler `F` is a union `C_1 ⊔ … ⊔ C_k` in the
+ontology, or a fresh filler `b ⊑ F` of a witness of `H` or of a positive minimum below such
+a union, is normalized as the disjunction of one existential restriction per case,
+`∃r.(F ⊓ C_1) ⊔ … ⊔ ∃r.(F ⊓ C_k)` and `∃r.(b ⊓ C_1) ⊔ … ⊔ ∃r.(b ⊓ C_k)`, each with a
+fresh conjunction class and a function symbol of its own. The two forms are equivalent in
+every interpretation, since `∃r.(A ⊓ (C_1 ⊔ … ⊔ C_k))` is `∃r.(A ⊓ C_1) ⊔ … ⊔ ∃r.(A ⊓ C_k)`
+and `b ⊑ F ⊑ C_1 ⊔ … ⊔ C_k` makes `b` equal to `b ⊓ (C_1 ⊔ … ⊔ C_k)`, so the normalized
+ontology has the same models over the original signature and Theorems 8 and 9 give
+soundness and completeness as they do for the Table 1 translation. The case then lies in
+`K_1` of the Succ rule and in the successor's core, where the Core rule makes it a unit,
+and the successor context derives the case's own existential restrictions as units and
+never sees the other cases, so it resolves no union and makes no conditional successor for
+a case it is not in. The predecessor's clause is `k` literals wider, and the Succ rule makes
+up to `k` successor terms for the restriction, one per case. A product of an at-most clause
+over two terms of different cases of one restriction has in its head the other cases of
+both, which together are every case, so Definition 4 makes it redundant against the
+predecessor's own `k`-way clause and the Elim rule drops it, and no equality between two
+cases of one restriction is ever derived. The equalities that remain are between terms of
+one case and between a successor and the predecessor. The part applies in runs that count
+and without the root, since those are the runs whose witnesses and hypothetical successors
+carry union fillers, and it applies to a union of pairwise disjoint classes and to any
+other union alike, since the identity does not need the disjointness. The witnesses of one
+restriction keep their pairwise disjoint fillers `b_i`, and the certificates of the
+inequalities are unchanged. A union of more than 16 cases keeps the former translation,
+and the bound is a constant of the normalization, so that a wide union does not multiply
+the terms of a context past the at-most rule's bounds on the widest clause and the subsets.
+
+The second part replaces the paramodulation of an equality between two successor terms by
+a merge, which is Kazakov's at-most rule written over context clauses. Where the Hyper
+rule would derive `Γ → Δ ⊔ f_1(x) ≈ f_2(x)` from an at-most clause with the qualified-role
+premises `Γ_1 → Δ_1 ⊔ r_B(x, f_1(x))` and `Γ_2 → Δ_2 ⊔ r_B(x, f_2(x))`, and the two terms
+are the successors of the existential restrictions `∃r_1.K_1` and `∃r_2.K_2`, the merge
+derives in place of the equality the clauses `Γ → Δ ⊔ ∃r_1.(K_1 ⊓ K_2)(x)` and
+`Γ → Δ ⊔ ∃r_2.(K_1 ⊓ K_2)(x)`, where `∃r_i.(K_1 ⊓ K_2)` is a successor trigger made during
+the run with a fresh conjunction class and a function symbol of its own, below `f_1` and
+`f_2` in the order of function symbols. The merged restriction's successor context has the
+conjunction in its core, derives what both fillers imply as units, and takes through Succ
+the markers of both terms, so the facts of the two terms meet in one context as merged
+assertions meet in the hypertableau's merged individual, and the predecessor derives
+nothing over `f_1` or `f_2` from the equality. Soundness is per element. In any model of the
+ontology, an element that satisfies `Γ` and none of `Δ` has an `r_1`-successor in `K_1 ⊑ B`
+and an `r_2`-successor in `K_2 ⊑ B`, both qualified neighbours over `r`, and the at-most
+clause's premise set holds of them, so they are one element, which is in `K_1 ⊓ K_2` and is
+both an `r_1`- and an `r_2`-successor, and both conclusions hold of the element. The
+conclusion is therefore entailed by the premises and the ontology, which is what Theorem
+8's induction needs of a derived clause, and the Succ rule's conditions S1 and S2 of
+Definition 6 hold of the new context since its core is exactly `K_1 ⊓ K_2` and the trigger
+names it. Completeness is the obligation of this part, and the design states it rather than
+assumes it. Theorem 9 is proved for the rules of Table 2, and its model construction makes
+a clause `Γ → Δ ⊔ f_1(x) ≈ f_2(x)` whose smaller literals are false true by the rewrite
+`f_1(x) ⇒ f_2(x)`, after which every clause over `f_1(x)` must be true of `f_2(x)`, which
+the Eq rule's conclusions guarantee. With the merge in the rule's place, the construction
+must map the term `f_1(t)` to the merged restriction's context in place of the rewrite, and
+show that every clause over `f_1(x)` or `f_2(x)` in the context is true there, which the
+merged context derives from its core and the markers it takes, and that the Pred rule
+carries back from the merged context what the rewritten clauses carried. The argument
+follows Kazakov's completeness proof for the at-most rule, where the canonical model
+identifies the two successors and the merged conjunction is their common type, and it is
+the review's first question. Until the argument is written and reviewed, the Eq rule stays
+for an equality between two successor terms whose restrictions the merge cannot name, and
+the merge runs in place of the Eq rule only where both terms are successors of existential
+restrictions of the run, which every successor term of a context is apart from the
+predecessor. An equality with the predecessor, `f(x) ≈ y`, keeps the Eq rule, since
+`x ≈ y` is a predecessor trigger of Definition 2 and the Pred rule carries it to the
+predecessor, where this spec's Horn rules with individuals and item 731 take it. The
+Ineq and Factor rules are unchanged. Under the first part the merge meets terms of one
+case only, so the merged fillers are two existential restrictions of one case of one
+union, and the number of merged restrictions a context can make is bounded by the pairs
+of its restrictions, which is bounded by the ontology, so the contexts of a run stay finite.
+
+The third part is item 728's third part, the witnesses' shared context, as that design
+states it, applied after the first part, so that the `n` witnesses `∃r.b_i` of one case
+share one successor context per role, filler and case, with `b_i` kept in the term's core
+for the certificates and sent as a marker, and the unit path sends the marker as that
+design says. It targets ore_ont_6952 and ore_ont_10140, whose cost is the witnesses'
+repeated unfolding of the transitive properties, 156,882 of the 280,093 conclusions of the
+attempt, and not an equality. The first two parts are measured on the two files before
+this one is built, since a case in the core may already remove the unfolding's repetition
+where the filler of a witness is a union, and the part is built when they still fall back.
+
+The acceptance is the gate of the roadmap row. The three files classify with counting on,
+with `Stats::dl_counting_over` and `Stats::dl_over_budget` false and every axiom that needs
+counting taken, within the speed target, which for ore_ont_6485 is at least the 18 ms of
+Konclude 0.7.0 on four threads, and no development file of the ORE 2015 DL sample costs
+more than twice its run without counting. Each part is measured apart, behind a switch of
+the lane that the landing removes, on the three files and on the counting fixtures, with
+the conclusions derived, the clauses stored and the contexts made under each setting, on
+one thread on `atlas` beside the run without counting. The development files, the
+generated fixtures with the 150 counting cases and the `shoi` and nominal fixtures give
+the taxonomies of HermiT with no new timeout, on one and four threads, under both
+strategies. Regressions cover a union filler whose cases are not disjoint, where the
+distribution is still the identity and a successor may be in two cases, a merged successor
+whose fillers clash so that the context derives the other disjuncts of the at-most clause,
+a merge under a conditional premise whose body reaches the predecessor by Pred, three
+successors of one case equated in a chain, an at-most restriction that identifies a
+successor with the predecessor, which keeps the Eq rule, a union of seventeen cases, which
+keeps the former translation, and the two regressions of the shared witness context from
+item 728's design. The measured effect of each part is recorded here when the item ships,
+and a part that measures no faster is not kept and goes to PERFORMANCE-EXPERIMENTS.md.
+
 ### Nominals in the disjunctive rules
 
 This section is the design of item 603's sixth phase, which extends the disjunctive rules
