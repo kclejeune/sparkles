@@ -474,6 +474,13 @@ impl Closures {
             }
             let before = g.len();
             if !outs.is_empty() {
+                tracing::debug!(
+                    outputs = outs.iter().map(Vec::len).sum::<usize>(),
+                    used_bytes = held.budget().used(),
+                    peak_bytes = held.budget().peak(),
+                    tier_bytes = g.heap_bytes(),
+                    "closure operator outputs before their merge"
+                );
                 g.merge(outs, held)?;
             }
             let after = g.len();

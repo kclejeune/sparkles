@@ -2159,6 +2159,9 @@ pub(crate) fn run_observed(
                 iteration = iteration + 1,
                 new = g.len() - closed,
                 close_ms = t_close.elapsed().as_millis() as u64,
+                used_bytes = limits.budget.used(),
+                peak_bytes = limits.budget.peak(),
+                tier_bytes = g.heap_bytes(),
                 "closure operators"
             );
         }
@@ -2170,6 +2173,9 @@ pub(crate) fn run_observed(
             candidates,
             eval_ms,
             merge_ms = t_merge.elapsed().as_millis() as u64,
+            used_bytes = limits.budget.used(),
+            peak_bytes = limits.budget.peak(),
+            tier_bytes = g.heap_bytes(),
             "reasoner iteration"
         );
         if g.inferred_since(base_len) > limits.max_inferred {
