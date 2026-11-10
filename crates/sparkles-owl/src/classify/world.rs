@@ -721,24 +721,27 @@ struct WorldSink<'b> {
     ctx_len: usize,
     dynamic: Option<&'b Dynamic>,
     table: std::sync::Arc<Dynamic>,
-    /// the messages pushed in this activation, and the bytes charged for them so far,
-    /// which the activation's end releases before the checkpoint counts them as waiting
+    /// the messages in the buffers that the bound has been charged for, and the bytes of
+    /// that charge, which a checkpoint folds into what the world reported and the
+    /// activation's end releases
     grown: &'b Cell<usize>,
     charged: &'b Cell<isize>,
 }
 
-/// The messages a world's sink pushes between two charges of their bytes.
+/// The messages a world's sink buffers between two charges of their bytes.
 const CHARGE_EVERY: usize = 1024;
 
 impl WorldSink<'_> {
-    /// A message was pushed: every [`CHARGE_EVERY`] messages their bytes are charged to
-    /// the bound, so that a rule whose one inference sends many messages, such as R7 of
-    /// the Horn rules with individuals, is admitted as it grows.
+    /// A message was pushed: once the buffers hold [`CHARGE_EVERY`] messages more than
+    /// the bound was charged for, the growth is charged, so that a rule whose one
+    /// inference sends many messages, such as R7 of the Horn rules with individuals, is
+    /// admitted as it grows. The charge follows the live buffers, not the messages sent.
     fn grew(&self) {
-        let g = self.grown.get() + 1;
-        self.grown.set(g);
-        if g.is_multiple_of(CHARGE_EVERY) {
-            let bytes = (CHARGE_EVERY * std::mem::size_of::<(Ex, Concl)>()) as isize;
+        let live = self.local.len() + self.out.len();
+        let base = self.grown.get();
+        if live >= base + CHARGE_EVERY {
+            let bytes = ((live - base) * std::mem::size_of::<(Ex, Concl)>()) as isize;
+            self.grown.set(live);
             self.charged.set(self.charged.get() + bytes);
             if !(self.bound)(bytes) {
                 self.halted.set(true);
@@ -777,6 +780,10 @@ impl Sink for WorldSink<'_> {
     }
 
     fn send(&mut self, to: Ex, c: Concl) {
+        // a halted world's answer is discarded, so its sink keeps nothing more
+        if self.halted.get() {
+            return;
+        }
         if to == self.me && c != Concl::Real {
             self.local.push(c);
         } else {
@@ -785,6 +792,9 @@ impl Sink for WorldSink<'_> {
         self.grew();
     }
     fn me(&mut self, c: Concl) {
+        if self.halted.get() {
+            return;
+        }
         self.local.push(c);
         self.grew();
     }
@@ -1131,6 +1141,11 @@ impl<'a> World<'a> {
                             break;
                         }
                         if self.applied.is_multiple_of(CHECK_EVERY) {
+                            // the sink's charge for the buffers counts as reported, so
+                            // that the checkpoint charges the buffers once
+                            self.reported = self.reported.saturating_add_signed(charged.get());
+                            charged.set(0);
+                            grown.set(sink.local.len() + sink.out.len());
                             self.checkpoint(sink.local.len() + sink.out.len());
                             if self.halted {
                                 break;

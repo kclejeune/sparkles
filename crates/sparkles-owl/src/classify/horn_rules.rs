@@ -691,13 +691,19 @@ fn send_links<S: Sink>(st: &State, to: Ex, out: &mut S) {
 /// element: its loops and its Horn successors. The subsumers go by the rules of
 /// individuals.
 pub fn send_own<S: Sink>(st: &State, to: Ex, out: &mut S) {
+    let mut work = 0usize;
     for &l in &st.loops {
         out.send(to, Concl::Loop(l));
+        work += 1;
+        if work.is_multiple_of(POLL) && !out.go_on() {
+            return;
+        }
     }
     if let Some(x) = &st.extra {
-        for (i, &(r, n)) in x.horn.succ.list.iter().enumerate() {
+        for &(r, n) in &x.horn.succ.list {
             out.send(to, Concl::Succ(r, n));
-            if (i + 1).is_multiple_of(POLL) && !out.go_on() {
+            work += 1;
+            if work.is_multiple_of(POLL) && !out.go_on() {
                 return;
             }
         }
@@ -747,12 +753,9 @@ pub fn singular<S: Sink>(ix: &Index, me: Ex, st: &mut State, counted: bool, out:
     propagate_singular(ix, st, out);
     r7(ix, me, st, None, out);
     let links: Vec<(Role, Small<Ex>)> = st.back.iter().map(|(r, s)| (*r, s.clone())).collect();
-    let mut work = 0usize;
     for (r, srcs) in links {
         for &m in &srcs.list {
-            r8_back(ix, me, st, m, r, out);
-            work += 1;
-            if work.is_multiple_of(64) && !out.go_on() {
+            if !r8_back(ix, me, st, m, r, out) {
                 return;
             }
         }
@@ -840,25 +843,36 @@ fn r7<S: Sink>(ix: &Index, me: Ex, st: &mut State, only: Option<Ex>, out: &mut S
 /// R8 at a singular context, for a backward link from `m` by `r`: two links from `m` by
 /// roles that clash make `m` unsatisfiable, and a forward link to `m` by a role that
 /// clashes with `r⁻` makes the context unsatisfiable.
-fn r8_back<S: Sink>(ix: &Index, _me: Ex, st: &mut State, m: Ex, r: Role, out: &mut S) {
+fn r8_back<S: Sink>(ix: &Index, _me: Ex, st: &mut State, m: Ex, r: Role, out: &mut S) -> bool {
     if !is_singular(st) || ix.roles.clash.is_empty() {
-        return;
+        return true;
     }
+    // the scans poll the run's bounds, and the answer is whether the run goes on
+    let mut work = 0usize;
     for (r2, srcs) in &st.back {
         if *r2 != r && srcs.contains(&m) && clash(ix, r, *r2) {
             out.send(m, Concl::Sub(BOTTOM));
         }
+        work += 1;
+        if work.is_multiple_of(64) && !out.go_on() {
+            return false;
+        }
     }
     if let Some(i) = ix.roles.inv(r)
         && let Some(x) = &st.extra
-        && x.horn
-            .succ
-            .list
-            .iter()
-            .any(|&(r1, n)| n == m && clash(ix, r1, i))
     {
-        out.me(Concl::Sub(BOTTOM));
+        for &(r1, n) in &x.horn.succ.list {
+            if n == m && clash(ix, r1, i) {
+                out.me(Concl::Sub(BOTTOM));
+                break;
+            }
+            work += 1;
+            if work.is_multiple_of(64) && !out.go_on() {
+                return false;
+            }
+        }
     }
+    true
 }
 
 /// R8 at a singular context, for a forward link to `n` by `r1`: a backward link from `n`
@@ -914,7 +928,7 @@ pub fn back_full<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, r: Role, ou
     if is_singular(st) {
         propagate_singular(ix, st, out);
         r7(ix, me, st, Some(e), out);
-        r8_back(ix, me, st, e, r, out);
+        let _ = r8_back(ix, me, st, e, r, out);
     }
 }
 
