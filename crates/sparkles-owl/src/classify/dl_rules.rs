@@ -1499,6 +1499,7 @@ fn univ_over(ix: &Index, st: &State, f: Ex, r: Role, prem: &Side, found: &mut Fo
 /// with a premise for each and for the holder, gives the equalities of every pair (DL4).
 /// The predecessor is a neighbour through the body atom `q(x, y)`. `fixed` is a new premise
 /// of one successor term, which the inference must use, and `holder` the holder's premises.
+#[allow(clippy::too_many_arguments)]
 fn at_most(
     ix: &Index,
     st: &State,
