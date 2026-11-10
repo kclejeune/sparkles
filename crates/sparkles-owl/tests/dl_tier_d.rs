@@ -1593,3 +1593,108 @@ fn counting_is_off_by_default_and_the_axioms_that_count_are_left_out() {
         assert_eq!(again.stats.dl_work, out.stats.dl_work);
     }
 }
+
+#[test]
+fn a_cardinality_in_a_negative_position_over_a_transitive_role_is_left_out() {
+    // r is not simple, so a number restriction over it is outside OWL 2 DL and Tier D
+    // leaves the ontology's disjunctive axioms out rather than count the direct neighbours
+    // alone: every B has an r-neighbour in C and another in E along the transitive path,
+    // which the disjointness keeps apart, so A ⊑ D holds and a count of the direct
+    // neighbours misses it (item 728)
+    let ax = axioms(&format!(
+        "TransitiveObjectProperty(:r)
+         SubClassOf(:A ObjectSomeValuesFrom(:s :B))
+         SubClassOf(:B ObjectSomeValuesFrom(:r :C))
+         SubClassOf(:C ObjectSomeValuesFrom(:r :E))
+         DisjointClasses(:C :E)
+         SubClassOf(ObjectSomeValuesFrom(:s ObjectMinCardinality(2 :r)) :D) {UNION}"
+    ));
+    for threads in [1, 4] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                ..counting()
+            })
+            .unwrap();
+        assert!(
+            out.taxonomy.is_subclass(&c("A"), &c("D")) || !k.excluded().is_empty(),
+            "the count over a transitive role misses A ⊑ D and nothing is left out"
+        );
+    }
+    // the exact cardinality takes the same path
+    let ax = axioms(&format!(
+        "TransitiveObjectProperty(:r) SubClassOf(ObjectExactCardinality(2 :r) :D) {UNION}"
+    ));
+    let mut k = Classifier::of(&ax);
+    k.classify(&counting()).unwrap();
+    assert!(
+        !k.excluded().is_empty(),
+        "a cardinality over a transitive role is left out"
+    );
+}
+
+#[test]
+fn a_rooted_run_keeps_its_translation_of_a_cardinality_in_a_negative_position() {
+    // a nominal, an inverse and an at-most restriction together need the Nom rule, which
+    // is not built, so a rooted run leaves the disjunctive axioms out whatever form the
+    // cardinality in a negative position takes (item 728)
+    for card in ["ObjectExactCardinality(2 :r)", "ObjectMinCardinality(2 :r)"] {
+        let ax = axioms(&format!(
+            "ClassAssertion(:X :a)
+             SubClassOf(:B ObjectSomeValuesFrom(ObjectInverseOf(:r) :C))
+             SubClassOf({card} :D) {UNION}"
+        ));
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                rooted: true,
+                ..counting()
+            })
+            .unwrap();
+        assert!(
+            !k.excluded().is_empty(),
+            "{card}: the rooted run took the at-most restriction beside a nominal and an inverse"
+        );
+        assert!(!out.taxonomy.is_subclass(&c("B"), &c("D")));
+    }
+}
+
+#[test]
+fn a_wide_redundant_product_is_charged_to_the_memory_budget() {
+    // the product of a clause over sixteen body atoms, each held under two disjunctions,
+    // derives tens of thousands of distinct conclusions that are all redundant, since A is
+    // T already; the product's record of the conclusions it derived counts toward the
+    // memory budget, so a budget of a megabyte stops the run (item 728)
+    let n = 16;
+    let mut body = String::new();
+    for i in 0..n {
+        body += &format!(
+            "SubClassOf(:A ObjectUnionOf(ObjectMaxCardinality(1 :p{i}) :Z{i}))
+             SubClassOf(:A ObjectUnionOf(ObjectMaxCardinality(1 :q{i}) :Z{i}))\n"
+        );
+    }
+    let zs: Vec<String> = (0..n).map(|i| format!(":Z{i}")).collect();
+    body += &format!(
+        "SubClassOf(:A :T)
+         SubClassOf(ObjectIntersectionOf({}) ObjectUnionOf(:T :U))",
+        zs.join(" ")
+    );
+    let ax = axioms(&body);
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&Limits {
+        threads: 1,
+        max_memory: Some(1_000_000),
+        dl_work: Some(1 << 28),
+        partial: true,
+        ..counting()
+    });
+    match out {
+        Err(e) => eprintln!("stopped: {e}"),
+        Ok(out) => assert!(
+            !out.complete || out.stats.peak_memory >= 1_000_000,
+            "the run finished under the budget with a peak of {} bytes",
+            out.stats.peak_memory
+        ),
+    }
+}

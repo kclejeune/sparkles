@@ -567,6 +567,12 @@ impl Norm<'_> {
             C::ObjectSomeValuesFrom(p, f) => self.neg_some(p, Some(f), d)?,
             C::ObjectMinCardinality(0, ..) => TOP,
             C::ObjectMinCardinality(1, p, f) => self.neg_some(p, f.as_deref(), d)?,
+            C::ObjectMinCardinality(n, p, f) if self.counting && self.rooted => {
+                // ≥n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f, with a holder for the maximum: a rooted
+                // run keeps its rules (F24, item 728)
+                let m = self.pos(&C::ObjectMaxCardinality(n - 1, p.clone(), f.clone()), d)?;
+                self.global_or(m)?
+            }
             C::ObjectMinCardinality(n, p, f) if self.counting => {
                 // ≥n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f, written as the paper's at-most clause
                 // itself, `p_B(x, z_1) ∧ … ∧ p_B(x, z_n) → y ⊔ ⋁ z_i ≈ z_j`, item 728
@@ -615,6 +621,26 @@ impl Norm<'_> {
             C::ObjectExactCardinality(0, p, f) => {
                 let m = self.pos(&C::ObjectMinCardinality(1, p.clone(), f.clone()), d)?;
                 self.global_or(m)?
+            }
+            C::ObjectExactCardinality(n, p, f) if self.counting && self.rooted => {
+                // =n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f ⊔ ≥(n+1) p.f, with a holder for the
+                // maximum: a rooted run keeps its rules (F24, item 728)
+                let lo = self.pos(&C::ObjectMaxCardinality(n - 1, p.clone(), f.clone()), d)?;
+                let n1 = n.checked_add(1).ok_or("a cardinality too large")?;
+                let hi = self.pos(&C::ObjectMinCardinality(n1, p.clone(), f.clone()), d)?;
+                if lo == TOP || hi == TOP {
+                    return Ok(BOTTOM);
+                }
+                let mut head: Vec<Ex> = [lo, hi].into_iter().filter(|&e| e != BOTTOM).collect();
+                let y = self.it.fresh_class();
+                head.push(y);
+                head.sort_unstable();
+                head.dedup();
+                if head.len() == 1 {
+                    return Ok(TOP);
+                }
+                self.out.clauses.push((Vec::new(), head));
+                y
             }
             C::ObjectExactCardinality(n, p, f) if self.counting => {
                 // =n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f ⊔ ≥(n+1) p.f, with H the at-least
@@ -1070,7 +1096,7 @@ pub fn normalize(
     }
     // the Nom rule, which a nominal, an inverse and an at-most restriction need together,
     // is not built
-    if rooted && all.inverse && !all.atmost.is_empty() {
+    if rooted && all.inverse && (!all.atmost.is_empty() || !all.lazy.is_empty()) {
         return Ok(None);
     }
     // the role box: the inclusions closed under inverses, with the chains
@@ -1100,6 +1126,7 @@ pub fn normalize(
     }
     // number restrictions and disjointness need simple roles, which OWL 2 DL asks
     if all.atmost.iter().any(|&(_, _, r, _)| !rb.simple(r))
+        || all.lazy.iter().any(|&(_, r, _, _)| !rb.simple(r))
         || all
             .rdis
             .iter()

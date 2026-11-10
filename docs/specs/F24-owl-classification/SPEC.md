@@ -1473,7 +1473,9 @@ Pred products in one class context, with the at-most products and paramodulation
 feed, pass three million conclusions. A product now derives each distinct conclusion once,
 since two choices whose premises share their literals merged to one conclusion and each
 counted toward the bound, and that alone removed two thirds of the Pred conclusions of
-that context. The remedy this leaves is the one named below, a hypothetical successor
+that context. The product's record of the conclusions it has derived lives until the
+product ends and is charged to the run's memory budget as it grows, so a wide product
+whose conclusions are all redundant still stops the run at its budget. The remedy this leaves is the one named below, a hypothetical successor
 keyed by the predecessor's restriction, so that no context combines the markers of
 different predecessors.
 

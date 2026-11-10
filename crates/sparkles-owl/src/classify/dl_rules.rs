@@ -1002,11 +1002,16 @@ pub(super) fn drain_with<S: Sink>(
         let mut at = vec![0usize; lists.len()];
         // two choices whose premises share their literals merge to one conclusion, as
         // when one role premise fits two places of a Pred body or two needs share their
-        // premise lists, and the product derives each conclusion once
+        // premise lists, and the product derives each conclusion once. Its record of the
+        // conclusions, kept or redundant, lives until the product ends, so it is charged
+        // to the memory budget as it grows and released at the end, and a conclusion the
+        // ground restriction rejects is not recorded
         let mut seen: FxHashSet<(Vec<Lit>, Vec<Lit>)> = FxHashSet::default();
+        let (mut charged, mut pending) = (0usize, 0usize);
         'choices: loop {
             if out.stopped() {
                 ds(st).store.interrupted = true;
+                out.release_data(charged);
                 return;
             }
             let mut s = base.clone();
@@ -1014,12 +1019,25 @@ pub(super) fn drain_with<S: Sink>(
                 s.0.extend_from_slice(&l[i].0);
                 s.1.extend_from_slice(&l[i].1);
             }
-            let mut key = (s.0.clone(), s.1.clone());
-            key.0.sort_unstable();
-            key.0.dedup();
-            key.1.sort_unstable();
-            key.1.dedup();
-            if seen.insert(key) && (!ground || !restricted(&out.dl().lits, inv, &s)) {
+            let mut fresh = !ground || !restricted(&out.dl().lits, inv, &s);
+            if fresh {
+                let mut key = (s.0.clone(), s.1.clone());
+                key.0.sort_unstable();
+                key.0.dedup();
+                key.1.sort_unstable();
+                key.1.dedup();
+                let bytes = (key.0.capacity() + key.1.capacity()) * std::mem::size_of::<Lit>();
+                let cap = seen.capacity();
+                fresh = seen.insert(key);
+                if fresh {
+                    // charged at the next check of the bounds, so that the record adds
+                    // no checks of its own
+                    pending += bytes
+                        + (seen.capacity() - cap)
+                            * (std::mem::size_of::<(Vec<Lit>, Vec<Lit>)>() + 1);
+                }
+            }
+            if fresh {
                 if trace {
                     let lits = &out.dl().lits;
                     eprintln!(
@@ -1035,10 +1053,17 @@ pub(super) fn drain_with<S: Sink>(
             x.choices += 1;
             if x.choices as usize >= PRODUCT_POLL {
                 x.choices = 0;
-                if !out.go_on() {
+                let go = if pending > 0 {
+                    charged += pending;
+                    out.reserve_data(std::mem::take(&mut pending))
+                } else {
+                    out.go_on()
+                };
+                if !go {
                     // the stop can come after the last choice, and the mark then only
                     // keeps the context open
                     ds(st).store.interrupted = true;
+                    out.release_data(charged);
                     return;
                 }
             }
@@ -1055,6 +1080,7 @@ pub(super) fn drain_with<S: Sink>(
                 at[k] = 0;
             }
         }
+        out.release_data(charged);
     }
 }
 
