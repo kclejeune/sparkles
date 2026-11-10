@@ -8,6 +8,7 @@
 //! eager executor hands the kernel whole columns, and the cursor hands it the keys of
 //! the left rows a loaded right batch decides, keeping the runs that cross its batch
 //! boundaries and the spooling of long runs to itself.
+use super::gallop;
 use super::hash::NO_ROW;
 use super::zipper::lower_bounds;
 use crate::error::{Error, Result};
@@ -91,6 +92,66 @@ pub(crate) fn expand(
 
 /// Candidates tested between two checks of cancellation and the deadline.
 const POLL: usize = 4096;
+
+/// The pairs of an inner merge join of the sorted key columns `a` and `b` in one pass:
+/// a zipper that gallops over the side whose key is behind and pairs the rows of two
+/// equal-key runs that `compatible` accepts, as (left row, right row). `admit` is asked
+/// every [`POLL`] steps with the pairs so far. When the key is `exact`, every pair of
+/// two equal-key runs is accepted, so a run product of more than 64 pairs is admitted
+/// before it is expanded rather than after; a filtered join admits only the pairs it
+/// gave, since the product bounds them loosely.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn zip(
+    ctx: &Ctx,
+    a: &[Id],
+    b: &[Id],
+    exact: bool,
+    compatible: impl Fn(usize, usize) -> bool,
+    admit: impl Fn(usize) -> Result<()>,
+    lrows: &mut Vec<u32>,
+    rrows: &mut Vec<u32>,
+) -> Result<()> {
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut steps = 0usize;
+    while i < a.len() && j < b.len() {
+        steps += 1;
+        if steps.is_multiple_of(POLL) {
+            ctx.check()?;
+            admit(lrows.len())?;
+        }
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i = gallop(a, i, |x| *x < b[j]),
+            std::cmp::Ordering::Greater => j = gallop(b, j, |x| *x < a[i]),
+            std::cmp::Ordering::Equal => {
+                let ie = run_end(a, i);
+                let je = run_end(b, j);
+                // an equal-key run emits up to the product of its lengths, which is
+                // admitted before it is expanded; small runs are covered by the
+                // periodic check above
+                let run = (ie - i).saturating_mul(je - j);
+                if exact && run > 64 {
+                    admit(lrows.len().saturating_add(run))?;
+                }
+                for ii in i..ie {
+                    for jj in j..je {
+                        steps += 1;
+                        if steps.is_multiple_of(POLL) {
+                            ctx.check()?;
+                            admit(lrows.len())?;
+                        }
+                        if compatible(ii, jj) {
+                            lrows.push(ii as u32);
+                            rrows.push(jj as u32);
+                        }
+                    }
+                }
+                i = ie;
+                j = je;
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Pair the left row `left` with the right rows `rows`, one run of its key, from
 /// `rows.start`, as [`expand`] does for a run that fits its room, but at most `room`
@@ -350,6 +411,41 @@ mod tests {
             "{}",
             tested.get()
         );
+    }
+
+    /// The one-pass zipper gives the pairs the lower-bound expansion gives, with runs on
+    /// both sides, keys only one side has and a compatibility test.
+    #[test]
+    fn the_zipper_agrees_with_the_lower_bound_expansion() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let lk = ids(&[1, 2, 2, 4, 5, 5, 5, 9, 9]);
+        let rk = ids(&[0, 2, 2, 2, 3, 5, 6, 6, 9, 9]);
+        let first = bounds(&ctx, &lk, &rk).unwrap();
+        for test in [0usize, 1] {
+            let compatible = |l: usize, r: usize| test == 0 || (l + r) % 3 != 0;
+            let (mut el, mut er) = (Vec::new(), Vec::new());
+            let mut from = 0;
+            while from < lk.len() {
+                from += expand(
+                    &ctx, &lk, &rk, &first, from, false, 1000, compatible, &mut el, &mut er,
+                )
+                .unwrap();
+            }
+            let (mut zl, mut zr) = (Vec::new(), Vec::new());
+            zip(
+                &ctx,
+                &lk,
+                &rk,
+                test == 0,
+                compatible,
+                |_| Ok(()),
+                &mut zl,
+                &mut zr,
+            )
+            .unwrap();
+            assert_eq!((zl, zr), (el, er), "test {test}");
+        }
     }
 
     #[test]

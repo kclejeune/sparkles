@@ -4322,7 +4322,10 @@ fn hash_index<'a>(
         .copied()
         .filter(|&(p, b)| !has_undef(probe, p) && !has_undef(build, b))
         .collect();
-    let (index, probe_keys, keys) = if exact.len() > 1 {
+    let (index, probe_keys, keys) = if let [(p, b)] = exact[..] {
+        // the one column neither side leaves unbound is the key
+        (Some(HashIndex::new(ctx, build, b, p)?), None, None)
+    } else if exact.len() > 1 {
         let keys = ctx.charge((probe.len() + build.len()) as u64 * 8 + 64)?;
         let composite = |t: &Table, cols: &[usize]| -> Result<Vec<Id>> {
             map_rows(ctx, t.len(), t.len() >= PAR_THRESHOLD, |i| {
@@ -4426,12 +4429,20 @@ fn merge_pairs(
     w: usize,
 ) -> Result<(Vec<u32>, Vec<u32>)> {
     let (a, b) = (&l.cols[lk], &r.cols[rk]);
+    // most merge joins match each row of the smaller side about once
+    let (mut li, mut rj) = (
+        Vec::with_capacity(a.len().min(b.len())),
+        Vec::with_capacity(a.len().min(b.len())),
+    );
+    let admit = |pairs: usize| ctx.check_output(pairs, w);
     if lay.shared.len() > 1 {
-        return merge_expand(ctx, a, b, false, w, |i, j| {
-            compatible(l, r, i, j, &lay.shared)
-        });
+        let same = |i: usize, j: usize| compatible(l, r, i, j, &lay.shared);
+        merge::zip(ctx, a, b, false, same, admit, &mut li, &mut rj)?;
+    } else {
+        merge::zip(ctx, a, b, true, |_, _| true, admit, &mut li, &mut rj)?;
     }
-    merge_expand(ctx, a, b, false, w, |_, _| true)
+    ctx.check_output(li.len(), w)?;
+    Ok((li, rj))
 }
 
 /// Every left row of the sorted key column `a` with the right rows of the sorted key
