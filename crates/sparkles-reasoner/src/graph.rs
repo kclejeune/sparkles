@@ -333,7 +333,7 @@ impl Graph {
     /// new triples. The base tier is not consulted: the caller adds facts that are not in
     /// it.
     pub fn add_batch(&mut self, ts: impl IntoIterator<Item = Triple>) -> usize {
-        let n = self.add_rows(ts, false);
+        let n = self.add_rows(ts, false, false);
         n.expect("charges that may pass the limit do not fail")
     }
 
@@ -343,13 +343,24 @@ impl Graph {
         &mut self,
         ts: impl IntoIterator<Item = Triple>,
     ) -> Result<usize, MemoryExceeded> {
-        self.add_rows(ts, true)
+        self.add_rows(ts, true, false)
     }
 
+    /// Protect the derived facts from id `floor` on from compaction, until the next call:
+    /// the engine sets it to the start of each iteration's delta, so that the runs the
+    /// iteration reads in part are never merged with older ones.
+    pub fn set_compaction_floor(&mut self, floor: u32) {
+        self.tier.set_compaction_floor(floor);
+    }
+
+    /// Add facts in one batch. Only a merge of the engine compacts the tier's runs
+    /// (`compact`), since a batch added between runs may be the delta a later run starts
+    /// from.
     fn add_rows(
         &mut self,
         ts: impl IntoIterator<Item = Triple>,
         strict: bool,
+        compact: bool,
     ) -> Result<usize, MemoryExceeded> {
         let start = self.tier.count();
         let budget = self.held.budget().clone();
@@ -360,6 +371,7 @@ impl Graph {
                 let h = hash3(&t);
                 let tbl = &mut index[shard3(&t)];
                 if tbl.find(h, |&r| tier.eq(r, &t)).is_none() {
+                    m.add(tier.rel_growth(t[1]))?;
                     if tier.count() == tier.capacity() {
                         // the new buffers, while the old ones are alive
                         let old = tier.capacity();
@@ -386,13 +398,18 @@ impl Graph {
         })();
         let new = self.tier.count() - start;
         self.live += new;
-        let r = r.and_then(|()| self.tier.index_new(start, &mut m));
+        let r = r.and_then(|()| self.tier.index_new(start, compact, &mut m));
         self.held.adopt(m.into_bytes());
         // after an error the graph is unusable, and settling would charge what was
         // allocated beyond the failed charge, past the limit
-        if r.is_ok() {
-            self.settle();
-        }
+        let r = r.and_then(|()| {
+            if strict {
+                self.try_settle()
+            } else {
+                self.settle();
+                Ok(())
+            }
+        });
         r.map(|()| new)
     }
 
@@ -406,9 +423,9 @@ impl Graph {
     /// allocated; a charge past the limit fails the merge, and the graph is unusable
     /// after an error.
     pub fn merge(&mut self, outs: Vec<Vec<Triple>>, outs_held: Held) -> anyhow::Result<usize> {
-        let r = self.merge_charged(outs, outs_held);
-        self.settle();
-        r
+        let n = self.merge_charged(outs, outs_held)?;
+        self.try_settle()?;
+        Ok(n)
     }
 
     fn merge_charged(
@@ -422,7 +439,7 @@ impl Graph {
             || outs.len() >= u32::MAX as usize
             || outs.iter().any(|o| o.len() >= u32::MAX as usize)
         {
-            let n = self.try_add_batch(outs.into_iter().flatten())?;
+            let n = self.add_rows(outs.into_iter().flatten(), true, true)?;
             drop(outs_held);
             return Ok(n);
         }
@@ -685,7 +702,9 @@ impl Graph {
                 while p >= offsets[item + 1] {
                     item += 1;
                 }
-                self.tier.push(outs[item][p - offsets[item]]);
+                let t = outs[item][p - offsets[item]];
+                work.try_grow(self.tier.rel_growth(t[1]))?;
+                self.tier.push(t);
                 w &= w - 1;
             }
         }
@@ -713,7 +732,7 @@ impl Graph {
         drop(kept);
         self.live += new;
         let mut m = Meter::new(&budget, true);
-        let filled = self.tier.index_new(start, &mut m);
+        let filled = self.tier.index_new(start, true, &mut m);
         work.adopt(m.into_bytes());
         filled?;
         tracing::trace!(
@@ -967,7 +986,9 @@ impl Graph {
                     .is_some_and(|b| b.contains_with(memo, t).unwrap_or(false)))
     }
 
-    /// The objects of `(s p ?)` among ids `< hi`, the base tier's first.
+    /// The objects of `(s p ?)` among ids `< hi`, the base tier's first and the derived
+    /// ones in id order, so that the earliest derived value comes first whatever order
+    /// the tier's runs hold them in.
     pub fn objects(&self, memo: &mut Memo, s: u64, p: u64, hi: u32) -> Vec<u64> {
         let mut out = Vec::new();
         if let Some(b) = &self.base
@@ -978,14 +999,17 @@ impl Graph {
                 true
             });
         }
+        let mut derived: Vec<(u32, u64)> = Vec::new();
         for i in self.cands(Some(s), Some(p), None, 0, hi).iter() {
             if self.alive(i) {
                 let t = self.triple(i);
                 if t[0] == s && t[1] == p {
-                    out.push(t[2]);
+                    derived.push((i, t[2]));
                 }
             }
         }
+        derived.sort_unstable();
+        out.extend(derived.into_iter().map(|x| x.1));
         out
     }
 
@@ -1168,7 +1192,8 @@ mod tests {
         assert_eq!(rows(g.cands(Some(1), None, None, 0, 3)), [0, 1]);
         g.add([1, 12, 4]);
         assert_eq!(rows(g.cands(Some(1), None, None, 0, 4)), [0, 1, 3]);
-        assert_eq!(g.pstats(10), (1, 2));
+        // distinct counts are summed over the runs, two here, so an upper bound
+        assert_eq!(g.pstats(10), (2, 2));
         assert_eq!(g.count_p(10, 1, 4), 1);
         assert_eq!(
             g.facts().collect::<Vec<_>>(),
@@ -1188,9 +1213,7 @@ mod tests {
         // added again as a new fact
         assert!(g.add([1, 10, 2]));
         assert_eq!(g.position(&[1, 10, 2]), Some(2));
-        let mut objs = g.objects(&mut Memo::default(), 1, 10, 3);
-        objs.sort();
-        assert_eq!(objs, [2, 3]);
+        assert_eq!(g.objects(&mut Memo::default(), 1, 10, 3), [3, 2]);
         assert_eq!((g.live(), g.dead_rows()), (2, 1));
         assert!(!g.flagged(2));
         g.set_flag_with(2, true, true).unwrap();

@@ -1848,6 +1848,9 @@ pub(crate) fn run_observed(
     let mut refresh: Vec<usize> = Vec::new();
     loop {
         terms.analysis_round(iteration);
+        // the facts from `ds` on are this iteration's delta: a compaction must not merge
+        // their runs with older ones while the iteration reads them
+        g.set_compaction_floor(ds);
         if cancelled() {
             anyhow::bail!("reasoning cancelled");
         }
@@ -2185,6 +2188,7 @@ pub(crate) fn run_observed(
         ds = de;
         de = g.len();
     }
+    g.set_compaction_floor(u32::MAX);
     tracing::debug!(
         derived = g.len() - base_len,
         tier_bytes = g.heap_bytes(),

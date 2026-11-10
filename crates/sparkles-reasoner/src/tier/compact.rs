@@ -1,7 +1,8 @@
 //! Merging the sorted runs of an order into one. The keys of a run's facts are read
 //! once into a buffer of `(key1, key2, id)` entries, in the run's order, so the merge
 //! itself compares buffered keys. Two runs merge in one pass, and more are sorted, which
-//! happens only when a compaction takes a tail of small runs.
+//! happens only when a compaction takes a tail of small runs. Every buffer is made at
+//! the size [`scratch_bytes`] charges for and never grows.
 
 use super::run::Run;
 use rayon::prelude::*;
@@ -11,29 +12,43 @@ const PAR_MIN: usize = 1 << 14;
 
 type Entry = (u64, u64, u32);
 
-/// The heap of the buffers a merge of `n` entries uses: the keyed entries and the ids.
+/// The heap of the buffers a merge or sort of `n` entries holds at once: the keyed
+/// entries and the ids.
 pub(crate) fn scratch_bytes(n: usize) -> usize {
     n * size_of::<Entry>() + n * size_of::<u32>()
+}
+
+/// The ids keyed, in their order, in a buffer of exactly their number.
+fn keyed(ids: &[u32], keys: &(impl Fn(u32) -> (u64, u64) + Sync)) -> Vec<Entry> {
+    let f = |&id: &u32| {
+        let (a, b) = keys(id);
+        (a, b, id)
+    };
+    let mut e: Vec<Entry> = Vec::with_capacity(ids.len());
+    if ids.len() >= PAR_MIN {
+        ids.par_iter().map(f).collect_into_vec(&mut e);
+    } else {
+        e.extend(ids.iter().map(f));
+    }
+    e
+}
+
+fn unkeyed(e: &[Entry]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(e.len());
+    out.extend(e.iter().map(|x| x.2));
+    out
 }
 
 /// Sort `ids` by `(key1, key2)` of their facts, as a new run: the entries are keyed
 /// once, sorted and unkeyed.
 pub(crate) fn sorted(ids: &[u32], keys: &(impl Fn(u32) -> (u64, u64) + Sync)) -> Vec<u32> {
-    let mut e: Vec<Entry> = Vec::with_capacity(ids.len());
-    if ids.len() >= PAR_MIN {
-        e.par_extend(ids.par_iter().map(|&id| {
-            let (a, b) = keys(id);
-            (a, b, id)
-        }));
+    let mut e = keyed(ids, keys);
+    if e.len() >= PAR_MIN {
         e.par_sort_unstable();
     } else {
-        e.extend(ids.iter().map(|&id| {
-            let (a, b) = keys(id);
-            (a, b, id)
-        }));
         e.sort_unstable();
     }
-    e.iter().map(|x| x.2).collect()
+    unkeyed(&e)
 }
 
 /// The ids of `runs` in one sorted sequence, without the ids `keep` refuses.
@@ -42,24 +57,16 @@ pub(crate) fn merged(
     keys: &(impl Fn(u32) -> (u64, u64) + Sync),
     keep: &(impl Fn(u32) -> bool + Sync),
 ) -> Vec<u32> {
-    let keyed = |r: &Run| -> Vec<Entry> {
-        let f = |&id: &u32| {
-            keep(id).then(|| {
-                let (a, b) = keys(id);
-                (a, b, id)
-            })
-        };
-        if r.len() >= PAR_MIN {
-            r.ids().par_iter().filter_map(f).collect()
-        } else {
-            r.ids().iter().filter_map(f).collect()
-        }
+    let kept = |r: &Run| -> Vec<Entry> {
+        let mut e = keyed(r.ids(), keys);
+        e.retain(|x| keep(x.2));
+        e
     };
     match runs {
         [] => Vec::new(),
-        [r] => keyed(r).iter().map(|x| x.2).collect(),
+        [r] => unkeyed(&kept(r)),
         [a, b] => {
-            let (a, b) = (keyed(a), keyed(b));
+            let (a, b) = (kept(a), kept(b));
             let mut out = Vec::with_capacity(a.len() + b.len());
             let (mut i, mut j) = (0, 0);
             while i < a.len() && j < b.len() {
@@ -76,16 +83,20 @@ pub(crate) fn merged(
             out
         }
         many => {
-            let mut all: Vec<Entry> = Vec::with_capacity(many.iter().map(Run::len).sum());
+            let total: usize = many.iter().map(Run::len).sum();
+            let mut all: Vec<Entry> = Vec::with_capacity(total);
             for r in many {
-                all.extend(keyed(r));
+                all.extend(r.ids().iter().filter(|&&id| keep(id)).map(|&id| {
+                    let (a, b) = keys(id);
+                    (a, b, id)
+                }));
             }
             if all.len() >= PAR_MIN {
                 all.par_sort_unstable();
             } else {
                 all.sort_unstable();
             }
-            all.iter().map(|x| x.2).collect()
+            unkeyed(&all)
         }
     }
 }
@@ -119,5 +130,26 @@ mod tests {
         assert_eq!(merged(&runs[..2], &key, &keep), two);
         assert_eq!(merged(&runs[..1], &key, &|_| true).len(), 100);
         assert!(merged(&[], &key, &keep).is_empty());
+    }
+
+    /// The buffers of a sort and of a merge hold what [`scratch_bytes`] charges for.
+    #[test]
+    fn buffers_fit_the_charge() {
+        let ids: Vec<u32> = (0..(1 << 15)).collect();
+        let key = |id: u32| ((id as u64 * 2_654_435_761) % 1000, id as u64);
+        let key1 = |id: u32| key(id).0;
+        let (run, peak) = crate::alloc_probe::peak_of(|| Run::new(sorted(&ids, &key), &key1));
+        assert!(
+            peak <= scratch_bytes(ids.len()) + Run::bytes_for(ids.len()),
+            "sort peak {peak}"
+        );
+        let b = Run::new(
+            sorted(&(1 << 15..1 << 16).collect::<Vec<u32>>(), &key),
+            &key1,
+        );
+        let runs = [run, b];
+        let total = runs[0].len() + runs[1].len();
+        let (_, peak) = crate::alloc_probe::peak_of(|| merged(&runs, &key, &|_| true));
+        assert!(peak <= scratch_bytes(total), "merge peak {peak}");
     }
 }
