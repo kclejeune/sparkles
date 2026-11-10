@@ -513,17 +513,16 @@ const EAGER_ROOTS: usize = if cfg!(test) { 64 } else { 4096 };
 const LAZY_START: Duration = Duration::from_micros(if cfg!(test) { 0 } else { 500 });
 /// The least time the first worker runs alone once a start has been measured.
 const LAZY_MIN: Duration = Duration::from_micros(if cfg!(test) { 0 } else { 20 });
-/// How long the helper threads of the process's last saturation that started them took
-/// to start, from the first worker's call until the last of them ran, in nanoseconds,
-/// and 0 before any start. A process's first threads cost much more to start than later
-/// ones, whose stacks and allocator heaps it keeps, so a later saturation waits only as
-/// long as the last start took, between [`LAZY_MIN`] and [`LAZY_START`] (roadmap item
-/// 720).
+/// How long the first worker of the process's last saturation that started helper
+/// threads took to start them, in nanoseconds, and 0 before any start. A process's first
+/// threads cost much more to start than later ones, whose stacks it keeps, so a later
+/// saturation waits only as long as the last start took, between [`LAZY_MIN`] and
+/// [`LAZY_START`] (roadmap item 720).
 static STARTED_NS: AtomicU64 = AtomicU64::new(0);
 
 /// How long the first worker of a saturation on several threads runs before the others
 /// start: as long as starting them last took, so that a run that ends sooner pays for
-/// no thread, and one that runs longer waits no longer than the threads took to start.
+/// no thread, and one that runs longer waits no longer than starting them costs it.
 fn lazy_start() -> Duration {
     match STARTED_NS.load(Ordering::Relaxed) {
         0 => LAZY_START,
@@ -1199,26 +1198,23 @@ impl<'a> Run<'a> {
             self.worker::<R>(None);
             return;
         }
-        // the most time a helper took to run after the first worker started them
-        let entered = AtomicU64::new(0);
+        // how long the first worker took to start the helpers, 0 while it has not
+        let spawned = AtomicU64::new(0);
         std::thread::scope(|s| {
-            let entered = &entered;
             let start = || {
                 // counted while the first worker is busy, so that the count cannot reach 0
                 // before they start
                 self.pending.fetch_add(threads - 1, Ordering::SeqCst);
                 let called = Instant::now();
                 for _ in 1..threads {
-                    s.spawn(move || {
-                        let ns = called.elapsed().as_nanos().clamp(1, u64::MAX as u128);
-                        entered.fetch_max(ns as u64, Ordering::Relaxed);
-                        self.worker::<R>(None);
-                    });
+                    s.spawn(move || self.worker::<R>(None));
                 }
+                let ns = called.elapsed().as_nanos().clamp(1, u64::MAX as u128);
+                spawned.store(ns as u64, Ordering::Relaxed);
             };
             self.worker::<R>(Some(&start));
         });
-        let ns = entered.into_inner();
+        let ns = spawned.into_inner();
         if ns > 0 {
             STARTED_NS.store(ns, Ordering::Relaxed);
         }
