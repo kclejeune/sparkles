@@ -619,15 +619,17 @@ fn a_join_condition_decodes_no_terms() {
             "{how}: {}",
             with.plan.description
         );
-        // The condition's mask and its merged rows of two columns at most, and the hash
-        // kernel's scratch for a chunk of candidate pairs. Decoding the 20,000 terms of
-        // ?o takes about 2 MiB more.
+        // The condition's mask and its merged rows of two columns at most, the parallel
+        // map's collector with its 1 KiB per pool thread, and the hash kernel's scratch
+        // for a chunk of candidate pairs. Decoding the 20,000 terms of ?o takes about
+        // 2 MiB more.
         let chunk = if how == "hash" {
             super::exec::KEYED_CHUNK as u64 * (2 * 8 + 24) + 256
         } else {
             0
         };
-        let slack = ROWS as u64 * (1 + 2 * 8) + chunk + 1024;
+        let threads = rayon::current_num_threads() as u64 * 1024;
+        let slack = ROWS as u64 * (1 + 2 * 8) + threads + chunk + 1024;
         assert!(
             with.mem_peak_bytes <= without.mem_peak_bytes + slack,
             "{how}: the condition took the peak from {} to {} bytes",

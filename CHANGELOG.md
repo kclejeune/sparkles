@@ -41,7 +41,7 @@ hash, keyed and merge kernels of `sparql/join` and one galloping search serve bo
 modes, the `merge_left_join` switch selects the merge OPTIONAL without a condition in
 both and EXPLAIN names the algorithm that ran, a hash join's OPTIONAL condition is tested
 once per chunk of candidate pairs in both from the ids of the candidate rows without
-decoding their terms, and an eager hash join whose table does not
+decoding their terms up front, and an eager hash join whose table does not
 fit the budget of a query that may spill partitions its inputs to disk through the
 cursor's join instead of failing.
 

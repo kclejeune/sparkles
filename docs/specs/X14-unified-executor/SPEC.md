@@ -670,7 +670,9 @@ tested conditions through the FILTER path, and decoding the 300,000 candidate ro
 item 570's eager OPTIONAL at 1M people, whose `?o != ex:x` the ids decide, took the
 query from 28 ms to 120 ms on the laptop and to five times its server time on the Intel
 worker. A unit test holds the conditional OPTIONAL over 20,000 rows, in both forms, to the
-memory of the OPTIONAL without the condition. The `merge_left_join` switch selects the
+memory of the OPTIONAL without the condition plus its mask and merged rows and, in the
+hash form, the kernel's scratch for one chunk of candidates, which together are below
+what decoding the 20,000 terms charges. The `merge_left_join` switch selects the
 merge OPTIONAL without a condition in both modes, and EXPLAIN names the algorithm that
 ran, `[merge on ?k]` or `[hash join]`, in both. An OPTIONAL with a condition over two
 sorted inputs still merges only in eager execution, where its condition is tested over
