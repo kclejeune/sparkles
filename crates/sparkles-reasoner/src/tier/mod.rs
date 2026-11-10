@@ -277,6 +277,13 @@ impl Tier {
         self.floor = floor;
     }
 
+    /// Lower the floor to `id` when it is above: a batch added between runs may be the
+    /// delta a later run starts from, so later batches leave its runs alone until the
+    /// engine sets the floor again.
+    pub fn lower_floor(&mut self, id: u32) {
+        self.floor = self.floor.min(id);
+    }
+
     pub fn set_offset(&mut self, offset: u32) {
         debug_assert!(self.s.is_empty());
         self.offset = offset;
@@ -391,8 +398,9 @@ impl Tier {
             .is_none_or(|w| w & (1 << (i % 64)) == 0)
     }
 
-    /// The bytes the dead bitmap grows by to hold a bit for `id`.
-    pub fn dead_growth(&self, id: u32) -> usize {
+    /// The bytes the dead bitmap allocates to hold a bit for `id`, and the bytes of the
+    /// allocation it releases then: both zero when the bit fits.
+    pub fn dead_growth(&self, id: u32) -> (usize, usize) {
         bitmap_growth(&self.dead, self.at(id))
     }
 
@@ -419,8 +427,9 @@ impl Tier {
             .is_some_and(|w| w & (1 << (i % 64)) != 0)
     }
 
-    /// The bytes the flags grow by to hold a bit for `id`.
-    pub fn flag_growth(&self, id: u32) -> usize {
+    /// The bytes the flags allocate to hold a bit for `id`, and the bytes of the
+    /// allocation they release then: both zero when the bit fits.
+    pub fn flag_growth(&self, id: u32) -> (usize, usize) {
         bitmap_growth(&self.flags, self.at(id))
     }
 
@@ -587,16 +596,15 @@ impl Tier {
         let mut ids: Vec<u32> = Vec::with_capacity(live);
         ids.extend((off..off + n as u32).filter(|&id| keep(id)));
         let mut order = Order::default();
-        m.add(order.push_growth())?;
         if subjects {
-            let keys = |id: u32| (sc[(id - off) as usize], oc[(id - off) as usize]);
+            let keys = |id: u32| (sc[(id - off) as usize], id as u64);
             let key1 = |id: u32| sc[(id - off) as usize];
-            order.push(Run::new(compact::sorted(&ids, &keys), &key1));
+            order.push_charged(Run::new(compact::sorted(&ids, &keys), &key1), m)?;
             self.by_s = Some(order);
         } else {
-            let keys = |id: u32| (oc[(id - off) as usize], sc[(id - off) as usize]);
+            let keys = |id: u32| (oc[(id - off) as usize], id as u64);
             let key1 = |id: u32| oc[(id - off) as usize];
-            order.push(Run::new(compact::sorted(&ids, &keys), &key1));
+            order.push_charged(Run::new(compact::sorted(&ids, &keys), &key1), m)?;
             self.by_o = Some(order);
         }
         drop(ids);
@@ -604,22 +612,16 @@ impl Tier {
         Ok(())
     }
 
-    /// Index the facts from column index `start` on: with `compact`, compact the runs
-    /// each of their relations has below the floor, then append the new facts as one run
-    /// per order, sorted. Growth is charged to `m` (and its strictness) before it is
-    /// allocated.
-    pub fn index_new(
-        &mut self,
-        start: usize,
-        compact: bool,
-        m: &mut Meter<'_>,
-    ) -> Result<(), MemoryExceeded> {
+    /// Index the facts from column index `start` on: compact the runs each of their
+    /// relations has below the floor, then append the new facts as one run per order,
+    /// sorted. Growth is charged to `m` (and its strictness) before it is allocated.
+    pub fn index_new(&mut self, start: usize, m: &mut Meter<'_>) -> Result<(), MemoryExceeded> {
         let n = self.s.len() - start;
         if n == 0 {
             return Ok(());
         }
         let off = self.offset;
-        let floor = if compact { self.floor } else { 0 };
+        let floor = self.floor;
         let first = off + start as u32;
         // the new ids grouped by relation: a counting sort
         let nrels = self.rels.len();
@@ -648,16 +650,17 @@ impl Tier {
         } = self;
         let (sc, oc, dead): (&[u64], &[u64], &[u64]) = (s, o, dead);
         let keep = move |id: u32| alive_in(dead, (id - off) as usize);
-        let keys_so = move |id: u32| (sc[(id - off) as usize], oc[(id - off) as usize]);
-        let keys_os = move |id: u32| (oc[(id - off) as usize], sc[(id - off) as usize]);
+        // sorted by key and then id, so that the ids a probe finds ascend within a run
+        let keys_so = move |id: u32| (sc[(id - off) as usize], id as u64);
+        let keys_os = move |id: u32| (oc[(id - off) as usize], id as u64);
         let key_s = move |id: u32| sc[(id - off) as usize];
         let key_o = move |id: u32| oc[(id - off) as usize];
         let (budget, strict) = (m.budget(), m.strict());
-        let grouped = &grouped;
+        let grouped_ref = &grouped;
         let counts = &counts;
         let task = |(ri, rel): (usize, &mut Rel)| -> Result<usize, MemoryExceeded> {
             let mut meter = Meter::new(budget, strict);
-            let new = &grouped[counts[ri]..counts[ri + 1]];
+            let new = &grouped_ref[counts[ri]..counts[ri + 1]];
             if floor > 0 {
                 // a relation with a quarter of its facts dead is rebuilt without them
                 let all = rel.dead > 0 && rel.dead as usize * 4 >= rel.subj.len();
@@ -683,16 +686,11 @@ impl Tier {
             }
             if !new.is_empty() {
                 let scratch = compact::scratch_bytes(new.len());
-                meter.add(
-                    scratch
-                        + 2 * Run::bytes_for(new.len())
-                        + rel.subj.push_growth()
-                        + rel.obj.push_growth(),
-                )?;
+                meter.add(scratch + 2 * Run::bytes_for(new.len()))?;
                 rel.subj
-                    .push(Run::new(compact::sorted(new, &keys_so), &key_s));
+                    .push_charged(Run::new(compact::sorted(new, &keys_so), &key_s), &mut meter)?;
                 rel.obj
-                    .push(Run::new(compact::sorted(new, &keys_os), &key_o));
+                    .push_charged(Run::new(compact::sorted(new, &keys_os), &key_o), &mut meter)?;
                 meter.sub(scratch);
             }
             Ok(meter.into_bytes())
@@ -730,11 +728,11 @@ impl Tier {
                 order.dead -= d as u32;
             }
             let scratch = compact::scratch_bytes(n);
-            m.add(scratch + Run::bytes_for(n) + order.push_growth())?;
+            m.add(scratch + Run::bytes_for(n))?;
             if subjects {
-                order.push(Run::new(compact::sorted(&all, &keys_so), &key_s));
+                order.push_charged(Run::new(compact::sorted(&all, &keys_so), &key_s), m)?;
             } else {
-                order.push(Run::new(compact::sorted(&all, &keys_os), &key_o));
+                order.push_charged(Run::new(compact::sorted(&all, &keys_os), &key_o), m)?;
             }
             m.sub(scratch);
         }
@@ -781,14 +779,17 @@ fn bitmap_grown(cap: usize, w: usize) -> usize {
     (cap * 2).max(w + 1).max(4)
 }
 
-/// The bytes `bits` grows by to hold bit `i`: the new allocation, while the old one is
-/// alive, or nothing when the capacity holds it.
-fn bitmap_growth(bits: &Vec<u64>, i: usize) -> usize {
+/// The allocation `bits` makes to hold bit `i`, while the old one is alive, and the old
+/// one's bytes, released after: both zero when the capacity holds the bit.
+fn bitmap_growth(bits: &Vec<u64>, i: usize) -> (usize, usize) {
     let (w, cap) = (i / 64, bits.capacity());
     if w < cap {
-        0
+        (0, 0)
     } else {
-        bitmap_grown(cap, w) * size_of::<u64>()
+        (
+            bitmap_grown(cap, w) * size_of::<u64>(),
+            cap * size_of::<u64>(),
+        )
     }
 }
 
@@ -820,7 +821,7 @@ mod tests {
         }
         let b = Budget::unlimited();
         let mut m = Meter::new(&b, true);
-        t.index_new(0, true, &mut m).unwrap();
+        t.index_new(0, &mut m).unwrap();
         t
     }
 
@@ -858,7 +859,7 @@ mod tests {
         // more facts: a second run per order, and the order by subject follows
         t.push([1, 10, 1]);
         t.push([7, 13, 1]);
-        t.index_new(5, true, &mut Meter::new(&b, true)).unwrap();
+        t.index_new(5, &mut Meter::new(&b, true)).unwrap();
         assert_eq!(ids(t.cands(Some(1), Some(10), None, 0, 7)), [0, 1, 5]);
         assert_eq!(ids(t.cands(Some(1), None, None, 0, 7)), [0, 1, 3, 5]);
         assert_eq!(ids(t.cands(None, Some(13), None, 0, 7)), [6]);
@@ -876,7 +877,7 @@ mod tests {
         // a quarter dead: the next merge rebuilds the relation without the dead fact
         t.push([9, 10, 9]);
         let b = Budget::unlimited();
-        t.index_new(4, true, &mut Meter::new(&b, true)).unwrap();
+        t.index_new(4, &mut Meter::new(&b, true)).unwrap();
         assert_eq!(t.rels()[0].dead, 0);
         assert_eq!(t.rels()[0].subj.len(), 4);
         assert_eq!(ids(t.cands(Some(1), Some(10), None, 0, 5)), [0]);
@@ -887,11 +888,11 @@ mod tests {
     #[test]
     fn flags_grow_as_charged() {
         let mut t = tier(&[[1, 10, 2]]);
-        assert_eq!(t.flag_growth(0), 4 * 8);
-        assert_eq!(t.dead_growth(0), 4 * 8);
+        assert_eq!(t.flag_growth(0), (4 * 8, 0));
+        assert_eq!(t.dead_growth(0), (4 * 8, 0));
         t.set_flag(0, true);
         assert!(t.flagged(0));
-        assert_eq!(t.flag_growth(0), 0);
+        assert_eq!(t.flag_growth(0), (0, 0));
         t.set_flag(0, false);
         assert!(!t.flagged(0));
     }

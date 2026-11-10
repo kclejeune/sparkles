@@ -13,6 +13,7 @@
 
 use super::Cands;
 use super::run::Run;
+use crate::budget::{MemoryExceeded, Meter};
 use std::ops::Range;
 
 /// The most runs an order keeps below the compaction floor after a compaction and the
@@ -29,20 +30,29 @@ pub(crate) struct Order {
 }
 
 impl Order {
-    /// The bytes the list of runs grows by for one more run.
-    pub fn push_growth(&self) -> usize {
-        if self.runs.len() < self.runs.capacity() {
-            0
-        } else {
-            (self.runs.capacity().max(2)) * size_of::<Run>()
-        }
-    }
-
     pub fn push(&mut self, r: Run) {
         if r.len() > 0 {
             self.len += r.len();
             self.runs.push(r);
         }
+    }
+
+    /// [`push`](Self::push), charging the list's new allocation to `m` before it grows
+    /// and releasing the old one after.
+    pub fn push_charged(&mut self, r: Run, m: &mut Meter<'_>) -> Result<(), MemoryExceeded> {
+        if r.len() == 0 {
+            return Ok(());
+        }
+        let (len, cap) = (self.runs.len(), self.runs.capacity());
+        if len == cap {
+            // the vector doubles, from four
+            let new = (cap * 2).max(4);
+            m.add(new * size_of::<Run>())?;
+            self.runs.reserve_exact(new - len);
+            m.sub(cap * size_of::<Run>());
+        }
+        self.push(r);
+        Ok(())
     }
 
     #[inline]

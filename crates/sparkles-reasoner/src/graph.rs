@@ -333,7 +333,7 @@ impl Graph {
     /// new triples. The base tier is not consulted: the caller adds facts that are not in
     /// it.
     pub fn add_batch(&mut self, ts: impl IntoIterator<Item = Triple>) -> usize {
-        let n = self.add_rows(ts, false, false);
+        let n = self.add_rows(ts, false, true);
         n.expect("charges that may pass the limit do not fail")
     }
 
@@ -343,7 +343,7 @@ impl Graph {
         &mut self,
         ts: impl IntoIterator<Item = Triple>,
     ) -> Result<usize, MemoryExceeded> {
-        self.add_rows(ts, true, false)
+        self.add_rows(ts, true, true)
     }
 
     /// Protect the derived facts from id `floor` on from compaction, until the next call:
@@ -353,14 +353,14 @@ impl Graph {
         self.tier.set_compaction_floor(floor);
     }
 
-    /// Add facts in one batch. Only a merge of the engine compacts the tier's runs
-    /// (`compact`), since a batch added between runs may be the delta a later run starts
-    /// from.
+    /// Add facts in one batch. A `batch` added between runs may be the delta a later run
+    /// starts from, so it lowers the compaction floor to its first id, and the engine's
+    /// merges set the floor themselves.
     fn add_rows(
         &mut self,
         ts: impl IntoIterator<Item = Triple>,
         strict: bool,
-        compact: bool,
+        batch: bool,
     ) -> Result<usize, MemoryExceeded> {
         let start = self.tier.count();
         let budget = self.held.budget().clone();
@@ -398,7 +398,10 @@ impl Graph {
         })();
         let new = self.tier.count() - start;
         self.live += new;
-        let r = r.and_then(|()| self.tier.index_new(start, compact, &mut m));
+        let r = r.and_then(|()| self.tier.index_new(start, &mut m));
+        if batch && new > 0 {
+            self.tier.lower_floor(self.offset() + start as u32);
+        }
         self.held.adopt(m.into_bytes());
         // after an error the graph is unusable, and settling would charge what was
         // allocated beyond the failed charge, past the limit
@@ -439,7 +442,7 @@ impl Graph {
             || outs.len() >= u32::MAX as usize
             || outs.iter().any(|o| o.len() >= u32::MAX as usize)
         {
-            let n = self.add_rows(outs.into_iter().flatten(), true, true)?;
+            let n = self.add_rows(outs.into_iter().flatten(), true, false)?;
             drop(outs_held);
             return Ok(n);
         }
@@ -732,7 +735,7 @@ impl Graph {
         drop(kept);
         self.live += new;
         let mut m = Meter::new(&budget, true);
-        let filled = self.tier.index_new(start, true, &mut m);
+        let filled = self.tier.index_new(start, &mut m);
         work.adopt(m.into_bytes());
         filled?;
         tracing::trace!(
@@ -805,8 +808,10 @@ impl Graph {
         };
         let (i, _) = e.remove();
         // a few bits per fact, charged as they grow
-        self.held.grow(self.tier.dead_growth(i));
+        let (grow, old) = self.tier.dead_growth(i);
+        self.held.grow(grow);
         self.tier.kill(i);
+        self.held.shrink(old);
         self.live -= 1;
         true
     }
@@ -830,7 +835,7 @@ impl Graph {
     /// Flag derived fact `id` explicit or not, charging the growth of the flags before it
     /// is allocated, and with `strict` failing when it does not fit.
     pub fn set_flag_with(&mut self, id: u32, on: bool, strict: bool) -> Result<(), MemoryExceeded> {
-        let grow = self.tier.flag_growth(id);
+        let (grow, old) = self.tier.flag_growth(id);
         if grow > 0 {
             if !on {
                 return Ok(());
@@ -842,6 +847,7 @@ impl Graph {
             }
         }
         self.tier.set_flag(id, on);
+        self.held.shrink(old);
         Ok(())
     }
 
@@ -1321,6 +1327,10 @@ mod tests {
             let batch: Vec<Triple> = (0..n)
                 .map(|_| [next() % 400, next() % 5, next() % 400])
                 .collect();
+            // every other round is like an engine run: everything before it may compact
+            if round % 2 == 0 {
+                g.set_compaction_floor(u32::MAX);
+            }
             g.add_batch(batch.iter().copied());
             for t in batch {
                 if !all.contains(&t) {
