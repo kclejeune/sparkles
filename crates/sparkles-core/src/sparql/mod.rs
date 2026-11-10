@@ -1609,6 +1609,22 @@ fn execute_prepared(
         .map_err(|error| Box::new(Failed { error, plan: None }))
 }
 
+/// The variables and retained table of an eager SELECT result. The body stays out of
+/// line, with one error exit, so that the result path of a small query runs through a
+/// short stretch of code rather than blocks spread across its caller.
+#[inline(never)]
+fn select_output(
+    ctx: &Arc<Ctx>,
+    pattern: &GraphPattern,
+    materialized: table::Materialized<'_>,
+) -> Result<(Arc<cursor::Variables>, table::RetainedMaterialized)> {
+    let variables = cursor::Variables::new(ctx, pattern, &materialized.table.vars, "")?;
+    let retained = materialized
+        .project(ctx, &variables.ids)?
+        .into_retained(ctx)?;
+    Ok((variables, retained))
+}
+
 fn execute_prepared_parts(
     parsed: &Query,
     opts: &QueryOptions,
@@ -1672,12 +1688,7 @@ fn execute_prepared_parts(
     };
     match parsed {
         Query::Select { .. } => {
-            let variables = cursor::Variables::new(&ctx, &pattern, &materialized.table.vars, "")
-                .map_err(|error| failed(error, None, None))?;
-            let vars = &variables.ids;
-            let retained = materialized
-                .project(&ctx, vars)
-                .and_then(|output| output.into_retained(&ctx))
+            let (variables, retained) = select_output(&ctx, &pattern, materialized)
                 .map_err(|error| failed(error, None, None))?;
             result.variables = Some(variables);
             result.table = retained.table;

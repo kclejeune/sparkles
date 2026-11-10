@@ -346,6 +346,10 @@ impl Error {
         }
     }
 
+    // An error is built off the hot path, so its message's allocation and copy are not
+    // inlined into the code that checks for it.
+    #[cold]
+    #[inline(never)]
     pub fn invalid(s: impl Into<String>) -> Error {
         Error::Invalid(s.into())
     }

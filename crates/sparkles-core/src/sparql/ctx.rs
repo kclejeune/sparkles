@@ -1976,6 +1976,8 @@ impl Ctx {
         usize::try_from(left / table_bytes(1, width)).unwrap_or(usize::MAX)
     }
 
+    #[cold]
+    #[inline(never)]
     pub(super) fn memory_exceeded(&self, requested: u64) -> Error {
         Error::BudgetExceeded(Budget {
             kind: BudgetKind::Memory,
