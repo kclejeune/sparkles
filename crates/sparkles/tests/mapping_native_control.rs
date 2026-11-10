@@ -266,8 +266,11 @@ fn publication_wins_over_cancellation_or_expiry_after_last_commit() {
             });
             let entered = gate.reached();
             let seq = published.seq.load(Ordering::SeqCst);
-            let actually_published =
-                seq == head + 1 && ds.store().snapshot().commit == seq && ds.len() == len + 2;
+            // The guard is told once the commit is durable and just before its snapshot
+            // is published (X16 phase 2), so the cancellation and the expiry below land
+            // between the durable write and the publication.
+            let durable_before_publication =
+                seq == head + 1 && ds.store().snapshot().commit == head && ds.len() == len;
             if let Some(deadline) = deadline {
                 wait_for_deadline(deadline);
             } else {
@@ -278,8 +281,8 @@ fn publication_wins_over_cancellation_or_expiry_after_last_commit() {
             worker.join().unwrap();
             ds.store().set_guard(None);
             assert!(
-                entered && actually_published,
-                "actual publication was not latched"
+                entered && durable_before_publication,
+                "the durable commit was not latched before its publication"
             );
             let result = result
                 .unwrap()
