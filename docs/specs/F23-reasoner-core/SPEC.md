@@ -188,7 +188,11 @@ batch is deduplicated against it, and a predicate's new facts are sorted into it
 once when its closure is done, as one merge of the whole closure sorted them, so each
 order still gets one run per closure and every fact keeps the id one merge would have
 given it. The sink holds the graph while a predicate's closure runs, so no probe can read
-the facts before they are indexed, and the probe roots assert that in debug builds. The
+the facts before they are indexed, and the probe roots assert that in debug builds. An
+operator decides before it emits a pair whether it gives its rules back, an equivalence
+by checking the literals of every class first and a guarded operator with a `notEqual`
+filter by building each predicate's graph once for the check and once for the closure,
+so a fallback has merged nothing, as it had when the step held every pair. The
 columns double when a merge does not fit them, since a closure now arrives in many
 merges. On OWL2Bench(5) the budget's peak fell from 10.5 GB to 4.2 GB, 80 bytes per
 derived fact against 199, under the gate of half. The peak is now the sort of the

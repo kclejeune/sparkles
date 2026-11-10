@@ -6,6 +6,14 @@ use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::store::{Store, StoreOptions};
 use sparkles_reasoner::{Profile, ReasonOptions, bench_derive, infer};
 use std::collections::BTreeSet;
+use std::sync::{Mutex, MutexGuard};
+
+/// The batch size of the closure operators is process-wide, so the tests that set it run
+/// one at a time.
+fn batch_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 const PREFIXES: &str = "@prefix ex: <http://ex.org/> .
 @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
@@ -332,6 +340,7 @@ fn batched_closures_keep_the_facts_and_their_order() {
     t += "ex:x a ex:C0 .\n";
     let s = store(&t);
     let p = Profile::OwlRl;
+    let _one = batch_lock();
     let (whole, _) = infer(s.snapshot(), &p, &options(true)).unwrap();
     sparkles_reasoner::set_closure_batch(1000);
     let batched = infer(s.snapshot(), &p, &options(true));
@@ -352,15 +361,17 @@ fn batched_closures_keep_the_facts_and_their_order() {
 /// An equivalence operator that meets two literals of equal value in a class gives its
 /// rules back before it emits a pair, so a clean class before that one is not merged
 /// first: with a batch of one pair, which would merge each pair at once, the run derives
-/// the same facts in the same order as with the default batch.
+/// the same facts in the same order as with the default batch. The clean class's nodes
+/// get the lower term ids, so the operator visits it before the class with the literals.
 #[test]
 fn a_fallback_merges_nothing_first() {
     let s = store(
-        "ex:s1 owl:sameAs ex:s2 . ex:s2 owl:sameAs ex:s3 . ex:s3 owl:sameAs ex:s4 .
-ex:l1 owl:sameAs \"1\"^^xsd:integer . ex:l1 owl:sameAs \"01\"^^xsd:integer .
+        "ex:a1 owl:sameAs ex:a2 . ex:a2 owl:sameAs ex:a3 . ex:a3 owl:sameAs ex:a4 .
+ex:z1 owl:sameAs \"1\"^^xsd:integer . ex:z1 owl:sameAs \"01\"^^xsd:integer .
 ex:x a ex:C .\n",
     );
     let p = Profile::OwlRl;
+    let _one = batch_lock();
     let (whole, _) = infer(s.snapshot(), &p, &options(true)).unwrap();
     sparkles_reasoner::set_closure_batch(1);
     let single = infer(s.snapshot(), &p, &options(true));
