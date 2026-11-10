@@ -28,7 +28,7 @@
 //! reached has a proof, and they are all remembered as unprovable.
 
 use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_capacity, table_grown};
-use crate::engine::{self, CHead, CRule, Eval, First, Limits, Mode, Slot, Step};
+use crate::engine::{self, CHead, CRule, Eval, First, Limits, Mode, Slot, Step, VISIT_BATCH};
 use crate::facts::{Base, Memo};
 use crate::graph::{Cands, Graph, Triple};
 use crate::lookups::{self, Lookups};
@@ -59,10 +59,6 @@ const MIN_VISITS: u64 = 1 << 20;
 /// of ordinary cost (see [`Bound`]).
 const MIN_HELD: usize = 64 << 20;
 
-/// The rule instances a search counts on its own before it adds them to [`Bound`] and
-/// compares the run's memory with it.
-const VISIT_BATCH: u64 = 1 << 10;
-
 /// The cost of the deletion of one update and its bound, past which the update gives
 /// way to a full run.
 ///
@@ -84,13 +80,14 @@ const VISIT_BATCH: u64 = 1 << 10;
 /// update stops with a [`Fallback`], its state is dropped, and the run materializes in
 /// full, which gives the same closure.
 ///
-/// The bound is a heuristic on sampled charges. Each search compares them once every
-/// [`VISIT_BATCH`] instances, and the steps that find consequences once their heads are
-/// found, so the charges can pass the bound by what one batch or one step charges before
-/// the update stops. A deletion that ends within the bound counts the same visits on every
-/// run with the same number of threads. When the bound stops it, the parallel searches of
-/// a round have counted what they reached by then, and the memory they held depends on
-/// how they interleaved, so near the bound one run can fall back where another does not.
+/// The bound is a heuristic on sampled charges. Each search, and each evaluation that
+/// finds consequences, compares them once every [`VISIT_BATCH`] instances it matched and
+/// once more when it ends, so the charges can pass the bound by what the batches under
+/// way charge before the update stops. A deletion that ends within the bound counts the
+/// same visits on every run with the same number of threads. When the bound stops it, the
+/// parallel work of a round has counted what it reached by then, and the memory it held
+/// depends on how it interleaved, so near the bound one run can fall back where another
+/// does not.
 pub(crate) struct Bound {
     visits: AtomicU64,
     max_visits: u64,
@@ -937,7 +934,8 @@ impl Plans {
 }
 
 /// The heads (in the closure) of the rule instances with a body atom in `dead`, whose
-/// rows are still live. Each instance counts as a visit of `bound`.
+/// rows are still live. Each instance the evaluations match counts as a visit of
+/// `bound`.
 fn consequences(
     c: &Closure,
     rules: &[CRule],
@@ -976,6 +974,14 @@ fn consequences(
             .sum(),
     )?;
     type Heads = (Vec<Triple>, Held, Option<anyhow::Error>);
+    // each instance the evaluations match counts as a visit of the deletion
+    let visit = |n: u64| -> anyhow::Result<()> {
+        match bound {
+            Some(b) => b.add(n).map_err(anyhow::Error::from),
+            None => Ok(()),
+        }
+    };
+    let visit: &engine::Visit<'_> = &visit;
     let mut heads: Vec<Heads> = work
         .par_iter()
         .map(|(ri, d, rows)| {
@@ -990,22 +996,28 @@ fn consequences(
                 &abort,
                 limits.cancel.as_deref(),
                 usize::MAX,
-                Mode::Existing,
+                Mode::Existing { visit: Some(visit) },
                 &limits.budget,
             );
             let mut b = vec![0u64; r.nvars];
             ev.run(0, &mut b, Some(First::Rows(Cands::Slice(rows))));
+            if ev.err.is_none()
+                && let Err(e) = visit(std::mem::take(&mut ev.visits))
+            {
+                ev.err = Some(e);
+                abort.store(true, Ordering::Relaxed);
+            }
             let (out, h) = ev.take_out();
             (out, h, ev.err.take())
         })
         .collect();
-    // an error of an evaluation comes before the bound, which counts what it found
-    if let Some(e) = heads.iter_mut().find_map(|h| h.2.take()) {
+    if let Some(e) = preferred_error(heads.iter_mut().filter_map(|h| h.2.take())) {
         return Err(e);
     }
     let n: usize = heads.iter().map(|h| h.0.len()).sum();
-    if let Some(v) = bound {
-        v.add(n as u64)?;
+    if let Some(b) = bound {
+        // the heads are held now
+        b.add(0)?;
     }
     // the heads, deduplicated
     held.try_grow(
@@ -1021,6 +1033,20 @@ fn consequences(
     drop(seen);
     let keep = held.split(out.capacity() * size_of::<Triple>());
     Ok((out, keep))
+}
+
+/// The error that parallel work of the deletion returns: the first [`Fallback`], since a
+/// part past the bound gives way to a full run, which may also avoid the other parts'
+/// errors, or else the first error.
+fn preferred_error(errs: impl Iterator<Item = anyhow::Error>) -> Option<anyhow::Error> {
+    let mut first = None;
+    for e in errs {
+        if e.is::<Fallback>() {
+            return Some(e);
+        }
+        first.get_or_insert(e);
+    }
+    first
 }
 
 // ------------------------------------------------------------------ proofs ----
@@ -1088,20 +1114,7 @@ fn prove_all(
             .collect()
     };
     // the errors first, before anything is absorbed, whose growth could fail too
-    let mut first_err: Option<anyhow::Error> = None;
-    for (_, s) in &mut parts {
-        if let Some(e) = s.err.take() {
-            // a search past the bound gives way to a full run, also when another search
-            // of the round failed first, which the full run may avoid
-            if first_err
-                .as_ref()
-                .is_none_or(|f| f.downcast_ref::<Fallback>().is_none() && e.is::<Fallback>())
-            {
-                first_err = Some(e);
-            }
-        }
-    }
-    if let Some(e) = first_err {
+    if let Some(e) = preferred_error(parts.iter_mut().filter_map(|p| p.1.err.take())) {
         return Err(e);
     }
     let mut dead = Vec::new();

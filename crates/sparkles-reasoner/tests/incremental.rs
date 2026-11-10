@@ -963,24 +963,20 @@ fn deleting_an_edge_of_a_small_clique_stays_incremental() {
     assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
 }
 
-/// Roadmap item 798. The consequences of deleted facts are the heads of the rule instances
-/// that used them, and a rule whose head does not depend on the deleted atom's bindings
-/// has one head for many instances. Deleting the 32 `ex:p` facts gives 3.2 million
-/// instances of one head, which the deletion keeps once, within the memory of a full run.
-#[test]
-fn the_consequences_of_a_deletion_keep_each_head_once() {
-    const LIMIT: usize = 32 << 20;
+/// Delete the `ex:p` facts of `ps` facts beside 100,000 `ex:q` facts, under the rule
+/// `(?x ex:p ex:on), (?y ex:q ex:on) -> head`, within `limit` bytes, and return the run
+/// after the deletion, checked against a full run.
+fn delete_from_a_product(head: &str, ps: usize, limit: Option<usize>) -> ReasonReport {
     let (_d, s) = persistent();
-    let rules = Profile::Rules(
+    let rules = Profile::Rules(format!(
         "@prefix ex: <http://ex.org/>.
-         [a: (?x ex:p ex:on), (?y ex:q ex:on) -> (ex:s ex:r ex:o)]"
-            .into(),
-    );
+         [a: (?x ex:p ex:on), (?y ex:q ex:on) -> {head}]"
+    ));
     let mut nt = String::new();
     for n in 0..100_000 {
         nt.push_str(&format!("<{EX}q{n}> <{EX}q> <{EX}on> .\n"));
     }
-    let ps: Vec<Triple> = (0..32)
+    let ps: Vec<Triple> = (0..ps)
         .map(|n| t(&format!("ex:p{n}"), "ex:p", "ex:on"))
         .collect();
     for p in &ps {
@@ -993,7 +989,7 @@ fn the_consequences_of_a_deletion_keep_each_head_once() {
     )])
     .unwrap();
     let opts = ReasonOptions {
-        max_memory: Some(LIMIT),
+        max_memory: limit,
         ..ReasonOptions::default()
     };
     let go = |since| {
@@ -1005,11 +1001,37 @@ fn the_consequences_of_a_deletion_keep_each_head_once() {
             &opts,
         )
     };
-    let full = go(None).unwrap_or_else(|e| panic!("the full run exceeds {LIMIT} bytes: {e:#}"));
+    let full = go(None).unwrap_or_else(|e| panic!("the full run: {e:#}"));
     check(&s, &rules, &full, "the full run");
     change(&s, &[], &ps);
     let r = go(Some(full.receipt.unwrap().commit.seq))
         .unwrap_or_else(|e| panic!("the run after the deletion: {e:#}"));
     check(&s, &rules, &r, "after the deletion");
-    assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
+    r
+}
+
+/// Roadmap item 798. The consequences of deleted facts are the heads of the rule instances
+/// that used them, and a rule whose head does not depend on the deleted atom's bindings
+/// has one head for many instances. Deleting 32 `ex:p` facts matches 3.2 million
+/// instances of one head, which the deletion kept once each, past the memory of a full
+/// run, before it counted them. The evaluations now keep each head once and count the
+/// instances as they match them, so the deletion passes its bound on visits and the run
+/// materializes in full.
+#[test]
+fn the_consequences_of_a_deletion_count_their_instances() {
+    let r = delete_from_a_product("(ex:s ex:r ex:o)", 32, Some(32 << 20));
+    assert_eq!(r.method, Method::Full);
+    let why = r.fallback.as_deref().unwrap_or_default();
+    assert!(why.starts_with("the deletion visited"), "{why}");
+}
+
+/// The same with heads that depend on the other atom: the evaluations of the deleted
+/// facts, 256 at a time, each find the same 100,000 heads, and the bound stops them
+/// before they hold a copy each.
+#[test]
+fn the_consequences_of_a_deletion_stop_across_evaluations() {
+    let r = delete_from_a_product("(?y ex:r ex:on)", 512, None);
+    assert_eq!(r.method, Method::Full);
+    let why = r.fallback.as_deref().unwrap_or_default();
+    assert!(why.starts_with("the deletion "), "{why}");
 }

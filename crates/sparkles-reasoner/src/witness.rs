@@ -731,7 +731,7 @@ impl<'a> Cx<'a> {
                     self.abort,
                     self.cancel,
                     usize::MAX,
-                    Mode::Existing,
+                    Mode::Existing { visit: None },
                     self.budget,
                 );
                 ev.lend_memo(m);
