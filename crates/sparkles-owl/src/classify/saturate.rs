@@ -2537,8 +2537,10 @@ mod horn_accounting_tests {
         let f = fixture();
         let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
         let [e_old, e_new, f_old, f_new, x_old, x_new] = [1, 2, 3, 4, 5, 6].map(|i| f.targets[i]);
-        let mut st = State::default();
-        st.init = true;
+        let mut st = State {
+            init: true,
+            ..Default::default()
+        };
         st.back_by(f.s).insert(e_old);
         st.fwd.insert((f.r, f_old));
         st.props.push((f.s, x_old));
