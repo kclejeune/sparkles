@@ -446,11 +446,52 @@ mod tests {
             .unwrap();
             assert_eq!((zl, zr), (el, er), "test {test}");
         }
-        // An exact run whose product exceeds 64 pairs is admitted before it is expanded,
-        // and a filtered run admits only the pairs it gave.
+        // An exact run whose product exceeds 64 pairs is admitted with its whole product
+        // before it is expanded, and then with the pairs so far every POLL candidates,
+        // where the first candidate of a run is the zipper's step after the step that
+        // found the run. A filtered run admits only the pairs it gave.
+        assert_eq!(POLL, 4096, "the admitted counts below assume this poll");
         let long = ids(&vec![3i64; 100]);
+        let admitted = std::cell::RefCell::new(Vec::new());
+        let record = |pairs: usize| {
+            admitted.borrow_mut().push(pairs);
+            Ok(())
+        };
+        let (mut l, mut r) = (Vec::new(), Vec::new());
+        zip(
+            &ctx,
+            &long,
+            &long,
+            true,
+            |_, _| true,
+            record,
+            &mut l,
+            &mut r,
+        )
+        .unwrap();
+        assert_eq!(l.len(), 10_000);
+        assert_eq!(admitted.take(), vec![10_000, 4094, 8190]);
+        let (mut l, mut r) = (Vec::new(), Vec::new());
+        zip(
+            &ctx,
+            &long,
+            &long,
+            false,
+            |a, b| a == b,
+            record,
+            &mut l,
+            &mut r,
+        )
+        .unwrap();
+        assert_eq!(l.len(), 100);
+        assert!(l.iter().zip(&r).all(|(a, b)| a == b));
+        // 41 pairs of the diagonal before candidate 4094 (row 40, column 94) and 82
+        // before candidate 8190 (row 81, column 90)
+        assert_eq!(admitted.take(), vec![41, 82]);
+        // A refusal of the product stops the exact join before any pair, and a refusal at
+        // a poll stops the filtered join with the pairs it had made.
         let refuse = |pairs: usize| {
-            if pairs > 90 {
+            if pairs > 50 {
                 Err(Error::Cancelled)
             } else {
                 Ok(())
@@ -470,7 +511,7 @@ mod tests {
         assert!(matches!(refused, Err(Error::Cancelled)), "{refused:?}");
         assert!(l.is_empty());
         let (mut l, mut r) = (Vec::new(), Vec::new());
-        zip(
+        let refused = zip(
             &ctx,
             &long,
             &long,
@@ -479,10 +520,46 @@ mod tests {
             refuse,
             &mut l,
             &mut r,
-        )
-        .unwrap();
-        assert_eq!(l.len(), 100);
-        assert!(l.iter().zip(&r).all(|(a, b)| a == b));
+        );
+        assert!(matches!(refused, Err(Error::Cancelled)), "{refused:?}");
+        assert_eq!(l.len(), 82);
+        // Runs of unequal lengths end where each side's key changes, and the distinct key
+        // after them pairs too. The product admitted is the runs' and not the columns'.
+        let mut a = vec![3i64; 100];
+        a.push(7);
+        let mut b = vec![3i64; 70];
+        b.extend([7, 7]);
+        let (a, b) = (ids(&a), ids(&b));
+        let (mut l, mut r) = (Vec::new(), Vec::new());
+        zip(&ctx, &a, &b, true, |_, _| true, record, &mut l, &mut r).unwrap();
+        let mut want: Vec<(u32, u32)> = (0..100u32)
+            .flat_map(|i| (0..70u32).map(move |j| (i, j)))
+            .collect();
+        want.extend([(100, 70), (100, 71)]);
+        assert_eq!(l.into_iter().zip(r).collect::<Vec<_>>(), want);
+        assert_eq!(admitted.take(), vec![7000, 4094]);
+        // A run of rejected candidates stops at a cancellation within one poll.
+        let tested = std::cell::Cell::new(0usize);
+        let cancelling = |_: usize, _: usize| {
+            tested.set(tested.get() + 1);
+            if tested.get() == 10 {
+                ctx.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            false
+        };
+        let (mut l, mut r) = (Vec::new(), Vec::new());
+        let stopped = zip(
+            &ctx, &long, &long, false, cancelling, record, &mut l, &mut r,
+        );
+        assert!(matches!(stopped, Err(Error::Cancelled)), "{stopped:?}");
+        assert!(
+            tested.get() >= 10 && tested.get() <= 10 + POLL,
+            "{}",
+            tested.get()
+        );
+        assert!(l.is_empty() && admitted.take().is_empty());
+        ctx.cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]
