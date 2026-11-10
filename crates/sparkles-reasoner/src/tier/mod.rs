@@ -49,6 +49,8 @@ pub(crate) struct Cands<'a> {
     parts: SmallVec<[Part<'a>; 4]>,
     lo: u32,
     hi: u32,
+    /// the ids do not ascend: the pieces of a predicate's order, sorted by subject
+    unordered: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -60,11 +62,7 @@ enum Part<'a> {
 
 impl<'a> Cands<'a> {
     pub fn empty() -> Cands<'a> {
-        Cands {
-            parts: SmallVec::new(),
-            lo: 0,
-            hi: 0,
-        }
+        Cands::with_bounds(0, 0)
     }
 
     /// The ids `[lo, hi)`, or nothing when `lo >= hi`.
@@ -88,7 +86,17 @@ impl<'a> Cands<'a> {
             parts: SmallVec::new(),
             lo,
             hi,
+            unordered: false,
         }
+    }
+
+    /// Whether the ids [`iter`](Self::iter) gives may not ascend. The ids of a probe with
+    /// a bound subject or object, of an id range and of a run's piece met by a filter
+    /// ascend, as the row lists before the tier did; the whole order of a predicate is
+    /// sorted by subject, so an evaluation that depends on the order sorts it.
+    #[inline]
+    pub fn unordered(&self) -> bool {
+        self.unordered
     }
 
     #[inline]
@@ -132,6 +140,8 @@ impl<'a> Cands<'a> {
             Cands::with_bounds(self.lo, self.hi),
             Cands::with_bounds(self.lo, self.hi),
         );
+        head.unordered = self.unordered;
+        tail.unordered = self.unordered;
         let mut left = n;
         for p in &self.parts {
             let (a, b) = p.split_at(left);
@@ -147,6 +157,7 @@ impl<'a> Cands<'a> {
         let n = n.max(1);
         let mut out = Vec::new();
         let mut cur = Cands::with_bounds(self.lo, self.hi);
+        cur.unordered = self.unordered;
         let mut room = n;
         for p in &self.parts {
             let mut p = *p;
@@ -155,10 +166,9 @@ impl<'a> Cands<'a> {
                 room -= a.len();
                 cur.add(a);
                 if room == 0 {
-                    out.push(std::mem::replace(
-                        &mut cur,
-                        Cands::with_bounds(self.lo, self.hi),
-                    ));
+                    let mut next = Cands::with_bounds(self.lo, self.hi);
+                    next.unordered = self.unordered;
+                    out.push(std::mem::replace(&mut cur, next));
                     room = n;
                 }
                 if b.len() == 0 {
@@ -540,6 +550,7 @@ impl Tier {
                             c.push_ids(run.ids(), !run.within(lo, hi));
                         }
                     }
+                    c.unordered = c.parts.len() > 1 || c.parts.first().is_some_and(|p| p.len() > 1);
                 }
             }
             (Some(s), None, o) => match (&self.by_s, o, &self.by_o) {
@@ -625,7 +636,11 @@ impl Tier {
         let first = off + start as u32;
         // the new ids grouped by relation: a counting sort
         let nrels = self.rels.len();
-        m.add(n * size_of::<u32>() + 2 * nrels * size_of::<usize>())?;
+        // the grouped ids, the two counting arrays and the tasks' results
+        let scratch = n * size_of::<u32>()
+            + 2 * (nrels + 1) * size_of::<usize>()
+            + nrels * size_of::<Result<usize, MemoryExceeded>>();
+        m.add(scratch)?;
         let mut counts = vec![0usize; nrels + 1];
         for &ri in &self.p[start..] {
             counts[ri as usize + 1] += 1;
@@ -737,7 +752,7 @@ impl Tier {
             m.sub(scratch);
         }
         drop(all);
-        m.sub(n * size_of::<u32>() + 2 * nrels * size_of::<usize>());
+        m.sub(scratch);
         Ok(())
     }
 }
