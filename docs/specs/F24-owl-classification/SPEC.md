@@ -1645,30 +1645,35 @@ the time of their normalization, their saturation, their candidate tests and the
 completion of their counting, and the counts of the conditional predecessor clauses and
 of the hypothetical successors under each rank are recorded.
 
-The outcome of the item. The gate is not met, and the item ships its clauses and its
-record. The first part is kept, with the `n = 1` revision above, so an exact or minimum
-cardinality in a negative position is the at-most clause with the neighbours in its body,
-an exact cardinality of one is `∃r.F ⊑ y ⊔ H`, a cardinality in a negative position over a
-non-simple role is left out and reported as the holder's clause was, and rooted runs keep
-their former translation. The second part, the low rank of `H`, stays behind
-`SPARKLES_DL_LOW_H`, off, since it diverges on `sriq-010` and finishes none of the three
-files. The third part, the witnesses' shared context, is not built, since the keyed
-successor's measurement showed that the cost of ore_ont_6485 lies in the equality
-reasoning over conditional successors, which no choice of the witnesses' contexts touches,
-and it goes to item 894 with the two versions of the Protein Ontology, whose cost it
-addresses. The product dedup and its memory charge are kept. On `atlas` on one thread,
-release, with the shared contexts and the control rank, ore_ont_6485 classifies in 11 ms
-without counting and its failed attempt with counting costs 190 ms, ore_ont_6952 907 ms
-and 1,105 ms, and ore_ont_10140 927 ms and 1,128 ms, each with `Stats::dl_counting_over`
-set and the answer of the run without counting. The development files, the generated
-fixtures with the 150 counting cases and the `shoi` and nominal fixtures give HermiT's
-taxonomies with no new timeout on one and eight threads, and the regressions of the
-predecessor, of the simple-role check, of the rooted translation and of the product
-record's charge are in the Tier D suite. The two regressions of the shared witness
-context go to item 894 with the third part. Item 894 is the calculus change for the
-equality reasoning that remains, from published calculi only, with the hypertableau's
-merging of equated terms and Kazakov and Klinov's exploration as the candidates named
-above, and its design is reviewed before any code as this one was.
+The item ends with its gate not met, and it ships its clauses and its record. The first
+part is kept, with the `n = 1` revision above, so an exact or minimum cardinality of two
+or more in a negative position is the at-most clause with the neighbours in its body, an
+exact cardinality of one is `∃r.F ⊑ y ⊔ H`, and rooted runs keep their former translation.
+A lazy clause over a non-simple role fails the simple-role check as an at-most clause does,
+and the run then leaves every disjunctive axiom out and reports it, as it did before the
+item. The `n = 1` form needs no such check, since it counts no neighbours. The second part,
+the low rank of `H`, stays behind `SPARKLES_DL_LOW_H`, off, since it diverges on `sriq-010`
+and finishes none of the three files. The third part, the witnesses' shared context, is
+not built, since the keyed successor's measurement showed that the cost of ore_ont_6485
+lies in the equality reasoning over conditional successors, which no choice of the
+witnesses' contexts touches, and it goes to item 894 with the two versions of the Protein
+Ontology, whose cost it addresses. The product dedup and its memory charge are kept. On
+`atlas` on one thread, release, with the binary of the keyed experiment set to the shared
+contexts and the control rank, which is the path the revert keeps, the whole classification
+of ore_ont_6485 takes 11 ms without counting and 190 ms with counting requested, where the
+attempt passes its bound and the run classifies again without it, ore_ont_6952 takes 907
+and 1,105 ms, and ore_ont_10140 927 and 1,128 ms, each with `Stats::dl_counting_over` set
+and the answer of the run without counting. The generated fixtures with the 150 counting
+cases and the `shoi` and nominal fixtures keep their results against HermiT on one and
+four classifier workers, with the five `shoi` fixtures of item 822 falling back as before,
+and the Tier D suite holds the regressions of the predecessor, of the simple-role check,
+of the rooted translation and of the product record's charge. The development files of
+the ORE 2015 DL sample were measured for time and not compared again against HermiT in
+this item, since counting stays off and the run without counting is unchanged. The two
+regressions of the shared witness context go to item 894 with the third part. Item 894 is
+the calculus change for the equality reasoning that remains, from published calculi only,
+with the hypertableau's merging of equated terms and Kazakov and Klinov's exploration as
+the candidates named above, and its design precedes its code.
 
 ### Nominals in the disjunctive rules
 

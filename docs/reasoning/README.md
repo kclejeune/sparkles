@@ -776,10 +776,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   item 768.
 * Counting is off by default. With it on, it passes its bound of derived conclusions on
   the five counting files of the ORE 2015 DL development set that the disjunctive rules
-  take, so those files get the answer without counting. On one thread on `atlas`,
-  ore_ont_6485 spends 190 ms on the attempt against 11 ms for the run without it, where
-  Konclude takes 18 ms on four threads, and the two versions of the Protein Ontology,
-  ore_ont_6952 and ore_ont_10140, spend 1.1 s against 0.9 s. Roadmap items 894 and 729.
+  take, so those files get the answer without counting. On one thread on `atlas`, the
+  whole classification of ore_ont_6485 takes 190 ms with counting requested, the attempt
+  and the run without it together, against 11 ms without counting, where Konclude takes
+  18 ms on four threads, and the two versions of the Protein Ontology, ore_ont_6952 and
+  ore_ont_10140, take 1.1 s against 0.9 s. Roadmap items 894 and 729.
 * BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies in 23 ms on four threads,
   the time Konclude takes, which is short of the classifier's aim of three times
   Konclude's speed. Roadmap item 712.

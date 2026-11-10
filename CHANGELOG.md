@@ -18,10 +18,10 @@ neighbours in its body, in place of a clause of every context with a holder, and
 cardinality of one is an existential restriction in a negative position, so that no
 context speculates about its predecessor's type. A product of the at-most and predecessor
 rules derives each distinct conclusion once and charges its record to the memory budget.
-A cardinality in a negative position over a non-simple role is left out and reported.
-Counting stays off by default, since the three counting files of the ORE 2015 DL
-development set still pass its bound and classify again without it (roadmap item 728,
-with the calculus change in item 894).
+The new clauses take the simple-role check that the at-most clauses take. Counting
+stays off by default, since the three counting files of the ORE 2015 DL development set
+still pass its bound and classify again without it. This is roadmap item 728, and the
+calculus change that remains is item 894.
 
 ### Compatibility
 
