@@ -3724,30 +3724,25 @@ pub(super) fn join_est_dom(a: &Node, b: &Node, keys: &[VarId], backoff: bool, ct
 /// share `rows / distinct subjects` of the other side, where dividing by the pattern's own
 /// distinct keys would take them for a superset of the other side's. Classes stay with
 /// the characteristic sets, which know which predicates their instances have. The walk
-/// looks at 64 nodes at most, so a large plan is priced as before.
+/// descends through the joins, index joins, filters, sorts, projections and extends that
+/// bind `v`, the operators the join order builds over its inputs, and stops at any other,
+/// so that the plan builder, the join-order DP and the greedy path, which carry an
+/// input's domain up through the joins by maximum, see the same domains. It is unbounded,
+/// since a bound would let a deep subtree hide a scan that a summary remembers.
 pub(super) fn domain(ctx: &Ctx, n: &Node, v: VarId) -> f64 {
     if !ctx.opt.domain_estimates || !ctx.snap.delta.is_empty() || !n.vars.contains(&v) {
         return 0.0;
     }
     let rdf_type = super::charsets::rdf_type(ctx);
-    let mut budget = 64usize;
     let mut best = 0.0f64;
-    domain_walk(ctx, n, v, rdf_type, &mut budget, &mut best);
+    domain_walk(ctx, n, v, rdf_type, &mut best);
     best
 }
 
-fn domain_walk(
-    ctx: &Ctx,
-    n: &Node,
-    v: VarId,
-    rdf_type: Option<u64>,
-    budget: &mut usize,
-    best: &mut f64,
-) {
-    if *budget == 0 || !n.vars.contains(&v) {
+fn domain_walk(ctx: &Ctx, n: &Node, v: VarId, rdf_type: Option<u64>, best: &mut f64) {
+    if !n.vars.contains(&v) {
         return;
     }
-    *budget -= 1;
     match &n.kind {
         Kind::Scan(spec) | Kind::RangeScan(spec, _) => {
             *best = best.max(scan_domain(ctx, spec, v, rdf_type));
@@ -3756,7 +3751,7 @@ fn domain_walk(
             for p in &j.probes {
                 *best = best.max(scan_domain(ctx, &p.scan, v, rdf_type));
             }
-            domain_walk(ctx, &n.children[0], v, rdf_type, budget, best);
+            domain_walk(ctx, &n.children[0], v, rdf_type, best);
         }
         Kind::Join { .. }
         | Kind::Filter(_)
@@ -3764,7 +3759,7 @@ fn domain_walk(
         | Kind::Project(_)
         | Kind::Extend(..) => {
             for c in &n.children {
-                domain_walk(ctx, c, v, rdf_type, budget, best);
+                domain_walk(ctx, c, v, rdf_type, best);
             }
         }
         _ => {}

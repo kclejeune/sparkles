@@ -508,3 +508,51 @@ fn a_join_against_a_constant_restriction_is_estimated_from_the_predicates_domain
         );
     }
 }
+
+/// The domain of a restricted scan reaches the joins above it however deep the plan
+/// wraps it, and the plan builder sees the domain that the join-order summaries carried
+/// (item 874). With a walk of 64 nodes at most, 70 nested subqueries hid the scan from the builder
+/// while the DP and the greedy path remembered it, and their summaries disagreed with the
+/// built plans.
+#[test]
+fn a_restricted_scans_domain_is_seen_at_any_depth() {
+    let s = store_with(&users(4000), StoreOptions::default());
+    let o = QueryOptions {
+        optimizations: Some(Optimizations {
+            probed_keys: false,
+            characteristic_sets: false,
+            node_sets: false,
+            set_remainders: false,
+            ..Optimizations::ALL
+        }),
+        no_cache: true,
+        ..opts()
+    };
+    let wrapped = |depth: usize, rest: &str| {
+        let mut inner = String::from("?u ex:group ex:g3");
+        for _ in 0..depth {
+            inner = format!("{{ SELECT ?u WHERE {{ {inner} }} }}");
+        }
+        format!("SELECT * WHERE {{ {inner} . {rest} }}")
+    };
+    let top_est = |q: &str| {
+        let r = query(s.snapshot(), q, &o).unwrap();
+        let join = nodes(&r.plan)
+            .into_iter()
+            .find(|n| n.operator.contains("Join"))
+            .unwrap_or_else(|| panic!("{q}\n{:#?}", r.plan));
+        (r.len(), join.estimated_rows)
+    };
+    // two joins take the DP, sixteen the greedy path
+    let dp = " ?u ex:artist ?a . ?u ex:country ?c";
+    let greedy: String = (0..16).map(|i| format!(" ?u ex:name ?n{i} .")).collect();
+    for rest in [dp, greedy.as_str()] {
+        let (rows, shallow) = top_est(&wrapped(0, rest));
+        let (deep_rows, deep) = top_est(&wrapped(70, rest));
+        assert_eq!(rows, deep_rows);
+        assert!(
+            (shallow - deep).abs() <= shallow * 1e-9,
+            "the top join is estimated at {shallow} rows shallow and {deep} rows under 70 subqueries"
+        );
+    }
+}
