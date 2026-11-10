@@ -547,56 +547,6 @@ impl DlSt {
 /// The bit that marks the class a test context's core denies.
 const NEG: Ex = 1 << 31;
 
-/// The bit that marks a context made during the run as the hypothetical successor of an
-/// existential restriction keyed by its predecessor, item 728. Its core is `[e, HYP | k]`
-/// for the restriction `e` and the key `k`, the predecessor's own existential restriction
-/// when the predecessor is a hypothetical successor and the predecessor's context
-/// otherwise, and the context has the empty core.
-pub(super) const HYP: Ex = 1 << 30;
-
-/// The core of the hypothetical successor of `e` keyed by `k`.
-fn keyed_core(k: Ex, e: Ex) -> [Ex; 2] {
-    debug_assert!(k < HYP && e < HYP);
-    [e, HYP | k]
-}
-
-/// The existential restriction whose hypothetical successor the context `core` stands
-/// for, when the core is a keyed one.
-pub(super) fn keyed_of(core: &[Ex]) -> Option<Ex> {
-    match core {
-        [e, k] if k & (HYP | NEG) == HYP => Some(*e),
-        _ => None,
-    }
-}
-
-/// The existential restriction whose hypothetical successor the context `v` is, shared
-/// by every predecessor or keyed by one, if it is one.
-pub(super) fn hyp_of<S: Sink>(ix: &Index, out: &S, v: Ex) -> Option<Ex> {
-    if let Some(&e) = dix(ix).of_hyp.get(&v) {
-        return Some(e);
-    }
-    out.keyed_hyp(v)
-}
-
-/// Whether a run that counts, without the root, keys the hypothetical successors by the
-/// predecessor, which `SPARKLES_DL_KEYED_HYP=0` turns off for the comparison (item 728).
-pub fn keyed_hyps() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("SPARKLES_DL_KEYED_HYP").is_ok_and(|v| v == "0"))
-}
-
-/// The hypothetical successor the context `me` sends e's literals to: in a run that
-/// counts, without the root, the one keyed by `me`'s own existential restriction or by
-/// `me`, made when first needed, and otherwise the one every predecessor of `e` shares.
-fn hyp_ctx<S: Sink>(ix: &Index, me: Ex, out: &mut S, e: Ex) -> Ex {
-    let dx = dix(ix);
-    if dx.counting && dx.root.is_none() && keyed_hyps() {
-        let k = hyp_of(ix, out, me).unwrap_or(me);
-        return out.intern(&keyed_core(k, e));
-    }
-    dx.hyp.get(&e).copied().unwrap_or(TOP)
-}
-
 /// The test context of whether `x` is below one of `bs`, sorted: its core is `x` and the
 /// complements of `bs`.
 pub fn test(d: &super::saturate::Dynamic, x: Ex, bs: &[Ex]) -> Ex {
@@ -605,13 +555,9 @@ pub fn test(d: &super::saturate::Dynamic, x: Ex, bs: &[Ex]) -> Ex {
     d.intern(&core)
 }
 
-/// Starts a test context: its core, `owl:Thing` and the class it denies. A keyed
-/// hypothetical successor starts with `owl:Thing` alone, since its core is empty.
+/// Starts a test context: its core, `owl:Thing` and the class it denies.
 pub fn init_test<S: Sink>(st: &mut State, core: &[Ex], out: &mut S) {
     out.me(Concl::Sub(TOP));
-    if keyed_of(core).is_some() {
-        return;
-    }
     for &m in core {
         if m & NEG != 0 {
             ds(st).neg.push(m & !NEG);
@@ -2226,15 +2172,15 @@ pub fn dedge<S: Sink>(ix: &Index, me: Ex, st: &mut State, u: Ex, e: Ex, out: &mu
     // a predecessor of a rooted run may reach the context over f_e(u) and finds the role
     // premises itself, with every role over f_e(u)
     let any = dix(ix).counting || dix(ix).root.is_some();
-    let hyp = hyp_of(ix, out, me);
     if tracing() {
         eprintln!(
-            "TR REG {} me={me} hyp={hyp:?} u={u} e={e}",
-            tr_ctx(st, false)
+            "TR REG {} me={me} hyp={:?} u={u} e={e}",
+            tr_ctx(st, false),
+            dix(ix).of_hyp.get(&me)
         );
     }
     let x = ds(st);
-    x.empty_core = hyp.is_some();
+    x.empty_core = dix(ix).of_hyp.contains_key(&me);
     if x.dpreds.contains(&(u, e)) {
         return false;
     }
@@ -2265,12 +2211,12 @@ pub fn dedge<S: Sink>(ix: &Index, me: Ex, st: &mut State, u: Ex, e: Ex, out: &mu
 /// The existential restrictions of this context whose successor is `v`: those it holds as
 /// units whose EL successor is v, and the one whose hypothetical successor v is, once the
 /// context registered with it.
-fn reaching(dx: &DlIx, st: &State, v: Ex, hyp: bool, out: &mut Vec<Ex>) {
+fn reaching(dx: &DlIx, st: &State, v: Ex, out: &mut Vec<Ex>) {
     out.clear();
     if let Some(x) = dl(st) {
         out.extend(x.edges.iter().filter(|&&(_, w)| w == v).map(|&(e, _)| e));
     }
-    if hyp {
+    if dx.of_hyp.contains_key(&v) {
         return;
     }
     if let Some(es) = dx.by_succ.get(&v) {
@@ -2312,7 +2258,7 @@ pub fn pred_c<S: Sink>(ix: &Index, me: Ex, st: &mut State, v: Ex, cid: u32, out:
     found.root = root;
     if !root {
         let mut es = Vec::new();
-        reaching(dx, st, v, hyp_of(ix, out, v).is_some(), &mut es);
+        reaching(dx, st, v, &mut es);
         for e in es {
             pred(ix, st, e, &c, None, &mut found, &out.dl().lits);
         }
@@ -2737,7 +2683,7 @@ pub(super) fn send_hyp<S: Sink>(ix: &Index, st: &mut State, v: Ex, a: Ex, out: &
         return;
     }
     let mut core = Vec::new();
-    if hyp_of(ix, out, v).is_none() {
+    if !dix(ix).of_hyp.contains_key(&v) {
         out.core(ix, v, &mut core);
     }
     if core.binary_search(&a).is_err() {
@@ -2756,6 +2702,7 @@ pub(super) fn send_hyp<S: Sink>(ix: &Index, st: &mut State, v: Ex, a: Ex, out: &
 fn target<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -> Ex {
     let dx = dix(ix);
     let unit = st.subs.contains(&e);
+    let h = dx.hyp.get(&e).copied().unwrap_or(TOP);
     let succ = ix.head(e).succ;
     if let Some(&(_, v)) = dl(st).and_then(|x| x.edges.iter().find(|&&(f, _)| f == e)) {
         return v;
@@ -2782,7 +2729,7 @@ fn target<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -> Ex
             return succ;
         }
         match k1.as_slice() {
-            [] => hyp_ctx(ix, me, out, e),
+            [] => h,
             [a] => *a,
             _ => out.intern(&k1),
         }
@@ -2790,7 +2737,7 @@ fn target<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -> Ex
         if unit {
             return succ;
         }
-        hyp_ctx(ix, me, out, e)
+        h
     };
     ds(st).edges.push((e, v));
     out.send(v, Concl::DEdge(me, e));

@@ -1479,6 +1479,28 @@ whose conclusions are all redundant still stops the run at its budget. The remed
 keyed by the predecessor's restriction, so that no context combines the markers of
 different predecessors.
 
+The measurement of the keyed successor. The keyed successor was built and measured and
+is not kept, and PERFORMANCE-EXPERIMENTS.md records it. A run that counts, without the
+root, sent a conditional existential restriction to a context made during the run and
+keyed by the predecessor's own existential restriction, when the predecessor is a
+hypothetical successor, and by the predecessor's context otherwise, against the shared
+context as the control. On ore_ont_6952 and ore_ont_10140 the two choices take the same
+time and both pass the bound, since their cost is the witnesses' unfolding and not the
+shared markers. On ore_ont_6485 both choices pass the default bound and the bound of four
+million conclusions. With the keyed successor the
+cost moves out of the hypothetical successors into one EL successor context, the
+successor of a witness `∃r.b_i` whose fresh filler lies below a union, which derives 1.9
+million paramodulations and 1.7 million lazy products of the four million. Its clauses
+hold the union's cases, each case's existential restrictions as conditional successor
+terms, eighteen of them, the lazy clauses equate the conditional qualified successors
+under the cases, and each equality, maximal in its clause since the terms rank above the
+atoms over x, rewrites every stored clause whose maximal literal is over the larger term,
+and the rewritten qualified-role literals feed the products again. Without the keyed
+successor the same four million spread over three class contexts. The keyed successor
+removes the combination of predecessors' markers and leaves this cost, which is the
+equality reasoning over conditional successors that the paper's Section 7 names as
+inherent in its translation of number restrictions, so it is not a remedy for this file.
+
 The third part gives the witnesses of one filler one context. A minimum `≥n r.F` in a
 positive position keeps its `n` witnesses `∃r.b_i` with fresh fillers `b_i ⊑ F` pairwise
 disjoint, since the terms must differ and the disjointness is what certifies that they
