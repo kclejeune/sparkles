@@ -13562,9 +13562,18 @@ A restart installs a new boot epoch before the process admits any claim, renewal
 publication. Attempts of an earlier epoch are interrupted, their runs return to their
 retry policy, and their tokens fail from then on. The ledger graph is hidden: it leaves
 every caller's query, Graph Store, listing, history and diff view, whatever the caller's
-grants say, and a request for it answers as for a graph that does not exist. Delivery
-through an outbox, recurring definitions and restore and clone recovery are
-[roadmap](ROADMAP.md) work.
+grants say, and a request for it answers as for a graph that does not exist. The surfaces
+that take no view follow the same exclusion. `/$/stats/{ds}` counts only the visible
+graphs, in its quad, base and delta totals, its graph list, its predicate counts and its
+class instances, while its vocabulary size and history figures describe the storage as a
+whole. The quad counts of `/$/datasets` and `/$/server` leave the ledger out. SHACL and
+ShEx validation never read it, and a validation that names it as its data or shapes graph
+gets `404`. Materialization never reads it, whatever input graphs a request names, so no
+rule copies a ledger value into the inferred graph. The MCP tools leave it out of every
+result. The counts a commit, a snapshot, a diff or a timeline bucket carries cover every
+graph, so the history routes leave them out while a dataset hides a graph, as they do for
+a caller whose grants cover only some graphs. Delivery through an outbox, recurring
+definitions and restore and clone recovery are [roadmap](ROADMAP.md) work.
 
 ### Suggested examples
 

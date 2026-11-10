@@ -44,7 +44,11 @@ worker's quads with the publication record, the source checkpoint and the run's 
 in one commit, so a retry after a lost response or a crash never duplicates its effects.
 A restart fences every earlier lease by boot epoch before the process admits a claim.
 The ledger graph is the first hidden managed graph: it leaves every request's and every
-library query's graph view, and only the jobs inspection renders it. Enabling jobs raises the dataset's `minimumReader` to 9, so older releases refuse to open
+library query's graph view, and only the jobs inspection renders it. Statistics, the
+dataset listings, validation, materialization, reasoning diagnostics and the MCP tools
+leave it out as well, and the history routes leave out the counts that cover every graph
+while a dataset hides one. A hidden graph no longer counts as a grant restriction, so
+branches, merges and source holds stay allowed on a dataset with jobs. Enabling jobs raises the dataset's `minimumReader` to 9, so older releases refuse to open
 such a dataset. The private import transport now names its destination reader as
 `IMPORTED_DESTINATION_READER`, one above `DATASET_READER`.
 

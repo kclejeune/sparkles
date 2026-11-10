@@ -318,7 +318,7 @@ pub(super) async fn list_snapshots(
     Extension(p): Extension<Principal>,
 ) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
-    let restricted = p.restricted(&ds.name);
+    let restricted = p.partial_view(&ds.name);
     let snaps: Vec<J> = ds
         .dataset
         .snapshots()
@@ -429,7 +429,7 @@ pub(super) async fn get_snapshot(
             format!("no snapshot '{snap}' in dataset {name}"),
         )
     })?;
-    Ok(Json(snapshot_json_for(&s, p.restricted(&ds.name))))
+    Ok(Json(snapshot_json_for(&s, p.partial_view(&ds.name))))
 }
 
 pub(super) async fn delete_snapshot(

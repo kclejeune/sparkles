@@ -2743,7 +2743,7 @@ async fn list_commits(
     } else {
         next
     };
-    if p.restricted(&ds.name) {
+    if p.partial_view(&ds.name) {
         commits.iter_mut().for_each(redact_commit_json);
     }
     Ok(Json(json!({
@@ -2793,7 +2793,7 @@ async fn get_commit(
         Err(e) => return Err(e.into()),
     };
     let mut commit = json!(detail);
-    if p.restricted(&ds.name) {
+    if p.partial_view(&ds.name) {
         redact_commit_json(&mut commit);
     }
     Ok(Json(json!({
@@ -4210,8 +4210,13 @@ fn dataset_info_for(st: &AppState, d: &Dataset, p: &Principal) -> J {
     if let Some(a) = p.access(&d.name) {
         info["access"] = a.as_str().into();
     }
-    if let Some(v) = p.view(&d.name, crate::auth::Endpoint::Info) {
-        redact_dataset_info(&mut info);
+    // the caller's view, and the dataset's hidden control graphs (spec C26 §2.3), which
+    // a listing without the dataset in its path does not get from the middleware
+    let view = d
+        .dataset
+        .hide_owner_graphs(p.view(&d.name, crate::auth::Endpoint::Info));
+    if let Some(v) = view {
+        redact_dataset_info(&mut info, p.restricted(&d.name));
         // the quads the caller can read, its guarded graphs decided at the snapshot
         let snap = d.store.snapshot();
         let v = v.bound(&snap);
@@ -4223,9 +4228,10 @@ fn dataset_info_for(st: &AppState, d: &Dataset, p: &Principal) -> J {
 }
 
 /// Leave out of a `DatasetInfo` the figures that count every graph (quads, index
-/// entries, inferences), for a caller whose grants cover only some graphs; `graphs:
-/// "limited"` says so. The caller fills in the quads it can read.
-pub(crate) fn redact_dataset_info(info: &mut J) {
+/// entries, inferences), for a caller who reads only some graphs, through its grants or
+/// because the dataset hides a control graph; `graphs: "limited"` says so when `limited`,
+/// that is when the grants are the reason. The caller fills in the quads it can read.
+pub(crate) fn redact_dataset_info(info: &mut J, limited: bool) {
     if let Some(m) = info.as_object_mut() {
         m.remove("quads");
         for k in ["text", "geo", "reasoning"] {
@@ -4238,7 +4244,9 @@ pub(crate) fn redact_dataset_info(info: &mut J) {
                 });
             }
         }
-        m.insert("graphs".into(), "limited".into());
+        if limited {
+            m.insert("graphs".into(), "limited".into());
+        }
     }
 }
 
@@ -6006,7 +6014,7 @@ async fn shacl(
         } else {
             let shapes = match &shapes_graph {
                 Some(iri) => {
-                    if !crate::validation_common::graph_exists(&snap, iri) {
+                    if !crate::validation_common::graph_visible(&ds.dataset, &snap, iri) {
                         return Err(err(
                             StatusCode::NOT_FOUND,
                             format!("no such shapes graph: <{iri}>"),
@@ -6033,7 +6041,7 @@ async fn shacl(
                 }
             };
             if let GraphParam::Named(iri) = &graph
-                && !crate::validation_common::graph_exists(&snap, iri)
+                && !crate::validation_common::graph_visible(&ds.dataset, &snap, iri)
             {
                 return Err(err(
                     StatusCode::NOT_FOUND,
@@ -6041,10 +6049,13 @@ async fn shacl(
                 ));
             }
             let mut opts = crate::shacl::validate_options(&snap, &graph, inferred, use_inferred)?;
-            // a shapes graph of the dataset is not part of the data it validates
+            // a shapes graph of the dataset is not part of the data it validates, and
+            // the dataset's hidden control graphs never are (spec C26 §2.3)
             if let Some(iri) = &shapes_graph {
                 opts.exclude_graphs.push(iri.clone());
             }
+            opts.exclude_graphs
+                .extend(ds.dataset.store().hidden_graphs());
             (std::sync::Arc::new(shapes), opts)
         };
         opts.timeout = Some(timeout);

@@ -1120,11 +1120,19 @@ impl Snapshot {
 
     /// Exact number of quads with a key prefix.
     pub fn count(&self, perm: Perm, prefix: &[u64]) -> Result<u64> {
+        let (base, ins, del) = self.count_split(perm, prefix)?;
+        Ok((base + ins).saturating_sub(del))
+    }
+
+    /// The parts of [`count`](Self::count): the quads with the prefix in the base
+    /// generation, those the delta inserted and those it deleted, for a reader that
+    /// reports the base and the delta separately.
+    pub fn count_split(&self, perm: Perm, prefix: &[u64]) -> Result<(u64, u64, u64)> {
         let base = self.perm(perm).count(&self.cache, prefix)?;
         let pi = perm.index();
         let ins = Delta::count_prefix(&self.delta.ins[pi], prefix);
         let del = Delta::count_prefix(&self.delta.del[pi], prefix);
-        Ok((base + ins).saturating_sub(del))
+        Ok((base, ins, del))
     }
 
     /// The exact number of quads of one predicate, from the generation's statistics and

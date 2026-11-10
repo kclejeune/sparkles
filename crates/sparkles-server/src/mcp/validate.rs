@@ -118,7 +118,7 @@ impl Tools<'_> {
         };
         let snap = self.snapshot(&ds, at_commit, at, self.call.arrived + timeout)?;
         if let GraphParam::Named(iri) = &graph
-            && !validation_common::graph_exists(&snap, iri)
+            && !validation_common::graph_visible(&ds.dataset, &snap, iri)
         {
             return Err(
                 ToolError::new("unknown-graph", 404, format!("no graph <{iri}>"))
@@ -129,7 +129,8 @@ impl Tools<'_> {
         let has_inferred = ds.reasoning.read().is_some();
         let inferred = has_inferred.then_some(INFERRED_GRAPH);
         let inputs = validation_common::inputs(&snap, &graph, inferred, reasoning)
-            .map_err(|e| ToolError::bad_argument(format!("{e:#}")))?;
+            .map_err(|e| ToolError::bad_argument(format!("{e:#}")))?
+            .excluding(&ds.dataset.store().hidden_graphs());
         Ok(Target {
             ds,
             snap,

@@ -309,3 +309,109 @@ async fn submit_claim_publish_and_fence_over_http() {
         "only failed or cancelled runs retry: {j} {location:?}"
     );
 }
+
+/// A persistent dataset with jobs enabled and one submitted run, so that its only quads
+/// are control records.
+async fn seeded() -> (tempfile::TempDir, Arc<AppState>, Router) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    state.attach("d", DbType::Persistent, None).unwrap();
+    let app = router(state.clone());
+    let (s, j, _) = call(&app, "PUT", "/$/jobs/d/settings", None, Some(settings())).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let body = json!({"definition": "collect", "idempotencyKey": "k1", "payload": {"page": 1}});
+    let (s, j, _) = call(&app, "POST", "/$/jobs/d", None, Some(body)).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{j}");
+    (dir, state, app)
+}
+
+#[tokio::test]
+async fn aggregates_and_listings_leave_the_hidden_ledger_out() {
+    let (_dir, state, app) = seeded().await;
+    let ledger = sparkles::jobs::LEDGER_GRAPH;
+    assert!(state.get("d").unwrap().dataset.snapshot().len() > 0);
+    // statistics
+    let (s, j, _) = call(&app, "GET", "/$/stats/d", None, None).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert!(!j.to_string().contains(ledger), "{j}");
+    assert!(!j.to_string().contains("urn:x-sparkles:jobs:"), "{j}");
+    assert_eq!(j["quads"], 0, "{j}");
+    assert_eq!(j["graphs"].as_array().map(Vec::len), Some(0), "{j}");
+    assert_eq!(j["classes"].as_array().map(Vec::len), Some(0), "{j}");
+    // the global listing and the server document, which name no dataset in their path
+    for uri in ["/$/datasets", "/$/server"] {
+        let (s, j, _) = call(&app, "GET", uri, None, None).await;
+        assert_eq!(s, StatusCode::OK, "{j}");
+        let d = j["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "d")
+            .unwrap()
+            .clone();
+        assert_eq!(d["quads"], 0, "{uri}: {d}");
+        assert!(d.get("graphs").is_none(), "the grants are not limited: {d}");
+    }
+    let (s, j, _) = call(&app, "GET", "/$/datasets/d", None, None).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!(j["quads"], 0, "{j}");
+    // history counts count every graph, so they are left out
+    let (s, j, _) = call(&app, "GET", "/$/commits/d/head", None, None).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert!(j["commit"].get("inserted").is_none(), "{j}");
+    let (s, j, _) = call(&app, "GET", "/$/commits/d", None, None).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let commits = j["commits"].as_array().unwrap();
+    assert!(!commits.is_empty());
+    assert!(commits.iter().all(|c| c.get("inserted").is_none()), "{j}");
+    // readiness sizes count every graph: left out for the dataset that hides one
+    state.attach("e", DbType::Mem, None).unwrap();
+    let (_, j, _) = call(&app, "GET", "/$/ready", None, None).await;
+    let ready = |name: &str| {
+        j["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    assert!(ready("e").get("deltaQuads").is_some(), "{j}");
+    assert!(ready("d").get("deltaQuads").is_none(), "{j}");
+}
+
+#[tokio::test]
+async fn validation_never_reads_the_hidden_ledger() {
+    let (_dir, _state, app) = seeded().await;
+    let ledger = sparkles::jobs::LEDGER_GRAPH;
+    // a shape over the run class would report every run, were the ledger read
+    let shapes = "@prefix sh: <http://www.w3.org/ns/shacl#> .
+        <urn:S> a sh:NodeShape ; sh:targetClass <urn:x-sparkles:jobs:Run> ;
+          sh:property [ sh:path <urn:x-sparkles:jobs:state> ; sh:maxCount 0 ] .";
+    for uri in ["/d/shacl?graph=union", "/d/shacl"] {
+        let req = Request::post(uri)
+            .header("content-type", "text/turtle")
+            .header("accept", "application/json")
+            .body(Body::from(shapes))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert!(body.contains("\"conforms\":true"), "{uri}: {body}");
+        assert!(!body.contains("urn:x-sparkles:jobs:run:"), "{uri}: {body}");
+    }
+    // the ledger named as the data graph is a graph that does not exist
+    let req = Request::post(format!("/d/shacl?graph={}", enc(ledger)))
+        .header("content-type", "text/turtle")
+        .header("accept", "application/json")
+        .body(Body::from(shapes))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}

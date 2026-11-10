@@ -136,7 +136,7 @@ pub(crate) async fn get(
                     j["snapshots"] = json!(names);
                 }
             }
-            if p.restricted(&on_branch(&name, &c.branch)) {
+            if p.partial_view(&on_branch(&name, &c.branch)) {
                 redact_commit_json(&mut j);
             }
             j

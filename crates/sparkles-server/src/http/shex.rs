@@ -36,7 +36,7 @@ mod enabled {
     use crate::auth::Principal;
     use crate::shex_cmd::{ShexFormat, write_report};
     use crate::state::AppState;
-    use crate::validation_common::{GraphParam, graph_exists};
+    use crate::validation_common::{GraphParam, graph_visible};
     use axum::extract::{Extension, Path};
     use axum::http::{HeaderMap, StatusCode, Uri, header};
     use axum::response::IntoResponse;
@@ -467,7 +467,7 @@ mod enabled {
                 MapText::Json(m) => ShapeMap::from_json(m).map_err(|e| syntax("shape map", &e))?,
             };
             if let GraphParam::Named(iri) = &p.graph
-                && !graph_exists(&snap, iri)
+                && !graph_visible(&ds.dataset, &snap, iri)
             {
                 return Err(err(
                     StatusCode::NOT_FOUND,
@@ -477,7 +477,8 @@ mod enabled {
             let inferred = has_inferred.then_some(INFERRED_GRAPH);
             let inputs =
                 crate::validation_common::inputs(&snap, &p.graph, inferred, p.use_inferred)
-                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?
+                    .excluding(&ds.dataset.store().hidden_graphs());
             let opts = ValidateOptions {
                 data_graph: inputs.data_graph,
                 extra_graphs: inputs.extra_graphs,

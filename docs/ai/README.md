@@ -697,9 +697,12 @@ In Rust, `Dataset::jobs()` configures, submits, claims, renews, publishes, fails
 retries and inspects. Over HTTP the routes are under `/$/jobs/{ds}`, described in
 [the API reference](../API.md#durable-jobs). The ledger graph leaves every caller's
 query, Graph Store, listing and history view, whatever the caller's grants say, and only
-the jobs inspection renders its records. The library's Graph Store, history, diff and dump
-handles subtract hidden graphs only from a view the caller gives, which roadmap item 902
-covers. Once configured, the ledger stays protected and hidden while jobs are disabled,
+the jobs inspection renders its records. Statistics, the dataset listings, validation,
+materialization and the MCP tools leave it out as well, and the history routes leave out
+the counts that cover every graph while a dataset hides one. The library's Graph Store,
+history, diff and dump handles subtract hidden graphs only from a view the caller gives,
+which roadmap item 902 covers, and a text, geo or vector index whose scope includes the
+ledger graph still indexes it, which item 904 covers. Once configured, the ledger stays protected and hidden while jobs are disabled,
 and a `managed.json` that cannot be read still hides it. A submitter's own grants must reach the definition's
 graphs, but a worker's publication is not intersected with the submitter's grants as they
 stand at publication, which item 903 covers. Delivery through an outbox, recurring

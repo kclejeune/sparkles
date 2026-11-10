@@ -843,18 +843,7 @@ impl Dataset {
         &self,
         graphs: Option<Arc<crate::access::GraphAccess>>,
     ) -> Option<Arc<crate::access::GraphAccess>> {
-        let hidden = self.inner.store.hidden_graphs();
-        if hidden.is_empty() {
-            return graphs;
-        }
-        let mut view = graphs
-            .map(|g| (*g).clone())
-            .unwrap_or_else(crate::access::GraphAccess::all);
-        for h in &hidden {
-            view.read = view.read.without_iri(h);
-            view.write = view.write.without_iri(h);
-        }
-        Some(Arc::new(view))
+        crate::access::GraphAccess::hiding_graphs(graphs, &self.inner.store.hidden_graphs())
     }
 
     /// `opts` under the dataset's memory pool, unless they name a pool or a grant.

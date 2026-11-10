@@ -2309,11 +2309,12 @@ impl Phase {
     }
 }
 
-/// [`dataset_ready`] for `p`: without the sizes, which count every graph, when its
-/// grants cover only some of the dataset's graphs.
+/// [`dataset_ready`] for `p`: without the sizes, which count every graph, when `p` reads
+/// only some of the dataset's graphs, or when the dataset hides a control graph (spec
+/// C26 §2.3), which a route without the dataset in its path does not tell `p` about.
 fn dataset_ready_for(d: &crate::state::Dataset, p: &crate::auth::Principal) -> J {
     let mut v = dataset_ready(d);
-    if p.restricted(&d.name)
+    if (p.partial_view(&d.name) || !d.dataset.store().hidden_graphs().is_empty())
         && let Some(m) = v.as_object_mut()
     {
         m.remove("walBytes");

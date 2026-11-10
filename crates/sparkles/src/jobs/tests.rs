@@ -182,6 +182,94 @@ fn a_registry_that_does_not_read_still_hides_the_ledger() {
 }
 
 #[test]
+fn statistics_count_only_the_visible_graphs() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    submit(&ds, "k1");
+    submit(&ds, "k2");
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{G}> {{ <urn:s1> a <urn:C> ; <urn:p> \"v\" }} <urn:s2> a <urn:C> }}"
+    ))
+    .unwrap();
+    let st = ds.stats(&Default::default()).unwrap();
+    assert_eq!(st.quads, 3, "{st:?}");
+    assert_eq!(st.base_quads, 0);
+    assert_eq!(st.delta_inserts, 3);
+    assert_eq!(st.delta_deletes, 0);
+    let names: Vec<Option<&str>> = st.graphs.iter().map(|g| g.name.as_deref()).collect();
+    assert_eq!(names, vec![None, Some(G)], "{st:?}");
+    assert!(
+        st.predicates
+            .iter()
+            .all(|p| !p.iri.starts_with("urn:x-sparkles:jobs:")),
+        "a ledger predicate is listed: {st:?}"
+    );
+    let rdf_type = st
+        .predicates
+        .iter()
+        .find(|p| p.iri == oxrdf::vocab::rdf::TYPE.as_str())
+        .expect("rdf:type is a visible predicate");
+    assert_eq!(rdf_type.count, 2, "the runs' types are left out: {st:?}");
+    assert_eq!(st.classes.len(), 1, "the run class is left out: {st:?}");
+    assert_eq!(st.classes[0].iri, "urn:C");
+    assert_eq!(st.classes[0].instances, 2);
+    // the figures of the raw snapshot differ, which is what the exclusion hides
+    assert!(ds.snapshot().len() > 3);
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn materialization_never_reads_the_ledger() {
+    use crate::reasoning::{ReasonRequest, reasoner::GraphRef};
+    let ds = Dataset::memory();
+    configured(&ds);
+    submit(&ds, "k1");
+    // a public schema triple over a ledger predicate: with the ledger as an input, RDFS
+    // would copy every run's definition name into the visible inferred graph
+    ds.update(
+        "INSERT DATA { <urn:x-sparkles:jobs:definition> \
+         <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> <urn:visible-definition> }",
+    )
+    .unwrap();
+    let req = ReasonRequest {
+        incremental: false,
+        threads: Some(1),
+        inputs: crate::reasoning::reasoner::Inputs {
+            data_graphs: vec![GraphRef::Default, GraphRef::Named(LEDGER_GRAPH.into())],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // the resolution the run uses leaves the ledger out, with a warning for the request
+    let hidden = ds.store().hidden_graphs();
+    let resolved =
+        crate::reasoning::reasoner::inputs::resolve_excluding(&ds.snapshot(), &req.inputs, &hidden);
+    assert_eq!(resolved.graphs, vec![GraphRef::Default]);
+    assert!(
+        resolved
+            .warnings
+            .iter()
+            .any(|w| w.contains(LEDGER_GRAPH) && w.contains("left out")),
+        "{:?}",
+        resolved.warnings
+    );
+    ds.reasoning().run(&req).unwrap();
+    assert!(
+        !ds.ask("ASK { ?run <urn:visible-definition> \"collect\" }")
+            .unwrap(),
+        "materialization copied a hidden ledger value into the inferred graph"
+    );
+    // the record describes what was read, so a job transition does not stale the closure
+    let record = ds.reasoning_record().expect("a record");
+    let recorded = record
+        .inputs
+        .as_ref()
+        .map(|i| i.to_string())
+        .unwrap_or_default();
+    assert!(!recorded.contains(LEDGER_GRAPH), "{record:?}");
+}
+
+#[test]
 fn a1_submission_is_idempotent_by_key_and_payload() {
     let ds = Dataset::memory();
     configured(&ds);

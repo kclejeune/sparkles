@@ -543,13 +543,24 @@ or a library query runs under: the server's authentication middleware subtracts 
 the principal's view for every route of the dataset, and the library subtracts them from
 the view of every SPARQL query it runs, including a caller's explicit all-graphs view.
 Of the surfaces that take a view, only the typed inspection of the jobs handle reads the
-ledger. A registry this build cannot enforce still hides the graphs its file names as
+ledger. The surfaces that take no view follow the exclusion on their own: the statistics
+count only the visible graphs, the dataset listings count only visible quads, SHACL and
+ShEx validation exclude the hidden graphs and answer a request that names one as for a
+graph that does not exist, materialization and reasoning diagnostics never read them
+whatever inputs a request names, and an MCP call hides each dataset's control graphs from
+its principal before any tool runs, since its dataset is an argument and not a path
+segment. A hidden graph does not restrict a grant, so whole-dataset operations such as
+branches and source holds stay allowed, but it makes the principal's view partial, and
+the counts that cover every graph leave the history responses as they do for a limited
+grant. A registry this build cannot enforce still hides the graphs its file names as
 hidden, and one whose file does not read hides the graphs that every configured owner
 always hides.
 
 Several parts of the design wait for later items. The library's Graph Store, history,
 diff and dump handles apply a caller's view when one is given but do not subtract hidden
-graphs on their own, which item 902 covers with the dispatch follow-ups. The dispatcher
+graphs on their own, which item 902 covers with the dispatch follow-ups. The text, geo
+and vector indexes index whatever graphs their scope names and answer hits before the
+query's view applies, which item 904 covers. The dispatcher
 scans the committed ledger by state within the bound of 4096 runs per state instead of
 keeping a ready-time index, inspection has no cursor, quotas are per dataset, a server
 shutdown does not fence claims, and the authority fence between a publication's
