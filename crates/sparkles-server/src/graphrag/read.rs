@@ -92,8 +92,8 @@ fn rows(
     snap: &Arc<Snapshot>,
     opts: &QueryOptions,
     q: &str,
-) -> Result<Vec<Vec<Option<Term>>>, Error> {
-    Ok(sparql::query(snap.clone(), q, opts)?.rows())
+) -> Result<sparql::output::OwnedRows, Error> {
+    sparql::query(snap.clone(), q, opts)?.rows()
 }
 
 fn lit(t: &Option<Term>) -> Option<String> {
@@ -131,6 +131,7 @@ pub fn level_counts(
     );
     let mut out = BTreeMap::new();
     for r in rows(snap, opts, &q)? {
+        let r = r.values();
         if let (Some(l), Some(n)) = (int(&r[0]), int(&r[1])) {
             out.insert(l as u32, n);
         }
@@ -209,6 +210,7 @@ fn reports_where(
     Ok(rows(snap, opts, &q)?
         .into_iter()
         .filter_map(|r| {
+            let r = r.values();
             Some(ReportRef {
                 iri: iri(&r[0])?,
                 community: iri(&r[1])?,
@@ -257,6 +259,7 @@ pub fn with_findings(
     );
     let mut by: HashMap<String, Vec<FindingRef>> = HashMap::new();
     for row in rows(snap, opts, &q)? {
+        let row = row.values();
         let (Some(r), Some(f), Some(text)) = (iri(&row[0]), iri(&row[1]), lit(&row[3])) else {
             continue;
         };
@@ -339,7 +342,10 @@ pub fn reports_of_members(
     );
     let mut pairs: Vec<(String, String, u64)> = rows(snap, opts, &q)?
         .into_iter()
-        .filter_map(|r| Some((iri(&r[0])?, iri(&r[1])?, int(&r[2])?)))
+        .filter_map(|r| {
+            let r = r.values();
+            Some((iri(&r[0])?, iri(&r[1])?, int(&r[2])?))
+        })
         .collect();
     // the finest first, so each member keeps the finest report that passes the filter
     pairs.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));

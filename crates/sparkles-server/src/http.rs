@@ -1396,6 +1396,33 @@ fn update_timeout(st: &AppState, params: &Params) -> Option<Duration> {
 
 /// A cancellation flag and the guard that sets it when dropped: kept in a handler's
 /// future, it stops the engine work of a request whose client disconnected.
+/// A streamed response body that holds its request's cancel guard, so that the
+/// producer keeps running while the body is read and stops once the body is dropped.
+struct CancelBody {
+    inner: axum::body::Body,
+    _cancel: CancelOnDrop,
+}
+
+impl http_body::Body for CancelBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 pub(crate) fn cancel_on_drop() -> (Arc<AtomicBool>, CancelOnDrop) {
     let cancel = Arc::new(AtomicBool::new(false));
     (cancel.clone(), CancelOnDrop(cancel))
@@ -2010,10 +2037,11 @@ pub(crate) async fn run_query(
             .await;
         }
     };
-    let algorithmic = r.ctx.calls_algorithm();
-    let derived = r.ctx.reasoning.clone();
+    let algorithmic = r.uses_algorithms();
+    let metadata = r.clone();
+    let derived = metadata.reasoning();
     let query_ms = r.timing.total_ms;
-    let cells = r.len().saturating_mul(r.vars.len().max(3));
+    let cells = r.len().saturating_mul(r.variables().len().max(3));
     let is_ask = r.kind == QueryKind::Ask;
     let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
     let truncated = r.describe_truncated;
@@ -2024,7 +2052,7 @@ pub(crate) async fn run_query(
     {
         // refuse before serializing when even the smallest encoding is too large
         let rows = send.map_or(r.len(), |s| s.min(r.len()));
-        let min = sfmt.min_bytes(rows, r.vars.len());
+        let min = sfmt.min_bytes(rows, r.variables().len());
         if min > l {
             return Err(Error::BudgetExceeded(sparkles::Budget {
                 kind: BudgetKind::ResultBytes,
@@ -2057,7 +2085,7 @@ pub(crate) async fn run_query(
         mem_peak_bytes: Some(r.mem_peak_bytes),
         rows_produced: Some(r.rows_produced),
         timing: Some(r.timing.clone()),
-        geo_work: crate::geo::plan_work(&r.plan),
+        geo_work: crate::geo::plan_work(r.plan()),
         ..Default::default()
     };
     // The repeatable serializer owns and borrows the immutable result on each
@@ -2067,6 +2095,10 @@ pub(crate) async fn run_query(
     // the rows the last attempt wrote whole, for the report of a body it stopped partway
     let sent_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let rows_written = sent_rows.clone();
+    // The retained answer decodes under the query's own cancel flag, so the request's
+    // cancel guard must outlive the handler while a streamed body is written. The
+    // response body holds it, so a client that leaves still cancels the writer.
+    let cancel_guard = _cancel_on_drop;
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
         let ts = std::time::Instant::now();
         let sent = std::cell::Cell::new(0);
@@ -2150,6 +2182,10 @@ pub(crate) async fn run_query(
         }
         stream::Serialized::Streamed(body) | stream::Serialized::Timed { body, .. } => {
             QUICK.record(quick_key, f64::INFINITY);
+            let body = axum::body::Body::new(CancelBody {
+                inner: body,
+                _cancel: cancel_guard,
+            });
             (body, report, Some(deferred))
         }
     };
@@ -2165,7 +2201,7 @@ pub(crate) async fn run_query(
         );
     }
     let resp = history::history_headers(resp, resolved.as_ref(), &uri);
-    let resp = with_reasoning(resp, derived.as_deref());
+    let resp = with_reasoning(resp, derived);
     // freshness is reported for the live state only
     let mut resp = match &resolved {
         Some(r) if r.historical => resp,
@@ -2256,13 +2292,11 @@ fn write_thrift_results(
     send: Option<usize>,
     sent: &std::cell::Cell<u64>,
 ) -> sparkles::Result<()> {
-    let mut out = jena_formats::ThriftResults::new(w, &r.vars)?;
-    let n = send.map_or(r.table.len(), |s| s.min(r.table.len()));
-    let mut row = Vec::with_capacity(r.vars.len());
+    let mut out = jena_formats::ThriftResults::new(w, r.variables())?;
+    let n = send.map_or(r.len(), |s| s.min(r.len()));
     for i in 0..n {
-        row.clear();
-        row.extend(r.table.cols.iter().map(|c| r.term(c[i])));
-        out.row(&row)?;
+        let row = r.row(i)?;
+        out.row(row.values())?;
         sent.set(sent.get() + 1);
     }
     out.finish()?;

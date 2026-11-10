@@ -116,13 +116,14 @@ fn suite(name: &str, failures: &mut Vec<String>) -> usize {
         }
         let ours: Rows = r
             .rows()
+            .unwrap()
             .into_iter()
             .map(|row| {
                 let mut v: Vec<(String, String)> = r
-                    .vars
+                    .variables()
                     .iter()
-                    .zip(row)
-                    .filter_map(|(k, t)| Some((k.clone(), t?.to_string())))
+                    .zip(row.values())
+                    .filter_map(|(k, t)| Some((k.clone(), t.as_ref()?.to_string())))
                     .collect();
                 v.sort();
                 v
@@ -164,7 +165,7 @@ fn no_schema_changes_nothing() {
             &opts,
         )
         .unwrap();
-        assert!(r.rows().is_empty());
+        assert!(r.is_empty());
     }
 }
 
@@ -200,8 +201,9 @@ fn update_where_sees_derived_triples() {
     .unwrap();
     let mut xs: Vec<String> = r
         .rows()
+        .unwrap()
         .into_iter()
-        .map(|row| match &row[0] {
+        .map(|row| match &row.values()[0] {
             Some(Term::NamedNode(n)) => n.as_str().to_string(),
             other => panic!("{other:?}"),
         })
@@ -223,7 +225,7 @@ fn schema_graph_follows_commits() {
     };
     let animals = |store: &Store| {
         let q = format!("{PREFIXES}SELECT ?x {{ ?x a ex:Animal }}");
-        query(store.snapshot(), &q, &opts).unwrap().rows().len()
+        query(store.snapshot(), &q, &opts).unwrap().len()
     };
     let insert = |triple: &str| {
         let u = format!("{PREFIXES}INSERT DATA {{ GRAPH ex:schema {{ {triple} }} }}");
@@ -276,7 +278,6 @@ fn many_subclasses() {
     let count = |q: &str| {
         query(s.snapshot(), &format!("{PREFIXES}{q}"), &opts)
             .unwrap()
-            .rows()
             .len()
     };
     assert_eq!(count("SELECT ?x { ?x a ex:Top }"), 20);

@@ -30,7 +30,7 @@
 //! limit, a shard of the run's table is emptied before it takes a new answer, and the
 //! answers of earlier runs are dropped when the run's answers join them.
 
-use crate::budget::{Budget, MemoryExceeded};
+use crate::budget::{Budget, Held};
 use crate::graph::Triple;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
@@ -389,7 +389,8 @@ impl Lookups {
     }
 
     /// Charge the answers to `budget` from now on, or fail when they do not fit.
-    pub fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), MemoryExceeded> {
+    #[cfg(test)]
+    pub fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), crate::budget::BudgetFailure> {
         if Arc::ptr_eq(&self.budget, budget) {
             return Ok(());
         }
@@ -398,6 +399,19 @@ impl Lookups {
         self.budget.release(n);
         self.budget = budget.clone();
         Ok(())
+    }
+
+    pub(crate) fn budget(&self) -> &Arc<Budget> {
+        &self.budget
+    }
+
+    /// Install a complete prepared component without releasing under its caller.
+    pub(crate) fn replace_credit(&mut self, held: Held) -> (Arc<Budget>, usize) {
+        let bytes = self.bytes();
+        assert_eq!(held.bytes(), bytes);
+        let old = std::mem::replace(&mut self.budget, held.budget().clone());
+        let _ = held.into_bytes();
+        (old, bytes)
     }
 
     /// The bytes charged for the answers.

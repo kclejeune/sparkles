@@ -27,8 +27,8 @@ fn show(row: &[Option<Term>]) -> String {
 /// The rows of the one-off query, with the dataset's query defaults.
 fn oracle(ds: &Dataset, q: &str) -> BTreeMap<String, i64> {
     let mut m = BTreeMap::new();
-    for r in ds.query(q).unwrap().rows() {
-        *m.entry(show(&r)).or_insert(0) += 1;
+    for r in ds.query(q).unwrap().rows().unwrap() {
+        *m.entry(show(r.values())).or_insert(0) += 1;
     }
     m
 }

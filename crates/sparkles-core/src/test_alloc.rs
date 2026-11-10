@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 
 thread_local! {
     // Allocation, real retained counter, value before physical free, event count.
-    static DEALLOCATION: Cell<(usize, usize, u64, usize)> = const { Cell::new((0, 0, 0, 0)) };
+    pub(crate) static DEALLOCATION: Cell<(usize, usize, u64, usize)> = const { Cell::new((0, 0, 0, 0)) };
 }
 
 /// The real Preparation outlives its raw counter borrow, and the watch cannot
@@ -66,12 +66,31 @@ impl Drop for Watch {
     }
 }
 
+thread_local! {
+    // Whether this thread records, and the largest allocation it has recorded.
+    static LARGEST: Cell<(bool, usize)> = const { Cell::new((false, 0)) };
+}
+
+/// The largest allocation `f` makes on this thread.
+pub(crate) fn record_largest(f: impl FnOnce()) -> usize {
+    LARGEST.with(|cell| cell.set((true, 0)));
+    f();
+    LARGEST.with(|cell| cell.replace((false, 0)).1)
+}
+
 struct AllocationObserver;
 // SAFETY: System receives exactly the original layouts. A selected test-thread
 // watch retains its actual Preparation until cleared. Dealloc reads one atomic
-// and updates Copy TLS only: no allocation, callback, borrow, panic or reentry.
+// and updates Copy TLS only, and alloc updates const Copy TLS only: no
+// allocation, callback, borrow, panic or reentry.
 unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let _ = LARGEST.try_with(|cell| {
+            let (on, largest) = cell.get();
+            if on {
+                cell.set((on, largest.max(layout.size())));
+            }
+        });
         unsafe { std::alloc::System.alloc(layout) }
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {

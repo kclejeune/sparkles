@@ -118,9 +118,14 @@ fn listing(
     fn uses(p: &sparkles_core::sparql::exec::PlanInfo) -> bool {
         p.operator == "PatternCount" || p.children.iter().any(uses)
     }
-    let mut rows: Vec<String> = r.rows().into_iter().map(|r| format!("{r:?}")).collect();
+    let mut rows: Vec<String> = r
+        .rows()
+        .unwrap()
+        .into_iter()
+        .map(|r| format!("{r:?}"))
+        .collect();
     rows.sort();
-    (rows, uses(&r.plan))
+    (rows, uses(r.plan()))
 }
 
 fn same_predicate_listing(snap: &std::sync::Arc<sparkles_core::store::Snapshot>) {

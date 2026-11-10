@@ -36,20 +36,29 @@ fn instant(second: i32) -> String {
 }
 
 fn verdicts(result: QueryResult) -> BTreeMap<String, String> {
-    let claim = result.vars.iter().position(|v| v == "claim").unwrap();
-    let verdict = result.vars.iter().position(|v| v == "verdict").unwrap();
+    let claim = result
+        .variables()
+        .iter()
+        .position(|v| v == "claim")
+        .unwrap();
+    let verdict = result
+        .variables()
+        .iter()
+        .position(|v| v == "verdict")
+        .unwrap();
     let revision = result
-        .vars
+        .variables()
         .iter()
         .position(|v| v == "sourceRevision")
         .unwrap();
     let status = result
-        .vars
+        .variables()
         .iter()
         .position(|v| v == "normalizationStatus")
         .unwrap();
     let mut out = BTreeMap::new();
-    for row in result.rows() {
+    for row in result.rows().unwrap() {
+        let row = row.values();
         assert!(matches!(row[revision], Some(Term::NamedNode(_))));
         assert!(matches!(row[status], Some(Term::NamedNode(_))));
         let Term::NamedNode(claim) = row[claim].as_ref().unwrap() else {

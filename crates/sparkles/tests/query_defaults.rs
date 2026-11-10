@@ -123,7 +123,7 @@ fn describe_follows_the_setting_unless_the_caller_sets_it() {
     assert_eq!(
         ds.query_with(q, &QueryOptions::default())
             .unwrap()
-            .triples
+            .triples()
             .len(),
         2
     );
@@ -132,7 +132,7 @@ fn describe_follows_the_setting_unless_the_caller_sets_it() {
         describe: DescribeOptions::default(),
         ..ds.query_options()
     };
-    assert_eq!(ds.query_with(q, &given).unwrap().triples.len(), 1);
+    assert_eq!(ds.query_with(q, &given).unwrap().triples().len(), 1);
 }
 
 /// One inference view per reasoning mode chooses what a query reads: the materialized

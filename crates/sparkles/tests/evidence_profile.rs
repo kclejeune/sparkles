@@ -27,10 +27,10 @@ fn query(name: &str) -> &'static str {
         .query
 }
 
-fn value<'a>(row: &'a sparkles::Solution, variable: &str) -> &'a str {
-    match row.get(variable).unwrap() {
-        Term::NamedNode(n) => n.as_str(),
-        Term::Literal(l) => l.value(),
+fn value(row: impl std::borrow::Borrow<sparkles::Solution>, variable: &str) -> String {
+    match row.borrow().get(variable).unwrap() {
+        Term::NamedNode(n) => n.as_str().to_owned(),
+        Term::Literal(l) => l.value().to_owned(),
         other => panic!("expected an IRI or literal for {variable}, found {other}"),
     }
 }
@@ -143,12 +143,17 @@ fn independent_occurrences_do_not_assert_propositions_or_collapse_polarity() {
             "https://example.org/claim3"
         ]
         .into_iter()
+        .map(String::from)
         .collect()
     );
     let scopes = ds.select("PREFIX ex: <https://example.org/> SELECT ?claim ?scope WHERE { ?claim ex:configuration ?scope } ORDER BY ?claim").unwrap();
     let scopes: Vec<_> = scopes
         .iter()
-        .map(|row| (value(row, "claim"), value(row, "scope")))
+        .map(|row| (value(&row, "claim"), value(&row, "scope")))
+        .collect();
+    let scopes: Vec<_> = scopes
+        .iter()
+        .map(|(claim, scope)| (claim.as_str(), scope.as_str()))
         .collect();
     assert_eq!(
         scopes,
@@ -196,7 +201,7 @@ fn mentions_lineage_and_missing_support_do_not_become_corroboration() {
         .iter()
         .find(|r| value(r, "revision") == format!("{EX}revision2"))
         .unwrap();
-    assert_eq!(value(unknown, "lineageStatus"), "unknown");
+    assert_eq!(value(&unknown, "lineageStatus"), "unknown");
     let unsupported = ds.select(query("unsupported-claims.rq")).unwrap();
     let unsupported: BTreeSet<_> = unsupported
         .iter()
@@ -218,19 +223,19 @@ fn retained_fixture_bytes_unicode_positions_and_json_pointer_digests_match() {
         .unwrap();
     let field = field.iter().next().unwrap();
     let raw = include_str!("../../../testsuite/evidence/v1/source.json");
-    assert_eq!(value(field, "digest"), digest(raw));
+    assert_eq!(value(&field, "digest"), digest(raw));
     let json: serde_json::Value = serde_json::from_str(raw).unwrap();
-    let selected = json.pointer(value(field, "pointer")).unwrap();
+    let selected = json.pointer(&value(&field, "pointer")).unwrap();
     assert_eq!(selected, "Café");
     assert_eq!(
-        value(field, "valueDigest"),
+        value(&field, "valueDigest"),
         digest(&serde_json::to_string(selected).unwrap())
     );
     let passages = ds.select(query("passage-selectors.rq")).unwrap();
     let passage = passages.iter().next().unwrap();
     let raw_text = include_str!("../../../testsuite/evidence/v1/source.txt");
-    let start: usize = value(passage, "start").parse().unwrap();
-    let end: usize = value(passage, "end").parse().unwrap();
+    let start: usize = value(&passage, "start").parse().unwrap();
+    let end: usize = value(&passage, "end").parse().unwrap();
     let rendition = ds.select("PREFIX ev: <urn:x-sparkles:evidence:> SELECT ?digest WHERE { <https://example.org/text> ev:contentDigest ?digest }").unwrap();
     assert_eq!(
         value(rendition.iter().next().unwrap(), "digest"),
@@ -240,8 +245,8 @@ fn retained_fixture_bytes_unicode_positions_and_json_pointer_digests_match() {
     assert_eq!(selected, "Café");
     assert_eq!(selected.chars().count(), 4);
     assert_eq!(selected.len(), 5);
-    assert_eq!(value(passage, "quote"), selected);
-    assert_eq!(value(passage, "digest"), digest(&selected));
+    assert_eq!(value(&passage, "quote"), selected);
+    assert_eq!(value(&passage, "digest"), digest(&selected));
 }
 
 #[test]
@@ -258,7 +263,7 @@ fn graph_kind_preserves_default_versus_a_named_graph_with_the_same_term() {
         .iter()
         .find(|r| value(r, "kind") == format!("{EV}NamedGraph"))
         .unwrap();
-    assert_eq!(value(named, "graph"), format!("{EV}DefaultGraph"));
+    assert_eq!(value(&named, "graph"), format!("{EV}DefaultGraph"));
 }
 
 #[test]
@@ -333,7 +338,11 @@ fn mapped_compatibility(ds: &Dataset, name: &str, visible: Option<&[&str]>) -> D
     };
     let result = ds.query_with(compatibility_query(name), &opts).unwrap();
     let mapped = Dataset::memory();
-    let text: String = result.triples.iter().map(|t| format!("{t} .\n")).collect();
+    let text: String = result
+        .triples()
+        .iter()
+        .map(|t| format!("{t} .\n"))
+        .collect();
     mapped.load_str(&text, RdfFormat::NTriples).unwrap();
     mapped
 }
@@ -466,6 +475,7 @@ fn evidence_query_retains_distinct_judgment_and_activity_identities() {
             )
         ]
         .into_iter()
+        .map(|(link, activity)| (link.to_owned(), activity.to_owned()))
         .collect()
     );
     assert!(

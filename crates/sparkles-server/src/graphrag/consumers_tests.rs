@@ -127,7 +127,7 @@ fn server(f: &Fixture) -> McpServer {
 }
 
 fn tool(f: &Fixture, name: &str, args: Value) -> Value {
-    let call = Call {
+    let mut call = Call {
         arrived: Instant::now(),
         cancel: Default::default(),
         request_id: "t".into(),
@@ -135,12 +135,14 @@ fn tool(f: &Fixture, name: &str, args: Value) -> Value {
         headers: None,
         held: None,
         grant: None,
+
+        preparation: None,
     };
     let Value::Object(mut m) = args else {
         panic!("arguments are an object")
     };
     m.insert("dataset".into(), "org".into());
-    match server(f).run_now(name, m, &call).unwrap() {
+    match server(f).run_now(name, m, &mut call).unwrap() {
         Outcome::Structured(v) => v,
         Outcome::Text(t) => Value::String(t),
     }

@@ -50,6 +50,10 @@ fn values(s: &Store, q: &str) -> Vec<String> {
         .unwrap_or_else(|e| panic!("{q}: {e}"));
     let mut v: Vec<String> = r
         .rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|row| match row.into_iter().next().flatten() {
             Some(Term::NamedNode(n)) => n.as_str().rsplit('/').next().unwrap().to_string(),

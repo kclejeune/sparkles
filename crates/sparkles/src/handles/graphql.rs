@@ -50,7 +50,7 @@ impl GraphQl {
         self.ds
             .state()
             .graphql
-            .put(config, change, &backs)
+            .put_checked(config, change, &backs)
             .map_err(|e| match e {
                 PutError::Engine(e) => e,
                 e => Error::Component(Box::new(
@@ -168,7 +168,7 @@ pub fn guard_shapes(
         };
         let q = format!("CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH {n} {{ ?s ?p ?o }} }}");
         if let Ok(r) = crate::sparql::query(snap.clone(), &q, &QueryOptions::default()) {
-            for t in &r.triples {
+            for t in r.triples() {
                 graph.insert(t);
             }
         }
@@ -245,27 +245,33 @@ impl Backing {
 
     /// Whether a shape of the guard requires a value of `path` for the class or one of
     /// its superclasses.
-    pub fn backs(&self, class: &str, path: &str, inverse: bool) -> bool {
+    pub fn backs(&self, class: &str, path: &str, inverse: bool) -> Result<bool> {
+        self.backs_with_options(class, path, inverse, &QueryOptions::default())
+    }
+
+    fn backs_with_options(
+        &self,
+        class: &str,
+        path: &str,
+        inverse: bool,
+        opts: &QueryOptions,
+    ) -> Result<bool> {
         if self.required.is_empty() {
-            return false;
+            return Ok(false);
         }
         let Ok(c) = oxrdf::NamedNode::new(class) else {
-            return false;
+            return Ok(false);
         };
         let q = format!(
             "SELECT DISTINCT ?s WHERE {{ {c} <http://www.w3.org/2000/01/rdf-schema#subClassOf>* ?s }}"
         );
-        let mut classes = vec![class.to_string()];
-        if let Ok(r) = crate::sparql::query(self.snap.clone(), &q, &QueryOptions::default()) {
-            for row in r.rows() {
-                if let Some(oxrdf::Term::NamedNode(n)) = &row[0] {
-                    classes.push(n.as_str().to_string());
-                }
-            }
-        }
-        self.required
-            .iter()
-            .any(|(k, p, i)| classes.contains(k) && p == path && *i == inverse)
+        let result = crate::sparql::query(self.snap.clone(), &q, opts)?;
+        let rows = result.rows()?;
+        Ok(self.required.iter().any(|(required,p,i)| {
+            p==path && *i==inverse && (required==class || rows.iter().any(|row| {
+                matches!(row.values().first().and_then(Option::as_ref),Some(oxrdf::Term::NamedNode(n)) if n.as_str()==required)
+            }))
+        }))
     }
 }
 
@@ -366,7 +372,7 @@ pub fn draft_of(
                 let q = format!("CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH {n} {{ ?s ?p ?o }} }}");
                 let res = crate::sparql::query(snap.clone(), &q, &qopts)?;
                 let mut graph = oxrdf::Graph::new();
-                for t in &res.triples {
+                for t in res.triples() {
                     graph.insert(t);
                 }
                 (graph, false)
@@ -430,4 +436,53 @@ pub fn draft_of(
         draft::render(types, Vec::new(), &prefixes, false, &header, "observed")
     };
     Ok((d, commit))
+}
+
+#[cfg(test)]
+mod backing_refusal_tests {
+    use super::*;
+    #[test]
+    fn actual_backing_preserves_query_refusal_and_borrows_ancestor_values() {
+        use std::sync::atomic::AtomicBool;
+        let store = Store::in_memory(Default::default());
+        let ancestor = format!("urn:{}", "x".repeat(64 << 10));
+        let mut write = store.write();
+        let child = write
+            .intern(&oxrdf::NamedNode::new_unchecked("urn:C").into())
+            .unwrap();
+        let subclass = write
+            .intern(
+                &oxrdf::NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#subClassOf")
+                    .into(),
+            )
+            .unwrap();
+        let parent = write
+            .intern(&oxrdf::NamedNode::new_unchecked(ancestor.clone()).into())
+            .unwrap();
+        write
+            .insert([child, subclass, parent, crate::id::Id::DEFAULT_GRAPH])
+            .unwrap();
+        write.commit().unwrap();
+        let backing = Backing {
+            required: vec![(ancestor, "urn:p".into(), false)],
+            snap: store.snapshot(),
+        };
+        assert!(backing.backs("urn:C", "urn:p", false).unwrap());
+        assert!(!backing.backs("urn:C", "urn:other", false).unwrap());
+        assert!(matches!(
+            backing.backs_with_options(
+                "urn:C",
+                "urn:p",
+                false,
+                &QueryOptions {
+                    cancel: Some(Arc::new(AtomicBool::new(true))),
+                    ..Default::default()
+                }
+            ),
+            Err(Error::Cancelled)
+        ));
+        assert!(
+            matches!(backing.backs_with_options("urn:C","urn:p",false,&QueryOptions { max_memory_bytes:Some(16 << 10),no_cache:true,..Default::default() }),Err(Error::BudgetExceeded(b)) if b.kind==crate::BudgetKind::Memory)
+        );
+    }
 }

@@ -60,9 +60,11 @@ fn select(s: &Store, q: &str) -> Vec<Vec<String>> {
     )
     .unwrap();
     r.rows()
+        .unwrap()
         .into_iter()
         .map(|row| {
-            row.into_iter()
+            row.values()
+                .iter()
                 .map(|t| match t {
                     Some(oxrdf::Term::Literal(l)) => l.value().to_string(),
                     Some(oxrdf::Term::NamedNode(n)) => n.as_str().to_string(),
@@ -300,11 +302,11 @@ fn graphalytics_request_selects_only_available_rows_and_summary() {
     let (q, vars) = query_text(&req, &prefixes(), false).unwrap();
     let result = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
     assert_eq!(vars, ["node", "coefficient"]);
-    assert_eq!(result.rows().len(), 7);
+    assert_eq!(result.len(), 7);
     let (q, vars) = query_text(&req, &prefixes(), true).unwrap();
     assert_eq!(vars, ["summary"]);
     let result = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
-    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.len(), 1);
     let mut ordinary = req.clone();
     ordinary.params.insert("graphalytics".into(), false.into());
     assert_eq!(

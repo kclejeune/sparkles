@@ -577,19 +577,19 @@ struct Answer {
 fn eager_answer(store: &Store, qtext: &str, opts: &QueryOptions) -> Result<Answer, String> {
     let r = sparkles_core::sparql::query(store.snapshot(), qtext, opts)
         .map_err(|e| format!("error: {e}"))?;
-    let rows = (0..r.table.len())
-        .map(|i| {
-            (0..r.vars.len())
-                .map(|c| r.term(r.table.cols[c][i]))
-                .collect()
-        })
+    // Independent conformance answer, matching the cursor fixture's owned cells.
+    let rows = r
+        .rows()
+        .map_err(|e| format!("error: {e}"))?
+        .iter()
+        .map(|row| row.values().to_vec())
         .collect();
     Ok(Answer {
         kind: r.kind,
         boolean: r.boolean,
-        vars: r.vars.clone(),
+        vars: r.variables().to_vec(),
         rows,
-        triples: r.triples.clone(),
+        triples: r.triples().to_vec(),
     })
 }
 
@@ -632,9 +632,13 @@ fn cursor_answer(
             answer.vars = cursor.variables().to_vec();
             while let Some(batch) = cursor.next_batch().map_err(|e| format!("error: {e}"))? {
                 for i in 0..batch.len() {
-                    answer
-                        .rows
-                        .push(batch.row(i).map_err(|e| format!("error: {e}"))?);
+                    answer.rows.push(
+                        batch
+                            .row(i)
+                            .map_err(|e| format!("error: {e}"))?
+                            .values()
+                            .to_vec(),
+                    );
                 }
             }
         }

@@ -111,7 +111,7 @@ fn operators(p: &PlanInfo, name: &str) -> Vec<String> {
     found
 }
 
-fn bag(rows: Vec<Vec<Option<Term>>>) -> Vec<String> {
+fn bag(rows: impl IntoIterator<Item = impl std::fmt::Debug>) -> Vec<String> {
     let mut result = rows
         .into_iter()
         .map(|r| format!("{r:?}"))
@@ -136,7 +136,7 @@ fn strict_rows(store: &Store, text: &str, options: &QueryOptions) -> Vec<String>
     let mut rows = Vec::new();
     while let Some(batch) = cursor.next_batch().unwrap() {
         for i in 0..batch.len() {
-            rows.push(batch.row(i).unwrap());
+            rows.push(batch.row(i).unwrap().values().to_vec());
         }
     }
     bag(rows)
@@ -152,22 +152,23 @@ fn bsbm_bi_q2_matches_an_oracle_through_a_keyed_join() {
             let r = query(store.snapshot(), &q2(p), &options(1_000_000, keyed)).unwrap();
             let got: Vec<(String, usize)> = r
                 .rows()
+                .unwrap()
                 .into_iter()
                 .map(|row| {
-                    let Some(Term::NamedNode(n)) = &row[0] else {
+                    let Some(Term::NamedNode(n)) = &row.values()[0] else {
                         panic!("{row:?}")
                     };
-                    let Some(Term::Literal(c)) = &row[1] else {
+                    let Some(Term::Literal(c)) = &row.values()[1] else {
                         panic!("{row:?}")
                     };
                     (n.as_str().to_string(), c.value().parse().unwrap())
                 })
                 .collect();
             assert_eq!(got, expected, "product {p}, keyed {keyed}");
-            let keyed_ops = operators(&r.plan, "KeyedJoin");
+            let keyed_ops = operators(r.plan(), "KeyedJoin");
             assert_eq!(keyed_ops.len(), usize::from(keyed), "{keyed_ops:?}");
             assert_eq!(
-                operators(&r.plan, "CartesianProduct").len(),
+                operators(r.plan(), "CartesianProduct").len(),
                 usize::from(!keyed)
             );
         }
@@ -184,7 +185,7 @@ fn keyed_join_avoids_a_product_over_the_row_limit() {
           ?other bsbm:productFeature ?g FILTER(?f = ?g) }";
     let limit = 2000;
     let r = query(store.snapshot(), text, &options(limit, true)).unwrap();
-    assert!(!r.rows().is_empty());
+    assert!(!r.is_empty());
     assert!(query(store.snapshot(), text, &options(limit, false)).is_err());
 }
 
@@ -255,7 +256,10 @@ fn keyed_join_keeps_value_equality_errors_and_unbound_values() {
         let text = format!("PREFIX ex: <http://example.org/> SELECT ?l ?r WHERE {{ {pattern} }}");
         let run = |keyed| {
             let r = query(store.snapshot(), &text, &options(1_000_000, keyed)).unwrap();
-            (bag(r.rows()), operators(&r.plan, "KeyedJoin").len())
+            (
+                bag(r.rows().unwrap()),
+                operators(r.plan(), "KeyedJoin").len(),
+            )
         };
         let (on, used) = run(true);
         let (off, unused) = run(false);
@@ -300,7 +304,7 @@ fn keyed_ask_limits_the_large_input_when_a_small_prefix_already_matches() {
         let opts = options(1024, true);
         let eager = query(store.snapshot(), text, &opts).unwrap();
         assert!(eager.boolean);
-        assert_eq!(operators(&eager.plan, "KeyedJoin").len(), 1);
+        assert_eq!(operators(eager.plan(), "KeyedJoin").len(), 1);
         let auto = query_execution(
             store.snapshot(),
             text,
@@ -311,13 +315,7 @@ fn keyed_ask_limits_the_large_input_when_a_small_prefix_already_matches() {
         .unwrap();
         assert!(matches!(auto, QueryExecution::Eager(_)));
         let select = text.replacen("ASK", "SELECT * WHERE", 1) + " LIMIT 1";
-        assert_eq!(
-            query(store.snapshot(), &select, &opts)
-                .unwrap()
-                .rows()
-                .len(),
-            1
-        );
+        assert_eq!(query(store.snapshot(), &select, &opts).unwrap().len(), 1);
     }
 }
 
@@ -431,12 +429,12 @@ fn application_callbacks_in_the_filter_keep_the_product() {
     let r = query(store.snapshot(), text, &options).unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
-        bag(r.rows()),
+        bag(r.rows().unwrap()),
         bag(vec![vec![Some(Term::NamedNode(
             NamedNode::new("urn:b").unwrap()
         ))]])
     );
-    assert!(operators(&r.plan, "KeyedJoin").is_empty());
+    assert!(operators(r.plan(), "KeyedJoin").is_empty());
 }
 
 /// SP2Bench q12a's shape: two large parts linked by an equality of names. A cursor
@@ -464,7 +462,7 @@ fn ask_over_a_large_keyed_join_reads_both_sides_alternately() {
             assert_eq!(r.boolean, expected, "{extra}, keyed {keyed}");
         }
         let r = query(store.snapshot(), &text, &options(100_000_000, true)).unwrap();
-        let keyed_ops = operators(&r.plan, "KeyedJoin");
+        let keyed_ops = operators(r.plan(), "KeyedJoin");
         assert_eq!(keyed_ops.len(), 1, "{extra}");
         for batch_rows in [1, 7, 4096] {
             let execution = query_execution(
@@ -662,7 +660,7 @@ fn forced_ask_probes_preserve_a_bounded_hash_cursor_for_repeated_keys() {
             assert!(answer.result().boolean);
             if batch_rows > 1 || produced.is_some() {
                 assert!(
-                    !operators(&answer.result().plan, "HashJoin").is_empty(),
+                    !operators(answer.result().plan(), "HashJoin").is_empty(),
                     "the bounded streaming hash input must remain available"
                 );
             }

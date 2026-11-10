@@ -1017,11 +1017,13 @@ impl Table {
     }
 }
 
-/// Convert a table, handing each triple to `sink`.
+/// Convert a table, lending each complete triple to `sink` for its callback.
+/// The callback may read or serialize the borrow without detaching query storage;
+/// an application that retains a triple makes its own explicit copy.
 pub fn convert(
     input: impl Read,
     opts: &Options,
-    sink: &mut dyn FnMut(Triple) -> Result<()>,
+    sink: &mut dyn FnMut(&Triple) -> Result<()>,
 ) -> Result<Stats> {
     let mut stats = Stats::default();
     let name = opts.name.clone();
@@ -1081,8 +1083,8 @@ pub fn convert(
     if quiet && opts.keys.is_none() {
         return Ok(stats);
     }
-    let mut discard = |_: Triple| -> Result<()> { Ok(()) };
-    let sink: &mut dyn FnMut(Triple) -> Result<()> = if quiet { &mut discard } else { sink };
+    let mut discard = |_: &Triple| -> Result<()> { Ok(()) };
+    let sink: &mut dyn FnMut(&Triple) -> Result<()> = if quiet { &mut discard } else { sink };
     let table_url = match desc
         .url
         .clone()
@@ -1208,7 +1210,7 @@ pub fn convert(
         let s = Standard::new(metadata.as_deref(), &desc, &table, opts.part).map_err(fail)?;
         for t in s.head.clone() {
             stats.triples += u64::from(!quiet);
-            sink(t)?;
+            sink(&t)?;
         }
         Some(s)
     } else {
@@ -1230,7 +1232,7 @@ pub fn convert(
     let mut warned = vec![0usize; width];
     let mut key_warned = 0usize;
     let mut row = 0u64;
-    let mut emit = |t: Triple, stats: &mut Stats| -> Result<()> {
+    let mut emit = |t: &Triple, stats: &mut Stats| -> Result<()> {
         stats.triples += u64::from(!quiet);
         sink(t)
     };
@@ -1325,7 +1327,7 @@ pub fn convert(
                 })?;
                 if let Some(s) = &standard {
                     for t in s.row(&r, &subjects) {
-                        emit(t, &mut stats)?;
+                        emit(&t, &mut stats)?;
                     }
                 }
             }
@@ -2024,7 +2026,7 @@ fn run_batch(
     first: u64,
     last: u64,
     name: &str,
-    sink: &mut dyn FnMut(Triple) -> Result<()>,
+    sink: &mut dyn FnMut(&Triple) -> Result<()>,
 ) -> Result<()> {
     run.run(vars, rows, sink).map_err(|e| match e {
         Error::Invalid(m) => Error::invalid(format!("{name}: data rows {first} to {last}: {m}")),
@@ -2060,7 +2062,7 @@ fn emit_row(
     table: &Table,
     r: &RowCtx<'_>,
     name: &str,
-    sink: &mut dyn FnMut(Triple) -> Result<()>,
+    sink: &mut dyn FnMut(&Triple) -> Result<()>,
 ) -> Result<()> {
     let row_node = || {
         NamedOrBlankNode::BlankNode(BlankNode::new_unchecked(format!(
@@ -2068,7 +2070,7 @@ fn emit_row(
             table.index, r.source_row
         )))
     };
-    let out = |t: Triple, sink: &mut dyn FnMut(Triple) -> Result<()>| sink(t);
+    let out = |t: Triple, sink: &mut dyn FnMut(&Triple) -> Result<()>| sink(&t);
     for (i, c) in table.columns.iter().enumerate() {
         if c.suppress {
             continue;
@@ -2276,11 +2278,11 @@ pub fn write(
         }
     };
     let quads = format.supports_datasets();
-    let stats = convert(input, opts, &mut |t: Triple| {
+    let stats = convert(input, opts, &mut |t: &Triple| {
         if quads && let Some(g) = graph {
             w.serialize_quad(t.as_ref().in_graph(g.as_ref()))
         } else {
-            w.serialize_triple(&t)
+            w.serialize_triple(t)
         }
         .map_err(map_io)
     })?;

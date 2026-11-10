@@ -1,3 +1,5 @@
+include!("support/retained_rows_eq.rs");
+
 use oxrdf::{Literal, Term};
 use sparkles_core::sparql::extensions::{
     ExtensionRegistry, ScalarContext, ScalarDescriptor, ScalarError, ScalarFunction, ScalarResult,
@@ -200,7 +202,10 @@ fn late_callbacks_keep_snapshot_and_nested_family_restrictions() {
                     });
                     let result = query(a.snapshot(), &source, &safe).unwrap();
                     assert!(safe_succeeded.load(Ordering::SeqCst));
-                    assert_eq!(result.rows()[0][0], Some(Literal::from("safe").into()));
+                    assert_eq!(
+                        result.row(0).unwrap().values()[0],
+                        Some(Literal::from("safe").into())
+                    );
 
                     let captured_store = a.clone();
                     let captured_snapshot = snapshot.clone();
@@ -478,7 +483,10 @@ fn independent_registries_and_prepared_runs_keep_callbacks_isolated() {
                 let result =
                     sparkles_core::sparql::execute_query(store.snapshot(), &parsed, &opts, 0.0)
                         .unwrap();
-                assert_eq!(result.rows()[0][0], Some(Literal::from(expected).into()));
+                assert_eq!(
+                    result.row(0).unwrap().values()[0],
+                    Some(Literal::from(expected).into())
+                );
             }
         })
     });
@@ -512,7 +520,10 @@ fn result_owns_registry_until_closed() {
     .unwrap();
     drop(opts);
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
-    assert_eq!(result.rows()[0][0], Some(Literal::from("kept").into()));
+    assert_eq!(
+        result.row(0).unwrap().values()[0],
+        Some(Literal::from("kept").into())
+    );
     drop(result);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }
@@ -550,8 +561,8 @@ fn expression_errors_arity_unbound_and_short_circuit() {
         &opts,
     )
     .unwrap();
-    let rows = result.rows();
-    let row = &rows[0];
+    let rows = result.rows().unwrap();
+    let row = &rows.row(0).unwrap().values();
     assert!(row[0].is_none() && row[1].is_none() && row[6].is_none() && row[7].is_none());
     assert_eq!(row[2], Some(Literal::from(7).into()));
     assert_eq!(row[3], Some(Literal::from(8).into()));
@@ -578,8 +589,8 @@ fn callback_terms_preserve_rdf12_and_cannot_forge_blank_nodes() {
         &opts,
     )
     .unwrap();
-    for row in result.rows() {
-        assert_eq!(row[0], row[1]);
+    for row in result.rows().unwrap() {
+        assert_eq!(row.values()[0], row.values()[1]);
     }
     let result = query(
         store.snapshot(),
@@ -587,8 +598,8 @@ fn callback_terms_preserve_rdf12_and_cannot_forge_blank_nodes() {
         &opts,
     )
     .unwrap();
-    let stored = result.rows()[0][0].clone().unwrap();
-    assert_eq!(Some(stored.clone()), result.rows()[0][1]);
+    let stored = result.row(0).unwrap().values()[0].clone().unwrap();
+    assert_eq!(Some(stored.clone()), result.row(0).unwrap().values()[1]);
     let forged = stored.clone();
     let opts = options(move |_: &ScalarContext<'_>, _: &[Term]| Ok(forged.clone()));
     let result = query(
@@ -597,8 +608,11 @@ fn callback_terms_preserve_rdf12_and_cannot_forge_blank_nodes() {
         &opts,
     )
     .unwrap();
-    assert_ne!(result.rows()[0][0], Some(stored));
-    assert!(matches!(&result.rows()[0][0], Some(Term::BlankNode(_))));
+    assert_ne!(result.row(0).unwrap().values()[0], Some(stored));
+    assert!(matches!(
+        &result.row(0).unwrap().values()[0],
+        Some(Term::BlankNode(_))
+    ));
 }
 
 #[test]
@@ -621,11 +635,15 @@ fn unused_registry_preserves_plans_and_does_not_invoke_callbacks() {
             anonymous.replace_all(&serde_json::to_string(&plain.1).unwrap(), "anonymous"),
             anonymous.replace_all(&serde_json::to_string(&registered.1).unwrap(), "anonymous")
         );
-        assert_eq!(
+        assert_retained_rows_eq!(
             query(store.snapshot(), source, &Default::default())
                 .unwrap()
-                .rows(),
-            query(store.snapshot(), source, &opts).unwrap().rows()
+                .rows()
+                .unwrap(),
+            query(store.snapshot(), source, &opts)
+                .unwrap()
+                .rows()
+                .unwrap()
         );
     }
 }
@@ -824,7 +842,9 @@ fn unrelated_unheld_family_query_remains_safe() {
                 &opts
             )
             .unwrap()
-            .rows()[0][0],
+            .row(0)
+            .unwrap()
+            .values()[0],
             Some(Literal::from("safe").into())
         );
     });
@@ -848,7 +868,10 @@ fn stable_context_and_explain_metadata() {
     };
     let source = format!("SELECT (<{IRI}>() AS ?a) (<{IRI}>() AS ?b) {{}}");
     let result = query(store.snapshot(), &source, &opts).unwrap();
-    assert_eq!(result.rows()[0][0], result.rows()[0][1]);
+    assert_eq!(
+        result.row(0).unwrap().values()[0],
+        result.row(0).unwrap().values()[1]
+    );
     let info =
         serde_json::to_string(&explain(store.snapshot(), &source, &opts).unwrap().1).unwrap();
     assert!(info.contains("scalar Stable") && info.contains("singleton batch"));
@@ -914,7 +937,11 @@ fn filter_sampling_and_filter_movement_do_not_invoke_or_drop_callbacks() {
         explain(store.snapshot(), &source, &opts).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(
-            query(store.snapshot(), &source, &opts).unwrap().rows()[0][0],
+            query(store.snapshot(), &source, &opts)
+                .unwrap()
+                .row(0)
+                .unwrap()
+                .values()[0],
             Some(Literal::from(64).into())
         );
         assert_eq!(calls.load(Ordering::SeqCst), 64);
@@ -1036,7 +1063,9 @@ fn callback_composite_literals_cannot_forge_stored_blank_nodes() {
         &Default::default(),
     )
     .unwrap()
-    .rows()[0][0]
+    .row(0)
+    .unwrap()
+    .values()[0]
         .clone()
         .unwrap();
     let Term::BlankNode(node) = &stored else {
@@ -1051,8 +1080,11 @@ fn callback_composite_literals_cannot_forge_stored_blank_nodes() {
         "SELECT (<http://w3id.org/awslabs/neptune/SPARQL-CDTs/get>(<{IRI}>(), 1) AS ?x) {{}}"
     );
     let result = query(store.snapshot(), &source, &opts).unwrap();
-    assert!(matches!(result.rows()[0][0], Some(Term::BlankNode(_))));
-    assert_ne!(result.rows()[0][0], Some(stored));
+    assert!(matches!(
+        result.row(0).unwrap().values()[0],
+        Some(Term::BlankNode(_))
+    ));
+    assert_ne!(result.row(0).unwrap().values()[0], Some(stored));
 }
 
 #[test]
@@ -1068,7 +1100,10 @@ fn topk_does_not_duplicate_first_key_or_skip_later_callback_keys() {
     for keys in [format!("<{IRI}>(?x) ?x"), format!("?x <{IRI}>(?x)")] {
         let source = format!("SELECT ?x {{VALUES ?x {{{values}}}}} ORDER BY {keys} LIMIT 1");
         let result = query(store.snapshot(), &source, &opts).unwrap();
-        assert_eq!(result.rows()[0][0], Some(Literal::from(0).into()));
+        assert_eq!(
+            result.row(0).unwrap().values()[0],
+            Some(Literal::from(0).into())
+        );
         assert_eq!(calls.swap(0, Ordering::SeqCst), 64);
     }
 }

@@ -718,7 +718,19 @@ pub struct Ctx {
     // Data and weak retained caches drop before final ledger ownership.
     fast: FastMemory,
     memory: std::sync::OnceLock<Arc<QueryMemoryLedger>>,
+    // All ordinary payloads, including graphs and ledger callbacks, retire before
+    // their actual sources. A new mask can share its original source's backing.
+    pub(super) source_view: Option<crate::access::PreparedView>,
+    pub(super) read_source: Option<crate::store::BoundReadSource>,
+    pub(super) source_preparation: Option<crate::access::Preparation>,
+    pub(super) source_setup: Option<crate::access::Reservation>,
+    #[cfg(test)]
+    pub(super) chunk_hook: parking_lot::Mutex<Option<ChunkHook>>,
 }
+
+/// A test observer of the chunks a retained output takes.
+#[cfg(test)]
+pub(super) type ChunkHook = Arc<dyn Fn(&'static str, usize) + Send + Sync>;
 
 /// Set in [`FastMemory::live`] once the ledger has taken the account over.
 const PROMOTED: u64 = 1 << 63;
@@ -805,13 +817,65 @@ pub(super) enum Accounting {
     Cursor,
 }
 
-/// The first budget refusal that infallible code met. Scalar evaluation cannot return
-/// a budget error, so it records the refusal here and the next check fails with it,
+/// The first supported resource refusal that infallible code met. Scalar evaluation cannot return
+/// a resource error, so it records the refusal here and the next check fails with it,
 /// which keeps a refused allocation from becoming an unbound value.
 #[derive(Default)]
 struct MemoryFailure {
-    failure: parking_lot::Mutex<Option<Budget>>,
+    failure: parking_lot::Mutex<Option<ResourceRefusal>>,
     failed: AtomicBool,
+}
+
+/// Only the supported resource outcomes become sticky. Arbitrary scalar/service
+/// errors keep their existing semantics; typed ownership errors never become UNDEF.
+#[derive(Clone)]
+enum ResourceRefusal {
+    Budget(Budget),
+    Parent {
+        component: &'static str,
+        code: String,
+        message: String,
+        source: sparkles_budget::ParentRefused,
+    },
+    Cancelled,
+    Timeout,
+}
+
+impl ResourceRefusal {
+    fn from_error(error: &Error) -> Option<Self> {
+        match error {
+            Error::BudgetExceeded(budget) => Some(Self::Budget(*budget)),
+            Error::Cancelled => Some(Self::Cancelled),
+            Error::Timeout => Some(Self::Timeout),
+            Error::Component(component) => component
+                .source
+                .as_ref()
+                .and_then(|source| source.downcast_ref::<sparkles_budget::ParentRefused>())
+                .map(|source| Self::Parent {
+                    component: component.component,
+                    code: component.code.clone(),
+                    message: component.message.clone(),
+                    source: *source,
+                }),
+            _ => None,
+        }
+    }
+
+    fn into_error(self) -> Error {
+        match self {
+            Self::Budget(budget) => Error::BudgetExceeded(budget),
+            Self::Cancelled => Error::Cancelled,
+            Self::Timeout => Error::Timeout,
+            Self::Parent {
+                component,
+                code,
+                message,
+                source,
+            } => Error::Component(Box::new(
+                crate::error::ComponentError::new(component, code, message).with_source(source),
+            )),
+        }
+    }
 }
 
 /// The high-water envelope that transient dictionary decoding reserves in both
@@ -858,6 +922,58 @@ impl Ctx {
             fast.eager.load(Ordering::Acquire),
             fast.peak.load(Ordering::Acquire),
         )
+    }
+
+    pub(super) fn owns_ledger(&self, ledger: &Arc<QueryMemoryLedger>) -> bool {
+        self.memory
+            .get()
+            .is_some_and(|own| Arc::ptr_eq(own, ledger))
+    }
+
+    /// A distinct reasoning child sharing this query's live total and original
+    /// backing. Construct it only when reasoning starts; ordinary execution keeps
+    /// its existing lazy fast account. The child retains accounting, not this Ctx.
+    pub fn memory_parent(&self) -> Result<sparkles_budget::ParentHandle> {
+        self.memory()
+            .child_parent(self.grant.clone(), self.mem_limit)
+    }
+
+    /// Attach a seed subcontext to its outer query before any charge. It retains
+    /// its own ledger/data lifetime and never reuses the outer primary owner id.
+    pub(crate) fn set_memory_parent(
+        &mut self,
+        parent: sparkles_budget::ParentHandle,
+    ) -> Result<()> {
+        if self.memory.get().is_some()
+            || self.fast.live.load(Ordering::Relaxed) != 0
+            || self.fast.eager.load(Ordering::Relaxed) != 0
+            || self.fast.peak.load(Ordering::Relaxed) != 0
+        {
+            return Err(Error::invalid(
+                "upstream query memory is set before the first charge",
+            ));
+        }
+        let factory = self
+            .grant
+            .as_ref()
+            .map_or(sparkles_budget::MemoryDomain::unpooled(), |g| {
+                g.memory_domain()
+            });
+        if factory.id() != parent.domain() {
+            return Err(Error::Component(Box::new(
+                crate::error::ComponentError::new(
+                    "query-memory",
+                    "foreign-domain",
+                    "upstream memory belongs to another accounting domain",
+                ),
+            )));
+        }
+        let ledger = QueryMemoryLedger::nested(self.grant.clone(), parent);
+        self.memory
+            .set(ledger)
+            .map_err(|_| Error::invalid("query memory already initialized"))?;
+        self.fast.live.store(PROMOTED, Ordering::Release);
+        Ok(())
     }
 
     /// The grant the query charges, if it has one.
@@ -1031,6 +1147,12 @@ impl Ctx {
             fast: Default::default(),
             memory: Default::default(),
             snap,
+            read_source: None,
+            source_view: None,
+            source_preparation: None,
+            source_setup: None,
+            #[cfg(test)]
+            chunk_hook: parking_lot::Mutex::new(None),
             local: RwLock::new(AppendVocab::default()),
             values: Default::default(),
             next_bnode: AtomicU64::new(0),
@@ -1309,6 +1431,15 @@ impl Ctx {
         #[cfg(test)]
         CHECKS.with(|n| n.set(n.get() + 1));
         self.check_memory_failure()?;
+        if let Some(preparation) = &self.source_preparation {
+            // Both source and query absolute controls apply during preparation
+            // and execution, without cursor wait extensions or renewed deadlines.
+            preparation.check()?;
+        } else if let Some(source) = &self.read_source {
+            // Source preparation has its original absolute deadline. Cursor wait
+            // pauses never extend it, and no cancellation watcher is required.
+            source.query_input().2.check()?;
+        }
         if self.calls_extensions
             && let Some(state) = &self.extension_failure
             && let Some(failure) = state.lock().as_ref()
@@ -1549,24 +1680,24 @@ impl Ctx {
     #[cold]
     #[inline(never)]
     fn recorded_failure(&self) -> Result<()> {
-        match *self.memory_failure.failure.lock() {
-            Some(budget) => Err(Error::BudgetExceeded(budget)),
+        let failure = self.memory_failure.failure.lock().clone();
+        match failure {
+            Some(failure) => Err(failure.into_error()),
             None => Ok(()),
         }
     }
 
-    /// Record a budget refusal that infallible code met, so that the next check fails
-    /// with it, in both accounting modes.
+    /// Record the first supported resource refusal met by infallible code, so
+    /// the next check preserves its original typed outcome in both modes.
     pub(super) fn fail_memory(&self, error: &Error) {
-        if let Error::BudgetExceeded(budget) = error {
-            self.record_failure(*budget);
+        if self.memory_failure.failed.load(Ordering::Acquire) {
+            return;
         }
-    }
-
-    fn record_failure(&self, budget: Budget) {
-        let failure = &self.memory_failure;
-        failure.failure.lock().get_or_insert(budget);
-        failure.failed.store(true, Ordering::Release);
+        if let Some(refusal) = ResourceRefusal::from_error(error) {
+            let failure = &self.memory_failure;
+            failure.failure.lock().get_or_insert(refusal);
+            failure.failed.store(true, Ordering::Release);
+        }
     }
 
     /// Charge `bytes` more of query-local terms and memos, which stay until the context
@@ -1852,6 +1983,8 @@ impl Ctx {
         usize::try_from(left / table_bytes(1, width)).unwrap_or(usize::MAX)
     }
 
+    #[cold]
+    #[inline(never)]
     pub(super) fn memory_exceeded(&self, requested: u64) -> Error {
         Error::BudgetExceeded(Budget {
             kind: BudgetKind::Memory,
@@ -2158,17 +2291,78 @@ impl Ctx {
         }
     }
 
-    /// Decode one private writer cell after admitting its owned payload. Unlike the
+    /// Decode one retained output cell after admitting its owned payload. Unlike the
     /// public compatibility decoder, this route cannot turn a refusal into UNDEF.
-    /// The row's credit outlives every returned term; no owning value escapes it.
-    /// `key` is the writer's reused reconstruction buffer, and `keys` admits its
-    /// growth before it is allocated and holds that credit until the buffer is freed.
+    /// The charge outlives every returned term; no owning value escapes it. Retained
+    /// pages and single terms use this route, so a simple literal takes over its
+    /// reconstructed vocabulary key's allocation. The streaming writer reuses one
+    /// scratch row through [`Ctx::output_term_into`] instead.
+    pub(super) fn output_term(&self, id: Id, row: &Charge<'_>) -> Result<Option<Term>> {
+        assert!(
+            std::ptr::eq(self, row.ctx),
+            "output credit belongs to its query"
+        );
+        self.check_memory_failure()?;
+        let term = match id.tag() {
+            Tag::Undef => None,
+            Tag::Local => {
+                // Keys are append-only. Read the estimate, leave the vocabulary lock,
+                // then admit before taking the lock again to allocate the term.
+                let bytes = self
+                    .local
+                    .read()
+                    .get(id.payload())
+                    .map(|key| output_key_bytes(self, key, 0))
+                    .transpose()?;
+                match bytes {
+                    None => None,
+                    Some(bytes) => {
+                        row.add(bytes)?;
+                        self.local.read().get(id.payload()).map(copied_output_key)
+                    }
+                }
+            }
+            Tag::Delta => {
+                let bytes = self
+                    .snap
+                    .generation
+                    .dvocab
+                    .with(|vocab| {
+                        vocab
+                            .get(id.payload())
+                            .map(|key| output_key_bytes(self, key, 0))
+                    })
+                    .transpose()?;
+                match bytes {
+                    None => None,
+                    Some(bytes) => {
+                        row.add(bytes)?;
+                        self.snap
+                            .generation
+                            .dvocab
+                            .with(|vocab| vocab.get(id.payload()).map(copied_output_key))
+                    }
+                }
+            }
+            Tag::Vocab => self.output_vocab_term(id.payload(), row)?,
+            // Inline numbers/calendar values and blank-node labels have bounded
+            // formatted text. This covers their strings and construction overlap.
+            _ => {
+                row.add(256)?;
+                self.snap.term(id)
+            }
+        };
+        self.check_memory_failure()?;
+        Ok(term)
+    }
+
+    /// Decode one streaming writer cell into the writer's reused scratch, for tests.
     #[cfg(test)]
-    pub(super) fn output_term(
+    pub(super) fn output_scratch_term(
         &self,
         id: Id,
-        row: &OutputCredit<'_>,
-        keys: &OutputCredit<'_>,
+        row: &RowCredit<'_>,
+        keys: &RowCredit<'_>,
         key: &mut Vec<u8>,
     ) -> Result<Option<Term>> {
         let mut out = Vec::with_capacity(1);
@@ -2176,16 +2370,26 @@ impl Ctx {
         Ok(out.pop().flatten())
     }
 
-    /// [`Ctx::output_term`], pushing the cell onto `out`. A decoded term is built in
-    /// place in the row rather than returned through the vocabulary's callback and
-    /// its nested results, whose copies of each term cost a large answer about a
-    /// tenth of its writing time.
+    /// Decode one streaming writer cell after admitting its owned payload, pushing it
+    /// onto `out`. Unlike the public compatibility decoder, this route cannot turn a
+    /// refusal into UNDEF. The row's credit outlives every pushed term, and the
+    /// writer drops the row's terms before it decodes the next row. `key` is the
+    /// writer's reused reconstruction buffer, and `keys` admits its growth before it
+    /// is allocated and holds that credit until the buffer is freed. A decoded term
+    /// is built in place in the row rather than returned through the vocabulary's
+    /// callback and its nested results, whose copies of each term cost a large
+    /// answer about a tenth of its writing time.
+    ///
+    /// No term escapes the scratch row, so this route copies each key out of the
+    /// reused buffer instead of moving the key's allocation into the term as
+    /// [`Ctx::output_term`] does. Both physical allocations stay admitted: the
+    /// buffer by `keys` and the copy by `row`.
     #[inline]
     pub(super) fn output_term_into(
         &self,
         id: Id,
-        row: &OutputCredit<'_>,
-        keys: &OutputCredit<'_>,
+        row: &RowCredit<'_>,
+        keys: &RowCredit<'_>,
         key: &mut Vec<u8>,
         out: &mut Vec<Option<Term>>,
     ) -> Result<()> {
@@ -2208,7 +2412,7 @@ impl Ctx {
                     row.add(bytes)?;
                 }
                 out.push(
-                    bytes.and_then(|_| self.local.read().get(id.payload()).map(id::key_to_term)),
+                    bytes.and_then(|_| self.local.read().get(id.payload()).map(copied_output_key)),
                 );
             }
             Tag::Delta => {
@@ -2229,7 +2433,7 @@ impl Ctx {
                     self.snap
                         .generation
                         .dvocab
-                        .with(|vocab| vocab.get(id.payload()).map(id::key_to_term))
+                        .with(|vocab| vocab.get(id.payload()).map(copied_output_key))
                 }));
             }
             // Reconstruction scratch is query-owned even when the vocabulary is mapped.
@@ -2261,6 +2465,115 @@ impl Ctx {
             }
         }
         Ok(())
+    }
+
+    /// A vocabulary key and its final simple literal share one physical allocation.
+    /// Every capacity change stays on the actual output account, including realloc
+    /// overlap. Other key kinds keep the admitted copy path while scratch is alive.
+    fn output_vocab_term(&self, id: u64, row: &Charge<'_>) -> Result<Option<Term>> {
+        let base = row.bytes();
+        let total = |old: usize, new: usize| {
+            base.checked_add(old as u64)
+                .and_then(|n| n.checked_add(new as u64))
+                .ok_or_else(|| self.memory_exceeded(u64::MAX))
+        };
+        self.snap.generation.vocab.get_owned_with_controlled(
+            id,
+            |old, new| row.resize(total(old, new)?),
+            |capacity| row.resize(total(0, capacity)?),
+            |_| self.check(),
+            |key| self.output_owned_key(key, row),
+        )
+    }
+
+    fn output_owned_key(&self, mut key: Vec<u8>, row: &Charge<'_>) -> Result<Term> {
+        self.check()?;
+        let capacity = key.capacity() as u64;
+        #[cfg(test)]
+        {
+            self.chunk_event("owned-key-pointer", key.as_ptr() as usize);
+            self.chunk_event("owned-key-capacity", key.capacity());
+        }
+        self.check()?;
+        let term = if key.first() == Some(&b'"')
+            && key.last() == Some(&id::KEY_SEP)
+            && std::str::from_utf8(&key[1..key.len() - 1]).is_ok()
+        {
+            #[cfg(test)]
+            {
+                use crate::algo::memory::probe;
+                probe::at(probe::Point::Allocation("chunk-term", key.len()));
+                if probe::fails("chunk-term") {
+                    return Err(Error::invalid("injected chunk term allocation failure"));
+                }
+            }
+            // Move lexical bytes over the marker without allocating or shrinking
+            // capacity. Both markers' capacity stays paid until the literal drops.
+            let end = key.len() - 1;
+            key.copy_within(1..end, 0);
+            key.truncate(end - 1);
+            let value = String::from_utf8(key)
+                .map_err(|_| Error::Corrupt("invalid simple literal key".into()))?;
+            Term::Literal(oxrdf::Literal::new_simple_literal(value))
+        } else {
+            let term = self.output_key(&key, row)?;
+            drop(key);
+            row.resize(
+                row.bytes()
+                    .checked_sub(capacity)
+                    .ok_or_else(|| Error::invalid("missing output vocabulary scratch credit"))?,
+            )?;
+            term
+        };
+        if let Err(error) = self.check() {
+            drop(term);
+            return Err(error);
+        }
+        Ok(term)
+    }
+
+    #[cfg(test)]
+    pub(super) fn chunk_event(&self, stage: &'static str, count: usize) {
+        let hook = self.chunk_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(stage, count);
+        }
+    }
+
+    /// The sorted bulk decoder already borrows a reconstructed key. Admit its
+    /// actual owned representation before copying, under the same real context.
+    pub(super) fn output_key(&self, key: &[u8], storage: &Charge<'_>) -> Result<Term> {
+        if !std::ptr::eq(self, storage.ctx) {
+            return Err(Error::invalid(
+                "bulk output belongs to another query account",
+            ));
+        }
+        let decode = || {
+            self.check()?;
+            storage.add(output_key_bytes(self, key, 0)?)?;
+            #[cfg(test)]
+            {
+                use crate::algo::memory::probe;
+                probe::at(probe::Point::Allocation("chunk-term", key.len()));
+                if probe::fails("chunk-term") {
+                    return Err(Error::invalid("injected chunk term allocation failure"));
+                }
+            }
+            self.check()?;
+            let term = id::key_to_term(key);
+            #[cfg(test)]
+            self.chunk_event("term-copied", key.len());
+            if let Err(error) = self.check() {
+                drop(term);
+                return Err(error);
+            }
+            Ok(term)
+        };
+        if key.first() == Some(&b'(') {
+            super::depth::with_stack(crate::nesting::MAX_TRIPLE_TERMS, decode)
+        } else {
+            decode()
+        }
     }
 
     /// Reconstruction scratch is query-owned even when the vocabulary is mapped.
@@ -2331,31 +2644,6 @@ impl Ctx {
         self.local.read().get(id).map(f)
     }
 
-    /// Batch resolution is independent of a producer's sticky failure. Previously
-    /// returned IDs remain valid; each decode still reserves its transient bytes.
-    pub(super) fn batch_term(&self, id: Id) -> Result<Option<Term>> {
-        let decode = |key: &[u8]| -> Result<Option<Term>> {
-            let _charge = self.charge((key.len() as u64).saturating_mul(8).saturating_add(1024))?;
-            Ok(Some(id::key_to_term(key)))
-        };
-        match id.tag() {
-            Tag::Local => self.local.read().get(id.payload()).map_or(Ok(None), decode),
-            Tag::Vocab => self
-                .with_cursor_vocab_key(id.payload(), decode)?
-                .unwrap_or(Ok(None)),
-            Tag::Delta => self
-                .snap
-                .generation
-                .dvocab
-                .with(|v| v.get(id.payload()).map_or(Ok(None), decode)),
-            Tag::Undef | Tag::Special => Ok(None),
-            _ => {
-                let _charge = self.charge(128)?;
-                Ok(self.snap.term(id))
-            }
-        }
-    }
-
     /// The term of an id as eager execution decodes it, without charging the scratch of
     /// a vocabulary block or the term, for a caller that drops the term at once.
     pub(super) fn transient_batch_term(&self, id: Id) -> Option<Term> {
@@ -2366,8 +2654,10 @@ impl Ctx {
         }
     }
 
-    /// [`Ctx::batch_term`] for a caller that has already reserved
-    /// [`Ctx::decoded_bytes`] for the term, as the result writers do for a row's cells.
+    /// The term of an id as a cursor batch resolves it, for a caller that has already
+    /// reserved [`Ctx::decoded_bytes`] for the term, as the result writers do for a
+    /// row's cells. Batch resolution is independent of a producer's sticky failure, so
+    /// previously returned ids remain valid.
     /// It takes no reservation of its own, which cost an inline number one pass through
     /// the memory ledger per cell.
     pub(super) fn reserved_batch_term(&self, id: Id) -> Result<Option<Term>> {
@@ -2385,8 +2675,8 @@ impl Ctx {
         })
     }
 
-    /// [`Ctx::batch_term`] that asks `cover` for the [`Ctx::decoded_bytes`] of the term
-    /// before it builds it, so that a result writer can hold one reservation for its row
+    /// The term of an id as a cursor batch resolves it. It asks `cover` for the
+    /// [`Ctx::decoded_bytes`] of the term before it builds it, so that a result writer can hold one reservation for its row
     /// and decode each key once.
     pub(super) fn covered_batch_term(
         &self,
@@ -2698,7 +2988,7 @@ impl Ctx {
 /// Sizing and building it in two passes repeated the separator scan and the UTF-8
 /// checks, a measurable share of the time to write a large answer.
 #[inline]
-fn output_key_term(ctx: &Ctx, key: &[u8], row: &OutputCredit<'_>) -> Result<Term> {
+fn output_key_term(ctx: &Ctx, key: &[u8], row: &RowCredit<'_>) -> Result<Term> {
     if let Some(text) = id::TextKey::parse(key) {
         let tag = match text {
             id::TextKey::Lang(_, tag) => tag.len() as u64,
@@ -2712,14 +3002,30 @@ fn output_key_term(ctx: &Ctx, key: &[u8], row: &OutputCredit<'_>) -> Result<Term
         return Ok(text.into_term());
     }
     row.add(output_key_bytes(ctx, key, 0)?)?;
-    Ok(id::key_to_term(key))
+    Ok(copied_output_key(key))
 }
 
 /// Heap and construction overlap of one decoded vocabulary key, excluding the
 /// outer Term slot already covered by its row. Ordinary lexical bytes are charged
 /// once, independently of the existing reconstruction envelope's eightfold policy.
 /// RDF-star nodes also cover their temporary component Vec and final boxed Triple.
+fn copied_output_key(key: &[u8]) -> Term {
+    if key.first() == Some(&b'(') {
+        super::depth::with_stack(crate::nesting::MAX_TRIPLE_TERMS, || id::key_to_term(key))
+    } else {
+        id::key_to_term(key)
+    }
+}
+
 fn output_key_bytes(ctx: &Ctx, key: &[u8], depth: usize) -> Result<u64> {
+    if depth == 0 && key.first() == Some(&b'(') {
+        return super::depth::with_stack(crate::nesting::MAX_TRIPLE_TERMS, || {
+            output_key_bytes_inner(ctx, key, depth)
+        });
+    }
+    output_key_bytes_inner(ctx, key, depth)
+}
+fn output_key_bytes_inner(ctx: &Ctx, key: &[u8], depth: usize) -> Result<u64> {
     let overflow = || ctx.memory_exceeded(u64::MAX);
     let malformed = || Error::Corrupt("invalid vocabulary triple-term key".into());
     if depth > crate::nesting::MAX_TRIPLE_TERMS {
@@ -2819,6 +3125,55 @@ pub struct Charge<'a> {
     owner: std::cell::Cell<Option<u64>>,
 }
 impl Charge<'_> {
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes.get()
+    }
+
+    pub(super) fn belongs_to(&self, ctx: &Ctx) -> bool {
+        std::ptr::eq(self.ctx, ctx)
+    }
+
+    /// Reconcile retained physical storage without moving it to a ledger account.
+    /// Callers admit growth before allocating and release a shrink after dropping it.
+    pub(super) fn resize(&self, bytes: u64) -> Result<()> {
+        let current = self.bytes.get();
+        if bytes > current {
+            self.add(bytes - current)?;
+        } else if bytes < current {
+            self.ctx.release_live(self.owner.get(), current - bytes);
+            self.bytes.set(bytes);
+        }
+        Ok(())
+    }
+
+    /// Consume another live charge on this exact context without a release interval.
+    /// Every check precedes mutation, including for an empty but owned source.
+    pub(super) fn adopt_charge(&self, source: &mut Option<Charge<'_>>) -> Result<()> {
+        let part = source
+            .as_ref()
+            .ok_or_else(|| Error::invalid("missing materialized input credit"))?;
+        if !std::ptr::eq(self.ctx, part.ctx)
+            || matches!((self.owner.get(), part.owner.get()), (Some(a), Some(b)) if a != b)
+            || (self.bytes.get() != 0 && self.owner.get().is_none())
+            || (part.bytes.get() != 0 && part.owner.get().is_none())
+        {
+            return Err(Error::invalid(
+                "materialized input belongs to another query account",
+            ));
+        }
+        let bytes = self
+            .bytes
+            .get()
+            .checked_add(part.bytes.get())
+            .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
+        let owner = self.owner.get().or(part.owner.get());
+        let part = source.take().expect("checked live input credit");
+        part.disarm();
+        self.owner.set(owner);
+        self.bytes.set(bytes);
+        Ok(())
+    }
+
     pub fn add(&self, bytes: u64) -> Result<()> {
         if bytes == 0 {
             return Ok(());
@@ -2850,6 +3205,23 @@ impl Charge<'_> {
         self.bytes.set(0);
         self.owner.take()
     }
+    /// Transfer this already admitted physical allocation to an immutable output.
+    /// The receiving context is the actual account owner, not a domain token.
+    pub(super) fn into_output(self, ctx: &Arc<Ctx>) -> OutputCredit {
+        assert!(
+            std::ptr::eq(self.ctx, Arc::as_ptr(ctx)),
+            "output account owner"
+        );
+        let bytes = self.bytes.get();
+        let owner = self.disarm();
+        OutputCredit {
+            ctx: ctx.clone(),
+            owner,
+            bytes,
+            exact_receiving: false,
+        }
+    }
+
     /// Move query-only input ownership into the returned backing without a release
     /// interval. Existing nonalgorithm kernels retain their estimate policy.
     pub(super) fn output_lease(&self, bytes: u64) -> Result<QueryMemoryLease> {
@@ -2899,11 +3271,11 @@ impl Charge<'_> {
 /// the next, so live output is at most the largest row so far. The credit keeps that
 /// high-water mark admitted and adds to the query's account only when a row exceeds it,
 /// which leaves one shared account update per growth instead of one per cell.
-pub(super) struct OutputCredit<'a> {
+pub(super) struct RowCredit<'a> {
     charge: Charge<'a>,
     used: std::cell::Cell<u64>,
 }
-impl<'a> OutputCredit<'a> {
+impl<'a> RowCredit<'a> {
     pub(super) fn new(ctx: &'a Ctx) -> Self {
         Self {
             charge: Charge {
@@ -2949,6 +3321,108 @@ impl Drop for Charge<'_> {
     }
 }
 
+/// Final physical output credit. Retaining the real context keeps its original
+/// fast account or promoted ledger alive. Moving a paid charge here never returns
+/// and reacquires its credit and never forces fast eager queries onto the ledger.
+pub(super) struct OutputCredit {
+    ctx: Arc<Ctx>,
+    owner: Option<u64>,
+    bytes: u64,
+    exact_receiving: bool,
+}
+impl OutputCredit {
+    pub(super) fn receiving(ctx: &Arc<Ctx>, bytes: u64) -> Result<Self> {
+        // Ordinary parentless eager outputs keep their original lock-free account.
+        if ctx.source_preparation.is_none() {
+            return Ok(ctx.charge(bytes)?.into_output(ctx));
+        }
+        let ledger = ctx.memory();
+        let owner = ledger.owner(ctx.grant.as_ref())?;
+        ledger.reserve_receiving(&owner, ctx.mem_limit, bytes)?;
+        Ok(Self {
+            ctx: ctx.clone(),
+            owner: Some(owner.id),
+            bytes,
+            exact_receiving: true,
+        })
+    }
+    /// Move a worker's already paid payload contribution without releasing it.
+    /// Metadata buffers remain with their own original guard until they are freed.
+    pub(super) fn absorb_charge(&mut self, slot: &mut Option<Charge<'_>>) -> Result<()> {
+        let part = slot
+            .as_ref()
+            .ok_or_else(|| Error::invalid("missing worker credit"))?;
+        if self.exact_receiving
+            || !std::ptr::eq(Arc::as_ptr(&self.ctx), part.ctx)
+            || matches!((self.owner, part.owner.get()), (Some(a), Some(b)) if a != b)
+            || (part.bytes.get() != 0 && part.owner.get().is_none())
+        {
+            return Err(Error::invalid(
+                "worker payload belongs to another query account",
+            ));
+        }
+        let bytes = self
+            .bytes
+            .checked_add(part.bytes.get())
+            .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
+        let part = slot.take().expect("validated worker credit");
+        let owner = part.disarm();
+        self.owner = self.owner.or(owner);
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    pub(super) fn belongs_to(&self, ctx: &Ctx) -> bool {
+        std::ptr::eq(Arc::as_ptr(&self.ctx), ctx)
+    }
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+    pub(super) fn check(&self) -> Result<()> {
+        self.ctx.check()
+    }
+    pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
+        if self.exact_receiving {
+            let ledger = self.ctx.memory();
+            let id = self.owner.expect("receiving owner");
+            if bytes > self.bytes {
+                ledger.reserve_receiving(
+                    &ledger.owner_by_id(id),
+                    self.ctx.mem_limit,
+                    bytes - self.bytes,
+                )?;
+            } else if bytes < self.bytes {
+                ledger.release_receiving(id, self.bytes - bytes);
+            }
+            self.bytes = bytes;
+            return Ok(());
+        }
+        let held = Charge {
+            ctx: &self.ctx,
+            bytes: std::cell::Cell::new(self.bytes),
+            owner: std::cell::Cell::new(self.owner),
+        };
+        let result = held.resize(bytes);
+        let bytes = held.bytes();
+        let owner = held.disarm();
+        drop(held);
+        self.bytes = bytes;
+        self.owner = owner;
+        result
+    }
+}
+impl Drop for OutputCredit {
+    fn drop(&mut self) {
+        if self.exact_receiving {
+            self.ctx
+                .memory()
+                .release_receiving(self.owner.expect("receiving owner"), self.bytes);
+        } else {
+            self.ctx.release_live(self.owner, self.bytes);
+        }
+    }
+}
+
 /// Weak retained state never owns the context, grant or ledger.
 pub(super) struct RetainedCharge {
     owner: Weak<Ctx>,
@@ -2961,6 +3435,24 @@ impl RetainedCharge {
     }
     pub(super) fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Transfer a previously validated live physical owner without returning its
+    /// bytes. The caller must validate the actual context before consuming it.
+    pub(super) fn into_output(mut self, ctx: &Arc<Ctx>) -> OutputCredit {
+        assert!(
+            std::ptr::eq(self.owner.as_ptr(), Arc::as_ptr(ctx)),
+            "retained output account owner"
+        );
+        let bytes = std::mem::take(&mut self.bytes);
+        let owner = self.id.take();
+        self.owner = Weak::new();
+        OutputCredit {
+            ctx: ctx.clone(),
+            owner,
+            bytes,
+            exact_receiving: false,
+        }
     }
     pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
         // A size that does not change takes neither the owner nor an account. A sort key
@@ -3080,11 +3572,32 @@ impl OwnedCharge {
     pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
         self.lease.resize(self.ctx.mem_limit, bytes)
     }
-    pub(super) fn retain(mut self) {
-        self.lease.bytes = 0;
+    /// Adopt the actual predecoded payload guard; the existing cursor ledger is
+    /// required and checked before the source is consumed.
+    pub(super) fn adopt_charge(&mut self, source: &mut Option<Charge<'_>>) -> Result<()> {
+        let held = source
+            .as_ref()
+            .ok_or_else(|| Error::invalid("missing graph payload credit"))?;
+        if !held.belongs_to(&self.ctx)
+            || held.owner.get().is_some_and(|id| id != self.lease.owner.id)
+            || (held.bytes() != 0 && held.owner.get().is_none())
+        {
+            return Err(Error::invalid(
+                "graph payload belongs to another query account",
+            ));
+        }
+        let bytes = self
+            .lease
+            .bytes
+            .checked_add(held.bytes())
+            .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
+        let held = source.take().expect("validated graph payload");
+        held.disarm();
+        self.lease.bytes = bytes;
+        Ok(())
     }
-    pub(super) fn into_lease(self) -> QueryMemoryLease {
-        self.lease
+    pub(super) fn into_parts(self) -> (Arc<Ctx>, QueryMemoryLease) {
+        (self.ctx, self.lease)
     }
 }
 
@@ -3112,6 +3625,95 @@ pub enum TermKind {
 mod charge_tests {
     use super::*;
     use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn eager_charge_transfer_keeps_the_actual_fast_credit_at_the_limit() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 12_288;
+        let output = ctx.charge(4096).unwrap();
+        let mut input = Some(ctx.charge(8192).unwrap());
+        assert_eq!(ctx.live_bytes(), ctx.mem_limit);
+        output.adopt_charge(&mut input).unwrap();
+        assert!(input.is_none());
+        assert_eq!(output.bytes.get(), 12_288);
+        assert_eq!(ctx.live_bytes(), ctx.mem_limit);
+        assert!(ctx.memory.get().is_none(), "transfer must not promote");
+        output.resize(4096).unwrap();
+        assert_eq!(ctx.live_bytes(), 4096);
+        output.resize(8192).unwrap();
+        assert_eq!(ctx.live_bytes(), 8192);
+        drop(output);
+        assert_eq!(ctx.live_bytes(), 0);
+        assert!(ctx.memory.get().is_none());
+    }
+
+    #[test]
+    fn eager_charge_transfer_rejects_a_different_context_on_the_same_grant() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(32 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        let one = pooled(&store, &grant);
+        let two = pooled(&store, &grant);
+        let output = one.charge(4096).unwrap();
+        let mut input = Some(two.charge(8192).unwrap());
+        let used = grant.used();
+        assert!(output.adopt_charge(&mut input).is_err());
+        assert_eq!(output.bytes.get(), 4096);
+        assert_eq!(input.as_ref().unwrap().bytes.get(), 8192);
+        assert_eq!(one.live_bytes(), 4096);
+        assert_eq!(two.live_bytes(), 8192);
+        assert_eq!(grant.used(), used);
+        assert!(one.memory.get().is_none() && two.memory.get().is_none());
+    }
+
+    #[test]
+    fn eager_charge_transfer_refuses_empty_foreign_accounts_and_overflow_unchanged() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let output = ctx.charge(4096).unwrap();
+        // These states exercise validation only; no fictitious credit is released.
+        let foreign = Charge {
+            ctx: &ctx,
+            bytes: std::cell::Cell::new(0),
+            owner: std::cell::Cell::new(Some(PRIMARY + 1)),
+        };
+        let mut input = Some(foreign);
+        let refused = output.adopt_charge(&mut input);
+        let foreign_owner = input.as_ref().unwrap().owner.get();
+        input.as_ref().unwrap().disarm();
+        assert!(refused.is_err());
+        assert_eq!(foreign_owner, Some(PRIMARY + 1));
+        assert_eq!(output.bytes.get(), 4096);
+        let part = input.as_ref().unwrap();
+        part.owner.set(Some(PRIMARY));
+        part.bytes.set(u64::MAX);
+        let refused = output.adopt_charge(&mut input);
+        let source_bytes = input.as_ref().unwrap().bytes.get();
+        input.as_ref().unwrap().disarm();
+        assert!(refused.is_err());
+        assert_eq!(source_bytes, u64::MAX);
+        assert_eq!(output.bytes.get(), 4096);
+        assert_eq!(ctx.live_bytes(), 4096);
+        assert!(ctx.memory.get().is_none());
+    }
+
+    #[test]
+    fn eager_charge_resize_refusal_preserves_the_admitted_storage() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 8192;
+        let charge = ctx.charge(4096).unwrap();
+        assert!(charge.resize(8193).is_err());
+        assert_eq!(charge.bytes.get(), 4096);
+        assert_eq!(ctx.live_bytes(), 4096);
+        charge.resize(0).unwrap();
+        assert_eq!(ctx.live_bytes(), 0);
+        let mut empty = Some(ctx.charge(0).unwrap());
+        charge.adopt_charge(&mut empty).unwrap();
+        assert!(empty.is_none());
+        assert!(ctx.memory.get().is_none());
+    }
 
     /// The one-pass output decode builds the same term as `key_to_term` and admits
     /// the same bytes as `output_key_bytes`, for valid, damaged and special keys.
@@ -3194,7 +3796,7 @@ mod charge_tests {
             assert!(!one_pass(key), "{key:?}");
         }
         for key in &keys {
-            let row = OutputCredit::new(&ctx);
+            let row = RowCredit::new(&ctx);
             let term = output_key_term(&ctx, key, &row).unwrap();
             assert_eq!(term, id::key_to_term(key), "{key:?}");
             assert_eq!(

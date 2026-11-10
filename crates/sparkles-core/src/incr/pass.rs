@@ -584,13 +584,13 @@ impl<'a> Pass<'a> {
         };
         let r = crate::sparql::execute_query(self.new.clone(), &q, &opts, 0.0)?;
         let snap = self.new.clone();
-        let width = r.table.width();
+        let width = r.table().width();
         let mut z = super::zset::ZSet::new();
         let mut decoded: FxHashMap<Id, Id> = FxHashMap::default();
-        for i in 0..r.table.len() {
+        for i in 0..r.table().len() {
             let mut row: Vec<Id> = Vec::with_capacity(width);
             for c in 0..width {
-                let id = r.table.cols[c][i];
+                let id = r.table().get(i, c)?;
                 let local = id.tag() == Tag::Local
                     || (id.tag() == Tag::BNode && id.payload() & Id::LOCAL_BNODE_BIT != 0);
                 if !local {
@@ -600,8 +600,8 @@ impl<'a> Pass<'a> {
                 let m = match decoded.get(&id) {
                     Some(m) => *m,
                     None => {
-                        let m = match r.term(id) {
-                            Some(t) => self.terms.intern(&snap, &t),
+                        let m = match r.term(id)? {
+                            Some(t) => self.terms.intern(&snap, t.as_term()),
                             None => Id::UNDEF,
                         };
                         decoded.insert(id, m);
@@ -618,7 +618,7 @@ impl<'a> Pass<'a> {
         }
         self.stats.recompute += t0.elapsed();
         self.stats.recomputes += 1;
-        if r.table.width() != vars.len() {
+        if r.table().width() != vars.len() {
             return Err(Error::Corrupt(
                 "a recompute node's evaluation returned other columns".into(),
             ));

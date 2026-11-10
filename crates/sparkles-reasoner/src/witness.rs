@@ -57,7 +57,7 @@
 //! fact one instance per intermediate node and many minimal supports, one per path, so
 //! such facts are often truncated.
 
-use crate::budget::{Budget, Held, MemoryExceeded, Meter, table_bytes, table_grown};
+use crate::budget::{Budget, BudgetFailure, Held, Meter, table_bytes, table_grown};
 use crate::builtins::BuiltinKind;
 use crate::engine::{self, CHead, CRule, Eval, Limits, Mode, Slot};
 use crate::facts::Memo;
@@ -168,15 +168,16 @@ fn tangled_lists(c: &Closure, first: u64, rest: u64, limits: &Limits) -> anyhow:
 fn grow_set<K: Eq + std::hash::Hash>(
     s: &mut FxHashSet<K>,
     held: &mut Held,
-) -> Result<(), MemoryExceeded> {
+) -> Result<(), BudgetFailure> {
     let cap = s.capacity();
     if s.len() < cap {
         return Ok(());
     }
     let next = table_grown(cap, s.len(), 1);
     let elem = size_of::<K>();
-    held.try_grow(table_bytes(next, elem).saturating_sub(table_bytes(cap, elem)))?;
+    held.try_grow(table_bytes(next, elem))?;
     s.reserve(next - s.len());
+    held.shrink(table_bytes(cap, elem));
     Ok(())
 }
 
@@ -212,6 +213,7 @@ struct Node {
 impl Node {
     fn bytes(&self) -> usize {
         size_of::<Node>()
+            + (self.w.capacity() - self.w.len()) * size_of::<Witness>()
             + self
                 .w
                 .iter()
@@ -372,24 +374,31 @@ fn insert_min(a: &mut Vec<Witness>, x: Witness) -> isize {
 fn grow_map<K: Eq + std::hash::Hash, V>(
     m: &mut FxHashMap<K, V>,
     held: &mut Held,
-) -> Result<(), MemoryExceeded> {
+) -> Result<(), BudgetFailure> {
     let cap = m.capacity();
     if m.len() < cap {
         return Ok(());
     }
     let next = table_grown(cap, m.len(), 1);
     let elem = size_of::<(K, V)>();
-    held.try_grow(table_bytes(next, elem).saturating_sub(table_bytes(cap, elem)))?;
+    held.try_grow(table_bytes(next, elem))?;
     m.reserve(next - m.len());
+    held.shrink(table_bytes(cap, elem));
     Ok(())
 }
 
 /// Push `x`, charging the list's growth to `held` first.
-fn push_charged(v: &mut Vec<u32>, x: u32, held: &mut Held) -> Result<(), MemoryExceeded> {
+fn push_charged(v: &mut Vec<u32>, x: u32, held: &mut Held) -> Result<(), BudgetFailure> {
     if v.len() == v.capacity() {
-        let add = v.capacity().max(4);
-        held.try_grow(add * size_of::<u32>())?;
+        let cap = v.capacity();
+        let add = cap.max(4);
+        let next = cap
+            .checked_add(add)
+            .and_then(|n| n.checked_mul(size_of::<u32>()))
+            .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+        held.try_grow(next)?;
         v.reserve_exact(add);
+        held.shrink(cap * size_of::<u32>());
     }
     v.push(x);
     Ok(())
@@ -425,7 +434,7 @@ fn product(
     let mut rb = witnesses_bytes(&r);
     for p in ws {
         if p.is_empty() {
-            tmp.set(base);
+            tmp.set(base)?;
             return Ok((Vec::new(), over));
         }
         let mut nb = 0usize;
@@ -459,7 +468,7 @@ fn product(
         }
         r = next;
         rb = nb;
-        tmp.set(base + rb);
+        tmp.set(base + rb)?;
     }
     Ok((r, over))
 }
@@ -619,12 +628,12 @@ impl<'a> Cx<'a> {
         &self,
         t: Triple,
         memo: &mut Memo,
-        charge: &mut dyn FnMut(isize) -> Result<(), MemoryExceeded>,
+        charge: &mut dyn FnMut(isize) -> Result<(), BudgetFailure>,
     ) -> anyhow::Result<Found> {
         let g = &self.c.graph;
         let mut f = Found::default();
         let mut lmemo = Memo::default();
-        let mut refused: Option<MemoryExceeded> = None;
+        let mut refused: Option<BudgetFailure> = None;
         for (ri, hi) in self.plans.heads(t[1]) {
             let Some((steps, pre)) = &self.plans.back[ri][hi] else {
                 continue;
@@ -811,7 +820,7 @@ impl Witnesses {
     }
 
     /// Charge the witnesses to `budget`, as the closure they belong to is.
-    pub(crate) fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), MemoryExceeded> {
+    pub(crate) fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), BudgetFailure> {
         let n = self.held.bytes();
         let mut h = Held::try_new(budget, n)?;
         std::mem::swap(&mut self.held, &mut h);
@@ -822,21 +831,22 @@ impl Witnesses {
     /// Charge the heap as it is now, even past the limit: the witnesses change one node
     /// at a time, and the passes check the budget after each, so a run past its limit
     /// stops there.
-    fn recharge(&mut self) {
+    fn recharge(&mut self) -> Result<(), BudgetFailure> {
         let n = self.heap_bytes_now();
-        self.held.set(n);
+        self.held.set(n)
     }
 
     /// [`heap_bytes`](Self::heap_bytes) without the check, in constant time.
     fn heap_bytes_now(&self) -> usize {
         self.node_bytes
+            + (self.nodes.capacity() - self.nodes.len()) * size_of::<Node>()
             + self.free.capacity() * 4
             + table_bytes(self.index.capacity(), size_of::<(Triple, u32)>())
             + table_bytes(self.rev.capacity(), size_of::<(FactKey, Vec<u32>)>())
             + self.rev_cap * 4
     }
 
-    fn settle_charge(&mut self) -> Result<(), MemoryExceeded> {
+    fn settle_charge(&mut self) -> Result<(), BudgetFailure> {
         let n = self.heap_bytes();
         self.held.try_set(n)
     }
@@ -845,9 +855,23 @@ impl Witnesses {
         self.index.get(t).copied()
     }
 
-    fn add_node(&mut self, t: Triple, key: Option<FactKey>) -> u32 {
+    fn add_node(&mut self, t: Triple, key: Option<FactKey>) -> Result<u32, BudgetFailure> {
         if let Some(&i) = self.index.get(&t) {
-            return i;
+            return Ok(i);
+        }
+        grow_map(&mut self.index, &mut self.held)?;
+        if self.free.is_empty() && self.nodes.len() == self.nodes.capacity() {
+            let cap = self.nodes.capacity();
+            let next = cap
+                .checked_mul(2)
+                .map(|n| n.max(4))
+                .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+            let bytes = next
+                .checked_mul(size_of::<Node>())
+                .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+            self.held.try_grow(bytes)?;
+            self.nodes.reserve_exact(next - self.nodes.len());
+            self.held.shrink(cap * size_of::<Node>());
         }
         let n = Node {
             t,
@@ -869,55 +893,92 @@ impl Witnesses {
             }
         };
         self.index.insert(t, i);
-        self.recharge();
-        i
+        self.recharge()?;
+        Ok(i)
     }
 
-    fn remove_node(&mut self, i: u32) {
-        let n = &mut self.nodes[i as usize];
-        if !n.live {
-            return;
+    fn remove_node(&mut self, i: u32) -> Result<(), BudgetFailure> {
+        if !self.nodes[i as usize].live {
+            return Ok(());
         }
+        push_charged(&mut self.free, i, &mut self.held)?;
+        let n = &mut self.nodes[i as usize];
         n.live = false;
         let gone = n.bytes() - size_of::<Node>();
         n.w = Vec::new();
         self.node_bytes -= gone;
         let t = n.t;
         self.index.remove(&t);
-        self.free.push(i);
-        self.recharge();
+        self.recharge()
     }
 
     /// Replace the kept supports of node `i`, indexing the quads they name.
-    fn set(&mut self, i: u32, w: Vec<Witness>, local: bool, trunc: bool) {
-        let n = &mut self.nodes[i as usize];
-        let mut added: Vec<FactKey> = Vec::new();
+    fn set(
+        &mut self,
+        i: u32,
+        w: Vec<Witness>,
+        local: bool,
+        trunc: bool,
+    ) -> Result<(), BudgetFailure> {
+        let atoms = w
+            .iter()
+            .try_fold(0usize, |n, x| n.checked_add(x.len()))
+            .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+        let scratch = atoms
+            .checked_mul(size_of::<FactKey>())
+            .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+        let _scratch = Held::try_new_exact(self.held.budget(), scratch)?;
+        let mut added = Vec::with_capacity(atoms);
+        let node = &self.nodes[i as usize];
         for x in &w {
-            if n.w.contains(x) {
+            if node.w.contains(x) {
                 continue;
             }
-            for a in x.atoms() {
-                if let Atom::Fact(k) = a {
-                    added.push(*k);
+            for atom in x.atoms() {
+                if let Atom::Fact(key) = atom {
+                    added.push(*key);
                 }
             }
         }
-        let before = n.bytes();
-        n.w = w;
-        n.local = local;
-        n.trunc = trunc;
-        let after = n.bytes();
         added.sort_unstable();
         added.dedup();
-        self.node_bytes = self.node_bytes + after - before;
-        for k in added {
-            let e = self.rev.entry(k).or_default();
-            let cap = e.capacity();
-            e.push(i);
-            self.rev_cap += e.capacity() - cap;
+        let payload = witnesses_bytes(&w)
+            .checked_add((w.capacity() - w.len()) * size_of::<Witness>())
+            .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+        self.held.try_grow(payload)?;
+        for key in added {
+            if !self.rev.contains_key(&key) {
+                grow_map(&mut self.rev, &mut self.held)?;
+            }
+            let users = self.rev.entry(key).or_default();
+            let cap = users.capacity();
+            push_charged(users, i, &mut self.held)?;
+            self.rev_cap += users.capacity() - cap;
             self.rev_entries += 1;
         }
-        self.recharge();
+        let node = &mut self.nodes[i as usize];
+        let before = node.bytes();
+        let retired = std::mem::replace(&mut node.w, w);
+        node.local = local;
+        node.trunc = trunc;
+        let after = node.bytes();
+        self.node_bytes = self.node_bytes + after - before;
+        drop(retired);
+        self.recharge()
+    }
+
+    fn set_base_support(
+        &mut self,
+        i: u32,
+        key: FactKey,
+        local: bool,
+        trunc: bool,
+    ) -> Result<(), BudgetFailure> {
+        let _temporary = Held::try_new_exact(
+            self.held.budget(),
+            size_of::<Witness>() + 2 * size_of::<Atom>(),
+        )?;
+        self.set(i, vec![Witness::new(vec![Atom::Fact(key)])], local, trunc)
     }
 
     /// The witnesses of `t` as an annotation of the `why` semiring: each kept support
@@ -1106,7 +1167,7 @@ impl Witnesses {
         let mut seeds = Vec::with_capacity(heads.len());
         for &t in &heads {
             let key = (kind(c, &t) == Kind::Base).then(|| fact_key(c, &t));
-            seeds.push(w.add_node(t, key));
+            seeds.push(w.add_node(t, key)?);
             // the nodes charge themselves as they are added
             cx.budget.check()?;
         }
@@ -1128,14 +1189,16 @@ impl Witnesses {
                 for body in f.bodies {
                     let ids: Box<[u32]> = body
                         .iter()
-                        .map(|u| match w.node(u) {
-                            Some(j) => j,
-                            None => {
-                                let key = (kind(c, u) == Kind::Base).then(|| fact_key(c, u));
-                                w.add_node(*u, key)
-                            }
+                        .map(|u| {
+                            Ok(match w.node(u) {
+                                Some(j) => j,
+                                None => {
+                                    let key = (kind(c, u) == Kind::Base).then(|| fact_key(c, u));
+                                    w.add_node(*u, key)?
+                                }
+                            })
                         })
-                        .collect();
+                        .collect::<Result<_, BudgetFailure>>()?;
                     ins.bodies.push(ids);
                 }
                 grow_map(&mut pass.ins, &mut held)?;
@@ -1158,7 +1221,7 @@ impl Witnesses {
                 && let Some(k) = w.nodes[i as usize].key
             {
                 let h = hidden(c, cx.opaque, &w.nodes[i as usize].t);
-                w.set(i, vec![Witness::new(vec![Atom::Fact(k)])], h, h);
+                w.set_base_support(i, k, h, h)?;
                 cx.budget.check()?;
             }
         }
@@ -1283,7 +1346,7 @@ impl Witnesses {
         &self,
         dead: &FxHashSet<FactKey>,
         held: &mut Held,
-    ) -> Result<FxHashSet<u32>, MemoryExceeded> {
+    ) -> Result<FxHashSet<u32>, BudgetFailure> {
         let mut out = FxHashSet::default();
         for k in dead {
             for &i in self.rev.get(k).into_iter().flatten() {
@@ -1345,14 +1408,14 @@ impl Witnesses {
                     seeds.push(i);
                 }
             }
-            self.recharge();
+            self.recharge()?;
         }
         // the facts that left the closure
         for t in deleted.iter().chain(removed).chain(touched) {
             if let Some(i) = self.node(t)
                 && !c.graph.contains(t)
             {
-                self.remove_node(i);
+                self.remove_node(i)?;
             }
         }
         // truncation is found again in the region
@@ -1371,7 +1434,7 @@ impl Witnesses {
             if !c.graph.contains(t) {
                 continue;
             }
-            let i = self.add_node(*t, None);
+            let i = self.add_node(*t, None)?;
             if kind(c, t) == Kind::Base {
                 self.nodes[i as usize].key = Some(fact_key(c, t));
             }
@@ -1382,7 +1445,7 @@ impl Witnesses {
         for t in added.iter().chain(touched) {
             if c.graph.contains(t) {
                 sh.try_grow(4)?;
-                seeds.push(self.add_node(*t, None));
+                seeds.push(self.add_node(*t, None)?);
                 self.held.budget().check()?;
             }
         }
@@ -1419,7 +1482,7 @@ impl Witnesses {
     }
 
     /// Drop the stale entries of the reverse index once they are most of it.
-    fn compact_rev(&mut self) -> Result<(), MemoryExceeded> {
+    fn compact_rev(&mut self) -> Result<(), BudgetFailure> {
         let live: usize = self
             .nodes
             .iter()
@@ -1460,8 +1523,8 @@ impl Witnesses {
         self.rev = rev;
         self.rev_entries = n;
         self.rev_cap = cap;
-        self.recharge();
-        tmp.set(0);
+        self.recharge()?;
+        tmp.set(0)?;
         Ok(())
     }
 
@@ -1519,23 +1582,25 @@ impl Witnesses {
             for body in f.bodies {
                 let ids: Box<[u32]> = body
                     .iter()
-                    .map(|u| match self.node(u) {
-                        Some(j) => j,
-                        None => {
-                            let base = kind(cx.c, u) == Kind::Base;
-                            let key = base.then(|| fact_key(cx.c, u));
-                            let j = self.add_node(*u, key);
-                            if let Some(k) = key {
-                                let h = hidden(cx.c, cx.opaque, u);
-                                self.set(j, vec![Witness::new(vec![Atom::Fact(k)])], h, h);
+                    .map(|u| {
+                        Ok(match self.node(u) {
+                            Some(j) => j,
+                            None => {
+                                let base = kind(cx.c, u) == Kind::Base;
+                                let key = base.then(|| fact_key(cx.c, u));
+                                let j = self.add_node(*u, key)?;
+                                if let Some(k) = key {
+                                    let h = hidden(cx.c, cx.opaque, u);
+                                    self.set_base_support(j, k, h, h)?;
+                                }
+                                if !base || cx.head_candidate(u) {
+                                    queue.push(j);
+                                }
+                                j
                             }
-                            if !base || cx.head_candidate(u) {
-                                queue.push(j);
-                            }
-                            j
-                        }
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_, BudgetFailure>>()?;
                 ins.bodies.push(ids);
             }
             held.shrink(found);
@@ -1569,7 +1634,7 @@ impl Witnesses {
                 Some(j) => j,
                 None => {
                     let key = (kind(cx.c, &h) == Kind::Base).then(|| fact_key(cx.c, &h));
-                    self.add_node(h, key)
+                    self.add_node(h, key)?
                 }
             });
         }
@@ -1593,7 +1658,7 @@ impl Witnesses {
                 queue.push_back(i);
             }
         }
-        wl.set(queue.len() * WORK_BYTES);
+        wl.set(queue.len() * WORK_BYTES)?;
         let mut changes: FxHashMap<u32, u32> = FxHashMap::default();
         let mut memo = Memo::default();
         let mut more: Vec<u32> = Vec::new();
@@ -1668,7 +1733,7 @@ impl Witnesses {
                     pool_bytes = witnesses_bytes(&pool);
                     local = true;
                 }
-                tmp.set(pool_bytes);
+                tmp.set(pool_bytes)?;
             }
             if pool.len() > self.max {
                 pool.truncate(self.max);
@@ -1683,7 +1748,7 @@ impl Witnesses {
             }
             let trunc = trunc || local;
             // the pool now either moves into the node, which charges it, or is dropped
-            tmp.set(0);
+            tmp.set(0)?;
             let n = &self.nodes[i as usize];
             let same = n.w == pool && n.local == local && n.trunc == trunc;
             if cx.lists && !same && (t[1] == cx.first || t[1] == cx.rest) && !pass.complete {
@@ -1710,12 +1775,12 @@ impl Witnesses {
                 frozen.insert(i);
                 if !n.trunc {
                     let w = n.w.clone();
-                    self.set(i, w, true, true);
+                    self.set(i, w, true, true)?;
                 } else {
                     continue;
                 }
             } else {
-                self.set(i, pool, local, trunc);
+                self.set(i, pool, local, trunc)?;
             }
             if was && !trunc {
                 // the truncation of the facts downstream may rest on this fact's, also
@@ -1745,7 +1810,7 @@ impl Witnesses {
         }
         for i in gone {
             if !cx.c.graph.contains(&self.nodes[i as usize].t) {
-                self.remove_node(i);
+                self.remove_node(i)?;
             }
         }
         Ok(())
@@ -2084,7 +2149,7 @@ mod tests {
     ) {
         let snap = set_default_graph(v, base);
         let moved = c.terms.rebase(snap.clone());
-        c.remap(&moved);
+        c.remap(&moved).unwrap();
         w.remap(&moved);
         if let Some(mut l) = c.set_inputs(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap() {
             l.update(inserted, removed, crate::facts::rank);
@@ -2238,7 +2303,7 @@ mod tests {
             base.remove(&gone);
             let snap = set_default_graph(&v, &base);
             let moved = c.terms.rebase(snap.clone());
-            c.remap(&moved);
+            c.remap(&moved).unwrap();
             w.remap(&moved);
             let _ = c.set_inputs(snap, &[Id::DEFAULT_GRAPH]).unwrap();
             let rules = compiled(rules_text, &c.terms);
@@ -2394,7 +2459,7 @@ mod tests {
         let budget = Budget::new(Some(64 * 1024));
         let mut tmp = Held::new(&budget);
         let e = product(&[&a, &b], 256, &|| false, &mut tmp).unwrap_err();
-        assert!(e.downcast_ref::<MemoryExceeded>().is_some(), "{e:#}");
+        assert!(BudgetFailure::from_anyhow(&e).is_some(), "{e:#}");
         let budget = Budget::new(None);
         let mut tmp = Held::new(&budget);
         let (r, over) = product(&[&a, &b], 256, &|| false, &mut tmp).unwrap();
@@ -2422,9 +2487,9 @@ mod tests {
                 unreachable!()
             };
             let k = *k;
-            let i = w.add_node([n, 1, 2], Some(k));
+            let i = w.add_node([n, 1, 2], Some(k)).unwrap();
             let ws: Vec<Witness> = (0..8).map(|k| singleton(n * 8 + k)).collect();
-            w.set(i, ws, false, false);
+            w.set(i, ws, false, false).unwrap();
             held = w.held.bytes();
             // regression (third review): the charge is the heap the final settlement
             // computes, so that refunds match it
@@ -2437,7 +2502,7 @@ mod tests {
         assert!(budget.used() >= before + held, "{} {held}", budget.used());
         for n in 0..1000u64 {
             let i = w.node(&[n, 1, 2]).unwrap();
-            w.remove_node(i);
+            w.remove_node(i).unwrap();
             assert_eq!(w.held.bytes(), w.heap_bytes());
         }
         w.compact_rev().unwrap();
@@ -2524,7 +2589,7 @@ mod tests {
         }) else {
             panic!("the search passed the limit");
         };
-        assert!(e.downcast_ref::<MemoryExceeded>().is_some(), "{e:#}");
+        assert!(BudgetFailure::from_anyhow(&e).is_some(), "{e:#}");
         assert!(charged <= 10 * one, "{charged}");
     }
 
@@ -2574,14 +2639,14 @@ mod tests {
         let budget = Budget::new(None);
         let mut w = Witnesses::empty(8, &budget);
         for n in 0..1000u64 {
-            let i = w.add_node([n, 1, 2], None);
+            let i = w.add_node([n, 1, 2], None).unwrap();
             let ws: Vec<Witness> = (0..4).map(|k| singleton(n * 4 + k)).collect();
-            w.set(i, ws, false, false);
+            w.set(i, ws, false, false).unwrap();
         }
         // the supports change, so that the index holds stale entries
         for n in 0..1000u64 {
             let i = w.node(&[n, 1, 2]).unwrap();
-            w.set(i, vec![singleton(10_000 + n)], false, false);
+            w.set(i, vec![singleton(10_000 + n)], false, false).unwrap();
         }
         // a fresh budget, whose peak is the charge from here on
         let budget = Budget::new(None);
@@ -2630,7 +2695,7 @@ mod tests {
         let Err(e) = w.prepare(&mut c, &rules, &l, &removed, &[]) else {
             panic!("the batch passed the limit");
         };
-        assert!(e.downcast_ref::<MemoryExceeded>().is_some(), "{e:#}");
+        assert!(BudgetFailure::from_anyhow(&e).is_some(), "{e:#}");
         assert!(budget.peak() <= 4 * one, "{}", budget.peak());
         assert_eq!(budget.used(), 0);
         // the collection stopped after the facts that fit: the others keep their keys
@@ -2655,7 +2720,7 @@ mod tests {
         let Err(e) = w.prepare(&mut c, &rules, &l, &[], &removed) else {
             panic!("the batch passed the limit");
         };
-        assert!(e.downcast_ref::<MemoryExceeded>().is_some(), "{e:#}");
+        assert!(BudgetFailure::from_anyhow(&e).is_some(), "{e:#}");
         let rekeyed = removed
             .iter()
             .filter(|t| w.nodes[w.node(t).unwrap() as usize].key != Some(fake(t)))

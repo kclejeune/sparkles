@@ -32,11 +32,11 @@ fn same_on(snap: &Arc<Snapshot>, text: &str, uses: Option<bool>) -> Vec<String> 
     let fast = run_on(snap, text, &opts(Optimizations::ALL));
     let slow = run_on(snap, text, &opts(Optimizations::NONE));
     assert_eq!(solutions(&fast), solutions(&slow), "{text}");
-    let used = has_op(&fast.plan, "PatternCount") || has_op(&fast.plan, "PatternScan");
+    let used = has_op(fast.plan(), "PatternCount") || has_op(fast.plan(), "PatternScan");
     if let Some(u) = uses {
-        assert_eq!(used, u, "{text}: {:#?}", fast.plan);
+        assert_eq!(used, u, "{text}: {:#?}", fast.plan());
     }
-    assert!(!has_op(&slow.plan, "PatternCount") && !has_op(&slow.plan, "PatternScan"));
+    assert!(!has_op(slow.plan(), "PatternCount") && !has_op(slow.plan(), "PatternScan"));
     solutions(&fast)
 }
 
@@ -162,7 +162,7 @@ fn a1_a2_a3_pattern_counts_and_has_predicate() {
         "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s a ex:Film . ?s ?p ?o } GROUP BY ?p",
         &opts(Optimizations::ALL),
     );
-    assert!(has_op(&r.plan, "PatternCount"), "{:#?}", r.plan);
+    assert!(has_op(r.plan(), "PatternCount"), "{:#?}", r.plan());
     // switched off by name
     let off = Optimizations::ALL.disable("predicate_patterns").unwrap();
     let r = run_on(
@@ -170,7 +170,7 @@ fn a1_a2_a3_pattern_counts_and_has_predicate() {
         "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p",
         &opts(off),
     );
-    assert!(!has_op(&r.plan, "PatternCount"));
+    assert!(!has_op(r.plan(), "PatternCount"));
 }
 
 #[test]
@@ -216,9 +216,9 @@ fn a4_delta_and_compactions() {
     assert!(after.iter().any(|r| r.contains("name>")), "{after:?}");
     let r = run_on(&s.snapshot(), q, &opts(Optimizations::ALL));
     assert!(
-        super::opt_tests::has_desc(&r.plan, "corrected for"),
+        super::opt_tests::has_desc(r.plan(), "corrected for"),
         "{:#?}",
-        r.plan
+        r.plan()
     );
     check_all(&s);
     // a partial compaction rewrites the tables
@@ -402,7 +402,7 @@ fn a5_hidden_predicates_are_not_listed() {
         "SELECT ?s ?p WHERE { ?s spk:hasPredicate ?p }",
     ] {
         let r = run_on(&s.snapshot(), q, &o);
-        assert!(!has_op(&r.plan, "PatternCount") && !has_op(&r.plan, "PatternScan"));
+        assert!(!has_op(r.plan(), "PatternCount") && !has_op(r.plan(), "PatternScan"));
         let rows = solutions(&r);
         assert!(!rows.is_empty());
         assert!(!rows.iter().any(|r| r.contains("p3>")), "{q}: {rows:?}");
@@ -610,7 +610,7 @@ fn near_misses_of_the_review() {
     let slow = query(s.snapshot(), &text, &bound(Optimizations::NONE)).unwrap();
     assert_eq!(solutions(&fast), solutions(&slow));
     assert_eq!(solutions(&fast).len(), 1, "{:?}", solutions(&fast));
-    assert!(!has_op(&fast.plan, "PatternCount"));
+    assert!(!has_op(fast.plan(), "PatternCount"));
 }
 
 /// A pattern scan admits its output against the memory budget, and stops at a LIMIT.
@@ -632,11 +632,11 @@ fn pattern_scans_are_budgeted_and_limited() {
     let limited = format!("{text} LIMIT 3");
     let r = query(s.snapshot(), &limited, &opts(Optimizations::ALL)).unwrap();
     assert_eq!(solutions(&r).len(), 3);
-    assert!(has_op(&r.plan, "PatternScan"), "{:#?}", r.plan);
+    assert!(has_op(r.plan(), "PatternScan"), "{:#?}", r.plan());
     assert!(
-        super::opt_tests::has_desc(&r.plan, "stopped early"),
+        super::opt_tests::has_desc(r.plan(), "stopped early"),
         "{:#?}",
-        r.plan
+        r.plan()
     );
 }
 
@@ -735,7 +735,7 @@ fn row_limits_count_rows() {
     };
     let r = query(s.snapshot(), &text, &limited).unwrap();
     assert_eq!(solutions(&r).len(), 5000);
-    assert!(has_op(&r.plan, "PatternScan"), "{:#?}", r.plan);
+    assert!(has_op(r.plan(), "PatternScan"), "{:#?}", r.plan());
     // one subject with 5,001 predicates under a limit of 100 rows
     let text = format!(
         "{SPK}SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE {{ ?s <urn:p0> 2 . ?s ?p ?o }} GROUP BY ?p LIMIT 1"

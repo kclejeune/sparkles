@@ -675,7 +675,9 @@ fn the_deadline_unwinds_a_nested_join() {
 
 #[test]
 fn a_deep_chain_fits_a_memory_limit_its_facts_fit() {
-    // 120 rules in a chain derive 120 facts, which need far less than the limit
+    // 120 rules in a chain derive 120 facts, which need far less than the limit.
+    // The search also pays for its compiled rules and its local terms, about
+    // 170 KB for this chain, so the limit is 200 KB.
     let mut rules = String::from("@prefix ex: <http://ex.org/> .\n");
     for i in 0..120 {
         rules.push_str(&format!(
@@ -693,7 +695,7 @@ fn a_deep_chain_fits_a_memory_limit_its_facts_fit() {
             &["default"],
             [ex("a"), ex("p120"), ex("b")],
             &ExplainOptions {
-                max_memory: Some(120_000),
+                max_memory: Some(200_000),
                 ..Default::default()
             },
         )

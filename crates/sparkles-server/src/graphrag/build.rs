@@ -179,9 +179,9 @@ fn rows(
     snap: &Arc<Snapshot>,
     q: &str,
     opts: &QueryOptions,
-) -> Result<Vec<Vec<Option<Term>>>, RunError> {
+) -> Result<sparql::output::OwnedRows, RunError> {
     sparql::query(snap.clone(), q, opts)
-        .map(|r| r.rows())
+        .and_then(|r| r.rows())
         .map_err(|e| match e {
             sparkles::Error::Cancelled => RunError::Cancelled,
             e => failed(e),
@@ -796,6 +796,7 @@ impl Run<'_> {
             // each label or type triple, with whether only the output graph holds it
             let mut lines: BTreeMap<(String, String), (Term, bool, bool)> = BTreeMap::new();
             for r in rows(&snap, &q, &opts)? {
+                let r = r.values();
                 let Some(e) = nt(&r[0]) else { continue };
                 let value = match (&r[1], &r[2]) {
                     (Some(l @ Term::Literal(_)), _) => l.clone(),
@@ -954,6 +955,7 @@ impl Run<'_> {
                 values.join(" ")
             );
             for r in rows(snap, &q, opts)? {
+                let r = r.values();
                 if let (Some(s), Some(p), Some(o)) = (nt(&r[0]), nt(&r[1]), nt(&r[2])) {
                     found.insert((s, p, o));
                 }
@@ -984,6 +986,7 @@ impl Run<'_> {
         );
         let mut out: HashMap<String, Revision> = HashMap::new();
         for r in rows(snap, &q, &QueryOptions::default())? {
+            let r = r.values();
             let Some(Term::NamedNode(rep)) = &r[0] else {
                 continue;
             };
@@ -1054,6 +1057,7 @@ impl Run<'_> {
                 store::RDF_TYPE
             );
             for r in rows(snap, &q, opts)? {
+                let r = r.values();
                 if let (Some(s), Some(p), Some(o)) = (nt(&r[0]), nt(&r[1]), nt(&r[2])) {
                     let flag = |i: usize| matches!(r.get(i), Some(Some(Term::Literal(l))) if l.value() == "1");
                     let origin = Origin {
@@ -1092,6 +1096,7 @@ impl Run<'_> {
         );
         let mut all: BTreeMap<String, Existing> = BTreeMap::new();
         for r in rows(snap, &q, &QueryOptions::default())? {
+            let r = r.values();
             let Some(Term::NamedNode(c)) = &r[0] else {
                 continue;
             };
@@ -1122,6 +1127,7 @@ impl Run<'_> {
         let mut summary = String::new();
         let mut findings: BTreeMap<u64, ChildFinding> = BTreeMap::new();
         for r in rows(snap, &q, &QueryOptions::default())? {
+            let r = r.values();
             if let Some(Term::Literal(l)) = &r[0] {
                 title = l.value().to_string();
             }

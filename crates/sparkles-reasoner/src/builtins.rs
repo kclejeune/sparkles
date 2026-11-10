@@ -1,6 +1,6 @@
 //! Jena rule builtins (`org.apache.jena.reasoner.rulesys.builtins`).
 
-use crate::budget::MemoryExceeded;
+use crate::budget::BudgetFailure;
 use crate::engine::{Eval, Slot};
 use crate::terms::{Kind, Terms};
 use oxrdf::{Literal, NamedNode, Term};
@@ -95,8 +95,8 @@ impl BuiltinKind {
         })
     }
 
-    pub fn check_arity(self, n: usize) -> Result<(), String> {
-        let ok = match self {
+    pub fn accepts_arity(self, n: usize) -> bool {
+        match self {
             Equal | NotEqual | LessThan | GreaterThan | Le | Ge | IsDType | NotDType
             | ListMember | ListContains | ListNotContains | ListLength | AddOne | GeoSfType
             | GeoGmlType => n == 2,
@@ -105,11 +105,6 @@ impl BuiltinKind {
             NoValue => n == 2 || n == 3,
             StrConcat | UriConcat | MakeTemp | MakeSkolem => n >= 1,
             Regex => n >= 2,
-        };
-        if ok {
-            Ok(())
-        } else {
-            Err(format!("wrong number of arguments ({n})"))
         }
     }
 
@@ -216,7 +211,7 @@ fn num(t: &Terms, a: u64) -> Option<Value> {
 
 /// The id of the result of an arithmetic builtin, `Ok(None)` when there is none, or the
 /// error when a new term does not fit the run's memory.
-fn arith(t: &Terms, kind: BuiltinKind, a: u64, b: u64) -> Result<Option<u64>, MemoryExceeded> {
+fn arith(t: &Terms, kind: BuiltinKind, a: u64, b: u64) -> Result<Option<u64>, BudgetFailure> {
     let Some(r) = arith_value(t, kind, a, b) else {
         return Ok(None);
     };
@@ -301,7 +296,7 @@ fn integer_in_range(lex: &str, dt: &str) -> bool {
     }
 }
 
-fn string_id(t: &Terms, s: String) -> Result<u64, MemoryExceeded> {
+fn string_id(t: &Terms, s: String) -> Result<u64, BudgetFailure> {
     t.try_id_for(&Term::Literal(Literal::new_simple_literal(s)))
 }
 
@@ -418,7 +413,7 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
             let mut parts = Vec::with_capacity(ids.len());
             for id in ids {
                 let Some(x) = t.lexical(id) else { return };
-                held.grow(x.len());
+                charged!(ev, held.grow(x.len()));
                 charged!(ev, t.budget().check());
                 parts.push(x);
             }
@@ -444,7 +439,7 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
             let (x, p) = (a(0), a(1));
             let Some(text) = t.lexical(x) else { return };
             let mut held = crate::budget::Held::new(&t.budget());
-            held.grow(text.len());
+            charged!(ev, held.grow(text.len()));
             charged!(ev, t.budget().check());
             let re = match &bi.regex {
                 Some(r) => r.clone(),

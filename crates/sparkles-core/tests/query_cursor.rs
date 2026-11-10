@@ -13,6 +13,21 @@ use std::sync::{
 };
 use std::time::Duration;
 
+// Explicit application-model copies for semantic comparisons only. Retained
+// ownership regressions below keep their real OwnedTerm/OwnedRow handles.
+trait ApplicationQueryRows {
+    fn application_rows(&self) -> Vec<Vec<Option<Term>>>;
+}
+impl ApplicationQueryRows for sparkles_core::sparql::QueryResult {
+    fn application_rows(&self) -> Vec<Vec<Option<Term>>> {
+        self.rows()
+            .expect("application comparison decode")
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect()
+    }
+}
+
 fn store(n: usize) -> Store {
     let s = Store::in_memory(StoreOptions::default());
     let data = (0..n)
@@ -44,7 +59,7 @@ fn all(mut c: QueryCursor) -> Vec<Vec<Option<Term>>> {
     let mut answer = Vec::new();
     while let Some(batch) = c.next_batch().unwrap() {
         for row in 0..batch.len() {
-            answer.push(batch.row(row).unwrap());
+            answer.push(batch.row(row).unwrap().values().to_vec());
         }
     }
     assert_eq!(c.status(), CursorStatus::Complete);
@@ -68,7 +83,9 @@ fn inline_and_dictionary_scalars_match_eager_across_batches() {
         "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ?x (YEAR(?x) AS ?year) WHERE { VALUES ?x { \"2030-01-02\"^^xsd:date \"2031-02-03T04:05:06Z\"^^xsd:dateTime \"invalid\"^^xsd:date } }",
     ];
     for q in queries {
-        let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+        let expected = bag(query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows());
         for rows in [1, 3, 4096] {
             assert_eq!(bag(all(open(&s, q, rows))), expected, "{q}; batch {rows}");
         }
@@ -88,7 +105,9 @@ fn computed_id_reuse_respects_budgets_options_and_impure_expressions() {
     )])
     .unwrap();
     let q = "SELECT ?s ?x WHERE { ?s <urn:p> ?o BIND(FLOOR(?o / 2) AS ?x) }";
-    let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+    let expected = bag(query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .application_rows());
     for (memory, reuse) in [(2 << 20, true), (2 << 20, false), (256 << 10, true)] {
         let opts = QueryOptions {
             max_memory_bytes: Some(memory),
@@ -102,7 +121,7 @@ fn computed_id_reuse_respects_budgets_options_and_impure_expressions() {
         let mut rows = Vec::new();
         while let Some(b) = c.next_batch().unwrap() {
             for i in 0..b.len() {
-                rows.push(b.row(i).unwrap());
+                rows.push(b.row(i).unwrap().values().to_vec());
             }
         }
         assert_eq!(bag(rows), expected);
@@ -150,7 +169,9 @@ fn batch_filter_reuse_preserves_term_errors_local_values_and_budget_fallback() {
         "?s <urn:p> ?original BIND(CONCAT(STR(?original), \" suffix\") AS ?o) FILTER(CONTAINS(?o, \"Ada\"))",
     ] {
         let q = format!("SELECT ?s ?o WHERE {{ {body} }}");
-        let expected = bag(query(s.snapshot(), &q, &Default::default()).unwrap().rows());
+        let expected = bag(query(s.snapshot(), &q, &Default::default())
+            .unwrap()
+            .application_rows());
         for (memory, reuse, batch) in [
             (2 << 20, true, 4096),
             (2 << 20, false, 4096),
@@ -169,7 +190,7 @@ fn batch_filter_reuse_preserves_term_errors_local_values_and_budget_fallback() {
             let mut rows = Vec::new();
             while let Some(b) = c.next_batch().unwrap() {
                 for i in 0..b.len() {
-                    rows.push(b.row(i).unwrap());
+                    rows.push(b.row(i).unwrap().values().to_vec());
                 }
             }
             assert_eq!(bag(rows), expected, "{q}: {memory}/{reuse}/{batch}");
@@ -197,7 +218,9 @@ fn buffered_key_filters_preserve_batches_pending_rows_and_controls() {
     .unwrap();
     for needle in ["", "Ada"] {
         let q = format!("SELECT ?s ?o {{ ?s <urn:p> ?o FILTER(CONTAINS(?o, \"{needle}\")) }}");
-        let expected = bag(query(s.snapshot(), &q, &Default::default()).unwrap().rows());
+        let expected = bag(query(s.snapshot(), &q, &Default::default())
+            .unwrap()
+            .application_rows());
         for (memory, rows, bytes) in [
             (64 << 20, 4096, 1 << 20),
             (12 << 20, 4096, 1 << 20),
@@ -218,7 +241,7 @@ fn buffered_key_filters_preserve_batches_pending_rows_and_controls() {
             while let Some(b) = c.next_batch().unwrap() {
                 assert!(b.len() <= rows);
                 assert!(b.len() * b.width() * 8 <= bytes);
-                answer.extend((0..b.len()).map(|i| b.row(i).unwrap()));
+                answer.extend((0..b.len()).map(|i| b.row(i).unwrap().values().to_vec()));
             }
             assert_eq!(bag(answer), expected);
             assert!(c.stats().mem_peak_bytes <= memory);
@@ -233,11 +256,15 @@ fn buffered_key_filters_preserve_batches_pending_rows_and_controls() {
     let mut c = select_cursor(s.snapshot(), q, &opts, &options(4096)).unwrap();
     let batch = c.next_batch().unwrap().unwrap();
     assert_eq!(batch.len(), 4096);
+    let decoded = batch.term(0, 1).unwrap().unwrap();
+    let key = batch.key(0, 1).unwrap();
     cancel.store(true, Ordering::Relaxed);
     assert!(matches!(c.next_batch(), Err(Error::Cancelled)));
     assert_eq!(c.status(), CursorStatus::Failed);
     assert!(c.next_batch().unwrap().is_none());
-    assert!(batch.term(0, 1).unwrap().is_some());
+    assert!(matches!(decoded.as_term(), Term::Literal(_)));
+    assert_eq!(batch.key(0, 1).unwrap(), key);
+    assert!(matches!(batch.term(0, 1), Err(Error::Cancelled)));
 
     let opts = QueryOptions {
         max_rows_produced: Some(4),
@@ -281,7 +308,9 @@ fn merge_interiors_preserve_gaps_duplicates_boundaries_and_shared_compatibility(
         "SELECT ?s ?x { ?s <urn:l> ?x; <urn:r> ?x }",
         "SELECT ?s ?x { ?s <urn:l> ?x OPTIONAL { ?s <urn:r> ?x } }",
     ] {
-        let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+        let expected = bag(query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows());
         for batch in [1, 7, 4096] {
             assert_eq!(bag(all(open(&s, q, batch))), expected, "{q}/{batch}");
         }
@@ -308,7 +337,9 @@ fn topk_partial_date_order_preserves_eager_results_across_chunks() {
             "SELECT ?v {{VALUES ?v {{ {} {} {} {} }} }} ORDER BY ?v LIMIT 1",
             values[a], values[a], values[b], values[c]
         );
-        let expected = query(s.snapshot(), &q, &Default::default()).unwrap().rows();
+        let expected = query(s.snapshot(), &q, &Default::default())
+            .unwrap()
+            .application_rows();
         let cursor_options = CursorOptions {
             batch_bytes: 16,
             fallback: FallbackPolicy::AllowMaterialization,
@@ -410,9 +441,28 @@ fn key_filters_borrow_large_delta_terms_without_decoding_them() {
     )
     .unwrap();
     let batch = terms.next_batch().unwrap().unwrap();
+    // Delta keys are borrowed, so retained output pays its actual copied payload,
+    // not the old call-only eightfold reconstruction estimate.
+    let retained = (0..3)
+        .map(|_| batch.term(0, 0).unwrap().unwrap())
+        .collect::<Vec<_>>();
+    for term in &retained {
+        let Term::Literal(value) = term.as_term() else {
+            panic!("stored literal");
+        };
+        assert_eq!(value.value().len(), (256 << 10) + 6);
+        assert!(value.value().starts_with("needle"));
+        assert!(
+            value.value().as_bytes()[6..]
+                .iter()
+                .all(|&byte| byte == b'x')
+        );
+    }
     assert!(
         matches!(batch.term(0, 0), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory)
     );
+    drop(retained);
+    assert!(batch.term(0, 0).unwrap().is_some());
 }
 
 #[test]
@@ -448,7 +498,7 @@ fn bags_match_for_filters_bind_offsets_range_and_union() {
         let eager = query(s.snapshot(), q, &Default::default()).unwrap();
         for rows in [1, 3, 17] {
             assert_eq!(
-                bag(eager.rows()),
+                bag(eager.application_rows()),
                 bag(all(open(&s, q, rows))),
                 "{q}, batch {rows}"
             );
@@ -476,7 +526,9 @@ fn graph_union_dedup_and_repeated_variables_survive_boundaries() {
         "SELECT ?s WHERE { GRAPH <urn:g:b> { ?s <urn:p> ?s } }",
     ] {
         assert_eq!(
-            bag(query(s.snapshot(), q, &Default::default()).unwrap().rows()),
+            bag(query(s.snapshot(), q, &Default::default())
+                .unwrap()
+                .application_rows()),
             bag(all(open(&s, q, 1)))
         );
     }
@@ -496,7 +548,9 @@ fn graph_union_dedup_and_repeated_variables_survive_boundaries() {
     assert!(!cursor.plan().has_materialization(), "{:#?}", cursor.plan());
     assert_eq!(
         bag(all(cursor)),
-        bag(query(s.snapshot(), q, &Default::default()).unwrap().rows())
+        bag(query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows())
     );
 }
 
@@ -506,8 +560,8 @@ fn zero_column_duplicates_and_first_appearance_order() {
     let q = "SELECT * WHERE { VALUES (?z ?a) { (1 2) (1 2) } }";
     let eager = query(s.snapshot(), q, &Default::default()).unwrap();
     let c = open(&s, q, 1);
-    assert_eq!(c.variables(), eager.vars);
-    assert_eq!(all(c), eager.rows());
+    assert_eq!(c.variables(), eager.variables());
+    assert_eq!(all(c), eager.application_rows());
     assert_eq!(
         all(open(&s, "SELECT * WHERE { {} UNION {} }", 1)),
         vec![vec![], vec![]]
@@ -522,7 +576,7 @@ fn initial_bindings_are_restored_and_snapshot_is_pinned() {
         initial_bindings: vec![("o".into(), oxrdf::Literal::from(2).into())],
         ..Default::default()
     };
-    let expected = query(s.snapshot(), q, &opts).unwrap().rows();
+    let expected = query(s.snapshot(), q, &opts).unwrap().application_rows();
     let c = select_cursor(s.snapshot(), q, &opts, &options(1)).unwrap();
     sparkles_core::sparql::update::update(&s, "CLEAR ALL", &Default::default()).unwrap();
     assert_eq!(all(c), expected);
@@ -543,7 +597,7 @@ fn batches_decode_local_terms_after_close_and_store_drop() {
     drop(c);
     drop(s);
     let value = b.term(0, 0).unwrap().unwrap();
-    assert!(matches!(value, Term::Literal(l) if l.value().ends_with('!')));
+    assert!(matches!(value.as_term(), Term::Literal(l) if l.value().ends_with('!')));
 }
 
 #[test]
@@ -759,8 +813,9 @@ fn charged_regex_key_filters_cover_planning_and_count_fallbacks() {
             ] {
                 for prefix in ["SELECT ?s ?o", "SELECT (COUNT(*) AS ?count)"] {
                     let q = format!("{prefix} WHERE {{ ?s <urn:p> ?o FILTER({body}) }}");
-                    let expected =
-                        bag(query(s.snapshot(), &q, &Default::default()).unwrap().rows());
+                    let expected = bag(query(s.snapshot(), &q, &Default::default())
+                        .unwrap()
+                        .application_rows());
                     for memory in [256 << 10, 16 << 20] {
                         let opts = QueryOptions {
                             max_memory_bytes: Some(memory),
@@ -775,7 +830,7 @@ fn charged_regex_key_filters_cover_planning_and_count_fallbacks() {
                             .unwrap_or_else(|e| panic!("{q}; {memory}: {e}"))
                         {
                             for i in 0..b.len() {
-                                rows.push(b.row(i).unwrap());
+                                rows.push(b.row(i).unwrap().values().to_vec());
                             }
                         }
                         assert_eq!(bag(rows), expected, "{q}; {memory}");
@@ -798,7 +853,9 @@ fn query_owned_regex_matches_eager_flags_captures_and_empty_matches() {
         r#"SELECT ?x (REGEX(?x, "[", "") AS ?bad) (REGEX(?x, "a", "!") AS ?flag) WHERE { VALUES ?x { "a" "b" } }"#,
     ];
     for q in queries {
-        let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+        let expected = bag(query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows());
         for memory in [256 << 10, 8 << 20] {
             let opts = QueryOptions {
                 max_memory_bytes: Some(memory),
@@ -845,7 +902,9 @@ fn charged_exists_state_matches_eager_with_budget_decline_and_partial_keys() {
         "SELECT ?s WHERE { ?s <urn:p> ?o FILTER EXISTS { ?s <urn:q> ?x FILTER(?o > 7) } }",
     ];
     for q in queries {
-        let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+        let expected = bag(query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows());
         for memory in [256 << 10, 8 << 20] {
             let opts = QueryOptions {
                 max_memory_bytes: Some(memory),
@@ -855,7 +914,7 @@ fn charged_exists_state_matches_eager_with_budget_decline_and_partial_keys() {
             let mut rows = Vec::new();
             while let Some(b) = c.next_batch().unwrap() {
                 for row in 0..b.len() {
-                    rows.push(b.row(row).unwrap());
+                    rows.push(b.row(row).unwrap().values().to_vec());
                 }
             }
             assert_eq!(bag(rows), expected, "{q}; {memory}");
@@ -891,13 +950,17 @@ fn eager_fallback_is_visible_lazy_and_budgeted() {
     assert_eq!(c.stats().rows_produced, 0);
     let b = c.next_batch().unwrap().unwrap();
     assert_eq!(
-        b.row(0).unwrap(),
-        query(s.snapshot(), q, &Default::default()).unwrap().rows()[0]
+        b.row(0).unwrap().values().to_vec(),
+        query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows()[0]
     );
     assert!(c.stats().rows_produced >= 100);
     assert_eq!(
         all(select_cursor(s.snapshot(), q, &Default::default(), &opts).unwrap()),
-        query(s.snapshot(), q, &Default::default()).unwrap().rows()
+        query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows()
     );
 }
 
@@ -906,8 +969,10 @@ fn explicit_collection_matches_eager_and_honors_its_memory_limit() {
     let s = store(97);
     let q = "SELECT ?s ?x WHERE { ?s <urn:p> ?o BIND(?o + 1 AS ?x) }";
     assert_eq!(
-        bag(open(&s, q, 3).collect().unwrap().rows()),
-        bag(query(s.snapshot(), q, &Default::default()).unwrap().rows())
+        bag(open(&s, q, 3).collect().unwrap().application_rows()),
+        bag(query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows())
     );
     let opts = QueryOptions {
         max_memory_bytes: Some(8 << 10),
@@ -962,7 +1027,7 @@ fn access_views_and_plan_redaction_match_eager() {
     assert_eq!(c.plan().operator.estimated_rows, -1.0);
     assert_eq!(
         bag(all(c)),
-        bag(query(s.snapshot(), q, &opts).unwrap().rows())
+        bag(query(s.snapshot(), q, &opts).unwrap().application_rows())
     );
 }
 
@@ -1075,7 +1140,7 @@ fn work_budget_overflow_and_failure_do_not_wrap_shared_counters() {
 }
 
 #[test]
-fn previously_returned_batches_remain_readable_after_producer_budget_failure() {
+fn previously_decoded_cells_remain_readable_after_producer_budget_failure() {
     let s = store(500);
     let opts = QueryOptions {
         max_memory_bytes: Some(16 << 10),
@@ -1089,10 +1154,27 @@ fn previously_returned_batches_remain_readable_after_producer_budget_failure() {
     )
     .unwrap();
     let first = c.next_batch().unwrap().unwrap();
-    while matches!(c.next_batch(), Ok(Some(_))) {}
+    let decoded = first.term(0, 0).unwrap().unwrap();
+    let key = first.key(0, 0).unwrap();
+    let terminal = loop {
+        match c.next_batch() {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the unchanged500-row/16KiB producer must exhaust its allowance"),
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        matches!(&terminal, Error::BudgetExceeded(budget)
+        if budget.kind == BudgetKind::Memory && budget.limit == 16 << 10 && budget.requested > budget.limit),
+        "preserve the real typed local producer refusal, got {terminal:?}"
+    );
     assert_eq!(c.status(), CursorStatus::Failed);
     drop(c);
-    assert!(matches!(first.term(0, 0).unwrap(), Some(Term::Literal(_))));
+    // Already decoded immutable storage needs no new allocation after failure.
+    // A new decode at an exhausted cap remains fallible.
+    assert!(matches!(decoded.as_term(), Term::Literal(_)));
+    assert_eq!(first.key(0, 0).unwrap(), key);
+    assert_eq!(first.variables(), &["x"]);
 }
 
 #[test]
@@ -1287,7 +1369,10 @@ fn persistent_snapshot_survives_compaction_and_store_drop() {
     let rest = all(c);
     assert_eq!(rest.len(), 1);
     assert_eq!(
-        bag(vec![first.row(0).unwrap(), rest[0].clone()]),
+        bag(vec![
+            first.row(0).unwrap().values().to_vec(),
+            rest[0].clone()
+        ]),
         bag(vec![
             vec![
                 Some(oxrdf::NamedNode::new_unchecked("urn:a").into()),
@@ -1363,7 +1448,9 @@ fn incremental_distinct_preserves_unbound_and_zero_column_rows_across_batches() 
         "SELECT DISTINCT * WHERE { {} UNION {} UNION {} }",
         "SELECT DISTINCT ?x WHERE { VALUES ?x { 1 2 1 2 3 } } LIMIT 2",
     ] {
-        let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+        let expected = bag(query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows());
         for cap in [1, 2, 3, 4096] {
             let cursor = open(&s, q, cap);
             assert!(!cursor.plan().has_materialization());
@@ -1428,7 +1515,9 @@ fn retained_order_keys_match_eager_and_fail_without_partial_success() {
         "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?o * 3) LIMIT 10",
         "SELECT ?s ?o WHERE { ?s <urn:name> ?o } ORDER BY ?o ?s LIMIT 10",
     ] {
-        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows();
         for reuse in [true, false] {
             let opts = QueryOptions {
                 max_memory_bytes: Some(16 << 20),
@@ -1533,7 +1622,9 @@ fn dictionary_inputs_match_eager_for_mixed_expressions_and_budget_decline() {
             112,
         ),
     ] {
-        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows();
         assert_eq!(expected.len(), expected_count, "{q}");
 
         for (memory, reuse, batch) in [
@@ -1562,7 +1653,7 @@ fn dictionary_inputs_match_eager_for_mixed_expressions_and_budget_decline() {
             let mut answer = Vec::new();
             while let Some(b) = cursor.next_batch().unwrap() {
                 for row in 0..b.len() {
-                    answer.push(b.row(row).unwrap());
+                    answer.push(b.row(row).unwrap().values().to_vec());
                 }
             }
             if ordered {
@@ -1578,7 +1669,9 @@ fn dictionary_inputs_match_eager_for_mixed_expressions_and_budget_decline() {
         }
     }
     let q = "SELECT ?s { ?s <urn:value> ?v FILTER(?v > 4000 && ?v < 4900) }";
-    let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+    let expected = bag(query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .application_rows());
     let opts = QueryOptions {
         max_memory_bytes: Some(1 << 20),
         ..Default::default()
@@ -1587,7 +1680,7 @@ fn dictionary_inputs_match_eager_for_mixed_expressions_and_budget_decline() {
     let mut answer = Vec::new();
     while let Some(b) = cursor.next_batch().unwrap() {
         for row in 0..b.len() {
-            answer.push(b.row(row).unwrap());
+            answer.push(b.row(row).unwrap().values().to_vec());
         }
     }
     assert_eq!(bag(answer), expected);
@@ -1617,7 +1710,9 @@ fn dictionary_numeric_topk_preserves_exact_order_and_non_numeric_fallbacks() {
         "SELECT ?s ?v { ?s <urn:value> ?v } ORDER BY ?v LIMIT 10",
         "SELECT ?s ?v { ?s <urn:value> ?v } ORDER BY DESC(?v) LIMIT 10",
     ] {
-        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows();
         for reuse in [true, false] {
             let opts = QueryOptions {
                 max_memory_bytes: Some(16 << 20),
@@ -1648,7 +1743,9 @@ fn resumable_binary_joins_preserve_bags_compatibility_and_optional_filters() {
         "SELECT * WHERE { VALUES ?x { 1 2 } VALUES ?y {} }",
         "SELECT * WHERE { VALUES ?x {} OPTIONAL { VALUES ?y { 1 2 } } }",
     ] {
-        let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+        let expected = bag(query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows());
         for cap in [1, 2, 3, 4096] {
             let c = open(&s, q, cap);
             assert!(!c.plan().has_materialization());
@@ -1704,7 +1801,9 @@ fn hash_join_keys_cover_unbound_build_and_probe_values_with_duplicates() {
     ));
     for q in &queries {
         let q = q.as_str();
-        let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+        let expected = bag(query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows());
         for cap in [1, 2, 3, 4096] {
             let c = open(&s, q, cap);
             assert!(!c.plan().has_materialization());
@@ -1722,7 +1821,9 @@ fn incremental_groups_match_eager_for_empty_unbound_numeric_and_text_inputs() {
         "SELECT (COUNT(*) AS ?c) (SUM(?x) AS ?sum) (AVG(?x) AS ?avg) (MIN(?x) AS ?min) WHERE { VALUES ?x {} }",
         "SELECT ?g (COUNT(*) AS ?c) WHERE { VALUES (?g ?x) {} } GROUP BY ?g",
     ] {
-        let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+        let expected = bag(query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows());
         for cap in [1, 2, 3, 4096] {
             let c = open(&s, q, cap);
             assert!(!c.plan().has_materialization());
@@ -1733,7 +1834,6 @@ fn incremental_groups_match_eager_for_empty_unbound_numeric_and_text_inputs() {
 
 #[test]
 fn construct_cursor_deduplicates_across_batches_and_retains_snapshot() {
-    use oxrdf::GraphName;
     use sparkles_core::sparql::graph_cursor;
     let s = store(40);
     let queries = [
@@ -1744,10 +1844,14 @@ fn construct_cursor_deduplicates_across_batches_and_retains_snapshot() {
     for q in queries {
         let expected = query(s.snapshot(), q, &Default::default()).unwrap();
         let mut expected = expected
-            .triples
-            .into_iter()
-            .map(|t| t.in_graph(GraphName::DefaultGraph).to_string())
-            .chain(expected.quads.into_iter().map(|q| q.to_string()))
+            .triples()
+            .iter()
+            .map(|t| {
+                t.as_ref()
+                    .in_graph(oxrdf::GraphNameRef::DefaultGraph)
+                    .to_string()
+            })
+            .chain(expected.quads().iter().map(|q| q.to_string()))
             .collect::<Vec<_>>();
         expected.sort();
         for rows in [1, 3, 4096] {
@@ -1851,9 +1955,12 @@ fn graph_send_cancel_budget_and_describe_barrier_are_explicit_and_fused() {
     assert_eq!(
         got,
         expected
-            .triples
-            .into_iter()
-            .map(|t| t.in_graph(oxrdf::GraphName::DefaultGraph).to_string())
+            .triples()
+            .iter()
+            .map(|t| t
+                .as_ref()
+                .in_graph(oxrdf::GraphNameRef::DefaultGraph)
+                .to_string())
             .collect::<Vec<_>>()
     );
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1993,11 +2100,10 @@ fn ordered_optional_unique_and_duplicate_runs_resume_across_batch_boundaries() {
         let expected = query(s.snapshot(), q, &Default::default()).unwrap();
         let mut want = (0..expected.len())
             .map(|i| {
-                expected
-                    .table
-                    .cols
+                let row = expected.row(i).unwrap();
+                row.values()
                     .iter()
-                    .map(|c| expected.term(c[i]).map(|t| t.to_string()))
+                    .map(|term| term.as_ref().map(Term::to_string))
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -2011,6 +2117,8 @@ fn ordered_optional_unique_and_duplicate_runs_resume_across_batch_boundaries() {
                     batch
                         .row(i)
                         .unwrap()
+                        .values()
+                        .to_vec()
                         .into_iter()
                         .map(|t| t.map(|t| t.to_string()))
                         .collect::<Vec<_>>()
@@ -2124,7 +2232,9 @@ fn strict_policy_admits_a_budgeted_sort_and_reports_it_as_blocking() {
         assert!(blocking(plan), "{q}");
         assert_eq!(
             all(c),
-            query(s.snapshot(), q, &Default::default()).unwrap().rows(),
+            query(s.snapshot(), q, &Default::default())
+                .unwrap()
+                .application_rows(),
             "{q}"
         );
     }
@@ -2135,7 +2245,9 @@ fn strict_policy_admits_a_budgeted_sort_and_reports_it_as_blocking() {
     assert!(!c.plan().has_materialization(), "{q}");
     assert_eq!(
         all(c),
-        query(s.snapshot(), q, &Default::default()).unwrap().rows()
+        query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows()
     );
 }
 
@@ -2185,9 +2297,9 @@ fn shared_scan_batches_pin_blocks_and_charge_retained_ownership() {
     let first = retained[0].row(0).unwrap();
     drop(cursor);
     drop(s);
-    assert_eq!(retained[0].row(0).unwrap(), first);
-    assert!(matches!(first[0], Some(Term::Literal(_))));
-    assert!(matches!(first[1], Some(Term::NamedNode(_))));
+    assert_eq!(retained[0].row(0).unwrap().values(), first.values());
+    assert!(matches!(first.values()[0], Some(Term::Literal(_))));
+    assert!(matches!(first.values()[1], Some(Term::NamedNode(_))));
 }
 
 #[test]
@@ -2198,7 +2310,9 @@ fn shared_scan_projection_limit_and_offset_preserve_order_and_work_limits() {
         "SELECT ?o ?s WHERE { ?s <urn:p> ?o } OFFSET 7 LIMIT 5000",
         "SELECT ?o WHERE { ?s <urn:p> ?o } LIMIT 5",
     ] {
-        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows();
         assert_eq!(all(open(&s, q, 4096)), expected);
     }
     let opts = QueryOptions {
@@ -2238,7 +2352,9 @@ fn dictionary_filters_keep_exact_values_with_tight_budgets() {
         "SELECT ?s ?v {?s <urn:p> ?v FILTER(?v < 200 || (?v > 1500 && ?v < 2100))}",
     ];
     for (i, q) in queries.iter().enumerate() {
-        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows();
         for cache in [true, false] {
             for memory in if i == 0 {
                 vec![2 << 20, 8 << 20]
@@ -2257,7 +2373,9 @@ fn dictionary_filters_keep_exact_values_with_tight_budgets() {
                     select_cursor(s.snapshot(), q, &opts, &CursorOptions::default()).unwrap();
                 let mut answer = Vec::new();
                 while let Some(batch) = cursor.next_batch().unwrap() {
-                    answer.extend((0..batch.len()).map(|row| batch.row(row).unwrap()));
+                    answer.extend(
+                        (0..batch.len()).map(|row| batch.row(row).unwrap().values().to_vec()),
+                    );
                 }
                 assert!(cursor.stats().mem_peak_bytes <= memory);
                 if i == 1 {
@@ -2291,7 +2409,9 @@ fn parallel_dictionary_order_preserves_lexical_values_and_budget_decline() {
         "SELECT ?s ?v {?s <urn:p> ?v FILTER(?v > 1)} ORDER BY DESC(?v) LIMIT 17",
         "SELECT ?s ?v {?s <urn:w> ?v} ORDER BY ?v LIMIT 17",
     ] {
-        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows();
         for memory in [8 << 20, 32 << 20] {
             let opts = QueryOptions {
                 max_memory_bytes: Some(memory),
@@ -2300,7 +2420,7 @@ fn parallel_dictionary_order_preserves_lexical_values_and_budget_decline() {
             let mut cursor = select_cursor(s.snapshot(), q, &opts, &Default::default()).unwrap();
             let mut rows = Vec::new();
             while let Some(batch) = cursor.next_batch().unwrap() {
-                rows.extend((0..batch.len()).map(|row| batch.row(row).unwrap()));
+                rows.extend((0..batch.len()).map(|row| batch.row(row).unwrap().values().to_vec()));
             }
             assert_eq!(rows, expected);
             assert!(cursor.stats().mem_peak_bytes <= memory);
@@ -2328,7 +2448,9 @@ fn optional_count_merges_preserve_multiplicity_with_short_and_long_key_gaps() {
         "SELECT (COUNT(*) AS ?n) {?s <urn:a> ?a OPTIONAL {?s <urn:b> ?b}}",
         "SELECT (COUNT(*) AS ?n) {?s <urn:b> ?b OPTIONAL {?s <urn:a> ?a}}",
     ] {
-        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows();
         for cap in [1, 7, 4096] {
             assert_eq!(all(open(&s, q, cap)), expected);
         }
@@ -2368,11 +2490,11 @@ fn cursor_reads_its_generation_after_compactions_retire_it() {
         .expect("a sealed generation");
     let expected = bag(query(snapshot.clone(), q, &Default::default())
         .unwrap()
-        .rows());
+        .application_rows());
     let mut cursor = select_cursor(snapshot, q, &Default::default(), &options(7)).unwrap();
     let mut got = Vec::new();
     let first = cursor.next_batch().unwrap().unwrap();
-    got.extend((0..first.len()).map(|i| first.row(i).unwrap()));
+    got.extend((0..first.len()).map(|i| first.row(i).unwrap().values().to_vec()));
     for round in 0..3 {
         sparkles_core::sparql::update::update(
             &s,
@@ -2388,7 +2510,7 @@ fn cursor_reads_its_generation_after_compactions_retire_it() {
         generation.display()
     );
     while let Some(batch) = cursor.next_batch().unwrap() {
-        got.extend((0..batch.len()).map(|i| batch.row(i).unwrap()));
+        got.extend((0..batch.len()).map(|i| batch.row(i).unwrap().values().to_vec()));
     }
     assert_eq!(bag(got), expected);
 }
@@ -2405,7 +2527,9 @@ fn sort_over_union_arms_reorders_their_concatenation() {
     )])
     .unwrap();
     let q = "prefix : <http://www.example.org/> select ?t where { :a (:p1|:p2)/(:p3|:p4) ?t }";
-    let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+    let expected = bag(query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .application_rows());
     assert_eq!(expected.len(), 2);
     for rows in [1, 2, 4096] {
         assert_eq!(bag(all(open(&s, q, rows))), expected, "{rows}");
@@ -2816,7 +2940,7 @@ type Rows = Vec<Vec<Option<Term>>>;
 
 fn eager(snapshot: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> (Vec<String>, Rows) {
     let r = query(snapshot, q, opts).unwrap_or_else(|e| panic!("{q}: {e}"));
-    (r.vars.clone(), r.rows())
+    (r.variables().to_vec(), r.application_rows())
 }
 
 /// Cursor rows, reordered to the columns of `vars`.
@@ -3131,7 +3255,9 @@ fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
         "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s <urn:q> ?t }",
         "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }",
     ] {
-        let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+        let expected = bag(query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows());
         for rows in [1, 2, 3, 4096] {
             let opts = CursorOptions {
                 batch_rows: rows,
@@ -3169,7 +3295,7 @@ fn widened_incremental_groups_match_eager() {
         "SELECT ?s ?o (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o } GROUP BY ?s ?o HAVING (?o > 30)".into(),
         "SELECT ?m (COUNT(?s) AS ?n) (SUM(?o) AS ?t) WHERE { ?s <urn:p> ?o BIND(?o - (?o / 5 - FLOOR(?o / 5)) * 5 AS ?r) } GROUP BY (FLOOR(?o / 10) AS ?m)".into(),
     ] {
-        let expected = bag(query(s.snapshot(), &q, &Default::default()).unwrap().rows());
+        let expected = bag(query(s.snapshot(), &q, &Default::default()).unwrap().application_rows());
         for cap in [1, 2, 3, 4096] {
             let c = open(&s, &q, cap);
             assert!(!c.plan().has_materialization(), "{q}");
@@ -3203,7 +3329,9 @@ fn group_count_scans_stream_their_counts() {
     ];
     for round in 0..2 {
         for q in queries {
-            let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+            let expected = bag(query(s.snapshot(), q, &Default::default())
+                .unwrap()
+                .application_rows());
             for cap in [1, 2, 3, 4096] {
                 let c = open(&s, q, cap);
                 assert!(has(c.plan(), "GroupCount"), "{q}: {:?}", c.plan());
@@ -3251,7 +3379,9 @@ fn transitive_paths_stream_one_start_at_a_time() {
     ];
     for round in 0..2 {
         for q in queries {
-            let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+            let expected = bag(query(s.snapshot(), q, &Default::default())
+                .unwrap()
+                .application_rows());
             for cap in [1, 2, 5, 4096] {
                 let c = open(&s, q, cap);
                 assert!(!c.plan().has_materialization(), "{q}: {:?}", c.plan());
@@ -3260,7 +3390,7 @@ fn transitive_paths_stream_one_start_at_a_time() {
                     let full = "SELECT ?s ?o WHERE { ?s <urn:q>+ ?o }";
                     let full = bag(query(s.snapshot(), full, &Default::default())
                         .unwrap()
-                        .rows());
+                        .application_rows());
                     assert_eq!(got.len(), expected.len(), "{q}; cap {cap}");
                     assert!(got.iter().all(|r| full.contains(r)), "{q}; cap {cap}");
                 } else {
@@ -3297,7 +3427,9 @@ fn count_joins_from_key_runs_run_without_fallback() {
     s.compact().unwrap();
     let q = "SELECT (COUNT(*) AS ?n) WHERE { ?a <urn:k> ?b . ?b <urn:k> ?c }";
     for round in 0..2 {
-        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows();
         for cap in [1, 4096] {
             let c = open(&s, q, cap);
             if round == 0 {
@@ -3387,7 +3519,9 @@ fn streaming_top_k_matches_eager_in_order_at_every_batch_size() {
         "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v LIMIT 100000",
     ];
     for q in queries {
-        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows();
         for (rows, bytes) in [
             (1, 1 << 20),
             (2, 1 << 20),
@@ -3436,7 +3570,7 @@ fn streaming_top_k_keeps_only_its_rows_within_the_memory_budget() {
     let mut rows = Vec::new();
     while let Some(b) = c.next_batch().unwrap() {
         for i in 0..b.len() {
-            rows.push(b.row(i).unwrap());
+            rows.push(b.row(i).unwrap().values().to_vec());
         }
     }
     assert_eq!(rows.len(), 5);
@@ -3600,7 +3734,7 @@ fn long_filters_and_top_k_read_growing_inputs_with_the_answers_of_eager() {
     let filtered = "SELECT ?s ?n WHERE { ?s <urn:name> ?n FILTER(CONTAINS(?n, \"Ada\")) }";
     let expected = bag(query(s.snapshot(), filtered, &Default::default())
         .unwrap()
-        .rows());
+        .application_rows());
     assert_eq!(expected.len(), 150_000 / 7 + 1);
     let ordered = [
         "SELECT ?s ?a WHERE { ?s <urn:age> ?a } ORDER BY DESC(ABS(?a - 50)) ?s LIMIT 10",
@@ -3616,12 +3750,14 @@ fn long_filters_and_top_k_read_growing_inputs_with_the_answers_of_eager() {
                 "the filter keeps the caller's batch size"
             );
             for row in 0..batch.len() {
-                rows.push(batch.row(row).unwrap());
+                rows.push(batch.row(row).unwrap().values().to_vec());
             }
         }
         assert_eq!(bag(rows), expected);
         for q in ordered {
-            let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+            let eager = query(s.snapshot(), q, &Default::default())
+                .unwrap()
+                .application_rows();
             let c = select_cursor(s.snapshot(), q, &opts, &options(4096)).unwrap();
             assert_eq!(all(c), eager, "{q}");
         }
@@ -3635,7 +3771,9 @@ fn long_filters_and_top_k_read_growing_inputs_with_the_answers_of_eager() {
 fn top_k_keeps_the_callers_byte_cap_when_its_input_does_not_grow() {
     let s = store(200_000);
     let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(ABS(?o - 7)) LIMIT 5";
-    let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    let eager = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .application_rows();
     let cursor_options = CursorOptions {
         batch_rows: 1 << 20,
         batch_bytes: 64 << 10,
@@ -3649,7 +3787,7 @@ fn top_k_keeps_the_callers_byte_cap_when_its_input_does_not_grow() {
     let mut rows = Vec::new();
     while let Some(batch) = c.next_batch().unwrap() {
         for row in 0..batch.len() {
-            rows.push(batch.row(row).unwrap());
+            rows.push(batch.row(row).unwrap().values().to_vec());
         }
     }
     assert_eq!(rows, eager);
@@ -3676,7 +3814,9 @@ fn top_k_over_improving_input_with_repeated_values_matches_eager() {
         "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(?v) ?s LIMIT 7",
         "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v LIMIT 10",
     ] {
-        let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let eager = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows();
         for opts in [QueryOptions::default(), without("grow_input")] {
             let c = select_cursor(
                 s.snapshot(),
@@ -3805,7 +3945,9 @@ fn top_k_over_a_cycle_of_partially_ordered_keys_matches_eager_at_every_batch_siz
         "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v LIMIT 1",
         "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v ?s LIMIT 2",
     ] {
-        let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let eager = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows();
         for rows in [1, 512, 1024, 4096] {
             let c = select_cursor(
                 s.snapshot(),
@@ -3912,7 +4054,9 @@ fn morsel_filters_over_scans_match_eager_in_order() {
         "SELECT ?s WHERE { ?s <urn:name> ?n FILTER(CONTAINS(?n, \"nobody\")) }",
     ];
     for q in queries {
-        let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let eager = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows();
         for (opts, batch) in [
             (QueryOptions::default(), 4096),
             (QueryOptions::default(), 100_000),
@@ -4030,17 +4174,17 @@ fn ordered_top_k_streams_unordered_pieces_with_the_answers_of_eager() {
         for q in queries {
             let eager = query(s.snapshot(), q, &Default::default()).unwrap();
             assert!(
-                q.contains("FILTER") || plan_has(&eager.plan, "IndexTopK"),
+                q.contains("FILTER") || plan_has(eager.plan(), "IndexTopK"),
                 "{q}: {:#?}",
-                eager.plan
+                eager.plan()
             );
-            let expected = eager.rows();
+            let expected = eager.application_rows();
             // no eager fallback, even when the generic plan answers
             let strict = options(4096);
             let mut c = select_cursor(s.snapshot(), q, &Default::default(), &strict).unwrap();
             let mut rows = Vec::new();
             while let Some(batch) = c.next_batch().unwrap() {
-                rows.extend((0..batch.len()).map(|i| batch.row(i).unwrap()));
+                rows.extend((0..batch.len()).map(|i| batch.row(i).unwrap().values().to_vec()));
             }
             assert_eq!(rows, expected, "{q} with {extra:?}");
             // The generic plan is built, and shown, only when it answers.
@@ -4082,17 +4226,17 @@ fn ordered_top_k_memory_does_not_grow_with_its_unordered_pieces() {
     for n in [300_000, 900_000] {
         let s = decimal_store(n, 3, "");
         let eager = query(s.snapshot(), q, &Default::default()).unwrap();
-        assert!(plan_has(&eager.plan, "IndexTopK"), "{:#?}", eager.plan);
+        assert!(plan_has(eager.plan(), "IndexTopK"), "{:#?}", eager.plan());
         let peak = |opts: &QueryOptions| {
             let mut c = select_cursor(s.snapshot(), q, opts, &options(4096)).unwrap();
             let rows = pool.install(|| {
                 let mut rows = Vec::new();
                 while let Some(b) = c.next_batch().unwrap() {
-                    rows.extend((0..b.len()).map(|i| b.row(i).unwrap()));
+                    rows.extend((0..b.len()).map(|i| b.row(i).unwrap().values().to_vec()));
                 }
                 rows
             });
-            assert_eq!(rows, eager.rows());
+            assert_eq!(rows, eager.application_rows());
             c.stats().mem_peak_bytes
         };
         peaks.push(peak(&QueryOptions::default()));
@@ -4149,8 +4293,12 @@ fn ordered_top_k_dedups_union_graph_rows_across_morsels() {
             format!("SELECT ?s ?v {from}WHERE {{ ?s <urn:p> ?v }} ORDER BY DESC(?v) LIMIT 21000"),
         ] {
             let eager = query(s.snapshot(), &q, &Default::default()).unwrap();
-            assert!(plan_has(&eager.plan, "IndexTopK"), "{q}: {:#?}", eager.plan);
-            let expected = eager.rows();
+            assert!(
+                plan_has(eager.plan(), "IndexTopK"),
+                "{q}: {:#?}",
+                eager.plan()
+            );
+            let expected = eager.application_rows();
             assert_eq!(
                 expected
                     .iter()
@@ -4294,7 +4442,9 @@ fn morsel_filters_and_ordered_top_k_agree_with_eager_on_mixed_terms() {
     for (seed, delta) in [(0x5eed_0001, false), (0x5eed_0002, true)] {
         let s = mixed_store(120_000, seed, delta);
         for q in &queries {
-            let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+            let eager = query(s.snapshot(), q, &Default::default())
+                .unwrap()
+                .application_rows();
             for pool in &pools {
                 for batch in [4096, 50_000] {
                     let mut c =
@@ -4303,7 +4453,7 @@ fn morsel_filters_and_ordered_top_k_agree_with_eager_on_mixed_terms() {
                     let rows = pool.install(|| {
                         let mut rows = Vec::new();
                         while let Some(b) = c.next_batch().unwrap() {
-                            rows.extend((0..b.len()).map(|i| b.row(i).unwrap()));
+                            rows.extend((0..b.len()).map(|i| b.row(i).unwrap().values().to_vec()));
                         }
                         rows
                     });
@@ -4338,7 +4488,9 @@ fn parallel_cursor_operators_release_their_memory_when_stopped() {
     ];
     let pool = QueryPool::new(1 << 30);
     for q in queries {
-        let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let eager = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows();
         // cancelled after its first batch
         let grant = Arc::new(pool.try_grant(0).unwrap());
         let opts = QueryOptions {
@@ -4373,12 +4525,16 @@ fn parallel_cursor_operators_release_their_memory_when_stopped() {
             let answer = select_cursor(s.snapshot(), q, &opts, &options(4096)).and_then(|mut c| {
                 let mut rows = Vec::new();
                 while let Some(b) = c.next_batch()? {
-                    rows.extend((0..b.len()).map(|i| b.row(i).unwrap()));
+                    for i in 0..b.len() {
+                        rows.push(b.row(i)?.values().to_vec());
+                    }
                 }
                 Ok(rows)
             });
-            if let Ok(rows) = answer {
-                assert_eq!(rows, eager, "{q}");
+            match answer {
+                Ok(rows) => assert_eq!(rows, eager, "{q}"),
+                Err(Error::Timeout) => {}
+                Err(error) => panic!("{q}: unexpected deadline outcome: {error}"),
             }
             assert_eq!(grant.used(), 0, "{q}: {timeout} ms, {base}");
         }
@@ -4394,7 +4550,9 @@ fn parallel_cursor_operators_release_their_memory_when_stopped() {
             let answer = select_cursor(s.snapshot(), q, &opts, &options(4096)).and_then(|mut c| {
                 let mut rows = Vec::new();
                 while let Some(b) = c.next_batch()? {
-                    rows.extend((0..b.len()).map(|i| b.row(i).unwrap()));
+                    for i in 0..b.len() {
+                        rows.push(b.row(i)?.values().to_vec());
+                    }
                 }
                 Ok((rows, c.stats().mem_peak_bytes))
             });
@@ -4499,7 +4657,7 @@ fn temporal_bind_reuse_matches_an_independent_calendar_oracle() {
     validate(
         query(old.clone(), text, &Default::default())
             .unwrap()
-            .rows(),
+            .application_rows(),
         0,
     );
     for cache in [false, true] {
@@ -4628,7 +4786,9 @@ fn arq_uuid_aliases_and_dynamic_calls_stay_volatile_across_cursor_morsels() {
                 "native cursor {fresh}, cache={cache} must generate one UUID per row"
             );
             assert!(!unique.contains(&None));
-            let rows = query(s.snapshot(), &text, &opts).unwrap().rows();
+            let rows = query(s.snapshot(), &text, &opts)
+                .unwrap()
+                .application_rows();
             let unique = rows
                 .iter()
                 .map(|r| r[0].clone())
@@ -4713,7 +4873,9 @@ fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
     )])
     .unwrap();
     let q = "SELECT ?s ?o ?x WHERE { ?s <urn:p> ?o OPTIONAL { ?s <urn:q> ?x } }";
-    let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+    let expected = bag(query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .application_rows());
     for merge in [true, false] {
         let opts = QueryOptions {
             optimizations: Some(sparkles_core::sparql::Optimizations {
@@ -4723,7 +4885,7 @@ fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
             ..Default::default()
         };
         let eager = query(s.snapshot(), q, &opts).unwrap();
-        let eager_plan = serde_json::to_string(&eager.plan).unwrap();
+        let eager_plan = serde_json::to_string(eager.plan()).unwrap();
         let c = select_cursor(s.snapshot(), q, &opts, &options(7)).unwrap();
         let plan = c.plan_json().unwrap();
         for (mode, plan) in [("eager", &eager_plan), ("cursor", &plan)] {
@@ -4735,6 +4897,6 @@ fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
         }
         assert_eq!(plan.contains("[hash join]"), !merge, "{plan}");
         assert_eq!(bag(all(c)), expected, "merge_left_join {merge}");
-        assert_eq!(bag(eager.rows()), expected);
+        assert_eq!(bag(eager.application_rows()), expected);
     }
 }

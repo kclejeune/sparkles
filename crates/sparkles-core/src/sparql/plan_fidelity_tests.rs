@@ -70,7 +70,7 @@ fn every_written_node_has_its_path_as_id() {
         &opts(),
     )
     .unwrap();
-    let j = serde_json::to_value(&r.plan).unwrap();
+    let j = serde_json::to_value(r.plan()).unwrap();
     fn check(j: &serde_json::Value, id: &str, count: &mut usize) {
         assert_eq!(j["id"], id, "{j}");
         *count += 1;
@@ -94,9 +94,9 @@ fn every_written_node_has_its_path_as_id() {
         out
     };
     for id in ids {
-        assert!(r.plan.node(&id).is_some(), "{id}");
+        assert!(r.plan().node(&id).is_some(), "{id}");
     }
-    assert!(r.plan.node("0.9.9").is_none());
+    assert!(r.plan().node("0.9.9").is_none());
 }
 
 #[test]
@@ -108,7 +108,7 @@ fn a_join_whose_left_side_is_empty_skips_its_right_side() {
         &opts(),
     )
     .unwrap();
-    let skipped: Vec<_> = nodes(&r.plan)
+    let skipped: Vec<_> = nodes(r.plan())
         .into_iter()
         .filter(|n| n.fidelity().skipped.is_some())
         .collect();
@@ -118,7 +118,7 @@ fn a_join_whose_left_side_is_empty_skips_its_right_side() {
         assert_eq!(n.actual_rows, -1);
         assert_eq!(n.time_ms, 0.0);
     }
-    let j = serde_json::to_value(&r.plan).unwrap().to_string();
+    let j = serde_json::to_value(r.plan()).unwrap().to_string();
     if !skipped.is_empty() {
         assert!(j.contains("\"skipped\""), "{j}");
     }
@@ -135,21 +135,21 @@ fn reruns_under_limit_add_up_and_say_they_stopped_early() {
     )
     .unwrap();
     assert_eq!(r.len(), 20);
-    let all = nodes(&r.plan);
+    let all = nodes(r.plan());
     let filter = all
         .iter()
         .find(|n| n.operator == "Filter")
         .expect("a filter node");
-    assert!(filter.fidelity().stopped_early, "{:#?}", r.plan);
+    assert!(filter.fidelity().stopped_early, "{:#?}", r.plan());
     let child = &filter.children[0];
     assert!(
         child.fidelity().reruns > 0,
         "the scan ran more than once: {:#?}",
-        r.plan
+        r.plan()
     );
     // the children's time is all within the parent's
     assert!(child.time_ms <= filter.time_ms + 1e-6);
-    let j = serde_json::to_value(&r.plan).unwrap().to_string();
+    let j = serde_json::to_value(r.plan()).unwrap().to_string();
     assert!(
         j.contains("\"stoppedEarly\":true") && j.contains("\"runs\""),
         "{j}"
@@ -168,14 +168,14 @@ fn a_cache_hit_keeps_the_subtree_it_was_computed_from() {
     let text = "SELECT ?t (COUNT(?p) AS ?c) WHERE { ?p ex:team ?t ; ex:name ?n } GROUP BY ?t";
     let first = query(s.snapshot(), text, &opts()).unwrap();
     let second = query(s.snapshot(), text, &opts()).unwrap();
-    let hit = nodes(&second.plan)
+    let hit = nodes(second.plan())
         .into_iter()
         .find(|n| n.cached)
         .expect("a cache hit");
-    assert!(!hit.children.is_empty(), "{:#?}", second.plan);
+    assert!(!hit.children.is_empty(), "{:#?}", second.plan());
     assert!(hit.children.iter().all(|c| c.fidelity().skipped.is_some()));
     // the same shape as the run that filled the cache
-    assert_eq!(shape(&first.plan), shape(&second.plan));
+    assert_eq!(shape(first.plan()), shape(second.plan()));
 }
 
 #[test]
@@ -189,7 +189,7 @@ fn estimated_and_executed_plans_have_the_same_shape() {
     ] {
         let (_, est) = explain(s.snapshot(), text, &opts()).unwrap();
         let run = query(s.snapshot(), text, &opts()).unwrap();
-        assert_eq!(shape(&est), shape(&run.plan), "{text}");
+        assert_eq!(shape(&est), shape(run.plan()), "{text}");
     }
     let run = query(
         s.snapshot(),
@@ -197,9 +197,9 @@ fn estimated_and_executed_plans_have_the_same_shape() {
         &opts(),
     )
     .unwrap();
-    assert_eq!(run.plan.operator, "CONSTRUCT");
-    assert_eq!(run.plan.actual_rows, 5);
-    assert!(run.plan.time_ms >= run.plan.children[0].time_ms);
+    assert_eq!(run.plan().operator, "CONSTRUCT");
+    assert_eq!(run.plan().actual_rows, 5);
+    assert!(run.plan().time_ms >= run.plan().children[0].time_ms);
 }
 
 #[test]
@@ -407,12 +407,12 @@ fn correlation_estimates_raise_the_error_of_no_recorded_plan() {
         let a = query(s.snapshot(), q, &off).unwrap();
         let b = query(s.snapshot(), q, &on).unwrap();
         assert_eq!(a.len(), b.len(), "{q}");
-        let (ea, eb) = (join_qerror(&a.plan), join_qerror(&b.plan));
+        let (ea, eb) = (join_qerror(a.plan()), join_qerror(b.plan()));
         assert!(
             eb <= ea * 1.0001,
             "{q}: the largest join q-error rose from {ea:.3} to {eb:.3}\n{:#?}\n{:#?}",
-            a.plan,
-            b.plan
+            a.plan(),
+            b.plan()
         );
         if eb < ea * 0.9 {
             better += 1;

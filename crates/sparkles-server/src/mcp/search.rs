@@ -302,7 +302,8 @@ impl Tools<'_> {
                 Error::Invalid(m) => no_vectors(m),
                 e => ctx.engine(e),
             })?
-            .rows();
+            .rows()
+            .map_err(|e| ctx.engine(e))?;
         if rows.is_empty() {
             // say why nothing matched
             let mut opts = opts.clone();
@@ -334,16 +335,18 @@ impl Tools<'_> {
                 )));
             }
         }
-        let mut hits: Vec<(Term, f64)> = rows
-            .into_iter()
-            .filter_map(|r| {
-                let mut r = r.into_iter();
-                let s = r.next().flatten()?;
-                let score = score_of(r.next().flatten().as_ref());
-                Some((s, score))
-            })
-            .filter(|(s, _)| !(exclude_self && Some(s) == entity.as_ref()))
-            .collect();
+        let mut hits: Vec<(&Term, f64)> = Vec::new();
+        for index in 0..rows.len() {
+            let row = rows.row(index).map_err(|e| ctx.engine(e))?;
+            let mut values = row.values().iter();
+            let Some(subject) = values.next().and_then(Option::as_ref) else {
+                continue;
+            };
+            let score = score_of(values.next().and_then(Option::as_ref));
+            if !(exclude_self && Some(subject) == entity.as_ref()) {
+                hits.push((subject, score));
+            }
+        }
         hits.truncate(k);
         let iris: Vec<&NamedNode> = hits
             .iter()
@@ -416,8 +419,8 @@ fn types_of(
     );
     let mut opts = opts.clone();
     opts.timeout = Some(remaining(deadline)?);
-    for row in sparql::query(snap.clone(), &q, &opts)?.rows() {
-        if let [Some(Term::NamedNode(x)), Some(t)] = row.as_slice() {
+    for row in sparql::query(snap.clone(), &q, &opts)?.rows()? {
+        if let [Some(Term::NamedNode(x)), Some(t)] = row.values() {
             let v = out.entry(x.as_str().to_string()).or_default();
             if v.len() < 3 {
                 v.push(t.clone());

@@ -201,6 +201,15 @@ fn fixture(config: &Config, ordered: bool) -> String {
     }
 }
 
+/// An application copy of one cell of a retained result.
+fn cell(result: &sparkles_core::sparql::QueryResult, row: usize, column: usize) -> Option<Term> {
+    let id = result.table().get(row, column).expect("result cell");
+    result
+        .term(id)
+        .expect("result term")
+        .map(|term| term.as_term().clone())
+}
+
 fn integer(term: &Option<Term>) -> usize {
     let Some(Term::Literal(value)) = term else {
         panic!("expected an integer, got {term:?}")
@@ -362,7 +371,7 @@ fn read_cursor(
     let mut cursor = select_cursor(store.snapshot(), text, options, &cursor_options())?;
     while let Some(batch) = cursor.next_batch()? {
         for i in 0..batch.len() {
-            check(batch.row(i)?);
+            check(batch.row(i)?.values().to_vec());
         }
     }
     assert_eq!(cursor.status(), CursorStatus::Complete);
@@ -486,7 +495,7 @@ fn sort_oracle(
     let expected = query(store.snapshot(), text, &reference_options())?;
     std::fs::write(
         config.out.join("eager-plan.json"),
-        serde_json::to_vec_pretty(&expected.plan)?,
+        serde_json::to_vec_pretty(expected.plan())?,
     )?;
     assert_eq!(expected.len(), n);
     let keys = keys();
@@ -494,14 +503,10 @@ fn sort_oracle(
     let mut last = [None; 20];
     let mut order = Vec::with_capacity(n);
     for i in 0..n {
-        let id = integer(&expected.term(expected.table.cols[0][i]));
+        let id = integer(&cell(&expected, i, 0));
         seen.add(id);
         let key = &keys[(id / config.repeats) % keys.len()];
-        assert_eq!(
-            expected.term(expected.table.cols[1][i]),
-            key.term,
-            "fixture key changed"
-        );
+        assert_eq!(cell(&expected, i, 1), key.term, "fixture key changed");
         let rank = ranks[id];
         if let Some(previous) = last[key.equality] {
             assert!(
@@ -515,7 +520,7 @@ fn sort_oracle(
     }
     seen.finish();
     let peak = expected.mem_peak_bytes;
-    let plan = serde_json::to_value(&expected.plan)?;
+    let plan = serde_json::to_value(expected.plan())?;
     drop(expected);
     Ok((order, ranks, peak, plan))
 }
@@ -549,11 +554,8 @@ fn run(config: Config) -> Result<()> {
         assert_eq!(result.len(), n);
         let mut seen = Seen::new(n);
         for i in 0..n {
-            let row: Vec<_> = result
-                .table
-                .cols
-                .iter()
-                .map(|col| result.term(col[i]))
+            let row: Vec<_> = (0..result.table().width())
+                .map(|column| cell(&result, i, column))
                 .collect();
             let id = group_id(&config, &row);
             seen.add(id);
@@ -570,7 +572,7 @@ fn run(config: Config) -> Result<()> {
         }
         seen.finish();
         let peak = result.mem_peak_bytes;
-        let plan = serde_json::to_value(&result.plan)?;
+        let plan = serde_json::to_value(result.plan())?;
         drop(result);
         (Vec::new(), Vec::new(), peak, plan)
     };

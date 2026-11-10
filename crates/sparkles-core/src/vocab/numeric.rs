@@ -1257,16 +1257,18 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(
-            result.rows()[0][0],
+            result.test_application_rows()[0][0],
             Some(Literal::new_typed_literal("0042", oxrdf::vocab::xsd::INT).into())
         );
         assert!(
-            matches!(result.ctx.value(result.table.cols[1][0]), Some(Value::Integer(n)) if i64::from(n) == 84)
+            matches!(result.test_context().value(result.test_table().cols[1][0]), Some(Value::Integer(n)) if i64::from(n) == 84)
         );
-        let id = result.table.cols[0][0];
+        let id = result.test_table().cols[0][0];
         assert_eq!(id.tag(), crate::id::Tag::Vocab);
         // A base numeric id takes the actual Ctx::column_value fast path, not key fallback.
-        assert!(matches!(result.ctx.value(id), Some(Value::Integer(n)) if i64::from(n) == 42));
+        assert!(
+            matches!(result.test_context().value(id), Some(Value::Integer(n)) if i64::from(n) == 42)
+        );
         let report = profile.report();
         assert!(report.pages.as_ref().unwrap()["vocab.num"].touched > 0);
         assert_eq!(report.numeric_pages_requested, 0);

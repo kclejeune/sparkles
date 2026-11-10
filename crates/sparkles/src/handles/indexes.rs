@@ -267,10 +267,10 @@ fn text_search(ds: &Dataset, snap: Arc<Snapshot>, req: &TextSearch) -> Result<Te
     let commit = snap.commit;
     let r = crate::sparql::query(snap, &query, &ds.with_query_defaults(&req.options))?;
     let hits: Vec<TextHit> = r
-        .rows()
+        .rows()?
         .into_iter()
         .map(|row| {
-            let get = |i: usize| row.get(i).cloned().flatten();
+            let get = |i: usize| row.values().get(i).cloned().flatten();
             let score = match get(1) {
                 Some(Term::Literal(sc)) => sc.value().parse::<f64>().ok(),
                 _ => None,

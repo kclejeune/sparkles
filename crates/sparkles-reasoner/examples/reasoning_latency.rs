@@ -80,9 +80,13 @@ fn store(universities: usize) -> Store {
 /// across builds so that a gate can compare it with a baseline. A row of another width
 /// than the variables gives a digest of its own.
 fn answer(r: &QueryResult) -> (usize, u64) {
-    let head = format!("{:?} {}", r.kind, r.vars.join(" "));
+    let head = format!("{:?} {}", r.kind, r.variables().join(" "));
     let mut rows: Vec<String> = r
         .rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|row| {
             row.into_iter()
@@ -92,7 +96,14 @@ fn answer(r: &QueryResult) -> (usize, u64) {
         })
         .collect();
     rows.sort_unstable();
-    if r.rows().iter().any(|row| row.len() != r.vars.len()) {
+    if r.rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>()
+        .iter()
+        .any(|row| row.len() != r.variables().len())
+    {
         rows.push("rows of another width than the variables".into());
     }
     let mut h = 0xcbf2_9ce4_8422_2325u64;

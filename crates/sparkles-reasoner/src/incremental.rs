@@ -27,7 +27,7 @@
 //! finds no proof and has explored every instance it reached, none of the facts it
 //! reached has a proof, and they are all remembered as unprovable.
 
-use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_capacity, table_grown};
+use crate::budget::{Budget, BudgetFailure, Held, table_bytes, table_capacity, table_grown};
 use crate::engine::{self, CHead, CRule, Eval, First, Limits, Mode, Slot, Step, VISIT_BATCH};
 use crate::facts::{Base, Memo};
 use crate::graph::{Cands, Graph, Triple};
@@ -172,11 +172,11 @@ pub(crate) struct Closure {
     /// one bit per row of the derived tier, from the graph's offset on: the row holds a
     /// fact that counts as explicit
     flags: Vec<u64>,
-    /// the heap of `flags`, charged to the budget of the graph
-    flags_held: Held,
     /// the GeoSPARQL default geometries the closure holds as explicit facts, when they
     /// are known (see [`crate::default_geometry_changes`])
     pub defaults: Option<Defaults>,
+    /// Returned after flags and default-geometry payloads have been destroyed.
+    flags_held: Held,
 }
 
 /// The GeoSPARQL default geometries of a closure: each feature's default geometry, and
@@ -210,7 +210,7 @@ impl Defaults {
         moved: &FxHashMap<u64, u64>,
         budget: &Arc<Budget>,
         strict: bool,
-    ) -> Result<(), MemoryExceeded> {
+    ) -> Result<(), BudgetFailure> {
         let m = |x: u64| moved.get(&x).copied().unwrap_or(x);
         self.pred = m(self.pred);
         if self
@@ -223,7 +223,7 @@ impl Defaults {
             if strict {
                 held.try_grow(bytes)?;
             } else {
-                held.grow(bytes);
+                held.grow(bytes)?;
             }
             self.of = self.of.iter().map(|(f, g)| (m(*f), m(*g))).collect();
         }
@@ -246,7 +246,7 @@ impl Closure {
                 None => {
                     let b = graph.base().expect("checked above");
                     let b = Base::new(b.snap.clone(), &b.graph_ids())?;
-                    graph.set_base(Arc::new(b.with_lookups(lookups)));
+                    graph.set_base(Arc::new(b.with_lookups(lookups)))?;
                 }
             }
         }
@@ -284,31 +284,83 @@ impl Closure {
     }
 
     /// Charge the closure to `budget` from now on, or fail when it does not fit.
-    pub fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), MemoryExceeded> {
-        let held = Held::try_new(budget, self.own_bytes())?;
-        self.graph.set_budget(budget)?;
-        self.terms.set_budget(budget)?;
-        if self.lookups().is_some() {
-            match self.lookups_mut() {
-                Some(l) => l.set_budget(budget)?,
-                // a shared tier would keep its answers charged to the old budget
-                None => debug_assert!(false, "the remembered lookups of a shared base tier"),
-            }
+    pub fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), BudgetFailure> {
+        // Validate exclusivity before reserving or mutating any existing owner.
+        if self.lookups().is_some() && self.lookups_mut().is_none() {
+            return Err(BudgetFailure::parent(
+                sparkles_budget::ParentRefused::DifferentParent,
+            ));
         }
-        self.flags_held = held;
+        let graph = self.graph.budget().clone();
+        let terms = self.terms.budget();
+        let flags = self.flags_held.budget().clone();
+        let lookups = self.lookups().map(|l| l.budget().clone());
+        let move_bytes = |source: &Arc<Budget>, bytes: usize| -> Result<usize, BudgetFailure> {
+            if Arc::ptr_eq(source, budget) {
+                return Ok(0);
+            }
+            if bytes != 0 && source.domain() != budget.domain() {
+                return Err(BudgetFailure::parent(
+                    sparkles_budget::ParentRefused::ForeignDomain,
+                ));
+            }
+            Ok(bytes)
+        };
+        let graph_bytes = move_bytes(&graph, self.graph.heap_bytes())?;
+        let term_bytes = move_bytes(&terms, self.terms.heap_bytes())?;
+        let flag_bytes = move_bytes(&flags, self.own_bytes())?;
+        let lookup_bytes = match &lookups {
+            Some(source) => move_bytes(source, self.lookups().expect("captured lookups").bytes())?,
+            None => 0,
+        };
+        let total = graph_bytes
+            .checked_add(term_bytes)
+            .and_then(|n| n.checked_add(flag_bytes))
+            .and_then(|n| n.checked_add(lookup_bytes))
+            .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+        // One still-owned reservation backs all components until their commit.
+        // Refusal above or here preserves every old owner and its contribution.
+        let mut prepared = Held::try_new_exact(budget, total)?;
+        let old_terms = (!Arc::ptr_eq(&terms, budget)).then(|| {
+            self.terms
+                .replace_credit(&terms, prepared.split(term_bytes))
+        });
+        let old_graph = (!Arc::ptr_eq(&graph, budget))
+            .then(|| self.graph.replace_credit(prepared.split(graph_bytes)));
+        let old_flags = (!Arc::ptr_eq(&flags, budget))
+            .then(|| std::mem::replace(&mut self.flags_held, prepared.split(flag_bytes)));
+        let old_lookups = lookups
+            .as_ref()
+            .filter(|source| !Arc::ptr_eq(source, budget))
+            .map(|_| {
+                self.lookups_mut()
+                    .expect("exclusive prepared lookups")
+                    .replace_credit(prepared.split(lookup_bytes))
+            });
+        drop(prepared);
+        // The entire transition is visible before returning any old contribution.
+        drop(old_graph);
+        drop(old_flags);
+        if let Some((source, bytes, retired_cache)) = old_terms {
+            drop(retired_cache);
+            source.release(bytes);
+        }
+        if let Some((source, bytes)) = old_lookups {
+            source.release(bytes);
+        }
         Ok(())
     }
 
     /// Charge the change of the closure's own buffers (the flags and the default
     /// geometries) since the last call.
-    pub fn settle(&mut self) {
+    pub fn settle(&mut self) -> Result<(), BudgetFailure> {
         let own = self.own_bytes();
-        self.flags_held.set(own);
-        self.graph.settle();
+        self.flags_held.set(own)?;
+        self.graph.settle()
     }
 
     /// [`settle`](Self::settle), failing instead of charging past the limit.
-    pub fn try_settle(&mut self) -> Result<(), MemoryExceeded> {
+    pub fn try_settle(&mut self) -> Result<(), BudgetFailure> {
         let own = self.own_bytes();
         self.flags_held.try_set(own)?;
         self.graph.try_settle()
@@ -327,7 +379,7 @@ impl Closure {
     ) -> anyhow::Result<Option<Lookups>> {
         let base = Base::new(snap, graphs)?;
         let fresh = Lookups::new(self.graph.budget(), lookups::DEFAULT_MAX_BYTES);
-        let old = self.graph.swap_base(Arc::new(base.with_lookups(fresh)));
+        let old = self.graph.swap_base(Arc::new(base.with_lookups(fresh)))?;
         // the lookups move over only when no one else shares the old tier, which holds
         // between runs
         let mut lookups = old
@@ -365,12 +417,7 @@ impl Closure {
 
     /// [`set_flag`](Self::set_flag), charging the growth of the flags before it is
     /// allocated, and with `strict` failing when it does not fit.
-    pub fn set_flag_with(
-        &mut self,
-        row: u32,
-        on: bool,
-        strict: bool,
-    ) -> Result<(), MemoryExceeded> {
+    pub fn set_flag_with(&mut self, row: u32, on: bool, strict: bool) -> Result<(), BudgetFailure> {
         let i = row - self.graph.offset();
         let w = i as usize / 64;
         if self.flags.len() <= w {
@@ -384,7 +431,7 @@ impl Closure {
                 if strict {
                     self.flags_held.try_grow(bytes)?;
                 } else {
-                    self.flags_held.grow(bytes);
+                    self.flags_held.grow(bytes)?;
                 }
                 self.flags.reserve_exact(new - self.flags.len());
             }
@@ -415,14 +462,13 @@ impl Closure {
     }
 
     /// Replace local ids by store ids (`moved`) in every live row.
-    pub fn remap(&mut self, moved: &FxHashMap<u64, u64>) {
-        let done = self.remap_with(moved, false);
-        debug_assert!(done.is_ok(), "charges that may pass the limit do not fail");
+    pub fn remap(&mut self, moved: &FxHashMap<u64, u64>) -> Result<(), BudgetFailure> {
+        self.remap_with(moved, false)
     }
 
     /// [`remap`](Self::remap), charging the work beside the closure before it is
     /// allocated and failing past the limit. The closure is unusable after an error.
-    pub fn try_remap(&mut self, moved: &FxHashMap<u64, u64>) -> Result<(), MemoryExceeded> {
+    pub fn try_remap(&mut self, moved: &FxHashMap<u64, u64>) -> Result<(), BudgetFailure> {
         self.remap_with(moved, true)
     }
 
@@ -430,7 +476,7 @@ impl Closure {
         &mut self,
         moved: &FxHashMap<u64, u64>,
         strict: bool,
-    ) -> Result<(), MemoryExceeded> {
+    ) -> Result<(), BudgetFailure> {
         if moved.is_empty() {
             return Ok(());
         }
@@ -453,7 +499,7 @@ impl Closure {
                 if strict {
                     held.try_grow(new * fact)?;
                 } else {
-                    held.grow(new * fact);
+                    held.grow(new * fact)?;
                 }
                 hit.reserve_exact(new - hit.len());
                 held.shrink(cap * fact);
@@ -464,7 +510,7 @@ impl Closure {
             if let Some(r) = self.graph.position(t) {
                 self.set_flag(r, false);
             }
-            self.graph.kill(t);
+            self.graph.kill(t)?;
         }
         for (t, flag) in hit {
             let n = [m(t[0]), m(t[1]), m(t[2])];
@@ -491,7 +537,7 @@ impl Closure {
     /// Rebuild the derived tier without its dead rows when they are a quarter of it or
     /// more. The new tier is built beside the old one, charged as it grows; with
     /// `strict`, failing past the limit (the closure is unusable then).
-    pub fn compact_if_needed(&mut self, strict: bool) -> Result<(), MemoryExceeded> {
+    pub fn compact_if_needed(&mut self, strict: bool) -> Result<(), BudgetFailure> {
         let g = &self.graph;
         let rows = (g.len() - g.offset()) as usize;
         if (g.dead_rows() as usize) * 4 < rows {
@@ -504,7 +550,7 @@ impl Closure {
         if strict {
             held.try_grow(list)?;
         } else {
-            held.grow(list);
+            held.grow(list)?;
         }
         let live: Vec<(Triple, bool)> = self.live().collect();
         let mut graph = g.try_like(live.len(), &budget, strict)?;
@@ -523,7 +569,7 @@ impl Closure {
         self.flags = flags;
         drop(live);
         drop(held);
-        self.settle();
+        self.settle()?;
         Ok(())
     }
 }
@@ -701,7 +747,7 @@ pub(crate) fn update(
             queue = next;
             step.absorb(next_held);
             for t in &dead {
-                c.graph.kill(t);
+                c.graph.kill(t)?;
             }
             queue.retain(|t| c.graph.position(t).is_some() && !search.proved.contains(t));
             // the new buffer is charged before it is allocated, and the old one is
@@ -767,7 +813,7 @@ pub(crate) fn update(
     for (t, _) in ins.iter().zip(in_base).filter(|x| x.1) {
         if let Some(r) = c.graph.position(t) {
             c.set_flag(r, false);
-            c.graph.kill(t);
+            c.graph.kill(t)?;
         }
     }
     drop(ins);
@@ -784,7 +830,7 @@ pub(crate) fn dred_overdeletion(
     rules: &[CRule],
     limits: &Limits,
     removed: &[Triple],
-) -> usize {
+) -> anyhow::Result<usize> {
     // the removed facts of the base tier, as derived facts that are deleted first
     let back: Vec<Triple> = removed
         .iter()
@@ -792,7 +838,7 @@ pub(crate) fn dred_overdeletion(
         .copied()
         .collect();
     c.graph.add_batch(back);
-    let plans = Plans::new(&mut c.graph, rules).expect("an unlimited budget");
+    let plans = Plans::new(&mut c.graph, rules)?;
     let mut gone: FxHashSet<Triple> = FxHashSet::default();
     let mut frontier: Vec<Triple> = removed
         .iter()
@@ -800,17 +846,16 @@ pub(crate) fn dred_overdeletion(
         .copied()
         .collect();
     while !frontier.is_empty() {
-        let (next, _held) =
-            consequences(c, rules, &plans, &frontier, limits, None).expect("an unlimited budget");
+        let (next, _held) = consequences(c, rules, &plans, &frontier, limits, None)?;
         for t in &frontier {
-            c.graph.kill(t);
+            c.graph.kill(t)?;
         }
         frontier = next
             .into_iter()
             .filter(|t| c.graph.position(t).is_some() && gone.insert(*t))
             .collect();
     }
-    gone.len()
+    Ok(gone.len())
 }
 
 // ------------------------------------------------------------------ plans ----
@@ -834,7 +879,7 @@ pub(crate) struct Plans {
 }
 
 impl Plans {
-    pub(crate) fn new(g: &mut Graph, rules: &[CRule]) -> Result<Plans, MemoryExceeded> {
+    pub(crate) fn new(g: &mut Graph, rules: &[CRule]) -> Result<Plans, BudgetFailure> {
         let mut p = Plans {
             back: Vec::with_capacity(rules.len()),
             by_pred: FxHashMap::default(),
@@ -1260,7 +1305,7 @@ impl Search {
 
     /// Take in what another search of the same round learned, charging the growth of
     /// the sets before it is allocated.
-    fn absorb(&mut self, other: Search) -> Result<(), MemoryExceeded> {
+    fn absorb(&mut self, other: Search) -> Result<(), BudgetFailure> {
         let fact = size_of::<Triple>();
         for (mine, theirs) in [
             (&mut self.proved, &other.proved),
@@ -1840,9 +1885,11 @@ pub(crate) mod tests {
             let lits = ["\"a\"", "\"b\""]
                 .iter()
                 .map(|l| {
-                    terms.id_for(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
-                        &l[1..2],
-                    )))
+                    terms
+                        .id_for(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+                            &l[1..2],
+                        )))
+                        .unwrap()
                 })
                 .chain([sparkles_core::id::Id::from_i64(7).unwrap().0])
                 .collect();
@@ -1936,10 +1983,10 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn compiled(text: &str, terms: &Terms) -> Vec<CRule> {
+    pub(crate) fn compiled(text: &str, terms: &Terms) -> engine::CompiledRules {
         let rules = crate::parse_rules(text).unwrap();
-        let mut w = Vec::new();
-        let c = engine::compile(&rules, terms, &mut w);
+        let mut w = crate::budget::WorkingWarnings::new(&terms.budget());
+        let c = engine::compile(&rules, terms, &mut w).unwrap();
         assert!(
             c.iter()
                 .all(|r| engine::incremental_blocker(r, terms).is_none())
@@ -2114,7 +2161,7 @@ pub(crate) mod tests {
             // the closure reads the input graphs of the new state, as an update does
             let snap = set_default_graph(&v, &base);
             let moved = c.terms.rebase(snap.clone());
-            c.remap(&moved);
+            c.remap(&moved).unwrap();
             // the remembered lookups take the changes in, as `maintain::previous` does
             if let Some(mut l) = c.set_inputs(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap() {
                 l.update(&inserted, &removed, crate::facts::rank);

@@ -50,9 +50,9 @@ fn at(s: &Store, a: &str) -> sparkles_core::Result<Vec<String>> {
         "SELECT ?s WHERE { ?s ?p ?o } ORDER BY ?s",
         &QueryOptions::default(),
     )?;
-    Ok(r.rows()
+    Ok(r.rows()?
         .into_iter()
-        .map(|row| row[0].as_ref().unwrap().to_string())
+        .map(|row| row.values()[0].as_ref().unwrap().to_string())
         .collect())
 }
 

@@ -150,7 +150,7 @@ fn oracle() -> Vec<String> {
     rows
 }
 
-fn bag(rows: Vec<Vec<Option<Term>>>) -> Vec<String> {
+fn bag(rows: impl IntoIterator<Item = impl std::fmt::Debug>) -> Vec<String> {
     let mut result = rows
         .into_iter()
         .map(|r| format!("{r:?}"))
@@ -191,7 +191,7 @@ fn q6_fixture_matches_an_independent_oracle_with_and_without_the_key() {
     // the generic product fits this limit, so both plans can answer
     for keyed in [true, false] {
         let r = query(store.snapshot(), Q6, &options(1_000_000, keyed)).unwrap();
-        assert_eq!(bag(r.rows()), expected, "keyed {keyed}");
+        assert_eq!(bag(r.rows().unwrap()), expected, "keyed {keyed}");
     }
 }
 
@@ -203,8 +203,8 @@ fn q6_pairs_by_the_condition_equality_instead_of_the_product() {
     // the keyed plan reports how many candidate pairs it tested.
     let limit = 4096;
     let r = query(store.snapshot(), Q6, &options(limit, true)).unwrap();
-    assert_eq!(bag(r.rows()), oracle());
-    let notes = keyed_candidates(&r.plan);
+    assert_eq!(bag(r.rows().unwrap()), oracle());
+    let notes = keyed_candidates(r.plan());
     assert_eq!(notes.len(), 1, "{notes:?}");
     let candidates: u64 = notes[0]
         .split(": ")
@@ -217,7 +217,7 @@ fn q6_pairs_by_the_condition_equality_instead_of_the_product() {
     // answers within the limit too and reports no candidate pairs.
     let generic = query(store.snapshot(), Q6, &options(limit, false)).unwrap();
     assert_eq!(bag(generic.rows()), oracle());
-    assert!(keyed_candidates(&generic.plan).is_empty());
+    assert!(keyed_candidates(generic.plan()).is_empty());
 }
 
 /// A store whose values of ?x and ?y mix IRIs, blank nodes, numbers that are equal by
@@ -274,7 +274,7 @@ fn keyed_optional_keeps_value_equality_errors_and_unbound_values() {
         );
         let run = |keyed| {
             let r = query(store.snapshot(), &text, &options(1_000_000, keyed)).unwrap();
-            (bag(r.rows()), keyed_candidates(&r.plan).len())
+            (bag(r.rows().unwrap()), keyed_candidates(r.plan()).len())
         };
         let (on, used) = run(true);
         let (off, unused) = run(false);
@@ -300,7 +300,7 @@ fn strict_rows(store: &Store, text: &str, options: &QueryOptions) -> Vec<String>
     let mut rows = Vec::new();
     while let Some(batch) = cursor.next_batch().unwrap() {
         for i in 0..batch.len() {
-            rows.push(batch.row(i).unwrap());
+            rows.push(batch.row(i).unwrap().values().to_vec());
         }
     }
     bag(rows)
@@ -320,7 +320,7 @@ fn keyed_optional_streams_in_a_cursor_with_the_same_answers() {
         let eager = query(store.snapshot(), &text, &options(1_000_000, false)).unwrap();
         assert_eq!(
             strict_rows(&store, &text, &options(1_000_000, true)),
-            bag(eager.rows()),
+            bag(eager.rows().unwrap()),
             "{condition}"
         );
     }
@@ -344,8 +344,8 @@ fn keyed_optional_charges_its_chunk_within_a_small_budget() {
         },
     )
     .unwrap();
-    assert_eq!(bag(r.rows()), oracle());
-    assert_eq!(keyed_candidates(&r.plan).len(), 1);
+    assert_eq!(bag(r.rows().unwrap()), oracle());
+    assert_eq!(keyed_candidates(r.plan()).len(), 1);
     assert!(
         r.mem_peak_bytes <= budget,
         "{} > {budget}",
@@ -378,12 +378,12 @@ fn application_callbacks_in_the_condition_keep_the_generic_join() {
     let r = query(store.snapshot(), text, &options).unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
-        bag(r.rows()),
+        bag(r.rows().unwrap()),
         bag(vec![vec![Some(Term::NamedNode(
             NamedNode::new("urn:b").unwrap()
         ))]])
     );
-    assert!(keyed_candidates(&r.plan).is_empty());
+    assert!(keyed_candidates(r.plan()).is_empty());
 }
 
 /// A keyed OPTIONAL that has finished releases its equality index, so a cursor that

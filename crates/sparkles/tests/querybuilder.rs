@@ -563,7 +563,7 @@ fn exec_select_optional_filter_order_limit() {
         ))
         .order_by("?name");
     let rows = q.execute(&ds).unwrap();
-    assert_eq!(rows.vars, vec!["name", "age"]);
+    assert_eq!(rows.variables(), vec!["name", "age"]);
     assert_eq!(col(&rows, "name"), ["Alice", "Carol", "Dave"]);
     assert_eq!(col(&rows, "age"), ["34", "41", "-"]);
 

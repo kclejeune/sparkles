@@ -1297,7 +1297,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     /// The solutions with `ex:` IRIs as local names, sorted.
     fn names(r: &QueryResult) -> Vec<String> {
         let mut v: Vec<String> = r
-            .rows()
+            .test_application_rows()
             .into_iter()
             .map(|row| {
                 row.into_iter()
@@ -1340,7 +1340,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         let r = run(&s, "SELECT ?f { ?f spatial:nearby (2 2 50 uom:kilometre) }").unwrap();
         assert_eq!(names(&r), ["A", "p1"]);
         // without an index the serialization predicates are read
-        let pf = find(&r.plan, "SpatialPf").expect("a SpatialPf node");
+        let pf = find(r.plan(), "SpatialPf").expect("a SpatialPf node");
         let c = pf.counters.as_ref().unwrap();
         assert_eq!(c["fallback"], true);
         assert_eq!(c["index"], "off");
@@ -1591,7 +1591,7 @@ ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coord
                 "SELECT ?f { VALUES ?lat { 2 } ?f spatial:nearby (?lat 2 50) }",
             )
             .unwrap();
-            let pf = find(&r.plan, "SpatialPf").expect("a SpatialPf node");
+            let pf = find(r.plan(), "SpatialPf").expect("a SpatialPf node");
             assert!(
                 pf.description.contains("per binding of the arguments"),
                 "{}",
@@ -1709,17 +1709,17 @@ ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coord
         let fast = run_on(snap, q, true);
         let slow = run_on(snap, q, false);
         assert_eq!(names(&fast), names(&slow), "{q}");
-        assert!(find(&slow.plan, "SpatialScan").is_none(), "{q}");
+        assert!(find(slow.plan(), "SpatialScan").is_none(), "{q}");
         // the filter is tested row by row, in a FILTER or on the rows an index join reads
         assert!(
-            find(&slow.plan, "Filter").is_some() || filtered_probe(&slow.plan),
+            find(slow.plan(), "Filter").is_some() || filtered_probe(slow.plan()),
             "{q}: {:#?}",
-            slow.plan
+            slow.plan()
         );
         assert!(
-            find(&fast.plan, "SpatialScan").is_some(),
+            find(fast.plan(), "SpatialScan").is_some(),
             "{q}: not pushed: {:#?}",
-            fast.plan
+            fast.plan()
         );
         (names(&fast), fast)
     }
@@ -1733,7 +1733,7 @@ ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coord
         let q = format!("SELECT ?g {{ ?g geo:asWKT ?w FILTER(geof:sfWithin(?w, {GA})) }}");
         let (a, r) = pushed(&snap, &q);
         assert_eq!(a, ["g1", "gA"]);
-        let scan = find(&r.plan, "SpatialScan").unwrap();
+        let scan = find(r.plan(), "SpatialScan").unwrap();
         assert!(
             scan.description
                 .contains("<http://www.opengis.net/ont/geosparql#asWKT> sfWithin POLYGON(5 pts)"),
@@ -1789,7 +1789,7 @@ ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coord
             let (a, r) = pushed(&snap, &q);
             assert_eq!(a, ["g1", "gA"], "{f}");
             // the exact comparison stays in a filter over the scan's candidates
-            assert!(find(&r.plan, "Filter").is_some(), "{f}");
+            assert!(find(r.plan(), "Filter").is_some(), "{f}");
         }
         let q = format!(
             "SELECT ?g {{ ?g geo:asWKT ?w FILTER(geof:metricDistance(?w, {p}) < 2000000) }}"
@@ -1803,14 +1803,14 @@ ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coord
         let snap = indexed(&s);
         let warned = |q: &str, needle: &str| {
             let r = run_on(&snap, q, true);
-            assert!(find(&r.plan, "SpatialScan").is_none(), "{q}");
+            assert!(find(r.plan(), "SpatialScan").is_none(), "{q}");
             assert!(
-                r.plan
+                r.plan()
                     .warnings
                     .iter()
                     .any(|w| w.code == "geo-not-pushed" && w.message.contains(needle)),
                 "{q}: {:?}",
-                r.plan.warnings
+                r.plan().warnings
             );
             names(&r)
         };
@@ -1835,7 +1835,7 @@ ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coord
         .unwrap();
         assert_eq!(names(&r), ["g1", "gA"]);
         assert!(
-            r.plan
+            r.plan()
                 .warnings
                 .iter()
                 .any(|w| w.code == "geo-not-pushed" && w.message.contains("no spatial index"))
@@ -1846,7 +1846,7 @@ ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coord
             "SELECT ?g { ?g geo:asWKT ?w FILTER(isLiteral(?w)) }",
             true,
         );
-        assert!(r.plan.warnings.is_empty());
+        assert!(r.plan().warnings.is_empty());
     }
 
     /// The planner's node of a query and its context.
@@ -1909,7 +1909,7 @@ ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coord
         let snap = indexed(&s);
         let sel = |q: &str| {
             let r = run_on(&snap, q, true);
-            let c = find(&r.plan, "SpatialPf")
+            let c = find(r.plan(), "SpatialPf")
                 .unwrap()
                 .counters
                 .clone()
@@ -1945,13 +1945,13 @@ ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coord
         let q = "SELECT ?g { ?g geo:asWKT ?w FILTER(geof:sfIntersects(?w, \
                  \"POLYGON((-180 -90, 180 -90, 180 90, -180 90, -180 -90))\"^^geo:wktLiteral)) }";
         let r = run_on(&snap, q, true);
-        assert!(find(&r.plan, "SpatialScan").is_none(), "{:#?}", r.plan);
+        assert!(find(r.plan(), "SpatialScan").is_none(), "{:#?}", r.plan());
         assert_eq!(names(&r), names(&run_on(&snap, q, false)));
-        assert!(r.plan.warnings.is_empty(), "{:?}", r.plan.warnings);
+        assert!(r.plan().warnings.is_empty(), "{:?}", r.plan().warnings);
         // a small window: the index
         let q = format!("SELECT ?g {{ ?g geo:asWKT ?w FILTER(geof:sfWithin(?w, {GA})) }}");
         let r = run_on(&snap, &q, true);
-        let scan = find(&r.plan, "SpatialScan").expect("pushed");
+        let scan = find(r.plan(), "SpatialScan").expect("pushed");
         assert!(scan.estimated_cost < 1000.0, "{}", scan.estimated_cost);
         // joined with the feature links, the scan's subject order serves a merge join
         let q = format!(
@@ -1970,14 +1970,14 @@ ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coord
         let q = format!("SELECT ?g {{ ?g geo:asWKT ?w FILTER(geof:sfWithin(?w, {GA})) }}");
         let r = run_on(&snap, &q, true);
         assert_eq!(names(&r), ["g1", "gA"]);
-        assert!(find(&r.plan, "SpatialScan").is_none());
+        assert!(find(r.plan(), "SpatialScan").is_none());
         assert!(
-            r.plan
+            r.plan()
                 .warnings
                 .iter()
                 .any(|w| w.code == "geo-index-building"),
             "{:?}",
-            r.plan.warnings
+            r.plan().warnings
         );
         let r = run_on(
             &snap,
@@ -1985,7 +1985,7 @@ ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coord
             true,
         );
         assert_eq!(names(&r), ["A", "p1"]);
-        let c = find(&r.plan, "SpatialPf")
+        let c = find(r.plan(), "SpatialPf")
             .unwrap()
             .counters
             .clone()
@@ -2003,7 +2003,7 @@ ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coord
             true,
         );
         assert_eq!(names(&r), ["A", "p1"]);
-        let c = find(&r.plan, "SpatialPf")
+        let c = find(r.plan(), "SpatialPf")
             .unwrap()
             .counters
             .clone()
@@ -2044,7 +2044,7 @@ ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coord
             let snap = s.snapshot();
             let q = format!("SELECT ?g {{ ?g geo:asWKT ?w FILTER(geof:sfWithin(?w, {GA})) }}");
             let (a, r) = pushed(&snap, &q);
-            let c = find(&r.plan, "SpatialScan")
+            let c = find(r.plan(), "SpatialScan")
                 .unwrap()
                 .counters
                 .clone()
@@ -2056,7 +2056,7 @@ ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coord
             near.retain(|g| g.starts_with("big") || g.starts_with("new"));
             let pf = |q: &str| {
                 let r = run_on(&snap, q, true);
-                let c = find(&r.plan, "SpatialPf")
+                let c = find(r.plan(), "SpatialPf")
                     .unwrap()
                     .counters
                     .clone()
@@ -2097,7 +2097,7 @@ ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coord
             true,
         );
         assert!(r.boolean);
-        let c = find(&r.plan, "SpatialPf")
+        let c = find(r.plan(), "SpatialPf")
             .unwrap()
             .counters
             .clone()

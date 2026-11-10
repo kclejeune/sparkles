@@ -2,6 +2,7 @@
 use super::pool::PoolGrant;
 use crate::error::{Budget, BudgetKind, Error, Result};
 use parking_lot::Mutex;
+use sparkles_budget::{MemoryDomain, MemoryLease, ParentHandle, ParentRefused, Scope};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,6 +17,7 @@ struct State {
     next: u64,
     cursor: bool,
     calls: usize,
+    upstream: Option<ParentHandle>,
 }
 /// The owner id of an eager context's fast account, the first owner of its ledger.
 pub(crate) const PRIMARY: u64 = 1;
@@ -35,6 +37,8 @@ pub(crate) struct MemoryOwner {
     grant: Option<Arc<PoolGrant>>,
 }
 struct Account {
+    /// Supplied child credit is returned exactly, independently of executor mode.
+    exact: bool,
     owner: Arc<MemoryOwner>,
     live: u64,
     /// The account's reservation from its grant. Under eager accounting it is the
@@ -42,6 +46,9 @@ struct Account {
     /// follows `live` in steps of [`LIVE_STEP`] and never falls below it.
     eager: u64,
     decode: u64,
+    /// Nested contexts own actual upstream credit instead of charging their grant
+    /// metadata again. Drop or split only after leaving the ledger lock.
+    lease: Option<MemoryLease>,
 }
 
 impl Account {
@@ -65,6 +72,44 @@ impl Account {
         Ok(())
     }
 
+    fn reserve_upstream(&mut self, live: u64) -> std::result::Result<(), ParentRefused> {
+        if live <= self.eager {
+            return Ok(());
+        }
+        let lease = self.lease.as_mut().expect("upstream account");
+        let ahead = if self.exact {
+            live
+        } else {
+            live.checked_next_multiple_of(LIVE_STEP).unwrap_or(live)
+        };
+        let next = match lease.try_grow(ahead - self.eager) {
+            Ok(()) => ahead,
+            Err(ParentRefused::Limit { .. } | ParentRefused::Overflow) if ahead > live => {
+                lease.try_grow(live - self.eager)?;
+                live
+            }
+            Err(error) => return Err(error),
+        };
+        self.eager = next;
+        Ok(())
+    }
+
+    /// Detach already accounted credit without running its return callback.
+    fn retire(&mut self, bytes: u64) -> Release {
+        match &mut self.lease {
+            Some(lease) => Release {
+                grant: None,
+                bytes: 0,
+                lease: Some(lease.split(bytes).expect("owned nested credit")),
+            },
+            None => Release {
+                grant: self.owner.grant.clone(),
+                bytes,
+                lease: None,
+            },
+        }
+    }
+
     /// The part of a live account's reservation to give back now that its live bytes
     /// fell: everything above the next step once the excess passes [`LIVE_SLACK`].
     fn shrink_live(&mut self) -> u64 {
@@ -77,15 +122,61 @@ impl Account {
         bytes
     }
 }
+/// Captured by the two backend callbacks, with no path back from the ledger.
+/// Its final drop follows the final owned lease's release and retires bookkeeping.
+struct ChildAccount {
+    ledger: Arc<QueryMemoryLedger>,
+    owner: Arc<MemoryOwner>,
+}
+impl Drop for ChildAccount {
+    fn drop(&mut self) {
+        let retired = {
+            let mut state = self.ledger.lock();
+            let i = state
+                .owners
+                .iter()
+                .position(|a| a.owner.id == self.owner.id)
+                .expect("owned child account");
+            let account = &state.owners[i];
+            assert!(account.exact && account.live == 0 && account.eager == 0);
+            state.owners.swap_remove(i)
+        };
+        drop(retired);
+    }
+}
+
 struct Release {
     grant: Option<Arc<PoolGrant>>,
     bytes: u64,
+    lease: Option<MemoryLease>,
 }
 impl Release {
     fn finish(self) {
         if let Some(grant) = self.grant {
             grant.release(self.bytes);
         }
+        drop(self.lease);
+    }
+}
+fn parent_error(error: ParentRefused) -> Error {
+    match error {
+        ParentRefused::Limit {
+            limit,
+            requested,
+            scope,
+        } => Error::BudgetExceeded(Budget {
+            kind: if scope == Scope::Local {
+                BudgetKind::Memory
+            } else {
+                BudgetKind::ServerMemory
+            },
+            limit,
+            requested,
+        }),
+        error => Error::Component(Box::new(
+            crate::error::ComponentError::new("query-memory", "ownership", error.to_string())
+                .with_source(error),
+        )),
     }
 }
 fn memory(limit: u64, requested: u64) -> Error {
@@ -135,27 +226,46 @@ impl QueryMemoryLedger {
             peak: AtomicU64::new(peak),
             state: Mutex::new(State {
                 owners: vec![Account {
+                    exact: false,
                     owner: Arc::new(MemoryOwner { id: PRIMARY, grant }),
                     live,
                     eager,
                     decode: 0,
+                    lease: None,
                 }],
                 next: PRIMARY,
                 cursor: false,
                 calls: 0,
+                upstream: None,
             }),
         })
     }
+    pub(crate) fn nested(grant: Option<Arc<PoolGrant>>, parent: ParentHandle) -> Arc<Self> {
+        let mut ledger = Self::seeded(grant, 0, 0, 0);
+        let state = Arc::get_mut(&mut ledger)
+            .expect("fresh ledger")
+            .state
+            .get_mut();
+        state.owners[0].lease = Some(parent.reserve(0).expect("sealed zero reservation"));
+        state.upstream = Some(parent);
+        ledger
+    }
+
     /// Prepare bookkeeping outside the admission lock. Failed and zero-only public
     /// reconfiguration cannot accumulate idle owner records.
     pub(crate) fn owner(&self, grant: Option<&Arc<PoolGrant>>) -> Result<Arc<MemoryOwner>> {
+        self.new_owner(grant, false)
+    }
+
+    fn new_owner(&self, grant: Option<&Arc<PoolGrant>>, exact: bool) -> Result<Arc<MemoryOwner>> {
         let mut prepared = None;
         let mut storage = Vec::new();
         loop {
             let mut state = self.lock();
             let cursor = state.cursor;
             if let Some(i) = state.owners.iter().position(|a| {
-                a.live == 0
+                !a.exact
+                    && a.live == 0
                     && (a.eager == 0 || cursor)
                     && Arc::strong_count(&a.owner) == 1
                     && !same(a.owner.grant.as_ref(), grant)
@@ -163,7 +273,9 @@ impl QueryMemoryLedger {
                 let retired = state.owners.swap_remove(i);
                 drop(state);
                 // A retired live account gives back the step it still reserved.
-                if let Some(g) = &retired.owner.grant {
+                if retired.lease.is_none()
+                    && let Some(g) = &retired.owner.grant
+                {
                     g.release(retired.eager);
                 }
                 drop(retired);
@@ -172,7 +284,7 @@ impl QueryMemoryLedger {
             if let Some(account) = state
                 .owners
                 .iter()
-                .find(|a| same(a.owner.grant.as_ref(), grant))
+                .find(|a| !exact && !a.exact && same(a.owner.grant.as_ref(), grant))
             {
                 let owner = account.owner.clone();
                 drop(state);
@@ -209,16 +321,110 @@ impl QueryMemoryLedger {
             let mut owner = prepared.take().expect("prepared owner");
             Arc::get_mut(&mut owner).expect("unpublished owner").id = id;
             state.next = id;
+            let lease = state
+                .upstream
+                .as_ref()
+                .map(|parent| parent.reserve(0).expect("sealed zero reservation"));
             state.owners.push(Account {
+                exact,
                 owner: owner.clone(),
                 live: 0,
                 eager: 0,
                 decode: 0,
+                lease,
             });
             drop(state);
             return Ok(owner);
         }
     }
+    /// An exact-credit child has a separate account even when the executor uses
+    /// the same grant. Its caller amortizes reservations above this adapter.
+    pub(crate) fn child_parent(
+        self: &Arc<Self>,
+        grant: Option<Arc<PoolGrant>>,
+        limit: u64,
+    ) -> Result<ParentHandle> {
+        let factory = grant
+            .as_ref()
+            .map_or(MemoryDomain::unpooled(), |g| g.memory_domain());
+        if self
+            .lock()
+            .upstream
+            .as_ref()
+            .is_some_and(|p| p.domain() != factory.id())
+        {
+            return Err(parent_error(ParentRefused::ForeignDomain));
+        }
+        let owner = self.new_owner(grant.as_ref(), true)?;
+        let held = Arc::new(ChildAccount {
+            ledger: self.clone(),
+            owner,
+        });
+        let take = held.clone();
+        let domain = grant
+            .as_ref()
+            .map_or(MemoryDomain::unpooled(), |g| g.memory_domain());
+        Ok(domain.parent(
+            move |bytes| take.ledger.reserve_child(&take.owner, limit, bytes),
+            move |bytes| held.ledger.release(held.owner.id, bytes),
+        ))
+    }
+
+    fn reserve_child(
+        &self,
+        owner: &MemoryOwner,
+        limit: u64,
+        bytes: u64,
+    ) -> std::result::Result<(), ParentRefused> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut state = self.lock();
+        let live = self
+            .live
+            .load(Ordering::Relaxed)
+            .checked_add(bytes)
+            .ok_or(ParentRefused::Overflow)?;
+        if live > limit {
+            return Err(ParentRefused::Limit {
+                limit,
+                requested: live,
+                scope: Scope::Local,
+            });
+        }
+        let account = state
+            .owners
+            .iter_mut()
+            .find(|a| a.owner.id == owner.id)
+            .expect("exact child account");
+        assert!(account.exact && account.decode == 0);
+        let next = account
+            .live
+            .checked_add(bytes)
+            .ok_or(ParentRefused::Overflow)?;
+        if account.lease.is_some() {
+            account.reserve_upstream(next)?;
+        } else {
+            if let Some(grant) = &owner.grant {
+                grant.charge(bytes).map_err(|error| {
+                    let Error::BudgetExceeded(budget) = error else {
+                        unreachable!("grant only refuses memory");
+                    };
+                    ParentRefused::Limit {
+                        limit: budget.limit,
+                        requested: budget.requested,
+                        scope: Scope::Work,
+                    }
+                })?;
+            }
+            account.eager = next;
+        }
+        account.live = next;
+        self.live.store(live, Ordering::Release);
+        self.peak.fetch_max(live, Ordering::Relaxed);
+        Ok(())
+    }
+
     pub(crate) fn owner_by_id(&self, id: u64) -> Arc<MemoryOwner> {
         self.lock()
             .owners
@@ -255,8 +461,10 @@ impl QueryMemoryLedger {
             .decode
             .checked_add(if decode { bytes } else { 0 })
             .ok_or_else(|| memory(limit, u64::MAX))?;
-        if let Some(grant) = &owner.grant {
-            if cursor {
+        if account.lease.is_some() {
+            account.reserve_upstream(own_live).map_err(parent_error)?;
+        } else if let Some(grant) = &owner.grant {
+            if cursor && !account.exact {
                 account.reserve_live(grant, own_live)?;
             } else if own_live > account.eager {
                 grant.charge(own_live - account.eager)?;
@@ -281,6 +489,70 @@ impl QueryMemoryLedger {
         }
         self.admit(&mut self.lock(), owner, limit, bytes, decode)
     }
+    /// A concrete mutable receiver adds an exact contribution alongside the
+    /// executor's existing amortized allowance. Returning it cannot consume that
+    /// allowance or strand its own bytes behind LIVE_SLACK.
+    pub(crate) fn reserve_receiving(
+        &self,
+        owner: &MemoryOwner,
+        limit: u64,
+        bytes: u64,
+    ) -> Result<()> {
+        let mut state = self.lock();
+        let prior = self.live.load(Ordering::Relaxed);
+        let live = prior
+            .checked_add(bytes)
+            .filter(|n| *n <= limit)
+            .ok_or_else(|| memory(limit, prior.saturating_add(bytes)))?;
+        let account = state
+            .owners
+            .iter_mut()
+            .find(|a| a.owner.id == owner.id)
+            .expect("receiving owner");
+        let own_live = account
+            .live
+            .checked_add(bytes)
+            .ok_or_else(|| memory(limit, u64::MAX))?;
+        let eager = account
+            .eager
+            .checked_add(bytes)
+            .ok_or_else(|| memory(limit, u64::MAX))?;
+        if let Some(lease) = &mut account.lease {
+            lease.try_grow(bytes).map_err(parent_error)?;
+        } else if let Some(grant) = &owner.grant {
+            grant.charge(bytes)?;
+        }
+        account.live = own_live;
+        account.eager = eager;
+        self.live.store(live, Ordering::Release);
+        self.peak.fetch_max(live, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn release_receiving(&self, id: u64, bytes: u64) {
+        let release = {
+            let mut state = self.lock();
+            let account = state
+                .owners
+                .iter_mut()
+                .find(|a| a.owner.id == id)
+                .expect("receiving owner");
+            assert!(
+                bytes <= account.live - account.decode,
+                "owned receiving bytes"
+            );
+            account.live -= bytes;
+            account.eager = account
+                .eager
+                .checked_sub(bytes)
+                .expect("receiving contribution");
+            self.live.fetch_sub(bytes, Ordering::Release);
+            account.retire(bytes)
+        };
+        // Pool wakeups and parent return callbacks may reenter the ledger.
+        release.finish();
+    }
+
     fn release_locked(&self, state: &mut State, id: u64, bytes: u64, decode: bool) -> Release {
         let cursor = state.cursor;
         let account = state
@@ -306,12 +578,21 @@ impl QueryMemoryLedger {
             .checked_sub(bytes)
             .expect("query live bytes");
         self.live.store(live, Ordering::Release);
-        let grant = cursor.then(|| account.owner.grant.clone()).flatten();
-        let bytes = match &grant {
-            Some(_) => account.shrink_live(),
-            None => 0,
+        let returned = if account.exact {
+            account.eager = account
+                .eager
+                .checked_sub(bytes)
+                .expect("owned exact child credit");
+            bytes
+        } else if cursor && (account.owner.grant.is_some() || account.lease.is_some()) {
+            // An eager account keeps its admitted high point until the result drops
+            // (X14 stage 4), whether a grant or a parent's lease backs it. Only a
+            // finished SELECT or ASK lowers it, through `shrink_eager`.
+            account.shrink_live()
+        } else {
+            0
         };
-        Release { grant, bytes }
+        account.retire(returned)
     }
     pub(crate) fn release(&self, id: u64, bytes: u64) {
         let release = {
@@ -360,7 +641,13 @@ impl QueryMemoryLedger {
             .iter_mut()
             .find(|a| a.owner.id == owner.id)
             .expect("output owner");
-        if let Some(grant) = &owner.grant {
+        if account.lease.is_some() {
+            let own = account
+                .live
+                .checked_add(bytes)
+                .ok_or_else(|| parent_error(ParentRefused::Overflow))?;
+            account.reserve_upstream(own).map_err(parent_error)?;
+        } else if let Some(grant) = &owner.grant {
             if cursor {
                 grant.cover_transient(grant.used().saturating_add(bytes))?;
             } else {
@@ -402,17 +689,13 @@ impl QueryMemoryLedger {
                 continue;
             }
             for account in &mut state.owners {
-                if let Some(grant) = &account.owner.grant {
+                if account.lease.is_some() || account.owner.grant.is_some() {
                     let bytes = account
                         .eager
                         .checked_sub(account.live)
-                        .expect("admitted eager live ownership");
-                    releases.push(Release {
-                        grant: Some(grant.clone()),
-                        bytes,
-                    });
+                        .expect("backed live ownership");
+                    releases.push(account.retire(bytes));
                 }
-                // A live account's reservation starts at its live bytes.
                 account.eager = account.live;
             }
             state.cursor = true;
@@ -445,20 +728,18 @@ impl QueryMemoryLedger {
                 continue;
             }
             for account in &mut state.owners {
-                let Some(grant) = &account.owner.grant else {
+                if account.lease.is_none() && account.owner.grant.is_none() {
                     continue;
-                };
+                }
                 let floor = if account.owner.id == PRIMARY {
                     account.live.saturating_add(keep)
                 } else {
                     account.live
                 };
                 if account.eager > floor {
-                    releases.push(Release {
-                        grant: Some(grant.clone()),
-                        bytes: account.eager - floor,
-                    });
+                    let bytes = account.eager - floor;
                     account.eager = floor;
+                    releases.push(account.retire(bytes));
                 }
             }
             break;
@@ -636,7 +917,9 @@ impl Drop for QueryMemoryLedger {
     fn drop(&mut self) {
         let state = self.state.get_mut();
         for account in &state.owners {
-            if let Some(grant) = &account.owner.grant {
+            if account.lease.is_none()
+                && let Some(grant) = &account.owner.grant
+            {
                 // Both policies keep the reservation at or above the live bytes.
                 grant.release(account.eager);
             }
@@ -717,6 +1000,51 @@ mod tests {
     use crate::sparql::Ctx;
     use crate::sparql::pool::QueryPool;
     use crate::store::{Store, StoreOptions};
+    #[test]
+    fn receiving_exact_release_returns_after_unlock_with_live_sibling() {
+        let used = Arc::new(AtomicU64::new(0));
+        let returned = Arc::new(AtomicU64::new(0));
+        let callback_ledger =
+            Arc::new(std::sync::OnceLock::<std::sync::Weak<QueryMemoryLedger>>::new());
+        let take = used.clone();
+        let give = used.clone();
+        let returns = returned.clone();
+        let inspect = callback_ledger.clone();
+        let parent = MemoryDomain::unpooled().parent(
+            move |n| {
+                take.fetch_add(n, Ordering::Relaxed);
+                Ok(())
+            },
+            move |n| {
+                if n != 0 {
+                    let ledger = inspect.get().unwrap().upgrade().unwrap();
+                    assert!(
+                        ledger.state.try_lock().is_some(),
+                        "parent return may reenter ledger"
+                    );
+                    returns.fetch_add(n, Ordering::Relaxed);
+                }
+                give.fetch_sub(n, Ordering::Relaxed);
+            },
+        );
+        let ledger = QueryMemoryLedger::nested(None, parent);
+        callback_ledger.set(Arc::downgrade(&ledger)).unwrap();
+        let owner = ledger.owner(None).unwrap();
+        ledger.reserve(&owner, 256 << 10, 4096, false).unwrap();
+        let base = used.load(Ordering::Relaxed);
+        ledger.reserve_receiving(&owner, 256 << 10, 8192).unwrap();
+        assert_eq!(used.load(Ordering::Relaxed), base + 8192);
+        ledger.release_receiving(owner.id, 4096);
+        ledger.release_receiving(owner.id, 4096);
+        assert_eq!(returned.load(Ordering::Relaxed), 8192);
+        assert_eq!(used.load(Ordering::Relaxed), base);
+        assert_eq!(ledger.live.load(Ordering::Relaxed), 4096);
+        ledger.release(owner.id, 4096);
+        // No nonzero callback needs to upgrade a ledger which is already dropping.
+        ledger.shrink_eager(0).unwrap();
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+    }
+
     const MB: u64 = 1 << 20;
     fn context() -> Ctx {
         Ctx::new(Store::in_memory(StoreOptions::default()).snapshot())
@@ -777,7 +1105,10 @@ mod tests {
         ] {
             let before = LEDGER_OPS.with(|n| n.get());
             let r = query(store.snapshot(), q, &opts).unwrap();
-            assert!(!r.rows().is_empty() || !r.triples.is_empty(), "{q}");
+            assert!(
+                !r.test_application_rows().is_empty() || !r.triples().is_empty(),
+                "{q}"
+            );
             let ops = LEDGER_OPS.with(|n| n.get()) - before;
             eprintln!("{ops} ledger operations for {q}");
             assert_eq!(ops, 0, "{ops} ledger operations for {q}");
@@ -1335,3 +1666,6 @@ mod tests {
         assert!(ops[1] <= ops[0] + 16, "{ops:?}");
     }
 }
+
+#[cfg(test)]
+mod child_tests;

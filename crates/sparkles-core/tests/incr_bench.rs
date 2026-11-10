@@ -121,11 +121,12 @@ fn check_with(name: &str, ok: bool, detail: String, fingerprint: Option<String>)
 /// Rows as sorted strings, each repeated by its multiplicity. A row of negative weight,
 /// which a correct maintained result never holds, is kept as a marked row so that the
 /// answer cannot match a query's.
-fn rows_of(rows: &[(Vec<Option<oxrdf::Term>>, i64)]) -> Vec<String> {
+fn rows_of<R: AsRef<[Option<oxrdf::Term>]>>(rows: &[(R, i64)]) -> Vec<String> {
     let mut out: Vec<String> = rows
         .iter()
         .flat_map(|(r, w)| {
             let s = r
+                .as_ref()
                 .iter()
                 .map(|t| t.as_ref().map_or("UNDEF".into(), |t| t.to_string()))
                 .collect::<Vec<_>>()
@@ -168,20 +169,26 @@ fn check_view(rt: &Runtime, s: &Store, key: &str, name: &str, text: &str, opts: 
         },
     )
     .unwrap();
-    let want = rows_of(&fresh.rows().into_iter().map(|r| (r, 1)).collect::<Vec<_>>());
+    let decoded = fresh.rows().unwrap();
+    let want = rows_of(
+        &(0..decoded.len())
+            .map(|row| (decoded.row(row).unwrap().values(), 1))
+            .collect::<Vec<_>>(),
+    );
     // the evaluated answer's variables and rows, which stay the same across builds, so that
     // a change that breaks the view and its query alike still differs from the baseline
-    let fingerprint = answer_fingerprint(&fresh.vars, &want);
+    let fingerprint = answer_fingerprint(fresh.variables(), &want);
     let (ok, detail) = match read {
         Ok(r) if r.commit != snap.commit => (
             false,
             format!("the view is at commit {} of {}", r.commit, snap.commit),
         ),
-        Ok(r) if r.columns != fresh.vars => (
+        Ok(r) if r.columns != fresh.variables() => (
             false,
             format!(
                 "the view's columns are {:?}, the query's {:?}",
-                r.columns, fresh.vars
+                r.columns,
+                fresh.variables()
             ),
         ),
         Ok(r) => {
@@ -613,12 +620,11 @@ fn commit_path_without_views() {
     )
     .unwrap();
     let added = s.snapshot().len() - quads;
-    let vars = written.vars.clone();
+    let vars = written.variables().to_vec();
+    let decoded = written.rows().unwrap();
     let rows = rows_of(
-        &written
-            .rows()
-            .into_iter()
-            .map(|r| (r, 1))
+        &(0..decoded.len())
+            .map(|row| (decoded.row(row).unwrap().values(), 1))
             .collect::<Vec<_>>(),
     );
     // the i-th commit of a round gave its subject the team t(i % 50) and the age i % 60
@@ -696,19 +702,24 @@ fn pass_breakdown() {
             },
         )
         .unwrap();
-        let want = rows_of(&fresh.rows().into_iter().map(|r| (r, 1)).collect::<Vec<_>>());
+        let decoded = fresh.rows().unwrap();
+        let want = rows_of(
+            &(0..decoded.len())
+                .map(|row| (decoded.row(row).unwrap().values(), 1))
+                .collect::<Vec<_>>(),
+        );
         let got = rows_of(&c.rows());
         check_with(
             &format!("breakdown/{name}/answer"),
-            c.columns() == fresh.vars && got == want,
+            c.columns() == fresh.variables() && got == want,
             format!(
                 "columns {:?} against {:?}, {} rows against {}",
                 c.columns(),
-                fresh.vars,
+                fresh.variables(),
                 got.len(),
                 want.len()
             ),
-            Some(answer_fingerprint(&fresh.vars, &want)),
+            Some(answer_fingerprint(fresh.variables(), &want)),
         );
         let (r, o, a) = (pct(&mut read, 0.5), pct(&mut old, 0.5), pct(&mut adv, 0.5));
         println!("| {name} | {r:.1} | {o:.1} | {a:.1} |");

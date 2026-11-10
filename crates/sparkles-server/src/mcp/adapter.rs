@@ -161,14 +161,14 @@ impl Adapter {
     }
 
     /// A call of the request's caller.
-    fn call(
+    async fn call(
         &self,
         ctx: &RequestContext<RoleServer>,
         cancel: Arc<AtomicBool>,
     ) -> Result<Call, McpError> {
         let principal = self.principal(ctx)?;
         let parts = ctx.extensions.get::<axum::http::request::Parts>();
-        Ok(Call {
+        let mut call = Call {
             arrived: Instant::now(),
             cancel,
             request_id: ctx.id.to_string(),
@@ -178,7 +178,14 @@ impl Adapter {
             grant: parts
                 .and_then(|p| p.extensions.get::<super::http::GrantShare>())
                 .map(|g| g.0.clone()),
-        })
+
+            preparation: None,
+        };
+        self.server
+            .admit_call(&mut call)
+            .await
+            .map_err(|error| context_error(ContextError::Tool(error)))?;
+        Ok(call)
     }
 }
 
@@ -347,7 +354,7 @@ impl ServerHandler for Adapter {
         request: CompleteRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CompleteResult, McpError> {
-        let call = self.call(&ctx, Arc::default())?;
+        let call = self.call(&ctx, Arc::default()).await?;
         let target = match request.r#ref {
             Reference::Prompt(p) => Target::Prompt(p.name),
             Reference::Resource(r) => Target::Template(r.uri),
@@ -461,7 +468,7 @@ impl ServerHandler for Adapter {
         _request: Option<PaginatedRequestParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        let call = self.call(&ctx, Arc::default())?;
+        let call = self.call(&ctx, Arc::default()).await?;
         let resources = self
             .server
             .resources(&call)
@@ -511,7 +518,7 @@ impl ServerHandler for Adapter {
         ctx: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
         let cancel = Arc::new(AtomicBool::new(false));
-        let call = self.call(&ctx, cancel.clone())?;
+        let call = self.call(&ctx, cancel.clone()).await?;
         let work = self.server.read_resource(&request.uri, call);
         tokio::pin!(work);
         let read = tokio::select! {
@@ -566,7 +573,7 @@ impl ServerHandler for Adapter {
         request: GetPromptRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetPromptResponse, McpError> {
-        let call = self.call(&ctx, Arc::default())?;
+        let call = self.call(&ctx, Arc::default()).await?;
         let args = request.arguments.unwrap_or_default();
         let (description, text) = self
             .server
@@ -627,7 +634,7 @@ impl ServerHandler for Adapter {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let cancel = Arc::new(AtomicBool::new(false));
-        let call = self.call(&ctx, cancel.clone())?;
+        let call = self.call(&ctx, cancel.clone()).await?;
         let name = request.name.to_string();
         if !self.server.known(&call.principal, &name) {
             return Err(McpError::invalid_params(

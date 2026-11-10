@@ -15,7 +15,7 @@ fn fixture(body: &str) -> McpServer {
 }
 
 fn read(server: &McpServer, principal: Principal, extra: Value) -> Value {
-    let call = Call {
+    let mut call = Call {
         arrived: Instant::now(),
         cancel: Arc::new(AtomicBool::new(false)),
         request_id: "citation-source".into(),
@@ -23,13 +23,15 @@ fn read(server: &McpServer, principal: Principal, extra: Value) -> Value {
         headers: None,
         held: None,
         grant: None,
+
+        preparation: None,
     };
     let mut args = json!({"dataset":"mem", "seeds":["urn:cite:entity"], "hops":0, "format":"json"});
     args.as_object_mut()
         .unwrap()
         .extend(extra.as_object().unwrap().clone());
     match server
-        .run_now("recall", args.as_object().unwrap().clone(), &call)
+        .run_now("recall", args.as_object().unwrap().clone(), &mut call)
         .unwrap()
     {
         Outcome::Text(text) => serde_json::from_str(&text).unwrap(),

@@ -342,22 +342,22 @@ pub enum Status {
 pub enum ShexFailure {
     NodeKind {
         #[serde(serialize_with = "term_json")]
-        value: Term,
+        value: sparkles_core::sparql::output::OwnedTerm,
         constraint: String,
     },
     Datatype {
         #[serde(serialize_with = "term_json")]
-        value: Term,
+        value: sparkles_core::sparql::output::OwnedTerm,
         constraint: String,
     },
     Facet {
         #[serde(serialize_with = "term_json")]
-        value: Term,
+        value: sparkles_core::sparql::output::OwnedTerm,
         constraint: String,
     },
     ValueSet {
         #[serde(serialize_with = "term_json")]
-        value: Term,
+        value: sparkles_core::sparql::output::OwnedTerm,
         constraint: String,
     },
     Cardinality {
@@ -372,13 +372,13 @@ pub enum ShexFailure {
     Closed {
         predicate: String,
         #[serde(serialize_with = "term_json")]
-        value: Term,
+        value: sparkles_core::sparql::output::OwnedTerm,
     },
     /// an arc no triple constraint matches, with a predicate that is not EXTRA
     Extra {
         predicate: String,
         #[serde(serialize_with = "term_json")]
-        value: Term,
+        value: sparkles_core::sparql::output::OwnedTerm,
     },
     /// a OneOf or group cardinality that no partition of the arcs matches
     NoMatch {
@@ -388,7 +388,7 @@ pub enum ShexFailure {
     Reference {
         shape: String,
         #[serde(serialize_with = "term_json")]
-        value: Term,
+        value: sparkles_core::sparql::output::OwnedTerm,
     },
     Not {
         shape: String,
@@ -402,14 +402,17 @@ pub enum ShexFailure {
     },
 }
 
-fn term_json<S: serde::Serializer>(t: &Term, s: S) -> Result<S::Ok, S::Error> {
-    sparkles_core::sparql::results::term_json(t).serialize(s)
+fn term_json<S: serde::Serializer>(
+    t: &sparkles_core::sparql::output::OwnedTerm,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    sparkles_core::sparql::results::term_json(t.as_term()).serialize(s)
 }
 
 /// The result of one association of the fixed map.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShapeResult {
-    pub node: Term,
+    pub node: sparkles_core::sparql::output::OwnedTerm,
     pub shape: ShapeLabel,
     pub status: Status,
     /// the first failure, in one line (nonconformant results)
@@ -565,6 +568,18 @@ pub fn validate_node(
     engine::validate_node(snap, schema, node, shape, opts)
 }
 
+// Explicit application input construction for semantic test fixtures only. These
+// owners are real and must never replace the engine's original receiving parent.
+#[cfg(test)]
+pub(crate) fn owned_test_term(term: Term) -> sparkles_core::sparql::output::OwnedTerm {
+    let store = sparkles_core::store::Store::in_memory(Default::default());
+    shapemap::output_root(&store.snapshot(), &Default::default(), None)
+        .unwrap()
+        .budget()
+        .copy_term(term.as_ref())
+        .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,7 +622,15 @@ mod tests {
                 "inverse": false, "min": 1, "max": null, "count": 0})
         );
         let f = ShexFailure::NodeKind {
-            value: oxrdf::Literal::new_simple_literal("x").into(),
+            value: crate::shapemap::output_root(
+                &sparkles_core::store::Store::in_memory(Default::default()).snapshot(),
+                &Default::default(),
+                None,
+            )
+            .unwrap()
+            .budget()
+            .copy_term(oxrdf::LiteralRef::new_simple_literal("x").into())
+            .unwrap(),
             constraint: "IRI".into(),
         };
         let j = serde_json::to_value(&f).unwrap();

@@ -84,6 +84,8 @@ pub(crate) fn redirect(
             headers: call.headers.clone(),
             held: call.held.clone(),
             grant: call.grant.clone(),
+
+            preparation: call.preparation.clone(),
         },
         notice,
     )))

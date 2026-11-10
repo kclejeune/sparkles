@@ -3236,9 +3236,10 @@ impl<'a> Planner<'a> {
         if !scan.est.is_finite() || scan.est > POINT_ROWS || !spec.eqs.is_empty() {
             return Ok(None);
         }
-        let (rows, _) = super::exec::scan_limited(self.ctx, spec, &scan.vars, Some(2))?;
-        Ok(match (rows.len(), rows.col_of(v)) {
-            (1, Some(c)) => Some((v, rows.cols[c][0])).filter(|(_, id)| !id.is_undef()),
+        let (rows, _) =
+            super::exec::scan_limited(self.ctx, spec, &scan.vars, &scan.sorted, Some(2))?;
+        Ok(match (rows.table.len(), rows.table.col_of(v)) {
+            (1, Some(c)) => Some((v, rows.table.cols[c][0])).filter(|(_, id)| !id.is_undef()),
             _ => None,
         })
     }
@@ -6087,8 +6088,8 @@ pub fn eval_exists(ctx: &Ctx, spec: &ExistsSpec, key: &[Id], schema: &[VarId]) -
     };
     let node = p.plan(&spec.pattern, &graph, Vec::new())?;
     let node = slice(node, 0, Some(1), ctx);
-    let (t, _) = super::exec::execute(ctx, &node)?;
-    Ok(!t.is_empty())
+    let (input, _) = super::exec::execute_materialized(ctx, &node)?;
+    Ok(!input.table.is_empty())
 }
 
 /// Literal helper for tests.

@@ -74,18 +74,20 @@ impl Algorithms {
     }
 
     /// Run a request and return its summary (the statistics of the run) as a JSON text.
-    pub fn stats(&self, req: &AlgoRequest, opts: &QueryOptions) -> Result<String> {
+    pub fn stats(
+        &self,
+        req: &AlgoRequest,
+        opts: &QueryOptions,
+    ) -> Result<crate::sparql::output::OwnedText> {
         let (q, _) = crate::sparql::algorun::query_text(req, &self.prefixes(), true)?;
         let r = self.ds.query_with(&q, opts)?;
-        r.rows()
-            .into_iter()
-            .next()
-            .and_then(|row| row.into_iter().next().flatten())
-            .map(|t| match t {
-                oxrdf::Term::Literal(l) => l.value().to_string(),
-                t => t.to_string(),
-            })
-            .ok_or_else(|| Error::invalid("the run has no nodes to report on"))
+        if r.is_empty() || r.variables().is_empty() {
+            return Err(Error::invalid("the run has no nodes to report on"));
+        }
+        let value = r
+            .term(r.table().get(0, 0)?)?
+            .ok_or_else(|| Error::invalid("the run has no nodes to report on"))?;
+        r.output_budget().term_text(value.as_term())
     }
 
     /// Run a request with a `write` part: compute at the head commit and write the rows

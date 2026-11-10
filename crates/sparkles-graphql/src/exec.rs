@@ -18,6 +18,7 @@ use apollo_compiler::validation::Valid;
 use oxrdf::Term;
 use serde_json::{Map, Value as J, json};
 use sparkles_core::sparql::QueryOptions;
+use sparkles_core::sparql::output::OwnedTerm;
 use sparkles_core::store::Snapshot;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -27,9 +28,9 @@ use std::time::Instant;
 /// The nodes of a node group: one record per (parent, node).
 #[derive(Clone, Debug)]
 pub struct Rec {
-    pub node: Term,
+    pub node: OwnedTerm,
     /// distinct values per single column
-    pub singles: Vec<Vec<Term>>,
+    pub singles: Vec<Vec<OwnedTerm>>,
     pub flags: Vec<bool>,
     /// the position in the collection (connections)
     pub pos: u64,
@@ -44,9 +45,9 @@ pub struct Page {
 #[derive(Clone, Debug, Default)]
 pub struct Data {
     pub recs: Vec<Rec>,
-    pub by_parent: HashMap<Term, Vec<usize>>,
+    pub by_parent: HashMap<OwnedTerm, Vec<usize>>,
     /// values groups: per node, the values of each field number
-    pub values: HashMap<Term, Vec<Vec<Term>>>,
+    pub values: HashMap<OwnedTerm, Vec<Vec<OwnedTerm>>>,
     pub count: Option<u64>,
     pub page: Page,
     pub rows: usize,
@@ -61,11 +62,15 @@ fn is_node(t: &Term) -> bool {
 }
 
 /// The distinct node ids of a group's records, in order.
-fn node_ids(d: &Data) -> Vec<Term> {
+fn node_ids(d: &Data) -> Vec<OwnedTerm> {
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "OwnedTerm hashes and compares its immutable term, not its owner"
+    )]
     let mut seen = std::collections::HashSet::new();
     d.recs
         .iter()
-        .filter(|r| is_node(&r.node) && seen.insert(r.node.clone()))
+        .filter(|r| is_node(r.node.as_term()) && seen.insert(r.node.clone()))
         .map(|r| r.node.clone())
         .collect()
 }
@@ -100,22 +105,44 @@ impl Run<'_> {
 }
 
 fn col(r: &sparkles_core::sparql::QueryResult, name: &str) -> Option<usize> {
-    r.vars.iter().position(|v| v == name)
+    r.variables().iter().position(|v| v == name)
 }
 
-fn cell(r: &sparkles_core::sparql::QueryResult, c: Option<usize>, i: usize) -> Option<Term> {
-    c.and_then(|c| r.term(r.table.cols[c][i]))
+fn cell(
+    r: &sparkles_core::sparql::QueryResult,
+    c: Option<usize>,
+    i: usize,
+) -> Result<Option<OwnedTerm>, GqlError> {
+    let Some(column) = c else {
+        return Ok(None);
+    };
+    if i >= r.table().len() {
+        return Ok(None);
+    }
+    r.term(r.table().get(i, column).map_err(engine)?)
+        .map_err(engine)
 }
 
-fn decode_nodes(r: &sparkles_core::sparql::QueryResult, b: &Built, parent: bool, d: &mut Data) {
+fn decode_nodes(
+    r: &sparkles_core::sparql::QueryResult,
+    b: &Built,
+    parent: bool,
+    d: &mut Data,
+) -> Result<(), GqlError> {
     let pc = if parent { col(r, "p") } else { None };
     let nc = col(r, "n");
     let sc: Vec<Option<usize>> = b.singles.iter().map(|v| col(r, v.as_str())).collect();
     let fc: Vec<Option<usize>> = b.flags.iter().map(|v| col(r, v.as_str())).collect();
-    let mut index: HashMap<(Option<Term>, Term), usize> = HashMap::new();
-    for i in 0..r.table.len() {
-        let Some(node) = cell(r, nc, i) else { continue };
-        let p = cell(r, pc, i);
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "OwnedTerm hashes and compares its immutable term, not its owner"
+    )]
+    let mut index: HashMap<(Option<OwnedTerm>, OwnedTerm), usize> = HashMap::new();
+    for i in 0..r.table().len() {
+        let Some(node) = cell(r, nc, i)? else {
+            continue;
+        };
+        let p = cell(r, pc, i)?;
         let idx = match index.get(&(p.clone(), node.clone())) {
             Some(&x) => x,
             None => {
@@ -125,9 +152,9 @@ fn decode_nodes(r: &sparkles_core::sparql::QueryResult, b: &Built, parent: bool,
                     flags: fc
                         .iter()
                         .map(|c| {
-                            matches!(cell(r, *c, i), Some(Term::Literal(l)) if l.value() == "true")
+                            Ok::<_,GqlError>(cell(r,*c,i)?.is_some_and(|value| matches!(value.as_term(),Term::Literal(l) if l.value()=="true")))
                         })
-                        .collect(),
+                        .collect::<Result<Vec<_>,_>>()?,
                     pos: 0,
                 });
                 let x = d.recs.len() - 1;
@@ -139,13 +166,14 @@ fn decode_nodes(r: &sparkles_core::sparql::QueryResult, b: &Built, parent: bool,
             }
         };
         for (k, c) in sc.iter().enumerate() {
-            if let Some(v) = cell(r, *c, i)
+            if let Some(v) = cell(r, *c, i)?
                 && !d.recs[idx].singles[k].contains(&v)
             {
                 d.recs[idx].singles[k].push(v);
             }
         }
     }
+    Ok(())
 }
 
 /// Run every group of a plan.
@@ -173,11 +201,11 @@ pub fn run_groups(
             GroupKind::Count { ty, filter } => {
                 let q = algebra::count_query(m, ty, filter.as_ref())?;
                 let r = run.run(&q, Vec::new())?;
-                d.count = cell(&r, col(&r, "c"), 0).and_then(|t| match t {
+                d.count = cell(&r, col(&r, "c"), 0)?.and_then(|t| match t.as_term() {
                     Term::Literal(l) => l.value().parse().ok(),
                     _ => None,
                 });
-                d.rows = r.table.len();
+                d.rows = r.table().len();
                 text = q.to_string();
             }
             GroupKind::Values => {
@@ -189,13 +217,16 @@ pub fn run_groups(
                 } else {
                     let r = run.run(&q, bindings)?;
                     let (pc, fc, vc) = (col(&r, "p"), col(&r, "f"), col(&r, "v"));
-                    for i in 0..r.table.len() {
-                        let (Some(p), Some(Term::Literal(f)), Some(v)) =
-                            (cell(&r, pc, i), cell(&r, fc, i), cell(&r, vc, i))
+                    for i in 0..r.table().len() {
+                        let (Some(p), Some(field), Some(v)) =
+                            (cell(&r, pc, i)?, cell(&r, fc, i)?, cell(&r, vc, i)?)
                         else {
                             continue;
                         };
-                        let Ok(f) = f.value().parse::<usize>() else {
+                        let Term::Literal(field) = field.as_term() else {
+                            continue;
+                        };
+                        let Ok(f) = field.value().parse::<usize>() else {
                             continue;
                         };
                         let e = d
@@ -206,7 +237,7 @@ pub fn run_groups(
                             e[f].push(v);
                         }
                     }
-                    d.rows = r.table.len();
+                    d.rows = r.table().len();
                 }
             }
             GroupKind::Collection { window, count, .. } => {
@@ -234,11 +265,12 @@ pub fn run_groups(
                 let hi = hi.unwrap_or(lo).max(lo);
                 let len = (hi - lo) as usize;
                 let fetch = len + usize::from(probe);
-                let b = algebra::node_query(m, g, &[], Some((lo as usize, Some(fetch))))?;
+                let b =
+                    algebra::node_query(m, g, &[] as &[Term], Some((lo as usize, Some(fetch))))?;
                 text = b.query.to_string();
                 let r = run.run(&b.query, b.bindings.clone())?;
-                decode_nodes(&r, &b, false, &mut d);
-                d.rows = r.table.len();
+                decode_nodes(&r, &b, false, &mut d)?;
+                d.rows = r.table().len();
                 let more = d.recs.len() > len;
                 d.recs.truncate(len);
                 for (i, rec) in d.recs.iter_mut().enumerate() {
@@ -250,11 +282,11 @@ pub fn run_groups(
                 };
             }
             GroupKind::Lookup { .. } | GroupKind::Node { .. } => {
-                let b = algebra::node_query(m, g, &[], None)?;
+                let b = algebra::node_query(m, g, &[] as &[Term], None)?;
                 text = b.query.to_string();
                 let r = run.run(&b.query, b.bindings.clone())?;
-                decode_nodes(&r, &b, false, &mut d);
-                d.rows = r.table.len();
+                decode_nodes(&r, &b, false, &mut d)?;
+                d.rows = r.table().len();
             }
             GroupKind::Child { .. } => {
                 let ids = ids();
@@ -264,8 +296,8 @@ pub fn run_groups(
                     d.skipped = true;
                 } else {
                     let r = run.run(&b.query, b.bindings.clone())?;
-                    decode_nodes(&r, &b, true, &mut d);
-                    d.rows = r.table.len();
+                    decode_nodes(&r, &b, true, &mut d)?;
+                    d.rows = r.table().len();
                 }
             }
         }
@@ -334,12 +366,12 @@ impl<'a> Cx<'a> {
                 rec.node, grp.declared
             ),
         )
-        .with("node", id_of(&rec.node).unwrap_or_default()))
+        .with("node", id_of(rec.node.as_term()).unwrap_or_default()))
     }
 
     fn node<'b>(&'b self, g: usize, rec: usize) -> Result<ResolvedValue<'b>, FieldError> {
         let r = &self.data[g].recs[rec];
-        if !is_node(&r.node) {
+        if !is_node(r.node.as_term()) {
             return Err(self.fail(
                 GqlError::new(
                     Code::InvalidValue,
@@ -538,13 +570,14 @@ struct NodeObj<'a> {
 }
 
 /// Values in the first language range that has any (§4.5).
-fn by_lang<'t>(values: &'t [Term], ranges: &[String]) -> Vec<&'t Term> {
+fn by_lang<'t>(values: &'t [OwnedTerm], ranges: &[String]) -> Vec<&'t Term> {
     if ranges.is_empty() || ranges.iter().any(|r| r == "*") && ranges.len() == 1 {
-        return values.iter().collect();
+        return values.iter().map(OwnedTerm::as_term).collect();
     }
     for r in ranges {
         let hit: Vec<&Term> = values
             .iter()
+            .map(OwnedTerm::as_term)
             .filter(|v| match tag_of(v) {
                 Some(tag) => r == "*" || lang_matches(tag, r),
                 None => false,
@@ -565,7 +598,7 @@ impl NodeObj<'_> {
     fn err(&self, code: Code, msg: String, f: &FieldMap) -> FieldError {
         self.cx.fail(
             GqlError::new(code, msg)
-                .with("node", id_of(&self.rec().node).unwrap_or_default())
+                .with("node", id_of(self.rec().node.as_term()).unwrap_or_default())
                 .with("predicate", f.predicate.as_str()),
         )
     }
@@ -574,7 +607,7 @@ impl NodeObj<'_> {
         let bad = |msg: String| {
             self.cx.fail(
                 GqlError::new(Code::InvalidValue, msg)
-                    .with("node", id_of(&self.rec().node).unwrap_or_default())
+                    .with("node", id_of(self.rec().node.as_term()).unwrap_or_default())
                     .with("predicate", f.predicate.as_str())
                     .with("value", t.to_string()),
             )
@@ -636,14 +669,14 @@ impl NodeObj<'_> {
                         f.name
                     ),
                 )
-                .with("node", id_of(&self.rec().node).unwrap_or_default())
+                .with("node", id_of(self.rec().node.as_term()).unwrap_or_default())
                 .with("predicate", f.predicate.as_str())
                 .with("values", n),
             )),
         }
     }
 
-    fn values_of(&self, fno: usize) -> &[Term] {
+    fn values_of(&self, fno: usize) -> &[OwnedTerm] {
         let grp = &self.cx.plan.groups[self.group];
         grp.values
             .and_then(|vg| self.cx.data[vg].values.get(&self.rec().node))
@@ -677,12 +710,16 @@ impl ObjectValue for NodeObj<'_> {
             .and_then(|m| m.get(&k))
         else {
             if info.field_name() == "id" {
-                return Ok(leaf(id_of(&self.rec().node).unwrap_or_default().into()));
+                return Ok(leaf(
+                    id_of(self.rec().node.as_term()).unwrap_or_default().into(),
+                ));
             }
             return Err(self.unknown_field_error(info));
         };
         match fp {
-            FieldPlan::Id => Ok(leaf(id_of(&self.rec().node).unwrap_or_default().into())),
+            FieldPlan::Id => Ok(leaf(
+                id_of(self.rec().node.as_term()).unwrap_or_default().into(),
+            )),
             FieldPlan::Single { col, field, lang } => {
                 let vals = by_lang(&self.rec().singles[*col], lang);
                 self.single(vals, field)
@@ -709,7 +746,7 @@ impl ObjectValue for NodeObj<'_> {
                 let items: Vec<Result<ResolvedValue<'a>, FieldError>> = self
                     .values_of(*fno)
                     .iter()
-                    .filter_map(id_of)
+                    .filter_map(|term| id_of(term.as_term()))
                     .map(|s| Ok(leaf(s.into())))
                     .collect();
                 Ok(ResolvedValue::List(Box::new(items.into_iter())))
@@ -755,7 +792,7 @@ impl ObjectValue for NodeObj<'_> {
                                 field.name
                             ),
                         )
-                        .with("node", id_of(&self.rec().node).unwrap_or_default())
+                        .with("node", id_of(self.rec().node.as_term()).unwrap_or_default())
                         .with("predicate", field.predicate.as_str())
                         .with("values", n),
                     )),
@@ -856,4 +893,105 @@ pub fn explain(plan: &Plan, data: &[Data]) -> J {
             })
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod retained_input_tests {
+    use super::*;
+    use sparkles_core::sparql::{pool::QueryPool, query};
+    use sparkles_core::store::{Store, StoreOptions};
+
+    #[test]
+    fn data_retains_genuine_parent_node_single_and_value_owners_after_query_drop() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = QueryPool::new(16 << 20);
+        let opts = QueryOptions {
+            pool: Some(pool.clone()),
+            max_memory_bytes: Some(4 << 20),
+            no_cache: true,
+            ..Default::default()
+        };
+        let text = format!(
+            "SELECT ?p ?n ?v WHERE {{ VALUES (?p ?n ?v) {{ (<urn:p> <urn:n> \"{}\") }} }}",
+            "x".repeat(32 << 10)
+        );
+        let result = query(store.snapshot(), &text, &opts).unwrap();
+        let parent = cell(&result, col(&result, "p"), 0).unwrap().unwrap();
+        let node = cell(&result, col(&result, "n"), 0).unwrap().unwrap();
+        let value = cell(&result, col(&result, "v"), 0).unwrap().unwrap();
+        let mut data = Data::default();
+        data.recs.push(Rec {
+            node: node.clone(),
+            singles: vec![vec![value.clone()]],
+            flags: vec![],
+            pos: 0,
+        });
+        data.by_parent.insert(parent, vec![0]);
+        data.values.insert(node, vec![vec![value]]);
+        drop(result);
+        drop(store);
+        let last = data.clone();
+        drop(data);
+        assert_eq!(last.recs[0].node.as_term().to_string(), "<urn:n>");
+        assert!(
+            matches!(last.recs[0].singles[0][0].as_term(),Term::Literal(l) if l.value().len()==32 << 10)
+        );
+        assert_eq!(
+            last.by_parent
+                .get(&Term::NamedNode(oxrdf::NamedNode::new_unchecked("urn:p")))
+                .unwrap(),
+            &[0]
+        );
+        assert!(pool.granted() >= 32 << 10);
+        drop(last);
+        assert_eq!(pool.granted(), 0);
+    }
+    #[test]
+    fn cell_preserves_real_decode_budget_and_late_cancellation_errors() {
+        use sparkles_core::id::Id;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut write = store.write();
+        let s = write
+            .intern(&oxrdf::NamedNode::new_unchecked("urn:s").into())
+            .unwrap();
+        let p = write
+            .intern(&oxrdf::NamedNode::new_unchecked("urn:p").into())
+            .unwrap();
+        let o = write
+            .intern(&oxrdf::Literal::new_simple_literal("x".repeat(64 << 10)).into())
+            .unwrap();
+        write.insert([s, p, o, Id::DEFAULT_GRAPH]).unwrap();
+        write.commit().unwrap();
+        let result = query(
+            store.snapshot(),
+            "SELECT ?o WHERE { <urn:s> <urn:p> ?o }",
+            &QueryOptions {
+                max_memory_bytes: Some(16 << 10),
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            cell(&result, col(&result, "o"), 0).unwrap_err().code,
+            Code::BudgetExceeded
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = query(
+            store.snapshot(),
+            "SELECT ?o WHERE { <urn:s> <urn:p> ?o }",
+            &QueryOptions {
+                cancel: Some(cancel.clone()),
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(
+            cell(&result, col(&result, "o"), 0).unwrap_err().code,
+            Code::Cancelled
+        );
+    }
 }

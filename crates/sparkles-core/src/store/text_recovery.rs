@@ -631,7 +631,6 @@ mod tests {
     fn count(s: &Store) -> usize {
         query(s.snapshot(), QUERY, &Default::default())
             .unwrap()
-            .rows()
             .len()
     }
     fn wait(s: &Store) {
@@ -1120,7 +1119,7 @@ mod tests {
             pause.resume();
             wait(&s);
             assert_eq!(count(&s), 3);
-            assert_eq!(query(s.snapshot(), "PREFIX text:<http://jena.apache.org/text#> SELECT ?s { GRAPH <http://ex/g> { ?s text:query \"fox\" } }", &Default::default()).unwrap().rows().len(), 1);
+            assert_eq!(query(s.snapshot(), "PREFIX text:<http://jena.apache.org/text#> SELECT ?s { GRAPH <http://ex/g> { ?s text:query \"fox\" } }", &Default::default()).unwrap().len(), 1);
             assert_eq!(s.snapshot().commit, head);
             assert!(matches!(
                 query(held, QUERY, &Default::default()),
@@ -1129,7 +1128,7 @@ mod tests {
             let bag = |snapshot| {
                 let mut rows = query(snapshot, QUERY, &Default::default())
                     .unwrap()
-                    .rows()
+                    .test_application_rows()
                     .into_iter()
                     .map(|row| format!("{row:?}"))
                     .collect::<Vec<_>>();
@@ -1427,10 +1426,7 @@ mod tests {
         assert_eq!(s.snapshot().commit, commit);
         assert_ne!(owner, s.snapshot().text.as_ref().unwrap().owner);
         assert_eq!(
-            query(held, QUERY, &QueryOptions::default())
-                .unwrap()
-                .rows()
-                .len(),
+            query(held, QUERY, &QueryOptions::default()).unwrap().len(),
             1
         );
         s.enable_text(Default::default()).unwrap();
@@ -1732,7 +1728,6 @@ mod tests {
         assert_eq!(
             query(Arc::new(caught_up), QUERY, &Default::default())
                 .unwrap()
-                .rows()
                 .len(),
             2
         );

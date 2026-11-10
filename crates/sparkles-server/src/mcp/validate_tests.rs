@@ -293,7 +293,9 @@ async fn shex_errors() {
 #[cfg(feature = "shex")]
 #[tokio::test(flavor = "multi_thread")]
 async fn shex_budget_and_timeout() {
-    // 640 bytes of memory: at most 10 typing pairs
+    // 640 bytes would allow 10 typing pairs, but the request root, the prepared
+    // view and the 100 focus nodes are charged too, and they need more, so the
+    // memory budget refuses first
     let cfg = McpConfig {
         query_memory_bytes: Some(640),
         ..McpConfig::default()
@@ -308,7 +310,8 @@ async fn shex_budget_and_timeout() {
         .await;
     assert_eq!(
         e,
-        json!({"code": "budget-validation-work", "status": 507, "budget": "validation-work"})
+        json!({"code": "budget-memory", "status": 507, "budget": "memory"}),
+        "{t}"
     );
     assert!(t.contains("fewer focus nodes"), "{t}");
     let mut c = Client::start(server_with(
