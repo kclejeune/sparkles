@@ -933,6 +933,12 @@ impl<'a> Eval<'a> {
         g.exists(&mut self.bmemo, s, p, o, self.end)
     }
 
+    /// Whether the evaluation has stopped, for good.
+    #[inline]
+    pub fn stopped(&self) -> bool {
+        self.stop
+    }
+
     /// Whether the evaluation reports rule instances (and so tracks their bodies).
     #[inline]
     pub fn collecting(&self) -> bool {
