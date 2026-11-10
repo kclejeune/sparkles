@@ -1585,6 +1585,42 @@ test('entity-history', async ({ page, request }) => {
   await request.delete(`/$/branches/uni/${branch}?force=true`);
 });
 
+test('watches', async ({ page, request }) => {
+  // the Watches page with a subtree watch on Professor and an entity watch on Student on a
+  // branch, after three commits, with Professor's matched commits opened
+  const branch = 'watches-shot';
+  const uni = 'http://example.org/uni#';
+  await request.delete('/$/watches');
+  await request.post('/$/branches/uni', { data: { name: branch } });
+  for (const data of [
+    { dataset: 'uni', branch, entity: `${uni}Professor`, scope: 'subtree' },
+    { dataset: 'uni', branch, entity: `${uni}Student` },
+  ]) {
+    const w = await request.post('/$/watches', { data });
+    expect(w.ok(), await w.text()).toBe(true);
+  }
+  for (const [message, body] of [
+    ['Lecturer under Professor', 'uni:Lecturer rdfs:subClassOf uni:Professor'],
+    ['Label for Lecturer', 'uni:Lecturer rdfs:label "Lecturer"@en'],
+    ['Comment on Student', `uni:Student rdfs:comment "Enrolled in at least one course."@en`],
+  ]) {
+    const u = await request.post(`/uni@${branch}/update`, {
+      headers: { 'Content-Type': 'application/sparql-update', 'Sparkles-Commit-Message': message },
+      data: `PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> PREFIX uni: <${uni}>
+        INSERT DATA { ${body} }`,
+    });
+    expect(u.ok(), await u.text()).toBe(true);
+  }
+  await page.goto('/ui/watches');
+  await page.getByRole('button', { name: `${uni}Professor` }).click({ timeout: 30_000 });
+  await expect(
+    page.getByRole('list', { name: 'Matched commits' }).getByRole('listitem'),
+  ).toHaveCount(2);
+  await shoot(page, 'watches');
+  await request.delete('/$/watches');
+  await request.delete(`/$/branches/uni/${branch}?force=true`);
+});
+
 test('ontology-discussions', async ({ page, request }) => {
   // Professor's Discussion view with a thread that mentions a colleague and has a reply,
   // a thread on one of its axioms and a resolved one, written as the editor writes them

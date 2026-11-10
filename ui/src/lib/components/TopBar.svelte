@@ -7,6 +7,8 @@
   import { afterNavigate } from '$app/navigation';
   import { resolve } from '$app/paths';
   import { app } from '$lib/app.svelte';
+  import { routes } from '$lib/routes';
+  import { watchCount } from '$lib/watch-count.svelte';
   import DatasetMenu from './DatasetMenu.svelte';
   import Icon from './Icon.svelte';
   import NavLinks from './NavLinks.svelte';
@@ -92,6 +94,19 @@
   <ScopeSearch />
 
   <div class="end">
+    {#if watchCount.unread !== null}
+      <a
+        class="btn ghost sm watches"
+        href={routes.watches()}
+        title={watchCount.unread
+          ? `${watchCount.unread} unread ${watchCount.unread === 1 ? 'change' : 'changes'} to watched entities`
+          : 'Your watches'}
+        aria-label={watchCount.unread ? `Watches, ${watchCount.unread} unread` : 'Watches'}
+        ><Icon name="eye" size={16} />{#if watchCount.unread}<span class="badge count"
+            >{watchCount.unread > 99 ? '99+' : watchCount.unread}</span
+          >{/if}</a
+      >
+    {/if}
     <span class="wide">{@render statusDot()}</span>
     <span class="wide">{@render iriButton()}<RenderingPreferences /></span>
     <span class="wide">{@render themeButton()}</span>
@@ -150,6 +165,14 @@
 </dialog>
 
 <style>
+  .watches {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1);
+  }
+  .watches .count {
+    font-variant-numeric: tabular-nums;
+  }
   /* Three columns: the brand, the search and the end. The two outer columns share the
      free space equally, so the search sits in the middle of the viewport; a side that needs
      more room than its share (a long user name at medium width) pushes the search over

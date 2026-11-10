@@ -164,7 +164,10 @@ Its entity frame lists the commits that changed an entity and holds
 [discussion threads](visualization/README.md#ontology-editor) on the entity and its
 axioms, with mentions, replies, resolve and reopen, which the editor's Discussions tab
 lists for the ontology. Threads are Web Annotation RDF in a named graph on the branch,
-so each comment is a commit.
+so each comment is a commit. A user can
+[watch](visualization/README.md#ontology-editor) an entity or its asserted subtree from
+the frame. The Watches page lists the commits that changed it, and an email channel that
+a server administrator marks for watchers mails them to the user's verified address.
 Its [Bulk edits tab](visualization/README.md#ontology-editor) finds and replaces text
 across labels and annotations, sets or removes an annotation on many entities and moves
 many classes under a new parent, each as one previewed commit of at most 1,000 changes.
@@ -211,6 +214,8 @@ datasets and saved queries alone.
 ![The ontology editor's History view of Professor on a branch, with three commits and the opened one showing the annotation it added, its full diff link and its revert](images/entity-history.png)
 
 ![The ontology editor's Discussion view of Professor with an open thread that mentions a colleague and has a reply, a thread on one of its axioms, and the composer](images/ontology-discussions.png)
+
+![The Watches page with a subtree watch on Professor opened, listing the commits that put a class below it and labelled it](images/watches.png)
 
 ![The ontology editor's Bulk edits tab with a find and replace of student by learner in the English labels and the two changes it lists](images/ontology-bulk.png)
 

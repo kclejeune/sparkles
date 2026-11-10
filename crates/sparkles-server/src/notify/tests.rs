@@ -1002,7 +1002,7 @@ async fn a_runtime_layer_past_the_cap_is_refused_on_reading() {
 }
 // ------------------------------------------------------------------ email (§4.3) ------
 
-const TEST_CA: &[u8] = include_bytes!("../tls/testdata/ca.pem");
+pub(crate) const TEST_CA: &[u8] = include_bytes!("../tls/testdata/ca.pem");
 const TEST_CERT: &[u8] = include_bytes!("../tls/testdata/cert-a.pem");
 const TEST_KEY: &[u8] = include_bytes!("../tls/testdata/key-a.pem");
 
@@ -1011,7 +1011,7 @@ impl<T: Read + Write> Rw for T {}
 
 /// How the fake mail server offers TLS.
 #[derive(Clone, Copy, PartialEq)]
-enum SmtpMode {
+pub(crate) enum SmtpMode {
     /// STARTTLS on a plain connection
     Starttls,
     /// TLS from the first byte
@@ -1023,14 +1023,14 @@ enum SmtpMode {
 /// One message the fake mail server took, or the commands of a session that ended
 /// before DATA.
 #[derive(Clone, Debug, Default)]
-struct Mail {
+pub(crate) struct Mail {
     /// whether the commands after the greeting ran over TLS
     secure: bool,
     /// `\0user\0password` decoded from AUTH PLAIN
     auth: Option<String>,
     from: String,
-    to: Vec<String>,
-    data: String,
+    pub(crate) to: Vec<String>,
+    pub(crate) data: String,
     commands: Vec<String>,
 }
 
@@ -1048,8 +1048,8 @@ struct Script {
 }
 
 /// A local mail server inside the test process. It stops when it is dropped.
-struct FakeSmtp {
-    port: u16,
+pub(crate) struct FakeSmtp {
+    pub(crate) port: u16,
     got: Arc<Mutex<Vec<Mail>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -1206,7 +1206,7 @@ fn smtp_session(
 }
 
 impl FakeSmtp {
-    fn start(mode: SmtpMode, rcpt: Vec<u16>) -> FakeSmtp {
+    pub(crate) fn start(mode: SmtpMode, rcpt: Vec<u16>) -> FakeSmtp {
         FakeSmtp::start_with(
             mode,
             Script {
@@ -1270,7 +1270,7 @@ impl FakeSmtp {
 
     /// The sessions once `n` have ended, since a session ends after the client has its
     /// last reply.
-    fn wait(&self, n: usize) -> Vec<Mail> {
+    pub(crate) fn wait(&self, n: usize) -> Vec<Mail> {
         for _ in 0..200 {
             if self.got.lock().len() >= n {
                 break;

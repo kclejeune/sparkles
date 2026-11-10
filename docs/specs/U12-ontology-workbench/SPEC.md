@@ -355,6 +355,74 @@ notify no one until the notifications of item 46 exist. Item 769 covers an optio
 discussion store outside versioning, with comments allowed on protected branches and
 kept out of exports.
 
+### Watches
+
+Item 619 adds watches. A watch belongs to an identity and names an entity IRI in one
+graph of one branch, alone or with its asserted subtree, with an optional depth for a
+subtree. The server keeps watches and their matched commits in `<dataDir>/watches.json`,
+outside every dataset, so they are neither committed nor exported. The routes are
+`/$/watches`, which [API: Watches](../../API.md#watches) describes.
+
+These points settle what the candidate phase left open. The maintainer decided the
+first five.
+
+- An owner learns of matches in the web UI, read with the owner's live access. A
+  delivery outside the UI goes only through an email channel that a server
+  administrator marks for watchers, to the owner's verified address. The ordinary
+  routes of C21 never carry a watch.
+- A subtree is the asserted hierarchy of `rdfs:subClassOf`, `rdfs:subPropertyOf`,
+  `skos:broader` and the inverse of `skos:narrower`. A follower thread reads each
+  watched branch's commits in order. It walks upward from each IRI that a commit's
+  changes name, in the hierarchy before the commit and after it, and matches the
+  subtree watches whose entity the walk reaches. The cost of a commit is its changes
+  times the ancestors each walk visits, and it does not depend on the size of a subtree.
+  The hierarchy of each watched graph is kept in memory, about 100 bytes per edge, and
+  is kept current from the commits, so the state before and after each commit is exact.
+  This memory buys exact matching without reading past states.
+- A watch is refused while triple protections limit what its owner reads, because
+  History and the change feed do not support them.
+- Commits by the owner are listed and marked `own`. Watches made through a token belong
+  to the token's owner and outlive the token. A watch keeps 200 matches.
+- The bounds `maxAncestors`, `largeCommit`, `identityMaxAgeDays` and `batchSecs` are the
+  `watches` member of the `notifications` kind.
+- Every route and every match is authorized again. The follower computes the owner's
+  current grants from the policy with the groups that the owner's provider or proxy last
+  asserted, on whichever route, and an owner who is gone or can no longer read the graph
+  matches nothing. A
+  watch stores its branch's id, so it follows a rename and is removed with the branch.
+- A commit whose changes are not listed, such as a bulk load, and a gap the change feed
+  no longer holds, match every watch of the branch as unverified.
+
+Mail goes through an email channel with `watchers: true`, as
+[C21](../C21-outbound-notifications.md#mail-to-the-owners-of-watches-item-619) records.
+The follower gathers each owner's new matches in a dataset, other than the owner's own,
+for `batchSecs`, and the delivery builds its message at each attempt from the watches
+and the owner's access as they are then. The address is the `email` of a configured
+user, an OIDC `email` claim with `email_verified`, or the header that `[proxy]
+verified_email_header` names. An OIDC or proxy owner is mailed only while its provider or
+proxy vouched for it within `identityMaxAgeDays`.
+
+The web UI has a **Watch** button in the entity frame of the Ontology editor, which
+watches the entity alone or with its subtree to an optional depth and lists the caller's
+watches on it with a way to stop each. The **Watches** page at `/ui/watches` lists every
+watch with its unread count, opens a watch's matched commits with links to each member's
+History view, marks a watch read and removes it, and says whether matches are also mailed
+and where. The top bar shows the unread count, read at most once a minute while the page
+is visible, and links to the page.
+
+![The Watches page with a subtree watch on Professor opened](../../images/watches.png)
+
+Tests in `crates/sparkles-server/src/watches/tests.rs` cover entity matches in the three
+positions, own commits, unread counts and marking read, a class moved into and out of a
+subtree between two runs of the follower, root changes, deletions, a depth limit, a
+summary entry for a large commit, a renamed and a deleted branch, graph grants, triple
+protections, an owner who no longer exists, a refused file, and a restart that keeps the
+matches and the cursor. They also cover a watch made from a head that the follower has
+passed, a dataset that drains after a rename, a graph and a first hierarchy edge that
+appear after the follower bound a generation, the follower's names of hierarchy nodes
+that came and went, and the mail cases that C21's Outcome lists. `ui/src/lib/watches.test.ts`,
+`ui/tests/mock/watches.spec.ts` and `ui/tests/e2e/watches.spec.ts` cover the UI.
+
 ### Bulk edits
 
 Item 626 adds a **Bulk edits** tab to the ontology editor, beside **Discussions**, for the
