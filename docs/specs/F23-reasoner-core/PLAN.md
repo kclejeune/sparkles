@@ -136,8 +136,9 @@ first derived it, as `RuleProgram::Record` holds them today. The bindings name t
 facts by instantiating the rule's atoms, so a premise in the base tier, which has no fact
 id, and one in the derived tier are addressed the same way. The records are a column keyed
 by fact id that holds a `u16` rule index and a `u32` offset into a pool of `u64` bindings,
-so a record costs 6 bytes plus 8 per rule variable, between 22 and 46 bytes on the `owl-rl`
-rules, whose bodies bind two to five variables. A deletion finds the broken facts without a
+so a record costs 6 bytes plus 8 per rule variable, from 6 bytes for an axiom to 94 for
+`prp-spo2-3`, whose body binds eleven variables, and about 30 bytes for the three-variable
+rules that derive most of an OWL 2 RL closure. A deletion finds the broken facts without a
 reverse index, as the operator does. The instances that read a removed fact are enumerated
 over the old closure, and a head is broken when its record is that instance.
 The record is the same object as the fixed-point operator's `Record`, and it is well
@@ -380,7 +381,8 @@ before.
 ### Phase 5, rule frontends, item 838
 
 A `shacl-af` reasoning profile reads a shapes graph among the inputs, `sh:TripleRule`
-compiles to the IR through a `shConforms` builtin that calls the SHACL validator,
+compiles to the engine's current rule form, and to the IR after Phase 6, through a
+`shConforms` builtin that calls the SHACL validator,
 `sh:SPARQLRule` compiles to a query stratum, SPIN translates to `sh:SPARQLRule`, and the
 Fuseki configuration maps TopBraid's rule settings. N3 rules get a parser for the subset
 above into the same rule form. SWRL waits for item 71. `sh:TripleRule`, the SPIN
