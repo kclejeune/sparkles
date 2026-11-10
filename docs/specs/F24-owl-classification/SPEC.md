@@ -105,6 +105,16 @@ gives its default answer, and 45 of the 50 `shoi` fixtures exact against HermiT.
 fixtures that pass the bound are item 822, the default is item 823, and keys and the
 universal property are item 805.
 
+Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
+and their record. With counting, an exact or minimum cardinality in a negative position
+is the calculus's own at-most clause with the neighbours in its body, an exact
+cardinality of one is an existential restriction in a negative position, and a product
+derives each distinct conclusion once with its record charged to the memory budget. The
+three files of the item still pass the bound of the counting run and classify again
+without counting, so counting stays off by default, and the calculus change for the
+equality reasoning over conditional successors that remains is item 894, which also takes
+the design's third part, the witnesses' shared context.
+
 The bounded named-class read phase of items 588 and 622, and the availability route
 of item 726, publish an immutable completed result beside the incremental saturation.
 `GET /$/ontology/{ds}/classification` and the Rust, Python, Node.js and JVM read adapters
@@ -1170,8 +1180,10 @@ that need counting out and reports them, and takes a minimum as the existential
 restriction it implies, so it costs what the classifier cost before counting. The reason
 is the cost on real ontologies, since no file of the ORE 2015 DL development set finishes
 with counting and the five that attempt it spend 2 to 30 times the time of the run
-without it before they give up where that run finishes, item 728. Turning counting on is the work of
-that item. A run that counts when asked takes a number restriction that the Horn rules
+without it before they give up where that run finishes. Item 728 replaced the clauses of
+every context and the hypothesis about the predecessor, as [its subsection](#item-728s-clauses-for-counting-over-definitions)
+records, and the three files still give up, so turning counting on is the work of item
+894, the calculus change for the equality reasoning that remains. A run that counts when asked takes a number restriction that the Horn rules
 cannot take, a functional or inverse functional property, disjoint properties or an
 asymmetric property. The terms of a clause then include
 equalities of the successor terms and of a successor with the predecessor, and the order
@@ -1238,7 +1250,8 @@ minimum cardinality `=n r.F` and `≥n r.F` by `∃r.F`, with `owl:Thing` for an
 filler, does not finish in 120 s on one thread on the build before counting, and takes
 105 s with the premise index and the Pred check below. A copy that replaces only the exact
 cardinalities classifies in 44 to 50 ms but leaves its four minimums of two out. Item 728
-holds the choice among the remedies.
+chose among the remedies, as its subsection below records, and item 894 holds the
+calculus change that remains.
 The normalization of a clause with a universal or a maximum
 beside a class or an existential restriction keeps the class in the clause's body, which
 classifies BioTop in 56 ms on one thread and 27 ms on four against 940 and 350 ms before.
@@ -1630,9 +1643,32 @@ under the clause's body, and one where a unit witness's marker must reach the sh
 context. The two large files are measured apart from the first, with
 the time of their normalization, their saturation, their candidate tests and the
 completion of their counting, and the counts of the conditional predecessor clauses and
-of the hypothetical successors under each rank are recorded. The measured effect of the
-design, the rank and the witness contexts that are kept are recorded here when the item
-ships.
+of the hypothetical successors under each rank are recorded.
+
+The outcome of the item. The gate is not met, and the item ships its clauses and its
+record. The first part is kept, with the `n = 1` revision above, so an exact or minimum
+cardinality in a negative position is the at-most clause with the neighbours in its body,
+an exact cardinality of one is `∃r.F ⊑ y ⊔ H`, a cardinality in a negative position over a
+non-simple role is left out and reported as the holder's clause was, and rooted runs keep
+their former translation. The second part, the low rank of `H`, stays behind
+`SPARKLES_DL_LOW_H`, off, since it diverges on `sriq-010` and finishes none of the three
+files. The third part, the witnesses' shared context, is not built, since the keyed
+successor's measurement showed that the cost of ore_ont_6485 lies in the equality
+reasoning over conditional successors, which no choice of the witnesses' contexts touches,
+and it goes to item 894 with the two versions of the Protein Ontology, whose cost it
+addresses. The product dedup and its memory charge are kept. On `atlas` on one thread,
+release, with the shared contexts and the control rank, ore_ont_6485 classifies in 11 ms
+without counting and its failed attempt with counting costs 190 ms, ore_ont_6952 907 ms
+and 1,105 ms, and ore_ont_10140 927 ms and 1,128 ms, each with `Stats::dl_counting_over`
+set and the answer of the run without counting. The development files, the generated
+fixtures with the 150 counting cases and the `shoi` and nominal fixtures give HermiT's
+taxonomies with no new timeout on one and eight threads, and the regressions of the
+predecessor, of the simple-role check, of the rooted translation and of the product
+record's charge are in the Tier D suite. The two regressions of the shared witness
+context go to item 894 with the third part. Item 894 is the calculus change for the
+equality reasoning that remains, from published calculi only, with the hypertableau's
+merging of equated terms and Kazakov and Klinov's exploration as the candidates named
+above, and its design is reviewed before any code as this one was.
 
 ### Nominals in the disjunctive rules
 
@@ -1783,7 +1819,7 @@ The phase's gate is the `dl-o` stratum of the ORE 2015 DL development set, the n
 fixtures that need no counting and the hand cases. Of the six development files in `dl-o`,
 ore_ont_15803 and ore_ont_14924 have no data properties and both name the top object
 property. The other four use data properties and join the gate with item 768. The `dl-oiq`
-stratum needs counting and the Nom rule and joins the gate after item 728. The fixtures in
+stratum needs counting and the Nom rule and joins the gate after item 894. The fixtures in
 the gate are the 50 `shoi` cases, `sroiq-048` and the hand cases `nominal-disjunction`,
 `nominal-ripple`, `nominal-ripple-conditional`, `key-disjunction`, `top-forall` and
 `top-forall-conditional`, each on the rules that take it. Those hand cases that are Horn
