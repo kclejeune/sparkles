@@ -7,7 +7,7 @@ accounting model and mode-neutral kernels of its fourth stage have shipped, as i
 tail of item 484 remain with [X16](../X16-storage-consolidation/README.md), the
 hierarchical budget of item 675 and the decoding twins of item 678 close stage 4, and
 [roadmap item 453](../../ROADMAP.md) holds the rest of the work. The [plan](PLAN.md)
-orders the remaining stages into lanes, items 825 to 829 first, with their files, gates,
+orders the remaining stages into phases, items 825 to 829 first, with their files, gates,
 measurements and the decisions that are open.
 
 Read the [design](SPEC.md), its [candidate phases](SPEC.md#candidate-phases), its
