@@ -63,6 +63,10 @@ limit that item 84 also raises. Each phase lands in the unified executor of
   and no query under 0.3 ms slower on an Intel host.
 * `plan_fidelity_tests.rs` records estimated against actual rows, and a new estimator
   must not raise the error on any recorded plan.
+* An estimator change that moves plans is measured on atlas over the changed plans. No
+  query above 0.3 ms may run 10% slower, the sum and the geometric mean of the execution
+  time may not be worse, and the median q-error of the workload may not rise. A slowdown
+  the gate accepts gets a follow-up item.
 * Cyclic workloads, namely triangles, the WatDiv C templates and LUBM `q2`, are the
   acceptance cases of the worst-case-optimal join, with answers equal to the binary-join
   plans.
@@ -196,15 +200,68 @@ accurate estimate leads the planner to a 704-key index join that the cost model 
 too low. A cost term for keys spread at random brought their base plan back, but the 64
 queries whose plans it changed took 1.15 times as long, since keys close together cost a
 third of what spread keys cost and the planner cannot tell them apart. The
-[experiment](../../PERFORMANCE-EXPERIMENTS.md#query-execution) is recorded, and item
-701 prices probes by how their keys spread. Planning takes 1 to 90 microseconds
+[experiment](../../PERFORMANCE-EXPERIMENTS.md#query-execution) is recorded. Item 701
+found that the two `S4` plans tie on estimated cost because the estimate of a join
+against a constant-object restriction divides by the input's distinct keys, so the base
+plan's last probe is estimated at 666 keys where it probes 4, and item 874 changes that
+estimate. Planning takes 1 to 90 microseconds
 longer on WatDiv `F4` and on short synthetic, WatDiv and DBpedia queries, 5% to 10% of
-their time, which item 702 follows up. Two synthetic queries with unchanged plans
+their time. Item 702 kept each group's holdings table and star factors across the
+candidate plans, which atlas measured no faster, and the
+[experiment](../../PERFORMANCE-EXPERIMENTS.md#query-execution) is recorded. Two synthetic queries with unchanged plans
 run 1.06 and 1.11 times as long in execution in eight rounds, and item 703 follows
 them up. Interleaved runs on atlas, an Intel host like forge, found the same slowdowns of
 `S4-2`, `S4-4` and `F4`. The
 [engine results](../../benchmarks/engine/RESULTS.md#estimation-timing-on-forge) list every
 changed plan.
+
+Item 874 divides a join against a pattern that a constant restricts, for a predicate other
+than `rdf:type`, by the predicate's distinct subjects or objects at least, on the pattern
+and on the joins above it, since the pattern's keys are a sample of the predicate's
+values and not a superset of the other side's. It applies to the estimate from distinct
+values, which the probed keys and the characteristic sets precede, and not while the
+snapshot holds a delta. The switch is `domain_estimates`. Two sides restricted by the same
+constant on the same predicate are still taken for independent samples, which item 875
+follows up. On
+WatDiv at scale 100, `S4-2` and `S4-4` then take a third plan. The `artist` and
+`nationality` scans merge, estimated at 122 rows where 21 come, and a 21-key star probe
+of `age` and `familyName` follows, estimated at 15 rows where 4 come, at 21,874 cost units
+against 66,034 for the 704-key probe plan. Over the 88 WatDiv queries the geometric mean of
+the join q-error falls from 3.98 to 2.40, the median from 2.00 to 1.67 and the 90th
+percentile from 59 to 6.1. The largest error of `S4-1` and `S4-3` falls from 666 to 1.6
+and 2.0, of `F1-1` from 103 to 14, of `F4-4` from 196 to 9 and of the `L2` and `L5`
+queries from about 15 to 3. The synthetic workload keeps every estimate. On the DBpedia
+slice the geometric mean falls from 1.96 to 1.80 and the largest error, on
+`outlink-classes-2`, from 78 to 31. Every answer matches the base build's, and the build
+with the switch off changes no estimate on the three workloads. The plans of 32 WatDiv queries change,
+and the largest join error of nine of them rises. The five `F5` queries, `S1-3` and
+`S1-4` fuse another pair of patterns into the star over `<Retailer> gr:offers ?v0`, and
+the estimate of that star without a set that fits, 19 rows where 73 come, carries through
+the probes above it, where the earlier pair happened to estimate 21 rows for 23. `S5-1`
+joins `rdf:type` with `schema:language` first and estimates 487 rows for none, where the
+earlier order estimated 106 for none, because the 5,504 subjects of `language` are 5,000
+websites and 504 products and the domain of one predicate cannot separate the two. `F4-1`
+estimates 3 rows where 9 come for the `language` restriction on 17 websites, of which
+1,238 in 5,000 have the language and 9 of these 17 do, and the five joins above keep that
+factor, to 9 rows where 72 come.
+On atlas, an Intel host like forge, six interleaved rounds of servers pinned to one core, with
+the switch on against off in one build over the 32 changed plans and `F4-1`, `S4-2`, `L1-2`
+and `S7-2`, put the execution time of the changed plans at 0.825 of the unchanged ones by
+geometric mean and at 2.30 ms against 2.65 ms in sum, with spreads of 1% to 7% between
+server processes. `S4-2` and `S4-4` take 0.37 and 0.34 times as long, 0.042 ms against
+0.116, `S5-2` to `S5-5` 0.27, 0.016 ms against 0.059, `S5-1` 0.60, `C2-1` 0.80 and `F2-3`
+0.78. Nine queries take longer, by 6 to 24 microseconds each on 0.03 to 0.13 ms: `S4-3`
+1.42, `S4-5` 1.36, `F5-4` 1.23, `S4-1` 1.23, `F5-1` 1.17, `F5-5` 1.16, `F5-2` 1.16, `F1-5`
+1.14 and `F1-3` 1.12 times. They are the queries whose largest estimate rose, apart from
+`S5-1`, which runs 0.60. Planning time is within 1% by geometric mean, 6 microseconds
+longer on `S4-1`, `S4-3` and `S4-5` and 86 microseconds shorter on `F2-3`. The Namespace
+screen of the synthetic store, whose plans do not change, shows no query 10% or more
+slower after the rerun of the five it flagged.
+Item 874 meets the gate for a plan change. No query above 0.3 ms is slower, since the nine
+slower queries run 0.03 to 0.13 ms, the sum falls from 2.65 to 2.30 ms and the geometric
+mean to 0.825, and the median join q-error falls from 2.00 to 1.67 on WatDiv and stays at
+1.01 on the synthetic store and DBpedia. Item 877 follows up the shared estimate of the
+`<Retailer> gr:offers ?v0` star behind the slower `F5` and `S1` plans.
 
 The first query of a fresh server over a store that holds the correlation statistics pays
 for them once. On atlas at 1.05M triples, with one thread, the first run of the synthetic
