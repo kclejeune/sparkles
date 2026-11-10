@@ -36,6 +36,14 @@ it.
 
 ### Added
 
+Incremental views and live queries maintain `MIN`, `MAX`, `GROUP_CONCAT`, `SAMPLE`,
+`HAVING` over them and correlated `EXISTS` instead of evaluating the query again at each
+commit (item 418). The group operator keeps each group's values as an ordered multiset,
+and a correlated `EXISTS` is evaluated by the query engine for the rows a commit can have
+changed. A view's `GROUP_CONCAT` lists a group's values in their `ORDER BY` order. View
+checkpoints written by earlier releases for queries with these operators are refused by
+their compiler fingerprint and the views are built again.
+
 Community reports can read a review policy's accepted projection (item 652). The
 `graphrag` settings member `reviewPolicy` names a review policy of the dataset's evidence
 settings, and a build or refresh then reads the policy's output graph with the projection's

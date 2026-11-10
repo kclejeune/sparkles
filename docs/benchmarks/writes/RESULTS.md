@@ -947,6 +947,22 @@ every process, the comparison of the two builds and the commands. It also holds 
 runs of the overdeletion experiment that
 [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#incremental-views) records.
 
+### Aggregates and correlated EXISTS in views
+
+The ignored test `aggregate_pass_against_recompute` of
+`crates/sparkles-core/tests/incr_bench.rs` measures the operators of
+[F13 §4.2](../../specs/F13-incremental-views-and-provenance.md#aggregates-and-correlated-exists)
+on the people data of the other view tests, with the same 200 commits of one or two quads
+each and the same columns. Every team has at most one label, so the `GROUP_CONCAT` and
+`SAMPLE` of `team-labels` have one answer per snapshot and the maintained rows are
+checked against the query. `knows-older` keeps the people who know someone older, which
+is a correlated `EXISTS` with the outer age in a filter of its pattern. An age inserted for
+a new person touches its `?q :age ?b` pattern, which names no outer variable, so that
+commit evaluates the condition again for every row, and the p95 shows it while the
+median does not.
+
+AGG_TABLE
+
 ### Incremental view gate baseline
 
 `mise run bench:incr` is the rewrite gate of incremental view maintenance, as
