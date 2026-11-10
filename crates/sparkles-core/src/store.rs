@@ -2414,6 +2414,14 @@ impl Store {
             // included, gets this release's records only: it is strictly framed from 0.
             headerless = r.good == 0 || buf.first() != Some(&WAL_HEADER);
             wal_len = r.good as u64;
+            if r.good == 0 && buf.first() != Some(&WAL_HEADER) {
+                // The header record a crash tore at the log's creation, or an empty
+                // file: the log holds nothing, so it is created again below with its
+                // header, and the writer starts after that header.
+                std::fs::remove_file(&wal_path)?;
+                sync_dir(&root.join(&name))?;
+                truncated = false;
+            }
             wal_index = r.index;
             delta = r.delta;
             version = r.version;

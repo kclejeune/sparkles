@@ -794,7 +794,11 @@ impl Checker<'_> {
             // the version first: a newer meta may have another shape
             Ok(b) => match crate::builder::index_meta_version(&b, "meta.json").and_then(|v| {
                 let written_by = dir.parent().and_then(crate::commit::read_written_by);
-                crate::formats::INDEX.check(name, v, written_by.as_deref())
+                crate::formats::INDEX.check(name, v, written_by.as_deref())?;
+                // a readable format lists its features, as open requires
+                let value: serde_json::Value = serde_json::from_slice(&b)
+                    .map_err(|e| Error::Corrupt(format!("meta.json: {e}")))?;
+                crate::builder::check_features_listed(&value, "meta.json")
             }) {
                 Err(e @ Error::Unsupported(_)) => {
                     run.add(Issue::error(e.to_string()).file(&meta_file))

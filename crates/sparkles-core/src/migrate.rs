@@ -305,9 +305,17 @@ fn inspect_store(plan: &mut Plan, dir: &Path, prefix: &str, by: Option<&str>) ->
 /// build reads: a feature it does not know is refused by name, and the FSST tables of an
 /// FSST-coded vocabulary are checked for their version, as opening the store checks them.
 fn inspect_features(plan: &mut Plan, gdir: &Path, rel: &str, meta: &[u8], by: Option<&str>) {
-    let features: Vec<String> = serde_json::from_slice::<serde_json::Value>(meta)
-        .ok()
-        .and_then(|v| v.get("features").cloned())
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(meta) else {
+        return;
+    };
+    // a readable format lists its features, as open requires
+    if let Err(e) = crate::builder::check_features_listed(&value, &format!("{rel}/meta.json")) {
+        plan.refused.push(e.to_string());
+        return;
+    }
+    let features: Vec<String> = value
+        .get("features")
+        .cloned()
         .and_then(|f| serde_json::from_value(f).ok())
         .unwrap_or_default();
     if let Err(e) = crate::builder::check_features(rel, &features, by) {

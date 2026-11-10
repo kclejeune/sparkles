@@ -523,6 +523,7 @@ impl Vocab {
                 data.as_slice().len() as u64,
             )?)
         } else {
+            require_index_file(dir)?;
             None
         };
         let offsets = Bytes::open(&off_path, sparse.is_some())?;
@@ -627,6 +628,7 @@ impl Vocab {
                 Err(error) => return Err(error),
             }
         } else {
+            require_index_file(dir)?;
             None
         };
         let prefetched = budget.filled(blocks.div_ceil(64))?;
@@ -2327,6 +2329,16 @@ pub(crate) fn verify_sparse_index(
         }
     }
     Ok(s.len())
+}
+
+/// Require `vocab.idx` of the vocabulary in `dir` to exist when a process opens the
+/// vocabulary without using it: the switch leaves the index out of memory, not off the
+/// disk.
+fn require_index_file(dir: &Path) -> crate::error::Result<()> {
+    let path = dir.join("vocab.idx");
+    std::fs::metadata(&path)
+        .map(|_| ())
+        .map_err(|e| missing_index(&path, &e))
 }
 
 /// The refusal of a generation whose `vocab.idx` cannot be read: index format 5
@@ -4353,11 +4365,11 @@ mod tests {
                 .to_string()
                 .contains("requires the sparse vocabulary index")
         );
-        // a process that does not use the index opens the vocabulary without the file
+        // a process that does not use the index still needs the file on disk
         crate::index::set_sparse_vocab(false);
         let opened = Vocab::open(dir.path());
         crate::index::set_sparse_vocab(true);
-        assert!(opened.unwrap().sparse.is_none());
+        assert!(matches!(opened, Err(crate::Error::Corrupt(_))));
     }
 
     #[test]

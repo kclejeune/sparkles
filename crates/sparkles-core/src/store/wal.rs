@@ -154,7 +154,7 @@ pub(crate) fn descriptor_version(file: &mut File, path: &Path) -> Result<u32> {
             }
             length += count;
         }
-        committed_version_of(&bytes[..length], path)
+        version_at_start(&bytes[..length], file.metadata()?.len(), path)
     })();
     let restored = file.seek(SeekFrom::Start(position));
     match result {
@@ -221,37 +221,58 @@ pub(crate) fn header_version(rec: &[u8], path: &Path) -> Result<u32> {
 /// refuses with the dump-and-reload message (spec X16 Phase 1).
 pub(crate) const HEADERLESS_VERSION: u32 = 0;
 
-/// The version of the log whose first bytes are `buf`. A log whose first record is not
-/// a header record is the pre-release headerless form, version 0, and is refused. A
-/// first record of zeros is a header that a crash at the log's creation tore before its
-/// bytes reached the disk, so it holds no committed record and reads as an empty log of
-/// [`PLAIN_VERSION`], which [`open_for_append`] gives its header.
-pub(crate) fn version_of(buf: &[u8], path: &Path) -> Result<u32> {
-    match buf.first() {
-        Some(&WAL_HEADER) => header_version(buf, path),
+/// The version of a log whose first bytes are `first` and whose length is `total`. A
+/// log whose first record is not a header record is the pre-release headerless form,
+/// version 0, and is refused. A header that a crash at the log's creation tore before
+/// its bytes reached the disk, fewer bytes than a record or a record of zeros, holds no
+/// committed record and reads as an empty log of [`PLAIN_VERSION`], which the open
+/// creates again with its header. `wal::create` syncs the header before any record
+/// follows it, so a record of zeros followed by more bytes is not that case: it is
+/// damage, and refusing it keeps the records after it from being read as a torn tail.
+fn version_at_start(first: &[u8], total: u64, path: &Path) -> Result<u32> {
+    match first.first() {
         None => Ok(PLAIN_VERSION),
-        Some(_) if buf.len() < WAL_REC || is_zero_record(&buf[..WAL_REC]) => Ok(PLAIN_VERSION),
+        Some(_) if first.len() < WAL_REC => Ok(PLAIN_VERSION),
+        Some(&WAL_HEADER) => header_version(first, path),
+        Some(_) if is_zero_record(&first[..WAL_REC]) => {
+            if total <= WAL_REC as u64 {
+                Ok(PLAIN_VERSION)
+            } else {
+                Err(Error::Corrupt(format!(
+                    "{}: the header record is zeros, but {total} bytes follow it",
+                    path.display()
+                )))
+            }
+        }
         Some(_) => {
             Err(crate::formats::WAL.refuse(&path.display().to_string(), HEADERLESS_VERSION, None))
         }
     }
 }
 
-/// The version of a log for replay, from its first complete record only. A
-/// header record cut short by a crash is a torn tail with no committed record,
-/// as it is to the record-by-record readers, so it reads as an empty log.
-pub(crate) fn committed_version_of(buf: &[u8], path: &Path) -> Result<u32> {
-    match buf.get(..WAL_REC) {
-        Some(record) => version_of(record, path),
-        None => Ok(PLAIN_VERSION),
-    }
+/// The version of the log whose first bytes are `buf` (see [`version_at_start`]).
+#[cfg(test)]
+pub(crate) fn version_of(buf: &[u8], path: &Path) -> Result<u32> {
+    version_at_start(buf, buf.len() as u64, path)
 }
 
-/// The version of the log at `path` ([`PLAIN_VERSION`] for a missing or empty log), for
-/// `sparkles migrate --check`. A headerless log is refused.
+/// The version of a log for replay, from the whole log `buf`. A header record cut short
+/// by a crash is a torn tail with no committed record, as it is to the record-by-record
+/// readers, so it reads as an empty log, and so does a log of zeros alone, whose length
+/// grew for its header before the bytes reached the disk.
+pub(crate) fn committed_version_of(buf: &[u8], path: &Path) -> Result<u32> {
+    if buf.first().is_some_and(|&b| b != WAL_HEADER) && buf.iter().all(|&b| b == 0) {
+        return Ok(PLAIN_VERSION);
+    }
+    version_at_start(buf, buf.len() as u64, path)
+}
+
+/// The version of the log at `path` ([`PLAIN_VERSION`] for a missing or empty log,
+/// [`HEADERLESS_VERSION`] for the pre-release headerless log, which the registry then
+/// refuses), for `sparkles migrate --check`.
 pub fn file_version(path: &Path) -> Result<u32> {
     let mut buf = [0u8; WAL_REC];
-    let n = match File::open(path) {
+    let (n, total) = match File::open(path) {
         Ok(mut f) => {
             let mut n = 0;
             while n < WAL_REC {
@@ -260,12 +281,15 @@ pub fn file_version(path: &Path) -> Result<u32> {
                     k => n += k,
                 }
             }
-            n
+            (n, f.metadata()?.len())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, 0),
         Err(e) => return Err(e.into()),
     };
-    version_of(&buf[..n], path)
+    if n == WAL_REC && buf[0] != WAL_HEADER && !is_zero_record(&buf) {
+        return Ok(HEADERLESS_VERSION);
+    }
+    version_at_start(&buf[..n], total, path)
 }
 
 /// The bytes a new log starts with: its header record.
@@ -291,12 +315,6 @@ pub(crate) fn open_for_append(path: &Path, version: u32) -> std::io::Result<File
         Err(e) => return Err(e),
     }
     let mut f = OpenOptions::new().write(true).open(path)?;
-    // A log whose header a crash tore at its creation was replayed as empty and cut
-    // back to nothing. It takes its header now, before any record follows.
-    if f.metadata()?.len() == 0 {
-        f.write_all(&header_record_of(version))?;
-        f.sync_all()?;
-    }
     f.seek(SeekFrom::End(0))?;
     Ok(f)
 }

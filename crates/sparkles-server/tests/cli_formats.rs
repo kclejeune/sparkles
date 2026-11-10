@@ -289,6 +289,37 @@ fn every_fixture_opens_answers_writes_and_restores() {
     }
 }
 
+/// A pre-release fixture is refused by the command line with the dump-and-reload
+/// message: `migrate --check` puts it outside the window with no step, and `query`
+/// refuses to open it. The refusal changes no file.
+#[test]
+fn every_pre_release_fixture_is_refused_by_the_cli() {
+    for fixture in refused_fixtures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = tmp.path();
+        unpack(&fixture, h);
+        let data = h.join("data");
+        let db = data.join("databases/books");
+        let before = std::fs::read(db.join("dataset.json")).unwrap();
+        let o = sparkles(h, &["migrate", "--data", data.to_str().unwrap(), "--check"]);
+        assert_eq!(o.status.code(), Some(1), "{}", fixture.display());
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(
+            out.contains("has format 1") && out.contains("sparkles dump"),
+            "{out}"
+        );
+        assert!(!out.contains("`sparkles migrate`"), "{out}");
+        let o = sparkles(h, &["query", "--loc", db.to_str().unwrap(), "ASK {}"]);
+        assert!(!o.status.success());
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            err.contains("has format 1") && err.contains("sparkles dump"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(db.join("dataset.json")).unwrap(), before);
+    }
+}
+
 #[test]
 fn a_newer_index_format_is_refused_by_name() {
     let fixture = &fixtures()[0];

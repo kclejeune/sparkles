@@ -125,20 +125,21 @@ fn parse_delta_inner<'a>(
         chunks: 0,
     };
     if buf.len() < MAGIC.len() || buf[..MAGIC.len()] != MAGIC {
-        // An empty file holds no entries, and so does one whose length grew for its
-        // first chunk before the chunk's bytes reached the disk, which is all zeros.
-        // Anything else without the header is a pre-release file of the entries alone.
-        for chunk in buf.chunks(64 << 10) {
-            if let Some(budget) = budget.as_deref_mut() {
-                budget.check()?;
-            }
-            if chunk.iter().any(|&byte| byte != 0) {
-                return Err(crate::formats::DELTA_VOCAB.refuse(
-                    "delta.vocab",
-                    UNFRAMED_VERSION,
-                    None,
-                ));
-            }
+        // An empty file holds no entries, and neither does one whose first chunk a crash
+        // tore: its header, written with the chunk, did not reach the disk, so the first
+        // bytes are zeros, or a prefix of the magic followed by zeros, whatever later
+        // pages of the chunk hold. A pre-release file of the entries alone starts with
+        // the length of its first key, which is neither, and is refused.
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.check()?;
+        }
+        let head = &buf[..buf.len().min(MAGIC.len())];
+        let torn = head.iter().all(|&byte| byte == 0)
+            || (head.len() < MAGIC.len()
+                && MAGIC.starts_with(head)
+                && buf[head.len()..].iter().all(|&byte| byte == 0));
+        if !torn {
+            return Err(crate::formats::DELTA_VOCAB.refuse("delta.vocab", UNFRAMED_VERSION, None));
         }
         return Ok(out);
     }
@@ -523,7 +524,7 @@ pub fn file_version(path: &Path) -> Result<u32> {
             0 => VERSION,
             v => v,
         })
-    } else if buf.iter().all(|&byte| byte == 0) {
+    } else if buf.iter().take(MAGIC.len()).all(|&byte| byte == 0) {
         Ok(VERSION)
     } else {
         Ok(UNFRAMED_VERSION)

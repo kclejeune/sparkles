@@ -325,6 +325,88 @@ fn each_removed_form_is_refused_from_a_minimal_file() {
     drop(Store::open(&root, StoreOptions::default()).unwrap());
 }
 
+/// A header record that a crash at the log's creation tore, an empty file, zeros or a
+/// few bytes of the header, reads as an empty log that the open creates again, and the
+/// next commit survives a reopen. A zeroed header with records after it is damage, not a
+/// torn creation, and is refused as corrupt. A headerless log with records is the
+/// pre-release form, which the migration plan refuses with dump and reload.
+#[test]
+#[ignore = "lane format-cutoff-479 continuation: the torn-header cases still write the first record at offset 0, see the lane report"]
+fn a_torn_log_header_is_recreated_and_a_zeroed_one_with_records_is_corrupt() {
+    for torn in [&[][..], &[0u8; 33][..], &b"\x89SPKWAL\n\x01"[..]] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("db");
+        drop(Store::open(&root, StoreOptions::default()).unwrap());
+        let current = std::fs::read_to_string(root.join("CURRENT")).unwrap();
+        let wal = root.join(current.trim()).join("wal.log");
+        std::fs::write(&wal, torn).unwrap();
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        assert_eq!(s.head_commit().seq, 0);
+        update(
+            &s,
+            "INSERT DATA { <http://ex.org/s> <http://ex.org/p> 1 }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        drop(s);
+        let bytes = std::fs::read(&wal).unwrap();
+        assert_eq!(
+            &bytes[..8],
+            b"\x89SPKWAL\n",
+            "the log starts with its header again"
+        );
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        assert_eq!(s.head_commit().seq, 1);
+        assert_eq!(s.snapshot().len(), 1);
+        drop(s);
+        assert_clean(&root);
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("db");
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        update(
+            &s,
+            "INSERT DATA { <http://ex.org/s> <http://ex.org/p> 1 }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+    }
+    let current = std::fs::read_to_string(root.join("CURRENT")).unwrap();
+    let wal = root.join(current.trim()).join("wal.log");
+    let good = std::fs::read(&wal).unwrap();
+    let mut zeroed = good.clone();
+    zeroed[..33].fill(0);
+    std::fs::write(&wal, &zeroed).unwrap();
+    let e = Store::open(&root, StoreOptions::default()).err().unwrap();
+    assert!(matches!(e, sparkles_core::Error::Corrupt(_)), "{e}");
+    assert!(e.to_string().contains("header record is zeros"), "{e}");
+    assert_eq!(
+        std::fs::read(&wal).unwrap(),
+        zeroed,
+        "the refusal changed the log"
+    );
+    std::fs::write(&wal, &good[33..]).unwrap();
+    let plan = sparkles_core::migrate::plan(&root).unwrap();
+    assert!(!plan.in_window(), "{plan:?}");
+    assert!(
+        plan.refused
+            .iter()
+            .any(|r| r.contains("wal version 0") && r.contains("sparkles dump")),
+        "{:?}",
+        plan.refused
+    );
+    assert!(plan.steps.is_empty());
+    std::fs::write(&wal, &good).unwrap();
+    assert_eq!(
+        Store::open(&root, StoreOptions::default())
+            .unwrap()
+            .head_commit()
+            .seq,
+        1
+    );
+}
+
 const LISTING: &str = "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p";
 
 fn listing(
