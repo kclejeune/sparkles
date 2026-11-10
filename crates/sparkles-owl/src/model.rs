@@ -969,6 +969,13 @@ impl Shape {
 }
 
 impl Signature {
+    /// Whether an axiom names an individual in any position but its annotations.
+    pub(crate) fn names_individual(k: &AxiomKind) -> bool {
+        let mut s = Signature::default();
+        s.axiom(k);
+        s.0.iter().any(|e| matches!(e, Entity::NamedIndividual(_)))
+    }
+
     fn class(&mut self, c: &Class) {
         self.0.insert(Entity::Class(c.clone()));
     }

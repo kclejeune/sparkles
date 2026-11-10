@@ -1,0 +1,6 @@
+{"run": "sparkles-full", "round": 1, "threads": 1, "status": "ok", "seconds": 3.86242, "max_rss_kib": 459960, "derived_triples": 1400688}
+{"run": "sparkles-full", "round": 1, "threads": 16, "status": "ok", "seconds": 2.71445, "max_rss_kib": 580428, "derived_triples": 1400688}
+{"run": "nemo-full", "round": 1, "threads": 1, "status": "ok", "seconds": 20.9709, "max_rss_kib": 126668, "nemo_import_seconds": 1.821, "nemo_reasoning_seconds": 18.431, "nemo_export_seconds": 0.685}
+{"run": "nemo-minus", "round": 1, "threads": 1, "status": "ok", "seconds": 14.4233, "max_rss_kib": 124836, "nemo_import_seconds": 1.333, "nemo_reasoning_seconds": 12.527, "nemo_export_seconds": 0.531}
+{"run": "sparkles-insert", "round": 1, "threads": 16, "status": "ok", "seconds": 1.9194, "max_rss_kib": 393916, "derived_triples": 1400688}
+{"run": "sparkles-delete", "round": 1, "threads": 16, "status": "oom", "seconds": 46.4249, "max_rss_kib": 8401964}

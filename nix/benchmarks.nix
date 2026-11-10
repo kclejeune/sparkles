@@ -38,3 +38,7 @@ engines
 // lib.optionalAttrs (reasoners ? konclude) {
   konclude = reasoners.konclude;
 }
+# The reference OWL 2 RL materializer of the reasoning benchmark (scripts/rl-reference).
+// lib.optionalAttrs (reasoners ? nemo) {
+  nemo = reasoners.nemo;
+}

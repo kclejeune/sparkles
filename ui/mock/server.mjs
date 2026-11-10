@@ -38,6 +38,7 @@ import {
 import { handleDescribe } from './describe.mjs';
 import { PathError, pathSearch } from './paths.mjs';
 import { handleModels } from './models.mjs';
+import { handleNotifications } from './notifications.mjs';
 import { handleAsk, isAdmin, ORG_MEMORY, ORG_PREFIXES, orgTrig, whoamiFor } from './memory.mjs';
 import { handleAssistant } from './assistant.mjs';
 import { handleFacets } from './facets.mjs';
@@ -60,6 +61,7 @@ import {
   UNI_PREFIXES,
   UNI_TURTLE,
 } from './ontology.mjs';
+import { handleImports } from './imports.mjs';
 import { handleSkos, isSkosShapes, skosReport, THES_PREFIXES, THES_TURTLE } from './skos.mjs';
 import { PREFIXES, buildTurtle, provenanceTrig, scratchTurtle, vectorTurtle } from './data.mjs';
 
@@ -2482,6 +2484,8 @@ const server = http.createServer(async (req, res) => {
       return;
     // the model configuration, its keys and its runtime changes (mock/models.mjs)
     if (handleModels(req, res, seg, { send, fail })) return;
+    // outbound notifications: the kind, the status and test sends (mock/notifications.mjs)
+    if (handleNotifications(req, res, seg, { send, fail })) return;
     // the facets of a set (mock/facets.mjs)
     if (await handleFacets(req, res, seg, { datasets, send, fail, readBody })) return;
     // GraphRAG community reports (mock/graphrag.mjs)
@@ -2513,6 +2517,18 @@ const server = http.createServer(async (req, res) => {
       return;
     // the built-in SKOS shapes (mock/skos.mjs)
     if (handleSkos(req, res, seg, { send })) return;
+    // the ontology editor's import map and import actions (mock/imports.mjs)
+    if (
+      await handleImports(req, res, url, seg, {
+        datasets,
+        send,
+        fail,
+        readBody,
+        quadSet,
+        commitWrite,
+      })
+    )
+      return;
     // the ontology editor's routes and the change feed (mock/ontology.mjs)
     if (
       await handleOntology(req, res, url, seg, {

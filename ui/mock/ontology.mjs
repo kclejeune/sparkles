@@ -16,6 +16,7 @@ import ox from 'oxigraph';
 import { createHash, randomUUID } from 'node:crypto';
 import { linesOf } from './branches.mjs';
 import { pastView, stateLines, storeAt } from './history.mjs';
+import { closureOf } from './imports.mjs';
 
 const RDF = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#';
 const RDFS = 'http://www.w3.org/2000/01/rdf-schema#';
@@ -1828,6 +1829,7 @@ export async function handleOntology(req, res, url, seg, ctx) {
       triples: o.quads,
       unmapped: o.unmapped,
       diagnostics: { warnings: 0, errors: 0, list: [] },
+      closure: p.get('imports') === 'false' ? [] : closureOf(ds, graph).edges,
       cached: false,
     };
     send(res, 200, body, 'application/json', { ETag: etag(ds, head()) });

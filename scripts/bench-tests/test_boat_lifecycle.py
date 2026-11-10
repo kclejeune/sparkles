@@ -1676,6 +1676,197 @@ class StatOnlyStatus(SourceDriftRecord):
         self.assertEqual(self.O['STATUS_CREDENTIAL_STEMS'],diagnostic_module().CREDENTIAL_STEMS)
 
 
+class TransientStatOnlyStatus(unittest.TestCase):
+    """Item 788. In run 12 the helper hashed the link's ` M` line (9817bcbe) and the probe's
+    own listing a moment later was empty, so item 778's acceptance could not apply."""
+    setUp=SourceDriftRecord.setUp;git=SourceDriftRecord.git;repository=SourceDriftRecord.repository
+    source=StatOnlyStatus.source;linked=StatOnlyStatus.linked;stale_link_size=StatOnlyStatus.stale_link_size
+    def line(self,*paths):return hashlib.sha256(b''.join(b' M '+p.encode()+b'\0' for p in paths)).hexdigest()
+
+    def clearing(self,repo,after=1):
+        """The helper's observations, the first ``after`` of which see a stale link size that
+        has cleared again by the time the probe lists the status."""
+        index=(repo/'.git'/'index').read_bytes();rows=[]
+        def observe():
+            if len(rows)<after:self.stale_link_size(repo)
+            rows.append(self.source(repo));(repo/'.git'/'index').write_bytes(index)
+            return rows[-1]
+        return observe,rows
+
+    def test_run_12_a_link_line_that_cleared_before_the_listing_is_accepted(self):
+        repo=self.linked();clean=self.source(repo);observe,rows=self.clearing(repo)
+        first,stale=self.O['startup_source'](repo,clean,observe,None)
+        # The run 12 record: the hashed status is the link's line and the listing is empty,
+        # which the stat-only rule of item 778 alone refuses.
+        self.assertEqual(first['status_sha256'],self.line('crates/LICENSE'));self.assertEqual(first['tracked_diff_sha256'],clean['tracked_diff_sha256'])
+        listing=self.O['status_record'](repo,None);self.assertEqual(listing['entries'],[])
+        self.assertFalse(self.O['stat_only_status'](clean,first,listing))
+        self.assertEqual(len(rows),2);self.assertEqual(rows[1],clean)
+        self.assertEqual((stale['stat_only'],stale['transient'],stale['attributed'],stale['entries']),(True,True,['crates/LICENSE'],[]))
+        row=self.O['status_evidence'](stale);self.assertEqual((row['transient'],row['attributed'],row['stat_only']),(True,['crates/LICENSE'],True))
+
+    def test_a_line_that_clears_on_a_later_reread_is_accepted(self):
+        repo=self.linked();clean=self.source(repo);observe,rows=self.clearing(repo,after=3);pauses=[]
+        first,stale=self.O['startup_source'](repo,clean,observe,None,pauses.append)
+        self.assertEqual((len(rows),pauses,rows[-1]),(4,[1,1],clean));self.assertTrue(stale['transient'])
+        # A line that outlasts every reread with an empty listing stays drift.
+        repo=self.linked();clean=self.source(repo);observe,rows=self.clearing(repo,after=5);pauses=[]
+        with self.assertRaises(self.O['SourceDrift']):self.O['startup_source'](repo,clean,observe,None,pauses.append)
+        self.assertEqual((len(rows),pauses),(4,[1,1]))
+
+    def test_a_reread_with_any_other_drift_is_refused_at_once(self):
+        # Review round 1. A content change seen on a reread is drift even when a later
+        # observation is clean again, and no further reread follows it.
+        repo=self.linked();clean=self.source(repo);(repo/'a.txt').write_text('changed\n');dirty=self.source(repo);(repo/'a.txt').write_text('a\n')
+        self.assertNotEqual(dirty['tracked_diff_sha256'],clean['tracked_diff_sha256'])
+        rows=[dict(clean,status_sha256=self.line('crates/LICENSE')),dirty,clean];seen=[]
+        def observe():seen.append(rows[len(seen)]);return seen[-1]
+        with self.assertRaises(self.O['SourceDrift']) as caught:self.O['startup_source'](repo,clean,observe,None,lambda s:None)
+        self.assertEqual(len(seen),2);self.assertTrue(caught.exception.source_drift['fields']['tracked_diff_sha256']['differs'])
+        # So is an untracked file or another status the links cannot account for.
+        for other in (hashlib.sha256(b'?? new.txt\0').hexdigest(),self.line('a.txt')):
+            rows=[dict(clean,status_sha256=self.line('crates/LICENSE')),dict(clean,status_sha256=other),clean];seen=[]
+            with self.assertRaises(self.O['SourceDrift']):self.O['startup_source'](repo,clean,observe,None,lambda s:None)
+            self.assertEqual(len(seen),2)
+
+    def test_a_listing_with_any_other_drift_is_refused(self):
+        # Review round 2. The probe's own listing can show a change the helper's observation
+        # missed. A listing with anything but stale link lines refuses at every step, here
+        # with the helper's rows injected and the checkout itself changed.
+        link=lambda clean:dict(clean,status_sha256=self.line('crates/LICENSE'))
+        for change in ('content','untracked'):
+            for rows in (lambda c:[link(c),link(c),c],lambda c:[link(c),c],lambda c:[link(c)]):
+                with self.subTest(change=change,rows=len(rows({}))):
+                    repo=self.linked();clean=self.source(repo)
+                    if change=='content':(repo/'a.txt').write_text('changed\n')
+                    else:(repo/'new.txt').write_text('x\n')
+                    seq=rows(clean);seen=[]
+                    def observe():seen.append(seq[min(len(seen),len(seq)-1)]);return seen[-1]
+                    with self.assertRaises(self.O['SourceDrift']) as caught:self.O['startup_source'](repo,clean,observe,None,lambda s:None)
+                    self.assertLessEqual(len(seen),2)
+                    self.assertEqual([e['xy'] for e in caught.exception.source_drift['status']['entries']],[' M' if change=='content' else '??'])
+
+    def test_a_reread_listing_with_any_other_drift_is_refused(self):
+        # Review round 3. The change appears only after the first listing, while the
+        # helper's reread is clean or attributable, so only the reread's listing sees it.
+        link=lambda clean:dict(clean,status_sha256=self.line('crates/LICENSE'))
+        for change in ('content','untracked'):
+            for reread in ('clean','attributable'):
+                with self.subTest(change=change,reread=reread):
+                    repo=self.linked();clean=self.source(repo);seen=[]
+                    def observe():
+                        if len(seen)==1:
+                            if change=='content':(repo/'a.txt').write_text('changed\n')
+                            else:(repo/'new.txt').write_text('x\n')
+                        seen.append(link(clean) if not seen or reread=='attributable' else clean);return seen[-1]
+                    with self.assertRaises(self.O['SourceDrift']) as caught:self.O['startup_source'](repo,clean,observe,None,lambda s:None)
+                    self.assertEqual(len(seen),2)
+                    self.assertEqual([e['xy'] for e in caught.exception.source_drift['status']['entries']],[' M' if change=='content' else '??'])
+
+    def test_a_link_line_still_listed_keeps_the_item_778_path(self):
+        repo=self.linked();clean=self.source(repo);self.stale_link_size(repo);rows=[]
+        def observe():rows.append(self.source(repo));return rows[-1]
+        first,stale=self.O['startup_source'](repo,clean,observe,None)
+        self.assertEqual(len(rows),1);self.assertNotIn('transient',stale);self.assertEqual(stale['entries'][0]['index_bytes'],99)
+
+    def test_a_clean_first_observation_reads_nothing_else(self):
+        repo=self.linked();clean=self.source(repo)
+        self.assertEqual(self.O['startup_source'](repo,clean,lambda:self.source(repo),None),(clean,None))
+
+    def refused(self,repo,clean,rows):
+        # The rereads repeat the last observation, and the pauses only count.
+        it=iter(rows);last=[None];pauses=[]
+        def observe():
+            last[0]=next(it,last[0]);return last[0]
+        with self.assertRaises(self.O['SourceDrift']) as caught:self.O['startup_source'](repo,clean,observe,None,pauses.append)
+        self.assertLessEqual(len(pauses),self.O['SOURCE_REREADS']-1)
+        return caught.exception.source_drift
+
+    def test_a_cleared_status_that_no_link_accounts_for_stays_drift(self):
+        repo=self.linked();clean=self.source(repo)
+        cases={'regular file':self.line('a.txt'),'untracked':hashlib.sha256(b'?? new.txt\0').hexdigest(),
+               'link and file':self.line('a.txt','crates/LICENSE'),'staged link':hashlib.sha256(b'M  crates/LICENSE\0').hexdigest(),
+               'unrelated':'1'*64}
+        for name,value in cases.items():
+            with self.subTest(name):
+                drift=self.refused(repo,clean,[dict(clean,status_sha256=value),clean])
+                self.assertEqual(drift['fields']['status_sha256']['observed'],value)
+        # A link line with any other field changed, or against a recording that was not clean.
+        for name,first,recorded in (('diff',dict(clean,status_sha256=self.line('crates/LICENSE'),tracked_diff_sha256='2'*64),clean),
+                                    ('head',dict(clean,status_sha256=self.line('crates/LICENSE'),head='9'*40),clean),
+                                    ('input',dict(clean,status_sha256=self.line('crates/LICENSE'),inputs={'mise.toml':'0'*64,'rust-toolchain.toml':'f'*64}),clean),
+                                    ('recorded dirty',dict(clean,status_sha256=self.line('crates/LICENSE')),dict(clean,status_sha256='3'*64))):
+            with self.subTest(name):self.refused(repo,recorded,[first,recorded])
+
+    def test_a_link_that_no_longer_matches_head_stays_drift(self):
+        repo=self.linked();clean=self.source(repo);link=repo/'crates'/'LICENSE';link.unlink();os.symlink('../run.sh',link)
+        self.refused(repo,clean,[dict(clean,status_sha256=self.line('crates/LICENSE')),clean])
+        # Nor does a link whose index entry no longer holds HEAD's blob.
+        repo=self.linked();clean=self.source(repo);link=repo/'crates'/'LICENSE';link.unlink();os.symlink('../run.sh',link)
+        self.git(repo,'add','crates/LICENSE');link.unlink();os.symlink('../a.txt',link)
+        self.refused(repo,clean,[dict(clean,status_sha256=self.line('crates/LICENSE')),clean])
+
+    def test_the_second_observation_must_be_clean_or_stat_only(self):
+        repo=self.linked();clean=self.source(repo);(repo/'new.txt').write_text('x\n');dirty=self.source(repo)
+        drift=self.refused(repo,clean,[dict(clean,status_sha256=self.line('crates/LICENSE')),dirty])
+        # The probe's first listing already shows the untracked file, so it refuses there.
+        self.assertEqual(drift['fields']['status_sha256']['observed'],self.line('crates/LICENSE'))
+        self.assertEqual([e['xy'] for e in drift['status']['entries']],['??'])
+        # A dirty helper reread with a clean listing refuses at the reread.
+        (repo/'new.txt').unlink()
+        drift=self.refused(repo,clean,[dict(clean,status_sha256=self.line('crates/LICENSE')),dirty])
+        self.assertEqual(drift['fields']['status_sha256']['observed'],dirty['status_sha256'])
+
+    def test_a_subset_of_several_links_is_attributed_in_git_order(self):
+        repo=self.linked()
+        for name in ('b-link','z-link'):os.symlink('a.txt',repo/name)
+        self.git(repo,'add','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','-c','commit.gpgsign=false','commit','-qm','links')
+        clean=self.source(repo)
+        first,stale=self.O['startup_source'](repo,clean,iter([dict(clean,status_sha256=self.line('b-link','z-link')),clean]).__next__,None)
+        self.assertEqual(stale['attributed'],['b-link','z-link'])
+        # The same lines out of git's order are not a listing git could print.
+        self.refused(repo,clean,[dict(clean,status_sha256=self.line('z-link','b-link')),clean])
+
+    def test_an_index_listing_larger_than_a_mebibyte_is_read(self):
+        # Run 13. The startup checkout's `ls-files --stage -z` is about 1.6 MB, more than
+        # the probe's 1 MiB command bound, so the attribution failed and op-13 refused.
+        repo=self.linked();d=repo/'many';d.mkdir()
+        for n in range(12000):(d/('f%05d-'%n+'x'*40)).touch()
+        self.git(repo,'add','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','-c','commit.gpgsign=false','commit','-qm','many')
+        self.assertGreater(len(self.git(repo,'ls-files','--stage','-z')),1024*1024)
+        clean=self.source(repo);self.assertEqual(self.O['head_links'](repo,None),[b'crates/LICENSE'])
+        first,stale=self.O['startup_source'](repo,clean,iter([dict(clean,status_sha256=self.line('crates/LICENSE')),clean]).__next__,None)
+        self.assertEqual(stale['attributed'],['crates/LICENSE'])
+
+    def test_the_index_listing_is_bounded_in_time(self):
+        # Review round 4. A stalled git refuses at the deadline, before output and after a
+        # complete record, and its process is gone afterwards.
+        import sys,time
+        for code in ('import time;time.sleep(30)','import sys,time;sys.stdout.buffer.write(b"a\\0");sys.stdout.flush();time.sleep(30)'):
+            with self.subTest(code=code):
+                start=time.monotonic();rows=[]
+                with self.assertRaises(self.O['Refusal']):
+                    for item in self.O['index_listing'](Path('.'),None,0.5,[sys.executable,'-c',code]):rows.append(item)
+                self.assertLess(time.monotonic()-start,5)
+        # A complete listing that ends in time is read whole.
+        self.assertEqual(list(self.O['index_listing'](Path('.'),None,5,[sys.executable,'-c','import sys;sys.stdout.buffer.write(b"a\\0b\\0")'])),[b'a',b'b'])
+        with self.assertRaises(self.O['Refusal']):list(self.O['index_listing'](Path('.'),None,5,[sys.executable,'-c','import sys;sys.stdout.buffer.write(b"a\\0b");sys.exit(0)']))
+        with self.assertRaises(self.O['Refusal']):list(self.O['index_listing'](Path('.'),None,5,[sys.executable,'-c','import sys;sys.exit(3)']))
+
+    def test_more_links_than_the_bound_are_not_attributed(self):
+        repo=self.linked()
+        for n in range(self.O['LINK_LISTING_MAX']):os.symlink('a.txt',repo/f'link-{n}')
+        self.git(repo,'add','.');self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','-c','commit.gpgsign=false','commit','-qm','links')
+        clean=self.source(repo);self.assertIsNone(self.O['head_links'](repo,None))
+        self.refused(repo,clean,[dict(clean,status_sha256=self.line('crates/LICENSE')),clean])
+
+    def test_a_credential_like_link_is_not_attributed(self):
+        repo=self.linked();os.symlink('a.txt',repo/'.netrc');self.git(repo,'add','.')
+        self.git(repo,'-c','user.name=t','-c','user.email=t@invalid','-c','commit.gpgsign=false','commit','-qm','link')
+        clean=self.source(repo)
+        self.refused(repo,clean,[dict(clean,status_sha256=self.line('.netrc')),clean])
+
+
 class SourceDriftBounds(SourceDriftRecord):
     """The drift summary keeps its reason code, its time and output bounds, and git's formats."""
     def test_both_drift_reason_codes_survive_into_the_receipt(self):
@@ -1829,6 +2020,72 @@ class UntrackedRoundFour(UntrackedDiagnostics):
         for name in ('.envrc','backup.env','backup.env.bak','plain.txt'):(repo/name).write_text('DO_NOT_COPY')
         row=d.untracked([str(repo)])[str(repo)]
         self.assertEqual(([p['path'] for p in row['paths']],row['omitted_credential_like']),(['plain.txt'],3))
+
+
+class RunningResumeAck(unittest.TestCase):
+    """Item 802. Op-12b's resume of the stopped worker was answered `accepted` with the status
+    `running`, the worker ran within seconds and its archiveAfter was 10,800 s after the request."""
+    def running_io(self,body=None,archive=None,**change):
+        r=controls.fixture();io=controls.InertIO(r);original=io.boat;real=io.info
+        reply=dict({'event':'accepted','id':controller.worker_id(),'status':'running'},**(body or {}))
+        def boat(args,*a,**k):
+            out=original(args,*a,**k)
+            return dict(out,body=reply,reply=controller.reply_summary(json.dumps(reply).encode())) if args[0]=='resume' else out
+        def info():
+            row=real()
+            if io.started and not io.stopping:row['archiveAfter']=archive if archive is not None else controls.iso(io.resumed_at+10800)
+            return dict(row,**change) if io.started and not io.stopping else row
+        def wall_after(args,*a,**k):
+            if args[0]=='resume':io.resumed_at=io.wall()
+            return boat(args,*a,**k)
+        io.boat=wall_after;io.info=info;return r,io
+
+    def test_a_running_reply_with_this_resumes_lifetime_qualifies(self):
+        r,io=self.running_io()
+        self.assertEqual(controller.drive(r,io),'QUALIFIED_STOP_REQUESTED')
+        row=io.read('resume-outcome.json');self.assertEqual((row['acceptance'],row['uncertain_acceptance']),('running_pending_lifetime',False))
+        self.assertEqual(row['reply']['objects'][0]['fields']['status'],'running')
+        confirmed=io.read('resume-running-confirmed.json');self.assertTrue(confirmed['stopped_before_resume'])
+        self.assertEqual(confirmed['archiveAfter'],controls.iso(io.resumed_at+10800))
+        self.assertTrue(io.exists('qualification.json'));self.assertEqual(sum(c[0]=='resume' for c in io.calls),1)
+        # The clock difference the window allows, on either side.
+        base=controls.InertIO(controls.fixture()).w
+        for offset in (-controller.RUNNING_ACK_SKEW,controller.RUNNING_ACK_SKEW):
+            with self.subTest(offset=offset):
+                r,io=self.running_io(archive=controls.iso(base+10800+offset))
+                self.assertEqual(controller.drive(r,io),'QUALIFIED_STOP_REQUESTED')
+
+    def test_a_running_reply_without_this_resumes_lifetime_is_refused(self):
+        base=controls.InertIO(controls.fixture()).w
+        for name,archive in (('null',None),('earlier resume',controls.iso(base+10800-3600)),('longer ttl',controls.iso(base+43200)),
+                             ('just outside',controls.iso(base+10800-controller.RUNNING_ACK_SKEW-1)),('garbage','not a time')):
+            with self.subTest(name):
+                if name=='null':
+                    r,io=self.running_io();real=io.info;io.info=lambda real=real,io=io:dict(real(),archiveAfter=None) if io.started and not io.stopping else real()
+                else:r,io=self.running_io(archive=archive)
+                with self.assertRaises(controller.Refusal) as caught:controller.drive(r,io)
+                self.assertEqual(controller.reason_code(caught.exception),'refusal:running resume without this lifetime')
+                self.assertFalse(io.exists('qualification.json'));self.assertFalse(io.exists('resume-running-confirmed.json'))
+                self.assertTrue(io.exists('stop-trigger.json'));self.assertEqual(sum(c[0]=='resume' for c in io.calls),1)
+                self.assertFalse(io.exists('diagnostic-hold.json'))
+
+    def test_other_running_replies_stay_uncertain(self):
+        for name,body in (('other worker',{'id':'bx_other'}),('not accepted',{'event':'resuming'}),('ready',{'status':'ready'}),('list',{'status':['running']})):
+            with self.subTest(name):
+                r,io=self.running_io(body)
+                with self.assertRaises(controller.Refusal) as caught:controller.drive(r,io)
+                self.assertIn('uncertain resume',str(caught.exception));self.assertTrue(io.read('resume-outcome.json')['uncertain_acceptance'])
+                self.assertFalse(io.exists('qualification.json'));self.assertEqual(sum(c[0]=='resume' for c in io.calls),1)
+        r=controls.fixture();contract=r['provider_contract']['resume_ack']
+        self.assertEqual(controller.resume_ack({'exit':0,'error':None,'body':{'event':'accepted','id':controller.worker_id(),'status':'running'}},contract),'running')
+        self.assertFalse(controller.positive_resume_ack({'exit':0,'error':None,'body':{'event':'accepted','id':controller.worker_id(),'status':'running'}},contract))
+        self.assertIsNone(controller.resume_ack({'exit':1,'error':None,'body':{'event':'accepted','id':controller.worker_id(),'status':'running'}},contract))
+
+    def test_a_running_reply_needs_the_stopped_state_before_the_resume(self):
+        # The state read before the resume is checked first, so a worker already running is never resumed.
+        r,io=self.running_io();real=io.info;io.info=lambda:dict(real(),state='running',stoppedAt=None)
+        with self.assertRaises(controller.Refusal):controller.drive(r,io)
+        self.assertEqual(sum(c[0]=='resume' for c in io.calls),0)
 
 
 class ResumeReply(unittest.TestCase):

@@ -43,6 +43,7 @@
     patchKind,
     pathString,
     pendingLayer,
+    putKind,
     previewEffective,
     readKind,
     rebase,
@@ -82,6 +83,7 @@
     check,
     extras,
     secrets,
+    replace,
   }: {
     /** Where the declared layer comes from, in words. */
     declaredName?: string;
@@ -109,6 +111,13 @@
      * given the form and the effective object the pending change gives.
      */
     check?: (form: FormValues, effective: JsonObject) => Record<string, string>;
+    /**
+     * The body of a `PUT` for a change that a merge patch cannot make, given the effective
+     * object the pending change gives and the form, or null to send the merge patch. A
+     * merge patch that empties a field only drops its runtime value, so a member that the
+     * declared layer sets needs a `PUT` of the whole object to go.
+     */
+    replace?: (effective: JsonObject, form: FormValues) => JsonObject | null;
     /** What a structured field's editor needs, by field. */
     extras?: (def: FieldDef) => FieldExtras;
     /** The secrets a `secret` field names, and how to store a key under one. */
@@ -284,7 +293,10 @@
       return;
     }
     if (confirmWrite && !(await confirmWrite(patch, k.effective))) return;
-    await write(`Saved the ${lower} settings`, (etag) => patchKind(url, patch, etag));
+    const body = replace?.(previewEffective(k, pending.layer), st.form) ?? null;
+    await write(`Saved the ${lower} settings`, (etag) =>
+      body ? putKind(url, body, etag) : patchKind(url, patch, etag),
+    );
   }
 
   function discard() {

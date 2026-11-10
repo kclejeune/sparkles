@@ -1,0 +1,37 @@
+# The comparisons, from a checkout at the lane's commit with SPARKLES set to the binary
+# that env.txt names and NMO to the flake's Nemo.
+scripts/rl-reference/bench.sh lubm 1 WORK/lubm-1          # RUNS=2 MEM_MAX=8G
+scripts/rl-reference/bench.sh owl2bench 1 WORK/owl2bench-1  # RUNS=1 MEM_MAX=8G
+python3 -I scripts/rl-reference/w3c.py all.rdf WORK/w3c
+
+# bench.sh ran compare.sh on the base data (lubm-1-aligned.json, lubm-1-core.json,
+# owl2bench-1-aligned.json, owl2bench-1-core.json) and compared the closures that
+# incremental maintenance left after inserting and deleting its change
+# (*-after-insert.json, lubm-1-after-delete.json). Its deletion run on OWL2Bench(1) ran out
+# of the 8G limit, and was repeated by hand on a copy of the materialized store with the
+# change deleted (owl2bench-1-delete.txt):
+sparkles update --loc del.db --update delete.ru
+systemd-run --user --scope -q -p MemoryMax=16G -p MemorySwapMax=0 timeout 600 \
+  sparkles infer --loc del.db --profile owl-rl --threads 16
+
+# owl2bench-1-runs.jsonl is bench.sh's record of that OWL2Bench(1) round, and
+# owl2bench-1-full-t16.time and owl2bench-1-delete-8g.time are GNU time's reports of the
+# full run on 16 threads (580,428 KiB, or 566 MiB, at most) and of the deletion run that the
+# 8G scope ended. This bench.sh predates the later harness, so its "seconds" span the scope
+# and its "oom" follows exit status 137. owl2bench-1-delete-oom.txt holds the kernel's
+# records of both deletion runs. The harness run was killed at its cgroup's limit with
+# 8.0 GiB of anonymous memory, and the run by hand was killed by the host's out-of-memory
+# killer, below its 16G scope limit, with 14.1 GiB after 136 s.
+
+# After the review fixes the comparisons ran again with the same binary and the rules,
+# encoding and runner at the lane's tip. The W3C summary, the LUBM(1) and OWL2Bench(1)
+# aligned and core comparisons and the incremental checks were identical to the files
+# above. owl2bench-1-runs-2.jsonl is that runner's record, with GNU time's elapsed
+# seconds, and owl2bench-1-full-t16-2.time shows a full run on 16 threads at 787,216 KiB,
+# or 769 MiB, at most. The deletion run ended at the 8G limit with oom_kill 1 in its
+# scope's memory.events (owl2bench-1-delete-8g-2.events) after 28 s.
+
+# workload.txt gives the counts of the workloads, the OWL2Bench(1) change and its clique
+# and the W3C cases. lubm-1-record-2.json and owl2bench-1-record-2.json are the second
+# round's complete runner records, and the *-summary.md files its summaries.
+# item-798-test.txt is the outcome of roadmap item 798's ignored regression test.

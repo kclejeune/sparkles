@@ -584,6 +584,13 @@ fn entries() -> Vec<(&'static str, Entry)> {
                 &any(),
             );
         }),
+        // the import map (item 624) is a file of the server beside the dataset, like the
+        // ingest and memory settings, and a fetch goes through the server's outbound
+        // policy; a library caller passes the map's targets in `OntologyRequest`
+        server_only!("getOntologyImportMap", Process),
+        server_only!("patchOntologyImportMap", Process),
+        server_only!("loadOntologyImportCatalog", Process),
+        server_only!("fetchOntologyImport", Process),
         // ------------------------------------------------------------------- schema
         op!("getSchema", "schema.report", |ds| {
             if let Ok(r) = ds.schema().report(&Default::default()) {

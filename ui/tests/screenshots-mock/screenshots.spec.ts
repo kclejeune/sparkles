@@ -9,7 +9,8 @@
 // `share_query`. The maps of relations, the communities, the Pattern pane, the diff graph
 // and the path finder on a query's graph use the `world` showcase dataset of
 // mock/world.mjs. The model configuration form uses the declared configuration of
-// mock/models.mjs. The ontology editor uses the `uni` dataset of mock/ontology.mjs, and the
+// mock/models.mjs, and the Notifications section the declared channels of
+// mock/notifications.mjs. The ontology editor uses the `uni` dataset of mock/ontology.mjs, and the
 // thesaurus editor the `thes` dataset of mock/skos.mjs. Run
 // with `mise run docs:screenshots`.
 
@@ -1199,6 +1200,24 @@ test('models-settings', async ({ page, request }) => {
   await shoot(page, 'models-settings');
 });
 
+test('notifications-settings', async ({ page, request }) => {
+  // the declared channels with their secrets and routes, a test just sent to ops, and the
+  // recent deliveries below
+  await request.delete('/$/server/settings/notifications');
+  await page.goto('/ui/admin/server');
+  const section = page.getByTestId('notifications-section');
+  const ops = section.locator('[data-channel=ops]');
+  await expect(ops).toBeVisible();
+  await section.getByRole('button', { name: 'Send a test to ops' }).click();
+  await expect(ops.getByRole('status')).toContainText('Delivered');
+  // the toast that confirms the test would cover the deliveries
+  await page.getByRole('button', { name: 'Dismiss' }).click();
+  await page.waitForTimeout(400);
+  await section.evaluate((e) => e.scrollIntoView({ block: 'start' }));
+  await page.evaluate(() => document.querySelector('main')?.scrollBy(0, -16));
+  await shoot(page, 'notifications-settings');
+});
+
 test('models-settings-errors', async ({ page, request }) => {
   // errors beside the fields as they are typed: a per-model option out of range, text in
   // a token field, and a role entry whose model the provider's allowed models leave out
@@ -1655,5 +1674,42 @@ test('ontology-bulk', async ({ page, request }) => {
   await form.getByRole('button', { name: 'Find' }).click();
   await expect(page.getByRole('region', { name: 'Changes' }).locator('tbody tr')).toHaveCount(2);
   await shoot(page, 'ontology-bulk');
+  await request.delete(`/$/branches/uni/${branch}?force=true`);
+});
+
+test('ontology-imports', async ({ page, request }) => {
+  // the Imports tab with a cycle between two library graphs, an unresolved import, an import
+  // resolved through the import map and one fetched into a graph
+  const branch = 'imports-shot';
+  const owl = 'http://www.w3.org/2002/07/owl#';
+  await request.post('/$/branches/uni', { data: { name: branch } });
+  const u = await request.post(`/uni@${branch}/update`, {
+    headers: { 'Content-Type': 'application/sparql-update' },
+    data: `INSERT DATA {
+      <http://example.org/uni> <${owl}imports> <http://example.org/core>, <http://example.org/people>,
+        <http://imports.mock/units.ttl>, <http://purl.example.org/geo> .
+      GRAPH <http://example.org/core> { <http://example.org/core> <${owl}imports> <http://example.org/terms> }
+      GRAPH <http://example.org/terms> { <http://example.org/terms> <${owl}imports> <http://example.org/core> }
+      GRAPH <http://example.org/people-v2> { <http://example.org/people-v2> a <${owl}Ontology> }
+    }`,
+  });
+  expect(u.ok(), await u.text()).toBe(true);
+  const m = await request.patch('/$/ontology/uni/imports', {
+    data: { set: { 'http://example.org/people': 'http://example.org/people-v2' } },
+  });
+  expect(m.ok(), await m.text()).toBe(true);
+  const f = await request.post(`/$/ontology/uni/imports/fetch?branch=${branch}`, {
+    data: { iri: 'http://imports.mock/units.ttl' },
+  });
+  expect(f.ok(), await f.text()).toBe(true);
+  await page.goto(
+    `/ui/workbench/ontology?${new URLSearchParams({ ds: 'uni', branch, tab: 'imports' })}`,
+  );
+  await expect(page.getByRole('table', { name: 'Import map' })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByLabel('Imports closure').getByText('cycle')).toHaveCount(2);
+  await shoot(page, 'ontology-imports');
+  await request.patch('/$/ontology/uni/imports', {
+    data: { remove: ['http://example.org/people', 'http://imports.mock/units.ttl'] },
+  });
   await request.delete(`/$/branches/uni/${branch}?force=true`);
 });

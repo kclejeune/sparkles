@@ -83,6 +83,10 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/ontology/{ds}/individuals", &["GET"]),
     ("/$/ontology/{ds}/classification", &["GET"]),
     ("/$/ontology/{ds}/term", &["GET"]),
+    // the import map and the import actions (U12): read with read, changed with admin
+    ("/$/ontology/{ds}/imports", &["GET", "PATCH"]),
+    ("/$/ontology/{ds}/imports/catalog", &["POST"]),
+    ("/$/ontology/{ds}/imports/fetch", &["POST"]),
     ("/$/graph/{ds}/groups", &["POST"]),
     ("/$/graph/{ds}/facets", &["POST"]),
     // editing forms (U02): the check and the save check write on the branch they name
@@ -428,6 +432,12 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // an entity is read with read access and removed with write
         "/$/ontology/{ds}/entity" if get => Dataset(Read),
         "/$/ontology/{ds}/entity" => Dataset(Write),
+        // the import map is read with read access and changed with admin, since a
+        // catalog upload or a fetch also changes the dataset's map (spec U12)
+        "/$/ontology/{ds}/imports" if get => Dataset(Read),
+        "/$/ontology/{ds}/imports"
+        | "/$/ontology/{ds}/imports/catalog"
+        | "/$/ontology/{ds}/imports/fetch" => Dataset(Admin),
         "/$/assistant/{ds}" => Dataset(Admin),
         "/$/graphrag/{ds}"
         | "/$/graphrag/{ds}/communities"
@@ -705,6 +715,10 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/$/ontology/{ds}/entity" => Endpoint::Query,
         "/$/ontology/{ds}/axioms" if get => Endpoint::Query,
         "/$/ontology/{ds}/axioms" => Endpoint::Update,
+        "/$/ontology/{ds}/imports" if get => Endpoint::Query,
+        "/$/ontology/{ds}/imports"
+        | "/$/ontology/{ds}/imports/catalog"
+        | "/$/ontology/{ds}/imports/fetch" => Endpoint::Update,
         "/{ds}/graphql" | "/{ds}/graphql/schema" => Endpoint::Graphql,
         "/{ds}/update"
         | "/{ds}/facts"

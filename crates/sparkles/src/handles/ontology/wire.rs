@@ -117,8 +117,29 @@ pub fn summary_body(name: &str, o: &Opened, req: &OntologyRequest, r: &Renderer)
             "message": d.message,
         })).collect::<Vec<_>>(),
     });
+    j["closure"] = closure_json(&o.closure);
     j["cached"] = json!(o.cached);
     j
+}
+
+/// The edges of an imports closure as the summary answers them (spec U12, import
+/// resolution): the importing graph, the IRI, the graphs it resolved to, the source that
+/// resolved it and whether it closes a cycle.
+pub fn closure_json(edges: &[super::ImportEdge]) -> J {
+    J::Array(
+        edges
+            .iter()
+            .map(|e| {
+                json!({
+                    "from": e.from.as_str(),
+                    "iri": e.iri,
+                    "graphs": e.graphs,
+                    "via": e.via.map(|v| v.as_str()),
+                    "cycle": e.cycle,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// What a listing of axioms keeps.

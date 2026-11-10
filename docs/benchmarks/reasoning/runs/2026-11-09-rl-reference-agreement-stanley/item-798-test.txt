@@ -1,0 +1,23 @@
+# Roadmap item 798's ignored test, run on stanley at 9cab4fcb (the test is unchanged since 3fadbd5e
+# apart from its comment) with
+#   mbx test -p sparkles-reasoner --test incremental -- --ignored --exact deleting_edges_of_a_clique_stays_within_a_full_runs_memory
+# The full run passes within 256 MiB, since the panic comes from the run after the deletion.
+running 1 test
+test deleting_edges_of_a_clique_stays_within_a_full_runs_memory ... FAILED
+
+failures:
+
+---- deleting_edges_of_a_clique_stays_within_a_full_runs_memory stdout ----
+
+thread 'deleting_edges_of_a_clique_stays_within_a_full_runs_memory' (3651709) panicked at crates/sparkles-reasoner/tests/incremental.rs:934:42:
+the run after the deletion: reasoning exceeded the memory limit of 268435456 bytes
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    deleting_edges_of_a_clique_stays_within_a_full_runs_memory
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 4.51s
+
+error: test failed, to rerun pass `-p sparkles-reasoner --test incremental`
+T798-EXIT=101

@@ -75,7 +75,9 @@ callers and records the selected numeric user in its receipt.
   [USAGE.md](../USAGE.md#sending-notifications)). Channels and routes are a server settings
   kind, failures are retried with backoff, each channel delivers from its own queue so
   that a slow channel delays no other, and `sparkles notify status` and
-  `sparkles notify test` show and test channels.
+  `sparkles notify test` show and test channels. The server page's Notifications section
+  lists, adds, edits, tests and removes channels and routes, and shows the active
+  conditions and the recent deliveries.
 
 ### Memory and resource limits
 

@@ -147,6 +147,10 @@ def status_evidence(x):
     out={'sha256':source_hex(x.get('sha256')),'total':status_count(x.get('total')),'omitted_credential_like':status_count(x.get('omitted_credential_like')),
          'truncated':x.get('truncated') is True,'stat_only':x.get('stat_only') is True,'entries':[]}
     if isinstance(x.get('unread'),str):out['unread']=status_text(x['unread'],64)
+    # Item 788. A status the helper hashed but the probe's listing no longer showed.
+    if x.get('transient') is True:
+        out['transient']=True;names=x.get('attributed') if isinstance(x.get('attributed'),list) else []
+        out['attributed']=[status_text(n) for n in names[:8] if isinstance(n,str)]
     for e in (x.get('entries') if isinstance(x.get('entries'),list) else [])[:STATUS_MAX]:
         if not isinstance(e,dict):continue
         row={'xy':e['xy'] if isinstance(e.get('xy'),str) and STATUS_XY.fullmatch(e['xy']) else None,'path':status_text(e.get('path'))}
@@ -224,11 +228,29 @@ def systemd_seconds(text):
     need(tokens and ''.join(n+u for n,u in tokens)==text.replace(' ',''),'unknown systemd duration')
     return sum(float(n)*factors[u] for n,u in tokens)
 
-def positive_resume_ack(result,contract):
-    if result.get('exit')!=0 or result.get('error')is not None:return False
+def resume_ack(result,contract):
+    """The status of an accepted resume of this worker, `resuming` or `running`, else None.
+
+    `running` is the reply of a resume the provider completed at once (item 802). It is
+    positive only together with the stopped state read just before the resume and the
+    lifetime check of ``running_resume_lifetime``, which the controller applies.
+    """
+    if result.get('exit')!=0 or result.get('error')is not None:return None
     b=result.get('body');need(contract.get('verified_by_Root') is True and sha(contract.get('receipt_sha256')),'ack schema unbound')
-    if not isinstance(b,dict):return False
-    return contract.get('kind')=='cli_accepted_resuming' and b.get('event')=='accepted' and b.get('id')==worker_id() and b.get('status')=='resuming'
+    if not isinstance(b,dict) or contract.get('kind')!='cli_accepted_resuming':return None
+    if b.get('event')!='accepted' or b.get('id')!=worker_id():return None
+    return b['status'] if b.get('status') in ('resuming','running') and isinstance(b.get('status'),str) else None
+def positive_resume_ack(result,contract):return resume_ack(result,contract)=='resuming'
+# A `running` acknowledgement must show the lifetime that this resume requested: the
+# provider's archiveAfter lies 10,800 seconds after a moment between the resume request
+# and its reply, within RUNNING_ACK_SKEW seconds for clock differences.
+RUNNING_ACK_SKEW=30
+def running_resume_lifetime(info,request_wall,reply_wall):
+    value=info.get('archiveAfter')
+    if not isinstance(value,str):return False
+    try:archive=timestamp(value)
+    except Refusal:return False
+    return request_wall+10800-RUNNING_ACK_SKEW<=archive<=reply_wall+10800+RUNNING_ACK_SKEW
 
 UNITS={'B':1,'K':1024,'M':1024**2,'G':1024**3,'T':1024**4}
 SUMMARY_PEAK=re.compile(r'Memory peak: ([0-9]{1,6})(?:\.([0-9]))?([BKMGT]) \(swap: ([0-9]{1,6})(?:\.([0-9]))?([BKMGT])\)')

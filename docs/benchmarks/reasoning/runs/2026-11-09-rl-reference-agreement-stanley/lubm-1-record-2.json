@@ -1,0 +1,96 @@
+{
+ "suite": "lubm",
+ "scale": 1,
+ "host": "stanley",
+ "cpus": 16,
+ "threads": 16,
+ "sparkles": ".artifacts/lanes/rl-reference-791/bin/sparkles",
+ "nemo": "nemo-cli 0.10.1",
+ "base_triples": 100836,
+ "change_triples": 824,
+ "derived_triples": 85098,
+ "correctness": {
+  "aligned": {
+   "sparkles": 85098,
+   "reference": 85098,
+   "common": 85098,
+   "subset": false,
+   "differences": {
+    "sparkles": {
+     "total": 0,
+     "by_explanation": {},
+     "by_predicate": {},
+     "examples": {}
+    },
+    "reference": {
+     "total": 0,
+     "by_explanation": {},
+     "by_predicate": {},
+     "examples": {}
+    }
+   },
+   "unexplained": 0
+  },
+  "core": 0
+ },
+ "runs": [
+  {
+   "run": "sparkles-full",
+   "round": 1,
+   "threads": 1,
+   "status": "ok",
+   "seconds": 0.25,
+   "max_rss_kib": 181200,
+   "derived_triples": 85098
+  },
+  {
+   "run": "sparkles-full",
+   "round": 1,
+   "threads": 16,
+   "status": "ok",
+   "seconds": 0.2,
+   "max_rss_kib": 341336,
+   "derived_triples": 85098
+  },
+  {
+   "run": "nemo-full",
+   "round": 1,
+   "threads": 1,
+   "status": "ok",
+   "seconds": 1.83,
+   "max_rss_kib": 52304,
+   "nemo_import_seconds": 0.613,
+   "nemo_reasoning_seconds": 1.183,
+   "nemo_export_seconds": 0.033
+  },
+  {
+   "run": "nemo-minus",
+   "round": 1,
+   "threads": 1,
+   "status": "ok",
+   "seconds": 1.78,
+   "max_rss_kib": 52172,
+   "nemo_import_seconds": 0.616,
+   "nemo_reasoning_seconds": 1.122,
+   "nemo_export_seconds": 0.033
+  },
+  {
+   "run": "sparkles-insert",
+   "round": 1,
+   "threads": 16,
+   "status": "ok",
+   "seconds": 0.17,
+   "max_rss_kib": 220800,
+   "derived_triples": 85098
+  },
+  {
+   "run": "sparkles-delete",
+   "round": 1,
+   "threads": 16,
+   "status": "ok",
+   "seconds": 0.18,
+   "max_rss_kib": 229284,
+   "derived_triples": 84941
+  }
+ ]
+}

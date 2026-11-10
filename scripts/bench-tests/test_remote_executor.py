@@ -466,12 +466,12 @@ class Admission(unittest.TestCase):
             for word in shell_commands((scripts/name).read_text(),remote_only=True):found.setdefault(word,set()).add(name)
         # The command strings remote-executor.py itself sends for put, get, sync and bundle.
         for word in ('bash','env','python3','mkdir','mktemp','cat','sha256sum','cut','mv','tar','git','rm','dirname'):found.setdefault(word,set()).add('remote-executor.py')
-        # mbx and rustc are pinned by tool_check, c++ only feeds the build's info.txt, and
-        # remote-screen.sh runs nohup and setsid only on the nsc branch.
-        exempt={'mbx','rustc','c++','nohup','setsid'}
+        # mbx and rustc are pinned by tool_check, and c++ only feeds the build's info.txt.
+        # nsc-build-remote.sh starts the detached build with setsid and nohup.
+        exempt={'mbx','rustc','c++'}
         missing={w:f for w,f in found.items() if w not in RX.WORKER_TOOLS and w not in exempt}
         self.assertEqual(missing,{})
-        self.assertIn('realpath',found);self.assertIn('tee',found);self.assertIn('gzip',RX.WORKER_TOOLS)
+        self.assertIn('realpath',found);self.assertIn('setsid',found);self.assertIn('nohup',found);self.assertIn('tee',found);self.assertIn('gzip',RX.WORKER_TOOLS)
         self.assertIn('/lib64/ld-linux-x86-64.so.2',found)
         # The build body reaches bash -s through a heredoc of mbx sparkles-task.
         self.assertIn('nsc-build.sh',found['cp'])
@@ -861,6 +861,22 @@ exit "$code"
 
 
 class ScreenAcceptance(unittest.TestCase):
+    def setUp(self):
+        # Unit names of this test's own fixtures, unique to it.
+        self.owned = set()
+
+    def tearDown(self):
+        # A real unit's stop ends its watchdog with the rest of its cgroup. Here the
+        # watchdogs are process groups of their own, and only those of this test's own
+        # unit names end with it.
+        for proc in Path('/proc').iterdir():
+            if not proc.name.isdigit():continue
+            try:args=(proc/'cmdline').read_bytes().split(b'\0')
+            except OSError:continue
+            if b'watchdog' in args and any(name.encode() in args for name in self.owned) and os.getpgid(int(proc.name))==int(proc.name):
+                try:os.killpg(int(proc.name),signal.SIGKILL)
+                except (ProcessLookupError,PermissionError):pass
+
     def test_unknown_launch_is_recorded_once_and_cleanup_retains_lock_on_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -890,6 +906,121 @@ screen_destroy && exit 1
             self.assertNotIn('stop sparkles-screen-lock-owned', commands)
             self.assertNotIn('resume', commands)
 
+
+    def admission(self, root, seconds):
+        boot = RX.boat_clock.boottime()
+        receipt = root/'admission.json'
+        receipt.write_text(json.dumps({'schema':'sparkles.boat.adapter-observation','version':2,
+            'expires_at':time.time()+seconds,'original_wall_end':time.time()+seconds,'boot_end':boot+seconds,
+            'guard_boot_id':RX.boat_clock.current_boot_id()}))
+        return receipt
+
+    def test_screen_units_stop_by_their_expiry_however_late_they_begin(self):
+        """A Boat screen's units stop, their stop included, 960 seconds before the admitted
+        lifetime ends, ahead of the closure watch's 900-second lead. The worker enforces the
+        absolute expiry, so a unit that begins late still stops in time."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.admission(root, 3600)
+            program = r'''
+set -euo pipefail
+. "$SCRIPTS/remote-screen.sh"
+EXECUTOR=boat:bx_test
+SCREEN_LOCK=sparkles-screen-lock-owned
+REMOTE=/home/user/lanes/remote-screens/owned
+OUT=$RESULTS
+screen_exec() { printf '%s\n' "$1" > "$OUT/command"; }
+screen_launch nsc-bench-remote.sh nohup.log
+'''
+            result = subprocess.run(['bash', '-c', program], env=dict(os.environ, SCRIPTS=str(ROOT/'scripts'), RESULTS=tmp),
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            command = (root/'command').read_text()
+            runtime = int(command.split('RuntimeMaxSec=')[1].split()[0])
+            self.assertTrue(3600 - 990 - 5 <= runtime <= 3600 - 990, runtime)
+            self.assertIn('TimeoutStopSec=30', command)
+            text = shlex.split(command)[-1]
+            expiry = int(text.split('left=$((')[1].split()[0])
+            self.assertLessEqual(abs(expiry - (time.time() + 3600 - 960)), 5)
+            # The guard refuses a unit that begins too late and stops one that outlives its expiry.
+            fake = root/'bin'; fake.mkdir()
+            (fake/'systemctl').write_text('#!/bin/sh\necho "$@" >> "$FAKE_LOG"\n'); (fake/'systemctl').chmod(0o755)
+            env = dict(os.environ, PATH=str(fake)+os.pathsep+os.environ['PATH'], FAKE_LOG=str(root/'systemctl.log'))
+            name = 'sparkles-screen-run-test-' + os.urandom(6).hex(); self.owned.add(name)
+            guard = lambda e: subprocess.run(['bash', '-c', '. "$1"; screen_expiry_guard "$3" "$2"', 'bash',
+                                              str(ROOT/'scripts/remote-screen.sh'), str(e), name], capture_output=True, text=True).stdout
+            late = subprocess.run(['bash', '-c', guard(int(time.time()) + 20) + ' echo began'], env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(late.returncode, 75)
+            self.assertIn('began after its expiry', late.stderr)
+            self.assertNotIn('began', late.stdout)
+            unit = subprocess.Popen(['bash', '-c', guard(int(time.time()) + 32) + ' exec sleep 20'], env=env, start_new_session=True)
+            try:
+                deadline = time.monotonic() + 8
+                while not (root/'systemctl.log').exists() or 'stop' not in (root/'systemctl.log').read_text():
+                    self.assertLess(time.monotonic(), deadline, 'the watchdog did not stop the unit')
+                    time.sleep(0.05)
+                self.assertEqual((root/'systemctl.log').read_text().split(), ['--user', 'stop', '--no-block', name])
+            finally:
+                os.killpg(unit.pid, signal.SIGKILL); unit.wait()
+
+    def test_the_screen_lock_reads_its_expiry_when_it_begins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.admission(root, 3600).rename(root/'fixture.json')
+            home = root/'home'; home.mkdir()
+            fake = root/'bin'; fake.mkdir()
+            # The fake systemd-run starts the unit's command in the background, as systemd would.
+            (fake/'systemd-run').write_text('#!/usr/bin/env bash\nwhile [ "${1#-}" != "$1" ]; do case $1 in -p) shift 2 ;; *) shift ;; esac; done\nsetsid "$@" < /dev/null > /dev/null 2>&1 &\necho $! >> "$HOME/units"\n')
+            (fake/'systemd-run').chmod(0o755)
+            program = r'''
+set -euo pipefail
+. "$SCRIPTS/remote-screen.sh"
+EXECUTOR=boat:bx_test
+OUT=$RESULTS
+rx_admit() { cat "$OUT/fixture.json"; }
+rx_exec() { printf '%s\n' "$2" > "$OUT/lock-command"; return 1; }
+screen_create test || true
+'''
+            subprocess.run(['bash', '-c', program], env=dict(os.environ, SCRIPTS=str(ROOT/'scripts'), RESULTS=tmp),
+                           capture_output=True, text=True, timeout=10)
+            text = (root/'lock-command').read_text()
+            lock = 'sparkles-screen-lock-' + text.split('--unit=sparkles-screen-lock-')[1].split()[0]
+            self.owned.add(lock)
+            expiry = int(text.rstrip().split('bash "$d" ')[1].split()[0])
+            self.assertLessEqual(abs(expiry - (time.time() + 3600 - 960)), 5)
+            env = dict(os.environ, PATH=str(fake)+os.pathsep+os.environ['PATH'], HOME=str(home))
+            try:
+                for e, ok in ((int(time.time()) + 20, False), (int(time.time()) + 600, True)):
+                    with self.subTest(expiry=e):
+                        body = text.replace('bash "$d" %d' % expiry, 'bash "$d" %d' % e)
+                        run = subprocess.run(['bash', '-c', body], env=env, capture_output=True, text=True, timeout=30)
+                        self.assertEqual(run.returncode == 0, ok, run.stderr)
+                        units = (home/'units').read_text().split()
+                        if not ok:
+                            # The refused lock wrote its answer and ended without the heavy lock.
+                            time.sleep(0.2)
+                            self.assertEqual(subprocess.run(['flock', '-n', str(home/'lanes/.heavy.lock'), 'true']).returncode, 0)
+                # With nobody reading its answer and a late start, the lock's watchdog, started
+                # before the FIFO is opened, still stops the lock before its expiry.
+                script = text.split("bash -c '", 1)[1].split("' bash \"$d\"", 1)[0]
+                fifo = root/'unread'; fifo.mkdir(); os.mkfifo(fifo/'ready')
+                (fake/'systemctl').write_text('#!/bin/sh\necho "$@" >> "$HOME/systemctl.log"\n'); (fake/'systemctl').chmod(0o755)
+                unit = subprocess.Popen(['bash', '-c', script, 'bash', str(fifo), str(int(time.time()) + 33), lock],
+                                        env=env, start_new_session=True)
+                try:
+                    deadline = time.monotonic() + 8
+                    log = home/'systemctl.log'
+                    while not log.exists() or 'stop' not in log.read_text():
+                        self.assertLess(time.monotonic(), deadline, 'the lock watchdog did not stop the unit')
+                        time.sleep(0.05)
+                    self.assertEqual(log.read_text().split(), ['--user', 'stop', '--no-block', lock])
+                    self.assertIsNone(unit.poll(), 'the lock waits on its unread answer')
+                finally:
+                    os.killpg(unit.pid, signal.SIGKILL); unit.wait()
+            finally:
+                for pid in (home/'units').read_text().split() if (home/'units').exists() else []:
+                    try:os.killpg(int(pid), signal.SIGKILL)
+                    except ProcessLookupError:pass
 
 
 class JenaStaging(unittest.TestCase):

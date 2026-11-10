@@ -100,6 +100,7 @@
   import EntityHistory from '$components/EntityHistory.svelte';
   import Discussions from '$components/Discussions.svelte';
   import BulkEdit from '$components/BulkEdit.svelte';
+  import OntoImports from '$components/OntoImports.svelte';
   import { isDiscussionGraph } from '$lib/discussions';
   import TreeCrumbs from '$components/TreeCrumbs.svelte';
 
@@ -112,6 +113,7 @@
     ['history', 'History'],
     ['discussions', 'Discussions'],
     ['bulk', 'Bulk edits'],
+    ['imports', 'Imports'],
   ];
 
   type Tab = OntologyTab;
@@ -122,7 +124,9 @@
   const branch = $derived(branchParam(q.get('branch')));
   const target = $derived(onBranch(name, branch));
   const graph = $derived(q.get('graph') || null);
-  const sel: Selection = $derived({ graph, imports: true });
+  // `imports=0` excludes the imported axioms from every view (spec U12, import resolution)
+  const withImports = $derived(q.get('imports') !== '0');
+  const sel: Selection = $derived({ graph, imports: withImports });
   // the page's one tab row: the tree, DL Query, the header and the history (ROADMAP item 633)
   const tab = $derived<Tab>(
     (ONTOLOGY_TABS as readonly string[]).includes(q.get('tab') ?? '')
@@ -255,6 +259,8 @@
       ? (shortForms.get(iri) ?? iriName(iri, prefixes))
       : null;
 
+  // the summary on screen was read before the imports changed, and its next read is due
+  let summaryStale = $state(false);
   async function loadAll() {
     const t = target;
     const s = sel;
@@ -269,6 +275,7 @@
       // first summary of a scope arrives beside, such as the labels of the tree, is kept
       if (loadedTarget === t && shown !== r.summary.commit) resetLazy();
       summary = r.summary;
+      summaryStale = false;
       etag = r.etag;
       shown = r.summary.commit;
       loadedTarget = t;
@@ -300,7 +307,7 @@
    * names as they are typed. The labels of the kinds read come in one query.
    */
   async function ensureKinds(kinds: EntityKind[]) {
-    if (!summary) return;
+    if (!summary || summaryStale) return;
     const want = kinds.filter((k) => !listed.has(k));
     if (!want.length) return;
     const my = listSeq;
@@ -371,6 +378,30 @@
       session.reset(`sparkles.onto.undo.${target}|${graph ?? ''}`);
       void loadAll();
       void loadSide();
+    });
+  });
+
+  // Including or excluding the imported axioms, or a change of the import map, reads every
+  // view again and keeps the undo stack. A map change keeps the commit, so the views'
+  // identities carry `importsRev` as well as the switch.
+  let importsRev = $state(0);
+  function rereadImports() {
+    // the summary stays on screen until its next read lands, so the Imports tab keeps its
+    // form state; the reset below forgets what the views read
+    summaryStale = true;
+    loadedTarget = null;
+    resetLazy();
+    for (const lt of levelTrees.values()) lt.drop();
+    individualLevel.drop();
+    classification = null;
+    void loadAll();
+  }
+  let importsShown: string | null = null;
+  $effect(() => {
+    const w = `${withImports}\u0000${importsRev}`;
+    untrack(() => {
+      if (importsShown !== null && importsShown !== w) rereadImports();
+      importsShown = w;
     });
   });
 
@@ -470,7 +501,7 @@
   let levelCommit: number | null = null;
   $effect(() => {
     const context = `${target}\u0000${graph ?? ''}`;
-    const scope = `${context}\u0000${langs.join(',')}`;
+    const scope = `${context}\u0000${langs.join(',')}\u0000${withImports}\u0000${importsRev}`;
     const commit = summary?.commit ?? null;
     untrack(() => {
       if (scope !== levelScope) {
@@ -532,8 +563,10 @@
     // the scope is read here, where the effect tracks it, not in the timer below
     const scopeTarget = target;
     const scopeGraph = graph;
+    const scopeImports = withImports;
+    void importsRev;
     const individualCommit = k === 'NamedIndividual' ? (summary?.commit ?? null) : null;
-    const scope = `${scopeTarget}\u0000${scopeGraph ?? ''}\u0000${langs.join(',')}\u0000${individualCommit ?? ''}`;
+    const scope = `${scopeTarget}\u0000${scopeGraph ?? ''}\u0000${scopeImports}\u0000${importsRev}\u0000${langs.join(',')}\u0000${individualCommit ?? ''}`;
     if (scope !== filteredIn) {
       // another dataset, branch or graph must not keep showing the last scope's hits
       filteredIn = scope;
@@ -552,6 +585,7 @@
           kind: [kind],
           limit: 20,
           graph: scopeGraph,
+          imports: scopeImports,
           signal: ctl.signal,
         });
         if (kind === 'individual') {
@@ -559,7 +593,7 @@
             r.results.map((h) =>
               fetchIndividuals(
                 scopeTarget,
-                { graph: scopeGraph, imports: true },
+                { graph: scopeGraph, imports: scopeImports },
                 {
                   iri: h.iri,
                   at: `commit:${individualCommit}`,
@@ -612,7 +646,7 @@
           r.results.map((h) =>
             fetchHierarchy(
               scopeTarget,
-              { graph: scopeGraph, imports: true },
+              { graph: scopeGraph, imports: scopeImports },
               { kind, iri: h.iri, ancestors: true, limit: 1 },
               ctl.signal,
             ),
@@ -666,7 +700,9 @@
     const key = `${selected ?? ''}\u0000${tab}\u0000${createOpen}`;
     const missing = PICKER_KINDS.some((k) => !listed.has(k));
     const failed = listFailed;
-    const ready = !!summary;
+    // a summary kept on screen while the imports are read again has the old counts, which
+    // must not decide which kinds are too large to list
+    const ready = !!summary && !summaryStale;
     untrack(() => {
       // another need is a new try
       if (key !== needKey) {
@@ -798,7 +834,7 @@
     const t = target;
     const commit = summary?.commit;
     const selection = { ...sel };
-    const scope = JSON.stringify([t, selection.graph, selection.imports]);
+    const scope = JSON.stringify([t, selection.graph, selection.imports, importsRev]);
     if (!iri || commit == null) {
       frameSeq++;
       frameAbort?.abort();
@@ -862,6 +898,8 @@
     void selected;
     void target;
     void graph;
+    void withImports;
+    void importsRev;
     void summary?.commit;
     untrack(() => void loadFrame());
   });
@@ -910,7 +948,12 @@
   const names = () => completionNames;
   /** Names of the kinds too long to list, found by the server's search as they are typed. */
   async function searchNames(word: string, signal: AbortSignal): Promise<NameOption[]> {
-    const r = await searchEntities(target, word, { limit: 20, graph, signal });
+    const r = await searchEntities(target, word, {
+      limit: 20,
+      graph,
+      imports: withImports,
+      signal,
+    });
     return r.results.map((h) => ({
       name: h.label ?? h.shortForm ?? iriName(h.iri, prefixes),
       iri: h.iri,
@@ -1058,10 +1101,10 @@
     frameContext: string | null;
   } | null>(null);
   const frameContext = $derived(
-    JSON.stringify([target, sel.graph, sel.imports, selected, frameKind]),
+    JSON.stringify([target, sel.graph, sel.imports, importsRev, selected, frameKind]),
   );
   const frameSource = $derived(
-    JSON.stringify([target, sel.graph, sel.imports, selected, frameKind, frameCommit]),
+    JSON.stringify([target, sel.graph, sel.imports, importsRev, selected, frameKind, frameCommit]),
   );
   const session = new EditSession({
     reload: async () => {
@@ -1435,6 +1478,14 @@
           {#if graph && !graphs.includes(graph)}<option value={graph}>{graph}</option>{/if}
         </select>
       </label>
+      <label class="form-row check" title="Include or exclude the axioms of the imported graphs">
+        <input
+          type="checkbox"
+          checked={withImports}
+          onchange={(e) => nav({ imports: e.currentTarget.checked ? null : '0' })}
+        />
+        Imported axioms
+      </label>
       {#if branchList.length}
         <label class="form-row">
           Branch
@@ -1523,6 +1574,22 @@
               onedit={(op, label) =>
                 // the plan was read without the imports, and its edit reads and writes the same
                 edit(op, label, undefined, null, { graph, imports: false })}
+            />{/key}
+        </div>
+      </section>
+    {:else if tab === 'imports' && summary}
+      <section class="panel" aria-label="Imports">
+        <div class="panel-body">
+          {#key target}<OntoImports
+              {target}
+              root={graph ?? 'default'}
+              closure={summary.closure ?? []}
+              {etag}
+              {readonly}
+              imports={withImports}
+              name={(i) => (i === 'default' ? 'default graph' : iriName(i, prefixes))}
+              oncommitted={discussed}
+              onchanged={() => importsRev++}
             />{/key}
         </div>
       </section>
@@ -1713,16 +1780,18 @@
               {#if inferredKind && inferredOn}
                 <div class="tree-col">
                   <div class="tree-scroll">
-                    <InferredTreeView
-                      {target}
-                      {graph}
-                      imports={sel.imports}
-                      commit={summary?.commit ?? null}
-                      kind={inferredKind}
-                      {selected}
-                      pins={inferredPins}
-                      onopen={(iri) => nav({ iri })}
-                    />
+                    {#key importsRev}
+                      <InferredTreeView
+                        {target}
+                        {graph}
+                        imports={sel.imports}
+                        commit={summary?.commit ?? null}
+                        kind={inferredKind}
+                        {selected}
+                        pins={inferredPins}
+                        onopen={(iri) => nav({ iri })}
+                      />
+                    {/key}
                   </div>
                   {#if kindTab === 'Class'}
                     <h2 class="col-title">
@@ -1901,26 +1970,30 @@
                     onopen={(iri) => nav({ iri, view: null })}
                   />
                   {#if frameKind === 'Class'}
-                    <ClassificationFrame
-                      {target}
-                      {graph}
-                      imports={sel.imports}
-                      iri={selected}
-                      commit={frameCommit}
-                      items={frameItems}
-                      pins={frameCommit === summary?.commit ? inferredPins : undefined}
-                      onopen={(iri) => nav({ iri, view: null })}
-                    />
+                    {#key importsRev}
+                      <ClassificationFrame
+                        {target}
+                        {graph}
+                        imports={sel.imports}
+                        iri={selected}
+                        commit={frameCommit}
+                        items={frameItems}
+                        pins={frameCommit === summary?.commit ? inferredPins : undefined}
+                        onopen={(iri) => nav({ iri, view: null })}
+                      />
+                    {/key}
                   {:else if ['ObjectProperty', 'DataProperty', 'NamedIndividual'].includes(frameKind)}
-                    <MaterializedFrame
-                      {target}
-                      {graph}
-                      imports={sel.imports}
-                      iri={selected}
-                      commit={frameCommit}
-                      items={frameItems}
-                      pins={frameCommit === summary?.commit ? inferredPins : undefined}
-                    />
+                    {#key importsRev}
+                      <MaterializedFrame
+                        {target}
+                        {graph}
+                        imports={sel.imports}
+                        iri={selected}
+                        commit={frameCommit}
+                        items={frameItems}
+                        pins={frameCommit === summary?.commit ? inferredPins : undefined}
+                      />
+                    {/key}
                   {/if}
                 {/key}
               {:else if view === 'discussion' && summary && selected}

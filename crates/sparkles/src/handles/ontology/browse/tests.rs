@@ -1,7 +1,7 @@
 use super::*;
 use crate::Dataset;
 use crate::access::{GraphAccess, GraphRule, Graphs};
-use sparkles_reasoner::inputs::ImportMode;
+use sparkles_reasoner::inputs::{ImportMode, Inputs};
 
 fn strict_named_individual_fixture() -> Dataset {
     let ds = dataset(

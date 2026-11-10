@@ -47,6 +47,17 @@ it.
 
 ### Added
 
+Roadmap item 791 adds Nemo 0.10.1 as the reference for the `owl-rl` materialization. The
+flake builds it from its checksum-pinned release binaries as `.#nemo`, and
+`scripts/rl-reference/owl2rl.rls` writes the OWL 2 RL/RDF rules of OWL 2 Profiles for it.
+`mise run test:rl-reference` compares the closures triple for triple on the W3C OWL 2 RL
+test cases, and `mise run bench:rl-reference` does so on LUBM or OWL2Bench before it
+times full materialization and incremental insertion and deletion. The closures are equal
+on LUBM(1), OWL2Bench(1) and 66 test cases. RDFox is not a reference, because its
+evaluation agreement restricts publishing benchmark results. Deleting 1% of OWL2Bench(1)'s
+data triples grew to 14.1 GiB in incremental maintenance before the out-of-memory killer
+ended it, and roadmap item 798 covers it.
+
 Roadmap item 651 adds a `claims` mode to `POST /$/ingest/{ds}` and `sparkles ingest`. It registers
 the document's source and chunks as the other modes do and proposes the extracted facts
 as claim occurrences of one evidence batch, with their passages and supporting evidence
@@ -59,6 +70,17 @@ written. New `sourceGraph` and `proposalGraph` options choose the evidence graph
 publish in the batch's commit. The evidence rendition keeps its text, so a claims
 ingestion stores the text in its chunks and again in the evidence graph.
 
+Ontology reads resolve imports within the dataset (item 624). An `owl:imports` IRI
+resolves to the graph the dataset's import map names, then to the graph the IRI names, then
+to the graphs of a resource catalog vocabulary whose namespace matches it. The map is kept
+in `ontology-imports.json`, format 1, and `GET` and `PATCH /$/ontology/{ds}/imports` read
+and change it. `POST /$/ontology/{ds}/imports/catalog` loads an OASIS XML catalog with its
+files in one commit, and `POST /$/ontology/{ds}/imports/fetch` fetches an import into a
+graph through the outbound policy and records its ETag and digest. The summary lists the
+imports closure with its cycles, and its entity tag changes when the map does. The
+ontology editor's Imports tab shows the closure and the map with these actions, and a
+switch includes or excludes imported axioms in every view.
+
 The ontology editor has a Bulk edits tab (item 626). It finds and replaces text across
 labels, every annotation or one property, as literal text or a regular expression, with a
 language filter and a scope of the whole graph or an entity list. It sets or removes an
@@ -66,6 +88,12 @@ annotation on the entities of a list and moves the listed classes under a new pa
 the top, refusing a cycle. Each edit is one previewed commit through the editor's preview
 and undo stack, and an edit of more than 1,000 changes is refused with its count.
 
+
+The server page has a Notifications section (item 46, spec C21 Phase 3). Server
+administrators list, add, edit, test and remove notification channels and routes, see
+each channel's secrets, queue and last delivery, and read the active conditions and the
+recent deliveries. The OpenAPI description gains the `NotificationsSettings` and
+`NotificationChannelSettings` schemas that the section builds its form from.
 
 Failed background backup operations raise notifications (item 46). A backup started
 by hand that fails, a policy run that stops on an error, cannot start or fails its
@@ -115,6 +143,14 @@ and query results. Viewers choose labels, prefixed names or complete IRIs and an
 language list, saved in the browser. Query tables batch label lookups for visible rows
 at the result's branch and commit. Missing labels and failed lookups keep a prefixed
 name or the complete IRI visible, and copying keeps the original RDF term.
+
+The disjunctive classification rules have rules for nominals and the object assertions
+of individuals, as F24's design for the sixth phase of roadmap item 603 describes, but
+they stay behind a switch that is off. With it on they time out on 19 of the 50 nominal
+fixtures of the phase's gate, so ontologies with individuals or nominals are still
+refused by the disjunctive rules and every classification gives the taxonomy it gave
+before. Roadmap item 804 redesigns the rules to meet the gate, and item 805 adds keys
+and the universal property.
 
 The disjunctive classification rules can count, and `Limits::counting` turns it on. It is
 off by default, because counting finishes on no real ontology of the ORE 2015 DL

@@ -1,12 +1,15 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { OPENAPI, OUT, extract, render } from './models-schema.mjs';
+import { OPENAPI, OUTPUTS, extract, render } from './models-schema.mjs';
 
-describe('models-schema.json', () => {
-  it('is the current extract of docs/openapi.json (run `pnpm models-schema`)', () => {
-    const doc = JSON.parse(readFileSync(OPENAPI, 'utf8'));
-    expect(readFileSync(OUT, 'utf8')).toBe(render(doc));
-  });
+describe('models-schema.json and notifications-schema.json', () => {
+  it.each(Object.entries(OUTPUTS))(
+    'the %s extract is current with docs/openapi.json (run `pnpm models-schema`)',
+    (root, out) => {
+      const doc = JSON.parse(readFileSync(OPENAPI, 'utf8'));
+      expect(readFileSync(out, 'utf8')).toBe(render(doc, root));
+    },
+  );
 
   it('follows references and leaves out the API links', () => {
     const doc = {

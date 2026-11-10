@@ -1,0 +1,1795 @@
+{
+ "counts": {
+  "equal": 66,
+  "skipped": 1
+ },
+ "cases": [
+  {
+   "case": "DisjointClasses-001",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 417,
+    "reference": 417,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 417,
+    "reference": 57,
+    "sparkles_only": 360,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 360
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "DisjointClasses-002",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 417,
+    "reference": 417,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 417,
+    "reference": 57,
+    "sparkles_only": 360,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 360
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "DisjointClasses-003",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 434,
+    "reference": 434,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 434,
+    "reference": 61,
+    "sparkles_only": 373,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 373
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "FS2RDF-different-individuals-2-ar",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 401,
+    "reference": 401,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 401,
+    "reference": 48,
+    "sparkles_only": 353,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 353
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "FS2RDF-different-individuals-3-ar",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 411,
+    "reference": 411,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 411,
+    "reference": 48,
+    "sparkles_only": 363,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 363
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "FS2RDF-no-builtin-prefixes-ar",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 416,
+    "reference": 416,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 416,
+    "reference": 64,
+    "sparkles_only": 352,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 352
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "FS2RDF-same-individual-2-ar",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 401,
+    "reference": 401,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 401,
+    "reference": 49,
+    "sparkles_only": 352,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 352
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-AnnotationAnnotations-001",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 418,
+    "reference": 418,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 418,
+    "reference": 48,
+    "sparkles_only": 370,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 370
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-AsymmetricProperty-001",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 404,
+    "reference": 404,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 404,
+    "reference": 50,
+    "sparkles_only": 354,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 354
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-AxiomAnnotations-001",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 425,
+    "reference": 425,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 425,
+    "reference": 56,
+    "sparkles_only": 369,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 369
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-DisjointDataProperties-001",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 410,
+    "reference": 410,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 410,
+    "reference": 52,
+    "sparkles_only": 358,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 358
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-DisjointDataProperties-002",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 423,
+    "reference": 423,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 423,
+    "reference": 54,
+    "sparkles_only": 369,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 369
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-DisjointObjectProperties-001",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 410,
+    "reference": 410,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 410,
+    "reference": 52,
+    "sparkles_only": 358,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 358
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-DisjointObjectProperties-002",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 423,
+    "reference": 423,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 423,
+    "reference": 54,
+    "sparkles_only": 369,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 369
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-IrreflexiveProperty-001",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 404,
+    "reference": 404,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 404,
+    "reference": 50,
+    "sparkles_only": 354,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 354
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-Keys-003",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 423,
+    "reference": 423,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 423,
+    "reference": 58,
+    "sparkles_only": 365,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 365
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-Keys-004",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 423,
+    "reference": 423,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 423,
+    "reference": 58,
+    "sparkles_only": 365,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 365
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-Keys-005",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 419,
+    "reference": 419,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 419,
+    "reference": 55,
+    "sparkles_only": 364,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 364
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-Keys-006",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 419,
+    "reference": 419,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 419,
+    "reference": 55,
+    "sparkles_only": 364,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 364
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-NegativeDataPropertyAssertion-001",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 415,
+    "reference": 415,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 415,
+    "reference": 50,
+    "sparkles_only": 365,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 365
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-NegativeObjectPropertyAssertion-001",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 415,
+    "reference": 415,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 415,
+    "reference": 50,
+    "sparkles_only": 365,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 365
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-ObjectPropertyChain-001",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 419,
+    "reference": 419,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 419,
+    "reference": 55,
+    "sparkles_only": 364,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 364
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-ObjectPropertyChain-BJP-003",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 415,
+    "reference": 415,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 415,
+    "reference": 53,
+    "sparkles_only": 362,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 362
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-ObjectPropertyChain-BJP-004",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 414,
+    "reference": 414,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 414,
+    "reference": 52,
+    "sparkles_only": 362,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 362
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-ObjectQCR-002",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 428,
+    "reference": 428,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 428,
+    "reference": 55,
+    "sparkles_only": 373,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 373
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "New-Feature-ReflexiveProperty-001",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 409,
+    "reference": 409,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 409,
+    "reference": 50,
+    "sparkles_only": 359,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 359
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-AnnotationProperty-003",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 409,
+    "reference": 409,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 409,
+    "reference": 52,
+    "sparkles_only": 357,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 357
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-AnnotationProperty-004",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 403,
+    "reference": 403,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 403,
+    "reference": 48,
+    "sparkles_only": 355,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 355
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-I4.6-004",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 417,
+    "reference": 417,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 417,
+    "reference": 59,
+    "sparkles_only": 358,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 358
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-I4.6-005-Direct",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 417,
+    "reference": 417,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 417,
+    "reference": 59,
+    "sparkles_only": 358,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 358
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-I5.26-001",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 439,
+    "reference": 439,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 439,
+    "reference": 70,
+    "sparkles_only": 369,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 369
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-I5.26-002",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 434,
+    "reference": 434,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 434,
+    "reference": 68,
+    "sparkles_only": 366,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 366
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-I5.26-005",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 438,
+    "reference": 438,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 438,
+    "reference": 69,
+    "sparkles_only": 369,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 369
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-I5.26-010",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 404,
+    "reference": 404,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 404,
+    "reference": 50,
+    "sparkles_only": 354,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 354
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-I5.5-005",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 406,
+    "reference": 406,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 406,
+    "reference": 52,
+    "sparkles_only": 354,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 354
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-I5.8-006",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 405,
+    "reference": 405,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 405,
+    "reference": 50,
+    "sparkles_only": 355,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 355
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-I5.8-007",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 405,
+    "reference": 405,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 405,
+    "reference": 50,
+    "sparkles_only": 355,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 355
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-I5.8-008",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 405,
+    "reference": 405,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 405,
+    "reference": 50,
+    "sparkles_only": 355,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 355
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-I5.8-009",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 405,
+    "reference": 405,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 405,
+    "reference": 50,
+    "sparkles_only": 355,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 355
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-I5.8-011",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 400,
+    "reference": 400,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 400,
+    "reference": 48,
+    "sparkles_only": 352,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 352
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-Nothing-001",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 402,
+    "reference": 402,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 402,
+    "reference": 49,
+    "sparkles_only": 353,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 353
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-backwardCompatibleWith-002",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 400,
+    "reference": 400,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 400,
+    "reference": 48,
+    "sparkles_only": 352,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 352
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-description-logic-101",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 496,
+    "reference": 496,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 496,
+    "reference": 105,
+    "sparkles_only": 391,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 391
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-description-logic-103",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 502,
+    "reference": 502,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 502,
+    "reference": 111,
+    "sparkles_only": 391,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 391
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-description-logic-104",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 480,
+    "reference": 480,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 480,
+    "reference": 96,
+    "sparkles_only": 384,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 384
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-differentFrom-001",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 401,
+    "reference": 401,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 401,
+    "reference": 48,
+    "sparkles_only": 353,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 353
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-disjointWith-003",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 487,
+    "reference": 487,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 487,
+    "reference": 93,
+    "sparkles_only": 394,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 394
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-disjointWith-004",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 487,
+    "reference": 487,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 487,
+    "reference": 93,
+    "sparkles_only": 394,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 394
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-disjointWith-005",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 482,
+    "reference": 482,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 482,
+    "reference": 93,
+    "sparkles_only": 389,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 389
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-disjointWith-006",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 484,
+    "reference": 484,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 484,
+    "reference": 93,
+    "sparkles_only": 391,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 391
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-disjointWith-007",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 476,
+    "reference": 476,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 476,
+    "reference": 88,
+    "sparkles_only": 388,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 388
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-disjointWith-008",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 452,
+    "reference": 452,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 452,
+    "reference": 74,
+    "sparkles_only": 378,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 378
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-disjointWith-009",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 453,
+    "reference": 453,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 453,
+    "reference": 74,
+    "sparkles_only": 379,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 379
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-equivalentClass-002",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 417,
+    "reference": 417,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 417,
+    "reference": 59,
+    "sparkles_only": 358,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 358
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-equivalentClass-003",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 416,
+    "reference": 416,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 416,
+    "reference": 58,
+    "sparkles_only": 358,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 358
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-equivalentClass-008-Direct",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 419,
+    "reference": 419,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 419,
+    "reference": 59,
+    "sparkles_only": 360,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 360
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-equivalentProperty-002",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 411,
+    "reference": 411,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 411,
+    "reference": 55,
+    "sparkles_only": 356,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 356
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-equivalentProperty-003",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 410,
+    "reference": 410,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 410,
+    "reference": 54,
+    "sparkles_only": 356,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 356
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-imports-011",
+   "outcome": "skipped",
+   "reason": "the premise imports another ontology"
+  },
+  {
+   "case": "WebOnt-miscellaneous-303",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 402,
+    "reference": 402,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 402,
+    "reference": 48,
+    "sparkles_only": 354,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 354
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "WebOnt-sameAs-001",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 422,
+    "reference": 422,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 422,
+    "reference": 62,
+    "sparkles_only": 360,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 360
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "chain2trans1",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 410,
+    "reference": 410,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 410,
+    "reference": 50,
+    "sparkles_only": 360,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 360
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "owl2-rl-anonymous-individual",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 410,
+    "reference": 410,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 410,
+    "reference": 50,
+    "sparkles_only": 360,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 360
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "owl2-rl-rules-fp-differentFrom",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 413,
+    "reference": 413,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 413,
+    "reference": 50,
+    "sparkles_only": 363,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 363
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "owl2-rl-rules-ifp-differentFrom",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 413,
+    "reference": 413,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 413,
+    "reference": 50,
+    "sparkles_only": 363,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 363
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "owl2-rl-valid-oneof",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 431,
+    "reference": 431,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 431,
+    "reference": 59,
+    "sparkles_only": 372,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 372
+     },
+     "reference": {}
+    }
+   }
+  },
+  {
+   "case": "owl2-rl-valid-rightside-allvaluesfrom",
+   "exit": 0,
+   "outcome": "equal",
+   "diff": {
+    "sparkles": 428,
+    "reference": 428,
+    "sparkles_only": 0,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {},
+     "reference": {}
+    }
+   },
+   "core": {
+    "sparkles": 428,
+    "reference": 61,
+    "sparkles_only": 367,
+    "reference_only": 0,
+    "explained": {
+     "sparkles": {
+      "unexplained": 367
+     },
+     "reference": {}
+    }
+   }
+  }
+ ]
+}

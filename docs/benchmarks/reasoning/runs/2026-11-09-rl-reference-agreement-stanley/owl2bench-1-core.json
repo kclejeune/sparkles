@@ -1,0 +1,41 @@
+{
+ "sparkles": 1400688,
+ "reference": 1395689,
+ "common": 1395689,
+ "subset": true,
+ "differences": {
+  "sparkles": {
+   "total": 4999,
+   "by_explanation": {
+    "unexplained": 4999
+   },
+   "by_predicate": {
+    "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>": 4391,
+    "<http://www.w3.org/2000/01/rdf-schema#subClassOf>": 316,
+    "<http://www.w3.org/2000/01/rdf-schema#domain>": 136,
+    "<http://www.w3.org/2000/01/rdf-schema#range>": 117,
+    "<http://www.w3.org/2002/07/owl#inverseOf>": 22,
+    "<http://www.w3.org/2000/01/rdf-schema#subPropertyOf>": 7,
+    "<http://www.w3.org/2002/07/owl#equivalentProperty>": 6,
+    "<http://www.w3.org/2002/07/owl#disjointWith>": 3,
+    "<http://www.w3.org/2002/07/owl#equivalentClass>": 1
+   },
+   "examples": {
+    "unexplained": [
+     "<http://benchmark/OWL2Bench#AbstractPainting> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2000/01/rdf-schema#Resource> .",
+     "<http://benchmark/OWL2Bench#ActionMovie> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2000/01/rdf-schema#Resource> .",
+     "<http://benchmark/OWL2Bench#AeronauticalEngineering> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2000/01/rdf-schema#Class> .",
+     "<http://benchmark/OWL2Bench#AeronauticalEngineering> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2000/01/rdf-schema#Resource> .",
+     "<http://benchmark/OWL2Bench#AeronauticalEngineering> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://www.w3.org/2000/01/rdf-schema#Resource> ."
+    ]
+   }
+  },
+  "reference": {
+   "total": 0,
+   "by_explanation": {},
+   "by_predicate": {},
+   "examples": {}
+  }
+ },
+ "unexplained": 0
+}

@@ -2290,6 +2290,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ontology/{ds}/imports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The import map
+         * @description The dataset's import map, which sends an import IRI to a graph of the dataset before a read looks for the graph the IRI names. Every branch shares it. A caller with `admin` sees every entry, and another caller sees the entries whose graph holds triples it can read. The entity tag is the map's revision.
+         */
+        get: operations["getOntologyImportMap"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Change the import map
+         * @description Sets and removes entries of the import map. A graph given as a string makes a manual entry, and an entry object, such as one that an `import-map-unwritten` answer lists, is kept as given. The map holds at most 4,096 entries, and each IRI and graph is at most 4 KiB. The `If-Match` header must name the map's revision. Without it, or with `*`, the change is `428`, and a stale revision is `412`.
+         */
+        patch: operations["patchOntologyImportMap"];
+        trace?: never;
+    };
+    "/$/ontology/{ds}/imports/catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Load an XML catalog
+         * @description Loads an OASIS XML catalog and the files it names in one commit on the branch, and writes its entries to the import map with source `catalog`. Each `uri` entry maps its `name` to a graph. A relative `uri` whose file is a part of the body replaces the graph named by `name`, and an absolute `uri` maps the name to that graph. Other entries, entries under an `xml:base` and missing files are listed in `skipped`. A document type or entity declaration is refused, and nothing outside the body is read. The catalog is at most 1 MiB with 1,000 entries.
+         */
+        post: operations["loadOntologyImportCatalog"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ontology/{ds}/imports/fetch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Fetch an import into a graph
+         * @description Fetches an import's document through the server's outbound policy and makes the graph hold it in one commit on the branch, then records the map entry with source `fetch`, the location, the branch and commit, the ETag, the SHA-256 digest and the time. The location defaults to the entry's and then to the IRI, and must be http or https. The graph defaults to the entry's and then to the IRI. A refresh is the same request, and a document without blank nodes that equals the graph makes no commit. A refused destination is `403`, and a document that does not parse is `422`.
+         */
+        post: operations["fetchOntologyImport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/ontology/{ds}/individuals": {
         parameters: {
             query?: never;
@@ -9732,6 +9796,122 @@ export interface components {
             /** @description Kept materialized. */
             warm: boolean;
         };
+        /**
+         * Channel
+         * @description One channel of the `notifications` kind. `type` decides the members it takes, and `x-sparkles-kinds` lists the types each member applies to. A credential is always named by a secret reference and never held inline.
+         */
+        NotificationChannelSettings: {
+            /**
+             * From
+             * @description The sender's mail address.
+             */
+            from?: string;
+            /**
+             * Host
+             * @description The SMTP server's host name or IP address. It passes the outbound policy's host check.
+             */
+            host?: string;
+            /**
+             * Password
+             * @description A secret that holds the SMTP password, sent with SASL PLAIN. It needs a user name.
+             */
+            password?: {
+                /**
+                 * Password
+                 * @description The secret that holds the password.
+                 */
+                secret: string;
+            };
+            /**
+             * Port
+             * @description The SMTP server's port.
+             */
+            port?: number;
+            /**
+             * Priority
+             * @description The ntfy priority from 1 to 5.
+             */
+            priority?: number;
+            /**
+             * Server
+             * Format: uri
+             * @description The ntfy server's base URL.
+             * @default https://ntfy.sh
+             */
+            server: string;
+            /**
+             * Signing secret
+             * @description A secret that holds the key of the Standard Webhooks signature. Without it, requests are not signed.
+             */
+            signingSecret?: {
+                /**
+                 * Signing secret
+                 * @description The secret that holds the signing key. A value that starts with whsec_ is decoded from Base64.
+                 */
+                secret: string;
+            };
+            /**
+             * Tags
+             * @description Tags added to the event type's own tag, at most 10 of 1 to 64 characters without commas.
+             */
+            tags?: string[];
+            /**
+             * TLS
+             * @description STARTTLS on the submission port, or TLS from the first byte. A connection without TLS is refused.
+             * @default starttls
+             * @enum {string}
+             */
+            tls: "starttls" | "tls";
+            /**
+             * To
+             * @description The recipients' mail addresses, 1 to 20.
+             */
+            to?: string[];
+            /**
+             * Access token
+             * @description A secret that holds an ntfy access token, sent as a bearer token.
+             */
+            token?: {
+                /**
+                 * Access token
+                 * @description The secret that holds the token.
+                 */
+                secret: string;
+            };
+            /**
+             * Topic
+             * @description The topic to publish to, 1 to 64 letters, digits, - and _. Anyone who guesses a topic on a public server can read it, so use a token with a reserved topic or a server of your own.
+             */
+            topic?: string;
+            /**
+             * Type
+             * @description How the channel delivers: a webhook POST, an ntfy publish or an email over SMTP.
+             * @enum {string}
+             */
+            type: "webhook" | "ntfy" | "email";
+            /**
+             * URL
+             * Format: uri
+             * @description The http or https URL the envelope is posted to. A URL that carries a user name, a password, a query or a fragment is refused, so name such a URL with the URL secret instead. A private address requires --outbound-allow-private.
+             */
+            url?: string;
+            /**
+             * URL secret
+             * @description A secret that holds the whole URL, for a URL that carries a credential, in place of URL.
+             */
+            urlSecret?: {
+                /**
+                 * URL secret
+                 * @description The secret that holds the URL. Set either URL or this.
+                 */
+                secret: string;
+            };
+            /**
+             * User name
+             * @description The SASL PLAIN user name. It needs a password.
+             */
+            username?: string;
+        };
         /** @description Whether notifications are on, each channel's last success and failure, the conditions notified and the recent deliveries. */
         NotificationStatus: {
             active: {
@@ -9802,6 +9982,79 @@ export interface components {
             status: number;
             /** @enum {string} */
             type: "webhook" | "ntfy" | "email";
+        };
+        /**
+         * Notification configuration
+         * @description The `notifications` kind of `/$/server/settings/notifications` and of the settings file's `server.notifications`: whether events are delivered, the channels, the routes from event types to channels, the repeat interval and the retries. The web UI builds its form from this schema.
+         */
+        NotificationsSettings: {
+            /**
+             * Base URL
+             * Format: uri
+             * @description The URL the web UI is reached at, which makes the links in notifications absolute.
+             */
+            baseUrl?: string;
+            /**
+             * Channels
+             * @description Channels by name, at most 32. Names can contain only letters, digits and the characters _ - .
+             */
+            channels?: {
+                [key: string]: components["schemas"]["NotificationChannelSettings"];
+            };
+            /**
+             * Delivery
+             * @description The retries and timeout of each delivery.
+             */
+            delivery?: {
+                /**
+                 * Attempts
+                 * @description Attempts of one delivery, the first included.
+                 * @default 5
+                 */
+                attempts: number;
+                /**
+                 * Backoff
+                 * @description The wait before the second attempt, which doubles for each later one.
+                 * @default 30
+                 */
+                backoffSecs: number;
+                /**
+                 * Longest backoff
+                 * @description The longest wait between two attempts, at least the backoff.
+                 * @default 1800
+                 */
+                maxBackoffSecs: number;
+                /**
+                 * Timeout
+                 * @description How long one attempt may take.
+                 * @default 10
+                 */
+                timeoutSecs: number;
+            };
+            /**
+             * Enabled
+             * @description Deliver events to the channels the routes name. A test send works either way.
+             * @default false
+             */
+            enabled: boolean;
+            /**
+             * Repeat every
+             * @description The shortest time between two notifications about one lasting condition, as a duration of at least 1m such as 12h or 1d.
+             * @default 1d
+             */
+            repeatEvery: string;
+            /**
+             * Routes
+             * @description The channels each event type goes to. A key is an event type, a prefix ending in .* or *, and an event goes to the union of the channels of every key that matches it. Each route is one field.
+             */
+            routes?: {
+                [key: string]: string[];
+            };
+            /**
+             * Server name
+             * @description The server's name in each notification.
+             */
+            server?: string;
         };
         OAuthError: {
             /**
@@ -11284,7 +11537,7 @@ export interface components {
             declared: {
                 [key: string]: unknown;
             };
-            /** @description The effective object. For `models` it is a `ModelsSettings`: `providers`, `roles` and `routing`, from the built-in defaults, `--model-config` and the runtime layer, with the locked fields from the declared configuration. */
+            /** @description The effective object. For `models` it is a `ModelsSettings`: `providers`, `roles` and `routing`, from the built-in defaults, `--model-config` and the runtime layer, with the locked fields from the declared configuration. For `notifications` it is a `NotificationsSettings`. */
             effective: {
                 [key: string]: unknown;
             };
@@ -12676,6 +12929,15 @@ export interface components {
         };
         /** @description `If-Match` or `If-None-Match` failed (`code: precondition-failed`). */
         PreconditionFailed: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description The change must name the revision it starts from in `If-Match` (`code: precondition-required`). */
+        PreconditionRequired: {
             headers: {
                 [name: string]: unknown;
             };
@@ -18688,6 +18950,364 @@ export interface operations {
             408: components["responses"]["Timeout"];
             409: components["responses"]["Conflict"];
             507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getOntologyImportMap: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
+                graph?: string;
+                /** @description Follow `owl:imports` to graphs of the dataset (the default). */
+                imports?: boolean;
+                /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
+                mode?: "lenient" | "strict";
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The map. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description Whether the caller sees every entry. */
+                        admin?: boolean;
+                        dataset?: string;
+                        entries?: {
+                            branch?: string;
+                            commit?: number;
+                            /** @description `sha256:` and the hex digest of the bytes loaded. */
+                            digest?: string;
+                            etag?: string;
+                            /** Format: date-time */
+                            fetched?: string;
+                            /** @description The catalog's path of the file loaded into the graph. */
+                            file?: string;
+                            graph?: string;
+                            /** @description The import IRI or version IRI. */
+                            iri?: string;
+                            /** @description The URL fetched. */
+                            location?: string;
+                            /** @enum {string} */
+                            source?: "manual" | "catalog" | "fetch";
+                        }[];
+                        maxEntries?: number;
+                        /** @description The map's entity tag, which a PATCH's `If-Match` names. */
+                        revision?: string;
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    patchOntologyImportMap: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description The map's revision that the change starts from, as `GET` gives it. `*` is refused. */
+                "If-Match": string;
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The change. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    remove?: string[];
+                    /** @description Import IRI to graph or entry. */
+                    set?: {
+                        [key: string]: string | {
+                            branch?: string;
+                            commit?: number;
+                            /** @description `sha256:` and the hex digest of the bytes loaded. */
+                            digest?: string;
+                            etag?: string;
+                            /** Format: date-time */
+                            fetched?: string;
+                            /** @description The catalog's path of the file loaded into the graph. */
+                            file?: string;
+                            graph: string;
+                            /** @description The import IRI or version IRI. */
+                            iri?: string;
+                            /** @description The URL fetched. */
+                            location?: string;
+                            /** @enum {string} */
+                            source: "manual" | "catalog" | "fetch";
+                        };
+                    };
+                };
+            };
+        };
+        responses: {
+            /** @description The map after the change. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description Whether the caller sees every entry. */
+                        admin?: boolean;
+                        dataset?: string;
+                        entries?: {
+                            branch?: string;
+                            commit?: number;
+                            /** @description `sha256:` and the hex digest of the bytes loaded. */
+                            digest?: string;
+                            etag?: string;
+                            /** Format: date-time */
+                            fetched?: string;
+                            /** @description The catalog's path of the file loaded into the graph. */
+                            file?: string;
+                            graph?: string;
+                            /** @description The import IRI or version IRI. */
+                            iri?: string;
+                            /** @description The URL fetched. */
+                            location?: string;
+                            /** @enum {string} */
+                            source?: "manual" | "catalog" | "fetch";
+                        }[];
+                        maxEntries?: number;
+                        /** @description The map's entity tag, which a PATCH's `If-Match` names. */
+                        revision?: string;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            412: components["responses"]["PreconditionFailed"];
+            428: components["responses"]["PreconditionRequired"];
+            default: components["responses"]["Error"];
+        };
+    };
+    loadOntologyImportCatalog: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Run the write as a preview and roll it back. `dryRun` with no value means true. */
+                dryRun?: components["parameters"]["dryRun"];
+                /** @description With `dryRun`: list up to this many changed quads. */
+                changes?: components["parameters"]["changes"];
+                /** @description Add a commit receipt to the body. */
+                receipt?: components["parameters"]["receipt"];
+                /** @description `false` skips write-time validation when the server allows it (`--allow-unvalidated-writes`). */
+                validate?: components["parameters"]["validate"];
+                /** @description The most validation results reported when a write is rejected. */
+                validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
+            };
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+                /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
+                "Sparkles-Commit-Message"?: components["parameters"]["commitMessage"];
+                /** @description `true` runs the write as a preview. */
+                "Sparkles-Dry-Run"?: components["parameters"]["dryRunHeader"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The `catalog` part, and one part per file, named by the path the catalog gives. */
+        requestBody: {
+            content: {
+                "multipart/form-data": {
+                    catalog: string;
+                } & {
+                    [key: string]: string;
+                };
+            };
+        };
+        responses: {
+            /** @description What the upload loaded and mapped, with the receipt when asked for. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        changed?: boolean;
+                        entries?: {
+                            branch?: string;
+                            commit?: number;
+                            /** @description `sha256:` and the hex digest of the bytes loaded. */
+                            digest?: string;
+                            etag?: string;
+                            /** Format: date-time */
+                            fetched?: string;
+                            /** @description The catalog's path of the file loaded into the graph. */
+                            file?: string;
+                            graph?: string;
+                            /** @description The import IRI or version IRI. */
+                            iri?: string;
+                            /** @description The URL fetched. */
+                            location?: string;
+                            /** @enum {string} */
+                            source?: "manual" | "catalog" | "fetch";
+                        }[];
+                        loaded?: {
+                            file?: string;
+                            graph?: string;
+                            triples?: number;
+                        }[];
+                        revision?: string;
+                        skipped?: {
+                            entry?: string;
+                            reason?: string;
+                        }[];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            412: components["responses"]["PreconditionFailed"];
+            415: components["responses"]["UnsupportedMediaType"];
+            default: components["responses"]["Error"];
+        };
+    };
+    fetchOntologyImport: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Run the write as a preview and roll it back. `dryRun` with no value means true. */
+                dryRun?: components["parameters"]["dryRun"];
+                /** @description With `dryRun`: list up to this many changed quads. */
+                changes?: components["parameters"]["changes"];
+                /** @description Add a commit receipt to the body. */
+                receipt?: components["parameters"]["receipt"];
+                /** @description `false` skips write-time validation when the server allows it (`--allow-unvalidated-writes`). */
+                validate?: components["parameters"]["validate"];
+                /** @description The most validation results reported when a write is rejected. */
+                validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
+            };
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+                /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
+                "Sparkles-Commit-Message"?: components["parameters"]["commitMessage"];
+                /** @description `true` runs the write as a preview. */
+                "Sparkles-Dry-Run"?: components["parameters"]["dryRunHeader"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The import. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    graph?: string;
+                    iri: string;
+                    location?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The entry written, with the receipt when asked for. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        changed?: boolean;
+                        entry?: {
+                            branch?: string;
+                            commit?: number;
+                            /** @description `sha256:` and the hex digest of the bytes loaded. */
+                            digest?: string;
+                            etag?: string;
+                            /** Format: date-time */
+                            fetched?: string;
+                            /** @description The catalog's path of the file loaded into the graph. */
+                            file?: string;
+                            graph?: string;
+                            /** @description The import IRI or version IRI. */
+                            iri?: string;
+                            /** @description The URL fetched. */
+                            location?: string;
+                            /** @enum {string} */
+                            source?: "manual" | "catalog" | "fetch";
+                        };
+                        revision?: string;
+                        triples?: number;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            412: components["responses"]["PreconditionFailed"];
+            422: components["responses"]["Unprocessable"];
             default: components["responses"]["Error"];
         };
     };

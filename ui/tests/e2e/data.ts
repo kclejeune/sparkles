@@ -155,3 +155,9 @@ export const DISCUSSIONS_AUTH = 'discussions-auth';
  * only reads it. The spec creates and loads it.
  */
 export const BULK_AUTH = 'bulk-auth';
+
+/**
+ * The ontology of the import resolution tests under auth (item 624): `USER` writes it and
+ * `READER` only reads it, and neither administers it. The spec creates and loads it.
+ */
+export const IMPORTS_AUTH = 'imports-auth';

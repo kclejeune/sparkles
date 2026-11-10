@@ -25,6 +25,11 @@ request or on every write, and the schema report counts what the data holds.
   `owl:someValuesFrom` with a datatype does. Property chains have rules for 2 and 3
   properties and keys for 1 and 2, because each longer rule adds thousands of rules to
   the demand programs of query-time reasoning.
+* The materialized closure is checked triple for triple against Nemo, a Datalog engine
+  that runs the OWL 2 RL/RDF rules written from the recommendation. The closures are equal
+  on LUBM, OWL2Bench and the W3C OWL 2 RL test cases, and the
+  [reasoning benchmark](../benchmarks/reasoning/README.md#the-owl-2-rl-reference)
+  describes the comparison.
 * Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
   and `owl:sameAs` with closure operators instead of joins. An operator condenses the
   relation's strongly connected components and works out each component's reachable

@@ -278,6 +278,7 @@ servers and memory readings, and checks answers with `scripts/bench-answers.py`.
 | USearch | Apache-2.0 | Python package pinned by version | Vectors |
 | Qdrant | Apache-2.0 | Release binary pinned by checksum | Vectors |
 | pgvector | PostgreSQL License | nixpkgs | Vectors |
+| Nemo | Apache-2.0 or MIT | Release binary pinned by checksum | OWL 2 RL materialization on LUBM, OWL2Bench and the W3C OWL 2 RL test cases |
 
 Rules:
 
@@ -2192,6 +2193,29 @@ ranges over five processes. Replay cost about 32,000
 instructions per commit. The
 [baseline](../benchmarks/engine/RESULTS.md#instruction-counts-of-vocabulary-scans-and-wal-replay)
 keeps every count.
+
+### OWL 2 RL reference engine
+
+Roadmap item 791 adds Nemo 0.10.1, the Datalog engine of TU Dresden, as the reference for
+the `owl-rl` materialization, with the [methodology](../benchmarks/reasoning/README.md#the-owl-2-rl-reference)
+in the reasoning benchmark. Nemo is licensed under Apache-2.0 or MIT, and `nix/reasoners`
+packages its release binaries for Linux and Apple silicon by the SHA-256 sums that the
+release publishes. The check of RDFox's evaluation agreement found that a free
+evaluation key needs a request to its vendor, and that publishing benchmark results
+needs an application at least 30 days in advance and the vendor's approval to name the
+product. Under the second rule of §4 RDFox is not run, and item 797 revisits it if Nemo
+proves too slow to be a meaningful baseline.
+
+`scripts/rl-reference/owl2rl.rls` writes the OWL 2 RL/RDF rules of OWL 2 Profiles section
+4.3 for Nemo from the recommendation's tables. `sparkles-extensions.rls` restates the
+additions of Sparkles' rule set, which section 4.3 permits, for a comparison of whole
+closures. On LUBM(1), OWL2Bench(1) and the premises of the 66 W3C OWL 2 RL test cases
+that have an RDF/XML premise and no imports, the derived graphs of Sparkles and of the aligned program are equal
+triple for triple, and every triple of the W3C program alone is in Sparkles' closure. The
+[results](../benchmarks/reasoning/RESULTS.md#owl-2-rl-reference-agreement) give the
+counts. Nemo evaluates its rules on one thread and has no incremental maintenance, so the
+incremental runs compare Sparkles' maintenance with Nemo's full run on the changed data.
+Timings on a benchmark worker and on the benchmark host remain under item 791.
 
 ### Scope changes
 

@@ -64,6 +64,7 @@ use sparkles_owl::profiles::{CheckOptions, Checker, Profile, Report};
 use sparkles_owl::read::{self, Mode, ReadOptions};
 use sparkles_owl::{Axiom, AxiomKind, AxiomType, Entity, EntityKind, Individual, vocab, write};
 use sparkles_reasoner::inputs::{GraphRef, Import, ImportMode, Inputs};
+pub use sparkles_reasoner::inputs::{ImportEdge, ImportTargets, Via};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -94,6 +95,9 @@ pub struct OntologyRequest {
     /// answer says whether they were read and whether they are fresh
     /// ([`Opened::inferences`]). Edits and diffs refuse it.
     pub inferences: bool,
+    /// where imports resolve besides the graphs their IRIs name: the dataset's import
+    /// map and the vocabulary resources (spec U12, import resolution)
+    pub import_targets: ImportTargets,
 }
 
 impl Default for OntologyRequest {
@@ -104,6 +108,7 @@ impl Default for OntologyRequest {
             mode: Mode::Lenient,
             at: None,
             inferences: false,
+            import_targets: ImportTargets::default(),
         }
     }
 }
@@ -134,11 +139,28 @@ impl OntologyRequest {
 
     fn key(&self, commit: u64, inferred: bool) -> String {
         format!(
-            "{commit}|{:?}|{:?}|{}|{inferred}",
+            "{commit}|{:?}|{:?}|{}|{inferred}|{:016x}",
             self.graphs(),
             self.imports,
-            self.mode.as_str()
+            self.mode.as_str(),
+            self.import_targets.digest()
         )
+    }
+
+    /// The graphs this request reads in `view`, with its imports resolved through the
+    /// graphs `readable` admits, and the edges of the imports closure.
+    pub(crate) fn resolve(
+        &self,
+        view: &Snapshot,
+        readable: &dyn Fn(Id) -> bool,
+    ) -> (sparkles_reasoner::inputs::Resolved, Vec<ImportEdge>) {
+        let inputs = Inputs {
+            data_graphs: self.graphs(),
+            ontology_graphs: Vec::new(),
+            imports: self.imports,
+            location_mapping: Default::default(),
+        };
+        sparkles_reasoner::inputs::resolve_closure(view, &inputs, readable, &self.import_targets)
     }
 }
 
@@ -154,6 +176,8 @@ pub struct Opened {
     /// how many of [`graphs`](Self::graphs) the request named
     pub requested: usize,
     pub imports: Vec<Import>,
+    /// one edge for each `owl:imports` triple of a graph read
+    pub closure: Vec<ImportEdge>,
     pub warnings: Vec<String>,
     /// whether the dataset's kept copy answered
     pub cached: bool,
@@ -202,6 +226,7 @@ pub struct CacheEntry {
     graphs: Vec<GraphRef>,
     requested: usize,
     imports: Vec<Import>,
+    closure: Vec<ImportEdge>,
     warnings: Vec<String>,
     inner: Arc<Inner>,
 }
@@ -230,6 +255,7 @@ pub struct ReadView<'a> {
     /// the graphs read: index `n` is graph `n` of [`read::Ontology::graph_of`]
     pub graphs: &'a [GraphRef],
     pub imports: &'a [Import],
+    pub closure: &'a [ImportEdge],
     pub warnings: &'a [String],
     pub inferences: Option<&'a Inferences>,
 }
@@ -253,6 +279,7 @@ impl Opened {
             commit: self.snapshot.commit,
             graphs: &self.graphs,
             imports: &self.imports,
+            closure: &self.closure,
             warnings: &self.warnings,
             inferences: self.inferences.as_ref(),
         }
@@ -1231,6 +1258,7 @@ impl Ontologies {
                     graphs: e.graphs.clone(),
                     requested: e.requested,
                     imports: e.imports.clone(),
+                    closure: e.closure.clone(),
                     warnings: e.warnings.clone(),
                     cached: true,
                     inferences: None,
@@ -1243,13 +1271,7 @@ impl Ontologies {
             }
         }
         let readable = |g: Id| access.as_ref().is_none_or(|a| a.readable_id(snap, g));
-        let inputs = Inputs {
-            data_graphs: req.graphs(),
-            ontology_graphs: Vec::new(),
-            imports: req.imports,
-            location_mapping: Default::default(),
-        };
-        let resolved = sparkles_reasoner::inputs::resolve_readable(&view, &inputs, &readable);
+        let (resolved, closure) = req.resolve(&view, &readable);
         let mut graphs = resolved.graphs.clone();
         let inferred = GraphRef::Named(INFERRED_GRAPH.to_string());
         if record.is_some() && !graphs.contains(&inferred) {
@@ -1276,6 +1298,7 @@ impl Ontologies {
                 graphs: graphs.clone(),
                 requested,
                 imports: resolved.imports.clone(),
+                closure: closure.clone(),
                 warnings: resolved.warnings.clone(),
                 inner: inner.clone(),
             });
@@ -1286,6 +1309,7 @@ impl Ontologies {
             graphs,
             requested,
             imports: resolved.imports,
+            closure,
             warnings: resolved.warnings,
             cached: false,
             inferences: None,
@@ -2108,13 +2132,7 @@ impl Ontologies {
             None => snap.clone(),
         };
         let readable = |g: Id| access.as_ref().is_none_or(|a| a.readable_id(snap, g));
-        let inputs = Inputs {
-            data_graphs: req.graphs(),
-            ontology_graphs: Vec::new(),
-            imports: req.imports,
-            location_mapping: Default::default(),
-        };
-        Ok(sparkles_reasoner::inputs::resolve_readable(&view, &inputs, &readable).graphs)
+        Ok(req.resolve(&view, &readable).0.graphs)
     }
 
     /// The axioms that differ between the states `from` and `to` of the ontology `req`

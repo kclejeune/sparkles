@@ -1161,6 +1161,38 @@ arg "[profile]" default="rdfs" help="rdfs | rdfs-simple | owl-rl"
 '''
 run = 'mbx run --release -p sparkles-reasoner --example reasoner-bench -- "$usage_triples" "$usage_profile"'
 
+[tasks."bench:rl-reference"]
+description = "OWL 2 RL materialization against the reference, Nemo, on LUBM or OWL2Bench: the closures compared triple for triple, then full materialization on 1 and N threads and incremental insertion and deletion (scripts/rl-reference/bench.sh)"
+depends = ["build"]
+usage = '''
+arg "[suite]" default="lubm" help="lubm or owl2bench"
+arg "[scale]" default="1" help="universities: 1 (smoke) or more"
+arg "[workdir]" help="data, databases, logs and results/ (default .artifacts/bench-rl-reference/<suite>-<scale>)"
+flag "--runs <n>" default="3" help="timed rounds"
+flag "--threads <n>" help="Sparkles' threads beside 1 (default: all cores)"
+flag "--delta-every <n>" default="100" help="the change of the incremental runs is every n-th data triple"
+'''
+run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+# Built again inside this lease, so collection cannot remove the binary before it runs.
+mbx build --release -p sparkles-server
+RUNS="$usage_runs" THREADS="${usage_threads:-$(nproc)}" DELTA_EVERY="$usage_delta_every" \
+scripts/rl-reference/bench.sh "$usage_suite" "$usage_scale" \
+  "$(realpath -m "${usage_workdir:-.artifacts/bench-rl-reference/$usage_suite-$usage_scale}")"
+SPARKLES_TASK
+'''
+
+[tasks."test:rl-reference"]
+description = "The OWL 2 RL closures of Sparkles and of the reference, Nemo, compared triple for triple on the premise of every OWL 2 RL case of the W3C OWL 2 test cases (scripts/rl-reference/w3c.py)"
+depends = ["build"]
+run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+mbx build --release -p sparkles-server
+export $(scripts/fetch-test-suites.sh | grep '^SPARKLES_OWL2_TESTS=')
+python3 -I scripts/rl-reference/w3c.py "$SPARKLES_OWL2_TESTS" .artifacts/rl-reference-w3c
+SPARKLES_TASK
+'''
+
 [tasks."bench:shacl"]
 description = "SHACL validation benchmark on generated data"
 usage = '''

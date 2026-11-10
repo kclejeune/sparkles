@@ -1,0 +1,328 @@
+% The OWL 2 RL/RDF rules of the W3C OWL 2 Profiles recommendation, section 4.3
+% (https://www.w3.org/TR/owl2-profiles/#Reasoning_in_OWL_2_RL_and_RDF_Graphs_using_Rules),
+% written for Nemo (https://github.com/knowsys/nemo) as the reference materialization of
+% docs/benchmarks/reasoning. The rules are transcribed from the recommendation's tables 4
+% to 9 and use the recommendation's rule names. docs/benchmarks/reasoning/README.md
+% describes the conventions below, and scripts/rl-reference/compare.sh and bench.sh run
+% the program.
+%
+% Input. base.nt holds the graph with every literal replaced by an IRI <urn:x-lit:N> and
+% every blank node by an IRI <urn:x-bnode:N> (scripts/rl-reference/rl_terms.py encode),
+% so that Nemo's normalization of literal values and its renaming of blank nodes cannot
+% change a term. literals.nt marks each encoded blank node with the triple
+%   <urn:x-bnode:N> <urn:x-rl:kind> <urn:x-rl:bnode>,
+% and describes each encoded literal with the triples
+%   <urn:x-lit:N> <urn:x-rl:kind> <urn:x-rl:literal>,
+%   <urn:x-lit:N> <urn:x-rl:inDatatype> dt   for each datatype of OWL 2 RL whose value
+%                                          space holds its value (dt-type2), and
+%   <urn:x-lit:N> <urn:x-rl:value> <urn:x-rl:one>   when its value is the number 1.
+%
+% Output. derived.nt holds the triples of the closure that base.nt does not hold.
+%
+% Conventions, which docs/benchmarks/reasoning/README.md explains:
+% * The closure is an RDF graph. A rule is not applied when its conclusion would have a
+%   literal as subject, or a literal or a blank node as predicate, so no generalized
+%   triple is derived. dt-type2 is
+%   kept as the relation inDatatype and used by cls-svf1 for data values.
+% * eq-ref, dt-eq and dt-diff are left out, and no rule derives a reflexive owl:sameAs
+%   triple, including the rules whose property is a variable.
+% * The rules whose conclusion is false are left out, since they check consistency and
+%   derive no triple.
+% * prp-spo2, prp-key and cls-int1 take lists of any length. A list is read through
+%   rdf:first and rdf:rest of the closure, has an element at every node and ends at
+%   rdf:nil, as LIST of the recommendation's Table 3 requires.
+% * The aligned comparison leaves out the two lines tagged reflexive-scm-eq, the cases
+%   c1 = c2 of scm-eqc2 and p1 = p2 of scm-eqp2, since Sparkles states the reflexive
+%   owl:equivalentClass and owl:equivalentProperty only through scm-cls, scm-op and scm-dp.
+% * Inequalities that only skip a conclusion equal to a premise (prp-spo1 with p1 = p2,
+%   cax-sco with c1 = c2) do not change the closure.
+
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix rl: <urn:x-rl:> .
+
+@import base :- ntriples{resource="base.nt"} .
+@import lits :- ntriples{resource="literals.nt"} .
+
+t(?s, ?p, ?o) :- base(?s, ?p, ?o) .
+ntr(?s, ?p, ?o) :- base(?s, ?p, ?o), trp(?p) .
+% Nemo 0.10.1 stops with "predicate appears with multiple arities" on a rule that projects
+% the imported triples to their subject, so each literal carries a constant marker.
+isLit(?l) :- lits(?l, rl:kind, rl:literal) .
+% notIri(?x): a literal or a blank node, which cannot be a property
+notIri(?l) :- isLit(?l) .
+notIri(?b) :- lits(?b, rl:kind, rl:bnode) .
+inDatatype(?l, ?dt) :- lits(?l, rl:inDatatype, ?dt) .
+isOne(?l) :- lits(?l, rl:value, rl:one) .
+
+% The schema vocabulary as binary relations of the closure, which keeps Nemo's joins of the
+% schema rules on small tables. Each relation holds the closure's triples of its property.
+onProperty(?s, ?o) :- t(?s, owl:onProperty, ?o) .
+someValuesFrom(?s, ?o) :- t(?s, owl:someValuesFrom, ?o) .
+allValuesFrom(?s, ?o) :- t(?s, owl:allValuesFrom, ?o) .
+hasValue(?s, ?o) :- t(?s, owl:hasValue, ?o) .
+onClass(?s, ?o) :- t(?s, owl:onClass, ?o) .
+maxCardinality(?s, ?o) :- t(?s, owl:maxCardinality, ?o) .
+maxQualifiedCardinality(?s, ?o) :- t(?s, owl:maxQualifiedCardinality, ?o) .
+subClassOf(?s, ?o) :- t(?s, rdfs:subClassOf, ?o) .
+subPropertyOf(?s, ?o) :- t(?s, rdfs:subPropertyOf, ?o) .
+domain(?s, ?o) :- t(?s, rdfs:domain, ?o) .
+range(?s, ?o) :- t(?s, rdfs:range, ?o) .
+equivalentClass(?s, ?o) :- t(?s, owl:equivalentClass, ?o) .
+equivalentProperty(?s, ?o) :- t(?s, owl:equivalentProperty, ?o) .
+inverseOf(?s, ?o) :- t(?s, owl:inverseOf, ?o) .
+intersectionOf(?s, ?o) :- t(?s, owl:intersectionOf, ?o) .
+unionOf(?s, ?o) :- t(?s, owl:unionOf, ?o) .
+oneOf(?s, ?o) :- t(?s, owl:oneOf, ?o) .
+propertyChainAxiom(?s, ?o) :- t(?s, owl:propertyChainAxiom, ?o) .
+hasKey(?s, ?o) :- t(?s, owl:hasKey, ?o) .
+first(?s, ?o) :- t(?s, rdf:first, ?o) .
+rest(?s, ?o) :- t(?s, rdf:rest, ?o) .
+
+% The properties that rules name in their conclusions, for the linear form of prp-trp.
+headProperty(rdf:type) .
+headProperty(owl:sameAs) .
+headProperty(rdfs:subClassOf) .
+headProperty(owl:equivalentClass) .
+headProperty(rdfs:subPropertyOf) .
+headProperty(owl:equivalentProperty) .
+headProperty(rdfs:domain) .
+headProperty(rdfs:range) .
+headProperty(owl:inverseOf) .
+
+% ---------------------------------------------------------------- Table 4, equality
+
+% eq-ref is left out
+% eq-sym
+t(?y, owl:sameAs, ?x) :- t(?x, owl:sameAs, ?y), ?x != ?y, ~isLit(?y) .
+% eq-trans
+t(?x, owl:sameAs, ?z) :- t(?x, owl:sameAs, ?y), t(?y, owl:sameAs, ?z), ?x != ?z .
+% eq-rep-s, eq-rep-p and eq-rep-o. With p = owl:sameAs, eq-rep-s and eq-rep-o conclude
+% what eq-sym and eq-trans conclude, apart from reflexive owl:sameAs.
+t(?s2, ?p, ?o) :- t(?s, owl:sameAs, ?s2), ?s != ?s2, ~isLit(?s2), t(?s, ?p, ?o), ?p != owl:sameAs, OR(UNEQUALITY(?p, owl:sameAs), UNEQUALITY(?s2, ?o)) .
+ntr(?s2, ?p, ?o) :- t(?s, owl:sameAs, ?s2), ?s != ?s2, ~isLit(?s2), t(?s, ?p, ?o), ?p != owl:sameAs, trp(?p), OR(UNEQUALITY(?p, owl:sameAs), UNEQUALITY(?s2, ?o)) .
+t(?s, ?p2, ?o) :- t(?p, owl:sameAs, ?p2), ?p != ?p2, ~isLit(?p2), t(?s, ?p, ?o), ~notIri(?p2), OR(UNEQUALITY(?p2, owl:sameAs), UNEQUALITY(?s, ?o)) .
+ntr(?s, ?p2, ?o) :- t(?p, owl:sameAs, ?p2), ?p != ?p2, ~isLit(?p2), t(?s, ?p, ?o), trp(?p2), ~notIri(?p2), OR(UNEQUALITY(?p2, owl:sameAs), UNEQUALITY(?s, ?o)) .
+t(?s, ?p, ?o2) :- t(?o, owl:sameAs, ?o2), ?o != ?o2, t(?s, ?p, ?o), ?p != owl:sameAs, OR(UNEQUALITY(?p, owl:sameAs), UNEQUALITY(?s, ?o2)) .
+ntr(?s, ?p, ?o2) :- t(?o, owl:sameAs, ?o2), ?o != ?o2, t(?s, ?p, ?o), ?p != owl:sameAs, trp(?p), OR(UNEQUALITY(?p, owl:sameAs), UNEQUALITY(?s, ?o2)) .
+
+% ---------------------------------------------------------------- Table 5, properties
+
+% prp-ap, for the built-in annotation properties of OWL 2
+t(rdfs:label, rdf:type, owl:AnnotationProperty) .
+t(rdfs:comment, rdf:type, owl:AnnotationProperty) .
+t(rdfs:seeAlso, rdf:type, owl:AnnotationProperty) .
+t(rdfs:isDefinedBy, rdf:type, owl:AnnotationProperty) .
+t(owl:deprecated, rdf:type, owl:AnnotationProperty) .
+t(owl:versionInfo, rdf:type, owl:AnnotationProperty) .
+t(owl:priorVersion, rdf:type, owl:AnnotationProperty) .
+t(owl:backwardCompatibleWith, rdf:type, owl:AnnotationProperty) .
+t(owl:incompatibleWith, rdf:type, owl:AnnotationProperty) .
+
+% prp-dom
+t(?x, rdf:type, ?c) :- domain(?p, ?c), t(?x, ?p, ?y) .
+% prp-rng
+t(?y, rdf:type, ?c) :- range(?p, ?c), t(?x, ?p, ?y), ~isLit(?y) .
+% prp-fp
+t(?y1, owl:sameAs, ?y2) :- t(?p, rdf:type, owl:FunctionalProperty), t(?x, ?p, ?y1), t(?x, ?p, ?y2),
+    ?y1 != ?y2, ~isLit(?y1) .
+% prp-ifp
+t(?x1, owl:sameAs, ?x2) :- t(?p, rdf:type, owl:InverseFunctionalProperty), t(?x1, ?p, ?y), t(?x2, ?p, ?y),
+    ?x1 != ?x2 .
+% prp-symp
+t(?y, ?p, ?x) :- t(?p, rdf:type, owl:SymmetricProperty), t(?x, ?p, ?y), ~isLit(?y), OR(UNEQUALITY(?p, owl:sameAs), UNEQUALITY(?y, ?x)) .
+ntr(?y, ?p, ?x) :- t(?p, rdf:type, owl:SymmetricProperty), trp(?p), ntr(?x, ?p, ?y), ~isLit(?y), OR(UNEQUALITY(?p, owl:sameAs), UNEQUALITY(?y, ?x)) .
+% prp-trp, in a linear form. trp(?p): ?p is transitive. ntr(?x, ?p, ?y) holds the triples
+% of a transitive property that a rule other than prp-trp derives, or a superset of them
+% within the closure: every rule with a variable property in its conclusion has a twin
+% that writes ntr, and the triples of the properties that the rules name in their
+% conclusions are all in ntr. A triple that prp-trp derives is then a path of ntr
+% triples, and prp-trp only extends a path by one ntr triple, which turns its cubic
+% join over a clique into a linear one. The twin of prp-symp reverses only ntr triples,
+% since the reverse of a path is the path of the reversed triples.
+trp(?p) :- t(?p, rdf:type, owl:TransitiveProperty) .
+ntr(?s, ?p, ?o) :- trp(?p), headProperty(?p), t(?s, ?p, ?o), OR(UNEQUALITY(?p, owl:sameAs), UNEQUALITY(?s, ?o)) .
+t(?x, ?p, ?z) :- trp(?p), t(?x, ?p, ?y), ntr(?y, ?p, ?z), OR(UNEQUALITY(?p, owl:sameAs), UNEQUALITY(?x, ?z)) .
+% prp-spo1
+t(?x, ?p2, ?y) :- subPropertyOf(?p1, ?p2), ?p1 != ?p2, ~isLit(?p2), t(?x, ?p1, ?y), ~notIri(?p2), OR(UNEQUALITY(?p2, owl:sameAs), UNEQUALITY(?x, ?y)) .
+ntr(?x, ?p2, ?y) :- subPropertyOf(?p1, ?p2), ?p1 != ?p2, ~isLit(?p2), t(?x, ?p1, ?y), trp(?p2), ~notIri(?p2), OR(UNEQUALITY(?p2, owl:sameAs), UNEQUALITY(?x, ?y)) .
+
+% prp-spo2. chain(?h, ?l, ?u, ?v): a path from ?u to ?v follows the properties of the
+% chain list ?h from its first node up to its node ?l.
+chain(?h, ?h, ?u, ?v) :- propertyChainAxiom(?p, ?h), first(?h, ?p1), t(?u, ?p1, ?v) .
+chain(?h, ?r, ?u, ?w) :- chain(?h, ?l, ?u, ?v), rest(?l, ?r), first(?r, ?pi), t(?v, ?pi, ?w) .
+t(?u, ?p, ?w) :- propertyChainAxiom(?p, ?h), ~isLit(?p), chain(?h, ?l, ?u, ?w), rest(?l, rdf:nil), ~notIri(?p), OR(UNEQUALITY(?p, owl:sameAs), UNEQUALITY(?u, ?w)) .
+ntr(?u, ?p, ?w) :- propertyChainAxiom(?p, ?h), ~isLit(?p), chain(?h, ?l, ?u, ?w), rest(?l, rdf:nil), trp(?p), ~notIri(?p), OR(UNEQUALITY(?p, owl:sameAs), UNEQUALITY(?u, ?w)) .
+
+% prp-eqp1, prp-eqp2
+t(?x, ?p2, ?y) :- equivalentProperty(?p1, ?p2), ?p1 != ?p2, ~isLit(?p2), t(?x, ?p1, ?y), ~notIri(?p2), OR(UNEQUALITY(?p2, owl:sameAs), UNEQUALITY(?x, ?y)) .
+ntr(?x, ?p2, ?y) :- equivalentProperty(?p1, ?p2), ?p1 != ?p2, ~isLit(?p2), t(?x, ?p1, ?y), trp(?p2), ~notIri(?p2), OR(UNEQUALITY(?p2, owl:sameAs), UNEQUALITY(?x, ?y)) .
+t(?x, ?p1, ?y) :- equivalentProperty(?p1, ?p2), ?p1 != ?p2, t(?x, ?p2, ?y), ~notIri(?p1), OR(UNEQUALITY(?p1, owl:sameAs), UNEQUALITY(?x, ?y)) .
+ntr(?x, ?p1, ?y) :- equivalentProperty(?p1, ?p2), ?p1 != ?p2, t(?x, ?p2, ?y), trp(?p1), ~notIri(?p1), OR(UNEQUALITY(?p1, owl:sameAs), UNEQUALITY(?x, ?y)) .
+% prp-inv1, prp-inv2
+t(?y, ?p2, ?x) :- inverseOf(?p1, ?p2), ~isLit(?p2), t(?x, ?p1, ?y), ~isLit(?y), ~notIri(?p2), OR(UNEQUALITY(?p2, owl:sameAs), UNEQUALITY(?y, ?x)) .
+ntr(?y, ?p2, ?x) :- inverseOf(?p1, ?p2), ~isLit(?p2), t(?x, ?p1, ?y), ~isLit(?y), trp(?p2), ~notIri(?p2), OR(UNEQUALITY(?p2, owl:sameAs), UNEQUALITY(?y, ?x)) .
+t(?y, ?p1, ?x) :- inverseOf(?p1, ?p2), t(?x, ?p2, ?y), ~isLit(?y), ~notIri(?p1), OR(UNEQUALITY(?p1, owl:sameAs), UNEQUALITY(?y, ?x)) .
+ntr(?y, ?p1, ?x) :- inverseOf(?p1, ?p2), t(?x, ?p2, ?y), ~isLit(?y), trp(?p1), ~notIri(?p1), OR(UNEQUALITY(?p1, owl:sameAs), UNEQUALITY(?y, ?x)) .
+
+% prp-key. keyed(?c, ?h, ?x): ?x is an instance of ?c, whose key list is ?h.
+% key(?c, ?h, ?l, ?x, ?y): two instances of ?c agree on the key properties of ?h from its
+% first node up to its node ?l.
+keyed(?c, ?h, ?x) :- hasKey(?c, ?h), t(?x, rdf:type, ?c) .
+key(?c, ?h, ?h, ?x, ?y) :- keyed(?c, ?h, ?x), first(?h, ?p), t(?x, ?p, ?z), t(?y, ?p, ?z),
+    keyed(?c, ?h, ?y), ?x != ?y .
+key(?c, ?h, ?r, ?x, ?y) :- key(?c, ?h, ?l, ?x, ?y), rest(?l, ?r), first(?r, ?p),
+    t(?x, ?p, ?z), t(?y, ?p, ?z) .
+t(?x, owl:sameAs, ?y) :- key(?c, ?h, ?l, ?x, ?y), rest(?l, rdf:nil) .
+
+% ---------------------------------------------------------------- Table 6, classes
+
+% cls-thing, cls-nothing1
+t(owl:Thing, rdf:type, owl:Class) .
+t(owl:Nothing, rdf:type, owl:Class) .
+
+% list membership for cls-int2, cls-uni, cls-oo, scm-int and scm-uni.
+% member(?h, ?e): ?e is an element of the list that starts at ?h.
+listNode(?h, ?h) :- intersectionOf(?c, ?h) .
+listNode(?h, ?h) :- unionOf(?c, ?h) .
+listNode(?h, ?h) :- oneOf(?c, ?h) .
+listNode(?h, ?r) :- listNode(?h, ?l), first(?l, ?x), rest(?l, ?r), ?r != rdf:nil .
+% complete(?l): the list from node ?l has an element at every node and ends at rdf:nil,
+% as LIST of the recommendation's Table 3 requires.
+complete(?l) :- first(?l, ?x), rest(?l, rdf:nil) .
+complete(?l) :- first(?l, ?x), rest(?l, ?r), complete(?r) .
+member(?h, ?e) :- listNode(?h, ?l), complete(?l), first(?l, ?e) .
+
+% cls-int1. inter(?h, ?l, ?y): ?y has the classes of the intersection list ?h from its first
+% node up to its node ?l.
+inter(?h, ?h, ?y) :- intersectionOf(?c, ?h), first(?h, ?c1), t(?y, rdf:type, ?c1) .
+inter(?h, ?r, ?y) :- inter(?h, ?l, ?y), rest(?l, ?r), first(?r, ?ci), t(?y, rdf:type, ?ci) .
+t(?y, rdf:type, ?c) :- intersectionOf(?c, ?h), inter(?h, ?l, ?y), rest(?l, rdf:nil) .
+% cls-int2
+t(?y, rdf:type, ?ci) :- intersectionOf(?c, ?h), member(?h, ?ci), t(?y, rdf:type, ?c) .
+% cls-uni
+t(?y, rdf:type, ?c) :- unionOf(?c, ?h), member(?h, ?ci), t(?y, rdf:type, ?ci) .
+% cls-svf1, with dt-type2 for the values that are literals
+t(?u, rdf:type, ?x) :- someValuesFrom(?x, ?y), onProperty(?x, ?p), t(?u, ?p, ?v), t(?v, rdf:type, ?y) .
+t(?u, rdf:type, ?x) :- someValuesFrom(?x, ?y), onProperty(?x, ?p), t(?u, ?p, ?v), inDatatype(?v, ?y) .
+% cls-svf2
+t(?u, rdf:type, ?x) :- someValuesFrom(?x, owl:Thing), onProperty(?x, ?p), t(?u, ?p, ?v) .
+% cls-avf
+t(?v, rdf:type, ?y) :- allValuesFrom(?x, ?y), onProperty(?x, ?p), t(?u, rdf:type, ?x), t(?u, ?p, ?v),
+    ~isLit(?v) .
+% cls-hv1
+t(?u, ?p, ?y) :- hasValue(?x, ?y), onProperty(?x, ?p), ~isLit(?p), t(?u, rdf:type, ?x), ~notIri(?p), OR(UNEQUALITY(?p, owl:sameAs), UNEQUALITY(?u, ?y)) .
+ntr(?u, ?p, ?y) :- hasValue(?x, ?y), onProperty(?x, ?p), ~isLit(?p), t(?u, rdf:type, ?x), trp(?p), ~notIri(?p), OR(UNEQUALITY(?p, owl:sameAs), UNEQUALITY(?u, ?y)) .
+% cls-hv2
+t(?u, rdf:type, ?x) :- hasValue(?x, ?y), onProperty(?x, ?p), t(?u, ?p, ?y) .
+% cls-maxc2
+t(?y1, owl:sameAs, ?y2) :- maxCardinality(?x, ?n), isOne(?n), onProperty(?x, ?p),
+    t(?u, rdf:type, ?x), t(?u, ?p, ?y1), t(?u, ?p, ?y2), ?y1 != ?y2, ~isLit(?y1) .
+% cls-maxqc3
+t(?y1, owl:sameAs, ?y2) :- maxQualifiedCardinality(?x, ?n), isOne(?n), onProperty(?x, ?p),
+    onClass(?x, ?c), t(?u, rdf:type, ?x), t(?u, ?p, ?y1), t(?y1, rdf:type, ?c),
+    t(?u, ?p, ?y2), t(?y2, rdf:type, ?c), ?y1 != ?y2 .
+% cls-maxqc4
+t(?y1, owl:sameAs, ?y2) :- maxQualifiedCardinality(?x, ?n), isOne(?n), onProperty(?x, ?p),
+    onClass(?x, owl:Thing), t(?u, rdf:type, ?x), t(?u, ?p, ?y1), t(?u, ?p, ?y2), ?y1 != ?y2, ~isLit(?y1) .
+% cls-oo
+t(?y, rdf:type, ?c) :- oneOf(?c, ?h), member(?h, ?y), ~isLit(?y) .
+
+% ---------------------------------------------------------------- Table 7, class axioms
+
+% cax-sco
+t(?x, rdf:type, ?c2) :- subClassOf(?c1, ?c2), ?c1 != ?c2, t(?x, rdf:type, ?c1) .
+% cax-eqc1, cax-eqc2
+t(?x, rdf:type, ?c2) :- equivalentClass(?c1, ?c2), ?c1 != ?c2, t(?x, rdf:type, ?c1) .
+t(?x, rdf:type, ?c1) :- equivalentClass(?c1, ?c2), ?c1 != ?c2, t(?x, rdf:type, ?c2) .
+
+% ---------------------------------------------------------------- Table 8, datatypes
+
+% dt-type1, for the datatypes of OWL 2 RL (section 4.2.1)
+t(rdf:PlainLiteral, rdf:type, rdfs:Datatype) .
+t(rdf:XMLLiteral, rdf:type, rdfs:Datatype) .
+t(rdfs:Literal, rdf:type, rdfs:Datatype) .
+t(xsd:decimal, rdf:type, rdfs:Datatype) .
+t(xsd:integer, rdf:type, rdfs:Datatype) .
+t(xsd:nonNegativeInteger, rdf:type, rdfs:Datatype) .
+t(xsd:nonPositiveInteger, rdf:type, rdfs:Datatype) .
+t(xsd:positiveInteger, rdf:type, rdfs:Datatype) .
+t(xsd:negativeInteger, rdf:type, rdfs:Datatype) .
+t(xsd:long, rdf:type, rdfs:Datatype) .
+t(xsd:int, rdf:type, rdfs:Datatype) .
+t(xsd:short, rdf:type, rdfs:Datatype) .
+t(xsd:byte, rdf:type, rdfs:Datatype) .
+t(xsd:unsignedLong, rdf:type, rdfs:Datatype) .
+t(xsd:unsignedInt, rdf:type, rdfs:Datatype) .
+t(xsd:unsignedShort, rdf:type, rdfs:Datatype) .
+t(xsd:unsignedByte, rdf:type, rdfs:Datatype) .
+t(xsd:float, rdf:type, rdfs:Datatype) .
+t(xsd:double, rdf:type, rdfs:Datatype) .
+t(xsd:string, rdf:type, rdfs:Datatype) .
+t(xsd:normalizedString, rdf:type, rdfs:Datatype) .
+t(xsd:token, rdf:type, rdfs:Datatype) .
+t(xsd:language, rdf:type, rdfs:Datatype) .
+t(xsd:Name, rdf:type, rdfs:Datatype) .
+t(xsd:NCName, rdf:type, rdfs:Datatype) .
+t(xsd:NMTOKEN, rdf:type, rdfs:Datatype) .
+t(xsd:boolean, rdf:type, rdfs:Datatype) .
+t(xsd:hexBinary, rdf:type, rdfs:Datatype) .
+t(xsd:base64Binary, rdf:type, rdfs:Datatype) .
+t(xsd:anyURI, rdf:type, rdfs:Datatype) .
+t(xsd:dateTime, rdf:type, rdfs:Datatype) .
+t(xsd:dateTimeStamp, rdf:type, rdfs:Datatype) .
+% dt-type2 is the relation inDatatype, dt-eq and dt-diff are left out
+
+% ---------------------------------------------------------------- Table 9, schema vocabulary
+
+% scm-cls
+t(?c, rdfs:subClassOf, ?c), t(?c, owl:equivalentClass, ?c), t(?c, rdfs:subClassOf, owl:Thing),
+    t(owl:Nothing, rdfs:subClassOf, ?c) :- t(?c, rdf:type, owl:Class) .
+% scm-sco
+t(?c1, rdfs:subClassOf, ?c3) :- subClassOf(?c1, ?c2), subClassOf(?c2, ?c3) .
+% scm-eqc1
+t(?c1, rdfs:subClassOf, ?c2) :- equivalentClass(?c1, ?c2) .
+t(?c2, rdfs:subClassOf, ?c1) :- equivalentClass(?c1, ?c2), ~isLit(?c2) .
+% scm-eqc2, with its case c1 = c2 apart (see the tag below)
+t(?c1, owl:equivalentClass, ?c2) :- subClassOf(?c1, ?c2), subClassOf(?c2, ?c1), ?c1 != ?c2 .
+t(?c, owl:equivalentClass, ?c) :- subClassOf(?c, ?c) . % reflexive-scm-eq
+% scm-op, scm-dp
+t(?p, rdfs:subPropertyOf, ?p), t(?p, owl:equivalentProperty, ?p) :- t(?p, rdf:type, owl:ObjectProperty) .
+t(?p, rdfs:subPropertyOf, ?p), t(?p, owl:equivalentProperty, ?p) :- t(?p, rdf:type, owl:DatatypeProperty) .
+% scm-spo
+t(?p1, rdfs:subPropertyOf, ?p3) :- subPropertyOf(?p1, ?p2), subPropertyOf(?p2, ?p3) .
+% scm-eqp1
+t(?p1, rdfs:subPropertyOf, ?p2) :- equivalentProperty(?p1, ?p2) .
+t(?p2, rdfs:subPropertyOf, ?p1) :- equivalentProperty(?p1, ?p2), ~isLit(?p2) .
+% scm-eqp2, with its case p1 = p2 apart
+t(?p1, owl:equivalentProperty, ?p2) :- subPropertyOf(?p1, ?p2), subPropertyOf(?p2, ?p1), ?p1 != ?p2 .
+t(?p, owl:equivalentProperty, ?p) :- subPropertyOf(?p, ?p) . % reflexive-scm-eq
+% scm-dom1, scm-dom2, scm-rng1, scm-rng2
+t(?p, rdfs:domain, ?c2) :- domain(?p, ?c1), subClassOf(?c1, ?c2) .
+t(?p1, rdfs:domain, ?c) :- domain(?p2, ?c), subPropertyOf(?p1, ?p2) .
+t(?p, rdfs:range, ?c2) :- range(?p, ?c1), subClassOf(?c1, ?c2) .
+t(?p1, rdfs:range, ?c) :- range(?p2, ?c), subPropertyOf(?p1, ?p2) .
+% scm-hv
+t(?c1, rdfs:subClassOf, ?c2) :- hasValue(?c1, ?i), onProperty(?c1, ?p1), hasValue(?c2, ?i),
+    onProperty(?c2, ?p2), subPropertyOf(?p1, ?p2) .
+% scm-svf1, scm-svf2
+t(?c1, rdfs:subClassOf, ?c2) :- someValuesFrom(?c1, ?y1), onProperty(?c1, ?p),
+    someValuesFrom(?c2, ?y2), onProperty(?c2, ?p), subClassOf(?y1, ?y2) .
+t(?c1, rdfs:subClassOf, ?c2) :- someValuesFrom(?c1, ?y), onProperty(?c1, ?p1),
+    someValuesFrom(?c2, ?y), onProperty(?c2, ?p2), subPropertyOf(?p1, ?p2) .
+% scm-avf1, scm-avf2
+t(?c1, rdfs:subClassOf, ?c2) :- allValuesFrom(?c1, ?y1), onProperty(?c1, ?p),
+    allValuesFrom(?c2, ?y2), onProperty(?c2, ?p), subClassOf(?y1, ?y2) .
+t(?c2, rdfs:subClassOf, ?c1) :- allValuesFrom(?c1, ?y), onProperty(?c1, ?p1),
+    allValuesFrom(?c2, ?y), onProperty(?c2, ?p2), subPropertyOf(?p1, ?p2) .
+% scm-int
+t(?c, rdfs:subClassOf, ?ci) :- intersectionOf(?c, ?h), member(?h, ?ci) .
+% scm-uni
+t(?ci, rdfs:subClassOf, ?c) :- unionOf(?c, ?h), member(?h, ?ci), ~isLit(?ci) .
+
+% ---------------------------------------------------------------- output
+
+derived(?s, ?p, ?o) :- t(?s, ?p, ?o), ~base(?s, ?p, ?o) .
+@export derived :- ntriples{resource="derived.nt"} .

@@ -56,8 +56,11 @@ environment file by digest.
 
 Boat jobs build with MBX in local-only mode. The empty `MBX_REMOTE_URL` overrides the
 worker's configured remote cache, and the job shell drops any inherited token setting.
-The local store stays in MBX's default cache directory in the worker home, which the
-normal stop's snapshot keeps for the next resume. Its 64 GiB budget holds two release
+The local store stays in MBX's default cache directory in the worker home. The normal
+stop's snapshot keeps the worker's checkouts and build directories but not that cache
+directory, so each resume starts with an empty store and its first build is a cold one.
+Later builds in the same lifetime reuse that build's entries. Roadmap item 812 covers a store location that the snapshot keeps. Within
+one lifetime the store keeps every build warm. Its 64 GiB budget holds two release
 builds and the workspace test builds, and its 45 GiB free-space floor keeps the disk
 headroom that qualification requires. `admit` asks the pinned `mbx` for these effective
 settings and refuses a remote URL, a token setting or another budget. Laptops, gate
@@ -161,7 +164,11 @@ guard's stop does not depend on the provider TTL. The
 A Boat screen builds both revisions on the worker with mbx, because binaries built on a
 host with a newer glibc do not run there. The executor does not choose the build host,
 so the screen names the worker as its build host and passes two revisions rather than
-binary paths.
+binary paths. The screen keeps each binary in its local cache with a record of the host
+that built it. A later screen with the same worker as its build host reuses a cached
+binary only when that worker built it, so a repeated screen of the same revisions skips
+both builds. A write screen with a Boat build host keeps its cache entries under a key
+that names the worker, with the same effect.
 
 ```sh
 mise run bench:remote --executor "$worker" --build-host "$worker" origin/main HEAD
@@ -203,7 +210,35 @@ source/results for the lifecycle owner to reconcile.
 
 Each build receives an exact commit archive in a new source directory. Warm reuse
 shares immutable compiler cache entries and cannot retain deleted files in a reused
-source directory. A gate receives a standard bounded Git bundle of the exact
+source directory. While it holds the host's heavy lock, the build moves that directory
+to a stable path named by the commit and a hash of its cargo flags, builds there and
+moves it back. mbx records the predicted compiler actions of each checkout path, and a
+rebuild of an unchanged commit at the same path finds its own predictions, so its crates
+come from the store when the store still holds them. A rebuild at a new path takes the
+latest predictions of the same command, which name the other revision's crates when a
+screen alternates two revisions. The crates it then compiles embed the new path in their
+metadata, so the crates that depend on them miss as well, and the rebuilt binary differs
+from the first.
+
+A remote build runs detached from the ssh connection in its named `nsc-build-*` scope.
+The caller polls the scope over a fresh connection for its log and recorded exit
+status. Each remote step is written so that repeating it does not change what an earlier
+attempt did, and a step whose connection drops is retried a bounded number of times. A
+start whose reply was lost is resolved from the build's recorded state, and a start the
+host refuses fails at once. A cancellation takes the same lock as a start and fences any
+later one, and a scope that begins after a cancellation builds nothing. A start whose scope
+does not begin within 30 seconds cancels its own build. The caller gives the start an
+absolute expiry, at which the remaining admitted lifetime falls to the closure watch's lead
+and a minute, and the host enforces it on its own clock, which must agree with the
+caller's. The scope's runtime limit is computed from the expiry at the launch, and a
+watchdog in the scope stops it at the expiry less its 30-second stop time however late it
+began. A Boat screen's lock and workload units get an absolute expiry at the same point of
+the admitted lifetime. The worker refuses a unit that begins too close to it, and a
+watchdog in each unit stops the unit 30 seconds before it. The lock starts its watchdog
+before it answers through its readiness FIFO, and its answer waits at most 15 seconds for
+a reader. When contact cannot be restored
+within the retry bound, the build fails. Its cleanup then stops the scope, or names the
+scope for reconciliation when it cannot reach the host within its own shorter bound. The closure watch's unit check covers the detached scope. A gate receives a standard bounded Git bundle of the exact
 commit and comparison base. Temporary bundle refs live outside the caller's repository.
 The first bounded seed preserves a complete valid history and the original merge-base
 selection. Later jobs reuse an exact commit whose reachable object coverage matches

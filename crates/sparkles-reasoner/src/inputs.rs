@@ -384,11 +384,106 @@ pub fn resolve_readable(
     inputs: &Inputs,
     readable: &dyn Fn(Id) -> bool,
 ) -> Resolved {
+    resolve_closure(snap, inputs, readable, &ImportTargets::default()).0
+}
+
+/// Which source resolved an import (spec U12, import resolution).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Via {
+    /// the dataset's import map
+    Map,
+    /// the graph named by the import's IRI, or by its location mapping
+    Graph,
+    /// a vocabulary resource of the resource catalog
+    Resource,
+}
+
+impl Via {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Via::Map => "map",
+            Via::Graph => "graph",
+            Via::Resource => "resource",
+        }
+    }
+}
+
+/// The graphs an import IRI may resolve to besides the graph it names: the dataset's
+/// import map, tried first, and the vocabulary resources, tried last.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ImportTargets {
+    /// import IRI → the graph the import map names
+    pub map: BTreeMap<String, String>,
+    /// import IRI → the graphs of the vocabulary resources it matches
+    pub resources: BTreeMap<String, Vec<String>>,
+}
+
+impl ImportTargets {
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty() && self.resources.is_empty()
+    }
+
+    /// A digest of the targets, stable across runs: two sets of targets with the same
+    /// digest resolve every import alike.
+    pub fn digest(&self) -> u64 {
+        // FNV-1a over a canonical text, since the std hasher is not stable across builds
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |s: &str| {
+            for b in s.bytes().chain([0xff]) {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        for (k, v) in &self.map {
+            eat("m");
+            eat(k);
+            eat(v);
+        }
+        for (k, v) in &self.resources {
+            eat("r");
+            eat(k);
+            for g in v {
+                eat(g);
+            }
+        }
+        h
+    }
+}
+
+/// One `owl:imports` triple of a graph read, as resolved.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportEdge {
+    /// the importing graph
+    pub from: GraphRef,
+    pub iri: String,
+    /// the graphs it resolved to (empty: unresolved)
+    pub graphs: Vec<String>,
+    /// the source that resolved it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<Via>,
+    /// whether one of its graphs is the importing graph or imports it
+    pub cycle: bool,
+}
+
+/// [`resolve_readable`] with `targets`, and the edges of the imports closure. An import
+/// resolves to the import map's graph, else to the graph its IRI (or location mapping)
+/// names, else to the graphs of the vocabulary resources it matches; a candidate counts
+/// only when it holds quads the caller may read. The edges list each `owl:imports`
+/// triple found in a graph read, also when an earlier one named the same IRI.
+pub fn resolve_closure(
+    snap: &Snapshot,
+    inputs: &Inputs,
+    readable: &dyn Fn(Id) -> bool,
+    targets: &ImportTargets,
+) -> (Resolved, Vec<ImportEdge>) {
     let id = |g: &GraphRef| g.id(snap).filter(|i| readable(*i));
     let mut r = Resolved {
         graphs: inputs.configured(),
         ..Default::default()
     };
+    let mut edges: Vec<ImportEdge> = Vec::new();
     for g in &r.graphs {
         if g.id(snap).is_none() {
             r.warnings
@@ -396,54 +491,127 @@ pub fn resolve_readable(
         }
     }
     if inputs.imports == ImportMode::None {
-        return r;
+        return (r, edges);
     }
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let exists = |name: &str| id(&GraphRef::Named(name.to_string())).is_some();
+    // import IRI → what it resolved to, so a second importer gets the same edge
+    let mut seen: BTreeMap<String, (Vec<String>, Option<Via>)> = BTreeMap::new();
+    let mut stopped = false;
     let mut i = 0;
     while i < r.graphs.len() {
-        let Some(g) = id(&r.graphs[i]) else {
+        let from = r.graphs[i].clone();
+        let Some(g) = id(&from) else {
             i += 1;
             continue;
         };
         i += 1;
         let mut warnings = Vec::new();
         for iri in imports_in(snap, g, &mut warnings) {
-            if !seen.insert(iri.clone()) {
+            if let Some((graphs, via)) = seen.get(&iri) {
+                edges.push(ImportEdge {
+                    from: from.clone(),
+                    iri,
+                    graphs: graphs.clone(),
+                    via: *via,
+                    cycle: false,
+                });
                 continue;
             }
-            if r.imports.len() >= MAX_IMPORTS {
+            // an import past the bound keeps its edge, unresolved, and the warning says
+            // why it was not followed
+            if !stopped && r.imports.len() >= MAX_IMPORTS {
                 warnings.push(format!(
                     "more than {MAX_IMPORTS} imports: <{iri}> and later ones were not followed"
                 ));
-                break;
+                stopped = true;
+            }
+            if stopped {
+                edges.push(ImportEdge {
+                    from: from.clone(),
+                    iri,
+                    graphs: Vec::new(),
+                    via: None,
+                    cycle: false,
+                });
+                continue;
             }
             let location = inputs.location_mapping.map(&iri);
-            let exists = |name: &str| id(&GraphRef::Named(name.to_string())).is_some();
-            let graph = if exists(&iri) {
-                Some(iri.clone())
-            } else if location != iri && exists(&location) {
-                Some(location.clone())
-            } else {
-                None
-            };
-            match &graph {
-                Some(name) => {
-                    let gr = GraphRef::Named(name.clone());
-                    if !r.graphs.contains(&gr) {
-                        r.graphs.push(gr);
+            let (graphs, via): (Vec<String>, Option<Via>) = match targets.map.get(&iri) {
+                Some(g) if exists(g) => (vec![g.clone()], Some(Via::Map)),
+                _ if exists(&iri) => (vec![iri.clone()], Some(Via::Graph)),
+                _ if location != iri && exists(&location) => {
+                    (vec![location.clone()], Some(Via::Graph))
+                }
+                _ => {
+                    let found: Vec<String> = targets
+                        .resources
+                        .get(&iri)
+                        .map(|v| v.iter().filter(|g| exists(g)).cloned().collect())
+                        .unwrap_or_default();
+                    if found.is_empty() {
+                        (found, None)
+                    } else {
+                        (found, Some(Via::Resource))
                     }
                 }
-                None => warnings.push(format!("owl:imports <{iri}> did not resolve to a graph")),
+            };
+            if graphs.is_empty() {
+                warnings.push(format!("owl:imports <{iri}> did not resolve to a graph"));
+            }
+            for name in &graphs {
+                let gr = GraphRef::Named(name.clone());
+                if !r.graphs.contains(&gr) {
+                    r.graphs.push(gr);
+                }
             }
             r.imports.push(Import {
                 location: (location != iri).then_some(location),
+                iri: iri.clone(),
+                graph: graphs.first().cloned(),
+            });
+            seen.insert(iri.clone(), (graphs.clone(), via));
+            edges.push(ImportEdge {
+                from: from.clone(),
                 iri,
-                graph,
+                graphs,
+                via,
+                cycle: false,
             });
         }
         r.warnings.extend(warnings);
     }
-    r
+    mark_cycles(&mut edges);
+    (r, edges)
+}
+
+/// Mark the edges whose target graphs reach their importing graph.
+fn mark_cycles(edges: &mut [ImportEdge]) {
+    let mut next: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for e in edges.iter() {
+        for g in &e.graphs {
+            next.entry(e.from.as_str()).or_default().insert(g.as_str());
+        }
+    }
+    let reaches = |start: &str, goal: &str| {
+        let mut stack = vec![start];
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        while let Some(n) = stack.pop() {
+            if n == goal {
+                return true;
+            }
+            if seen.insert(n) {
+                stack.extend(next.get(n).into_iter().flatten().copied());
+            }
+        }
+        false
+    };
+    let cycles: Vec<bool> = edges
+        .iter()
+        .map(|e| e.graphs.iter().any(|g| reaches(g, e.from.as_str())))
+        .collect();
+    for (e, c) in edges.iter_mut().zip(cycles) {
+        e.cycle = c;
+    }
 }
 
 /// What [`fetch_imports`] did.

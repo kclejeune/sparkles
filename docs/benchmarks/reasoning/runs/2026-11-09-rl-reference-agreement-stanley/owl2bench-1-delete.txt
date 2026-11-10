@@ -1,0 +1,6 @@
+Command terminated by signal 9
+	Command being timed: "systemd-run --user --scope -q -p MemoryMax=16G -p MemorySwapMax=0 timeout 600 ../bin/sparkles infer --loc del.db --profile owl-rl --threads 16"
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:16.18
+	Maximum resident set size (kbytes): 14804220
+	Exit status: 0
+systemd scope MemoryMax=16G MemorySwapMax=0; the command exited with status 137

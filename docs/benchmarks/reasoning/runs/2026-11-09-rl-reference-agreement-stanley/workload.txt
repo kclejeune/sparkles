@@ -1,0 +1,18 @@
+# Workload counts behind RESULTS.md and roadmap item 798, from the second round's work
+# directories (bench.sh with RUNS=1, DELTA_EVERY=100).
+#
+# lubm-1-summary.md and owl2bench-1-summary.md are bench.sh's summaries. They give the
+# base triples (100,836 and 54,815), the derived triples and the size of the incremental
+# change (824 and 462 triples).
+#
+# The OWL2Bench(1) change, delta.nt, holds 18 triples of
+# <http://benchmark/OWL2Bench#hasSameHomeTownWith>:
+#   grep -c hasSameHomeTownWith delta.nt                       -> 18
+# base.nt holds 1,413 triples of that property over 1,406 people in 93 connected
+# components, the largest of 1,145 people, whose symmetric and transitive closure is one
+# clique (a union-find over the subjects and objects of those triples).
+#
+# The W3C OWL 2 test cases in all.rdf that list the RL profile number 70. Three have no
+# RDF/XML premise ("Plus and Minus Zero are Distinct", functionality-clash and
+# string-integer-clash) and are not compared. WebOnt-imports-011 imports another
+# ontology and is recorded as skipped in w3c-summary.json, and the other 66 are equal.

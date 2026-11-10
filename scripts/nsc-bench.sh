@@ -12,7 +12,8 @@
 # $SPARKLES_NSC_CACHE/bin/<commit> (default ~/.cache/sparkles-nsc), or under
 # bin/<commit>-<SHA-256 of the --cargo-args text> when --cargo-args is given. An entry is
 # reused only when its build.txt records the same cargo arguments, wherever it was built,
-# and build.txt and the manifest name the host that built it. The dataset comes from
+# and build.txt and the manifest name the host that built it. A screen whose --build-host
+# is a Boat worker reuses only an entry built on that worker. The dataset comes from
 # scripts/gen-data.py and is cached there as zstd. The queries are those of scripts/bench.sh
 # unless --query-dir names a directory of *.rq files.
 #
@@ -204,7 +205,7 @@ trap 'exit 130' INT TERM
 # binary <rev|path> <A|B>: stages bin-<A|B>.zst and notes its source, SHA-256 and compilers
 binary() {
   local ref=$1 v=$2 bin sha src key entry lock host
-  entry_current() { [ -x "$bin" ] && grep -qxF "cargo args: $CARGO_ARGS" "$entry/build.txt" 2> /dev/null; }
+  entry_current() { [ -x "$bin" ] && grep -qxF "cargo args: $CARGO_ARGS" "$entry/build.txt" 2> /dev/null && bh_entry_host_ok "$entry/build.txt"; }
   if [ -f "$ref" ]; then
     bin=$(realpath "$ref")
     src="file $bin"

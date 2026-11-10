@@ -52,7 +52,7 @@ use oxrdf::{NamedOrBlankNode, Quad, Term, Triple};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles_owl::Axiom;
 use sparkles_owl::read::{self, Mode, ReadOptions};
-use sparkles_reasoner::inputs::{GraphRef, Import, Inputs};
+use sparkles_reasoner::inputs::{GraphRef, Import};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -459,13 +459,7 @@ impl Ontologies {
             }
         };
         let readable = |g: Id| access.as_ref().is_none_or(|a| a.readable_id(&snap, g));
-        let inputs = Inputs {
-            data_graphs: req.graphs(),
-            ontology_graphs: Vec::new(),
-            imports: req.imports,
-            location_mapping: Default::default(),
-        };
-        let resolved = sparkles_reasoner::inputs::resolve_readable(&view, &inputs, &readable);
+        let (resolved, _) = req.resolve(&view, &readable);
         let mut graphs = FxHashMap::default();
         for (n, g) in resolved.graphs.iter().enumerate() {
             if let Some(id) = g.id(&view).filter(|id| readable(*id)) {

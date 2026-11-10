@@ -208,6 +208,33 @@ again, since they are not stored. The
 [base](runs/2026-11-01-witnesses-nsc/latency-base.jsonl) and
 [witness](runs/2026-11-01-witnesses-nsc/latency-witnesses.jsonl) builds.
 
+### OWL 2 RL reference agreement
+
+The [OWL 2 RL reference](README.md#the-owl-2-rl-reference) runs the OWL 2 RL/RDF rules on
+Nemo 0.10.1. Each row compares the triples that `sparkles infer --profile owl-rl`
+derived with those of the reference on the same stored data. The aligned program adds
+Sparkles' RDFS and OWL vocabulary additions to the W3C rules, and its derived graph must
+be equal. The W3C program alone must derive nothing that Sparkles lacks.
+
+| Input | Base triples | Derived by Sparkles | Aligned difference | Derived by the W3C program | Missing from Sparkles |
+|---|---:|---:|---:|---:|---:|
+| LUBM(1) | 100,836 | 85,098 | 0 | 67,268 | 0 |
+| OWL2Bench(1) | 54,815 | 1,400,688 | 0 | 1,395,689 | 0 |
+| 66 W3C OWL 2 RL test cases | | 28,004 | 0 | 3,946 | 0 |
+
+*Checked on stanley, a development laptop, with Sparkles built at 233f0362. The
+[run directory](runs/2026-11-09-rl-reference-agreement-stanley/commands.txt) holds the commands, the [host](runs/2026-11-09-rl-reference-agreement-stanley/env.txt) and
+each comparison's counts.*
+
+The test cases are those of the approved W3C OWL 2 test cases that list the RL profile and
+have an RDF/XML premise and no imports, 66 of 70. The closures that incremental
+maintenance left after inserting and after deleting a change of 1% of LUBM(1)'s data
+triples equal the reference's closures of the same data, and so does the closure after
+inserting the change into OWL2Bench(1). Deleting the change from OWL2Bench(1) grew to
+14.1 GiB in 136 s until the out-of-memory killer ended it, against less than 800 MiB for a
+full run, and [roadmap](../../ROADMAP.md) item 798 covers it. Those memory figures come
+from the development laptop and are not benchmark measurements.
+
 ## Query-time reasoning latency
 
 `mise run bench:reasoning-latency` is the rewrite gate of derivation on demand and RDFS

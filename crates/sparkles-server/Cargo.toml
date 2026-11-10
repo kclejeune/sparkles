@@ -66,6 +66,7 @@ sha1.workspace = true
 uuid.workspace = true
 # the UI's Content Security Policy (hashes of inline scripts); API token hashes
 sha2.workspace = true
+quick-xml = "0.37"
 # native TLS (feature `tls`) and the email channel of notifications: rustls with the
 # aws-lc-rs provider, already in the tree through reqwest, and the platform verifier
 # that reqwest's rustls client uses
