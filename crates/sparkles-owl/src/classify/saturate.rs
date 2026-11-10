@@ -1070,7 +1070,9 @@ impl<'a> Run<'a> {
             let to = outbox[at].0;
             let end = at + outbox[at..].iter().take_while(|m| m.0 == to).count();
             let ctx = self.get(to);
-            if !(filter && self.deliver_new(ctx, &outbox[at..end])) {
+            if filter {
+                self.deliver_new(ctx, &mut outbox[at..end]);
+            } else {
                 ctx.todo
                     .lock()
                     .extend(outbox[at..end].iter().map(|&(_, c)| c));
@@ -1083,30 +1085,33 @@ impl<'a> Run<'a> {
         outbox.clear();
     }
 
-    /// Delivers to a context the messages it does not already hold, and says whether it
-    /// could look, which it cannot while another worker holds the context (roadmap item
-    /// 695).
+    /// Delivers to a context the messages of a congested run once each, without those
+    /// that the context already holds when no other worker holds it (roadmap items 695
+    /// and 721).
     #[cold]
     #[inline(never)]
-    fn deliver_new(&self, ctx: &Ctx, msgs: &[(Ex, Concl)]) -> bool {
-        let Some(st) = ctx.st.try_lock() else {
-            return false;
-        };
-        if !st.init {
-            return false;
-        }
+    fn deliver_new(&self, ctx: &Ctx, msgs: &mut [(Ex, Concl)]) {
+        // the same message from several senders, or from one several times, side by side
+        msgs.sort_unstable_by_key(|m| m.1);
+        let st = ctx.st.try_lock().filter(|st| st.init);
         let mut t = ctx.todo.lock();
         let before = t.len();
-        t.extend(
-            msgs.iter()
-                .map(|&(_, c)| c)
-                .filter(|c| !(matches!(c, Concl::Sub(_) | Concl::Back(..)) && st.holds(c))),
-        );
+        let mut last = None;
+        for &(_, c) in msgs.iter() {
+            // a subsumption or backward link that the context holds, or will once it
+            // takes the same message just before, adds nothing
+            if matches!(c, Concl::Sub(_) | Concl::Back(..)) {
+                if last == Some(c) || st.as_ref().is_some_and(|st| st.holds(&c)) {
+                    continue;
+                }
+                last = Some(c);
+            }
+            t.push(c);
+        }
         let dropped = msgs.len() - (t.len() - before);
         if dropped > 0 {
             self.queued.fetch_sub(dropped as isize, Ordering::Relaxed);
         }
-        true
     }
 
     /// Whether the messages waiting in to-do lists and outboxes take more than the stored
