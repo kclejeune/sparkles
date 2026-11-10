@@ -247,6 +247,25 @@ fn claim_publish_and_replay_commit_business_quads_checkpoint_and_state_together(
     let other = ds.jobs().publish(c.run, &c.token, &publication(op, 2), &w);
     assert_eq!(code(other), "publication-conflict");
     assert!(!has(&ds, 2));
+    // the receipt is the worker's own: a stranger with the operation id, a wrong token
+    // or another run learns nothing
+    let stranger = worker("stranger");
+    assert_eq!(
+        code(
+            ds.jobs()
+                .publish(c.run, &c.token, &publication(op, 1), &stranger)
+        ),
+        "lease-lost"
+    );
+    assert_eq!(
+        code(ds.jobs().publish(c.run, "wrong", &publication(op, 1), &w)),
+        "lease-lost"
+    );
+    let s2 = submit(&ds, "k2");
+    assert_eq!(
+        code(ds.jobs().publish(s2.run, &c.token, &publication(op, 1), &w)),
+        "lease-lost"
+    );
     // a new operation under the finished lease is fenced
     let late = ds
         .jobs()
@@ -580,6 +599,20 @@ fn inputs_are_held_until_the_run_is_terminal() {
         .publish(c.run, &c.token, &publication(Uuid::new_v4(), 1), &w)
         .unwrap();
     assert!(ds.store().source_holds().unwrap().is_empty());
+}
+
+#[test]
+fn an_enablement_interrupted_after_the_reader_rose_reopens_and_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    ds.update("INSERT DATA { <urn:a> <urn:b> <urn:c> }")
+        .unwrap();
+    ds.store().require_dataset_reader(READER).unwrap();
+    drop(ds);
+    let ds = Dataset::open(dir.path()).unwrap();
+    assert!(ds.ask("ASK { <urn:a> <urn:b> <urn:c> }").unwrap());
+    configured(&ds);
+    submit(&ds, "k1");
 }
 
 #[test]

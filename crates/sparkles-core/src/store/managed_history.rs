@@ -35,21 +35,16 @@ pub(crate) fn activation_recorded(root: &Path) -> Result<bool> {
 
 /// Whether the dataset reader at `root` records an activation: a reader of
 /// [`READER`] or more that nothing else explains. Reader 9 belongs to the durable job
-/// ledger ([`crate::jobs::READER`]), so a root at exactly that reader with a `jobs.json`
-/// is read as a jobs dataset, and only the history directory then records an
-/// activation. A reader this build does not know still refuses as activated.
+/// ledger ([`crate::jobs::READER`]), and an interrupted enablement of jobs leaves that
+/// reader with no `jobs.json`, which C26 §7 says is safe to resume, so reader 9 never
+/// records an activation by itself and only the history directory does. A reader this
+/// build does not know still refuses as activated.
 fn reader_records_activation(root: &Path) -> Result<bool> {
     let Some(versions) = crate::commit::read_dataset_versions(root)? else {
         return Ok(false);
     };
     let reader = versions.minimum_reader;
-    if reader < READER {
-        return Ok(false);
-    }
-    if reader == crate::jobs::READER && root.join(crate::jobs::FILE).exists() {
-        return Ok(false);
-    }
-    Ok(true)
+    Ok(reader >= READER && reader != crate::jobs::READER)
 }
 
 /// Refuse an activated root whose registry no longer names its history root.

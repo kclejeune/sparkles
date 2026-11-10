@@ -758,8 +758,14 @@ impl Jobs {
         drop(l);
         ch.apply(&mut t)?;
         ds.store().failpoint("jobs-before-claim-commit");
-        t.commit()?;
+        // The monotonic deadline exists before the commit publishes, while this
+        // transaction still holds the writer, so no claim can read the new attempt
+        // without its deadline and take it over as expired.
         rt.grant(run.id, def.lease_ms);
+        if let Err(e) = t.commit() {
+            rt.revoke(run.id);
+            return Err(e);
+        }
         let payload: serde_json::Value = serde_json::from_str(&run.payload).map_err(|e| {
             Error::Corrupt(format!("the payload of run {} is not JSON: {e}", run.id))
         })?;
@@ -888,8 +894,14 @@ impl Jobs {
         )?;
         drop(l);
         ch.apply(&mut t)?;
-        t.commit()?;
         self.runtime().grant(run.id, extend);
+        if let Err(e) = t.commit() {
+            // the previous deadline is gone with the failed renewal; the lease is
+            // treated as expired, which is the safe side for a worker whose renewal
+            // did not commit
+            self.runtime().revoke(run.id);
+            return Err(e);
+        }
         Ok(Renewed {
             run: run.id,
             version: run.version + 1,
@@ -916,7 +928,7 @@ impl Jobs {
             let prep = preparation()?;
             let mut l = Ledger::new(&prep, &snap);
             if let Some(found) = l.publication(p.operation)? {
-                return Self::replay_publication(&mut l, &found, &digest);
+                return Self::replay_publication(&mut l, &found, run_id, token, caller, &digest);
             }
         }
         let Begun {
@@ -928,7 +940,7 @@ impl Jobs {
         let prep = preparation()?;
         let mut l = Ledger::new(&prep, &base);
         if let Some(found) = l.publication(p.operation)? {
-            return Self::replay_publication(&mut l, &found, &digest);
+            return Self::replay_publication(&mut l, &found, run_id, token, caller, &digest);
         }
         let (run, attempt) = self.check_lease(&mut l, run_id, token, caller, protection)?;
         Self::expect_version(&run, p.expected_version)?;
@@ -1040,11 +1052,30 @@ impl Jobs {
         })
     }
 
+    /// The original receipt of a completed publication, for the worker that made it:
+    /// the operation must belong to `run_id` and `token` must be the token of the
+    /// attempt that published, even when its lease has since ended. Anyone else gets
+    /// `lease-lost`, so an operation id alone discloses nothing.
     fn replay_publication(
         l: &mut Ledger<'_>,
         found: &ledger::PublicationRecord,
+        run_id: Uuid,
+        token: &str,
+        caller: &Caller,
         digest: &str,
     ) -> Result<Published> {
+        let attempt = l.attempt(found.attempt)?;
+        let owner = attempt.as_ref().is_some_and(|a| {
+            found.run == run_id
+                && a.run == run_id
+                && a.worker == caller.principal
+                && token_matches(token, &a.verifier)
+        });
+        if !owner {
+            return Err(lease_lost(
+                "the token does not match the attempt that published",
+            ));
+        }
         if found.digest != digest {
             return Err(managed(
                 ManagedErrorKind::PublicationConflict,
