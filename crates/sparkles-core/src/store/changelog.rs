@@ -1968,10 +1968,11 @@ impl Store {
         Some(log.limits.bulk_max_quads)
     }
 
-    /// Queue the changes of bulk commit `c`, from state `before` to `after` (writer
-    /// lock held, before the commit is published). `candidates` are the quads that the
-    /// build found can have changed, for a commit into a dataset too large to compare.
-    pub(super) fn log_bulk_commit(
+    /// The change log's record of bulk commit `c`, from state `before` to `after`, when
+    /// the log is on (writer lock held, before the commit is published). `candidates` are
+    /// the quads that the build found can have changed, for a commit into a dataset too
+    /// large to compare.
+    pub(super) fn bulk_change(
         &self,
         c: &CommitInfo,
         message: Option<Arc<str>>,
@@ -1979,18 +1980,16 @@ impl Store {
         before: &Snapshot,
         after: &Snapshot,
         candidates: Option<BulkCandidates<'_>>,
-    ) {
-        let Some(log) = self.changelog.as_ref().filter(|l| l.is_enabled()) else {
-            return;
-        };
+    ) -> Option<Pending> {
+        let log = self.changelog.as_ref().filter(|l| l.is_enabled())?;
         let max = log.limits.bulk_max_quads;
         let body = state_change_keys(before, after, max)
             .or_else(|| candidates.and_then(|k| candidate_changes(before, after, k, max)))
             .map_or(PendingBody::Summary, PendingBody::Keys);
-        log.push(Pending {
+        Some(Pending {
             commit: ChangeCommit::of(c, author, message),
             body,
-        });
+        })
     }
 
     /// Write every queued commit to the change log and sync it (the background writer

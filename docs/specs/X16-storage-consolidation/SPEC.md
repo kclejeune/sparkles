@@ -1,10 +1,11 @@
 # X16: Storage consolidation
 
-> **Status:** planned. The plan below is ordered and audited against the code.
+> **Status:** in progress. The plan below is ordered and audited against the code, and
+> phase 2 has shipped.
 >
-> **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 479, 484 and 830 to 833
-> hold the phases that are ready to start, and each is named in its phase. The later
-> candidate phases get their numbers when their prerequisites land.
+> **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 479 and 830 to 833
+> hold the phases that are ready to start, and each is named in its phase. Item 484 is
+> complete. The later candidate phases get their numbers when their prerequisites land.
 
 The design covers a first-release format cutoff, budgeted readers through one Control
 trait, a shared commit publish tail, one load plan, partitioned vocabularies with
@@ -107,7 +108,7 @@ dataset file gains `format` 2 and the index gains format 5.
 
 | Kind | Today | After the cutoff | How |
 |---|---|---|---|
-| `index` | It reads 2, 3 and 4, and writes 3 without features and 4 with them. | It reads and writes 5. Format 5 is format 4 with the `features` list always present and `vocab.idx` required. | Drop the format 2 unsegmented layout from `PermIndex::open_format`, `index.rs` and `cold.rs`, and `PLAIN_FORMAT_VERSION` from `builder.rs`. Add format 5 to `READABLE_INDEX_FORMATS` alone and move `builder::FORMAT_VERSION` to it, subject to open decision 3. |
+| `index` | It reads 2, 3 and 4, and writes 3 without features and 4 with them. | It reads and writes 5. Format 5 is format 4 with the `features` list always present and `vocab.idx` required. | Drop the format 2 unsegmented layout from `PermIndex::open_format`, `index.rs` and `cold.rs`, and `PLAIN_FORMAT_VERSION` from `builder.rs`. Add format 5 to `READABLE_INDEX_FORMATS` alone and move `builder::FORMAT_VERSION` to it, as decision 3 records. |
 | `vocab-index` | Every build writes `vocab.idx`, but a reader opens a generation without one, and `add_vocab_index` writes it for a generation an older build left bare. | Index format 5 requires it, and a format 5 generation without one is corrupt. | Make `Sparse` a required field of the vocabulary, delete `add_vocab_index`, and add a refusal test for a format 4 generation and a corruption test for a format 5 generation without the file. |
 | `wal` | It reads 0, 1 and 2. A plain store writes 1 and an activated store writes 2. | It reads 1 and 2 and writes them as today. | Delete `Framing::Mixed`, `fold_legacy`, `walStrictFrom` in `commit.json`, the headerless branches of `WalCursor`, `WalIndex::scan`, `apply_backward`, `probe.rs`, `history_limited.rs`, `backup.rs` and `diff.rs`. |
 | `delta-vocab` | It reads 1 and 2, with a `migrate` step from 1. | It reads and writes 2. | Delete `convert_legacy_file`, the step and the legacy parser of `vocab/delta.rs`. |
@@ -558,7 +559,28 @@ No code from another project is copied.
 
 ## Outcome
 
-Nothing is built. [Item 455](../../ROADMAP.md) tracks the work. The plan above replaced
+Phase 2 is built. `wal::encode_txn` in `store/wal.rs` encodes a transaction's records for
+the serial, group and compaction writers, which pass their own flags and unfenced count
+through a `Seal`, and the compaction writer passes translated ids. `SnapshotBuilder` in
+`store/snapshot.rs` replaced the twelve full `Snapshot` literals with two starts, an
+opened generation and the previous snapshot, and the seven struct-update literals stay.
+`Store::publish_committed` in `store/publish.rs` takes a logical commit from the serial
+path, the group leader and the bulk rebuild, and a generation switch from the compaction
+switch, which calls `guard.rekey` between `current.store` and `send_replace`. The tail
+notifies the guard of a logical commit before `current.store`, which the group path did
+and the serial and bulk paths did after, and a regression test holds a serial committer
+and a bulk committer right after their publication while a waiter woken through
+`commits` reads what the guard knows. The compaction tap stays under the writer lock in
+each path, and the quota accounting stays with each path's write, since the serial path
+counts the growth of its files and the group leader settles a prefix's reservations. No
+write that makes a commit durable moved, and no synchronization changed order. The
+bookkeeping around the publication did change places. The compaction clock and the
+writer head move before the catalog append on the serial and group paths, and the bulk
+path writes the generation's prefixes before the tail appends its catalog entry, so a
+failed prefix write leaves the catalog and the snapshot in step. No on-disk format
+changed.
+
+[Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the
 code, which found about 114 twin readers rather than 80, three publish paths with a
 compaction writer rather than three paths alone, a 17-field snapshot rather than 20, and
