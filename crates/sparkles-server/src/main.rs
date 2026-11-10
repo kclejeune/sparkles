@@ -43,6 +43,7 @@ mod graphrag;
 mod http;
 #[cfg(feature = "mcp")]
 mod ingest;
+mod jobs;
 #[cfg(feature = "fmt")]
 mod lsp;
 mod map_cmd;

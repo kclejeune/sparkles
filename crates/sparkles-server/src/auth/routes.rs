@@ -116,6 +116,16 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/evidence/{ds}/detach", &["POST"]),
     ("/$/evidence/{ds}/holds", &["GET", "POST"]),
     ("/$/evidence/{ds}/holds/{id}", &["DELETE"]),
+    // durable jobs (C26 §6)
+    ("/$/jobs/{ds}/settings", &["GET", "PUT"]),
+    ("/$/jobs/{ds}", &["GET", "POST"]),
+    ("/$/jobs/{ds}/claim", &["POST"]),
+    ("/$/jobs/{ds}/{id}", &["GET"]),
+    ("/$/jobs/{ds}/{id}/renew", &["POST"]),
+    ("/$/jobs/{ds}/{id}/publish", &["POST"]),
+    ("/$/jobs/{ds}/{id}/fail", &["POST"]),
+    ("/$/jobs/{ds}/{id}/cancel", &["POST"]),
+    ("/$/jobs/{ds}/{id}/retry", &["POST"]),
     ("/$/queries/{ds}", &["GET"]),
     // suggested examples (C18 §4.6): readers suggest, admins list and remove
     ("/$/queries/{ds}/suggestions", &["GET", "POST", "DELETE"]),
@@ -596,6 +606,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/text/{ds}/rebuild"
         | "/$/geo/{ds}"
         | "/$/geo/{ds}/rebuild"
+        // the definitions name the graphs workers publish into
+        | "/$/jobs/{ds}/settings"
         // the settings name the protected graphs and review policies
         | "/$/evidence/{ds}/settings"
         | "/$/evidence/{ds}/detach"
@@ -651,6 +663,15 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/claims/withdraw"
         | "/{ds}/mappings/{name}/run" => Dataset(Write),
         "/{ds}/memory/brief" => Dataset(Read),
+        // inspection of visible runs reads, and every transition writes
+        "/$/jobs/{ds}" | "/$/jobs/{ds}/{id}" if get => Dataset(Read),
+        "/$/jobs/{ds}"
+        | "/$/jobs/{ds}/claim"
+        | "/$/jobs/{ds}/{id}/renew"
+        | "/$/jobs/{ds}/{id}/publish"
+        | "/$/jobs/{ds}/{id}/fail"
+        | "/$/jobs/{ds}/{id}/cancel"
+        | "/$/jobs/{ds}/{id}/retry" => Dataset(Write),
         "/{ds}/sources" if get => Dataset(Read),
         "/{ds}/sources" => Dataset(Write),
         // a method that is refused anyway needs only read, so a reader learns the 405
@@ -735,6 +756,14 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/claims/withdraw" => Endpoint::Update,
         "/{ds}/sources" if get => Endpoint::Query,
         "/{ds}/sources" => Endpoint::Update,
+        "/$/jobs/{ds}" | "/$/jobs/{ds}/{id}" if get => Endpoint::Query,
+        "/$/jobs/{ds}"
+        | "/$/jobs/{ds}/claim"
+        | "/$/jobs/{ds}/{id}/renew"
+        | "/$/jobs/{ds}/{id}/publish"
+        | "/$/jobs/{ds}/{id}/fail"
+        | "/$/jobs/{ds}/{id}/cancel"
+        | "/$/jobs/{ds}/{id}/retry" => Endpoint::Update,
         "/{ds}/get" => Endpoint::GspR,
         "/{ds}/data" | "/{ds}/{*graph}" if get => Endpoint::GspR,
         "/{ds}/data" | "/{ds}/{*graph}" => Endpoint::GspRw,

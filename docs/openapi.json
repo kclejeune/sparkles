@@ -13786,6 +13786,830 @@
         ],
         "type": "object"
       },
+      "JobAttempt": {
+        "additionalProperties": false,
+        "description": "An attempt of a run. It never carries the lease token or its verifier.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "claimedMs": {
+            "description": "Milliseconds since the epoch in UTC.",
+            "type": "integer"
+          },
+          "diagnostic": {
+            "description": "The worker's redacted diagnostic, at most 512 characters.",
+            "type": "string"
+          },
+          "epoch": {
+            "description": "The boot epoch of the process that granted the lease.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "generation": {
+            "description": "The lease generation, raised by every claim.",
+            "type": "integer"
+          },
+          "id": {
+            "description": "The attempt's id.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "leaseExpiresMs": {
+            "description": "Milliseconds since the epoch in UTC, for reporting.",
+            "type": "integer"
+          },
+          "number": {
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "active",
+              "published",
+              "failed",
+              "interrupted",
+              "expired",
+              "cancelled"
+            ],
+            "type": "string"
+          },
+          "worker": {
+            "description": "The worker's principal IRI.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "worker",
+          "number",
+          "generation",
+          "epoch",
+          "state",
+          "claimedMs",
+          "leaseExpiresMs"
+        ],
+        "type": "object"
+      },
+      "JobClaim": {
+        "additionalProperties": false,
+        "description": "A claim request.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "definitions": {
+            "description": "Restrict the claim to these definitions. Empty claims any permitted definition.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "format": {
+            "const": 1
+          }
+        },
+        "type": "object"
+      },
+      "JobClaimed": {
+        "additionalProperties": false,
+        "description": "A claimed run and its lease.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "attempt": {
+            "description": "The attempt's id.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "checkpoint": {
+            "type": "string"
+          },
+          "definition": {
+            "type": "string"
+          },
+          "generation": {
+            "type": "integer"
+          },
+          "graphs": {
+            "description": "The graphs the publication may change.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "inputs": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "branchId": {
+                  "description": "The branch by id.",
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "seq": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "branchId",
+                "seq"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "kindVersion": {
+            "type": "integer"
+          },
+          "leaseExpiresMs": {
+            "description": "Milliseconds since the epoch in UTC.",
+            "type": "integer"
+          },
+          "number": {
+            "type": "integer"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "description": "The submitted payload.",
+            "type": "object"
+          },
+          "run": {
+            "description": "The run's id.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "token": {
+            "description": "The bearer lease token for `Sparkles-Job-Lease`. It is returned once and never recorded.",
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "run",
+          "attempt",
+          "number",
+          "generation",
+          "version",
+          "token",
+          "leaseExpiresMs",
+          "definition",
+          "kind",
+          "kindVersion",
+          "payload",
+          "inputs",
+          "graphs"
+        ],
+        "type": "object"
+      },
+      "JobFailure": {
+        "additionalProperties": false,
+        "description": "A typed failure of an attempt.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "expectedVersion": {
+            "type": "integer"
+          },
+          "format": {
+            "const": 1
+          },
+          "reason": {
+            "description": "A diagnostic the worker has redacted. Cut to 512 characters.",
+            "type": "string"
+          },
+          "retryAfterMs": {
+            "description": "The least delay before the next attempt.",
+            "type": "integer"
+          },
+          "transient": {
+            "description": "Whether another attempt may succeed. Default false, which ends the run.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "JobPublication": {
+        "additionalProperties": false,
+        "description": "A committed publication.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "attempt": {
+            "description": "The attempt that published.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "checkpoint": {
+            "type": "string"
+          },
+          "commit": {
+            "description": "The commit that holds the quads, the record and the state.",
+            "type": "integer"
+          },
+          "deleted": {
+            "type": "integer"
+          },
+          "digest": {
+            "description": "The digest of the published result.",
+            "type": "string"
+          },
+          "id": {
+            "description": "The publication operation id.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "inserted": {
+            "type": "integer"
+          },
+          "publishedMs": {
+            "description": "Milliseconds since the epoch in UTC.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "attempt",
+          "digest",
+          "commit",
+          "inserted",
+          "deleted",
+          "publishedMs"
+        ],
+        "type": "object"
+      },
+      "JobPublish": {
+        "additionalProperties": false,
+        "description": "The typed result of a `quads` run.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "checkpoint": {
+            "description": "The source checkpoint that becomes visible with the quads.",
+            "type": "string"
+          },
+          "delete": {
+            "description": "N-Quads lines, one quad each, in the definition's graphs.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "expectedVersion": {
+            "type": "integer"
+          },
+          "format": {
+            "const": 1
+          },
+          "insert": {
+            "description": "N-Quads lines, one quad each, in the definition's graphs.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "description": "The commit message.",
+            "type": "string"
+          },
+          "operation": {
+            "description": "The publication operation id, chosen by the worker and kept across retries.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "type": "object"
+      },
+      "JobPublished": {
+        "additionalProperties": false,
+        "description": "The receipt of a publication.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "commit": {
+            "type": "integer"
+          },
+          "deleted": {
+            "type": "integer"
+          },
+          "inserted": {
+            "type": "integer"
+          },
+          "publication": {
+            "description": "The publication operation id.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "replayed": {
+            "description": "Whether this is the original receipt of an operation completed before.",
+            "type": "boolean"
+          },
+          "run": {
+            "description": "The run's id.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "run",
+          "publication",
+          "commit",
+          "version",
+          "inserted",
+          "deleted",
+          "replayed"
+        ],
+        "type": "object"
+      },
+      "JobRenew": {
+        "additionalProperties": false,
+        "description": "A lease renewal.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "expectedVersion": {
+            "description": "Refused with `412` when the run is at another version.",
+            "type": "integer"
+          },
+          "extendMs": {
+            "description": "The extension, at most the definition's largest. Default the lease length.",
+            "type": "integer"
+          },
+          "format": {
+            "const": 1
+          }
+        },
+        "type": "object"
+      },
+      "JobRenewed": {
+        "additionalProperties": false,
+        "description": "A renewed lease.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "leaseExpiresMs": {
+            "description": "Milliseconds since the epoch in UTC.",
+            "type": "integer"
+          },
+          "run": {
+            "description": "The run's id.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "run",
+          "version",
+          "leaseExpiresMs"
+        ],
+        "type": "object"
+      },
+      "JobRetry": {
+        "additionalProperties": false,
+        "description": "An explicit retry of a failed or cancelled run.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "format": {
+            "const": 1
+          },
+          "idempotencyKey": {
+            "description": "The new run's key.",
+            "maxLength": 256,
+            "type": "string"
+          }
+        },
+        "required": [
+          "idempotencyKey"
+        ],
+        "type": "object"
+      },
+      "JobRun": {
+        "additionalProperties": false,
+        "description": "The redacted state of a run.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "attempt": {
+            "$ref": "#/components/schemas/JobAttempt"
+          },
+          "attempts": {
+            "type": "integer"
+          },
+          "checkpoint": {
+            "type": "string"
+          },
+          "definition": {
+            "type": "string"
+          },
+          "generation": {
+            "type": "integer"
+          },
+          "id": {
+            "description": "The run's id.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "inputs": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "branchId": {
+                  "description": "The branch by id.",
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "seq": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "branchId",
+                "seq"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "kindVersion": {
+            "type": "integer"
+          },
+          "nextEligibleMs": {
+            "description": "When a `retry-wait` run may be claimed again.",
+            "type": "integer"
+          },
+          "operation": {
+            "description": "The submission operation, derived from the idempotency key's scope.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "payloadDigest": {
+            "type": "string"
+          },
+          "principal": {
+            "description": "The submitter's principal IRI.",
+            "type": "string"
+          },
+          "publication": {
+            "$ref": "#/components/schemas/JobPublication"
+          },
+          "reason": {
+            "description": "Why the run failed or was cancelled, redacted.",
+            "type": "string"
+          },
+          "retryOf": {
+            "description": "The terminal run this one retries.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "revision": {
+            "description": "The definition revision the run was accepted under.",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "queued",
+              "leased",
+              "retry-wait",
+              "paused",
+              "succeeded",
+              "failed",
+              "cancelled"
+            ],
+            "type": "string"
+          },
+          "submittedCommit": {
+            "type": "integer"
+          },
+          "submittedMs": {
+            "description": "Milliseconds since the epoch in UTC.",
+            "type": "integer"
+          },
+          "version": {
+            "description": "Raised by every transition, for `expectedVersion`.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "definition",
+          "revision",
+          "kind",
+          "kindVersion",
+          "principal",
+          "state",
+          "version",
+          "attempts",
+          "generation",
+          "submittedMs",
+          "submittedCommit",
+          "payloadDigest",
+          "operation",
+          "inputs"
+        ],
+        "type": "object"
+      },
+      "JobRuns": {
+        "additionalProperties": false,
+        "description": "The visible runs, newest first.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/JobRun"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "runs"
+        ],
+        "type": "object"
+      },
+      "JobSubmission": {
+        "additionalProperties": false,
+        "description": "A run to submit.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "checkpoint": {
+            "description": "The source checkpoint the run starts from.",
+            "type": "string"
+          },
+          "definition": {
+            "description": "A registered definition's name.",
+            "type": "string"
+          },
+          "format": {
+            "const": 1
+          },
+          "idempotencyKey": {
+            "description": "Scoped to the dataset, the branch, the caller and the definition revision.",
+            "maxLength": 256,
+            "type": "string"
+          },
+          "inputs": {
+            "description": "Commits the run reads, pinned by a source hold until the run is terminal.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "branchId": {
+                  "description": "The branch by id.",
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "seq": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "branchId",
+                "seq"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "message": {
+            "description": "The commit message of the submission.",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "description": "The typed payload the worker receives at its claim. It must hold no secret.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "definition",
+          "idempotencyKey"
+        ],
+        "type": "object"
+      },
+      "JobSubmitted": {
+        "additionalProperties": false,
+        "description": "The durable receipt of a submission.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "commit": {
+            "description": "The commit that recorded the run, or the head when the key was replayed.",
+            "type": "integer"
+          },
+          "replayed": {
+            "description": "Whether the key was known with the same payload.",
+            "type": "boolean"
+          },
+          "run": {
+            "description": "The run's id.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "queued",
+              "leased",
+              "retry-wait",
+              "paused",
+              "succeeded",
+              "failed",
+              "cancelled"
+            ],
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "run",
+          "version",
+          "commit",
+          "replayed",
+          "state"
+        ],
+        "type": "object"
+      },
+      "JobsSettings": {
+        "additionalProperties": false,
+        "description": "The jobs settings of a dataset, as `jobs.json` format 1 holds them.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "definitions": {
+            "additionalProperties": {
+              "additionalProperties": false,
+              "properties": {
+                "attempts": {
+                  "description": "Default 8.",
+                  "type": "integer"
+                },
+                "concurrency": {
+                  "description": "The most runs of the definition leased at once. Default 1.",
+                  "type": "integer"
+                },
+                "enabled": {
+                  "description": "A disabled definition takes no claims. Default true.",
+                  "type": "boolean"
+                },
+                "graphs": {
+                  "description": "The named graphs a publication may change.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "kind": {
+                  "description": "The registered kind. `quads` publishes bounded insert and delete quads into the definition's graphs.",
+                  "enum": [
+                    "quads"
+                  ],
+                  "type": "string"
+                },
+                "leaseMs": {
+                  "description": "Default 60000.",
+                  "type": "integer"
+                },
+                "maxInputBytes": {
+                  "description": "The largest canonical payload. Default 1 MiB.",
+                  "type": "integer"
+                },
+                "maxLeaseExtensionMs": {
+                  "description": "Default 300000.",
+                  "type": "integer"
+                },
+                "maxOutputQuads": {
+                  "description": "The most quads one publication holds. Default 100000.",
+                  "type": "integer"
+                },
+                "retryHorizonMs": {
+                  "description": "Default one day.",
+                  "type": "integer"
+                },
+                "submitters": {
+                  "description": "The principal IRIs that may submit runs. Empty admits every principal with `write`.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "version": {
+                  "description": "The kind's version. Default 1.",
+                  "type": "integer"
+                },
+                "workers": {
+                  "description": "The principal IRIs that may claim runs. Empty admits every principal with `write`.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "description": "The registered definitions by name.",
+            "maxProperties": 256,
+            "type": "object"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "format": {
+            "const": 1
+          },
+          "maxQueued": {
+            "description": "The most runs waiting in `queued` or `retry-wait` at once. Default 1024.",
+            "type": "integer"
+          },
+          "profile": {
+            "const": 1
+          }
+        },
+        "required": [
+          "format",
+          "profile",
+          "enabled"
+        ],
+        "type": "object"
+      },
+      "JobsSettingsStatus": {
+        "additionalProperties": false,
+        "description": "The settings and their protection.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "digest": {
+            "oneOf": [
+              {
+                "description": "The SHA-256 digest of the recorded `jobs.json`, or null before the first configuration.",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "protected": {
+            "description": "Whether the ledger graph is protected from ordinary writes.",
+            "type": "boolean"
+          },
+          "revision": {
+            "description": "The revision of the dataset's managed-graph registry.",
+            "type": "integer"
+          },
+          "revisions": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "The revision digest of each definition.",
+            "type": "object"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/JobsSettings"
+          }
+        },
+        "required": [
+          "settings",
+          "revision",
+          "protected",
+          "revisions"
+        ],
+        "type": "object"
+      },
       "Justification": {
         "properties": {
           "facts": {
@@ -36471,6 +37295,896 @@
           "Datasets"
         ],
         "x-sparkles-permission": "read"
+      }
+    },
+    "/$/jobs/{ds}": {
+      "get": {
+        "description": "Needs `read` on the dataset through the query endpoint. An administrator sees every run, and another caller the runs it submitted or currently works on. Newest first, at most `limit`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "operationId": "listJobs",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "Only runs in this state.",
+            "in": "query",
+            "name": "state",
+            "schema": {
+              "enum": [
+                "queued",
+                "leased",
+                "retry-wait",
+                "paused",
+                "succeeded",
+                "failed",
+                "cancelled"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only runs of this definition.",
+            "in": "query",
+            "name": "definition",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "At most this many runs, up to 1000. Default 100.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRuns"
+                }
+              }
+            },
+            "description": "The visible runs."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List the visible runs",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "post": {
+        "description": "Needs `write` on the dataset through the update endpoint, and to be among the definition's submitters when it names any. Records the run in the dataset's job ledger as one commit and answers `202` with its `Location` once that commit is durable. The same `idempotencyKey` with the same payload answers `200` with the existing run and `replayed`; whitespace and member order do not change the payload's digest. Refusals write nothing: `400` for a malformed submission, `404` for an unknown definition, `409 idempotency-conflict` for a known key with another payload, `409` for a disabled definition and `429 jobs-overloaded` when the dataset's bound on waiting runs is reached.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "operationId": "submitJob",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobSubmission"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobSubmitted"
+                }
+              }
+            },
+            "description": "The existing run of a replayed key."
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobSubmitted"
+                }
+              }
+            },
+            "description": "The durable receipt.",
+            "headers": {
+              "Location": {
+                "description": "The run's route.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Submit a run",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "write"
+      }
+    },
+    "/$/jobs/{ds}/claim": {
+      "post": {
+        "description": "Needs `write` on the dataset through the update endpoint, and to be among a definition's workers when it names any. Leases the first submitted eligible run of the caller's permitted definitions, raising its lease generation, and answers the payload with a bearer lease token that is returned once and never recorded. A run whose lease expired is taken over with a later generation, and the earlier worker's token fails from then on. `204` when nothing is eligible.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "operationId": "claimJob",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobClaim"
+              }
+            }
+          },
+          "description": "",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobClaimed"
+                }
+              }
+            },
+            "description": "The claimed run and its lease."
+          },
+          "204": {
+            "description": "Nothing is eligible."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Claim one eligible run",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "write"
+      }
+    },
+    "/$/jobs/{ds}/settings": {
+      "get": {
+        "description": "Needs `admin` on the dataset. Answers the disabled defaults before the first configuration.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "operationId": "getJobsSettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobsSettingsStatus"
+                }
+              }
+            },
+            "description": "The settings and their protection."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get the jobs settings",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      },
+      "put": {
+        "description": "Needs `admin` on the dataset. Records complete settings, protects the ledger graph `urn:x-sparkles:jobs:ledger` and raises the dataset reader to 9 durably on the first configuration. Editing a definition changes its revision, and a run accepted under an older revision is not claimed until the definition is restored. Disabling jobs while runs are queued, leased or waiting to retry is a `409` that writes nothing, as is a configuration that races with another change of the registry.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "operationId": "putJobsSettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobsSettings"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobsSettingsStatus"
+                }
+              }
+            },
+            "description": "The settings and their protection."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Set the jobs settings",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/jobs/{ds}/{id}": {
+      "get": {
+        "description": "Needs `read` on the dataset through the query endpoint. An unknown run and a run the caller may not see share the same `404`. The response never carries a lease token or its verifier.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "operationId": "getJob",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRun"
+                }
+              }
+            },
+            "description": "The redacted state of the run."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Inspect a run",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/jobs/{ds}/{id}/cancel": {
+      "post": {
+        "description": "Needs `write` through the update endpoint, as the submitter or an administrator. Durably ends the run and fences its active attempt, whose token fails from then on. Work already committed stays committed, and the reason records that an external request already sent may still take effect. A terminal run is `409`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "operationId": "cancelJob",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRun"
+                }
+              }
+            },
+            "description": "The cancelled run."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Cancel a run",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "write"
+      }
+    },
+    "/$/jobs/{ds}/{id}/fail": {
+      "post": {
+        "description": "Needs `write` through the update endpoint and the lease token in `Sparkles-Job-Lease`. A transient failure enters `retry-wait` with exponential backoff and jitter, honoring `retryAfterMs`, within the definition's attempts and retry horizon; any other failure, or an exhausted policy, ends the run as `failed` with the redacted reason. `409 lease-lost`, `412 precondition-failed` and `401 lease-missing` as for a renewal.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "operationId": "failJob",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "description": "The bearer lease token the claim returned.",
+            "in": "header",
+            "name": "Sparkles-Job-Lease",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobFailure"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRun"
+                }
+              }
+            },
+            "description": "The run after the failure."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Record a failure",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "write"
+      }
+    },
+    "/$/jobs/{ds}/{id}/publish": {
+      "post": {
+        "description": "Needs `write` through the update endpoint, update grants on every graph the result writes and the lease token in `Sparkles-Job-Lease`. Commits the result's quads, the publication record, the checkpoint and the run's completion in one commit of the dataset, so a crash leaves all of them or none. A repeated `operation` with the same quads and checkpoint answers the original receipt with `replayed`, even after the lease ended, and another result under the same `operation` is `409 publication-conflict`. Refusals write nothing: `400` for malformed quads or more quads than the definition allows, `403` for a graph outside the definition's graphs or the caller's grants, `409 profile-managed-graph` for a managed graph, `409 lease-lost`, `412 precondition-failed` and `401 lease-missing`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "operationId": "publishJob",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "description": "The bearer lease token the claim returned.",
+            "in": "header",
+            "name": "Sparkles-Job-Lease",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobPublish"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobPublished"
+                }
+              }
+            },
+            "description": "The receipt of the publication."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Publish a run's result",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "write"
+      }
+    },
+    "/$/jobs/{ds}/{id}/renew": {
+      "post": {
+        "description": "Needs `write` through the update endpoint and the lease token in `Sparkles-Job-Lease`. Extends the lease by `extendMs`, at most the definition's largest extension. `409 lease-lost` for a token whose generation was superseded, whose lease expired, whose process restarted or whose run is no longer leased, `412 precondition-failed` for another `expectedVersion`, and `401 lease-missing` without the header.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "operationId": "renewJobLease",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "description": "The bearer lease token the claim returned.",
+            "in": "header",
+            "name": "Sparkles-Job-Lease",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobRenew"
+              }
+            }
+          },
+          "description": "",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRenewed"
+                }
+              }
+            },
+            "description": "The renewed lease."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Renew a lease",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "write"
+      }
+    },
+    "/$/jobs/{ds}/{id}/retry": {
+      "post": {
+        "description": "Needs `write` through the update endpoint. Creates a new run from a failed or cancelled one, with its payload, checkpoint and inputs, under the new `idempotencyKey`, and links it to the old run, which stays as evidence. A run in any other state is `409`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "operationId": "retryJob",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobRetry"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobSubmitted"
+                }
+              }
+            },
+            "description": "The new run's receipt.",
+            "headers": {
+              "Location": {
+                "description": "The new run's route.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Retry a terminal run",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "write"
       }
     },
     "/$/lint": {

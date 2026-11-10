@@ -36,6 +36,17 @@ it.
 
 ### Added
 
+Durable jobs (item 339, C26 Phase 1). A dataset keeps accepted work in a job ledger, the
+protected control graph `urn:x-sparkles:jobs:ledger`, with its definitions in `jobs.json`.
+`Dataset::jobs()` and the routes under `/$/jobs/{ds}` submit runs with an idempotency
+key, lease them to workers with a bearer token and a lease generation, and publish a
+worker's quads with the publication record, the source checkpoint and the run's completion
+in one commit, so a retry after a lost response or a crash never duplicates its effects.
+A restart fences every earlier lease by boot epoch before the process admits a claim.
+Enabling jobs raises the dataset's `minimumReader` to 9, so older releases refuse to open
+such a dataset. The private import transport now names its destination reader as
+`IMPORTED_DESTINATION_READER`, one above `DATASET_READER`.
+
 Community reports can read a review policy's accepted projection (item 652). The
 `graphrag` settings member `reviewPolicy` names a review policy of the dataset's evidence
 settings, and a build or refresh then reads the policy's output graph with the projection's

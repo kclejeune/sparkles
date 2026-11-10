@@ -1633,6 +1633,194 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/jobs/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the visible runs
+         * @description Needs `read` on the dataset through the query endpoint. An administrator sees every run, and another caller the runs it submitted or currently works on. Newest first, at most `limit`.
+         */
+        get: operations["listJobs"];
+        put?: never;
+        /**
+         * Submit a run
+         * @description Needs `write` on the dataset through the update endpoint, and to be among the definition's submitters when it names any. Records the run in the dataset's job ledger as one commit and answers `202` with its `Location` once that commit is durable. The same `idempotencyKey` with the same payload answers `200` with the existing run and `replayed`; whitespace and member order do not change the payload's digest. Refusals write nothing: `400` for a malformed submission, `404` for an unknown definition, `409 idempotency-conflict` for a known key with another payload, `409` for a disabled definition and `429 jobs-overloaded` when the dataset's bound on waiting runs is reached.
+         */
+        post: operations["submitJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/jobs/{ds}/claim": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Claim one eligible run
+         * @description Needs `write` on the dataset through the update endpoint, and to be among a definition's workers when it names any. Leases the first submitted eligible run of the caller's permitted definitions, raising its lease generation, and answers the payload with a bearer lease token that is returned once and never recorded. A run whose lease expired is taken over with a later generation, and the earlier worker's token fails from then on. `204` when nothing is eligible.
+         */
+        post: operations["claimJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/jobs/{ds}/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the jobs settings
+         * @description Needs `admin` on the dataset. Answers the disabled defaults before the first configuration.
+         */
+        get: operations["getJobsSettings"];
+        /**
+         * Set the jobs settings
+         * @description Needs `admin` on the dataset. Records complete settings, protects the ledger graph `urn:x-sparkles:jobs:ledger` and raises the dataset reader to 9 durably on the first configuration. Editing a definition changes its revision, and a run accepted under an older revision is not claimed until the definition is restored. Disabling jobs while runs are queued, leased or waiting to retry is a `409` that writes nothing, as is a configuration that races with another change of the registry.
+         */
+        put: operations["putJobsSettings"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/jobs/{ds}/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Inspect a run
+         * @description Needs `read` on the dataset through the query endpoint. An unknown run and a run the caller may not see share the same `404`. The response never carries a lease token or its verifier.
+         */
+        get: operations["getJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/jobs/{ds}/{id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel a run
+         * @description Needs `write` through the update endpoint, as the submitter or an administrator. Durably ends the run and fences its active attempt, whose token fails from then on. Work already committed stays committed, and the reason records that an external request already sent may still take effect. A terminal run is `409`.
+         */
+        post: operations["cancelJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/jobs/{ds}/{id}/fail": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Record a failure
+         * @description Needs `write` through the update endpoint and the lease token in `Sparkles-Job-Lease`. A transient failure enters `retry-wait` with exponential backoff and jitter, honoring `retryAfterMs`, within the definition's attempts and retry horizon; any other failure, or an exhausted policy, ends the run as `failed` with the redacted reason. `409 lease-lost`, `412 precondition-failed` and `401 lease-missing` as for a renewal.
+         */
+        post: operations["failJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/jobs/{ds}/{id}/publish": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Publish a run's result
+         * @description Needs `write` through the update endpoint, update grants on every graph the result writes and the lease token in `Sparkles-Job-Lease`. Commits the result's quads, the publication record, the checkpoint and the run's completion in one commit of the dataset, so a crash leaves all of them or none. A repeated `operation` with the same quads and checkpoint answers the original receipt with `replayed`, even after the lease ended, and another result under the same `operation` is `409 publication-conflict`. Refusals write nothing: `400` for malformed quads or more quads than the definition allows, `403` for a graph outside the definition's graphs or the caller's grants, `409 profile-managed-graph` for a managed graph, `409 lease-lost`, `412 precondition-failed` and `401 lease-missing`.
+         */
+        post: operations["publishJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/jobs/{ds}/{id}/renew": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Renew a lease
+         * @description Needs `write` through the update endpoint and the lease token in `Sparkles-Job-Lease`. Extends the lease by `extendMs`, at most the definition's largest extension. `409 lease-lost` for a token whose generation was superseded, whose lease expired, whose process restarted or whose run is no longer leased, `412 precondition-failed` for another `expectedVersion`, and `401 lease-missing` without the header.
+         */
+        post: operations["renewJobLease"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/jobs/{ds}/{id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry a terminal run
+         * @description Needs `write` through the update endpoint. Creates a new run from a failed or cancelled one, with its payload, checkpoint and inputs, under the new `idempotencyKey`, and links it to the old run, which stays as evidence. A run in any other state is `409`.
+         */
+        post: operations["retryJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/lint": {
         parameters: {
             query?: never;
@@ -8639,6 +8827,328 @@ export interface components {
             };
             dataset: string;
             tasks: components["schemas"]["IngestTask"][];
+        };
+        /** @description An attempt of a run. It never carries the lease token or its verifier. */
+        JobAttempt: {
+            /** @description Milliseconds since the epoch in UTC. */
+            claimedMs: number;
+            /** @description The worker's redacted diagnostic, at most 512 characters. */
+            diagnostic?: string;
+            /**
+             * Format: uuid
+             * @description The boot epoch of the process that granted the lease.
+             */
+            epoch: string;
+            /** @description The lease generation, raised by every claim. */
+            generation: number;
+            /**
+             * Format: uuid
+             * @description The attempt's id.
+             */
+            id: string;
+            /** @description Milliseconds since the epoch in UTC, for reporting. */
+            leaseExpiresMs: number;
+            number: number;
+            /** @enum {string} */
+            state: "active" | "published" | "failed" | "interrupted" | "expired" | "cancelled";
+            /** @description The worker's principal IRI. */
+            worker: string;
+        };
+        /** @description A claim request. */
+        JobClaim: {
+            /** @description Restrict the claim to these definitions. Empty claims any permitted definition. */
+            definitions?: string[];
+            /** @constant */
+            format?: 1;
+        };
+        /** @description A claimed run and its lease. */
+        JobClaimed: {
+            /**
+             * Format: uuid
+             * @description The attempt's id.
+             */
+            attempt: string;
+            checkpoint?: string;
+            definition: string;
+            generation: number;
+            /** @description The graphs the publication may change. */
+            graphs: string[];
+            inputs: {
+                /**
+                 * Format: uuid
+                 * @description The branch by id.
+                 */
+                branchId: string;
+                seq: number;
+            }[];
+            kind: string;
+            kindVersion: number;
+            /** @description Milliseconds since the epoch in UTC. */
+            leaseExpiresMs: number;
+            number: number;
+            /** @description The submitted payload. */
+            payload: {
+                [key: string]: unknown;
+            };
+            /**
+             * Format: uuid
+             * @description The run's id.
+             */
+            run: string;
+            /** @description The bearer lease token for `Sparkles-Job-Lease`. It is returned once and never recorded. */
+            token: string;
+            version: number;
+        };
+        /** @description A typed failure of an attempt. */
+        JobFailure: {
+            expectedVersion?: number;
+            /** @constant */
+            format?: 1;
+            /** @description A diagnostic the worker has redacted. Cut to 512 characters. */
+            reason?: string;
+            /** @description The least delay before the next attempt. */
+            retryAfterMs?: number;
+            /** @description Whether another attempt may succeed. Default false, which ends the run. */
+            transient?: boolean;
+        };
+        /** @description A committed publication. */
+        JobPublication: {
+            /**
+             * Format: uuid
+             * @description The attempt that published.
+             */
+            attempt: string;
+            checkpoint?: string;
+            /** @description The commit that holds the quads, the record and the state. */
+            commit: number;
+            deleted: number;
+            /** @description The digest of the published result. */
+            digest: string;
+            /**
+             * Format: uuid
+             * @description The publication operation id.
+             */
+            id: string;
+            inserted: number;
+            /** @description Milliseconds since the epoch in UTC. */
+            publishedMs: number;
+        };
+        /** @description The typed result of a `quads` run. */
+        JobPublish: {
+            /** @description The source checkpoint that becomes visible with the quads. */
+            checkpoint?: string;
+            /** @description N-Quads lines, one quad each, in the definition's graphs. */
+            delete?: string[];
+            expectedVersion?: number;
+            /** @constant */
+            format?: 1;
+            /** @description N-Quads lines, one quad each, in the definition's graphs. */
+            insert?: string[];
+            /** @description The commit message. */
+            message?: string;
+            /**
+             * Format: uuid
+             * @description The publication operation id, chosen by the worker and kept across retries.
+             */
+            operation: string;
+        };
+        /** @description The receipt of a publication. */
+        JobPublished: {
+            commit: number;
+            deleted: number;
+            inserted: number;
+            /**
+             * Format: uuid
+             * @description The publication operation id.
+             */
+            publication: string;
+            /** @description Whether this is the original receipt of an operation completed before. */
+            replayed: boolean;
+            /**
+             * Format: uuid
+             * @description The run's id.
+             */
+            run: string;
+            version: number;
+        };
+        /** @description A lease renewal. */
+        JobRenew: {
+            /** @description Refused with `412` when the run is at another version. */
+            expectedVersion?: number;
+            /** @description The extension, at most the definition's largest. Default the lease length. */
+            extendMs?: number;
+            /** @constant */
+            format?: 1;
+        };
+        /** @description A renewed lease. */
+        JobRenewed: {
+            /** @description Milliseconds since the epoch in UTC. */
+            leaseExpiresMs: number;
+            /**
+             * Format: uuid
+             * @description The run's id.
+             */
+            run: string;
+            version: number;
+        };
+        /** @description An explicit retry of a failed or cancelled run. */
+        JobRetry: {
+            /** @constant */
+            format?: 1;
+            /** @description The new run's key. */
+            idempotencyKey: string;
+        };
+        /** @description The redacted state of a run. */
+        JobRun: {
+            attempt?: components["schemas"]["JobAttempt"];
+            attempts: number;
+            checkpoint?: string;
+            definition: string;
+            generation: number;
+            /**
+             * Format: uuid
+             * @description The run's id.
+             */
+            id: string;
+            inputs: {
+                /**
+                 * Format: uuid
+                 * @description The branch by id.
+                 */
+                branchId: string;
+                seq: number;
+            }[];
+            kind: string;
+            kindVersion: number;
+            /** @description When a `retry-wait` run may be claimed again. */
+            nextEligibleMs?: number;
+            /**
+             * Format: uuid
+             * @description The submission operation, derived from the idempotency key's scope.
+             */
+            operation: string;
+            payloadDigest: string;
+            /** @description The submitter's principal IRI. */
+            principal: string;
+            publication?: components["schemas"]["JobPublication"];
+            /** @description Why the run failed or was cancelled, redacted. */
+            reason?: string;
+            /**
+             * Format: uuid
+             * @description The terminal run this one retries.
+             */
+            retryOf?: string;
+            /** @description The definition revision the run was accepted under. */
+            revision: string;
+            /** @enum {string} */
+            state: "queued" | "leased" | "retry-wait" | "paused" | "succeeded" | "failed" | "cancelled";
+            submittedCommit: number;
+            /** @description Milliseconds since the epoch in UTC. */
+            submittedMs: number;
+            /** @description Raised by every transition, for `expectedVersion`. */
+            version: number;
+        };
+        /** @description The visible runs, newest first. */
+        JobRuns: {
+            runs: components["schemas"]["JobRun"][];
+        };
+        /** @description A run to submit. */
+        JobSubmission: {
+            /** @description The source checkpoint the run starts from. */
+            checkpoint?: string;
+            /** @description A registered definition's name. */
+            definition: string;
+            /** @constant */
+            format?: 1;
+            /** @description Scoped to the dataset, the branch, the caller and the definition revision. */
+            idempotencyKey: string;
+            /** @description Commits the run reads, pinned by a source hold until the run is terminal. */
+            inputs?: {
+                /**
+                 * Format: uuid
+                 * @description The branch by id.
+                 */
+                branchId: string;
+                seq: number;
+            }[];
+            /** @description The commit message of the submission. */
+            message?: string;
+            /** @description The typed payload the worker receives at its claim. It must hold no secret. */
+            payload?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description The durable receipt of a submission. */
+        JobSubmitted: {
+            /** @description The commit that recorded the run, or the head when the key was replayed. */
+            commit: number;
+            /** @description Whether the key was known with the same payload. */
+            replayed: boolean;
+            /**
+             * Format: uuid
+             * @description The run's id.
+             */
+            run: string;
+            /** @enum {string} */
+            state: "queued" | "leased" | "retry-wait" | "paused" | "succeeded" | "failed" | "cancelled";
+            version: number;
+        };
+        /** @description The jobs settings of a dataset, as `jobs.json` format 1 holds them. */
+        JobsSettings: {
+            /** @description The registered definitions by name. */
+            definitions?: {
+                [key: string]: {
+                    /** @description Default 8. */
+                    attempts?: number;
+                    /** @description The most runs of the definition leased at once. Default 1. */
+                    concurrency?: number;
+                    /** @description A disabled definition takes no claims. Default true. */
+                    enabled?: boolean;
+                    /** @description The named graphs a publication may change. */
+                    graphs?: string[];
+                    /**
+                     * @description The registered kind. `quads` publishes bounded insert and delete quads into the definition's graphs.
+                     * @enum {string}
+                     */
+                    kind: "quads";
+                    /** @description Default 60000. */
+                    leaseMs?: number;
+                    /** @description The largest canonical payload. Default 1 MiB. */
+                    maxInputBytes?: number;
+                    /** @description Default 300000. */
+                    maxLeaseExtensionMs?: number;
+                    /** @description The most quads one publication holds. Default 100000. */
+                    maxOutputQuads?: number;
+                    /** @description Default one day. */
+                    retryHorizonMs?: number;
+                    /** @description The principal IRIs that may submit runs. Empty admits every principal with `write`. */
+                    submitters?: string[];
+                    /** @description The kind's version. Default 1. */
+                    version?: number;
+                    /** @description The principal IRIs that may claim runs. Empty admits every principal with `write`. */
+                    workers?: string[];
+                };
+            };
+            enabled: boolean;
+            /** @constant */
+            format: 1;
+            /** @description The most runs waiting in `queued` or `retry-wait` at once. Default 1024. */
+            maxQueued?: number;
+            /** @constant */
+            profile: 1;
+        };
+        /** @description The settings and their protection. */
+        JobsSettingsStatus: {
+            digest?: string | null;
+            /** @description Whether the ledger graph is protected from ordinary writes. */
+            protected: boolean;
+            /** @description The revision of the dataset's managed-graph registry. */
+            revision: number;
+            /** @description The revision digest of each definition. */
+            revisions: {
+                [key: string]: string;
+            };
+            settings: components["schemas"]["JobsSettings"];
         };
         Justification: {
             facts: components["schemas"]["SupportFact"][];
@@ -17308,6 +17818,410 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listJobs: {
+        parameters: {
+            query?: {
+                /** @description Only runs in this state. */
+                state?: "queued" | "leased" | "retry-wait" | "paused" | "succeeded" | "failed" | "cancelled";
+                /** @description Only runs of this definition. */
+                definition?: string;
+                /** @description At most this many runs, up to 1000. Default 100. */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The visible runs. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobRuns"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    submitJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["JobSubmission"];
+            };
+        };
+        responses: {
+            /** @description The existing run of a replayed key. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobSubmitted"];
+                };
+            };
+            /** @description The durable receipt. */
+            202: {
+                headers: {
+                    /** @description The run's route. */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobSubmitted"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    claimJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["JobClaim"];
+            };
+        };
+        responses: {
+            /** @description The claimed run and its lease. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobClaimed"];
+                };
+            };
+            /** @description Nothing is eligible. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getJobsSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The settings and their protection. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobsSettingsStatus"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putJobsSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["JobsSettings"];
+            };
+        };
+        responses: {
+            /** @description The settings and their protection. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobsSettingsStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The redacted state of the run. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobRun"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    cancelJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The cancelled run. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobRun"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    failJob: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description The bearer lease token the claim returned. */
+                "Sparkles-Job-Lease": string;
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["JobFailure"];
+            };
+        };
+        responses: {
+            /** @description The run after the failure. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobRun"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    publishJob: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description The bearer lease token the claim returned. */
+                "Sparkles-Job-Lease": string;
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["JobPublish"];
+            };
+        };
+        responses: {
+            /** @description The receipt of the publication. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobPublished"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    renewJobLease: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description The bearer lease token the claim returned. */
+                "Sparkles-Job-Lease": string;
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["JobRenew"];
+            };
+        };
+        responses: {
+            /** @description The renewed lease. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobRenewed"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    retryJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["JobRetry"];
+            };
+        };
+        responses: {
+            /** @description The new run's receipt. */
+            202: {
+                headers: {
+                    /** @description The new run's route. */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobSubmitted"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
