@@ -456,7 +456,14 @@ pub type Contexts = Vec<OnceLock<Box<Ctx>>>;
 pub enum Stop {
     Cancelled,
     Timeout,
-    Memory { used: usize },
+    Memory {
+        used: usize,
+    },
+    /// Tier D derived more conclusions than its bound, which is the run's own stop and
+    /// not the caller's
+    Work {
+        used: usize,
+    },
 }
 
 /// What bounds a saturation.
@@ -486,6 +493,7 @@ const STOP_NONE: u8 = 0;
 const STOP_CANCEL: u8 = 1;
 const STOP_TIMEOUT: u8 = 2;
 const STOP_MEMORY: u8 = 3;
+const STOP_WORK: u8 = 4;
 
 /// The conclusions a worker applies between checks of the bounds.
 const CHECK_EVERY: usize = 4096;
@@ -697,6 +705,7 @@ pub fn saturate_counted(
         STOP_TIMEOUT => Some(Stop::Timeout),
         // the most counted, waiting messages included, which is what passed the limit
         STOP_MEMORY => Some(Stop::Memory { used: peak }),
+        STOP_WORK => Some(Stop::Work { used: peak }),
         _ => None,
     };
     (totals, stop)
@@ -1339,9 +1348,14 @@ impl<'a> Run<'a> {
         let grown = used.saturating_sub(before);
         if b.max_memory.is_some_and(|m| used > m)
             || b.charge.is_some_and(|f| grown > 0 && !f(grown))
-            || b.dl.is_some_and(|d| d.over_work())
         {
             self.halt(STOP_MEMORY);
+            return false;
+        }
+        // the work bound is its own reason, so that the first stop published decides
+        // whether the run falls back or answers in part
+        if b.dl.is_some_and(|d| d.over_work()) {
+            self.halt(STOP_WORK);
             return false;
         }
         if b.deadline.is_some_and(|d| Instant::now() >= d) {

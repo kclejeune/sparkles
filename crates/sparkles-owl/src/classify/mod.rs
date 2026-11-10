@@ -1641,22 +1641,33 @@ impl Saturation {
         let stopped = |stop: Stop| match stop {
             Stop::Cancelled => Error::Cancelled,
             Stop::Timeout => Error::Timeout,
-            Stop::Memory { used } => Error::Memory {
+            // the bound on derived conclusions goes back as the memory error that the
+            // fallback chain of `run_with` takes
+            Stop::Memory { used } | Stop::Work { used } => Error::Memory {
                 limit: limits.max_memory.unwrap_or(usize::MAX),
                 used,
             },
         };
         // a run that answers in part keeps the reason it stopped and goes on to the answer
         let mut halted: Option<Error> = None;
+        // whether the stop that won was Tier D's bound on derived conclusions, which the
+        // fallback chain reads in `dl_worked`: a check that saw the bound passed but lost
+        // the stop to the caller's deadline, cancellation or memory refusal does not count
+        let mut over_work = false;
         let partial = bounds.partial;
         let mut totals = match saturate::saturate_counted(&ix, &self.ctx, &roots, &[], &[], &bounds)
         {
             (t, None) => t,
             (t, Some(s)) if partial => {
+                over_work = matches!(s, Stop::Work { .. });
                 halted = Some(stopped(s));
                 t
             }
-            (_, Some(s)) => return Err(stopped(s)),
+            (_, Some(s)) => {
+                self.dl_worked
+                    .store(matches!(s, Stop::Work { .. }), Ordering::Relaxed);
+                return Err(stopped(s));
+            }
         };
         // the candidates whose tests ended without a contradiction
         let mut refuted: FxHashSet<(Ex, Ex)> = FxHashSet::default();
@@ -1690,7 +1701,7 @@ impl Saturation {
                     peak: totals.peak.max(more.peak),
                     merged: false,
                 };
-                stop.map_or(Ok(()), |s| Err(stopped(s)))
+                stop.map_or(Ok(()), Err)
             };
             loop {
                 if let Err(e) = poll(limits) {
@@ -1716,8 +1727,9 @@ impl Saturation {
                     .iter()
                     .map(|(x, bs)| dl_rules::test(d, *x, bs))
                     .collect();
-                if let Err(e) = round(&[], &ids, &mut totals) {
-                    halted = Some(e);
+                if let Err(s) = round(&[], &ids, &mut totals) {
+                    over_work = matches!(s, Stop::Work { .. });
+                    halted = Some(stopped(s));
                     break;
                 }
                 let mut seeds: Vec<Ex> = Vec::new();
@@ -1742,8 +1754,9 @@ impl Saturation {
                 }
                 seeds.sort_unstable();
                 seeds.dedup();
-                if let Err(e) = round(&seeds, &[], &mut totals) {
-                    halted = Some(e);
+                if let Err(s) = round(&seeds, &[], &mut totals) {
+                    over_work = matches!(s, Stop::Work { .. });
+                    halted = Some(stopped(s));
                     break;
                 }
             }
@@ -1753,7 +1766,8 @@ impl Saturation {
         // caller's, so it is not a partial answer: it goes back as the error that the
         // fallback chain of `run_with` takes to the run that starts again, with counting
         // or the rooted rules left out, and the caller gets that run's answer.
-        if (!partial || self.dl_worked.load(Ordering::Relaxed))
+        self.dl_worked.store(over_work, Ordering::Relaxed);
+        if (!partial || over_work)
             && let Some(h) = halted.take()
         {
             return Err(h);
@@ -2498,6 +2512,72 @@ fn poll(limits: &Limits) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    /// A check that sees Tier D's bound passed sets `dl_worked` before it publishes its
+    /// stop, and the caller's cancellation, deadline or memory refusal can win the stop
+    /// instead. The run then follows the stop that won: the partial answer the caller
+    /// asked for, and no fallback past the bound.
+    #[test]
+    fn a_caller_stop_that_wins_over_a_passed_bound_keeps_the_partial_answer() {
+        let doc = crate::ofn_read::parse(
+            "Prefix(:=<http://ex.org/>)
+             Ontology(
+             ClassAssertion(ObjectUnionOf(:B :C) :a)
+             ClassAssertion(ObjectComplementOf(:C) :a)
+             SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:a)))
+             SubClassOf(ObjectSomeValuesFrom(:r :B) :D)
+             )",
+        )
+        .unwrap();
+        for threads in [1, 4] {
+            // The cancellation holds from its n-th poll on. The polls before the
+            // saturation fail the run as cancelled, so the first n whose run answers is
+            // a cancellation the saturation saw, and the answer is partial.
+            let mut answered = false;
+            for n in 0..64 {
+                let mut k = Classifier::of(&doc.axioms);
+                // the cancellation sets the losing check's flag as it is published, as
+                // the check that saw the bound passed did before it lost the stop
+                let worked = k.sat.dl_worked.clone();
+                let polls = Arc::new(AtomicUsize::new(0));
+                let p = polls.clone();
+                let out = k.classify(&Limits {
+                    threads,
+                    rooted: true,
+                    partial: true,
+                    cancelled: Some(Arc::new(move || {
+                        if p.fetch_add(1, Ordering::Relaxed) >= n {
+                            worked.store(true, Ordering::Relaxed);
+                            true
+                        } else {
+                            false
+                        }
+                    })),
+                    ..Limits::default()
+                });
+                match out {
+                    Err(Error::Cancelled) => continue,
+                    Err(e) => panic!("{threads} threads, poll {n}: {e:?}"),
+                    Ok(out) => {
+                        assert!(
+                            !out.complete,
+                            "{threads} threads, poll {n}: the saturation was not cancelled"
+                        );
+                        assert_eq!(out.consistency, Consistency::Unknown);
+                        assert!(!out.stats.dl_rooted_over);
+                        assert!(!out.stats.dl_over_budget);
+                        assert!(!k.sat.dl_worked.load(Ordering::Relaxed));
+                        answered = true;
+                        break;
+                    }
+                }
+            }
+            assert!(
+                answered,
+                "{threads} threads: no poll reached the saturation"
+            );
+        }
+    }
+
     #[test]
     fn a_refused_charge_gives_back_the_credit_it_took() {
         // a pool with nothing left, and 100 bytes it admitted for an earlier run
