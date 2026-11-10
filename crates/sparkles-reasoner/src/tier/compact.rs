@@ -165,20 +165,20 @@ mod tests {
     }
 
     /// The buffers of a sort and of a merge hold what [`scratch_bytes`] charges for,
-    /// besides the run.
+    /// besides the run. The batches stay under [`PAR_MIN`]: the parallel path makes the
+    /// same buffers, and the probe would also count the pool's jobs the calling thread
+    /// runs while it waits, which are not the sort's.
     #[test]
     fn buffers_fit_the_charge() {
-        let ids: Vec<u32> = (0..(1 << 15)).collect();
+        let n = PAR_MIN / 2;
+        let ids: Vec<u32> = (0..n as u32).collect();
         let key = |id: u32| (id as u64 * 2_654_435_761) % 1000;
-        // the first parallel call of a thread sets up the pool's registry, which is not
-        // the sort's
-        drop(sorted(&ids, &key));
         let (run, peak) = crate::alloc_probe::peak_of(|| sorted(&ids, &key));
         assert!(
             peak <= scratch_bytes(ids.len()) + Run::bytes_for(ids.len()),
             "sort peak {peak}"
         );
-        let b = sorted(&(1 << 15..1 << 16).collect::<Vec<u32>>(), &key);
+        let b = sorted(&(n as u32..2 * n as u32).collect::<Vec<u32>>(), &key);
         let runs = [run, b];
         let total = runs[0].len() + runs[1].len();
         let (_, peak) = crate::alloc_probe::peak_of(|| merged(&runs, &key, &|_| true));
