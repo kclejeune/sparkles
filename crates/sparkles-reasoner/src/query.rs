@@ -675,7 +675,7 @@ impl Session {
     /// it, or `None` when it is not kept (see [`Session::cache_equality`]).
     fn equality_table(&self) -> Option<(Table, Held)> {
         let g = self.graph.as_ref().expect("graph made");
-        let kept = || g.derived().iter().filter(|t| !self.hidden.contains(&t[1]));
+        let kept = || g.facts().filter(|t| !self.hidden.contains(&t[1]));
         let local = |x: &u64| Id(*x).tag() == Tag::Local;
         // the facts and their local ids are counted first, and each list is made at the
         // size its charge admits, so that none of them grows
@@ -701,7 +701,7 @@ impl Session {
         let mut ids: Vec<u64> = Vec::with_capacity(locals);
         for t in kept() {
             ids.extend(t.iter().copied().filter(local));
-            facts.push(*t);
+            facts.push(t);
         }
         ids.sort_unstable();
         ids.dedup();
@@ -844,8 +844,8 @@ impl Session {
             true
         };
         if base_complete {
-            for triple in graph.derived() {
-                if !visit(*triple) {
+            for triple in graph.facts() {
+                if !visit(triple) {
                     break;
                 }
             }
@@ -909,7 +909,7 @@ impl Session {
             demand: "schema".into(),
             seeds: (0, 0),
         });
-        let schema_from = self.graph.as_ref().expect("graph made").derived().len();
+        let schema_from = self.graph.as_ref().expect("graph made").derived_len();
         let mut lower_end = schema_from;
         if let Some(t) = key.as_ref().and_then(tables::get) {
             let facts = self.remap(&t)?;
@@ -946,7 +946,7 @@ impl Session {
             // reads them (Codex review F17-P1 #3)
             self.run_lower(true, "the schema")?;
             let g = self.graph.as_mut().expect("graph made");
-            lower_end = g.derived().len();
+            lower_end = g.derived_len();
             let start = g.len();
             g.try_add_batch(seeds)
                 .map_err(|e| memory_error(e, "the schema"))?;
@@ -958,7 +958,7 @@ impl Session {
                 self.cache_schema(key, schema_from, lower_end, &closed);
             }
         }
-        let schema_to = self.graph.as_ref().expect("graph made").derived().len();
+        let schema_to = self.graph.as_ref().expect("graph made").derived_len();
         if self.exported == schema_from {
             self.exported = schema_to;
             self.schema_rows = Some((lower_end, schema_to));
@@ -1184,7 +1184,8 @@ impl Session {
         let mut facts: Vec<[u64; 3]> = Vec::new();
         let mut keys: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut seen: FxHashSet<u64> = FxHashSet::default();
-        for (i, t) in g.derived()[from..].iter().enumerate() {
+        for (i, t) in g.facts_from(from).enumerate() {
+            let t = &t;
             if self.hidden.contains(&t[1]) || !self.terms.valid(t) {
                 continue;
             }
@@ -1234,7 +1235,7 @@ impl Session {
 
     /// The derived facts not returned yet, without magic facts and facts RDF cannot state.
     fn export(&mut self, out: &mut Derived) {
-        let end = self.graph.as_ref().expect("graph made").derived().len();
+        let end = self.graph.as_ref().expect("graph made").derived_len();
         self.export_rows(self.exported, end, Rows::All, out);
         self.exported = end;
     }
@@ -1243,9 +1244,9 @@ impl Session {
     /// them.
     fn export_rows(&mut self, lo: usize, hi: usize, which: Rows, out: &mut Derived) {
         let g = self.graph.as_ref().expect("graph made");
-        let rows = g.derived();
         let mut chunk: Vec<[u64; 3]> = Vec::new();
-        for t in &rows[lo..hi] {
+        for t in g.facts_range(lo, hi) {
+            let t = &t;
             if self.hidden.contains(&t[1]) || !self.terms.valid(t) {
                 continue;
             }
@@ -1313,7 +1314,8 @@ impl Session {
         let mut by_magic: FxHashMap<u64, usize> = FxHashMap::default();
         let mut by_pred: FxHashMap<u64, usize> = FxHashMap::default();
         let mut first: FxHashMap<u64, Vec<[u64; 3]>> = FxHashMap::default();
-        for t in g.derived() {
+        for t in g.facts() {
+            let t = &t;
             if self.hidden.contains(&t[1]) {
                 *by_magic.entry(t[1]).or_default() += 1;
                 let f = first.entry(t[1]).or_default();
@@ -1590,10 +1592,12 @@ impl ReasoningSession for Session {
                 } else {
                     // a withheld fact is one that no demand of this derivation can read
                     debug_assert!(
-                        self.graph.as_ref().expect("graph made").derived()[lo..hi]
-                            .iter()
+                        self.graph
+                            .as_ref()
+                            .expect("graph made")
+                            .facts_range(lo, hi)
                             .filter(|t| self.schema_fact(t))
-                            .all(|t| misses.iter().all(|(d, _, _)| !self.matches(*d, t)))
+                            .all(|t| misses.iter().all(|(d, _, _)| !self.matches(*d, &t)))
                     );
                 }
             }

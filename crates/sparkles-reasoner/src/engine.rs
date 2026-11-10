@@ -621,9 +621,9 @@ pub(crate) fn index_needs_with(rule: &CRule, steps: &[Step], prebound: &[usize])
 pub(crate) type Sink<'s> = dyn FnMut(&[Triple], &[Triple], &[u64]) -> bool + 's;
 
 /// Where the first step of a plan reads its candidates when the work is split.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum First<'a> {
-    /// in-memory rows
+    /// derived facts
     Rows(Cands<'a>),
     /// a share of a base-tier scan
     Base(BaseRange),
@@ -1074,13 +1074,12 @@ impl<'a> Eval<'a> {
                 .is_some_and(|b| b.lookups().is_some() && b.blocks(s, p, o) > 1)
     }
 
-    /// Match the atom of step `k` against in-memory rows.
+    /// Match the atom of step `k` against derived facts.
     fn rows(&mut self, k: usize, atom: usize, b: &mut [u64], cands: Cands<'_>) {
-        for j in 0..cands.len() {
+        for row in cands.iter() {
             if self.aborted() {
                 return;
             }
-            let row = cands.get(j);
             if !self.g.alive(row) {
                 continue;
             }
@@ -1426,7 +1425,7 @@ fn shares<'g>(
         );
     }
     let cands = g.cands(s, p, o, lo, hi);
-    if cands.len() > 0 {
+    if !cands.is_empty() {
         out.extend(
             cands
                 .chunks(CHUNK)
@@ -1491,7 +1490,7 @@ fn split_at<'g>(
             );
             ev.collect_at = Some((d, MAX_SPLIT_BINDINGS));
             let mut b = vec![0u64; r.nvars];
-            ev.run(0, &mut b, *f);
+            ev.run(0, &mut b, f.clone());
             if let Some(e) = ev.err.take() {
                 return Err(e);
             }
@@ -2026,13 +2025,13 @@ pub(crate) fn run_observed(
                     ev.delta_since = Some(ds);
                 }
                 if item.b.is_empty() {
-                    ev.run(item.k, &mut vec![0u64; r.nvars], item.first);
+                    ev.run(item.k, &mut vec![0u64; r.nvars], item.first.clone());
                 }
                 for b in &item.b {
                     if ev.err.is_some() || abort.load(Ordering::Relaxed) {
                         break;
                     }
-                    ev.run(item.k, &mut b.clone(), item.first);
+                    ev.run(item.k, &mut b.clone(), item.first.clone());
                 }
                 let total = produced.fetch_add(ev.out.len(), Ordering::Relaxed) + ev.out.len();
                 if total > max_out || ev.err.is_some() {
@@ -2119,7 +2118,8 @@ pub(crate) fn run_observed(
         } else {
             String::new()
         };
-        // ---- merge
+        // ---- merge: the work items borrow the graph, and the merge changes it
+        drop(work);
         let eval_ms = t_iter.elapsed().as_millis() as u64;
         let t_merge = std::time::Instant::now();
         let before = g.len();
@@ -2185,6 +2185,12 @@ pub(crate) fn run_observed(
         ds = de;
         de = g.len();
     }
+    tracing::debug!(
+        derived = g.len() - base_len,
+        tier_bytes = g.heap_bytes(),
+        peak_bytes = limits.budget.peak(),
+        "derived tier"
+    );
     Ok(Outcome {
         iterations: iteration,
     })

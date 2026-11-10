@@ -531,9 +531,8 @@ impl Op {
                     }
                 }
                 let c = g.cands(None, Some(gp), Some(go), g.offset(), now);
-                for i in 0..c.len() {
+                for r in c.iter() {
                     poll.tick(1)?;
-                    let r = c.get(i);
                     if g.alive(r) {
                         let t = g.triple(r);
                         if t[1] == gp && t[2] == go {
@@ -760,9 +759,8 @@ impl Local {
             }
         }
         let c = g.cands(None, Some(q), None, g.offset(), now);
-        for i in 0..c.len() {
+        for r in c.iter() {
             poll.tick(1)?;
-            let r = c.get(i);
             if !g.alive(r) {
                 continue;
             }
@@ -793,9 +791,8 @@ impl Local {
         let per = if shape == Shape::Equivalence { 2 } else { 1 };
         search.try_grow(c.len() * per * size_of::<u64>())?;
         let mut seeds: Vec<u64> = Vec::with_capacity(c.len() * per);
-        for i in 0..c.len() {
+        for r in c.iter() {
             poll.tick(1)?;
-            let r = c.get(i);
             if g.alive(r) {
                 let t = g.triple(r);
                 if t[1] == q {
