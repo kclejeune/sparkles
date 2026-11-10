@@ -28,7 +28,7 @@
 //! successor term.
 
 use super::dl_clause::{Lit, Lits, Made, RTerm, Rooted, XLit, rank, terms_of};
-use super::dl_rules::{DlIx, Found, Side, dl, merge, restricted, side, unit, with};
+use super::dl_rules::{DlIx, Found, Side, dl, local, merge, no_xy, restricted, side, unit, with};
 use super::index::{Ex, Index, Role, TOP};
 use super::saturate::State;
 use std::sync::OnceLock;
@@ -154,23 +154,24 @@ impl Eqs<'_> {
         }
     }
 
-    /// The premises whose maximal literals mention `t`, each with its literal: the stored
-    /// clauses, and the units in place of a context other than the root.
-    fn targets(&self, st: &State, t: RTerm, out: &mut Vec<(Side, XLit)>) {
+    /// The premises whose maximal literals mention `t`, each with its literal and whether
+    /// its clause is selected: the stored clauses, and the units in place of a context
+    /// other than the root.
+    fn targets(&self, st: &State, t: RTerm, out: &mut Vec<(Side, XLit, bool)>) {
         out.clear();
         if !self.root {
             match t {
                 RTerm::X => {
                     for &a in &st.subs {
                         if a != TOP {
-                            out.push((unit(), XLit::Atom(a, RTerm::X)));
+                            out.push((unit(), XLit::Atom(a, RTerm::X), false));
                         }
                     }
                 }
                 RTerm::Fx(e) => {
                     let mut us = Vec::new();
                     unit_lits(self, st, e, &mut us);
-                    out.extend(us.into_iter().map(|l| (unit(), l)));
+                    out.extend(us.into_iter().map(|l| (unit(), l, false)));
                 }
                 _ => {}
             }
@@ -185,15 +186,17 @@ impl Eqs<'_> {
                 continue;
             }
             for &l in d.store.maxima(i) {
-                out.push((side(&s.c, l), self.view(l)));
+                out.push((side(&s.c, l), self.view(l), s.sel));
             }
         }
     }
 
     /// The rules on a new premise `prem` whose maximal literal is `l`: as an equality it
     /// rewrites the premises that mention its side and factors with its own head, and as
-    /// any literal it is rewritten by the stored equalities of its terms.
-    pub fn on_max(&self, st: &State, l: Lit, prem: &Side, found: &mut Found) {
+    /// any literal it is rewritten by the stored equalities of its terms. A selected
+    /// premise, `sel`, takes only the inferences local to its context, those on a literal
+    /// that [`super::dl_rules::local`] admits, and so does a selected stored premise.
+    pub fn on_max(&self, st: &State, l: Lit, prem: &Side, found: &mut Found, sel: bool) {
         let v = self.view(l);
         let mut made = Vec::new();
         let mut ts = Vec::new();
@@ -203,13 +206,18 @@ impl Eqs<'_> {
                     continue;
                 }
                 // Factor has no exclusions of x ≈ y and y ≈ u, which only Eq has
-                self.factor(prem, l, s1, t1, found);
+                if !sel || local(v) {
+                    self.factor(prem, l, s1, t1, found);
+                }
                 if !Eqs::orients(s1, t1) {
                     continue;
                 }
                 self.targets(st, s1, &mut ts);
-                for (c2, v2) in &ts {
+                for (c2, v2, sel2) in &ts {
                     if *v2 == v && c2 == prem || !self.admits(s1, t1, *v2, c2) {
+                        continue;
+                    }
+                    if (sel || *sel2) && !(local(v) || local(*v2)) {
                         continue;
                     }
                     made.clear();
@@ -218,17 +226,17 @@ impl Eqs<'_> {
                 }
             }
         }
-        self.into(st, v, prem, found);
+        self.into(st, v, prem, found, sel);
     }
 
     /// A new premise in place `prem` of `v`, a unit of a context other than the root: the
     /// stored equalities of its terms rewrite it.
     pub fn on_unit(&self, st: &State, v: XLit, found: &mut Found) {
-        self.into(st, v, &unit(), found);
+        self.into(st, v, &unit(), found, false);
     }
 
     /// The stored equalities whose side is a term of `v` rewrite `prem`'s `v`.
-    fn into(&self, st: &State, v: XLit, prem: &Side, found: &mut Found) {
+    fn into(&self, st: &State, v: XLit, prem: &Side, found: &mut Found, sel: bool) {
         let Some(d) = dl(st) else { return };
         let Some(by) = d.store.terms.as_deref() else {
             return;
@@ -260,6 +268,9 @@ impl Eqs<'_> {
                             continue;
                         }
                         if !self.admits(s1, t1, v, prem) {
+                            continue;
+                        }
+                        if (sel || s.sel) && !(local(v) || local(self.view(e))) {
                             continue;
                         }
                         let c1 = side(&s.c, e);
@@ -324,15 +335,6 @@ impl Eqs<'_> {
             }
         }
     }
-}
-
-/// Whether a literal holds neither x nor y, so that its terms are constants and successor
-/// terms of constants.
-fn no_xy(v: XLit) -> bool {
-    let (ts, n) = terms_of(v);
-    ts[..n]
-        .iter()
-        .all(|t| matches!(t, RTerm::C(_) | RTerm::Fc(..)))
 }
 
 /// The literals over `f_e(x)` that a unit existential restriction e holds, its role and its

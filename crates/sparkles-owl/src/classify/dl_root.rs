@@ -181,7 +181,7 @@ pub fn init<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
     let mut found = Found::default();
     for &(u, n) in &dix(ix).consts {
         found.push((Vec::new(), vec![atom(ix, out, n, u)]));
-        hyper_at(ix, st, out, TOP, u, &unit(), &mut found);
+        hyper_at(ix, st, out, TOP, u, &unit(), &mut found, false);
     }
     drain_with(ix, st, found, out, derive);
 }
@@ -274,13 +274,13 @@ fn process<S: Sink>(ix: &Index, st: &mut State, c: &Clause, max: &[Lit], out: &m
             root: true,
             query: None,
         };
-        q.on_max(st, l, &prem, &mut found);
-        join_head(ix, st, c, l, &prem, &mut found, &out.dl().lits);
+        q.on_max(st, l, &prem, &mut found, false);
+        join_head(ix, st, c, l, &prem, &mut found, &out.dl().lits, false);
         let v = out.dl().lits.view(l, inv_of(ix, dx));
         if ground_trigger(v) {
             ground_out(ix, st, l, out);
         }
-        at_consts(ix, me, st, l, v, &prem, &mut found, out);
+        at_consts(ix, me, st, l, v, &prem, &mut found, out, false);
     }
     drain_with(ix, st, found, out, derive);
 }
@@ -300,6 +300,7 @@ fn at_consts<S: Sink>(
     prem: &Side,
     found: &mut Found,
     out: &mut S,
+    sel: bool,
 ) {
     let dx = dix(ix);
     let (ts, n) = terms_of(v);
@@ -322,17 +323,18 @@ fn at_consts<S: Sink>(
         }
     }
     match v {
-        XLit::Atom(d, RTerm::C(u)) => hyper_at(ix, st, out, d, u, prem, found),
+        XLit::Atom(d, RTerm::C(u)) => hyper_at(ix, st, out, d, u, prem, found, sel),
         v @ XLit::Role(..) => {
             for (u, s, t) in from(v, inv_of(ix, dx)) {
-                on_role(ix, st, out, s, u, t, prem, found);
+                on_role(ix, st, out, s, u, t, prem, found, sel);
             }
         }
         _ => {}
     }
 }
 
-/// The premises in the root whose maximal literal is `l`.
+/// The premises of a ground inference whose maximal literal is `l`, the selected clauses
+/// and the markers left out.
 fn partners(st: &State, l: Lit) -> Vec<Side> {
     let Some(d) = dl(st) else {
         return Vec::new();
@@ -342,7 +344,10 @@ fn partners(st: &State, l: Lit) -> Vec<Side> {
         .get(&l)
         .into_iter()
         .flatten()
-        .filter(|&&i| !d.store.clauses[i as usize].dead)
+        .filter(|&&i| {
+            let s = &d.store.clauses[i as usize];
+            !s.dead && !s.sel
+        })
         .map(|&i| side(&d.store.clauses[i as usize].c, l))
         .collect()
 }
@@ -365,7 +370,10 @@ fn put<S: Sink>(ix: &Index, out: &S, found: &mut Found, s: Side) {
 }
 
 /// Hyper on a new premise `prem` of `d(u)`: the ontology clauses with d in the body, with
-/// their x bound to u. A conclusion is a ground inference's unless it holds x or y.
+/// their x bound to u. A conclusion is a ground inference's unless it holds x or y. A
+/// selected premise, a marker included, takes only the universals over the role atoms
+/// from u that are local to the context ([`super::dl_rules::local`]).
+#[allow(clippy::too_many_arguments)]
 fn hyper_at<S: Sink>(
     ix: &Index,
     st: &State,
@@ -374,8 +382,13 @@ fn hyper_at<S: Sink>(
     u: u32,
     prem: &Side,
     found: &mut Found,
+    sel: bool,
 ) {
     let dx = dix(ix);
+    if sel {
+        hyper_roles(ix, st, out, d, u, prem, found, sel);
+        return;
+    }
     let at = |a: Ex| atom(ix, out, a, u);
     let h = ix.head(d);
     match h.node {
@@ -443,7 +456,24 @@ fn hyper_at<S: Sink>(
             found.ground_products(lists, base);
         }
     }
-    // the universals d stands for, over the role atoms from u
+    hyper_roles(ix, st, out, d, u, prem, found, sel);
+}
+
+/// The universals `d(u)` stands for, over the role atoms from u in the context. A role atom
+/// whose other end is a constant or a successor term of one makes a ground inference, which
+/// takes no selected premise, and any other is local and takes every premise.
+#[allow(clippy::too_many_arguments)]
+fn hyper_roles<S: Sink>(
+    ix: &Index,
+    st: &State,
+    out: &S,
+    d: Ex,
+    u: u32,
+    prem: &Side,
+    found: &mut Found,
+    sel: bool,
+) {
+    let dx = dix(ix);
     let mut ps = Vec::new();
     alls(ix, d, &mut ps);
     if ps.is_empty() {
@@ -460,6 +490,9 @@ fn hyper_at<S: Sink>(
         for &l in x.store.maxima(i) {
             for (w, t, f) in from(out.dl().lits.view(l, inv), inv) {
                 if w != u {
+                    continue;
+                }
+                if matches!(f, RTerm::C(_) | RTerm::Fc(..)) && (sel || s.sel) {
                     continue;
                 }
                 for &(a, b) in &ps {
@@ -493,7 +526,8 @@ fn from(v: XLit, inv: impl Fn(Role) -> Option<Role>) -> Vec<(u32, Role, RTerm)> 
 
 /// Hyper on a new premise `prem` of the role atom `s(u, f)`: the universals of the holders
 /// of u, `owl:Thing` included, and the disjoint roles. The inference is ground when f is a
-/// constant or a successor term of one, and the restriction then applies.
+/// constant or a successor term of one, and the restriction then applies and no selected
+/// premise takes part; otherwise it is local and every premise takes part.
 #[allow(clippy::too_many_arguments)]
 fn on_role<S: Sink>(
     ix: &Index,
@@ -504,10 +538,14 @@ fn on_role<S: Sink>(
     f: RTerm,
     prem: &Side,
     found: &mut Found,
+    sel: bool,
 ) {
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
     let ground = matches!(f, RTerm::C(_) | RTerm::Fc(..));
+    if ground && sel {
+        return;
+    }
     let add = |found: &mut Found, c: Side| {
         if !ground || !restricted(&out.dl().lits, inv, &c) {
             found.push(c);
@@ -529,7 +567,7 @@ fn on_role<S: Sink>(
     if let Some(r) = x.root.as_deref() {
         for &i in r.by_const.get(&u).into_iter().flatten() {
             let c = &x.store.clauses[i as usize];
-            if c.dead {
+            if c.dead || ground && c.sel {
                 continue;
             }
             for &l in x.store.maxima(i) {
@@ -546,7 +584,7 @@ fn on_role<S: Sink>(
             }
             for &i in r.roles_of.get(&u).into_iter().flatten() {
                 let c = &x.store.clauses[i as usize];
-                if c.dead {
+                if c.dead || ground && c.sel {
                     continue;
                 }
                 for &l in x.store.maxima(i) {
@@ -608,9 +646,12 @@ fn is_marker(c: &Clause) -> bool {
 
 /// Join on a new premise `prem` of the clause `c`, whose maximal literal is `l`: when l is a
 /// ground atom or an equality of constants, the processed clauses with l in the body. A
-/// marker is no premise on either side, since its conclusion would be the other premise.
-/// A Join of two clauses that hold neither x nor y is a ground inference, and its
-/// conclusion then holds neither, so the restriction applies to the conclusion.
+/// marker is no premise on either side, since its conclusion would be the other premise,
+/// and a selected clause is no premise on the side of the head, as ordered resolution
+/// with selection has it. A Join of two clauses that hold neither x nor y is a ground
+/// inference, and its conclusion then holds neither, so the restriction applies to the
+/// conclusion.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn join_head(
     ix: &Index,
     st: &State,
@@ -619,8 +660,9 @@ pub(super) fn join_head(
     prem: &Side,
     found: &mut Found,
     lits: &super::dl_clause::Lits,
+    sel: bool,
 ) {
-    if is_marker(c) {
+    if is_marker(c) || sel {
         return;
     }
     let inv = inv_of(ix, dix(ix));
@@ -665,7 +707,7 @@ pub(super) fn join_body(
         let Some(x) = dl(st) else { return };
         for &i in x.store.by_xl.get(&l).into_iter().flatten() {
             let s = &x.store.clauses[i as usize];
-            if !s.dead && !is_marker(&s.c) {
+            if !s.dead && !s.sel && !is_marker(&s.c) {
                 let c = merge(&side(&s.c, l), &rest);
                 if !restricted(lits, inv, &c) {
                     found.push(c);
@@ -700,6 +742,7 @@ pub(super) fn on_max<S: Sink>(
     prem: &Side,
     found: &mut Found,
     out: &mut S,
+    sel: bool,
 ) {
     let dx = dix(ix);
     let v = out.dl().lits.view(l, inv_of(ix, dx));
@@ -711,8 +754,8 @@ pub(super) fn on_max<S: Sink>(
     if ground_trigger(v) {
         ground_out(ix, st, l, out);
     }
-    join_head(ix, st, c, l, prem, found, &out.dl().lits);
-    at_consts(ix, me, st, l, v, prem, found, out);
+    join_head(ix, st, c, l, prem, found, &out.dl().lits, sel);
+    at_consts(ix, me, st, l, v, prem, found, out, sel);
 }
 
 /// A context other than the root takes a clause the root sent, a processed root clause with

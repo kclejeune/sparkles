@@ -818,6 +818,10 @@ pub struct Stored {
     pub sent: Option<u32>,
     /// its maximal literal once processed, when it has one
     pub max: Option<Lit>,
+    /// in a context other than the root of a rooted run, the processed clause has a
+    /// ground literal in its body and is selected: it takes part only in the local
+    /// inferences, Join on that literal, Pred and Succ ([`super::dl_rules::selected`])
+    pub sel: bool,
 }
 
 /// A context's clause store, with the indexes the rules read.
@@ -977,6 +981,7 @@ impl Store {
             done: false,
             sent: None,
             max: None,
+            sel: false,
         });
         self.bytes += bytes;
         Some(bytes)

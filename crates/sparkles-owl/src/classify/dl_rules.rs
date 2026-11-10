@@ -631,6 +631,7 @@ fn partners_x(st: &State, a: Ex) -> Vec<Side> {
     };
     d.store
         .with_x(a)
+        .filter(|&i| !d.store.clauses[i as usize].sel)
         .map(|i| side(&d.store.clauses[i as usize].c, Lit::x(a)))
         .collect()
 }
@@ -750,17 +751,58 @@ pub fn ground_restrict() -> bool {
 /// has a body and holds neither x nor y, so that every literal is over constants and
 /// successor terms `f_e(u)` of constants.
 pub(super) fn restricted(lits: &Lits, inv: impl Fn(Role) -> Option<Role> + Copy, s: &Side) -> bool {
-    use super::dl_clause::terms_of;
     ground_restrict()
         && !s.0.is_empty()
-        && s.0.iter().chain(&s.1).all(|&l| {
-            l.kind() == XL && {
-                let (ts, n) = terms_of(lits.view(l, inv));
-                ts[..n]
-                    .iter()
-                    .all(|t| matches!(t, RTerm::C(_) | RTerm::Fc(..)))
-            }
-        })
+        && s.0
+            .iter()
+            .chain(&s.1)
+            .all(|&l| l.kind() == XL && no_xy(lits.view(l, inv)))
+}
+
+/// Whether a literal holds neither x nor y, so that its terms are constants and successor
+/// terms of constants.
+pub(super) fn no_xy(v: super::dl_clause::XLit) -> bool {
+    use super::dl_clause::terms_of;
+    let (ts, n) = terms_of(v);
+    ts[..n]
+        .iter()
+        .all(|t| matches!(t, RTerm::C(_) | RTerm::Fc(..)))
+}
+
+/// Whether a context other than the root selects the ground literals in its bodies, item
+/// 804's selection (F24). `SPARKLES_ROOTED_SELECT_GROUND=0` turns it off, for measurement.
+pub fn select_ground() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_SELECT_GROUND").is_none_or(|v| v != "0"))
+}
+
+/// Whether a clause of a context other than the root is selected: its body holds a literal
+/// that holds neither x nor y, a ground marker among them. A selected clause, a marker
+/// included, is a premise only of a local inference ([`local`]), of Join on its ground
+/// body literal, of Pred and of Succ. The predecessor receives the clause by Pred,
+/// discharges its ground body with its actual clauses and sends the hypotheses and markers
+/// that let the context go on, so that the context never combines the markers of its
+/// predecessors in one body.
+pub(super) fn selected(lits: &Lits, inv: impl Fn(Role) -> Option<Role> + Copy, c: &Clause) -> bool {
+    select_ground()
+        && c.body()
+            .iter()
+            .any(|&l| l.kind() == XL && no_xy(lits.view(l, inv)))
+}
+
+/// Whether an inference on the literal `v` is local to its context, so that a selected
+/// clause and a marker may be its premises: the literal holds a successor term of the
+/// context, or it is a role atom between x or y and a constant or a successor term of a
+/// constant. No predecessor sees such a literal, so no other context can make the
+/// inference for it.
+pub(super) fn local(v: super::dl_clause::XLit) -> bool {
+    use super::dl_clause::{XLit, terms_of};
+    let (ts, n) = terms_of(v);
+    let ts = &ts[..n];
+    ts.iter().any(|t| matches!(t, RTerm::Fx(_)))
+        || matches!(v, XLit::Role(..))
+            && ts.iter().any(|t| matches!(t, RTerm::X | RTerm::Y))
+            && ts.iter().any(|t| matches!(t, RTerm::C(_) | RTerm::Fc(..)))
 }
 
 /// What the rules on one clause or unit give: single conclusions, and choices of one
@@ -1229,7 +1271,9 @@ fn univ_over(ix: &Index, st: &State, f: Ex, r: Role, prem: &Side, found: &mut Fo
         alls(ix, b, &mut ps);
         for &(t, c) in &ps {
             if roles.sub(r, t) {
-                for p in partners_x(st, b) {
+                // the inference is local to the context, so a selected holder takes part
+                for i in d.store.with_x(b) {
+                    let p = side(&d.store.clauses[i as usize].c, Lit::x(b));
                     found.push(with(&merge(prem, &p), Lit::f(f, c)));
                 }
             }
@@ -1623,9 +1667,20 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
 /// The rules of a rooted run on a new premise `prem` whose maximal literal is `l` in a
 /// context other than the root: `N_u(x) → x ≈ u`, the differing successor terms of a
 /// minimum's holder, and the equality rules.
-fn rooted_max(ix: &Index, me: Ex, st: &State, l: Lit, prem: &Side, found: &mut Found, lits: &Lits) {
+#[allow(clippy::too_many_arguments)]
+fn rooted_max(
+    ix: &Index,
+    me: Ex,
+    st: &State,
+    l: Lit,
+    prem: &Side,
+    found: &mut Found,
+    lits: &Lits,
+    sel: bool,
+    sel_x: bool,
+) {
     let dx = dix(ix);
-    if l.kind() == X {
+    if l.kind() == X && !sel_x {
         rooted_hyper(ix, l.atom(), prem, found, lits);
     }
     let q = super::dl_eq::Eqs {
@@ -1635,7 +1690,7 @@ fn rooted_max(ix: &Index, me: Ex, st: &State, l: Lit, prem: &Side, found: &mut F
         root: false,
         query: query_of(ix, me),
     };
-    q.on_max(st, l, prem, found);
+    q.on_max(st, l, prem, found, sel);
 }
 
 /// The named class whose context `me` is, which is a query context of the journal with that
@@ -2129,6 +2184,9 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
         }
         if dx.root.is_some() {
             super::dl_root::index_consts(ix, x, &max, id, out);
+            let inv = |r: Role| dx.inv(ix, r);
+            let s = &mut x.store.clauses[id as usize];
+            s.sel = selected(&out.dl().lits, inv, &s.c);
         }
         n += 1;
         let c = x.store.clauses[id as usize].c.clone();
@@ -2160,11 +2218,12 @@ fn process<S: Sink>(
         super::dl_root::join_body(ix, st, c, &mut found, &out.dl().lits);
         super::dl_root::register_body(ix, me, st, c, out);
     }
-    if if rooted {
+    let ready = if rooted {
         pred_ready(ix, dx, &out.dl().lits, c)
     } else {
         max.is_empty()
-    } {
+    };
+    if ready {
         // Pred: the clause goes to the predecessors whose role meets its role atoms
         let x = ds(st);
         let Some(cid) = pred_id(x, id, out) else {
@@ -2195,14 +2254,32 @@ fn process<S: Sink>(
             return;
         }
     }
+    // a selected clause takes only the local inferences, Join, Pred and Succ, except that
+    // one Pred cannot carry, whose head holds an atom over x, takes the Hyper over x too,
+    // since no predecessor sees it (its partners are still the unselected clauses)
+    let sel = rooted && dl(st).is_some_and(|x| x.store.clauses[id as usize].sel);
+    let sel_x = sel && ready;
     let mut ps: Vec<(Role, Ex)> = Vec::new();
     let mut es: Vec<Ex> = Vec::new();
     for &l in max {
         let prem = side(c, l);
         if dx.root.is_some() {
-            rooted_max(ix, me, st, l, &prem, &mut found, &out.dl().lits);
+            rooted_max(ix, me, st, l, &prem, &mut found, &out.dl().lits, sel, sel_x);
         }
         match l.kind() {
+            X if sel_x => {
+                // the universals d stands for over the successors, the one inference over
+                // x whose conclusion no predecessor can make
+                let d = l.atom();
+                alls(ix, d, &mut ps);
+                for &(t, x) in &ps {
+                    for (e, qs) in partners_rf(ix, st, t) {
+                        for q in qs {
+                            found.push(with(&merge(&prem, &q), Lit::f(e, x)));
+                        }
+                    }
+                }
+            }
             X => {
                 let d = l.atom();
                 let h = ix.head(d);
@@ -2317,7 +2394,7 @@ fn process<S: Sink>(
                     }
                 }
             }
-            XL if rooted => super::dl_root::on_max(ix, me, st, c, l, &prem, &mut found, out),
+            XL if rooted => super::dl_root::on_max(ix, me, st, c, l, &prem, &mut found, out, sel),
             _ => {}
         }
     }
