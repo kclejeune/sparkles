@@ -33,7 +33,9 @@ request or on every write, and the schema report counts what the data holds.
 * Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
   and `owl:sameAs` with closure operators instead of joins. An operator condenses the
   relation's strongly connected components and works out each component's reachable
-  set once, and `owl:sameAs` closes its classes with union-find. OWL2Bench with 5
+  set once, and `owl:sameAs` closes its classes with union-find. An operator merges its
+  pairs into the derived facts in batches of four million, so a closure larger than the
+  facts derived so far does not wait in memory beside them. OWL2Bench with 5
   universities materializes under OWL 2 RL in 44 s at 9.5 GiB of RSS, and with 2 in 5 s
   instead of 53 s ([results](../benchmarks/reasoning/RESULTS.md#owl2bench)). The rules stay in the
   program, so explanations and incremental maintenance still name them, and a run

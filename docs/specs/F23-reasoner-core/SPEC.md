@@ -166,22 +166,53 @@ sorted by id within a run and the runs' id intervals ascend, and an id range asc
 facts an iteration derives therefore get the ids the previous tier gave them, and a
 derived list link keeps its earliest value.
 
-On wally, a 20-thread development host with 32 GiB that other work shared during the
-runs, `sparkles infer --full` under `owl-rl` on OWL2Bench with 5 universities derived
-52,966,139 facts in six iterations with both builds. The tier held them in 1,925 MB at
-the end, 36 bytes per derived fact with the triple index and the cache of base facts,
-against about 135 bytes before, and RDFox reports 40 to 60. The peak of the run did not
-fall with it. The budget's peak was 10.3 GB, 195 bytes per derived fact, and the peak
-resident set was 8.4 to 9.5 GiB against 9.7 to 10.5 GiB for the build before, 7 to 13
-percent less. The peak lies in the first iteration, where the closure operators derive
-52.4 million facts in one step and the run holds their outputs, the operators' sets and
-the merge's buffers beside the tier at once, so the tier is not where the memory of
-OWL2Bench(5) goes, which answers item 522's question, and item 522 now covers the
-operators' step. The gate of half the peak heap per derived fact is therefore not met by
-the tier alone. At one thread the tier build took 96 and 158 s against 108 and 126 s,
-and at 20 threads 45 and 131 s against 44 and 49 s, on a host whose load average passed
-60 during the later rounds, so the timings decide nothing and the comparison is rerun on
-a quiet host after the push.
+On wally, a 20-thread development host with 32 GiB, `sparkles infer --full` under
+`owl-rl` on OWL2Bench with 5 universities derived 52,966,139 facts in six iterations with
+both builds. The tier held them in 2,137 MB at the end, 40 bytes per derived fact with
+the triple index and the cache of base facts, against about 135 bytes before, and RDFox
+reports 40 to 60. The peak of the run did not fall with it. The budget's peak was
+10.5 GB, 199 bytes per derived fact, and the peak resident set was 8.7 to 9.5 GiB against
+9.0 to 10.0 GiB for the build before. The peak lies in the first iteration, where the
+closure operators derive 52.4 million facts in one step: the step held 1.6 GB before the
+merge of its outputs and the merge's buffers and probes of the base tier took the run to
+its peak, so the tier is not where the memory of OWL2Bench(5) goes, which answers item
+522's question. Roadmap item 865, below, bounds that step. On the quiet host the tier
+build took 89 and 84 s at one thread against 77 and 70 s, and 41.0 and 42.0 s at 20
+threads against 41.1 and 36.9 s. Its one-thread cost lies in the second iteration's
+evaluation, 31.2 s against 24.4 s, and in the operators' step of the first, 18.2 s
+against 13.2 s, which sorts the step's 52 million facts into the orders.
+
+The closure operators merge their pairs into the tier in batches of four million (item
+865). A batch enters the columns and the triple index as soon as it is full, so the next
+batch is deduplicated against it, and a predicate's new facts are sorted into its orders
+once when its closure is done, as one merge of the whole closure sorted them, so each
+order still gets one run per closure and every fact keeps the id one merge would have
+given it. The sink holds the graph while a predicate's closure runs, so no probe can read
+the facts before they are indexed, and the probe roots assert that in debug builds. The
+columns double when a merge does not fit them, since a closure now arrives in many
+merges. On OWL2Bench(5) the budget's peak fell from 10.5 GB to 4.2 GB, 80 bytes per
+derived fact against 199, under the gate of half. The peak is now the sort of the
+step's 52.4 million facts into the two orders at the end of the closure, 1.3 GB of keyed
+entries and the two runs over the tier's 2.5 GB, and the intermediate peaks are the
+doublings of the columns while a batch is merged. The tier ends at 2,467 MB, 47 bytes per
+fact, since the columns hold the capacity of their last doubling. The peak resident set
+of the whole `infer` command did not fall, 9.6 to 10.9 GiB against 9.4 to 10.0 GiB for
+the build before, because the command commits the 53 million derived triples to the
+store after reasoning, and a profile of the command finds that commit, which sorts the
+quads on every thread, in most of its samples in both builds.
+
+The tier is slower at one thread on OWL2Bench(5): 88.6 and 84.5 s against 70.3 and 67.1 s
+with the batches, and 41.3 and 38.4 s against 38.3 and 34.3 s at 20 threads, on a quiet
+wally. A profile of the reasoning thread and the per-rule times place the cost in three
+places. A hit in the triple index compares the candidate's subject, object and predicate
+through three columns, three dependent cache misses where the row of 24 bytes it replaces
+cost one, and the rules that rederive facts the tier holds, `prp-symp` at 14.8 s against
+8.5 s and `prp-key-1` at 15.7 against 14.9 s in the second iteration, pay it through
+`Graph::position`, 10.9 percent of the run's samples against 7.0. The sort of a merge's
+ids by key into each order costs 5.9 s against 1.9 s for the hash lists it replaces in
+the first iteration's fill, and the compaction of the orders at the third iteration's
+merge 1.3 s against 0.1 s. Item 866 takes these up, with interleaved subject and object
+columns, so that a hit costs two misses, as the first candidate.
 
 ### Closure operators
 
