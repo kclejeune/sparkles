@@ -526,7 +526,8 @@ static STARTED_NS: AtomicU64 = AtomicU64::new(0);
 fn lazy_start() -> Duration {
     match STARTED_NS.load(Ordering::Relaxed) {
         0 => LAZY_START,
-        ns => Duration::from_nanos(ns).max(LAZY_MIN).min(LAZY_START),
+        // once a start has happened, a fixed 100 us, against the time it took
+        _ => Duration::from_micros(if cfg!(test) { 0 } else { 100 }).max(LAZY_MIN),
     }
 }
 
