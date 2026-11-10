@@ -1186,8 +1186,18 @@ pub fn normalize(
     }
     let mut role_subs: Vec<(Role, Role)> = ax.role_subs.clone();
     role_subs.extend(roles.role_subs.iter().copied());
-    // the universal role is its own inverse
-    if let Some(t) = it.role_id(&RoleName::Object(ObjectProperty::top())) {
+    // the universal role is its own inverse, also when a class expression here is the
+    // first to name it, since the role box is built before the class axioms
+    let names_top = it
+        .role_id(&RoleName::Object(ObjectProperty::top()))
+        .is_some()
+        || axioms.iter().any(|k| {
+            Axiom::from((*k).clone()).signature().iter().any(|e| {
+                matches!(e, Entity::ObjectProperty(p) if p.as_str() == vocab::OWL_TOP_OBJECT_PROPERTY)
+            })
+        });
+    if names_top {
+        let t = it.role(RoleName::Object(ObjectProperty::top()));
         let ti = it.role(RoleName::Inverse(ObjectProperty::top()));
         role_subs.push((t, ti));
         role_subs.push((ti, t));

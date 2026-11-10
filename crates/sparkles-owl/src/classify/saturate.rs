@@ -1853,7 +1853,7 @@ fn apply_rules<S: Sink, R: Rules>(
             }
             true
         }
-        Concl::Nom(k) if R::FULL => apply_nom(me, st, k, out),
+        Concl::Nom(k) if R::FULL => apply_nom(ix, me, st, k, out),
         Concl::Real if R::FULL => apply_real(ix, me, st, out),
         Concl::LinkTo(r, n) if R::FULL => apply_link_to(me, st, r, n, out),
         Concl::Nom(_) | Concl::Real | Concl::LinkTo(..) => {
@@ -1912,7 +1912,7 @@ fn apply_rules<S: Sink, R: Rules>(
 /// A context registers as one that stands for its individual.
 #[cold]
 #[inline(never)]
-fn apply_nom<S: Sink>(me: Ex, st: &mut State, k: Ex, out: &mut S) -> bool {
+fn apply_nom<S: Sink>(ix: &Index, me: Ex, st: &mut State, k: Ex, out: &mut S) -> bool {
     if k == me || !st.extra().members.insert(k) {
         return false;
     }
@@ -1921,6 +1921,11 @@ fn apply_nom<S: Sink>(me: Ex, st: &mut State, k: Ex, out: &mut S) -> bool {
     } else {
         for &s in &st.subs {
             out.send(k, Concl::Sub(s));
+        }
+        // a run with the Horn rules gives the member the loops and Horn successors
+        // too (roadmap item 692)
+        if ix.horn.is_some() {
+            horn_rules::send_own(st, k, out);
         }
     }
     true

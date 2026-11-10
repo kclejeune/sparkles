@@ -535,8 +535,8 @@ OWL 2 EL out as ELK does and gives ELK's taxonomy. An ontology with individuals,
 functional data properties or top properties runs them beside the EL rules of
 individuals, as the section
 [The Horn rules with individuals](#the-horn-rules-with-individuals) describes (item
-692). Axioms that are not Horn, property hierarchies
-that are not regular, automata of more than 65,536 states and data restrictions outside
+692). Axioms that are not Horn stay left out and reported, and so do property
+hierarchies that are not regular, automata of more than 65,536 states and data restrictions outside
 OWL 2 EL. `Stats::tier` says which rules a run needed, `Stats::outside_el` counts the
 axioms outside OWL 2 EL and those taken, and `Stats::conjunctions` counts the contexts
 the rules created.
@@ -1024,7 +1024,8 @@ they move can make R3 and R5 create contexts, which the same bound covers. The n
 worlds is at most the number of named classes, and each can approach a Horn saturation of
 its own, so the Horn budget counts them, and the scans of R7 and R8 over a singular
 context's predecessors, which are quadratic in their number, poll the run's stop as the
-long rules do. `Stats` counts the witnesses and the worlds. An ontology without
+long rules do. `Stats` gains no count of the witnesses and the worlds, since the API
+compatibility check guards the struct, and item 868 adds the count it needs. An ontology without
 individuals, functional data properties or top properties runs the code it ran before,
 which the EL identity gate checks byte for byte, and the Horn files without individuals of
 the development set are checked the same way. The Horn files with individuals are

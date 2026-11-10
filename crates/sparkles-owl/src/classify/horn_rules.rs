@@ -197,6 +197,7 @@ pub fn succ<S: Sink>(
     // to a successor it created
     if st.real && !sent {
         out.send(n, Concl::Real);
+        out.send(n, Concl::RealBack(me));
     }
     let h = hs(st);
     for &b in &h.fills {
@@ -486,6 +487,8 @@ pub fn fill<S: Sink>(ix: &Index, me: Ex, st: &mut State, b: Ex, out: &mut S) {
             }
         }
     }
+    // the loop now counts the context itself among the neighbours, which R7 reads
+    counted_full(ix, me, st, None, out);
 }
 
 /// A backward link from `e` by `r`: the source learns the fillers the context holds, and
@@ -655,7 +658,7 @@ fn send_links<S: Sink>(st: &State, to: Ex, out: &mut S) {
 /// What a real context knows of its own element, for a context that stands for the same
 /// element: its loops and its Horn successors. The subsumers go by the rules of
 /// individuals.
-fn send_own<S: Sink>(st: &State, to: Ex, out: &mut S) {
+pub fn send_own<S: Sink>(st: &State, to: Ex, out: &mut S) {
     for &l in &st.loops {
         out.send(to, Concl::Loop(l));
     }
@@ -759,13 +762,20 @@ fn r7<S: Sink>(ix: &Index, me: Ex, st: &mut State, only: Option<Ex>, out: &mut S
         let looped = members(ix, st, s, b)
             .iter()
             .any(|m| matches!(m, Member::Loop(_)));
-        for (i, &(m1, r1)) in real.iter().enumerate() {
-            if looped && only.is_none_or(|o| o == m1) {
+        // the pairs to consider: all of them, or those with the one predecessor the
+        // trigger named
+        let firsts: Vec<(Ex, Role)> = match only {
+            Some(o) => real.iter().copied().filter(|&(m, _)| m == o).collect(),
+            None => real.clone(),
+        };
+        let mut work = 0usize;
+        for &(m1, r1) in &firsts {
+            if looped {
                 out.send(m1, Concl::Same(me));
                 out.me(Concl::Same(m1));
             }
-            for &(m2, r2) in &real[..i] {
-                if only.is_some_and(|o| o != m1 && o != m2) {
+            for &(m2, r2) in &real {
+                if m2 == m1 || (only.is_none() && m2 > m1) {
                     continue;
                 }
                 if clash(ix, r1, r2) {
@@ -774,6 +784,10 @@ fn r7<S: Sink>(ix: &Index, me: Ex, st: &mut State, only: Option<Ex>, out: &mut S
                 } else {
                     out.send(m1, Concl::Same(m2));
                     out.send(m2, Concl::Same(m1));
+                }
+                work += 1;
+                if work.is_multiple_of(64) && !out.go_on() {
+                    return;
                 }
             }
         }
@@ -841,8 +855,11 @@ pub fn same<S: Sink>(_ix: &Index, me: Ex, st: &mut State, k: Ex, out: &mut S) ->
         out.send(k, Concl::Sub(BOTTOM));
         return true;
     }
-    for &s in &st.subs {
+    for (i, &s) in st.subs.iter().enumerate() {
         out.send(k, Concl::Sub(s));
+        if (i + 1).is_multiple_of(256) && out.stopped() {
+            return true;
+        }
     }
     send_own(st, k, out);
     send_links(st, k, out);

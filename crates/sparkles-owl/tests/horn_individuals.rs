@@ -331,3 +331,37 @@ fn the_disjunctive_rules_keep_refusing_individuals_by_default() {
     assert_eq!(out.stats.tier, Tier::Disjunctive);
     assert_eq!(out.stats.outside_el.taken, 1);
 }
+
+#[test]
+fn a_universal_on_the_inverse_of_the_top_property_is_a_fact_too() {
+    // the top property is its own inverse, also when a Horn axiom is the first to name it
+    check(
+        "ClassAssertion(:A :a)
+         SubClassOf(:A ObjectAllValuesFrom(ObjectInverseOf(owl:topObjectProperty) :B))
+         SubClassOf(:C :C)",
+        &[("C", "B"), ("A", "B")],
+        &[("B", "C")],
+    );
+    let (out, ex) = run(
+        "ClassAssertion(ObjectAllValuesFrom(ObjectInverseOf(owl:topObjectProperty) owl:Nothing) :a)",
+    );
+    assert!(ex.is_empty(), "left out: {ex:#?}");
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+}
+
+#[test]
+fn r7_counts_the_context_itself_through_a_loop_with_a_qualified_filler() {
+    // n has r to itself and at most one r-predecessor in B; m is in B with r to n, so m
+    // is n
+    check(
+        "EquivalentClasses(:N ObjectOneOf(:n))
+         ObjectPropertyAssertion(:r :n :n)
+         SubClassOf(:N ObjectMaxCardinality(1 ObjectInverseOf(:r) :B))
+         SubClassOf(:N :B)
+         SubClassOf(:M ObjectSomeValuesFrom(:r ObjectOneOf(:n)))
+         SubClassOf(:M :B)
+         ClassAssertion(:M :m)",
+        &[("M", "N"), ("N", "M")],
+        &[("B", "M")],
+    );
+}
