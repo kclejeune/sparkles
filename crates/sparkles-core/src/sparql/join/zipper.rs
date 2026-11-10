@@ -16,7 +16,9 @@ const ZIP_LANES_MIN_ROWS: usize = 4096;
 /// For each id of the sorted column `a`, the index of the first id of the sorted column
 /// `b` that is not less than it (`b.len()` when there is none).
 ///
-/// When `b` is much larger than `a`, it gallops over `b`. Otherwise it runs a branch-free
+/// When one column is much larger than the other, it gallops over the larger one: over
+/// `b` from each row of `a`, or over `a` from each row of `b`, filling the rows of `a`
+/// between two rows of `b` with the bound they share. Otherwise it runs a branch-free
 /// zipper, where each step advances the side with the smaller id. A zipper step depends on
 /// the ids that the previous step read, so one zipper waits for a load on every step.
 /// Larger inputs are therefore split at [`ZIP_LANES`] points of the merged order, and the
@@ -33,6 +35,26 @@ pub(crate) fn lower_bounds(ctx: &Ctx, a: &[Id], b: &[Id]) -> Result<Vec<u32>> {
                 j = gallop(b, j, |y| *y < x);
             }
             first[i] = j as u32;
+        }
+        return Ok(first);
+    }
+    if a.len() > 8 * b.len() {
+        // The rows of `a` below each row of `b`, and then the rows equal to it, which
+        // take the first row of its run of equal keys.
+        let mut i = 0;
+        let mut run = 0;
+        for (j, &y) in b.iter().enumerate() {
+            if j.is_multiple_of(ZIP_CHECK_STEPS) {
+                ctx.check()?;
+            }
+            if j == 0 || b[j - 1] != y {
+                run = j;
+            }
+            let below = gallop(a, i, |x| *x < y);
+            let equal = gallop(a, below, |x| *x <= y);
+            first[i..below].fill(j as u32);
+            first[below..equal].fill(run as u32);
+            i = equal;
         }
         return Ok(first);
     }

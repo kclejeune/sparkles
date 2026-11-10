@@ -245,9 +245,9 @@ fn merge_lower_bounds_match_a_binary_search() {
     let ctx = ctx_with(&s, Optimizations::ALL);
     let mut next = xorshift(0x2545_f491_4f6c_dd1d);
     for round in 0..400 {
-        let an = (next() % [10, 300, 3000, 20_000][round % 4]) as usize;
-        let bn = (next() % [10, 300, 6000, 40_000][(round / 4) % 4]) as usize;
-        let domain = [3, 50, 10_000, u64::MAX / 2][(round / 16) % 4];
+        let an = (next() % [10, 300, 3000, 20_000, 60_000][round % 5]) as usize;
+        let bn = (next() % [10, 300, 6000, 40_000][(round / 5) % 4]) as usize;
+        let domain = [3, 50, 10_000, u64::MAX / 2][(round / 20) % 4];
         let column = |n: usize, next: &mut dyn FnMut() -> u64| {
             let mut c: Vec<Id> = (0..n).map(|_| Id(1 + next() % domain)).collect();
             c.sort();

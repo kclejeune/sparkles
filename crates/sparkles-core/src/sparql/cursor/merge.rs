@@ -9,8 +9,7 @@ use super::{Buffer, CursorOptions, Operator, capacity_bytes};
 use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::sparql::ctx::{Ctx, RetainedCharge};
-use crate::sparql::exec;
-use crate::sparql::join::{gallop, zipper};
+use crate::sparql::join::{gallop, merge as kernel};
 use crate::sparql::plan::{JoinAlgo, Kind, Node};
 use crate::sparql::table::{Table, VarId};
 use crate::spill::{SpillKind, SpillReader, SpillRun, SpillWriter};
@@ -21,13 +20,18 @@ use std::sync::Arc;
 /// No right row: the OPTIONAL extension of an unmatched left row.
 const NO_ROW: u32 = u32::MAX;
 
-fn key(node: &Node) -> Option<VarId> {
+fn key(ctx: &Ctx, node: &Node) -> Option<VarId> {
     match &node.kind {
         Kind::Join {
             algo: JoinAlgo::Merge,
             keys,
         } => keys.first().copied(),
-        Kind::LeftJoin { expr: None } => node.children.first()?.sorted.first().copied(),
+        // An OPTIONAL merges on the key both inputs are sorted on when the switch that
+        // selects the merge OPTIONAL in eager execution is on, so that EXPLAIN names
+        // the same algorithm in both modes.
+        Kind::LeftJoin { expr: None } if ctx.opt.merge_left_join => {
+            node.children.first()?.sorted.first().copied()
+        }
         // MINUS and semi and anti joins compare the left row with the right input on
         // their shared variables. With one shared variable that both inputs bind on
         // every row, that comparison is equality of the key.
@@ -42,8 +46,10 @@ fn key(node: &Node) -> Option<VarId> {
         _ => None,
     }
 }
-pub(super) fn eligible(node: &Node) -> bool {
-    let Some(key) = key(node) else { return false };
+pub(super) fn eligible(ctx: &Ctx, node: &Node) -> bool {
+    let Some(key) = key(ctx, node) else {
+        return false;
+    };
     node.children.len() == 2
         && node
             .children
@@ -71,6 +77,8 @@ struct Pair {
 }
 
 pub(super) struct Merge {
+    /// The variable the inputs merge on.
+    key: VarId,
     inputs: [Input; 2],
     /// Child schemas survive a final run whose input has already reached EOF.
     widths: [usize; 2],
@@ -592,7 +600,7 @@ fn positions(vars: &[VarId], of: &[VarId]) -> Vec<Option<usize>> {
 
 impl Merge {
     pub(super) fn new(ctx: &Ctx, node: &Node) -> Result<Self> {
-        let keys = [key(node).expect("eligible merge key")];
+        let keys = [key(ctx, node).expect("eligible merge key")];
         let charge =
             ctx.retained_charge(node.vars.len() as u64 * 64 + keys.len() as u64 * 32 + 1024)?;
         let (left, right) = (
@@ -613,6 +621,7 @@ impl Merge {
                 .collect()
         };
         Ok(Self {
+            key: keys[0],
             inputs: Default::default(),
             widths: [node.children[0].vars.len(), node.children[1].vars.len()],
             keys: [key_columns(0), key_columns(1)],
@@ -701,19 +710,10 @@ impl Merge {
                 let end = covered.min(li.saturating_add(cap - passed));
                 if end > li {
                     let _scratch = ctx.charge((end - li) as u64 * 5 + 64)?;
-                    let first = zipper::lower_bounds(ctx, &lk[li..end], &rk[ri..])?;
+                    let first = kernel::bounds(ctx, &lk[li..end], &rk[ri..])?;
                     // Which left rows pass, decided without a branch per row, since
                     // interleaved keys make the outcome unpredictable.
-                    let right = &rk[ri..];
-                    let keep: Vec<bool> = first
-                        .iter()
-                        .zip(&lk[li..end])
-                        .map(|(&at, &key)| {
-                            let at = at as usize;
-                            let hit = at < right.len() && right[at.min(right.len() - 1)] == key;
-                            hit == keep_matched
-                        })
-                        .collect();
+                    let keep = kernel::filter(&lk[li..end], &rk[ri..], &first, keep_matched);
                     let n = keep.iter().filter(|&&k| k).count();
                     if let Some(out) = out.as_deref_mut() {
                         for (column, &(l, _)) in out.table.cols.iter_mut().zip(&self.columns) {
@@ -738,6 +738,11 @@ impl Merge {
             }
         }
         Ok(passed)
+    }
+
+    /// The variable the inputs merge on.
+    pub(super) fn key(&self) -> VarId {
+        self.key
     }
 
     pub(super) fn supports_count(&self) -> bool {
@@ -778,51 +783,36 @@ impl Merge {
         let (mut next_li, mut next_ri) = (li, ri);
         if end > li && room > 0 {
             let _scratch = ctx.charge((end - li) as u64 * 4 + room as u64 * 8 + 128)?;
-            let first = zipper::lower_bounds(ctx, &lk[li..end], &rk[ri..])?;
-            let rkeys = &rk[ri..];
+            let first = kernel::bounds(ctx, &lk[li..end], &rk[ri..])?;
             let mut lrows: Vec<u32> = Vec::with_capacity(room);
             let mut rrows: Vec<u32> = Vec::with_capacity(room);
-            let mut run = (usize::MAX, 0usize);
-            let mut done = 0;
-            for (j, (&at, &key)) in first.iter().zip(&lk[li..end]).enumerate() {
-                if j.is_multiple_of(4096) {
-                    ctx.check()?;
-                }
-                let at = at as usize;
-                let row = (li + j) as u32;
-                if at < rkeys.len() && rkeys[at] == key {
-                    if run.0 != at {
-                        run = (at, exec::run_end(rkeys, at));
-                    }
-                    let n = run.1 - at;
-                    if lrows.len() + n > room {
-                        break;
-                    }
-                    lrows.extend(std::iter::repeat_n(row, n));
-                    rrows.extend((ri + at) as u32..(ri + run.1) as u32);
-                } else if self.optional {
-                    if lrows.len() == room {
-                        break;
-                    }
-                    lrows.push(row);
-                    rrows.push(NO_ROW);
-                }
-                done = j + 1;
-            }
+            let done = kernel::expand(
+                ctx,
+                &lk[li..end],
+                &rk[ri..],
+                &first,
+                0,
+                self.optional,
+                room,
+                &mut lrows,
+                &mut rrows,
+            )?;
             if done > 0 {
                 for (column, &(l, r)) in out.table.cols.iter_mut().zip(&self.columns) {
                     match (l, r) {
                         (Some(c), _) => {
                             let source = &left.cols[c];
-                            column.extend(lrows.iter().map(|&i| source[i as usize]));
+                            column.extend(lrows.iter().map(|&i| source[li + i as usize]));
                         }
                         (None, Some(c)) => {
                             let source = &right.cols[c];
-                            column.extend(
-                                rrows
-                                    .iter()
-                                    .map(|&j| source.get(j as usize).copied().unwrap_or(Id::UNDEF)),
-                            );
+                            column.extend(rrows.iter().map(|&j| {
+                                if j == NO_ROW {
+                                    Id::UNDEF
+                                } else {
+                                    source[ri + j as usize]
+                                }
+                            }));
                         }
                         (None, None) => column.extend(std::iter::repeat_n(Id::UNDEF, lrows.len())),
                     }
@@ -915,20 +905,8 @@ impl Merge {
                     let rkeys = &rc[ri..];
                     let _scratch =
                         ctx.charge((covered - li) as u64 * 4 + rkeys.len() as u64 * 4 + 128)?;
-                    let first = zipper::lower_bounds(ctx, &lc[li..covered], rkeys)?;
-                    // The length of the run of equal keys that starts at each right row.
-                    let mut runs = vec![1u32; rkeys.len() + 1];
-                    runs[rkeys.len()] = 0;
-                    for j in (0..rkeys.len().saturating_sub(1)).rev() {
-                        runs[j] = 1 + u32::from(rkeys[j] == rkeys[j + 1]) * runs[j + 1];
-                    }
-                    let unmatched = u64::from(self.optional);
-                    let mut n = 0u64;
-                    for (&at, &key) in first.iter().zip(&lc[li..covered]) {
-                        let at = at as usize;
-                        let hit = at < rkeys.len() && rkeys[at.min(rkeys.len() - 1)] == key;
-                        n += u64::from(hit) * u64::from(runs[at]) + u64::from(!hit) * unmatched;
-                    }
+                    let first = kernel::bounds(ctx, &lc[li..covered], rkeys)?;
+                    let n = kernel::count(ctx, &lc[li..covered], rkeys, &first, self.optional)?;
                     count = count
                         .checked_add(n)
                         .ok_or_else(|| Error::invalid("join count overflow"))?;
@@ -1702,7 +1680,7 @@ mod tests {
                 if optional {
                     node.kind = Kind::LeftJoin { expr: None };
                 }
-                assert!(eligible(&node));
+                assert!(eligible(&ctx, &node));
                 let expected = rows(&exec::execute(&ctx, &node).unwrap().0);
                 let mut op =
                     Operator::build(&ctx, node, FallbackPolicy::RejectMaterialization).unwrap();
@@ -1767,7 +1745,7 @@ mod tests {
                     let mut node = Node::leaf(kind.clone(), left.vars.clone(), 8.0, String::new());
                     node.sorted = vec![0];
                     node.children = vec![left, values(vec![0, 2], right)];
-                    assert!(eligible(&node));
+                    assert!(eligible(&ctx, &node));
                     let expected = rows(&exec::execute(&ctx, &node).unwrap().0);
                     let mut op =
                         Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization)
@@ -1800,7 +1778,7 @@ mod tests {
             values(vec![0, 2], &[vec![0, 2]]),
         );
         node.children[0].certain.clear();
-        assert!(!eligible(&node));
+        assert!(!eligible(&context(1 << 20), &node));
         let op = Operator::build(
             &context(1 << 20),
             node,
@@ -1839,8 +1817,8 @@ mod tests {
             union,
             values(vec![0, 2], &[vec![0, 5], vec![1, 6], vec![3, 7]]),
         );
-        assert!(eligible(&node));
         let ctx = context(1 << 20);
+        assert!(eligible(&ctx, &node));
         let expected = rows(&exec::execute(&ctx, &node).unwrap().0);
         let mut op = Operator::build(&ctx, node, FallbackPolicy::RejectMaterialization).unwrap();
         assert!(matches!(op.state, super::super::State::Binary(_)));

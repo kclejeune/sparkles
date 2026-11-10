@@ -1,0 +1,203 @@
+//! The merge join kernel: two key columns sorted the same way, joined run by run.
+//!
+//! The kernel takes the lower bound of every left key in the right column from the
+//! branch-free zipper of [`super::zipper`], which gallops when one side is much larger,
+//! and then expands, counts or decides each left row against the run of right rows that
+//! starts at its lower bound. A compare per row would mispredict when the two sides'
+//! keys interleave, so the decisions are made without one where they can be. The
+//! eager executor hands the kernel whole columns, and the cursor hands it the keys of
+//! the left rows a loaded right batch decides, keeping the runs that cross its batch
+//! boundaries and the spooling of long runs to itself.
+use super::hash::NO_ROW;
+use super::zipper::lower_bounds;
+use crate::error::{Error, Result};
+use crate::id::Id;
+use crate::sparql::ctx::Ctx;
+use crate::sparql::exec::run_end;
+
+/// The lower bound of every key of `lk` in `rk`, both sorted: the first right row whose
+/// key is not less than the left row's, or `rk.len()`.
+pub(crate) fn bounds(ctx: &Ctx, lk: &[Id], rk: &[Id]) -> Result<Vec<u32>> {
+    lower_bounds(ctx, lk, rk)
+}
+
+/// Pair the left rows from `from` with the right runs of their keys, given the lower
+/// bounds `first` of the left keys in `rk`: a left row whose key the right column holds
+/// pairs with every row of the run, and in an OPTIONAL join a left row whose key it
+/// lacks pairs with [`NO_ROW`]. At most `room` pairs are appended to `lrows` and
+/// `rrows`, a run that does not fit is left whole for the next call, and the number of
+/// left rows decided is returned, so that the caller resumes at `from` plus it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn expand(
+    ctx: &Ctx,
+    lk: &[Id],
+    rk: &[Id],
+    first: &[u32],
+    from: usize,
+    optional: bool,
+    room: usize,
+    lrows: &mut Vec<u32>,
+    rrows: &mut Vec<u32>,
+) -> Result<usize> {
+    let limit = lrows.len().saturating_add(room);
+    let mut run = (usize::MAX, 0usize);
+    let mut done = 0;
+    for (j, (&at, &key)) in first[from..].iter().zip(&lk[from..]).enumerate() {
+        if j.is_multiple_of(4096) {
+            ctx.check()?;
+        }
+        let at = at as usize;
+        let row = (from + j) as u32;
+        if at < rk.len() && rk[at] == key {
+            if run.0 != at {
+                run = (at, run_end(rk, at));
+            }
+            let n = run.1 - at;
+            if lrows.len() + n > limit {
+                break;
+            }
+            lrows.extend(std::iter::repeat_n(row, n));
+            rrows.extend(at as u32..run.1 as u32);
+        } else if optional {
+            if lrows.len() == limit {
+                break;
+            }
+            lrows.push(row);
+            rrows.push(NO_ROW);
+        }
+        done = j + 1;
+    }
+    Ok(done)
+}
+
+/// How many rows the join of `lk` and `rk` has, given the lower bounds `first` of the
+/// left keys in `rk`: each left row adds the length of its key's right run, and in an
+/// OPTIONAL join one when the right column lacks its key. The run lengths come from one
+/// pass over the right column, so no row is paired and no branch depends on a key.
+pub(crate) fn count(ctx: &Ctx, lk: &[Id], rk: &[Id], first: &[u32], optional: bool) -> Result<u64> {
+    // The length of the run of equal keys that starts at each right row.
+    let _scratch = ctx.charge(rk.len() as u64 * 4 + 64)?;
+    let mut runs = vec![1u32; rk.len() + 1];
+    runs[rk.len()] = 0;
+    for j in (0..rk.len().saturating_sub(1)).rev() {
+        runs[j] = 1 + u32::from(rk[j] == rk[j + 1]) * runs[j + 1];
+    }
+    let unmatched = u64::from(optional);
+    let mut n = 0u64;
+    for (k, (&at, &key)) in first.iter().zip(lk).enumerate() {
+        if k.is_multiple_of(65536) {
+            ctx.check()?;
+        }
+        let at = at as usize;
+        let hit = at < rk.len() && rk[at.min(rk.len().saturating_sub(1))] == key;
+        n = n
+            .checked_add(u64::from(hit) * u64::from(runs[at]) + u64::from(!hit) * unmatched)
+            .ok_or_else(|| Error::invalid("join count overflow"))?;
+    }
+    Ok(n)
+}
+
+/// Which left rows pass a semi join (`keep_matched`) or an anti join or MINUS (not
+/// `keep_matched`) on the key, given the lower bounds `first` of the left keys in `rk`:
+/// a left row is matched when the right row at its lower bound holds its key. The
+/// verdicts are computed without a branch per row.
+pub(crate) fn filter(lk: &[Id], rk: &[Id], first: &[u32], keep_matched: bool) -> Vec<bool> {
+    first
+        .iter()
+        .zip(lk)
+        .map(|(&at, &key)| {
+            let at = at as usize;
+            let hit = at < rk.len() && rk[at.min(rk.len().saturating_sub(1))] == key;
+            hit == keep_matched
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+
+    fn ids(values: &[i64]) -> Vec<Id> {
+        values.iter().map(|v| Id::from_i64(*v).unwrap()).collect()
+    }
+
+    /// The expanded pairs, the count and the filter agree with a nested loop over the
+    /// keys, with runs on both sides and keys only one side has.
+    #[test]
+    fn expansion_count_and_filter_agree_with_a_nested_loop() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let lk = ids(&[1, 2, 2, 4, 5, 5, 5, 9]);
+        let rk = ids(&[0, 2, 2, 2, 3, 5, 6, 6, 9, 9]);
+        let first = bounds(&ctx, &lk, &rk).unwrap();
+        let mut expected = Vec::new();
+        for (i, l) in lk.iter().enumerate() {
+            for (j, r) in rk.iter().enumerate() {
+                if l == r {
+                    expected.push((i as u32, j as u32));
+                }
+            }
+        }
+        for optional in [false, true] {
+            let mut want = expected.clone();
+            if optional {
+                for i in [0u32, 3] {
+                    want.push((i, NO_ROW));
+                }
+                want.sort_by_key(|&(i, j)| (i, j == NO_ROW, j));
+            }
+            for room in [1usize, 2, 3, 7, 1000] {
+                let (mut lrows, mut rrows) = (Vec::new(), Vec::new());
+                let mut from = 0;
+                while from < lk.len() {
+                    let done = expand(
+                        &ctx, &lk, &rk, &first, from, optional, room, &mut lrows, &mut rrows,
+                    )
+                    .unwrap();
+                    if done == 0 {
+                        // a run larger than the room is expanded with a room that holds it
+                        let n = run_end(&rk, first[from] as usize) - first[from] as usize;
+                        assert!(n > room, "room {room} from {from}");
+                        from += expand(
+                            &ctx, &lk, &rk, &first, from, optional, n, &mut lrows, &mut rrows,
+                        )
+                        .unwrap();
+                        continue;
+                    }
+                    from += done;
+                }
+                let got: Vec<(u32, u32)> = lrows.into_iter().zip(rrows).collect();
+                assert_eq!(got, want, "optional {optional} room {room}");
+            }
+            assert_eq!(
+                count(&ctx, &lk, &rk, &first, optional).unwrap(),
+                want.len() as u64,
+                "optional {optional}"
+            );
+        }
+        let matched: Vec<bool> = lk.iter().map(|l| rk.contains(l)).collect();
+        assert_eq!(filter(&lk, &rk, &first, true), matched);
+        assert_eq!(
+            filter(&lk, &rk, &first, false),
+            matched.iter().map(|m| !m).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_empty_right_column_matches_nothing() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let lk = ids(&[1, 2]);
+        let first = bounds(&ctx, &lk, &[]).unwrap();
+        assert_eq!(count(&ctx, &lk, &[], &first, false).unwrap(), 0);
+        assert_eq!(count(&ctx, &lk, &[], &first, true).unwrap(), 2);
+        assert_eq!(filter(&lk, &[], &first, false), vec![true, true]);
+        let (mut l, mut r) = (Vec::new(), Vec::new());
+        assert_eq!(
+            expand(&ctx, &lk, &[], &first, 0, true, 10, &mut l, &mut r).unwrap(),
+            2
+        );
+        assert_eq!((l, r), (vec![0, 1], vec![NO_ROW, NO_ROW]));
+    }
+}

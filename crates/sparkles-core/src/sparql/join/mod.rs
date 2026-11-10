@@ -7,6 +7,8 @@
 //! join step with.
 
 pub(crate) mod gallop;
+pub(crate) mod hash;
+pub(crate) mod merge;
 pub(crate) mod zipper;
 
 pub(crate) use gallop::{gallop, gallop_to, search};

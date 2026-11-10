@@ -2646,7 +2646,7 @@ impl Operator {
         // it relies on none (item 93). A LIMIT or OFFSET chooses its rows by their
         // order, so it relies on it whatever its parent needs. Other operators may use
         // their inputs' order.
-        let hashes = joins && ctx.spill.is_some() && !merge::eligible(&node);
+        let hashes = joins && ctx.spill.is_some() && !merge::eligible(ctx, &node);
         let order_free_group = incremental_group
             && match &node.kind {
                 Kind::Group { aggs, .. } => aggs.iter().all(|(_, agg)| group::order_free(agg)),
@@ -2735,7 +2735,7 @@ impl Operator {
         }
         // A merge join needs both inputs ordered on its key. When an input cannot
         // promise that order, the hash join takes its place.
-        let incremental_merge = !materializes && merge::eligible(&node);
+        let incremental_merge = !materializes && merge::eligible(ctx, &node);
         let incremental_binary = !incremental_merge && joins;
         let growing = matches!(
             node.kind,
@@ -2799,6 +2799,19 @@ impl Operator {
                 "{} [planned as a merge join: an input is not ordered on the key, so a hash join runs]",
                 info.description
             );
+        }
+        if let Kind::LeftJoin { expr: None } = node.kind {
+            // the plan names the algorithm the merge_left_join switch selected, as the
+            // eager plan does
+            if let Some(merge) = &merge {
+                info.description = format!(
+                    "{} [merge on ?{}]",
+                    info.description,
+                    ctx.var_name(merge.key())
+                );
+            } else if binary.is_some() {
+                info.description = format!("{} [hash join]", info.description);
+            }
         }
         let heap = native_blocking && !materializes && topk::eligible(ctx, &node);
         let reason = (materializes || native_blocking || exists || index_topk || run_group).then(|| {
