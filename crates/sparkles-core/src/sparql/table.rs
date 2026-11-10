@@ -710,8 +710,16 @@ impl<'ctx> Materialized<'ctx> {
         let credit = ctx.charge(size)?;
         let vars = Self::copied(ctx, "eager-vars", &source.vars)?;
         let mut cols = Self::allocate("eager-columns", source.cols.len())?;
+        // A copy polls within a long column, and this loop polls once short columns
+        // add up to a chunk, so a wide table's clone still checks as it grows.
+        let mut unchecked = 0usize;
         for column in &source.cols {
+            if unchecked >= 1024 {
+                ctx.check()?;
+                unchecked = 0;
+            }
             cols.push(Self::copied(ctx, "eager-column", column)?);
+            unchecked = unchecked.saturating_add(column.len().max(1));
         }
         let sorted = Self::copied(ctx, "eager-sorted", &source.sorted)?;
         Self::with_fast(
@@ -939,6 +947,29 @@ mod materialized_credit_tests {
     use super::*;
     use crate::sparql::ctx::Ctx;
     use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn wide_paid_clone_polls_between_short_columns() {
+        // The variables and each column are shorter than a copy chunk, so only the
+        // clone itself can poll while it copies a million cells.
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let (width, rows) = (1000, 1000);
+        let source = Table {
+            vars: (0..width as VarId).collect(),
+            cols: (0..width).map(|_| vec![Id::UNDEF; rows]).collect(),
+            len: rows,
+            sorted: Vec::new(),
+        };
+        let before = crate::sparql::ctx::CHECKS.with(|n| n.get());
+        let copy = Materialized::clone_fast(&ctx, &source).unwrap();
+        let checks = crate::sparql::ctx::CHECKS.with(|n| n.get()) - before;
+        assert_eq!(copy.table.width(), width);
+        assert!(
+            checks >= 100,
+            "{checks} checks while cloning {width} columns"
+        );
+    }
 
     fn paid_spare_table(ctx: &Ctx) -> Materialized<'_> {
         // Admit the exact outer and spare column capacities before allocating them.
