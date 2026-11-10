@@ -1187,7 +1187,7 @@ mod tests {
 
     /// Growing a graph fact by fact from nothing charges each buffer once while it is
     /// resized and not again after: the peak stays near the final heap, plus the keyed
-    /// entries of 24 bytes per new fact that sorting the batch's runs holds for a moment.
+    /// entries of 16 bytes per new fact that sorting the batch's runs holds for a moment.
     #[test]
     fn add_rows_charges_the_final_buffers() {
         let b = Budget::unlimited();

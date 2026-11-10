@@ -2,9 +2,12 @@
 //! sorted per predicate.
 //!
 //! A derived fact gets a dense `u32` id in the order of its first derivation, from the
-//! graph's offset on, and the tier keeps its subject, object and predicate in three
-//! columns by id, so a fact is read from its id directly and the facts of one merge are
-//! an interval of ids, which the semi-naive ranges of the engine read. Each predicate is a
+//! graph's offset on, and the tier keeps its subject, object and predicate in one row of
+//! 24 bytes by id ([`Row`]), so a fact is read from its id with one cache line, and the
+//! facts of one merge are an interval of ids, which the semi-naive ranges of the engine
+//! read. A hit in the graph's triple index checks its fact against the probed triple,
+//! which three columns by id answered with three cache misses and the row answers with
+//! one. Each predicate is a
 //! relation with two orders of its ids, by subject then object and by object then
 //! subject, as sorted runs ([`order::Order`], [`run::Run`]), and a list of its ids in
 //! order. A probe with a bound predicate and subject searches the subject order, one with
@@ -13,9 +16,10 @@
 //! Orders over the whole tier by subject and by object serve atoms with a variable
 //! predicate and are built on demand.
 //!
-//! The columns cost 20 bytes per fact, the predicate's list of ids 4 and the two orders
-//! 10, with their fence keys, so a fact costs 34 bytes in the tier, besides the graph's
-//! triple index that finds a fact by its triple. The rows, lists and tables of the previous tier cost about 135 bytes.
+//! The row costs 24 bytes per fact, of which 4 are padding free for a later column, the
+//! predicate's list of ids 4 and the two orders 10, with their fence keys, so a fact costs
+//! 38 bytes in the tier, besides the graph's triple index that finds a fact by its triple.
+//! The rows, lists and tables of the previous tier cost about 135 bytes.
 //!
 //! Deletion marks a fact dead in a bitmap. A dead fact stays in the orders, which skip
 //! it, until a compaction drops it; a relation with a quarter of its facts dead is
@@ -37,8 +41,27 @@ pub(crate) type Triple = [u64; 3];
 /// Batches smaller than this build their runs on the calling thread.
 const PAR_MIN: usize = 1 << 14;
 
-/// The columns' bytes per fact: subject, object and the relation's index.
-pub(crate) const ROW: usize = 2 * size_of::<u64>() + size_of::<u32>();
+/// A fact: its subject, object and the index of its relation, in 24 bytes, so that the
+/// three are read with one cache line. The last four bytes are padding, free for a
+/// later column.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Row {
+    pub s: u64,
+    pub o: u64,
+    pub ri: u32,
+    _pad: u32,
+}
+
+impl Row {
+    #[inline]
+    fn new(s: u64, o: u64, ri: u32) -> Row {
+        Row { s, o, ri, _pad: 0 }
+    }
+}
+
+/// The row's bytes per fact.
+pub(crate) const ROW: usize = size_of::<Row>();
 
 /// Candidate ids for one access: pieces of sorted runs, or ranges of ids, in the order
 /// the access visits them. A piece of a run that an id range meets only in part is
@@ -247,10 +270,8 @@ impl Rel {
 pub(crate) struct Tier {
     /// the first id: ids before it are the base tier's
     offset: u32,
-    s: Vec<u64>,
-    o: Vec<u64>,
-    /// the index of the fact's relation in `rels`
-    p: Vec<u32>,
+    /// the facts by id, each with the index of its relation in `rels`
+    rows: Vec<Row>,
     rels: Vec<Rel>,
     rel_of: FxHashMap<u64, u32>,
     /// by subject and by object over the whole tier, built on demand
@@ -270,9 +291,7 @@ impl Tier {
     pub fn new(offset: u32) -> Tier {
         Tier {
             offset,
-            s: Vec::new(),
-            o: Vec::new(),
-            p: Vec::new(),
+            rows: Vec::new(),
             rels: Vec::new(),
             rel_of: FxHashMap::default(),
             by_s: None,
@@ -299,7 +318,7 @@ impl Tier {
     }
 
     pub fn set_offset(&mut self, offset: u32) {
-        debug_assert!(self.s.is_empty());
+        debug_assert!(self.rows.is_empty());
         self.offset = offset;
     }
 
@@ -311,26 +330,21 @@ impl Tier {
     /// The id after the last fact.
     #[inline]
     pub fn len(&self) -> u32 {
-        self.offset + self.s.len() as u32
+        self.offset + self.rows.len() as u32
     }
 
     /// The facts, dead ones included.
     #[inline]
     pub fn count(&self) -> usize {
-        self.s.len()
+        self.rows.len()
     }
 
     pub fn capacity(&self) -> usize {
-        self.s
-            .capacity()
-            .min(self.o.capacity())
-            .min(self.p.capacity())
+        self.rows.capacity()
     }
 
     pub fn reserve_exact(&mut self, n: usize) {
-        self.s.reserve_exact(n);
-        self.o.reserve_exact(n);
-        self.p.reserve_exact(n);
+        self.rows.reserve_exact(n);
     }
 
     #[inline]
@@ -340,25 +354,28 @@ impl Tier {
 
     #[inline]
     pub fn triple(&self, id: u32) -> Triple {
-        let i = self.at(id);
-        [self.s[i], self.rels[self.p[i] as usize].p, self.o[i]]
+        let r = &self.rows[self.at(id)];
+        [r.s, self.rels[r.ri as usize].p, r.o]
     }
 
-    /// Whether fact `id` is the triple `t`.
+    /// Whether fact `id` is the triple `t`: one read of the row, and of the relation's
+    /// predicate when its subject and object match.
     #[inline]
     pub fn eq(&self, id: u32, t: &Triple) -> bool {
-        let i = self.at(id);
-        self.s[i] == t[0] && self.o[i] == t[2] && self.rels[self.p[i] as usize].p == t[1]
+        let r = &self.rows[self.at(id)];
+        r.s == t[0] && r.o == t[2] && self.rels[r.ri as usize].p == t[1]
     }
 
     /// The facts in id order, dead ones included.
     pub fn facts(&self) -> impl Iterator<Item = Triple> + '_ {
-        self.facts_range(0, self.s.len())
+        self.facts_range(0, self.rows.len())
     }
 
-    /// The facts at column indexes `[a, b)`, in id order, dead ones included.
+    /// The facts at row indexes `[a, b)`, in id order, dead ones included.
     pub fn facts_range(&self, a: usize, b: usize) -> impl Iterator<Item = Triple> + '_ {
-        (a..b).map(|i| [self.s[i], self.rels[self.p[i] as usize].p, self.o[i]])
+        self.rows[a..b]
+            .iter()
+            .map(|r| [r.s, self.rels[r.ri as usize].p, r.o])
     }
 
     /// The bytes the relations and their table grow by when a fact with predicate `p`
@@ -400,9 +417,7 @@ impl Tier {
                 i
             }
         };
-        self.s.push(t[0]);
-        self.o.push(t[2]);
-        self.p.push(ri);
+        self.rows.push(Row::new(t[0], t[2], ri));
     }
 
     #[inline]
@@ -424,7 +439,7 @@ impl Tier {
         let i = self.at(id);
         set_bit(&mut self.dead, i, true);
         self.dead_rows += 1;
-        self.rels[self.p[i] as usize].dead += 1;
+        self.rels[self.rows[i].ri as usize].dead += 1;
         for o in [&mut self.by_s, &mut self.by_o].into_iter().flatten() {
             o.dead += 1;
         }
@@ -527,9 +542,9 @@ impl Tier {
             return Cands::empty();
         }
         let off = self.offset;
-        let (sc, oc) = (&self.s, &self.o);
-        let key_s = move |id: u32| sc[(id - off) as usize];
-        let key_o = move |id: u32| oc[(id - off) as usize];
+        let rows = &self.rows;
+        let key_s = move |id: u32| rows[(id - off) as usize].s;
+        let key_o = move |id: u32| rows[(id - off) as usize].o;
         let mut c = Cands::with_bounds(lo, hi);
         match (s, p, o) {
             (Some(s), Some(p), None) => {
@@ -561,12 +576,10 @@ impl Tier {
         c
     }
 
-    /// The heap of the columns, the relations with their orders, the orders over the
-    /// whole tier and the bitmaps, by capacity.
+    /// The heap of the rows, the relations with their orders, the orders over the whole
+    /// tier and the bitmaps, by capacity.
     pub fn heap_bytes(&self) -> usize {
-        let mut n = self.s.capacity() * size_of::<u64>()
-            + self.o.capacity() * size_of::<u64>()
-            + self.p.capacity() * size_of::<u32>();
+        let mut n = self.rows.capacity() * ROW;
         n += self.rels.capacity() * size_of::<Rel>();
         n += self
             .rels
@@ -591,10 +604,10 @@ impl Tier {
         if self.has_order(subjects) {
             return Ok(());
         }
-        let n = self.s.len();
+        let n = self.rows.len();
         let live = n - self.dead_rows as usize;
         let off = self.offset;
-        let (sc, oc, dead) = (&self.s, &self.o, &self.dead);
+        let (rows, dead) = (&self.rows, &self.dead);
         let keep = |id: u32| alive_in(dead, (id - off) as usize);
         // the live ids, the sort's buffers and the run, then the run's list
         m.add(live * size_of::<u32>() + compact::scratch_bytes(live) + Run::bytes_for(live))?;
@@ -602,14 +615,12 @@ impl Tier {
         ids.extend((off..off + n as u32).filter(|&id| keep(id)));
         let mut order = Order::default();
         if subjects {
-            let keys = |id: u32| (sc[(id - off) as usize], id as u64);
-            let key1 = |id: u32| sc[(id - off) as usize];
-            order.push_charged(Run::new(compact::sorted(&ids, &keys), &key1), m)?;
+            let key = |id: u32| rows[(id - off) as usize].s;
+            order.push_charged(compact::sorted(&ids, &key), m)?;
             self.by_s = Some(order);
         } else {
-            let keys = |id: u32| (oc[(id - off) as usize], id as u64);
-            let key1 = |id: u32| oc[(id - off) as usize];
-            order.push_charged(Run::new(compact::sorted(&ids, &keys), &key1), m)?;
+            let key = |id: u32| rows[(id - off) as usize].o;
+            order.push_charged(compact::sorted(&ids, &key), m)?;
             self.by_o = Some(order);
         }
         drop(ids);
@@ -617,11 +628,11 @@ impl Tier {
         Ok(())
     }
 
-    /// Index the facts from column index `start` on: compact the runs each of their
+    /// Index the facts from row index `start` on: compact the runs each of their
     /// relations has below the floor, then append the new facts as one run per order,
     /// sorted. Growth is charged to `m` (and its strictness) before it is allocated.
     pub fn index_new(&mut self, start: usize, m: &mut Meter<'_>) -> Result<(), MemoryExceeded> {
-        let n = self.s.len() - start;
+        let n = self.rows.len() - start;
         if n == 0 {
             return Ok(());
         }
@@ -636,64 +647,50 @@ impl Tier {
             + nrels * size_of::<Result<usize, MemoryExceeded>>();
         m.add(scratch)?;
         let mut counts = vec![0usize; nrels + 1];
-        for &ri in &self.p[start..] {
-            counts[ri as usize + 1] += 1;
+        for r in &self.rows[start..] {
+            counts[r.ri as usize + 1] += 1;
         }
         for i in 0..nrels {
             counts[i + 1] += counts[i];
         }
         let mut at = counts.clone();
         let mut grouped = vec![0u32; n];
-        for (j, &ri) in self.p[start..].iter().enumerate() {
-            grouped[at[ri as usize]] = first + j as u32;
-            at[ri as usize] += 1;
+        for (j, r) in self.rows[start..].iter().enumerate() {
+            grouped[at[r.ri as usize]] = first + j as u32;
+            at[r.ri as usize] += 1;
         }
         let Tier {
-            s,
-            o,
+            rows,
             rels,
             by_s,
             by_o,
             dead,
             ..
         } = self;
-        let (sc, oc, dead): (&[u64], &[u64], &[u64]) = (s, o, dead);
+        let (rows, dead): (&[Row], &[u64]) = (rows, dead);
         let keep = move |id: u32| alive_in(dead, (id - off) as usize);
-        // sorted by key and then id, so that the ids a probe finds ascend within a run
-        let keys_so = move |id: u32| (sc[(id - off) as usize], id as u64);
-        let keys_os = move |id: u32| (oc[(id - off) as usize], id as u64);
-        let key_s = move |id: u32| sc[(id - off) as usize];
-        let key_o = move |id: u32| oc[(id - off) as usize];
+        // each order sorts by its key and then id, so that the ids a probe finds ascend
+        // within a run
+        let key_s = move |id: u32| rows[(id - off) as usize].s;
+        let key_o = move |id: u32| rows[(id - off) as usize].o;
         let (budget, strict) = (m.budget(), m.strict());
         let grouped_ref = &grouped;
         let counts = &counts;
-        let task = |(ri, rel): (usize, &mut Rel)| -> Result<usize, MemoryExceeded> {
+        let t0 = std::time::Instant::now();
+        // the bytes the task charged and the entries its compactions rewrote
+        let task = |(ri, rel): (usize, &mut Rel)| -> Result<(usize, usize), MemoryExceeded> {
             let mut meter = Meter::new(budget, strict);
             let new = &grouped_ref[counts[ri]..counts[ri + 1]];
+            let mut rewrote = 0;
             if floor > 0 {
                 // a relation with a quarter of its facts dead is rebuilt without them
                 let all = rel.dead > 0 && rel.dead as usize * 4 >= rel.subj.len();
                 if all {
                     rel.ids.retain(|&id| keep(id));
                 }
-                let d = compaction(
-                    &mut rel.subj,
-                    floor,
-                    all,
-                    &keys_so,
-                    &key_s,
-                    &keep,
-                    &mut meter,
-                )?;
-                compaction(
-                    &mut rel.obj,
-                    floor,
-                    all,
-                    &keys_os,
-                    &key_o,
-                    &keep,
-                    &mut meter,
-                )?;
+                let (d, w) = compaction(&mut rel.subj, floor, all, &key_s, &keep, &mut meter)?;
+                rewrote += w;
+                rewrote += compaction(&mut rel.obj, floor, all, &key_o, &keep, &mut meter)?.1;
                 rel.dead -= d as u32;
             }
             if !new.is_empty() {
@@ -709,22 +706,26 @@ impl Tier {
                 let scratch = compact::scratch_bytes(new.len());
                 meter.add(scratch + 2 * Run::bytes_for(new.len()))?;
                 rel.subj
-                    .push_charged(Run::new(compact::sorted(new, &keys_so), &key_s), &mut meter)?;
+                    .push_charged(compact::sorted(new, &key_s), &mut meter)?;
                 rel.obj
-                    .push_charged(Run::new(compact::sorted(new, &keys_os), &key_o), &mut meter)?;
+                    .push_charged(compact::sorted(new, &key_o), &mut meter)?;
                 meter.sub(scratch);
             }
-            Ok(meter.into_bytes())
+            Ok((meter.into_bytes(), rewrote))
         };
-        let done: Vec<Result<usize, MemoryExceeded>> = if n < PAR_MIN {
+        let done: Vec<Result<(usize, usize), MemoryExceeded>> = if n < PAR_MIN {
             rels.iter_mut().enumerate().map(task).collect()
         } else {
             rels.par_iter_mut().enumerate().map(task).collect()
         };
         let mut first_err = None;
+        let mut rewrote = 0;
         for d in done {
             match d {
-                Ok(b) => m.adopt(b),
+                Ok((b, w)) => {
+                    m.adopt(b);
+                    rewrote += w;
+                }
                 Err(e) => {
                     first_err.get_or_insert(e);
                 }
@@ -733,6 +734,7 @@ impl Tier {
         if let Some(e) = first_err {
             return Err(e);
         }
+        let t_rels = std::time::Instant::now();
         // the orders over the whole tier take the new facts as one run each; the new
         // ids in order take the place of the grouped ones
         drop(grouped);
@@ -741,53 +743,59 @@ impl Tier {
             let Some(order) = order else { continue };
             if floor > 0 {
                 let whole = order.dead > 0 && order.dead as usize * 4 >= order.len();
-                let d = if subjects {
-                    compaction(order, floor, whole, &keys_so, &key_s, &keep, m)?
+                let (d, w) = if subjects {
+                    compaction(order, floor, whole, &key_s, &keep, m)?
                 } else {
-                    compaction(order, floor, whole, &keys_os, &key_o, &keep, m)?
+                    compaction(order, floor, whole, &key_o, &keep, m)?
                 };
+                rewrote += w;
                 order.dead -= d as u32;
             }
             let scratch = compact::scratch_bytes(n);
             m.add(scratch + Run::bytes_for(n))?;
             if subjects {
-                order.push_charged(Run::new(compact::sorted(&all, &keys_so), &key_s), m)?;
+                order.push_charged(compact::sorted(&all, &key_s), m)?;
             } else {
-                order.push_charged(Run::new(compact::sorted(&all, &keys_os), &key_o), m)?;
+                order.push_charged(compact::sorted(&all, &key_o), m)?;
             }
             m.sub(scratch);
         }
         drop(all);
         m.sub(scratch);
+        tracing::trace!(
+            new = n,
+            rewrote,
+            rels_ms = (t_rels - t0).as_millis() as u64,
+            whole_ms = t_rels.elapsed().as_millis() as u64,
+            "index"
+        );
         Ok(())
     }
 }
 
 /// Merge the runs the order's policy names below `floor`, or with `all` every run
-/// below it, without dead facts. Returns the dead facts dropped.
-#[allow(clippy::too_many_arguments)]
+/// below it, without dead facts. Returns the dead facts dropped and the entries read.
 fn compaction(
     order: &mut Order,
     floor: u32,
     all: bool,
-    keys: &(impl Fn(u32) -> (u64, u64) + Sync),
-    key1: &impl Fn(u32) -> u64,
+    key: &(impl Fn(u32) -> u64 + Sync),
     keep: &(impl Fn(u32) -> bool + Sync),
     m: &mut Meter<'_>,
-) -> Result<usize, MemoryExceeded> {
+) -> Result<(usize, usize), MemoryExceeded> {
     let Some(which) = order.compaction(floor, all) else {
-        return Ok(0);
+        return Ok((0, 0));
     };
     let runs = &order.runs()[which.clone()];
     let total: usize = runs.iter().map(Run::len).sum();
     let old: usize = runs.iter().map(Run::heap_bytes).sum();
     let scratch = compact::scratch_bytes(total);
     m.add(scratch + Run::bytes_for(total))?;
-    let ids = compact::merged(runs, keys, keep);
-    let dropped = total - ids.len();
-    order.replace(which, Run::new(ids, key1));
+    let run = compact::merged(runs, key, keep);
+    let dropped = total - run.len();
+    order.replace(which, run);
     m.sub(scratch + old);
-    Ok(dropped)
+    Ok((dropped, total))
 }
 
 #[inline]

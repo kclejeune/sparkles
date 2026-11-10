@@ -8,7 +8,7 @@ use std::ops::Range;
 /// Entries between two fence keys.
 pub(crate) const FENCE: usize = 8;
 
-/// A sorted run. The ids are sorted by `(key1, key2)` of their facts, and the run keeps
+/// A sorted run. The ids are sorted by `(key1, id)` of their facts, and the run keeps
 /// the first key of every [`FENCE`]-th entry, the interval of its ids and the number of
 /// distinct first keys.
 pub(crate) struct Run {
@@ -21,13 +21,21 @@ pub(crate) struct Run {
 }
 
 impl Run {
-    /// A run over `ids`, which are sorted by `(key1, key2)` already.
+    /// A run over `ids`, which are sorted by `(key1, id)` already.
+    #[cfg(test)]
     pub fn new(ids: Vec<u32>, key1: &impl Fn(u32) -> u64) -> Run {
-        let mut fence = Vec::with_capacity(ids.len().div_ceil(FENCE));
+        Run::from_sorted(ids.iter().map(|&id| (key1(id), id)))
+    }
+
+    /// A run over `(key1, id)` entries sorted by key and then id, which are read once:
+    /// the buffers are made at the entries' number and never grow.
+    pub fn from_sorted(entries: impl ExactSizeIterator<Item = (u64, u32)>) -> Run {
+        let n = entries.len();
+        let mut ids = Vec::with_capacity(n);
+        let mut fence = Vec::with_capacity(n.div_ceil(FENCE));
         let (mut lo, mut hi, mut distinct) = (u32::MAX, 0u32, 0u32);
         let mut prev = None;
-        for (i, &id) in ids.iter().enumerate() {
-            let k = key1(id);
+        for (i, (k, id)) in entries.enumerate() {
             if i % FENCE == 0 {
                 fence.push(k);
             }
@@ -37,6 +45,7 @@ impl Run {
             }
             lo = lo.min(id);
             hi = hi.max(id);
+            ids.push(id);
         }
         let (lo, hi) = if ids.is_empty() { (0, 0) } else { (lo, hi + 1) };
         Run {
