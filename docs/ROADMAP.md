@@ -176,7 +176,7 @@ the floor.
    files of item 720, the waiting messages of item 721 and the one-thread
    layout of item 722.
 
-The workbench UI runs as one stream of about two lanes beside the engine work. After the
+Workbench UI work runs beside the engine work, about two items at a time. After the
 DL Query tab, the SKOS editor, the web UI shell of item 632 and the visual SHACL shape
 editor of item 617 come these, in order:
 1. Inferred axioms in entity frames (622), with the inferred property and individual
@@ -540,8 +540,6 @@ continues within its caller-visible evidence and measured-latency scope.
 | 14 | **Compaction and operation progress.** Delta changes located per block, new vocabulary without a full rebuild, adaptive thresholds and automatic compaction in embedded use remain. Shared controlled load and compaction progress must also reach the Node callbacks without weakening cancellation or memory budgets. | [C13](specs/C13-automatic-compaction.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#operation-progress) | M | Medium–high |
 | 15 | **Ingestion of images and audio.** The remaining follow-ups are recorded in C18. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
 | 113 | **Small changes and undos over a kept closure.** Changes of 100 triples at 16 threads and undos at 1 thread remain slower than before the F16 follow-up, and a profile of the full run should find or rule out a cost of about 5%. The options are an opt-in in-memory index of the input facts, charged to the memory budget, and per-thread counters in the block cache. | [F16](specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) | M | Low |
-
-<a id="lanes-of-item-17"></a>
 
 ### Parts of item 17
 

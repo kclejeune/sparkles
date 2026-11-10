@@ -7,8 +7,8 @@ each stated scope.
 ## Server and protocols
 
 The server speaks Fuseki's protocols and admin API, and adds GraphQL, stored queries and
-an OpenAPI description. The MCP server for agents is described under
-[AI and agents](../ai/README.md#mcp-server).
+an OpenAPI description. The [MCP server for agents](../ai/README.md#mcp-server) belongs to
+AI and agents.
 
 ### SPARQL protocol and Fuseki compatibility
 
@@ -68,14 +68,14 @@ an OpenAPI description. The MCP server for agents is described under
 * A request runs as a fixed number of SPARQL queries on one snapshot, and its cursors name
   their commit. Depth, fetch groups and estimated nodes are limited before a request runs.
   Every query runs with the caller's graph view and protections of triples.
-* Introspection, the GraphQL over HTTP media types and status codes, and execution errors
-  with null propagation follow the specifications.
+* GraphQL follows the specifications for introspection, the HTTP media types and status
+  codes, and execution errors with null propagation.
 
 ### Stored queries
 
 * Named, parameterized queries are stored per dataset in `queries.json`, which backups
-  and clones include ([API.md](../API.md#stored-queries)). `/$/queries/{ds}`,
-  `/{ds}/queries/{name}`, `sparkles queries` and `sparkles::stored` manage and run them.
+  and clones include ([API.md](../API.md#stored-queries)). They are managed and run through
+  `/$/queries/{ds}`, `/{ds}/queries/{name}`, `sparkles queries` and `sparkles::stored`.
 * Parameters are typed, with defaults and allowed values, and each query has a
   description, example questions and a default result format.
 * A run binds each value as one RDF term through initial bindings, never as query text,
@@ -147,8 +147,8 @@ Authentication is off by default. Once it is on, access is denied unless a grant
 * Dataset and branch administration emit INFO records under `sparkles::audit` with the
   existing actor and completed operation identities. Clones record the selected source
   commit after registration, and authorized failures record bounded codes. Continuing
-  mutation workers retain these records when an HTTP request is cancelled. The
-  [operations guide](../operations/README.md#observability) describes local commands and
+  mutation workers retain these records when an HTTP request is cancelled. See the
+  [operations guide](../operations/README.md#observability) for local commands and
   automatic scratch expiry.
 * With an OIDC provider and `serve --mcp`, `/$/mcp` is an OAuth 2.1 protected resource
   ([API.md](../API.md#oauth-for-the-mcp-endpoint)). It publishes RFC 9728 metadata that
@@ -190,14 +190,13 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 ### Server, access control and operations
 
 * The JSON metrics snapshot and OTLP export omit some produced-row, memory-peak and
-  rebuild series available in Prometheus. Cross-format parity is roadmap item 342.
+  rebuild series available in Prometheus. Roadmap item 342.
 * Sparkles implements most of ARQ's function library, including `afn:sprintf`,
   `afn:localname` and `afn:version`. It lacks the JavaScript functions (`js:`),
   `afn:context`, the Leviathan `lfn:` library, the `JSON` query form, ARQ's `EXISTS { … }`
   group element and `AGG` with more than one argument. `afn:print` and `afn:execTime`
   print nothing, and `afn:collation` returns its string, so it orders by code point and not
-  by locale. Roadmap item 69, a lower-priority extension outside the completion of Server
-  and Fuseki integration.
+  by locale. This is a lower-priority extension. Roadmap item 69.
 * There are no JVM metrics. Assembler bodies are read only for the part that maps to a
   dataset. Direct Graph Store naming is chosen per dataset at start with
   `--gsp-direct-naming` and not through the settings API. Roadmap item 76.
@@ -213,22 +212,23 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   and no private queries per user. Roadmap item 39.
 * The resource catalog fetches nothing. The content-addressed source store, recipes and
   harvesters, load manifests with reload from sources, mirrors, update monitoring, IRI
-  minting and vocabulary graph bundles remain under roadmap item 458. The export and
-  publication routes do not apply the licence gate's verdict, item 525, and the
-  catalog has no Croissant export, item 526. Only server administrators read the
+  minting and vocabulary graph bundles are planned. Roadmap item 458. The export and
+  publication routes do not apply the licence gate's verdict. Roadmap item 525. The
+  catalog has no Croissant export. Roadmap item 526. Only server administrators read the
   catalog.
 * Request work keeps to the performance cores of a hybrid processor only on Linux and
   only when the kernel lists its cores in `/sys/devices/cpu_core/cpus` and
   `/sys/devices/cpu_atom/cpus`, as it does for Intel hybrid processors. The default
   query pool size and the limit of one request in flight per performance core were
-  measured on one Intel processor. Other hybrid processors and macOS remain under
-  roadmap item 576.
+  measured on one Intel processor. Other hybrid processors and macOS are not covered.
+  Roadmap item 576.
 * Sparkles runs as a single node on local disk. There is no clustering and there are no
-  replicas, roadmap item 66. Live RDF data on local disk is not encrypted at rest, item 65.
-* Backups cover individual datasets, with no whole-server backup, roadmap item 61.
-  Retained-history backups and storage-retention controls also remain under item 61.
-  Encryption keys for backup repositories cannot be managed through the API, Vault or a
-  cloud KMS, and write-only age-recipient repositories are not built, item 65.
+  replicas. Roadmap item 66. Live RDF data on local disk is not encrypted at rest. Roadmap
+  item 65.
+* Backups cover individual datasets, with no whole-server backup, retained-history backups
+  or storage-retention controls. Roadmap item 61. Encryption keys for backup repositories
+  cannot be managed through the API, Vault or a cloud KMS, and write-only age-recipient
+  repositories are not built. Roadmap item 65.
 * Without `--secrets-key`, runtime keys are sealed with a key that the server generated in
   the data directory, which does not protect them from someone who can read that
   directory. An operator who wants no keys on disk locks the secrets in the settings file.
@@ -290,7 +290,7 @@ Arbitrary protection-pattern planning and unresolved providers nested in triple 
 or protection graph definitions remain unsupported by the bounded helper. Static
 nested guards remain supported.
 Guarded Dataset queries, C25 exact references and U02 readers still need adoption under
-[C29](../specs/C29-bounded-view-preparation/README.md), roadmap item 395. These helpers
+[C29](../specs/C29-bounded-view-preparation/README.md). Roadmap item 395. These helpers
 provide no managed-write authority, source authenticity or complete HTTP query
 preparation limit. Bounded callers must propagate refusal without weakening the policy
 or selecting another state.

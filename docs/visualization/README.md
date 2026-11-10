@@ -121,7 +121,7 @@ The SvelteKit UI is embedded in the server binary.
   **Summarize again** ([USAGE.md](../USAGE.md#the-ask-bar)). The page keeps a local history
   of questions, saves a question and its query as a stored example, and takes suggested
   examples from readers.
-* The explanation of a plan shows beside the plan tree, with links that select
+* A plan's explanation shows beside the plan tree, with links that select
   operators, and a stopped query offers **Explain why**.
 * The Pattern pane, opened with `Alt+P`, draws the query's graph pattern beside the editor
   and edits it ([U08](../specs/U08-visual-query-builder.md),
@@ -154,7 +154,7 @@ The SvelteKit UI is embedded in the server binary.
   draw the GraphRAG communities instead, with a community's report beside the picture
   ([screenshot](../images/explore-communities.png)). A list view (`L`) is the accessible
   companion, and without WebGL the overview falls back to Cytoscape.
-* The drawn graph of a resource holds what the person has explored, up to 100,000 nodes, and
+* A resource's drawn graph holds what the person has explored, up to 100,000 nodes, and
   draws up to a budget of 5,000 of them. Past 1,000 visible nodes the canvas changes from
   Cytoscape to the WebGL view that the overview uses, and it changes back under 700. Click,
   double click to expand, a right click or a long press for the node menu, a click on an
@@ -288,7 +288,7 @@ The SvelteKit UI is embedded in the server binary.
   branches and settings, and a search across the page recalls facts as the same cards
   ([screenshot](../images/memory.png)). Its Inbox tab reviews facts, with **Accept all that pass** to select them,
   and **Promote selected** and **Reject selected** to act on the selection.
-* The Communities tab of a dataset shows the GraphRAG hierarchy as a tree or, with **Map**, as
+* A dataset's Communities tab shows the GraphRAG hierarchy as a tree or, with **Map**, as
   a treemap in which each community is a box sized by its members and a parent holds its
   sub-communities under its title ([screenshot](../images/communities-map.png)). A box is
   tinted by its report's status, and says the status in words wherever it is large
@@ -333,19 +333,19 @@ than one.
 
 ![A SKOS collection's form with a member chosen among the sh:or alternatives and the ordered member list after a move](../images/forms-list.png)
 
-The Rust library exposes the same model as `dataset.forms().nested_model(&request,
-&options)`, with the ordinary root form, a `nested_nodes` pool and `templates`. HTTP
-takes `nested=true` on the model route and `nested` entries in check and save bodies, and
-Python takes `nested=True`. One request admits at most 64 nested identities, 512
-generated field views, 512 parent anchors and 16 levels of first discovery. A shared
-preparation allowance refuses a larger or unfinished model, and the form then falls back
-to the flat model with nested values read-only. Complex nested paths, visible
-blank-named graph contexts and matching composite range bounds also refuse until their
-representation or producers have controlled admission. The allowance covers adapter
-preparation and retention, while physical reader and mask preparation depend on
-[item 395](../ROADMAP.md). The
-[specification](../specs/U02-shape-driven-forms/SPEC.md#231-nested-read-models-in-the-rust-library)
-explains the unit calculation.
+The Rust library exposes the same model as
+`dataset.forms().nested_model(&request, &options)`, with the ordinary root form, a
+`nested_nodes` pool and `templates`. HTTP takes `nested=true` on the model route and
+`nested` entries in check and save bodies, and Python takes `nested=True`. One request
+admits at most 64 nested identities, 512 generated field views, 512 parent anchors and 16
+levels of first discovery. A shared preparation allowance refuses a larger or unfinished
+model, and the form then falls back to the flat model with nested values read-only.
+Complex nested paths, visible blank-named graph contexts and matching composite range
+bounds also refuse until their representation or producers have controlled admission. The
+allowance covers adapter preparation and retention, while physical reader and mask
+preparation depend on a separate planned change. [Roadmap item 395](../ROADMAP.md). The
+[unit calculation](../specs/U02-shape-driven-forms/SPEC.md#231-nested-read-models-in-the-rust-library)
+is in the specification.
 
 ### Browse and the Workbench
 
@@ -534,19 +534,19 @@ shows the type groups and a selected member.
 
 The Individuals filter searches names at the current branch head and reads each candidate's
 memberships at the displayed commit. It skips candidates absent from that revision, keeps
-valid matches and displays hard read failures. Historical name search remains under item
-658.
+valid matches and displays hard read failures. Historical name search remains planned.
+Roadmap item 658.
 
-The same read is available through `Dataset.ontology.individuals` in Python and Node.js
-and `SparklesOnt.individuals` or the ontology handle on the JVM. Their cursors and
+Python and Node.js expose the same read as `Dataset.ontology.individuals`, and the JVM
+exposes it as `SparklesOnt.individuals` or the ontology handle. Their cursors and
 revision selectors follow the HTTP contract.
 
 The paged HTTP response does not imply bounded server work. The individuals route reuses
 the ontology's terminology mapping, and discovers buckets and Untyped members by scanning
 the authorized graph scope. A typed member page scans that type's membership. The cold
-terminology mapping cost remains under roadmap item 736. Repeated bucket discovery,
-lexical-page selection and exact-total scans remain under item 749, with grants, pinned
-views and bounded memory preserved. The first-member wait includes these scans even
+terminology mapping cost remains open. Roadmap item 736. Repeated bucket discovery,
+lexical-page selection and exact-total scans remain open, with grants, pinned views and
+bounded memory preserved. Roadmap item 749. The first-member wait includes these scans even
 when the browser receives only a small page.
 
 Typed pages read complete type lists for the members they return and reject a returned
@@ -680,9 +680,9 @@ only the entries whose graph they can read.
 The **Imported axioms** switch beside the graph picker includes or excludes the axioms of
 the imported graphs in every view of the editor, and the page keeps the choice in its URL.
 Edits write to the selected graph either way. Turning the switch or changing the map reads
-the trees, the filtered trees and the frame again. Reads never fetch, and item 559 covers
-fetching during a read. Reasoning runs keep their own location mapping, which item 772
-connects to the import map.
+the trees, the filtered trees and the frame again. Reads never fetch, and fetching during
+a read is planned. Roadmap item 559. Reasoning runs keep their own location mapping, which
+does not use the import map. Roadmap item 772.
 
 **Inferred** reveals the
 kept hierarchy beside the asserted class tree. It reads roots and expanded levels from
@@ -848,8 +848,8 @@ parent otherwise.
 The pages read two routes of the [API reference](../API.md#ontology), `hierarchy` and
 `term`, which read the store's indexes around one entity, so a page costs the same on
 GO or ChEBI as on a small ontology. The landing page search takes `/`,
-which opens the command palette on the other browser pages. The components of the page
-live in `ui/src/lib/components/browse` and take their data as properties, so other pages
+which opens the command palette on the other browser pages. The page's components live
+in `ui/src/lib/components/browse` and take their data as properties, so other pages
 can reuse them.
 
 ### Thesaurus editor
@@ -857,7 +857,7 @@ can reuse them.
 The **Thesaurus** editor, `/ui/workbench/thesaurus`, edits the SKOS concept schemes, concepts and
 collections of one graph, with their SKOS-XL labels
 ([U12](../specs/U12-ontology-workbench/SPEC.md#thesaurus-editor),
-[screenshot](../images/thesaurus-editor.png)). The concept tree of the chosen scheme
+[screenshot](../images/thesaurus-editor.png)). The chosen scheme's concept tree
 starts at its top concepts and reads one level of `skos:broader` and `skos:narrower` at a
 time, in both directions. A concept with several broader concepts appears under each of
 them with a count of its broader concepts, and a concept of the scheme without a broader
@@ -912,23 +912,22 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 * Forms edit predicate and inverse paths with literal and IRI values, nested blank-node
   children, lists and value alternatives. Node-level `sh:or` and `sh:xone` alternatives
-  with their own properties are not offered as sub-forms (612), nested values
-  reached through complex paths are read-only (613), and blank-named graph
-  contexts refuse the nested model (614). List members are IRIs or literals, so a
-  list of blank nodes is read-only. ShEx schemas do not drive forms. Checks admit up to 500
-  additional distinct affected targets beyond the directly touched resources, shared
-  across shapes and snapshots. They refuse a larger or unfinished discovery instead of
-  returning partial conformance. Forms admit graph-free target-node expressions made
+  with their own properties are not offered as sub-forms. Roadmap item 612. Nested values
+  reached through complex paths are read-only. Roadmap item 613. Blank-named graph
+  contexts refuse the nested model. Roadmap item 614. List members are IRIs or literals,
+  so a list of blank nodes is read-only. ShEx schemas do not drive forms. Checks admit up
+  to 500 additional distinct affected targets beyond the directly touched resources,
+  shared across shapes and snapshots. They refuse a larger or unfinished discovery instead
+  of returning partial conformance. Forms admit graph-free target-node expressions made
   from constants, lists, focus variables, basic list operators, conditionals and simple
-  aggregates. Target filters that inspect only their input node are admitted. Graph-reading
-  target filters and other target-node expression producers are refused before evaluation and
-  remain under roadmap item 615. Directly anchored SPARQL triple and path dependencies are
-  admitted. Property functions, computed predicates and indirect query-dependency producers
-  refuse an incomplete check until bounded
-  localization is available, while genuinely global queries enumerate bounded targets.
-  Ordinary SHACL validation retains its separate language
-  support. Discovery work bounds do not establish a total SHACL heap limit. Controlled
-  cold-reader admission waits for item 395.
+  aggregates. Target filters that inspect only their input node are admitted.
+  Graph-reading target filters and other target-node expression producers are refused
+  before evaluation. Roadmap item 615. Directly anchored SPARQL triple and path
+  dependencies are admitted. Property functions, computed predicates and indirect
+  query-dependency producers refuse an incomplete check until bounded localization is
+  available, while genuinely global queries enumerate bounded targets. Ordinary SHACL
+  validation retains its separate language support. Discovery work bounds do not establish
+  a total SHACL heap limit. Controlled cold-reader admission is planned. Roadmap item 395.
 * The Pattern pane builds and edits basic graph patterns, filters, one level of
   `OPTIONAL`, simple paths, the projection and the modifiers. `UNION`, `GRAPH`, inline
   `VALUES`, `MINUS` and `FILTER NOT EXISTS` are not editable on the canvas, a waiting node
@@ -944,25 +943,25 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   facets count whole years only, and at phone width the facets sit below the graph. The
   Explore map and facets read one dataset on its main branch. The `VALUES` block of
   **Use in query** is a locked block on the Pattern canvas. Roadmap item 140.
-* The frame rate of arcs and of the embedding map has been measured only in software
-  rendering, roadmap item 141. Projections are kept in memory only and are not offered to
-  callers with partial access, item 142.
-* The validation overlay validates the drawn nodes instead of reading a recorded result,
-  roadmap item 120. Under an incremental guard with other results in the dataset, a
-  preview cannot say whether a fix resolves its result, item 121. Callers whose grants
-  cover only some graphs get no overlay, item 75.
+* Arc and embedding-map frame rates have been measured only in software rendering.
+  Roadmap item 141. Projections are kept in memory only and are not offered to callers
+  with partial access. Roadmap item 142.
+* The validation overlay validates the drawn nodes instead of reading a recorded result.
+  Roadmap item 120. Under an incremental guard with other results in the dataset, a
+  preview cannot say whether a fix resolves its result. Roadmap item 121. Callers whose
+  grants cover only some graphs get no overlay. Roadmap item 75.
 * The ontology editor pages class and property levels and individuals by asserted type.
   Its inferred class tree reads kept roots and expanded levels. Fresh recorded RDFS or
   OWL RL materializations supply object/data-property groups and indirect named
   individual types beside asserted data. Classifier-backed property and individual
-  entailments remain under item 609 and F24. The IRI policy is kept in the browser per
-  dataset, 610. Rename covers the graph the
-  page reads and not IRIs inside triple terms, under item 457's refactoring phase. The
-  editable schema diagram is a further U12 phase of item 457.
+  entailments remain planned in F24. Roadmap item 609. The IRI policy is kept in the
+  browser per dataset. Roadmap item 610. Rename covers the graph the page reads and not
+  IRIs inside triple terms. Renaming those IRIs and the editable schema diagram are later
+  U12 phases. Roadmap item 457.
 * The DL Query tab's instances come from a classification with the assertions, which
   the dataset does not keep, so each instance query classifies the ontology again, and
-  a query outside OWL 2 EL copies the ontology into memory for the RL rules, item
-  662. Class answers under the RL rules can miss entailed subsumptions, and the
+  a query outside OWL 2 EL copies the ontology into memory for the RL rules. Roadmap
+  item 662. Class answers under the RL rules can miss entailed subsumptions, and the
   label marks them as possibly incomplete.
 * Named-class frames in Browse and the ontology editor read bounded direct-parent and
   equivalent clauses from kept state, with inferred badges and exact source/outcome.
@@ -975,55 +974,59 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   frame share an exact producer/revision pin. Restricted, missing, stale or replaced
   sources fail visibly and never run reasoning. Producer completeness and consistency
   are unknown, and explanations are unavailable. General classifier-backed inferred
-  axiom listings and explanation links remain in items 588, 622, 609 and F24. The full class-tree **Classify tree** action is explicit
-  and reads legacy POST pages; a toggle or `inferred=1` URL never starts it. Its later
+  axiom listings and explanation links remain planned in F24. Roadmap items 588, 622
+  and 609. The full class-tree **Classify tree** action is explicit and reads legacy POST
+  pages; a toggle or `inferred=1` URL never starts it. Its later
   pages and labels stay pinned to the original commit, and changed input/content refuses
   assembly. The legacy transfer can include a large equivalence node and is distinct
   from the bounded frame API.
 * The thesaurus editor reads at most 2,000 narrower concepts of a concept and 5,000 roots
   of a scheme, and the label search scans the labels for a substring and answers
-  its first 100 matches, 638. A mapping's target in another dataset is named by its
-  IRI, and the page lists only the mappings a concept states itself, 639.
-  `skosxl:labelRelation` links between SKOS-XL labels are not edited, 640. The
-  SKOS rules become a write guard only by replacing the dataset's guard, so a dataset
-  cannot keep its own shapes and the SKOS shapes together, 641. Editing forms
+  its first 100 matches. Roadmap item 638. A mapping's target in another dataset is named
+  by its IRI, and the page lists only the mappings a concept states itself. Roadmap
+  item 639. `skosxl:labelRelation` links between SKOS-XL labels are not edited. Roadmap
+  item 640. The SKOS rules become a write guard only by replacing the dataset's guard, so a
+  dataset cannot keep its own shapes and the SKOS shapes together. Roadmap item 641.
+  Editing forms
   read every graph and have no graph or commit precondition of a request's own, so the
   thesaurus editor's notes and members forms are read-only in a dataset with more than one
   graph and their saves do not name the commit the page shows. A form finds a resource's
   shapes through the default graph, so a resource kept only in a named graph gets no
-  editable form, 642. Blank-node SKOS-XL labels of
+  editable form. Roadmap item 642. Blank-node SKOS-XL labels of
   one kind with the same literal form cannot be told apart by an update and are shown
   without edit buttons.
 * The ontology editor decides whether the caller can write from the caller's level on the
   dataset, so a caller whose grants allow writes on a branch only sees the branch
-  read-only, 611. For the same reason the thesaurus editor's notes and members forms are
-  read-only on branches other than main when authentication is on. Undo and redo revert commits, which needs write access to the
-  whole branch, so a caller whose grants cover some graphs only can edit but not undo.
-  A revert from the entity frame's History view has the same requirement. The view reads
-  graph restrictions from the main branch's grants, so on another branch it offers a
-  revert that the preview's dry run refuses when that branch's grants cover only some
-  graphs, 611.
+  read-only. Roadmap item 611. For the same reason the thesaurus editor's notes and
+  members forms are read-only on branches other than main when authentication is on. Undo
+  and redo revert commits, which needs write access to the whole branch, so a caller whose
+  grants cover some graphs only can edit but not undo. A revert from the entity frame's
+  History view has the same requirement. The view reads graph restrictions from the main
+  branch's grants, so on another branch it offers a revert that the preview's dry run
+  refuses when that branch's grants cover only some graphs. Roadmap item 611.
 * The entity frame's History view lists the commits that changed a triple naming the
   entity, so a commit that changed only the blank nodes of a restriction or an annotated
-  axiom is not listed, 765. Each opened commit reads the editor's graph twice to compare
-  its axioms, so opening a commit of a large ontology takes as long as two reads of it.
+  axiom is not listed. Roadmap item 765. Each opened commit reads the editor's graph twice
+  to compare its axioms, so opening a commit of a large ontology takes as long as two
+  reads of it.
 * The ontology browser's edit mode changes definitions, synonyms, annotations, parents,
   axioms and SKOS labels and links. SKOS-XL labels and collection members are edited in
   the thesaurus editor, and property assertions, keys and chains have no form of their
-  own and are added as an axiom, 706. Its first preview on a large
-  ontology waits for the axioms route to open the whole ontology, 707. Its
+  own and are added as an axiom. Roadmap item 706. Its first preview on a large
+  ontology waits for the axioms route to open the whole ontology. Roadmap item 707. Its
   hierarchy shows asserted axioms alongside bounded kept class groups or strict
   materialization-backed property/individual groups. Derived frames remain read only,
-  and general classifier-backed inferred frames remain in item 622. Its search reads
-  the head of a branch, so a page at a past state has no search box, item 658. It shows
-  entities using the shared rendering preferences. Reuse is looked up in the other datasets of the same server,
-  and other servers' term pages are item 461. The landing page offers axiom counts and
+  and general classifier-backed inferred frames remain planned. Roadmap item 622. Its
+  search reads the head of a branch, so a page at a past state has no search box. Roadmap
+  item 658. It shows entities using the shared rendering preferences. Reuse is looked up
+  in the other datasets of the same server, and other servers' term pages are planned.
+  Roadmap item 461. The landing page offers axiom counts and
   conservative expressivity through its on-demand metrics panel.
 * The ontology editor's tree filter uses entity search. The thesaurus label search and
-  DL Query's completion still use separate name lookups, item 660.
+  DL Query's completion still use separate name lookups. Roadmap item 660.
 * Deleting the selected entity can leave an outstanding tree reveal with an unhandled
-  not-found rejection. Item 751 covers this navigation case while preserving selection,
-  revision pins and normal tree reveals.
+  not-found rejection. A planned fix preserves selection, revision pins and normal tree
+  reveals. Roadmap item 751.
 
 ## Configuration and usage
 
@@ -1043,9 +1046,9 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-A standalone desktop application is planned under [item 746](../ROADMAP.md), with
-its framework comparison and parity requirements in [U13](../specs/U13-desktop-application/README.md).
-The current interface is served by the Sparkles server.
+A standalone desktop application is planned, with its framework comparison and parity
+requirements in [U13](../specs/U13-desktop-application/README.md).
+[Roadmap item 746](../ROADMAP.md). The current interface is served by the Sparkles server.
 
 The remaining work described above refers to [item 622](../ROADMAP.md), [item 630](../ROADMAP.md), [item 658](../ROADMAP.md), [item 461](../ROADMAP.md), [item 612](../ROADMAP.md), [item 613](../ROADMAP.md), [item 614](../ROADMAP.md), [item 615](../ROADMAP.md), [item 27](../ROADMAP.md), [item 29](../ROADMAP.md), [item 75](../ROADMAP.md), [item 101](../ROADMAP.md), [item 120](../ROADMAP.md), [item 121](../ROADMAP.md), [item 140](../ROADMAP.md), [item 141](../ROADMAP.md), [item 142](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its

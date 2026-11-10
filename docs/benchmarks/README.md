@@ -30,10 +30,12 @@ The summary also records measurement coverage and the full loss table. The
 
 ## Evidence and generated reports
 
-RESULTS.md files contain imported, manually maintained reports unless they explicitly
-say they are generated. Their tables retain the original timing statistics, footnotes
-and qualifications. A report can mix multiple runs and timing contracts. It must not be
-reconstructed by selecting the newest JSON file alone.
+RESULTS.md files contain imported, manually maintained reports unless they explicitly say
+they are generated. Their tables retain the original timing statistics, footnotes and
+qualifications. A report can mix multiple runs and timing contracts. It must not be
+reconstructed by selecting the newest JSON file alone. A raw record supports only the
+measurements and metadata it contains, so a claim that needs a missing build revision,
+host detail, durability setting or answer evidence needs a new run.
 
 Each workload has a RUNS.json catalog. A run ID is the SHA-256 of the raw record bytes,
 so several runs on the same day remain distinct. Existing JSON records retain their
