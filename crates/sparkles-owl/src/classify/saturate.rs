@@ -830,6 +830,12 @@ pub trait Sink {
     fn dl(&self) -> &super::dl_rules::DlRun {
         unreachable!("Tier D runs only in a saturation")
     }
+    /// the existential restriction whose hypothetical successor, keyed by a predecessor,
+    /// the context `v` made during the run is (item 728)
+    fn keyed_hyp(&self, v: Ex) -> Option<Ex> {
+        let _ = v;
+        None
+    }
     /// whether the context has conclusions of its own waiting
     fn busy(&self) -> bool {
         false
@@ -919,6 +925,13 @@ impl Sink for Out<'_, '_> {
 
     fn dl(&self) -> &super::dl_rules::DlRun {
         self.run.bounds.dl.expect("a run with Tier D")
+    }
+
+    fn keyed_hyp(&self, v: Ex) -> Option<Ex> {
+        if (v as usize) < self.run.ctx.len() {
+            return None;
+        }
+        dl_rules::keyed_of(self.run.get_dynamic_core(v))
     }
 
     #[inline]
