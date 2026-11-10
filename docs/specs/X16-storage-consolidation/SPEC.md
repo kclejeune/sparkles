@@ -120,13 +120,14 @@ dataset file gains `format` 2 and the index gains format 5.
 The cutoff marker is therefore `format` 2 of `dataset.json`, which every store of the
 first release writes, and not `minimumReader`, because a plain store writes reader 5 and
 `managed_history::activation_recorded` reads a reader of 8 or more as a recorded
-activation. The reader stays what it is, a capability requirement that activation and
+activation, except reader 9 beside a `jobs.json`, which the durable job ledger explains. The reader stays what it is, a capability requirement that activation and
 the managed and held files raise. The private import transport of
 `store/backup/transport.rs`, which no production path wires and whose staged destination
-has no store constructor, writes `minimumReader` 9 for an imported destination, and its
-test asserts that a reader-8 build refuses those bytes. That is a compatibility decision
-for the lane that wires the import, which then raises `DATASET_READER` and the registry
-together, and the cutoff does not change it. The acceptance cases of the phase are a
+has no store constructor, writes `minimumReader` one above the current `DATASET_READER`
+for an imported destination, through the named constant `IMPORTED_DESTINATION_READER`, and
+its test asserts that this build refuses those bytes. Reader 9 belongs to the durable job
+ledger of C26. The lane that wires the import takes the next reader number and raises
+`DATASET_READER` and the registry together, and the cutoff does not change it. The acceptance cases of the phase are a
 plain store created, written, reopened, branched, cloned and compacted, with the clone
 reopened and carrying `format` 2 with its own reader requirement, an activated store doing
 the same apart from the clone, since `clone_to` refuses an activated source until item

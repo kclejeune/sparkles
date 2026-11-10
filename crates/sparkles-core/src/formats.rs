@@ -173,7 +173,7 @@ pub const DATASET: FileKind = FileKind {
     marker: "`format` 1, `minimumReader` (the reader capability the database needs) and `writtenBy`",
     class: Class::Primary,
     writes: crate::commit::DATASET_READER,
-    reads: &[1, 2, 3, 4, 5, 6, 7, 8],
+    reads: &[1, 2, 3, 4, 5, 6, 7, 8, 9],
 };
 
 /// A generation's index: `gen-*/meta.json` and the permutation and vocabulary files.
@@ -761,6 +761,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     // the managed-graph registry and its owners' settings (see `crate::managed`)
     ds("managed.json", 3),
     ds("evidence.json", 1),
+    ds("jobs.json", crate::jobs::FORMAT),
     // durable source holds (see `crate::holds`)
     ds("holds.json", 1),
     // a view's definition, `views/NAME/view.json`: format 2 is a paused one
@@ -800,7 +801,7 @@ pub fn informational(name: &str) -> bool {
 /// managed-graph registry and its owners' settings. A registry this build cannot
 /// enforce keeps the dataset readable and refuses every write instead (see
 /// [`crate::managed`]).
-pub const WRITE_FENCED_SETTINGS: &[&str] = &["managed.json", "evidence.json"];
+pub const WRITE_FENCED_SETTINGS: &[&str] = &["managed.json", "evidence.json", "jobs.json"];
 
 /// Dataset settings files that refuse the open only when they are of a newer version.
 /// Any other damage keeps the dataset open and makes the file's owner fail closed:

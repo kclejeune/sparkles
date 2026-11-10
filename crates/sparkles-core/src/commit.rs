@@ -433,8 +433,16 @@ pub(crate) fn parse_rfc3339_offset(s: &str) -> Option<i64> {
 /// 3: relinked generations with an immutable base overlay, 4: framed delta
 /// vocabularies, see [`crate::vocab::delta`], 5: write-ahead logs with a header record,
 /// see [`crate::store::wal`], 6: protected managed graphs, `managed.json`, see
-/// [`crate::managed`], 7: durable source holds, `holds.json`, see [`crate::holds`]). [`crate::formats::DATASET`] lists them.
-pub const DATASET_READER: u32 = 8;
+/// [`crate::managed`], 7: durable source holds, `holds.json`, see [`crate::holds`],
+/// 8: configuration history, see [`crate::store::managed_history`], 9: the durable job
+/// ledger, see [`crate::jobs`]). [`crate::formats::DATASET`] lists them.
+pub const DATASET_READER: u32 = 9;
+
+/// The reader an imported destination of the private import transport
+/// ([`reidentified_dataset_bytes`]) requires: one above what this build reads, so that
+/// no build accepts an imported destination before the lane that wires the import
+/// (roadmap item 61) raises [`DATASET_READER`] and the registry together.
+pub(crate) const IMPORTED_DESTINATION_READER: u32 = DATASET_READER + 1;
 fn legacy_reader() -> u32 {
     1
 }
@@ -798,8 +806,8 @@ fn write_dataset(root: &Path, ds: &DatasetFile) -> Result<()> {
 /// Pure receiving-owned metadata for an unpublished imported destination. The
 /// closed producer separately supplies its genuine old owner and selected data
 /// sequence. These bytes grant no Store/source/replay or current permission.
-/// Reader9 is emitted explicitly; this build still refuses that destination
-/// until the complete physical producer/consumer feature is enabled together.
+/// [`IMPORTED_DESTINATION_READER`] is emitted explicitly; this build still refuses that
+/// destination until the complete physical producer/consumer feature is enabled together.
 pub(crate) fn reidentified_dataset_bytes(
     bytes: &[u8],
     old: uuid::Uuid,
@@ -846,7 +854,7 @@ pub(crate) fn reidentified_dataset_bytes(
     file.created = rfc3339_ms(created_ms);
     file.forked_from = Some(ForkedFrom { id: old, seq });
     file.written_by = Some(crate::formats::SPARKLES_VERSION.to_owned());
-    file.minimum_reader = file.minimum_reader.max(9);
+    file.minimum_reader = file.minimum_reader.max(IMPORTED_DESTINATION_READER);
     held.release_to(budget.used());
     preparation.check()?;
     managed_history::encode_pretty(&file, preparation)
@@ -2683,7 +2691,7 @@ mod tests {
         let preparation = Preparation::new(Control::none(), 4 << 20).unwrap();
         let room = preparation.room();
         let mut original = parse_dataset(&dataset_file_bytes(old, "restore", 1000)).unwrap();
-        original.minimum_reader = 8;
+        original.minimum_reader = DATASET_READER;
         original.extra.insert(
             "futureMetadata".to_owned(),
             serde_json::json!({"retained":[1,2,3]}),
@@ -2700,14 +2708,20 @@ mod tests {
             let output =
                 reidentified_dataset_bytes(&raw, old, destination, 42, 2000, &preparation).unwrap();
             let value: serde_json::Value = serde_json::from_slice(&output.value).unwrap();
+            // this build never accepts an imported destination it cannot read
+            assert!(IMPORTED_DESTINATION_READER > DATASET_READER);
             assert!(matches!(
-                check_dataset_value_as(&value, 8),
+                check_dataset_value_as(&value, DATASET_READER),
                 Err(Error::Unsupported(_))
             ));
-            check_dataset_value_as(&value, 9).unwrap();
+            assert!(matches!(
+                parse_dataset(&output.value),
+                Err(Error::Unsupported(_))
+            ));
+            check_dataset_value_as(&value, IMPORTED_DESTINATION_READER).unwrap();
             let found: DatasetFile = serde_json::from_slice(&output.value).unwrap();
             assert_eq!(found.id, destination);
-            assert_eq!(found.minimum_reader, 9);
+            assert_eq!(found.minimum_reader, IMPORTED_DESTINATION_READER);
             assert_eq!(found.format, 1);
             assert_eq!(found.origin, "restore");
             assert_eq!(found.created, rfc3339_ms(2000));

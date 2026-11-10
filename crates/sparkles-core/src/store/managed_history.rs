@@ -23,9 +23,7 @@ pub(crate) const FORMAT: u32 = 1;
 /// root with either record is therefore activated, and a registry that is
 /// missing or names no history root must refuse rather than read as legacy.
 pub(crate) fn activation_recorded(root: &Path) -> Result<bool> {
-    let reader = crate::commit::read_dataset_versions(root)?
-        .is_some_and(|versions| versions.minimum_reader >= READER);
-    if reader {
+    if reader_records_activation(root)? {
         return Ok(true);
     }
     match std::fs::symlink_metadata(root.join(DIRECTORY)) {
@@ -33,6 +31,25 @@ pub(crate) fn activation_recorded(root: &Path) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Whether the dataset reader at `root` records an activation: a reader of
+/// [`READER`] or more that nothing else explains. Reader 9 belongs to the durable job
+/// ledger ([`crate::jobs::READER`]), so a root at exactly that reader with a `jobs.json`
+/// is read as a jobs dataset, and only the history directory then records an
+/// activation. A reader this build does not know still refuses as activated.
+fn reader_records_activation(root: &Path) -> Result<bool> {
+    let Some(versions) = crate::commit::read_dataset_versions(root)? else {
+        return Ok(false);
+    };
+    let reader = versions.minimum_reader;
+    if reader < READER {
+        return Ok(false);
+    }
+    if reader == crate::jobs::READER && root.join(crate::jobs::FILE).exists() {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Refuse an activated root whose registry no longer names its history root.
@@ -77,9 +94,9 @@ pub(crate) fn activated(
         Some(crate::managed::ManagedState::Installed(installed)) => {
             installed.configuration_history.is_some()
         }
-        Some(crate::managed::ManagedState::Unavailable { .. }) => family_root
-            .and_then(|root| crate::commit::read_dataset_versions(root).ok().flatten())
-            .is_some_and(|versions| versions.minimum_reader >= READER),
+        Some(crate::managed::ManagedState::Unavailable { .. }) => {
+            family_root.is_some_and(|root| reader_records_activation(root).unwrap_or(false))
+        }
         None => false,
     }
 }

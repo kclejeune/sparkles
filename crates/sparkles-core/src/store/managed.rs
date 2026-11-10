@@ -116,6 +116,22 @@ impl AdmittedManaged {
 }
 
 impl Store {
+    /// Raise the dataset's `minimumReader` to at least `reader` durably, before the
+    /// first file that reader needs is written. A store without a directory does
+    /// nothing. Through the main store of the dataset.
+    pub fn require_dataset_reader(&self, reader: u32) -> Result<()> {
+        if reader > crate::commit::DATASET_READER {
+            return Err(Error::invalid(format!(
+                "reader {reader} is above what Sparkles {} reads",
+                crate::formats::SPARKLES_VERSION
+            )));
+        }
+        match self.managed_root() {
+            Some(root) => crate::commit::require_reader(&root, reader),
+            None => Ok(()),
+        }
+    }
+
     fn managed_state(&self) -> Option<Arc<ManagedState>> {
         self.family.managed.load_full()
     }

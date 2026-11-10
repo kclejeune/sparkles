@@ -1438,7 +1438,10 @@ mod tests {
         let dataset: serde_json::Value =
             serde_json::from_slice(&std::fs::read(output.join("dataset.json")).unwrap()).unwrap();
         assert_eq!(dataset["id"], new.to_string());
-        assert_eq!(dataset["minimumReader"], 9);
+        assert_eq!(
+            dataset["minimumReader"],
+            crate::commit::IMPORTED_DESTINATION_READER
+        );
         assert_eq!(dataset["forkedFrom"]["id"], original_id.to_string());
         assert_eq!(dataset["forkedFrom"]["seq"], head);
         let origin: serde_json::Value = serde_json::from_slice(

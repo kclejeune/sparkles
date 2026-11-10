@@ -290,6 +290,15 @@ fn activation_is_recorded_by_the_reader_or_the_history_directory() {
         check_activated_registry(root, None).unwrap_err().code(),
         "evidence-unavailable"
     );
+    // reader 9 with a jobs settings file is a jobs dataset, not an activation, and the
+    // same reader without one is read as activated so that it refuses rather than
+    // reads as legacy
+    dataset(crate::jobs::READER);
+    std::fs::write(root.join(crate::jobs::FILE), b"{}").unwrap();
+    assert!(!activation_recorded(root).unwrap());
+    check_activated_registry(root, None).unwrap();
+    std::fs::remove_file(root.join(crate::jobs::FILE)).unwrap();
+    assert!(activation_recorded(root).unwrap());
     // the history directory alone records activation too
     dataset(crate::store::wal::HEADER_READER);
     std::fs::create_dir(root.join(DIRECTORY)).unwrap();
