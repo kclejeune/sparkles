@@ -17,9 +17,11 @@
 //! inverse-functional roles, self restrictions, chains and transitivity under universals,
 //! and disjoint, asymmetric and irreflexive roles. The Horn rules run as their own
 //! instantiation of the saturation, which creates the contexts of conjunctions that the
-//! index does not hold, and only when the EL axioms need no rules of individuals,
-//! universal roles or functional data roles; otherwise the Horn axioms are left out too.
-//! A run with the Horn rules saturates everything again on its next run. An axiom the
+//! index does not hold, and beside the rules of individuals, universal roles and
+//! functional data roles when the ontology has them (roadmap item 692), with two rules
+//! over the predecessors of a context that stands for one element and the worlds over
+//! the conjunction contexts. A run with the Horn rules saturates everything again on its
+//! next run. An axiom the
 //! classifier does not take is left out and reported, with the rule of the OWL 2 Profiles
 //! recommendation it breaks, and the run's [`Stats`] count the axioms outside OWL 2 EL by
 //! whether they are Horn, give the [`Tier`] of rules the ontology needs and count the
@@ -1300,8 +1302,7 @@ impl Saturation {
                 outside_el.add(dl::shape(k));
             }
         }
-        // The Horn rules take what they can of these (item 603) when the EL part needs
-        // no rules of individuals, universal roles or functional data roles.
+        // The Horn rules take what they can of these (items 603 and 692).
         let mut taken: FxHashSet<&AxiomKind> = FxHashSet::default();
         let stop = || poll(limits).is_err();
         let halt = |h: index::Halt| match h {
@@ -1318,7 +1319,7 @@ impl Saturation {
         if !candidates.is_empty()
             && !limits.el_only
             && !self.skip_dl
-            && (self.horn_allowed(&ax) || rooted && self.rooted_allowed(&ax))
+            && (self.disj_allowed(&ax) || rooted && self.rooted_allowed(&ax))
             && candidates.iter().any(|k| !dl::shape(k).horn)
             && dl_norm::eligible(&self.interner, &ax, rooted)
         {
@@ -1345,7 +1346,7 @@ impl Saturation {
                 dl_taken = true;
             }
         }
-        if !dl_taken && !candidates.is_empty() && !limits.el_only && self.horn_allowed(&ax) {
+        if !dl_taken && !candidates.is_empty() && !limits.el_only {
             self.horn_tried = true;
             let flags = horn::normalize(
                 &candidates,
@@ -1424,10 +1425,10 @@ impl Saturation {
                 .is_none()
     }
 
-    /// Whether the Horn rules may take axioms outside OWL 2 EL: when the EL part has no
-    /// individuals, top properties or functional data roles, whose rules the Horn
-    /// instantiation leaves out.
-    fn horn_allowed(&self, ax: &Axioms) -> bool {
+    /// Whether the disjunctive rules may take axioms outside OWL 2 EL without the rooted
+    /// run: when the EL part has no individuals, top properties or functional data roles,
+    /// whose rules they do not share. The Horn rules take all three (roadmap item 692).
+    fn disj_allowed(&self, ax: &Axioms) -> bool {
         let it = &self.interner;
         it.individuals.is_empty()
             && ax.functional.is_empty()
@@ -1802,8 +1803,10 @@ impl Saturation {
         // and so does what they reach, between rounds of the saturation, with the facts
         // of universal roles and the merges of keys, until none is new.
         let mut universal: Vec<Ex> = Vec::new();
+        // a run with the Horn rules and individuals always marks them, since R7 reads
+        // the real predecessors of the global state (roadmap item 692)
         let entangled = ix.has_individuals()
-            && (totals.merged || !ix.universal.is_empty() || !ix.keys.is_empty());
+            && (totals.merged || !ix.universal.is_empty() || !ix.keys.is_empty() || horn);
         if entangled {
             let mut seeds: Vec<(Ex, saturate::Concl)> = std::iter::once(TOP)
                 .chain(ix.nominals.iter().copied())
@@ -1834,7 +1837,10 @@ impl Saturation {
                     peak: totals.peak.max(more.peak),
                     merged: totals.merged || more.merged,
                 };
-                let view = world::Global(&self.ctx);
+                let view = world::GlobalAll {
+                    ctx: &self.ctx,
+                    dynamic: dynamic.as_ref(),
+                };
                 let facts = world::universal_facts(&ix, &view, &universal);
                 let key_budget = WorldBudget {
                     limits,
@@ -1865,6 +1871,14 @@ impl Saturation {
                             seeds.extend(facts.iter().map(|&x| (e as Ex, saturate::Concl::Sub(x))));
                         }
                     }
+                    if let Some(d) = &dynamic {
+                        for i in 0..d.len() as Ex {
+                            let e = d.base() + i;
+                            if d.get_ctx(e).is_some_and(|c| c.st.lock().init) {
+                                seeds.extend(facts.iter().map(|&x| (e, saturate::Concl::Sub(x))));
+                            }
+                        }
+                    }
                 }
                 universal.extend_from_slice(&facts);
                 for &(a, b) in merges.iter() {
@@ -1877,12 +1891,19 @@ impl Saturation {
         // real, each in a world of its own
         let mut world_bytes = 0usize;
         if entangled {
-            let witnesses = world::witnesses(&ix, &self.ctx, &universal);
+            let witnesses = world::witnesses(&ix, &self.ctx, dynamic.as_ref(), &universal);
             if !witnesses.is_empty() {
-                let classes = world::reaching(&ix, &self.ctx, &witnesses);
-                let real: Vec<Ex> = (0..self.ctx.len() as Ex)
+                let classes = world::reaching(&ix, &self.ctx, dynamic.as_ref(), &witnesses);
+                let mut real: Vec<Ex> = (0..self.ctx.len() as Ex)
                     .filter(|&e| self.ctx[e as usize].get().is_some_and(|c| c.st.lock().real))
                     .collect();
+                if let Some(d) = &dynamic {
+                    real.extend(
+                        (0..d.len() as Ex)
+                            .map(|i| d.base() + i)
+                            .filter(|&e| d.get_ctx(e).is_some_and(|c| c.st.lock().real)),
+                    );
+                }
                 // the worlds running and the subsumers of those done count against the
                 // budget beside the saturated state, and the pool is charged for what
                 // passes the peak
@@ -1899,7 +1920,14 @@ impl Saturation {
                 let found = par_map(&classes, threads, MIN_CLASSES, |_, chunk| {
                     let mut out = Vec::with_capacity(chunk.len());
                     for &d in chunk {
-                        let w = world::World::new(&ix, &self.ctx, &universal, &real, &bound);
+                        let w = world::World::new(
+                            &ix,
+                            &self.ctx,
+                            dynamic.as_ref(),
+                            &universal,
+                            &real,
+                            &bound,
+                        );
                         let f = w.classify(d)?;
                         let kept = 48 + f.subs.len() * 4;
                         if !bound(kept as isize) {

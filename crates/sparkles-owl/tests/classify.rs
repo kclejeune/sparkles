@@ -212,13 +212,16 @@ fn axioms_outside_el_are_reported() {
     assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
     // classes of axioms left out are still in the taxonomy
     assert!(out.taxonomy.node_of(&c("B")).is_some());
+    // the Horn rules take the inverse properties beside the individual (item 692), and
+    // the union needs case analysis
     let ex = k.excluded();
-    assert_eq!(ex.len(), 2, "{ex:#?}");
+    assert_eq!(ex.len(), 1, "{ex:#?}");
     let outside: Vec<&Excl> = ex
         .iter()
         .filter(|e| matches!(e.gap, Gap::Outside { .. }))
         .collect();
-    assert_eq!(outside.len(), 2);
+    assert_eq!(outside.len(), 1);
+    assert!(out.taxonomy.is_subclass(&c("E"), &c("E")));
 }
 
 type Excl = sparkles_owl::classify::Excluded;
@@ -263,9 +266,19 @@ fn chains_against_the_range_restriction_are_left_out() {
             [ce("D"), some("s", and([ce("X"), ce("R")]))].into(),
         )),
     ];
-    // with an individual, the run has only the EL rules
+    // with an individual the Horn rules take the chain too (item 692), and under the
+    // ELK mode the chain against the range stays out
     let mut k = Classifier::of(axioms.iter().chain(&[is_a("E", "i")]));
     let out = k.classify(&Limits::default()).unwrap();
+    assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+    let mut k = Classifier::of(axioms.iter().chain(&[is_a("E", "i")]));
+    let out = k
+        .classify(&Limits {
+            el_only: true,
+            ..Limits::default()
+        })
+        .unwrap();
     let ex = k.excluded();
     assert_eq!(ex.len(), 1);
     assert!(matches!(&ex[0].gap, Gap::Outside { rule, .. } if rule.contains("2.2.6")));
