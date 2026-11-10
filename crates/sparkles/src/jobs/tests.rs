@@ -134,8 +134,10 @@ fn the_ledger_graph_leaves_every_query_view_while_typed_inspection_reads_it() {
             .unwrap()
     );
     assert!(!ds.ask("ASK { GRAPH ?g { ?s ?p ?o } }").unwrap());
-    let mut opts = crate::sparql::QueryOptions::default();
-    opts.graphs = Some(Arc::new(crate::access::GraphAccess::all()));
+    let opts = crate::sparql::QueryOptions {
+        graphs: Some(Arc::new(crate::access::GraphAccess::all())),
+        ..Default::default()
+    };
     let r = ds
         .query_with(
             &format!("ASK {{ GRAPH <{LEDGER_GRAPH}> {{ ?s ?p ?o }} }}"),

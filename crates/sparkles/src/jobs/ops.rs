@@ -348,7 +348,7 @@ struct Staging<'a> {
 /// A submission under the writer: its staged transaction, or the receipt of the run
 /// another submission of the key recorded.
 enum Staged<'s> {
-    Ready(WriteTxn<'s>),
+    Ready(Box<WriteTxn<'s>>),
     Replayed(Submitted),
 }
 
@@ -738,7 +738,7 @@ impl Jobs {
             hook,
         );
         let t = match staged {
-            Ok(Staged::Ready(t)) => t,
+            Ok(Staged::Ready(t)) => *t,
             Ok(Staged::Replayed(r)) => {
                 // the run this submission would have made is not recorded
                 if held {
@@ -864,7 +864,7 @@ impl Jobs {
         ch.add(&r, "graphProtection", string(&protection.to_string()));
         drop(l);
         ch.apply(&mut t)?;
-        Ok(Staged::Ready(t))
+        Ok(Staged::Ready(Box::new(t)))
     }
 
     fn replay(
@@ -1652,7 +1652,7 @@ impl Jobs {
                 out.push(run.view(attempt.as_ref(), publication.as_ref()));
             }
         }
-        out.sort_by(|a, b| b.submitted_commit.cmp(&a.submitted_commit));
+        out.sort_by_key(|a| std::cmp::Reverse(a.submitted_commit));
         out.truncate(limit);
         Ok(out)
     }
