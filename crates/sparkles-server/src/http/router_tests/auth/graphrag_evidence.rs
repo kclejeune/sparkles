@@ -323,6 +323,16 @@ fn propose_in(
     source: &str,
     t: Triple,
 ) -> (NamedNode, Sha256Digest) {
+    propose_by(ds, graph, source, t, iri("urn:publisher"))
+}
+
+fn propose_by(
+    ds: &sparkles::Dataset,
+    graph: &str,
+    source: &str,
+    t: Triple,
+    author: NamedNode,
+) -> (NamedNode, Sha256Digest) {
     let key = |k: &str| RecordKey::new(k).unwrap();
     let input = EvidenceInput {
         revisions: vec![SourceRevisionInput {
@@ -346,7 +356,7 @@ fn propose_in(
             proposition: t,
             kind: ClaimKind::Reported,
             polarity: Polarity::Positive,
-            attributed_author: iri("urn:publisher"),
+            attributed_author: author,
             scope: Default::default(),
             confidence: Default::default(),
         }],
@@ -1200,6 +1210,107 @@ async fn private_checks_start_refreshes_only_for_changed_inputs() {
         assert_eq!(tasks().len(), 2, "{:?}", tasks());
         wait();
         assert!(tasks().iter().all(|t| t.state == "done"), "{:?}", tasks());
+    })
+    .await
+    .unwrap();
+}
+
+/// The change feed counts only the graphs that a run under the policy reads: a claim in
+/// a proposal graph that a wildcard of the projection names, attributed to a member,
+/// joins no community and changes no report's input.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_feed_counts_only_the_graphs_a_run_reads() {
+    let e = Arc::new(env(true));
+    let e2 = e.clone();
+    tokio::task::spawn_blocking(move || {
+        let e = e2;
+        let ds = e.dataset();
+        let a = propose(&ds, "advisory", leads());
+        decide(&ds, &a, Disposition::Accepted, 1);
+        let s = settings(serde_json::json!({
+            "projection": { "graphs": [ORG, "urn:ev:*"] },
+            "refresh": { "minChangedFraction": 1.0 }
+        }));
+        e.run(s.clone(), Mode::Build).unwrap();
+        let due = |e: &Env| {
+            crate::graphrag::refresh::due_reason(&e.s.state, &e.ds(), &s, &mut Default::default())
+                .unwrap()
+        };
+        assert_eq!(due(&e), None);
+        propose_by(
+            &ds,
+            CLAIMS,
+            "memo",
+            Triple::new(ex("z0"), ex("knows"), ex("z1")),
+            ex("x0"),
+        );
+        assert_eq!(due(&e), None);
+    })
+    .await
+    .unwrap();
+}
+
+/// Refreshes that private checks start and that keep failing back off further each
+/// time: a check finds the withdrawal, and a refresh without a model provider fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_refreshes_after_checks_back_off() {
+    use crate::graphrag::refresh::{Watch, tick_once};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    let e = Arc::new(env(true));
+    let e2 = e.clone();
+    tokio::task::spawn_blocking(move || {
+        let e = e2;
+        let ds = e.dataset();
+        let a = propose(&ds, "advisory", leads());
+        let m = propose(&ds, "mirror", leads());
+        decide(&ds, &a, Disposition::Accepted, 1);
+        decide(&ds, &m, Disposition::Accepted, 1);
+        let s = settings(serde_json::json!({
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 1.0 }
+        }));
+        e.run(s, Mode::Build).unwrap();
+        let tasks = || -> Vec<crate::state::Task> {
+            e.s.state
+                .tasks
+                .lock()
+                .iter()
+                .filter(|t| t.kind == build::TASK_KIND)
+                .cloned()
+                .collect()
+        };
+        let wait = || {
+            let end = Instant::now() + Duration::from_secs(60);
+            while e.s.state.active_task(build::TASK_KIND, "ev").is_some() {
+                assert!(Instant::now() < end, "the refresh did not finish");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let sec = Duration::from_secs(1);
+        let mut now = Instant::now();
+        let mut w: HashMap<String, Watch> = HashMap::new();
+        tick_once(&e.s.state, &mut w, now);
+        assert!(tasks().is_empty());
+        e.s.state.models.store(None);
+        withdraw(&ds, &a);
+        // the first refresh starts after the debounce, and fails
+        let mut started = Vec::new();
+        for t in 1..=40u32 {
+            now += sec;
+            tick_once(&e.s.state, &mut w, now);
+            if tasks().len() > started.len() {
+                started.push(t);
+                wait();
+                assert_eq!(tasks().last().unwrap().state, "failed");
+            }
+            if started.len() == 4 {
+                break;
+            }
+        }
+        // each retry waits twice as long as the one before
+        assert_eq!(started.len(), 4, "{started:?}");
+        let gaps: Vec<u32> = started.windows(2).map(|p| p[1] - p[0]).collect();
+        assert!(gaps.windows(2).all(|g| g[1] > g[0]), "{started:?}");
     })
     .await
     .unwrap();

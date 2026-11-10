@@ -2243,12 +2243,15 @@ the commits, another selected configuration generation, another generation of th
 access policy, which a reload moves, and the first sight of the dataset after the server
 starts. The principal's feed no longer starts a refresh for a decision, support or
 withdrawal, and when it cannot count the changes of a dataset with a policy, the check
-decides in its place. The settings' policy and the Head view's policy version are still
+decides in its place, once for each head. The principal's feed counts only the graphs
+that a run reads, so a change of another evidence graph that a wildcard of the
+projection names counts for nothing. The settings' policy and the Head view's policy version are still
 compared with the last build's once a debounce period, and a difference starts a refresh
 directly.
 
-The check admits the run as a refresh would, loads the state and runs the refresh's
-preparation and plan as the principal at the Head view. It makes no estimate, model call,
+The check admits the settings and the principal as a refresh would, without the model
+providers, since it calls none, loads the state and runs the refresh's preparation and
+plan as the principal at the Head view. It makes no estimate, model call,
 commit or state change and starts no task. The plan records why it decided each
 community. A report rewritten because its facts or children changed past the fraction,
 because a pair ended or because its policy, version or state does not match is a reason,
@@ -2258,8 +2261,9 @@ child never makes its parent a reason. A community that the plan adds, removes o
 other members or another parent is a reason, and so is a community of the reports graph
 that the run no longer has. Pending, failed and stale reports are not reasons. A check
 that finds a reason starts a refresh whose task names only that a check found reports
-whose input changed, and the check stays due until that refresh ends well. A check that
-finds none starts nothing. A check that fails is logged at debug level and retried after
+whose input changed, and the check stays due until that refresh ends well. A cancelled
+refresh leaves it due, and refreshes that fail back off as the loop's other refreshes do.
+A check that finds none starts nothing. A check that fails is logged at debug level and retried after
 its own backoff, which doubles from one debounce period up to 64, and it never holds back
 a refresh that the principal's feed or the policy comparison starts.
 

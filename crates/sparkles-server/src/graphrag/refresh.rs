@@ -28,7 +28,7 @@
 //! that fails never holds back what the principal's feed starts.
 
 use super::build::{self, Mode};
-use super::settings::{GraphragSettings, RefreshMode, is_guarded};
+use super::settings::{GraphragSettings, RefreshMode};
 use super::state::BuildState;
 use crate::auth::Endpoint;
 use crate::state::{AppState, Dataset, task_state};
@@ -92,6 +92,8 @@ pub(crate) struct Private {
     evidence_seen: Option<u64>,
     configuration: Option<String>,
     access: Option<u64>,
+    /// the head that the last check which found nothing read at least
+    covered: Option<u64>,
     failures: u32,
     retry_at: Option<Instant>,
     /// the checks run, for tests
@@ -114,12 +116,45 @@ impl Private {
         self.failures = 0;
         self.retry_at = None;
     }
+
+    /// The principal's feed cannot count the changes up to `head`: a check is due unless
+    /// one already covered that head, so an idle dataset is not checked on every pass.
+    fn uncounted(&mut self, head: u64) {
+        if self.covered != Some(head) {
+            self.due = true;
+        }
+    }
 }
 
 impl Watch {
     /// The private check's record, for tests.
     pub(crate) fn private(&self) -> &Private {
         &self.private
+    }
+
+    /// Follow the refresh this loop started, whose task is in `state`: whether it is
+    /// still queued or running. A failure backs off. Only a refresh that ended well
+    /// read everything a due private check would have read, so a cancelled or missing
+    /// task leaves the check due.
+    fn follow(&mut self, state: Option<&str>, head: u64, now: Instant, debounce: Duration) -> bool {
+        match state {
+            Some(task_state::QUEUED | task_state::RUNNING) => {
+                self.due(head, now, debounce);
+                return true;
+            }
+            Some(task_state::FAILED) => {
+                self.failed(now, debounce);
+                // the failed run used no daily retry of pending communities
+                self.retried_day = None;
+            }
+            Some(task_state::DONE) => {
+                self.failures = 0;
+                self.private.done();
+            }
+            _ => self.failures = 0,
+        }
+        self.task = None;
+        false
     }
 
     /// Note the head at `now`; whether a check is due.
@@ -223,23 +258,9 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
                 .iter()
                 .find(|t| &t.id == id)
                 .map(|t| t.state.clone());
-            match state.as_deref() {
-                Some(task_state::QUEUED | task_state::RUNNING) => {
-                    w.due(head, now, debounce);
-                    continue;
-                }
-                Some(task_state::FAILED) => {
-                    w.failed(now, debounce);
-                    // the failed run used no daily retry of pending communities
-                    w.retried_day = None;
-                }
-                // the refresh read everything a due private check would have read
-                _ => {
-                    w.failures = 0;
-                    w.private.done();
-                }
+            if w.follow(state.as_deref(), head, now, debounce) {
+                continue;
             }
-            w.task = None;
         }
         // a review policy that changed, or a new version of it, makes the dataset due
         // without a commit, so it is compared once a debounce period
@@ -271,12 +292,12 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
         };
         let reason = match reason {
             Some(r) => Some(r),
-            None => {
-                w.failures = 0;
-                private_check(st, &ds, &settings, w, now, debounce)
-            }
+            None => private_check(st, &ds, &settings, w, now, debounce),
         };
+        // the failures in a row end only when no refresh is needed, so the refreshes
+        // that private checks start back off as the others do
         let Some(reason) = reason else {
+            w.failures = 0;
             continue;
         };
         tracing::info!(target: "sparkles::graphrag", dataset = %name, "automatic refresh: {reason}");
@@ -306,6 +327,7 @@ fn private_check(
         return None;
     }
     w.private.runs += 1;
+    let head = ds.store.head_commit().seq;
     let r = build::Run {
         st,
         ds: ds.clone(),
@@ -320,6 +342,7 @@ fn private_check(
     match r.private_check() {
         Ok(None) => {
             w.private.done();
+            w.private.covered = Some(head);
             None
         }
         Ok(Some(why)) => {
@@ -508,7 +531,7 @@ pub(crate) fn due_reason(
             ) => {
                 // under a review policy, the private check decides
                 if evidence.is_some() {
-                    w.private.due = true;
+                    w.private.uncounted(ds.store.head_commit().seq);
                     return Ok(None);
                 }
                 return Ok(Some(format!(
@@ -523,7 +546,7 @@ pub(crate) fn due_reason(
             }
             if !c.complete() {
                 if evidence.is_some() {
-                    w.private.due = true;
+                    w.private.uncounted(ds.store.head_commit().seq);
                     return Ok(None);
                 }
                 return Ok(Some(format!(
@@ -537,11 +560,13 @@ pub(crate) fn due_reason(
                 };
                 // a decision, support or withdrawal, seen or not, is the private
                 // check's to weigh (`note_private`)
-                let output = evidence.as_ref().map(|e| e.policy.output.as_str());
-                if is_guarded(g.as_str())
-                    || !(super::projection::named(settings, g.as_str())
-                        || output == Some(g.as_str()))
-                {
+                // the graphs the preparation reads: the projection's and the output
+                // graph, without the other graphs of an evidence role
+                let extra = super::projection::Extra {
+                    output: evidence.as_ref().map(|e| e.policy.output.as_str()),
+                    excluded: evidence.as_ref().map(|e| &e.excluded),
+                };
+                if !extra.reads(settings, g.as_str()) {
                     continue;
                 }
                 if let Some(r) = counter.change(&q.subject, &q.predicate.to_string(), &q.object) {
@@ -663,6 +688,7 @@ impl<'a> Counter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graphrag::settings::is_guarded;
     use crate::graphrag::state::{BuildRecord, StoredCommunity};
 
     fn state() -> BuildState {
@@ -958,6 +984,51 @@ mod tests {
         w.private.done();
         assert!(!w.private.ready(t0 + d * 4));
         assert_eq!(w.private.failures, 0);
+    }
+
+    /// Only a refresh that ended well clears a due private check, and refreshes that
+    /// keep failing back off further each time.
+    #[test]
+    fn a_due_check_waits_for_a_refresh_that_ends_well() {
+        let d = Duration::from_secs(10);
+        let t0 = Instant::now();
+        for (state, cleared) in [
+            (Some(task_state::DONE), true),
+            (Some(task_state::CANCELLED), false),
+            (Some(task_state::FAILED), false),
+            (None, false),
+        ] {
+            let mut w = Watch::default();
+            w.private.due = true;
+            w.task = Some("t".into());
+            assert!(!w.follow(state, 5, t0, d), "{state:?}");
+            assert_eq!(w.private.due, !cleared, "{state:?}");
+            assert_eq!(w.task, None);
+        }
+        let mut w = Watch::default();
+        w.task = Some("t".into());
+        assert!(w.follow(Some(task_state::RUNNING), 5, t0, d));
+        assert!(w.task.is_some());
+        // consecutive failures, with no reset between them, double the backoff
+        let mut w = Watch::default();
+        w.follow(Some(task_state::FAILED), 5, t0, d);
+        assert_eq!(w.retry_at, Some(t0 + d * 2));
+        w.follow(Some(task_state::FAILED), 5, t0, d);
+        assert_eq!(w.retry_at, Some(t0 + d * 4));
+    }
+
+    /// A feed that cannot count the changes makes a check due once per head.
+    #[test]
+    fn an_uncountable_feed_is_checked_once_per_head() {
+        let mut p = Private::default();
+        p.uncounted(7);
+        assert!(p.due);
+        p.done();
+        p.covered = Some(7);
+        p.uncounted(7);
+        assert!(!p.due, "the check already covered head 7");
+        p.uncounted(8);
+        assert!(p.due);
     }
 
     #[test]

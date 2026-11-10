@@ -1286,7 +1286,14 @@ impl Run<'_> {
     /// answers why the dataset needs a refresh for a change of a report's input, and
     /// `None` when it does not. Pending, failed and stale reports are not such a reason.
     pub(crate) fn private_check(&self) -> Result<Option<String>, RunError> {
-        let (_, _, principal) = self.admit()?;
+        // the check calls no model, so it needs no provider: a refresh it starts without
+        // one fails as a visible task, as one the principal's feed starts does
+        if !self.settings.enabled {
+            return Ok(None);
+        }
+        self.settings.check().map_err(RunError::Refused)?;
+        let principal = authorized_principal(self.st, &self.ds, &self.settings.principal)
+            .map_err(RunError::Refused)?;
         let previous = self.load_state()?;
         let Some(b) = &previous.last_build else {
             return Ok(None);
