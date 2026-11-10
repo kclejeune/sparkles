@@ -108,6 +108,9 @@ struct Shared {
     j: u32,
     da: f64,
     db: f64,
+    /// each side's domain of the variable (see [`plan::domain`]), 0 when none
+    doma: f64,
+    domb: f64,
     ca: bool,
     cb: bool,
 }
@@ -136,7 +139,11 @@ fn pair_est(
         return m.est(a.est, b.est);
     }
     let cap = capped.then_some((a.est, b.est));
-    let denom = plan::keys_denom(shared.iter().map(|s| (s.da, s.db)), backoff, cap);
+    let denom = plan::keys_denom(
+        shared.iter().map(|s| (s.da.max(s.doma), s.db.max(s.domb))),
+        backoff,
+        cap,
+    );
     plan::join_est_from(a.est, b.est, denom)
 }
 
@@ -441,6 +448,36 @@ impl Models {
     }
 }
 
+/// The merge of two lists of domains by join variable, each sorted by it: the larger
+/// where both have the variable.
+fn merge_dom(a: &[(u32, f64)], b: &[(u32, f64)]) -> Vec<(u32, f64)> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut k) = (0, 0);
+    while i < a.len() || k < b.len() {
+        match (a.get(i), b.get(k)) {
+            (Some(&(ja, x)), Some(&(jb, y))) if ja == jb => {
+                out.push((ja, x.max(y)));
+                i += 1;
+                k += 1;
+            }
+            (Some(&(ja, x)), Some(&(jb, _))) if ja < jb => {
+                out.push((ja, x));
+                i += 1;
+            }
+            (Some(&(ja, x)), None) => {
+                out.push((ja, x));
+                i += 1;
+            }
+            (_, Some(&(jb, y))) => {
+                out.push((jb, y));
+                k += 1;
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    out
+}
+
 /// The merge of two lists of what plans hold by join variable, each sorted by it.
 fn merge_held(a: &[(u32, Held)], b: &[(u32, Held)]) -> Vec<(u32, Held)> {
     let mut out = Vec::with_capacity(a.len() + b.len());
@@ -716,6 +753,8 @@ struct Unit {
     certain: Bits,
     /// distinct-value estimates of the join variables, by join variable index
     d: Vec<(u32, f64)>,
+    /// the domains of the join variables (see [`plan::domain`]), by join variable index
+    dom: Vec<(u32, f64)>,
     probe: Option<ProbeSide>,
     from: From,
     /// the filters placed on top, by index
@@ -729,6 +768,12 @@ impl Unit {
     fn d(&self, j: u32) -> f64 {
         let i = self.d.binary_search_by_key(&j, |x| x.0).unwrap();
         self.d[i].1
+    }
+
+    fn dom(&self, j: u32) -> f64 {
+        self.dom
+            .binary_search_by_key(&j, |x| x.0)
+            .map_or(0.0, |i| self.dom[i].1)
     }
 
     fn held_on(&self, j: u32) -> Held {
@@ -832,6 +877,7 @@ impl Greedy {
             let node = filtered.as_ref().unwrap_or(best);
             let mut certain = Bits::new(nv);
             let mut d = Vec::new();
+            let mut dom = Vec::new();
             let vars: Vec<u32> = node.vars.iter().map(|v| g.idx[v]).collect();
             for (&l, &v) in vars.iter().zip(&node.vars) {
                 if node.certain.contains(&v) {
@@ -840,9 +886,11 @@ impl Greedy {
                 let j = g.join[l as usize];
                 if j != u32::MAX {
                     d.push((j, node.d(v)));
+                    dom.push((j, plan::domain(ctx, node, v)));
                 }
             }
             d.sort_unstable_by_key(|x| x.0);
+            dom.sort_unstable_by_key(|x| x.0);
             let mut inputs = Bits::new(items.len());
             inputs.set(i as u32);
             units.push(Unit {
@@ -852,6 +900,7 @@ impl Greedy {
                 has,
                 certain,
                 d,
+                dom,
                 probe: if batched.index_joins {
                     indexjoin::probe_side(node, ctx)
                 } else {
@@ -963,6 +1012,8 @@ impl Greedy {
                     j,
                     da: ua.d(j),
                     db: ub.d(j),
+                    doma: ua.dom(j),
+                    domb: ub.dom(j),
                     ca: ua.certain.get(l),
                     cb: ub.certain.get(l),
                 });
@@ -1062,6 +1113,7 @@ impl Greedy {
             };
             d.push((x.0, x.1.min(p.est).max(1.0)));
         }
+        let dom = merge_dom(&a.dom, &b.dom);
         let inputs = a.inputs.or(&b.inputs);
         let mut sum = Sum {
             chain: p.chain,
@@ -1100,6 +1152,7 @@ impl Greedy {
             has,
             certain,
             d,
+            dom,
             probe: None,
             from: From::Join(p.a as usize, p.b as usize, p.how),
             filters: now,
@@ -1241,6 +1294,9 @@ struct Dp {
     held: Vec<Held>,
     ents: Vec<Ent>,
     dval: Vec<f64>,
+    /// beside `dval`, each entry's domain of each join variable it binds (see
+    /// [`plan::domain`]), the larger of its inputs'
+    ddom: Vec<f64>,
 }
 
 /// The table of [`Dp::held`]: row `j` holds, per input, its star mask and side on join
@@ -1366,6 +1422,7 @@ impl Dp {
             held,
             ents: Vec::new(),
             dval: Vec::new(),
+            ddom: Vec::new(),
         })
     }
 
@@ -1486,6 +1543,7 @@ impl Dp {
                     let j = rest.trailing_zeros();
                     rest &= rest - 1;
                     self.dval.push(o.d(self.jvar[j as usize]));
+                    self.ddom.push(plan::domain(ctx, o, self.jvar[j as usize]));
                 }
                 ents.push(self.ents.len() as u32);
                 self.ents.push(Ent {
@@ -1685,6 +1743,8 @@ impl Dp {
                 v: self.jvar[j as usize],
                 j,
                 da: 0.0,
+                doma: 0.0,
+                domb: 0.0,
                 db: 0.0,
                 ca: ca >> j & 1 == 1,
                 cb: cb >> j & 1 == 1,
@@ -1729,6 +1789,8 @@ impl Dp {
                 for (s, &(pa, pb)) in shared.iter_mut().zip(pos.iter()) {
                     s.da = self.dval[(a.d + pa) as usize];
                     s.db = self.dval[(b.d + pb) as usize];
+                    s.doma = self.ddom[(a.d + pa) as usize];
+                    s.domb = self.ddom[(b.d + pb) as usize];
                 }
                 let est = pair_est(
                     &a.sum,
@@ -1831,6 +1893,9 @@ impl Dp {
                     x = x.min(b.rows.max(1.0));
                 }
                 self.dval.push(x);
+                let doma = (ja >> j & 1 == 1).then(|| self.ddom[(ea.d + rank(ba, j)) as usize]);
+                let domb = (jbm >> j & 1 == 1).then(|| self.ddom[(eb.d + rank(bb, j)) as usize]);
+                self.ddom.push(doma.unwrap_or(0.0).max(domb.unwrap_or(0.0)));
             }
             self.ents.push(Ent {
                 sum: Sum {

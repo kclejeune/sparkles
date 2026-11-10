@@ -223,6 +223,15 @@ implementation and always apply. EXPLAIN shows which ones ran.
   subqueries grouped by both keys, the keys depend on each other, so a side has at most
   as many tuples as rows. LUBM `q9`'s closing join is estimated at 792 rows for 2,540
   instead of 32,256, and `q2`'s at 115 for 28.
+* **Join estimates against a constant restriction** (`domain_estimates`). A pattern such as
+  `?v0 age AgeGroup5` keeps the subjects of `age` with that value, a sample of all its
+  subjects. The distinct-value estimate divided a join on `?v0` by the larger input's
+  distinct keys, as if the pattern's keys held the other side's, so WatDiv `S4-2`
+  estimated `age` joined with `artist` at 951 rows for 128 and the rows after
+  `nationality` at 666 for 4. A join on a variable that a pattern binds with the predicate
+  and the other column fixed to a constant other than a class now divides by the
+  predicate's distinct subjects or objects at least, on the pattern and on the joins above
+  it, which gives 117 and 2 for those joins. Classes stay with the characteristic sets.
 * **Join estimates from probed values** (`probed_keys`). When one input of a group is
   small, a VALUES table or a pattern of at most 1,024 rows, the planner reads up to 32 of
   its values, spread over them in order, and counts the rows each has in every other

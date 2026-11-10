@@ -307,6 +307,9 @@ pub struct Optimizations {
     /// a join on several keys combines their distinct counts by exponential back-off
     /// instead of dividing by the largest alone
     pub key_backoff: bool,
+    /// a join against a pattern that restricts the other column by a constant other than
+    /// a class divides by the predicate's distinct values of the key column at least
+    pub domain_estimates: bool,
     /// index joins that a fused star reads together are costed for the keys of the
     /// star's input, which a fused star probes in every pattern
     pub fused_star_costs: bool,
@@ -348,7 +351,7 @@ pub struct Optimizations {
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 43] = [
+    pub const NAMES: [&str; 44] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -379,6 +382,7 @@ impl Optimizations {
         "set_remainders",
         "node_sets",
         "key_backoff",
+        "domain_estimates",
         "fused_star_costs",
         "prefetch_blocks",
         "text_subject_pushdown",
@@ -426,6 +430,7 @@ impl Optimizations {
         set_remainders: true,
         node_sets: true,
         key_backoff: true,
+        domain_estimates: true,
         fused_star_costs: true,
         prefetch_blocks: true,
         text_subject_pushdown: true,
@@ -473,6 +478,7 @@ impl Optimizations {
         set_remainders: false,
         node_sets: false,
         key_backoff: false,
+        domain_estimates: false,
         fused_star_costs: false,
         prefetch_blocks: false,
         text_subject_pushdown: false,
@@ -520,6 +526,7 @@ impl Optimizations {
             "set_remainders" => &mut self.set_remainders,
             "node_sets" => &mut self.node_sets,
             "key_backoff" => &mut self.key_backoff,
+            "domain_estimates" => &mut self.domain_estimates,
             "fused_star_costs" => &mut self.fused_star_costs,
             "prefetch_blocks" => &mut self.prefetch_blocks,
             "text_subject_pushdown" => &mut self.text_subject_pushdown,
