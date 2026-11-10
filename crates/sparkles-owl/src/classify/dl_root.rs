@@ -220,6 +220,7 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
                 ix,
                 lits: &out.dl().lits,
                 inv: &inv,
+                ground_total: super::dl_clause::ground_total(),
             };
             x.store.next(ix, Some(&o), &mut max)
         };
@@ -1923,6 +1924,7 @@ mod tests {
             ix: &ix,
             lits: &lits,
             inv: &inv,
+            ground_total: false,
         };
         let Made::Lit(l) = lits.lit(XLit::Atom(TOP, RTerm::C(0)), inv) else {
             unreachable!()

@@ -483,6 +483,18 @@ pub struct Rooted<'a> {
     pub lits: &'a Lits,
     /// a role's inverse, the qualified roles' included
     pub inv: &'a (dyn Fn(Role) -> Option<Role> + Sync),
+    /// whether two ground literals compare by the one order every context shares (F24,
+    /// item 804's second departure), which puts a role atom above a class atom, a
+    /// predicate above every equality and inequality of constants, and otherwise compares
+    /// by the predicate's id and then the constants from the left
+    pub ground_total: bool,
+}
+
+/// Whether every context compares two ground literals by one shared order, item 804's
+/// second departure. `SPARKLES_ROOTED_GROUND_ORDER=0` turns it off, for measurement.
+pub fn ground_total() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_GROUND_ORDER").is_none_or(|v| v != "0"))
 }
 
 /// A term of the rooted order: true, an a-term or an atom.
@@ -630,7 +642,10 @@ impl Rooted<'_> {
             (OTerm::A(_), OTerm::P(_)) => false,
             (OTerm::P(p), OTerm::A(t)) => {
                 let (ts, n) = Rooted::args(p);
-                matches!(t, RTerm::X | RTerm::Y) || ts[..n].iter().any(|&a| Rooted::a_ge(a, t))
+                matches!(t, RTerm::X | RTerm::Y)
+                    || ts[..n].iter().any(|&a| Rooted::a_ge(a, t))
+                    // with the shared order a predicate is above every constant
+                    || self.ground_total && matches!(t, RTerm::C(_)) && Rooted::plain_ground(p)
             }
             (OTerm::P(p), OTerm::P(q)) => p != q && self.p_gt(p, q),
         }
@@ -647,10 +662,38 @@ impl Rooted<'_> {
         }
     }
 
-    /// `a ≻ b` on literals: the multiset extension of the order on terms.
+    /// Whether a literal is ground and function-free: `B(u)`, `S(u, v)`, `u ≈ v` or
+    /// `u ≉ v`.
+    fn plain_ground(l: XLit) -> bool {
+        let (ts, n) = terms_of(l);
+        ts[..n].iter().all(|t| matches!(t, RTerm::C(_)))
+    }
+
+    /// The key of the shared order on ground atoms: a role atom above a class atom, then
+    /// the predicate's id, then the constants from the left, on the canonical reading of
+    /// a role atom.
+    fn ground_key(&self, p: XLit) -> (u8, u32, u32, u32) {
+        match p.canon(self.inv) {
+            XLit::Atom(b, RTerm::C(u)) => (0, b, u, 0),
+            XLit::Role(s, RTerm::C(a), RTerm::C(b)) => (1, s, a, b),
+            _ => unreachable!("a ground atom"),
+        }
+    }
+
+    /// `a ≻ b` on literals: the multiset extension of the order on terms, and with
+    /// `ground_total` the shared order on two ground literals.
     pub fn gt(&self, a: XLit, b: XLit) -> bool {
         if a == b {
             return false;
+        }
+        if self.ground_total && Rooted::plain_ground(a) && Rooted::plain_ground(b) {
+            let atom = |l: XLit| matches!(l, XLit::Atom(..) | XLit::Role(..));
+            match (atom(a), atom(b)) {
+                (true, true) => return self.ground_key(a) > self.ground_key(b),
+                (true, false) => return true,
+                (false, true) => return false,
+                (false, false) => {}
+            }
         }
         let (ma, na) = Rooted::terms(a);
         let (mb, nb) = Rooted::terms(b);
@@ -1493,12 +1536,19 @@ mod tests {
 
     #[test]
     fn the_rooted_order_is_a_strict_order() {
+        for ground_total in [false, true] {
+            strict_order(ground_total);
+        }
+    }
+
+    fn strict_order(ground_total: bool) {
         let (ix, [a, b, fresh, e]) = ranked();
         let lits = Lits::default();
         let o = Rooted {
             ix: &ix,
             lits: &lits,
             inv: &inv,
+            ground_total,
         };
         for u in universes(&[a, b, fresh, e]) {
             let gt: Vec<Vec<bool>> = u
@@ -1539,6 +1589,7 @@ mod tests {
             ix: &ix,
             lits: &lits,
             inv: &inv,
+            ground_total: false,
         };
         let u = universe(&[a, b, fresh, e]);
         let consts = |l: &XLit| {
@@ -1596,6 +1647,56 @@ mod tests {
         }
     }
 
+    /// Item 804's shared order on ground literals makes them totally ordered, with a role
+    /// atom above a class atom and an atom above an equality or inequality of constants,
+    /// and otherwise adds only that a ground atom is above every equality of a constant.
+    #[test]
+    fn the_shared_ground_order_is_total_and_adds_only_ground_comparisons() {
+        use RTerm::*;
+        let (ix, [a, b, fresh, e]) = ranked();
+        let lits = Lits::default();
+        let weak = Rooted {
+            ix: &ix,
+            lits: &lits,
+            inv: &inv,
+            ground_total: false,
+        };
+        let total = Rooted {
+            ix: &ix,
+            lits: &lits,
+            inv: &inv,
+            ground_total: true,
+        };
+        let u = universe(&[a, b, fresh, e]);
+        let mut ground = 0;
+        for &p in &u {
+            for &q in &u {
+                if Rooted::plain_ground(p) && Rooted::plain_ground(q) {
+                    ground += 1;
+                    assert!(
+                        p == q || total.gt(p, q) != total.gt(q, p),
+                        "{p:?} and {q:?} not ordered"
+                    );
+                    if weak.gt(p, q) {
+                        assert!(total.gt(p, q), "{p:?} above {q:?} only without the order");
+                    }
+                } else if !(Rooted::plain_ground(p) && matches!(q, XLit::Eq(..) | XLit::Ne(..))) {
+                    assert_eq!(weak.gt(p, q), total.gt(p, q), "{p:?} against {q:?} changed");
+                } else if weak.gt(p, q) {
+                    assert!(total.gt(p, q), "{p:?} above {q:?} only without the order");
+                }
+            }
+        }
+        assert!(ground > 0);
+        assert!(total.gt(XLit::Role(4, C(0), C(1)).canon(inv), XLit::Atom(a, C(1))));
+        assert!(total.gt(XLit::Atom(a, C(0)), XLit::Ne(C(0), C(1))));
+        assert!(total.gt(XLit::Atom(a, C(0)), XLit::Eq(C(0), C(1))));
+        assert!(total.gt(XLit::Atom(a, C(0)), XLit::Eq(X, C(1))));
+        assert!(!total.gt(XLit::Atom(a, C(0)), XLit::Eq(Fx(1), C(1))));
+        assert!(!total.gt(XLit::Atom(a, C(0)), XLit::Atom(a, X)));
+        assert!(!total.gt(XLit::Atom(a, X), XLit::Atom(a, C(0))));
+    }
+
     #[test]
     fn a_rooted_clause_keeps_every_incomparable_maximal_literal() {
         use RTerm::*;
@@ -1605,6 +1706,7 @@ mod tests {
             ix: &ix,
             lits: &lits,
             inv: &inv,
+            ground_total: false,
         };
         let l = |x: XLit| match lits.lit(x, inv) {
             Made::Lit(l) => l,
@@ -1661,6 +1763,7 @@ mod tests {
             ix: &ix,
             lits: &lits,
             inv: &inv,
+            ground_total: false,
         };
         let mut max = Vec::new();
         for x in [XLit::Ne(X, Y), XLit::Eq(X, Y)] {
@@ -1682,6 +1785,7 @@ mod tests {
             ix: &ix,
             lits: &lits,
             inv: &inv,
+            ground_total: false,
         };
         let Made::Lit(g) = lits.lit(XLit::Atom(a, C(0)), inv) else {
             panic!()
@@ -1722,6 +1826,7 @@ mod tests {
             ix: &ix,
             lits: &lits,
             inv: &inv,
+            ground_total: false,
         };
         let Made::Lit(g) = lits.lit(XLit::Atom(a, C(0)), inv) else {
             panic!()

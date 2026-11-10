@@ -2041,6 +2041,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
                 ix,
                 lits: &out.dl().lits,
                 inv: &inv,
+                ground_total: super::dl_clause::ground_total(),
             };
             x.store.next(ix, Some(&o), &mut max)
         } else {
