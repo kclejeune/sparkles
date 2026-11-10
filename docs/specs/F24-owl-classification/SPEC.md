@@ -1365,10 +1365,10 @@ no holder to resolve on, and the clause is `r_B(x, z) → y ⊔ H`, which replac
 puts every `r`-neighbour in `N` and so outside `B`, and the new clause forbids every
 `r`-neighbour in `B`, which is the same constraint, and where one of them holds both are
 satisfied, so the two forms agree on every model of the normalized signature once `N` is
-read as `¬B`, and both say `∀r.¬F ⊔ y ⊔ H` of the original signature when `B` is read as
-`F`, which the structural transformation allows since `B` has `F ⊑ B` as its only
-constraint. The change for `n = 1` is therefore a change of proof shape and not of
-meaning. The old form derives `N` of each successor and of the predecessor as markers,
+read as `¬B`, with `B` and whatever constraints it has kept as they are. Each form relates
+to the original axiom through the structural transformation as the old one did, whose
+models extend to the fresh names and restrict back to the original signature. The change
+for `n = 1` is therefore a change of proof shape and not of meaning. The old form derives `N` of each successor and of the predecessor as markers,
 and the new form waits for a neighbour's own context to derive that it is in `B`, which
 the qualified-role clause of DL4 turns into `r_B` and Pred carries back. Soundness is the
 paper's Theorem 8 and completeness its Theorem 9, which hold for any set of DL-clauses,
@@ -1437,17 +1437,33 @@ The third part gives the witnesses of one filler one context. A minimum `≥n r.
 positive position keeps its `n` witnesses `∃r.b_i` with fresh fillers `b_i ⊑ F` pairwise
 disjoint, since the terms must differ and the disjointness is what certifies that they
 do, but each witness takes the context of `∃r.F`'s successor, the filler `F` with the
-role's range, as its successor in place of a context of its own, and `b_i` stays in the
-core of the witness's term, so that the predecessor still holds `b_i(f_i(x))` and the
-certificates still cut the equalities of two witnesses, and reaches the shared context as
-a marker. This is the paper's Definition 7 applied as its cautious strategy applies it to
-DL2, whose witnesses all have `B_2(f_i(x))` as their one certain atom and all take the
-context `v_{B_2}`, and the fresh filler changes only the name of the term. The shared
-context's core `F` is a subset of what is certain of every witness, since `b_i ⊑ F` is
-told, which is the condition the definition puts on reusing a context. The marker `b_i`
-has no rule of its own beyond `b_i ⊑ F`, which the core satisfies, and its disjointness
-with its siblings, which gives the clause `b_i ∧ b_j → ⊥` in the shared context and
-nothing else. The witnesses of `H` are conditional, so nothing is certain of them and
+role's range, as its successor in place of a context of its own. The facts of a witness's
+term and the core of its successor context are two different things, and the design
+keeps them apart. The facts of the term `f_i(x)` are `b_i`, `F` and the role's range, and
+the predecessor holds them in both paths that make a successor. For a unit witness it
+holds them as unit clauses `⊤ → b_i(f_i(x))`, `⊤ → F(f_i(x))` and `⊤ → range(f_i(x))`,
+which are DL2's `B_1 → B_2(f_i(x))` with `b_i ⊑ F` and the range unfolded, and for a
+witness of `H` it holds them under the clause's body and beside its other head literals,
+as `Γ → Δ ⊔ b_i(f_i(x))` and so on, since the unfolding of a conditional existential
+restriction must give the term's own facts and not only the shared successor's. The
+disjointness certificates read `b_i(f_i(x))` and `b_j(f_j(x))` from those clauses, unit
+or conditional, so a clause `Γ → H` whose two witnesses of a maximum of one are equated
+still derives `Γ → ⊥`. In both paths `b_i` goes to the shared context as a marker, which
+the unit path must send as well, since making an EL successor sends a backward link and
+no marker today. The selection is the paper's Definition 7 applied as its cautious
+strategy applies it to DL2, whose witnesses all have `B_2(f_i(x))` as their one certain
+atom and all take the context `v_{B_2}`, and the fresh filler changes only the name of the
+term. The definition's condition is on the set `K_1` of the Succ rule, the successor
+triggers that the predecessor holds as unit clauses over `f_i(x)`, and on the chosen
+context's core being equal to the chosen subset of `K_1`. For a unit witness `K_1` holds
+`b_i`, `F`, the range and the components of the flattened conjunction of `F` and the
+range, since the predecessor holds each as a unit clause, and the chosen context's core
+is exactly `F` with the range, the core the index gives `∃r.F`'s successor, so the
+condition holds by the predecessor's premises and not by entailment. For a witness of `H`
+nothing is certain, `K_1` is empty, and the chosen context is one with the empty core. The
+marker `b_i` has no rule of its own beyond `b_i ⊑ F`, which the core satisfies, and its
+disjointness with its siblings, which gives the clause `b_i ∧ b_j → ⊥` in the shared
+context and nothing else. The witnesses of `H` are conditional, so nothing is certain of them and
 their core is empty, and the hypothetical successors of all the witnesses over one role
 and one filler share one context in place of one per fresh filler, which the definition
 allows since an empty core is a subset of anything. Sharing is measured against one
@@ -1538,7 +1554,10 @@ development files, the generated fixtures and the `shoi` and nominal fixtures gi
 taxonomies of HermiT with no new timeout, on one and four threads, under both ranks, both
 strategies and both choices of the witnesses' contexts. Two regressions cover the
 predecessor, one where the predecessor is the only qualifying neighbour and one where it
-counts beside a successor. The two large files are measured apart from the first, with
+counts beside a successor, and two cover the shared witness context, one where a maximum
+of one equates two conditional witnesses of `H` and the certificates must derive `⊥`
+under the clause's body, and one where a unit witness's marker must reach the shared
+context. The two large files are measured apart from the first, with
 the time of their normalization, their saturation, their candidate tests and the
 completion of their counting, and the counts of the conditional predecessor clauses and
 of the hypothetical successors under each rank are recorded. The measured effect of the
