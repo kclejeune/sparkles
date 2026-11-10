@@ -20,11 +20,6 @@ use std::ops::Range;
 /// run a merge appends.
 pub(crate) const MAX_RUNS: usize = 8;
 
-/// A compaction leaves an older run alone when the runs it would join are more than this
-/// many times its size: rewriting them to lose one small run costs more than the run
-/// costs the probes, which read it with a few more dependent reads each.
-const ABSORB: usize = 8;
-
 #[derive(Default)]
 pub(crate) struct Order {
     runs: Vec<Run>,
@@ -133,9 +128,9 @@ impl Order {
 
     /// The runs a compaction merges into one before a merge appends its run, among the
     /// runs below `floor`: with `all`, every one of them, and otherwise from the newest
-    /// back while the next older run is at most twice their size and at least an
-    /// [`ABSORB`]th of it, and further back until at most [`MAX_RUNS`] minus one remain
-    /// for the appended run. `None` when there is nothing to merge.
+    /// back while the next older run is at most twice their size, and further back until
+    /// at most [`MAX_RUNS`] minus one remain for the appended run. `None` when there is
+    /// nothing to merge.
     pub fn compaction(&self, floor: u32, all: bool) -> Option<Range<usize>> {
         let n = self.below(floor);
         if n == 0 || (n < 2 && !all) {
@@ -146,7 +141,7 @@ impl Order {
         }
         let mut a = n - 1;
         let mut acc = self.runs[a].len();
-        while a > 0 && self.runs[a - 1].len() <= 2 * acc && self.runs[a - 1].len() * ABSORB >= acc {
+        while a > 0 && self.runs[a - 1].len() <= 2 * acc {
             a -= 1;
             acc += self.runs[a].len();
         }
@@ -193,20 +188,6 @@ mod tests {
         assert_eq!(o.compaction(1100, false), None);
         assert_eq!(o.compaction(1100, true), Some(0..2));
         assert_eq!(o.compaction(1000, true), Some(0..1));
-        // a run of 100 before one of 1000 is left alone: the merge would rewrite ten
-        // times its size to lose it, and the geometric tail behind the large run merges
-        let mut o = Order::default();
-        o.push(run(0..100));
-        o.push(run(100..1100));
-        assert_eq!(o.compaction(u32::MAX, false), None);
-        o.push(run(1100..1130));
-        o.push(run(1130..1160));
-        assert_eq!(o.compaction(u32::MAX, false), Some(2..4));
-        // one of 125 is an eighth of 1000 and merges
-        let mut o = Order::default();
-        o.push(run(0..125));
-        o.push(run(125..1125));
-        assert_eq!(o.compaction(u32::MAX, false), Some(0..2));
         let mut o = Order::default();
         let mut at = 0;
         for n in [10_000, 1000, 100, 10, 10, 10, 10, 10, 10, 10] {
