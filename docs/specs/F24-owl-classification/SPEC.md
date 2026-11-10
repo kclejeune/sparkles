@@ -728,6 +728,31 @@ the [small files and memory results](../../benchmarks/el-classification/RESULTS.
 give the numbers. Five variants that measured no better are in
 [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md).
 
+Items 720, 721 and 722 measured these follow-ups on `atlas`, which has the benchmark
+host's hardware. A process's first helper threads take much longer to start than later
+ones, whose stacks it keeps. A warm run on eight threads that starts no helper takes 0.21
+ms on `ore_ont_2775` against 0.29 ms when it starts them at once, and a cold run takes
+0.64 against 1.55 ms. The saturation therefore records how long its first worker took to
+start the helpers, and a later saturation of fewer than 4,096 roots starts them once the
+first worker has worked that long, between 20 and 500 us. The first saturation of a
+process still waits 0.5 ms. The first worker looks at the clock after each activation
+until then, since an activation of the Horn or disjunctive rules can take tens of
+microseconds. Warm runs of the five files of item 720 on eight threads take 2.1 to 3.8
+ms, 0.04 to 0.21 ms longer than with the build before item 709 against 0.4 to 0.6 ms
+before, and item 819 follows the rest. Cold runs keep item 709's gain. A run on one thread sends through its outbox
+once it is congested, so that its deliveries drop the messages their contexts hold as
+those of several threads do, and the check costs a run that is not congested one load
+at each check of the bounds. On one thread `ore_ont_8737` peaks at 5.9 GiB against 9.3
+GiB and takes 90.7 against 95.8 s, while its run on four threads keeps its 28 s and 6.8
+to 7.9 GiB, which item 818 follows against Konclude's 11 s. The one-thread times of GO,
+ChEBI lite, `ore_ont_3836`, `ore_ont_13482` and `ore_ont_7914` moved by up to 2% between
+builds that differ only in code that one thread never runs. The build of item 720 is 0.6%
+faster to 0.9% slower than the base on them, and item 722 stays open for the layout.
+Two more variants that measured no better are in
+[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md), together with a
+deduplication of congested deliveries that slowed the one-thread run of `ore_ont_8737`
+to 119 s.
+
 The references disagree on two files of the set. On ore_ont_15516, Konclude's parsers all
 failed at the first SWRL rule and it classified an empty ontology. HermiT found the
 ontology inconsistent, which its rules cannot cause, since the properties in their heads
