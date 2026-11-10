@@ -2784,6 +2784,55 @@ mod tests {
         })
     }
 
+    /// A saturation records its start of the helper threads as soon as they start, so
+    /// that a saturation that starts while it runs waits as long (roadmap item 720). The
+    /// cancellation hook, which the helpers poll at their checks of the bounds, looks at
+    /// the record while they run. The steps outside the saturation run on the calling
+    /// thread for so small an ontology.
+    #[test]
+    fn a_saturation_records_its_start_of_the_helpers_while_they_run() {
+        let c = |i: usize| ClassExpression::Class(Class::new(format!("http://ex.org/C{i}")));
+        let p = ObjectProperty::new("http://ex.org/p");
+        let axioms: Vec<AxiomKind> = (0..1000)
+            .flat_map(|i| {
+                [
+                    AxiomKind::SubClassOf(c(i), c(i + 1)),
+                    AxiomKind::SubClassOf(c(i), ClassExpression::some(p.clone(), c(i + 2))),
+                ]
+            })
+            .collect();
+        let kinds: Vec<&AxiomKind> = axioms.iter().collect();
+        let started: &'static std::sync::atomic::AtomicU64 =
+            Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
+        let seen = Arc::new(AtomicBool::new(false));
+        let caller = std::thread::current().id();
+        let hook = {
+            let seen = seen.clone();
+            move || {
+                if std::thread::current().id() != caller
+                    && started.load(std::sync::atomic::Ordering::Relaxed) > 0
+                {
+                    seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                false
+            }
+        };
+        saturate::STARTED_IN.set(Some(started));
+        let out = Saturation::new().classify(
+            &kinds,
+            None,
+            &Limits {
+                threads: 4,
+                cancelled: Some(Arc::new(hook)),
+                ..Limits::default()
+            },
+        );
+        saturate::STARTED_IN.set(None);
+        out.unwrap();
+        assert!(started.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(seen.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
     /// A saturation counts as congested only with hundreds of megabytes of waiting
     /// messages, so the test makes every saturation congested from its start. The
     /// answers are those of an ordinary run on every thread count, and a run on one

@@ -521,10 +521,11 @@ const LAZY_MIN: Duration = Duration::from_micros(if cfg!(test) { 0 } else { 20 }
 static STARTED_NS: AtomicU64 = AtomicU64::new(0);
 
 /// How long the first worker of a saturation on several threads runs before the others
-/// start: as long as starting them last took, so that a run that ends sooner pays for
-/// no thread, and one that runs longer waits no longer than starting them costs it.
-fn lazy_start() -> Duration {
-    match STARTED_NS.load(Ordering::Relaxed) {
+/// start: as long as starting them last took, as `started` holds it, so that a run that
+/// ends sooner pays for no thread, and one that runs longer waits no longer than starting
+/// them costs it.
+fn lazy_start(started: &AtomicU64) -> Duration {
+    match started.load(Ordering::Relaxed) {
         0 => LAZY_START,
         ns => Duration::from_nanos(ns).max(LAZY_MIN).min(LAZY_START),
     }
@@ -535,6 +536,9 @@ thread_local! {
     /// Makes the saturations this thread starts count as congested from the start, so
     /// that the tests reach the delivery of congested runs.
     pub(super) static ALWAYS_CONGESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Where the saturations this thread starts record their starts of the helpers in
+    /// place of [`STARTED_NS`], so that a test sees its own.
+    pub(super) static STARTED_IN: std::cell::Cell<Option<&'static AtomicU64>> = const { std::cell::Cell::new(None) };
 }
 
 struct Run<'a> {
@@ -577,6 +581,8 @@ struct Run<'a> {
     disj: bool,
     dynamic: Option<&'a Dynamic>,
     bounds: &'a Bounds<'a>,
+    /// where the run records its start of the helpers, [`STARTED_NS`] outside tests
+    started: &'static AtomicU64,
     #[cfg(test)]
     always_congested: bool,
 }
@@ -652,6 +658,10 @@ pub fn saturate_counted(
         disj: ix.dl.is_some() && bounds.dl.is_some(),
         dynamic: bounds.dynamic,
         bounds,
+        #[cfg(not(test))]
+        started: &STARTED_NS,
+        #[cfg(test)]
+        started: STARTED_IN.get().unwrap_or(&STARTED_NS),
         #[cfg(test)]
         always_congested: ALWAYS_CONGESTED.get(),
     };
@@ -1196,8 +1206,6 @@ impl<'a> Run<'a> {
             self.worker::<R>(None);
             return;
         }
-        // how long the first worker took to start the helpers, 0 while it has not
-        let spawned = AtomicU64::new(0);
         std::thread::scope(|s| {
             let start = || {
                 // counted while the first worker is busy, so that the count cannot reach 0
@@ -1207,15 +1215,13 @@ impl<'a> Run<'a> {
                 for _ in 1..threads {
                     s.spawn(move || self.worker::<R>(None));
                 }
+                // the saturations that start after this one wait as long, also while
+                // this one runs
                 let ns = called.elapsed().as_nanos().clamp(1, u64::MAX as u128);
-                spawned.store(ns as u64, Ordering::Relaxed);
+                self.started.store(ns as u64, Ordering::Relaxed);
             };
             self.worker::<R>(Some(&start));
         });
-        let ns = spawned.into_inner();
-        if ns > 0 {
-            STARTED_NS.store(ns, Ordering::Relaxed);
-        }
     }
 
     /// A worker activates up to [`ROOTS_PER_ROUND`] roots, then the contexts those
@@ -1229,7 +1235,7 @@ impl<'a> Run<'a> {
         {
             start();
         }
-        let began = others.map(|_| (Instant::now(), lazy_start()));
+        let began = others.map(|_| (Instant::now(), lazy_start(self.started)));
         let mut mine: VecDeque<Ex> = VecDeque::new();
         let mut chunk: Vec<Ex> = Vec::new();
         let mut round = 0usize;
@@ -2226,6 +2232,7 @@ mod horn_accounting_tests {
             disj: false,
             dynamic: None,
             bounds,
+            started: &STARTED_NS,
             always_congested: false,
         }
     }

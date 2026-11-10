@@ -807,9 +807,11 @@ thread pinned to CPU 4.
 | `ore_ont_13482` | 910.4 | 910.9 | 915.9 | 1.006 |
 | `ore_ont_7914` | 316.5 | 315.5 | 314.8 | 0.998 |
 
-The rounds spread by 0.5 to 2%. One thread runs none of the new code, and the times move
-with the code's layout. Commit 70a5234c, which differs from the lane only in code that
-runs on several threads, gave in ten rounds of an earlier run 0.998 of the time before
+The rounds spread by 0.5 to 2%. A run on one thread that is not congested reads the batching
+flag at each message it sends to another context, as it did before, and adds a comparison
+of the waiting messages with the stored conclusions to each check of the bounds. The times
+also move with the code's layout. Commit 70a5234c, whose run on one thread is the lane's
+and which differs from it only in code that runs on several threads, gave in ten rounds of an earlier run 0.998 of the time before
 on GO, 0.998 on ChEBI lite, 1.000 on `ore_ont_3836`, 1.005 on `ore_ont_13482` and 1.003 on
 `ore_ont_7914`, with the same user-space cycle counts as before within 0.3%. The base
 spent 1.3% more cycles than before on GO and 2.2% more on `ore_ont_3836`. Roadmap item

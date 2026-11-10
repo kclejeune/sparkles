@@ -741,8 +741,9 @@ microseconds. Warm runs of the five files of item 720 on eight threads take 2.1 
 ms, 0.04 to 0.21 ms longer than with the build before item 709 against 0.4 to 0.6 ms
 before, and item 819 follows the rest. Cold runs keep item 709's gain. A run on one thread sends through its outbox
 once it is congested, so that its deliveries drop the messages their contexts hold as
-those of several threads do, and the check costs a run that is not congested one load
-at each check of the bounds. On one thread `ore_ont_8737` peaks at 5.9 GiB against 9.3
+those of several threads do. A run that is not congested reads the batching flag at
+each message it sends to another context, as before, and adds a comparison of its
+waiting messages with its stored conclusions to each check of the bounds. On one thread `ore_ont_8737` peaks at 5.9 GiB against 9.3
 GiB and takes 90.7 against 95.8 s, while its run on four threads keeps its 28 s and 6.8
 to 7.9 GiB, which item 818 follows against Konclude's 11 s. The one-thread times of GO,
 ChEBI lite, `ore_ont_3836`, `ore_ont_13482` and `ore_ont_7914` moved by up to 2% between
