@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::branch::{
-    BranchOptions, CommitRef, ConflictScope, MergeOptions, MergeOutcome, Resolution, Take,
+    BranchOptions, CommitRef, ConflictScope, MAIN, MergeOptions, MergeOutcome, Resolution, Take,
 };
 use crate::history::At;
 use std::collections::BTreeSet;
@@ -2565,4 +2565,104 @@ fn branch_reentrancy_rename() {
         }
     }
     assert!(failed.is_empty(), "failed rename scenarios: {failed:?}");
+}
+
+/// `branch_info(MAIN)` must not hold the branch table while it waits for the main
+/// writer, since the history collector takes the writer and then the table. Every wait
+/// is bounded, so a regression fails here instead of hanging the suite.
+#[test]
+fn main_branch_info_releases_the_table_before_it_waits_for_the_writer() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    const WAIT: Duration = Duration::from_secs(10);
+    let (_dir, s) = setup();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    let dev_receipt = apply(&dev, "+<urn:dev> <urn:p> \"on-dev\" .");
+    s.set_branch_protected(MAIN, true).unwrap();
+    s.set_branch_note(MAIN, Some("primary".into())).unwrap();
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let reached_tx = Mutex::new(reached_tx);
+    let release_rx = Mutex::new(release_rx);
+    let hook: crate::store::backup::Failpoint = Arc::new(move |_| {
+        reached_tx.lock().send(()).unwrap();
+        // bounded, so a failed assertion still lets the paused reader finish
+        let _ = release_rx.lock().recv_timeout(WAIT);
+    });
+    s.set_failpoint("branch-info-main-captured", Some(hook.clone()));
+    let s = &s;
+    std::thread::scope(|scope| {
+        // Phase A: with the reader paused after its table read, the table is free and
+        // a whole history tick (writer, history, then table) completes.
+        let reader = scope.spawn(|| s.branch_info(MAIN).unwrap());
+        reached_rx.recv_timeout(WAIT).unwrap();
+        assert!(
+            s.try_hold_branch_table_for_test(Duration::from_secs(5))
+                .is_some(),
+            "branch_info(MAIN) holds the branch table past its metadata read"
+        );
+        let (tick_tx, tick_rx) = mpsc::channel();
+        scope.spawn(move || tick_tx.send(s.history_tick().map(|_| ())).unwrap());
+        tick_rx
+            .recv_timeout(WAIT)
+            .expect("history_tick blocked behind branch_info(MAIN)")
+            .unwrap();
+        release_tx.send(()).unwrap();
+        let info = reader.join().unwrap();
+        assert_eq!(info.name, MAIN);
+        assert!(info.protected);
+        assert_eq!(info.note.as_deref(), Some("primary"));
+        assert_eq!(info.head.unwrap().seq, s.head_commit().seq);
+        // A protected main refuses the ordinary commit below. Unprotecting reads
+        // branch_info(MAIN) itself, so it runs without the hook.
+        s.set_failpoint("branch-info-main-captured", None);
+        s.set_branch_protected(MAIN, false).unwrap();
+        s.set_failpoint("branch-info-main-captured", Some(hook.clone()));
+
+        // Phase B, the production interleaving: the reader waits for a writer that
+        // another thread holds, and the collector's table step still proceeds.
+        let reader = scope.spawn(|| s.branch_info(MAIN).unwrap());
+        reached_rx.recv_timeout(WAIT).unwrap();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (commit_tx, commit_rx) = mpsc::channel::<()>();
+        let writer = scope.spawn(move || {
+            let mut t = s.write();
+            held_tx.send(()).unwrap();
+            commit_rx.recv_timeout(WAIT).unwrap();
+            let mut labels = std::collections::HashMap::new();
+            let q = oxttl::NQuadsParser::new()
+                .for_slice(b"<urn:during> <urn:p> \"writer\" .\n".as_slice())
+                .next()
+                .unwrap()
+                .unwrap();
+            let ids = t.encode_quad(&q, &mut labels).unwrap();
+            t.insert(ids).unwrap();
+            t.commit().unwrap()
+        });
+        held_rx.recv_timeout(WAIT).unwrap();
+        release_tx.send(()).unwrap();
+        assert!(
+            s.try_hold_branch_table_for_test(Duration::from_secs(5))
+                .is_some(),
+            "branch_info(MAIN) holds the branch table while it waits for the writer"
+        );
+        let set = s.branching.set().unwrap();
+        let _ = set.holds_on(s.branch_id());
+        commit_tx.send(()).unwrap();
+        let receipt = writer.join().unwrap();
+        let info = reader.join().unwrap();
+        assert_eq!(info.head.unwrap().seq, receipt.commit.seq);
+        assert!(!info.protected);
+        assert_eq!(info.note.as_deref(), Some("primary"));
+    });
+    s.set_failpoint("branch-info-main-captured", None);
+    let names: Vec<_> = s.branches().unwrap().into_iter().map(|b| b.name).collect();
+    assert_eq!(names, [MAIN, "dev"]);
+    s.history_tick().unwrap();
+    assert!(has(&s, "writer"));
+    assert!(has(&dev, "on-dev"));
+    assert_eq!(dev.head_commit().seq, dev_receipt.commit.seq);
+    let dev_info = s.branch_info("dev").unwrap();
+    assert_eq!(dev_info.head.unwrap().seq, dev_receipt.commit.seq);
 }

@@ -1754,6 +1754,11 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 
 ### Fixed
 
+Reading the `main` branch's information no longer holds the dataset's branch table while
+it waits for the main writer. The periodic history collector takes the writer and then
+the branch table, so a branch listing that ran during a collection could deadlock both,
+and the server stopped answering dataset and branch requests until it restarted.
+
 Classification recounts retained index and context estimates consistently for fresh and
 reused state. A requested partial classification preserves its tier when final retained
 or taxonomy admission refuses memory, reports the original memory error and leaves
