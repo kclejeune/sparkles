@@ -632,6 +632,10 @@ count examples define no operational health policy or connector.
   the report's activity names every claim, decision and child report it read with
   `prov:used`, and a withdrawn, reversed or superseded claim rewrites the reports that
   read it ([C25](../specs/C25-evidence-and-assessments.md#reports-on-accepted-evidence)).
+  With `refresh.mode: auto`, a change of the policy's evidence, of the evidence
+  configuration or of the access policy starts a private check, a refresh's plan with no
+  model call or commit, and a refresh follows only when a report's input changed, including
+  through a decision the principal cannot see.
 * Ask answers questions about the whole dataset from the reports by map-reduce, and falls
   back to a query for callers who may not read them. The MCP tool `community_reports`,
   `recall` with `communities`, the brief, `sparkles graphrag` and the UI's Communities tab
@@ -725,11 +729,6 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Maintained analyses remain planned in [C25](../specs/C25-evidence-and-assessments.md).
   Ordinary RDF shape validation does not establish the runtime guarantees of the typed
   evidence operations. Roadmap item 340.
-* The automatic refresh of reports read under a review policy notices only the changes
-  of the policy's evidence that the principal's change feed lists. A hidden decision,
-  support or withdrawal, a settings-only change of the evidence configuration, a reload
-  of the access policy and a state left behind by a crash wait for the next visible
-  change or a manual refresh. Roadmap item 652.
 * A report waiting for a rewrite after its claim was withdrawn keeps its earlier
   citations while the daily budget holds the rewrite back, without a `stale` mark.
   Roadmap item 809.
