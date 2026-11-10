@@ -91,8 +91,10 @@ including values beyond 128 bits. Construction and copied storage obey the class
 resource controls, and large values share immutable storage until their last owner
 releases it. XML namespace conformance is checked without canonicalizing XML values.
 Canonical XML values, ill-typed literal semantics, datatypes outside the supported map
-and chains through the top object property remain in item 663. Horn reasoning with
-individuals remains in item 692, and the shared hierarchical budget remains in item 675.
+and chains through the top object property remain in item 663. Item 692 runs the Horn
+rules on ontologies with individuals, functional data properties and top properties, as
+[The Horn rules with individuals](#the-horn-rules-with-individuals) describes, and the
+shared hierarchical budget remains in item 675.
 
 Item 804 delivers the sixth phase's rooted run as the option `Limits::rooted`, off by
 default, as [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rules) and
@@ -527,14 +529,13 @@ chains and transitive properties through the automata of Horrocks, Kutz and Satt
 disjoint, asymmetric and irreflexive properties, and complements, unions and universal
 restrictions that move to the other side of an axiom as their duals. An at-least
 restriction of up to 64 becomes that many existential restrictions with fresh, pairwise
-disjoint fillers, as the paper's Lemma 2 does. The rules run when one of them can fire
-and the ontology has no individuals, functional data properties or top properties, and
-not at all under `Limits::el_only`, the ELK mode, which leaves every axiom outside OWL 2
-EL out as ELK does and gives ELK's taxonomy. With
-any of these the axioms outside OWL 2 EL stay left out and reported, and Horn reasoning
-with individuals is item 692, whose design is the section
-[The Horn rules with individuals](#the-horn-rules-with-individuals) below. So do axioms
-that are not Horn, property hierarchies
+disjoint fillers, as the paper's Lemma 2 does. The rules run when one of them can fire,
+and not at all under `Limits::el_only`, the ELK mode, which leaves every axiom outside
+OWL 2 EL out as ELK does and gives ELK's taxonomy. An ontology with individuals,
+functional data properties or top properties runs them beside the EL rules of
+individuals, as the section
+[The Horn rules with individuals](#the-horn-rules-with-individuals) describes (item
+692). Axioms that are not Horn, property hierarchies
 that are not regular, automata of more than 65,536 states and data restrictions outside
 OWL 2 EL. `Stats::tier` says which rules a run needed, `Stats::outside_el` counts the
 axioms outside OWL 2 EL and those taken, and `Stats::conjunctions` counts the contexts
@@ -781,10 +782,8 @@ classification comparison uses to report them as left out.
 
 ### The Horn rules with individuals
 
-This section is the design of item 692, which runs the Horn rules on ontologies with
-individuals, functional data properties and top properties. The rules it describes are
-not built yet, and until they are the Horn rules refuse such an ontology as the section
-above says. The design keeps two promises. The answers equal HermiT's on the Horn files
+Item 692 runs the Horn rules on ontologies with individuals, functional data properties
+and top properties, as this section describes. The design keeps two promises. The answers equal HermiT's on the Horn files
 with individuals of the ORE 2015 DL sample, and an ontology without individuals,
 functional data properties or top properties is unaffected, so that its taxonomy is byte
 for byte what it was. The second promise is about the taxonomy and the code the run

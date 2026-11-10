@@ -317,8 +317,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   default answer and sets `Stats::dl_rooted_over` and `Stats::dl_over_budget`. It refuses
   an ontology with keys, a top property or a functional data property, which take the
   default paths. Roadmap items 805, 822 and 823. Without the option, any other axiom
-  outside OWL 2 EL, such as a nominal, is left out and reported with its rule. Horn
-  reasoning with individuals is not supported. Roadmap item 692. An axiom with a literal
+  outside OWL 2 EL that needs case analysis, such as a union, is left out and reported
+  with its rule, while the Horn axioms run with the individuals. An axiom with a literal
   or datatype that the classifier cannot compare, such as an XML literal, an ill-typed
   literal or a datatype outside the OWL 2 datatype map, or with a property chain through
   the top object property, is used as far as the calculus goes and reported as partial.
@@ -733,8 +733,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   or a key saturates everything again, and so does any change after a run that merged
   a context with an individual.
   Roadmap item 664.
-* The classifier leaves out the Horn axioms outside OWL 2 EL in an ontology with
-  individuals, functional data properties or top properties. Roadmap item 692.
+* In an ontology with individuals, the Horn rules leave out an at-least restriction
+  above one and report it, since the unfolding they use elsewhere is argued for
+  tree-shaped models. Roadmap item 867. Such an ontology may get a world for a class
+  whose world finds nothing. Roadmap item 868.
 * GO's inverse properties take the Horn rules, which classify it 12% slower than the EL
   rules on one thread and raise its peak resident set from 196 to 223 MiB. Two
   Uberon-based ontologies of the ORE 2015 DL sample classify with the Horn rules in 2.2

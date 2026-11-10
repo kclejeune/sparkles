@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### OWL classification
+
+The Horn rules classify ontologies with individuals, functional data properties and top
+properties, in one saturation with the EL rules of individuals, with two rules over the
+predecessors of a context that stands for one element and a fact for a universal
+restriction on the top property. The disjunctive rules keep their condition. An at-least
+restriction above one beside individuals is left out and reported (roadmap item 692).
+
 ### Compatibility
 
 The adopted HTTP, CLI and public library compatibility policy is documented.

@@ -17,9 +17,11 @@
 //! inverse-functional roles, self restrictions, chains and transitivity under universals,
 //! and disjoint, asymmetric and irreflexive roles. The Horn rules run as their own
 //! instantiation of the saturation, which creates the contexts of conjunctions that the
-//! index does not hold, and only when the EL axioms need no rules of individuals,
-//! universal roles or functional data roles; otherwise the Horn axioms are left out too.
-//! A run with the Horn rules saturates everything again on its next run. An axiom the
+//! index does not hold, and beside the rules of individuals, universal roles and
+//! functional data roles when the ontology has them (roadmap item 692), with two rules
+//! over the predecessors of a context that stands for one element and the worlds over
+//! the conjunction contexts. A run with the Horn rules saturates everything again on its
+//! next run. An axiom the
 //! classifier does not take is left out and reported, with the rule of the OWL 2 Profiles
 //! recommendation it breaks, and the run's [`Stats`] count the axioms outside OWL 2 EL by
 //! whether they are Horn, give the [`Tier`] of rules the ontology needs and count the
