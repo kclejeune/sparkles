@@ -108,10 +108,25 @@ operators' build, whose OWL 2 RL rule set also gained the missing rules of the P
 tables, which add 720 facts to each OWL2Bench run and 350 to LUBM(100). Within one build,
 `examples/lubm.rs` derived the same facts, with the same order-free digest, with and
 without the operators. OWL2Bench(10) exceeded the 14 GiB run limit with or without the operators, and with the
-operators it also ran out of a 28 GiB limit on a 32 GiB development host, wally. Where
-that memory goes has not been profiled, and roadmap item 522 covers it. LUBM(100)
+operators it also ran out of a 28 GiB limit on a 32 GiB development host, wally. The
+profile of roadmap items 835 and 865 found where the memory of the 5-university run goes
+and bounded it, as the next paragraph records, and item 522 covers the 10-university run. LUBM(100)
 gains nothing, because its transitive relations are short and its time goes to the
 other rules.
+
+On wally, a 20-thread development host with 32 GiB, `sparkles infer --full --profile
+owl-rl --max-inferred 2e8` on OWL2Bench with 5 universities, two interleaved rounds per
+thread count against the build before the columnar derived tier (88538906), derived
+52,966,139 facts in six iterations with every build. The derived tier at 2ced03ad held
+them in 2,137 MB, 40 bytes per fact with the triple index, and the reasoner's budget
+peaked at 10.5 GB, 199 bytes per fact, in the closure operators' first step. With the
+operators' batched merges at f6264c44 the budget peaked at 4.2 GB, 80 bytes per fact, and
+the tier ended at 2,467 MB. The whole command's peak resident set stayed between 9.4 and
+10.9 GiB for every build, since the commit of the derived triples to the store follows
+the reasoning. Wall times at one thread were 70 and 67 s before the tier, 89 and 84 s with
+it and 89 and 85 s with the batches, and at 20 threads 38 and 34 s, 41 and 42 s, and 41
+and 38 s. These are development-host measurements, and the benchmark host has not rerun
+them. Roadmap item 866 covers the one-thread cost.
 
 ### Small incremental runs
 

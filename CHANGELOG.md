@@ -545,7 +545,9 @@ with fence keys that a probe searches before it reads the keys of at most eight 
 merge appends one run per order and compacts the older runs, and a relation with a
 quarter of its facts dead is rebuilt. A fact costs 34 bytes in the tier beside its slot
 in the triple index, and OWL2Bench with 5 universities measured 40 bytes per derived fact
-with the index, where the rows, hash lists and tables it replaces cost about 135 bytes.
+with the index when a closure arrived in one merge, and 47 with the batched closures
+below, whose columns keep the capacity of their last doubling, where the rows, hash lists
+and tables the tier replaces cost about 135 bytes.
 Full and incremental runs derive the same closures with the same fact ids as before.
 
 The closure operators merge their pairs into the derived tier in batches of four million
