@@ -202,7 +202,9 @@ against a constant-object restriction divides by the input's distinct keys, so t
 plan's last probe is estimated at 666 keys where it probes 4, and item 874 changes that
 estimate. Planning takes 1 to 90 microseconds
 longer on WatDiv `F4` and on short synthetic, WatDiv and DBpedia queries, 5% to 10% of
-their time, which item 702 follows up. Two synthetic queries with unchanged plans
+their time. Item 702 kept each group's holdings table and star factors across the
+candidate plans, which atlas measured no faster, and the
+[experiment](../../PERFORMANCE-EXPERIMENTS.md#query-execution) is recorded. Two synthetic queries with unchanged plans
 run 1.06 and 1.11 times as long in execution in eight rounds, and item 703 follows
 them up. Interleaved runs on atlas, an Intel host like forge, found the same slowdowns of
 `S4-2`, `S4-4` and `F4`. The
@@ -226,8 +228,8 @@ percentile from 59 to 6.1. The largest error of `S4-1` and `S4-3` falls from 666
 and 2.0, of `F1-1` from 103 to 14, of `F4-4` from 196 to 9 and of the `L2` and `L5`
 queries from about 15 to 3. The synthetic workload keeps every estimate. On the DBpedia
 slice the geometric mean falls from 1.96 to 1.80 and the largest error, on
-`outlink-classes-2`, from 78 to 31. Every answer matches the base build's, and item 702
-alone changes no estimate on the three workloads. The plans of 32 WatDiv queries change,
+`outlink-classes-2`, from 78 to 31. Every answer matches the base build's, and the build
+with the switch off changes no estimate on the three workloads. The plans of 32 WatDiv queries change,
 and the largest join error of nine of them rises. The five `F5` queries, `S1-3` and
 `S1-4` fuse another pair of patterns into the star over `<Retailer> gr:offers ?v0`, and
 the estimate of that star without a set that fits, 19 rows where 73 come, carries through
