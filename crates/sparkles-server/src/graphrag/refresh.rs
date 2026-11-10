@@ -998,15 +998,19 @@ mod tests {
             (Some(task_state::FAILED), false),
             (None, false),
         ] {
-            let mut w = Watch::default();
+            let mut w = Watch {
+                task: Some("t".into()),
+                ..Default::default()
+            };
             w.private.due = true;
-            w.task = Some("t".into());
             assert!(!w.follow(state, 5, t0, d), "{state:?}");
             assert_eq!(w.private.due, !cleared, "{state:?}");
             assert_eq!(w.task, None);
         }
-        let mut w = Watch::default();
-        w.task = Some("t".into());
+        let mut w = Watch {
+            task: Some("t".into()),
+            ..Default::default()
+        };
         assert!(w.follow(Some(task_state::RUNNING), 5, t0, d));
         assert!(w.task.is_some());
         // consecutive failures, with no reset between them, double the backoff
