@@ -1026,8 +1026,8 @@ fn the_consequences_of_a_deletion_count_their_instances() {
 }
 
 /// The same with heads that depend on the other atom: the evaluations of the deleted
-/// facts, 256 at a time, each find the same 100,000 heads, and the bound stops them
-/// before they hold a copy each.
+/// facts, 256 at a time, each find the same 100,000 heads, and the bound counts the
+/// instances of every evaluation as they match.
 #[test]
 fn the_consequences_of_a_deletion_stop_across_evaluations() {
     let r = delete_from_a_product("(?y ex:r ex:on)", 512, None);

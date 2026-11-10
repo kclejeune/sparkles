@@ -1658,6 +1658,55 @@ pub(crate) mod tests {
         );
     }
 
+    /// The consequences of a deleted fact stop at the bound also when their instances
+    /// come from a builtin that binds many values, `listMember` here: 2,000 members
+    /// twice give 4 million instances of one head.
+    #[test]
+    fn consequences_from_a_generator_stop_at_the_bound() {
+        let mut ttl = String::from("<http://ex.org/a> <http://ex.org/p> (");
+        for m in 0..2_000 {
+            ttl.push_str(&format!(" <http://ex.org/m{m}>"));
+        }
+        ttl.push_str(" ) .\n");
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let terms = Terms::new(snap.clone());
+        let text = "@prefix ex: <http://ex.org/>.
+            [a: (?x ex:p ?l), listMember(?l, ?m), listMember(?l, ?n) -> (ex:s ex:r ex:o)]";
+        let rules = compiled(text, &terms);
+        let b = Base::new(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap();
+        let mut g = Graph::with_base(Arc::new(b));
+        // the fact the deletion removes, held in the derived tier as an update holds it
+        let id = |l: &str| snap.lookup_iri(&format!("{EX}{l}")).unwrap().0;
+        let l = snap
+            .scan_keys(
+                sparkles_core::index::Perm::Gspo,
+                &[Id::DEFAULT_GRAPH.0, id("a"), id("p")],
+            )
+            .unwrap()[0][3];
+        let dead = [id("a"), id("p"), l];
+        g.try_add_batch(vec![dead]).unwrap();
+        let mut c = Closure::new(g, terms).unwrap();
+        let plans = Plans::new(&mut c.graph, &rules).unwrap();
+        let lim = limits();
+        let bound = Bound::new(&lim.budget, 2 * VISIT_BATCH, usize::MAX);
+        let e = consequences(&c, &rules, &plans, &[dead], &lim, Some(&bound)).unwrap_err();
+        assert!(e.is::<Fallback>(), "{e:#}");
+        // a batch past the bound, and not the rest of the product
+        assert!(
+            bound.visits() <= 3 * VISIT_BATCH,
+            "{} visits",
+            bound.visits()
+        );
+    }
+
     #[test]
     fn the_bound_counts_memory_from_its_start() {
         let budget = Budget::new(Some(1 << 20));

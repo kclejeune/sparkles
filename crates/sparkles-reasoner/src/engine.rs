@@ -1215,6 +1215,11 @@ impl<'a> Eval<'a> {
 
     /// Continue with a variable bound to `value` (or check it if already bound).
     pub fn bind_and_continue(&mut self, slot: Slot, value: u64, k: usize, b: &mut [u64]) {
+        // a builtin that binds many values, such as `listMember`, calls this for each, and
+        // its loop ends with the evaluation
+        if self.aborted() {
+            return;
+        }
         match slot {
             Slot::Var(v) if b[v] == 0 => {
                 b[v] = value;
