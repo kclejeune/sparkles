@@ -541,8 +541,10 @@ struct Run<'a> {
     applied: AtomicUsize,
     /// whether a context derived an individual other than its root
     merged: AtomicBool,
-    /// whether the workers send through outboxes, which they do when there are several
-    batch: bool,
+    /// whether the workers send through outboxes, which they do when there are several,
+    /// and which one worker starts doing once the run is congested, so that its messages
+    /// reach the delivery filter (roadmap item 721)
+    batch: AtomicBool,
     /// whether the rules run without those of individuals and functional data roles
     plain: bool,
     /// whether the rules are those of Tier H
@@ -618,7 +620,7 @@ pub fn saturate_counted(
         peak: AtomicUsize::new(bounds.base_memory.max(bounds.peak_memory)),
         applied: AtomicUsize::new(0),
         merged: AtomicBool::new(false),
-        batch: bounds.threads > 1,
+        batch: AtomicBool::new(bounds.threads > 1),
         plain: plain(ix),
         horn: ix.horn.is_some() && bounds.dynamic.is_some(),
         disj: ix.dl.is_some() && bounds.dl.is_some(),
@@ -804,7 +806,7 @@ impl Sink for Out<'_, '_> {
     fn send(&mut self, to: Ex, c: Concl) {
         if to == self.me {
             self.local.push(c);
-        } else if !self.run.batch {
+        } else if !self.run.batch.load(Ordering::Relaxed) {
             // one worker meets no other at a to-do list, and sorting costs more than it
             // saves
             let ctx = self.run.get(to);
@@ -1084,6 +1086,17 @@ impl<'a> Run<'a> {
             > self.memory.load(Ordering::Relaxed).max(CONGESTED_BYTES)
     }
 
+    /// Makes a run on one worker send through its outbox once it is congested, so that
+    /// its deliveries drop the messages their contexts hold, as those of several workers
+    /// do (roadmap item 721).
+    #[cold]
+    #[inline(never)]
+    fn batch_if_congested(&self) {
+        if self.congested() {
+            self.batch.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Moves half of a worker's queue to the shared queue when a worker waits for it.
     fn share(&self, mine: &mut VecDeque<Ex>) {
         let idle = self.idle.load(Ordering::SeqCst);
@@ -1273,6 +1286,9 @@ impl<'a> Run<'a> {
         let before = self.peak.fetch_max(used, Ordering::Relaxed);
         if self.stopped() {
             return false;
+        }
+        if !self.batch.load(Ordering::Relaxed) {
+            self.batch_if_congested();
         }
         let b = self.bounds;
         let grown = used.saturating_sub(before);
@@ -2165,7 +2181,7 @@ mod horn_accounting_tests {
             peak: AtomicUsize::new(bounds.peak_memory),
             applied: AtomicUsize::new(0),
             merged: AtomicBool::new(false),
-            batch: false,
+            batch: AtomicBool::new(false),
             plain: false,
             horn: true,
             disj: false,
