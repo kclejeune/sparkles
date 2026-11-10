@@ -361,6 +361,54 @@ their semantic input footprint. Explicit consumers can subscribe to typed job ev
 C23 trigger definitions may submit C26 jobs, with C23 recursion and ordering limits.
 They do not create another scheduler or imply atomic effects across trigger attempts.
 
+### 7.1 Ordering against the write-ahead log and the commit tail
+
+Every job transition is one ordinary commit of the dataset's main store. Submission,
+claim, renewal, publication, failure, cancellation, retry and recovery each open one
+`WriteTxn` under the dataset writer with the jobs owner's managed-write capability. The
+transaction stages the ledger quads and, for a publication, the business quads, the
+publication record and the source checkpoint together. The existing commit path appends
+them as one log record, synchronizes the log and only then publishes the snapshot and
+returns the receipt. There is no second journal. A ledger record is durable exactly when
+its commit is durable, and a reader sees it exactly when that commit is published.
+
+Preconditions read the transaction's base snapshot, which is the head when the writer was
+taken. Transitions of one run therefore serialize on the writer. A publication that reads
+`leased` at generation g and a cancellation that reads the same base cannot both commit,
+because whichever takes the writer second reads the other's commit in its base and
+refuses. This gives A6 without a separate lock.
+
+The response is rendered from the receipt after `commit` returns, so an acknowledged
+submission, claim or publication is in a synchronized log record. A crash before
+synchronization loses the whole record and nothing of it is visible after recovery. A
+crash after synchronization keeps the whole record even when the response was lost. This
+gives A2, A3 and A7, and the retry resolves the lost response from committed state. A
+submission is recorded under an operation id derived from the dataset, branch, principal,
+definition revision and idempotency key, and a publication under its operation UUID. A
+retry looks the id up in the current head before taking the writer and again in the base
+of its own transaction, so no error is ever read as proof of rollback.
+
+The claim commit records the attempt's lease generation, the process's boot epoch and
+the SHA-256 verifier of the random bearer token. A renewal, publication or failure
+verifies the token digest, the generation of the run's current attempt, the epoch of the
+running process and the lease expiry on the monotonic clock, all against committed state
+under the writer. An old token cannot write after another worker's claim has committed,
+which gives A4. The boot epoch is chosen at random when the dataset opens and is recorded
+by the first transition of that process before that process admits any claim. An attempt
+whose recorded epoch differs is interrupted, its lease counts as expired and its run
+returns to its retry policy in a recovery commit. The previous process's tokens therefore
+fail the epoch check before any new claim, whatever the wall clock says, which gives A5.
+Lease expiry is never derived from a record's UTC time within one process, so a backward
+clock change cannot lengthen a lease.
+
+Input commits are pinned by a source hold under the run's id before the submission
+commit, as the evidence profile pins its references. A crash between the hold and the
+commit leaves an orphan that the hold reconciliation releases after its grace period, and
+the hold is released when the run reaches a terminal state. Enabling jobs raises the
+dataset's `minimumReader` durably before `jobs.json` and then `managed.json` are written,
+and the registry's owner entry is the write fence of the ledger graph, so an older
+release refuses to open the dataset rather than treat the ledger as an ordinary graph.
+
 ## 8. Acceptance and verification
 
 The following examples are requirements for executable tests rather than claims about
