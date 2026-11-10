@@ -63,6 +63,10 @@ limit that item 84 also raises. Each phase lands in the unified executor of
   and no query under 0.3 ms slower on an Intel host.
 * `plan_fidelity_tests.rs` records estimated against actual rows, and a new estimator
   must not raise the error on any recorded plan.
+* An estimator change that moves plans is measured on atlas over the changed plans. No
+  query above 0.3 ms may run 10% slower, the sum and the geometric mean of the execution
+  time may not be worse, and the median q-error of the workload may not rise. A slowdown
+  the gate accepts gets a follow-up item.
 * Cyclic workloads, namely triangles, the WatDiv C templates and LUBM `q2`, are the
   acceptance cases of the worst-case-optimal join, with answers equal to the binary-join
   plans.
@@ -253,6 +257,11 @@ server processes. `S4-2` and `S4-4` take 0.37 and 0.34 times as long, 0.042 ms a
 longer on `S4-1`, `S4-3` and `S4-5` and 86 microseconds shorter on `F2-3`. The Namespace
 screen of the synthetic store, whose plans do not change, shows no query 10% or more
 slower after the rerun of the five it flagged.
+Item 874 meets the gate for a plan change. No query above 0.3 ms is slower, since the nine
+slower queries run 0.03 to 0.13 ms, the sum falls from 2.65 to 2.30 ms and the geometric
+mean to 0.825, and the median join q-error falls from 2.00 to 1.67 on WatDiv and stays at
+1.01 on the synthetic store and DBpedia. Item 877 follows up the shared estimate of the
+`<Retailer> gr:offers ?v0` star behind the slower `F5` and `S1` plans.
 
 The first query of a fresh server over a store that holds the correlation statistics pays
 for them once. On atlas at 1.05M triples, with one thread, the first run of the synthetic
