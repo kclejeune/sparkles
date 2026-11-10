@@ -209,10 +209,14 @@ them up. Interleaved runs on atlas, an Intel host like forge, found the same slo
 [engine results](../../benchmarks/engine/RESULTS.md#estimation-timing-on-forge) list every
 changed plan.
 
-Item 874 divides a join against a pattern that a constant restricts by the predicate's
-distinct subjects or objects at least, on the pattern and on the joins above it, since the
-pattern's keys are a sample of the predicate's values and not a superset of the other
-side's. The switch is `domain_estimates`. Classes stay with the characteristic sets. On
+Item 874 divides a join against a pattern that a constant restricts, for a predicate other
+than `rdf:type`, by the predicate's distinct subjects or objects at least, on the pattern
+and on the joins above it, since the pattern's keys are a sample of the predicate's
+values and not a superset of the other side's. It applies to the estimate from distinct
+values, which the probed keys and the characteristic sets precede, and not while the
+snapshot holds a delta. The switch is `domain_estimates`. Two sides restricted by the same
+constant on the same predicate are still taken for independent samples, which item 875
+follows up. On
 WatDiv at scale 100, `S4-2` and `S4-4` then take a third plan. The `artist` and
 `nationality` scans merge, estimated at 122 rows where 21 come, and a 21-key star probe
 of `age` and `familyName` follows, estimated at 15 rows where 4 come, at 21,874 cost units
