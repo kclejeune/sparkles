@@ -240,6 +240,19 @@ websites and 504 products and the domain of one predicate cannot separate the tw
 estimates 3 rows where 9 come for the `language` restriction on 17 websites, of which
 1,238 in 5,000 have the language and 9 of these 17 do, and the five joins above keep that
 factor, to 9 rows where 72 come.
+On atlas, an Intel host like forge, six interleaved rounds of servers pinned to one core, with
+the switch on against off in one build over the 32 changed plans and `F4-1`, `S4-2`, `L1-2`
+and `S7-2`, put the execution time of the changed plans at 0.825 of the unchanged ones by
+geometric mean and at 2.30 ms against 2.65 ms in sum, with spreads of 1% to 7% between
+server processes. `S4-2` and `S4-4` take 0.37 and 0.34 times as long, 0.042 ms against
+0.116, `S5-2` to `S5-5` 0.27, 0.016 ms against 0.059, `S5-1` 0.60, `C2-1` 0.80 and `F2-3`
+0.78. Nine queries take longer, by 6 to 24 microseconds each on 0.03 to 0.13 ms: `S4-3`
+1.42, `S4-5` 1.36, `F5-4` 1.23, `S4-1` 1.23, `F5-1` 1.17, `F5-5` 1.16, `F5-2` 1.16, `F1-5`
+1.14 and `F1-3` 1.12 times. They are the queries whose largest estimate rose, apart from
+`S5-1`, which runs 0.60. Planning time is within 1% by geometric mean, 6 microseconds
+longer on `S4-1`, `S4-3` and `S4-5` and 86 microseconds shorter on `F2-3`. The Namespace
+screen of the synthetic store, whose plans do not change, shows no query 10% or more
+slower after the rerun of the five it flagged.
 
 The first query of a fresh server over a store that holds the correlation statistics pays
 for them once. On atlas at 1.05M triples, with one thread, the first run of the synthetic
