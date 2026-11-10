@@ -987,6 +987,12 @@ was a `recompute` node that evaluated the whole query at every touching commit, 
 view now pays that cost at a quarter of the commits of this mix instead of all of them,
 and item 906 scopes such a change through the condition's joins.
 
+The writes screen of `scripts/nsc-writes.sh` with `--views async:4`, four table views over
+the writers' predicate, ran three rounds of `serial-literal`, `writers` and `mixed` on a
+Namespace instance for the build before item 418 and the build with it. The medians were
+0.85, 1.23 and 0.94 of the base's transactions per second, with every range overlapping,
+and item 907 pins them on the batch screen and forge.
+
 ### Incremental view gate baseline
 
 `mise run bench:incr` is the rewrite gate of incremental view maintenance, as

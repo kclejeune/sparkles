@@ -1533,8 +1533,11 @@ has its table. On a laptop at 200,000 people, the `MIN` and `MAX`, `HAVING` and
 commit, and the correlated `EXISTS` view 2.5 ms at the median, against 22.5 s for its
 query. A commit that touches a pattern of the condition without an outer variable
 evaluates the condition for every row again, at about the query's cost, which is the
-view's p95 and what item 906 scopes further. Item 418 changed no code of the query engine,
-and the writes screen with four table views ran as [ROADMAP](../ROADMAP.md) item 17 asks.
+view's p95 and what item 906 scopes further. Item 418 changed no code of the query engine.
+The writes screen with four table views, which [ROADMAP](../ROADMAP.md) item 17 asks for,
+ran three rounds on a Namespace instance with `serial-literal` at 0.85 of the base's
+transactions per second, `mixed` at 0.94 and `writers` at 1.23, with every range
+overlapping, which item 907 pins on the batch screen and forge.
 
 ### Maintained assessments and conservative dependencies
 
