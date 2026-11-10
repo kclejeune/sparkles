@@ -50,10 +50,13 @@ request or on every write, and the schema report counts what the data holds.
 * Re-runs, automatic runs and `sparkles infer` update the previous materialization
   incrementally with the backward/forward algorithm, and write what a full run would.
   Rules that are not monotonic or create blank nodes, large deletions and a changed set of
-  input graphs run in full. A deletion whose maintenance would cost more than a full run
-  also runs in full. Its maintenance stops once it has matched four rule instances for
-  each fact of the closure, or holds more memory than the closure itself, with floors of
-  about a million instances and 64 MiB for small closures. The kept closure holds only
+  input graphs run in full. So does a deletion whose maintenance passes an allowance set
+  by the size of the closure, which approximates the cost of a full run. The allowance is
+  four matched rule instances for each fact of the closure and as much memory beyond what
+  the run held when the deletion started as the closure's own heap, with floors of about
+  a million instances and 64 MiB. The maintenance compares its count and the run's
+  charges with the allowance every 1,024 instances, so it can pass the allowance by a
+  few batches before it stops. The kept closure holds only
   the derived facts, which takes 41% to 47% of the memory of a closure with the explicit
   facts on LUBM-style data.
 * A materialization reads the default graph unless data and ontology graphs are named,
