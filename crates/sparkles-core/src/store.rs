@@ -2431,8 +2431,12 @@ impl Store {
             )),
         )?;
         if !wal_existed {
-            // a new log starts with its header record
+            // A new log starts with its header record, and its directory entry is
+            // durable before the writer starts: the file's own sync does not cover the
+            // entry, and a power loss after the first commits would otherwise lose the
+            // whole log with them.
             wal_len = wal::HEADER_BYTES;
+            sync_dir(&root.join(&name))?;
         }
         // What this open read is where the writes to come start, so it must be durable
         // first. A process that stopped without syncing can leave bytes that are only

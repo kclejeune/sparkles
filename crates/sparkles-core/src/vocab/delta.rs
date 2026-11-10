@@ -125,20 +125,10 @@ fn parse_delta_inner<'a>(
         chunks: 0,
     };
     if buf.len() < MAGIC.len() || buf[..MAGIC.len()] != MAGIC {
-        // An empty file holds no entries, and neither does one whose first chunk a crash
-        // tore: its header, written with the chunk, did not reach the disk, so the first
-        // bytes are zeros, or a prefix of the magic followed by zeros, whatever later
-        // pages of the chunk hold. A pre-release file of the entries alone starts with
-        // the length of its first key, which is neither, and is refused.
         if let Some(budget) = budget.as_deref_mut() {
             budget.check()?;
         }
-        let head = &buf[..buf.len().min(MAGIC.len())];
-        let torn = head.iter().all(|&byte| byte == 0)
-            || (head.len() < MAGIC.len()
-                && MAGIC.starts_with(head)
-                && buf[head.len()..].iter().all(|&byte| byte == 0));
-        if !torn {
+        if !torn_first_chunk(buf) {
             return Err(crate::formats::DELTA_VOCAB.refuse("delta.vocab", UNFRAMED_VERSION, None));
         }
         return Ok(out);
@@ -513,9 +503,26 @@ impl DeltaFile {
     }
 }
 
+/// Whether a file that does not start with the complete header is the first chunk a
+/// crash tore, which holds no entries: an empty file, or one whose header, written with
+/// the chunk, did not reach the disk, so that its first eight bytes are zeros, or a
+/// prefix of the magic followed by zeros, whatever later pages of the chunk hold. A
+/// pre-release file of the entries alone starts with the length of its first key, which
+/// is neither. The parser and [`file_version`] share this rule.
+fn torn_first_chunk(buf: &[u8]) -> bool {
+    let head = &buf[..buf.len().min(MAGIC.len())];
+    let magic = head
+        .iter()
+        .zip(MAGIC.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    head[magic..].iter().all(|&byte| byte == 0)
+}
+
 /// The version of the delta vocabulary at `path`: the header's version, [`VERSION`]
-/// for a missing or empty file or one of zeros, which holds no entries yet, and 1 for a
-/// pre-release file of the entries alone, which this build refuses.
+/// for a missing or empty file or a torn first chunk (see [`torn_first_chunk`]), which
+/// holds no entries yet, and 1 for a pre-release file of the entries alone, which this
+/// build refuses.
 pub fn file_version(path: &Path) -> Result<u32> {
     let buf = read_file(path)?;
     if buf.len() >= 12 && buf[..MAGIC.len()] == MAGIC {
@@ -524,7 +531,7 @@ pub fn file_version(path: &Path) -> Result<u32> {
             0 => VERSION,
             v => v,
         })
-    } else if buf.iter().take(MAGIC.len()).all(|&byte| byte == 0) {
+    } else if torn_first_chunk(&buf) {
         Ok(VERSION)
     } else {
         Ok(UNFRAMED_VERSION)
@@ -1355,6 +1362,48 @@ mod tests {
             assert_eq!(&buf[..8], &MAGIC);
             assert_eq!(parse_delta(&buf).unwrap().chunks, 1);
             assert_eq!(DeltaVocab::open(&path).unwrap().len(), 1);
+        }
+    }
+
+    /// The first chunk a crash tore holds no entries, whether its first eight bytes are
+    /// zeros or a prefix of the magic followed by zeros, and whatever the later pages of
+    /// the chunk hold. The parser and `file_version` agree on each form, and so a
+    /// pre-release file is told apart by its first key's length alone.
+    #[test]
+    fn a_torn_first_chunk_with_a_prefix_of_the_magic_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delta.vocab");
+        let later_page = [&[0u8; 4096][..], b"<later page of the chunk>"].concat();
+        let mut torn: Vec<Vec<u8>> = Vec::new();
+        for prefix in 1..MAGIC.len() {
+            torn.push(MAGIC[..prefix].to_vec());
+            torn.push([&MAGIC[..prefix], &[0u8; 64][..]].concat());
+            torn.push([&MAGIC[..prefix], &later_page[prefix..]].concat());
+        }
+        torn.push(MAGIC.to_vec());
+        torn.push([&MAGIC[..], &[0u8; 3][..]].concat());
+        torn.push(later_page.clone());
+        for bytes in &torn {
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(file_version(&path).unwrap(), VERSION, "{bytes:?}");
+            assert!(parse_delta(bytes).unwrap().keys.is_empty(), "{bytes:?}");
+            assert_eq!(DeltaVocab::open(&path).unwrap().len(), 0, "{bytes:?}");
+            assert_eq!(
+                DeltaVocab::open_read_only(&path).unwrap().len(),
+                0,
+                "{bytes:?}"
+            );
+        }
+        // a byte that is neither zero nor the next byte of the magic is a key length
+        for bytes in [
+            [&MAGIC[..3], &[7u8][..]].concat(),
+            [&MAGIC[..3], &[0u8, 7][..]].concat(),
+            [&[0u8; 7][..], &[1u8][..]].concat(),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(file_version(&path).unwrap(), UNFRAMED_VERSION, "{bytes:?}");
+            let error = DeltaVocab::open(&path).err().expect("refused");
+            assert!(matches!(error, Error::Unsupported(_)), "{error}");
         }
     }
 

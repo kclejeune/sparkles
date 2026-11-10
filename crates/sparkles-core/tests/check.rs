@@ -594,12 +594,27 @@ fn a_damaged_final_commit_that_the_catalog_lists_is_an_error() {
 fn an_unknown_wal_record_before_the_last_commit_is_an_error() {
     let (_d, root) = fresh();
     let path = gen_dir(&root).join("wal.log");
-    let mut b = std::fs::read(&path).unwrap();
-    b[0] = 0x7f;
+    let good = std::fs::read(&path).unwrap();
+    // the first record after the 33-byte header record
+    let mut b = good.clone();
+    b[33] = 0x7f;
     std::fs::write(&path, &b).unwrap();
     let r = run(&root, true);
     assert!(
         messages(&r, "wal").contains("unknown type"),
+        "{}",
+        r.to_text()
+    );
+    assert_eq!(status(&r, "wal"), Status::Error);
+    // the header record itself: the log reads as the pre-release headerless form, which
+    // open refuses with the dump-and-reload message
+    let mut b = good;
+    b[0] = 0x7f;
+    std::fs::write(&path, &b).unwrap();
+    let r = run(&root, true);
+    let m = messages(&r, "wal");
+    assert!(
+        m.contains("wal version 0") && m.contains("open refuses"),
         "{}",
         r.to_text()
     );

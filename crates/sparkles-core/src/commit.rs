@@ -944,10 +944,9 @@ struct GenCommitFile {
     /// `create`, `baseline`, `bulk`, `compaction` or `clone`
     origin: String,
     commit: CommitJson,
-    /// Where strict framing starts in the generation's headerless (version 0) log, in
-    /// bytes. A release that writes commit metadata records the log's logical end here
-    /// once, at its first write open of the log, before it appends anything. Absent in
-    /// files written before the member existed, and for logs with a header record.
+    /// The configuration history binding of the generation's base
+    /// ([`crate::history::ConfigurationBinding`]). Absent in the files of a store
+    /// without configuration history, which reads as the legacy unbound binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     configuration_binding: Option<crate::history::ConfigurationBinding>,
     /// Members this build does not know, added by a later release under the additive

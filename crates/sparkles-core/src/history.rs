@@ -703,7 +703,7 @@ pub(crate) struct GenEntry {
     pub base: CommitInfo,
     /// the last commit in its WAL (for the current generation: kept at the head)
     pub end: u64,
-    /// legacy WAL commits before the first one with metadata fold into the base
+    /// the size of its directory, 0 for the current generation
     pub bytes: u64,
 }
 

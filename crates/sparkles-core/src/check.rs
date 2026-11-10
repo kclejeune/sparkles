@@ -798,10 +798,8 @@ impl Checker<'_> {
                     .map_err(|e| Error::Corrupt(format!("meta.json: {e}")))?;
                 crate::builder::check_features_listed(&value, "meta.json")
             }) {
-                Err(e @ Error::Unsupported(_)) => {
-                    run.add(Issue::error(e.to_string()).file(&meta_file))
-                }
-                _ => match serde_json::from_slice::<IndexMeta>(&b) {
+                Err(e) => run.add(Issue::error(e.to_string()).file(&meta_file)),
+                Ok(()) => match serde_json::from_slice::<IndexMeta>(&b) {
                     Err(e) => {
                         run.add(Issue::error(format!("does not parse: {e}")).file(&meta_file))
                     }
@@ -1434,6 +1432,18 @@ impl Checker<'_> {
         // the commit the base holds
         let base_seq = self.base.map(|b| b.seq);
         let base_ts = self.base.map_or(i64::MIN, |b| b.timestamp_ms);
+        // The first record by the open's rule, on the whole file: a header record, or
+        // the zeros of a header torn at the log's creation. The pre-release headerless
+        // log and a record of zeros with bytes after it are refused as open refuses them.
+        if let Err(e) = crate::store::wal::committed_version_of(&buf, &dir.join("wal.log")) {
+            run.add(
+                Issue::error(format!("{e}: open refuses the database"))
+                    .file(&file)
+                    .offset(0),
+            );
+            self.checks.push(run.done("refused"));
+            return;
+        }
         // zero bytes after the last record are space preallocated for the next commits
         let zero = |r: &[u8]| r.iter().all(|&b| b == 0);
         let logical = buf

@@ -3524,6 +3524,103 @@ mod tests {
         }
     }
 
+    /// A log whose header a crash tore is removed and created again at the open. The
+    /// file's sync does not make its directory entry durable, so the open syncs the
+    /// generation's directory with the new log in it before the writer starts, or a
+    /// power loss after the first commits would lose the log with them.
+    #[cfg(unix)]
+    #[test]
+    fn a_recreated_log_is_durable_in_its_directory_before_the_first_commit() {
+        for torn in [&[][..], &[0u8; WAL_REC][..], &wal::MAGIC[..5]] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("db");
+            drop(Store::open(&root, options()).unwrap());
+            let path = wal_path(&root);
+            let gen_dir = path.parent().unwrap().to_path_buf();
+            std::fs::write(&path, torn).unwrap();
+            crate::fsutil::take_dir_syncs();
+            let store = Store::open(&root, options()).unwrap();
+            let syncs = crate::fsutil::take_dir_syncs();
+            let with_log = syncs
+                .iter()
+                .position(|(d, names)| *d == gen_dir && names.iter().any(|n| n == "wal.log"));
+            assert!(
+                with_log.is_some(),
+                "no sync of {} with the new log in it: {syncs:?}",
+                gen_dir.display()
+            );
+            insert(&store, "one").unwrap();
+            drop(store);
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(&bytes[..WAL_REC], &wal::header_record());
+            assert_eq!(Store::open(&root, options()).unwrap().snapshot().len(), 1);
+        }
+    }
+
+    /// `sparkles check` reports what open refuses, as an error: a `meta.json` without its
+    /// `features` list, which every format 5 generation has, and a log whose first record
+    /// is neither the header nor the zeros of a header torn at the log's creation. The
+    /// zeros alone are the torn creation that open heals, not an error.
+    #[test]
+    fn check_reports_a_missing_features_list_and_a_refused_first_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let store = Store::open(&root, options()).unwrap();
+        insert(&store, "one").unwrap();
+        drop(store);
+        let gen_dir = wal_path(&root).parent().unwrap().to_path_buf();
+        let opts = crate::check::CheckOptions { quick: false };
+        let check = |name: &str| {
+            let report = crate::check::check(&root, &opts).unwrap();
+            let c = report.get(name).expect("the check ran").clone();
+            (
+                c.status,
+                c.issues
+                    .iter()
+                    .map(|i| i.message.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let meta_path = gen_dir.join("meta.json");
+        let meta = std::fs::read(&meta_path).unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&meta).unwrap();
+        v.as_object_mut().unwrap().remove("features").unwrap();
+        std::fs::write(&meta_path, serde_json::to_vec(&v).unwrap()).unwrap();
+        let (status, issues) = check("generation");
+        assert_eq!(status, crate::check::Status::Error, "{issues:?}");
+        assert!(
+            issues.iter().any(|m| m.contains("features is missing")),
+            "{issues:?}"
+        );
+        std::fs::write(&meta_path, &meta).unwrap();
+        assert_eq!(check("generation").0, crate::check::Status::Ok);
+        let good = std::fs::read(wal_path(&root)).unwrap();
+        // a zero record with bytes after it, and the pre-release headerless log
+        for (bad, text) in [
+            (
+                [&[0u8; WAL_REC][..], &[1u8][..]].concat(),
+                "bytes follow it",
+            ),
+            (good[WAL_REC..].to_vec(), "wal version 0"),
+        ] {
+            std::fs::write(wal_path(&root), &bad).unwrap();
+            let (status, issues) = check("wal");
+            assert_eq!(status, crate::check::Status::Error, "{issues:?}");
+            assert!(
+                issues
+                    .iter()
+                    .any(|m| m.contains(text) && m.contains("open refuses")),
+                "{issues:?}"
+            );
+            assert!(Store::open(&root, options()).is_err());
+            assert_eq!(std::fs::read(wal_path(&root)).unwrap(), bad);
+        }
+        std::fs::write(wal_path(&root), [0u8; WAL_REC]).unwrap();
+        let (status, issues) = check("wal");
+        assert_ne!(status, crate::check::Status::Error, "{issues:?}");
+        assert_eq!(Store::open(&root, options()).unwrap().snapshot().len(), 0);
+    }
+
     /// A power loss can keep the first 4 KiB block of a record that straddles two blocks
     /// and drop the second, as a `log-writes` replay of X09 section 10.2 did. A record after
     /// the last commit then holds a type byte, a few id bytes and zeros. Open truncates the

@@ -282,9 +282,9 @@ fn inspect_generation(
                 budget.release(identity.charge);
                 result
             }
-            // First-identity migration folds genuinely pre-metadata records into
-            // baseline0. Still prove the WAL: deleting both small identity files
-            // must not hide a surviving accepted configuration seal.
+            // A generation without commit.json has no identity to bind. Still prove
+            // the WAL: deleting both small identity files must not hide a surviving
+            // accepted configuration seal.
             None if legacy => (0, ConfigurationBinding::LegacyUnbound, branch),
             None => {
                 return Err(managed_history::unavailable(
