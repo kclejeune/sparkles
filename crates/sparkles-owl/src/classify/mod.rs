@@ -2784,6 +2784,116 @@ mod tests {
         })
     }
 
+    /// A saturation records its start of the helper threads as soon as they start, so
+    /// that a saturation that starts while it runs waits as long (roadmap item 720). The
+    /// cancellation hook, which the helpers poll at their checks of the bounds, looks at
+    /// the record while they run, and a bounded handshake makes a helper look after the
+    /// record is written.
+    /// The steps outside the saturation run on the calling thread for so small an
+    /// ontology.
+    #[test]
+    fn a_saturation_records_its_start_of_the_helpers_while_they_run() {
+        let c = |i: usize| ClassExpression::Class(Class::new(format!("http://ex.org/C{i}")));
+        let p = ObjectProperty::new("http://ex.org/p");
+        let axioms: Vec<AxiomKind> = (0..1000)
+            .flat_map(|i| {
+                [
+                    AxiomKind::SubClassOf(c(i), c(i + 1)),
+                    AxiomKind::SubClassOf(c(i), ClassExpression::some(p.clone(), c(i + 2))),
+                ]
+            })
+            .collect();
+        let kinds: Vec<&AxiomKind> = axioms.iter().collect();
+        let started: &'static std::sync::atomic::AtomicU64 =
+            Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
+        let seen = Arc::new(AtomicBool::new(false));
+        let caller = std::thread::current().id();
+        // a handshake, bounded so that a failure ends: another thread that looks before
+        // the record waits for it once, and the first worker waits once for a helper to
+        // have seen it
+        thread_local! {
+            static WAITED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        let wait = |ready: &dyn Fn() -> bool, limit: Duration| {
+            let until = Instant::now() + limit;
+            while !ready() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let caller_waited = Arc::new(AtomicBool::new(false));
+        let hook = {
+            let seen = seen.clone();
+            move || {
+                let on = || started.load(std::sync::atomic::Ordering::Relaxed) > 0;
+                let relaxed = std::sync::atomic::Ordering::Relaxed;
+                if std::thread::current().id() != caller {
+                    if !on() && !WAITED.replace(true) {
+                        wait(&on, Duration::from_millis(250));
+                    }
+                    if on() {
+                        seen.store(true, relaxed);
+                    }
+                } else if on() && !caller_waited.swap(true, relaxed) {
+                    wait(&|| seen.load(relaxed), Duration::from_secs(2));
+                }
+                false
+            }
+        };
+        saturate::STARTED_IN.set(Some(started));
+        let out = Saturation::new().classify(
+            &kinds,
+            None,
+            &Limits {
+                threads: 4,
+                cancelled: Some(Arc::new(hook)),
+                ..Limits::default()
+            },
+        );
+        saturate::STARTED_IN.set(None);
+        out.unwrap();
+        assert!(started.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(seen.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// A saturation counts as congested only with hundreds of megabytes of waiting
+    /// messages, so the test makes every saturation congested from its start. The
+    /// answers are those of an ordinary run on every thread count, and a run on one
+    /// thread, which sends through its outbox once congested, drops repeated messages
+    /// (roadmap item 721).
+    #[test]
+    fn congested_runs_drop_repeated_messages_and_keep_the_answer() {
+        for seed in [3, 11, 29] {
+            let axioms = mixed_axioms(1500, seed);
+            let kinds: Vec<&AxiomKind> = axioms.iter().collect();
+            let run = |threads: usize, congested: bool| {
+                saturate::ALWAYS_CONGESTED.set(congested);
+                let out = Saturation::new().classify(
+                    &kinds,
+                    None,
+                    &Limits {
+                        threads,
+                        ..Limits::default()
+                    },
+                );
+                saturate::ALWAYS_CONGESTED.set(false);
+                out.unwrap()
+            };
+            let a = run(1, false);
+            for threads in [1, 4] {
+                let b = run(threads, true);
+                assert_eq!(a.consistent, b.consistent, "seed {seed}, {threads} threads");
+                assert_eq!(a.taxonomy, b.taxonomy, "seed {seed}, {threads} threads");
+            }
+            let b = run(1, true);
+            assert!(
+                b.stats.conclusions < a.stats.conclusions,
+                "seed {seed}: {} conclusions congested, {} not",
+                b.stats.conclusions,
+                a.stats.conclusions
+            );
+        }
+    }
+
     #[test]
     fn a_parallel_normalization_keeps_functional_data_roles() {
         let mut axioms = mixed_axioms(400, 7);
