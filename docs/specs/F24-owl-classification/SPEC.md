@@ -1026,7 +1026,7 @@ its head is greater.
 | Eq, Ineq and Factor | They run whenever the run is rooted, with counting on or off, and rewrite constants as well as successor terms. Eq keeps the journal's conditions on the rewriting equality, on a rewritten `x` and on rewriting every occurrence of a constant in the root. |
 | Elim | Subsumption and tautology elimination work as now. A marker `A → A` stays. |
 | Join | It resolves a maximal ground atom or equality of constants in one clause's head with the same literal in another clause's body, in any context. It is indexed by ground body literal so that either premise can arrive first. |
-| Succ | It creates or reuses a successor for a maximal literal over `f(x)`, or over `f(u)` in any context, where the edge also records the constant. One edge must cover every successor trigger of the journal's Definition 4, the ground atoms and constant equalities included, and the ground triggers are exactly those of Definition 4, so a ground atom `B(u)` is a trigger only when `B(x)` occurs in the body of an ontology clause. |
+| Succ | It creates or reuses a successor for a maximal literal over `f(x)`, or over `f(u)` in any context, where the edge also records the constant. One edge must cover every successor trigger of the journal's Definition 4, the ground atoms and constant equalities included. The ground triggers are every ground atom and equality of constants, a superset of Definition 4's, which only adds markers that no inference asks for. |
 | Pred | A successor's clause carries its ground body atoms and its ground head literals to the predecessor unchanged and resolves its other body atoms there. Along an edge that records a constant the predecessor reads `y` as the constant and `x` as `f(u)`, and also resolves the successor's core atoms against its own maximal premises, since such an edge holds only for its constant. |
 | r-Succ | Not used. A context reasons about its own ground literals, as the departure below says, so the root holds no markers. |
 | r-Pred | Only for the root's processed clauses with an empty body, which reach the contexts registered for one of their constants, as below. A root clause with a body stays in the root, where Join resolves its ground body literals. |
@@ -1155,10 +1155,11 @@ holds, where the root would derive them under every combination of markers.
 
 Successors still take markers. When Succ fires, the successor gets `A → A` for every
 ground literal `A` of Definition 4's successor triggers that is maximal in a processed
-clause of the predecessor, exactly as the journal's rule K2 says, and a context sends a
-later trigger to the successors it already has. The triggers are those of Definition 4
-and no more, since a successor uses `B(u)` only as the premise of a body atom `B(z)` that
-Hyper binds to `u`, so a predicate without a body occurrence is never asked for. A marker
+clause of the predecessor, as the journal's rule K2 says, and a context sends a later
+trigger to the successors it already has. The triggers are every ground atom and
+equality of constants, a superset of Definition 4's, since a told subsumption puts its
+subclass in a body and so nearly every predicate qualifies, and a marker that no
+inference asks for costs one clause in the successor's store. A marker
 is a hypothesis of the sender, and the sender holds the actual literal, so a ground
 inference whose conclusion would be a ground clause with a body is not made. A ground
 inference is a Hyper whose body atoms are all bound to constants, an Eq or Factor whose
