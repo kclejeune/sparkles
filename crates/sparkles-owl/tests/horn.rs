@@ -454,11 +454,18 @@ fn axioms_the_horn_rules_cannot_take_stay_left_out() {
          SubClassOf(:A ObjectMaxCardinality(2 :r :B))");
     assert_eq!(ex.len(), 1, "{ex:#?}");
     assert_eq!(out.stats.outside_el.taken, 3);
-    // with an individual the run keeps the EL rules alone
+    // with an individual the Horn rules run beside the rules of individuals (item 692)
     let (out, ex) = run("SubClassOf(:A ObjectAllValuesFrom(:r :B))
          ClassAssertion(:A :a)");
+    assert_eq!(ex.len(), 0, "{ex:#?}");
+    assert_eq!(out.stats.outside_el.taken, 1);
+    assert_eq!(out.stats.tier, Tier::Horn);
+    // an at-least restriction above one stays out beside individuals (item 867)
+    let (out, ex) = run("SubClassOf(:A ObjectMinCardinality(2 :r :B))
+         SubClassOf(:A ObjectAllValuesFrom(:r :C))
+         ClassAssertion(:A :a)");
     assert_eq!(ex.len(), 1, "{ex:#?}");
-    assert_eq!(out.stats.outside_el.taken, 0);
+    assert_eq!(out.stats.outside_el.taken, 1);
 }
 
 #[test]

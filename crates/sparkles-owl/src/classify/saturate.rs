@@ -61,6 +61,14 @@ pub enum Concl {
     /// Tier H: an instance of this context has an instance of the target as an
     /// `r`-successor, which this context links to
     Succ(Role, Ex),
+    /// Tier H with individuals (roadmap item 692): the predecessor is real
+    RealBack(Ex),
+    /// Tier H with individuals: an at-most restriction of a singular successor counts
+    /// this context, so it has at most one instance
+    Singular,
+    /// Tier H with individuals: the context stands for the same element as this one,
+    /// and takes what this one holds and derives
+    Same(Ex),
     /// Tier D: the marker `A → A` of an atom that may hold of the context's instance
     Hyp(Ex),
     /// Tier D: the source context registers with this hypothetical successor by its
@@ -387,6 +395,15 @@ impl State {
                 .as_ref()
                 .and_then(|x| x.dl.as_ref())
                 .is_some_and(|d| d.has_hyp(a)),
+            Concl::RealBack(m) => self
+                .extra
+                .as_ref()
+                .is_some_and(|x| x.horn.real_preds.contains(&m)),
+            Concl::Singular => self.extra.as_ref().is_some_and(|x| x.horn.counted),
+            Concl::Same(k) => self
+                .extra
+                .as_ref()
+                .is_some_and(|x| x.horn.same.contains(&k)),
             Concl::SuccIn(..)
             | Concl::PredIn(..)
             | Concl::Succ(..)
@@ -683,8 +700,10 @@ pub fn saturate_counted(
         run.pending.fetch_add(q.len(), Ordering::SeqCst);
     }
     let threads = bounds.threads.max(1);
-    if run.horn {
+    if run.horn && run.plain {
         run.workers::<Horn>(threads);
+    } else if run.horn {
+        run.workers::<HornFull>(threads);
     } else if run.disj {
         run.workers::<Disj>(threads);
     } else if run.plain {
@@ -1014,12 +1033,37 @@ impl Dynamic {
         e
     }
 
+    /// The id of a conjunction the table holds, without creating one.
+    pub fn find(&self, core: &[Ex]) -> Option<Ex> {
+        use std::hash::BuildHasher;
+        let h = rustc_hash::FxBuildHasher.hash_one(core);
+        self.shards[(h >> 32) as usize % SHARDS]
+            .lock()
+            .get(core)
+            .copied()
+    }
+
+    /// The first id of the table's contexts.
+    pub fn base(&self) -> Ex {
+        self.base
+    }
+
+    /// Whether the id is one of the table's contexts.
+    pub fn holds(&self, e: Ex) -> bool {
+        e >= self.base && ((e - self.base) as usize) < self.len()
+    }
+
     pub fn core(&self, e: Ex) -> &[Ex] {
         self.slot(e).core.get().map_or(&[], |c| c)
     }
 
     pub fn ctx(&self, e: Ex) -> &Ctx {
         self.slot(e).ctx.get_or_init(Box::default)
+    }
+
+    /// The context of a conjunction, when the saturation has made one.
+    pub fn get_ctx(&self, e: Ex) -> Option<&Ctx> {
+        self.slot(e).ctx.get().map(|c| &**c)
     }
 
     /// The contexts created.
@@ -1407,14 +1451,7 @@ impl<'a> Run<'a> {
                 dl_rules::init_test(&mut st, core, &mut out);
             } else if R::HORN && me as usize >= self.ctx.len() {
                 let core = self.dynamic.expect("a run with the Horn rules").core(me);
-                st.init = true;
-                out.me(Concl::Sub(TOP));
-                for &m in core {
-                    out.me(Concl::Sub(m));
-                }
-                for &r in &self.ix.roles.reflexive {
-                    out.me(Concl::Loop(r));
-                }
+                init_conjunction(self.ix, core, &mut st, self.universal, &mut out);
             } else if R::DISJ && self.ix.dl.as_deref().is_some_and(|d| d.is_root(me)) {
                 dl_root::init(self.ix, &mut st, &mut out);
             } else {
@@ -1521,9 +1558,37 @@ fn individuals(ix: &Index, me: Ex, st: &State, mut f: impl FnMut(Ex)) {
     }
 }
 
-/// Applies the rules to one conclusion. The answer says whether it was new.
+/// Applies the rules to one conclusion, in a world: every rule of the EL calculus, with
+/// the Horn rules when the index has them. The answer says whether it was new.
 pub fn apply<S: Sink>(ix: &Index, me: Ex, st: &mut State, c: Concl, out: &mut S) -> bool {
-    apply_rules::<S, Full>(ix, me, st, c, out)
+    if ix.horn.is_some() {
+        apply_rules::<S, HornFull>(ix, me, st, c, out)
+    } else {
+        apply_rules::<S, Full>(ix, me, st, c, out)
+    }
+}
+
+/// Initializes the context of a conjunction that the Horn rules created: it holds
+/// `owl:Thing`, each expression of its core, the reflexive loops and the facts of
+/// universal roles.
+pub fn init_conjunction<S: Sink>(
+    ix: &Index,
+    core: &[Ex],
+    st: &mut State,
+    universal: &[Ex],
+    out: &mut S,
+) {
+    st.init = true;
+    out.me(Concl::Sub(TOP));
+    for &m in core {
+        out.me(Concl::Sub(m));
+    }
+    for &r in &ix.roles.reflexive {
+        out.me(Concl::Loop(r));
+    }
+    for &x in universal {
+        out.me(Concl::Sub(x));
+    }
 }
 
 /// Whether the rules of individuals and functional data roles can apply to the index:
@@ -1560,6 +1625,16 @@ struct Horn;
 
 impl Rules for Horn {
     const FULL: bool = false;
+    const HORN: bool = true;
+}
+
+/// The rules of Tier H over an index with individuals, universal roles or functional
+/// data roles (roadmap item 692): every rule of the EL calculus with the Horn rules
+/// beside them.
+struct HornFull;
+
+impl Rules for HornFull {
+    const FULL: bool = true;
     const HORN: bool = true;
 }
 
@@ -1621,18 +1696,34 @@ fn apply_rules<S: Sink, R: Rules>(
                     }
                     if R::FULL && st.real {
                         out.send(succ, Concl::Real);
+                        if R::HORN {
+                            out.send(succ, Concl::RealBack(me));
+                        }
                     }
                     if R::HORN {
-                        horn_rules::succ(ix, me, st, r, succ, true, out);
+                        let new = horn_rules::succ(ix, me, st, r, succ, true, out);
+                        if R::FULL && new {
+                            horn_rules::succ_full(ix, me, st, r, succ, out);
+                        }
                     }
                 }
                 Node::Forall(s, a)
-                    if R::HORN && !ix.horn.as_ref().is_some_and(|h| h.is(d, HornIx::UNFOLDED)) =>
+                    if R::HORN
+                        && !ix
+                            .horn
+                            .as_ref()
+                            .is_some_and(|h| h.is(d, HornIx::UNFOLDED | HornIx::GLOBAL)) =>
                 {
                     horn_rules::forall(ix, me, st, s, a, out)
                 }
                 Node::AtMost1(s, b) if R::HORN => horn_rules::at_most(ix, me, st, s, b, out),
                 Node::SelfLoop(r) => out.me(Concl::Loop(r)),
+                Node::Nominal(_) if R::FULL && R::HORN => {
+                    if d != me {
+                        nominal(ix, me, st, d, out);
+                    }
+                    horn_rules::derived_nominal(ix, me, st, d, out);
+                }
                 Node::Nominal(_) if R::FULL && d != me => nominal(ix, me, st, d, out),
                 Node::DataSome(r, _) if R::FULL && !roles.functional(r).is_empty() => {
                     functional(ix, st, r, h.succ, out)
@@ -1671,6 +1762,9 @@ fn apply_rules<S: Sink, R: Rules>(
             }
             if R::FULL && st.extra.is_some() {
                 give(st, d, out);
+                if R::HORN {
+                    horn_rules::spread_sub(st, d, out);
+                }
             }
             if R::HORN && ix.horn.as_ref().is_some_and(|h| h.is(d, HornIx::FILLER)) && d != TOP {
                 horn_rules::fill(ix, me, st, d, out);
@@ -1703,6 +1797,9 @@ fn apply_rules<S: Sink, R: Rules>(
             }
             if R::HORN {
                 horn_rules::back(ix, me, st, e, r, out);
+                if R::FULL {
+                    horn_rules::back_full(ix, me, st, e, r, out);
+                }
             }
             if R::DISJ {
                 dl_rules::back(ix, me, st, e, r, out);
@@ -1750,19 +1847,47 @@ fn apply_rules<S: Sink, R: Rules>(
             }
             if R::HORN {
                 horn_rules::self_loop(ix, me, st, r, out);
+                if R::FULL {
+                    horn_rules::loop_full(ix, me, st, r, out);
+                }
             }
             true
         }
         Concl::Nom(k) if R::FULL => apply_nom(me, st, k, out),
-        Concl::Real if R::FULL => apply_real(ix, st, out),
+        Concl::Real if R::FULL => apply_real(ix, me, st, out),
         Concl::LinkTo(r, n) if R::FULL => apply_link_to(me, st, r, n, out),
         Concl::Nom(_) | Concl::Real | Concl::LinkTo(..) => {
             unreachable!("a conclusion of individuals in a saturation without them")
         }
         Concl::SuccIn(n, b) if R::HORN => horn_rules::succ_in(ix, me, st, n, b, out),
-        Concl::PredIn(m, b) if R::HORN => horn_rules::pred_in(ix, me, st, m, b, out),
-        Concl::Succ(r, n) if R::HORN => horn_rules::succ(ix, me, st, r, n, false, out),
-        Concl::SuccIn(..) | Concl::PredIn(..) | Concl::Succ(..) => {
+        Concl::PredIn(m, b) if R::HORN => {
+            let new = horn_rules::pred_in(ix, me, st, m, b, out);
+            if R::FULL && new {
+                horn_rules::spread(st, Concl::PredIn(m, b), true, false, out);
+                horn_rules::counted_full(ix, me, st, Some(m), out);
+            }
+            new
+        }
+        Concl::Succ(r, n) if R::HORN => {
+            let new = horn_rules::succ(ix, me, st, r, n, false, out);
+            if R::FULL && new {
+                horn_rules::succ_full(ix, me, st, r, n, out);
+            }
+            new
+        }
+        Concl::RealBack(m) if R::HORN && R::FULL => horn_rules::real_back(ix, me, st, m, out),
+        Concl::Singular if R::HORN && R::FULL => {
+            let new = !st.extra.as_ref().is_some_and(|x| x.horn.counted);
+            horn_rules::singular(ix, me, st, true, out);
+            new
+        }
+        Concl::Same(k) if R::HORN && R::FULL => horn_rules::same(ix, me, st, k, out),
+        Concl::SuccIn(..)
+        | Concl::PredIn(..)
+        | Concl::Succ(..)
+        | Concl::RealBack(_)
+        | Concl::Singular
+        | Concl::Same(_) => {
             unreachable!("a conclusion of the Horn rules in a saturation without them")
         }
         Concl::Hyp(a) if R::DISJ => dl_rules::hyp(st, a, out),
@@ -1805,7 +1930,7 @@ fn apply_nom<S: Sink>(me: Ex, st: &mut State, k: Ex, out: &mut S) -> bool {
 /// knows.
 #[cold]
 #[inline(never)]
-fn apply_real<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
+fn apply_real<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S) -> bool {
     if st.real {
         return false;
     }
@@ -1824,11 +1949,18 @@ fn apply_real<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
         }
     }
     if let Some(x) = &st.extra {
+        // the successors the Horn rules made (roadmap item 692)
+        for &(_, n) in &x.horn.succ.list {
+            out.send(n, Concl::Real);
+        }
         for &n in &x.noms {
             for &s in &st.subs {
                 out.send(n, Concl::Sub(s));
             }
         }
+    }
+    if ix.horn.is_some() {
+        horn_rules::became_real(me, st, out);
     }
     true
 }

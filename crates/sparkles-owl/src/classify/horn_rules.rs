@@ -60,6 +60,17 @@ pub struct HornSt {
     /// the at-most restrictions whose successors R5 has still to merge, which [`flush`]
     /// does at the end of the context's activation
     pub merges: Vec<(Role, Ex)>,
+    /// the context has at most one instance (F24, "The Horn rules with individuals")
+    pub singular: bool,
+    /// an at-most restriction of a singular successor counts the context, which makes it
+    /// a witness when it is not real
+    pub counted: bool,
+    /// the predecessors that are real
+    pub real_preds: Small<Ex>,
+    /// the contexts that stand for the same element, which take what this one holds
+    pub same: Small<Ex>,
+    /// the predecessors told that this context is singular
+    pub told_singular: Small<Ex>,
 }
 
 impl HornSt {
@@ -73,6 +84,9 @@ impl HornSt {
             + self.fills.capacity() * 4
             + self.pending.capacity() * 8
             + self.merges.capacity() * 8
+            + self.real_preds.bytes()
+            + self.same.bytes()
+            + self.told_singular.bytes()
     }
 }
 
@@ -178,6 +192,11 @@ pub fn succ<S: Sink>(
         if roles.is_empty_role(r) {
             out.me(Concl::Sub(BOTTOM));
         }
+    }
+    // a real context's successors are real (roadmap item 692); the EL rule sent `Real`
+    // to a successor it created
+    if st.real && !sent {
+        out.send(n, Concl::Real);
     }
     let h = hs(st);
     for &b in &h.fills {
@@ -311,7 +330,8 @@ pub fn forall<S: Sink>(ix: &Index, _me: Ex, st: &mut State, s: Role, a: Ex, out:
     }
 }
 
-/// The context derives `≤1 s.b`: R5 over its successors and R6 over its predecessors.
+/// The context derives `≤1 s.b`: R5 over its successors and R6 over its predecessors,
+/// and at a singular context the predecessors it counts learn so, and R7 runs.
 pub fn at_most<S: Sink>(ix: &Index, me: Ex, st: &mut State, s: Role, b: Ex, out: &mut S) {
     let h = hs(st);
     if h.atmost.contains(&(s, b)) {
@@ -325,6 +345,7 @@ pub fn at_most<S: Sink>(ix: &Index, me: Ex, st: &mut State, s: Role, b: Ex, out:
             identify(ix, me, st, m, r1, x, out);
         }
     }
+    counted_full(ix, me, st, None, out);
 }
 
 /// A successor that `≤1 s.b` counts is new: R5 at the end of the activation, and R6
@@ -566,4 +587,299 @@ pub fn self_loop<S: Sink>(ix: &Index, me: Ex, st: &mut State, r: Role, out: &mut
 #[inline]
 fn absorbed(ix: &Index, a: Ex) -> bool {
     ix.horn.as_ref().is_some_and(|h| h.is(a, HornIx::ABSORBED))
+}
+
+// The rules of Tier H with individuals (roadmap item 692, F24 "The Horn rules with
+// individuals"). A context is singular when it has at most one instance: when it derives
+// an individual, or when an at-most restriction of a singular successor counts it. R7
+// identifies two real predecessors that an at-most restriction of a singular context
+// counts, and R8 derives `owl:Nothing` from two roles that clash on a pair of elements a
+// singular context forces. Contexts that stand for one element exchange their subsumers,
+// Horn successors, backward links with what they know of each predecessor, and loops.
+
+/// Whether the context is singular.
+fn is_singular(st: &State) -> bool {
+    st.extra.as_ref().is_some_and(|x| x.horn.singular)
+}
+
+/// Whether two roles clash, in either order.
+fn clash(ix: &Index, r1: Role, r2: Role) -> bool {
+    let roles = &ix.roles;
+    !roles.clash.is_empty() && (roles.clashes(r1, r2) || roles.clashes(r2, r1))
+}
+
+/// Sends a conclusion to the contexts that stand for the same element as this one: the
+/// partners R7 identified, and, when `noms` says so, the individuals the context derives
+/// and the contexts that stand for the context's individual.
+pub fn spread<S: Sink>(st: &State, c: Concl, noms: bool, members: bool, out: &mut S) {
+    let Some(x) = &st.extra else { return };
+    for &k in &x.horn.same.list {
+        out.send(k, c);
+    }
+    if noms {
+        for &n in &x.noms {
+            out.send(n, c);
+        }
+    }
+    if members {
+        for &m in &x.members.list {
+            out.send(m, c);
+        }
+    }
+}
+
+/// A new subsumer goes to the partners R7 identified; the rules of individuals give it
+/// to the context's individuals and the contexts that stand for them.
+pub fn spread_sub<S: Sink>(st: &State, d: Ex, out: &mut S) {
+    spread(st, Concl::Sub(d), false, false, out);
+}
+
+/// What the context knows of its backward links, for a context that stands for the same
+/// element: each link, whether its source holds each at-most filler and whether the
+/// source is real.
+fn send_links<S: Sink>(st: &State, to: Ex, out: &mut S) {
+    for (r, srcs) in &st.back {
+        for &e in &srcs.list {
+            out.send(to, Concl::Back(e, *r));
+        }
+    }
+    let Some(x) = &st.extra else { return };
+    for &(m, b) in &x.horn.pred_in.list {
+        out.send(to, Concl::PredIn(m, b));
+    }
+    for &m in &x.horn.real_preds.list {
+        out.send(to, Concl::RealBack(m));
+    }
+}
+
+/// What a real context knows of its own element, for a context that stands for the same
+/// element: its loops and its Horn successors. The subsumers go by the rules of
+/// individuals.
+fn send_own<S: Sink>(st: &State, to: Ex, out: &mut S) {
+    for &l in &st.loops {
+        out.send(to, Concl::Loop(l));
+    }
+    if let Some(x) = &st.extra {
+        for &(r, n) in &x.horn.succ.list {
+            out.send(to, Concl::Succ(r, n));
+        }
+    }
+}
+
+/// The context derives the individual `n`: it gives `n` its backward links, with what it
+/// knows of each predecessor, which hold of `n` whether or not the context has an
+/// instance, and, when real, its loops and Horn successors. It is singular.
+pub fn derived_nominal<S: Sink>(ix: &Index, me: Ex, st: &mut State, n: Ex, out: &mut S) {
+    if n != me {
+        send_links(st, n, out);
+        if st.real {
+            send_own(st, n, out);
+        }
+    }
+    singular(ix, me, st, false, out);
+}
+
+/// The context becomes real: its individuals take its loops and Horn successors, and its
+/// successors learn that a predecessor is real.
+pub fn became_real<S: Sink>(me: Ex, st: &State, out: &mut S) {
+    if let Some(x) = &st.extra {
+        for &n in &x.noms {
+            send_own(st, n, out);
+        }
+        for &(_, n) in &x.horn.succ.list {
+            out.send(n, Concl::RealBack(me));
+        }
+    }
+}
+
+/// The context is singular: when `counted` an at-most restriction of a singular
+/// successor counts it. It tells the predecessors its at-most restrictions count, and R7
+/// and R8 run over what it holds.
+pub fn singular<S: Sink>(ix: &Index, me: Ex, st: &mut State, counted: bool, out: &mut S) {
+    let h = hs(st);
+    if counted && !h.counted {
+        h.counted = true;
+        out.merged();
+    }
+    if h.singular {
+        return;
+    }
+    h.singular = true;
+    out.merged();
+    propagate_singular(ix, st, out);
+    r7(ix, me, st, None, out);
+    let links: Vec<(Role, Small<Ex>)> = st.back.iter().map(|(r, s)| (*r, s.clone())).collect();
+    for (r, srcs) in links {
+        for &m in &srcs.list {
+            r8_back(ix, me, st, m, r, out);
+        }
+    }
+}
+
+/// Tells each predecessor that an at-most restriction of this singular context counts
+/// that it is singular.
+fn propagate_singular<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
+    if !is_singular(st) {
+        return;
+    }
+    let atmost = hs(st).atmost.clone();
+    let mut told = Vec::new();
+    for (s, b) in atmost {
+        for (m, _) in preds(ix, st, s, b) {
+            told.push(m);
+        }
+    }
+    let h = hs(st);
+    for m in told {
+        if h.told_singular.insert(m) {
+            out.send(m, Concl::Singular);
+        }
+    }
+}
+
+/// R7 at a singular context: two real predecessors that one at-most restriction counts
+/// are one element, and so are a real predecessor and the context itself when a loop
+/// counts the context. With `only`, the pairs considered are those with that
+/// predecessor.
+fn r7<S: Sink>(ix: &Index, me: Ex, st: &mut State, only: Option<Ex>, out: &mut S) {
+    if !is_singular(st) {
+        return;
+    }
+    let Some(x) = &st.extra else { return };
+    let atmost = x.horn.atmost.clone();
+    for (s, b) in atmost {
+        let real: Vec<(Ex, Role)> = preds(ix, st, s, b)
+            .into_iter()
+            .filter(|&(m, _)| {
+                st.extra
+                    .as_ref()
+                    .is_some_and(|x| x.horn.real_preds.contains(&m))
+            })
+            .collect();
+        let looped = members(ix, st, s, b)
+            .iter()
+            .any(|m| matches!(m, Member::Loop(_)));
+        for (i, &(m1, r1)) in real.iter().enumerate() {
+            if looped && only.is_none_or(|o| o == m1) {
+                out.send(m1, Concl::Same(me));
+                out.me(Concl::Same(m1));
+            }
+            for &(m2, r2) in &real[..i] {
+                if only.is_some_and(|o| o != m1 && o != m2) {
+                    continue;
+                }
+                if clash(ix, r1, r2) {
+                    out.send(m1, Concl::Sub(BOTTOM));
+                    out.send(m2, Concl::Sub(BOTTOM));
+                } else {
+                    out.send(m1, Concl::Same(m2));
+                    out.send(m2, Concl::Same(m1));
+                }
+            }
+        }
+        if !out.go_on() {
+            return;
+        }
+    }
+}
+
+/// R8 at a singular context, for a backward link from `m` by `r`: two links from `m` by
+/// roles that clash make `m` unsatisfiable, and a forward link to `m` by a role that
+/// clashes with `r⁻` makes the context unsatisfiable.
+fn r8_back<S: Sink>(ix: &Index, _me: Ex, st: &mut State, m: Ex, r: Role, out: &mut S) {
+    if !is_singular(st) || ix.roles.clash.is_empty() {
+        return;
+    }
+    for (r2, srcs) in &st.back {
+        if *r2 != r && srcs.contains(&m) && clash(ix, r, *r2) {
+            out.send(m, Concl::Sub(BOTTOM));
+        }
+    }
+    if let Some(i) = ix.roles.inv(r)
+        && let Some(x) = &st.extra
+        && x.horn
+            .succ
+            .list
+            .iter()
+            .any(|&(r1, n)| n == m && clash(ix, r1, i))
+    {
+        out.me(Concl::Sub(BOTTOM));
+    }
+}
+
+/// R8 at a singular context, for a forward link to `n` by `r1`: a backward link from `n`
+/// by a role whose inverse clashes with `r1` makes the context unsatisfiable.
+fn r8_succ<S: Sink>(ix: &Index, st: &State, r1: Role, n: Ex, out: &mut S) {
+    if !is_singular(st) || ix.roles.clash.is_empty() {
+        return;
+    }
+    for (r2, srcs) in &st.back {
+        if srcs.contains(&n) && ix.roles.inv(*r2).is_some_and(|i| clash(ix, r1, i)) {
+            out.me(Concl::Sub(BOTTOM));
+            return;
+        }
+    }
+}
+
+/// `RealBack(m)`: the predecessor m is real.
+pub fn real_back<S: Sink>(ix: &Index, me: Ex, st: &mut State, m: Ex, out: &mut S) -> bool {
+    if !hs(st).real_preds.insert(m) {
+        return false;
+    }
+    spread(st, Concl::RealBack(m), true, false, out);
+    r7(ix, me, st, Some(m), out);
+    true
+}
+
+/// `Same(k)`: the context k stands for the same element, and takes everything this
+/// context holds now; what comes later goes to it as it comes.
+pub fn same<S: Sink>(_ix: &Index, me: Ex, st: &mut State, k: Ex, out: &mut S) -> bool {
+    if k == me || !hs(st).same.insert(k) {
+        return false;
+    }
+    if st.bottom {
+        out.send(k, Concl::Sub(BOTTOM));
+        return true;
+    }
+    for &s in &st.subs {
+        out.send(k, Concl::Sub(s));
+    }
+    send_own(st, k, out);
+    send_links(st, k, out);
+    true
+}
+
+/// A new backward link from `e` by `r` in a run with individuals: it goes to the
+/// contexts that stand for the same element and to the individuals the context derives,
+/// the singular context tells `e` when the link counts, and R7 and R8 run for it.
+pub fn back_full<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, r: Role, out: &mut S) {
+    spread(st, Concl::Back(e, r), true, false, out);
+    if is_singular(st) {
+        propagate_singular(ix, st, out);
+        r7(ix, me, st, Some(e), out);
+        r8_back(ix, me, st, e, r, out);
+    }
+}
+
+/// A new loop by `r` in a run with individuals goes to the contexts that stand for the
+/// same element, and R7 runs for the loop, which counts the context itself.
+pub fn loop_full<S: Sink>(ix: &Index, me: Ex, st: &mut State, r: Role, out: &mut S) {
+    spread(st, Concl::Loop(r), st.real, true, out);
+    r7(ix, me, st, None, out);
+}
+
+/// A new Horn successor by `r` in `n` in a run with individuals goes to the contexts that
+/// stand for the same element, and R8 runs for it.
+pub fn succ_full<S: Sink>(ix: &Index, _me: Ex, st: &mut State, r: Role, n: Ex, out: &mut S) {
+    spread(st, Concl::Succ(r, n), st.real, true, out);
+    r8_succ(ix, st, r, n, out);
+}
+
+/// A new at-most restriction or a new predecessor filler at a singular context in a run
+/// with individuals: the predecessors it counts learn that they are singular, and R7 runs.
+pub fn counted_full<S: Sink>(ix: &Index, me: Ex, st: &mut State, only: Option<Ex>, out: &mut S) {
+    if is_singular(st) {
+        propagate_singular(ix, st, out);
+        r7(ix, me, st, only, out);
+    }
 }

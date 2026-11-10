@@ -85,6 +85,10 @@ impl HornIx {
     /// whose successors would send nothing back for it, while R4 still takes the filler
     /// to the predecessors, where it can be a named class's answer.
     pub const ABSORBED: u8 = 4;
+    /// The expression is a universal on a universal role, which holds everywhere once a
+    /// real context holds it, as a fact of a universal role (F24, "The Horn rules with
+    /// individuals"), so that R3 and R4 pass over it.
+    pub const GLOBAL: u8 = 8;
 
     #[inline]
     pub fn is(&self, e: Ex, flag: u8) -> bool {
@@ -99,8 +103,13 @@ impl HornIx {
 /// Marks the expressions that [`HornIx::ABSORBED`] describes, as the greatest set
 /// closed under its definition, or marks none when `stop` says the run's deadline or
 /// cancellation came. The work is linear in the told subsumptions: a rejected candidate
-/// rejects the candidates whose told subsumers it is.
+/// rejects the candidates whose told subsumers it is. A run with individuals marks none,
+/// since a successor that R3 would extend can stand for an individual, which then takes
+/// the filler as a subsumer of its own (F24, "The Horn rules with individuals").
 pub fn absorb(ix: &mut super::index::Index, stop: &dyn Fn() -> bool) {
+    if ix.has_individuals() {
+        return;
+    }
     let n = ix
         .horn
         .as_ref()
@@ -500,17 +509,17 @@ struct Norm<'a> {
     it: &'a mut Interner,
     rb: Option<&'a RoleBox>,
     out: Out,
+    /// whether the ontology has individuals, which leaves at-least restrictions above
+    /// one out (F24, "The Horn rules with individuals")
+    individuals: bool,
 }
 
 impl Norm<'_> {
     /// The role of an object property expression, with its inverse interned beside it.
     fn role(&mut self, p: &ObjectPropertyExpression) -> Result<Role, Why> {
         let named = p.named();
-        if matches!(
-            named.as_str(),
-            vocab::OWL_TOP_OBJECT_PROPERTY | vocab::OWL_BOTTOM_OBJECT_PROPERTY
-        ) {
-            return Err("the top and bottom object properties");
+        if named.as_str() == vocab::OWL_BOTTOM_OBJECT_PROPERTY {
+            return Err("the bottom object property");
         }
         let r = self.it.role(RoleName::Object(named.clone()));
         let i = self.it.role(RoleName::Inverse(named.clone()));
@@ -522,6 +531,9 @@ impl Norm<'_> {
 
     /// The role of an expression that OWL 2 DL requires to be simple.
     fn simple_role(&mut self, p: &ObjectPropertyExpression) -> Result<Role, Why> {
+        if is_top(p) {
+            return Err("the top object property where OWL 2 DL needs a simple one");
+        }
         let r = self.role(p)?;
         match self.rb {
             Some(rb) if !rb.simple(r) => Err("a role that is not simple where OWL 2 DL needs one"),
@@ -633,10 +645,23 @@ impl Norm<'_> {
                 let b = self.at_most(*n, p, f.as_deref(), d)?;
                 self.conj(vec![a, b])
             }
-            C::ObjectOneOf(_) | C::ObjectHasValue(..) => return Err("individuals"),
+            C::ObjectOneOf(is) if is.len() == 1 => self.el(c)?,
+            C::ObjectOneOf(_) => {
+                return Err("an enumeration of several individuals in a positive position");
+            }
+            C::ObjectHasValue(p, a) => self.has_value(p, a)?,
             C::DataSomeValuesFrom(..) | C::DataHasValue(..) => self.el(c)?,
             _ => return Err("a data restriction outside OWL 2 EL"),
         })
+    }
+
+    /// `∃p.{a}`, with `p` an object property or its inverse.
+    fn has_value(&mut self, p: &ObjectPropertyExpression, a: &Individual) -> Result<Ex, Why> {
+        let r = self.role(p)?;
+        let n = self.el(&ClassExpression::ObjectOneOf(
+            std::iter::once(a.clone()).collect(),
+        ))?;
+        Ok(self.it.node(Node::Exist(r, n)))
     }
 
     fn at_least(
@@ -648,6 +673,11 @@ impl Norm<'_> {
     ) -> Result<Ex, Why> {
         if n == 0 {
             return Ok(TOP);
+        }
+        if n > 1 && self.individuals {
+            // Lemma 2's fresh disjoint fillers are argued for tree-shaped models, and a
+            // nominal is a shared successor (roadmap item 867)
+            return Err("an at-least restriction above one beside individuals");
         }
         let r = if n == 1 {
             self.role(p)?
@@ -781,7 +811,17 @@ impl Norm<'_> {
                 let r = self.role(&ObjectPropertyExpression::Property(p.named().clone()))?;
                 self.it.node(Node::SelfLoop(r))
             }
-            C::ObjectOneOf(_) | C::ObjectHasValue(..) => return Err("individuals"),
+            C::ObjectOneOf(is) if is.len() == 1 => self.el(c)?,
+            C::ObjectOneOf(is) => {
+                // the union of the singletons: a fresh class above each of them
+                let x = self.it.fresh_class();
+                for a in is {
+                    let n = self.el(&C::ObjectOneOf(std::iter::once(a.clone()).collect()))?;
+                    self.out.subs.push((n, x));
+                }
+                x
+            }
+            C::ObjectHasValue(p, a) => self.has_value(p, a)?,
             C::DataSomeValuesFrom(..) | C::DataHasValue(..) => self.el(c)?,
             C::DataAllValuesFrom(..)
             | C::DataMinCardinality(..)
@@ -877,13 +917,35 @@ impl Norm<'_> {
         )
     }
 
-    /// A role axiom of [`Norm::is_role_axiom`].
+    /// A role axiom of [`Norm::is_role_axiom`]. An inclusion under the top property is a
+    /// tautology and is taken as nothing, and the top property elsewhere in a role axiom
+    /// stays out: a chain through it is partial (roadmap item 663), and its inverse,
+    /// transitivity, symmetry and reflexivity hold already.
     fn role_axiom(&mut self, ax: &AxiomKind) -> Result<(), Why> {
         use AxiomKind as K;
         match ax {
+            K::SubObjectPropertyOf(_, s) if is_top(s) => return Ok(()),
             K::SubObjectPropertyOf(SubObjectPropertyExpression::Expression(p), s) => {
                 let (r, s) = (self.role(p)?, self.role(s)?);
                 self.out.role_subs.push((r, s));
+            }
+            K::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(ps), _)
+                if ps.iter().any(is_top) =>
+            {
+                return Err("a property chain through the top property");
+            }
+            K::EquivalentObjectProperties(ps) if ps.iter().any(is_top) => {
+                return Err("the top property in a property equivalence");
+            }
+            K::InverseObjectProperties(p, q) if is_top(p) || is_top(q) => {
+                return Err("the top property in an inverse property axiom");
+            }
+            K::SymmetricObjectProperty(p)
+            | K::TransitiveObjectProperty(p)
+            | K::ReflexiveObjectProperty(p)
+                if is_top(p) =>
+            {
+                return Err("a characteristic the top property has already");
             }
             K::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(ps), s) => {
                 let s = self.role(s)?;
@@ -933,8 +995,19 @@ impl Norm<'_> {
     fn axiom(&mut self, ax: &AxiomKind) -> Result<(), Why> {
         use AxiomKind as K;
         use ClassExpression as C;
+        let one = |a: &Individual| C::ObjectOneOf(std::iter::once(a.clone()).collect());
         match ax {
             K::SubClassOf(c, d) => self.sub(vec![c.clone()], vec![d.clone()]),
+            // the assertions with a Horn class expression or an inverse property, as the
+            // class axioms they are: `{a} ⊑ C`, `{a} ⊑ ∃p.{b}` and `{a} ⊓ ∃p.{b} ⊑ ⊥`
+            K::ClassAssertion(c, a) => self.sub(vec![one(a)], vec![c.clone()]),
+            K::ObjectPropertyAssertion(p, a, b) => {
+                self.sub(vec![one(a)], vec![C::ObjectHasValue(p.clone(), b.clone())])
+            }
+            K::NegativeObjectPropertyAssertion(p, a, b) => self.sub(
+                vec![one(a), C::ObjectHasValue(p.clone(), b.clone())],
+                vec![],
+            ),
             K::EquivalentClasses(cs) => {
                 let cs: Vec<&ClassExpression> = cs.iter().collect();
                 for w in 0..cs.len() {
@@ -1052,6 +1125,11 @@ impl Norm<'_> {
     }
 }
 
+/// Whether the expression is the top object property or its inverse.
+fn is_top(p: &ObjectPropertyExpression) -> bool {
+    p.named().as_str() == vocab::OWL_TOP_OBJECT_PROPERTY
+}
+
 /// Normalizes the axioms outside OWL 2 EL that the Horn rules can take, after the EL
 /// axioms are in `ax`. The answer says which were taken. Nothing is taken when the role
 /// inclusions are not regular, their automata are too large or no axiom is Horn, and
@@ -1066,6 +1144,15 @@ pub fn normalize(
 ) -> Result<Vec<bool>, Halt> {
     let mut taken = vec![false; axioms.len()];
     let mut h = HornAx::default();
+    // whether the run has individuals: those the EL axioms interned, and those the axioms
+    // here name
+    let individuals = !it.individuals.is_empty()
+        || axioms.iter().any(|k| {
+            Axiom::from((*k).clone())
+                .signature()
+                .iter()
+                .any(|e| matches!(e, Entity::NamedIndividual(_)))
+        });
     // every object property has its inverse
     let named: Vec<ObjectProperty> = it
         .roles
@@ -1087,6 +1174,7 @@ pub fn normalize(
             it,
             rb: None,
             out: Out::default(),
+            individuals,
         };
         if Norm::is_role_axiom(k) && n.role_axiom(k).is_ok() {
             let o = n.out;
@@ -1098,6 +1186,12 @@ pub fn normalize(
     }
     let mut role_subs: Vec<(Role, Role)> = ax.role_subs.clone();
     role_subs.extend(roles.role_subs.iter().copied());
+    // the universal role is its own inverse
+    if let Some(t) = it.role_id(&RoleName::Object(ObjectProperty::top())) {
+        let ti = it.role(RoleName::Inverse(ObjectProperty::top()));
+        role_subs.push((t, ti));
+        role_subs.push((ti, t));
+    }
     let inv = inverses(it);
     let mirror = |subs: &mut Vec<(Role, Role)>| {
         let n = subs.len();
@@ -1140,6 +1234,7 @@ pub fn normalize(
             it,
             rb: Some(&rb),
             out: Out::default(),
+            individuals,
         };
         if Norm::is_role_axiom(k) {
             continue;

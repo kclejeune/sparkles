@@ -24,7 +24,10 @@
 
 use super::data::Value;
 use super::index::{BOTTOM, Ex, Halt, Index, Node, Role};
-use super::saturate::{CONCLUSION_BYTES, CONTEXT_BYTES, Concl, Contexts, Sink, State, apply, init};
+use super::saturate::{
+    CONCLUSION_BYTES, CONTEXT_BYTES, Concl, Contexts, Dynamic, Sink, State, apply, flatten, init,
+    init_conjunction,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
 
@@ -51,6 +54,33 @@ impl View for Global<'_> {
     }
     fn len(&self) -> usize {
         self.0.len()
+    }
+}
+
+/// The global contexts with the contexts of conjunctions that the Horn rules created,
+/// whose ids lie above the index's (roadmap item 692).
+#[derive(Clone, Copy)]
+pub struct GlobalAll<'a> {
+    pub ctx: &'a Contexts,
+    pub dynamic: Option<&'a Dynamic>,
+}
+
+impl View for GlobalAll<'_> {
+    fn with(&self, e: Ex, f: &mut dyn FnMut(&State, bool)) {
+        if (e as usize) < self.ctx.len() {
+            Global(self.ctx).with(e, f);
+        } else if let Some(d) = self.dynamic
+            && d.holds(e)
+            && let Some(c) = d.get_ctx(e)
+        {
+            let st = c.st.lock();
+            if st.init {
+                f(&st, st.real);
+            }
+        }
+    }
+    fn len(&self) -> usize {
+        self.ctx.len() + self.dynamic.map_or(0, |d| d.len())
     }
 }
 
@@ -512,20 +542,41 @@ fn key_matches(
     Ok(())
 }
 
+/// What a context that derives an individual knows, which the individual lacks when the
+/// context is a witness.
+struct Knows {
+    subs: Vec<Ex>,
+    succ: Vec<(Role, Ex)>,
+    loops: Vec<Role>,
+    noms: Vec<Ex>,
+}
+
 /// The witnesses: the contexts that are not real, derive an individual and know more
 /// than it, or give a fact of a universal role that is not global. An intersection
 /// among the subsumers adds nothing beyond its operands, which are subsumers too, so
 /// only the other subsumers count.
-pub fn witnesses(ix: &Index, ctx: &Contexts, universal: &[Ex]) -> Vec<Ex> {
-    let view = Global(ctx);
+pub fn witnesses(
+    ix: &Index,
+    ctx: &Contexts,
+    dynamic: Option<&Dynamic>,
+    universal: &[Ex],
+) -> Vec<Ex> {
+    let view = GlobalAll { ctx, dynamic };
+    let horn = ix.horn.is_some();
     let mut out = Vec::new();
-    for e in 0..ctx.len() as Ex {
-        let mut mine: Option<(Vec<Ex>, Vec<Ex>)> = None;
+    for e in 0..view.len() as Ex {
+        // what the context knows: its subsumers, and in a run with the Horn rules its
+        // Horn successors and loops, which the individual takes from it when it is real
+        let mut mine: Option<Knows> = None;
         let mut universal_witness = false;
+        let mut counted = false;
         view.with(e, &mut |st, real| {
             if real || st.bottom {
                 return;
             }
+            // an at-most restriction of a singular context counts the context, and R7
+            // identifies it with another predecessor only where it has an instance
+            counted = horn && st.extra.as_ref().is_some_and(|x| x.horn.counted);
             if !st.noms().is_empty() {
                 let subs = st
                     .subs
@@ -533,23 +584,49 @@ pub fn witnesses(ix: &Index, ctx: &Contexts, universal: &[Ex]) -> Vec<Ex> {
                     .copied()
                     .filter(|&s| !matches!(ix.head(s).node, Node::Conj(..)))
                     .collect();
-                mine = Some((subs, st.noms().to_vec()));
+                let (succ, loops) = if horn {
+                    let succ = st
+                        .extra
+                        .as_ref()
+                        .map_or(Vec::new(), |x| x.horn.succ.list.to_vec());
+                    (succ, st.loops.clone())
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                mine = Some(Knows {
+                    subs,
+                    succ,
+                    loops,
+                    noms: st.noms().to_vec(),
+                });
             }
             universal_witness = ix
                 .universal
                 .iter()
                 .any(|&(f, x)| !universal.contains(&x) && st.subs.contains(&f));
         });
-        let more = mine.is_some_and(|(subs, noms)| {
-            noms.iter().any(|&n| {
-                let mut more = true;
-                view.with(n, &mut |st, _| {
-                    more = !st.bottom && subs.iter().any(|s| !st.subs.contains(s));
-                });
-                more
-            })
-        });
-        if more || universal_witness {
+        let more = mine.is_some_and(
+            |Knows {
+                 subs,
+                 succ,
+                 loops,
+                 noms,
+             }| {
+                noms.iter().any(|&n| {
+                    let mut more = true;
+                    view.with(n, &mut |st, _| {
+                        more = !st.bottom
+                            && (subs.iter().any(|s| !st.subs.contains(s))
+                                || loops.iter().any(|l| !st.loops.contains(l))
+                                || succ.iter().any(|s| {
+                                    !st.extra.as_ref().is_some_and(|x| x.horn.succ.contains(s))
+                                }));
+                    });
+                    more
+                })
+            },
+        );
+        if more || universal_witness || counted {
             out.push(e);
         }
     }
@@ -558,8 +635,8 @@ pub fn witnesses(ix: &Index, ctx: &Contexts, universal: &[Ex]) -> Vec<Ex> {
 
 /// The named classes whose contexts reach one of `from` through links, `from` included,
 /// which are not unsatisfiable, sorted.
-pub fn reaching(ix: &Index, ctx: &Contexts, from: &[Ex]) -> Vec<Ex> {
-    let view = Global(ctx);
+pub fn reaching(ix: &Index, ctx: &Contexts, dynamic: Option<&Dynamic>, from: &[Ex]) -> Vec<Ex> {
+    let view = GlobalAll { ctx, dynamic };
     let mut seen: FxHashSet<Ex> = from.iter().copied().collect();
     let mut stack: Vec<Ex> = from.to_vec();
     let mut out = Vec::new();
@@ -567,7 +644,8 @@ pub fn reaching(ix: &Index, ctx: &Contexts, from: &[Ex]) -> Vec<Ex> {
         let mut next = Vec::new();
         let mut keep = false;
         view.with(e, &mut |st, _| {
-            keep = !st.bottom && matches!(ix.head(e).node, Node::Class(_));
+            keep =
+                !st.bottom && (e as usize) < ctx.len() && matches!(ix.head(e).node, Node::Class(_));
             for (_, srcs) in &st.back {
                 next.extend(srcs.list.iter().copied());
             }
@@ -600,6 +678,11 @@ struct Slot {
 pub struct World<'a> {
     ix: &'a Index,
     ctx: &'a Contexts,
+    /// the contexts of conjunctions of the global saturation, which no world changes
+    dynamic: Option<&'a Dynamic>,
+    /// the contexts of conjunctions this world's Horn rules create, with ids above the
+    /// global table's (F24, "The Horn rules with individuals")
+    local: std::sync::Arc<Dynamic>,
     /// the facts of universal roles of the global state
     global_universal: &'a [Ex],
     /// the contexts that are real in the global state
@@ -635,6 +718,9 @@ struct WorldSink<'b> {
     data_growth: &'b Cell<isize>,
     halted: &'b Cell<bool>,
     overflow: &'b Cell<bool>,
+    ctx_len: usize,
+    dynamic: Option<&'b Dynamic>,
+    table: std::sync::Arc<Dynamic>,
 }
 
 impl Sink for WorldSink<'_> {
@@ -676,6 +762,51 @@ impl Sink for WorldSink<'_> {
     fn me(&mut self, c: Concl) {
         self.local.push(c);
     }
+
+    fn core(&self, ix: &Index, e: Ex, out: &mut Vec<Ex>) {
+        out.clear();
+        if (e as usize) < self.ctx_len {
+            flatten(ix, e, out);
+        } else if let Some(d) = self.dynamic
+            && d.holds(e)
+        {
+            out.extend_from_slice(d.core(e));
+        } else {
+            out.extend_from_slice(self.table.core(e));
+        }
+    }
+
+    fn intern(&mut self, core: &[Ex]) -> Ex {
+        // the global table first, which no world changes, then the world's own
+        match self.dynamic.and_then(|d| d.find(core)) {
+            Some(e) => e,
+            None => self.table.intern(core),
+        }
+    }
+}
+
+impl World<'_> {
+    /// The global state with the global conjunction contexts.
+    fn global(&self) -> GlobalAll<'_> {
+        GlobalAll {
+            ctx: self.ctx,
+            dynamic: self.dynamic,
+        }
+    }
+
+    /// The core of a conjunction context, global or the world's own, or none for a
+    /// context of the index.
+    fn conjunction_core(&self, e: Ex) -> Option<&[Ex]> {
+        if (e as usize) < self.ctx.len() {
+            None
+        } else if let Some(d) = self.dynamic
+            && d.holds(e)
+        {
+            Some(d.core(e))
+        } else {
+            Some(self.local.core(e))
+        }
+    }
 }
 
 impl View for World<'_> {
@@ -690,13 +821,13 @@ impl View for World<'_> {
             }
             Some(Slot { real, .. }) => {
                 let real = *real;
-                Global(self.ctx).with(e, &mut |st, r| f(st, real || r));
+                self.global().with(e, &mut |st, r| f(st, real || r));
             }
-            None => Global(self.ctx).with(e, f),
+            None => self.global().with(e, f),
         }
     }
     fn len(&self) -> usize {
-        self.ctx.len()
+        self.local.base() as usize + self.local.len()
     }
 }
 
@@ -710,13 +841,17 @@ impl<'a> World<'a> {
     pub fn new(
         ix: &'a Index,
         ctx: &'a Contexts,
+        dynamic: Option<&'a Dynamic>,
         global_universal: &'a [Ex],
         global_real: &'a [Ex],
         bound: &'a (dyn Fn(isize) -> bool + Sync),
     ) -> World<'a> {
+        let base = ctx.len() + dynamic.map_or(0, |d| d.len());
         World {
             ix,
             ctx,
+            dynamic,
+            local: std::sync::Arc::new(Dynamic::new(base as Ex)),
             global_universal,
             global_real,
             slots: FxHashMap::default(),
@@ -738,6 +873,7 @@ impl<'a> World<'a> {
     /// of the context being processed.
     fn checkpoint(&mut self, busy: usize) {
         let used = self.held
+            + self.local.bytes()
             + (self.waiting + self.pending.len() + busy) * std::mem::size_of::<(Ex, Concl)>();
         let delta = used as isize - self.reported as isize;
         self.reported = used;
@@ -748,7 +884,7 @@ impl<'a> World<'a> {
 
     fn global_real(&self, e: Ex) -> bool {
         let mut r = false;
-        Global(self.ctx).with(e, &mut |st, _| r = st.real);
+        self.global().with(e, &mut |st, _| r = st.real);
         r
     }
 
@@ -778,7 +914,7 @@ impl<'a> World<'a> {
         let slot = &self.slots[&to];
         if slot.st.is_none() {
             let mut held = false;
-            Global(self.ctx).with(to, &mut |st, _| held = st.holds(&c));
+            self.global().with(to, &mut |st, _| held = st.holds(&c));
             if held {
                 return;
             }
@@ -808,11 +944,38 @@ impl<'a> World<'a> {
             let ix = self.ix;
             let mut init = false;
             let mut out: Vec<(Ex, Concl)> = Vec::new();
-            Global(self.ctx).with(e, &mut |st, _| {
+            let global = GlobalAll {
+                ctx: self.ctx,
+                dynamic: self.dynamic,
+            };
+            let horn = ix.horn.is_some();
+            global.with(e, &mut |st, _| {
                 init = true;
                 for &s in &st.subs {
                     if let Node::Exist(..) = ix.head(s).node {
                         out.push((ix.head(s).succ, Concl::Real));
+                        if horn {
+                            out.push((ix.head(s).succ, Concl::RealBack(e)));
+                        }
+                    }
+                }
+                // the successors the Horn rules made, which learn that a predecessor is
+                // real, and the individuals the context stands for, which take its loops
+                // and Horn successors (roadmap item 692)
+                if let Some(x) = &st.extra
+                    && horn
+                {
+                    for &(_, n) in &x.horn.succ.list {
+                        out.push((n, Concl::Real));
+                        out.push((n, Concl::RealBack(e)));
+                    }
+                    for &n in &x.noms {
+                        for &l in &st.loops {
+                            out.push((n, Concl::Loop(l)));
+                        }
+                        for &(r, n2) in &x.horn.succ.list {
+                            out.push((n, Concl::Succ(r, n2)));
+                        }
                     }
                 }
                 for &n in st.noms() {
@@ -858,7 +1021,11 @@ impl<'a> World<'a> {
                 Some(st) => st,
                 None => {
                     let mut copy = None;
-                    Global(self.ctx).with(e, &mut |st, _| {
+                    let global = GlobalAll {
+                        ctx: self.ctx,
+                        dynamic: self.dynamic,
+                    };
+                    global.with(e, &mut |st, _| {
                         let Some(bytes) = CONTEXT_BYTES
                             .checked_add(st.bytes())
                             .filter(|&n| n <= isize::MAX as usize)
@@ -896,6 +1063,7 @@ impl<'a> World<'a> {
             let data_halted = Cell::new(false);
             let data_overflow = Cell::new(false);
             {
+                let core = self.conjunction_core(e).map(|c| c.to_vec());
                 let mut sink = WorldSink {
                     me: e,
                     local: &mut local,
@@ -904,6 +1072,9 @@ impl<'a> World<'a> {
                     data_growth: &data_growth,
                     halted: &data_halted,
                     overflow: &data_overflow,
+                    ctx_len: self.ctx.len(),
+                    dynamic: self.dynamic,
+                    table: self.local.clone(),
                 };
                 if !st.init {
                     let all: Vec<Ex> = self
@@ -912,23 +1083,38 @@ impl<'a> World<'a> {
                         .chain(&self.universal)
                         .copied()
                         .collect();
-                    init(ix, e, &mut st, &all, &mut sink);
+                    match &core {
+                        Some(core) => init_conjunction(ix, core, &mut st, &all, &mut sink),
+                        None => init(ix, e, &mut st, &all, &mut sink),
+                    }
                 }
                 todo.reverse();
                 sink.local.append(&mut todo);
-                while let Some(c) = sink.local.pop() {
-                    if apply(ix, e, &mut st, c, &mut sink) {
-                        self.held += CONCLUSION_BYTES;
-                    }
-                    self.applied += 1;
-                    if data_halted.get() {
-                        break;
-                    }
-                    if self.applied.is_multiple_of(CHECK_EVERY) {
-                        self.checkpoint(sink.local.len() + sink.out.len());
-                        if self.halted {
+                let horn = ix.horn.is_some();
+                loop {
+                    while let Some(c) = sink.local.pop() {
+                        if apply(ix, e, &mut st, c, &mut sink) {
+                            self.held += CONCLUSION_BYTES;
+                        }
+                        self.applied += 1;
+                        if data_halted.get() {
                             break;
                         }
+                        if self.applied.is_multiple_of(CHECK_EVERY) {
+                            self.checkpoint(sink.local.len() + sink.out.len());
+                            if self.halted {
+                                break;
+                            }
+                        }
+                    }
+                    // R3 and R5 of the Horn rules wait for the activation's universals
+                    // and at-most restrictions, as in the saturation (roadmap item 692)
+                    if data_halted.get()
+                        || self.halted
+                        || !horn
+                        || !super::horn_rules::flush(ix, &mut st, &mut sink)
+                    {
+                        break;
                     }
                 }
             }
@@ -1519,7 +1705,7 @@ mod numeric_resource_tests {
             let ix = sat.index.as_ref().unwrap();
             for conditional in [false, true] {
                 let global = Global(&sat.ctx);
-                let world = World::new(ix, &sat.ctx, &[], &[], &bound);
+                let world = World::new(ix, &sat.ctx, None, &[], &[], &bound);
                 let view: &dyn View = if conditional { &world } else { &global };
                 assert_two_real_members(ix, view);
                 let found = key_merges(ix, view, &bound).unwrap();
@@ -1810,7 +1996,7 @@ mod numeric_resource_tests {
                 live.fetch_add(delta, Ordering::Relaxed);
                 true
             };
-            let mut world = World::new(ix, &sat.ctx, &[], &[], &bound);
+            let mut world = World::new(ix, &sat.ctx, None, &[], &[], &bound);
             world.slots.insert(
                 root,
                 Slot {
@@ -1896,7 +2082,7 @@ mod numeric_resource_tests {
             held.fetch_add(delta, Ordering::Relaxed);
             delta <= 0
         };
-        let mut world = World::new(ix, &sat.ctx, &[], &[], &bound);
+        let mut world = World::new(ix, &sat.ctx, None, &[], &[], &bound);
         // Prepare the legacy delivery buffers outside the measured region, so the
         // zero-allocation assertion addresses the newly guarded state-copy operation.
         world.slots.insert(
@@ -1967,7 +2153,14 @@ mod numeric_resource_tests {
             held.fetch_add(delta, Ordering::Relaxed);
             !KEY_ADMITTING.with(Cell::get)
         };
-        let world = World::new(sat.index.as_ref().unwrap(), &sat.ctx, &[], &[], &bound);
+        let world = World::new(
+            sat.index.as_ref().unwrap(),
+            &sat.ctx,
+            None,
+            &[],
+            &[],
+            &bound,
+        );
         assert!(
             matches!(world.classify(root), Err(Halt::Stopped)),
             "world caller must propagate key scratch refusal"
@@ -1977,7 +2170,14 @@ mod numeric_resource_tests {
             held.fetch_add(delta, Ordering::Relaxed);
             true
         };
-        let world = World::new(sat.index.as_ref().unwrap(), &sat.ctx, &[], &[], &allowed);
+        let world = World::new(
+            sat.index.as_ref().unwrap(),
+            &sat.ctx,
+            None,
+            &[],
+            &[],
+            &allowed,
+        );
         assert!(world.classify(root).is_ok());
         assert_eq!(held.load(Ordering::Relaxed), 0);
     }
