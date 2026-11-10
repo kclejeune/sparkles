@@ -6,16 +6,16 @@
 //! columns by id, so a fact is read from its id directly and the facts of one merge are
 //! an interval of ids, which the semi-naive ranges of the engine read. Each predicate is a
 //! relation with two orders of its ids, by subject then object and by object then
-//! subject, as sorted runs ([`order::Order`], [`run::Run`]). A probe with a bound
-//! predicate and subject searches the subject order, one with a bound object the object
-//! order, and one with a bound predicate alone reads either the subject order or, when
-//! the predicate holds most of the facts in the probe's range, the columns in id order.
+//! subject, as sorted runs ([`order::Order`], [`run::Run`]), and a list of its ids in
+//! order. A probe with a bound predicate and subject searches the subject order, one with
+//! a bound object the object order, and one with a bound predicate alone reads the list,
+//! as it read the predicate's row list before.
 //! Orders over the whole tier by subject and by object serve atoms with a variable
 //! predicate and are built on demand.
 //!
-//! The columns cost 20 bytes per fact and the two orders 10, with their fence keys, so a
-//! fact costs 30 bytes in the tier, besides the graph's triple index that finds a fact by
-//! its triple. The rows, lists and tables of the previous tier cost about 135 bytes.
+//! The columns cost 20 bytes per fact, the predicate's list of ids 4 and the two orders
+//! 10, with their fence keys, so a fact costs 34 bytes in the tier, besides the graph's
+//! triple index that finds a fact by its triple. The rows, lists and tables of the previous tier cost about 135 bytes.
 //!
 //! Deletion marks a fact dead in a bitmap. A dead fact stays in the orders, which skip
 //! it, until a compaction drops it; a relation with a quarter of its facts dead is
@@ -49,8 +49,6 @@ pub(crate) struct Cands<'a> {
     parts: SmallVec<[Part<'a>; 4]>,
     lo: u32,
     hi: u32,
-    /// the ids do not ascend: the pieces of a predicate's order, sorted by subject
-    unordered: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -86,17 +84,7 @@ impl<'a> Cands<'a> {
             parts: SmallVec::new(),
             lo,
             hi,
-            unordered: false,
         }
-    }
-
-    /// Whether the ids [`iter`](Self::iter) gives may not ascend. The ids of a probe with
-    /// a bound subject or object, of an id range and of a run's piece met by a filter
-    /// ascend, as the row lists before the tier did; the whole order of a predicate is
-    /// sorted by subject, so an evaluation that depends on the order sorts it.
-    #[inline]
-    pub fn unordered(&self) -> bool {
-        self.unordered
     }
 
     #[inline]
@@ -140,8 +128,6 @@ impl<'a> Cands<'a> {
             Cands::with_bounds(self.lo, self.hi),
             Cands::with_bounds(self.lo, self.hi),
         );
-        head.unordered = self.unordered;
-        tail.unordered = self.unordered;
         let mut left = n;
         for p in &self.parts {
             let (a, b) = p.split_at(left);
@@ -157,7 +143,6 @@ impl<'a> Cands<'a> {
         let n = n.max(1);
         let mut out = Vec::new();
         let mut cur = Cands::with_bounds(self.lo, self.hi);
-        cur.unordered = self.unordered;
         let mut room = n;
         for p in &self.parts {
             let mut p = *p;
@@ -166,9 +151,10 @@ impl<'a> Cands<'a> {
                 room -= a.len();
                 cur.add(a);
                 if room == 0 {
-                    let mut next = Cands::with_bounds(self.lo, self.hi);
-                    next.unordered = self.unordered;
-                    out.push(std::mem::replace(&mut cur, next));
+                    out.push(std::mem::replace(
+                        &mut cur,
+                        Cands::with_bounds(self.lo, self.hi),
+                    ));
                     room = n;
                 }
                 if b.len() == 0 {
@@ -232,12 +218,30 @@ impl Iterator for Iter<'_> {
 /// The facts of one predicate: its two orders and its dead facts.
 pub(crate) struct Rel {
     pub p: u64,
-    /// by subject, then object
+    /// the ids, ascending, as the row list of a predicate was before the tier: a probe
+    /// with the predicate alone reads them, and a count over an id range is a binary
+    /// search in them
+    pub ids: Vec<u32>,
+    /// by subject, then id
     pub subj: Order,
-    /// by object, then subject
+    /// by object, then id
     pub obj: Order,
-    /// dead facts still in the orders
+    /// dead facts still in the orders and the ids
     pub dead: u32,
+}
+
+impl Rel {
+    /// The ids in `[lo, hi)`.
+    #[inline]
+    fn ids_in(&self, lo: u32, hi: u32) -> &[u32] {
+        let a = if lo == 0 {
+            0
+        } else {
+            self.ids.partition_point(|&id| id < lo)
+        };
+        let b = self.ids.partition_point(|&id| id < hi);
+        &self.ids[a..b.max(a)]
+    }
 }
 
 pub(crate) struct Tier {
@@ -387,6 +391,7 @@ impl Tier {
                 let i = self.rels.len() as u32;
                 self.rels.push(Rel {
                     p: t[1],
+                    ids: Vec::new(),
                     subj: Order::default(),
                     obj: Order::default(),
                     dead: 0,
@@ -468,7 +473,7 @@ impl Tier {
     /// Calls `f` with each predicate of a fact from id `lo` on.
     pub fn predicates_since(&self, lo: u32, mut f: impl FnMut(u64)) {
         for r in &self.rels {
-            if r.subj.since(lo) {
+            if r.ids.last().is_some_and(|&id| id >= lo) {
                 f(r.p);
             }
         }
@@ -480,7 +485,7 @@ impl Tier {
         if lo >= hi {
             return 0;
         }
-        self.rel(p).map_or(0, |r| r.subj.count_in(lo, hi))
+        self.rel(p).map_or(0, |r| r.ids_in(lo, hi).len())
     }
 
     /// Distinct subjects and objects of predicate `p`, upper bounds.
@@ -539,18 +544,7 @@ impl Tier {
             }
             (None, Some(p), None) => {
                 if let Some(r) = self.rel(p) {
-                    // a predicate with most of the range's facts is read in id order,
-                    // along the columns, and otherwise along its order
-                    let n = r.subj.count_in(lo, hi);
-                    if n * 4 >= (hi - lo) as usize {
-                        return Cands::range(lo, hi);
-                    }
-                    for run in r.subj.runs() {
-                        if run.overlaps(lo, hi) {
-                            c.push_ids(run.ids(), !run.within(lo, hi));
-                        }
-                    }
-                    c.unordered = c.parts.len() > 1 || c.parts.first().is_some_and(|p| p.len() > 1);
+                    c.push_ids(r.ids_in(lo, hi), false);
                 }
             }
             (Some(s), None, o) => match (&self.by_s, o, &self.by_o) {
@@ -577,7 +571,7 @@ impl Tier {
         n += self
             .rels
             .iter()
-            .map(|r| r.subj.heap_bytes() + r.obj.heap_bytes())
+            .map(|r| r.ids.capacity() * size_of::<u32>() + r.subj.heap_bytes() + r.obj.heap_bytes())
             .sum::<usize>();
         n += table_bytes(self.rel_of.capacity(), size_of::<(u64, u32)>());
         for o in [&self.by_s, &self.by_o].into_iter().flatten() {
@@ -679,6 +673,9 @@ impl Tier {
             if floor > 0 {
                 // a relation with a quarter of its facts dead is rebuilt without them
                 let all = rel.dead > 0 && rel.dead as usize * 4 >= rel.subj.len();
+                if all {
+                    rel.ids.retain(|&id| keep(id));
+                }
                 let d = compaction(
                     &mut rel.subj,
                     floor,
@@ -700,6 +697,15 @@ impl Tier {
                 rel.dead -= d as u32;
             }
             if !new.is_empty() {
+                // the ids, which ascend already, in a list that doubles
+                let (len, cap) = (rel.ids.len(), rel.ids.capacity());
+                if len + new.len() > cap {
+                    let grown = (cap * 2).max(len + new.len()).max(16);
+                    meter.add(grown * size_of::<u32>())?;
+                    rel.ids.reserve_exact(grown - len);
+                    meter.sub(cap * size_of::<u32>());
+                }
+                rel.ids.extend_from_slice(new);
                 let scratch = compact::scratch_bytes(new.len());
                 meter.add(scratch + 2 * Run::bytes_for(new.len()))?;
                 rel.subj

@@ -1077,28 +1077,6 @@ impl<'a> Eval<'a> {
     /// Match the atom of step `k` against derived facts, in ascending id order, which the
     /// order of first derivation of the heads follows.
     fn rows(&mut self, k: usize, atom: usize, b: &mut [u64], cands: Cands<'_>) {
-        if cands.unordered() {
-            // the whole order of a predicate, sorted by subject: sorted by id here, in a
-            // buffer charged for the time of the step
-            let bytes = cands.len() * size_of::<u32>();
-            if let Err(e) = self.held().try_grow(bytes) {
-                self.fail(e);
-                return;
-            }
-            let mut ids: Vec<u32> = cands.iter().collect();
-            ids.sort_unstable();
-            for row in ids {
-                if self.aborted() {
-                    break;
-                }
-                if self.g.alive(row) {
-                    let t = self.g.triple(row);
-                    self.fact(k, atom, b, t);
-                }
-            }
-            self.held().shrink(bytes);
-            return;
-        }
         for row in cands.iter() {
             if self.aborted() {
                 return;
