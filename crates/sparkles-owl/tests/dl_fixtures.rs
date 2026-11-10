@@ -317,3 +317,103 @@ fn the_cases_past_the_bound_fall_back_on_every_schedule() {
         );
     }
 }
+
+/// With `Limits::rooted`, the rooted run of Tier D takes the `shoi` fixtures, which have
+/// individuals and nominals. The run gives HermiT's taxonomy on every fixture it finishes
+/// within its bound on derived conclusions, and the five fixtures that pass the bound fall
+/// back to the answer of a run without the option, which is sound, on every schedule.
+#[test]
+fn the_rooted_run_is_exact_on_the_shoi_fixtures_within_its_bound() {
+    let dir = fixtures();
+    let mut cases: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n.starts_with("shoi-") && n.ends_with(".ofn") && n.matches('.').count() == 1
+            })
+        })
+        .collect();
+    cases.sort();
+    assert_eq!(cases.len(), 50);
+    let past_bound = ["shoi-005", "shoi-022", "shoi-027", "shoi-032", "shoi-042"];
+    let mut exact = 0;
+    let mut failures = Vec::new();
+    for case in &cases {
+        let stem = case
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let want = std::fs::read_to_string(case.with_extension("hermit.ofn")).unwrap();
+        let doc = ofn_read::parse(&std::fs::read_to_string(case).unwrap()).unwrap();
+        let mut classes: BTreeSet<String> = doc
+            .axioms
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AxiomKind::Declaration(Entity::Class(c)) => Some(c.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        classes.insert(THING.to_string());
+        classes.insert(NOTHING.to_string());
+        let want = reference(&want, &classes);
+        for (threads, expansion) in [(1, Expansion::Cautious), (4, Expansion::Eager)] {
+            let mut k = Classifier::of(&doc.axioms);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    rooted: true,
+                    ..Limits::default()
+                })
+                .unwrap();
+            assert!(
+                out.complete,
+                "{stem}: a run without a deadline answered in part"
+            );
+            let mut got = BTreeSet::new();
+            for a in &classes {
+                for b in &classes {
+                    if out
+                        .taxonomy
+                        .is_subclass(&Class::new(a.as_str()), &Class::new(b.as_str()))
+                    {
+                        got.insert((a.clone(), b.clone()));
+                    }
+                }
+            }
+            let extra = got.difference(&want).count();
+            let missing = want.difference(&got).count();
+            let fell = out.stats.dl_rooted_over;
+            if extra > 0 {
+                failures.push(format!("{stem} {threads} {expansion:?}: {extra} wrong"));
+            }
+            if fell != past_bound.contains(&stem) {
+                failures.push(format!(
+                    "{stem} {threads} {expansion:?}: fell back {fell}, work {}",
+                    out.stats.dl_work
+                ));
+            }
+            if fell {
+                assert!(out.stats.dl_over_budget);
+                assert!(
+                    !k.excluded().is_empty(),
+                    "{stem}: nothing reported after the fallback"
+                );
+            } else {
+                if !k.excluded().is_empty() {
+                    failures.push(format!(
+                        "{stem} {threads} {expansion:?}: {:?}",
+                        k.excluded()
+                    ));
+                }
+                if missing > 0 {
+                    failures.push(format!("{stem} {threads} {expansion:?}: {missing} missing"));
+                }
+                exact += 1;
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+    assert_eq!(exact, 90);
+}
