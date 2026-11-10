@@ -125,8 +125,15 @@ the tier ended at 2,467 MB. The whole command's peak resident set stayed between
 10.9 GiB for every build, since the commit of the derived triples to the store follows
 the reasoning. Wall times at one thread were 70 and 67 s before the tier, 89 and 84 s with
 it and 89 and 85 s with the batches, and at 20 threads 38 and 34 s, 41 and 42 s, and 41
-and 38 s. These are development-host measurements, and the benchmark host has not rerun
-them. Roadmap item 866 covers the one-thread cost.
+and 38 s. With item 866's row of 24 bytes, 16-byte sort entries and digit sort, in two
+further rounds against the same base build, the wall times were 81 and 78 s against 75 and
+69 s at one thread and 39.0 and 37.6 s against 40.7 and 37.3 s at 20 threads, with the
+budget's peak at 4.6 GB, 87 bytes per fact, and the tier at 2,745 MB. LUBM(100) under
+`owl-rl` took 25.7 and 25.2 s against 24.8 and 24.7 s at one thread, 14.7 and 14.6 s
+against 14.3 and 14.1 s at 20 threads, and the insertion and deletion of every hundredth
+of its triples at 20 threads 2.2 and 3.0 s against 2.1 and 2.9 s. These are
+development-host measurements, and the benchmark host has not rerun them. Roadmap item
+866 covers the one-thread cost that remains, in the triple index's lookups.
 
 ### Small incremental runs
 

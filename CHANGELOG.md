@@ -539,15 +539,15 @@ CPU's performance counters, checks every result and records a forge baseline.
 ### Changed
 
 The reasoner's derived facts live in a columnar tier (roadmap item 835). A fact's
-subject, object and predicate are three columns by fact id, each predicate keeps its ids
-in order, and each predicate's facts are sorted twice, by subject and by object, in runs
-with fence keys that a probe searches before it reads the keys of at most eight facts. A
-merge appends one run per order and compacts the older runs, and a relation with a
-quarter of its facts dead is rebuilt. A fact costs 34 bytes in the tier beside its slot
-in the triple index, and OWL2Bench with 5 universities measured 40 bytes per derived fact
-with the index when a closure arrived in one merge, and 47 with the batched closures
-below, whose columns keep the capacity of their last doubling, where the rows, hash lists
-and tables the tier replaces cost about 135 bytes.
+subject, object and predicate are one row of 24 bytes by fact id, each predicate keeps its
+ids in order, and each predicate's facts are sorted twice, by subject and by object, in
+runs with fence keys that a probe searches before it reads the keys of at most eight
+facts. A merge sorts its ids into each order as 16-byte entries, by digits when the batch
+is large and the pool has at most three threads, appends one run per order and compacts
+the older runs, and a relation with a quarter of its facts dead is rebuilt. A fact costs
+38 bytes in the tier beside its slot in the triple index, and OWL2Bench with 5
+universities measured 52 bytes per derived fact with the index, where the rows, hash
+lists and tables the tier replaces cost about 135 bytes.
 Full and incremental runs derive the same closures with the same fact ids as before.
 
 The closure operators merge their pairs into the derived tier in batches of four million
@@ -557,9 +557,10 @@ complete, and on OWL2Bench with 5 universities that step, which emits 52 million
 set the run's peak. A batch now enters the tier's columns and triple index as soon as it
 is full, and the predicate's new facts are sorted into its orders once at the end, so the
 facts keep the ids one merge of the whole closure gave them. The reasoner's peak heap on
-that run fell from 199 to 80 bytes per derived fact. The tier is slower at one thread on
-OWL2Bench(5), 85 to 89 s against 67 to 70 s, and 38 to 41 s against 34 to 38 s at 20
-threads, which roadmap item 866 takes up.
+that run fell from 199 to 72 bytes per derived fact, or 87 with the digit sort's second
+buffer. The tier's merges are now faster than the hash lists were, and the tier is still
+slower at one thread on OWL2Bench(5), 78 to 81 s against 69 to 75 s, in the triple
+index's lookups, which roadmap item 866 takes up; at 20 threads it is no slower.
 
 Notification channels deliver independently (item 46). Each channel has its own queue
 and delivery thread, so a webhook or ntfy server that hangs or fails delays only its own

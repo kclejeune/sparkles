@@ -126,16 +126,21 @@ other core and convergence phases remain under [item 456](../../ROADMAP.md).
 
 `crates/sparkles-reasoner/src/tier` holds the derived facts. A fact gets a dense `u32`
 id in the order of its first derivation, as the rows were numbered before, and its
-subject, object and predicate live in three columns by id, so the facts of one merge are
-an interval of ids and the semi-naive ranges of the engine keep their meaning. Each
+subject, object and the index of its predicate live in one row of 24 bytes by id, of
+which 4 are padding free for a later column, so the facts of one merge are an interval
+of ids and the semi-naive ranges of the engine keep their meaning, and a hit in the
+triple index checks its fact with one cache line. Each
 predicate is a relation with its ids in ascending order, as its row list was before, and
 two orders of its ids, by subject then id and by object then id. An order is a list of
 immutable sorted runs, and a run keeps a fence key every eight entries, so a probe with a
 bound subject or object searches the fence keys, which are few, and then the keys of at
-most eight facts. A merge appends one run per order and compacts the older runs first,
-from the newest back while the next older run is at most twice their size and further
-back until eight runs remain, and a relation with a quarter of its facts dead is rebuilt
-without them. The engine sets a compaction floor at the start of each iteration's delta,
+most eight facts. A merge sorts its ids into each order as `(key, id)` entries of 16
+bytes, by least significant digit over the digits in which the keys differ when the
+batch is large and the pool has at most three threads, and by a parallel comparison sort
+otherwise, and builds the run from the sorted entries. It appends one run per order and
+compacts the older runs first, from the newest back while the next older run is at most
+twice their size and further back until eight runs remain, and a relation with a quarter
+of its facts dead is rebuilt without them. The engine sets a compaction floor at the start of each iteration's delta,
 so a run the iteration reads is never merged with older ones, and a batch added between
 runs lowers the floor to its first id. Orders over the whole tier by subject and by
 object serve atoms with a variable predicate and are built on demand. A probe with a
@@ -148,9 +153,10 @@ ranges rather than a list of rows, filtered by the id range where a run is met i
 
 The plan weighed two layouts. The first keeps each order as columns of subject, object
 and id, 20 bytes per fact per order, with a position table of 8 bytes from id to place,
-48 bytes in all. The second, which is built, keeps the columns by id once, 20 bytes, the
-predicate's id list, 4 bytes, and each order as ids with fence keys, 5 bytes, 34 bytes in
-all, and pays an indirection for each key it compares. The second was chosen because the memory gate of the phase is a
+48 bytes in all. The second, which is built, keeps the fact by id once, 24 bytes in a row
+that was three columns of 20 bytes until item 866, the predicate's id list, 4 bytes, and
+each order as ids with fence keys, 5 bytes, 38 bytes in all, and pays an indirection for
+each key it compares. The second was chosen because the memory gate of the phase is a
 halving of the peak heap per derived fact and the candidate buffers, the term table and
 the operators' workspace take a share of that peak the tier does not control, so the
 smaller tier gives the gate room, and because the fence keys keep the indirect
@@ -205,18 +211,31 @@ the build before, because the command commits the 53 million derived triples to 
 store after reasoning, and a profile of the command finds that commit, which sorts the
 quads on every thread, in most of its samples in both builds.
 
-The tier is slower at one thread on OWL2Bench(5): 88.6 and 84.5 s against 70.3 and 67.1 s
-with the batches, and 41.3 and 38.4 s against 38.3 and 34.3 s at 20 threads, on a quiet
-wally. A profile of the reasoning thread and the per-rule times place the cost in three
-places. A hit in the triple index compares the candidate's subject, object and predicate
-through three columns, three dependent cache misses where the row of 24 bytes it replaces
-cost one, and the rules that rederive facts the tier holds, `prp-symp` at 14.8 s against
-8.5 s and `prp-key-1` at 15.7 against 14.9 s in the second iteration, pay it through
-`Graph::position`, 10.9 percent of the run's samples against 7.0. The sort of a merge's
-ids by key into each order costs 5.9 s against 1.9 s for the hash lists it replaces in
-the first iteration's fill, and the compaction of the orders at the third iteration's
-merge 1.3 s against 0.1 s. Item 866 takes these up, with interleaved subject and object
-columns, so that a hit costs two misses, as the first candidate.
+The tier was slower at one thread on OWL2Bench(5) when the batches landed: 88.6 and
+84.5 s against 70.3 and 67.1 s, and 41.3 and 38.4 s against 38.3 and 34.3 s at 20 threads,
+on a quiet wally. The per-rule times placed the cost in the second iteration's `prp-symp`,
+14.8 s against 8.5 s, which rederives the facts of a symmetric closure and checks each
+through the triple index, in the sort of a merge's ids into the orders, 5.9 s against
+1.9 s for the hash lists it replaces in the first iteration's fill, and in the third
+iteration's compaction, 1.3 s. Item 866 took these up. The fact is now one row of 24 bytes
+in place of three columns, the sort keys `(key, id)` entries of 16 bytes and builds the
+run from them in one pass, and a large batch sorts by least significant digit on one to
+three threads. With these, on the same host in two interleaved rounds against the build
+before the tier, the first iteration's merge takes 14.8 s against 15.5 s at one thread,
+so the fill is faster than the hash lists were, the whole run takes 81.3 and 77.7 s
+against 74.9 and 69.1 s at one thread and 39.0 and 37.6 s against 40.7 and 37.3 s at 20
+threads, LUBM(100) takes 25.7 and 25.2 s against 24.8 and 24.7 s at one thread and 14.7
+and 14.6 s against 14.3 and 14.1 s at 20 threads, and its insertion and deletion of every
+hundredth triple at 20 threads take 2.2 and 3.0 s against 2.1 and 2.9 s. The budget's
+peak is 71.5 bytes per derived fact with the comparison sort and 87.3 with the digit
+sort's second buffer, under the gate of half of 199. The remaining cost at one thread
+is in `Graph::position`, 13.1 s of samples against 7.5 s for the same lookups: the row
+read costs the same in both builds, and the reads of the hash table's control bytes and
+buckets cost two to three times as much, which item 866 still has to explain. A
+compaction policy that left an older run alone when it was under an eighth of the runs
+behind it saved the third iteration's 1.25 s and was not kept, since the planner's
+distinct-key estimates sum over runs and the retained run changed a join order, and so
+derived ids, in the reviewer's reproduction.
 
 ### Closure operators
 
