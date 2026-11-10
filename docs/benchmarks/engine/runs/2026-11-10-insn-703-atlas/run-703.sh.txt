@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Item 703 on atlas: per-request instruction and cache counts of the four queries on three
+# binaries, with one Rayon thread pinned to CPU 2 (the lane's A/B method) and with twelve
+# threads on CPUs 0-11 (the forge method of the record that observed the differences).
+# usage: run-703.sh   (in /home/kclejeune/lanes/x15-cost-701 on atlas, under the heavy lock)
+set -euo pipefail
+cd /home/kclejeune/lanes/x15-cost-701
+export PERF=/home/kclejeune/lanes/x15-cost-701/perf-out/bin/perf
+R=${ROUNDS:-6}
+N=${REPS:-30}
+arms=(base=./sparkles-71d11ad0 main=./sparkles-321508fe tip=./sparkles-ce993ece)
+synth=(q703/f-regex-iri-join.rq q703/f-expr-range-join.rq q703/two-hop-count.rq)
+echo "$(date -u +%FT%TZ) PS703-START rounds=$R reps=$N"
+THREADS=1 SERVER_CPU=2 CLIENT_CPU=4 python3 perfstat.py synth-71d11ad0.db 29714 "$R" "$N" \
+  ps703-synth-t1.json "${arms[@]}" -- "${synth[@]}"
+THREADS=1 SERVER_CPU=2 CLIENT_CPU=4 python3 perfstat.py dbpedia-71d11ad0.db 29714 "$R" "$N" \
+  ps703-dbp-t1.json "${arms[@]}" -- q703/births-by-decade.rq
+THREADS=12 SERVER_CPU=0-11 CLIENT_CPU=12 python3 perfstat.py synth-71d11ad0.db 29714 "$R" "$N" \
+  ps703-synth-t12.json "${arms[@]}" -- "${synth[@]}"
+THREADS=12 SERVER_CPU=0-11 CLIENT_CPU=12 python3 perfstat.py dbpedia-71d11ad0.db 29714 "$R" "$N" \
+  ps703-dbp-t12.json "${arms[@]}" -- q703/births-by-decade.rq
+echo "$(date -u +%FT%TZ) PS703-DONE"
