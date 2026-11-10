@@ -191,7 +191,7 @@ fn refused_expr(e: &Expression, found: &mut Option<String>) {
 
 /// Whether `iri` names a property function, which computes its answers instead of
 /// matching stored triples.
-fn property_function(iri: &str) -> bool {
+pub(super) fn property_function(iri: &str) -> bool {
     iri == crate::sparql::arqpf::RDFS_MEMBER
         || crate::sparql::catalog::property_functions()
             .iter()

@@ -13,7 +13,9 @@
 //! `MIN`, `MAX`, `GROUP_CONCAT` and `SAMPLE` keep the group's values as an ordered
 //! multiset ([`Multiset`]): the distinct values in the order of `ORDER BY` with their
 //! counts, 16 bytes each. `MIN` and `MAX` read its ends, so removing the extreme value
-//! costs one search and no scan. `GROUP_CONCAT` joins the values again for a changed
+//! costs one search and no scan, and among values the order does not tell apart both
+//! report the one that entered the group first, as the engine keeps the first of equal
+//! values. `GROUP_CONCAT` joins the values again for a changed
 //! group, in that order, where a one-off evaluation joins them in the order its rows
 //! arrive. `SAMPLE` reports one value and keeps it while the group holds it, then takes
 //! the smallest. Adding or removing a value decodes the values it is compared with on
@@ -190,8 +192,11 @@ impl SumState {
 }
 
 /// The values of a group as an ordered multiset: the distinct values in the order of
-/// `ORDER BY` (then by id, for values the order does not tell apart) with their counts.
-/// The state of `MIN`, `MAX`, `GROUP_CONCAT` and `SAMPLE`.
+/// `ORDER BY` with their counts. Values the order does not tell apart, such as
+/// `"01"^^xsd:integer` and `"1"^^xsd:integer`, form a run in the order they entered the
+/// group, which a checkpoint and a generation switch keep, since the vector is saved and
+/// loaded in its order and the order depends on the terms and not on their ids. The
+/// state of `MIN`, `MAX`, `GROUP_CONCAT` and `SAMPLE`.
 #[derive(Clone, Debug, Default)]
 struct Multiset {
     vals: Vec<(Id, i64)>,
@@ -203,22 +208,28 @@ struct Multiset {
 }
 
 impl Multiset {
-    /// Where `v`, whose decoded value is `value`, is or belongs in `vals`.
+    /// Where `v`, whose decoded value is `value`, is or belongs in `vals`: its index, or
+    /// the index after the run of values the order does not tell apart from it.
     fn position(
         &self,
         p: &Pass,
         v: Id,
         value: Option<&Value>,
     ) -> std::result::Result<usize, usize> {
-        self.vals.binary_search_by(|(x, _)| {
-            if *x == v {
-                return Ordering::Equal;
-            }
-            match order_cmp(p.value(*x).as_ref(), value) {
-                Ordering::Equal => x.0.cmp(&v.0),
-                o => o,
-            }
-        })
+        let cmp = |x: Id| order_cmp(p.value(x).as_ref(), value);
+        let i = self.vals.binary_search_by(|(x, _)| cmp(*x))?;
+        let mut lo = i;
+        while lo > 0 && cmp(self.vals[lo - 1].0) == Ordering::Equal {
+            lo -= 1;
+        }
+        let mut hi = i + 1;
+        while hi < self.vals.len() && cmp(self.vals[hi].0) == Ordering::Equal {
+            hi += 1;
+        }
+        match self.vals[lo..hi].iter().position(|(x, _)| *x == v) {
+            Some(k) => Ok(lo + k),
+            None => Err(hi),
+        }
     }
 
     /// Add `w` copies of `v`.
@@ -229,13 +240,25 @@ impl Multiset {
                 self.vals[i].1 += w;
                 if self.vals[i].1 == 0 {
                     self.vals.remove(i);
-                    if self.sample == Some(v) {
-                        self.sample = None;
-                    }
                 }
             }
             Err(i) => self.vals.insert(i, (v, w)),
         }
+    }
+
+    /// The first value of the run at `i` that the group holds, which is the value that
+    /// entered the group first among those the order does not tell apart, as the engine
+    /// keeps the first of equal values.
+    fn first_of_run(&self, p: &Pass, i: usize) -> Id {
+        let value = p.value(self.vals[i].0);
+        let mut lo = i;
+        while lo > 0
+            && self.vals[lo - 1].1 > 0
+            && order_cmp(p.value(self.vals[lo - 1].0).as_ref(), value.as_ref()) == Ordering::Equal
+        {
+            lo -= 1;
+        }
+        self.vals[lo].0
     }
 
     /// The smallest value the group holds.
@@ -243,19 +266,24 @@ impl Multiset {
         self.vals.iter().find(|(_, n)| *n > 0).map(|(v, _)| *v)
     }
 
-    fn max(&self) -> Option<Id> {
-        self.vals
-            .iter()
-            .rev()
-            .find(|(_, n)| *n > 0)
-            .map(|(v, _)| *v)
+    /// The largest value the group holds.
+    fn max(&self, p: &Pass) -> Option<Id> {
+        let i = self.vals.iter().rposition(|(_, n)| *n > 0)?;
+        Some(self.first_of_run(p, i))
     }
 
-    /// Give `SAMPLE` a value when the group has values and its value left.
-    fn settle(&mut self) {
-        if self.sample.is_none() {
-            self.sample = self.min();
+    /// Give `SAMPLE` a value when the group holds values, keeping the one it reported
+    /// while the group still holds it after the pass.
+    fn settle(&mut self, p: &Pass) {
+        if let Some(s) = self.sample {
+            let value = p.value(s);
+            if let Ok(i) = self.position(p, s, value.as_ref())
+                && self.vals[i].1 > 0
+            {
+                return;
+            }
         }
+        self.sample = self.min();
     }
 }
 
@@ -506,7 +534,7 @@ impl Group {
                 AState::Sum(s) => self.sum_value(p, spec.kind, s),
                 AState::Multi(m) => match spec.kind {
                     AggKind::Min => m.min().unwrap_or(Id::UNDEF),
-                    AggKind::Max => m.max().unwrap_or(Id::UNDEF),
+                    AggKind::Max => m.max(p).unwrap_or(Id::UNDEF),
                     AggKind::Sample => m.sample.unwrap_or(Id::UNDEF),
                     _ => Self::concat(p, spec, m),
                 },
@@ -658,7 +686,7 @@ impl Group {
             if let Some(g) = self.groups.get_mut(&key) {
                 for st in g.aggs.iter_mut() {
                     if let AState::Multi(m) = st {
-                        m.settle();
+                        m.settle(p);
                     }
                 }
             }

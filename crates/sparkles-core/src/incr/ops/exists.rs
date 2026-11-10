@@ -9,8 +9,10 @@
 //! evaluate again: each changed quad is matched against the condition's triple patterns,
 //! and a match binds the outer variables the pattern names, so only rows with those
 //! bindings, or without them, can have a new answer. A pattern that no triple pattern
-//! scopes, such as a property path, sends every row to the engine again. The rows the
-//! input changes are evaluated when they are new, and keep their answer otherwise.
+//! scopes, such as a property path, a property function, a `GRAPH` whose body reads no
+//! triple or that holds another `GRAPH`, or one of ARQ's special graphs, sends every row
+//! to the engine again. The rows the input changes are evaluated when they are new, and
+//! keep their answer otherwise.
 //!
 //! The evaluation runs the query engine on the inner pattern with the row's bindings
 //! substituted, so the answer is the engine's own, with its treatment of nested scopes
@@ -28,7 +30,7 @@ use crate::error::Result;
 use crate::id::Id;
 use oxrdf::Term;
 use rustc_hash::FxHashMap;
-use spargebra::algebra::{Expression, GraphPattern};
+use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
 use spargebra::term::{NamedNodePattern, TermPattern};
 
 /// The graph a probe's quads are in.
@@ -92,6 +94,8 @@ struct RProbe {
 pub struct Probes {
     probes: Vec<Probe>,
     unscoped: bool,
+    /// inside a `GRAPH`
+    nested: bool,
 }
 
 impl Probes {
@@ -99,6 +103,7 @@ impl Probes {
         let mut out = Probes {
             probes: Vec::new(),
             unscoped: false,
+            nested: false,
         };
         let cols: Vec<(String, usize)> = outer
             .iter()
@@ -123,6 +128,13 @@ impl Probes {
         match gp {
             GP::Bgp { patterns } => {
                 for t in patterns {
+                    // a property function reads triples its pattern does not name
+                    if let NamedNodePattern::NamedNode(n) = &t.predicate
+                        && super::super::compile::property_function(n.as_str())
+                    {
+                        self.unscoped = true;
+                        continue;
+                    }
                     self.probes.push(Probe {
                         g: g.clone(),
                         s: term(&t.subject),
@@ -177,12 +189,28 @@ impl Probes {
             }
             GP::Graph { name, inner } => {
                 let g = match name {
+                    // the special graphs of ARQ read other graphs
+                    NamedNodePattern::NamedNode(n) if n.as_str().starts_with("urn:x-arq:") => {
+                        self.unscoped = true;
+                        return;
+                    }
                     NamedNodePattern::NamedNode(n) => PGraph::Graph(Term::NamedNode(n.clone())),
                     NamedNodePattern::Variable(v) => {
                         col(v.as_str()).map_or(PGraph::Named, PGraph::Var)
                     }
                 };
+                // a GRAPH inside a GRAPH still ranges over every graph, and a GRAPH
+                // whose body reads no triple depends on which graphs exist
+                if self.nested {
+                    self.unscoped = true;
+                }
+                let before = self.probes.len();
+                let outer = std::mem::replace(&mut self.nested, true);
                 self.walk(inner, &g, cols);
+                self.nested = outer;
+                if self.probes.len() == before {
+                    self.unscoped = true;
+                }
             }
             // the engine substitutes a subquery's projected variables only
             GP::Project { inner, variables } => {
@@ -194,8 +222,22 @@ impl Probes {
                 self.walk(inner, g, &kept);
             }
             GP::Group {
-                inner, variables, ..
+                inner,
+                variables,
+                aggregates,
             } => {
+                for (_, a) in aggregates {
+                    match a {
+                        AggregateExpression::FunctionCall { expr, .. } => self.expr(expr, g, cols),
+                        AggregateExpression::Fold { expr, value, .. } => {
+                            self.expr(expr, g, cols);
+                            if let Some(v) = value {
+                                self.expr(v, g, cols);
+                            }
+                        }
+                        AggregateExpression::CountSolutions { .. } => {}
+                    }
+                }
                 let kept: Vec<(String, usize)> = cols
                     .iter()
                     .filter(|(n, _)| variables.iter().any(|v| v.as_str() == n))
@@ -203,10 +245,16 @@ impl Probes {
                     .collect();
                 self.walk(inner, g, &kept);
             }
-            GP::Distinct { inner }
-            | GP::Reduced { inner }
-            | GP::Slice { inner, .. }
-            | GP::OrderBy { inner, .. } => self.walk(inner, g, cols),
+            GP::OrderBy { inner, expression } => {
+                for o in expression {
+                    let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
+                    self.expr(e, g, cols);
+                }
+                self.walk(inner, g, cols);
+            }
+            GP::Distinct { inner } | GP::Reduced { inner } | GP::Slice { inner, .. } => {
+                self.walk(inner, g, cols)
+            }
             GP::Values { .. } => {}
             _ => self.unscoped = true,
         }

@@ -398,16 +398,31 @@ impl<'a> Pass<'a> {
         Ok(self.union_changes.as_deref().unwrap_or_default())
     }
 
-    fn ctx(&mut self) -> &Ctx {
+    /// The context expressions are evaluated in. An `EXISTS` in an expression reads
+    /// the snapshot as the circuit's principal reads it, through the same grant binding,
+    /// masking and dataset restriction as a one-off query, and keeps the pass's
+    /// deadline, cancellation and memory budget.
+    fn ctx(&mut self) -> Result<&Ctx> {
         if self.ctx.is_none() {
-            let mut c = Ctx::new(self.new.clone());
+            let graphs = self.access.as_ref().map(|a| a.bound(&self.new));
+            let snap = match &graphs {
+                Some(a) => a.masked(&self.new)?,
+                None => self.new.clone(),
+            };
+            let mut c = Ctx::new(snap);
             c.use_cache = false;
             c.base_iri = self.base.clone();
-            // an EXISTS in an expression reads what the circuit's principal reads
-            c.graphs = self.access.clone();
+            c.deadline = self.control.deadline;
+            c.cancel = self.control.cancel.flag();
+            if let Some(m) = self.max_memory_bytes {
+                c.mem_limit = m;
+            }
+            c.allow_service = false;
+            c.forbid_service = true;
+            crate::sparql::restrict_ctx(&mut c, graphs.as_ref())?;
             self.ctx = Some(c);
         }
-        self.ctx.as_ref().expect("made above")
+        Ok(self.ctx.as_ref().expect("made above"))
     }
 
     /// Evaluate `e` over rows of `schema` (circuit variables): the id of each value, or
@@ -425,7 +440,7 @@ impl<'a> Pass<'a> {
         }
         let vars = self.vars;
         let ctx_vars: Vec<VarId> = {
-            let ctx = self.ctx();
+            let ctx = self.ctx()?;
             schema.iter().map(|&v| ctx.var(&vars[v as usize])).collect()
         };
         // the rows as ids of the expression's context
@@ -439,7 +454,7 @@ impl<'a> Pass<'a> {
                 }
             }
         }
-        let ctx = self.ctx();
+        let ctx = self.ctx()?;
         let to_ctx: FxHashMap<Id, Id> = local
             .into_iter()
             .map(|(i, t)| (i, ctx.intern_term(&t)))

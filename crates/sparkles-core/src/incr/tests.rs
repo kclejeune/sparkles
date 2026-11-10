@@ -653,6 +653,245 @@ fn concat_and_sample_follow_the_oracle_up_to_order() {
     assert!(!cc.plan().has_recompute() && !sc.plan().has_recompute());
 }
 
+/// A `GROUP_CONCAT` with a separator the values do not hold lists the engine's parts,
+/// each as often as the engine does, and an empty separator gives a string of the same
+/// characters.
+#[test]
+fn concat_separators_follow_the_oracle() {
+    let s = store();
+    for u in [
+        "INSERT DATA { :a rdfs:label \"a one\" . :a rdfs:label \"a two\" . :b rdfs:label \"b one\" . :c rdfs:label \"c one\" . :d :memberOf :t1 . :d rdfs:label \"a one\" }",
+    ] {
+        upd(&s, &format!("{PREFIX}{u}")).expect("update");
+    }
+    let parts = |cell: &str, sep: &str| -> Vec<String> {
+        let inner = cell
+            .strip_prefix('"')
+            .and_then(|c| c.strip_suffix('"'))
+            .unwrap_or(cell);
+        let mut v: Vec<String> = if sep.is_empty() {
+            inner.chars().map(|c| c.to_string()).collect()
+        } else {
+            inner.split(sep).map(str::to_string).collect()
+        };
+        v.sort();
+        v
+    };
+    for (q, sep) in [
+        (
+            "SELECT ?t (GROUP_CONCAT(?l; SEPARATOR=\"|\") AS ?ls) WHERE { ?p :memberOf ?t . ?p rdfs:label ?l } GROUP BY ?t",
+            "|",
+        ),
+        (
+            "SELECT ?t (GROUP_CONCAT(DISTINCT ?l; SEPARATOR=\"|\") AS ?ls) WHERE { ?p :memberOf ?t . ?p rdfs:label ?l } GROUP BY ?t",
+            "|",
+        ),
+        (
+            "SELECT ?t (GROUP_CONCAT(?l; SEPARATOR=\"\") AS ?ls) WHERE { ?p :memberOf ?t . ?p rdfs:label ?l } GROUP BY ?t",
+            "",
+        ),
+    ] {
+        let mut c = circuit(&s, q);
+        let compare = |c: &Circuit, what: &str| {
+            let want: Vec<(String, Vec<String>)> = oracle(&s, q, &c.columns(), c.kind)
+                .into_iter()
+                .map(|r| {
+                    let (t, cell) = r.split_once(' ').expect("two columns");
+                    (t.to_string(), parts(cell, sep))
+                })
+                .collect();
+            let got: Vec<(String, Vec<String>)> = result(c)
+                .into_iter()
+                .map(|r| {
+                    let (t, cell) = r.split_once(' ').expect("two columns");
+                    (t.to_string(), parts(cell, sep))
+                })
+                .collect();
+            assert_eq!(got, want, "{what}: {q}");
+        };
+        compare(&c, "after the build");
+        for u in [
+            "INSERT DATA { :e :memberOf :t1 . :e rdfs:label \"e one\" }",
+            "DELETE DATA { :a rdfs:label \"a one\" }",
+            "INSERT DATA { :b rdfs:label \"a two\" }",
+            "DELETE DATA { :d rdfs:label \"a one\" }",
+        ] {
+            upd(&s, &format!("{PREFIX}{u}")).expect("update");
+            step(&s, &mut c);
+            compare(&c, u);
+        }
+    }
+}
+
+/// Conditions and aggregates that a review found diverging from the engine: a graph
+/// grant hides a graph from an `EXISTS`, values the order does not tell apart survive a
+/// compaction and tie as the engine ties them, a `SAMPLE` survives a replacement of its
+/// row within one commit, and a graph's existence, an ARQ special graph, a property
+/// function and an `EXISTS` inside an aggregate's argument touch a condition.
+#[test]
+fn review_findings_of_item_418_follow_the_oracle() {
+    const XSD: &str = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
+    let fresh = || Store::in_memory(StoreOptions::default());
+    let run = |q: &str, before: &[&str], after: &[&str]| {
+        let s = fresh();
+        for u in before {
+            upd(&s, &format!("{PREFIX}{XSD}{u}")).expect("update");
+        }
+        let mut c = circuit(&s, &format!("{XSD}{q}"));
+        check(&s, &c, &format!("{XSD}{q}"), "after the build");
+        for u in after {
+            upd(&s, &format!("{PREFIX}{XSD}{u}")).expect("update");
+            step(&s, &mut c);
+            check(&s, &c, &format!("{XSD}{q}"), u);
+        }
+    };
+    // a graph's existence
+    run(
+        "SELECT ?x WHERE { VALUES ?x { :a } FILTER(EXISTS { GRAPH ?g {} } || false) }",
+        &[],
+        &[
+            "INSERT DATA { GRAPH :g { :s :p :o } }",
+            "DELETE DATA { GRAPH :g { :s :p :o } }",
+        ],
+    );
+    // an EXISTS inside an aggregate's argument and a HAVING of the condition's subquery
+    run(
+        "SELECT ?x WHERE { VALUES ?x { :a } FILTER(EXISTS { SELECT (SUM(IF(EXISTS { :s :p :o }, 1, 0)) AS ?n) WHERE {} HAVING(SUM(IF(EXISTS { :s :p :o }, 1, 0)) > 0) } || false) }",
+        &[],
+        &["INSERT DATA { :s :p :o }", "DELETE DATA { :s :p :o }"],
+    );
+    // a property function reads other predicates
+    run(
+        "SELECT ?x WHERE { VALUES ?x { :a } FILTER(EXISTS { :l <http://jena.apache.org/ARQ/list#member> :a } || false) }",
+        &[],
+        &[
+            "INSERT DATA { :l <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> :a ; <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> }",
+        ],
+    );
+    // an ARQ special graph reads the named graphs
+    run(
+        "SELECT ?x WHERE { VALUES ?x { :a } FILTER(EXISTS { GRAPH <urn:x-arq:UnionGraph> { :s :p :o } } || false) }",
+        &[],
+        &["INSERT DATA { GRAPH :g { :s :p :o } }"],
+    );
+    // MIN and MAX tie as the engine ties, on the first value
+    run(
+        "SELECT (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) WHERE { ?p :v ?v }",
+        &["INSERT DATA { :a :v \"01\"^^xsd:integer . :b :v \"001\"^^xsd:integer }"],
+        &["INSERT DATA { :c :v \"+1\"^^xsd:integer }"],
+    );
+    // values the order does not tell apart keep their counts across a compaction
+    for a in ["01", "001", "+1"] {
+        for b in ["001", "+1", "0001"] {
+            if a == b {
+                continue;
+            }
+            let s = fresh();
+            upd(
+                &s,
+                &format!("{PREFIX}{XSD}INSERT DATA {{ :a :v \"{a}\"^^xsd:integer }}"),
+            )
+            .unwrap();
+            upd(
+                &s,
+                &format!("{PREFIX}{XSD}INSERT DATA {{ :b :v \"{b}\"^^xsd:integer }}"),
+            )
+            .unwrap();
+            let q = format!(
+                "{XSD}SELECT (COUNT(?v) AS ?n) (GROUP_CONCAT(?v) AS ?s) WHERE {{ ?p :v ?v }}"
+            );
+            let mut c = circuit(&s, &q);
+            s.compact().unwrap();
+            step(&s, &mut c);
+            upd(
+                &s,
+                &format!("{PREFIX}{XSD}DELETE DATA {{ :a :v \"{a}\"^^xsd:integer }}"),
+            )
+            .unwrap();
+            step(&s, &mut c);
+            check(
+                &s,
+                &c,
+                &q,
+                &format!("{a} and {b} after a compaction and a delete"),
+            );
+        }
+    }
+    // a SAMPLE keeps its value through a replacement of its row in one commit
+    let s = fresh();
+    upd(&s, &format!("{PREFIX}INSERT DATA {{ :p :v 2 }}")).unwrap();
+    let q = "SELECT (SAMPLE(?v) AS ?s) WHERE { ?p :v ?v }";
+    let mut c = circuit(&s, q);
+    upd(&s, &format!("{PREFIX}INSERT DATA {{ :q :v 1 }}")).unwrap();
+    step(&s, &mut c);
+    let before = result(&c);
+    for i in 0..20 {
+        upd(
+            &s,
+            &format!("{PREFIX}DELETE DATA {{ :p :v 2 }} ; INSERT DATA {{ :r{i} :v 2 }} ; DELETE DATA {{ :r{i} :v 2 }} ; INSERT DATA {{ :p :v 2 }}"),
+        )
+        .unwrap();
+        step(&s, &mut c);
+        assert_eq!(result(&c), before, "the value 2 remained in the group");
+    }
+    // an EXISTS reads what the circuit's principal reads
+    {
+        use crate::access::{GraphRule, Graphs};
+        let s = fresh();
+        upd(
+            &s,
+            &format!("{PREFIX}INSERT DATA {{ GRAPH :hidden {{ :s :p :o }} }}"),
+        )
+        .unwrap();
+        let a = Arc::new(GraphAccess::graphs(
+            Graphs::Only(GraphRule::new(["default"], &[])),
+            Graphs::none(),
+        ));
+        let q = "SELECT ?x WHERE { VALUES ?x { :a } FILTER(EXISTS { GRAPH :hidden { :s :p :o } } || false) }";
+        let parsed = sparql::parse_query(&format!("{PREFIX}{q}"), None, &[]).unwrap();
+        let mut c = Circuit::new(compile(&parsed, None).unwrap(), Some(a.clone()));
+        c.build(s.snapshot(), &Control::none()).unwrap();
+        assert!(
+            c.plan()
+                .children
+                .iter()
+                .any(|n| n.operator == "ExistsFilter")
+                || c.plan().operator == "ExistsFilter"
+        );
+        let want = oracle_as(&s, q, &c.columns(), c.kind, Some(&a));
+        assert_eq!(result(&c), want, "a hidden graph reached an EXISTS");
+    }
+    // an EXISTS keeps the pass's deadline and memory budget
+    {
+        let s = fresh();
+        let q = "SELECT ?x WHERE { VALUES ?x { :a } FILTER(EXISTS { SELECT (MAX(?y) AS ?m) WHERE { VALUES ?y { 1 2 3 } } } || false) }";
+        let parsed = sparql::parse_query(&format!("{PREFIX}{q}"), None, &[]).unwrap();
+        let mut c = Circuit::new(compile(&parsed, None).unwrap(), None);
+        c.max_memory_bytes = Some(1);
+        let one_off = sparql::query(
+            s.snapshot(),
+            &format!("{PREFIX}{q}"),
+            &QueryOptions {
+                no_cache: true,
+                max_memory_bytes: Some(1),
+                ..Default::default()
+            },
+        );
+        assert!(one_off.is_err());
+        assert!(
+            c.build(s.snapshot(), &Control::none()).is_err(),
+            "an EXISTS accepted a one-byte budget"
+        );
+        let mut c = Circuit::new(compile(&parsed, None).unwrap(), None);
+        let mut ctl = Control::none();
+        ctl.deadline = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        assert!(
+            c.build(s.snapshot(), &ctl).is_err(),
+            "an EXISTS accepted an expired deadline"
+        );
+    }
+}
+
 /// Queries whose circuits once missed changes or disagreed with the engine: each runs
 /// from an empty store through its updates and is checked after every commit.
 #[test]
