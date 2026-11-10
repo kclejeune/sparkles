@@ -669,6 +669,9 @@ pub(crate) struct Eval<'a> {
     delta_since: Option<u32>,
     /// The current explicit atom path consumed a fact from that delta.
     matched_delta: bool,
+    /// for the rule's trace line: the rows visited, the facts matched, the head probes
+    /// and the delta probes
+    pub stats: [u64; 4],
     /// facts matched by the atoms of the current partial instance ([`Mode::Instances`])
     trail: smallvec::SmallVec<[Triple; 4]>,
     /// facts read by builtins of the current partial instance ([`Mode::Instances`])
@@ -764,6 +767,7 @@ impl<'a> Eval<'a> {
             mode,
             delta_since: None,
             matched_delta: false,
+            stats: [0; 4],
             trail: smallvec::SmallVec::new(),
             implicit: smallvec::SmallVec::new(),
             stop: false,
@@ -1081,6 +1085,7 @@ impl<'a> Eval<'a> {
             if self.aborted() {
                 return;
             }
+            self.stats[0] += 1;
             if !self.g.alive(row) {
                 continue;
             }
@@ -1203,7 +1208,11 @@ impl<'a> Eval<'a> {
             && unify(a.p, t[1], b, &mut newly, &mut n)
             && unify(a.o, t[2], b, &mut newly, &mut n);
         if ok {
+            self.stats[1] += 1;
             let previous_delta = self.matched_delta;
+            if self.delta_since.is_some() {
+                self.stats[3] += 1;
+            }
             self.matched_delta |= self.delta_fact(&t);
             if self.collecting() {
                 self.trail.push(t);
@@ -1252,6 +1261,13 @@ impl<'a> Eval<'a> {
                 .position(t)
                 .map_or_else(|| self.g.reads_base(since, self.end), |row| row >= since)
         })
+    }
+
+    /// [`Graph::known`], counted for the rule's trace line.
+    #[inline]
+    fn probe_known(&mut self, t: &Triple) -> bool {
+        self.stats[2] += 1;
+        self.g.known(t)
     }
 
     fn replay_consumed_delta(&mut self, bindings: &[u64]) -> bool {
@@ -1323,7 +1339,7 @@ impl<'a> Eval<'a> {
                                 Some(new) => new,
                                 None => return,
                             }
-                    } else if self.g.known(&t) {
+                    } else if self.probe_known(&t) {
                         false
                     } else {
                         match self.see(t) {
@@ -1999,6 +2015,14 @@ pub(crate) fn run_observed(
         } else {
             Vec::new()
         };
+        let item_stats: Vec<[AtomicUsize; 4]> = if timed {
+            rules
+                .iter()
+                .map(|_| std::array::from_fn(|_| AtomicUsize::new(0)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let t_eval = std::time::Instant::now();
         let results: Vec<Done> = work
             .par_iter()
@@ -2043,6 +2067,9 @@ pub(crate) fn run_observed(
                 }
                 if let Some(t) = t_item {
                     item_time[*ri].fetch_add(t.elapsed().as_micros() as usize, Ordering::Relaxed);
+                    for (s, v) in item_stats[*ri].iter().zip(ev.stats) {
+                        s.fetch_add(v as usize, Ordering::Relaxed);
+                    }
                 }
                 let (out, held) = ev.take_out();
                 (*ri, out, held, ev.err.take())
@@ -2068,9 +2095,21 @@ pub(crate) fn run_observed(
                 .filter(|x| x.0 > 0)
                 .collect();
             by_rule.sort_unstable_by(|a, b| b.cmp(a));
-            for (us, ri) in by_rule.into_iter().take(5) {
+            for (us, ri) in by_rule.into_iter().take(8) {
                 let items = work.iter().filter(|w| w.ri == ri).count();
-                tracing::trace!(iteration, rule = %rules[ri].name, ms = us / 1000, items, "rule time");
+                let [rows, facts, known, delta] =
+                    item_stats[ri].each_ref().map(|a| a.load(Ordering::Relaxed));
+                tracing::trace!(
+                    iteration,
+                    rule = %rules[ri].name,
+                    ms = us / 1000,
+                    items,
+                    rows,
+                    facts,
+                    known,
+                    delta,
+                    "rule time"
+                );
             }
         }
         // the first error in the order of the work items: a memory error as it is, with
