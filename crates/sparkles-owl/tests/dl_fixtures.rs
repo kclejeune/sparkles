@@ -5,9 +5,9 @@
 //!
 //! Every subsumption between named classes that the classifier answers must be one that
 //! HermiT entails, on every case, and on a case the classifier takes whole, with no axiom
-//! left out, it must answer exactly HermiT's subsumptions. The cases of the Horn families
-//! and the Horn hand cases that the Horn rules take whole are listed in
-//! [`HORN_WHOLE`]'s count, so that a rule that stops taking a case shows.
+//! left out, it must answer exactly HermiT's subsumptions. The cases of the two Horn
+//! families that the classifier takes whole are counted in [`HORN_WHOLE`], so that a rule
+//! that stops taking a case shows.
 
 use sparkles_owl::classify::{Classifier, Expansion, Limits};
 use sparkles_owl::model::*;
