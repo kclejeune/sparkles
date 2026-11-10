@@ -433,7 +433,7 @@ fn users(n: usize) -> String {
             (h >> 20) % 8,
             (h >> 40) % 50
         ));
-        if (h >> 8) % 73 == 0 {
+        if (h >> 8).is_multiple_of(73) {
             d.push_str(&format!("ex:u{i} ex:artist ex:a{} .\n", (h >> 50) % 5));
         }
     }
