@@ -617,9 +617,14 @@ impl Norm<'_> {
                 self.global_or(m)?
             }
             C::ObjectExactCardinality(n, p, f) if self.counting => {
-                // =n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f ⊔ ≥(n+1) p.f, written as the paper's
-                // at-most clause itself, `p_B(x, z_1) ∧ … ∧ p_B(x, z_n) → y ⊔ H ⊔ ⋁ z_i ≈ z_j`
-                // with H the at-least conjunction, which the order ranks lowest, item 728
+                // =n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f ⊔ ≥(n+1) p.f, with H the at-least
+                // conjunction, which the order ranks lowest, item 728. For n = 1 the maximum
+                // is ∀p.¬f, and the axiom is ∃p.f ⊑ y ⊔ H, an existential restriction in a
+                // negative position as any other, so that a context derives y ⊔ H only once
+                // it knows a neighbour in f, a successor through its context or the
+                // predecessor through its own, and never from a hypothesis about the
+                // predecessor. For n ≥ 2 it is the paper's at-most clause itself,
+                // `p_B(x, z_1) ∧ … ∧ p_B(x, z_n) → y ⊔ H ⊔ ⋁ z_i ≈ z_j`.
                 let r = self.role(p)?;
                 let b = match f {
                     Some(f) => self.neg(f, d)?,
@@ -634,12 +639,23 @@ impl Norm<'_> {
                     return Ok(BOTTOM);
                 }
                 let y = self.it.fresh_class();
-                let mut head = vec![y];
                 if hi != BOTTOM {
-                    head.push(hi);
                     self.out.low.push(hi);
                 }
-                self.out.lazy.push((n - 1, r, b, head));
+                if *n == 1 {
+                    let e = self.it.node(Node::Exist(r, b));
+                    if hi == BOTTOM {
+                        self.out.subs.push((e, y));
+                    } else {
+                        self.out.clauses.push((vec![e], vec![y, hi]));
+                    }
+                } else {
+                    let mut head = vec![y];
+                    if hi != BOTTOM {
+                        head.push(hi);
+                    }
+                    self.out.lazy.push((n - 1, r, b, head));
+                }
                 y
             }
             C::ObjectExactCardinality(..) => {

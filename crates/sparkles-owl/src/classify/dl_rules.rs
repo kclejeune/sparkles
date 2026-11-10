@@ -1000,6 +1000,10 @@ pub(super) fn drain_with<S: Sink>(
     let inv = |r: Role| dx.and_then(|d| d.inv(ix, r));
     for (lists, base, ground, rule) in found.prods {
         let mut at = vec![0usize; lists.len()];
+        // two choices whose premises share their literals merge to one conclusion, as
+        // when one role premise fits two places of a Pred body or two needs share their
+        // premise lists, and the product derives each conclusion once
+        let mut seen: FxHashSet<(Vec<Lit>, Vec<Lit>)> = FxHashSet::default();
         'choices: loop {
             if out.stopped() {
                 ds(st).store.interrupted = true;
@@ -1010,7 +1014,12 @@ pub(super) fn drain_with<S: Sink>(
                 s.0.extend_from_slice(&l[i].0);
                 s.1.extend_from_slice(&l[i].1);
             }
-            if !ground || !restricted(&out.dl().lits, inv, &s) {
+            let mut key = (s.0.clone(), s.1.clone());
+            key.0.sort_unstable();
+            key.0.dedup();
+            key.1.sort_unstable();
+            key.1.dedup();
+            if seen.insert(key) && (!ground || !restricted(&out.dl().lits, inv, &s)) {
                 if trace {
                     let lits = &out.dl().lits;
                     eprintln!(
@@ -1495,6 +1504,13 @@ fn at_most(
     // each subset's product holds its premise lists and the equalities of every pair
     let payload = subsets.saturating_mul(k * (k - 1) / 2 + k + 1);
     if k > AT_MOST_WIDEST || subsets > AT_MOST_SUBSETS || payload > AT_MOST_PAYLOAD {
+        if tracing() {
+            eprintln!(
+                "TR OVER {} q={q} k={k} cands={} subsets={subsets} payload={payload}",
+                tr_ctx(st, false),
+                cands.len()
+            );
+        }
         found.over = true;
         return;
     }
@@ -1583,6 +1599,7 @@ fn on_rl(ix: &Index, st: &State, f: Ex, s: Role, prem: &Side, found: &mut Found)
             at_most(ix, st, *n, *q, vec![unit()], Some((f, prem)), head, found);
         }
     }
+    found.rule = "qual";
     for (k, &(r, b)) in dx.quals.iter().enumerate() {
         let q = dx.base + 2 * k as Role;
         if let Some(i) = dx.inv(ix, r)
@@ -1593,6 +1610,7 @@ fn on_rl(ix: &Index, st: &State, f: Ex, s: Role, prem: &Side, found: &mut Found)
             }
         }
     }
+    found.rule = "rdis";
     for &(a, b) in &dx.rdis {
         if dx.sub(ix, s, a) {
             for p in partners_rl(ix, dx, st, f, b) {
@@ -1816,15 +1834,6 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
             at_most(ix, st, n, q, vec![unit.clone()], None, &[], &mut found);
         }
         on_filler(ix, st, d, &unit, &mut found);
-        // item 728's clauses for one neighbour, once at the context's start, for the
-        // predecessor alone when the context carries the inverse of the qualified role
-        if d == TOP {
-            for (n, q, head) in &dx.lazy {
-                if *n == 0 {
-                    at_most(ix, st, 0, *q, vec![unit.clone()], None, head, &mut found);
-                }
-            }
-        }
     }
     // an existential restriction: its role and core over the new successor term are
     // premises in place
@@ -2111,6 +2120,13 @@ pub fn dedge<S: Sink>(ix: &Index, me: Ex, st: &mut State, u: Ex, e: Ex, out: &mu
     // a predecessor of a rooted run may reach the context over f_e(u) and finds the role
     // premises itself, with every role over f_e(u)
     let any = dix(ix).counting || dix(ix).root.is_some();
+    if tracing() {
+        eprintln!(
+            "TR REG {} me={me} hyp={:?} u={u} e={e}",
+            tr_ctx(st, false),
+            dix(ix).of_hyp.get(&me)
+        );
+    }
     let x = ds(st);
     x.empty_core = dix(ix).of_hyp.contains_key(&me);
     if x.dpreds.contains(&(u, e)) {

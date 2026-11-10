@@ -1387,6 +1387,27 @@ are now, so that a term first counted under a conditional premise is counted aga
 a later unconditional one, and for `n = 1` also once when a context starts, for the
 predecessor alone.
 
+The measurement revised the `n = 1` case. The clause `r_B(x, y) → y ⊔ H` with the
+predecessor as its one neighbour is a hypothesis about the predecessor's type, and the
+engine's hypotheses are the paper's markers `A → A`, which Pred discharges in the
+predecessor, so every context that carries the inverse of the role speculates on it, and
+with the symmetric bond properties of ore_ont_6485 that is every atom context for every
+one of the fifteen definitions. Under the present rank `H` is maximal there and Succ
+makes its witnesses everywhere, which a functional holder then equates with the
+predecessor and with each other, and under the low rank `y` is resolved into the
+definition's class wherever its guard holds, whose own holder then counts every
+hypothetical witness in the context. Both attempts passed the bound, and the traces are
+in the lane record. The `n = 1` case therefore takes the form `∃r.F ⊑ y ⊔ H`, which is
+`=1 r.F ⊑ y` written as `⊤ ⊑ y ⊔ ∀r.¬F ⊔ H` with the universal restriction moved to the
+left, and an existential restriction in a negative position as any other of the
+normalization. A context derives `y ⊔ H` once it knows a neighbour in `F`, a successor
+through the successor's own context and Pred, or the predecessor through the universal
+rule over the predecessor, which derives `∃r.B(y)` in the neighbour's context from `B`
+and the edge and sends it back, and never from a hypothesis. The two regressions of the
+acceptance cover the predecessor as the only neighbour and beside a successor. The lazy
+clause with the neighbours in the body remains the form for `n ≥ 2`, where it fires only
+with `n` qualified neighbours, the predecessor among them.
+
 The predecessor is a candidate neighbour whenever the context carries the inverse of the
 qualified role, as a premise `r_B(x, y)` in the body of the product and not as a fact, so
 the new clause for `n = 1` is derived with the body `r_B(x, y)` in every context that
@@ -1432,6 +1453,29 @@ candidate adds a test and never a subsumption, so the rank carries no soundness 
 the completeness obligation is the one the runs already meet, that candidates come from a
 model of the context and that no required test is missed. The present rank is measured
 beside the new one as the control.
+
+The measurement of the rank. The low rank stays behind `SPARKLES_DL_LOW_H=1`, off by
+default. On the fixture sriq-010 it diverges where the present rank finishes, because the
+ontology's own clause `⊤ → ∃r1⁻.¬(C2 ⊔ C5) ⊔ ∀r0.¬C0 ⊔ ≥2 r1.C1` shares a clause with `H`
+after Hyper, and once `H` ranks lowest the `≥2 r1.C1` witnesses are the maximal literal
+in its place, Succ makes two more successor terms, and the functional role equates them
+with the other neighbours, which multiplies the at-most products and the paramodulations
+by about ten in one context. The rank moves the exploration onto the other disjuncts of
+such a clause rather than delaying it. On the three files of this item both ranks pass
+the bound, with the clauses of the first part and with the `n = 1` revision above, and
+the products of one shared hypothetical successor context are the cost that remains.
+That context, the hypothetical successor of `∃hasSingleBondWith.HeteroAtom`, is
+registered by fourteen predecessors, holds the markers of all of them, and resolves the
+union cases of `HeteroAtom` and `HalogenAtom` against every disjoint marker and the
+predecessor-direction existential restrictions into tens of thousands of distinct clauses
+over the predecessor, whose bodies combine the role atoms of different predecessors. Their
+Pred products in one class context, with the at-most products and paramodulations they
+feed, pass three million conclusions. A product now derives each distinct conclusion once,
+since two choices whose premises share their literals merged to one conclusion and each
+counted toward the bound, and that alone removed two thirds of the Pred conclusions of
+that context. The remedy this leaves is the one named below, a hypothetical successor
+keyed by the predecessor's restriction, so that no context combines the markers of
+different predecessors.
 
 The third part gives the witnesses of one filler one context. A minimum `≥n r.F` in a
 positive position keeps its `n` witnesses `∃r.b_i` with fresh fillers `b_i ⊑ F` pairwise

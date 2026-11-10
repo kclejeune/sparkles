@@ -167,6 +167,38 @@ fn a_universal_over_an_inverse_reaches_the_predecessor() {
 }
 
 #[test]
+fn an_exact_cardinality_counts_the_predecessor_alone() {
+    // B's r-successor in A has B, its predecessor, as its one r⁻-neighbour in B, so it is
+    // D, and A alone has no such neighbour (item 728)
+    check(
+        "SubClassOf(:B ObjectSomeValuesFrom(:r :A))
+         SubClassOf(:A ObjectMaxCardinality(1 ObjectInverseOf(:r) :B))
+         EquivalentClasses(:D ObjectIntersectionOf(:A ObjectExactCardinality(1 ObjectInverseOf(:r) :B)))
+         EquivalentClasses(:E ObjectSomeValuesFrom(:r :D))",
+        &[("B", "E")],
+        &[("A", "D"), ("A", "E")],
+    );
+}
+
+#[test]
+fn an_exact_cardinality_counts_the_predecessor_beside_a_successor() {
+    // B's r-successor in A has two r⁻-neighbours in F, its predecessor in B and its own
+    // successor in C, which the disjointness keeps apart, so it is D (item 728)
+    check(
+        &format!(
+            "SubClassOf(:B ObjectSomeValuesFrom(:r :A))
+             SubClassOf(:A ObjectSomeValuesFrom(ObjectInverseOf(:r) :C))
+             SubClassOf(:A ObjectMaxCardinality(2 ObjectInverseOf(:r) :F))
+             SubClassOf(:B :F) SubClassOf(:C :F) DisjointClasses(:B :C)
+             EquivalentClasses(:D ObjectIntersectionOf(:A ObjectExactCardinality(2 ObjectInverseOf(:r) :F)))
+             EquivalentClasses(:E ObjectSomeValuesFrom(:r :D)) {UNION}"
+        ),
+        &[("B", "E")],
+        &[("A", "D"), ("A", "E")],
+    );
+}
+
+#[test]
 fn a_complement_on_the_left_is_a_global_case() {
     // ¬B ⊑ C makes everything B or C
     check(
