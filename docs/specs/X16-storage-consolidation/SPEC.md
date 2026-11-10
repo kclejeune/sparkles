@@ -128,7 +128,8 @@ for the lane that wires the import, which then raises `DATASET_READER` and the r
 together, and the cutoff does not change it. The acceptance cases of the phase are a
 plain store created, written, reopened, branched, cloned and compacted, with the clone
 reopened and carrying `format` 2 with its own reader requirement, an activated store doing
-the same, and a backup and restore of each, all writing `format` 2 and index format 5
+the same apart from the clone, since `clone_to` refuses an activated source until item
+764 changes that, and a backup and restore of each, all writing `format` 2 and index format 5
 and reading only the retained forms, together with the refusal of a `format` 1 dataset,
 a format 4 generation and a headerless log.
 
