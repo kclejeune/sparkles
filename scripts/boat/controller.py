@@ -533,17 +533,22 @@ def drive(r,io):
         io.record('cancel-before-resume.json',{'no_provider_resume_intent':True});raise Refusal('guard arm failed; no resume') from None
     # Recheck time-bound facts while the Root environment-exclusion lock is held.
     validate_release(r,io.wall());budget(io.mono(),intent['deadline_mono'],2400);io.limits()
-    io.record('resume-intent.json',{'worker':worker_id(),'wall':io.wall(),'mono':io.mono(),'argv':['resume',worker_id(),'--environment',profile()['future_environment']['name'],'--type','large','--ttl','10800','--fail-fast','--no-wait']})
+    request_wall=io.wall()
+    io.record('resume-intent.json',{'worker':worker_id(),'wall':request_wall,'mono':io.mono(),'argv':['resume',worker_id(),'--environment',profile()['future_environment']['name'],'--type','large','--ttl','10800','--fail-fast','--no-wait']})
     try:
         result=io.boat(['resume',worker_id(),'--environment',profile()['future_environment']['name'],'--type','large','--ttl','10800','--fail-fast','--no-wait'])
-        io.record('resume-outcome.json',{'exit':result['exit'],'transport_error':result['error'],'no_ready_machine':no_ready(result),'acceptance':'positive' if positive_resume_ack(result,r['provider_contract']['resume_ack']) else ('no_ready_candidate' if no_ready(result) else 'uncertain'),'uncertain_acceptance':not positive_resume_ack(result,r['provider_contract']['resume_ack']) and not no_ready(result),'reply':recorded_reply(result)})
+        reply_wall=io.wall();ack=resume_ack(result,r['provider_contract']['resume_ack'])
+        # `running` is held as pending until the first running info shows this resume's lifetime.
+        acceptance={'resuming':'positive','running':'running_pending_lifetime'}.get(ack,'no_ready_candidate' if no_ready(result) else 'uncertain')
+        io.record('resume-outcome.json',{'exit':result['exit'],'transport_error':result['error'],'no_ready_machine':no_ready(result),'acceptance':acceptance,'uncertain_acceptance':ack is None and not no_ready(result),'reply_wall':reply_wall,'reply':recorded_reply(result)})
         if no_ready(result):
             after=io.info();stopped(after)
             need(after['environmentVersion'] in (r['snapshot_continuity']['pre_resume_environment_version'],profile()['future_environment']['version']) and after['snapshotCompletedAt']==before['snapshotCompletedAt'] and after['stoppedAt']==before['stoppedAt'],'no-ready state drift')
             io.record('no-ready-confirmed.json',{'safe_info':after,'no_start_count_claim':'documented fail-fast no_ready_machine only'})
             return 'NO_READY_CONFIRMED'
         # Never send a second resume, including timeout/malformed/unknown responses.
-        need(positive_resume_ack(result,r['provider_contract']['resume_ack']),'uncertain resume; conserve reservation, no qualification or retry')
+        # A `running` reply counts as this resume's start like `resuming` does (item 802).
+        need(ack is not None,'uncertain resume; conserve reservation, no qualification or retry')
         end=io.mono()+1950;count=0;expiry=None
         while io.mono()<end:
             budget(io.mono(),intent['deadline_mono'],30)
@@ -553,7 +558,10 @@ def drive(r,io):
             if info['state']=='stopped':raise Refusal('resume not established; retained stopped state')
             if info['state'] not in ('ready','idle','running'):
                 io.wait(1);continue
-            need(positive_resume_ack(result,r['provider_contract']['resume_ack']),'uncertain resume')
+            need(ack is not None,'uncertain resume')
+            if ack=='running':
+                need(running_resume_lifetime(info,request_wall,reply_wall),'running resume without this lifetime')
+                io.record('resume-running-confirmed.json',{'archiveAfter':info['archiveAfter'],'request_wall':request_wall,'reply_wall':reply_wall,'skew_seconds':RUNNING_ACK_SKEW,'state':info['state'],'stopped_before_resume':True})
             expiry=resumed(info,r,intent['wall'])
             budget(io.mono(),min(intent['deadline_mono'],io.mono()+expiry-io.wall()),330)
             need(info['setupStatus'] not in ('failed','error'),'startup failed')
@@ -638,7 +646,9 @@ def diagnostic_hold(io,intent):
         # A published handoff never holds, even withdrawn, since a job could be bound to it.
         if not isinstance(intent,dict) or handoff_active(io) or io.exists('no-ready-confirmed.json'):return
         if io.exists('root-handoff.json') and io.exists('qualified-worker-admission.json'):return
-        if not io.exists('resume-outcome.json') or io.read('resume-outcome.json').get('acceptance')!='positive':return
+        if not io.exists('resume-outcome.json'):return
+        acceptance=io.read('resume-outcome.json').get('acceptance')
+        if not (acceptance=='positive' or (acceptance=='running_pending_lifetime' and io.exists('resume-running-confirmed.json'))):return
         if not any(n.startswith('info-') and io.read(n).get('state') in ('ready','idle','running') for n in io.names()):return
         start=io.mono();end=min(start+HOLD_MAX,intent['mono']+CONTROLLER_RUNTIME-HOLD_RESERVE,intent['deadline_mono']-HOLD_DEADLINE_RESERVE)
         io.record('diagnostic-hold.json',{'started_boottime':start,'end_boottime':end,'seconds':max(0,end-start),'started_wall':io.wall(),'qualification_only':True})

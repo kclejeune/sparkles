@@ -1113,6 +1113,23 @@ class Controls(unittest.TestCase):
         io=self.metadata_io(self.OP4_LIKE);io.names=lambda:(_ for _ in ()).throw(OSError(5,'x'))
         with self.assertRaises(Refusal):c.drive(io.r,io)
         self.assertTrue(io.exists('stop-trigger.json'));self.assertFalse(io.exists('diagnostic-hold.json'))
+    def test_a_confirmed_running_resume_holds_like_a_resuming_one(self):
+        # Item 802. A `running` reply whose lifetime the first running info confirmed.
+        io=self.metadata_io(self.OP4_LIKE);original=io.boat
+        def running(args,*a,**k):
+            out=original(args,*a,**k)
+            return dict(out,body={'event':'accepted','id':worker_id(),'status':'running'}) if args[0]=='resume' else out
+        io.boat=running
+        with self.assertRaises(Refusal):c.drive(io.r,io)
+        self.assertEqual(io.read('resume-outcome.json')['acceptance'],'running_pending_lifetime')
+        self.assertTrue(io.exists('resume-running-confirmed.json'));self.assertTrue(io.exists('diagnostics.json'))
+        # Without the confirmation the controller neither qualifies nor holds.
+        io=self.metadata_io(self.OP4_LIKE);second=io.boat
+        io.boat=lambda args,*a,**k:dict(second(args,*a,**k),body={'event':'accepted','id':worker_id(),'status':'running'}) if args[0]=='resume' else second(args,*a,**k)
+        real=io.info;io.info=lambda:dict(real(),archiveAfter=None) if io.started and not io.stopping else real()
+        with self.assertRaises(Refusal) as caught:c.drive(io.r,io)
+        self.assertEqual(str(caught.exception),'running resume without this lifetime');self.assertEqual(sum(x[0]=='resume' for x in io.calls),1)
+        self.assertFalse(io.exists('resume-running-confirmed.json'));self.assertFalse(io.exists('diagnostic-hold.json'));self.assertTrue(io.exists('stop-trigger.json'))
     def test_no_hold_without_a_running_worker_or_after_a_handoff(self):
         for mode in ('malformed','timeout'):
             io=self.metadata_io(self.OP4_LIKE);io.mode=mode

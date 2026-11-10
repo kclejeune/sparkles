@@ -39,7 +39,16 @@ The lifecycle requests one 10,800-second resume and arms a local guard at the ea
 10,500-second wall/BOOTTIME deadline. The guard unit's own runtime limit is 43,500
 seconds, which covers the 12-hour extension cap, the wait for a running extension act
 and the stop margin. The provider TTL stays the worker's backstop. It checks the live guard's boot, invocation,
-loaded command, PID, cgroup and limits. Null, malformed or lost acknowledgements retain
+loaded command, PID, cgroup and limits. A resume is acknowledged when the provider's
+reply is `accepted` for this worker with the status `resuming`. The provider also answers
+`running` when it resumes a stopped worker at once. That reply is accepted only because
+the worker was read as stopped with a completed snapshot just before the resume, and
+only once the first running state shows an `archiveAfter` 10,800 seconds after a moment
+between the request and its reply, within 30 seconds of clock difference. That proves
+the lifetime is this resume's, and `resume-running-confirmed.json` records it. Until
+then `resume-outcome.json` names the acceptance `running_pending_lifetime`, and a
+running worker without that lifetime is refused and stopped. Either reply spends the
+start reservation. Null, malformed or lost acknowledgements, and any other status, retain
 the start reservation and never authorize another resume. `resume-outcome.json` keeps a
 bounded summary of the reply beside the acceptance, with its byte and line counts,
 whether it parsed as one JSON document or as JSON lines, and for at most four objects
@@ -145,7 +154,22 @@ worktree, the index and HEAD, whose `lstat` size differs from its index size and
 raw target hashes to the blob HEAD records. A regular file is never accepted this way,
 because a clean filter or a line-ending conversion can hide a content change from the
 diff while its new size still marks it. The qualification keeps the lines as
-`stat_only_status` beside the checkout's source observations. Any other status change
+`stat_only_status` beside the checkout's source observations.
+
+The helper hashes its status listing a moment before the probe lists it, and the stale
+line can clear in between, which leaves the probe's listing empty. The probe then
+accepts the hashed status only when it equals the hash of ` M` lines of tracked
+symbolic links, in git's order, whose index entry holds the blob HEAD records and whose
+raw target hashes to that blob. At most eight links are tried, and a credential-like
+path never accounts for a status. The probe then observes the checkout again, up to three
+times a second apart, and needs an observation equal to the recording or one that its
+own listing shows to be stat-only as above. A reread whose status the links cannot
+account for in the same way, or whose other fields differ, is a refusal at once, even
+when a later observation would be clean. So is any listing of the probe's own, at the
+first observation or a reread, with a line that is not a stale link line. The record marks such a status `transient`
+and names the links it attributed. No index refresh is used, since git keeps a size
+mismatch without reading the link and a refresh would only write the startup checkout's
+index. Any other status change
 remains a refusal, and so does a stat-only status whose content changes during the
 checker. The identity has the limits of git's own view. A path marked assume-unchanged
 or skip-worktree, a mode change under `core.fileMode=false` and ignored files do not

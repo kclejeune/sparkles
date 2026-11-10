@@ -1,6 +1,6 @@
 """Run inside the named 512-MiB qualification service."""
 from pathlib import Path
-import hashlib,json,os,stat,subprocess,sys,re,shutil,tomllib
+import hashlib,itertools,json,os,stat,subprocess,sys,re,shutil,tomllib
 
 class Refusal(Exception):pass
 def need(ok,why):
@@ -114,12 +114,123 @@ def stat_only_status(recorded,observed,status):
     if set(recorded)!=set(observed) or recorded.get('inputs')!=observed.get('inputs'):return False
     lines=status.get('_lines')
     if status.get('sha256')!=o['status_sha256'] or not lines or status.get('truncated') or status.get('omitted_credential_like'):return False
+    return stat_only_listing(status)
+def stat_only_listing(status):
+    """Whether the probe's own listing is complete and every line in it, if any, is a stale
+    link line: a worktree-only ` M` of a link in the worktree, the index and HEAD, whose lstat
+    size differs from its index size and whose raw target is the blob HEAD records."""
+    lines=status.get('_lines')
+    if not isinstance(lines,list) or 'unread' in status or status.get('truncated') or status.get('omitted_credential_like'):return False
     entries=status.get('entries') or []
     if len(entries)!=len(lines):return False
     return all(xy==' M' and e.get('xy')==' M' and e.get('kind')=='link' and e.get('index_mode')==0o120000 and isinstance(e.get('index_bytes'),int)
                and e.get('index_bytes')!=e.get('bytes') and e.get('link_matches_head') is True for (xy,_),e in zip(lines,entries))
 def public_status(status):
     return {k:v for k,v in status.items() if k!='_lines'}
+# Item 788. The helper hashes its own status listing, and the probe lists the status a
+# moment later. A stat-only line can clear in between, as in run 12, where the helper
+# hashed the ` M` line of the checkout's only symbolic link and the probe's listing was
+# empty. The helper's hash is then matched against the ` M` lines that tracked links
+# could produce, and only links whose index entry, HEAD entry and worktree target agree
+# can account for it. At most LINK_LISTING_MAX links are tried, every subset in git's order.
+LINK_LISTING_MAX=8
+INDEX_LISTING_MAX=64*1024*1024
+def index_listing(repo,env,seconds=30,argv=None):
+    """The NUL-separated entries of `git ls-files --stage -z`, read in bounded chunks.
+
+    Every read waits only for the time left, and output or an exit after the deadline refuses."""
+    import selectors,time
+    p=subprocess.Popen(argv or ['git','-C',str(repo),'-c','core.fsmonitor=false','--no-optional-locks','ls-files','--stage','-z'],
+                       stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env,cwd=repo)
+    end=time.monotonic()+seconds;total=0;rest=b'';sel=selectors.DefaultSelector();sel.register(p.stdout,selectors.EVENT_READ)
+    left=lambda:end-time.monotonic()
+    try:
+        while True:
+            need(left()>0 and sel.select(left()),'index listing time bound')
+            part=os.read(p.stdout.fileno(),1024*1024)
+            need(left()>0,'index listing time bound')
+            if not part:break
+            total+=len(part);need(total<=INDEX_LISTING_MAX,'index listing bound')
+            items=(rest+part).split(b'\0');rest=items.pop()
+            yield from items
+        try:code=p.wait(max(0.001,left()))
+        except subprocess.TimeoutExpired:raise Refusal('index listing time bound') from None
+        need(code==0 and not rest and left()>0,'qualification command failed')
+    finally:
+        sel.close()
+        if p.poll() is None:p.kill();p.wait()
+        p.stdout.close()
+def head_links(repo,env):
+    """The tracked symbolic links whose index blob is HEAD's and whose raw target matches it.
+
+    Returns None when the checkout has more than LINK_LISTING_MAX tracked links."""
+    # The whole index listing of a large checkout exceeds the 1 MiB bound of ``command``,
+    # so it is read in a stream and only link entries are kept, within INDEX_LISTING_MAX.
+    links=[]
+    for item in index_listing(repo,env):
+        m=re.fullmatch(rb'120000 ([0-9a-f]{40,64}) 0\t(.+)',item,re.S)
+        if m:links.append((m[1],m[2]))
+        if len(links)>LINK_LISTING_MAX:return None
+    out=[]
+    for blob,raw in links:
+        full=os.path.join(os.fsencode(str(repo)),raw)
+        try:linked=stat.S_ISLNK(os.lstat(full).st_mode)
+        except FileNotFoundError:continue
+        if not linked:continue
+        tree=command(['git','-C',str(repo),'--literal-pathspecs','ls-tree','-z','HEAD','--',raw.decode('utf-8','surrogateescape')],15,env,repo)
+        if tree==b'120000 blob '+blob+b'\t'+raw+b'\0' and link_matches_head(repo,raw,full,env):out.append(raw)
+    return out
+def link_listing(status_sha256,links):
+    """The links whose ` M` lines alone, in git's order, hash to ``status_sha256``, or None."""
+    for n in range(1,len(links)+1):
+        for subset in itertools.combinations(links,n):
+            if hash_bytes(b''.join(b' M '+raw+b'\0' for raw in subset))==status_sha256:return list(subset)
+    return None
+def stat_only_lines(recorded,observed,repo,env):
+    """The link paths that alone account for a drifted status the probe could not list.
+
+    Every field but the status equals a clean recording, the tracked diff is empty, and
+    the helper's status hash is that of ` M` lines of tracked links that match HEAD."""
+    r,o=source_fields(recorded),source_fields(observed)
+    if any(r[k]!=o[k] for k in SOURCE_FIELDS if k!='status_sha256'):return None
+    if r['status_sha256']!=EMPTY_SHA256 or o['tracked_diff_sha256']!=EMPTY_SHA256 or o['status_sha256'] is None:return None
+    if set(recorded)!=set(observed) or recorded.get('inputs')!=observed.get('inputs'):return None
+    links=head_links(repo,env)
+    names=None if links is None else link_listing(o['status_sha256'],links)
+    # A credential-like path is never listed, so it never accounts for a status either.
+    return None if names is None or any(status_credential_like(raw.decode('utf-8','replace')) for raw in names) else names
+SOURCE_REREADS=3
+def startup_source(repo,expected,observe,env,pause=None):
+    """The checkout's first source observation and, when a stat-only status is accepted, its evidence.
+
+    ``observe`` runs the installed helper. A first observation equal to the recording
+    passes. A drift passes when the probe's own listing shows it is stat-only. When the
+    listing cannot show the hashed lines (item 788), the hash must belong to ` M` lines of
+    HEAD-matching links. Up to SOURCE_REREADS further observations, a second apart, then
+    look for one that equals the recording or is stat-only by a listing read right after
+    it. A reread that is neither and whose status the links cannot account for in the
+    same way is drift at once, so a change seen between two clean observations is never
+    accepted. SourceDrift names the last pair read.
+    """
+    first=observe()
+    if first==expected:return first,None
+    status=status_record(repo,env)
+    if stat_only_status(expected,first,status):return first,dict(public_status(status),stat_only=True)
+    def attributed(row):
+        try:return stat_only_lines(expected,row,repo,env)
+        except Exception:return None
+    # The probe's own listing must show nothing but stale link lines at every step too.
+    names=attributed(first) if stat_only_listing(status) else None
+    if names is None:raise SourceDrift('existing source drift',repo,expected,first,status)
+    again,now=first,status
+    for attempt in range(SOURCE_REREADS):
+        if attempt:(pause or __import__('time').sleep)(1)
+        again=observe();now=status_record(repo,env)
+        if not stat_only_listing(now):break
+        if again==expected or stat_only_status(expected,again,now):
+            return first,dict(public_status(now),stat_only=True,transient=True,attributed=[raw.decode('utf-8','replace') for raw in names])
+        if attributed(again) is None:break
+    raise SourceDrift('existing source drift',repo,expected,again,now)
 
 class SourceDrift(Refusal):
     """A checkout whose source identity differs, with every field recorded beside observed."""
@@ -217,12 +328,7 @@ def probe(payload):
     need(shutil.which('cargo',path=env['PATH'])==str(home/'.local/share/mbx/bin/cargo'),'Cargo resolution')
     helper=str(new/'toolchain-state.py');sources={};checks={}
     for repo,expected in [(Path(profile()['startup_repositories']['default']),s['default_source']),(Path(profile()['startup_repositories']['retained']),s['retained_source'])]:
-        first=json.loads(command(['/usr/bin/python3',helper,'source',str(repo)],30,env,repo))
-        stale=None
-        if first!=expected:
-            status=status_record(repo,env)
-            if not stat_only_status(expected,first,status):raise SourceDrift('existing source drift',repo,expected,first,status)
-            stale=dict(public_status(status),stat_only=True)
+        first,stale=startup_source(repo,expected,lambda:json.loads(command(['/usr/bin/python3',helper,'source',str(repo)],30,env,repo)),env)
         check=json.loads(command(['/bin/bash',str(new/'repository-start.sh'),str(repo)],55,env,repo))
         need(check['native_started'] is False and check['status']=='tools-ready-workload-admission-still-required' and check['uid']==uid,'checker outcome')
         last=json.loads(command(['/usr/bin/python3',helper,'source',str(repo)],30,env,repo))
