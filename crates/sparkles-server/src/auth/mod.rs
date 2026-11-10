@@ -887,6 +887,11 @@ impl Principal {
         self.is_ambient()
     }
 
+    /// The graph patterns hidden from this principal's reads so far.
+    pub fn hidden_patterns(&self) -> &[String] {
+        self.hidden.as_deref().unwrap_or(&[])
+    }
+
     /// This principal with the graphs that `patterns` match hidden from its reads, in
     /// every dataset, whatever its grants say.
     #[cfg_attr(not(feature = "mcp"), allow(dead_code))]

@@ -690,10 +690,11 @@ explicit retry makes a new run that links the old one.
 
 In Rust, `Dataset::jobs()` configures, submits, claims, renews, publishes, fails, cancels,
 retries and inspects. Over HTTP the routes are under `/$/jobs/{ds}`, described in
-[the API reference](../API.md#durable-jobs). The ledger graph is readable under the
-caller's grants in this release. Delivery through an outbox, recurring definitions and
-recovery after a restore or clone are roadmap item 339, and the analysis and batch kinds
-are items 899 and 900.
+[the API reference](../API.md#durable-jobs). The ledger graph leaves every caller's
+query, Graph Store, listing and history view, whatever the caller's grants say, and only
+the jobs inspection renders its records. Delivery through an outbox, recurring definitions
+and recovery after a restore or clone are roadmap item 339, and the analysis and batch
+kinds are items 899 and 900.
 
 ## Known gaps
 

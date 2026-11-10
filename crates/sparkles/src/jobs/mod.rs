@@ -285,7 +285,9 @@ impl Jobs {
             store.require_dataset_reader(READER)?;
         }
         let graphs = settings.managed_graphs();
-        let entry = OwnerEntry::for_settings(PROFILE, graphs, &canonical);
+        let mut entry = OwnerEntry::for_settings(PROFILE, graphs, &canonical);
+        // the ledger leaves every caller's read view (C26 §2.3)
+        entry.visibility = crate::managed::Visibility::Hidden;
         let graphs = store.enable_managed_at(OwnerKind::Jobs, entry, &canonical, revision)?;
         status_from(Some(&graphs), Some(&canonical))
     }

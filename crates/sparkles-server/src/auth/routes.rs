@@ -1254,6 +1254,26 @@ pub(crate) fn protected_resource(
 }
 
 /// The `{ds}` segment of the request path.
+/// `p` with the hidden managed graphs of the request's dataset (spec C26 §2.3), such as
+/// the job ledger, left out of its read and write views on top of the graphs its grants
+/// and the server's configuration hide. A request that names no dataset, or one the
+/// server does not hold, is unchanged.
+fn hiding_owner_graphs(st: &AppState, route: &str, uri: &Uri, p: Principal) -> Principal {
+    let Some(ds) = ds_of(route, uri) else {
+        return p;
+    };
+    let Some(dataset) = st.get(&ds) else {
+        return p;
+    };
+    let hidden = dataset.dataset.store().hidden_graphs();
+    if hidden.is_empty() {
+        return p;
+    }
+    let mut patterns: Vec<String> = p.hidden_patterns().to_vec();
+    patterns.extend(hidden);
+    p.hiding_graphs(&patterns)
+}
+
 fn ds_of(route: &str, uri: &Uri) -> Option<String> {
     let pos = route.split('/').position(|s| s == "{ds}")?;
     let seg = uri.path().split('/').nth(pos)?;
@@ -1300,7 +1320,17 @@ pub async fn middleware(State(st): State<Arc<AppState>>, mut req: Request, next:
         crate::http::add_request_id(&mut r, id);
         return r;
     }
-    req.extensions_mut().insert(Principal::local());
+    // without authentication the local principal still loses the dataset's hidden
+    // control graphs (spec C26 §2.3)
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_string());
+    let p = match route {
+        Some(route) => hiding_owner_graphs(&st, &route, req.uri(), Principal::local()),
+        None => Principal::local(),
+    };
+    req.extensions_mut().insert(p);
     next.run(req).await
 }
 
@@ -1694,7 +1724,8 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         }
     }
 
-    // pass
+    // pass, with the dataset's hidden control graphs out of the principal's views
+    let p = hiding_owner_graphs(st, &route, req.uri(), p);
     let report = report_of(&p, None);
     req.extensions_mut().insert(p);
     let mut resp = next.run(req).await;

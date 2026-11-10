@@ -1,7 +1,6 @@
 # C26: Durable jobs and delivery
 
-> **Status:** Phase 1 shipped for the `quads` kind, without the hidden visibility of the
-> ledger graph.
+> **Status:** Phase 1 shipped for the `quads` kind.
 >
 > **Phases:** Phase 1 adds durable jobs, fenced worker leases, atomic publication and
 > checkpoints through the library and HTTP. Phase 2 adds the delivery outbox, recurring
@@ -499,7 +498,7 @@ implementation status. This spec's status and Outcome describe its delivery.
 ## Outcome
 
 Phase 1 shipped for the `quads` kind. The jobs owner `OwnerKind::Jobs` of the
-managed-graph registry protects one control graph, `urn:x-sparkles:jobs:ledger`, and
+managed-graph registry protects one hidden control graph, `urn:x-sparkles:jobs:ledger`, and
 keeps its definitions in `jobs.json` at format 1 and profile 1. Enabling jobs raises the
 dataset reader to 9 through `require_reader` before `jobs.json` and `managed.json` are
 written. `Dataset::jobs()` submits with an idempotency key scoped as §3 says, claims with
@@ -519,9 +518,17 @@ crashes before and after the submission, claim and publication commits, each reo
 the dataset and checking the business quads and the ledger together. The ordering argument
 is §7.1.
 
-Not in this phase. The ledger graph is visible to readers of the dataset under their
-grants, since no read surface filters by an owner's visibility yet; it stores no secret.
-The dispatcher scans the committed ledger by state with a bound of 4096 runs per state
+The ledger graph is the first owner graph with the `hidden` visibility of §2.3. The
+registry lists the hidden graphs of its owners, and they leave every graph view a request
+or a library query runs under: the server's authentication middleware subtracts them from
+the principal's view for every route of the dataset, and the library subtracts them from
+the view of every SPARQL query it runs, including a caller's explicit all-graphs view.
+Only the typed inspection of the jobs handle reads the ledger. A registry this build cannot
+enforce still hides the graphs its file names as hidden.
+
+Not in this phase. The library's Graph Store, history, diff and dump handles apply a
+caller's view when one is given but do not subtract hidden graphs on their own, which
+item 902 covers with the dispatch follow-ups. The dispatcher scans the committed ledger by state with a bound of 4096 runs per state
 instead of keeping a ready-time index, inspection has no cursor, quotas are per dataset,
 a server shutdown does not fence claims, and the authority fence between a publication's
 preparation and its commit is the next request's recheck (item 902). Current task records

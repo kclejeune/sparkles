@@ -43,7 +43,8 @@ key, lease them to workers with a bearer token and a lease generation, and publi
 worker's quads with the publication record, the source checkpoint and the run's completion
 in one commit, so a retry after a lost response or a crash never duplicates its effects.
 A restart fences every earlier lease by boot epoch before the process admits a claim.
-Enabling jobs raises the dataset's `minimumReader` to 9, so older releases refuse to open
+The ledger graph is the first hidden managed graph: it leaves every request's and every
+library query's graph view, and only the jobs inspection renders it. Enabling jobs raises the dataset's `minimumReader` to 9, so older releases refuse to open
 such a dataset. The private import transport now names its destination reader as
 `IMPORTED_DESTINATION_READER`, one above `DATASET_READER`.
 

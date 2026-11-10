@@ -278,9 +278,14 @@ impl Jobs {
                 "the job ledger graph is not protected; record the jobs settings again",
             )
         })?;
+        // The ledger graph lies outside every caller's view once it is hidden, so the
+        // store's own view check cannot run on a typed commit. The business quads of a
+        // publication are checked against the caller's view one by one in `publish`,
+        // and a view with triple rules is refused there.
+        let _ = write;
         let opts = crate::guard::WriteOptions {
             message: message.map(Arc::from),
-            graphs: write,
+            graphs: None,
             ..Default::default()
         };
         let mut t = store.try_write_with(crate::commit::CommitKind::Transaction, opts)?;
@@ -937,6 +942,11 @@ impl Jobs {
                 "the result holds {count} quads, more than the definition's {}",
                 def.max_output_quads
             )));
+        }
+        if caller.write.as_ref().is_some_and(|a| a.triples.is_some()) {
+            return Err(Error::NotPermitted(
+                "a publication under a view that protects triples is not supported; the worker needs graph-level grants".into(),
+            ));
         }
         {
             let capability = t.managed().expect("capability set");

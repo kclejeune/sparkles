@@ -159,6 +159,22 @@ impl Store {
         }
     }
 
+    /// The managed graphs that leave every caller's read view: those of owners whose
+    /// visibility is `hidden`. Empty without a registry. A registry this build cannot
+    /// enforce answers the graphs its file still names as hidden, when the file reads,
+    /// so that a damaged registry does not disclose them.
+    pub fn hidden_graphs(&self) -> Vec<String> {
+        match self.managed_state().as_deref() {
+            None => Vec::new(),
+            Some(ManagedState::Installed(i)) => i.graphs.hidden_graphs(),
+            Some(ManagedState::Unavailable { .. }) => self
+                .managed_root()
+                .and_then(|root| std::fs::read(root.join(crate::managed::FILE)).ok())
+                .and_then(|bytes| crate::managed::hidden_graphs_of_file(&bytes))
+                .unwrap_or_default(),
+        }
+    }
+
     /// The managed graphs of this store's dataset, `None` when no owner manages any.
     /// Fails with `managed-unavailable` when the registry cannot be enforced.
     pub fn managed_graphs(&self) -> Result<Option<ManagedGraphs>> {

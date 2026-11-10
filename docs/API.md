@@ -13478,7 +13478,8 @@ definitions, each with a kind, the graphs its publications may change, the princ
 that may submit and claim it, and its retry and lease policy. The only kind in this build
 is `quads`, whose typed result is bounded insert and delete quads in the definition's
 graphs with an opaque source checkpoint. The first configuration raises the dataset reader
-to 9 durably, so a release that does not know the ledger refuses to open the dataset.
+to 9 durably, so a release that does not know the ledger refuses to open the dataset, and
+marks the ledger graph hidden in the managed-graph registry.
 
 ```json
 {
@@ -13543,9 +13544,11 @@ the same `404`, and no response carries a token or its verifier.
 
 A restart installs a new boot epoch before the process admits any claim, renewal or
 publication. Attempts of an earlier epoch are interrupted, their runs return to their
-retry policy, and their tokens fail from then on. The ledger graph is readable under the
-caller's grants in this release. Delivery through an outbox, recurring definitions and
-restore and clone recovery are [roadmap](ROADMAP.md) work.
+retry policy, and their tokens fail from then on. The ledger graph is hidden: it leaves
+every caller's query, Graph Store, listing, history and diff view, whatever the caller's
+grants say, and a request for it answers as for a graph that does not exist. Delivery
+through an outbox, recurring definitions and restore and clone recovery are
+[roadmap](ROADMAP.md) work.
 
 ### Suggested examples
 

@@ -4,6 +4,7 @@
 use super::*;
 use crate::Dataset;
 use oxrdf::{GraphName, Literal, NamedNode, Quad};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -119,6 +120,33 @@ fn submit_result(ds: &Dataset, key: &str) -> Result<Submitted> {
         &Submission::new("collect", serde_json::json!({"page": 1}), key),
         &admin(),
     )
+}
+
+#[test]
+fn the_ledger_graph_leaves_every_query_view_while_typed_inspection_reads_it() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    let s = submit(&ds, "k1");
+    let hidden = ds.store().hidden_graphs();
+    assert_eq!(hidden, vec![LEDGER_GRAPH.to_string()]);
+    assert!(
+        !ds.ask(&format!("ASK {{ GRAPH <{LEDGER_GRAPH}> {{ ?s ?p ?o }} }}"))
+            .unwrap()
+    );
+    assert!(!ds.ask("ASK { GRAPH ?g { ?s ?p ?o } }").unwrap());
+    let mut opts = crate::sparql::QueryOptions::default();
+    opts.graphs = Some(Arc::new(crate::access::GraphAccess::all()));
+    let r = ds
+        .query_with(
+            &format!("ASK {{ GRAPH <{LEDGER_GRAPH}> {{ ?s ?p ?o }} }}"),
+            &opts,
+        )
+        .unwrap();
+    assert!(
+        !r.boolean,
+        "an explicit all-graphs view still leaves the ledger out"
+    );
+    assert!(ds.jobs().get(s.run, &admin()).unwrap().is_some());
 }
 
 #[test]

@@ -49,6 +49,10 @@ async fn call(
     )
 }
 
+fn enc(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
 fn settings() -> J {
     json!({
         "format": 1, "profile": 1, "enabled": true,
@@ -117,6 +121,45 @@ async fn submit_claim_publish_and_fence_over_http() {
     assert_eq!(s, StatusCode::CONFLICT, "{j}");
     assert_eq!(j["code"], "idempotency-conflict");
 
+    // the ledger graph leaves the query, Graph Store and listing views (C26 §2.3)
+    let ledger = sparkles::jobs::LEDGER_GRAPH;
+    let ask = format!("ASK {{ GRAPH <{ledger}> {{ ?s ?p ?o }} }}");
+    let (s, j, _) = call(
+        &app,
+        "GET",
+        &format!("/d/query?query={}", enc(&ask)),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!(j["boolean"], false);
+    let (s, j, _) = call(
+        &app,
+        "GET",
+        &format!(
+            "/d/query?query={}",
+            enc("SELECT ?g { GRAPH ?g { ?s ?p ?o } }")
+        ),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!(j["results"]["bindings"].as_array().unwrap().len(), 0);
+    let (s, _, _) = call(
+        &app,
+        "GET",
+        &format!("/d/data?graph={}", enc(ledger)),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "a hidden graph answers as a missing one"
+    );
     let (s, j, _) = call(&app, "GET", &format!("/$/jobs/d/{run}"), None, None).await;
     assert_eq!(s, StatusCode::OK, "{j}");
     assert_eq!(j["state"], "queued");

@@ -830,9 +830,31 @@ impl Dataset {
             views: Some(Arc::new(crate::handles::views::Source {
                 state: self.inner.reference.clone(),
             })),
+            graphs: self.hide_owner_graphs(None),
             defaults_applied: true,
             ..Default::default()
         }
+    }
+
+    /// `graphs` without the dataset's hidden managed graphs (spec C26 §2.3), such as the
+    /// job ledger, which only their owner's typed inspection renders. `None` stays `None`
+    /// while nothing is hidden, so the common case costs one registry load.
+    pub fn hide_owner_graphs(
+        &self,
+        graphs: Option<Arc<crate::access::GraphAccess>>,
+    ) -> Option<Arc<crate::access::GraphAccess>> {
+        let hidden = self.inner.store.hidden_graphs();
+        if hidden.is_empty() {
+            return graphs;
+        }
+        let mut view = graphs
+            .map(|g| (*g).clone())
+            .unwrap_or_else(crate::access::GraphAccess::all);
+        for h in &hidden {
+            view.read = view.read.without_iri(h);
+            view.write = view.write.without_iri(h);
+        }
+        Some(Arc::new(view))
     }
 
     /// `opts` under the dataset's memory pool, unless they name a pool or a grant.
@@ -859,6 +881,7 @@ impl Dataset {
         }
         let defaults = self.query_options();
         let mut o = opts.clone();
+        o.graphs = self.hide_owner_graphs(o.graphs.take());
         if o.rdfs.is_none() {
             o.rdfs = defaults.rdfs;
         }

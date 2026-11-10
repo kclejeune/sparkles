@@ -327,13 +327,16 @@ fn capabilities_admit_only_their_owner_and_registry() {
             .is_err()
     );
     drop(t);
-    // reserved entry members are refused
+    // a hidden owner's graphs leave every caller's read view, and a public one's do not
     let mut hidden = entry(&[M], SETTINGS);
     hidden.visibility = crate::managed::Visibility::Hidden;
-    assert_eq!(
-        managed_code(s.enable_managed(OwnerKind::Evidence, hidden, SETTINGS)),
-        "unsupported-profile"
-    );
+    s.enable_managed(OwnerKind::Evidence, hidden, SETTINGS)
+        .unwrap();
+    assert_eq!(s.hidden_graphs(), vec![M.to_string()]);
+    s.enable_managed(OwnerKind::Evidence, entry(&[M], SETTINGS), SETTINGS)
+        .unwrap();
+    assert!(s.hidden_graphs().is_empty());
+    // the reserved merge policy is refused
     let mut exclude = entry(&[M], SETTINGS);
     exclude.merge = crate::managed::MergePolicy::Exclude;
     assert_eq!(
@@ -474,7 +477,7 @@ fn an_unenforceable_registry_refuses_writes_and_keeps_reads() {
         (
             "managed.json",
             "unknown owner",
-            |v| v["owners"]["jobs"] = v["owners"]["evidence"].clone(),
+            |v| v["owners"]["widgets"] = v["owners"]["evidence"].clone(),
             false,
         ),
         (
@@ -906,9 +909,9 @@ fn copies_of_unknown_owners_are_refused() {
         match name {
             "unknown owner" => {
                 edit(&root, "managed.json", |v| {
-                    v["owners"]["jobs"] = v["owners"]["evidence"].clone()
+                    v["owners"]["widgets"] = v["owners"]["evidence"].clone()
                 });
-                std::fs::write(root.join("jobs.json"), b"{}").unwrap();
+                std::fs::write(root.join("widgets.json"), b"{}").unwrap();
             }
             "newer format" => edit(&root, "managed.json", |v| v["format"] = 3.into()),
             _ => edit(&root, "managed.json", |v| {
