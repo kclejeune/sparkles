@@ -8566,7 +8566,7 @@ triples.
 The run needs the closure of the previous run, which includes the derived triples that
 are not valid RDF and so never reach the inferred graph. Each dataset of a server keeps
 it in memory after a run, up to `serve --reason-cache-triples` derived triples. The limit
-is 10 million by default, and a derived triple takes about 135 bytes. The kept closure
+is 10 million by default, and a derived triple takes about 40 bytes. The kept closure
 holds only the derived triples and reads the input graphs from the store's indexes. After a
 restart, and in `sparkles infer`, the run builds it again from the input graphs and the
 inferred graph of the recorded commit. A persistent dataset keeps the derived triples that

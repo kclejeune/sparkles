@@ -119,8 +119,69 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 The quick-fixes phase is built. Roadmap items 485 and 486 shipped and item 487 was
 measured and not adopted. The reasoner also records witnesses for F18 under item 416.
-The core and convergence phases remain under
-[item 456](../../ROADMAP.md).
+The columnar derived tier, the first phase of the core, is built under item 835. The
+other core and convergence phases remain under [item 456](../../ROADMAP.md).
+
+### Columnar derived tier
+
+`crates/sparkles-reasoner/src/tier` holds the derived facts. A fact gets a dense `u32`
+id in the order of its first derivation, as the rows were numbered before, and its
+subject, object and predicate live in three columns by id, so the facts of one merge are
+an interval of ids and the semi-naive ranges of the engine keep their meaning. Each
+predicate is a relation with its ids in ascending order, as its row list was before, and
+two orders of its ids, by subject then id and by object then id. An order is a list of
+immutable sorted runs, and a run keeps a fence key every eight entries, so a probe with a
+bound subject or object searches the fence keys, which are few, and then the keys of at
+most eight facts. A merge appends one run per order and compacts the older runs first,
+from the newest back while the next older run is at most twice their size and further
+back until eight runs remain, and a relation with a quarter of its facts dead is rebuilt
+without them. The engine sets a compaction floor at the start of each iteration's delta,
+so a run the iteration reads is never merged with older ones, and a batch added between
+runs lowers the floor to its first id. Orders over the whole tier by subject and by
+object serve atoms with a variable predicate and are built on demand. A probe with a
+bound predicate alone reads the predicate's id list, and a count of a predicate's facts
+over an id range is a binary search in it. The triple index by hash stays, since the merge deduplicates its candidates through it and
+`position` finds a fact by its triple in one lookup. The explicit flags of a maintained
+closure are a bitmap of the tier beside the dead bitmap. `graph.rs` is a front over the
+tier with the same interface, and the candidates of a probe are pieces of runs or id
+ranges rather than a list of rows, filtered by the id range where a run is met in part.
+
+The plan weighed two layouts. The first keeps each order as columns of subject, object
+and id, 20 bytes per fact per order, with a position table of 8 bytes from id to place,
+48 bytes in all. The second, which is built, keeps the columns by id once, 20 bytes, the
+predicate's id list, 4 bytes, and each order as ids with fence keys, 5 bytes, 34 bytes in
+all, and pays an indirection for each key it compares. The second was chosen because the memory gate of the phase is a
+halving of the peak heap per derived fact and the candidate buffers, the term table and
+the operators' workspace take a share of that peak the tier does not control, so the
+smaller tier gives the gate room, and because the fence keys keep the indirect
+comparisons of a probe to about three dependent reads. Measuring the first layout
+against it is roadmap item 862, and a merge that deduplicates against the sorted orders
+without the triple index is item 863. The ids still start after the base tier's facts,
+so an input of more than `u32::MAX / 2` triples is still refused, and item 864 moves the
+base tier off the id space.
+
+The candidates of every probe are visited by ascending id, as the row lists gave them:
+the id list of a predicate ascends, a probe with a bound subject or object finds ids
+sorted by id within a run and the runs' id intervals ascend, and an id range ascends. The
+facts an iteration derives therefore get the ids the previous tier gave them, and a
+derived list link keeps its earliest value.
+
+On wally, a 20-thread development host with 32 GiB that other work shared during the
+runs, `sparkles infer --full` under `owl-rl` on OWL2Bench with 5 universities derived
+52,966,139 facts in six iterations with both builds. The tier held them in 1,925 MB at
+the end, 36 bytes per derived fact with the triple index and the cache of base facts,
+against about 135 bytes before, and RDFox reports 40 to 60. The peak of the run did not
+fall with it. The budget's peak was 10.3 GB, 195 bytes per derived fact, and the peak
+resident set was 8.4 to 9.5 GiB against 9.7 to 10.5 GiB for the build before, 7 to 13
+percent less. The peak lies in the first iteration, where the closure operators derive
+52.4 million facts in one step and the run holds their outputs, the operators' sets and
+the merge's buffers beside the tier at once, so the tier is not where the memory of
+OWL2Bench(5) goes, which answers item 522's question, and item 522 now covers the
+operators' step. The gate of half the peak heap per derived fact is therefore not met by
+the tier alone. At one thread the tier build took 96 and 158 s against 108 and 126 s,
+and at 20 threads 45 and 131 s against 44 and 49 s, on a host whose load average passed
+60 during the later rounds, so the timings decide nothing and the comparison is rerun on
+a quiet host after the push.
 
 ### Closure operators
 

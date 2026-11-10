@@ -538,6 +538,18 @@ CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
 
+The reasoner's derived facts live in a columnar tier (roadmap item 835). A fact's
+subject, object and predicate are three columns by fact id, each predicate keeps its ids
+in order, and each predicate's facts are sorted twice, by subject and by object, in runs
+with fence keys that a probe searches before it reads the keys of at most eight facts. A
+merge appends one run per order and compacts the older runs, and a relation with a
+quarter of its facts dead is rebuilt. A fact costs 34 bytes in the tier beside its slot
+in the triple index, and OWL2Bench with 5 universities measured 36 bytes per derived fact
+with the index, where the rows, hash lists and tables it replaces cost about 135 bytes.
+The run's peak memory moved little, because the closure operators' first step holds
+their 52 million outputs and the merge's buffers beside the tier. Full and incremental
+runs derive the same closures with the same fact ids as before.
+
 Notification channels deliver independently (item 46). Each channel has its own queue
 and delivery thread, so a webhook or ntfy server that hangs or fails delays only its own
 deliveries. A channel's queue holds its share of 1,000 deliveries, at least 50, and a
