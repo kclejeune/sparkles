@@ -550,3 +550,28 @@ fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_5_of_6() {
 fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_6_of_6() {
     galloping_index_joins_part(5, 6);
 }
+
+/// An algorithm join admits the bytes of the table it is about to build and refuses a
+/// table whose capacity differs. A join of one to a few rows must therefore gather its
+/// columns at exactly that length, since a column grown from empty takes the allocator's
+/// minimum capacity of four instead.
+#[test]
+fn an_algorithm_join_of_a_few_rows_fits_its_admitted_capacity() {
+    let store = Store::in_memory(StoreOptions::default());
+    let ctx = Ctx::new(store.snapshot());
+    let [k, a, b] = ["k", "a", "b"].map(|n| ctx.var(n));
+    for n in 1..=6u64 {
+        let mut l = Table::new(vec![a, k]);
+        let mut r = Table::new(vec![k, b]);
+        for i in 1..=n {
+            l.push_row(&[Id(10 + i), Id(i)]);
+            r.push_row(&[Id(i), Id(20 + i)]);
+        }
+        let out = super::exec::join_algorithm_tables(&ctx, &l, &r)
+            .unwrap_or_else(|e| panic!("{n} rows: {e}"));
+        assert_eq!(out.table.len(), n as usize);
+        for col in &out.table.cols {
+            assert_eq!(col.capacity(), n as usize, "{n} rows");
+        }
+    }
+}

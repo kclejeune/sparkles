@@ -4161,9 +4161,15 @@ fn compatible(l: &Table, r: &Table, i: usize, j: usize, shared: &[(usize, usize)
 }
 
 /// The rows of a join from left row indices `li` and right row indices `rj` (`NO_ROW`
-/// for none). The left side's unbound shared variables take the right row's values.
+/// for none). The left side's unbound shared variables take the right row's values. Each
+/// column is allocated at exactly the row count, since the algorithm join admits the
+/// table's bytes before it is built and a column grown from empty would take the
+/// allocator's minimum capacity instead for a few rows.
 fn materialize(l: &Table, r: &Table, lay: &JoinLayout, li: &[u32], rj: &[u32]) -> Table {
     let mut t = Table::new(lay.vars.clone());
+    for col in &mut t.cols {
+        col.reserve_exact(li.len());
+    }
     let columns = hash::columns(&lay.vars, &l.vars, &r.vars);
     gather(&mut t, &columns, l, r, li, rj);
     t
