@@ -829,6 +829,19 @@ impl Graph {
         r
     }
 
+    /// The shape of the triple index, for the trace of an iteration: the sum of the
+    /// shards' capacities, the sum of their lengths, and the largest and the smallest
+    /// capacity of one shard.
+    pub fn index_shape(&self) -> (usize, usize, usize, usize) {
+        let caps = self.index.iter().map(|t| t.capacity());
+        (
+            caps.clone().sum(),
+            self.index.iter().map(|t| t.len()).sum(),
+            caps.clone().max().unwrap_or(0),
+            caps.min().unwrap_or(0),
+        )
+    }
+
     /// The id of a live derived triple.
     #[inline]
     pub fn position(&self, t: &Triple) -> Option<u32> {

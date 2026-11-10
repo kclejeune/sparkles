@@ -2166,6 +2166,7 @@ pub(crate) fn run_observed(
             );
         }
         iteration += 1;
+        let (index_cap, index_len, index_cap_max, index_cap_min) = g.index_shape();
         tracing::debug!(
             iteration,
             new,
@@ -2176,6 +2177,10 @@ pub(crate) fn run_observed(
             used_bytes = limits.budget.used(),
             peak_bytes = limits.budget.peak(),
             tier_bytes = g.heap_bytes(),
+            index_cap,
+            index_len,
+            index_cap_max,
+            index_cap_min,
             "reasoner iteration"
         );
         if g.inferred_since(base_len) > limits.max_inferred {
