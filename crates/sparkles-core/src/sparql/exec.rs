@@ -4317,6 +4317,14 @@ fn hash_index<'a>(
     shared: &[(usize, usize)],
     note: &mut Option<String>,
 ) -> Result<EagerIndex<'a>> {
+    if build.is_empty() {
+        // nothing to find: every probe row visits the no rows there are
+        return Ok(EagerIndex {
+            index: None,
+            probe_keys: None,
+            _keys: None,
+        });
+    }
     let exact: Vec<(usize, usize)> = shared
         .iter()
         .copied()

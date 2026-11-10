@@ -446,6 +446,43 @@ mod tests {
             .unwrap();
             assert_eq!((zl, zr), (el, er), "test {test}");
         }
+        // An exact run whose product exceeds 64 pairs is admitted before it is expanded,
+        // and a filtered run admits only the pairs it gave.
+        let long = ids(&vec![3i64; 100]);
+        let refuse = |pairs: usize| {
+            if pairs > 90 {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        };
+        let (mut l, mut r) = (Vec::new(), Vec::new());
+        let refused = zip(
+            &ctx,
+            &long,
+            &long,
+            true,
+            |_, _| true,
+            refuse,
+            &mut l,
+            &mut r,
+        );
+        assert!(matches!(refused, Err(Error::Cancelled)), "{refused:?}");
+        assert!(l.is_empty());
+        let (mut l, mut r) = (Vec::new(), Vec::new());
+        zip(
+            &ctx,
+            &long,
+            &long,
+            false,
+            |a, b| a == b,
+            refuse,
+            &mut l,
+            &mut r,
+        )
+        .unwrap();
+        assert_eq!(l.len(), 100);
+        assert!(l.iter().zip(&r).all(|(a, b)| a == b));
     }
 
     #[test]
