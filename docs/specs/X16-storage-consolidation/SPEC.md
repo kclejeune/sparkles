@@ -563,14 +563,17 @@ Phase 1, the first-release format cutoff of item 479, is built. `dataset.json` i
 written as `format` 2 with reader 5 or more, the generation index as format 5 with its
 feature list and a required `vocab.idx`, and every pre-release form is refused with the
 dump-and-reload message: a `format` 1 dataset or a reader below 5, index formats 2 to 4,
-a generation without `vocab.idx`, the headerless write-ahead log, delta vocabulary
-version 1 and backup key slot format 1. No `migrate` step is registered, and the tests
-exercise the migration machinery through a synthetic step. The legacy framing of the log,
+the headerless write-ahead log, delta vocabulary version 1 and backup key slot format 1.
+A format 5 generation without `vocab.idx`, or with one that does not describe its
+vocabulary, is corrupt. No `migrate` step is registered, and the tests exercise the
+migration machinery through a synthetic step. The legacy framing of the log,
 `Framing::Mixed`, `fold_legacy`, `walStrictFrom` and the folding of legacy commits, is
-deleted, and the replay, `sparkles check` and the read-only prefix prover apply one
-first-record rule: a header record, or the zeros of a header that a crash tore at the
-log's creation, which the open reads as an empty log and creates again, with the
-generation directory synced before the writer starts. The fixture
+deleted. The replay, `sparkles check` and the read-only prefix prover refuse a first
+record that is neither a header record nor zeros, and read a record of zeros alone as a
+header that a crash tore at the log's creation, which the open reads as an empty log and
+creates again, with the generation directory synced before the writer starts. The open
+and `check` also read a log of zeros longer than one record as that torn creation, while
+the prover refuses it, a conservative difference for a read-only reader. The fixture
 `testsuite/formats/35e7cae4` was written at the cutoff commit, and the two pre-release
 fixtures stay for their refusal tests in the engine and through the command line. Items
 847 and 848 record the follow-ups, a required `Segments` and `Sparse` without an `Option`

@@ -54,8 +54,7 @@ These read paths are tuned for queries over data that is not yet in memory
   repeat of a query makes no read hint.
 * Index joins decode the columns they need on a separate pool, and optional warmup
   observes cancellation and deadlines. Each step has its own `Optimizations` flag.
-* A point lookup in index format 3 decodes the frames of 2,048 rows that can hold its
-  keys. An index join whose keys in one block span more than a quarter of the block's
+* A point lookup decodes the frames of 2,048 rows that can hold its keys. An index join whose keys in one block span more than a quarter of the block's
   frames reads the block whole at its first cold frame, so a large join does not read
   frames one by one before it reads their block again.
 * `sparkles serve --prewarm` records, at shutdown and every `--prewarm-interval` seconds,
@@ -161,10 +160,10 @@ These read paths are tuned for queries over data that is not yet in memory
   15 to 21 MiB.
 * `/$/metrics` reports the synchronization time, the commits per fence, the wait, and why
   commits fell back or failed. `/$/stats/{ds}` says whether the dataset groups commits.
-* A WAL written before logs had a header record is framed strictly from the offset where
-  the current release first opened it for writing. The offset is recorded in the
-  generation's `commit.json` once the log, its vocabulary and its annotations are durable,
-  so a torn modern record after it is never read as a legacy one.
+* Every write-ahead log starts with a header record and every commit record carries
+  metadata, so a commit record without it is damage: a torn tail when no later record
+  proves the commit durable, and corruption otherwise. A header that a crash tore at the
+  log's creation reads as an empty log, which the open creates again.
 * A data directory belongs on a local file system. Sparkles does not support NFS for a
   data directory, because the process lock is an advisory file lock and the index files
   are memory-mapped, and neither is reliable across clients of a network file system.

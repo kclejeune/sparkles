@@ -4,7 +4,7 @@
 
 ### Format
 
-The first-release format cutoff (item 479, spec X16 Phase 1). `dataset.json` is written
+The first-release format cutoff of item 479 implements X16 Phase 1. `dataset.json` is written
 as `format` 2 with `minimumReader` 5 or more, and a `format` 1 file or one that requires a
 reader below 5 is refused with the dump-and-reload message. The generation index is
 written and read as format 5, which is format 4 with the `features` list always present
