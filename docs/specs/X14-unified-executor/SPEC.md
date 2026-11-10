@@ -661,15 +661,19 @@ operator all run through the kernels. The cursor's merge operator keeps its runs
 batch boundaries and the spooling of long runs, and the ripple join and the index join
 stay as they were.
 
-An OPTIONAL condition is tested once over the gathered candidate rows of a chunk in both
-modes, so the generic conditional OPTIONAL over two inputs that share no variable no
-longer materializes their product. The `merge_left_join` switch selects the merge
-OPTIONAL in both modes, and EXPLAIN names the algorithm that ran, `[merge on ?k]` or
-`[hash join]`, in both. An eager join whose hash table does not fit the memory budget of
-a query that may spill runs again as the cursor's partitioned hash join over its two
-input tables, whose Grace partitioning wraps the same kernel, and its plan notes
-`[build did not fit: partitioned to disk]`. The eager memory retry still covers the
-operators that do not spill.
+A hash join's OPTIONAL condition is tested once over the gathered candidate rows of a
+chunk in both modes, so the generic conditional OPTIONAL over two inputs that share no
+variable no longer materializes their product. The `merge_left_join` switch selects the
+merge OPTIONAL without a condition in both modes, and EXPLAIN names the algorithm that
+ran, `[merge on ?k]` or `[hash join]`, in both. An OPTIONAL with a condition over two
+sorted inputs still merges only in eager execution, where its condition is tested over
+all of the matched pairs at once, and hashes in the cursor, which item 854 follows. An
+eager hash join, OPTIONAL, semi join, anti join or MINUS whose hash table does not fit
+the memory budget of a query that may spill runs again as the cursor's partitioned hash
+join over its two input tables, whose Grace partitioning wraps the same kernel, and its
+plan notes `[build did not fit: partitioned to disk]`. A keyed join partitions in neither
+mode, since its sides share no variable to partition on, which item 853 follows. The
+eager memory retry still covers the operators that do not spill.
 
 A unit test checks the galloping search against `partition_point` on random sorted
 slices, a cursor test checks that the OPTIONAL over sorted inputs honours the switch and
@@ -679,8 +683,9 @@ side is charged in eager execution, which it was not before, and the eager OPTIO
 builds on its right side as the cursor does rather than on the smaller side. An eager
 MINUS, semi join or anti join on one bound key now builds the kernel's table with its
 grouped rows, about twice the memory of the id set it used, which item 852 follows. The
-conditional OPTIONAL of item 570 is measured in both modes on the benchmark worker as
-the plan describes, and item 570 records the result.
+measurement of item 570's conditional OPTIONAL in both modes on the benchmark worker,
+which the plan asks of this phase, is outstanding, and item 570 records it when it is
+taken.
 
 ### Measurements of stage 1
 

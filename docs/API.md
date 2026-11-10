@@ -2690,7 +2690,7 @@ Query parameters beyond the standard protocol:
   every operator of the query has a cursor implementation. That covers counts over
   OPTIONAL and MINUS. Such groupings measured 0.50 to 0.91 times the eager time. On a
   server with spill on, a SELECT of cursor operators that eager execution would hold in
-  more than half its memory budget streams too, an eager join whose hash table does not
+  more than half its memory budget streams too, an eager hash join whose table does not
   fit the budget partitions its inputs to disk through the cursor's join, and an eager
   SELECT that still exceeds its memory budget runs once more as a cursor within the same
   deadline, unless it calls SERVICE anywhere, inside an EXISTS included, a graph

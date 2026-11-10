@@ -794,6 +794,7 @@ impl Merge {
                 0,
                 self.optional,
                 room,
+                |_, _| true,
                 &mut lrows,
                 &mut rrows,
             )?;
@@ -903,8 +904,8 @@ impl Merge {
                 };
                 if covered > li {
                     let rkeys = &rc[ri..];
-                    let _scratch =
-                        ctx.charge((covered - li) as u64 * 4 + rkeys.len() as u64 * 4 + 128)?;
+                    // the lower bounds; the kernel charges the run lengths it counts with
+                    let _scratch = ctx.charge((covered - li) as u64 * 4 + 128)?;
                     let first = kernel::bounds(ctx, &lc[li..covered], rkeys)?;
                     let n = kernel::count(ctx, &lc[li..covered], rkeys, &first, self.optional)?;
                     count = count

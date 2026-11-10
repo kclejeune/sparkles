@@ -88,7 +88,13 @@ impl HashIndex {
     /// with. Row numbers are 32 bits wide, and the grouped rows, the unbound rows and
     /// the key tables are charged before they grow.
     pub(crate) fn new(ctx: &Ctx, build: &Table, column: usize, probe: usize) -> Result<Self> {
-        let rows = u32::try_from(build.len)
+        Self::from_keys(ctx, &build.cols[column], probe)
+    }
+
+    /// Index the build rows on the keys `keys`, one per row, which probe column `probe`
+    /// is compared with unless the probe brings keys of its own ([`Join::probe_keys`]).
+    pub(crate) fn from_keys(ctx: &Ctx, keys: &[Id], probe: usize) -> Result<Self> {
+        let rows = u32::try_from(keys.len())
             .ok()
             .filter(|&n| n < NO_ROW)
             .ok_or_else(|| Error::invalid("a hash join build input has too many rows"))?;
@@ -97,7 +103,6 @@ impl HashIndex {
         // hold a key per row, and with its old buckets while it grows.
         let mut charge =
             ctx.retained_charge((n as u64) * 12 + map_bytes(n, 16).saturating_mul(3) / 2 + 1024)?;
-        let keys = &build.cols[column];
         let bits = if n < PART_MIN {
             0
         } else {
@@ -397,6 +402,10 @@ pub(crate) struct Join<'a> {
     pub build: &'a Table,
     pub shared: &'a [(usize, usize)],
     pub index: Option<&'a HashIndex>,
+    /// The key of each probe row when the index is keyed on a hash of several columns,
+    /// in place of the probe column the index names. The shared columns are then checked
+    /// on every candidate, since keys of other rows can share the hash.
+    pub probe_keys: Option<&'a [Id]>,
     /// A keyed join's equality: the probe column and the index of the build values.
     pub equality: Option<(usize, &'a EqualityIndex)>,
 }
@@ -432,7 +441,10 @@ impl Join<'_> {
         }
         Ok(match self.index {
             Some(index) => {
-                let key = self.probe.cols[index.probe][row];
+                let key = match self.probe_keys {
+                    Some(keys) => keys[row],
+                    None => self.probe.cols[index.probe][row],
+                };
                 if key.is_undef() {
                     Candidates::All(self.build.len)
                 } else {
@@ -465,7 +477,7 @@ impl Join<'_> {
         {
             // Every build row binds the key, so a bound probe row matches exactly the rows
             // of its key. Whole rows go into the pairs while they fit, written in place.
-            let keys = &probe.cols[index.probe];
+            let keys = self.probe_keys.unwrap_or(&probe.cols[index.probe]);
             let mut w = lp.len();
             lp.resize(limit, 0);
             rp.resize(limit, 0);

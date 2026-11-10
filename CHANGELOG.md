@@ -39,9 +39,9 @@ it.
 Roadmap item 825 gives the eager executor and the cursor one join-kernel library. The
 hash, keyed and merge kernels of `sparql/join` and one galloping search serve both
 modes, the `merge_left_join` switch selects the merge OPTIONAL in both and EXPLAIN names
-the algorithm that ran, an OPTIONAL condition is tested once per chunk of candidate
-pairs in both, and an eager join whose hash table does not fit the budget of a query
-that may spill partitions its inputs to disk through the cursor's join instead of
+the algorithm that ran, a hash join's OPTIONAL condition is tested once per chunk of
+candidate pairs in both, and an eager hash join whose table does not fit the budget of a
+query that may spill partitions its inputs to disk through the cursor's join instead of
 failing.
 
 Roadmap item 791 adds Nemo 0.10.1 as the reference for the `owl-rl` materialization. The

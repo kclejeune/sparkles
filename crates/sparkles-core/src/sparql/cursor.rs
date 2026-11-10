@@ -2174,12 +2174,20 @@ impl Drop for QueryCursor {
 /// cursor's join operator, which partitions its build input to disk when it does not
 /// fit, and append its rows to `out`. An eager join calls this when its build does not
 /// fit the memory budget of a query that may spill. The output is checked against the
-/// query's limits as it grows, as an eager join's output is.
+/// query's memory limit as it grows, as an eager join's output is, and the eager
+/// operator counts the produced rows of its inputs and its output, so the tree here
+/// counts none.
 pub(super) fn spilled_join(ctx: &Arc<Ctx>, node: Node, out: &mut Table) -> Result<()> {
     let options = CursorOptions::default();
     let mut operator = Operator::build(ctx, node, FallbackPolicy::RejectMaterialization)?;
+    fn uncount(operator: &mut Operator) {
+        operator.uncounted = true;
+        operator.children.iter_mut().for_each(uncount);
+    }
+    uncount(&mut operator);
     while let Some(batch) = operator.next(ctx, &options, options.batch_rows)? {
-        ctx.check_output(out.len() + batch.table.len, out.width() + 1)?;
+        ctx.check_output_bytes(out.len() + batch.table.len, out.width() + 1)?;
+        ctx.check_rows(out.len() + batch.table.len)?;
         out.append(batch.table);
     }
     Ok(())
@@ -2266,6 +2274,9 @@ struct Operator {
     bind_reuse: Option<Box<bind::Reuse>>,
     /// Whether the operator and those below it released what they hold for reading.
     released: bool,
+    /// Whether the operator's rows stay out of the produced-row count, because an eager
+    /// operator that runs this tree counts them as its own.
+    uncounted: bool,
     /// The variables every output batch, and the concatenation of all of them, is
     /// sorted on in raw ID order. It is fixed when the operator is built, and each
     /// output batch carries it.
@@ -2950,6 +2961,7 @@ impl Operator {
             reason,
             bind_reuse,
             released: false,
+            uncounted: false,
             order,
             #[cfg(debug_assertions)]
             last: None,
@@ -2998,6 +3010,7 @@ impl Operator {
             growing: true,
             bind_reuse: None,
             released: false,
+            uncounted: false,
             order,
             #[cfg(debug_assertions)]
             last: None,
@@ -3274,7 +3287,9 @@ impl Operator {
                     .checked_add(rows)
                     .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
                 ctx.check_rows(self.rows)?;
-                ctx.produced(rows)?;
+                if !self.uncounted {
+                    ctx.produced(rows)?;
+                }
                 self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
             } else {
                 self.done = true;
@@ -3316,13 +3331,15 @@ impl Operator {
                     .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
                 ctx.check_rows(self.rows)?;
                 // Eager kernels already counted all their operator work during execution.
-                if !matches!(
-                    self.state,
-                    State::Fallback { .. }
-                        | State::Scalar(_)
-                        | State::Counts { .. }
-                        | State::Expand(_)
-                ) {
+                if !self.uncounted
+                    && !matches!(
+                        self.state,
+                        State::Fallback { .. }
+                            | State::Scalar(_)
+                            | State::Counts { .. }
+                            | State::Expand(_)
+                    )
+                {
                     ctx.produced(b.table.len)?;
                 }
                 // a fallback counts the rows it emitted; `materializedRows` holds its table

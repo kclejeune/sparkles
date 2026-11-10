@@ -235,6 +235,35 @@ fn merge_left_joins_keep_the_left_order_and_the_rows_of_hash_left_joins() {
     assert!(merged > 400);
 }
 
+/// A merge join on two shared variables tests the second one on each pair of the first
+/// key's runs before the pair counts, so a constant first key with unique second keys
+/// gives one row per left row within a row limit that the product of the runs exceeds.
+#[test]
+fn merge_joins_on_two_keys_count_only_compatible_pairs_against_the_row_limit() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ctx = ctx_with(&s, Optimizations::ALL);
+    ctx.max_rows = 4096;
+    let [k, x] = ["k", "x"].map(|n| ctx.var(n));
+    let rows = 1000usize;
+    let side = |vars: Vec<VarId>| {
+        let mut t = Table::new(vars);
+        for i in 0..rows {
+            t.push_row(&[Id(7), Id(100 + i as u64)]);
+        }
+        t.sorted = vec![k, x];
+        t
+    };
+    let (l, r) = (side(vec![k, x]), side(vec![k, x]));
+    let joined = super::exec::join_tables(&ctx, &l, &r, &[k], true).unwrap();
+    assert_eq!(joined.len(), rows);
+    assert!(
+        joined.cols[1]
+            .iter()
+            .enumerate()
+            .all(|(i, v)| *v == Id(100 + i as u64))
+    );
+}
+
 /// The zippers of merge left joins and anti joins, alone, side by side over parts of the
 /// inputs, or galloping, give every left id's lower bound in the right column. The inputs
 /// include runs of duplicates, gaps that leave a part without rows on one side, and sizes

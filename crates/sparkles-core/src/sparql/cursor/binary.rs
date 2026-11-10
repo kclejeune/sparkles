@@ -337,6 +337,7 @@ impl Binary {
             build: &self.build.as_ref().expect("captured build").table,
             shared: &self.shared,
             index: self.index.as_ref(),
+            probe_keys: None,
             equality: self
                 .equality
                 .map(|(p, _)| p)

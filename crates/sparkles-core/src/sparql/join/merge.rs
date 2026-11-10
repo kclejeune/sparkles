@@ -23,10 +23,11 @@ pub(crate) fn bounds(ctx: &Ctx, lk: &[Id], rk: &[Id]) -> Result<Vec<u32>> {
 
 /// Pair the left rows from `from` with the right runs of their keys, given the lower
 /// bounds `first` of the left keys in `rk`: a left row whose key the right column holds
-/// pairs with every row of the run, and in an OPTIONAL join a left row whose key it
-/// lacks pairs with [`NO_ROW`]. At most `room` pairs are appended to `lrows` and
-/// `rrows`, a run that does not fit is left whole for the next call, and the number of
-/// left rows decided is returned, so that the caller resumes at `from` plus it.
+/// pairs with every row of the run that `compatible` accepts, as (left row, right
+/// row), and in an OPTIONAL join a left row with no accepted pair pairs with
+/// [`NO_ROW`]. At most `room` pairs are appended to `lrows` and `rrows`, a run whose
+/// length does not fit is left whole for the next call, and the number of left rows
+/// decided is returned, so that the caller resumes at `from` plus it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn expand(
     ctx: &Ctx,
@@ -36,6 +37,7 @@ pub(crate) fn expand(
     from: usize,
     optional: bool,
     room: usize,
+    compatible: impl Fn(usize, usize) -> bool,
     lrows: &mut Vec<u32>,
     rrows: &mut Vec<u32>,
 ) -> Result<usize> {
@@ -47,7 +49,8 @@ pub(crate) fn expand(
             ctx.check()?;
         }
         let at = at as usize;
-        let row = (from + j) as u32;
+        let left = from + j;
+        let row = left as u32;
         if at < rk.len() && rk[at] == key {
             if run.0 != at {
                 run = (at, run_end(rk, at));
@@ -56,8 +59,17 @@ pub(crate) fn expand(
             if lrows.len() + n > limit {
                 break;
             }
-            lrows.extend(std::iter::repeat_n(row, n));
-            rrows.extend(at as u32..run.1 as u32);
+            let before = lrows.len();
+            for right in at..run.1 {
+                if compatible(left, right) {
+                    lrows.push(row);
+                    rrows.push(right as u32);
+                }
+            }
+            if optional && lrows.len() == before {
+                lrows.push(row);
+                rrows.push(NO_ROW);
+            }
         } else if optional {
             if lrows.len() == limit {
                 break;
@@ -152,7 +164,16 @@ mod tests {
                 let mut from = 0;
                 while from < lk.len() {
                     let done = expand(
-                        &ctx, &lk, &rk, &first, from, optional, room, &mut lrows, &mut rrows,
+                        &ctx,
+                        &lk,
+                        &rk,
+                        &first,
+                        from,
+                        optional,
+                        room,
+                        |_, _| true,
+                        &mut lrows,
+                        &mut rrows,
                     )
                     .unwrap();
                     if done == 0 {
@@ -160,7 +181,16 @@ mod tests {
                         let n = run_end(&rk, first[from] as usize) - first[from] as usize;
                         assert!(n > room, "room {room} from {from}");
                         from += expand(
-                            &ctx, &lk, &rk, &first, from, optional, n, &mut lrows, &mut rrows,
+                            &ctx,
+                            &lk,
+                            &rk,
+                            &first,
+                            from,
+                            optional,
+                            n,
+                            |_, _| true,
+                            &mut lrows,
+                            &mut rrows,
                         )
                         .unwrap();
                         continue;
@@ -184,6 +214,35 @@ mod tests {
         );
     }
 
+    /// Pairs a second shared variable rejects are not produced, so a run's length bounds
+    /// the room it needs while the pairs it gives count only when accepted, and an
+    /// OPTIONAL row none of whose candidates passes is kept alone.
+    #[test]
+    fn incompatible_pairs_of_a_run_are_dropped_before_they_count() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let lk = ids(&[1, 1, 1, 2]);
+        let rk = ids(&[1, 1, 1, 2]);
+        let first = bounds(&ctx, &lk, &rk).unwrap();
+        // left row i pairs with right row j only when i == j, and row 3 with none
+        let same = |l: usize, r: usize| l == r && l != 3;
+        for optional in [false, true] {
+            let (mut l, mut r) = (Vec::new(), Vec::new());
+            let mut from = 0;
+            while from < lk.len() {
+                from += expand(
+                    &ctx, &lk, &rk, &first, from, optional, 3, same, &mut l, &mut r,
+                )
+                .unwrap();
+            }
+            let mut want = vec![(0, 0), (1, 1), (2, 2)];
+            if optional {
+                want.push((3, NO_ROW));
+            }
+            assert_eq!(l.into_iter().zip(r).collect::<Vec<_>>(), want);
+        }
+    }
+
     #[test]
     fn an_empty_right_column_matches_nothing() {
         let store = Store::in_memory(StoreOptions::default());
@@ -195,7 +254,19 @@ mod tests {
         assert_eq!(filter(&lk, &[], &first, false), vec![true, true]);
         let (mut l, mut r) = (Vec::new(), Vec::new());
         assert_eq!(
-            expand(&ctx, &lk, &[], &first, 0, true, 10, &mut l, &mut r).unwrap(),
+            expand(
+                &ctx,
+                &lk,
+                &[],
+                &first,
+                0,
+                true,
+                10,
+                |_, _| true,
+                &mut l,
+                &mut r
+            )
+            .unwrap(),
             2
         );
         assert_eq!((l, r), (vec![0, 1], vec![NO_ROW, NO_ROW]));

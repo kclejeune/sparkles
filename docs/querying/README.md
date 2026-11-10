@@ -185,11 +185,11 @@ check them against the W3C suites and Jena's own answers.
   ASK products whose eager candidates would exceed a budget, and large equality-keyed
   ASK joins. Other plans run eagerly, and
   `execution=eager` or `execution=streaming` overrides the choice. Both modes join
-  through the same hash, keyed and merge kernels, so an OPTIONAL over two inputs sorted
-  on their shared variable merges in both when `merge_left_join` is on and hashes in
-  both when it is off, an OPTIONAL condition is tested once over each chunk of candidate
-  pairs rather than over the whole product, and EXPLAIN names the algorithm that ran in
-  either mode.
+  through the same hash, keyed and merge kernels, so an OPTIONAL without a condition over
+  two inputs sorted on their shared variable merges in both when `merge_left_join` is on
+  and hashes in both when it is off, a hash join's OPTIONAL condition is tested once over
+  each chunk of candidate pairs rather than over the whole product, and EXPLAIN names
+  the algorithm that ran in either mode.
 * Rust, Python and Node have snapshot-owning SELECT and graph cursors, and the JVM
   library pulls SELECT results. Result writers use bounded buffers with backpressure and
   stop when the client disconnects.
@@ -237,11 +237,11 @@ check them against the W3C suites and Jena's own answers.
     in memory. Spill files are versioned, CRC-checked, unnamed while written and removed
     with their query or process.
   * Disk is reserved per query with `--query-spill-mb` or `spill-mb=`, and for the server
-    with `--spill-max-mb`. With spill on, an eager join whose hash table does not fit the
-    budget partitions its two inputs to disk through the cursor's join and gives the same
-    answer, automatic execution streams a query that eager execution would hold in more
-    than half its budget, and it reruns an eager query that exceeds its budget as a
-    cursor unless it calls SERVICE.
+    with `--spill-max-mb`. With spill on, an eager hash join, OPTIONAL, semi join, anti
+    join or MINUS whose hash table does not fit the budget partitions its two inputs to
+    disk through the cursor's join and gives the same answer, automatic execution streams
+    a query that eager execution would hold in more than half its budget, and it reruns
+    an eager query that exceeds its budget as a cursor unless it calls SERVICE.
   * With `--spill on` or `encrypted`, the server refuses to start with an unusable spill
     directory, one on tmpfs or ramfs, or one that other users can write. With the default,
     it logs a warning and runs without spill.

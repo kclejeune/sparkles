@@ -1255,18 +1255,15 @@ fn run_node(
         Kind::KeyedLeftJoin { expr, left, right } => {
             let l = child(0, infos)?;
             let r = child(1, infos)?;
-            join_or_spill(ctx, n, l, r, &mut note, |l, r, note| {
-                keyed_left_join(ctx, l, r, expr, (*left, *right), note)
-            })?
+            // a keyed join partitions in neither mode, since its sides share no variable
+            keyed_left_join(ctx, &l, &r, expr, (*left, *right), &mut note)?
         }
         Kind::KeyedJoin {
             expr, left, right, ..
         } => {
             let l = child(0, infos)?;
             let r = child(1, infos)?;
-            join_or_spill(ctx, n, l, r, &mut note, |l, r, note| {
-                keyed_join(ctx, l, r, expr, (*left, *right), false, note)
-            })?
+            keyed_join(ctx, &l, &r, expr, (*left, *right), false, &mut note)?
         }
         Kind::Minus => {
             let l = child(0, infos)?;
@@ -4277,26 +4274,90 @@ fn hash_filter(ctx: &Ctx, join: &Join) -> Result<Vec<bool>> {
     Ok(keep)
 }
 
-/// The hash table of `build` on the key column the kernel chooses for the shared
-/// columns `shared` (probe column, build column), or none when every probe row must
-/// visit every build row. Its note names the table.
-fn hash_index(
-    ctx: &Ctx,
+/// The hash table of an eager join's build side: the table itself, the probe side's
+/// composite keys when the table is keyed on several columns, and the charge of the
+/// keys while the probe runs.
+struct EagerIndex<'a> {
+    index: Option<HashIndex>,
+    probe_keys: Option<Vec<Id>>,
+    _keys: Option<super::ctx::Charge<'a>>,
+}
+
+impl EagerIndex<'_> {
+    /// The kernel's view of the probe table `probe` against `build` in `mode`.
+    fn join<'a>(
+        &'a self,
+        mode: Mode,
+        probe: &'a Table,
+        build: &'a Table,
+        shared: &'a [(usize, usize)],
+    ) -> Join<'a> {
+        Join {
+            mode,
+            probe,
+            build,
+            shared,
+            index: self.index.as_ref(),
+            probe_keys: self.probe_keys.as_deref(),
+            equality: None,
+        }
+    }
+}
+
+/// The hash table of `build` for the shared columns `shared` (probe column, build
+/// column). Two or more shared columns that neither side leaves unbound key the table
+/// on a hash of them all, so that a probe row meets about the rows of its own key, and
+/// the kernel checks the columns themselves on each candidate. Otherwise the table is
+/// keyed on the one column the kernel chooses, or there is none and every probe row
+/// visits every build row. The note names the table.
+fn hash_index<'a>(
+    ctx: &'a Ctx,
     probe: &Table,
     build: &Table,
     shared: &[(usize, usize)],
     note: &mut Option<String>,
-) -> Result<Option<HashIndex>> {
-    let Some((p, b)) = hash::key_column(ctx, probe, build, shared)? else {
-        return Ok(None);
+) -> Result<EagerIndex<'a>> {
+    let exact: Vec<(usize, usize)> = shared
+        .iter()
+        .copied()
+        .filter(|&(p, b)| !has_undef(probe, p) && !has_undef(build, b))
+        .collect();
+    let (index, probe_keys, keys) = if exact.len() > 1 {
+        let keys = ctx.charge((probe.len() + build.len()) as u64 * 8 + 64)?;
+        let composite = |t: &Table, cols: &[usize]| -> Result<Vec<Id>> {
+            map_rows(ctx, t.len(), t.len() >= PAR_THRESHOLD, |i| {
+                use std::hash::{Hash, Hasher};
+                let mut h = rustc_hash::FxHasher::default();
+                for &c in cols {
+                    t.cols[c][i].0.hash(&mut h);
+                }
+                Id(h.finish())
+            })
+        };
+        let bcols: Vec<usize> = exact.iter().map(|&(_, b)| b).collect();
+        let pcols: Vec<usize> = exact.iter().map(|&(p, _)| p).collect();
+        let build_keys = composite(build, &bcols)?;
+        let index = HashIndex::from_keys(ctx, &build_keys, usize::MAX)?;
+        drop(build_keys);
+        (Some(index), Some(composite(probe, &pcols)?), Some(keys))
+    } else {
+        match hash::key_column(ctx, probe, build, shared)? {
+            Some((p, b)) => (Some(HashIndex::new(ctx, build, b, p)?), None, None),
+            None => (None, None, None),
+        }
     };
-    let index = HashIndex::new(ctx, build, b, p)?;
-    *note = Some(format!(
-        "[flat hash table: {} keys in {} parts]",
-        index.keys(),
-        index.partitions()
-    ));
-    Ok(Some(index))
+    if let Some(index) = &index {
+        *note = Some(format!(
+            "[flat hash table: {} keys in {} parts]",
+            index.keys(),
+            index.partitions()
+        ));
+    }
+    Ok(EagerIndex {
+        index,
+        probe_keys,
+        _keys: keys,
+    })
 }
 
 /// Pairs of compatible rows (inner join), as (left rows, right rows).
@@ -4347,14 +4408,7 @@ fn join_pairs(
         .map(|&(lc, rc)| if build_left { (rc, lc) } else { (lc, rc) })
         .collect();
     let index = hash_index(ctx, probe, build, &shared, note)?;
-    let join = Join {
-        mode: Mode::Inner,
-        probe,
-        build,
-        shared: &shared,
-        index: index.as_ref(),
-        equality: None,
-    };
+    let join = index.join(Mode::Inner, probe, build, &shared);
     let (lp, rp) = hash_pairs(ctx, &join, w)?;
     Ok(if build_left { (rp, lp) } else { (lp, rp) })
 }
@@ -4372,25 +4426,12 @@ fn merge_pairs(
     w: usize,
 ) -> Result<(Vec<u32>, Vec<u32>)> {
     let (a, b) = (&l.cols[lk], &r.cols[rk]);
-    let (mut li, mut rj) = merge_expand(ctx, a, b, false, w)?;
     if lay.shared.len() > 1 {
-        let mut k = 0;
-        let keep: Vec<bool> = li
-            .iter()
-            .zip(&rj)
-            .map(|(&i, &j)| compatible(l, r, i as usize, j as usize, &lay.shared))
-            .collect();
-        li.retain(|_| {
-            k += 1;
-            keep[k - 1]
-        });
-        k = 0;
-        rj.retain(|_| {
-            k += 1;
-            keep[k - 1]
+        return merge_expand(ctx, a, b, false, w, |i, j| {
+            compatible(l, r, i, j, &lay.shared)
         });
     }
-    Ok((li, rj))
+    merge_expand(ctx, a, b, false, w, |_, _| true)
 }
 
 /// Every left row of the sorted key column `a` with the right rows of the sorted key
@@ -4403,8 +4444,10 @@ fn merge_expand(
     b: &[Id],
     optional: bool,
     w: usize,
+    compatible: impl Fn(usize, usize) -> bool,
 ) -> Result<(Vec<u32>, Vec<u32>)> {
     // `first[i]`: the first right row whose key is at least left row i's
+    let _bounds = ctx.charge(a.len() as u64 * 4 + 64)?;
     let first = merge::bounds(ctx, a, b)?;
     // most merge joins match each row of the smaller side about once
     let (mut li, mut rj) = (
@@ -4422,6 +4465,7 @@ fn merge_expand(
             from,
             optional,
             PROBE_PIECE,
+            &compatible,
             &mut li,
             &mut rj,
         )?;
@@ -4430,7 +4474,18 @@ fn merge_expand(
             let at = first[from] as usize;
             let n = run_end(b, at) - at;
             ctx.check_output(li.len().saturating_add(n), w)?;
-            from += merge::expand(ctx, a, b, &first, from, optional, n, &mut li, &mut rj)?;
+            from += merge::expand(
+                ctx,
+                a,
+                b,
+                &first,
+                from,
+                optional,
+                n,
+                &compatible,
+                &mut li,
+                &mut rj,
+            )?;
         } else {
             from += done;
         }
@@ -4448,6 +4503,7 @@ fn join_count(ctx: &Ctx, l: &Table, r: &Table, merge: bool) -> Result<u64> {
         let rsorted = r.sorted.first().is_some_and(|v| r.col_of(*v) == Some(rk));
         if lsorted && rsorted && !has_undef(l, lk) && !has_undef(r, rk) {
             let (a, b) = (&l.cols[lk], &r.cols[rk]);
+            let _bounds = ctx.charge(a.len() as u64 * 4 + 64)?;
             let first = merge::bounds(ctx, a, b)?;
             return merge::count(ctx, a, b, &first, false);
         }
@@ -4953,14 +5009,7 @@ pub(super) fn left_join(
         return merge_left_join(ctx, l, r, &lay, (lc, rc), expr);
     }
     let index = hash_index(ctx, l, r, &lay.shared, note)?;
-    let join = Join {
-        mode: Mode::Optional,
-        probe: l,
-        build: r,
-        shared: &lay.shared,
-        index: index.as_ref(),
-        equality: None,
-    };
+    let join = index.join(Mode::Optional, l, r, &lay.shared);
     let (li, rj) = match expr {
         Some(e) => {
             let (li, rj, _) = hash_condition(ctx, &join, &lay, e)?;
@@ -5027,6 +5076,7 @@ fn keyed_join(
         build: r,
         shared: &[],
         index: None,
+        probe_keys: None,
         equality: Some((lc, &index)),
     };
     let (li, rj, candidates) = hash_condition(ctx, &join, &lay, expr)?;
@@ -5053,7 +5103,7 @@ fn merge_left_join(
     let (a, b) = (&l.cols[lc], &r.cols[rc]);
     let w = lay.vars.len() + 1;
     // each left row with the right rows of its key, or with none
-    let (mut li, mut rj) = merge_expand(ctx, a, b, true, w)?;
+    let (mut li, mut rj) = merge_expand(ctx, a, b, true, w, |_, _| true)?;
     if let Some(e) = expr {
         // the FILTER is tested on the matched rows; a left row none of whose matches
         // pass is kept alone
@@ -5198,14 +5248,12 @@ fn unfold(
 fn half_join(ctx: &Ctx, l: &Table, r: &Table, anti: bool) -> Result<Table> {
     let lay = layout(l, r);
     let index = hash_index(ctx, l, r, &lay.shared, &mut None)?;
-    let join = Join {
-        mode: if anti { Mode::Anti } else { Mode::Semi },
-        probe: l,
-        build: r,
-        shared: &lay.shared,
-        index: index.as_ref(),
-        equality: None,
-    };
+    let join = index.join(
+        if anti { Mode::Anti } else { Mode::Semi },
+        l,
+        r,
+        &lay.shared,
+    );
     let keep = hash_filter(ctx, &join)?;
     drop(index);
     kept_rows(ctx, l, &keep)
@@ -5252,14 +5300,7 @@ fn minus(ctx: &Ctx, l: &Table, r: &Table, note: &mut Option<String>) -> Result<T
         }
         _ => {
             let index = hash_index(ctx, l, r, &lay.shared, &mut None)?;
-            let join = Join {
-                mode: Mode::Minus,
-                probe: l,
-                build: r,
-                shared: &lay.shared,
-                index: index.as_ref(),
-                equality: None,
-            };
+            let join = index.join(Mode::Minus, l, r, &lay.shared);
             if let Some((lc, _)) = anti {
                 *note = Some(format!(
                     "[anti-join on ?{} by hash]",
@@ -5275,6 +5316,7 @@ fn minus(ctx: &Ctx, l: &Table, r: &Table, note: &mut Option<String>) -> Result<T
 /// Which ids of the sorted column `a` are not in the sorted column `b`: a left row is
 /// kept when the first right id not less than its own differs.
 fn merge_anti_join(ctx: &Ctx, a: &[Id], b: &[Id]) -> Result<Vec<bool>> {
+    let _bounds = ctx.charge(a.len() as u64 * 4 + 64)?;
     let first = merge::bounds(ctx, a, b)?;
     Ok(merge::filter(a, b, &first, false))
 }

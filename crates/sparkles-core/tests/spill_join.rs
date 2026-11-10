@@ -729,7 +729,12 @@ fn an_eager_join_whose_build_does_not_fit_spills_instead_of_failing() {
         failed.err()
     );
     let spill = spill(tmp.path());
-    let r = query(s.snapshot(), q, &options(Some(spill.clone()))).unwrap();
+    let work = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let spilled = QueryOptions {
+        work: Some(work.clone()),
+        ..options(Some(spill.clone()))
+    };
+    let r = query(s.snapshot(), q, &spilled).unwrap();
     assert_eq!(
         sorted(r.rows().into_iter().map(|row| format!("{row:?}")).collect()),
         expected
@@ -743,6 +748,23 @@ fn an_eager_join_whose_build_does_not_fit_spills_instead_of_failing() {
     assert!(plan.contains("partitioned to disk"), "{plan}");
     assert_eq!(spill.reserved_bytes(), 0);
     assert!(leftovers(tmp.path()).is_empty());
+    // The spilled join produces the rows the eager join produces, once: its inputs and
+    // its output are the eager operators', and the cursor tree that runs it counts none.
+    let unspilled = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    query(
+        s.snapshot(),
+        q,
+        &QueryOptions {
+            work: Some(unspilled.clone()),
+            no_cache: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        work.load(std::sync::atomic::Ordering::Relaxed),
+        unspilled.load(std::sync::atomic::Ordering::Relaxed)
+    );
 }
 
 /// A budget the hash table of the MINUS's right input, 60,000 rows of about 50,000 keys,
