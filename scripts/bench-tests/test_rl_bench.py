@@ -1,6 +1,7 @@
 """Check scripts/rl-reference/bench.sh: every helper is defined before the script first
-calls it, and its capped runner classifies a run's end and leaves no process behind. The
-runner tests need a systemd user manager and GNU time, and are skipped without them."""
+calls it, every `sparkles infer` of it and of compare.sh takes MAX_INFERRED as its
+--max-inferred, and its capped runner classifies a run's end and leaves no process behind.
+The runner tests need a systemd user manager and GNU time, and are skipped without them."""
 
 import os
 import re
@@ -13,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 BENCH = ROOT / "scripts" / "rl-reference" / "bench.sh"
+COMPARE = ROOT / "scripts" / "rl-reference" / "compare.sh"
 TEXT = BENCH.read_text()
 
 
@@ -60,6 +62,41 @@ class Order(unittest.TestCase):
             for name, at in defs.items():
                 if re.match(rf"\s*(if !? *)?{name}\b(?!\()", line):
                     self.assertLess(at, i, f"{name} is called at line {i + 1} before its definition")
+
+
+class InferredLimit(unittest.TestCase):
+    def test_every_infer_passes_the_limit(self):
+        for script in (BENCH, COMPARE):
+            calls = [
+                line for line in script.read_text().splitlines()
+                if re.search(r'"\$SPARKLES" infer\b', line) and not line.lstrip().startswith("#")
+            ]
+            self.assertTrue(calls, f"{script.name} has no infer call")
+            for line in calls:
+                self.assertIn('--max-inferred "$MAX_INFERRED"', line, f"{script.name}: {line.strip()}")
+            self.assertIn("MAX_INFERRED=${MAX_INFERRED:-0}", script.read_text())
+        self.assertIn("export SPARKLES NMO MAX_INFERRED", TEXT)
+
+    def test_compare_passes_the_limit_to_sparkles(self):
+        # a stand-in for sparkles records its arguments and fails the infer step
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            fake = d / "sparkles"
+            fake.write_text('#!/bin/sh\necho "$@" >> "$ARGS_LOG"\n[ "$1" != infer ]\n')
+            fake.chmod(0o755)
+            (d / "in.nt").write_text("<urn:s> <urn:p> <urn:o> .\n")
+            for env, want in (({}, "0"), ({"MAX_INFERRED": "123456789"}, "123456789")):
+                log = d / "args.log"
+                log.unlink(missing_ok=True)
+                e = dict(os.environ, SPARKLES=str(fake), NMO="/bin/false", ARGS_LOG=str(log))
+                e.pop("MAX_INFERRED", None)
+                e.update(env)
+                r = subprocess.run(["bash", str(COMPARE), str(d / "in.nt"), str(d / "work")], env=e,
+                                   capture_output=True, text=True, timeout=60)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("sparkles infer failed", r.stderr)
+                infer = [ln for ln in log.read_text().splitlines() if ln.startswith("infer ")]
+                self.assertEqual(infer, [f"infer --loc db --profile owl-rl --max-inferred {want}"])
 
 
 @unittest.skipUnless(GTIME and SCOPED, "needs GNU time and a systemd user manager")
