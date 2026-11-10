@@ -77,13 +77,20 @@ const VISIT_BATCH: u64 = 1 << 10;
 /// for every instance.
 ///
 /// The deletion may visit [`VISITS_PER_FACT`] instances for each fact of the closure, and
-/// at least [`MIN_VISITS`]. It may hold as many bytes beyond its start as the closure's
-/// own heap, and at least [`MIN_HELD`], so that an update holds at most about twice the
-/// closure while it deletes. Past either bound the update stops with a [`Fallback`], its
-/// state is dropped, and the run materializes in full, which gives the same closure.
-/// With the same number of threads an update counts the same visits on every run. The
-/// memory of the parallel searches of one round depends on how they interleave, so near
-/// the bound on memory one run can fall back where another does not.
+/// at least [`MIN_VISITS`]. The charges of the run may grow by as many bytes beyond their
+/// total when the deletion started as the closure's own heap, and by at least
+/// [`MIN_HELD`]. That total already holds the closure, the changes, the removed facts
+/// held as candidates, the plans and what the witnesses prepared. Past either bound the
+/// update stops with a [`Fallback`], its state is dropped, and the run materializes in
+/// full, which gives the same closure.
+///
+/// The bound is a heuristic on sampled charges. Each search compares them once every
+/// [`VISIT_BATCH`] instances, and the steps that find consequences once their heads are
+/// found, so the charges can pass the bound by what one batch or one step charges before
+/// the update stops. A deletion that ends within the bound counts the same visits on every
+/// run with the same number of threads. When the bound stops it, the parallel searches of
+/// a round have counted what they reached by then, and the memory they held depends on
+/// how they interleaved, so near the bound one run can fall back where another does not.
 pub(crate) struct Bound {
     visits: AtomicU64,
     max_visits: u64,
@@ -1049,7 +1056,7 @@ fn prove_all(
         .len()
         .div_ceil(rayon::current_num_threads() * 4)
         .max(1);
-    let parts: Vec<(Vec<bool>, Search)> = {
+    let mut parts: Vec<(Vec<bool>, Search)> = {
         let cx = Cx {
             c,
             rules,
@@ -1080,9 +1087,9 @@ fn prove_all(
             })
             .collect()
     };
-    let mut dead = Vec::new();
+    // the errors first, before anything is absorbed, whose growth could fail too
     let mut first_err: Option<anyhow::Error> = None;
-    for (ch, (found, mut s)) in facts.chunks(chunk).zip(parts) {
+    for (_, s) in &mut parts {
         if let Some(e) = s.err.take() {
             // a search past the bound gives way to a full run, also when another search
             // of the round failed first, which the full run may avoid
@@ -1092,13 +1099,15 @@ fn prove_all(
             {
                 first_err = Some(e);
             }
-            continue;
         }
-        dead.extend(ch.iter().zip(&found).filter(|x| !*x.1).map(|x| *x.0));
-        search.absorb(s)?;
     }
     if let Some(e) = first_err {
         return Err(e);
+    }
+    let mut dead = Vec::new();
+    for (ch, (found, s)) in facts.chunks(chunk).zip(parts) {
+        dead.extend(ch.iter().zip(&found).filter(|x| !*x.1).map(|x| *x.0));
+        search.absorb(s)?;
     }
     if cancelled(limits) {
         anyhow::bail!("reasoning cancelled");

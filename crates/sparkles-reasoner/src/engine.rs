@@ -633,7 +633,7 @@ pub(crate) enum First<'a> {
 pub(crate) enum Mode<'s> {
     /// heads not in the graph yet (forward chaining)
     New,
-    /// heads in the graph (the consequences of deleted facts)
+    /// heads in the graph, each once (the consequences of deleted facts)
     Existing,
     /// the instances whose head number `head` is `target`
     Instances {
@@ -665,7 +665,8 @@ pub(crate) struct Eval<'a> {
     /// facts read by builtins of the current partial instance ([`Mode::Instances`])
     pub implicit: smallvec::SmallVec<[Triple; 2]>,
     stop: bool,
-    /// heads emitted so far ([`Mode::New`]), so that each goes out once
+    /// heads emitted so far ([`Mode::New`] and [`Mode::Existing`]), so that each goes
+    /// out once
     seen: FxHashSet<Triple>,
     /// the first error of a base-tier scan
     pub err: Option<anyhow::Error>,
@@ -1267,8 +1268,13 @@ impl<'a> Eval<'a> {
             match h {
                 CHead::Triple(s, p, o) => {
                     let t = [self.val(*s, b), self.val(*p, b), self.val(*o, b)];
+                    // many instances can have one head, which goes out once
                     let emit = if existing {
                         self.g.contains(&t)
+                            && match self.see(t) {
+                                Some(new) => new,
+                                None => return,
+                            }
                     } else if self.g.known(&t) {
                         false
                     } else {

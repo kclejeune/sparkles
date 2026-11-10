@@ -962,3 +962,54 @@ fn deleting_an_edge_of_a_small_clique_stays_incremental() {
     check(&s, &p, &r, "after deleting edges of the clique");
     assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
 }
+
+/// Roadmap item 798. The consequences of deleted facts are the heads of the rule instances
+/// that used them, and a rule whose head does not depend on the deleted atom's bindings
+/// has one head for many instances. Deleting the 32 `ex:p` facts gives 3.2 million
+/// instances of one head, which the deletion keeps once, within the memory of a full run.
+#[test]
+fn the_consequences_of_a_deletion_keep_each_head_once() {
+    const LIMIT: usize = 32 << 20;
+    let (_d, s) = persistent();
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [a: (?x ex:p ex:on), (?y ex:q ex:on) -> (ex:s ex:r ex:o)]"
+            .into(),
+    );
+    let mut nt = String::new();
+    for n in 0..100_000 {
+        nt.push_str(&format!("<{EX}q{n}> <{EX}q> <{EX}on> .\n"));
+    }
+    let ps: Vec<Triple> = (0..32)
+        .map(|n| t(&format!("ex:p{n}"), "ex:p", "ex:on"))
+        .collect();
+    for p in &ps {
+        nt.push_str(&format!("{} {} {} .\n", p.subject, p.predicate, p.object));
+    }
+    s.load(&[Source::from_bytes(
+        nt.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let opts = ReasonOptions {
+        max_memory: Some(LIMIT),
+        ..ReasonOptions::default()
+    };
+    let go = |since| {
+        materialize_incremental(
+            &s,
+            &rules,
+            &Extras::default(),
+            Incremental { since, cache: None },
+            &opts,
+        )
+    };
+    let full = go(None).unwrap_or_else(|e| panic!("the full run exceeds {LIMIT} bytes: {e:#}"));
+    check(&s, &rules, &full, "the full run");
+    change(&s, &[], &ps);
+    let r = go(Some(full.receipt.unwrap().commit.seq))
+        .unwrap_or_else(|e| panic!("the run after the deletion: {e:#}"));
+    check(&s, &rules, &r, "after the deletion");
+    assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
+}
