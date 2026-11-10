@@ -4235,6 +4235,8 @@ type PlanNode = {
 };
 ```
 
+`planMs` covers planning and the setup that follows from the prepared query alone, which includes building a SELECT result's variables in both modes, and `execMs` starts after it.
+
 A native streaming response puts `rows` before `meta`. It includes the final counts and
 capabilities only when the query has produced every row successfully. When the query or
 the serialization fails, the response carries no success metadata. `commit` and
