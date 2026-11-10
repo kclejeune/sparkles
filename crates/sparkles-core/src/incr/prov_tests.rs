@@ -611,6 +611,13 @@ fn check(c: &Circuit, want: &Sols, mode: Provenance, what: &str) -> Result<(), S
     Ok(())
 }
 
+/// Whether a circuit has rows whose derivations are unknown: those of a `recompute`
+/// node, and those a correlated `EXISTS` keeps, since the engine evaluates its condition
+/// without reporting why it holds (spec F13, item 528).
+fn unknown_witnesses(p: &super::ops::PlanNode) -> bool {
+    p.has_recompute() || p.operator == "ExistsFilter" || p.children.iter().any(unknown_witnesses)
+}
+
 fn run(seed: u64, mode: Provenance) -> Result<bool, String> {
     let mut rng = StdRng::seed_from_u64(seed);
     // every third case reads the union of two named graphs as its default graph
@@ -639,7 +646,7 @@ fn run(seed: u64, mode: Provenance) -> Result<bool, String> {
     let parsed = sparql::parse_query(&text, None, &[]).map_err(|e| format!("{text}: {e}"))?;
     let compiled = compile(&parsed, None).map_err(|e| format!("{text}: {e}"))?;
     let mut c = Circuit::new(compiled, None);
-    if c.plan().has_recompute() {
+    if unknown_witnesses(&c.plan()) {
         return Ok(false);
     }
     c.set_provenance(mode).map_err(|e| e.to_string())?;

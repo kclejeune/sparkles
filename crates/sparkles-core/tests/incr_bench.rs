@@ -1035,3 +1035,120 @@ fn path_pass_against_recompute() {
         rt.round(&s);
     }
 }
+
+/// The views of item 418: the aggregates of spec F13 §4.2, `HAVING` and a correlated
+/// `EXISTS`, over the people data. Each has one answer per snapshot: every team has at
+/// most one label, so its `GROUP_CONCAT` and `SAMPLE` do not depend on the order of its
+/// rows.
+const AGG_VIEWS: &[(&str, &str)] = &[
+    (
+        "team-age-range",
+        "SELECT ?t (MIN(?a) AS ?lo) (MAX(?a) AS ?hi) WHERE { ?p :memberOf ?t . ?p :age ?a } GROUP BY ?t",
+    ),
+    (
+        "full-teams",
+        "SELECT ?t (COUNT(?p) AS ?n) WHERE { ?p :memberOf ?t } GROUP BY ?t HAVING (COUNT(?p) >= 200)",
+    ),
+    (
+        "team-labels",
+        "SELECT ?t (GROUP_CONCAT(?l; SEPARATOR=\", \") AS ?ls) (SAMPLE(?l) AS ?one) WHERE { ?p :memberOf ?t OPTIONAL { ?t rdfs:label ?l } } GROUP BY ?t",
+    ),
+    (
+        "knows-older",
+        "SELECT ?p ?a WHERE { ?p :age ?a FILTER EXISTS { ?p :knows ?q . ?q :age ?b FILTER(?b > ?a) } }",
+    ),
+];
+
+const AGG_WORKLOAD: &str = "incr_bench aggregates v1";
+
+/// §4.2: a one- or two-quad commit's pass of the item 418 views against evaluating the
+/// query again, through the commit mix of `pass_against_recompute`. An age insert
+/// touches the `?q :age ?b` pattern of `knows-older`, which names no outer variable,
+/// so that commit evaluates the condition again for every row, and the p95 shows it.
+#[test]
+#[ignore]
+fn aggregate_pass_against_recompute() {
+    let n = people();
+    let t0 = Instant::now();
+    let s = store(n, None);
+    eprintln!("loaded {n} people in {:.1?}", t0.elapsed());
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let views: Vec<&str> = AGG_VIEWS.iter().flat_map(|(n, q)| [*n, *q]).collect();
+    for p in [data(n).as_str(), &views.join("\n"), AGG_WORKLOAD] {
+        for b in p.bytes().chain([0]) {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    check_with(
+        "aggregates/workload",
+        true,
+        format!("{n} people"),
+        Some(format!("{h:016x}")),
+    );
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    rt.set_host(Arc::new(OpenHost));
+    println!(
+        "| view | build ms | query ms | pass median ms | pass p95 ms | query / pass | state MiB |"
+    );
+    println!("|---|---|---|---|---|---|---|");
+    for (name, q) in AGG_VIEWS {
+        let text = format!("{PREFIX}{q}");
+        let t = Instant::now();
+        let mut def = ViewDef::table(text.clone());
+        def.memory_bytes = 4 << 30;
+        rt.put(&s, name, def).unwrap();
+        rt.round(&s);
+        let build = t.elapsed().as_secs_f64() * 1e3;
+        let mut query = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            let r = sparql::query(
+                s.snapshot(),
+                &text,
+                &QueryOptions {
+                    no_cache: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            std::hint::black_box(r.len());
+            query.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let mut passes = Vec::new();
+        for i in 0..200 {
+            mix(&s, i, n);
+            let t = Instant::now();
+            rt.round(&s);
+            passes.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        check_view(
+            &rt,
+            &s,
+            &format!("aggregates/{name}"),
+            name,
+            &text,
+            QueryOptions::default(),
+        );
+        let info = rt.get(&s, name).unwrap();
+        assert!(
+            !info.plan.has_recompute(),
+            "{name} has a recompute node: {:#?}",
+            info.plan
+        );
+        let qm = pct(&mut query, 0.5);
+        let pm = pct(&mut passes, 0.5);
+        let p95 = pct(&mut passes, 0.95);
+        let state = info.state_bytes as f64 / (1 << 20) as f64;
+        println!(
+            "| {name} | {build:.1} | {qm:.1} | {pm:.3} | {p95:.3} | {:.0} | {state:.1} |",
+            qm / pm,
+        );
+        metric(&format!("aggregates/{name}/build"), build, "ms", "lower");
+        metric(&format!("aggregates/{name}/query"), qm, "ms", "lower");
+        metric(&format!("aggregates/{name}/pass-median"), pm, "ms", "lower");
+        metric(&format!("aggregates/{name}/pass-p95"), p95, "ms", "lower");
+        metric(&format!("aggregates/{name}/state"), state, "MiB", "lower");
+        rt.delete(name).unwrap();
+        rt.round(&s);
+    }
+}

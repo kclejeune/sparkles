@@ -403,6 +403,8 @@ impl<'a> Pass<'a> {
             let mut c = Ctx::new(self.new.clone());
             c.use_cache = false;
             c.base_iri = self.base.clone();
+            // an EXISTS in an expression reads what the circuit's principal reads
+            c.graphs = self.access.clone();
             self.ctx = Some(c);
         }
         self.ctx.as_ref().expect("made above")
@@ -451,11 +453,18 @@ impl<'a> Pass<'a> {
             table.push_row(&row);
         }
         let empty = FxHashMap::default();
+        // an EXISTS is evaluated by substitution of the row's bindings, as the planner
+        // evaluates one in a one-off query
         let exists = |p: &GraphPattern| {
+            let mut names = Vec::new();
+            crate::sparql::plan::collect_pattern_vars(p, &mut names);
+            let mut vars: Vec<VarId> = names.iter().map(|n| ctx.var(n)).collect();
+            vars.sort_unstable();
+            vars.dedup();
             Arc::new(expr::ExistsSpec::new(
                 p.clone(),
                 crate::sparql::plan::ActiveGraph::Default,
-                Vec::new(),
+                vars,
                 Vec::new(),
             ))
         };

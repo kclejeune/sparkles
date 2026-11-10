@@ -173,6 +173,20 @@ const QUERIES: &[&str] = &[
     "SELECT ?t (COUNT(?l) AS ?n) WHERE { ?p :memberOf ?t OPTIONAL { ?p rdfs:label ?l } } GROUP BY ?t HAVING (COUNT(?l) > 0)",
     "SELECT * WHERE { GRAPH :g1 { ?s ?p ?o } }",
     "SELECT ?s (CONCAT(STR(?s), \"-x\") AS ?k) WHERE { ?s :memberOf ?t }",
+    // the aggregates of spec F13 §4.2 (item 418)
+    "SELECT ?t (MIN(?a) AS ?lo) (MAX(?a) AS ?hi) WHERE { ?p :memberOf ?t . ?p :age ?a } GROUP BY ?t",
+    "SELECT (MIN(?a) AS ?lo) (MAX(?s) AS ?hi) (MIN(DISTINCT ?o) AS ?m) WHERE { ?s :age ?a . ?s ?q ?o }",
+    "SELECT ?t (MIN(?l) AS ?lo) (MAX(?a) AS ?hi) WHERE { ?p :memberOf ?t OPTIONAL { ?p rdfs:label ?l } OPTIONAL { ?p :age ?a } } GROUP BY ?t",
+    "SELECT ?t (MIN(?a) AS ?lo) (COUNT(*) AS ?n) WHERE { ?p :memberOf ?t . ?p :age ?a } GROUP BY ?t HAVING (MIN(?a) > 30 && COUNT(*) < 3)",
+    "SELECT ?t (MAX(?a + 1) AS ?hi) WHERE { ?p :memberOf ?t . ?p :age ?a } GROUP BY ?t",
+    // correlated EXISTS: an outer variable in a filter of the pattern, a shared variable
+    // the outer rows do not always bind, an EXISTS inside an expression, and an empty
+    // path at an outer variable
+    "SELECT ?p ?a WHERE { ?p :age ?a FILTER EXISTS { ?q :age ?b FILTER(?b > ?a) } }",
+    "SELECT * WHERE { ?p :memberOf ?t OPTIONAL { ?p :age ?a } FILTER NOT EXISTS { ?x :age ?a . ?x :knows ?p } }",
+    "SELECT ?p WHERE { ?p :memberOf ?t FILTER(?t = :t2 || EXISTS { ?p :knows ?x FILTER(?x != ?t) }) }",
+    "SELECT ?p ?t WHERE { ?p :memberOf ?t FILTER EXISTS { ?p :knows* :c } }",
+    "SELECT ?p ?a WHERE { ?p :age ?a FILTER NOT EXISTS { ?p :knows ?q . ?q :age ?b FILTER(?b < ?a) } FILTER EXISTS { ?p :memberOf ?t } }",
 ];
 
 const UPDATES: &[&str] = &[
@@ -556,6 +570,87 @@ fn generated(n: usize, masked: bool) {
         followed * 4 >= n * 3,
         "only {followed} of {n} generated queries compiled; refused: {refused:#?}"
     );
+}
+
+/// `GROUP_CONCAT` and `SAMPLE` have more than one answer per snapshot. The circuit's
+/// `GROUP_CONCAT` lists the values the engine lists, in another order, and its `SAMPLE`
+/// is one of the group's values and stays while the group holds it.
+#[test]
+fn concat_and_sample_follow_the_oracle_up_to_order() {
+    let concat = "SELECT ?t (GROUP_CONCAT(?l; SEPARATOR=\"|\") AS ?ls) (GROUP_CONCAT(DISTINCT ?a) AS ?as) (GROUP_CONCAT(STR(?a)) AS ?ss) WHERE { ?p :memberOf ?t OPTIONAL { ?p rdfs:label ?l } OPTIONAL { ?p :age ?a } } GROUP BY ?t";
+    let sample = "SELECT ?t (SAMPLE(?p) AS ?one) WHERE { ?p :memberOf ?t } GROUP BY ?t";
+    let members = "SELECT ?t ?p WHERE { ?p :memberOf ?t }";
+    let canon_concat = |rows: Vec<String>| -> Vec<String> {
+        rows.into_iter()
+            .map(|r| {
+                // cells are quoted simple literals or UNDEF; the parts sort
+                let mut cells: Vec<String> = Vec::new();
+                let mut rest = r.as_str();
+                while !rest.is_empty() {
+                    let (cell, tail) = if let Some(q) = rest.strip_prefix('"') {
+                        let end = q.find('"').expect("a closing quote");
+                        let mut parts: Vec<&str> = q[..end].split(['|', ' ']).collect();
+                        parts.sort_unstable();
+                        (
+                            format!("\"{}\"", parts.join(" ")),
+                            q[end + 1..].trim_start(),
+                        )
+                    } else {
+                        let end = rest.find(' ').unwrap_or(rest.len());
+                        (rest[..end].to_string(), rest[end..].trim_start())
+                    };
+                    cells.push(cell);
+                    rest = tail;
+                }
+                cells.join(" ")
+            })
+            .collect()
+    };
+    let s = store();
+    let mut cc = circuit(&s, concat);
+    let mut sc = circuit(&s, sample);
+    let mut last: std::collections::HashMap<String, String> = Default::default();
+    let mut check_both = |s: &Store, cc: &Circuit, sc: &Circuit, what: &str| {
+        let want = canon_concat(oracle(s, concat, &cc.columns(), cc.kind));
+        let got = canon_concat(result(cc));
+        assert_eq!(got, want, "{what}: GROUP_CONCAT");
+        let groups = oracle(s, members, &["t".into(), "p".into()], Kind::Select);
+        let mut seen: std::collections::HashMap<String, String> = Default::default();
+        for row in result(sc) {
+            let (t, one) = row.split_once(' ').expect("two columns");
+            assert!(
+                groups.contains(&format!("{t} {one}")),
+                "{what}: SAMPLE {one} is not a member of {t}"
+            );
+            if let Some(prev) = last.get(t)
+                && groups.contains(&format!("{t} {prev}"))
+            {
+                assert_eq!(
+                    one, prev,
+                    "{what}: the sample of {t} changed while it remained"
+                );
+            }
+            seen.insert(t.to_string(), one.to_string());
+        }
+        assert_eq!(
+            seen.len(),
+            groups
+                .iter()
+                .map(|g| g.split(' ').next().unwrap())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            "{what}: one sample per group"
+        );
+        last = seen;
+    };
+    check_both(&s, &cc, &sc, "after the build");
+    for u in UPDATES {
+        upd(&s, &format!("{PREFIX}{u}")).expect("update");
+        step(&s, &mut cc);
+        step(&s, &mut sc);
+        check_both(&s, &cc, &sc, u);
+    }
+    assert!(!cc.plan().has_recompute() && !sc.plan().has_recompute());
 }
 
 /// Queries whose circuits once missed changes or disagreed with the engine: each runs

@@ -9,6 +9,17 @@
 //! evaluation is. A one-off evaluation can also overflow on the way to a sum in the
 //! range, depending on the order of the rows, where the circuit's exact sum does not. `DISTINCT` aggregates keep the
 //! counts of the group's distinct values.
+//!
+//! `MIN`, `MAX`, `GROUP_CONCAT` and `SAMPLE` keep the group's values as an ordered
+//! multiset ([`Multiset`]): the distinct values in the order of `ORDER BY` with their
+//! counts, 16 bytes each. `MIN` and `MAX` read its ends, so removing the extreme value
+//! costs one search and no scan. `GROUP_CONCAT` joins the values again for a changed
+//! group, in that order, where a one-off evaluation joins them in the order its rows
+//! arrive. `SAMPLE` reports one value and keeps it while the group holds it, then takes
+//! the smallest. Adding or removing a value decodes the values it is compared with on
+//! the way, about the logarithm of the group's distinct values, and shifts the entries
+//! after it. A hash map of counts would take the same memory and make removing the
+//! extreme value scan the group, which this trades for the shift.
 
 use super::super::pass::Pass;
 use super::super::persist::{Reader, Writer};
@@ -17,10 +28,12 @@ use super::super::zset::{Changes, Row, consolidate, row_bytes};
 use super::Node;
 use crate::error::Result;
 use crate::id::Id;
+use crate::sparql::value::order_cmp;
 use crate::sparql::value::{NumOp, Value, arith};
 use oxsdatatypes::{Decimal, Double, Float};
 use rustc_hash::FxHashMap;
 use spargebra::algebra::Expression;
+use std::cmp::Ordering;
 
 /// A 256-bit two's complement integer, for exact sums of 128-bit products.
 #[derive(Default)]
@@ -69,6 +82,21 @@ pub enum AggKind {
     Count,
     Sum,
     Avg,
+    Min,
+    Max,
+    /// `GROUP_CONCAT`
+    Concat,
+    Sample,
+}
+
+impl AggKind {
+    /// Whether the aggregate's state is the group's values as a [`Multiset`].
+    fn ordered(self) -> bool {
+        matches!(
+            self,
+            AggKind::Min | AggKind::Max | AggKind::Concat | AggKind::Sample
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +106,8 @@ pub struct AggSpec {
     pub expr: Option<Expression>,
     /// the expression is this input column (`Some(None)`: a variable the input lacks)
     pub column: Option<Option<usize>>,
+    /// the separator of `GROUP_CONCAT` (`None`: a space)
+    pub separator: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -159,6 +189,76 @@ impl SumState {
     }
 }
 
+/// The values of a group as an ordered multiset: the distinct values in the order of
+/// `ORDER BY` (then by id, for values the order does not tell apart) with their counts.
+/// The state of `MIN`, `MAX`, `GROUP_CONCAT` and `SAMPLE`.
+#[derive(Clone, Debug, Default)]
+struct Multiset {
+    vals: Vec<(Id, i64)>,
+    /// the count of arguments whose evaluation failed, which make a `GROUP_CONCAT`
+    /// unbound
+    errs: i64,
+    /// `SAMPLE`: the value reported, kept while the group holds it
+    sample: Option<Id>,
+}
+
+impl Multiset {
+    /// Where `v`, whose decoded value is `value`, is or belongs in `vals`.
+    fn position(
+        &self,
+        p: &Pass,
+        v: Id,
+        value: Option<&Value>,
+    ) -> std::result::Result<usize, usize> {
+        self.vals.binary_search_by(|(x, _)| {
+            if *x == v {
+                return Ordering::Equal;
+            }
+            match order_cmp(p.value(*x).as_ref(), value) {
+                Ordering::Equal => x.0.cmp(&v.0),
+                o => o,
+            }
+        })
+    }
+
+    /// Add `w` copies of `v`.
+    fn add(&mut self, p: &Pass, v: Id, w: i64) {
+        let value = p.value(v);
+        match self.position(p, v, value.as_ref()) {
+            Ok(i) => {
+                self.vals[i].1 += w;
+                if self.vals[i].1 == 0 {
+                    self.vals.remove(i);
+                    if self.sample == Some(v) {
+                        self.sample = None;
+                    }
+                }
+            }
+            Err(i) => self.vals.insert(i, (v, w)),
+        }
+    }
+
+    /// The smallest value the group holds.
+    fn min(&self) -> Option<Id> {
+        self.vals.iter().find(|(_, n)| *n > 0).map(|(v, _)| *v)
+    }
+
+    fn max(&self) -> Option<Id> {
+        self.vals
+            .iter()
+            .rev()
+            .find(|(_, n)| *n > 0)
+            .map(|(v, _)| *v)
+    }
+
+    /// Give `SAMPLE` a value when the group has values and its value left.
+    fn settle(&mut self) {
+        if self.sample.is_none() {
+            self.sample = self.min();
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum AState {
     Count(i64),
@@ -171,6 +271,8 @@ enum AState {
     /// `COUNT(DISTINCT *)`: the counts of the distinct rows
     Rows(FxHashMap<Row, i64>),
     Sum(SumState),
+    /// `MIN`, `MAX`, `GROUP_CONCAT` and `SAMPLE`, with or without `DISTINCT`
+    Multi(Multiset),
 }
 
 #[derive(Clone, Debug)]
@@ -334,6 +436,7 @@ impl Group {
                 .aggs
                 .iter()
                 .map(|a| match (a.kind, a.distinct) {
+                    (k, _) if k.ordered() => AState::Multi(Multiset::default()),
                     (AggKind::CountAll, true) => AState::Rows(FxHashMap::default()),
                     (AggKind::CountAll | AggKind::Count, false) => AState::Count(0),
                     (_, true) => AState::Values {
@@ -341,7 +444,7 @@ impl Group {
                         errs: 0,
                         sum: SumState::default(),
                     },
-                    (AggKind::Sum | AggKind::Avg, false) => AState::Sum(SumState::default()),
+                    (_, false) => AState::Sum(SumState::default()),
                 })
                 .collect(),
             out: None,
@@ -365,10 +468,18 @@ impl Group {
                     AggKind::CountAll | AggKind::Count => "COUNT",
                     AggKind::Sum => "SUM",
                     AggKind::Avg => "AVG",
+                    AggKind::Min => "MIN",
+                    AggKind::Max => "MAX",
+                    AggKind::Concat => "GROUP_CONCAT",
+                    AggKind::Sample => "SAMPLE",
                 };
                 let d = if a.distinct { "DISTINCT " } else { "" };
+                let sep = match &a.separator {
+                    Some(s) => format!("; SEPARATOR = {:?}", s),
+                    None => String::new(),
+                };
                 match &a.expr {
-                    Some(e) => format!("{f}({d}{e})"),
+                    Some(e) => format!("{f}({d}{e}{sep})"),
                     None => format!("{f}({d}*)"),
                 }
             })
@@ -393,10 +504,46 @@ impl Group {
                     }
                 },
                 AState::Sum(s) => self.sum_value(p, spec.kind, s),
+                AState::Multi(m) => match spec.kind {
+                    AggKind::Min => m.min().unwrap_or(Id::UNDEF),
+                    AggKind::Max => m.max().unwrap_or(Id::UNDEF),
+                    AggKind::Sample => m.sample.unwrap_or(Id::UNDEF),
+                    _ => Self::concat(p, spec, m),
+                },
             };
             out.push(v);
         }
         out
+    }
+
+    /// `GROUP_CONCAT` of a group's values in their order, each as often as the group
+    /// holds it, or once with `DISTINCT`. An argument that failed, or a value without a
+    /// lexical form, makes the result unbound, as in a one-off evaluation. The result is a
+    /// simple literal.
+    fn concat(p: &mut Pass, spec: &AggSpec, m: &Multiset) -> Id {
+        if m.errs != 0 {
+            return Id::UNDEF;
+        }
+        let sep = spec.separator.as_deref().unwrap_or(" ");
+        let mut out = String::new();
+        let mut first = true;
+        for (v, n) in &m.vals {
+            if *n <= 0 {
+                continue;
+            }
+            let Some(s) = p.value(*v).and_then(|v| v.lexical().ok()) else {
+                return Id::UNDEF;
+            };
+            let reps = if spec.distinct { 1 } else { *n };
+            for _ in 0..reps {
+                if !first {
+                    out.push_str(sep);
+                }
+                first = false;
+                out.push_str(&s);
+            }
+        }
+        p.value_id(&Value::Str(out.into()))
     }
 
     fn sum_value(&self, p: &mut Pass, kind: AggKind, s: &SumState) -> Id {
@@ -490,11 +637,31 @@ impl Group {
                         }
                     },
                     AState::Sum(s) => s.add(vals[ai].as_ref(), w),
+                    AState::Multi(m) => match arg {
+                        Some(v) => m.add(p, v, w),
+                        // a failed expression is an error, and so is an unbound variable
+                        // under GROUP_CONCAT, where a one-off evaluation answers an
+                        // error; MIN, MAX and SAMPLE leave an unbound variable out, as a
+                        // one-off evaluation does
+                        None if self.aggs[ai].column.is_none()
+                            || self.aggs[ai].kind == AggKind::Concat =>
+                        {
+                            m.errs += w
+                        }
+                        None => {}
+                    },
                 }
             }
         }
         let mut out = Changes::new();
         for key in touched {
+            if let Some(g) = self.groups.get_mut(&key) {
+                for st in g.aggs.iter_mut() {
+                    if let AState::Multi(m) = st {
+                        m.settle();
+                    }
+                }
+            }
             let g = self.groups.get(&key).expect("touched groups exist").clone();
             let new = if g.rows > 0 || self.implicit {
                 let mut row = key.to_vec();
@@ -561,6 +728,7 @@ impl Group {
                                 96 + (s.floats.len() + s.doubles.len()) as u64 * 24
                                     + s.decs.len() as u64 * 40
                             }
+                            AState::Multi(m) => 40 + m.vals.len() as u64 * 16,
                         })
                         .sum::<u64>()
             })
@@ -623,6 +791,21 @@ impl Group {
                         sum(w, s);
                     }
                     AState::Sum(s) => sum(w, s),
+                    AState::Multi(m) => {
+                        w.u64(m.vals.len() as u64);
+                        for (v, n) in &m.vals {
+                            w.id(*v)?;
+                            w.i64(*n);
+                        }
+                        w.i64(m.errs);
+                        match m.sample {
+                            Some(v) => {
+                                w.u64(1);
+                                w.id(v)?;
+                            }
+                            None => w.u64(0),
+                        }
+                    }
                 }
             }
         }
@@ -682,6 +865,18 @@ impl Group {
                         *s = sum(r)?;
                     }
                     AState::Sum(s) => *s = sum(r)?,
+                    AState::Multi(m) => {
+                        // the entries were written in their order, which the terms keep
+                        for _ in 0..r.u64()? {
+                            let v = r.id()?;
+                            m.vals.push((v, r.i64()?));
+                        }
+                        m.errs = r.i64()?;
+                        m.sample = match r.u64()? {
+                            0 => None,
+                            _ => Some(r.id()?),
+                        };
+                    }
                 }
             }
             self.groups.insert(k, g);
