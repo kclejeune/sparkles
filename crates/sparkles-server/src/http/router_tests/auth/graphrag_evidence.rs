@@ -243,12 +243,10 @@ impl Env {
         )
         .unwrap()
         .rows()
-        .unwrap()
         .into_iter()
         .map(|r| {
-            r.values()
-                .iter()
-                .map(|t| t.as_ref().map(|t| t.to_string()).unwrap_or_default())
+            r.into_iter()
+                .map(|t| t.map(|t| t.to_string()).unwrap_or_default())
                 .collect()
         })
         .collect();
@@ -566,7 +564,6 @@ fn tool_as(s: &AuthServer, user: &str, name: &str, args: serde_json::Value) -> s
         headers: None,
         held: None,
         grant: None,
-        preparation: None,
     };
     let serde_json::Value::Object(mut m) = args else {
         panic!("arguments are an object")

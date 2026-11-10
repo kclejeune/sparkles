@@ -890,7 +890,6 @@ impl Run<'_> {
                 values.join(" ")
             );
             for r in rows(snap, &q, opts)? {
-                let r = r.values();
                 if let (Some(s), Some(p), Some(o)) = (nt(&r[0]), nt(&r[1]), nt(&r[2])) {
                     found.insert((s, p, o));
                 }
@@ -921,7 +920,6 @@ impl Run<'_> {
         );
         let mut out: HashMap<String, Revision> = HashMap::new();
         for r in rows(snap, &q, &QueryOptions::default())? {
-            let r = r.values();
             let Some(Term::NamedNode(rep)) = &r[0] else {
                 continue;
             };
