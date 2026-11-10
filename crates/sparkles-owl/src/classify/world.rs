@@ -1098,9 +1098,10 @@ impl<'a> World<'a> {
             let data_growth = Cell::new(0isize);
             let data_halted = Cell::new(false);
             let data_overflow = Cell::new(false);
-            // the incoming messages were reported as waiting, so the charge for the
-            // buffers starts above them
-            let grown = Cell::new(todo.len());
+            // the initialization's output is metered from zero, and the incoming
+            // messages, which were reported as waiting, raise the mark when they join
+            // the buffers below
+            let grown = Cell::new(0usize);
             let charged = Cell::new(0isize);
             {
                 let core = self.conjunction_core(e).map(|c| c.to_vec());
@@ -1131,6 +1132,7 @@ impl<'a> World<'a> {
                     }
                 }
                 todo.reverse();
+                grown.set(grown.get() + todo.len());
                 sink.local.append(&mut todo);
                 let horn = ix.horn.is_some();
                 loop {
