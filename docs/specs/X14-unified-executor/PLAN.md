@@ -7,9 +7,8 @@ measurements, and names the pieces that are routine enough for a worker with an 
 specification. The [design](SPEC.md) stays the authority on what each stage delivers,
 and the [Outcome](SPEC.md#outcome) records what has shipped.
 [Roadmap item 453](../../ROADMAP.md) holds the work, and the items numbered here are the
-phases that are ready to start. The [open decisions](#open-decisions) at the end are
-questions for the maintainer, and the schedule below says what changes with each
-answer.
+phases that are ready to start. The [decisions](#decisions) at the end record the maintainer's
+answers, and the schedule below follows them.
 
 ## Where the code stands
 
@@ -198,13 +197,9 @@ ownership boundaries given below, and the rows are serial.
 | After 825 to 829, 512, 243, 293, 534 and the remaining work of item 7 | The merge phase is numbered and starts. | The merge deletes the eager executor, so every kernel it keeps must already be one, and the reference evaluator must already be the oracle. |
 | After the merge | The frontier kernel and the demand seeding phases are numbered and start, and so does [X15](../X15-join-algorithms-and-estimation/README.md). | Neither blocks the merge, and new algorithms land in one executor. |
 
-The schedule changes with two of the open decisions. If the maintainer wants item 418's
-view operator inside item 826, item 826 waits for item 418's design in F13 and runs
-`bench:incr` as a gate, and otherwise item 826 defines the trait's `retract` method and
-leaves the view operator where it is. If the maintainer wants exchange operators and
-partitioned hash builds inside the merge, the merge phase grows by a scheduler and its
-forge measurement covers the 12-thread cells twice, before and after the scheduler, and
-otherwise those operators follow as a numbered phase after the merge.
+Item 826 defines the trait's `retract` method and leaves the view operator of
+`incr/ops/group.rs` to item 418, and exchange operators with partitioned hash builds
+follow the merge as item 857, as the [decisions](#decisions) record.
 
 The phases that run at the same time own these parts of the code. Item 678 owns
 `exec::string_order_mask`, `exec::decode_for`, `exprcache::cursor_dictionary_values` and
@@ -334,11 +329,9 @@ stops declining it. The count plans keep their own kinds, since they read counts
 index rather than aggregate rows, and the count-only grouping keeps its shortcut through
 the merge join's key-only count.
 
-Whether the view operator of `incr/ops/group.rs` moves onto the trait in this phase is
-the maintainer's [question](#open-decisions). With the move, the phase waits for item
-418's design, ports the view operator's `AggKind` and i128 sums onto the trait with
-`retract`, and runs `mise run bench:incr` as a gate. Without it, the phase defines
-`retract` for item 418 to implement and leaves the view operator where it is.
+The view operator of `incr/ops/group.rs` stays with item 418, as
+[decision 3](#decisions) records, so the phase defines `retract` for item 418 to
+implement and leaves the view operator where it is.
 
 The regression tests that fail before the change are a test that an eager `GROUP_CONCAT`
 over one key takes the incremental path in EXPLAIN, a test in `tests/group_runs.rs` that
@@ -489,15 +482,16 @@ variables, a text search with a constant query string, a vector search with a co
 vector and no candidate join, a hybrid search, history changes, a view read, an algorithm
 call, a spatial scan with constant arguments or a path search between a constant source
 and a constant target, and `CountJoin`, answers a whole table from the index or a remote
-endpoint. Whether such a form may become a charged
-materialized leaf, which runs its kernel once into a `Buffer` charged to the budget and
-serves it batch by batch as `State::Fallback` without inputs does today, is the
-maintainer's [question](#open-decisions), and this half of the phase waits for the
-answer. With a yes, each such form gets a `State` variant with its reason string, the
-phase states what `RejectMaterialization` refuses afterwards, which the plan proposes to
-be a materialized leaf whose answer is not bounded by `k`, `maxHits` or a LIMIT the
-planner pushed down, and the subtree fallback goes for these kinds. With a no, each
-source gets a resumable reader, and the phase grows accordingly.
+endpoint. Under [decision 2](#decisions), a text, vector, hybrid or spatial search
+bounded by `k` or `maxHits`, an algorithm call and a form under a LIMIT the planner
+pushed down become charged materialized leaves, which run their kernel once into a
+`Buffer` charged to the budget and serve it batch by batch as `State::Fallback` without
+inputs does today. Each such leaf shows its peak memory against its budget on a
+measurement before it counts as native. SERVICE and history changes get resumable
+streaming readers instead, since a remote response already arrives as a stream and a
+change history is ordered. Each form gets a `State` variant with its reason string,
+`RejectMaterialization` then refuses a materialized leaf whose answer is not bounded by
+`k`, `maxHits` or a pushed-down LIMIT, and the subtree fallback goes for these kinds.
 
 A form that reads its input, a SERVICE or text, vector, hybrid, history, algorithm or
 spatial node whose `needs_input` is true, remote LATERAL, path search with input, a path
@@ -525,8 +519,7 @@ construction error other than cancellation, a timeout and a budget failure into 
 fallback. After the phase it therefore still answers a fallback in two cases. One is a
 pattern that does not plan, such as one over an embedding provider that is not
 configured, which fails in eager execution too. The other is a pattern whose leaf the
-strict policy refuses. Whether such a leaf exists depends on the maintainer's answer
-about materialized leaves. If the strict policy admits every leaf, or
+strict policy refuses. [Decision 2](#decisions) admits only bounded materialized leaves. If the strict policy admits every leaf, or
 admits a leaf inside an EXISTS pattern whatever its bound, `State::Fallback` goes in this
 phase. If the strict policy refuses an unbounded materialized leaf inside an EXISTS
 pattern, the fallback remains for that one shape, an EXISTS over a SERVICE or search
@@ -592,9 +585,8 @@ collected cursor in this phase, `reasoning::seed_values`, `exists::build`,
 `plan::eval_exists`, the update path of `update.rs` and the algorithm service among them.
 Collection asks for unbounded demand, so a scan serves its whole range as one morsel, a
 join probes it in parallel pieces, and the operators keep the Rayon they have inside
-kernels. This is the parallelism eager execution has today, and whether exchange
-operators and partitioned hash builds across pipelines are part of this phase or a later
-one is the maintainer's [question](#open-decisions). The phase then deletes `run_node`
+kernels. This is the parallelism eager execution has today, and exchange
+operators and partitioned hash builds across pipelines follow the merge as item 857. The phase then deletes `run_node`
 and the eager executor, the admission layer from `auto_streaming` to
 `fits_without_spill`, `retry_as_cursor` with the `eagerMemoryRetry`
 plan counter and the `sparkles_spill_eager_retries_total` metric, the mode branch of
@@ -612,10 +604,9 @@ under both mode keys, so that the merged engine must be within 5% of the baselin
 eager time and of its streaming time for every query at 12 threads, which is the design's
 oracle of the faster mode, and no query under 0.3 ms may be slower under the Intel rule.
 The memory benchmarks of `docs/benchmarks/memory`, the spill matrices, `bench:incr`,
-`bench:reasoning-latency`, `bench:insn` and `bench:bindings` run as the design lists. The
-plan asks the maintainer whether the merge, as the design's decision gate, may run the
-forge matrix before it lands rather than after the push, which the benchmark host's
-policy otherwise rules out.
+`bench:reasoning-latency`, `bench:insn` and `bench:bindings` run as the design lists. Before it
+lands, the merge runs the same matrix on atlas, which has forge's hardware, as
+[decision 8](#decisions) records, and forge runs it again after the push.
 
 ### Demand seeding inside the planner and one algebra visitor
 
@@ -728,57 +719,34 @@ Items 678, 512, 534 and 825 run at the same time with item 827 within the owners
 boundaries above. Items 826 and 829 follow their predecessors in the order of work. No two
 phases run the Namespace screen of one commit at once.
 
-## Open decisions
+## Decisions
 
-These questions are for the maintainer. Each gives the plan's recommendation, and the
-[order of work](#order-of-work) says what changes with the answer.
+The maintainer took these answers, and the phases above follow them.
 
-1. Which parallelism does the merged engine get first? The design names both
-   whole-input morsels with Rayon inside kernels and exchange operators with partitioned
-   hash builds and parallel merge joins across pipelines. The plan recommends that the
-   merge phase keep the first, which is the parallelism eager execution has today, and
-   that exchange operators follow as a later phase measured on forge, so that the
-   deletion of the eager executor is not held up by a new scheduler.
-2. May a charged materialized leaf count as native? For a SERVICE, text, vector, spatial,
-   algorithm, history or view form that reads no input, the plan recommends that a leaf
-   which runs its kernel once into a charged buffer and serves it in batches counts as
-   native, that `RejectMaterialization` then refuses only a leaf whose answer is not
-   bounded by `k`, `maxHits` or a pushed-down LIMIT, and that the subtree fallback goes.
-   The alternative is a resumable reader per source. The question asks which source
-   forms may keep whole answers and what memory and performance evidence the leaf must
-   show, since the engineering rules prefer streaming and admit materialization on a
-   measurement.
-3. Does item 826 carry the view operator of `incr/ops/group.rs` onto the accumulator
-   trait? Item 418 maintains `MIN`, `MAX`, `GROUP_CONCAT`, `SAMPLE`, `HAVING` and
-   correlated EXISTS in views and has no priority. The plan recommends that item 826
-   define `retract` and leave the view operator to item 418, so that item 826 stays
-   bounded and `bench:incr` is not at stake in it.
-4. Do the frontier kernel and the algebra visitor stay in X14? Both phases remove copies
-   outside the two executors and neither blocks the merge. The plan recommends keeping
-   them as phases after the merge, numbered when items 8, 51 and 190 allow, rather than
-   moving them to their own specs.
-5. May the merge remove the eager memory retry's counter and metric? After the merge an
-   eager answer is a collected cursor whose joins, groupings, sorts and DISTINCT spill, so
-   `retry_as_cursor`, the `eagerMemoryRetry` plan counter and the Prometheus metric
-   `sparkles_spill_eager_retries_total` can only read zero. The plan recommends removing
-   both in the merge phase and recording the change in `docs/API.md` and the server's
-   metrics documentation.
-6. What does the in-place quick runner keep? The runner's history per query text chooses
-   between an eager run and automatic execution. The plan recommends that the merge phase
-   reduce it to its scheduling choice, the receiving worker against the blocking pool,
-   keyed by the same history of run times, and that items 827 and 829 leave it alone.
-7. Does ASK keep one response shape in every mode? After item 827 every ASK is pulled
-   through the cursor, as a streaming request's ASK is today, and the plan recommends
-   that the response stay an unchunked body with its status code in every mode, since it
-   is one value, and that the Jena binding's context symbol keep its meaning.
-8. How often does the forge matrix run? The plan recommends one forge matrix after the
-   push of the batch that ends each stage, after items 826 and 829, with atlas A/Bs of
-   the matrix queries for every phase before it lands, since a matrix takes about two and
-   a half hours and the benchmark host takes no phase measurements. The merge is the
-   design's decision gate, and the plan asks whether it may run the forge matrix before
-   it lands as the one exception to that policy.
-9. Does the bounded-reads test count direct reads of the mode flag? The test counts
-   textual `streams()` calls and not the three direct reads of the field in `ctx.rs`. The
-   plan recommends that item 678 count both, so that the bound is eight after item 678
-   and six after item 827 as the phases above enumerate, and the CI check means what the
-   design says.
+1. The merge keeps whole-input morsels with Rayon inside kernels, the parallelism eager
+   execution has today. Exchange operators and partitioned hash builds across pipelines
+   follow as item 857, measured on forge. The merge's gate at 12 threads guards against
+   the merged engine losing eager execution's parallel speed.
+2. A charged materialized leaf counts as native only for a form whose answer is bounded,
+   a text, vector, hybrid or spatial search by `k` or `maxHits`, an algorithm call, or a
+   form under a pushed-down LIMIT, and only after a measurement shows its peak memory
+   against its budget. SERVICE and history changes get resumable streaming readers.
+   `RejectMaterialization` refuses an unbounded materialized leaf.
+3. Item 826 defines `retract` on the accumulator trait and leaves the view operator of
+   `incr/ops/group.rs` to item 418, so `bench:incr` is not a gate of item 826.
+4. The frontier kernel and the algebra visitor stay in X14 as phases after the merge,
+   numbered when items 8, 51 and 190 allow.
+5. The merge removes `retry_as_cursor`, the `eagerMemoryRetry` plan counter and the
+   `sparkles_spill_eager_retries_total` metric, and records the change in `docs/API.md`
+   and the server's metrics documentation.
+6. The merge reduces the in-place quick runner to its scheduling choice, the receiving
+   worker against the blocking pool, keyed by the same history of run times, and items
+   827 and 829 leave it alone.
+7. ASK keeps one unchunked response body with its status code in every mode, and the
+   Jena binding's context symbol keeps its meaning.
+8. Forge runs the matrix after the push of the batch that ends each stage, after items
+   826 and 829, and after the merge. Every phase runs atlas A/Bs of the matrix queries
+   before it lands. The merge also runs the full matrix on atlas before it lands, since
+   it deletes the eager executor and atlas has forge's hardware.
+9. The bounded-reads test counts direct reads of the mode flag as well as `streams()`
+   calls, so its bound is eight after item 678 and six after item 827.
