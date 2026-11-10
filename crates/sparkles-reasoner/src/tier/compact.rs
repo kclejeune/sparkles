@@ -7,7 +7,7 @@
 //! significant digit, in one pass per digit of eleven bits in which its keys differ, and
 //! other batches sort by comparison, in parallel. Two runs merge in one pass, and more are
 //! sorted, which happens only when a compaction takes a tail of small runs. Every buffer
-//! is made at the size [`scratch_bytes`] charges for and never grows.
+//! is made at the size [`sort_bytes`] or [`merge_bytes`] charges for and never grows.
 
 use super::run::Run;
 use rayon::prelude::*;
@@ -33,16 +33,23 @@ fn by_digits(n: usize) -> bool {
     n >= RADIX_MIN && rayon::current_num_threads() <= RADIX_THREADS
 }
 
-/// The heap of the buffers a sort or merge of `n` entries holds at once, besides the run
-/// it builds: the keyed entries, and for a sort by digits a second buffer of them and
-/// the counts of a pass.
-pub(crate) fn scratch_bytes(n: usize) -> usize {
-    let e = n * size_of::<Entry>();
+/// The heap of the buffers a sort of `n` new facts holds at once, besides the run it
+/// builds: the keyed entries, and for a sort by digits a second buffer of them and the
+/// counts of a pass.
+pub(crate) fn sort_bytes(n: usize) -> usize {
+    let e = merge_bytes(n);
     if by_digits(n) {
         2 * e + BUCKETS * size_of::<usize>()
     } else {
         e
     }
+}
+
+/// The heap of the buffers a merge of runs with `n` entries in all holds at once, besides
+/// the run it builds: the keyed entries. A merge never sorts by digits, since the ids of
+/// several runs do not ascend.
+pub(crate) fn merge_bytes(n: usize) -> usize {
+    n * size_of::<Entry>()
 }
 
 /// The ids keyed, in their order, in a buffer of exactly their number.
@@ -262,10 +269,10 @@ mod tests {
         assert!(digit_sorted(Vec::new()).is_empty());
     }
 
-    /// The buffers of a sort and of a merge hold what [`scratch_bytes`] charges for,
-    /// besides the run. The batches stay under [`PAR_MIN`]: the parallel path makes the
-    /// same buffers, and the probe would also count the pool's jobs the calling thread
-    /// runs while it waits, which are not the sort's.
+    /// The buffers of a sort and of a merge hold what [`sort_bytes`] and [`merge_bytes`]
+    /// charge for, besides the run. The batches stay under [`PAR_MIN`]: the parallel path
+    /// makes the same buffers, and the probe would also count the pool's jobs the calling
+    /// thread runs while it waits, which are not the sort's.
     #[test]
     fn buffers_fit_the_charge() {
         let n = PAR_MIN / 2;
@@ -273,7 +280,7 @@ mod tests {
         let key = |id: u32| (id as u64 * 2_654_435_761) % 1000;
         let (run, peak) = crate::alloc_probe::peak_of(|| sorted(&ids, &key));
         assert!(
-            peak <= scratch_bytes(ids.len()) + Run::bytes_for(ids.len()),
+            peak <= sort_bytes(ids.len()) + Run::bytes_for(ids.len()),
             "sort peak {peak}"
         );
         let b = sorted(&(n as u32..2 * n as u32).collect::<Vec<u32>>(), &key);
@@ -281,8 +288,12 @@ mod tests {
         let total = runs[0].len() + runs[1].len();
         let (_, peak) = crate::alloc_probe::peak_of(|| merged(&runs, &key, &|_| true));
         assert!(
-            peak <= scratch_bytes(total) + Run::bytes_for(total),
+            peak <= merge_bytes(total) + Run::bytes_for(total),
             "merge peak {peak}"
         );
+        // a merge of runs over the digit threshold is charged its keyed entries alone, on
+        // any number of threads
+        assert_eq!(merge_bytes(RADIX_MIN), RADIX_MIN * size_of::<Entry>());
+        assert!(sort_bytes(RADIX_MIN) >= merge_bytes(RADIX_MIN));
     }
 }

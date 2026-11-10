@@ -7,7 +7,8 @@
 //! facts of one merge are an interval of ids, which the semi-naive ranges of the engine
 //! read. A hit in the graph's triple index checks its fact against the probed triple,
 //! which three columns by id answered with three cache misses and the row answers with
-//! one. Each predicate is a
+//! one for most facts, since a row of 24 bytes straddles a 64-byte cache line in two of
+//! eight places. Each predicate is a
 //! relation with two orders of its ids, by subject then object and by object then
 //! subject, as sorted runs ([`order::Order`], [`run::Run`]), and a list of its ids in
 //! order. A probe with a bound predicate and subject searches the subject order, one with
@@ -42,8 +43,8 @@ pub(crate) type Triple = [u64; 3];
 const PAR_MIN: usize = 1 << 14;
 
 /// A fact: its subject, object and the index of its relation, in 24 bytes, so that the
-/// three are read with one cache line. The last four bytes are padding, free for a
-/// later column.
+/// three are read with one cache line in six of eight places and two otherwise. The last
+/// four bytes are padding, free for a later column.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct Row {
@@ -610,7 +611,7 @@ impl Tier {
         let (rows, dead) = (&self.rows, &self.dead);
         let keep = |id: u32| alive_in(dead, (id - off) as usize);
         // the live ids, the sort's buffers and the run, then the run's list
-        m.add(live * size_of::<u32>() + compact::scratch_bytes(live) + Run::bytes_for(live))?;
+        m.add(live * size_of::<u32>() + compact::sort_bytes(live) + Run::bytes_for(live))?;
         let mut ids: Vec<u32> = Vec::with_capacity(live);
         ids.extend((off..off + n as u32).filter(|&id| keep(id)));
         let mut order = Order::default();
@@ -624,7 +625,7 @@ impl Tier {
             self.by_o = Some(order);
         }
         drop(ids);
-        m.sub(live * size_of::<u32>() + compact::scratch_bytes(live));
+        m.sub(live * size_of::<u32>() + compact::sort_bytes(live));
         Ok(())
     }
 
@@ -703,7 +704,7 @@ impl Tier {
                     meter.sub(cap * size_of::<u32>());
                 }
                 rel.ids.extend_from_slice(new);
-                let scratch = compact::scratch_bytes(new.len());
+                let scratch = compact::sort_bytes(new.len());
                 meter.add(scratch + 2 * Run::bytes_for(new.len()))?;
                 rel.subj
                     .push_charged(compact::sorted(new, &key_s), &mut meter)?;
@@ -751,7 +752,7 @@ impl Tier {
                 rewrote += w;
                 order.dead -= d as u32;
             }
-            let scratch = compact::scratch_bytes(n);
+            let scratch = compact::sort_bytes(n);
             m.add(scratch + Run::bytes_for(n))?;
             if subjects {
                 order.push_charged(compact::sorted(&all, &key_s), m)?;
@@ -789,7 +790,7 @@ fn compaction(
     let runs = &order.runs()[which.clone()];
     let total: usize = runs.iter().map(Run::len).sum();
     let old: usize = runs.iter().map(Run::heap_bytes).sum();
-    let scratch = compact::scratch_bytes(total);
+    let scratch = compact::merge_bytes(total);
     m.add(scratch + Run::bytes_for(total))?;
     let run = compact::merged(runs, key, keep);
     let dropped = total - run.len();
