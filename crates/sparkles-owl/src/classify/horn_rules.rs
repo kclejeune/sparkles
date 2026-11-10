@@ -286,10 +286,12 @@ pub fn forall<S: Sink>(ix: &Index, _me: Ex, st: &mut State, s: Role, a: Ex, out:
     let roles = &ix.roles;
     if let Some(i) = roles.inv(s) {
         st.props.push((i, a));
-        for (r, srcs) in &st.back {
-            if roles.sub(*r, i) {
-                for &e in &srcs.list {
-                    out.send(e, Concl::Sub(a));
+        if !out.defer() {
+            for (r, srcs) in &st.back {
+                if roles.sub(*r, i) {
+                    for &e in &srcs.list {
+                        out.send(e, Concl::Sub(a));
+                    }
                 }
             }
         }

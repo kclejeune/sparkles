@@ -742,10 +742,14 @@ struct Marks {
     props: usize,
     /// one per entry of [`State::back`], in its order
     back: Vec<usize>,
-    /// the messages that every source of one group of backward links takes, built once
-    /// per group and sent to each source as one run
+    /// the messages that every source of one group of backward links takes, built
+    /// [`RUN_CHUNK`] at a time and sent to each source as one run
     run: Vec<Concl>,
 }
+
+/// The products of one group of a context's links that a flush builds at a time, so that
+/// its buffer stays this size whatever the context's lists hold.
+const RUN_CHUNK: usize = OUTBOX;
 
 impl Marks {
     /// Sets the marks to the lists' ends, at the start of an activation.
@@ -1244,36 +1248,34 @@ impl<'a> Run<'a> {
                 if sources.is_empty() {
                     continue;
                 }
-                marks.run.clear();
-                if !st.bottom {
-                    marks.run.extend(
-                        props
-                            .iter()
-                            .filter(|&&(s, _)| roles.sub(*r1, s))
-                            .map(|&(_, x)| Concl::Sub(x)),
-                    );
-                }
-                for &(r2, f) in fwds {
-                    for &t in roles.comp(*r1, r2) {
-                        if roles.keeps_forward(t) {
-                            marks.run.push(Concl::Fwd(t, f));
-                        }
-                        if roles.is_empty_role(t) {
-                            marks.run.push(Concl::Sub(BOTTOM));
-                        }
+                let r1 = *r1;
+                let subs = props
+                    .iter()
+                    .filter(|&&(s, _)| !st.bottom && roles.sub(r1, s))
+                    .map(|&(_, x)| Concl::Sub(x));
+                let links = fwds.iter().flat_map(|&(r2, f)| {
+                    roles.comp(r1, r2).iter().flat_map(move |&t| {
+                        let fwd = roles.keeps_forward(t).then_some(Concl::Fwd(t, f));
+                        let bottom = roles.is_empty_role(t).then_some(Concl::Sub(BOTTOM));
+                        fwd.into_iter().chain(bottom)
+                    })
+                });
+                let mut products = subs.chain(links);
+                loop {
+                    marks.run.clear();
+                    marks.run.extend(products.by_ref().take(RUN_CHUNK));
+                    if marks.run.is_empty() {
+                        break;
                     }
-                }
-                if marks.run.is_empty() {
-                    continue;
-                }
-                for &e in sources {
-                    for &c in &marks.run {
-                        out.send(e, c);
-                    }
-                    if out.sent >= SEND_EVERY && !self.flush_sends(out, tally) {
-                        ok = false;
-                        if !self.bounds.partial {
-                            break 'sources;
+                    for &e in sources {
+                        for &c in &marks.run {
+                            out.send(e, c);
+                        }
+                        if out.sent >= SEND_EVERY && !self.flush_sends(out, tally) {
+                            ok = false;
+                            if !self.bounds.partial {
+                                break 'sources;
+                            }
                         }
                     }
                 }
@@ -2625,6 +2627,118 @@ mod horn_accounting_tests {
         };
         assert!(run.flush_links(&st, &mut out, &mut tally));
         assert_eq!(out.sent, 0);
+    }
+
+    /// The messages an outbox holds, by destination, in the order sent.
+    fn sent(outbox: &Outbox) -> Vec<(Ex, Concl)> {
+        outbox
+            .runs
+            .iter()
+            .flat_map(|d| {
+                outbox.msgs[d.start as usize..d.end as usize]
+                    .iter()
+                    .map(move |&c| (d.to, c))
+            })
+            .collect()
+    }
+
+    fn bounds(partial: bool) -> Bounds<'static> {
+        Bounds {
+            threads: 2,
+            deadline: None,
+            max_memory: None,
+            cancelled: None,
+            charge: None,
+            base_memory: 0,
+            peak_memory: 0,
+            dynamic: None,
+            dl: None,
+            partial,
+        }
+    }
+
+    /// An activation composes the links its rules store through the deferred flush: the
+    /// first sends the backward link of the chain s∘r ⊑ t for the pair it finds, a later
+    /// one only for its new forward link, and one with a new source pairs it with the old
+    /// forward links (roadmap item 818).
+    #[test]
+    fn activations_compose_new_links_with_old_ones_once_through_the_flush() {
+        let f = fixture();
+        let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+        let root = ctx[f.root as usize].get_or_init(Box::default);
+        let [e1, e2, f1] = [1, 2, 3].map(|i| f.targets[i]);
+        let bounds = bounds(false);
+        let run = run(&f.ix, &ctx, &bounds);
+        run.batch.store(true, Ordering::Relaxed);
+        let (mut mine, mut tally, mut local, mut marks) = (
+            VecDeque::new(),
+            Tally::default(),
+            Vec::new(),
+            Marks::default(),
+        );
+        let mut outbox = Outbox::default();
+        let mut activate = |todo: Vec<Concl>, outbox: &mut Outbox| {
+            root.todo.lock().extend(todo);
+            run.process::<Horn>(
+                f.root, &mut mine, &mut tally, &mut local, outbox, &mut marks,
+            );
+            let mut s: Vec<(Ex, Concl)> = sent(outbox)
+                .into_iter()
+                .filter(|(_, c)| matches!(c, Concl::Back(..) | Concl::Fwd(..) | Concl::Sub(_)))
+                .collect();
+            s.sort();
+            outbox.clear();
+            s
+        };
+        // the root's told existential gives Fwd(r, target0) and the to-do list Back(e1, s)
+        let mut want = vec![
+            (f.targets[0], Concl::Back(e1, f.t)),
+            (f.targets[0], Concl::Back(f.root, f.r)),
+        ];
+        want.sort();
+        assert_eq!(activate(vec![Concl::Back(e1, f.s)], &mut outbox), want);
+        assert_eq!(
+            activate(vec![Concl::Fwd(f.r, f1)], &mut outbox),
+            vec![(f1, Concl::Back(e1, f.t))]
+        );
+        let mut want = vec![
+            (f.targets[0], Concl::Back(e2, f.t)),
+            (f1, Concl::Back(e2, f.t)),
+        ];
+        want.sort();
+        assert_eq!(activate(vec![Concl::Back(e2, f.s)], &mut outbox), want);
+    }
+
+    /// A run that answers in part and stops inside an activation still sends the products
+    /// of the links the activation stored, and gives the conclusions it did not apply back
+    /// to the to-do list (roadmap items 603 and 818).
+    #[test]
+    fn a_stopped_partial_activation_flushes_its_link_products() {
+        let f = fixture();
+        let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+        let root = ctx[f.root as usize].get_or_init(Box::default);
+        let e1 = f.targets[1];
+        let bounds = bounds(true);
+        let run = run(&f.ix, &ctx, &bounds);
+        run.batch.store(true, Ordering::Relaxed);
+        run.stop.store(STOP_CANCEL, Ordering::SeqCst);
+        {
+            let mut t = root.todo.lock();
+            t.push(Concl::Back(e1, f.s));
+            // enough repeats to reach a check of the bounds, which finds the run stopped
+            t.extend(std::iter::repeat_n(Concl::Sub(TOP), CHECK_EVERY + 4));
+        }
+        let mut outbox = Outbox::default();
+        run.process::<Horn>(
+            f.root,
+            &mut VecDeque::new(),
+            &mut Tally::default(),
+            &mut Vec::new(),
+            &mut outbox,
+            &mut Marks::default(),
+        );
+        assert!(sent(&outbox).contains(&(f.targets[0], Concl::Back(e1, f.t))));
+        assert!(!root.todo.lock().is_empty());
     }
 
     #[test]
