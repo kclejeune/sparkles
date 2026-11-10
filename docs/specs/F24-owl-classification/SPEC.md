@@ -1132,133 +1132,172 @@ conditions, so that r-Pred can hand each conditional clause to every context tha
 its conditions as maximal literals. The root therefore computes the consequences of the
 ontology at `u` under every subset of the ground atoms that any context has ever found
 maximal, which is the second measured cause, and the fifth condition of Definition 7 keeps
-every ground atom maximal so that each one can become a marker, which is the first. The
-two causes have one root, and the three departures below remove it. Each of them is an
-inference restriction or an extension by sound instances of the ontology's clauses, so the
-run stays sound by the argument of the journal's Theorem 1. Completeness is argued against
-the journal's Theorem 2 below, and the phase's gate measures it.
+every ground atom maximal so that each one can become a marker, which the first cause
+needs. The three departures below remove the markers, order the ground literals and block
+the equalities with `x` outside query contexts. Each is an inference restriction or an
+extension by sound instances of the ontology's clauses, so the run stays sound by the
+argument of the journal's Theorem 1, and the soundness of each is argued in its place.
+The journal's completeness proof does not carry over to the departures as it stands. Each
+departure therefore records the argument for its completeness, the obligations of the
+journal's proof that the argument leaves open, and its measured effect, and the run keeps
+a departure only when the gate needs it. The gate, exact taxonomies and consistency on
+every fixture, is regression evidence for completeness and not a proof of it, and a
+further check classifies freshly generated ontologies of the gate's families against
+HermiT.
 
 **A context reasons about its own ground literals.** Hyper binds the ontology clause's `x`
 to a constant in every context, not only in the root, with the other variables bound to
 `x`, `y`, a successor term or a constant as the context's literals allow. A maximal
-literal over `f(u)` takes Succ in any context, with the edge recording the constant as the
-root's edges do, and Pred along such an edge reads `y` as `u` and `x` as `f(u)` and
-resolves the successor's core atoms as it does for the root. The run uses neither r-Succ
-nor the r-Pred of a root clause with a body, and the root holds no markers. The root is
-the context of the unconditional ground facts, which the assertions, the singleton classes
-and the clauses with the body `owl:Thing` give it, saturated with Hyper at the constants,
-Succ over `f(u)` and the equality rules, and its processed clauses with an empty body
-reach the contexts registered for their constants as above. A context's own ground
-literals are conditional on its core and on its bodies, so the root cannot take them, and
-the context derives their consequences at `u` itself from the actual disjunctions it
-holds, where the root would derive them under every combination of markers.
+literal over `f(u)` takes Succ in any context. The edge records the predecessor, the
+existential restriction, the constant and the successor, and is distinct from the edge
+for `f(x)` of the same restriction even when both reach the same successor. Pred along
+such an edge reads `y` as `u` and `x` as `f(u)`, resolves the successor's core atoms as
+it does for the root and admits the head forms that Table 3 admits for the root, among
+them a role atom between the successor's `x` and a constant, and it replays for an edge
+or a premise that comes later. The run uses neither r-Succ nor the r-Pred of a root
+clause with a body, and the root holds no markers. The root is the context of the
+unconditional ground facts, which the assertions, the singleton classes and the clauses
+with the body `owl:Thing` give it, saturated with Hyper at the constants, Succ over
+`f(u)` and the equality rules. Its processed clauses with an empty body reach the
+contexts registered for their constants as above, whether the registration or the
+clause comes first, and a context registers for the constants of every maximal literal
+of its processed clauses, inside `f(u)` included, for the constants of `x ≈ u` and for
+those of the ground literals in its bodies. The empty clause in the root has no constant
+to route it by, so the root's bottom is the run's inconsistency and reaches the answer
+without registration. A context's own ground literals are conditional on its core and
+on its bodies, so the root cannot take them, and the context derives their consequences
+at `u` itself from the actual disjunctions it holds, where the root would derive them
+under every combination of markers.
+
+The literals of a context other than the root are those over `x`, `y` and `f(x)` of the
+rules above, the ground literals, which are `B(u)`, `S(u, v)`, `u ≈ v` and `u ≉ v`, the
+role atoms `S(x, u)` and `S(u, x)`, the equalities `x ≈ u` and `f(x) ≈ u`, and the
+literals over `f(u)` that the root holds, `B(f(u))`, `S(u, f(u))`, `S(f(u), v)` and
+`f(u) ≈ v`. A constant that Eq rewrites is rewritten at every occurrence in the selected
+literal, in every context, as Table 2 has the root do, so that `S(u, f(u))` rewritten by
+`u ≈ v` is `S(v, f(v))` and a literal never mixes a constant with a successor term of
+another constant. The order groups a literal over `f(u)` with the literals over successor
+terms, which are totally ordered as above.
 
 Successors still take markers. When Succ fires, the successor gets `A → A` for every
 ground literal `A` of Definition 4's successor triggers that is maximal in a processed
 clause of the predecessor, as the journal's rule K2 says, and a context sends a later
-trigger to the successors it already has. The triggers are every ground atom and
+trigger to the successors it already has. A hypothetical successor with the empty core
+takes its predecessors' hypotheses as markers and nothing as a core unit, and keeps every
+guard when several predecessors share it. The triggers are every ground atom and
 equality of constants, a superset of Definition 4's, since a told subsumption puts its
 subclass in a body and so nearly every predicate qualifies, and a marker that no
-inference asks for costs one clause in the successor's store. A marker
-is a hypothesis of the sender, and the sender holds the actual literal, so a ground
-inference whose conclusion would be a ground clause with a body is not made. A ground
-inference is a Hyper whose body atoms are all bound to constants, an Eq or Factor whose
-equality and rewritten literal are both ground, or a Join of two ground clauses, and its
-conclusion has a body only when a premise carries a hypothesis. The restriction keeps a
-successor from computing the ground closure of the ontology under the markers of all its
-predecessors, which would be the root's explosion again, one successor at a time. What a
-marker contributes is what follows for the successor's own element from the hypothesis,
-through Hyper with a body atom bound to `x` or `y`, which may conclude a ground clause
-with a body, such as `A(u) → B(u)` from `D(x) ∧ S(x, u)` and a universal restriction, and
-through the ground inferences whose conclusions mention `x` or `y`. The ground
-consequences of a hypothesis alone are derived by the sender from its actual clause and
-sent as further markers when they become maximal there.
+inference asks for costs one clause in the successor's store.
 
-The completeness argument takes the journal's Theorem 2 as the reference and shows that
-the run derives, up to redundancy, every clause the journal's calculus derives in a
-context other than the root, apart from clauses that only the restriction below leaves
-out. A root clause `A_1 ∧ … ∧ A_n → Δ` that r-Pred would hand to a context `v`, where
-`v` holds each `A_iσ` as a maximal literal in `Γ_i → Δ_i ∨ A_iσ`, is derived in the root
-by Hyper at constants, Eq, Join, Succ over `f(u)` and Pred from the markers and the
-ontology clauses. Each of those inferences has a counterpart in `v` with the actual
-premises in place of the markers, since `v` has the same rules at constants and the same
-successor for `f(u)`, and the counterpart's conclusion is `Γ_1 ∧ … ∧ Γ_n → Δ_1 ∨ … ∨ Δ_n ∨
-Δσ`, which is what r-Pred would give. The induction needs each intermediate ground literal
-to be maximal in the counterpart's premise, which the departure on the order below
-guarantees for ground literals, since they stay ground and keep their order under every
-substitution that moves a clause, and which the fifth condition of Definition 7 guarantees
-for the literals over `x` and `y`, which stay incomparable with the ground literals. A
-root clause with an empty body reaches `v` as before. The restriction on ground inferences
-leaves out a ground conclusion under hypotheses, `A_1 ∧ … ∧ A_n → Δ` with everything
-ground. Each hypothesis `A_i` is a marker that a predecessor sent or a ground body literal
-that Pred carried from a successor, and in either case the context that sent the marker
-holds `A_i` in an actual clause with `A_i` maximal. The conclusion serves either as a
-premise of a Hyper that binds a body atom to `x` or `y`, which then concludes under the
-same hypotheses, or goes to a predecessor by Pred, where Join discharges the hypotheses.
-In both uses the sender reaches the same clause without the conclusion. It holds the
-other premises of the ground inference too, since a ground clause without a body is a
-root fact it receives by registration or a successor's clause that Pred carries to it
-with the ground head unchanged, so it derives `Γ_1 ∧ … ∧ Γ_n → Δ_1 ∨ … ∨ Δ_n ∨ Δ` from
-its actual clauses, which is what Pred and Join would have given it, and it sends each
-literal of `Δ` as a marker once that literal is maximal there, after which the successor
-concludes what it would have concluded from the left-out clause by Hyper with the
-marker. The argument is by induction on the derivation of the left-out clause, and it
-needs no maximality beyond the one the order below gives to ground literals. Termination
-holds as in the journal's Theorem 5. The
-terms of a context are `x`, `y`, `f(x)`, the constants and `f(u)`, and a successor's
-`x` stands for `f(x)` or `f(u)` of its predecessor, so no context holds a nested term and
-the set of literals of each context is finite.
+The run also restricts the ground inferences. A ground inference is a Hyper whose body
+atoms are all bound to constants, an Eq or Factor whose equality and rewritten literal
+hold neither `x` nor `y`, or a Join of two clauses that hold neither `x` nor `y`, and
+its conclusion has a body only when a premise carries a hypothesis. Such a conclusion, a
+clause that holds neither `x` nor `y` and has a body, is not made in any context. The
+restriction keeps a successor from computing the ground closure of the ontology under
+the markers of all its predecessors, which would be the root's explosion again, one
+successor at a time, and it keeps a hypothesis from creating successors of `u` in a
+context that holds it only as a marker. What a marker contributes is what follows for
+the successor's own element from the hypothesis, through Hyper with a body atom bound to
+`x` or `y`, which may conclude a ground clause with a body, such as `A(u) → B(u)` from
+`D(x) ∧ S(x, u)` and a universal restriction, and through the ground inferences whose
+conclusions mention `x` or `y`. The ground consequences of a hypothesis alone are left to
+the context that holds the marked literal in an actual clause.
 
-**One order of ground literals.** Every context compares two ground literals, which are
-the ground atoms `B(u)` and `S(u, v)` and the equalities and inequalities of constants, by
-the lexicographic path order of one precedence on the predicates and the constants, which
-every context shares. Everything else follows Definition 7 and the Sequoia construction as
-above. The fifth condition of Definition 7 leaves ground atoms of different predicates
-incomparable, and the journal says why, in the text before the definition. A literal that
-could be propagated to another context must not block a literal that is relevant in its
-own context. Under the journal's rules a ground atom is propagated by r-Succ only when it
-is maximal, so a ground atom that another ground atom blocked would never reach the root.
-Under the departure above no rule propagates a ground literal because it is maximal.
-Pred carries the ground head literals of a successor's clause whatever their order, the
-root's clauses reach a context by the constants they mention, and a successor's marker
-is demand-driven, as it is in the journal's K2, where a ground trigger that is not yet
-maximal is not yet a hypothesis the successor needs. So a context resolves its ground
-literals as ordered resolution does, one at a time by the order, and a ground literal that
-is never maximal is one the context never needs to resolve, since the clause that holds
-it is satisfied by a greater literal in the model that the completeness proof builds. The
-order remains compatible with the proof's lifting, because the proof compares ground atoms
-as terms of sort `p` by a total order on the Herbrand universe that extends its order on
-function symbols and constants, and the lexicographic path order of a precedence that
-extends that order to the predicates is such an order, so a context order that compares
-ground literals by it stays contained in the ground order under every grounding
-substitution. The ground literals keep the comparisons with the other literals that the
-fifth condition allows. A ground atom is above `x`, `y`, the constants and the equalities
-`x ≈ u` and `y ≈ u`, and it stays incomparable with every atom over `x` or `y`, so a
-clause that holds both a ground atom and an atom over `x` still resolves on either.
+The argument for completeness is the one for ordered resolution. A root clause `A_1 ∧ … ∧
+A_n → Δ` that r-Pred would hand to a context `v`, where `v` holds each `A_iσ` as a
+maximal literal in `Γ_i → Δ_i ∨ A_iσ`, is derived in the root by Hyper at constants, Eq,
+Join, Succ over `f(u)` and Pred from the markers and the ontology clauses, and each of
+those inferences has a counterpart in `v` with the actual premises in place of the
+markers, since `v` has the same rules at constants and the same successor for `f(u)`.
+The counterpart's conclusion carries the residual disjunctions `Δ_i`, which can leave an
+intermediate ground literal below a greater one, so that the next inference of the chain
+is not made in `v` while the root made it. That is the case ordered resolution leaves
+out on purpose. The clause is satisfied by its greatest literal in the model that a
+saturated set gives, and the inference on the smaller literal is needed only once the
+greater one is resolved away, after which the chain continues. The restriction leaves
+out a ground conclusion under hypotheses, and the argument for it is that the context
+which holds a marked literal in an actual clause can derive the ground conclusion from
+its actual clause and the other premises, which reach it as root facts by registration or
+as ground heads that Pred carries, and sends each literal of the conclusion as a marker
+once it is maximal there. The argument is not a proof. The journal's Appendix D builds
+its model one term at a time with a ground order chosen from the literals it has already
+made false, under its properties O1 to O3, and lifts the ground clauses to context
+clauses with its Lemmas 7 and 8, which exclude `f(u)` from a context other than the root.
+The departure leaves open the lifting with `f(u)` in every context and the discharge of
+hypotheses across a successor that several predecessors share and across chains of
+successors, where no one context holds every actual premise of a left-out inference. The
+restriction is therefore kept only if the gate needs it, and its effect is measured
+with it on and off. Termination holds as in the journal's Theorem 5. The terms of a
+context are `x`, `y`, `f(x)`, the constants and `f(u)`, and a successor's `x` stands for
+`f(x)` or `f(u)` of its predecessor, so no context holds a nested term and the set of
+literals of each context is finite.
+
+**One order of ground literals.** Every context compares two ground literals by one
+order that every context shares. The order is on terms first. The constants are ordered
+by the one total order on function symbols and constants that Definition 7 starts from,
+and the ground atoms, which are terms of the sort of the predicates, by the lexicographic
+path order of a precedence that puts every predicate above every constant, the roles
+above the classes and then the predicates by their ids. Two ground atoms thus compare by
+predicate first and then by their constants from the left. The equalities and
+inequalities of constants compare as Definition 7 has them, by the multiset extension of
+the order on constants, and a ground atom is above every equality and inequality of
+constants, since a predicate is above every constant. Everything else follows Definition
+7 and the Sequoia construction as above. A ground atom is above `x`, `y`, the constants
+and the equalities `x ≈ u` and `y ≈ u`, and it stays incomparable with every atom over
+`x` or `y`, so a clause that holds both a ground atom and an atom over `x` still
+resolves on either.
+
+The fifth condition of Definition 7 leaves ground atoms of different predicates
+incomparable. The journal explains the condition by the literals that Pred carries to a
+predecessor, which must not block a literal that only the context itself can resolve, and
+that part of the condition the departure keeps, since a ground atom never blocks an atom
+over `x` or `y`. Two ground atoms of one clause both go to the predecessor whatever their
+order, and Succ's markers follow the order on purpose, since a ground trigger that is not
+yet maximal is not yet a hypothesis the successor needs, and so no inference of the
+departed run depends on a ground atom being maximal beside another one. A context then
+resolves its ground literals one at a time by the order, as ordered resolution does, and
+a ground literal that is never maximal is one the context never needs to resolve. The
+journal's proof needs more than that. Its Appendix D chooses the ground order of each
+model fragment from the literals already made false, under its properties O1 to O3, and
+the fifth condition is what lets every such order extend the context order. A context
+order that fixes the order of two ground atoms can contradict the order a fragment would
+choose, so the proof's construction does not carry over, and whether the departed run is
+complete under the shared order is an open obligation. The departure is kept only if the
+gate needs it, and its effect is measured against the admissible order with the other
+departures in place.
 
 **Equalities with `x` in query contexts.** The rewriting equality `x ≈ u` rewrites `x` to
-`u` only in a unit clause whose atom is a core atom of a query context, and rewrites `u`
-to `x` only in a named-class atom over `u`. Elsewhere Eq does not rewrite with `x ≈ u`,
-and the other equalities, among them `f(x) ≈ u` and `u ≈ v`, rewrite as Table 2 says. The
-journal's Section 7.2.3 reports that its completeness proof needs `x ≈ u` only in query
-contexts and only on query atoms, and its Lemmas 21 and 22 use exactly the two forms kept.
-Lemma 21 rewrites a unit `Γ_0 → A(x)` with `A(x)` in the query body, which for
-classification is the context's core atom, so that the constant's facts include `A(u)`
-and the consequences at `u` follow from the ontology's clauses there, and Lemma 22 needs
-a clause with `x ≈ u` maximal beside named atoms, which the second form rewrites back to
-`x`. A successor context has no query and needs neither form. Its element's equality to
-a constant reaches the predecessor as `f(x) ≈ u`, where Eq rewrites `f(x)` to `u` as
-usual and the predecessor reasons at `u`. Sequoia blocks the same inferences. Without
-the blocking the run rewrites every clause over `x` of a context that holds `x ≈ u`, and
-in the earlier experiments the blocking was on in every configuration that finished.
+`u` only in a unit clause whose atom is a core atom of a query context, which is the
+context of a named class, and rewrites `u` to `x` only in a named-class atom over `u` and
+only in a query context. Elsewhere Eq does not rewrite with `x ≈ u`. Every other rule
+stays. Factor takes `x ≈ u` and `x ≈ v` in one head as Table 2 says, and an equality of
+constants `u ≈ v` rewrites the constant in `x ≈ u` to give `x ≈ v`, since it is the
+rewriting equality and `x ≈ u` only the rewritten literal, and `f(x) ≈ u` rewrites as
+usual. The journal's Section 7.2.3 reports that its completeness proof needs `x ≈ u` as
+the rewriting equality only in query contexts and only on query atoms, and its Lemmas 21
+and 22 use exactly the two forms kept. Lemma 21 rewrites a unit `Γ_0 → A(x)` with `A(x)`
+in the query body, which for classification is the context's core atom, so that the
+constant's facts include `A(u)` and the consequences at `u` follow from the ontology's
+clauses there, and Lemma 22 rewrites `x ≈ u` by `u ≈ v` and then needs a clause with
+`x ≈ u` maximal beside named atoms, which the second form rewrites back to `x`. A
+successor context has no query and needs neither form. Its element's equality to a
+constant reaches the predecessor as `f(x) ≈ u`, where Eq rewrites `f(x)` to `u` as usual
+and the predecessor reasons at `u`. Sequoia blocks the same inferences. The journal's
+observation is about its own calculus, and that it carries over to the run without the
+root's markers is part of the open obligation above. Without the blocking the run
+rewrites every clause over `x` of a context that holds `x ≈ u`, and in the earlier
+experiments the blocking was on in every configuration that finished.
 
-**Measured effect.** The three departures were measured together at the end of the lane.
-With the journal's rules and the switch on, the smallest case gives no answer in 200 s
-and 19 of 50 `shoi` fixtures time out. The numbers with the departures are recorded here
-when the lane lands, for the smallest case, the 50 fixtures on one and four threads under
-both strategies, the triangle with counting and the hand cases, together with the share of
-the work that the duplication of ground reasoning across contexts costs on ore_ont_15803
-with its two top-property axioms removed, since the file itself waits on item 805.
+**Measured effect.** The departures will be measured together and one at a time when
+they are built, on the smallest case, the 50 `shoi` fixtures on one and four threads
+under both strategies, the triangle with counting and the hand cases, with wall time
+beside the counts of conclusions by context kind and rule, and the numbers will be
+recorded here with the revision measured. With the journal's rules and the switch on,
+the smallest case gives no answer in 200 s and 19 of 50 `shoi` fixtures time out. The
+share of the work that the duplication of ground reasoning across contexts costs will be
+measured on ore_ont_15803 with its two top-property axioms removed, since the file itself
+waits on item 805.
 
 ### ROBOT-compatible commands
 
