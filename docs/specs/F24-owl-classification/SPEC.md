@@ -1276,6 +1276,129 @@ its activation, and with `sparkles-owl` in one codegen unit GO classifies on one
 0.99 of the time of the build before and ChEBI lite in 0.98, with the same taxonomies, as
 the [code layout results](../../benchmarks/el-classification/RESULTS.md#code-layout) give.
 
+#### Item 728's clauses for counting over definitions
+
+This subsection is the design of item 728, written before its code. It decides how a run
+that counts takes an exact or minimum cardinality in a negative position, which is the
+form the right-to-left direction of a definition such as
+`AcylGroup ≡ CarbonAtom ⊓ =1 hasDoubleBondWith.OxygenAtom ⊓ =2 hasSingleBondWith.OrganicGroup`
+gives, so that ore_ont_6485, ore_ont_6952 and ore_ont_10140 of the ORE 2015 DL sample
+classify with counting on. The three files are in the `dl-q` stratum. The first has 15
+definitions of this shape over the symmetric bond properties, with the union fillers
+`HeteroAtom`, `HalogenAtom` and `CarbonGroup` and pairwise disjoint atom classes, and the
+other two have 1,014 and 1,020 cardinalities in 30,363 definitions over 83,036 classes.
+
+The normalization before this item follows the paper's Table 1 after the structural
+transformation. `=n r.F ⊑ y` becomes the clause of every context `⊤ → y ⊔ M ⊔ H`, where
+`M` is a fresh class that holds `≤(n-1) r.F` through the at-most clause DL4,
+`M(x) ∧ r_B(x, z_1) ∧ … ∧ r_B(x, z_n) → ⋁ z_i ≈ z_j`, with `r_B` the qualified role of
+`r` and the negative form `B` of `F`, and `H` is the conjunction of `n+1` existential
+restrictions with fresh pairwise disjoint fillers below `F`, which is the paper's DL2 with
+the inequalities read as disjointness. For `n = 1` the maximum is `∀r.¬F` in place of
+`M`. The paper names this translation as the source of its own reasoner's difficulty with
+number restrictions, where each application of an at-most clause to the clauses that
+define the neighbours gives a complex clause that gives rise to numerous others, and it
+writes that the problem seems inherent in transforming number restrictions as Table 1
+shows. The measurements of this spec and of PERFORMANCE-EXPERIMENTS.md locate three
+costs of the form in ore_ont_6485. The clause has an empty body, so Hyper derives it in
+all 156 contexts. For `n = 1` the disjunct `∀r.¬F` sends the marker `¬F` to every
+`r`-successor of the context and, since the bond properties are symmetric, to the
+predecessor. `H` is an expression, which the order of atoms ranks above every fresh and
+named class, so it is the maximal literal of the derived clause and Succ makes its
+hypothetical successors in every context. Those successors share one context per fresh
+existential restriction and gather the markers of every predecessor, each counts its
+predecessor over the symmetric role, and the equalities of the at-most clauses rewrite
+the literals of a known successor onto a hypothetical one, which sends them down the
+chain as markers. Absorbing the definition's named conjuncts into the body of the clause,
+the experiment that PERFORMANCE-EXPERIMENTS.md records, cut the stored clauses at the
+bound from 285,856 to 56,635 and still passed the bound, because the named guard holds
+in every context of a carbon atom and the clause still spawned `H` and sent `¬F` from each.
+
+The decision is to write the at-most disjunct of such a clause as the paper's at-most
+clause itself, with the neighbours in the body and no holder, so that a context derives
+the clause only when it has the neighbours that an exact count needs. With counting, an
+exact cardinality `=n r.F` in a negative position with `n ≥ 1` becomes the DL-clause
+
+`r_B(x, z_1) ∧ … ∧ r_B(x, z_n) → y ⊔ H ⊔ ⋁_{i<j} z_i ≈ z_j`
+
+and a minimum `≥n r.F` in a negative position with `n ≥ 2` becomes
+
+`r_B(x, z_1) ∧ … ∧ r_B(x, z_n) → y ⊔ ⋁_{i<j} z_i ≈ z_j`,
+
+where `B`, `r_B` and `H` are as above and the `z_i` are distinct neighbour terms, the
+successor terms and the predecessor. For `n = 1` the first clause is `r_B(x, z) → y ⊔ H`,
+which replaces the universal restriction. Both are DL-clauses of the paper's Section 2.4,
+whose bodies may hold atoms `S(x, z_j)` over neighbour variables and whose heads may hold
+any DL-literal, with each `z_j` in the body, and the paper states that DL-clauses outside
+Table 1 are handled correctly by its algorithm. The clause is the resolvent of the two
+clauses it replaces on `M`, and `M` occurs in no other clause, so the two sets have the
+same models over the ontology's signature. A model of the new clause satisfies the old
+pair when `M` is read as `¬y ⊓ ¬H`, since where `M` holds with `n` qualified neighbours
+the new clause gives `y`, `H` or an equality, and the first two are false. Soundness is
+the paper's Theorem 8 and completeness its Theorem 9, which hold for any set of
+DL-clauses, any expansion strategy and any context term order. The rules that apply the
+clause exist, since the at-most clauses of the holders already take their candidates from
+the qualified-role literals over the successor terms and over the predecessor, make one
+product per subset of `n` candidates under the bounds on the widest clause, the subsets
+and the payload, and cut an equality that a disjointness certificate contradicts. The new
+clause is such a product with an empty holder and with `y` and `H` added to its head.
+A maximum `≤n r.F` in a negative position keeps its dual `≥(n+1) r.F`, and a conjunct
+that `dual` moves beside named conjuncts keeps the body it has now. A minimum in a
+negative position without counting still reads as the existential restriction.
+
+Counting meets a union filler through the qualified roles. The atom `r_B(x, z)` for a
+neighbour `z` is derived in the neighbour's context from DL4's clause
+`r(y, x) ∧ B(x) → r_B(y, x)` and reaches `x` through Pred, so a neighbour counts toward
+`=n r.F` only when its own context has derived that it is in `B`. When the neighbour's
+filler is a union, as `HeteroAtom → HalogenAtom ⊔ NitrogenAtom ⊔ OxygenAtom ⊔ SulfurAtom`,
+and `B` is above some of the cases, the neighbour derives the qualified-role atom under
+those cases, as a clause whose head carries the other cases, and the new clause fires in
+`x` with those cases in its head. The case analysis therefore runs over the cases of the
+neighbours that `x` has, in the neighbour's context and in `x`'s, and not in every context
+of the ontology, and its products are bounded by the subsets of `x`'s neighbours under
+the at-most bounds. The disjointness of the cases, which ore_ont_6485 states for every
+pair of atom classes, gives the certificates that cut the equalities between fillers of
+different cases, so a filler of one case never equates with a filler of another.
+
+The disjunct `H` stays as it is and keeps its hypothetical successors, since they are
+what refutes `≥(n+1) r.F` when the context holds an at-most restriction over `r`, through
+the holder's at-most clause and the inequalities of DL2, and that refutation is what
+derives `y` and the definition's class. Where a context has no at-most restriction over
+`r` the successors cost work and refute nothing, which is the cost the paper describes.
+Two ranks of `H` are measured, and the measured one is kept. Under the present order `H`
+is the maximal literal, a context refutes it itself and derives `y` as a unit when the
+count is exact. Under a rank below `y`, which the paper's Theorem 9 allows since it holds
+for every context term order, `y` is the maximal literal, the context's canonical model
+makes `y` true, the definition's class becomes a candidate of the context, and the test
+context, which holds the candidate's complement, resolves the class away and refutes `H`
+with its successors, as the hypertableau explores the disjunct it chooses first and
+expands the at-least restriction only when the others fail. The second order moves the
+successors from every context that has the neighbours to the test contexts of the classes
+whose candidates the count decides.
+
+The bounds and the fallback are unchanged. A run that passes the bound on derived
+conclusions, the widest at-most clause, its subsets or its payload starts again as the
+section above says, on one thread and then without counting, and reports it. Every
+inference of the design is an inference of the paper's calculus on DL-clauses, so a run
+that finishes is complete, and a run that does not finish falls back and is sound. If the
+measurements show the hypothetical successors of `H` still dominate, the next remedies in
+order are a hypothetical successor of `H`'s existential restrictions for each predecessor
+in place of one shared by all, which the paper's Definition 7 allows since a strategy may
+return a fresh context for each application of Succ, and a filter that derives the new
+clause only in a context whose clauses mention an at-most holder over a role above `r`,
+which is a departure from the calculus whose argument would be that a model with `n`
+successors and no at-most restriction over `r` at `x` extends to one with `n+1` by a copy
+of a successor's subtree. Neither is part of this decision, and either would be recorded
+here with its argument and its measured effect before it ships. Items 727, 729 and 731
+keep their scope.
+
+The acceptance is the gate of the roadmap row. The three files classify with counting on
+and finish under twice the time of their run without counting, so that counting can be on
+by default, and the development files of the ORE 2015 DL sample, the generated fixtures
+and the `shoi` and nominal fixtures give the taxonomies of HermiT with no new timeout.
+The measured effect of the design on the three files and on the existing counting
+fixtures, with the rank that is kept, is recorded here when the item ships.
+
 ### Nominals in the disjunctive rules
 
 This section is the design of item 603's sixth phase, which extends the disjunctive rules
