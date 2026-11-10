@@ -290,7 +290,7 @@ impl Generation {
             )?),
             perms: Perm::ALL
                 .iter()
-                .map(|&p| PermIndex::open_format(dir, p, meta.format_version))
+                .map(|&p| PermIndex::open(dir, p))
                 .collect::<Result<_>>()?,
             stats,
             meta,
@@ -2293,58 +2293,49 @@ impl Store {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        // The commit the generation's base index holds. A database from an older version
-        // has no dataset.json yet: it gets a baseline root commit after replay.
-        let known_id = commit::read_dataset_file(root)?;
-        let migrating = known_id.is_none();
-        let dataset_id = known_id.unwrap_or_else(uuid::Uuid::new_v4);
+        // The commit the generation's base index holds. Only a pre-release database has
+        // a current generation without a dataset.json, and the cutoff of spec X16 Phase
+        // 1 refuses it with the dump-and-reload message instead of giving it a baseline.
+        let Some(dataset_id) = commit::read_dataset_file(root)? else {
+            return Err(Error::Unsupported(format!(
+                "{}: dataset.json is missing, which only a database written before the \
+                 first release lacks. {}",
+                root.display(),
+                crate::formats::dump_and_reload(None)
+            )));
+        };
         let catalog_path = root.join("commits.bin");
-        // WAL commits without metadata that precede the first one with it are part of a
-        // baseline commit (written by an older version before the upgrade)
-        let mut fold_legacy = true;
-        let (base, rebased, base_configuration) =
-            match commit::read_gen_commit_full(&root.join(&name))? {
-                Some(physical) if !migrating => {
-                    let commit::RetainedGenerationCommit {
-                        dataset_id: id,
-                        commit: c,
-                        origin,
-                        configuration: binding,
-                        ..
-                    } = physical;
-                    if id != dataset_id {
-                        return Err(Error::Corrupt(format!(
-                            "{name}/commit.json belongs to dataset {id}, not {dataset_id}"
-                        )));
-                    }
-                    fold_legacy = origin == "baseline";
-                    (c, false, binding)
+        // No log this build reads holds commit records without metadata, so none fold
+        // into a baseline commit.
+        let fold_legacy = false;
+        let (base, base_configuration) = match commit::read_gen_commit_full(&root.join(&name))? {
+            Some(physical) => {
+                let commit::RetainedGenerationCommit {
+                    dataset_id: id,
+                    commit: c,
+                    origin,
+                    configuration: binding,
+                    ..
+                } = physical;
+                if id != dataset_id {
+                    return Err(Error::Corrupt(format!(
+                        "{name}/commit.json belongs to dataset {id}, not {dataset_id}"
+                    )));
                 }
-                // a generation without commit metadata (built by an older version): its
-                // content becomes a baseline commit after the last cataloged one
-                _ => {
-                    let prev = match commit::read_catalog(&catalog_path)? {
-                        Some((id, recs)) if id == dataset_id && !migrating => recs.last().copied(),
-                        _ => None,
-                    };
-                    let c = CommitInfo {
-                        seq: prev.map_or(0, |c| c.seq + 1),
-                        timestamp_ms: prev.map_or(0, |c| c.timestamp_ms).max(commit::now_ms()),
-                        kind: CommitKind::Baseline,
-                        inserted: gen_.meta.quads,
-                        deleted: 0,
-                        quads: gen_.meta.quads,
-                        generation: gen_no,
-                        bulk: false,
-                        // counts relative to an earlier commit are unknown
-                        exact: prev.is_none(),
-                        reconstructed: false,
-                        default_graph: true,
-                        unvalidated: false,
-                    };
-                    (c, true, crate::history::ConfigurationBinding::LegacyUnbound)
-                }
-            };
+                let _ = origin;
+                (c, binding)
+            }
+            // Only a pre-release build left a current generation without its
+            // commit.json, and the cutoff refuses it instead of giving it a
+            // baseline commit.
+            None => {
+                return Err(Error::Unsupported(format!(
+                    "{name}/commit.json is missing, which only a generation written \
+                         before the first release lacks. {}",
+                    crate::formats::dump_and_reload(commit::read_written_by(root).as_deref())
+                )));
+            }
+        };
         let configuration_root = if ctx.is_some() {
             link::dataset_root_of(root)?
         } else {
@@ -2374,9 +2365,6 @@ impl Store {
         // the quads each replayed commit changed, for catching up the full-text index
         let text_on = cfg!(feature = "text") && root.join("text.json").exists();
         let mut wal_text: Vec<(u64, Vec<[Id; 4]>)> = Vec::new();
-        // quads of the base plus WAL transactions folded into a baseline commit
-        let mut base_quads =
-            (gen_.meta.quads + delta.inserts() as u64).saturating_sub(delta.deletes() as u64);
         let mut wal_len = 0u64;
         let mut wal_index = wal::WalIndex::new(base.seq, fold_legacy);
         let annotated = crate::annotations::seqs_of(root, dataset_id);
@@ -2430,29 +2418,13 @@ impl Store {
             delta = r.delta;
             version = r.version;
             replayed = r.commits;
-            base_quads = r.base_quads;
             next_bnode = r.next_bnode.max(bnode_floor);
             wal_text = r.touched;
         }
         drop(configuration_references);
         drop(configuration_state);
         drop(configuration_preparation);
-        let mut base = base;
-        if rebased {
-            // record the baseline: in the generation, the catalog, and (for an upgrade)
-            // dataset.json last, whose presence marks the upgrade complete
-            base.quads = base_quads;
-            base.inserted = base_quads;
-            write_atomic(
-                &root.join(&name).join("commit.json"),
-                &commit::gen_commit_bytes(dataset_id, "baseline", &base),
-            )?;
-        }
         let catalog = Catalog::open(&catalog_path, dataset_id, base, &replayed)?;
-        if migrating {
-            let bytes = commit::dataset_file_bytes(dataset_id, "baseline", base.timestamp_ms);
-            write_atomic(&root.join("dataset.json"), &bytes)?;
-        }
         // the catalog's record of the head: a commit that a compaction carried into this
         // generation's log keeps the generation it was made in
         let head = replayed
@@ -2492,7 +2464,7 @@ impl Store {
         open_step("vocab-settled");
         let dvocab_len = gen_.dvocab.len();
         *gen_.wal_index.lock() = Some(wal_index);
-        let mut history = open_history(root, dataset_id, gen_no, head.seq, !rebased, &catalog)?;
+        let mut history = open_history(root, dataset_id, gen_no, head.seq, true, &catalog)?;
         // the dataset's source holds, which its branches share, before anything is
         // collected
         if ctx.is_none() {
@@ -6133,22 +6105,6 @@ impl Store {
         tmp.as_file().sync_all()?;
         tmp.persist(&path).map_err(|e| Error::Io(e.error))?;
         Ok(path)
-    }
-
-    /// Write the sparse vocabulary index (`vocab.idx`) of the current generation when
-    /// it has none, because an older version built it. The store opened next uses it.
-    /// Returns its number of entries, or `None` when the generation already has one or
-    /// the store is in memory.
-    pub fn add_vocab_index(&self) -> Result<Option<usize>> {
-        let _w = self.guarded_writer();
-        let snap = self.snapshot();
-        let Some(dir) = snap.generation.dir.as_ref() else {
-            return Ok(None);
-        };
-        if dir.join("vocab.idx").exists() {
-            return Ok(None);
-        }
-        crate::vocab::add_sparse_index(dir).map(Some)
     }
 
     /// Write the numeric column (`vocab.num`) of the current generation when it has

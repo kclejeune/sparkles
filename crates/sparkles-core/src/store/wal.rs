@@ -217,26 +217,38 @@ pub(crate) fn header_version(rec: &[u8], path: &Path) -> Result<u32> {
     Ok(v)
 }
 
-/// The version of the log whose first bytes are `buf` (0 without a header).
+/// The version of a log without a header record, the pre-release form that this build
+/// refuses with the dump-and-reload message (spec X16 Phase 1).
+pub(crate) const HEADERLESS_VERSION: u32 = 0;
+
+/// The version of the log whose first bytes are `buf`. A log whose first record is not
+/// a header record is the pre-release headerless form, version 0, and is refused. A
+/// first record of zeros is a header that a crash at the log's creation tore before its
+/// bytes reached the disk, so it holds no committed record and reads as an empty log of
+/// [`PLAIN_VERSION`], which [`open_for_append`] gives its header.
 pub(crate) fn version_of(buf: &[u8], path: &Path) -> Result<u32> {
     match buf.first() {
         Some(&WAL_HEADER) => header_version(buf, path),
-        _ => Ok(0),
+        None => Ok(PLAIN_VERSION),
+        Some(_) if buf.len() < WAL_REC || is_zero_record(&buf[..WAL_REC]) => Ok(PLAIN_VERSION),
+        Some(_) => {
+            Err(crate::formats::WAL.refuse(&path.display().to_string(), HEADERLESS_VERSION, None))
+        }
     }
 }
 
 /// The version of a log for replay, from its first complete record only. A
 /// header record cut short by a crash is a torn tail with no committed record,
-/// as it is to the record-by-record readers, so it reads as an empty log (0).
+/// as it is to the record-by-record readers, so it reads as an empty log.
 pub(crate) fn committed_version_of(buf: &[u8], path: &Path) -> Result<u32> {
     match buf.get(..WAL_REC) {
         Some(record) => version_of(record, path),
-        None => Ok(0),
+        None => Ok(PLAIN_VERSION),
     }
 }
 
-/// The version of the log at `path` (0 for a missing or headerless log), for
-/// `sparkles migrate --check`.
+/// The version of the log at `path` ([`PLAIN_VERSION`] for a missing or empty log), for
+/// `sparkles migrate --check`. A headerless log is refused.
 pub fn file_version(path: &Path) -> Result<u32> {
     let mut buf = [0u8; WAL_REC];
     let n = match File::open(path) {
@@ -279,6 +291,12 @@ pub(crate) fn open_for_append(path: &Path, version: u32) -> std::io::Result<File
         Err(e) => return Err(e),
     }
     let mut f = OpenOptions::new().write(true).open(path)?;
+    // A log whose header a crash tore at its creation was replayed as empty and cut
+    // back to nothing. It takes its header now, before any record follows.
+    if f.metadata()?.len() == 0 {
+        f.write_all(&header_record_of(version))?;
+        f.sync_all()?;
+    }
     f.seek(SeekFrom::End(0))?;
     Ok(f)
 }
@@ -1482,6 +1500,13 @@ mod tests {
                 fixture(version, &data, flags)
             };
             std::fs::write(&path, bytes).unwrap();
+            if version == 0 {
+                // the pre-release headerless log is refused before any record is read
+                let error = WalCursor::open(&path, p(0, 0)).err().expect("version 0");
+                assert!(matches!(error, Error::Unsupported(_)), "{error}");
+                assert!(error.to_string().contains("wal version 0"), "{error}");
+                continue;
+            }
             let mut cursor = WalCursor::open(&path, p(0, 0)).unwrap();
             let result = cursor.next().map(|r| r.map(|(seq, _)| seq));
             assert_eq!(
@@ -1715,62 +1740,6 @@ mod tests {
             assert!(store.history.as_ref().unwrap().lock().cache.is_empty());
             assert_eq!(durable_files(root.path()), before);
         }
-    }
-
-    #[test]
-    fn bounded_crc_headerless_legacy_keeps_forward_fallback() {
-        let (root, store, path, first, second) = crc_fixture(true);
-        let mut bytes = std::fs::read(&path).unwrap()[WAL_REC..second.offset as usize].to_vec();
-        for record in bytes.as_chunks_mut::<WAL_REC>().0 {
-            if record[0] == WAL_COMMIT {
-                record[9..].fill(0);
-            }
-        }
-        std::fs::write(&path, bytes).unwrap();
-        let snap = store.snapshot();
-        let first = p(1, first.offset - WAL_REC as u64);
-        let second = p(2, second.offset - WAL_REC as u64);
-        *snap.generation.wal_index.lock() = Some(WalIndex {
-            points: vec![p(0, 0), first, second],
-            last: second,
-            since: 0,
-        });
-        let before = durable_files(root.path());
-        let observer = std::sync::Arc::new(|_, _, _| panic!("legacy data has no modern CRC"));
-        let (bounded, _) = commit::with_wal_crc_observer(observer, || {
-            store.snapshot_at_limited(
-                &crate::history::At::Commit(1),
-                &Default::default(),
-                128 << 20,
-            )
-        })
-        .unwrap();
-        assert_eq!(bounded.len(), 6_000);
-        let mut history = store.history.as_ref().unwrap().lock();
-        history.cache.clear();
-        history.settle();
-        drop(history);
-        let (ordinary, _) = store
-            .snapshot_at(&crate::history::At::Commit(1), &Default::default())
-            .unwrap();
-        let mut bounded_quads = Vec::new();
-        bounded
-            .for_each_quad(|q| {
-                bounded_quads.push(*q);
-                Ok(())
-            })
-            .unwrap();
-        let mut ordinary_quads = Vec::new();
-        ordinary
-            .for_each_quad(|q| {
-                ordinary_quads.push(*q);
-                Ok(())
-            })
-            .unwrap();
-        bounded_quads.sort_unstable();
-        ordinary_quads.sort_unstable();
-        assert_eq!(bounded_quads, ordinary_quads);
-        assert_eq!(durable_files(root.path()), before);
     }
 
     /// Direct writes, buffered writes in between, and block boundaries leave the file

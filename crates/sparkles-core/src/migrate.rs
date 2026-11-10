@@ -42,28 +42,32 @@ pub struct Step {
     pub run: fn(root: &Path, file: &Path) -> Result<()>,
 }
 
-/// The registered steps.
-pub const STEPS: &[Step] = &[Step {
-    kind: "delta-vocab",
-    from: 1,
-    to: 2,
-    summary: "rewrite a legacy delta vocabulary as a framed one, as the first write to it would",
-    run: delta_vocab_framed,
-}];
+/// The registered steps. The first release registers none: the format cutoff of spec
+/// X16 Phase 1 refuses every pre-release form with the dump-and-reload message, and the
+/// step that rewrote a pre-release delta vocabulary went with its reader. The tests keep
+/// the machinery exercised through a step of their own.
+pub const STEPS: &[Step] = &[];
 
-fn delta_vocab_framed(root: &Path, file: &Path) -> Result<()> {
-    crate::commit::require_reader(root, crate::vocab::delta::FRAMED_READER)?;
-    crate::vocab::delta::convert_legacy_file(&root.join(file))?;
-    Ok(())
+/// The steps this build runs: [`STEPS`], and in the tests the synthetic step of
+/// [`tests::TEST_STEPS`] as well.
+fn steps() -> &'static [Step] {
+    #[cfg(test)]
+    {
+        tests::TEST_STEPS
+    }
+    #[cfg(not(test))]
+    {
+        STEPS
+    }
 }
 
 /// Whether a registered step upgrades version `from` of the kind `kind`.
 pub fn upgrades(kind: &str, from: u32) -> bool {
-    STEPS.iter().any(|s| s.kind == kind && s.from == from)
+    steps().iter().any(|s| s.kind == kind && s.from == from)
 }
 
 fn step(kind: &str, from: u32) -> Option<&'static Step> {
-    STEPS.iter().find(|s| s.kind == kind && s.from == from)
+    steps().iter().find(|s| s.kind == kind && s.from == from)
 }
 
 /// The version of one file.
@@ -234,6 +238,8 @@ fn inspect_dir(plan: &mut Plan, dir: &Path, prefix: &str, by: Option<&str>) -> R
         Ok(_) => {}
         Err(e) => plan.refused.push(format!("{prefix}{e}")),
     }
+    #[cfg(test)]
+    tests::inspect_test_file(plan, dir, prefix, by);
     for e in formats::dataset_dir_refusals(dir) {
         // the message already names the directory
         plan.refused.push(e.to_string());
@@ -283,17 +289,13 @@ fn inspect_store(plan: &mut Plan, dir: &Path, prefix: &str, by: Option<&str>) ->
         let dv = gdir.join("delta.vocab");
         if dv.exists() {
             let v = crate::vocab::delta::file_version(&dv)?;
-            // a legacy file without entries is written framed by its first write
-            let empty = v == 1 && std::fs::metadata(&dv)?.len() == 0;
-            if !empty {
-                add(
-                    plan,
-                    &formats::DELTA_VOCAB,
-                    format!("{rel}/delta.vocab"),
-                    v,
-                    by,
-                );
-            }
+            add(
+                plan,
+                &formats::DELTA_VOCAB,
+                format!("{rel}/delta.vocab"),
+                v,
+                by,
+            );
         }
     }
     Ok(())
@@ -1047,8 +1049,64 @@ mod tests {
     use super::*;
     use crate::store::{Store, StoreOptions};
 
-    /// A database whose current delta vocabulary is legacy (as a release before framed
-    /// files wrote it), with one commit that uses its terms.
+    /// The file of the synthetic step: a JSON object in the database's directory whose
+    /// `format` the step raises from 1 to 2. No release writes or reads it.
+    pub(super) const TEST_FILE: &str = "migrate-test.json";
+
+    /// The kind of [`TEST_FILE`], outside the registry of [`crate::formats`].
+    pub(super) const TEST_KIND: FileKind = FileKind {
+        id: "migrate-test",
+        files: TEST_FILE,
+        marker: "`format`",
+        class: formats::Class::Config,
+        writes: 2,
+        reads: &[2],
+    };
+
+    /// The steps the tests run: [`STEPS`] and the synthetic step, which exercises the
+    /// copy, the swap and the recovery of a migration now that no release step exists.
+    pub(super) const TEST_STEPS: &[Step] = &[Step {
+        kind: "migrate-test",
+        from: 1,
+        to: 2,
+        summary: "raise the format of the test file, as a release step would",
+        run: raise_test_file,
+    }];
+
+    fn raise_test_file(root: &Path, file: &Path) -> Result<()> {
+        let path = root.join(file);
+        let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)
+            .map_err(|e| Error::Corrupt(e.to_string()))?;
+        v["format"] = 2.into();
+        std::fs::write(&path, serde_json::to_vec_pretty(&v).unwrap())?;
+        Ok(())
+    }
+
+    /// Report [`TEST_FILE`] of `dir` to the plan as the registry's files are reported.
+    pub(super) fn inspect_test_file(plan: &mut Plan, dir: &Path, prefix: &str, by: Option<&str>) {
+        if let Ok(b) = std::fs::read(dir.join(TEST_FILE)) {
+            let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            let version = v["format"].as_u64().unwrap() as u32;
+            add(
+                plan,
+                &TEST_KIND,
+                format!("{prefix}{TEST_FILE}"),
+                version,
+                by,
+            );
+        }
+    }
+
+    /// The `format` of [`TEST_FILE`] in `root`.
+    pub(super) fn test_file_version(root: &Path) -> u32 {
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join(TEST_FILE)).unwrap()).unwrap();
+        v["format"].as_u64().unwrap() as u32
+    }
+
+    /// A database with one commit and a [`TEST_FILE`] at format 1, which the synthetic
+    /// step raises, standing in for a database that a release step would upgrade.
+    /// Returns the name of its current generation.
     pub(super) fn legacy_database(root: &Path) -> String {
         let s = Store::open(root, StoreOptions::default()).unwrap();
         crate::sparql::update::update(
@@ -1059,16 +1117,7 @@ mod tests {
         .unwrap();
         let gen_name = s.snapshot().generation.name.clone();
         drop(s);
-        let dv = root.join(&gen_name).join("delta.vocab");
-        let b = std::fs::read(&dv).unwrap();
-        let parsed = crate::vocab::delta::parse_delta(&b).unwrap();
-        let mut legacy = Vec::new();
-        for k in &parsed.keys {
-            legacy.extend_from_slice(&(k.len() as u32).to_le_bytes());
-            legacy.extend_from_slice(k);
-        }
-        assert!(!legacy.is_empty());
-        std::fs::write(&dv, &legacy).unwrap();
+        std::fs::write(root.join(TEST_FILE), br#"{"format": 1}"#).unwrap();
         gen_name
     }
 
@@ -1097,22 +1146,20 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_delta_vocabulary_is_upgraded_on_a_copy() {
+    fn a_planned_step_runs_on_a_copy() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("db");
         let g = legacy_database(&root);
         let p = plan(&root).unwrap();
         assert!(p.in_window(), "{:?}", p.refused);
         assert_eq!(p.steps.len(), 1, "{:?}", p.steps);
-        assert_eq!(p.steps[0].file, format!("{g}/delta.vocab"));
+        assert_eq!(p.steps[0].file, TEST_FILE);
         let out = migrate(&root, true).unwrap();
         assert_eq!(out.steps.len(), 1);
         let kept = out.kept.unwrap();
         assert!(kept.join(&g).join("delta.vocab").exists());
-        assert_eq!(
-            crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap(),
-            2
-        );
+        assert_eq!(test_file_version(&kept), 1);
+        assert_eq!(test_file_version(&root), 2);
         assert!(plan(&root).unwrap().steps.is_empty());
         assert_eq!(count(&root), 1);
         // nothing left to do
@@ -1124,7 +1171,7 @@ mod tests {
         for at in ["copied", "checked", "moved-aside"] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().join("db");
-            let g = legacy_database(&root);
+            let _g = legacy_database(&root);
             let e = migrate_with(&root, false, &mut |p| {
                 if p == at {
                     Err(Error::Cancelled)
@@ -1138,7 +1185,7 @@ mod tests {
             recover(&root).unwrap();
             assert!(root.exists(), "{at}");
             assert_nothing_pending(dir.path(), &root, at);
-            let v = crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap();
+            let v = test_file_version(&root);
             assert_eq!(v, if at == "moved-aside" { 2 } else { 1 }, "{at}");
             assert_eq!(count(&root), 1, "{at}");
         }
@@ -1149,7 +1196,7 @@ mod tests {
         for at in ["copied", "checked", "moved-aside"] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().join("db");
-            let g = legacy_database(&root);
+            let _g = legacy_database(&root);
             let e = migrate_with(&root, false, &mut |p| {
                 if p == at {
                     Err(Error::Cancelled)
@@ -1161,7 +1208,7 @@ mod tests {
             migrate(&root, false).unwrap();
             assert!(root.exists(), "{at}");
             assert_nothing_pending(dir.path(), &root, at);
-            let v = crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap();
+            let v = test_file_version(&root);
             assert_eq!(v, 2, "{at}");
             assert_eq!(count(&root), 1, "{at}");
         }
@@ -1187,16 +1234,13 @@ mod tests {
         let _g = CWD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("db");
-        let g = legacy_database(&root);
+        let _g = legacy_database(&root);
         let _restore = RestoreCwd(std::env::current_dir().unwrap());
         std::env::set_current_dir(dir.path()).unwrap();
         let out = migrate(Path::new("db"), false).unwrap();
         assert_eq!(out.steps.len(), 1);
         assert!(root.exists());
-        assert_eq!(
-            crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap(),
-            2
-        );
+        assert_eq!(test_file_version(&root), 2);
         let left: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -1315,7 +1359,7 @@ mod tests {
     fn an_open_after_an_interrupted_swap_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("db");
-        let g = legacy_database(&root);
+        let _g = legacy_database(&root);
         let e = migrate_with(&root, false, &mut |p| {
             if p == "moved-aside" {
                 Err(Error::Cancelled)
@@ -1333,10 +1377,7 @@ mod tests {
         // the next migrate finishes the swap
         migrate(&root, false).unwrap();
         assert_eq!(count(&root), 1);
-        assert_eq!(
-            crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap(),
-            2
-        );
+        assert_eq!(test_file_version(&root), 2);
         assert_nothing_pending(dir.path(), &root, "after the finish");
     }
 
@@ -1344,7 +1385,7 @@ mod tests {
     fn an_open_during_a_copy_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("db");
-        let g = legacy_database(&root);
+        let _g = legacy_database(&root);
         let mut refused = false;
         migrate_with(&root, false, &mut |p| {
             if p == "copied" {
@@ -1354,10 +1395,7 @@ mod tests {
         })
         .unwrap();
         assert!(refused);
-        assert_eq!(
-            crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap(),
-            2
-        );
+        assert_eq!(test_file_version(&root), 2);
         assert_eq!(count(&root), 1);
     }
 
@@ -1379,7 +1417,7 @@ mod tests {
         for keep in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().join("db");
-            let g = legacy_database(&root);
+            let _g = legacy_database(&root);
             let e = migrate_with(&root, keep, &mut |p| {
                 if p == "swapped" {
                     Err(Error::Cancelled)
@@ -1395,10 +1433,7 @@ mod tests {
             assert!(!root.join(CHECKED_MARK).exists(), "keep {keep}");
             assert_eq!(old_dir(&root).exists(), keep, "keep {keep}");
             assert!(!work_dir(&root).exists());
-            assert_eq!(
-                crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap(),
-                2
-            );
+            assert_eq!(test_file_version(&root), 2);
             assert_eq!(count(&root), 1);
         }
     }
@@ -1407,7 +1442,7 @@ mod tests {
     fn a_concurrent_check_does_not_disturb_a_running_migration() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("db");
-        let g = legacy_database(&root);
+        let _g = legacy_database(&root);
         let mut during = None;
         migrate_with(&root, false, &mut |p| {
             if p == "copied" {
@@ -1421,10 +1456,7 @@ mod tests {
             .expect_err("the check waits for the migration");
         assert!(matches!(e, Error::Locked { .. }), "{e:?}");
         assert_eq!(count(&root), 1);
-        assert_eq!(
-            crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap(),
-            2
-        );
+        assert_eq!(test_file_version(&root), 2);
     }
 
     #[test]
@@ -1611,7 +1643,7 @@ mod mode_tests {
         let g = tests::legacy_database(&root);
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(root.join(&g), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let dv = root.join(&g).join("delta.vocab");
+        let dv = root.join(tests::TEST_FILE);
         std::fs::set_permissions(&dv, std::fs::Permissions::from_mode(0o600)).unwrap();
         let ds = root.join("dataset.json");
         std::fs::set_permissions(&ds, std::fs::Permissions::from_mode(0o600)).unwrap();

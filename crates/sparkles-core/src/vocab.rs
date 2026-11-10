@@ -166,19 +166,11 @@ impl Sparse {
     }
 
     /// Read `vocab.idx` for a vocabulary of `blocks` front-coded blocks and `data_len`
-    /// data bytes. `None` when the file is missing, or does not describe this
-    /// vocabulary (then lookups do without it).
-    fn read(path: &Path, blocks: usize, data_len: u64) -> Option<Sparse> {
-        let buf = std::fs::read(path).ok()?;
-        let s = Self::decode(&buf, blocks, data_len);
-        if s.is_none() {
-            tracing::warn!(
-                target: "sparkles::vocab",
-                "{} does not match its vocabulary; terms are looked up without it",
-                path.display()
-            );
-        }
-        s
+    /// data bytes. Index format 5 requires the file, so a missing one, or one that does
+    /// not describe this vocabulary, is [`crate::Error::Corrupt`].
+    fn read(path: &Path, blocks: usize, data_len: u64) -> crate::error::Result<Sparse> {
+        let buf = std::fs::read(path).map_err(|e| missing_index(path, &e))?;
+        Self::decode(&buf, blocks, data_len).ok_or_else(|| mismatched_index(path))
     }
 
     fn read_controlled(
@@ -190,9 +182,9 @@ impl Sparse {
         let start = budget.used();
         let bytes = match budget.read_file(path) {
             Ok(bytes) => bytes,
-            Err(crate::Error::Io(_)) => {
+            Err(crate::Error::Io(error)) => {
                 budget.release(budget.used() - start);
-                return Ok(None);
+                return Err(missing_index(path, &error));
             }
             Err(error) => return Err(error),
         };
@@ -211,9 +203,10 @@ impl Sparse {
                 charge: budget.used() - start,
             })),
             None => {
-                // The invalid optional index and all of its partial storage dropped.
+                // The index that does not describe this vocabulary and all of its
+                // partial storage dropped before the refusal.
                 budget.release(budget.used() - start);
-                Ok(None)
+                Err(mismatched_index(path))
             }
         }
     }
@@ -524,7 +517,11 @@ impl Vocab {
         let off_path = dir.join("vocab.off");
         let blocks = (std::fs::metadata(&off_path)?.len() as usize / 8).saturating_sub(1);
         let sparse = if crate::index::sparse_vocab() {
-            Sparse::read(&dir.join("vocab.idx"), blocks, data.as_slice().len() as u64)
+            Some(Sparse::read(
+                &dir.join("vocab.idx"),
+                blocks,
+                data.as_slice().len() as u64,
+            )?)
         } else {
             None
         };
@@ -555,12 +552,7 @@ impl Vocab {
             && (s.offsets[0] != v.block_offset(0) as u64
                 || s.offsets[last] != v.block_offset(last * IDX_BLOCKS) as u64)
         {
-            tracing::warn!(
-                target: "sparkles::vocab",
-                "{} does not match its vocabulary; terms are looked up without it",
-                dir.join("vocab.idx").display()
-            );
-            v.sparse = None;
+            return Err(mismatched_index(&dir.join("vocab.idx")));
         }
         v.first_iri = match v.find(b"<") {
             Ok(i) | Err(i) => i,
@@ -626,8 +618,9 @@ impl Vocab {
             ) {
                 Ok(loaded) => loaded.map(|loaded| loaded.value),
                 Err(crate::Error::BudgetExceeded(_)) => {
-                    // This derived accelerator is optional. Its failed decoder owns
-                    // no surviving storage; the controlled base lookup remains exact.
+                    // The index is required on disk but not in memory: a budgeted
+                    // reader that cannot hold it looks terms up through the offsets,
+                    // which remains exact. Its failed decoder owns no surviving storage.
                     budget.release(budget.used() - before);
                     None
                 }
@@ -653,7 +646,7 @@ impl Vocab {
             && (sparse.offsets[0] != vocab.block_offset(0) as u64
                 || sparse.offsets[last] != vocab.block_offset(last * IDX_BLOCKS) as u64)
         {
-            // This optional derived accelerator and its actual owned storage drop.
+            // The index and its owned storage drop with the refused vocabulary.
             let sparse = vocab.sparse.take().unwrap();
             let bytes = sparse.keys.capacity() as u64
                 + sparse.starts.capacity() as u64 * 4
@@ -661,6 +654,7 @@ impl Vocab {
                 + (sparse.hinted.len() + sparse.warm_keys.len()) as u64 * 8;
             drop(sparse);
             budget.release(bytes);
+            return Err(mismatched_index(&dir.join("vocab.idx")));
         }
         // Type boundaries need one byte, not a reconstructed giant literal.
         vocab.first_iri = vocab.boundary_controlled(b'<', budget)?;
@@ -2306,21 +2300,19 @@ fn write_sparse_index(dir: &Path, entries: &[(u64, Vec<u8>)]) -> Result<()> {
 }
 
 /// For `sparkles check`: compare the sparse index in `dir` with the vocabulary's block
-/// `offsets` and `data`. `None` without an index, the number of its entries when it
-/// matches, and otherwise whether the mismatch is an error and what it is. An index
-/// that does not read as one for this vocabulary is ignored by the server (a warning).
-/// One that reads well but names other offsets or keys would be used (an error).
+/// `offsets` and `data`. The number of its entries when it matches, and otherwise what
+/// is wrong. Index format 5 requires the file, so a missing one, one that does not read
+/// as an index of this vocabulary and one that names other offsets or keys are all
+/// errors, and the open refuses the first two.
 pub(crate) fn verify_sparse_index(
     dir: &Path,
     offsets: &[usize],
     data: &[u8],
-) -> Option<std::result::Result<usize, (bool, String)>> {
-    let buf = std::fs::read(dir.join("vocab.idx")).ok()?;
+) -> std::result::Result<usize, String> {
+    let path = dir.join("vocab.idx");
+    let buf = std::fs::read(&path).map_err(|e| missing_index(&path, &e).to_string())?;
     let Some(s) = Sparse::decode(&buf, offsets.len(), data.len() as u64) else {
-        return Some(Err((
-            false,
-            "not a sparse index of this vocabulary; lookups do without it".into(),
-        )));
+        return Err("not a sparse index of this vocabulary".into());
     };
     for g in 0..s.len() {
         let b = g * IDX_BLOCKS;
@@ -2329,33 +2321,30 @@ pub(crate) fn verify_sparse_index(
             .and_then(|_| crate::index::read_varint_checked(data, &mut pos))
             .and_then(|len| data.get(pos..pos + len as usize));
         if s.offsets[g] != offsets[b] as u64 || first != Some(s.key(g)) {
-            return Some(Err((
-                true,
-                format!("entry {g} does not name the offset and first key of block {b}"),
-            )));
+            return Err(format!(
+                "entry {g} does not name the offset and first key of block {b}"
+            ));
         }
     }
-    Some(Ok(s.len()))
+    Ok(s.len())
 }
 
-/// Write the sparse index (`vocab.idx`) of the vocabulary in `dir` that lacks one,
-/// built by a version from before the index. It reads the first key of every
-/// [`IDX_BLOCKS`]-th block. Returns the number of entries.
-pub fn add_sparse_index(dir: &Path) -> Result<usize> {
-    let v = Vocab::open(dir)?;
-    let entries: Vec<(u64, Vec<u8>)> = (0..v.num_blocks())
-        .step_by(IDX_BLOCKS)
-        .map(|b| (v.block_offset(b) as u64, v.block_first(b).to_vec()))
-        .collect();
-    let tmp = dir.join("vocab.idx.tmp");
-    {
-        let mut f = File::create(&tmp)?;
-        f.write_all(&Sparse::encode(&entries))?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, dir.join("vocab.idx"))?;
-    crate::store::sync_dir(dir)?;
-    Ok(entries.len())
+/// The refusal of a generation whose `vocab.idx` cannot be read: index format 5
+/// requires the file.
+fn missing_index(path: &Path, error: &std::io::Error) -> crate::Error {
+    crate::Error::Corrupt(format!(
+        "{}: {error}; index format {} requires the sparse vocabulary index",
+        path.display(),
+        crate::builder::FORMAT_VERSION
+    ))
+}
+
+/// The refusal of a generation whose `vocab.idx` does not describe its vocabulary.
+fn mismatched_index(path: &Path) -> crate::Error {
+    crate::Error::Corrupt(format!(
+        "{} is not the sparse index of this vocabulary",
+        path.display()
+    ))
 }
 
 /// For `sparkles check`: compare the numeric column in `dir` with its vocabulary.
@@ -4350,31 +4339,38 @@ mod tests {
     }
 
     #[test]
-    fn sparse_index_added_later_matches_the_written_one() {
+    fn a_missing_sparse_index_is_corrupt() {
         let dir = tempfile::tempdir().unwrap();
         write_keys(dir.path(), 3 * FC_BLOCK * IDX_BLOCKS + 77);
-        let written = std::fs::read(dir.path().join("vocab.idx")).unwrap();
-        std::fs::remove_file(dir.path().join("vocab.idx")).unwrap();
-        assert!(Vocab::open(dir.path()).unwrap().sparse.is_none());
-        let n = add_sparse_index(dir.path()).unwrap();
-        assert_eq!(n, 4);
-        assert_eq!(
-            std::fs::read(dir.path().join("vocab.idx")).unwrap(),
-            written
-        );
         assert!(Vocab::open(dir.path()).unwrap().sparse.is_some());
+        std::fs::remove_file(dir.path().join("vocab.idx")).unwrap();
+        let error = Vocab::open(dir.path())
+            .err()
+            .expect("the index is required");
+        assert!(matches!(error, crate::Error::Corrupt(_)), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("requires the sparse vocabulary index")
+        );
+        // a process that does not use the index opens the vocabulary without the file
+        crate::index::set_sparse_vocab(false);
+        let opened = Vocab::open(dir.path());
+        crate::index::set_sparse_vocab(true);
+        assert!(opened.unwrap().sparse.is_none());
     }
 
     #[test]
-    fn a_sparse_index_of_another_vocabulary_is_ignored() {
+    fn a_sparse_index_of_another_vocabulary_is_corrupt() {
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
         write_keys(a.path(), 2 * FC_BLOCK * IDX_BLOCKS);
-        let keys = write_keys(b.path(), 5 * FC_BLOCK * IDX_BLOCKS);
+        write_keys(b.path(), 5 * FC_BLOCK * IDX_BLOCKS);
         std::fs::copy(a.path().join("vocab.idx"), b.path().join("vocab.idx")).unwrap();
-        let v = Vocab::open(b.path()).unwrap();
-        assert!(v.sparse.is_none());
-        assert_eq!(v.find(&keys[4000]), Ok(4000));
+        let error = Vocab::open(b.path())
+            .err()
+            .expect("another vocabulary's index");
+        assert!(matches!(error, crate::Error::Corrupt(_)), "{error}");
         // a cut file and a wrong magic number
         let idx = std::fs::read(a.path().join("vocab.idx")).unwrap();
         let blocks = (2 * IDX_BLOCKS * FC_BLOCK + 2 * IDX_BLOCKS * FC_BLOCK / 4).div_ceil(FC_BLOCK);
@@ -4396,18 +4392,22 @@ mod tests {
             .map(|c| u64::from_le_bytes(*c) as usize)
             .collect();
         let verify = || verify_sparse_index(dir.path(), &offsets, &data);
-        assert_eq!(verify(), Some(Ok(4)));
+        assert_eq!(verify(), Ok(4));
         // the last key's final digit, lowered: still in order, but not block 384's key
         let path = dir.path().join("vocab.idx");
         let mut idx = std::fs::read(&path).unwrap();
         let n = idx.len();
         idx[n - 1] -= 1;
         std::fs::write(&path, &idx).unwrap();
-        assert!(matches!(verify(), Some(Err((true, _)))));
+        assert!(verify().unwrap_err().contains("block 384"));
         std::fs::write(&path, b"junk").unwrap();
-        assert!(matches!(verify(), Some(Err((false, _)))));
+        assert!(verify().unwrap_err().contains("not a sparse index"));
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(verify(), None);
+        assert!(
+            verify()
+                .unwrap_err()
+                .contains("requires the sparse vocabulary index")
+        );
     }
 
     #[test]

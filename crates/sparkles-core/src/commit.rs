@@ -429,13 +429,28 @@ pub(crate) fn parse_rfc3339_offset(s: &str) -> Option<i64> {
 
 // ------------------------------------------------------------- dataset.json ------
 
-/// Dataset capabilities supported by this reader (1: legacy, 2: branches,
-/// 3: relinked generations with an immutable base overlay, 4: framed delta
-/// vocabularies, see [`crate::vocab::delta`], 5: write-ahead logs with a header record,
-/// see [`crate::store::wal`], 6: protected managed graphs, `managed.json`, see
-/// [`crate::managed`], 7: durable source holds, `holds.json`, see [`crate::holds`]). [`crate::formats::DATASET`] lists them.
+/// The `format` of `dataset.json` this build writes and reads. Format 2 marks the
+/// first-release cutoff (spec X16 Phase 1). Format 1 is every pre-release form, which
+/// this build refuses with the dump-and-reload message, and a file without the member
+/// reads as format 1.
+pub const DATASET_FORMAT: u32 = 2;
+
+/// The dataset reader capabilities this build has (5: write-ahead logs with a header
+/// record, see [`crate::store::wal`], 6: protected managed graphs, `managed.json`, see
+/// [`crate::managed`], 7: durable source holds, `holds.json`, see [`crate::holds`], 8:
+/// configuration history, see [`crate::store::managed_history`]). Readers 1 to 4 named
+/// the pre-release forms, a dataset without branches, relinked generations, framed delta
+/// vocabularies or log headers, and [`OLDEST_DATASET_READER`] is the first one this
+/// build reads. [`crate::formats::DATASET`] lists them.
 pub const DATASET_READER: u32 = 8;
-fn legacy_reader() -> u32 {
+
+/// The oldest dataset reader this build reads: every store of the first release writes
+/// a log with a header record, so a `format` 2 dataset requires at least this reader.
+pub const OLDEST_DATASET_READER: u32 = crate::store::wal::HEADER_READER;
+
+/// The reader of a `dataset.json` without a `minimumReader` member, which no release
+/// that writes `format` 2 produces.
+fn absent_reader() -> u32 {
     1
 }
 
@@ -468,21 +483,35 @@ pub(crate) fn check_dataset_value_as(v: &serde_json::Value, reader: u32) -> Resu
     };
     let format = member("format")?;
     let minimum_reader = member("minimumReader")?;
-    if format != 1 || minimum_reader > u64::from(reader) {
-        let by = v
-            .get("writtenBy")
-            .and_then(|w| w.as_str())
-            // A damaged header must not format an unbounded native string.
-            .filter(|value| value.len() <= 256)
-            .map(|v| format!(", written by Sparkles {v},"))
-            .unwrap_or_default();
+    let newer = format > u64::from(DATASET_FORMAT) || minimum_reader > u64::from(reader);
+    let older =
+        format < u64::from(DATASET_FORMAT) || minimum_reader < u64::from(OLDEST_DATASET_READER);
+    if !newer && !older {
+        return Ok(());
+    }
+    let written_by = v
+        .get("writtenBy")
+        .and_then(|w| w.as_str())
+        // A damaged header must not format an unbounded native string.
+        .filter(|value| value.len() <= 256);
+    let by = written_by
+        .map(|v| format!(", written by Sparkles {v}"))
+        .unwrap_or_default();
+    let head = format!(
+        "dataset.json{by} has format {format} and requires reader {minimum_reader}; Sparkles {} reads format {DATASET_FORMAT} with readers {OLDEST_DATASET_READER} to {reader}",
+        crate::formats::SPARKLES_VERSION,
+    );
+    // A file that is newer in one member and older in the other was written by no
+    // release, and the newer release is the one to ask about it.
+    if newer {
         return Err(Error::Unsupported(format!(
-            "dataset.json{by} has format {format} and requires reader {minimum_reader}; Sparkles {} reads format 1 up to reader {}. Open the database with a newer release",
-            crate::formats::SPARKLES_VERSION,
-            reader
+            "{head}. It was written by a newer release: open it with that release or a later one"
         )));
     }
-    Ok(())
+    Err(Error::Unsupported(format!(
+        "{head}. {}",
+        crate::formats::dump_and_reload(written_by)
+    )))
 }
 
 /// Decode the same identity and version contract without mutable Store startup.
@@ -588,19 +617,17 @@ pub fn read_written_by(root: &Path) -> Option<String> {
 }
 
 /// Record that this release opens the database at `root` for writing: `writtenBy`
-/// becomes this release, and `minimumReader` rises to the reader of the files this
-/// release creates (a log with a header record, [`crate::store::wal::HEADER_READER`]).
-/// `dataset.json` is rewritten only when either changes.
+/// becomes this release. `dataset.json` is rewritten only when it changes. Every
+/// dataset this build reads already requires the reader of the files a plain store
+/// creates, [`OLDEST_DATASET_READER`], so the reader stays.
 pub(crate) fn note_writer(root: &Path) -> Result<()> {
     let Some(mut ds) = read_dataset(root)? else {
         return Ok(());
     };
-    let reader = ds.minimum_reader.max(crate::store::wal::HEADER_READER);
     let version = crate::formats::SPARKLES_VERSION;
-    if ds.minimum_reader == reader && ds.written_by.as_deref() == Some(version) {
+    if ds.written_by.as_deref() == Some(version) {
         return Ok(());
     }
-    ds.minimum_reader = reader;
     ds.written_by = Some(version.to_string());
     write_dataset(root, &ds)
 }
@@ -608,11 +635,6 @@ pub(crate) fn note_writer(root: &Path) -> Result<()> {
 /// Check compatibility without changing any database files.
 pub fn check_dataset_compatibility(root: &Path) -> Result<()> {
     read_dataset(root).map(|_| ())
-}
-
-/// Publish the minimum reader needed by branches before publishing their table.
-pub(crate) fn require_branch_reader(root: &Path) -> Result<()> {
-    require_reader(root, 2)
 }
 
 /// The bytes of a `dataset.json` with its `minimumReader` raised to at least `reader`,
@@ -658,7 +680,7 @@ macro_rules! dataset_file {
 
 dataset_file! {
     format: u32 => "format",
-    #[serde(default = "legacy_reader")]
+    #[serde(default = "absent_reader")]
     minimum_reader: u32 => "minimumReader",
     #[serde(default, skip_serializing_if = "Option::is_none")]
     written_by: Option<String> => "writtenBy",
@@ -864,8 +886,8 @@ pub(crate) fn clone_dataset_file_bytes(
     from: ForkedFrom,
 ) -> Vec<u8> {
     serde_json::to_vec_pretty(&DatasetFile {
-        format: 1,
-        minimum_reader: crate::store::wal::HEADER_READER,
+        format: DATASET_FORMAT,
+        minimum_reader: OLDEST_DATASET_READER,
         written_by: Some(crate::formats::SPARKLES_VERSION.to_string()),
         id,
         created: rfc3339_ms(created_ms),
@@ -898,8 +920,8 @@ pub(crate) fn read_dataset_file(root: &Path) -> Result<Option<uuid::Uuid>> {
 
 pub(crate) fn dataset_file_bytes(id: uuid::Uuid, origin: &str, created_ms: i64) -> Vec<u8> {
     serde_json::to_vec_pretty(&DatasetFile {
-        format: 1,
-        minimum_reader: crate::store::wal::HEADER_READER,
+        format: DATASET_FORMAT,
+        minimum_reader: OLDEST_DATASET_READER,
         written_by: Some(crate::formats::SPARKLES_VERSION.to_string()),
         id,
         created: rfc3339_ms(created_ms),
@@ -2515,13 +2537,12 @@ mod tests {
         assert_eq!(v["writtenBy"], crate::formats::SPARKLES_VERSION);
         assert_eq!(v["futureMember"], serde_json::json!({"a": 1}));
         // a member that a later release added never shadows a known one
-        assert_eq!(v["format"], 1);
+        assert_eq!(v["format"], DATASET_FORMAT);
         assert_eq!(v["minimumReader"], 5);
         // raising the reader keeps it too
-        edit(&|v| v["minimumReader"] = 1.into());
-        require_reader(&root, 5).unwrap();
+        require_reader(&root, 6).unwrap();
         let v = read();
-        assert_eq!(v["minimumReader"], 5);
+        assert_eq!(v["minimumReader"], 6);
         assert_eq!(v["futureMember"], serde_json::json!({"a": 1}));
     }
     #[test]
@@ -2706,7 +2727,7 @@ mod tests {
             let found: DatasetFile = serde_json::from_slice(&output.value).unwrap();
             assert_eq!(found.id, destination);
             assert_eq!(found.minimum_reader, 9);
-            assert_eq!(found.format, 1);
+            assert_eq!(found.format, DATASET_FORMAT);
             assert_eq!(found.origin, "restore");
             assert_eq!(found.created, rfc3339_ms(2000));
             assert_eq!(found.forked_from, Some(ForkedFrom { id: old, seq: 42 }));

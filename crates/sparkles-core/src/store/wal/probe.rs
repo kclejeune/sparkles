@@ -332,59 +332,17 @@ mod tests {
     }
 
     #[test]
-    fn durable_boundary_refuses_eof_and_partial_record_truncation() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("wal.log");
-        let data = data(0);
-        let wire: Vec<u8> = [
-            data,
-            commit_record(11, &data, 0),
-            data,
-            commit_record(12, &data, 0),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        assert_eq!(wire.len(), 132);
+    fn physical_observations_skip_the_header_and_refuse_a_headerless_log() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("wal.log");
         let options = HistoryOptions::default();
-        for end in [0, 33, 66, 67, 98, 99, 131, 132] {
-            let bytes = &wire[..end];
-            std::fs::write(&path, bytes).unwrap();
-            let mut budget = ColdBudget::new(ReadLimit {
-                options: &options,
-                memory: Some(4096),
-                held: 0,
-            })
-            .unwrap();
-            let loaded = budget.buffered(&path).unwrap();
-            let mut reader = loaded.value;
-            let result = prove_prefix(
-                &mut reader,
-                end as u64,
-                10,
-                11,
-                false,
-                Some(132),
-                u64::MAX,
-                None,
-                &path,
-                &budget,
-            );
-            if end < 132 {
-                assert!(
-                    matches!(result, Err(Error::Corrupt(_))),
-                    "accepted durable truncation at{end}: {result:?}"
-                );
-            } else {
-                let result = result.unwrap();
-                assert_eq!(result.head.seq, 12);
-                assert_eq!(result.selected.unwrap().seq, 11);
-            }
-            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let data = data(0);
+        let mut wire = header_record().to_vec();
+        for seq in [11, 12] {
+            wire.extend_from_slice(&data);
+            wire.extend_from_slice(&commit_record(seq, &data, 0));
         }
-        // A complete first transaction is a valid prefix when only those bytes
-        // were recorded durable, even if a later transaction has not reached disk.
-        std::fs::write(&path, &wire[..66]).unwrap();
+        std::fs::write(&path, &wire).unwrap();
         let mut budget = ColdBudget::new(ReadLimit {
             options: &options,
             memory: Some(4096),
@@ -392,122 +350,57 @@ mod tests {
         })
         .unwrap();
         let mut reader = budget.buffered(&path).unwrap().value;
+        let mut observed = Vec::new();
+        let proof = prove_prefix_with(
+            &mut reader,
+            wire.len() as u64,
+            10,
+            u64::MAX,
+            false,
+            None,
+            u64::MAX,
+            None,
+            &path,
+            &budget,
+            &mut |record| {
+                observed.push((record.point.seq, record.start_offset, record.point.offset));
+                Ok(())
+            },
+        )
+        .unwrap();
+        let start = WAL_REC as u64;
         assert_eq!(
-            prove_prefix(
-                &mut reader,
-                66,
-                10,
-                11,
-                false,
-                Some(66),
-                u64::MAX,
-                None,
-                &path,
-                &budget
-            )
-            .unwrap()
-            .head
-            .seq,
-            11
+            observed,
+            [
+                (11, start, start + 2 * WAL_REC as u64),
+                (12, start + 2 * WAL_REC as u64, start + 4 * WAL_REC as u64),
+            ]
         );
-        let mut headed = header_record().to_vec();
-        headed.extend_from_slice(&wire);
-        std::fs::write(&path, &headed).unwrap();
+        assert_eq!(proof.head.offset, wire.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), wire);
+        // the same records without the header are the pre-release headerless log, which
+        // is refused with the dump-and-reload message before any record is read
+        let headerless = &wire[WAL_REC..];
+        std::fs::write(&path, headerless).unwrap();
         let mut reader = budget.buffered(&path).unwrap().value;
-        // A real header supersedes a stale headerless marker, exactly as recovery.
-        assert_eq!(
-            prove_prefix(
-                &mut reader,
-                headed.len() as u64,
-                10,
-                11,
-                false,
-                Some(3300),
-                u64::MAX,
-                None,
-                &path,
-                &budget
-            )
-            .unwrap()
-            .head
-            .seq,
-            12
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), headed);
-    }
-
-    #[test]
-    fn physical_observations_distinguish_folded_sequences_and_skip_the_header() {
-        let temporary = tempfile::tempdir().unwrap();
-        let path = temporary.path().join("wal.log");
-        let options = HistoryOptions::default();
-        for (headed, modern, folding) in [
-            (true, true, false),
-            (false, true, false),
-            (false, false, true),
-            (false, false, false),
-        ] {
-            let mut wire = if headed {
-                header_record().to_vec()
-            } else {
-                Vec::new()
-            };
-            let data = data(0);
-            for seq in [11, 12] {
-                wire.extend_from_slice(&data);
-                let record = if modern {
-                    commit_record(seq, &data, 0)
-                } else {
-                    let mut record = [0; WAL_REC];
-                    record[0] = WAL_COMMIT;
-                    record
-                };
-                wire.extend_from_slice(&record);
-            }
-            std::fs::write(&path, &wire).unwrap();
-            let mut budget = ColdBudget::new(ReadLimit {
-                options: &options,
-                memory: Some(4096),
-                held: 0,
-            })
-            .unwrap();
-            let mut reader = budget.buffered(&path).unwrap().value;
-            let mut observed = Vec::new();
-            let proof = prove_prefix_with(
-                &mut reader,
-                wire.len() as u64,
-                10,
-                u64::MAX,
-                folding,
-                None,
-                u64::MAX,
-                None,
-                &path,
-                &budget,
-                &mut |record| {
-                    observed.push((record.point.seq, record.start_offset, record.point.offset));
-                    Ok(())
-                },
-            )
-            .unwrap();
-            let start = if headed { WAL_REC as u64 } else { 0 };
-            let first_seq = if folding { 10 } else { 11 };
-            let last_seq = if folding { 10 } else { 12 };
-            assert_eq!(
-                observed,
-                [
-                    (first_seq, start, start + 2 * WAL_REC as u64),
-                    (
-                        last_seq,
-                        start + 2 * WAL_REC as u64,
-                        start + 4 * WAL_REC as u64
-                    ),
-                ],
-                "headed={headed} modern={modern} folding={folding}"
-            );
-            assert_eq!(proof.head.offset, wire.len() as u64);
-            assert_eq!(std::fs::read(&path).unwrap(), wire);
-        }
+        let error = prove_prefix(
+            &mut reader,
+            headerless.len() as u64,
+            10,
+            u64::MAX,
+            false,
+            None,
+            u64::MAX,
+            None,
+            &path,
+            &budget,
+        )
+        .err()
+        .expect("a headerless log is refused");
+        assert!(matches!(error, Error::Unsupported(_)), "{error}");
+        assert!(error.to_string().contains("wal version 0"), "{error}");
+        assert!(error.to_string().contains("sparkles dump"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), headerless);
     }
 
     #[test]
@@ -516,6 +409,7 @@ mod tests {
         let path = root.path().join("wal.log");
         let data = data(0);
         let wire: Vec<u8> = [
+            header_record(),
             data,
             commit_record(11, &data, 0),
             data,
@@ -540,7 +434,7 @@ mod tests {
             10,
             11,
             false,
-            Some(132),
+            None,
             u64::MAX,
             None,
             &path,
@@ -560,20 +454,24 @@ mod tests {
         assert_eq!(
             observed,
             [
-                (11, 0, 66, Some((100, CommitKind::Update, 0))),
-                (12, 66, 132, Some((100, CommitKind::Update, 0)))
+                (11, 33, 99, Some((100, CommitKind::Update, 0))),
+                (12, 99, 165, Some((100, CommitKind::Update, 0)))
             ]
         );
-        std::fs::write(&path, &wire[..66]).unwrap();
+        // commit 11's data damaged while commit 12's record proves it durable: the
+        // proof refuses the log, and no commit is observed before the refusal
+        let mut damaged = wire.clone();
+        damaged[WAL_REC + 1] ^= 1;
+        std::fs::write(&path, &damaged).unwrap();
         let mut reader = budget.buffered(&path).unwrap().value;
         observed.clear();
         let result = prove_prefix_with(
             &mut reader,
-            66,
+            damaged.len() as u64,
             10,
             11,
             false,
-            Some(132),
+            None,
             u64::MAX,
             None,
             &path,
@@ -588,11 +486,10 @@ mod tests {
                 Ok(())
             },
         );
-        assert!(matches!(result, Err(Error::Corrupt(_))));
-        assert_eq!(
-            observed.len(),
-            1,
-            "observations must be discarded after the final refusal"
+        assert!(matches!(result, Err(Error::Corrupt(_))), "{result:?}");
+        assert!(
+            observed.is_empty(),
+            "no observation precedes the refusal of a damaged durable prefix"
         );
         std::fs::write(&path, &wire).unwrap();
         let mut reader = budget.buffered(&path).unwrap().value;
@@ -604,7 +501,7 @@ mod tests {
                 10,
                 11,
                 false,
-                Some(132),
+                None,
                 u64::MAX,
                 None,
                 &path,

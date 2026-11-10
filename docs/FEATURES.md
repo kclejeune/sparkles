@@ -345,10 +345,10 @@ roadmap item as unfinished or promise another implementation.
   predicate. Queries that count triples use the ordinary permutations. Encoded IRIs and
   alternative block codecs are not available because their measured savings did not
   meet the adoption gates in [X11](specs/X11-index-compression-and-predicate-patterns.md#phases-not-built).
-* A headerless WAL that has never been opened for writing by the current format keeps
-  its legacy interpretation. A torn record left by an older build can therefore be
-  read as a legacy commit or refused, as [X09](specs/X09-group-commit-by-default.md#phase-3)
-  describes.
+* Databases and backups written before the first release are refused with a message
+  that names `sparkles dump` from the release that wrote them and `sparkles load`, as
+  [X16](specs/X16-storage-consolidation/SPEC.md#phase-1-first-release-format-cutoff-item-479)
+  describes. There is no upgrade step for them.
 * ShEx 2.2 does not support `RESTRICTS` or `EXACTLY` reference syntax. SHACL 1.2 reifier
   constraints, `sh:uniqueValuesFor`, `sh:subsetOf`, `sh:someValue`, `sh:rootClass`,
   `sh:singleLine` and SHACL 1.2 custom functions are outside the supported scope. The

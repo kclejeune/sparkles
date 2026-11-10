@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Format
+
+The first-release format cutoff (item 479, spec X16 Phase 1). `dataset.json` is written
+as `format` 2 with `minimumReader` 5 or more, and a `format` 1 file or one that requires a
+reader below 5 is refused with the dump-and-reload message. The generation index is
+written and read as format 5, which is format 4 with the `features` list always present
+and `vocab.idx` required, and formats 2 to 4 are refused. The write-ahead log reads
+versions 1 and 2 and refuses a headerless log, version 0. The delta vocabulary reads the
+framed version 2 and refuses the pre-release file of the entries alone, and the
+`sparkles migrate` step that rewrote it is gone, so no step is registered. Backup key
+slots read format 2 alone. `sparkles vocab-index` no longer writes `vocab.idx`, which
+every generation has, and still adds the numeric column. The two pre-release fixtures
+stay in `testsuite/formats/` for their refusal tests, and a fixture written at the
+cutoff commit joins them.
+
 ### Compatibility
 
 The adopted HTTP, CLI and public library compatibility policy is documented.

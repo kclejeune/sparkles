@@ -680,13 +680,11 @@ fn minimum_reader(root: &Path) -> u64 {
     ds["minimumReader"].as_u64().unwrap()
 }
 
-/// A dataset from an earlier release has a legacy `delta.vocab`, the entries alone. It
-/// opens and reads as before, and nothing in the file changes until a commit adds a
-/// term. That commit first requires reader 4 in `dataset.json`, which earlier releases
-/// refuse, and then rewrites the file framed. Commits that add no terms keep the
-/// dataset's reader.
+/// A pre-release `delta.vocab` of the entries alone, without a header, is refused with
+/// the dump-and-reload message by the open and by `check`, and the refusal changes no
+/// file. A dataset that requires a reader this build does not have is refused as newer.
 #[test]
-fn a_legacy_delta_vocabulary_is_rewritten_framed_by_the_first_new_term() {
+fn an_unframed_delta_vocabulary_is_refused_with_dump_and_reload() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");
     {
@@ -694,64 +692,34 @@ fn a_legacy_delta_vocabulary_is_rewritten_framed_by_the_first_new_term() {
         upd(&s, "INSERT DATA { <urn:a> <urn:p> \"one\" }");
         upd(&s, "INSERT DATA { <urn:b> <urn:p> \"two\" }");
     }
-    // the dataset as an earlier release left it, with a torn entry at the end
+    // the file as a pre-release wrote it: the entries alone, with a torn entry at the end
     let vocab = vocab_of(&root);
-    let parsed = std::fs::read(&vocab).unwrap();
-    let keys = sparkles_core::vocab::parse_delta(&parsed).unwrap().keys;
+    let framed = std::fs::read(&vocab).unwrap();
+    let keys = sparkles_core::vocab::parse_delta(&framed).unwrap().keys;
     assert_eq!(keys.len(), 5);
-    let mut legacy: Vec<u8> = keys
+    let mut unframed: Vec<u8> = keys
         .iter()
         .flat_map(|k| [&(k.len() as u32).to_le_bytes()[..], k].concat())
         .collect();
-    let legacy_len = legacy.len();
-    legacy.extend_from_slice(&[9, 0, 0, 0, b'<']);
-    std::fs::write(&vocab, &legacy).unwrap();
-    let mut ds: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.join("dataset.json")).unwrap()).unwrap();
-    ds["minimumReader"] = serde_json::json!(1);
-    std::fs::write(root.join("dataset.json"), ds.to_string()).unwrap();
-    {
-        let s = Store::open(&root, StoreOptions::default()).unwrap();
-        assert_eq!(s.head_commit().seq, 2);
-        assert!(ask(&s, "ASK { <urn:b> <urn:p> \"two\" }"));
-        // opening for writing requires the reader of the log header (5), and a commit
-        // without new terms leaves the file as it is
-        assert_eq!(minimum_reader(&root), 5);
-        upd(&s, "INSERT DATA { <urn:b> <urn:p> \"one\" }");
-    }
-    // the open dropped the torn entry, and the legacy entries are as they were
-    assert_eq!(std::fs::read(&vocab).unwrap(), &legacy[..legacy_len]);
-    let check = |root: &Path| {
-        let r = sparkles_core::check::check(root, &Default::default()).unwrap();
-        r.get("delta-vocabulary").unwrap().summary.clone()
-    };
-    assert!(check(&root).contains("legacy format"), "{}", check(&root));
-    {
-        let s = Store::open(&root, StoreOptions::default()).unwrap();
-        upd(&s, "INSERT DATA { <urn:c> <urn:p> \"three\" }");
-        // the framed file needs reader 4, which the log header's reader 5 covers
-        assert_eq!(minimum_reader(&root), 5);
-        assert_eq!(s.head_commit().seq, 4);
-    }
-    let framed = std::fs::read(&vocab).unwrap();
-    assert_eq!(&framed[..8], &sparkles_core::vocab::delta::MAGIC);
-    // the rewritten entries in one chunk, the new terms in the next
-    assert_eq!(chunk_ends(&vocab).len(), 2);
-    assert!(check(&root).contains("framed format"), "{}", check(&root));
-    let s = Store::open(&root, StoreOptions::default()).unwrap();
-    assert_eq!(s.head_commit().seq, 4);
-    for q in [
-        "ASK { <urn:a> <urn:p> \"one\" }",
-        "ASK { <urn:b> <urn:p> \"two\" }",
-        "ASK { <urn:b> <urn:p> \"one\" }",
-        "ASK { <urn:c> <urn:p> \"three\" }",
-    ] {
-        assert!(ask(&s, q), "{q}");
-    }
-    drop(s);
-    // a release that reads up to reader 4 refuses the dataset now, as this one
-    // refuses a dataset that requires a later reader
-    // reader 8 is configuration history, which only an activated dataset records
+    unframed.extend_from_slice(&[9, 0, 0, 0, b'<']);
+    std::fs::write(&vocab, &unframed).unwrap();
+    let before: Vec<(std::path::PathBuf, Vec<u8>)> = walkdir(&root);
+    let e = Store::open(&root, StoreOptions::default()).err().unwrap();
+    assert!(e.to_string().contains("delta-vocab version 1"), "{e}");
+    assert!(e.to_string().contains("sparkles dump"), "{e}");
+    let r = sparkles_core::check::check(&root, &Default::default()).unwrap();
+    let summary = r.to_text();
+    assert!(summary.contains("sparkles dump"), "{summary}");
+    let plan = sparkles_core::migrate::plan(&root).unwrap();
+    assert!(!plan.in_window(), "{:?}", plan.refused);
+    assert!(plan.steps.is_empty());
+    assert_eq!(walkdir(&root), before, "the refusal changed a file");
+    // the framed file opens again, and a dataset that requires a later reader is
+    // refused as newer. Reader 8 is configuration history, which only an activated
+    // dataset records.
+    std::fs::write(&vocab, &framed).unwrap();
+    assert_eq!(minimum_reader(&root), 5);
+    drop(Store::open(&root, StoreOptions::default()).unwrap());
     assert_eq!(sparkles_core::commit::DATASET_READER, 8);
     let mut ds: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("dataset.json")).unwrap()).unwrap();
@@ -759,6 +727,25 @@ fn a_legacy_delta_vocabulary_is_rewritten_framed_by_the_first_new_term() {
     std::fs::write(root.join("dataset.json"), ds.to_string()).unwrap();
     let e = Store::open(&root, StoreOptions::default()).err().unwrap();
     assert!(e.to_string().contains("requires reader 9"), "{e}");
+    assert!(e.to_string().contains("newer release"), "{e}");
+}
+
+/// Every file under `root` with its content, in path order.
+fn walkdir(root: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().is_some_and(|n| n != "sparkles.lock") {
+                out.push((path.clone(), std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 #[test]

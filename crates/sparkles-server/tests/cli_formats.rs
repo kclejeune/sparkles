@@ -17,7 +17,18 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
 
-fn fixtures() -> Vec<PathBuf> {
+/// The `format` of the dataset's `dataset.json` that a fixture's `facts.txt` records,
+/// absent in the pre-release fixtures, whose datasets are format 1.
+fn dataset_format(fixture: &Path) -> u32 {
+    std::fs::read_to_string(fixture.join("facts.txt"))
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("dataset-format "))
+        .map_or(1, |v| v.trim().parse().unwrap())
+}
+
+/// Every fixture, in label order, with whether this build reads its dataset format.
+fn all_fixtures() -> Vec<(PathBuf, bool)> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testsuite/formats");
     let mut out: Vec<PathBuf> = std::fs::read_dir(&dir)
         .unwrap()
@@ -27,6 +38,31 @@ fn fixtures() -> Vec<PathBuf> {
         .collect();
     out.sort();
     assert!(!out.is_empty(), "no fixtures in {}", dir.display());
+    out.into_iter()
+        .map(|p| {
+            let inside = dataset_format(&p) == sparkles_core::commit::DATASET_FORMAT;
+            (p, inside)
+        })
+        .collect()
+}
+
+/// The fixtures inside the window, which open and answer as recorded.
+fn fixtures() -> Vec<PathBuf> {
+    let out: Vec<PathBuf> = all_fixtures()
+        .into_iter()
+        .filter_map(|(p, inside)| inside.then_some(p))
+        .collect();
+    assert!(!out.is_empty(), "no fixture inside the window");
+    out
+}
+
+/// The pre-release fixtures, outside the window, whose refusal the tests check.
+fn refused_fixtures() -> Vec<PathBuf> {
+    let out: Vec<PathBuf> = all_fixtures()
+        .into_iter()
+        .filter_map(|(p, inside)| (!inside).then_some(p))
+        .collect();
+    assert!(!out.is_empty(), "no fixture outside the window");
     out
 }
 

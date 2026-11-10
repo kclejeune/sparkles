@@ -1387,8 +1387,6 @@ impl Store {
             sync_dir(root)?;
             self.failpoint("compact-before-current");
             if let Some((main, source)) = &relink {
-                commit::require_reader(main.root.as_ref().expect("persistent main"), 3)?;
-                commit::require_reader(root, 3)?;
                 main.add_relink_hold(self.dataset_id, &source.segment)?;
                 self.failpoint("relink-held");
                 if cancelled() {

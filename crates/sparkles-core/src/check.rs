@@ -1150,18 +1150,10 @@ impl Checker<'_> {
             summary.push_str(", block first keys checked for order");
         }
         match crate::vocab::verify_sparse_index(dir, &offsets, data) {
-            None => {}
-            Some(Ok(n)) => summary.push_str(&format!(", sparse index of {n} keys")),
-            // the server does without an index it cannot read, but would use one that
-            // reads well and names other keys
-            Some(Err((error, m))) => run.add(
-                if error {
-                    Issue::error(m)
-                } else {
-                    Issue::warning(m)
-                }
-                .file(format!("{name}/vocab.idx")),
-            ),
+            Ok(n) => summary.push_str(&format!(", sparse index of {n} keys")),
+            // index format 5 requires the sparse index, so a missing one or one that
+            // does not describe this vocabulary is an error, as the open refuses it
+            Err(m) => run.add(Issue::error(m).file(format!("{name}/vocab.idx"))),
         }
         match crate::vocab::verify_numeric_column(dir, self.full) {
             None => {}
@@ -1277,11 +1269,7 @@ impl Checker<'_> {
             }
         }
         self.dvocab_len = Some(keys.len() as u64);
-        let mut summary = format!(
-            "{} terms added by updates; {} format",
-            keys.len(),
-            parsed.format.as_str()
-        );
+        let mut summary = format!("{} terms added by updates", keys.len());
         if parsed.chunks > 0 {
             summary.push_str(&format!(", {} chunks", parsed.chunks));
         }
@@ -1297,15 +1285,10 @@ impl Checker<'_> {
         let full = self.full;
         let quads = self.meta.as_ref().map(|m| m.quads);
         let vocab_len = self.vocab_len;
-        // format 3 generations are segmented (spec X07 §6.5); without a readable meta.json
-        // the `.seg` files say
-        let segmented = |p: Perm| match self.meta.as_ref() {
-            Some(m) => m.format_version >= 3,
-            None => dir.join(format!("{}.seg", p.name())).exists(),
-        };
+        // every generation this build reads is segmented (spec X07 §6.5)
         let scans: Vec<PermScan> = Perm::ALL
             .par_iter()
-            .map(|&p| scan_perm(dir, name, p, quads, vocab_len, full, segmented(p)))
+            .map(|&p| scan_perm(dir, name, p, quads, vocab_len, full))
             .collect();
         let t0 = Instant::now();
         let mut refs = IdRefs::default();
@@ -2443,7 +2426,6 @@ fn scan_perm(
     quads: Option<u64>,
     vocab_len: Option<u64>,
     full: bool,
-    segmented: bool,
 ) -> PermScan {
     let name = perm.name();
     let mut run = Run::new(format!("perm.{name}"));
@@ -2570,16 +2552,12 @@ fn scan_perm(
         );
     }
     // the segment directory: its header, and one entry per segment of every block
-    let seg_bytes = if segmented {
-        match std::fs::read(dir.join(format!("{name}.seg"))) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                run.add(Issue::error(format!("{e}: a format 3 index needs it")).file(&seg_file));
-                None
-            }
+    let seg_bytes = match std::fs::read(dir.join(format!("{name}.seg"))) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            run.add(Issue::error(format!("{e}: a segmented index needs it")).file(&seg_file));
+            None
         }
-    } else {
-        None
     };
     // (segment size, the index of each block's first entry)
     let mut directory: Option<(usize, Vec<usize>)> = None;
@@ -2646,7 +2624,7 @@ fn scan_perm(
                     )),
                     _ => None,
                 };
-                if segmented && segs.is_none() {
+                if segs.is_none() {
                     return BlockScan {
                         issues: Vec::new(),
                         id_issues: Vec::new(),

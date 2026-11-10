@@ -1,8 +1,10 @@
 //! The on-disk format fixtures of `testsuite/formats/` (X12 §4.6) at the engine level:
-//! every fixture's dataset opens in this build without an upgrade, `check` finds no
-//! errors, its quad counts match what the release that wrote it recorded (at the head
-//! and at past commits), and a write, a compaction and a second open succeed. The
-//! server test `cli_formats.rs` covers the catalog, the queries and the backups.
+//! every fixture inside the window opens in this build without an upgrade, `check`
+//! finds no errors, its quad counts match what the release that wrote it recorded (at
+//! the head and at past commits), and a write, a compaction and a second open succeed.
+//! Every pre-release fixture is refused with the dump-and-reload message, and the
+//! refusal changes no file. The server test `cli_formats.rs` covers the catalog, the
+//! queries and the backups.
 
 use sparkles_core::check::{CheckOptions, Status, check};
 use sparkles_core::history::{At, HistoryOptions};
@@ -12,7 +14,18 @@ use sparkles_core::store::{Store, StoreOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn fixtures() -> Vec<PathBuf> {
+/// The `format` of the dataset's `dataset.json` that a fixture's `facts.txt` records,
+/// absent in the pre-release fixtures, whose datasets are format 1.
+fn dataset_format(fixture: &Path) -> u32 {
+    std::fs::read_to_string(fixture.join("facts.txt"))
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("dataset-format "))
+        .map_or(1, |v| v.trim().parse().unwrap())
+}
+
+/// Every fixture, in label order, with whether this build reads its dataset format.
+fn all_fixtures() -> Vec<(PathBuf, bool)> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testsuite/formats");
     let mut out: Vec<PathBuf> = std::fs::read_dir(&dir)
         .unwrap()
@@ -22,6 +35,31 @@ fn fixtures() -> Vec<PathBuf> {
         .collect();
     out.sort();
     assert!(!out.is_empty(), "no fixtures in {}", dir.display());
+    out.into_iter()
+        .map(|p| {
+            let inside = dataset_format(&p) == sparkles_core::commit::DATASET_FORMAT;
+            (p, inside)
+        })
+        .collect()
+}
+
+/// The fixtures inside the window, which open and answer as recorded.
+fn fixtures() -> Vec<PathBuf> {
+    let out: Vec<PathBuf> = all_fixtures()
+        .into_iter()
+        .filter_map(|(p, inside)| inside.then_some(p))
+        .collect();
+    assert!(!out.is_empty(), "no fixture inside the window");
+    out
+}
+
+/// The pre-release fixtures, outside the window, whose refusal the tests check.
+fn refused_fixtures() -> Vec<PathBuf> {
+    let out: Vec<PathBuf> = all_fixtures()
+        .into_iter()
+        .filter_map(|(p, inside)| (!inside).then_some(p))
+        .collect();
+    assert!(!out.is_empty(), "no fixture outside the window");
     out
 }
 
@@ -97,6 +135,181 @@ fn every_fixture_opens_in_place() {
         assert!(s.snapshot().generation.patterns.file.is_some());
         same_predicate_listing(&s.snapshot());
     }
+}
+
+/// Every file under `root` with its content, in path order.
+fn files_under(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push((path.clone(), std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A pre-release fixture is refused by its `dataset.json`, which is `format` 1, with the
+/// release that wrote it and the dump-and-reload path named, by the open, by `check` and
+/// by the migration plan, and the refusal changes no file. The cutoff of spec X16
+/// Phase 1 keeps no reader of the pre-release forms, so there is no upgrade step.
+#[test]
+fn every_pre_release_fixture_is_refused_with_dump_and_reload() {
+    for fixture in refused_fixtures() {
+        let tmp = tempfile::tempdir().unwrap();
+        unpack(&fixture, tmp.path());
+        let db = tmp.path().join("data/databases/books");
+        let before = files_under(&db);
+        let written_by = sparkles_core::commit::read_written_by(&db);
+        let e = Store::open(&db, StoreOptions::default()).err().unwrap();
+        let message = e.to_string();
+        assert!(
+            matches!(e, sparkles_core::Error::Unsupported(_)),
+            "{message}"
+        );
+        assert!(message.contains("dataset.json"), "{message}");
+        assert!(message.contains("has format 1"), "{message}");
+        assert!(message.contains("sparkles dump"), "{message}");
+        assert!(message.contains("sparkles load"), "{message}");
+        match written_by {
+            Some(v) => assert!(message.contains(&format!("Sparkles {v}")), "{message}"),
+            None => assert!(message.contains("the release that wrote it"), "{message}"),
+        }
+        let plan = sparkles_core::migrate::plan(&db).unwrap();
+        assert!(!plan.in_window(), "{}", fixture.display());
+        assert!(plan.steps.is_empty(), "{:?}", plan.steps);
+        assert!(
+            plan.refused.iter().any(|r| r.contains("sparkles dump")),
+            "{:?}",
+            plan.refused
+        );
+        let r = check(&db, &CheckOptions { quick: false }).unwrap();
+        assert_eq!(r.status, Status::Error, "{}", r.to_text());
+        assert!(r.to_text().contains("sparkles dump"), "{}", r.to_text());
+        assert_eq!(files_under(&db), before, "the refusal changed a file");
+    }
+}
+
+/// The removed forms, each refused from a minimal hand-written file so that the refusal
+/// does not depend on a fixture: a `format` 1 dataset, a dataset that requires a reader
+/// below 5, a format 4 generation, a format 5 generation without `vocab.idx`, a delta
+/// vocabulary of the entries alone and a headerless log.
+#[test]
+fn each_removed_form_is_refused_from_a_minimal_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("db");
+    drop(Store::open(&root, StoreOptions::default()).unwrap());
+    let dataset = root.join("dataset.json");
+    let original = std::fs::read(&dataset).unwrap();
+    let refusal = |root: &Path| Store::open(root, StoreOptions::default()).err().unwrap();
+    let edit_dataset = |f: &dyn Fn(&mut serde_json::Value)| {
+        let mut v: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        f(&mut v);
+        std::fs::write(&dataset, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    };
+    // the pre-release dataset file, with and without the version members
+    edit_dataset(&|v| v["format"] = 1.into());
+    let e = refusal(&root).to_string();
+    assert!(
+        e.contains("has format 1") && e.contains("sparkles dump"),
+        "{e}"
+    );
+    edit_dataset(&|v| {
+        v.as_object_mut().unwrap().remove("format");
+        v.as_object_mut().unwrap().remove("minimumReader");
+    });
+    let e = refusal(&root).to_string();
+    assert!(e.contains("has format 1 and requires reader 1"), "{e}");
+    assert!(e.contains("sparkles dump"), "{e}");
+    // a dataset that requires a pre-release reader
+    edit_dataset(&|v| v["minimumReader"] = 4.into());
+    let e = refusal(&root).to_string();
+    assert!(
+        e.contains("requires reader 4") && e.contains("sparkles dump"),
+        "{e}"
+    );
+    // a newer dataset is refused as newer, not with dump and reload
+    edit_dataset(&|v| v["format"] = 3.into());
+    let e = refusal(&root).to_string();
+    assert!(
+        e.contains("has format 3") && e.contains("newer release"),
+        "{e}"
+    );
+    assert!(!e.contains("sparkles dump"), "{e}");
+    std::fs::write(&dataset, &original).unwrap();
+    drop(Store::open(&root, StoreOptions::default()).unwrap());
+
+    // the pre-release index formats, and a format 5 generation without its vocab.idx
+    let current = std::fs::read_to_string(root.join("CURRENT")).unwrap();
+    let gen_dir = root.join(current.trim());
+    let meta = gen_dir.join("meta.json");
+    let original_meta = std::fs::read(&meta).unwrap();
+    let mut m: serde_json::Value = serde_json::from_slice(&original_meta).unwrap();
+    assert_eq!(m["format_version"], 5);
+    assert_eq!(m["features"], serde_json::json!([]));
+    for format in [2, 3, 4] {
+        m["format_version"] = format.into();
+        std::fs::write(&meta, serde_json::to_vec(&m).unwrap()).unwrap();
+        let e = refusal(&root).to_string();
+        assert!(e.contains(&format!("index version {format}")), "{e}");
+        assert!(
+            e.contains("reads version 5") && e.contains("sparkles dump"),
+            "{e}"
+        );
+    }
+    m["format_version"] = 5.into();
+    m.as_object_mut().unwrap().remove("features");
+    std::fs::write(&meta, serde_json::to_vec(&m).unwrap()).unwrap();
+    let e = refusal(&root);
+    assert!(matches!(e, sparkles_core::Error::Corrupt(_)), "{e}");
+    assert!(e.to_string().contains("features is missing"), "{e}");
+    std::fs::write(&meta, &original_meta).unwrap();
+    let idx = gen_dir.join("vocab.idx");
+    let original_idx = std::fs::read(&idx).unwrap();
+    std::fs::remove_file(&idx).unwrap();
+    let e = refusal(&root);
+    assert!(matches!(e, sparkles_core::Error::Corrupt(_)), "{e}");
+    assert!(
+        e.to_string()
+            .contains("requires the sparse vocabulary index"),
+        "{e}"
+    );
+    std::fs::write(&idx, &original_idx).unwrap();
+    drop(Store::open(&root, StoreOptions::default()).unwrap());
+
+    // a delta vocabulary of the entries alone, without the framed header
+    let delta = gen_dir.join("delta.vocab");
+    let original_delta = std::fs::read(&delta).unwrap();
+    std::fs::write(&delta, [&7u32.to_le_bytes()[..], b"<urn:a>"].concat()).unwrap();
+    let e = refusal(&root).to_string();
+    assert!(
+        e.contains("delta-vocab version 1") && e.contains("sparkles dump"),
+        "{e}"
+    );
+    std::fs::write(&delta, &original_delta).unwrap();
+    drop(Store::open(&root, StoreOptions::default()).unwrap());
+
+    // a headerless log: the records of a committed transaction without the header record
+    let wal = gen_dir.join("wal.log");
+    let original_wal = std::fs::read(&wal).unwrap();
+    assert!(
+        original_wal.len() >= 33,
+        "the log starts with its header record"
+    );
+    std::fs::write(&wal, &original_wal[33..]).unwrap();
+    let e = refusal(&root).to_string();
+    assert!(
+        e.contains("wal version 0") && e.contains("sparkles dump"),
+        "{e}"
+    );
+    std::fs::write(&wal, &original_wal).unwrap();
+    drop(Store::open(&root, StoreOptions::default()).unwrap());
 }
 
 const LISTING: &str = "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p";

@@ -8,7 +8,9 @@ use zeroize::Zeroizing;
 
 pub const MAX_SLOTS: usize = 32;
 pub const MAX_SLOT_BYTES: usize = 16384;
-/// The slot format written for new slots. Format 1 slots remain readable.
+/// The slot format written for new slots, and the only one this build reads. A format
+/// 1 slot of a pre-release repository is refused with the dump-and-reload message, as
+/// every pre-release form is (spec X16 Phase 1).
 pub const SLOT_FORMAT: u32 = sparkles_core::formats::BACKUP_SLOTS.writes;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -356,13 +358,17 @@ impl Slot {
         }
         let slot: Self =
             serde_json::from_slice(bytes).map_err(|_| config("invalid key slot metadata"))?;
+        if !sparkles_core::formats::BACKUP_SLOTS.reads(slot.format) {
+            let refusal =
+                sparkles_core::formats::BACKUP_SLOTS.refuse("key slot", slot.format, None);
+            return Err(BackupError::new(Code::InvalidConfig, refusal.to_string()));
+        }
         check_label(&slot.label)?;
         let (source, fingerprint) = slot
             .kek_id
             .split_once(':')
             .ok_or_else(|| config("invalid key fingerprint"))?;
         if slot.kind != "sparkles-key-slot"
-            || !matches!(slot.format, 1 | SLOT_FORMAT)
             || slot.id.is_nil()
             || slot.epoch == 0
             || chrono::DateTime::parse_from_rfc3339(&slot.created).is_err()
@@ -436,9 +442,10 @@ impl Slot {
         slot.ct = STANDARD.encode(ct);
         Ok(slot)
     }
-    /// Associated data of the wrap. Format 1 binds the repository, epoch and slot id.
-    /// Format 2 also binds the label, creation time, source, `kekId` and KDF
-    /// parameters, so they cannot be edited without the slot failing to open.
+    /// Associated data of the wrap: the repository, epoch and slot id, and from format
+    /// 2 the label, creation time, source, `kekId` and KDF parameters as well, so they
+    /// cannot be edited without the slot failing to open. Format 1 bound only the first
+    /// three and is no longer read.
     fn aad(&self, repository: Uuid) -> Vec<u8> {
         let mut bytes = repository.as_bytes().to_vec();
         bytes.extend_from_slice(&self.epoch.to_le_bytes());
@@ -600,15 +607,24 @@ mod tests {
             edit(&mut bad);
             assert!(bad.open(repo, &opts).is_err());
         }
-        // A format 1 slot binds only the repository, epoch and slot id.
+        // A format 1 slot of a pre-release repository is refused by name with the
+        // dump-and-reload message, before its wrap is tried.
         let mut legacy = slot.clone();
         legacy.format = 1;
         let nonce: [u8; 12] = STANDARD.decode(&legacy.nonce).unwrap().try_into().unwrap();
         legacy.ct = STANDARD.encode(
             primitive::seal(&[8; 32], nonce, &legacy.aad(repo), master.master.as_ref()).unwrap(),
         );
-        let legacy = Slot::parse(&serde_json::to_vec(&legacy).unwrap()).unwrap();
-        assert!(legacy.open(repo, &opts).unwrap().is_some());
+        let refused = Slot::parse(&serde_json::to_vec(&legacy).unwrap()).unwrap_err();
+        assert!(
+            refused.to_string().contains("backup-slots version 1"),
+            "{refused}"
+        );
+        assert!(refused.to_string().contains("sparkles dump"), "{refused}");
+        let mut newer = slot.clone();
+        newer.format = SLOT_FORMAT + 1;
+        let refused = Slot::parse(&serde_json::to_vec(&newer).unwrap()).unwrap_err();
+        assert!(refused.to_string().contains("newer release"), "{refused}");
     }
     #[test]
     fn descriptor_tags_bind_repository_and_epochs() {

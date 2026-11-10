@@ -2748,8 +2748,9 @@ mod tests {
         let path = root.join(&snapshot.generation.name).join("meta.json");
         let original = std::fs::read(&path).unwrap();
         let actual = serde_json::to_value(&snapshot.generation.meta).unwrap();
+        // format_version is not in the list: this build reads one index format, so any
+        // other value is refused by its version before the metadata is fingerprinted
         for field in [
-            "format_version",
             "quads",
             "terms",
             "next_bnode",
@@ -2760,13 +2761,6 @@ mod tests {
         ] {
             let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
             match field {
-                "format_version" => {
-                    changed[field] = if snapshot.generation.meta.format_version == 3 {
-                        4.into()
-                    } else {
-                        3.into()
-                    }
-                }
                 "quads" | "terms" | "next_bnode" => {
                     changed[field] = changed[field]
                         .as_u64()
@@ -4922,7 +4916,7 @@ mod tests {
         let c = s.backup_capture("b1").unwrap();
         assert_eq!(c.commit.seq, 3);
         assert_eq!(c.generation, "gen-0001");
-        assert_eq!(c.index_format, crate::builder::PLAIN_FORMAT_VERSION);
+        assert_eq!(c.index_format, crate::builder::FORMAT_VERSION);
         assert_eq!(c.lease.generation(), 1);
         assert_eq!(c.lease.label(), "b1");
         let paths: Vec<&str> = c.files.iter().map(|f| f.path.as_str()).collect();
