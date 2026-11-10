@@ -17,8 +17,9 @@
 //! runs after the fence, without the lock, would change that contract.
 //!
 //! The caller serializes publication. The serial, bulk and compaction paths hold the
-//! writer lock, and the group coordinator publishes a prefix's commits in order while
-//! the writer lock is free, so no two publications run at once.
+//! writer lock, and the group coordinator publishes a prefix's commits in order without
+//! acquiring that lock, while every other path drains the grouped work before it
+//! publishes, so no two publications run at once.
 
 use super::*;
 
