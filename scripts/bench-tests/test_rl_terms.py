@@ -256,7 +256,8 @@ class DiffMatchesSets(unittest.TestCase):
                     with contextlib.redirect_stderr(err):
                         rc = rl.diff(str(d / "a.nt"), str(d / "b.nt"), str(d / "r.json"), str(d / "known.tsv"), subset)
                     want, want_err = set_diff(str(d / "a.nt"), str(d / "b.nt"), known_rows, subset)
-                    self.assertEqual(json.loads((d / "r.json").read_text()), want)
+                    # the text, so that the order of every count and example counts too
+                    self.assertEqual((d / "r.json").read_text(), json.dumps(want, indent=1))
                     self.assertEqual(err.getvalue().splitlines(), want_err)
                     self.assertEqual(rc, 1 if want["unexplained"] else 0)
                     self.assertEqual(sorted(p.name for p in d.iterdir()), ["a.nt", "b.nt", "known.tsv", "r.json"])

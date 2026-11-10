@@ -34,7 +34,7 @@ MAX_INFERRED=${MAX_INFERRED:-0}
 INFERRED=urn:x-sparkles:inferred
 
 [ $# -eq 2 ] || {
-  sed -n '2,23p' "$0" >&2
+  sed -n '2,27p' "$0" >&2
   exit 2
 }
 input=$(realpath "$1")

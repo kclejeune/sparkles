@@ -77,6 +77,12 @@ class InferredLimit(unittest.TestCase):
             self.assertIn("MAX_INFERRED=${MAX_INFERRED:-0}", script.read_text())
         self.assertIn("export SPARKLES NMO MAX_INFERRED", TEXT)
 
+    def test_usage_prints_the_whole_header(self):
+        for script in (BENCH, COMPARE):
+            lines = script.read_text().splitlines()
+            end = next(i for i, ln in enumerate(lines) if not ln.startswith("#"))
+            self.assertIn(f"sed -n '2,{end}p'", script.read_text(), script.name)
+
     def test_compare_passes_the_limit_to_sparkles(self):
         # a stand-in for sparkles records its arguments and fails the infer step
         with tempfile.TemporaryDirectory() as d:

@@ -99,8 +99,10 @@ from the task's `--max-inferred` flag, which the scripts read as the `MAX_INFERR
 environment variable. Its default of 0 sets no limit, because the closure of OWL2Bench at
 five universities passes the command's own default of 50 million derived triples, and the
 memory limit of each run's scope bounds the run instead. `rl_terms.py` sorts each decoded
-closure and each side of a comparison on disk with GNU sort and merges the sorted files,
-so its memory stays near the sort buffer of 1 GiB at any scale.
+closure and each side of a comparison on disk with GNU sort, which has a buffer of 1 GiB,
+and merges the sorted files, so it holds no closure in memory. What it still holds grows
+with the encoded literals and blank nodes of the input and with the differences it counts,
+not with the size of the closure.
 
 The runner writes every run to `results/rl-reference.json` and the medians to
 `results/summary.md` in its working directory.
