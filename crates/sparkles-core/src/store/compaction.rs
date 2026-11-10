@@ -747,7 +747,6 @@ impl CatchUp {
                 self.index.note(wal::WalPoint {
                     seq: c.info.seq,
                     offset: self.wal_len,
-                    folding: false,
                 });
             }
             self.last = c.info.seq;
@@ -1071,7 +1070,6 @@ impl Store {
                 dir: g.dir.clone(),
                 base,
                 end: head,
-                fold_legacy: false,
                 bytes: 0,
             };
             after.gens.insert(next, entry);
@@ -1293,7 +1291,7 @@ impl Store {
             },
             // a new log holds its header record
             wal_len: if persistent { wal::HEADER_BYTES } else { 0 },
-            index: wal::WalIndex::new(base.seq, false),
+            index: wal::WalIndex::new(base.seq),
             ids: Default::default(),
             last: base.seq,
             commits: 0,
@@ -1404,7 +1402,7 @@ impl Store {
             if relink.is_some() {
                 self.failpoint("relink-current");
             }
-            let index = std::mem::replace(&mut cu.index, wal::WalIndex::new(base.seq, false));
+            let index = std::mem::replace(&mut cu.index, wal::WalIndex::new(base.seq));
             self.adopt_generation_log(
                 &mut w,
                 &gen_,
@@ -1479,7 +1477,6 @@ impl Store {
                     dir: dir.clone(),
                     base,
                     end: view.commit,
-                    fold_legacy: false,
                     bytes: 0,
                 },
             );

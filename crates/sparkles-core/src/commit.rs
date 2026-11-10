@@ -949,8 +949,6 @@ struct GenCommitFile {
     /// once, at its first write open of the log, before it appends anything. Absent in
     /// files written before the member existed, and for logs with a header record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    wal_strict_from: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     configuration_binding: Option<crate::history::ConfigurationBinding>,
     /// Members this build does not know, added by a later release under the additive
     /// rule of X12 section 4.3. They are kept when the file is rewritten.
@@ -995,7 +993,6 @@ fn gen_commit_file(dataset_id: uuid::Uuid, origin: &str, c: &CommitInfo) -> GenC
         dataset_id,
         base_seq: c.seq,
         origin: origin.to_string(),
-        wal_strict_from: None,
         configuration_binding: None,
         extra: Default::default(),
         commit: CommitJson {
@@ -1069,7 +1066,6 @@ pub(crate) struct RetainedGenerationCommit {
     pub(crate) dataset_id: uuid::Uuid,
     pub(crate) commit: CommitInfo,
     pub(crate) origin: String,
-    pub(crate) wal_strict_from: Option<u64>,
     pub(crate) configuration: crate::history::ConfigurationBinding,
 }
 
@@ -1093,7 +1089,6 @@ fn decode_gen_commit_file(f: GenCommitFile, path: &Path) -> Result<RetainedGener
             unvalidated: c.unvalidated,
         },
         origin: f.origin,
-        wal_strict_from: f.wal_strict_from,
         configuration: f.configuration_binding.unwrap_or_default(),
     })
 }
@@ -1302,28 +1297,6 @@ fn check_gen_commit_value(path: &Path, value: &serde_json::Value) -> Result<()> 
     }
 
     Ok(())
-}
-
-/// The strict-framing offset of a generation's headerless log (`walStrictFrom` of
-/// `gen-NNNN/commit.json`, see [`GenCommitFile`]): `None` when the file or the member is
-/// missing.
-pub(crate) fn wal_strict_from(dir: &Path) -> Result<Option<u64>> {
-    let path = dir.join("commit.json");
-    match std::fs::read(&path) {
-        Ok(b) => Ok(parse_gen_commit(&path, &b)?.wal_strict_from),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Record `at` as the strict-framing offset of the generation in `dir`, keeping every
-/// other member of its `commit.json`, durably (the file is replaced atomically and the
-/// directory synced) before the caller appends to the log.
-pub(crate) fn set_wal_strict_from(dir: &Path, at: u64) -> Result<()> {
-    let path = dir.join("commit.json");
-    let mut f = parse_gen_commit(&path, &std::fs::read(&path)?)?;
-    f.wal_strict_from = Some(at);
-    crate::store::write_atomic(&path, &serde_json::to_vec_pretty(&f).unwrap())
 }
 
 // ----------------------------------------------------------------- catalog ------
@@ -2235,7 +2208,6 @@ mod tests {
         let commit = sample_commit(42);
         let path = dir.path().join("commit.json");
         std::fs::write(&path, gen_commit_bytes(id, "compaction", &commit)).unwrap();
-        set_wal_strict_from(dir.path(), 33 * 8).unwrap();
         let before = std::fs::read(&path).unwrap();
         let options = HistoryOptions::default();
         let mut budget = ColdBudget::new(ReadLimit {
@@ -2256,7 +2228,6 @@ mod tests {
             ),
             (normal.0, normal.1, normal.2.as_str())
         );
-        assert_eq!(loaded.value.wal_strict_from, Some(33 * 8));
         assert_eq!(budget.used(), loaded.charge);
         drop(loaded.value);
         budget.release(loaded.charge);
@@ -2572,16 +2543,11 @@ mod tests {
             let mut file = gen_commit_file(old, "compaction", &commit);
             file.format = 2;
             file.configuration_binding = Some(binding);
-            file.wal_strict_from = Some(crate::store::WAL_REC as u64 * 4);
             let raw = serde_json::to_vec_pretty(&file).unwrap();
             let before = raw.clone();
             let result = reidentified_generation_bytes(&raw, old, new, &preparation).unwrap();
             let decoded = parse_gen_commit(Path::new("diagnostic"), &result.value).unwrap();
             assert_eq!(decoded.dataset_id, new);
-            assert_eq!(
-                decoded.wal_strict_from,
-                Some(crate::store::WAL_REC as u64 * 4)
-            );
             assert_eq!(decoded.origin, "compaction");
             assert_eq!(
                 decode_gen_commit_file(decoded, Path::new("diagnostic"))
@@ -2612,7 +2578,6 @@ mod tests {
         let old = uuid::Uuid::new_v4();
         let new = uuid::Uuid::new_v4();
         let mut file = gen_commit_file(old, "baseline", &sample_commit(3));
-        file.wal_strict_from = Some(crate::store::WAL_REC as u64 * 32);
         file.extra
             .insert("laterRoot".to_owned(), serde_json::json!({"x":[1,2,3]}));
         file.commit
@@ -2625,10 +2590,6 @@ mod tests {
         let parsed = parse_gen_commit(Path::new("diagnostic"), &output.value).unwrap();
         assert_eq!(parsed.format, 1);
         assert_eq!(parsed.configuration_binding, None);
-        assert_eq!(
-            parsed.wal_strict_from,
-            Some(crate::store::WAL_REC as u64 * 32)
-        );
         assert_eq!(parsed.extra, file.extra);
         assert_eq!(parsed.commit.extra, file.commit.extra);
         assert_eq!(parsed.origin, file.origin);

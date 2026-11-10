@@ -698,7 +698,7 @@ pub(crate) struct Replay { pub delta: Delta, pub commits: Vec<CommitInfo>, pub n
                            pub good_bytes: u64, pub records: u64 }
 pub(crate) enum Stop { End, AfterSeq(u64) }
 pub(crate) fn replay_wal(gen_: &Arc<Generation>, cache: &Arc<BlockCache>, base: CommitInfo,
-                         fold_legacy: bool, wal: impl Read, stop: Stop,
+                         wal: impl Read, stop: Stop,
                          check: &mut dyn FnMut(u64 /*records*/, &Delta) -> Result<()>) -> Result<Replay>;
 ```
 
@@ -708,8 +708,8 @@ pub(crate) fn replay_wal(gen_: &Arc<Generation>, cache: &Arc<BlockCache>, base: 
 * History reads call it with `Stop::AfterSeq(s)` on a sealed or live WAL and never
   truncate. A CRC mismatch at or before `s` is `Error::Corrupt`. Records after `s` are
   never read.
-* Legacy (version-0) records get the same seqs as at open, because the same `base` and
-  `fold_legacy` inputs number them deterministically.
+* Commits get the same seqs as at open, because the same `base` numbers them
+  deterministically from their metadata.
 
 ### 5.7 Crash safety
 

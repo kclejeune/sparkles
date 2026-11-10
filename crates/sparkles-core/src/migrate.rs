@@ -1053,13 +1053,13 @@ mod path_tests;
 mod recovery_tests;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::store::{Store, StoreOptions};
 
     /// The file of the synthetic step: a JSON object in the database's directory whose
     /// `format` the step raises from 1 to 2. No release writes or reads it.
-    pub(super) const TEST_FILE: &str = "migrate-test.json";
+    pub(crate) const TEST_FILE: &str = "migrate-test.json";
 
     /// The kind of [`TEST_FILE`], outside the registry of [`crate::formats`].
     pub(super) const TEST_KIND: FileKind = FileKind {

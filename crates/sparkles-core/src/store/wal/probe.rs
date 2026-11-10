@@ -10,15 +10,9 @@ fn durable_after<R: Read + Seek>(
     extent: u64,
     at: usize,
     seq: u64,
-    framing: Framing,
     budget: &ColdBudget<'_>,
 ) -> Result<bool> {
     budget.check()?;
-    if let Framing::Strict { from } = framing
-        && at < from
-    {
-        return Ok(true);
-    }
     let resume = reader.stream_position()?;
     let result = (|| {
         let start = at
@@ -42,7 +36,6 @@ fn durable_after<R: Read + Seek>(
                         {
                             return Ok(true);
                         }
-                        None if !framing.strict_at(index) => return Ok(true),
                         _ => {}
                     }
                     crc = flate2::Crc::new();
@@ -72,8 +65,6 @@ mod tests {
         extent: u64,
         base: u64,
         target: u64,
-        fold_legacy: bool,
-        strict_from: Option<u64>,
         dvocab_len: u64,
         annotated: Option<&[u64]>,
         path: &Path,
@@ -84,8 +75,6 @@ mod tests {
             extent,
             base,
             target,
-            fold_legacy,
-            strict_from,
             dvocab_len,
             annotated,
             path,
@@ -170,8 +159,6 @@ mod tests {
             wire.len() as u64,
             0,
             2,
-            false,
-            None,
             u64::MAX,
             Some(&[]),
             Path::new("record-observer"),
@@ -206,8 +193,6 @@ mod tests {
             wire.len() as u64,
             0,
             2,
-            false,
-            None,
             u64::MAX,
             Some(&[]),
             Path::new("record-observer"),
@@ -237,8 +222,6 @@ mod tests {
             wire.len() as u64,
             0,
             0,
-            false,
-            None,
             u64::MAX,
             None,
             Path::new("record-observer"),
@@ -295,8 +278,6 @@ mod tests {
                 wire.len() as u64,
                 10,
                 11,
-                false,
-                None,
                 u64::MAX,
                 Some(&[]),
                 &path,
@@ -315,8 +296,6 @@ mod tests {
                 damaged.len() as u64,
                 10,
                 11,
-                false,
-                None,
                 u64::MAX,
                 None,
                 &path,
@@ -356,8 +335,6 @@ mod tests {
             wire.len() as u64,
             10,
             u64::MAX,
-            false,
-            None,
             u64::MAX,
             None,
             &path,
@@ -388,8 +365,6 @@ mod tests {
             headerless.len() as u64,
             10,
             u64::MAX,
-            false,
-            None,
             u64::MAX,
             None,
             &path,
@@ -433,8 +408,6 @@ mod tests {
             wire.len() as u64,
             10,
             11,
-            false,
-            None,
             u64::MAX,
             None,
             &path,
@@ -470,8 +443,6 @@ mod tests {
             damaged.len() as u64,
             10,
             11,
-            false,
-            None,
             u64::MAX,
             None,
             &path,
@@ -500,8 +471,6 @@ mod tests {
                 wire.len() as u64,
                 10,
                 11,
-                false,
-                None,
                 u64::MAX,
                 None,
                 &path,
@@ -544,28 +513,16 @@ mod tests {
                     let loaded = budget.buffered(&path).unwrap();
                     let mut reader = loaded.value;
                     reader.seek(SeekFrom::Start(3)).unwrap();
-                    for framing in [
-                        Framing::Mixed,
-                        Framing::Strict { from: 1 },
-                        Framing::Strict { from: 4 },
-                    ] {
-                        for seq in [10, 11, 12, 13, 14] {
-                            let actual = durable_after(
-                                &mut reader,
-                                wire.len() as u64,
-                                damage,
-                                seq,
-                                framing,
-                                &budget,
-                            )
-                            .unwrap();
-                            assert_eq!(
-                                actual,
-                                !wal_torn_from(&wire, damage, seq, framing),
-                                "damage={damage} byte={byte} seq={seq} framing={framing:?}"
-                            );
-                            assert_eq!(reader.stream_position().unwrap(), 3);
-                        }
+                    for seq in [10, 11, 12, 13, 14] {
+                        let actual =
+                            durable_after(&mut reader, wire.len() as u64, damage, seq, &budget)
+                                .unwrap();
+                        assert_eq!(
+                            actual,
+                            !wal_torn_from(&wire, damage, seq),
+                            "damage={damage} byte={byte} seq={seq}"
+                        );
+                        assert_eq!(reader.stream_position().unwrap(), 3);
                     }
                     assert_eq!(std::fs::read(&path).unwrap(), wire);
                 }
@@ -601,8 +558,6 @@ pub(crate) fn prove_prefix_with<R: Read + Seek>(
     extent: u64,
     base: u64,
     target: u64,
-    fold_legacy: bool,
-    strict_from: Option<u64>,
     dvocab_len: u64,
     annotated: Option<&[u64]>,
     path: &Path,
@@ -614,8 +569,6 @@ pub(crate) fn prove_prefix_with<R: Read + Seek>(
         extent,
         base,
         target,
-        fold_legacy,
-        strict_from,
         dvocab_len,
         annotated,
         path,
@@ -637,8 +590,6 @@ pub(crate) fn prove_prefix_recording<
     extent: u64,
     base: u64,
     target: u64,
-    fold_legacy: bool,
-    strict_from: Option<u64>,
     dvocab_len: u64,
     annotated: Option<&[u64]>,
     path: &Path,
@@ -651,8 +602,6 @@ pub(crate) fn prove_prefix_recording<
         extent,
         base,
         target,
-        fold_legacy,
-        strict_from,
         dvocab_len,
         annotated,
         path,
@@ -672,8 +621,6 @@ pub(crate) fn prove_prefix_through<R: Read + Seek>(
     extent: u64,
     base: u64,
     target: u64,
-    fold_legacy: bool,
-    strict_from: Option<u64>,
     dvocab_len: u64,
     annotated: Option<&[u64]>,
     path: &Path,
@@ -685,8 +632,6 @@ pub(crate) fn prove_prefix_through<R: Read + Seek>(
         extent,
         base,
         target,
-        fold_legacy,
-        strict_from,
         dvocab_len,
         annotated,
         path,
@@ -703,8 +648,6 @@ fn prove_prefix_bounded<R: Read + Seek, F: FnMut(u64, &[u8; WAL_REC]) -> Result<
     extent: u64,
     base: u64,
     target: u64,
-    fold_legacy: bool,
-    strict_from: Option<u64>,
     dvocab_len: u64,
     annotated: Option<&[u64]>,
     path: &Path,
@@ -713,23 +656,18 @@ fn prove_prefix_bounded<R: Read + Seek, F: FnMut(u64, &[u8; WAL_REC]) -> Result<
     record_used: &mut F,
     stop_at_target: bool,
 ) -> Result<ProvenWal> {
-    check_strict_from(path, strict_from)?;
     reader.seek(SeekFrom::Start(0))?;
     let mut head = WalPoint {
         seq: base,
         offset: 0,
-        folding: fold_legacy,
     };
     let mut selected = (target == base).then_some(head);
-    if stop_at_target && selected.is_some() && !head.folding {
+    if stop_at_target && selected.is_some() {
         budget.check()?;
         return Ok(ProvenWal { head, selected });
     }
-    let mut framing = Framing::of(strict_from);
     let mut crc = flate2::Crc::new();
     let mut needed = 0;
-    let mut seen_modern = false;
-    let mut header = false;
     let mut wal_version = 0;
     let mut configuration = ConfigurationRecords::default();
     let mut record = [0; WAL_REC];
@@ -737,13 +675,17 @@ fn prove_prefix_bounded<R: Read + Seek, F: FnMut(u64, &[u8; WAL_REC]) -> Result<
     for index in 0..(extent / WAL_REC as u64) as usize {
         budget.key_step("WAL prefix record", index)?;
         reader.read_exact(&mut record)?;
+        if index == 0 && record[0] != WAL_HEADER {
+            // The same rule as the open's: the pre-release headerless log is refused with
+            // the dump-and-reload message, a record of zeros with bytes after it is
+            // corrupt, and a record of zeros alone is the header a crash tore at the
+            // log's creation, so the log holds nothing.
+            version_at_start(&record, extent, path)?;
+            break;
+        }
         match record[0] {
             WAL_HEADER if index == 0 => {
-                header = true;
                 wal_version = header_version(&record, path)?;
-                if wal_version >= 1 {
-                    framing = Framing::Strict { from: 1 };
-                }
                 head.offset = WAL_REC as u64;
             }
             WAL_INSERT | WAL_DELETE => {
@@ -761,45 +703,34 @@ fn prove_prefix_bounded<R: Read + Seek, F: FnMut(u64, &[u8; WAL_REC]) -> Result<
                 crc.update(&record);
             }
             WAL_COMMIT => {
-                let meta = commit::open_wal_commit_with_crc(&record, crc);
                 let next = head.seq.checked_add(1).ok_or_else(corrupt)?;
-                let invalid = matches!(meta, Some(Err(())))
-                    || (meta.is_none() && framing.strict_at(index))
-                    || needed > dvocab_len;
-                if invalid {
-                    if durable_after(reader, extent, index, next, framing, budget)? {
-                        return Err(corrupt());
-                    }
-                    break;
-                }
-                let configuration_digest = configuration.finish(
-                    wal_version,
-                    match &meta {
-                        Some(Ok((_, _, _, flags))) => *flags,
-                        _ => 0,
-                    },
-                )?;
-                if let (Some(seqs), Some(Ok((seq, _, _, flags)))) = (annotated, &meta)
+                // a commit record without metadata, or failing its checksum, or naming
+                // terms the vocabulary lacks, is damage: a torn tail unless a later
+                // record proves it durable
+                let (seq, timestamp, kind, flags) =
+                    match commit::open_wal_commit_with_crc(&record, crc) {
+                        Some(Ok(meta)) if needed <= dvocab_len => meta,
+                        _ => {
+                            if durable_after(reader, extent, index, next, budget)? {
+                                return Err(corrupt());
+                            }
+                            break;
+                        }
+                    };
+                let configuration_digest = configuration.finish(wal_version, flags)?;
+                if let Some(seqs) = annotated
                     && flags & commit::WAL_FLAG_ANNOTATED != 0
-                    && seqs.binary_search(seq).is_err()
-                    && !durable_after(reader, extent, index, next, framing, budget)?
+                    && seqs.binary_search(&seq).is_err()
+                    && !durable_after(reader, extent, index, next, budget)?
                 {
                     break;
                 }
-                match meta {
-                    Some(Ok((seq, ..))) => {
-                        if seq != next {
-                            return Err(corrupt());
-                        }
-                        head.seq = seq;
-                        seen_modern = true;
-                    }
-                    _ if fold_legacy && !seen_modern => {}
-                    _ => head.seq = next,
+                if seq != next {
+                    return Err(corrupt());
                 }
+                head.seq = seq;
                 let start_offset = head.offset;
                 head.offset = (index as u64 + 1) * WAL_REC as u64;
-                head.folding = fold_legacy && !seen_modern;
                 if head.seq == target {
                     selected = Some(head);
                 }
@@ -808,15 +739,10 @@ fn prove_prefix_bounded<R: Read + Seek, F: FnMut(u64, &[u8; WAL_REC]) -> Result<
                     start_offset,
                     point: head,
                     configuration: configuration_digest,
-                    metadata: match meta {
-                        Some(Ok((_, timestamp, kind, flags))) => Some((timestamp, kind, flags)),
-                        _ => None,
-                    },
+                    metadata: Some((timestamp, kind, flags)),
                 })?;
                 budget.check()?;
-                // Folded legacy commits share one number, so a folding prefix
-                // continues to the first commit that ends the fold.
-                if stop_at_target && selected.is_some() && !head.folding {
+                if stop_at_target && selected.is_some() {
                     return Ok(ProvenWal { head, selected });
                 }
                 crc = flate2::Crc::new();
@@ -825,22 +751,13 @@ fn prove_prefix_bounded<R: Read + Seek, F: FnMut(u64, &[u8; WAL_REC]) -> Result<
             }
             _ => {
                 let next = head.seq.checked_add(1).ok_or_else(corrupt)?;
-                if durable_after(reader, extent, index, next, framing, budget)? {
+                if durable_after(reader, extent, index, next, budget)? {
                     return Err(corrupt());
                 }
                 break;
             }
         }
         record_used(index as u64 * WAL_REC as u64, &record)?;
-    }
-    // A headerless generation recorded these bytes durable before raising its
-    // framing boundary. EOF and partial records cannot erase that evidence. A
-    // real header supersedes this legacy marker, as in ordinary recovery.
-    if let Some(boundary) = strict_from
-        && !header
-        && head.offset < boundary
-    {
-        return Err(corrupt());
     }
     budget.check()?;
     Ok(ProvenWal { head, selected })

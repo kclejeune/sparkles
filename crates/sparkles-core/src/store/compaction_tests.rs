@@ -1790,10 +1790,10 @@ fn open_sets_aside_newer_generations_when_current_was_restored_older() {
 }
 
 #[test]
-fn open_sets_aside_a_newer_generation_of_a_dataset_without_commit_json() {
+fn open_refuses_a_dataset_without_commit_json_and_leaves_its_generations() {
     // A dataset from before commit.json, whose CURRENT names a generation older than
-    // one it built: the newer generation has no build marker and no commit.json, as
-    // every generation of such a dataset, so nothing shows that it is unfinished.
+    // one it built, is a pre-release form: the open refuses it with the dump-and-reload
+    // message instead of recording a baseline and setting the newer generation aside.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");
     drop(Store::open(&root, StoreOptions::default()).unwrap());
@@ -1808,22 +1808,15 @@ fn open_sets_aside_a_newer_generation_of_a_dataset_without_commit_json() {
     std::fs::remove_file(root.join("commits.bin")).ok();
     assert!(!root.join(&g).join("compacting").exists());
     let log = std::fs::read(root.join(&g).join("wal.log")).unwrap();
-    drop(Store::open(&root, StoreOptions::default()).unwrap());
-    assert!(
-        root.join(&cur).join("commit.json").is_file(),
-        "open records a baseline"
-    );
-    assert!(!root.join(&g).exists(), "{:?}", gens(&root));
-    let aside = set_aside(&root);
-    assert_eq!(aside.len(), 1, "{:?}", gens(&root));
-    assert!(
-        aside[0].starts_with(&format!("{g}.set-aside-")),
-        "{aside:?}"
-    );
-    assert_eq!(
-        std::fs::read(root.join(&aside[0]).join("wal.log")).unwrap(),
-        log
-    );
+    let before = gens(&root);
+    let e = Store::open(&root, StoreOptions::default()).err().unwrap();
+    assert!(matches!(e, crate::Error::Unsupported(_)), "{e}");
+    assert!(e.to_string().contains("sparkles dump"), "{e}");
+    assert_eq!(gens(&root), before);
+    assert!(set_aside(&root).is_empty(), "{:?}", set_aside(&root));
+    assert!(!root.join(&cur).join("commit.json").exists());
+    assert!(!root.join("dataset.json").exists());
+    assert_eq!(std::fs::read(root.join(&g).join("wal.log")).unwrap(), log);
 }
 
 #[test]

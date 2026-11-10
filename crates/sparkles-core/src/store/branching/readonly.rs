@@ -67,8 +67,6 @@ struct Current {
     number: u32,
     dir: PathBuf,
     base: CommitInfo,
-    folding: bool,
-    strict_from: Option<u64>,
     configuration: crate::history::ConfigurationBinding,
 }
 
@@ -162,8 +160,6 @@ fn current_controlled(
             number,
             dir,
             base: physical.value.commit,
-            folding: physical.value.origin == "baseline",
-            strict_from: physical.value.wal_strict_from,
             configuration: physical.value.configuration,
         };
         drop(physical.value);
@@ -218,16 +214,10 @@ fn prove_file_with(
         let loaded = match budget.buffered(&path) {
             Ok(loaded) => loaded,
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                if generation.strict_from.is_some() {
-                    return Err(Error::Corrupt(
-                        "retained generation lost its recorded durable WAL".into(),
-                    ));
-                }
                 budget.check()?;
                 let point = wal::WalPoint {
                     seq: generation.base.seq,
                     offset: 0,
-                    folding: generation.folding,
                 };
                 return Ok(wal::probe::ProvenWal {
                     head: point,
@@ -244,8 +234,6 @@ fn prove_file_with(
             extent,
             generation.base.seq,
             target,
-            generation.folding,
-            generation.strict_from,
             terms,
             annotations.value.as_deref(),
             &path,
@@ -301,10 +289,6 @@ pub(in crate::store) fn authenticate_retained_generation(
         number: commit::generation_number(&entry.name),
         dir: entry.dir.clone(),
         base: entry.base,
-        folding: entry.fold_legacy,
-        strict_from: physical
-            .as_ref()
-            .and_then(|physical| physical.value.wal_strict_from),
         configuration: physical.as_ref().map_or(
             crate::history::ConfigurationBinding::LegacyUnbound,
             |physical| physical.value.configuration,
@@ -330,9 +314,7 @@ pub(in crate::store) fn authenticate_retained_generation(
     let path = entry.dir.join("wal.log");
     let loaded = match budget.buffered(&path) {
         Ok(loaded) => loaded,
-        Err(Error::Io(error))
-            if error.kind() == std::io::ErrorKind::NotFound && generation.strict_from.is_none() =>
-        {
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(());
         }
         Err(error) => return Err(error),
@@ -356,8 +338,6 @@ pub(in crate::store) fn authenticate_retained_generation(
             extent,
             entry.base.seq,
             u64::MAX,
-            entry.fold_legacy,
-            generation.strict_from,
             terms,
             annotations.value.as_deref(),
             &path,
@@ -370,8 +350,6 @@ pub(in crate::store) fn authenticate_retained_generation(
             extent,
             entry.base.seq,
             through,
-            entry.fold_legacy,
-            generation.strict_from,
             terms,
             annotations.value.as_deref(),
             &path,
@@ -474,8 +452,6 @@ fn generation_for(
                 number,
                 dir,
                 base: identity.value.commit,
-                folding: identity.value.origin == "baseline",
-                strict_from: identity.value.wal_strict_from,
                 configuration: identity.value.configuration,
             };
             drop(identity.value);
@@ -696,7 +672,7 @@ impl Store {
                 terms,
                 &mut budget,
                 &mut |observation| {
-                    if observation.point.seq == metadata.seq && !observation.point.folding {
+                    if observation.point.seq == metadata.seq {
                         digest = observation.configuration;
                     }
                     Ok(())
@@ -758,7 +734,6 @@ impl Store {
         let mut previous = wal::WalPoint {
             seq: selected.value.base.seq,
             offset: 0,
-            folding: selected.value.folding,
         };
         let mut parent_point = None;
         let proof = prove_file_with(
@@ -769,7 +744,7 @@ impl Store {
             terms,
             &mut budget,
             &mut |observation| {
-                if observation.point.seq == metadata.seq && !observation.point.folding {
+                if observation.point.seq == metadata.seq {
                     parent_point = Some(previous);
                 }
                 previous = observation.point;
@@ -801,7 +776,6 @@ impl Store {
             wal::WalPoint {
                 seq: selected.value.base.seq,
                 offset: 0,
-                folding: selected.value.folding,
             },
             replay_to,
             &budget.owned_limit()?,

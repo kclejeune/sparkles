@@ -1063,6 +1063,11 @@ refuses a `format` other than 1 in open, in `sparkles check` and in the restore 
 writing keeps the mixed rules for the bytes it holds, so a torn record that an older
 build left there is still ambiguous. Legacy records that a downgraded build appends after
 the offset are treated as damage, and downgrading stays unsupported.
+The first-release format cutoff of
+[X16 Phase 1](X16-storage-consolidation/SPEC.md#phase-1-first-release-format-cutoff-item-479)
+later refused the headerless log altogether and removed `walStrictFrom`, the mixed
+framing and the folding of legacy records, so these rules describe the releases before
+it.
 
 **Indexed and ShEx-guarded datasets.** Datasets with a full-text, spatial or embedding
 index stay on the ordinary path. These indexes are opt-in per dataset. A commit on such a

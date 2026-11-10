@@ -675,7 +675,7 @@ impl ConfigurationCapture {
         let metadata_pin = self.check_metadata_basis(basis.metadata, preparation)?;
         // This ephemeral loan admits the input, JSON scratch and decoded origin.
         // No publication callback can run while it holds the remaining allowance.
-        let (base_binding, strict_from, commit_pin) = {
+        let (base_binding, commit_pin) = {
             let allowance = preparation.room();
             let _loan = preparation.reserve(allowance)?;
             let options = crate::history::HistoryOptions {
@@ -706,11 +706,7 @@ impl ConfigurationCapture {
                 bytes: extent,
                 sha256: crate::evidence::Sha256Digest::of_bytes(&bytes, preparation.control())?,
             };
-            (
-                decoded.value.configuration,
-                decoded.value.wal_strict_from,
-                pin,
-            )
+            (decoded.value.configuration, pin)
         };
         let family = self.original.identities.family();
         let coverage = {
@@ -766,8 +762,6 @@ impl ConfigurationCapture {
             extent,
             basis.base.seq,
             self.data.commit.seq,
-            basis.fold_legacy,
-            strict_from,
             basis.dvocab_len,
             Some(membership.seqs.as_deref().unwrap_or(&[])),
             Path::new("captured-primary/wal.log"),
@@ -1016,7 +1010,6 @@ struct CapturedBasis {
     base: CommitInfo,
     physical_owner: uuid::Uuid,
     dvocab_len: u64,
-    fold_legacy: bool,
     metadata: crate::evidence::Sha256Digest,
 }
 
@@ -1166,7 +1159,6 @@ impl CapturedOriginal {
                     base: entry.base,
                     physical_owner: store.dataset_id,
                     dvocab_len: snapshot.dvocab_len,
-                    fold_legacy: entry.fold_legacy,
                     metadata: metadata_fingerprint(&snapshot.generation.meta, preparation)?,
                 })
             } else {
@@ -1677,7 +1669,6 @@ impl Store {
                 base: commit,
                 physical_owner: self.dataset_id,
                 dvocab_len: 0,
-                fold_legacy: false,
                 metadata: metadata_fingerprint(&meta, preparation)?,
             });
         }

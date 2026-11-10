@@ -837,7 +837,7 @@ fn copied_primary_validation_refuses_native_seal_with_unreadable_registry_and_no
 }
 
 #[test]
-fn copied_primary_validation_keeps_real_pre_metadata_wal_upgrade() {
+fn copied_primary_validation_refuses_a_pre_release_copy() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("legacy");
     let store = Store::open(&root, StoreOptions::default()).unwrap();
@@ -866,11 +866,17 @@ fn copied_primary_validation_keeps_real_pre_metadata_wal_upgrade() {
     ] {
         std::fs::remove_file(path).unwrap();
     }
-    validate_copy(&root, false, &preparation()).unwrap();
+    // the validation reads the log's first record by the open's rule, so the headerless
+    // pre-release copy is refused with the dump-and-reload message, and the open refuses
+    // the copy for its missing dataset.json with the same message
+    let refusal = validate_copy(&root, false, &preparation()).err().unwrap();
+    assert!(matches!(refusal, Error::Unsupported(_)), "{refusal}");
+    assert!(refusal.to_string().contains("wal version 0"), "{refusal}");
+    assert!(refusal.to_string().contains("sparkles dump"), "{refusal}");
+    let refusal = Store::open(&root, StoreOptions::default()).err().unwrap();
+    assert!(matches!(refusal, Error::Unsupported(_)), "{refusal}");
+    assert!(refusal.to_string().contains("sparkles dump"), "{refusal}");
     assert_eq!(std::fs::read(&wal).unwrap(), legacy);
-    let upgraded = Store::open(&root, StoreOptions::default()).unwrap();
-    assert_eq!(upgraded.snapshot().len(), 1);
-    assert!(upgraded.evidence_view(&At::Head, &preparation()).is_err());
 }
 
 #[test]
