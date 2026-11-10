@@ -4724,7 +4724,7 @@ fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
         };
         let eager = query(s.snapshot(), q, &opts).unwrap();
         let eager_plan = serde_json::to_string(&eager.plan).unwrap();
-        let mut c = select_cursor(s.snapshot(), q, &opts, &options(7)).unwrap();
+        let c = select_cursor(s.snapshot(), q, &opts, &options(7)).unwrap();
         let plan = c.plan_json().unwrap();
         for (mode, plan) in [("eager", &eager_plan), ("cursor", &plan)] {
             assert_eq!(

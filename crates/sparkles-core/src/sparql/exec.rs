@@ -1167,8 +1167,12 @@ fn run_node(
                         },
                         None => cross(ctx, &l, &r)?,
                     },
-                    JoinAlgo::Merge => join_noted(ctx, &l, &r, true, &mut note)?,
-                    JoinAlgo::Hash => join_noted(ctx, &l, &r, false, &mut note)?,
+                    JoinAlgo::Merge => join_or_spill(ctx, n, l, r, &mut note, |l, r, note| {
+                        join_noted(ctx, l, r, true, note)
+                    })?,
+                    JoinAlgo::Hash => join_or_spill(ctx, n, l, r, &mut note, |l, r, note| {
+                        join_noted(ctx, l, r, false, note)
+                    })?,
                 }
             }
         }
@@ -1236,7 +1240,9 @@ fn run_node(
                 }
                 None => child(1, infos)?,
             };
-            let t = left_join(ctx, &l, &r, expr.as_ref(), &mut note)?;
+            let t = join_or_spill(ctx, n, l, r, &mut note, |l, r, note| {
+                left_join(ctx, l, r, expr.as_ref(), note)
+            })?;
             if let Some(e) = expr {
                 let (exists, c) = super::exists::explain(ctx, std::slice::from_ref(e));
                 if let Some(x) = exists {
@@ -1249,24 +1255,30 @@ fn run_node(
         Kind::KeyedLeftJoin { expr, left, right } => {
             let l = child(0, infos)?;
             let r = child(1, infos)?;
-            keyed_left_join(ctx, &l, &r, expr, (*left, *right), &mut note)?
+            join_or_spill(ctx, n, l, r, &mut note, |l, r, note| {
+                keyed_left_join(ctx, l, r, expr, (*left, *right), note)
+            })?
         }
         Kind::KeyedJoin {
             expr, left, right, ..
         } => {
             let l = child(0, infos)?;
             let r = child(1, infos)?;
-            keyed_join(ctx, &l, &r, expr, (*left, *right), false, &mut note)?
+            join_or_spill(ctx, n, l, r, &mut note, |l, r, note| {
+                keyed_join(ctx, l, r, expr, (*left, *right), false, note)
+            })?
         }
         Kind::Minus => {
             let l = child(0, infos)?;
             let r = child(1, infos)?;
-            minus(ctx, l, &r, &mut note)?
+            join_or_spill(ctx, n, l, r, &mut note, |l, r, note| minus(ctx, l, r, note))?
         }
         Kind::HalfJoin { anti } => {
             let l = child(0, infos)?;
             let r = child(1, infos)?;
-            half_join(ctx, l, &r, *anti)?
+            join_or_spill(ctx, n, l, r, &mut note, |l, r, _| {
+                half_join(ctx, l, r, *anti)
+            })?
         }
         Kind::Union => {
             let mut out = Table::new(n.vars.clone());
@@ -4048,6 +4060,72 @@ fn scan_into(
 
 // ------------------------------------------------------------------ joins ------
 
+/// Run `join` over the tables `l` and `r` of the binary join `n`, and when it fails on a
+/// memory budget that a query with spill answers by spilling, join them again as the
+/// cursor's partitioned hash join over the two tables, so that an eager join whose
+/// build does not fit spills instead of failing.
+fn join_or_spill(
+    ctx: &Ctx,
+    n: &Node,
+    l: Table,
+    r: Table,
+    note: &mut Option<String>,
+    join: impl FnOnce(&Table, &Table, &mut Option<String>) -> Result<Table>,
+) -> Result<Table> {
+    match join(&l, &r, note) {
+        Err(error) if hash::spills(ctx, &error) => spilled_join(ctx, n, l, r, note, error),
+        other => other,
+    }
+}
+
+/// The join `n` of the tables `l` and `r` through the cursor's partitioned hash join,
+/// after the eager join failed with `error`. A context that is not shared, or a join
+/// the cursor cannot run, keeps the eager failure.
+fn spilled_join(
+    ctx: &Ctx,
+    n: &Node,
+    l: Table,
+    r: Table,
+    note: &mut Option<String>,
+    error: Error,
+) -> Result<Table> {
+    let Some(shared) = ctx.shared() else {
+        return Err(error);
+    };
+    let leaf = |t: Table| {
+        let certain: Vec<VarId> = t
+            .vars
+            .iter()
+            .enumerate()
+            .filter(|&(c, _)| !has_undef(&t, c))
+            .map(|(_, v)| *v)
+            .collect();
+        let sorted = t.sorted.clone();
+        let vars = t.vars.clone();
+        let est = t.len() as f64;
+        let mut leaf = Node::leaf(Kind::Values(t), vars, est, String::new());
+        leaf.certain = certain;
+        leaf.sorted = sorted;
+        leaf
+    };
+    let mut node = Node::leaf(n.kind.clone(), n.vars.clone(), n.est, String::new());
+    node.certain.clone_from(&n.certain);
+    node.children = vec![leaf(l), leaf(r)];
+    let mut out = Table::new(n.vars.clone());
+    match super::cursor::spilled_join(&shared, node, &mut out) {
+        Ok(()) => {}
+        // the cursor could not run the join, so the eager failure stands
+        Err(Error::Unsupported(_)) => return Err(error),
+        Err(other) => return Err(other),
+    }
+    let spilled = "[build did not fit: partitioned to disk]";
+    *note = Some(match note.take() {
+        Some(note) => format!("{note} {spilled}"),
+        None => spilled.to_string(),
+    });
+    Ok(out)
+}
+
 /// Output layout of a join: left vars, then right-only vars.
 struct JoinLayout {
     vars: Vec<VarId>,
@@ -5117,12 +5195,12 @@ fn unfold(
 /// ARQ's SEMIJOIN and ANTIJOIN (`QueryIterHalfJoin`): the rows of `l` compatible with a
 /// row of `r` (with none, when `anti`), each once and unchanged. Unlike MINUS, a row of
 /// `r` that shares no bound variable with a row of `l` is compatible with it.
-fn half_join(ctx: &Ctx, mut l: Table, r: &Table, anti: bool) -> Result<Table> {
-    let lay = layout(&l, r);
-    let index = hash_index(ctx, &l, r, &lay.shared, &mut None)?;
+fn half_join(ctx: &Ctx, l: &Table, r: &Table, anti: bool) -> Result<Table> {
+    let lay = layout(l, r);
+    let index = hash_index(ctx, l, r, &lay.shared, &mut None)?;
     let join = Join {
         mode: if anti { Mode::Anti } else { Mode::Semi },
-        probe: &l,
+        probe: l,
         build: r,
         shared: &lay.shared,
         index: index.as_ref(),
@@ -5130,27 +5208,42 @@ fn half_join(ctx: &Ctx, mut l: Table, r: &Table, anti: bool) -> Result<Table> {
     };
     let keep = hash_filter(ctx, &join)?;
     drop(index);
-    let sorted = l.sorted.clone();
-    l.filter_rows(&keep);
-    l.sorted = sorted;
-    Ok(l)
+    kept_rows(ctx, l, &keep)
 }
 
-fn minus(ctx: &Ctx, mut l: Table, r: &Table, note: &mut Option<String>) -> Result<Table> {
-    let lay = layout(&l, r);
+/// The rows of `l` that `keep` marks, in order, with its sort order.
+fn kept_rows(ctx: &Ctx, l: &Table, keep: &[bool]) -> Result<Table> {
+    let n = keep.iter().filter(|k| **k).count();
+    ctx.check_output(n, l.width())?;
+    let mut t = Table::new(l.vars.clone());
+    for (column, source) in t.cols.iter_mut().zip(&l.cols) {
+        column.reserve_exact(n);
+        column.extend(
+            source
+                .iter()
+                .zip(keep)
+                .filter(|(_, k)| **k)
+                .map(|(v, _)| *v),
+        );
+    }
+    t.len = n;
+    t.sorted = l.sorted.clone();
+    Ok(t)
+}
+
+fn minus(ctx: &Ctx, l: &Table, r: &Table, note: &mut Option<String>) -> Result<Table> {
+    let lay = layout(l, r);
     if lay.shared.is_empty() || r.is_empty() {
-        return Ok(l);
+        return Ok(l.clone());
     }
     // One shared variable that neither side leaves unbound: compatibility is equality
     // of the key, so a merge of two sorted sides or the hash kernel decides each row.
     let anti = match lay.shared[..] {
-        [(lc, rc)] if ctx.opt.anti_join && !has_undef(&l, lc) && !has_undef(r, rc) => {
-            Some((lc, rc))
-        }
+        [(lc, rc)] if ctx.opt.anti_join && !has_undef(l, lc) && !has_undef(r, rc) => Some((lc, rc)),
         _ => None,
     };
     let keep = match anti {
-        Some((lc, rc)) if sorted_on(&l, lc) && sorted_on(r, rc) => {
+        Some((lc, rc)) if sorted_on(l, lc) && sorted_on(r, rc) => {
             *note = Some(format!(
                 "[anti-join on ?{} by merge]",
                 ctx.var_name(l.vars[lc])
@@ -5158,10 +5251,10 @@ fn minus(ctx: &Ctx, mut l: Table, r: &Table, note: &mut Option<String>) -> Resul
             merge_anti_join(ctx, &l.cols[lc], &r.cols[rc])?
         }
         _ => {
-            let index = hash_index(ctx, &l, r, &lay.shared, &mut None)?;
+            let index = hash_index(ctx, l, r, &lay.shared, &mut None)?;
             let join = Join {
                 mode: Mode::Minus,
-                probe: &l,
+                probe: l,
                 build: r,
                 shared: &lay.shared,
                 index: index.as_ref(),
@@ -5176,10 +5269,7 @@ fn minus(ctx: &Ctx, mut l: Table, r: &Table, note: &mut Option<String>) -> Resul
             hash_filter(ctx, &join)?
         }
     };
-    let sorted = l.sorted.clone();
-    l.filter_rows(&keep);
-    l.sorted = sorted;
-    Ok(l)
+    kept_rows(ctx, l, &keep)
 }
 
 /// Which ids of the sorted column `a` are not in the sorted column `b`: a left row is

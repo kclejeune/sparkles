@@ -704,3 +704,47 @@ fn a_limit_below_an_order_free_grouping_keeps_its_input_order() {
     assert_eq!(spill.reserved_bytes(), 0);
     assert!(leftovers(tmp.path()).is_empty());
 }
+
+/// An eager join whose build does not fit the memory budget of a query that may spill
+/// partitions its inputs to disk through the cursor's join and gives the eager answer,
+/// where without spill the same budget fails it. The output fits the budget, so the
+/// build alone decides.
+#[test]
+fn an_eager_join_whose_build_does_not_fit_spills_instead_of_failing() {
+    let s = store(30_000, false);
+    let tmp = tempfile::tempdir().unwrap();
+    let q = "SELECT ?a ?v { ?a <urn:v> ?v . ?a <urn:p> ?k MINUS { ?b <urn:q> ?k } }";
+    let expected = eager(&s, q);
+    assert!(expected.len() > 1000, "{}", expected.len());
+    let options = |spill| QueryOptions {
+        max_memory_bytes: Some(EAGER_BUILD_MEMORY),
+        spill,
+        no_cache: true,
+        ..Default::default()
+    };
+    let failed = query(s.snapshot(), q, &options(None));
+    assert!(
+        matches!(&failed, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{:?}",
+        failed.err()
+    );
+    let spill = spill(tmp.path());
+    let r = query(s.snapshot(), q, &options(Some(spill.clone()))).unwrap();
+    assert_eq!(
+        sorted(r.rows().into_iter().map(|row| format!("{row:?}")).collect()),
+        expected
+    );
+    assert!(
+        r.mem_peak_bytes <= EAGER_BUILD_MEMORY,
+        "{}",
+        r.mem_peak_bytes
+    );
+    let plan = serde_json::to_string(&r.plan).unwrap();
+    assert!(plan.contains("partitioned to disk"), "{plan}");
+    assert_eq!(spill.reserved_bytes(), 0);
+    assert!(leftovers(tmp.path()).is_empty());
+}
+
+/// A budget the hash table of the MINUS's right input, about 28,000 keys, does not fit
+/// beside the two inputs of about 1.1 MiB, while the output of 1,500 rows does.
+const EAGER_BUILD_MEMORY: u64 = 2 << 20;

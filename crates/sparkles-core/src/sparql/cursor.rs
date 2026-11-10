@@ -2170,6 +2170,21 @@ impl Drop for QueryCursor {
     }
 }
 
+/// Run the binary join `node`, whose two children are the tables it joins, as the
+/// cursor's join operator, which partitions its build input to disk when it does not
+/// fit, and append its rows to `out`. An eager join calls this when its build does not
+/// fit the memory budget of a query that may spill. The output is checked against the
+/// query's limits as it grows, as an eager join's output is.
+pub(super) fn spilled_join(ctx: &Arc<Ctx>, node: Node, out: &mut Table) -> Result<()> {
+    let options = CursorOptions::default();
+    let mut operator = Operator::build(ctx, node, FallbackPolicy::RejectMaterialization)?;
+    while let Some(batch) = operator.next(ctx, &options, options.batch_rows)? {
+        ctx.check_output(out.len() + batch.table.len, out.width() + 1)?;
+        out.append(batch.table);
+    }
+    Ok(())
+}
+
 fn plan_bytes(node: &Node) -> u64 {
     let values = match &node.kind {
         Kind::Values(t) => capacity_bytes(t),

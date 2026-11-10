@@ -20,7 +20,7 @@ use crate::sparql::table::{Table, VarId};
 use std::sync::Arc;
 
 pub(super) use crate::sparql::join::hash::{
-    EqualityIndex, HashIndex, Mode, NO_ROW, gather, map_bytes,
+    EqualityIndex, HashIndex, Mode, NO_ROW, gather, map_bytes, spills,
 };
 
 pub(super) fn eligible(node: &Node) -> bool {
@@ -467,14 +467,4 @@ impl Binary {
         output.reconcile()?;
         Ok((!output.table.is_empty()).then_some(output))
     }
-}
-
-/// Whether `error` is a memory budget that a query with spill answers by spilling.
-pub(super) fn spills(ctx: &Ctx, error: &Error) -> bool {
-    ctx.spill.is_some()
-        && matches!(
-            error,
-            Error::BudgetExceeded(b)
-                if matches!(b.kind, crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory)
-        )
 }

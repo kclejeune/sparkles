@@ -706,6 +706,16 @@ impl Join<'_> {
     }
 }
 
+/// Whether `error` is a memory budget that a query with spill answers by spilling.
+pub(crate) fn spills(ctx: &Ctx, error: &Error) -> bool {
+    ctx.spill.is_some()
+        && matches!(
+            error,
+            Error::BudgetExceeded(b)
+                if matches!(b.kind, crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory)
+        )
+}
+
 /// Append the rows of the pairs `lp` and `rp` to `out`, one column at a time. A probe
 /// value that is unbound takes the build row's value, and [`NO_ROW`] binds none.
 pub(crate) fn gather(
