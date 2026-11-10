@@ -684,41 +684,23 @@ impl Store {
         if let Some(staged) = p.text.take() {
             staged.apply(&p.snapshot);
         }
-        let generation = &p.snapshot.generation;
-        self.wal_end.store(p.wal_end, Ordering::Release);
-        if let Some(ix) = generation.wal_index.lock().as_mut() {
-            ix.note(wal::WalPoint {
-                seq: c.seq,
-                offset: p.wal_end,
-                folding: false,
-            });
-        }
-        if let Some(log) = self.changelog.as_ref().filter(|l| l.is_enabled()) {
-            log.push(changelog::Pending {
-                commit: changelog::ChangeCommit::of(
-                    &c,
-                    p.author.clone(),
-                    p.annotation.message.clone(),
-                ),
-                body: changelog::PendingBody::Log {
-                    generation: generation.clone(),
-                    changes: p.changes.clone(),
-                },
-            });
-        }
-        self.catalog.lock().append(c);
+        let change = self.change_of_log(
+            &c,
+            p.author.clone(),
+            p.annotation.message.clone(),
+            &p.snapshot.generation,
+            &p.changes,
+        );
         self.compaction.committed(c.timestamp_ms);
-        // The guard learns of the commit before anyone can see it published, so a writer
-        // that waited for the publication checks against the state this commit left.
-        if p.validation.is_some() {
-            self.guard_committed(c.seq);
-        }
-        self.deltas.noted(c.seq, generation, &p.changes);
-        self.note_configuration(c.seq, p.configuration);
-        self.current.store(p.snapshot.clone());
-        self.commits.send_replace(c.seq);
-        // after the publication: a worker that takes these pairs reads this state
-        self.embed_noted(&p.snapshot, &p.changes, c.seq, c.kind);
+        self.publish_committed(Publication::Commit(Committed {
+            info: c,
+            snapshot: p.snapshot.clone(),
+            configuration: p.configuration,
+            log_end: Some(p.wal_end),
+            changes: Some(&p.changes),
+            change,
+            validated: p.validation.is_some(),
+        }));
     }
 }
 

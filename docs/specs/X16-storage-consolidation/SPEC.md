@@ -1,10 +1,11 @@
 # X16: Storage consolidation
 
-> **Status:** planned. The plan below is ordered and audited against the code.
+> **Status:** in progress. The plan below is ordered and audited against the code, and
+> phase 2 has shipped.
 >
-> **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 479, 484 and 830 to 833
-> hold the phases that are ready to start, and each is named in its phase. The later
-> candidate phases get their numbers when their prerequisites land.
+> **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 479 and 830 to 833
+> hold the phases that are ready to start, and each is named in its phase. Item 484 is
+> complete. The later candidate phases get their numbers when their prerequisites land.
 
 The design covers a first-release format cutoff, budgeted readers through one Control
 trait, a shared commit publish tail, one load plan, partitioned vocabularies with
@@ -559,7 +560,24 @@ No code from another project is copied.
 
 ## Outcome
 
-Nothing is built. [Item 455](../../ROADMAP.md) tracks the work. The plan above replaced
+Phase 2 is built. `wal::encode_txn` in `store/wal.rs` encodes a transaction's records for
+the serial, group and compaction writers, which pass their own flags and unfenced count
+through a `Seal`, and the compaction writer passes translated ids. `SnapshotBuilder` in
+`store/snapshot.rs` replaced the twelve full `Snapshot` literals with two starts, an
+opened generation and the previous snapshot, and the seven struct-update literals stay.
+`Store::publish_committed` in `store/publish.rs` takes a logical commit from the serial
+path, the group leader and the bulk rebuild, and a generation switch from the compaction
+switch, which calls `guard.rekey` between `current.store` and `send_replace`. The tail
+notifies the guard before `current.store` on every path, and a regression test holds a
+serial committer right after its publication while a waiter woken through `commits`
+reads what the guard knows. The compaction tap stays under the writer lock in each path,
+and the quota accounting stays with each path's write, since the serial path counts the
+growth of its files and the group leader settles a prefix's reservations. The bulk path
+adds the generation's prefixes before the tail appends its catalog entry, so a failed
+prefix write leaves the catalog and the snapshot in step. No write moved, and no on-disk
+format changed.
+
+[Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the
 code, which found about 114 twin readers rather than 80, three publish paths with a
 compaction writer rather than three paths alone, a 17-field snapshot rather than 20, and

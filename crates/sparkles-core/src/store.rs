@@ -79,6 +79,9 @@ mod preflight_tests;
 mod preparation;
 mod preview;
 pub mod prewarm;
+mod publish;
+#[cfg(test)]
+mod publish_tests;
 mod quota;
 mod replay;
 mod schedule;
@@ -93,6 +96,7 @@ mod vector;
 pub(crate) use diff::QuadKey;
 pub(crate) use embed::embed_query_text;
 pub use embed::embed_texts;
+use publish::{Committed, Publication};
 use snapshot::{Shared, SnapshotBuilder};
 pub(crate) mod wal;
 pub use backup::{
@@ -5694,14 +5698,12 @@ impl Store {
         // the switch is the commit point: a failure after it leaves the published state
         // behind the durable one, so later writes are refused
         w.head = head;
-        self.catalog.lock().append(head);
-        self.forget_annotations();
-        self.compaction
-            .bulk_committed(head.seq, head.timestamp_ms, started.elapsed());
         if let Err(e) = self.add_prefixes(meta.prefixes.clone()) {
             w.poisoned = true;
             return Err(e);
         }
+        self.compaction
+            .bulk_committed(head.seq, head.timestamp_ms, started.elapsed());
         let old = snap.generation.dir.clone();
         let old_name = snap.generation.name.clone();
         let mut new_snap = self
@@ -5721,7 +5723,7 @@ impl Store {
             log: txn_log,
             bulk: extra_quads,
         });
-        self.log_bulk_commit(
+        let change = self.bulk_change(
             &head,
             message.clone(),
             o.author.clone(),
@@ -5731,10 +5733,18 @@ impl Store {
         );
         // a new generation needs its own spatial base
         self.rebuild_geo_locked(&mut new_snap, snap);
-        self.remember_past(head.seq);
-        self.note_configuration(head.seq, configuration);
-        self.current.store(Arc::new(new_snap));
-        self.commits.send_replace(head.seq);
+        // The bulk commit was validated on the built generation and has no change list,
+        // so the tail tells the guard nothing and announces no delta. It schedules its
+        // own index work below.
+        self.publish_committed(Publication::Commit(Committed {
+            info: head,
+            snapshot: Arc::new(new_snap),
+            configuration,
+            log_end: None,
+            changes: None,
+            change,
+            validated: false,
+        }));
         // and its own vector indexes, built in the background
         self.vectors_switched(snap);
         // a bulk commit has no log to schedule embeddings from
@@ -7190,15 +7200,11 @@ impl WriteTxn<'_> {
             self.store
                 .quota
                 .set_vocab_preallocated(gen_.dvocab.preallocated());
-            self.store.wal_end.store(w.wal_len, Ordering::Relaxed);
-            if let Some(ix) = gen_.wal_index.lock().as_mut() {
-                ix.note(wal::WalPoint {
-                    seq: c.seq,
-                    offset: w.wal_len,
-                    folding: false,
-                });
-            }
         }
+        // the commit's records end where the log ends now, when it has a log
+        let log_end = w.wal.is_some().then_some(w.wal_len);
+        // The tap takes the commit under the writer lock, as the group path does before
+        // it enqueues, so a compaction that is building carries it over.
         if let Some(tap) = self.guard.tap.as_mut() {
             if tap.active.load(Ordering::Acquire) {
                 tap.commits.push(compaction::TapCommit {
@@ -7211,23 +7217,14 @@ impl WriteTxn<'_> {
                 self.guard.tap = None;
             }
         }
-        if let Some(log) = self.store.changelog.as_ref().filter(|l| l.is_enabled()) {
-            // the background writer turns the ids into keys
-            log.push(changelog::Pending {
-                commit: changelog::ChangeCommit::of(
-                    &c,
-                    self.opts.author.clone(),
-                    annotation.message.clone(),
-                ),
-                body: changelog::PendingBody::Log {
-                    generation: gen_.clone(),
-                    changes: self.log.clone(),
-                },
-            });
-        }
+        let change = self.store.change_of_log(
+            &c,
+            self.opts.author.clone(),
+            annotation.message.clone(),
+            gen_,
+            &self.log,
+        );
         self.guard.head = c;
-        self.store.catalog.lock().append(c);
-        self.store.forget_annotations();
         self.store.compaction.committed(c.timestamp_ms);
         if let Some(m) = self.merge
             && let Some(set) = self.store.branching.set()
@@ -7239,18 +7236,16 @@ impl WriteTxn<'_> {
             .build();
         self.store.maintain_text(&mut snap, &self.log);
         self.store.maintain_geo(&mut snap, &self.base, &self.log);
-        self.store.remember_past(c.seq);
         let snap = Arc::new(snap);
-        // before the publication: a view runtime woken by it finds the changes
-        self.store.deltas.noted(c.seq, gen_, &self.log);
-        self.store.note_configuration(c.seq, self.configuration);
-        self.store.current.store(snap.clone());
-        self.store.commits.send_replace(c.seq);
-        // after the publication: a worker that takes these pairs reads this state
-        self.store.embed_noted(&snap, &self.log, c.seq, self.kind);
-        if validation.is_some() {
-            self.store.guard_committed(c.seq);
-        }
+        self.store.publish_committed(Publication::Commit(Committed {
+            info: c,
+            snapshot: snap,
+            configuration: self.configuration,
+            log_end,
+            changes: Some(&self.log),
+            change,
+            validated: validation.is_some(),
+        }));
         Ok(Receipt {
             dataset_id: self.store.owner_dataset_id(),
             committed: true,
