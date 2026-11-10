@@ -20,24 +20,25 @@ a branch Store or BranchSet. Removed and retired branch stores keep the same lea
 until their resources are destroyed. Release those owners before reopening the
 dataset directory. In-memory branches share runtime ownership without a file lock.
 
-Catalog deletion, persistent rename and backup replacement also prove exclusive runtime
-ownership before publishing directory changes. Raw Strong or Weak aliases to a participating
-DatasetState, branch Store or BranchSet conservatively make disposal busy. Refusal preserves
-the original allocations and files. Release those aliases and retry. An in-place restore
-retries the proof itself until its drain time ends. Built-in worker and
-branch references use revocable links, so idle cached branches can close without changing
-the public StoreHandle variants. Close callbacks run after catalog lookup exclusion ends.
-Callbacks may look up datasets. A catalog management call from a callback on the disposing
-thread, such as create, delete or rename, fails at once with a `catalog-disposing` conflict.
-`Catalog::defer` queues the call instead, and the delete, rename or restore runs it on the
-same thread after releasing the catalog and before returning. A deferred call that panics
-is logged and later calls still run. Calls that deferred calls defer in turn run in the
-same loop. A reserved clone or restore publication refused this way leaves its files and
-staged directory in place. A deferred open or an expected attach refused this way keeps its name
-opening or expected for the startup code that owns it. Deferred calls are kept only in memory, so callbacks
-must be idempotent. Management calls from other threads wait for the disposal as before.
-Members closed during unwinding can skip checkpoints that require a clean close.
-The runtime retains root exclusion through required resource shutdown.
+Publishing a directory change by catalog deletion, persistent rename or backup
+replacement also requires proof of exclusive runtime ownership. Raw Strong or Weak aliases
+to a participating DatasetState, branch Store or BranchSet conservatively make disposal
+busy. Refusal preserves the original allocations and files. Release those aliases and
+retry. An in-place restore retries the proof itself until its drain time ends. Built-in
+worker and branch references use revocable links, so idle cached branches can close
+without changing the public StoreHandle variants. Close callbacks run after catalog lookup
+exclusion ends. Callbacks may look up datasets. A catalog management call from a callback
+on the disposing thread, such as create, delete or rename, fails at once with a
+`catalog-disposing` conflict. `Catalog::defer` queues the call instead, and the delete,
+rename or restore runs it on the same thread after releasing the catalog and before
+returning. A deferred call that panics is logged and later calls still run. Calls that
+deferred calls defer in turn run in the same loop. A reserved clone or restore publication
+refused this way leaves its files and staged directory in place. A deferred open or an
+expected attach refused this way keeps its name opening or expected for the startup code
+that owns it. Deferred calls are kept only in memory, so callbacks must be idempotent.
+Management calls from other threads wait for the disposal as before. Members closed during
+unwinding can skip checkpoints that require a clean close. The runtime retains root
+exclusion through required resource shutdown.
 
 After runtime close commits, an I/O failure can reopen the existing dataset through a
 fresh runtime. Recovery verifies its original UUID and existing CURRENT before opening.
@@ -109,8 +110,8 @@ durable consumer.
 The JVM `DatasetGraphSparkles.algorithms()` handle lists, gets, stores and deletes
 named projections. It also builds query text, runs queries, returns statistics and writes
 results. Callers close the returned query execution. Writes use batched commits, so a
-later failure can leave earlier batches committed. Other algorithm surfaces remain under
-roadmap item 8.
+later failure can leave earlier batches committed. Other algorithm surfaces are planned.
+Roadmap item 8.
 
 The JVM `DatasetGraphSparkles.mappings()` and Node.js `Dataset.mappings` handles list,
 version, store, delete and run mappings. Their `runMapping` methods run mapping text.
@@ -134,14 +135,14 @@ unchanged. `RunOptions.check` remains a conversion-only callback and is also hon
 by the controlled variant. Use the structured write options for cancellation or a
 deadline that must reach the final writer wait.
 
-The OWL 2 ontology handle is Python's `Dataset.ontology`, Node.js's `dataset.ontology`
-and the JVM's `DatasetGraphSparkles.ontology()`. Each reads the summary and the axioms,
-checks the profiles, edits axioms, removes entities and diffs commits, and answers in the
-JSON forms of the `/$/ontology` routes ([API.md](../API.md#ontology)). Python's `Axiom`
-is a frozen axiom with structural equality and hashing, read from functional-style
-syntax or the JSON form, and the listings carry `Axiom` objects. Node.js's `axioms` is
-an async iterable that reads pages from the commit of the first page, and its `timeout`
-bounds the whole listing. Python takes
+Each binding has an OWL 2 ontology handle, namely Python's `Dataset.ontology`, Node.js's
+`dataset.ontology` and the JVM's `DatasetGraphSparkles.ontology()`. Each handle reads the
+summary and the axioms, checks the profiles, edits axioms, removes entities and diffs
+commits, and answers in the JSON forms of the `/$/ontology` routes
+([API.md](../API.md#ontology)). Python's `Axiom` is a frozen axiom with structural
+equality and hashing, read from functional-style syntax or the JSON form, and the listings
+carry `Axiom` objects. Node.js's `axioms` is an async iterable that reads pages from the
+commit of the first page, and its `timeout` bounds the whole listing. Python takes
 `cancel` and `timeout`, Node.js the operation options, and the JVM a
 `SparklesOperation`.
 
@@ -158,10 +159,11 @@ once. `jena-ontapi` is not bundled, and a program that calls `model`
 adds `org.apache.jena:jena-ontapi` of its Jena version. `SparklesOnt.check` and the
 other `SparklesOnt` functions run the native operations over one graph.
 
-The [API compatibility policy](../DEVELOPMENT.md#api-compatibility) identifies the
-covered package roots and version rules. HTTP and standard CLI development-baseline
-checks are available. Public Rust and binding release comparisons remain under
-roadmap item 60. Native libraries and JVM JARs must still have matching versions.
+Covered package roots and version rules follow the
+[API compatibility policy](../DEVELOPMENT.md#api-compatibility). HTTP and standard CLI
+development-baseline checks are available. Public Rust and binding release comparisons
+are planned. Roadmap item 60. Native libraries and JVM JARs must still have matching
+versions.
 
 ## Known gaps
 
@@ -171,9 +173,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 ### Rust HTTP client
 
 The remaining administration routes use `call_json` where no typed method exists.
-Typed change feeds, clones, merges, search, reasoning, validation and settings remain
-under roadmap item 47. Proactive rate-limit pacing and isolated integration tests for
-environment and saved credentials remain under the same item.
+Typed change feeds, clones, merges, search, reasoning, validation and settings are
+planned, as are proactive rate-limit pacing and isolated integration tests for
+environment and saved credentials. Roadmap item 47.
 
 ### Bindings and packaging
 
@@ -186,10 +188,9 @@ environment and saved credentials remain under the same item.
   library has no musl build. Roadmap item 58.
 * Python mapping runs cannot be cancelled and have no timeout. Roadmap item 404.
 * Python `branches.update(name, note=None)` leaves the note unchanged, as omitting the
-  argument does. Explicit clearing needs argument presence handling under roadmap
-  item 755.
-* Python async administration and bulk operations remain under roadmap item 58.
-  The available async surface covers queries, updates, bounded cursors and transactions.
+  argument does. Explicit clearing needs argument presence handling. Roadmap item 755.
+* Python async administration and bulk operations are planned. The available async
+  surface covers queries, updates, bounded cursors and transactions. Roadmap item 58.
 * JVM functions registered in Java run through ARQ. Roadmap item 25.
 * Branch administration still needs logical caller ownership checks for Node.js manual
   transactions and raw FFI calls, nested upstream dependencies, Python and Node.js

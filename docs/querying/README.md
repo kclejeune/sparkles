@@ -55,8 +55,8 @@ check them against the W3C suites and Jena's own answers.
 * Pure BIND expressions that read one variable can reuse their results across cursor
   batches. The query owns and budgets the cache, preserving RDF term identity and
   expression errors. Admission uses observed repetition and bounded snapshot statistics.
-  Sparse reuse can remain rowwise, tracked in [item 293](../ROADMAP.md). Volatile expressions
-  and application callbacks run per row.
+  Sparse reuse can remain rowwise. Volatile expressions and application callbacks run per
+  row. Roadmap [item 293](../ROADMAP.md).
 * The function library has the SPARQL 1.1 built-ins, the XSD casts, including the
   derived integer types with their ranges, `anyURI` and the Gregorian types, and ARQ's
   `fn:`, `afn:` and `math:` functions ([API.md](../API.md#extension-functions-and-aggregates)).
@@ -124,8 +124,8 @@ check them against the W3C suites and Jena's own answers.
 * The planner estimates joins from statistics that a bulk load or compaction counts:
   the characteristic sets of subjects and of nodes over both directions, each with a
   remainder for the nodes outside the 32,768 sets kept, and key probes of small inputs.
-  Stars, joins on an object, the links of chains and joins on several keys are estimated
-  from them, and other joins from distinct values
+  It uses them for stars, joins on an object, the links of chains and joins on several
+  keys, and estimates other joins from distinct values
   ([internals](../internals/OPTIMIZATIONS.md#further-scan-and-filter-optimizations)).
   Statistics written before node sets existed keep the earlier estimates until the next
   bulk load or full compaction.
@@ -210,9 +210,9 @@ check them against the W3C suites and Jena's own answers.
   shapes the cursor does not support materialize within the budget and fail explicitly
   when they exceed it.
 * Property path closures run within the query's memory budget and timeout in both
-  executors. The visited set, the frontier and the edge relation of a sequence or
-  alternative path count against the budget, and the walk checks the deadline while it
-  scans and between index lookups. A path with two unbound ends reads its start nodes a
+  executors. A closure counts its visited set, its frontier and the edge relation of a
+  sequence or alternative path against the budget, and the walk checks the deadline while
+  it scans and between index lookups. A path with two unbound ends reads its start nodes a
   few thousand at a time from the indexes, and under an `ASK` or a `LIMIT` it stops once
   it has the rows it needs. A closure over an alternative of predicates and inverse
   predicates, such as `(ex:p|^ex:q)*`, walks from a bound or constant end by index
@@ -275,7 +275,29 @@ check them against the W3C suites and Jena's own answers.
 * Incremental views and live queries ([API.md](../API.md#incremental-views), spec [F13](../specs/F13-incremental-views-and-provenance.md) Phase 1). A `table` view keeps a SELECT or CONSTRUCT query's result current after every commit, through a circuit of Z-set operators compiled from the query that joins each commit's net changes against the store's own indexes. Basic graph patterns, `GRAPH`, `FILTER`, `BIND`, `UNION`, `OPTIONAL`, `MINUS`, `EXISTS`, `VALUES`, `DISTINCT`, subqueries, `GROUP BY` with `COUNT`, `SUM` and `AVG`, and property paths are maintained, and other operators are evaluated again as `recompute` nodes. A commit that misses a view's patterns skips it. Queries read a view with `SERVICE view:read`, and `GET /{ds}/live` streams a query's result and then its changes as server-sent events, resuming after a commit with `Last-Event-ID`. Views and live queries with the same query and access share one circuit. On a dataset with RDFS on read or materialized inferences in the default graph, a view or live query evaluates its whole query again with them at each commit that touches it, so it answers as the one-off query does, and the view's state reports `evaluation: recompute`. Turning either setting on or off switches existing views and live queries between the two modes without detaching them. View state is checkpointed and recovered from the change log, views read as their principal, and `Dataset::views`, `Dataset::live`, `sparkles views`, `sparkles query --live` and Python's `Dataset.views` and `Dataset.live` expose them.
 * Property paths in views ([F13 §4.3](../specs/F13-incremental-views-and-provenance.md#fixed-point-operator)). A path with `+` or `*` over a step of IRIs, inverses, sequences and alternatives is maintained by a fixed-point operator that keeps each reachable pair with the one derivation that first reached it. After a commit only the walks that reach a changed step are followed again. A deleted step removes exactly the pairs that no other path still reaches, so cycles and self-loops need no recomputation, and the zero-length rows of `*` follow the active graph's nodes without state. Paths with constant ends, inverses, `GRAPH` with a constant or a variable, and paths inside `EXISTS`, `NOT EXISTS`, `MINUS` and `OPTIONAL` are covered. The operator's state takes about 40 bytes for each reachable pair on top of the view's rows, and a view with a path checkpoints in `VIEW_STATE` format 2. With a provenance setting a path row reports one real witness, the quads of the path that reached it first. Paths with `?`, negated property sets, nested closures or a closure inside a sequence are still `recompute` nodes ([measurements](../benchmarks/writes/RESULTS.md#property-path-views)).
 * Internal circuits ([F13 §3.6](../specs/F13-incremental-views-and-provenance.md#internal-circuits)). Server code, or an embedding application through `Dataset::attach_internal`, can attach a circuit that no user defined. It keeps a query's rows, or counts the changed facts per key in each commit, so that a fact added and removed later counts 2, a replacement within one commit counts 2 and a deletion counts 1, as the change feed lists them. The counts after any commit they cover are exact, and a commit whose changes are not known is reported as unknown. An internal circuit has no definition file, no entry in the list of views, no rows in `SERVICE view:read` and no route, binding or MCP tool, and it is checkpointed under `circuits/` and recovered from the change log like a view.
-* Provenance annotations ([F13 §5](../specs/F13-incremental-views-and-provenance.md#provenance-annotations)). A circuit that keeps rows can annotate each row with `count`, `lineage` or `why`, the images of the row's provenance polynomial over the input quads. `count` is the number of derivations. `lineage` lists every input quad, or condition, that some derivation uses. `why` keeps the row's witnesses, each a set of quads that derives it, bounded by `maxWitnesses` (8 by default) and reported minimal and smallest first. Joins multiply annotations, and unions, projections, `DISTINCT` and groups add them. A row that `MINUS`, `NOT EXISTS` or an unmatched `OPTIONAL` keeps has a negative condition in its witnesses, which names the operator and the bindings that must have no match. Quads are named by a 128-bit `FactKey` over their terms' vocabulary keys, which survives compaction and resolves back to the quad through the circuit's snapshot. Deletions are exact, since every coefficient is a signed count. A `why` row whose witnesses did not fit in the bound is reported as truncated. Its witnesses are then real but may not be all. The row is exact again once the extra derivations are removed, or after a rebuild when its supports fit the bound. Rows of a `recompute` node, and triples of a CONSTRUCT template with blank nodes, are truncated with no known witnesses. Internal circuits take the setting through `InternalSpec::with_provenance` and read the rows with `annotated_rows()`. An annotated pass costs little more than a plain one, but `lineage` can make a state up to 80 times larger and `why` up to 8 times, and an annotated build matches its patterns with index probes, which takes seconds for a large join ([measurements](../benchmarks/writes/RESULTS.md#provenance-annotations)). Views do not take it, and `view:witness` and `view:why` remain planned under roadmap item 429.
+* Provenance annotations
+  ([F13 §5](../specs/F13-incremental-views-and-provenance.md#provenance-annotations)). A
+  circuit that keeps rows can annotate each row with `count`, `lineage` or `why`, the
+  images of the row's provenance polynomial over the input quads. `count` is the number of
+  derivations. `lineage` lists every input quad, or condition, that some derivation uses.
+  `why` keeps the row's witnesses, each a set of quads that derives it, bounded by
+  `maxWitnesses` (8 by default) and reported minimal and smallest first. Joins multiply
+  annotations, and unions, projections, `DISTINCT` and groups add them. A row that
+  `MINUS`, `NOT EXISTS` or an unmatched `OPTIONAL` keeps has a negative condition in its
+  witnesses, which names the operator and the bindings that must have no match. Quads are
+  named by a 128-bit `FactKey` over their terms' vocabulary keys, which survives
+  compaction and resolves back to the quad through the circuit's snapshot. Deletions are
+  exact, since every coefficient is a signed count. A `why` row whose witnesses did not
+  fit in the bound is reported as truncated. Its witnesses are then real but may not be
+  all. The row is exact again once the extra derivations are removed, or after a rebuild
+  when its supports fit the bound. Rows of a `recompute` node, and triples of a CONSTRUCT
+  template with blank nodes, are truncated with no known witnesses. Internal circuits take
+  the setting through `InternalSpec::with_provenance` and read the rows with
+  `annotated_rows()`. An annotated pass costs little more than a plain one, but `lineage`
+  can make a state up to 80 times larger and `why` up to 8 times, and an annotated build
+  matches its patterns with index probes, which takes seconds for a large join
+  ([measurements](../benchmarks/writes/RESULTS.md#provenance-annotations)). Views do not
+  take it, and `view:witness` and `view:why` are planned. Roadmap item 429.
 
 
 ## Command line
@@ -361,8 +383,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Sparkles lacks ARQ's JavaScript functions, `afn:context`, the Leviathan `lfn:` library
   the `JSON` query form, ARQ's `EXISTS { … }` group element and `AGG` with more than one
   argument. `afn:print` and `afn:execTime` print nothing, and `afn:collation` orders by
-  code point instead of by locale. Roadmap item 69, a lower-priority extension outside the completion of Server and
-  Fuseki integration.
+  code point instead of by locale. This is a lower-priority extension. Roadmap item 69.
 * The linter reads a document whole, so a file over `--max-bytes` is refused even in a line
   format. It does not lint SHACL query literals in N-Triples and N-Quads or JSON-LD queries
   under `@index` maps, and a JSON-LD document over 8 MiB gets no query findings and no
@@ -399,8 +420,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * A view maintains a property path with `+` or `*` only when its step is made of IRIs,
   inverses, sequences and alternatives, and recomputes paths with `?`, negated property
   sets, nested closures or a closure inside a sequence. Roadmap item 544. A path
-  row reports one witness, not all of them, under a provenance setting. Roadmap item
-  543. A path with two variable ends walks from every subject of its step, even
+  row reports one witness, not all of them, under a provenance setting. Roadmap
+  item 543. A path with two variable ends walks from every subject of its step, even
   when a joined pattern binds one end. Roadmap item 546.
 * A zero-length `*` row with a constant end over the union default graph can stay stale
   for a reader who cannot read a named graph that gains its first quad or loses its last,
