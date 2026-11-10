@@ -137,8 +137,9 @@ facts by instantiating the rule's atoms, so a premise in the base tier, which ha
 id, and one in the derived tier are addressed the same way. The records are a column keyed
 by fact id that holds a `u16` rule index and a `u32` offset into a pool of `u64` bindings,
 so a record costs 6 bytes plus 8 per rule variable, from 6 bytes for an axiom to 94 for
-`prp-spo2-3`, whose body binds eleven variables, and about 30 bytes for the three-variable
-rules that derive most of an OWL 2 RL closure. A deletion finds the broken facts without a
+`prp-spo2-3`, whose body binds eleven variables, with 30 bytes for a three-variable rule
+and 38 for the four-variable domain, range and inverse rules. A deletion finds the broken
+facts without a
 reverse index, as the operator does. The instances that read a removed fact are enumerated
 over the old closure, and a head is broken when its record is that instance.
 The record is the same object as the fixed-point operator's `Record`, and it is well
