@@ -1460,7 +1460,9 @@ context's core being equal to the chosen subset of `K_1`. For a unit witness `K_
 range, since the predecessor holds each as a unit clause, and the chosen context's core
 is exactly `F` with the range, the core the index gives `∃r.F`'s successor, so the
 condition holds by the predecessor's premises and not by entailment. For a witness of `H`
-nothing is certain, `K_1` is empty, and the chosen context is one with the empty core. The
+the chosen context has the empty core, which is a subset of whatever `K_1` holds, and a
+witness that later becomes a unit, through unit premises of its own, takes the unit
+contract above from then on. The
 marker `b_i` has no rule of its own beyond `b_i ⊑ F`, which the core satisfies, and its
 disjointness with its siblings, which gives the clause `b_i ∧ b_j → ⊥` in the shared
 context and nothing else. The witnesses of `H` are conditional, so nothing is certain of them and
