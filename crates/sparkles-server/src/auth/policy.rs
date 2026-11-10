@@ -83,7 +83,12 @@ struct UserEntry {
     /// argon2id PHC string
     password: String,
     grants: Grants,
+    /// the address an administrator set for the user
+    email: Option<String>,
 }
+
+/// What [`Auth::on_vouched`] calls.
+pub type VouchedHook = Arc<dyn Fn(&Identity, bool, &super::EmailClaim) + Send + Sync>;
 
 /// Admission and role mapping of OIDC and proxy identities.
 #[derive(Default)]
@@ -307,6 +312,7 @@ impl Policy {
                         &roles,
                         &protections,
                     ),
+                    email: u.email.clone(),
                 },
             );
         }
@@ -400,6 +406,11 @@ impl Policy {
         (x.allowed_users.is_empty() && x.allowed_groups.is_empty())
             || x.allowed_users.contains(name)
             || groups.iter().any(|g| x.allowed_groups.contains(g))
+    }
+
+    /// The mail address an administrator set for configured user `name`.
+    pub fn user_email(&self, name: &str) -> Option<&str> {
+        self.users.get(name).and_then(|u| u.email.as_deref())
     }
 
     /// The grants of an identity under this policy; `None` when it no longer exists or
@@ -725,6 +736,9 @@ pub struct Auth {
     /// the groups last recorded for each OIDC or proxy owner, so that an unchanged list
     /// costs no store lookup (bounded; cleared when full)
     refreshed: Mutex<HashMap<String, Vec<String>>>,
+    /// told each time a provider or proxy vouches for an OIDC or proxy identity, so
+    /// that watches on entities follow its groups and verified address (spec U12)
+    vouched: parking_lot::RwLock<Option<VouchedHook>>,
     pub cli: super::grants::CliGrants,
     pub metrics: AuthMetrics,
     /// seconds added to the clock (tests)
@@ -785,6 +799,7 @@ impl Auth {
             oidc,
             cloudflare,
             refreshed: Mutex::new(HashMap::new()),
+            vouched: parking_lot::RwLock::new(None),
             cli: super::grants::CliGrants::open(dir.join("device-grants.json"), now)?,
             metrics: AuthMetrics::default(),
             clock_offset: AtomicI64::new(0),
@@ -796,6 +811,22 @@ impl Auth {
 
     pub fn policy(&self) -> Arc<Policy> {
         self.policy.load_full()
+    }
+
+    /// Tell `f` each time a provider or proxy vouches for an OIDC or proxy identity:
+    /// the identity, whether the groups were asserted, and what was said of its
+    /// address.
+    pub fn on_vouched(&self, f: VouchedHook) {
+        *self.vouched.write() = Some(f);
+    }
+
+    /// A provider or proxy vouched for `who` now; `groups` says whether it asserted the
+    /// groups, which an absent claim or header does not.
+    pub(crate) fn vouched(&self, who: &Identity, groups: bool, email: &super::EmailClaim) {
+        let f = self.vouched.read().clone();
+        if let Some(f) = f {
+            f(who, groups, email);
+        }
     }
 
     /// Unix seconds (with the test clock offset).
@@ -1071,6 +1102,12 @@ impl Auth {
                     if asserted {
                         self.refresh_owner(&who);
                     }
+                    // a proxy without a groups header never passes groups
+                    self.vouched(
+                        &who,
+                        asserted || px.groups_header.is_none(),
+                        &px.verified_email(h),
+                    );
                     return match self.proxy_principal(&policy, &name, groups) {
                         Some(p) => Ok(Authenticated {
                             principal: p,
@@ -1341,6 +1378,11 @@ impl Auth {
         if groups_claim.is_some() {
             self.refresh_owner(&who);
         }
+        self.vouched(
+            &who,
+            groups_claim.is_some(),
+            &super::EmailClaim::of_claims(&claims),
+        );
         let grants = policy
             .identity_grants(&who)
             .ok_or(err(Failure::NotAllowed))?;
@@ -1397,6 +1439,12 @@ impl Auth {
         if groups_claim.is_some() {
             self.refresh_owner(&who);
         }
+        // without a groups claim configured, Access never passes groups
+        self.vouched(
+            &who,
+            groups_claim.is_some() || cf.groups_claim.is_none(),
+            &super::EmailClaim::Unknown,
+        );
         let grants = policy
             .identity_grants(&who)
             .ok_or(err(Failure::NotAllowed))?;

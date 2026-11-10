@@ -287,7 +287,7 @@ class Admission(unittest.TestCase):
         out=io.StringIO()
         with self.clocks(wall,boot),patch.object(RX.boat_environment.controller,'bounded',return_value={'exit':0,'error':None,'body':{'sandbox':{
                 'id':'bx_fixture','environment':self.fixtures['qualified']['environment']['name'],
-                'environmentVersion':self.fixtures['qualified']['environment']['version'],'type':'large','vcpu':8,'memoryGB':16,'state':'ready'}}}),\
+                'environmentVersion':self.fixtures['qualified']['environment']['version'],'type':'large','vcpu':8,'memoryGB':16,'state':'ready','hydrated':True}}}),\
              patch.object(RX,'exchange',return_value=0),patch('sys.stdout',out):
             RX.admit('boat:bx_fixture',60)
         return json.loads(out.getvalue())
@@ -329,11 +329,13 @@ class Admission(unittest.TestCase):
         if install_mbx:
             pinned=home/'.local/share/mise/installs/mr-boxington/1.29.1';pinned.mkdir(parents=True)
             # The fake answers `settings get` the way mbx does: an environment variable
-            # wins over the worker's configuration, which names the read-only remote cache.
+            # wins over the worker's configuration, which names the read-only remote cache,
+            # and an unset cache directory prints nothing.
             (pinned/'mbx').write_text('#!/bin/sh\nif [ "$1" = settings ] && [ "$2" = get ]; then\n case "$3" in\n'
                                       '  remote.url) echo "${MBX_REMOTE_URL-https://cache.invalid}" ;;\n'
                                       '  gc.max_total_size) echo "${MBX_GC_MAX_TOTAL_SIZE-}" ;;\n'
-                                      '  gc.min_free_size) echo "${MBX_GC_MIN_FREE_SIZE-}" ;;\n  *) exit 2 ;;\n esac\n exit 0\nfi\n'
+                                      '  gc.min_free_size) echo "${MBX_GC_MIN_FREE_SIZE-}" ;;\n'
+                                      '  cache_dir) echo "${MBX_CACHE_DIR-}" ;;\n  *) exit 2 ;;\n esac\n exit 0\nfi\n'
                                       'echo "mbx '+mbx_version+'"\n');(pinned/'mbx').chmod(0o755)
         env=dict(RX.boat_environment.environment(profile),HOME=str(home))
         # Keep the job's home entries and replace the system ones with awk alone,
@@ -373,9 +375,14 @@ class Admission(unittest.TestCase):
         profile=self.fixtures['profile'];values=RX.boat_environment.environment(profile)
         self.assertEqual(values['MBX_REMOTE_URL'],'')
         self.assertFalse([k for k in values if 'TOKEN' in k])
-        self.assertEqual(values['MBX_GC_MAX_TOTAL_SIZE'],'64GiB');self.assertEqual(values['MBX_GC_MIN_FREE_SIZE'],'45GiB')
-        self.assertNotIn('MBX_CACHE_DIR',values)
         body=RX.boat_environment.environment_body(profile).decode()
+        self.assertEqual(values['MBX_GC_MAX_TOTAL_SIZE'],'64GiB');self.assertEqual(values['MBX_GC_MIN_FREE_SIZE'],'45GiB')
+        # The provider's snapshot does not keep ~/.cache, so the worker's one shared
+        # store lives in a home path that it keeps, and every job names that same path.
+        home=profile['worker_home']
+        self.assertEqual(values['MBX_CACHE_DIR'],home+'/.local/share/mbx-cache')
+        self.assertFalse((values['MBX_CACHE_DIR']+'/').startswith(home+'/.cache/'))
+        self.assertIn("MBX_CACHE_DIR="+home+"/.local/share/mbx-cache\n",body)
         self.assertIn("MBX_REMOTE_URL=''\n",body);self.assertNotIn('token',body.lower())
         # Every Boat job shell drops an inherited token setting before it runs.
         script=RX.command('boat:bx_fixture','true')[-1]
@@ -404,13 +411,15 @@ class Admission(unittest.TestCase):
                (lambda e:e.update(MBX_REMOTE_URL='https://other.invalid'),'mbx resolves a remote cache URL, not local-only mode'),
                (lambda e:e.update(MBX_REMOTE_TOKEN_FILE='/nonexistent'),'the job environment names an mbx remote token'),
                (lambda e:e.update(MBX_GC_MAX_TOTAL_SIZE='5GiB'),'mbx local budget is 5GiB, pinned 64GiB'),
-               (lambda e:e.pop('MBX_GC_MIN_FREE_SIZE'),'mbx free-space floor is , pinned 45GiB')]
+               (lambda e:e.pop('MBX_GC_MIN_FREE_SIZE'),'mbx free-space floor is , pinned 45GiB'),
+               (lambda e:e.pop('MBX_CACHE_DIR'),'mbx cache directory is , pinned {home}/.local/share/mbx-cache'),
+               (lambda e:e.update(MBX_CACHE_DIR=e['HOME']+'/private'),'mbx cache directory is {home}/private, pinned {home}/.local/share/mbx-cache')]
         for change,reason in cases:
             with self.subTest(reason=reason),tempfile.TemporaryDirectory()as tmp:
                 self.root=Path(tmp);profile,env=self.fake_worker();change(env)
                 result=self.run_tool_check(profile,env)
                 self.assertEqual(result.returncode,86,result.stdout+result.stderr)
-                self.assertIn('ADMIT-REFUSAL: '+reason,result.stdout,result.stderr)
+                self.assertIn('ADMIT-REFUSAL: '+reason.format(home=env['HOME']),result.stdout,result.stderr)
 
     def test_gate_unit_forwards_the_local_only_job_settings(self):
         """A gate's service unit starts empty, so every job setting but PATH is forwarded when set."""
@@ -422,7 +431,7 @@ class Admission(unittest.TestCase):
         self.assertIn('systemd-run --user --unit "$unit" --collect -q "${forward[@]}"',text)
         build=(ROOT/'scripts/nsc-build-remote.sh').read_text()
         self.assertNotIn('MBX_REMOTE_TOKEN_FILE=',build)
-        self.assertIn('MBX_REMOTE_URL MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE; do',build)
+        self.assertIn('MBX_REMOTE_URL MBX_CACHE_DIR MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE; do',build)
 
     def test_admit_renders_its_probe_and_names_a_missing_worker_tool(self):
         """The admit probe parses as shell, carries its formatted values, and checks every worker tool."""
@@ -433,7 +442,7 @@ class Admission(unittest.TestCase):
               'worker_env_path':profile['worker_home']+'/.config/sparkles-boat/job.env','worker_env_sha256':'e'*64,
               'bootstrap_lock_path':profile['worker_home']+'/.local/state/sparkles-boat/bootstrap.lock','toolchain_manifest_path':profile['worker_home']+'/.local/state/sparkles-boat/toolchain.json',
               'toolchain_manifest_sha256':'f'*64,'_lifetime':{'wall_end':time.time()+7200,'boot_end':RX.boat_clock.boottime()+7200,'boot_id':boot}}
-        info={'sandbox':{'id':'bx_fixture','environment':'fixture-environment','environmentVersion':3,'type':'large','vcpu':8,'memoryGB':16,'state':'idle'}}
+        info={'sandbox':{'id':'bx_fixture','environment':'fixture-environment','environmentVersion':3,'type':'large','vcpu':8,'memoryGB':16,'state':'idle','hydrated':True}}
         seen=[]
         with patch.object(RX,'admission',return_value=data),patch.object(RX.boat_environment.controller,'bounded',return_value={'exit':0,'body':info}),\
              patch.object(RX,'command',side_effect=lambda host,text:seen.append(text) or ['true']),patch.object(RX,'exchange',return_value=0),patch('builtins.print'):
@@ -453,6 +462,23 @@ class Admission(unittest.TestCase):
         missing=[n for n in RX.WORKER_TOOLS if not (shutil.which(n) if '/' in n else (tools/n).exists())]
         result=sp.run(['/bin/bash','-c',script],env={'PATH':str(tools)},stdin=sp.DEVNULL,capture_output=True,text=True,timeout=10)
         self.assertEqual(result.returncode,86 if missing else 0,(missing,result.stdout))
+
+    def test_admit_refuses_a_worker_that_is_still_restoring_its_files(self):
+        """A resumed worker downloads its files in the background, and a build that runs meanwhile
+        sees its inputs change and fails, so admission waits for the provider's hydrated flag."""
+        profile,env=self.fake_worker()
+        boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        data={'worker':'bx_fixture','environment':'fixture-environment','environment_version':3,'_cli':{'path':'/inert/boat'},'_profile':profile,
+              '_lifetime':{'wall_end':time.time()+7200,'boot_end':RX.boat_clock.boottime()+7200,'boot_id':boot}}
+        base={'id':'bx_fixture','environment':'fixture-environment','environmentVersion':3,'type':'large','vcpu':8,'memoryGB':16,'state':'idle'}
+        for extra in ({'hydrated':False,'hydration':{'entriesDone':348576,'entriesTotal':375191,'percent':92,'phase':'hydrating'}},
+                      {'hydrated':False,'hydration':None},{'hydrated':None},{}):
+            with self.subTest(extra=extra):
+                info={'sandbox':dict(base,**extra)};seen=[]
+                with patch.object(RX,'admission',return_value=data),patch.object(RX.boat_environment.controller,'bounded',return_value={'exit':0,'body':info}),\
+                     patch.object(RX,'command',side_effect=lambda host,text:seen.append(text) or ['true']),patch.object(RX,'exchange',return_value=0),patch('builtins.print'):
+                    with self.assertRaises(ValueError) as raised:RX.admit('boat:bx_fixture',1800)
+                self.assertIn('still restoring its files',str(raised.exception));self.assertEqual(seen,[])
 
     def test_admission_checks_every_command_the_worker_scripts_run(self):
         """Each external command of the worker-side scripts and remote strings is checked at admission."""

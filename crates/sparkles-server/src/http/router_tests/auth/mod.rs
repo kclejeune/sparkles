@@ -24,6 +24,8 @@ mod generation;
 #[cfg(feature = "graphql")]
 mod graphql;
 mod graphrag;
+#[cfg(feature = "mcp")]
+mod graphrag_evidence;
 pub(super) mod graphs;
 mod idp;
 mod io_profile;

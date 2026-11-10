@@ -32,7 +32,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// A conclusion waiting in a context's to-do list.
@@ -69,12 +69,8 @@ pub enum Concl {
     /// Tier D: the successor sent a clause over its predecessor, by its id in the run's
     /// table
     PredC(Ex, u32),
-    /// Tier D in a rooted run: the source context sends the root the marker of a root
-    /// successor trigger, by its id in the run's literals, and registers with the root for
-    /// each of its constants (r-Succ)
-    RHyp(Ex, u32),
-    /// Tier D in a rooted run: the root sent a clause, by its id in the run's table
-    /// (r-Pred)
+    /// Tier D in a rooted run: the root sent a processed clause with an empty body over
+    /// one of the constants the context registered for, by its id in the run's table
     RPred(u32),
     /// Tier D in a rooted run: the marker of a ground literal that a predecessor holds as
     /// a maximal literal, by its id in the run's literals (Succ)
@@ -82,6 +78,10 @@ pub enum Concl {
     /// Tier D in a rooted run: the source context registers with the root for the
     /// constant, which a ground literal in one of its bodies mentions
     REdge(Ex, u32),
+    /// Tier D in a rooted run: a hypothetical successor derived a clause with an empty
+    /// body over constants and their successor terms, a fact of the root, by its id in
+    /// the run's table
+    RFact(u32),
 }
 
 // a conclusion takes three words, so that the to-do lists and outboxes keep their size
@@ -392,10 +392,10 @@ impl State {
             | Concl::Succ(..)
             | Concl::DEdge(..)
             | Concl::PredC(..)
-            | Concl::RHyp(..)
             | Concl::RPred(..)
             | Concl::HypL(..)
-            | Concl::REdge(..) => false,
+            | Concl::REdge(..)
+            | Concl::RFact(..) => false,
         }
     }
 
@@ -456,7 +456,14 @@ pub type Contexts = Vec<OnceLock<Box<Ctx>>>;
 pub enum Stop {
     Cancelled,
     Timeout,
-    Memory { used: usize },
+    Memory {
+        used: usize,
+    },
+    /// Tier D derived more conclusions than its bound, which is the run's own stop and
+    /// not the caller's
+    Work {
+        used: usize,
+    },
 }
 
 /// What bounds a saturation.
@@ -486,6 +493,7 @@ const STOP_NONE: u8 = 0;
 const STOP_CANCEL: u8 = 1;
 const STOP_TIMEOUT: u8 = 2;
 const STOP_MEMORY: u8 = 3;
+const STOP_WORK: u8 = 4;
 
 /// The conclusions a worker applies between checks of the bounds.
 const CHECK_EVERY: usize = 4096;
@@ -508,10 +516,38 @@ const CONGESTED_BYTES: usize = 256 << 20;
 /// The roots from which a saturation on several threads starts them all at once.
 const EAGER_ROOTS: usize = if cfg!(test) { 64 } else { 4096 };
 /// How long the first worker of a smaller saturation runs before the others start, so
-/// that a run that ends sooner pays for no thread (roadmap item 709).
+/// that a run that ends sooner pays for no thread (roadmap item 709), until a start in
+/// the process has measured what starting them costs ([`STARTED_NS`]).
 const LAZY_START: Duration = Duration::from_micros(if cfg!(test) { 0 } else { 500 });
-/// The activations between the first worker's checks of [`LAZY_START`].
-const LAZY_EVERY: u32 = 16;
+/// The least time the first worker runs alone once a start has been measured.
+const LAZY_MIN: Duration = Duration::from_micros(if cfg!(test) { 0 } else { 20 });
+/// How long the first worker of the process's last saturation that started helper
+/// threads took to start them, in nanoseconds, and 0 before any start. A process's first
+/// threads cost much more to start than later ones, whose stacks it keeps, so a later
+/// saturation waits only as long as the last start took, between [`LAZY_MIN`] and
+/// [`LAZY_START`] (roadmap item 720).
+static STARTED_NS: AtomicU64 = AtomicU64::new(0);
+
+/// How long the first worker of a saturation on several threads runs before the others
+/// start: as long as starting them last took, as `started` holds it, so that a run that
+/// ends sooner pays for no thread, and one that runs longer waits no longer than starting
+/// them costs it.
+fn lazy_start(started: &AtomicU64) -> Duration {
+    match started.load(Ordering::Relaxed) {
+        0 => LAZY_START,
+        ns => Duration::from_nanos(ns).max(LAZY_MIN).min(LAZY_START),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the saturations this thread starts count as congested from the start, so
+    /// that the tests reach the delivery of congested runs.
+    pub(super) static ALWAYS_CONGESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Where the saturations this thread starts record their starts of the helpers in
+    /// place of [`STARTED_NS`], so that a test sees its own.
+    pub(super) static STARTED_IN: std::cell::Cell<Option<&'static AtomicU64>> = const { std::cell::Cell::new(None) };
+}
 
 struct Run<'a> {
     ix: &'a Index,
@@ -541,8 +577,10 @@ struct Run<'a> {
     applied: AtomicUsize,
     /// whether a context derived an individual other than its root
     merged: AtomicBool,
-    /// whether the workers send through outboxes, which they do when there are several
-    batch: bool,
+    /// whether the workers send through outboxes, which they do when there are several,
+    /// and which one worker starts doing once the run is congested, so that its messages
+    /// reach the delivery filter (roadmap item 721)
+    batch: AtomicBool,
     /// whether the rules run without those of individuals and functional data roles
     plain: bool,
     /// whether the rules are those of Tier H
@@ -551,6 +589,10 @@ struct Run<'a> {
     disj: bool,
     dynamic: Option<&'a Dynamic>,
     bounds: &'a Bounds<'a>,
+    /// where the run records its start of the helpers, [`STARTED_NS`] outside tests
+    started: &'static AtomicU64,
+    #[cfg(test)]
+    always_congested: bool,
 }
 
 /// What a worker counted since it last added to the totals.
@@ -618,12 +660,18 @@ pub fn saturate_counted(
         peak: AtomicUsize::new(bounds.base_memory.max(bounds.peak_memory)),
         applied: AtomicUsize::new(0),
         merged: AtomicBool::new(false),
-        batch: bounds.threads > 1,
+        batch: AtomicBool::new(bounds.threads > 1),
         plain: plain(ix),
         horn: ix.horn.is_some() && bounds.dynamic.is_some(),
         disj: ix.dl.is_some() && bounds.dl.is_some(),
         dynamic: bounds.dynamic,
         bounds,
+        #[cfg(not(test))]
+        started: &STARTED_NS,
+        #[cfg(test)]
+        started: STARTED_IN.get().unwrap_or(&STARTED_NS),
+        #[cfg(test)]
+        always_congested: ALWAYS_CONGESTED.get(),
     };
     {
         let mut q = run.queue.lock();
@@ -657,6 +705,7 @@ pub fn saturate_counted(
         STOP_TIMEOUT => Some(Stop::Timeout),
         // the most counted, waiting messages included, which is what passed the limit
         STOP_MEMORY => Some(Stop::Memory { used: peak }),
+        STOP_WORK => Some(Stop::Work { used: peak }),
         _ => None,
     };
     (totals, stop)
@@ -804,7 +853,7 @@ impl Sink for Out<'_, '_> {
     fn send(&mut self, to: Ex, c: Concl) {
         if to == self.me {
             self.local.push(c);
-        } else if !self.run.batch {
+        } else if !self.run.batch.load(Ordering::Relaxed) {
             // one worker meets no other at a to-do list, and sorting costs more than it
             // saves
             let ctx = self.run.get(to);
@@ -1079,9 +1128,24 @@ impl<'a> Run<'a> {
     /// Whether the messages waiting in to-do lists and outboxes take more than the stored
     /// conclusions and [`CONGESTED_BYTES`], as of the workers' last checks.
     fn congested(&self) -> bool {
+        #[cfg(test)]
+        if self.always_congested {
+            return true;
+        }
         let waiting = self.queued.load(Ordering::Relaxed).max(0) as usize;
         waiting * std::mem::size_of::<Concl>()
             > self.memory.load(Ordering::Relaxed).max(CONGESTED_BYTES)
+    }
+
+    /// Makes a run on one worker send through its outbox once it is congested, so that
+    /// its deliveries drop the messages their contexts hold, as those of several workers
+    /// do (roadmap item 721).
+    #[cold]
+    #[inline(never)]
+    fn batch_if_congested(&self) {
+        if self.congested() {
+            self.batch.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Moves half of a worker's queue to the shared queue when a worker waits for it.
@@ -1143,9 +1207,9 @@ impl<'a> Run<'a> {
     /// (roadmap items 711 and 715).
     ///
     /// The calling thread is the first worker. A run of many roots starts the others at
-    /// once, and a smaller one when the first has run for [`LAZY_START`], so that a
+    /// once, and a smaller one when the first has run for [`lazy_start`], so that a
     /// small ontology, whose saturation takes less time than starting threads, runs on
-    /// one (roadmap item 709).
+    /// one (roadmap items 709 and 720).
     fn workers<R: Rules>(&self, threads: usize) {
         if threads == 1 {
             self.worker::<R>(None);
@@ -1156,9 +1220,14 @@ impl<'a> Run<'a> {
                 // counted while the first worker is busy, so that the count cannot reach 0
                 // before they start
                 self.pending.fetch_add(threads - 1, Ordering::SeqCst);
+                let called = Instant::now();
                 for _ in 1..threads {
-                    s.spawn(|| self.worker::<R>(None));
+                    s.spawn(move || self.worker::<R>(None));
                 }
+                // the saturations that start after this one wait as long, also while
+                // this one runs
+                let ns = called.elapsed().as_nanos().clamp(1, u64::MAX as u128);
+                self.started.store(ns as u64, Ordering::Relaxed);
             };
             self.worker::<R>(Some(&start));
         });
@@ -1175,8 +1244,7 @@ impl<'a> Run<'a> {
         {
             start();
         }
-        let began = others.map(|_| Instant::now());
-        let mut activations = 0u32;
+        let began = others.map(|_| (Instant::now(), lazy_start(self.started)));
         let mut mine: VecDeque<Ex> = VecDeque::new();
         let mut chunk: Vec<Ex> = Vec::new();
         let mut round = 0usize;
@@ -1244,14 +1312,13 @@ impl<'a> Run<'a> {
                 return;
             }
             self.process::<R>(next, &mut mine, &mut tally, &mut local, &mut outbox);
-            if let Some(start) = others {
-                activations += 1;
-                if activations.is_multiple_of(LAZY_EVERY)
-                    && began.is_some_and(|b| b.elapsed() >= LAZY_START)
-                {
-                    others = None;
-                    start();
-                }
+            // a Horn or disjunctive activation can take tens of microseconds, so the
+            // first worker looks at the clock after each
+            if let Some(start) = others
+                && began.is_some_and(|(b, wait)| b.elapsed() >= wait)
+            {
+                others = None;
+                start();
             }
             if !outbox.is_empty() && self.idle.load(Ordering::Relaxed) > 0 {
                 self.deliver(&mut outbox, &mut mine);
@@ -1274,13 +1341,21 @@ impl<'a> Run<'a> {
         if self.stopped() {
             return false;
         }
+        if !self.batch.load(Ordering::Relaxed) {
+            self.batch_if_congested();
+        }
         let b = self.bounds;
         let grown = used.saturating_sub(before);
         if b.max_memory.is_some_and(|m| used > m)
             || b.charge.is_some_and(|f| grown > 0 && !f(grown))
-            || b.dl.is_some_and(|d| d.over_work())
         {
             self.halt(STOP_MEMORY);
+            return false;
+        }
+        // the work bound is its own reason, so that the first stop published decides
+        // whether the run falls back or answers in part
+        if b.dl.is_some_and(|d| d.over_work()) {
+            self.halt(STOP_WORK);
             return false;
         }
         if b.deadline.is_some_and(|d| Instant::now() >= d) {
@@ -1692,24 +1767,18 @@ fn apply_rules<S: Sink, R: Rules>(
         }
         Concl::Hyp(a) if R::DISJ => dl_rules::hyp(st, a, out),
         Concl::DEdge(u, e) if R::DISJ => dl_rules::dedge(ix, me, st, u, e, out),
-        Concl::PredC(v, c) if R::DISJ => {
-            if ix.dl.as_deref().is_some_and(|d| d.is_root(me)) {
-                dl_root::pred_c(ix, st, v, c, out)
-            } else {
-                dl_rules::pred_c(ix, st, v, c, out)
-            }
-        }
-        Concl::RHyp(v, l) if R::DISJ => dl_root::rhyp(ix, st, v, l, out),
+        Concl::PredC(v, c) if R::DISJ => dl_rules::pred_c(ix, me, st, v, c, out),
         Concl::RPred(c) if R::DISJ => dl_root::rpred_c(ix, st, c, out),
         Concl::HypL(l) if R::DISJ => dl_root::hyp_l(st, l, out),
-        Concl::REdge(v, u) if R::DISJ => dl_root::redge(ix, st, v, u, out),
+        Concl::REdge(v, u) if R::DISJ => dl_root::redge(st, v, u, out),
+        Concl::RFact(c) if R::DISJ => dl_root::rfact(ix, st, c, out),
         Concl::Hyp(_)
         | Concl::DEdge(..)
         | Concl::PredC(..)
-        | Concl::RHyp(..)
         | Concl::RPred(..)
         | Concl::HypL(..)
-        | Concl::REdge(..) => {
+        | Concl::REdge(..)
+        | Concl::RFact(..) => {
             unreachable!("a conclusion of Tier D in a saturation without it")
         }
     }
@@ -2165,12 +2234,14 @@ mod horn_accounting_tests {
             peak: AtomicUsize::new(bounds.peak_memory),
             applied: AtomicUsize::new(0),
             merged: AtomicBool::new(false),
-            batch: false,
+            batch: AtomicBool::new(false),
             plain: false,
             horn: true,
             disj: false,
             dynamic: None,
             bounds,
+            started: &STARTED_NS,
+            always_congested: false,
         }
     }
 

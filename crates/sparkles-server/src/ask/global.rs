@@ -606,14 +606,18 @@ impl Asking<'_, '_> {
                 .map(|(r, mut fs)| {
                     fs.sort_unstable();
                     let rep = &reports[r];
-                    json!({
+                    let mut v = json!({
                         "iri": rep["iri"],
                         "title": rep["title"],
                         "level": rep["level"],
                         "status": rep["status"],
                         "rating": rep["rating"],
                         "findings": fs.iter().filter_map(|f| rep["findings"].get(*f).cloned()).collect::<Vec<_>>(),
-                    })
+                    });
+                    if let Some(p) = rep.get("reviewPolicy") {
+                        v["reviewPolicy"] = p.clone();
+                    }
+                    v
                 })
                 .collect()
         };

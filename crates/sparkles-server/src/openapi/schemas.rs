@@ -20,6 +20,7 @@ mod notification_settings;
 mod ontology;
 mod policies;
 mod server;
+mod watches;
 
 /// An object with these members, of which `required` must be present.
 fn obj(required: &[&str], props: J) -> J {
@@ -1414,6 +1415,7 @@ pub(super) fn schemas() -> Map<String, J> {
     assist::put_all(&mut put);
     model_settings::put_all(&mut put);
     notification_settings::put_all(&mut put);
+    watches::put_all(&mut put);
     catalog::put_all(&mut put);
     ontology::put_all(&mut put);
     s

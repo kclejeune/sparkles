@@ -28,6 +28,18 @@ pub struct FindingRef {
     /// the cited facts as N-Triples triple terms, their reifiers and the cited child
     /// findings
     pub cites: Vec<String>,
+    /// under a review policy, the IRIs of the claims and decisions it cites
+    pub claims: Vec<String>,
+    pub decisions: Vec<String>,
+}
+
+/// The review policy a report was read under (spec C25, "Reports on accepted
+/// evidence").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewPolicyRef {
+    pub iri: String,
+    pub version: Option<u64>,
+    pub configuration: Option<String>,
 }
 
 /// A report that a consumer may use.
@@ -44,6 +56,7 @@ pub struct ReportRef {
     /// the relevance to a search, when one ranked the reports
     pub score: Option<f64>,
     pub findings: Vec<FindingRef>,
+    pub review_policy: Option<ReviewPolicyRef>,
 }
 
 /// Which reports a consumer uses.
@@ -179,7 +192,7 @@ fn reports_where(
     limit: usize,
 ) -> Result<Vec<ReportRef>, Error> {
     let q = format!(
-        "SELECT ?r ?c ?l ?title ?summary ?status ?rating ?n WHERE {{ {values} {extra} GRAPH <{graph}> {{ ?c a <{community}> ; <{level}> ?l ; <{report}> ?r ; <{count}> ?n . ?r <{status}> ?status ; <{label}> ?title ; <{summary}> ?summary . OPTIONAL {{ ?r <{rating}> ?rating }} }} }} ORDER BY DESC(?rating) ?r LIMIT {limit}",
+        "SELECT ?r ?c ?l ?title ?summary ?status ?rating ?n ?policy ?version ?configuration WHERE {{ {values} {extra} GRAPH <{graph}> {{ ?c a <{community}> ; <{level}> ?l ; <{report}> ?r ; <{count}> ?n . ?r <{status}> ?status ; <{label}> ?title ; <{summary}> ?summary . OPTIONAL {{ ?r <{rating}> ?rating }} OPTIONAL {{ ?r <{policy}> ?policy OPTIONAL {{ ?r <{version}> ?version }} OPTIONAL {{ ?r <{configuration}> ?configuration }} }} }} }} ORDER BY DESC(?rating) ?r LIMIT {limit}",
         values = filter.values(),
         community = gr("Community"),
         level = gr("level"),
@@ -189,6 +202,9 @@ fn reports_where(
         label = store::RDFS_LABEL,
         summary = gr("summary"),
         rating = gr("rating"),
+        policy = gr("reviewPolicy"),
+        version = gr("policyVersion"),
+        configuration = gr("evidenceConfiguration"),
     );
     Ok(rows(snap, opts, &q)?
         .into_iter()
@@ -204,6 +220,11 @@ fn reports_where(
                 member_count: int(&r[7]).unwrap_or(0),
                 score: None,
                 findings: Vec::new(),
+                review_policy: iri(&r[8]).map(|p| ReviewPolicyRef {
+                    iri: p,
+                    version: int(&r[9]),
+                    configuration: lit(&r[10]),
+                }),
             })
         })
         .collect())
@@ -225,12 +246,14 @@ pub fn with_findings(
         .map(|n| n.to_string())
         .collect();
     let q = format!(
-        "SELECT ?r ?f ?o ?text ?cite WHERE {{ VALUES ?r {{ {} }} GRAPH <{graph}> {{ ?r <{finding}> ?f . ?f <{order}> ?o ; <{text}> ?text . OPTIONAL {{ ?f <{cites}> ?cite }} }} }} ORDER BY ?r ?o",
+        "SELECT ?r ?f ?o ?text ?p ?cite WHERE {{ VALUES ?r {{ {} }} GRAPH <{graph}> {{ ?r <{finding}> ?f . ?f <{order}> ?o ; <{text}> ?text . OPTIONAL {{ ?f ?p ?cite FILTER(?p IN (<{cites}>, <{claim}>, <{decision}>)) }} }} }} ORDER BY ?r ?o",
         names.join(" "),
         finding = gr("finding"),
         order = gr("order"),
         text = gr("text"),
         cites = gr("cites"),
+        claim = gr("citesClaim"),
+        decision = gr("citesDecision"),
     );
     let mut by: HashMap<String, Vec<FindingRef>> = HashMap::new();
     for row in rows(snap, opts, &q)? {
@@ -238,15 +261,40 @@ pub fn with_findings(
             continue;
         };
         let list = by.entry(r).or_default();
-        let cite = row[4].as_ref().map(|t| t.to_string());
-        match list.iter_mut().find(|x| x.iri == f) {
-            Some(x) => x.cites.extend(cite),
-            None => list.push(FindingRef {
-                iri: f,
-                order: int(&row[2]).unwrap_or(0),
-                text,
-                cites: cite.into_iter().collect(),
-            }),
+        let at = match list.iter().position(|x| x.iri == f) {
+            Some(i) => i,
+            None => {
+                list.push(FindingRef {
+                    iri: f,
+                    order: int(&row[2]).unwrap_or(0),
+                    text,
+                    cites: Vec::new(),
+                    claims: Vec::new(),
+                    decisions: Vec::new(),
+                });
+                list.len() - 1
+            }
+        };
+        let x = &mut list[at];
+        let p = iri(&row[4]);
+        match (p.as_deref(), &row[5]) {
+            (Some(p), Some(Term::NamedNode(n))) if p == gr("citesClaim") => {
+                if !x.claims.iter().any(|c| c == n.as_str()) {
+                    x.claims.push(n.as_str().to_string());
+                }
+            }
+            (Some(p), Some(Term::NamedNode(n))) if p == gr("citesDecision") => {
+                if !x.decisions.iter().any(|c| c == n.as_str()) {
+                    x.decisions.push(n.as_str().to_string());
+                }
+            }
+            (Some(_), Some(t)) => {
+                let t = t.to_string();
+                if !x.cites.contains(&t) {
+                    x.cites.push(t);
+                }
+            }
+            _ => {}
         }
     }
     for r in reports {

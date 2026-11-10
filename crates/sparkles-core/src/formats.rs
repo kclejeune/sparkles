@@ -765,13 +765,15 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("holds.json", 1),
     // a view's definition, `views/NAME/view.json`: format 2 is a paused one
     ds("view.json", 2),
-    named(ds("graphrag/state.json", 2), "version"),
+    named(ds("graphrag/state.json", 3), "version"),
     named(ds("graphrag/ledger.json", 1), "version"),
     // the data directory
     server("config.json", 1),
     server("models.json", 1),
     server("notifications.json", 1),
     server("notifications-state.json", 1),
+    // watches on entities and their matched commits (`sparkles-server`'s `watches`)
+    server("watches.json", 1),
     server("connections.json", 1),
     server("tokens.json", 1),
     server("sessions.json", 1),

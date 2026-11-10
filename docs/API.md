@@ -11436,6 +11436,7 @@ name = "bob"
 password = "$argon2id$v=19$m=19456,t=2,p=1$…"  # sparkles auth hash
 roles = ["wiki-editors"]
 datasets = { "team-*" = "read" }
+# email = "bob@example.org"                  # where watches on entities are mailed
 
 [[tokens]]                                   # static machine token
 name = "prometheus"
@@ -11486,6 +11487,7 @@ trusted = ["127.0.0.1/32", "unix"]
 groups_separator = ","
 name_from = "user"                           # or "email"
 logout_url = "https://auth.example.org/logout"
+# verified_email_header = "Remote-Email"     # an address the proxy verified, for watches
 
 # [cloudflare_access]                        # instead of the cloudflare-access preset
 # team_domain = "https://example.cloudflareaccess.com"
@@ -13962,6 +13964,27 @@ community with its members, its children and its report with findings and citati
 Both read through the caller's view, and a community the caller may not read is a
 `404`.
 
+The settings member `reviewPolicy` names a review policy of the dataset's
+[evidence settings](#evidence-settings), and every build and refresh then reads under it.
+The store's configuration history must be active, or the run is refused with
+`configuration-history-inactive`. A policy that the Head view's configuration does not
+name as a review policy, or whose decisions, supports and output graphs the principal may
+not read, is refused with recall's message for an unknown policy, before any model call.
+The run reads the projection's graphs and the policy's output graph, which
+`projection.graphs` need not name, and never a graph with another evidence role. A triple
+of the output graph enters a report's input only with an accepted claim that the
+principal may see, unless another graph of the projection also holds it. Each finding of
+such a report gains `claims` and `decisions`, the IRIs of the claims behind its cited
+facts and of their current decisions, and the report gains `reviewPolicy` with the
+policy's `iri`, `version` and `configuration`. The report's activity records every claim,
+decision and child report its input read as `prov:used`, and its footprint also lists the
+policy's decisions and supports graphs and the proposal graphs the principal may read, so
+a reader who may not read them is not admitted. A refresh rewrites a report whose
+recorded claim was withdrawn, reversed or superseded, and that report's ancestors,
+whatever the fraction. The automatic refresh also starts after a new policy version, a
+change of `reviewPolicy`, or a change of the policy's decisions or supports that the
+principal's change feed lists. A report without a policy has none of these members.
+
 `POST /$/graphrag/{ds}/memberships` takes `{"nodes": ["<iri>", …], "level": 0}` with at
 most 20,000 IRIs and answers which communities hold each node, at the given level or at
 every level when `level` is left out. Each row of `memberships` names a node, its
@@ -14492,6 +14515,93 @@ The metrics are `sparkles_notifications_sent_total{channel,event,result}`,
 `notification_test` with the channel, the result and the `principal`, and each failed
 delivery is logged under `sparkles::notify` with an error that never holds a secret.
 `sparkles notify status` and `sparkles notify test CHANNEL` use these routes.
+`GET /$/notifications` also counts the watches of each dataset under `watches`, without
+their owners or entities.
+
+### Watches
+
+A watch tells its owner about the commits that change an entity, or the entity's
+asserted subtree, in one graph of one branch. The design is in
+[U12](specs/U12-ontology-workbench/SPEC.md#watches). Watches belong to an identity,
+which is a configured user, an OIDC or proxy account, or the owner of a minted token.
+Anonymous callers and static tokens cannot watch. Without auth, watches belong to
+`local`. Every route answers only the caller's own watches, and only those whose graph
+the caller can read now on the watch's branch through the history endpoint. A token
+limited to one dataset therefore sees nothing of another.
+
+| Method | Path | Effect |
+|---|---|---|
+| GET | `/$/watches` | The caller's watches with `unread` for each and in all, and `mail`, which says whether matches are also mailed to the caller and where. `dataset`, `entity` and `graph` (`default` for the default graph) filter them. |
+| POST | `/$/watches` | `{dataset, branch?, graph?, entity, scope?, depth?}` makes a watch, `201`, or answers the same watch with `200`. `scope` is `entity` or `subtree`, and `depth` limits a subtree to that many levels below the entity. |
+| DELETE | `/$/watches/{id}` | Removes the watch, `204`. |
+| GET | `/$/watches/{id}/matches` | The matched commits, newest first, with `after`, `before` and `limit` (at most 200). |
+| POST | `/$/watches/{id}/seen` | `{commit}` marks the matches up to that commit as read. A lower value than the current mark is kept as it is. |
+
+An `entity` watch matches a commit whose net changes on the branch include a quad in the
+graph that names the entity as subject, predicate or object, which is the rule of the
+editor's History view. A `subtree` watch also matches a commit whose changes name an IRI
+from which the entity is reachable upward through `rdfs:subClassOf`,
+`rdfs:subPropertyOf`, `skos:broader` or the inverse of `skos:narrower`, in the graph's
+asserted hierarchy before or after the commit. A class moved into or out of the subtree
+therefore matches, and so does one deleted from it. Imports and inferred hierarchy are
+not followed.
+
+A match has `commit`, `time`, `author`, `members` (at most 20 of the IRIs the commit
+named, in IRI order), `count`, `exact`, and `own` when the caller made the commit. A
+commit that names more members of one watch than the `largeCommit` bound is one entry
+with `summary: true` and no members. `partial` says that an ancestor walk stopped at the
+`maxAncestors` bound. `exact: false` marks a commit whose changes were not listed, such as
+a bulk load, or a stretch of history that is no longer readable, which may or may not
+change the entity. A watch keeps its 200 newest matches and then shows `overflow`. A
+graph with more than 2,000,000 hierarchy edges is not followed, and its subtree watches
+show `truncated` and match only the entity.
+
+The bounds are the `watches` member of the `notifications` kind: `maxAncestors`
+(default 10,000), `largeCommit` (default 1,000), `identityMaxAgeDays` (default 30) and
+`batchSecs` (default 300).
+
+Matches are also mailed when notifications are on and a server administrator sets
+`"watchers": true` on an email channel. Such a channel may have an empty `to`, and the
+routes cannot then name it. The routes never carry a watch, and `entity.changed` and
+`entity.*` are refused as route keys. The first match of an owner in a dataset opens a
+window of `batchSecs`, and at its close one `entity.changed` message per channel goes to
+the owner's verified address, listing each watch with its entity, scope, branch, graph
+and up to 20 commits with their time, author, message and members. The owner's own
+commits are listed in the UI but not mailed, and so are the matches of one window past
+the first 1,000.
+
+The address of a configured user is the `email` member of its `[[users]]` entry. The
+address of an OIDC account is the `email` claim of its sign-in when `email_verified` is
+true. The address of a proxy account is the value of the header that `[proxy]
+verified_email_header` names, which only the administrator sets. An account name is
+never used as an address, and a minted token's watches go to its owner's address. An OIDC
+or proxy owner is mailed only while its provider or proxy vouched for it within
+`identityMaxAgeDays`, by a sign-in, an access token or a proxied request, and the groups
+of that vouching are recorded on the owner's watches at once, whichever route the
+request took.
+
+A delivery holds only the owner, the dataset and the matched watches and commits. Its
+message is built again at each attempt from the watches as they are then, so a watch
+that was removed, a match that was dropped, a graph the owner can no longer read, an
+owner who is gone or out of date, and an address that is no longer verified each shrink
+or end the delivery. A delivery that ends this way counts as `dropped` in the
+notification metrics. It uses the channel's queue share, retries and timeout, and a
+restart loses a window that has not closed, while the matches stay in the UI.
+
+A watch is refused with `403` when the caller cannot read the graph, with `409` and
+`watch-unsupported-protections` while triple protections limit what the caller reads in
+the dataset, and with `409` and `watch-limit` past 200 watches of one owner or 20,000 in
+all. A watch of an owner who no longer exists, is no longer admitted or can no longer read
+the graph matches nothing. A renamed branch keeps its watches under its new name, and the
+watches of a deleted branch or dataset are removed. A branch made again under an old name
+is another branch.
+
+Watches and their matches are kept in `<dataDir>/watches.json`, outside every dataset,
+with mode 0600. A file that a newer release wrote, one without its `format` member, or one
+that does not parse, is left as it is, and the routes answer `503` with
+`watches-unavailable` until it is fixed. A watch whose graph the caller can no longer read
+on its branch's current name answers `403` with `watch-access-lost` to every route that
+names it, including `DELETE`.
 
 ### Ask history
 

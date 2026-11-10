@@ -503,6 +503,9 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
             };
             let mut seen = rustc_hash::FxHashSet::default();
             for &m in ms.iter() {
+                if ev.stopped() {
+                    return;
+                }
                 if seen.insert(m) {
                     ev.bind_and_continue(bi.args[1], m, k, b);
                 }

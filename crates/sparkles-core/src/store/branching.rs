@@ -1710,6 +1710,18 @@ impl Store {
         set.table.lock()
     }
 
+    /// Take the branch table within `timeout`, or `None` when another thread holds it.
+    #[cfg(test)]
+    pub(crate) fn try_hold_branch_table_for_test(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Option<parking_lot::MutexGuard<'_, impl Sized>> {
+        let SetRef::Owner(set) = &self.branching.set else {
+            panic!("a main store with branches");
+        };
+        set.table.try_lock_for(timeout)
+    }
+
     /// Fail with `no-such-branch` unless `branch` is a listed branch of this main.
     pub(super) fn listed_limited(
         &self,
@@ -1804,7 +1816,14 @@ impl Store {
         let set = self.owned_set()?;
         self.check_branch_info_writers(set, name)?;
         if name == MAIN {
-            let t = set.table.lock();
+            // Copy the table's fields and release it before the writer, catalog and
+            // disk reads below: the history collector takes the writer and then the
+            // table, so waiting for the writer under the table can deadlock with it.
+            let (protected, note) = {
+                let t = set.table.lock();
+                (t.main.protected, t.main.note.clone())
+            };
+            self.failpoint("branch-info-main-captured");
             let created_ms = commit::read_dataset_created(self.root.as_deref())
                 .unwrap_or_else(|| self.catalog.lock().first().map_or(0, |c| c.timestamp_ms));
             return Ok(BranchInfo {
@@ -1817,8 +1836,8 @@ impl Store {
                 merge_base: None,
                 ahead: 0,
                 behind: 0,
-                protected: t.main.protected,
-                note: t.main.note.clone(),
+                protected,
+                note,
                 created_ms,
                 storage: BranchStorage {
                     linked: false,

@@ -364,6 +364,10 @@ pub struct UserCfg {
     pub server: Vec<ServerPerm>,
     #[serde(default)]
     pub grants: Vec<GrantCfg>,
+    /// the user's mail address, which an administrator vouches for: the address that
+    /// watches on entities mail (spec U12)
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 impl std::fmt::Debug for UserCfg {
@@ -375,6 +379,7 @@ impl std::fmt::Debug for UserCfg {
             .field("datasets", &self.datasets)
             .field("server", &self.server)
             .field("grants", &self.grants)
+            .field("email", &self.email)
             .finish()
     }
 }
@@ -633,6 +638,10 @@ pub struct ProxyCfg {
     pub name_from: String,
     #[serde(default)]
     pub logout_url: Option<String>,
+    /// a header in which the proxy passes a mail address it verified, which watches on
+    /// entities mail (spec U12); without it, no proxy account has a verified address
+    #[serde(default)]
+    pub verified_email_header: Option<String>,
 }
 
 fn default_separator() -> String {
@@ -875,6 +884,10 @@ impl FileConfig {
             if !names.insert(u.name.as_str()) {
                 bail!("duplicate user '{}'", u.name);
             }
+            if let Some(e) = &u.email {
+                crate::notify::config::check_address(e)
+                    .map_err(|m| anyhow::anyhow!("user {}: email: {m}", u.name))?;
+            }
             if argon2id_params(&u.password).is_none() {
                 bail!(
                     "user {}: password must be an argon2id PHC string ($argon2id$…, see `sparkles auth hash`)",
@@ -1042,6 +1055,11 @@ impl FileConfig {
             }
             if p.groups_separator.is_empty() {
                 bail!("proxy.groups_separator is empty");
+            }
+            if let Some(h) = &p.verified_email_header
+                && axum::http::HeaderName::from_bytes(h.as_bytes()).is_err()
+            {
+                bail!("proxy.verified_email_header: '{h}' is not a header name");
             }
         }
         Ok(())

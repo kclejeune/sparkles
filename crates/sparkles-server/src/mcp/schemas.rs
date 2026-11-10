@@ -691,8 +691,11 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                     "title":{"type":"string"},"summary":{"type":"string"},
                     "status":{"enum":["unreviewed","reviewed","stale"]},"rating":{"type":["integer","null"]},
                     "memberCount":{"type":"integer"},"score":{"type":"number"},
+                    "reviewPolicy":{"type":"object","required":["iri"],"description":"The review policy the report was read under, when it has one","properties":{
+                        "iri":{"type":"string"},"version":{"type":["integer","null"]},"configuration":{"type":["string","null"]}}},
                     "findings":{"type":"array","items":{"type":"object","required":["iri","text","cites"],"properties":{
-                        "iri":{"type":"string"},"text":{"type":"string"},"cites":strings()}}}}}}}})),
+                        "iri":{"type":"string"},"text":{"type":"string"},"cites":strings(),
+                        "claims":strings(),"decisions":strings()}}}}}}}})),
         ),
         read(
             "why_empty",

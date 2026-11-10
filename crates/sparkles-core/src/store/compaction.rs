@@ -681,7 +681,6 @@ impl CatchUp {
     /// Carry `batch` (in commit order) over; `view` is a snapshot of the old generation
     /// that knows every term the batch names.
     fn apply(&mut self, batch: &[TapCommit], view: &Snapshot, o: &CompactOptions) -> Result<()> {
-        let mut rec = [0u8; WAL_REC];
         for c in batch {
             if o.cancel
                 .as_ref()
@@ -695,7 +694,8 @@ impl CatchUp {
                     c.info.seq, self.last
                 )));
             }
-            let mut data = Vec::with_capacity((c.changes.len() + 1) * WAL_REC);
+            // the commit's operations in the new generation's ids, applied to its delta
+            let mut translated = Vec::with_capacity(c.changes.len());
             for (i, (op, q)) in c.changes.iter().enumerate() {
                 if i % 1024 == 0
                     && o.cancel
@@ -715,32 +715,17 @@ impl CatchUp {
                     .perm(Perm::Spo)
                     .contains(&self.cache, &Perm::Spo.to_key(&n))?;
                 apply(&mut self.delta, &n, *op == WAL_INSERT, in_base);
-                rec[0] = *op;
-                for j in 0..4 {
-                    rec[1 + j * 8..9 + j * 8].copy_from_slice(&n[j].0.to_le_bytes());
-                }
-                data.extend_from_slice(&rec);
+                translated.push((*op, n));
             }
-            let configuration_flags = wal::append_configuration(&mut data, c.configuration)?;
-            rec[0] = WAL_COMMIT;
-            rec[1..9].copy_from_slice(&c.next_bnode.to_le_bytes());
             // WAL_FLAG_ANNOTATED is not carried: the commits copied here were durable,
-            // annotation included, before the compaction took the writer lock.
-            let flags = configuration_flags
-                | if c.info.unvalidated {
-                    commit::WAL_FLAG_UNVALIDATED
-                } else {
-                    0
-                };
-            commit::seal_wal_commit(
-                &mut rec,
-                c.info.seq,
-                c.info.timestamp_ms,
-                c.info.kind,
-                flags,
-                &data,
-            );
-            data.extend_from_slice(&rec);
+            // annotation included, before the compaction took the writer lock. Nothing
+            // before a copied commit is unfenced either.
+            let data = wal::encode_txn(
+                &translated,
+                c.configuration,
+                c.next_bnode,
+                wal::Seal::of(&c.info, 0, 0),
+            )?;
             if let Some(w) = self.wal.as_mut() {
                 w.write_all(&data)?;
                 self.wal_len += data.len() as u64;
@@ -1425,26 +1410,15 @@ impl Store {
             w.poisoned = true;
             return Err(e);
         }
-        let dvocab_len = gen_.dvocab.len();
-        let mut new_snap = Snapshot {
-            cacheable: true,
-            dataset_id: self.owner_dataset_id(),
-            generation: gen_,
-            delta: std::mem::take(&mut cu.delta),
-            version: view.version + 1,
-            cache: self.cache.clone(),
-            results: self.results.clone(),
-            dvocab_len,
-            commit: view.commit,
-            text: view.text.clone(),
-            geo: None,
-            union_default_graph: self.opts.union_default_graph,
-            geo_op_vertices: self.opts.geo_op_vertices,
-            counts: Default::default(),
-            historical: false,
-            mask: None,
-            change_log: self.changelog.clone(),
-        };
+        // The new generation at the commit the store already has, with the carried
+        // commits in its delta and the full-text view as it was. The switch below gives
+        // it its spatial view.
+        let mut new_snap = self
+            .snapshot_of(gen_, view.commit)
+            .delta(std::mem::take(&mut cu.delta))
+            .version(view.version + 1)
+            .text(view.text.clone())
+            .build();
         #[cfg(feature = "text")]
         if let Some(job) = self.text_recovery.load_full().filter(|j| j.pending()) {
             job.changed_generation();
@@ -1452,13 +1426,10 @@ impl Store {
         }
         self.switch_geo_locked(&mut new_snap, &view, geo);
         let quads = new_snap.len();
-        let published = Arc::new(new_snap);
-        self.current.store(published.clone());
-        if let Some(g) = self.guard() {
-            g.rekey(&view, &published);
-        }
-        drop(published);
-        self.commits.send_replace(view.commit);
+        self.publish_committed(Publication::Switch {
+            previous: &view,
+            snapshot: Arc::new(new_snap),
+        });
         self.vectors_switched(&view);
         self.compaction.rebased(base.seq, cu.oldest_ms);
         self.compaction
@@ -1689,25 +1660,10 @@ impl Store {
     /// A snapshot of `gen_` alone, with an empty delta, at commit `seq` (what a
     /// compaction's new generation holds before the commits carried over).
     pub(super) fn base_snapshot(&self, gen_: &Arc<Generation>, seq: u64) -> Snapshot {
-        Snapshot {
-            cacheable: true,
-            dataset_id: self.owner_dataset_id(),
-            generation: gen_.clone(),
-            delta: gen_.base_delta(),
-            version: 0,
-            cache: self.cache.clone(),
-            results: self.results.clone(),
-            dvocab_len: gen_.dvocab.len(),
-            commit: seq,
-            text: None,
-            geo: None,
-            union_default_graph: self.opts.union_default_graph,
-            geo_op_vertices: self.opts.geo_op_vertices,
-            counts: Default::default(),
-            historical: false,
-            mask: None,
-            change_log: None,
-        }
+        self.snapshot_of(gen_.clone(), seq)
+            .delta(gen_.base_delta())
+            .change_log(None)
+            .build()
     }
 
     /// What stops or paces a compaction's build: its cancel flag, the free-space reserve,

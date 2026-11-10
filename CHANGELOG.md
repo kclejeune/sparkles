@@ -36,6 +36,23 @@ it.
 
 ### Added
 
+Community reports can read a review policy's accepted projection (item 652). The
+`graphrag` settings member `reviewPolicy` names a review policy of the dataset's evidence
+settings, and a build or refresh then reads the policy's output graph with the projection's
+graphs, never another evidence graph, and admits an accepted fact only with a claim the
+principal may see. A run is refused before any model call on a store without activated
+configuration history and for a policy the principal cannot use. Each finding records
+`gr:citesClaim` and `gr:citesDecision`, a report records `gr:reviewPolicy`,
+`gr:policyVersion` and `gr:evidenceConfiguration`, and its activity names every claim,
+decision and child report it read with `prov:used`. The footprint lists the policy's
+decisions and supports graphs and the readable proposal graphs. A withdrawal, reversal or
+superseding decision rewrites the reports that read it and their ancestors at the next
+refresh, and a new policy version rewrites every report. `GET /$/graphrag/{ds}/community`,
+`community_reports` and a global answer's `reports` carry `reviewPolicy` and each
+finding's `claims` and `decisions`. The automatic refresh notices only the evidence
+changes that the principal's change feed lists, and roadmap item 652 adds a private check
+for the others.
+
 Roadmap item 791 adds Nemo 0.10.1 as the reference for the `owl-rl` materialization. The
 flake builds it from its checksum-pinned release binaries as `.#nemo`, and
 `scripts/rl-reference/owl2rl.rls` writes the OWL 2 RL/RDF rules of OWL 2 Profiles for it.
@@ -58,6 +75,21 @@ written. New `sourceGraph` and `proposalGraph` options choose the evidence graph
 `sparkles::evidence::propose` takes ordinary changes outside every managed graph to
 publish in the batch's commit. The evidence rendition keeps its text, so a claims
 ingestion stores the text in its chunks and again in the evidence graph.
+
+Users can watch an entity or its asserted subtree (item 619, spec U12). The server keeps
+watches in `<dataDir>/watches.json`, format 1, and a follower thread matches each watched
+branch's commits in order, walking upward from each changed IRI through the hierarchy
+before and after the commit. The routes are `/$/watches`, and every answer is filtered by
+the caller's current access. The ontology editor's entity frame has a Watch button, the
+new Watches page lists the matched commits with links to each member's History view, and
+the top bar shows the unread count. An email channel with `"watchers": true` mails each
+owner's matches in a dataset, gathered over `watches.batchSecs`, to the owner's verified
+address as the event `entity.changed`, which no route carries. The address comes from the
+new `email` member of `[[users]]`, the OIDC `email` claim with `email_verified`, or the
+header that the new `[proxy] verified_email_header` names. Each attempt rebuilds the
+message from the watches and the owner's access at that moment. The `notifications` kind
+gains the `watches` member with `maxAncestors`, `largeCommit`, `identityMaxAgeDays` and
+`batchSecs`, and `GET /$/notifications` gains the count of watches per dataset.
 
 Ontology reads resolve imports within the dataset (item 624). An `owl:imports` IRI
 resolves to the graph the dataset's import map names, then to the graph the IRI names, then
@@ -133,13 +165,18 @@ language list, saved in the browser. Query tables batch label lookups for visibl
 at the result's branch and commit. Missing labels and failed lookups keep a prefixed
 name or the complete IRI visible, and copying keeps the original RDF term.
 
-The disjunctive classification rules have rules for nominals and the object assertions
-of individuals, as F24's design for the sixth phase of roadmap item 603 describes, but
-they stay behind a switch that is off. With it on they time out on 19 of the 50 nominal
-fixtures of the phase's gate, so ontologies with individuals or nominals are still
-refused by the disjunctive rules and every classification gives the taxonomy it gave
-before. Roadmap item 804 redesigns the rules to meet the gate, and item 805 adds keys
-and the universal property.
+The disjunctive classification rules take ontologies with individuals and nominals
+through the rooted run of F24's sixth phase when `Limits::rooted` asks for it, which is
+off by default (roadmap item 804). The run departs from the journal calculus of Tena
+Cucala and others in four recorded ways, and F24 gives each its rationale, its soundness
+argument and its measured effect. Its completeness is not proved, and every answer it
+gives is entailed. A rooted run without counting stops at 524,288 derived conclusions,
+which `Limits::dl_work` changes, and classifies again without the rooted rules, which
+gives the answer a run without the option gives and sets `dl_rooted_over` and
+`dl_over_budget`. With the option on, 45 of the 50 nominal fixtures of the phase's gate
+give HermiT's taxonomy and the other five fall back to their default answer. Those five
+are item 822, the default is item 823, and keys and the universal property are item 805.
+Without the option every classification gives the taxonomy it gave before.
 
 The disjunctive classification rules can count, and `Limits::counting` turns it on. It is
 off by default, because counting finishes on no real ontology of the ORE 2015 DL
@@ -575,6 +612,23 @@ files take 0.74 of the time of the build before on four threads on forge and 0.6
 eight, with the same taxonomies. Warm runs of five of them take about 0.5 ms longer on
 eight threads, which roadmap item 720 follows, and ChEBI lite and `ore_ont_13482`
 classify 1.0 to 1.6% slower on one thread from code layout, item 722.
+
+A classification on several threads that has already started helper threads in its
+process starts them, for a saturation of fewer than 4,096 roots, after as long as its
+first worker took to start them the last time, between 20 and 500 us, instead of after
+0.5 ms (roadmap item 720). Later threads start much faster than a process's first ones.
+Warm runs on eight threads on atlas of five small ORE 2015 DL files whose saturation takes
+1.8 to 4 ms take 0.04 to 0.21 ms longer than before item 709, where they had been 0.4
+to 0.6 ms longer, and cold runs keep item 709's gain. Warm runs of the smallest files
+take 0.01 to 0.05 ms longer, item 819.
+
+A congested EL saturation on one thread sends through its outbox, so that its deliveries
+drop the messages their contexts hold (roadmap item 721). The one-thread run of
+`ore_ont_8737` peaks at 5.9 instead of 9.3 GiB on atlas and takes 90.7 instead of 95.8 s,
+with the same taxonomy. Its time on four threads, 28 s against Konclude's 11 s, is item
+818. The one-thread times of five larger files move by up to 2% with the code's layout,
+and the new build is 0.6% faster to 0.9% slower than the one before on them, item
+722.
 
 A congested EL saturation drops the subsumptions and backward links it delivers to a
 context that already holds them (roadmap item 695). The peak resident set of
@@ -1754,6 +1808,23 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 
 ### Fixed
 
+Reading the `main` branch's information no longer holds the dataset's branch table while
+it waits for the main writer. The periodic history collector takes the writer and then
+the branch table, so a branch listing that ran during a collection could deadlock both,
+and the server stopped answering dataset and branch requests until it restarted.
+
+Roadmap item 798 bounds incremental maintenance after a deletion by the cost of a full
+run. The deletion counts the rule instances its backward searches and its consequence
+steps match and compares the run's memory with what it held when the deletion started.
+Past four instances for each fact of the closure, at least 2^20, or past the closure's own
+heap, at least 64 MiB, the run materializes in full and gives the same closure. Deleting
+1% of OWL2Bench(1)'s data triples, whose `hasSameHomeTownWith` closure is a clique, grew
+to 14.1 GiB before. It now falls back and finishes at 808 to 866 MiB of RSS, equal to
+Nemo's closure. The consequences of deleted facts keep each head once, and a builtin
+that binds many values, such as `listMember`, stops when its evaluation is stopped by the
+bound, a memory refusal or cancellation. Items 815 and 816 follow up the witness
+preparation of a deletion and the peak that a run that falls back reports.
+
 Classification recounts retained index and context estimates consistently for fresh and
 reused state. A requested partial classification preserves its tier when final retained
 or taxonomy admission refuses memory, reports the original memory error and leaves
@@ -1981,6 +2052,11 @@ frequent predicate gains the least. Planning observes the request's timeout and 
 throughout.
 
 ### Format
+
+The GraphRAG state `graphrag/state.json` moves to format version 3, which records the
+review policy of the last build and the claim and decision pairs each report read under
+it. This release reads version 2 states as states without a policy and writes version 3.
+An older release refuses a version 3 state as a newer format.
 
 The planner statistics in `gen-*/stats.json` gain the member `correlations`, which
 carries its own version, 1, and is registered as the derived kind `planner-statistics`.

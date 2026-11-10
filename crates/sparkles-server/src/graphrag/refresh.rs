@@ -43,6 +43,9 @@ const FEED_DEADLINE: Duration = Duration::from_secs(60);
 
 const RDF_TYPE: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
 
+/// The class of a claim's withdrawal.
+const WITHDRAWAL: &str = "urn:x-sparkles:evidence:Withdrawal";
+
 /// What the loop remembers of one dataset.
 #[derive(Debug, Default)]
 pub struct Watch {
@@ -61,6 +64,10 @@ pub struct Watch {
     retry_at: Option<Instant>,
     /// the refresh task this loop started last, until it ends
     task: Option<String>,
+    /// when the review policy was last compared with the last build's, which needs no
+    /// commit, and whether the last build read under one
+    policy_checked: Option<Instant>,
+    had_policy: bool,
 }
 
 impl Watch {
@@ -179,7 +186,13 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
             }
             w.task = None;
         }
-        if !w.wants_check(head, now, debounce, build::today()) {
+        // a review policy that changed, or a new version of it, makes the dataset due
+        // without a commit, so it is compared once a debounce period
+        let policy_due = (settings.review_policy.is_some() || w.had_policy)
+            && w.retry_at.is_none_or(|t| now >= t)
+            && w.policy_checked
+                .is_none_or(|t| now.duration_since(t) >= debounce);
+        if !w.wants_check(head, now, debounce, build::today()) && !policy_due {
             continue;
         }
         // a running or queued build or refresh goes first, and the check waits for it
@@ -187,6 +200,7 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
             continue;
         }
         w.checked();
+        w.policy_checked = Some(now);
         let reason = match due_reason(st, &ds, &settings, w) {
             Ok(r) => r,
             Err(e) => {
@@ -209,7 +223,7 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
 }
 
 /// Why the dataset needs a refresh now, if it does.
-fn due_reason(
+pub(crate) fn due_reason(
     st: &AppState,
     ds: &Dataset,
     settings: &GraphragSettings,
@@ -223,6 +237,41 @@ fn due_reason(
         return Ok(None);
     }
     w.has_pending = !b.pending.is_empty();
+    w.had_policy = b.policy.is_some();
+    // the policy the reports read under: enabling, switching or removing it, or a new
+    // version, rewrites every report (spec C25, "Reports on accepted evidence")
+    let evidence = match &settings.review_policy {
+        Some(name) => Some(
+            super::evidence::Evidence::admit(
+                ds,
+                Some(name),
+                None,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                Default::default(),
+            )
+            .map_err(|e| e.to_string())?
+            .expect("a named policy"),
+        ),
+        None => None,
+    };
+    match (&evidence, &b.policy) {
+        (None, None) => {}
+        (None, Some(_)) => {
+            return Ok(Some(
+                "the reports no longer read under a review policy".into(),
+            ));
+        }
+        (Some(e), stored) => {
+            if !stored.as_ref().is_some_and(|p| {
+                p.name == e.policy.name && p.iri == e.policy.iri && p.version == e.policy.version
+            }) {
+                return Ok(Some(format!(
+                    "the reports read under review policy {} at version {}",
+                    e.policy.name, e.policy.version
+                )));
+            }
+        }
+    }
     if !b.pending.is_empty() {
         let today = build::today();
         if w.retried_day != Some(today) {
@@ -277,7 +326,28 @@ fn due_reason(
                 let GraphName::NamedNode(g) = &q.graph_name else {
                     continue;
                 };
-                if is_guarded(g.as_str()) || !super::projection::named(settings, g.as_str()) {
+                // a decision or support the principal can see, or a withdrawal, can end
+                // what a report read without changing the output graph
+                if let Some(e) = &evidence {
+                    let g = g.as_str();
+                    if g == e.policy.decisions || g == e.policy.supports {
+                        return Ok(Some(format!(
+                            "commit {} changed the decisions or supports of review policy {}",
+                            c.commit.seq, e.policy.name
+                        )));
+                    }
+                    if e.proposals.iter().any(|p| p == g)
+                        && q.predicate.as_str() == super::store::RDF_TYPE
+                        && matches!(&q.object, Term::NamedNode(o) if o.as_str() == WITHDRAWAL)
+                    {
+                        return Ok(Some(format!("commit {} withdrew a claim", c.commit.seq)));
+                    }
+                }
+                let output = evidence.as_ref().map(|e| e.policy.output.as_str());
+                if is_guarded(g.as_str())
+                    || !(super::projection::named(settings, g.as_str())
+                        || output == Some(g.as_str()))
+                {
                     continue;
                 }
                 if let Some(r) = counter.change(&q.subject, &q.predicate.to_string(), &q.object) {
@@ -414,11 +484,15 @@ mod tests {
                     members: vec!["<http://ex/a>".into(), "<http://ex/b>".into()],
                     report: None,
                     facts: (0..10).collect(),
+                    policy: false,
+                    pairs: None,
                 }],
                 pending: Vec::new(),
                 tokens: 0,
                 reports_graph: String::new(),
                 footprint: String::new(),
+                policy: None,
+                pairs: Vec::new(),
             }),
             ..Default::default()
         }

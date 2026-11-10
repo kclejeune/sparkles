@@ -89,6 +89,8 @@ pub struct ProxySettings {
     pub separator: String,
     pub name_from_email: bool,
     pub logout_url: Option<String>,
+    /// the header that carries an address the proxy verified
+    pub verified_email_header: Option<String>,
 }
 
 #[cfg(feature = "auth")]
@@ -110,6 +112,24 @@ impl ProxySettings {
             separator: c.groups_separator.clone(),
             name_from_email: c.name_from == "email",
             logout_url: c.logout_url.clone(),
+            verified_email_header: c.verified_email_header.clone(),
+        }
+    }
+
+    /// The verified address the proxy passes, when it is configured to pass one.
+    pub fn verified_email(&self, h: &HeaderMap) -> super::EmailClaim {
+        let Some(name) = &self.verified_email_header else {
+            return super::EmailClaim::Unknown;
+        };
+        match h
+            .get(name.as_str())
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+        {
+            Some(v) if crate::notify::config::check_address(v).is_ok() => {
+                super::EmailClaim::Verified(v.to_string())
+            }
+            _ => super::EmailClaim::Unverified,
         }
     }
 
@@ -183,6 +203,7 @@ mod tests {
             groups_separator: ",".into(),
             name_from: "user".into(),
             logout_url: None,
+            verified_email_header: None,
         };
         let s = ProxySettings::from_config(&cfg);
         assert_eq!(s.user_header, "Remote-User");

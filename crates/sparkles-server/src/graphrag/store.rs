@@ -11,7 +11,7 @@
 //! The functions here only build quads and the SPARQL that reads them back. The build
 //! writes them in commits of kind `graphrag`.
 
-use super::guard::{DISCLOSURE_GRAPH, gr};
+use super::guard::{DISCLOSURE_GRAPH, GR, gr};
 use super::report::{Checked, Item, Rendered};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
 
@@ -98,6 +98,24 @@ pub struct NewReport {
     /// the report this one replaces
     pub revision_of: Option<String>,
     pub body: Body,
+    /// the review policy the report was read under, and what it read
+    pub evidence: Option<ReportEvidence>,
+}
+
+/// What a report read under a review policy records (spec C25, "Reports on accepted
+/// evidence").
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReportEvidence {
+    pub policy: String,
+    pub version: u32,
+    /// the configuration history's lineage and generation, joined with a slash
+    pub configuration: String,
+    /// for each item of the input, the claims of its fact and their current decisions
+    pub items: Vec<Vec<(String, String)>>,
+    /// every claim and decision behind the input, cited or not
+    pub used: Vec<(String, String)>,
+    /// the child reports the input read
+    pub children: Vec<String>,
 }
 
 /// What a report says.
@@ -118,7 +136,11 @@ pub fn parse_term(nt: &str) -> Option<Term> {
     if let Some(iri) = nt.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
         return NamedNode::new(iri).ok().map(Term::NamedNode);
     }
-    let doc = format!("<urn:x> <urn:x> {nt} .");
+    // one allocation of the document's exact length, which the run's charges count on
+    let mut doc = String::with_capacity(nt.len() + 18);
+    doc.push_str("<urn:x> <urn:x> ");
+    doc.push_str(nt);
+    doc.push_str(" .");
     oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NTriples)
         .for_slice(doc.as_bytes())
         .next()
@@ -220,8 +242,27 @@ pub fn report_quads(r: &NewReport, graph: &str) -> Vec<Quad> {
     if let Some(old) = &r.revision_of {
         o.add(id, &format!("{PROV}wasRevisionOf"), nn(old));
     }
+    if let Some(e) = &r.evidence {
+        o.add(id, &gr("reviewPolicy"), nn(&e.policy));
+        o.int(id, &gr("policyVersion"), e.version.into());
+        o.lit(id, &gr("evidenceConfiguration"), &e.configuration);
+    }
     if let Some(a) = &r.activity {
         let act = activity_iri(id);
+        // a failed report has no activity and records no claim
+        if let Some(e) = &r.evidence {
+            let mut used: Vec<&str> = Vec::new();
+            for (c, d) in &e.used {
+                used.push(c);
+                used.push(d);
+            }
+            used.extend(e.children.iter().map(String::as_str));
+            used.sort_unstable();
+            used.dedup();
+            for u in used {
+                o.add(&act, &format!("{PROV}used"), nn(u));
+            }
+        }
         o.add(id, &format!("{PROV}wasGeneratedBy"), nn(&act));
         o.add(&act, RDF_TYPE, nn(&format!("{PROV}Activity")));
         o.add(&act, &format!("{PROV}wasAssociatedWith"), nn(WRITER));
@@ -264,6 +305,28 @@ pub fn report_quads(r: &NewReport, graph: &str) -> Vec<Quad> {
                     if let Some(Term::NamedNode(n)) = parse_term(e) {
                         o.add(&fid, &gr("about"), n);
                     }
+                }
+                let mut claims: Vec<&str> = Vec::new();
+                let mut decisions: Vec<&str> = Vec::new();
+                for n in &f.cites {
+                    if let Some(e) = &r.evidence
+                        && let Some(pairs) = e.items.get(n - 1)
+                    {
+                        for (c, d) in pairs {
+                            claims.push(c);
+                            decisions.push(d);
+                        }
+                    }
+                }
+                claims.sort_unstable();
+                claims.dedup();
+                decisions.sort_unstable();
+                decisions.dedup();
+                for c in claims {
+                    o.add(&fid, &gr("citesClaim"), nn(c));
+                }
+                for d in decisions {
+                    o.add(&fid, &gr("citesDecision"), nn(d));
                 }
                 for n in &f.cites {
                     let Some(item) = input.items.get(n - 1) else {
@@ -310,35 +373,63 @@ pub fn delete_subjects(graph: &str, subjects: &[String]) -> Option<String> {
     if subjects.is_empty() {
         return None;
     }
-    let values: Vec<String> = subjects.iter().map(|s| format!("<{s}>")).collect();
-    Some(format!(
-        "DELETE {{ GRAPH <{graph}> {{ ?x ?p ?o }} }} WHERE {{ VALUES ?r {{ {} }} GRAPH <{graph}> {{ ?x ?p ?o }} FILTER(?x = ?r || STRSTARTS(STR(?x), CONCAT(STR(?r), \"#\"))) }}",
-        values.join(" ")
-    ))
+    let mut out = String::new();
+    write_delete_subjects(&mut out, graph, subjects);
+    Some(out)
+}
+
+/// Write [`delete_subjects`]'s update for a nonempty `subjects` into `w`.
+pub fn write_delete_subjects(w: &mut impl std::fmt::Write, graph: &str, subjects: &[String]) {
+    let _ = write!(
+        w,
+        "DELETE {{ GRAPH <{graph}> {{ ?x ?p ?o }} }} WHERE {{ VALUES ?r {{ "
+    );
+    for (i, s) in subjects.iter().enumerate() {
+        let _ = write!(w, "{}<{s}>", if i > 0 { " " } else { "" });
+    }
+    let _ = write!(
+        w,
+        " }} GRAPH <{graph}> {{ ?x ?p ?o }} FILTER(?x = ?r || STRSTARTS(STR(?x), CONCAT(STR(?r), \"#\"))) }}"
+    );
 }
 
 /// The SPARQL update that removes the reports of `graph` that no community links to and
-/// that no linked report reaches through one or more `gr:citesReport` links, with their
-/// findings and activities. A report a kept parent still cites, directly or through
-/// another cited report, stays until that parent is replaced, so its findings remain
-/// resolvable, and the history keeps every removed report.
+/// that no linked report reaches, with their findings and activities. A report reaches
+/// the reports it cites through `gr:citesReport`, the child reports its activity used,
+/// and, for a person's edit of a report read under a review policy, the report it edits
+/// through `gr:editOf`, so that the edit's provenance resolves wherever the edit is kept
+/// (spec C25, "Reports on accepted evidence"). A report that a run wrote in place of
+/// another does not keep it. A report a kept parent still reaches stays until that
+/// parent is replaced, so its findings remain resolvable, and the history keeps every
+/// removed report.
 pub fn delete_unreachable_reports(graph: &str) -> String {
-    format!(
-        "DELETE {{ GRAPH <{graph}> {{ ?x ?p ?o }} }} WHERE {{ {{ SELECT DISTINCT ?r WHERE {{ GRAPH <{graph}> {{ ?r a <{report_t}> FILTER NOT EXISTS {{ ?c <{report}> ?r }} FILTER NOT EXISTS {{ ?c2 <{report}> ?r2 . ?r2 <{cites}>+ ?r }} }} }} }} GRAPH <{graph}> {{ ?x ?p ?o }} FILTER(?x = ?r || STRSTARTS(STR(?x), CONCAT(STR(?r), \"#\"))) }}",
-        report_t = gr("Report"),
-        report = gr("report"),
-        cites = gr("citesReport"),
-    )
+    let mut out = String::new();
+    write_delete_unreachable_reports(&mut out, graph);
+    out
+}
+
+/// Write [`delete_unreachable_reports`]'s update into `w`.
+pub fn write_delete_unreachable_reports(w: &mut impl std::fmt::Write, graph: &str) {
+    let _ = write!(
+        w,
+        "DELETE {{ GRAPH <{graph}> {{ ?x ?p ?o }} }} WHERE {{ {{ SELECT DISTINCT ?r WHERE {{ GRAPH <{graph}> {{ ?r a <{GR}Report> FILTER NOT EXISTS {{ ?c <{GR}report> ?r }} FILTER NOT EXISTS {{ ?c2 <{GR}report> ?r2 . ?r2 (<{GR}citesReport>|(<{PROV}wasGeneratedBy>/<{PROV}used>)|<{GR}editOf>)+ ?r }} }} }} }} GRAPH <{graph}> {{ ?x ?p ?o }} FILTER(?x = ?r || STRSTARTS(STR(?x), CONCAT(STR(?r), \"#\"))) }}"
+    );
 }
 
 /// The SPARQL update that removes footprints of `graph` that no report or community
 /// links to.
 pub fn delete_unlinked_footprints(graph: &str) -> String {
-    format!(
-        "DELETE {{ GRAPH <{DISCLOSURE_GRAPH}> {{ ?f ?p ?o }} }} WHERE {{ GRAPH <{DISCLOSURE_GRAPH}> {{ ?f <{covers}> <{graph}> ; ?p ?o }} FILTER NOT EXISTS {{ GRAPH <{graph}> {{ ?r <{disclosure}> ?f }} }} }}",
-        covers = gr("covers"),
-        disclosure = gr("disclosure"),
-    )
+    let mut out = String::new();
+    write_delete_unlinked_footprints(&mut out, graph);
+    out
+}
+
+/// Write [`delete_unlinked_footprints`]'s update into `w`.
+pub fn write_delete_unlinked_footprints(w: &mut impl std::fmt::Write, graph: &str) {
+    let _ = write!(
+        w,
+        "DELETE {{ GRAPH <{DISCLOSURE_GRAPH}> {{ ?f ?p ?o }} }} WHERE {{ GRAPH <{DISCLOSURE_GRAPH}> {{ ?f <{GR}covers> <{graph}> ; ?p ?o }} FILTER NOT EXISTS {{ GRAPH <{graph}> {{ ?r <{GR}disclosure> ?f }} }} }}"
+    );
 }
 
 #[cfg(test)]

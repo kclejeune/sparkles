@@ -50,9 +50,15 @@ request or on every write, and the schema report counts what the data holds.
 * Any later run, whether a re-run, an automatic run or `sparkles infer`, updates the
   previous materialization incrementally with the backward/forward algorithm and writes
   what a full run would. A run is full when rules are not monotonic or create blank nodes,
-  when deletions are large, or when the set of input graphs changed. The kept closure
-  holds only the derived facts, which takes 41% to 47% of the memory of a closure with the
-  explicit facts on LUBM-style data.
+  when deletions are large, or when the set of input graphs changed. A deletion also runs
+  in full when its maintenance passes an allowance set by the size of the closure, which
+  approximates the cost of a full run. The allowance is four matched rule instances for
+  each fact of the closure and as much memory beyond what the run held when the deletion
+  started as the closure's own heap, with floors of about a million instances and 64 MiB.
+  The maintenance compares its count and the run's charges with the allowance every 1,024
+  instances, so it can pass the allowance by a few batches before it stops. The kept
+  closure holds only the derived facts, which takes 41% to 47% of the memory of a closure
+  with the explicit facts on LUBM-style data.
 * A materialization reads the default graph unless data and ontology graphs are named,
   and follows `owl:imports` to graphs of the dataset through a Jena-style location
   mapping ([API.md](../API.md#input-graphs-and-imports)). With `imports: fetch`, missing
@@ -306,8 +312,18 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   again without counting, leaves the axioms that need counting out and reports them, and
   sets `Stats::dl_counting_over` and `Stats::dl_over_budget`. Near the bound the thread
   schedule can decide whether a run answers in full or falls back, and the fallback is
-  always reported and never a different complete answer. Roadmap item 727. Any other
-  axiom outside OWL 2 EL, such as nominals, is left out and reported with its rule. Horn
+  always reported and never a different complete answer. Roadmap item 727. In an
+  ontology with individuals or nominals, `Limits::rooted` lets the disjunctive rules take
+  nominals, class and property assertions, equalities and inequalities of individuals and
+  negative assertions through a root context where the individuals' facts meet, with the
+  four departures from the published calculus that F24 records. It is off by default,
+  since the completeness of the departed calculus is not proved, and every answer it gives
+  is entailed. A rooted run without counting has a bound of 524,288 derived conclusions,
+  `Limits::dl_work`, past which it classifies again without the rooted rules, gives the
+  default answer and sets `Stats::dl_rooted_over` and `Stats::dl_over_budget`. It refuses
+  an ontology with keys, a top property or a functional data property, which take the
+  default paths. Roadmap items 805, 822 and 823. Without the option, any other axiom
+  outside OWL 2 EL, such as a nominal, is left out and reported with its rule. Horn
   reasoning with individuals is not supported. Roadmap item 692. An axiom with a literal
   or datatype that the classifier cannot compare, such as an XML literal, an ill-typed
   literal or a datatype outside the OWL 2 datatype map, or with a property chain through
@@ -652,6 +668,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap item 520.
 * Closure operators serve full materialization only. Incremental updates and query-time
   reasoning evaluate transitive and equivalence rules as joins. Roadmap item 521.
+* A deletion in a large clique of a symmetric and transitive property, where every fact
+  follows through every member, passes the bound on maintenance and runs in full. The
+  bound leaves out the witness preparation of a deletion, which is roadmap item 815. A run
+  that falls back reports the full run's peak memory and not the higher peak of the update
+  it abandoned, which is roadmap item 816.
 * Inference is forward materialization, RDFS on read and derivation on demand.
   Derivation on demand has no cost-based choice against a materialization, no OWL 2 QL
   rewriting, no reuse of tables across commits and no dataset setting, and Jena's hybrid
@@ -731,18 +752,23 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   and 4.0 seconds on one thread, against 0.7 and 0.8 for the EL rules alone. Roadmap
   item 693.
 * The EL saturation of one ORE 2015 DL ontology with 2.5 million existential
-  restrictions peaks at 7.5 GiB on four threads and 9.4 GiB on one, since most of its
-  waiting messages repeat what their contexts hold and take about nine times the memory
-  of the conclusions it keeps. Roadmap item 721.
-* A small ontology's classification on several threads starts its helper threads after
-  0.5 ms of work, which makes warm runs of some small files about 0.5 ms slower on eight
-  threads. Roadmap item 720.
+  restrictions takes 28 s on four threads and peaks at 6.8 to 7.9 GiB, since many of its
+  waiting messages repeat what their contexts hold and wait while another thread holds
+  the context. Konclude 0.7.0 classifies it in 11 s. Its run on one thread peaks at 5.9
+  GiB. Roadmap item 818.
+* A small ontology's first classification in a process on several threads starts its
+  helper threads after 0.5 ms of work, and later ones after as long as the last start of
+  the helpers took. Warm runs of some small files on eight threads take up to 0.2 ms
+  longer than a start at once would. Roadmap item 819.
 * The ELK mode, which classifies by the OWL 2 EL rules alone, is an option of the Rust
   library and the ROBOT-compatible commands only, and HTTP, the other CLI commands and
   the bindings always take the Horn axioms. Roadmap item 694.
-* Axioms outside OWL 2 EL that need nominals, and axioms that need case analysis or
-  counting in an ontology with individuals or data properties, are left out, and an
-  external DL reasoner bridge is planned. Roadmap item 603. The disjunctive rules need a
+* By default, axioms outside OWL 2 EL that need nominals, and axioms that need case
+  analysis or counting in an ontology with individuals, are left out, since the rooted run
+  that takes them is an option whose completeness is not proved, and five of the 50
+  nominal fixtures of its gate pass its work bound. Roadmap items 822 and 823. Axioms that
+  need case analysis in an ontology with data properties are left out, and an external DL
+  reasoner bridge is planned. Roadmap item 603. The disjunctive rules need a
   datatype checker with data cardinalities before they take data properties, and 10 of
   the 97 disjunctive development files of the ORE 2015 DL sample wait on it. Roadmap
   item 768.

@@ -223,6 +223,33 @@ fn axioms_outside_el_are_reported() {
 
 type Excl = sparkles_owl::classify::Excluded;
 
+/// With `Limits::rooted`, the rooted run of Tier D takes the same axioms, which an ontology
+/// with an individual otherwise leaves out, and reports nothing.
+#[test]
+fn a_rooted_run_takes_the_axioms_outside_el_beside_an_individual() {
+    let mut k = Classifier::of(&[
+        sub(c("A"), ClassExpression::or([ce("B"), ce("C")])),
+        sub(c("A"), c("D")),
+        sub(
+            c("E"),
+            ClassExpression::ObjectHasValue(ope("r"), Individual::named("http://ex.org/i")),
+        ),
+        ax(AxiomKind::InverseObjectProperties(ope("r"), ope("s"))),
+    ]);
+    let out = k
+        .classify(&Limits {
+            rooted: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(out.complete);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+    assert!(out.taxonomy.node_of(&c("B")).is_some());
+    assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+    assert_eq!(out.stats.tier, sparkles_owl::classify::Tier::Disjunctive);
+    assert!(!out.stats.dl_rooted_over);
+}
+
 #[test]
 fn chains_against_the_range_restriction_are_left_out() {
     let axioms = [

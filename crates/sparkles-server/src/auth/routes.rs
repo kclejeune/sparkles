@@ -171,6 +171,10 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // outbound notifications (C21 §8)
     ("/$/notifications", &["GET"]),
     ("/$/notifications/test/{channel}", &["POST"]),
+    ("/$/watches", &["GET", "POST"]),
+    ("/$/watches/{id}", &["DELETE"]),
+    ("/$/watches/{id}/matches", &["GET"]),
+    ("/$/watches/{id}/seen", &["POST"]),
     // the resource catalog (C30)
     ("/$/resources", &["GET", "POST"]),
     ("/$/resources/{id}", &["GET", "PUT", "DELETE"]),
@@ -459,6 +463,10 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         }
         // the operator's notification channels and their deliveries (C21 §8)
         "/$/notifications" | "/$/notifications/test/{channel}" => Server(ServerPerm::ServerAdmin),
+        // the caller's own watches, filtered by the handlers to the graphs it reads
+        "/$/watches" | "/$/watches/{id}" | "/$/watches/{id}/matches" | "/$/watches/{id}/seen" => {
+            Authed
+        }
         // the server's resource catalog (C30); installing a vocabulary's prefixes changes
         // one dataset's settings
         "/$/resources/{id}/install/{ds}" => Dataset(Admin),

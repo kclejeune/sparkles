@@ -15,6 +15,7 @@
 //! facts it reads now, rather than reading the change feed (§5).
 
 use super::budget::{BuildAdmission, Ledger, Tokenizers, byte_bound};
+use super::evidence::{Evidence, EvidenceCheck, Limits, RunPolicy, TripleKey};
 use super::guard::{CaptureInput, Footprint, capture};
 use super::hierarchy;
 use super::identity::{self, Fresh};
@@ -22,7 +23,7 @@ use super::ledger::DatasetLedger;
 use super::projection::{self, Projection};
 use super::report::{self, ChildFinding, ChildReport, EntityInfo, Fact, Rendered};
 use super::settings::GraphragSettings;
-use super::state::{BuildRecord, BuildState, StoredCommunity};
+use super::state::{BuildRecord, BuildState, StoredCommunity, StoredPolicy};
 use super::store::{
     self, Activity, Body, CommunityRecord, NewReport, Status, community_quads, report_quads,
 };
@@ -206,6 +207,16 @@ pub fn fact_digest(f: &Fact) -> u64 {
     u64::from_be_bytes(d[..8].try_into().expect("8 bytes"))
 }
 
+/// The key of a fact's triple.
+fn key(f: &Fact) -> TripleKey {
+    (f.s.clone(), f.p.clone(), f.o.clone())
+}
+
+/// Whether a build recorded the policy a run reads under, at the same version.
+fn same_policy(stored: Option<&StoredPolicy>, run: &RunPolicy) -> bool {
+    stored.is_some_and(|p| p.name == run.name && p.iri == run.iri && p.version == run.version)
+}
+
 /// A community of the run.
 #[derive(Clone, Debug)]
 struct Node {
@@ -226,6 +237,15 @@ impl Node {
     fn leaf(&self) -> bool {
         self.children.is_empty()
     }
+}
+
+/// Which graphs hold a fact, under a review policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Origin {
+    /// the policy's output graph holds it
+    output: bool,
+    /// no other graph of the projection holds it
+    only_output: bool,
 }
 
 /// What the reports graph holds about a community before the run.
@@ -253,7 +273,57 @@ struct Prepared {
     /// communities of the graph the run no longer has
     gone: Vec<String>,
     footprint: Footprint,
+    /// the graphs the footprint lists: the projection's, and the evidence graphs
     projection_graphs: Vec<String>,
+    /// the run's evidence under a review policy
+    evidence: Option<Evidence>,
+    /// the claims behind each entity's label and type lines
+    entity_claims: HashMap<String, Vec<u32>>,
+    /// the positions in the previous build's pairs of those that have ended
+    ended: HashSet<u32>,
+    /// each report of the graph with what it revises, how it was written and its policy
+    revisions: HashMap<String, Revision>,
+}
+
+/// What the reports graph records about one report's origin.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Revision {
+    /// the report it revises
+    pub(crate) prev: Option<String>,
+    /// whether a run wrote it, rather than a person's edit
+    pub(crate) generated: bool,
+    /// the review policy's IRI and version it records
+    pub(crate) policy: Option<(String, u64)>,
+}
+
+/// Whether `report` is a person's edit of `of`, directly or through earlier edits. Every
+/// report of the chain but `of` is an edit, and a chain that returns to a report it
+/// passed is not one.
+pub(crate) fn edit_of(revisions: &HashMap<String, Revision>, report: &str, of: &str) -> bool {
+    let mut at = report;
+    let mut seen: HashSet<&str> = HashSet::new();
+    loop {
+        if at == of {
+            return true;
+        }
+        if !seen.insert(at) {
+            return false;
+        }
+        match revisions.get(at) {
+            Some(Revision {
+                prev: Some(prev),
+                generated: false,
+                ..
+            }) => at = prev,
+            _ => return false,
+        }
+    }
+}
+
+impl Prepared {
+    fn edit_of(&self, report: &str, of: &str) -> bool {
+        edit_of(&self.revisions, report, of)
+    }
 }
 
 /// Everything a run needs from the server.
@@ -267,6 +337,8 @@ pub struct Run<'a> {
     pub task: Option<&'a TaskHandle>,
     pub task_id: String,
     pub cancel: Arc<AtomicBool>,
+    /// the bounds of the run's evidence under a review policy
+    pub limits: Limits,
 }
 
 /// The outcome of a run, as the task's result.
@@ -346,6 +418,7 @@ impl Run<'_> {
         pairs: &[Pair],
         footprint: &Footprint,
         graphs: &[String],
+        evidence: Option<&EvidenceCheck>,
     ) -> Result<(), RunError> {
         let live: GraphragSettings =
             crate::settings::effective(self.st, &self.ds, &crate::settings::GRAPHRAG);
@@ -372,6 +445,9 @@ impl Run<'_> {
                 "the principal's view or the access policy changed during the run; start a new run"
                     .into(),
             ));
+        }
+        if let Some(e) = evidence {
+            e.check()?;
         }
         Ok(())
     }
@@ -415,15 +491,41 @@ impl Run<'_> {
         }
     }
 
-    /// Read the projection, the hierarchy, the identities and the inputs.
+    /// Read the projection, the hierarchy, the identities and the inputs. Under a review
+    /// policy, the run is admitted to the policy first, before it reads anything, and
+    /// reads the evidence view's snapshot throughout (spec C25, "Reports on accepted
+    /// evidence").
     fn prepare(&self, p: &Principal, previous: &BuildState) -> Result<Prepared, RunError> {
-        let snap = self.ds.store.snapshot();
         let opts = options_of(self.st, &self.ds, p, self.cancel.clone());
+        let mut ev = Evidence::admit(
+            &self.ds,
+            self.settings.review_policy.as_deref(),
+            opts.graphs.clone(),
+            self.cancel.clone(),
+            self.limits,
+        )?;
+        let snap = match &ev {
+            Some(e) => e.snapshot(),
+            None => self.ds.store.snapshot(),
+        };
+        let output: Option<String> = ev.as_ref().map(|e| e.policy.output.clone());
         let ctl = sparkles::algo::Control::new(self.cancel.clone(), None, u64::MAX);
         self.progress(0.01, "reading the projection");
+        let extra = projection::Extra {
+            output: output.as_deref(),
+            excluded: ev.as_ref().map(|e| &e.excluded),
+        };
         let proj: Projection =
-            projection::read(snap.clone(), &opts, &self.settings, &ctl).map_err(failed)?;
-        let footprint = self.footprint(p, snap.commit, &proj.graphs)?;
+            projection::read_with(snap.clone(), &opts, &self.settings, &extra, &ctl)
+                .map_err(failed)?;
+        // the footprint lists the evidence graphs whose records the citations name (§6.2)
+        let mut footprint_graphs = proj.graphs.clone();
+        if let Some(e) = &ev {
+            footprint_graphs.extend(e.footprint.iter().cloned());
+            footprint_graphs.sort();
+            footprint_graphs.dedup();
+        }
+        let footprint = self.footprint(p, snap.commit, &footprint_graphs)?;
         self.progress(0.03, "finding communities");
         let h = hierarchy::compute(
             &proj.graph,
@@ -492,6 +594,20 @@ impl Run<'_> {
         let graphs: Vec<String> = proj.graphs.iter().map(|g| format!("<{g}>")).collect();
         let mut info: HashMap<String, EntityInfo> = HashMap::new();
         let order: Vec<usize> = (0..nodes.len()).rev().collect();
+        // a fact's digest covers its claims and their decisions under a policy (§5)
+        let digest = |ev: &Option<Evidence>, f: &Fact| -> u64 {
+            match ev {
+                Some(e) => {
+                    let pairs: Vec<(String, String)> = e
+                        .claims(&key(f))
+                        .iter()
+                        .map(|&i| e.pair(i).clone())
+                        .collect();
+                    super::evidence::fact_digest(f, &e.policy, &pairs)
+                }
+                None => fact_digest(f),
+            }
+        };
         for (k, &i) in order.iter().enumerate() {
             self.check()?;
             if k % 64 == 0 {
@@ -500,7 +616,25 @@ impl Run<'_> {
                     "reading the facts of each community",
                 );
             }
-            let facts = self.facts_of(&snap, &opts, &graphs, &nodes[i].members)?;
+            let read =
+                self.facts_of(&snap, &opts, &graphs, &nodes[i].members, output.as_deref())?;
+            let facts: Vec<Fact> = match ev.as_mut() {
+                None => read.into_iter().map(|(f, _)| f).collect(),
+                Some(e) => {
+                    // a triple of the output graph enters with the claims the run can
+                    // cite, or as an ordinary fact when another graph also holds it
+                    let keys: Vec<TripleKey> = read
+                        .iter()
+                        .filter(|(_, o)| o.output)
+                        .map(|(f, _)| key(f))
+                        .collect();
+                    e.read(&keys)?;
+                    read.into_iter()
+                        .filter(|(f, o)| !o.only_output || !e.claims(&key(f)).is_empty())
+                        .map(|(f, _)| f)
+                        .collect()
+                }
+            };
             if nodes[i].leaf() {
                 let members: BTreeSet<String> = nodes[i].members.iter().cloned().collect();
                 let chosen = report::select_facts(
@@ -509,7 +643,7 @@ impl Run<'_> {
                     self.settings.max_facts_per_community as usize,
                 );
                 nodes[i].fact_count = facts.len() as u64;
-                let mut d: Vec<u64> = chosen.iter().map(fact_digest).collect();
+                let mut d: Vec<u64> = chosen.iter().map(|f| digest(&ev, f)).collect();
                 d.sort_unstable();
                 d.dedup();
                 nodes[i].digests = d;
@@ -556,7 +690,7 @@ impl Run<'_> {
                 let room =
                     (self.settings.max_facts_per_community as usize).saturating_sub(own.len());
                 edges.truncate(room);
-                let mut d: Vec<u64> = own.iter().map(fact_digest).collect();
+                let mut d: Vec<u64> = own.iter().map(|f| digest(&ev, f)).collect();
                 d.sort_unstable();
                 d.dedup();
                 nodes[i].digests = d;
@@ -581,26 +715,76 @@ impl Run<'_> {
             }
         }
         let entities: Vec<String> = entities.into_iter().collect();
+        // under a policy, the claims behind each entity's label and type lines
+        let mut entity_claims: HashMap<String, Vec<u32>> = HashMap::new();
         for chunk in entities.chunks(CHUNK) {
             self.check()?;
+            if graphs.is_empty() {
+                break;
+            }
             let q = format!(
-                "SELECT ?e ?l ?t WHERE {{ VALUES ?g {{ {} }} VALUES ?e {{ {} }} GRAPH ?g {{ {{ ?e <{}> ?l }} UNION {{ ?e <{}> ?t FILTER(isIRI(?t)) }} }} }}",
+                "SELECT ?e ?l ?t ?g WHERE {{ VALUES ?g {{ {} }} VALUES ?e {{ {} }} GRAPH ?g {{ {{ ?e <{}> ?l }} UNION {{ ?e <{}> ?t FILTER(isIRI(?t)) }} }} }}",
                 iri_list(&graphs),
                 iri_list(chunk),
                 store::RDFS_LABEL,
                 store::RDF_TYPE
             );
-            if graphs.is_empty() {
-                break;
-            }
+            // each label or type triple, with whether only the output graph holds it
+            let mut lines: BTreeMap<(String, String), (Term, bool, bool)> = BTreeMap::new();
             for r in rows(&snap, &q, &opts)? {
                 let Some(e) = nt(&r[0]) else { continue };
-                let entry = info.entry(e).or_default();
-                if let Some(Term::Literal(l)) = &r[1] {
-                    entry.labels.push(l.value().to_string());
+                let value = match (&r[1], &r[2]) {
+                    (Some(l @ Term::Literal(_)), _) => l.clone(),
+                    (_, Some(t @ Term::NamedNode(_))) => t.clone(),
+                    _ => continue,
+                };
+                let in_output = matches!((&r[3], &output), (Some(Term::NamedNode(g)), Some(o)) if g.as_str() == o);
+                let entry = lines
+                    .entry((e, value.to_string()))
+                    .or_insert((value, false, false));
+                if in_output {
+                    entry.1 = true;
+                } else {
+                    entry.2 = true;
                 }
-                if let Some(Term::NamedNode(t)) = &r[2] {
-                    entry.types.push(t.as_str().to_string());
+            }
+            let line_key = |e: &str, v: &Term| -> TripleKey {
+                let p = match v {
+                    Term::Literal(_) => store::RDFS_LABEL,
+                    _ => store::RDF_TYPE,
+                };
+                (e.to_string(), format!("<{p}>"), v.to_string())
+            };
+            if let Some(e) = ev.as_mut() {
+                let keys: Vec<TripleKey> = lines
+                    .iter()
+                    .filter(|(_, (_, o, _))| *o)
+                    .map(|((ent, _), (v, _, _))| line_key(ent, v))
+                    .collect();
+                e.read(&keys)?;
+            }
+            for ((e, _), (value, in_output, in_other)) in lines {
+                let mut claims: &[u32] = &[];
+                if let Some(x) = &ev
+                    && in_output
+                {
+                    claims = x.claims(&line_key(&e, &value));
+                    if claims.is_empty() && !in_other {
+                        // a line of the output graph without a claim the run can cite
+                        continue;
+                    }
+                }
+                if !claims.is_empty() {
+                    entity_claims
+                        .entry(e.clone())
+                        .or_default()
+                        .extend_from_slice(claims);
+                }
+                let entry = info.entry(e).or_default();
+                match &value {
+                    Term::Literal(l) => entry.labels.push(l.value().to_string()),
+                    Term::NamedNode(t) => entry.types.push(t.as_str().to_string()),
+                    _ => {}
                 }
             }
         }
@@ -609,6 +793,33 @@ impl Run<'_> {
             v.labels.dedup();
             v.types.sort();
             v.types.dedup();
+        }
+        for v in entity_claims.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+        // the claims behind each input that are known before the reports are written
+        // must fit the bound before the estimate: a leaf's whole input, and a parent's
+        // edges and folded facts with their entity lines
+        if let Some(e) = &ev {
+            for n in &nodes {
+                let mut own: BTreeSet<u32> = BTreeSet::new();
+                let mut ents: Vec<&str> = Vec::new();
+                for f in &n.facts {
+                    own.extend(e.claims(&key(f)).iter().copied());
+                    ents.push(&f.s);
+                    if f.o.starts_with('<') {
+                        ents.push(&f.o);
+                    }
+                }
+                if n.leaf() {
+                    ents.extend(n.members.iter().map(String::as_str));
+                }
+                for x in ents {
+                    own.extend(entity_claims.get(x).into_iter().flatten().copied());
+                }
+                e.check_input(&n.iri, own.len())?;
+            }
         }
         // what the reports graph holds now, read without a view: the build writes it
         let (existing, all) = self.existing(&snap)?;
@@ -620,6 +831,30 @@ impl Run<'_> {
             .cloned()
             .collect();
         gone.sort();
+        // under the policy the previous build read under, which of its pairs have ended,
+        // and how the reports of the graph revise each other
+        let mut ended: HashSet<u32> = HashSet::new();
+        // read for every run, so that a run without a policy finds reports that record
+        // one even when the state does not say so, as after an interrupted run
+        let revisions = self.revisions(&snap)?;
+        if let Some(e) = ev.as_mut()
+            && let Some(b) = &previous.last_build
+            && same_policy(b.policy.as_ref(), &e.policy)
+            && !b.pairs.is_empty()
+        {
+            let old: Vec<(String, String)> = b
+                .pairs
+                .iter()
+                .map(|[c, d]| (c.clone(), d.clone()))
+                .collect();
+            let out = e.policy.output.clone();
+            let present = |ts: &[oxrdf::Triple]| self.present(&snap, &opts, &out, ts);
+            for (i, gone) in e.ended(&old, &present)?.into_iter().enumerate() {
+                if gone {
+                    ended.insert(i as u32);
+                }
+            }
+        }
         Ok(Prepared {
             snap,
             nodes,
@@ -627,19 +862,96 @@ impl Run<'_> {
             existing,
             gone,
             footprint,
-            projection_graphs: proj.graphs,
+            projection_graphs: footprint_graphs,
+            evidence: ev,
+            entity_claims,
+            ended,
+            revisions,
         })
     }
 
+    /// Which of `triples` the principal's view of the output graph `graph` holds.
+    fn present(
+        &self,
+        snap: &Arc<Snapshot>,
+        opts: &QueryOptions,
+        graph: &str,
+        triples: &[oxrdf::Triple],
+    ) -> Result<Vec<bool>, RunError> {
+        let mut found: HashSet<TripleKey> = HashSet::new();
+        for chunk in triples.chunks(CHUNK) {
+            self.check()?;
+            let values: Vec<String> = chunk
+                .iter()
+                .map(|t| format!("({} {} {})", t.subject, t.predicate, t.object))
+                .collect();
+            let q = format!(
+                "SELECT ?s ?p ?o WHERE {{ VALUES (?s ?p ?o) {{ {} }} GRAPH <{graph}> {{ ?s ?p ?o }} }}",
+                values.join(" ")
+            );
+            for r in rows(snap, &q, opts)? {
+                if let (Some(s), Some(p), Some(o)) = (nt(&r[0]), nt(&r[1]), nt(&r[2])) {
+                    found.insert((s, p, o));
+                }
+            }
+        }
+        Ok(triples
+            .iter()
+            .map(|t| {
+                found.contains(&(
+                    t.subject.to_string(),
+                    t.predicate.to_string(),
+                    t.object.to_string(),
+                ))
+            })
+            .collect())
+    }
+
+    /// Each report of the reports graph with the report it revises and whether a run
+    /// generated it, which tells a person's edit from a run's replacement.
+    fn revisions(&self, snap: &Arc<Snapshot>) -> Result<HashMap<String, Revision>, RunError> {
+        let g = self.graph();
+        let q = format!(
+            "SELECT ?r ?prev ?a ?pol ?ver WHERE {{ GRAPH <{g}> {{ ?r a <{}> OPTIONAL {{ ?r <{p}wasRevisionOf> ?prev }} OPTIONAL {{ ?r <{p}wasGeneratedBy> ?a }} OPTIONAL {{ ?r <{}> ?pol OPTIONAL {{ ?r <{}> ?ver }} }} }} }}",
+            super::guard::gr("Report"),
+            super::guard::gr("reviewPolicy"),
+            super::guard::gr("policyVersion"),
+            p = store::PROV,
+        );
+        let mut out: HashMap<String, Revision> = HashMap::new();
+        for r in rows(snap, &q, &QueryOptions::default())? {
+            let Some(Term::NamedNode(rep)) = &r[0] else {
+                continue;
+            };
+            let e = out.entry(rep.as_str().to_string()).or_default();
+            if let Some(Term::NamedNode(p)) = &r[1] {
+                e.prev = Some(p.as_str().to_string());
+            }
+            if r[2].is_some() {
+                e.generated = true;
+            }
+            if let Some(Term::NamedNode(p)) = &r[3] {
+                let v = match &r[4] {
+                    Some(Term::Literal(l)) => l.value().parse().unwrap_or(u64::MAX),
+                    _ => u64::MAX,
+                };
+                e.policy = Some((p.as_str().to_string(), v));
+            }
+        }
+        Ok(out)
+    }
+
     /// The facts whose subject is a member, in the projection's graphs, without the
-    /// excluded predicates.
+    /// excluded predicates. Under a review policy, each fact also says whether the
+    /// policy's output graph `output` holds it and whether only that graph does.
     fn facts_of(
         &self,
         snap: &Arc<Snapshot>,
         opts: &QueryOptions,
         graphs: &[String],
         members: &[String],
-    ) -> Result<Vec<Fact>, RunError> {
+        output: Option<&str>,
+    ) -> Result<Vec<(Fact, Origin)>, RunError> {
         let mut out = Vec::new();
         if graphs.is_empty() {
             return Ok(out);
@@ -660,11 +972,18 @@ impl Run<'_> {
         } else {
             format!("FILTER(?p NOT IN ({}))", excluded.join(", "))
         };
+        // which graphs hold each fact, when a policy's output graph is read
+        let origin = match output {
+            Some(g) => format!(
+                " (MAX(IF(?g = <{g}>, 1, 0)) AS ?inOutput) (MIN(IF(?g = <{g}>, 1, 0)) AS ?onlyOutput)"
+            ),
+            None => String::new(),
+        };
         for chunk in members.chunks(CHUNK) {
             // one named reifier per fact, read through the same view, so that a citation
             // names the assertion as well as the triple (§4)
             let q = format!(
-                "SELECT ?s ?p ?o (MIN(?rf) AS ?r) WHERE {{ VALUES ?g {{ {} }} VALUES ?s {{ {} }} GRAPH ?g {{ ?s ?p ?o OPTIONAL {{ ?rf <{}> <<( ?s ?p ?o )>> FILTER(isIRI(?rf)) }} }} FILTER(?p != <{}> && !isBlank(?o) && !isTRIPLE(?o)) {filter} }} GROUP BY ?s ?p ?o",
+                "SELECT ?s ?p ?o (MIN(?rf) AS ?r){origin} WHERE {{ VALUES ?g {{ {} }} VALUES ?s {{ {} }} GRAPH ?g {{ ?s ?p ?o OPTIONAL {{ ?rf <{}> <<( ?s ?p ?o )>> FILTER(isIRI(?rf)) }} }} FILTER(?p != <{}> && !isBlank(?o) && !isTRIPLE(?o)) {filter} }} GROUP BY ?s ?p ?o",
                 iri_list(graphs),
                 iri_list(chunk),
                 REIFIES,
@@ -672,12 +991,20 @@ impl Run<'_> {
             );
             for r in rows(snap, &q, opts)? {
                 if let (Some(s), Some(p), Some(o)) = (nt(&r[0]), nt(&r[1]), nt(&r[2])) {
-                    out.push(Fact {
-                        s,
-                        p,
-                        o,
-                        reifier: nt(&r[3]),
-                    });
+                    let flag = |i: usize| matches!(r.get(i), Some(Some(Term::Literal(l))) if l.value() == "1");
+                    let origin = Origin {
+                        output: output.is_some() && flag(4),
+                        only_output: output.is_some() && flag(5),
+                    };
+                    out.push((
+                        Fact {
+                            s,
+                            p,
+                            o,
+                            reifier: nt(&r[3]),
+                        },
+                        origin,
+                    ));
                 }
             }
         }
@@ -774,6 +1101,17 @@ impl Run<'_> {
             return plans;
         }
         let frac = self.settings.refresh.min_changed_fraction;
+        let policy = prep.evidence.as_ref().map(|e| &e.policy);
+        let same = policy.is_some_and(|p| {
+            same_policy(
+                previous.last_build.as_ref().and_then(|b| b.policy.as_ref()),
+                p,
+            )
+        });
+        // communities rewritten whatever the fraction, because a report does not record
+        // the run's policy, its recorded pairs ended or the state does not match it; a
+        // parent of one is rewritten too (spec C25, "Reports on accepted evidence")
+        let mut forced = vec![false; prep.nodes.len()];
         // communities the previous run left for a later one
         let pending: HashSet<&str> = previous
             .last_build
@@ -801,6 +1139,26 @@ impl Run<'_> {
             }
             // an entity joined or left
             if o.members != n.members {
+                continue;
+            }
+            // the policy the linked report records, whatever the state says
+            let recorded = prep.revisions.get(report).and_then(|r| r.policy.as_ref());
+            let force = match policy {
+                // a report read under a policy the run does not have
+                None => o.policy || recorded.is_some(),
+                Some(p) => {
+                    !same
+                        || !o.policy
+                        || o.pairs.is_none()
+                        || recorded.is_none_or(|(iri, v)| *iri != p.iri || *v != u64::from(p.version))
+                        // a report other than the one the state names, unless a person
+                        // edited it, which keeps the pairs of the report it revises
+                        || o.report.as_deref().is_none_or(|r| !prep.edit_of(report, r))
+                        || o.pairs.iter().flatten().any(|p| prep.ended.contains(p))
+                }
+            };
+            if force || n.children.iter().any(|&c| forced[c]) {
+                forced[i] = true;
                 continue;
             }
             // the share of the facts the report was written from that changed: a leaf's
@@ -1020,29 +1378,82 @@ enum Stop {
     Cancelled,
 }
 
-/// The SPARQL Update text of a level's commit.
+/// The SPARQL Update text of a level's commit, written into one buffer of exactly
+/// [`commit_bytes`] bytes, so that building it allocates nothing more.
 fn commit_text(graph: &str, delete: &[String], quads: &[oxrdf::Quad]) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(d) = store::delete_subjects(graph, delete) {
-        parts.push(d);
+    let mut out = String::with_capacity(commit_bytes(graph, delete, quads) as usize);
+    write_commit(&mut out, graph, delete, quads);
+    out
+}
+
+/// The length of [`commit_text`], counted by writing it to a sink that keeps nothing.
+fn commit_bytes(graph: &str, delete: &[String], quads: &[oxrdf::Quad]) -> u64 {
+    struct Count(u64);
+    impl std::fmt::Write for Count {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0 += s.len() as u64;
+            Ok(())
+        }
+    }
+    let mut n = Count(0);
+    write_commit(&mut n, graph, delete, quads);
+    n.0
+}
+
+/// A graph name's text as `Display` writes it, in three parts.
+fn graph_parts(g: &oxrdf::GraphName) -> [&str; 3] {
+    match g {
+        oxrdf::GraphName::NamedNode(n) => ["<", n.as_str(), ">"],
+        oxrdf::GraphName::BlankNode(b) => ["_:", b.as_str(), ""],
+        oxrdf::GraphName::DefaultGraph => ["DEFAULT", "", ""],
+    }
+}
+
+/// The order of two graph names' texts, without building them.
+fn graph_order(a: &oxrdf::GraphName, b: &oxrdf::GraphName) -> std::cmp::Ordering {
+    let bytes = |g| graph_parts(g).into_iter().flat_map(str::bytes);
+    bytes(a).cmp(bytes(b))
+}
+
+/// Write a level's commit into `w`: the deleted subjects, the quads of each graph in the
+/// order of the graphs' names, and the cleanup of unreachable reports and footprints.
+fn write_commit(
+    w: &mut impl std::fmt::Write,
+    graph: &str,
+    delete: &[String],
+    quads: &[oxrdf::Quad],
+) {
+    if !delete.is_empty() {
+        store::write_delete_subjects(w, graph, delete);
+        let _ = w.write_str(" ;\n");
     }
     if !quads.is_empty() {
-        let mut by_graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for q in quads {
-            by_graph
-                .entry(q.graph_name.to_string())
-                .or_default()
-                .push(format!("{} {} {} .", q.subject, q.predicate, q.object));
+        let _ = w.write_str("INSERT DATA {\n");
+        // each graph in turn, the least name after the last one written
+        let mut last: Option<&oxrdf::GraphName> = None;
+        while let Some(g) = quads
+            .iter()
+            .map(|q| &q.graph_name)
+            .filter(|g| last.is_none_or(|l| graph_order(g, l).is_gt()))
+            .min_by(|a, b| graph_order(a, b))
+        {
+            let _ = writeln!(w, "GRAPH {g} {{");
+            let mut first = true;
+            for q in quads.iter().filter(|q| &q.graph_name == g) {
+                if !first {
+                    let _ = w.write_char('\n');
+                }
+                first = false;
+                let _ = write!(w, "{} {} {} .", q.subject, q.predicate, q.object);
+            }
+            let _ = w.write_str("\n}\n");
+            last = Some(g);
         }
-        let mut body = String::new();
-        for (g, ts) in by_graph {
-            body.push_str(&format!("GRAPH {g} {{\n{}\n}}\n", ts.join("\n")));
-        }
-        parts.push(format!("INSERT DATA {{\n{body}}}"));
+        let _ = w.write_str("} ;\n");
     }
-    parts.push(store::delete_unreachable_reports(graph));
-    parts.push(store::delete_unlinked_footprints(graph));
-    parts.join(" ;\n")
+    store::write_delete_unreachable_reports(w, graph);
+    let _ = w.write_str(" ;\n");
+    store::write_delete_unlinked_footprints(w, graph);
 }
 
 /// Run a build or a refresh. Returns the outcome; a run stopped by its budget or an
@@ -1082,6 +1493,7 @@ pub fn spawn(
                 task: Some(h),
                 task_id,
                 cancel: cancel.clone(),
+                limits: Limits::default(),
             };
             let prefix = match &trigger {
                 Some(t) => format!("automatic refresh ({t}): "),
@@ -1120,11 +1532,122 @@ pub fn state_of(st: &AppState, ds: &Dataset) -> Result<BuildState, String> {
     }
 }
 
+/// What a run under a review policy records about a written report: the claims of
+/// each item of its input, the pairs behind its whole input, the child reports it read
+/// and the pairs its children's inputs used, `None` when one of those is not complete.
+struct Read {
+    items: Vec<Vec<u32>>,
+    own: BTreeSet<u32>,
+    children: Vec<usize>,
+    all: Option<BTreeSet<u32>>,
+}
+
+/// The quads `report_quads` writes for a written report besides its evidence, at most:
+/// the report's and its activity's own statements, and for each finding its link, order,
+/// text, entities, unmatched names and up to two quads for each citation, with a
+/// `gr:citesReport` for each cited child.
+fn ordinary_quads(checked: &report::Checked) -> u64 {
+    32 + checked
+        .findings
+        .iter()
+        .map(|f| (4 + f.entities.len() + 3 * f.cites.len() + f.unmatched.len()) as u64)
+        .sum::<u64>()
+}
+
+/// An upper bound of the bytes that a written report adds before the level's update
+/// text is charged: the claim, decision and child strings that `ReportEvidence` copies
+/// with their vectors, and every quad `report_quads` builds, each owning its subject,
+/// predicate, object and a copy of the reports graph's name. A quad's slot is charged
+/// five times, for the report's vector and the level's, each up to twice its length,
+/// and the old buffer of the level's while it grows.
+fn report_bytes<'a>(
+    pair: impl Fn(u32) -> &'a (String, String),
+    read: &Read,
+    checked: &report::Checked,
+    input: &Rendered,
+    iri: &str,
+    graph: &str,
+    current: &HashMap<usize, String>,
+) -> u64 {
+    // the predicates are shorter than this, and so are a literal's datatype or language
+    // tag; a finding's or the activity's IRI is the report's with a short suffix
+    const PREDICATE: u64 = 64;
+    const TAG: u64 = 64;
+    const SUFFIX: u64 = 32;
+    const SLOTS: u64 = 5;
+    let string = std::mem::size_of::<String>() as u64;
+    let vec = std::mem::size_of::<Vec<(String, String)>>() as u64;
+    let reference = std::mem::size_of::<&str>() as u64;
+    let slot = SLOTS * std::mem::size_of::<oxrdf::Quad>() as u64
+        + iri.len() as u64
+        + SUFFIX
+        + PREDICATE
+        + TAG
+        + graph.len() as u64
+        // the vectors of claims, decisions and children that are sorted before writing
+        + 2 * reference;
+    // `store::parse_term` writes a document of the term's length around it, and the
+    // parser's buffer for the term grows by doubling while it decodes, holding the old
+    // buffer while it copies to the new one, so a term holds about six times its length
+    // while it is parsed and its result once more; eight times leaves a margin
+    let parsed = |len: usize| 8 * len as u64 + 256;
+    let mut quads = ordinary_quads(checked);
+    let mut bytes = 0u64;
+    let mut add = |n: u64| bytes = bytes.saturating_add(n);
+    // the copies in `ReportEvidence`
+    for ps in &read.items {
+        add(vec);
+        for &p in ps {
+            let (c, d) = pair(p);
+            add((c.len() + d.len()) as u64 + 2 * string);
+        }
+    }
+    for &p in &read.own {
+        let (c, d) = pair(p);
+        add((c.len() + d.len()) as u64 + 2 * string);
+        // and the activity's `prov:used` of each
+        add((c.len() + d.len()) as u64);
+        quads += 2;
+    }
+    for c in &read.children {
+        let len = current.get(c).map_or(0, |s| s.len()) as u64;
+        add(2 * (len + string));
+        quads += 1;
+    }
+    // the objects of the findings' quads
+    add((checked.title.len() + checked.summary.len()) as u64);
+    for f in &checked.findings {
+        add(f.text.len() as u64);
+        add(f.entities.iter().map(|e| parsed(e.len())).sum());
+        add(f.unmatched.iter().map(|u| u.len() as u64).sum());
+        for &n in &f.cites {
+            for &p in read.items.get(n.wrapping_sub(1)).into_iter().flatten() {
+                let (c, d) = pair(p);
+                add((c.len() + d.len()) as u64);
+                quads += 2;
+            }
+            match input.items.get(n.wrapping_sub(1)) {
+                Some(report::Item::Fact(x) | report::Item::Edge(x)) => {
+                    let terms = [Some(&x.s), Some(&x.p), Some(&x.o), x.reifier.as_ref()];
+                    add(terms.into_iter().flatten().map(|t| parsed(t.len())).sum());
+                }
+                Some(report::Item::ChildFinding { report, .. }) => {
+                    add(2 * report.len() as u64 + SUFFIX)
+                }
+                None => {}
+            }
+        }
+    }
+    bytes.saturating_add(quads.saturating_mul(slot))
+}
+
 pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
     let (models, pairs, principal) = r.admit()?;
     let previous = r.load_state()?;
-    let prep = r.prepare(&principal, &previous)?;
+    let mut prep = r.prepare(&principal, &previous)?;
     let plans = r.plan(&prep, &previous);
+    let mut ev = prep.evidence.take();
+    let ev_check: Option<EvidenceCheck> = ev.as_ref().map(Evidence::check);
     let mut outcome = Outcome {
         mode: r.mode.as_str(),
         source_commit: prep.snap.commit,
@@ -1152,7 +1675,13 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         }
     }
     // the confirmation may have waited long: what the run was admitted with must hold
-    r.recheck(&models, &pairs, &prep.footprint, &prep.projection_graphs)?;
+    r.recheck(
+        &models,
+        &pairs,
+        &prep.footprint,
+        &prep.projection_graphs,
+        ev_check.as_ref(),
+    )?;
     let ledger = r.ledger()?;
     let tokenizers = Tokenizers::default();
     let check: Arc<super::budget::LiveCheck> = {
@@ -1165,6 +1694,8 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         let graphs = prep.projection_graphs.clone();
         let cancel = r.cancel.clone();
         let mode = r.mode;
+        let limits = r.limits;
+        let ev_check = ev_check.clone();
         Arc::new(move || {
             let run = Run {
                 st: &st,
@@ -1175,8 +1706,9 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                 task: None,
                 task_id: String::new(),
                 cancel: cancel.clone(),
+                limits,
             };
-            run.recheck(&models, &pairs, &footprint, &graphs)
+            run.recheck(&models, &pairs, &footprint, &graphs, ev_check.as_ref())
                 .map_err(|e| e.to_string())
         })
     };
@@ -1196,10 +1728,51 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         .filter(|p| matches!(p, Plan::Write))
         .count()
         .max(1);
+    // the previous build's communities, by IRI
+    let old: HashMap<&str, &StoredCommunity> = previous
+        .last_build
+        .iter()
+        .flat_map(|b| b.communities.iter())
+        .map(|c| (c.iri.as_str(), c))
+        .collect();
+    let old_pairs: &[[String; 2]] = previous
+        .last_build
+        .as_ref()
+        .map_or(&[], |b| b.pairs.as_slice());
+    let same = ev.as_ref().is_some_and(|e| {
+        same_policy(
+            previous.last_build.as_ref().and_then(|b| b.policy.as_ref()),
+            &e.policy,
+        )
+    });
+    // the report a community kept from the previous build: whether it records a policy,
+    // and its pairs in this run's table when it was read under the run's policy
+    let carried = |ev: &mut Option<Evidence>,
+                   inherited: Option<&str>|
+     -> Result<(bool, Option<BTreeSet<u32>>), RunError> {
+        let Some(o) = inherited.and_then(|p| old.get(p)) else {
+            return Ok((false, None));
+        };
+        let (Some(e), true, true) = (ev.as_mut(), same, o.policy) else {
+            return Ok((o.policy, None));
+        };
+        let Some(ps) = &o.pairs else {
+            return Ok((true, None));
+        };
+        e.charge_refs(ps.len())?;
+        let mut out = BTreeSet::new();
+        for &p in ps {
+            let [c, d] = &old_pairs[p as usize];
+            out.insert(e.intern(c, d)?);
+        }
+        Ok((true, Some(out)))
+    };
     let mut done = 0usize;
     let mut stopped: Option<String> = None;
     // the current report of each community after the run
     let mut current: HashMap<usize, String> = HashMap::new();
+    // whether that report records a policy, and the pairs its input used
+    let mut recorded: HashMap<usize, (bool, Option<BTreeSet<u32>>)> = HashMap::new();
     let mut statuses: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut pending: Vec<String> = Vec::new();
     // the links the reports graph should hold before each commit: what the run read,
@@ -1256,6 +1829,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
             if let Plan::Keep(rep) = &plans[i] {
                 link(&mut quads, rep);
                 current.insert(i, rep.clone());
+                recorded.insert(i, carried(&mut ev, n.inherited.as_deref())?);
                 links.push((n.iri.clone(), Some(rep.clone())));
                 outcome.kept += 1;
                 *statuses
@@ -1268,18 +1842,70 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                 if let Some(rep) = &ex.report {
                     link(&mut quads, rep);
                     current.insert(i, rep.clone());
+                    recorded.insert(i, carried(&mut ev, n.inherited.as_deref())?);
                 }
                 links.push((n.iri.clone(), ex.report.clone()));
                 continue;
             }
             let input = r.render(&prep, i, &current)?;
+            // under a policy, the claims behind the input, which must fit the bound
+            // before any model call for it
+            let read = match ev.as_mut() {
+                None => None,
+                Some(e) => {
+                    let mut items = Vec::with_capacity(input.items.len());
+                    let mut own: BTreeSet<u32> = BTreeSet::new();
+                    let mut refs = 0usize;
+                    for it in &input.items {
+                        match it {
+                            report::Item::Fact(f) | report::Item::Edge(f) => {
+                                let c = e.claims(&key(f)).to_vec();
+                                refs += c.len();
+                                own.extend(c.iter().copied());
+                                items.push(c);
+                            }
+                            report::Item::ChildFinding { .. } => items.push(Vec::new()),
+                        }
+                    }
+                    for x in &input.entities {
+                        own.extend(prep.entity_claims.get(x).into_iter().flatten().copied());
+                    }
+                    e.check_input(&n.iri, own.len())?;
+                    let children: Vec<usize> = n
+                        .children
+                        .iter()
+                        .copied()
+                        .filter(|c| current.contains_key(c))
+                        .collect();
+                    let mut all = Some(own.clone());
+                    for c in &children {
+                        match (all.as_mut(), recorded.get(c)) {
+                            (Some(a), Some((_, Some(p)))) => a.extend(p.iter().copied()),
+                            _ => all = None,
+                        }
+                    }
+                    e.charge_refs(refs + own.len() + all.as_ref().map_or(0, BTreeSet::len))?;
+                    Some(Read {
+                        items,
+                        own,
+                        children,
+                        all,
+                    })
+                }
+            };
             r.progress(
                 0.15 + 0.8 * done as f32 / total as f32,
                 &format!("writing reports at level {depth}"),
             );
             // nothing is sent under settings, providers or a view the run was not
             // admitted with
-            r.recheck(&models, &pairs, &prep.footprint, &prep.projection_graphs)?;
+            r.recheck(
+                &models,
+                &pairs,
+                &prep.footprint,
+                &prep.projection_graphs,
+                ev_check.as_ref(),
+            )?;
             let res = r.write_report(
                 &models,
                 &pairs,
@@ -1300,6 +1926,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                     if let Some(rep) = &ex.report {
                         link(&mut quads, rep);
                         current.insert(i, rep.clone());
+                        recorded.insert(i, carried(&mut ev, n.inherited.as_deref())?);
                     }
                     links.push((n.iri.clone(), ex.report.clone()));
                     continue;
@@ -1318,6 +1945,65 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                 outcome.written += 1;
             }
             *statuses.entry(status.as_str()).or_default() += 1;
+            // the citations and `prov:used` of a written report are charged before their
+            // strings and quads are built
+            let bytes = match (&ev, &read, &body) {
+                (Some(e), Some(read), Body::Written { checked, input }) => {
+                    report_bytes(|p| e.pair(p), read, checked, input, &iri, &graph, &current)
+                }
+                _ => 0,
+            };
+            if let Some(e) = ev.as_mut() {
+                e.charge(bytes)?;
+            }
+            // a failed report records its policy and no claim
+            let evidence = match (&ev, read) {
+                (Some(e), Some(read)) => {
+                    let pair = |i: &u32| e.pair(*i).clone();
+                    let written = status != Status::Failed;
+                    recorded.insert(
+                        i,
+                        (
+                            true,
+                            if written {
+                                read.all
+                            } else {
+                                Some(BTreeSet::new())
+                            },
+                        ),
+                    );
+                    Some(store::ReportEvidence {
+                        policy: e.policy.iri.clone(),
+                        version: e.policy.version,
+                        configuration: e.policy.configuration.clone(),
+                        items: if written {
+                            read.items
+                                .iter()
+                                .map(|x| x.iter().map(pair).collect())
+                                .collect()
+                        } else {
+                            Vec::new()
+                        },
+                        used: if written {
+                            read.own.iter().map(pair).collect()
+                        } else {
+                            Vec::new()
+                        },
+                        children: if written {
+                            read.children
+                                .iter()
+                                .filter_map(|c| current.get(c).cloned())
+                                .collect()
+                        } else {
+                            Vec::new()
+                        },
+                    })
+                }
+                _ => {
+                    recorded.insert(i, (false, None));
+                    None
+                }
+            };
             quads.extend(report_quads(
                 &NewReport {
                     iri: iri.clone(),
@@ -1329,6 +2015,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                     activity,
                     revision_of: ex.report.clone(),
                     body,
+                    evidence,
                 },
                 &graph,
             ));
@@ -1339,10 +2026,21 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         if depth == 0 {
             delete.extend(prep.gone.iter().cloned());
         }
+        // under a policy, the level's update text is charged before it is built, and a
+        // level that would pass the allowance is not committed
+        if let Some(e) = ev.as_mut() {
+            e.charge(commit_bytes(&graph, &delete, &quads))?;
+        }
         // builds and reviews of one dataset commit one at a time
         let lock = r.st.graphrag.lock(&r.ds.name);
         let _held = lock.lock();
-        r.recheck(&models, &pairs, &prep.footprint, &prep.projection_graphs)?;
+        r.recheck(
+            &models,
+            &pairs,
+            &prep.footprint,
+            &prep.projection_graphs,
+            ev_check.as_ref(),
+        )?;
         // a review or another writer changed a report link since the run read it: the
         // run's plan no longer describes the graph, and committing would undo that change
         let (now, _) = r.existing(&r.ds.store.snapshot())?;
@@ -1398,13 +2096,10 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
     });
     // the state the next run matches against: a kept or pending report keeps the
     // baseline it was written from, so that small changes add up (§5)
-    let old: HashMap<&str, &StoredCommunity> = previous
-        .last_build
-        .iter()
-        .flat_map(|b| b.communities.iter())
-        .map(|c| (c.iri.as_str(), c))
-        .collect();
     let pending_set: HashSet<&str> = pending.iter().map(String::as_str).collect();
+    // the pairs the state keeps, in a table of its own
+    let mut table: Vec<[String; 2]> = Vec::new();
+    let mut at: HashMap<u32, u32> = HashMap::new();
     let communities: Vec<StoredCommunity> = prep
         .nodes
         .iter()
@@ -1417,6 +2112,21 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                 .and_then(|p| old.get(p))
                 .filter(|_| carried)
                 .map(|o| o.facts.clone());
+            let (policy, own) = recorded.remove(&i).unwrap_or((false, None));
+            let pairs = match (&ev, own) {
+                (Some(e), Some(own)) => Some(
+                    own.into_iter()
+                        .map(|p| {
+                            *at.entry(p).or_insert_with(|| {
+                                let (c, d) = e.pair(p);
+                                table.push([c.clone(), d.clone()]);
+                                (table.len() - 1) as u32
+                            })
+                        })
+                        .collect::<Vec<u32>>(),
+                ),
+                _ => None,
+            };
             StoredCommunity {
                 depth: n.depth,
                 iri: n.iri.clone(),
@@ -1424,6 +2134,8 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                 members: n.members.clone(),
                 report: current.get(&i).cloned(),
                 facts: baseline.unwrap_or_else(|| n.digests.clone()),
+                policy,
+                pairs,
             }
         })
         .collect();
@@ -1437,6 +2149,12 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
             tokens: outcome.tokens,
             reports_graph: graph.clone(),
             footprint: fp_iri.clone(),
+            policy: ev.as_ref().map(|e| StoredPolicy {
+                name: e.policy.name.clone(),
+                iri: e.policy.iri.clone(),
+                version: e.policy.version,
+            }),
+            pairs: table,
         }),
         ..BuildState::default()
     })?;

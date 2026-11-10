@@ -405,6 +405,12 @@ editor and browser and the app shell. The collapsed panel below it has more work
     <td>An ontology edit previewed as axioms and triples before it commits</td>
     <td>A concept dragged to a new broader concept, previewed as one commit</td>
   </tr>
+  <tr>
+    <td colspan="2" align="center"><img width="50%" src="docs/images/watches.png" alt="The Watches page with a subtree watch on Professor opened, listing the commits that put a class below it and labelled it"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">Watches on entities, with the commits that changed each one or its subtree</td>
+  </tr>
 </table>
 
 </details>
