@@ -2200,6 +2200,7 @@ pub(crate) fn run_observed(
         derived = g.len() - base_len,
         tier_bytes = g.heap_bytes(),
         peak_bytes = limits.budget.peak(),
+        rss_peak_kib = proc_status("VmHWM"),
         "derived tier"
     );
     Ok(Outcome {
@@ -2475,4 +2476,17 @@ mod index_tests {
         let _rest = Held::try_new(&small, small.available()).unwrap();
         assert!(index.candidates(&g, 0, &small).is_err());
     }
+}
+
+/// A field of `/proc/self/status` in KiB, such as the peak resident set `VmHWM`, for
+/// the log, or zero where there is none.
+fn proc_status(field: &str) -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with(field))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+        })
+        .unwrap_or(0)
 }
