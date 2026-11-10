@@ -829,38 +829,24 @@ impl WriteTxn<'_> {
         let (annotation, ann) = store.annotate_queued(&c, message, || Some(self.change_lines()))?;
         let family = self.guard.family.clone();
         let w = &mut **self.guard;
-        let mut data = Vec::with_capacity(bytes as usize);
-        let mut rec = [0u8; WAL_REC];
-        for (op, q) in &self.log {
-            rec[0] = *op;
-            for j in 0..4 {
-                rec[1 + j * 8..9 + j * 8].copy_from_slice(&q[j].0.to_le_bytes());
-            }
-            data.extend_from_slice(&rec);
-        }
-        let configuration_flags = wal::append_configuration(&mut data, self.configuration)?;
-        rec[0] = WAL_COMMIT;
-        rec[1..9].copy_from_slice(&w.next_bnode.to_le_bytes());
-        commit::seal_wal_commit_unfenced(
-            &mut rec,
-            c.seq,
-            c.timestamp_ms,
-            c.kind,
-            configuration_flags
-                | (if c.unvalidated {
-                    commit::WAL_FLAG_UNVALIDATED
-                } else {
-                    0
-                })
-                | (if ann.is_some() {
-                    commit::WAL_FLAG_ANNOTATED
-                } else {
-                    0
-                }),
-            unfenced,
-            &data,
+        // The record says an annotation is expected when one is queued, so replay treats
+        // a flagged tail commit without its annotation as torn.
+        let annotated = if ann.is_some() {
+            commit::WAL_FLAG_ANNOTATED
+        } else {
+            0
+        };
+        let data = wal::encode_txn(
+            &self.log,
+            self.configuration,
+            w.next_bnode,
+            wal::Seal::of(&c, annotated, unfenced),
+        )?;
+        debug_assert_eq!(
+            data.len() as u64,
+            bytes,
+            "the queued bytes are the records'"
         );
-        data.extend_from_slice(&rec);
         // The records are not written here: the leader of the commit's fence writes them
         // with the rest of its prefix (X09 item 446). From here on the commit holds its
         // number and its place in the log, and a failure poisons the writer.

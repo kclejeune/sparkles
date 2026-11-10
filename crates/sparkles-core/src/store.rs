@@ -7131,26 +7131,6 @@ impl WriteTxn<'_> {
         }
         let w = &mut **self.guard;
         if let Some(wal) = w.wal.as_mut() {
-            let mut data = Vec::with_capacity(
-                (self.log.len() + 1 + usize::from(self.configuration_expected)) * WAL_REC,
-            );
-            let mut rec = [0u8; WAL_REC];
-            for (op, q) in &self.log {
-                rec[0] = *op;
-                for j in 0..4 {
-                    rec[1 + j * 8..9 + j * 8].copy_from_slice(&q[j].0.to_le_bytes());
-                }
-                data.extend_from_slice(&rec);
-            }
-            let configuration_flags = wal::append_configuration(&mut data, self.configuration)?;
-            rec[0] = WAL_COMMIT;
-            rec[1..9].copy_from_slice(&next_bnode.to_le_bytes());
-            let flags = configuration_flags
-                | if c.unvalidated {
-                    commit::WAL_FLAG_UNVALIDATED
-                } else {
-                    0
-                };
             // the record says no earlier commit may be missing from disk, so a fence
             // that is still running would make that untrue
             debug_assert!(
@@ -7161,8 +7141,14 @@ impl WriteTxn<'_> {
                     && w.head.seq == self.store.current.load().commit,
                 "an ordinary commit while group commit has commits in flight"
             );
-            commit::seal_wal_commit(&mut rec, c.seq, c.timestamp_ms, c.kind, flags, &data);
-            data.extend_from_slice(&rec);
+            // The records carry no `WAL_FLAG_ANNOTATED`: the annotation above is durable
+            // before them, so replay never has to tell a torn one from a missing one.
+            let data = wal::encode_txn(
+                &self.log,
+                self.configuration,
+                next_bnode,
+                wal::Seal::of(&c, 0, 0),
+            )?;
             // once the first byte is written, a failure leaves the WAL in an unknown
             // state: refuse further writes, so a seq can never be written twice
             let tail = w.tail.clone();
