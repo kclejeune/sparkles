@@ -32,7 +32,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// A conclusion waiting in a context's to-do list.
@@ -508,9 +508,29 @@ const CONGESTED_BYTES: usize = 256 << 20;
 /// The roots from which a saturation on several threads starts them all at once.
 const EAGER_ROOTS: usize = if cfg!(test) { 64 } else { 4096 };
 /// How long the first worker of a smaller saturation runs before the others start, so
-/// that a run that ends sooner pays for no thread (roadmap item 709).
+/// that a run that ends sooner pays for no thread (roadmap item 709), until a start in
+/// the process has measured what starting them costs ([`STARTED_NS`]).
 const LAZY_START: Duration = Duration::from_micros(if cfg!(test) { 0 } else { 500 });
-/// The activations between the first worker's checks of [`LAZY_START`].
+/// The least time the first worker runs alone once a start has been measured.
+const LAZY_MIN: Duration = Duration::from_micros(if cfg!(test) { 0 } else { 20 });
+/// How long the helper threads of the process's last saturation that started them took
+/// to start, from the first worker's call until the last of them ran, in nanoseconds,
+/// and 0 before any start. A process's first threads cost much more to start than later
+/// ones, whose stacks and allocator heaps it keeps, so a later saturation waits only as
+/// long as the last start took, between [`LAZY_MIN`] and [`LAZY_START`] (roadmap item
+/// 720).
+static STARTED_NS: AtomicU64 = AtomicU64::new(0);
+
+/// How long the first worker of a saturation on several threads runs before the others
+/// start: as long as starting them last took, so that a run that ends sooner pays for
+/// no thread, and one that runs longer waits no longer than the threads took to start.
+fn lazy_start() -> Duration {
+    match STARTED_NS.load(Ordering::Relaxed) {
+        0 => LAZY_START,
+        ns => Duration::from_nanos(ns).max(LAZY_MIN).min(LAZY_START),
+    }
+}
+/// The activations between the first worker's checks of [`lazy_start`].
 const LAZY_EVERY: u32 = 16;
 
 struct Run<'a> {
@@ -1156,25 +1176,37 @@ impl<'a> Run<'a> {
     /// (roadmap items 711 and 715).
     ///
     /// The calling thread is the first worker. A run of many roots starts the others at
-    /// once, and a smaller one when the first has run for [`LAZY_START`], so that a
+    /// once, and a smaller one when the first has run for [`lazy_start`], so that a
     /// small ontology, whose saturation takes less time than starting threads, runs on
-    /// one (roadmap item 709).
+    /// one (roadmap items 709 and 720).
     fn workers<R: Rules>(&self, threads: usize) {
         if threads == 1 {
             self.worker::<R>(None);
             return;
         }
+        // the most time a helper took to run after the first worker started them
+        let entered = AtomicU64::new(0);
         std::thread::scope(|s| {
+            let entered = &entered;
             let start = || {
                 // counted while the first worker is busy, so that the count cannot reach 0
                 // before they start
                 self.pending.fetch_add(threads - 1, Ordering::SeqCst);
+                let called = Instant::now();
                 for _ in 1..threads {
-                    s.spawn(|| self.worker::<R>(None));
+                    s.spawn(move || {
+                        let ns = called.elapsed().as_nanos().clamp(1, u64::MAX as u128);
+                        entered.fetch_max(ns as u64, Ordering::Relaxed);
+                        self.worker::<R>(None);
+                    });
                 }
             };
             self.worker::<R>(Some(&start));
         });
+        let ns = entered.into_inner();
+        if ns > 0 {
+            STARTED_NS.store(ns, Ordering::Relaxed);
+        }
     }
 
     /// A worker activates up to [`ROOTS_PER_ROUND`] roots, then the contexts those
@@ -1188,7 +1220,7 @@ impl<'a> Run<'a> {
         {
             start();
         }
-        let began = others.map(|_| Instant::now());
+        let began = others.map(|_| (Instant::now(), lazy_start()));
         let mut activations = 0u32;
         let mut mine: VecDeque<Ex> = VecDeque::new();
         let mut chunk: Vec<Ex> = Vec::new();
@@ -1260,7 +1292,7 @@ impl<'a> Run<'a> {
             if let Some(start) = others {
                 activations += 1;
                 if activations.is_multiple_of(LAZY_EVERY)
-                    && began.is_some_and(|b| b.elapsed() >= LAZY_START)
+                    && began.is_some_and(|(b, wait)| b.elapsed() >= wait)
                 {
                     others = None;
                     start();
