@@ -35,6 +35,9 @@ if [ "$host" != "$src" ]; then
   stage=$(mktemp -d)
   trap 'rm -rf "$stage"' EXIT
   rx_sync -- -a "$src:gate/suites/" "$stage/"
+  # The suites are test data and need no symbolic links, and the Boat transport refuses a
+  # link in an outbound archive, so the staged copy carries none.
+  find "$stage" -type l -delete
   rx_sync -- -a "$stage/" "$host:gate/suites/"
 fi
 
