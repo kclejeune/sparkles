@@ -659,11 +659,13 @@ fn concat_and_sample_follow_the_oracle_up_to_order() {
 #[test]
 fn concat_separators_follow_the_oracle() {
     let s = store();
-    for u in [
-        "INSERT DATA { :a rdfs:label \"a one\" . :a rdfs:label \"a two\" . :b rdfs:label \"b one\" . :c rdfs:label \"c one\" . :d :memberOf :t1 . :d rdfs:label \"a one\" }",
-    ] {
-        upd(&s, &format!("{PREFIX}{u}")).expect("update");
-    }
+    upd(
+        &s,
+        &format!(
+            "{PREFIX}INSERT DATA {{ :a rdfs:label \"a one\" . :a rdfs:label \"a two\" . :b rdfs:label \"b one\" . :c rdfs:label \"c one\" . :d :memberOf :t1 . :d rdfs:label \"a one\" }}"
+        ),
+    )
+    .expect("update");
     let parts = |cell: &str, sep: &str| -> Vec<String> {
         let inner = cell
             .strip_prefix('"')
