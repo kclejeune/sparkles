@@ -1149,7 +1149,9 @@ HermiT.
 
 **A context reasons about its own ground literals.** Hyper binds the ontology clause's `x`
 to a constant in every context, not only in the root, with the other variables bound to
-`x`, `y`, a successor term or a constant as the context's literals allow. A maximal
+`x`, `y`, a successor term or a constant as the context's literals allow, and it binds the
+clause's `x` to the context's `x` with a role atom's other end bound to a constant, so
+that a holder of `∀t.C` over `x` and `t(x, u)` give `C(u)` whichever comes first. A maximal
 literal over `f(u)` takes Succ in any context. The edge records the predecessor, the
 existential restriction, the constant and the successor, and is distinct from the edge
 for `f(x)` of the same restriction even when both reach the same successor. Pred along
@@ -1299,15 +1301,93 @@ root's markers is part of the open obligation above. Without the blocking the ru
 rewrites every clause over `x` of a context that holds `x ≈ u`, and in the earlier
 experiments the blocking was on in every configuration that finished.
 
-**Measured effect.** The departures will be measured together and one at a time when
-they are built, on the smallest case, the 50 `shoi` fixtures on one and four threads
-under both strategies, the triangle with counting and the hand cases, with wall time
-beside the counts of conclusions by context kind and rule, and the numbers will be
-recorded here with the revision measured. With the journal's rules and the switch on,
-the smallest case gives no answer in 200 s and 19 of 50 `shoi` fixtures time out. The
-share of the work that the duplication of ground reasoning across contexts costs will be
-measured on ore_ont_15803 with its two top-property axioms removed, since the file itself
-waits on item 805.
+**Selection of the ground literals in bodies.** In a context other than the root, a
+clause whose body holds a literal with neither `x` nor `y` is selected, a marker `A(u) →
+A(u)` included. A selected clause is a premise only of an inference local to the context,
+of Join on its ground body literal as the side with the body, of Pred and of Succ, and it
+still sends the hypotheses and markers of its maximal literals. An inference is local when
+it is on a literal that holds a successor term of the context or on a role atom between
+`x` or `y` and a constant or a successor term of a constant, since no predecessor sees
+such a literal and no other context can make the inference. Hyper over `x` and `y`, Hyper
+at a constant and Eq or Factor of ground or `x` literals on a selected clause are left to
+the predecessor, which receives the clause by Pred, discharges the ground body by Join
+against its actual clauses and sends the hypotheses and markers that let the context go
+on. One exception stays in the context. A selected clause whose head holds an atom over
+`x` cannot go to the predecessor, since Pred carries no such head, so it takes the Hyper
+over `x` itself, with the unselected clauses as its partners. Partner lookups leave out
+selected clauses the same way, so an inference between two clauses fires or not whatever
+their order of processing. The rationale is the measured cause of the remaining work
+after the first three departures. In shoi-005's dominant context 13,731 of 17,384 distinct
+clauses held a ground literal in the body and 9,731 two or more, which is the root's
+marker explosion moved into one context, since the context combined the markers of all
+its predecessors in bodies. A restriction of inferences is sound. The argument for
+completeness is that of ordered resolution with selection, where a clause with a selected
+literal resolves only on it, and the predecessor that holds the marked literal in an
+actual clause makes the inference the context leaves out. What the argument leaves open is
+the return path. The predecessor's clause after Join holds the context's literals over
+`f(x)` and sends them as hypotheses, and whether every inference the context leaves out
+comes back this way across a shared successor or a chain of successors is not shown. A
+consult proposed the ontology `Q ⊑ ∃s.D`, `Q ⊑ ∃t.{a}`, `Q ⊑ ∀t.∀r.A`, `D ⊑ ∃r⁻.{a}`,
+`A ⊑ ⊥` as a case where the exception is needed, and it is a regression test, which
+passes. The selection is measured with it on and off, and the run keeps it only if the
+gate needs it.
+
+**The facts of a hypothetical successor go to the root.** A hypothetical successor has the
+empty core and no denied class, and its hypotheses and markers are in the bodies of its
+clauses, so a clause of its with an empty body holds of every element under no assumption.
+Such a clause whose literals hold neither `x` nor `y`, which are over constants and their
+successor terms, holds in every model of the ontology, and it goes to the root as a fact,
+once per distinct head, instead of staying in the context. The root derives it as its own
+clause, with its redundancy, processes it and offers it to the contexts registered for its
+constants as it does its other facts, this context included when it is registered. The
+root's own facts stay in the context that takes them. The empty clause with an empty body
+takes no such path, since it has no constant, and makes the context unsatisfiable, which
+reaches its predecessors and the root by Pred as before. The rule is sound by the argument
+above. For completeness, the inferences on a clause over constants and their successor
+terms are Hyper at the constants, Join, Eq, Factor and Succ over `f(u)`, which the root
+makes on the same clause with the same rules, and the context's inferences that need the
+clause as a partner, Join on a ground body literal and Hyper or Eq with a mixed clause,
+need a clause of the context that mentions one of the fact's constants in a maximal
+literal or a body, which registers the context for that constant, so the fact comes back
+before the inference is due. The rationale is measured. A hypothetical successor derived
+2,956 pure ground clauses with an empty body in one second of shoi-005 after the
+selection, two thirds of them over a successor term of a constant, where the root derived
+197 distinct clauses in the same second, and the context ran Hyper at the constants, Succ
+and Pred over them again. With the rule, shoi-015 answers in 0.5 s where it timed out
+before.
+
+**Measured effect.** The measurements are on a debug build on the laptop under load, with
+one thread unless noted, and the counts of conclusions come from the derivation trace
+(`DLTRACE`), which labels each conclusion by context and rule before normalization and
+each processed clause. With the journal's rules and the switch on, the smallest case gives
+no answer in 200 s and 19 of 50 `shoi` fixtures time out. With the first three departures,
+the smallest case answers in 2.9 ms, and 44 of 50 `shoi` fixtures give HermiT's taxonomy
+in every one of the four configurations, one and four threads under both strategies, in 5
+s, with 0 wrong anywhere, and six time out, shoi-005, 015, 022, 027, 032 and 042. With
+the selection and the promotion of facts, 45 of 50 pass in every configuration, 180 of
+200 runs, with 0 wrong, shoi-015 answers in 0.5 s, and shoi-005, 022, 027, 032 and 042
+time out in every configuration at 5 s and at 10 s. The remaining work is attributed. In
+one second of shoi-005 the dominant context, a hypothetical successor shared by several
+predecessors with the hypotheses `N_a0(x)`, `∃r0⁻.C3(x)` and `∃r3.{a0}(x)`, derives
+24,286 distinct conclusions, 21,665 of them mixed, with literals over `x` beside ground
+literals in the head, and 18,524 of the mixed conclusions are Eq inferences whose
+rewriting equality is `f(x) ≈ u`, for the successor term of `∃r3.{a0}` and the constants
+that `{a2} ⊔ {a0}` and `{a3} ⊔ {a2}` make it equal to. 433 processed clauses with such an
+equality maximal, each with its own residue of ground literals, hypotheses and markers,
+each rewrite about 180 clauses that hold `f(x)` in a maximal literal, each with its own
+residue, and the rewritten clauses hold ground atoms over the constant beside the
+residue's literals over `x`, so the context then reasons at the constant once per residue.
+Every other rule contributes under a thousand conclusions. The product is ordered
+paramodulation on `f(x) ≈ u` as Table 2 has it, and the journal's calculus makes the same
+inferences in the same context, since the successor's `x ≈ u` reaches the predecessor as
+`f(x) ≈ u` there too. Sequoia's nominal contexts of Section 7.2.2 fragment the root by
+constant and keep the journal's markers, so they do not touch this context's work. A
+restriction that leaves these inferences out needs an argument that the knowledge about
+`f(x)` reaches the constant another way, and the run has none yet, so the five fixtures
+stay open under item 804 and the switch stays off by default. The share of the work that
+the duplication of ground reasoning across contexts costs will be measured on
+ore_ont_15803 with its two top-property axioms removed, since the file itself waits on
+item 805.
 
 ### ROBOT-compatible commands
 
