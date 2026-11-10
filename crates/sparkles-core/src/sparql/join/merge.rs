@@ -423,7 +423,7 @@ mod tests {
         let rk = ids(&[0, 2, 2, 2, 3, 5, 6, 6, 9, 9]);
         let first = bounds(&ctx, &lk, &rk).unwrap();
         for test in [0usize, 1] {
-            let compatible = |l: usize, r: usize| test == 0 || (l + r) % 3 != 0;
+            let compatible = |l: usize, r: usize| test == 0 || !(l + r).is_multiple_of(3);
             let (mut el, mut er) = (Vec::new(), Vec::new());
             let mut from = 0;
             while from < lk.len() {
