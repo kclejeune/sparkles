@@ -7,8 +7,9 @@ the cost of keeping it current across commits. The search and its limits are des
 in the [search guide](../../search/README.md#entity-search) and in
 [U12](../../specs/U12-ontology-workbench/SPEC.md#ontology-browser-search).
 
-Read the [results](RESULTS.md) and the [run catalog](RUNS.json). The result report is a
-manual import of the retained run record.
+Read the [results](RESULTS.md), a
+[manual report](../README.md#evidence-and-generated-reports) of the retained run record,
+and the [run catalog](RUNS.json).
 
 ## What is measured
 

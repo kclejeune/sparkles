@@ -8,8 +8,9 @@ beside ELK's. The classifier and its limits are described in
 [F24](../../specs/F24-owl-classification/SPEC.md#outcome) and the
 [reasoning guide](../../reasoning/README.md#owl-2-ontologies).
 
-Read the [results](RESULTS.md) and the [run catalog](RUNS.json). The result report is a
-manual import of the retained run records.
+Read the [results](RESULTS.md), a
+[manual report](../README.md#evidence-and-generated-reports) of the retained run records,
+and the [run catalog](RUNS.json).
 
 ## What is measured
 

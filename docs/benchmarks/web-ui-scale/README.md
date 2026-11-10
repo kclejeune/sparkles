@@ -7,8 +7,9 @@ tree through 10,000 rows, the browser's JavaScript heap, and the time, frames an
 Explore as the explored graph grows to 1,000, 5,000 and 20,000 nodes. The pages and their
 limits are described in the [visualization guide](../../visualization/README.md#explore).
 
-Read the [results](RESULTS.md) and the [run catalog](RUNS.json). The result report is a
-manual import of the retained run record.
+Read the [results](RESULTS.md), a
+[manual report](../README.md#evidence-and-generated-reports) of the retained run record,
+and the [run catalog](RUNS.json).
 
 ## What is measured
 
