@@ -803,8 +803,8 @@ individuals, and leave out and report the axioms that need case analysis and the
 they left out before, which are at-least restrictions above 64, data restrictions outside
 OWL 2 EL, and axioms over property hierarchies that are not regular or whose automata
 pass the bound. A run with individuals also leaves out at-least restrictions above one,
-for the reason the normalization paragraph gives, and chains through the top property
-stay partial, as item 663 records.
+for the reason the normalization paragraph gives, which item 867 follows, and chains
+through the top property stay partial, as item 663 records.
 
 **One saturation.** Kazakov's rules read a context as the set of instances of its
 conjunction, and every conclusion of a context holds of each of its instances. The EL
@@ -826,13 +826,15 @@ expression in an assertion reaches the rules, and an object property assertion o
 inverse property as the assertion over the property the other way round. The other
 assertions are EL axioms already. A run with individuals leaves out and reports an
 at-least restriction above one, where a run without them unfolds it as the paper's Lemma
-2 does into fresh, pairwise disjoint fillers. The unfolding is a conservative extension
-when the successors it names are fresh elements, which holds in a model that unravels
-into trees, and fails when nominals share them. Three individuals, each with the other
-two as `r`-successors and each holding `≥2 r.⊤`, are satisfiable, while two fresh
-fillers disjoint everywhere would have to colour a triangle with two colours. Lemma 2
-stays for runs without individuals, and at-least restrictions above one beside
-individuals are a follow-up item.
+2 does into fresh, pairwise disjoint fillers. The lemma's argument expands a model of
+the ontology to one of the unfolding, and it colours each element's successors with the
+fresh fillers, which it can do because the paper's models are trees in which no two
+elements share a successor. A nominal is a shared successor, and the argument is not
+made here for models with them, though no Horn axiom bounds an element's successors to
+a finite set, so an expansion that adds fresh successors may exist. Leaving the
+restriction out is a sound weakening that the run reports, no file of the lane's gate
+has such a restriction beside individuals, and item 867 holds the argument or the
+rule that takes them. Lemma 2 stays for runs without individuals.
 
 Three mechanisms of the EL rules of individuals have to reach the links and contexts of
 the Horn rules.
@@ -849,10 +851,14 @@ the Horn rules.
   run with the Horn rules the context also gives the individual its backward links, with
   what it knows of each predecessor, real or not, since a link from `P` by `r` to a
   context that stands for `a` is a link from `P` to `a` whether or not the context has an
-  instance. While real it gives the individual its loops too, since its one instance is
-  `a`. What a context knows of a predecessor is whether the predecessor holds each
-  at-most filler, which `PredIn` carries, and whether it is real, which the conclusion
-  below carries, and both go with the link and as they come later.
+  instance. While real it gives the individual its loops and its Horn successors too,
+  since its one instance is `a`, and takes the individual's subsumers, Horn successors
+  and loops, as it takes the subsumers today. A Horn successor is a link that R6 gives a
+  predecessor without an existential restriction among its subsumers, so a partner that
+  takes only subsumers would miss it, and it travels as the `Succ` conclusion it is.
+  What a context knows of a predecessor is whether the predecessor holds each at-most
+  filler, which `PredIn` carries, and whether it is real, which the conclusion below
+  carries, and both go with the link and as they come later.
 - A universal restriction `∀t.A` on a universal role `t` held by a real context is a
   fact that holds everywhere, as a negative `∃t.F ⊑ x` whose `F` is real is today. The
   index lists the restriction among the facts of universal roles, the rounds between
@@ -885,8 +891,8 @@ derives. R7 closes it. At a singular context `N` holding `≤1 S.B`, two real
 predecessors `M_1` and `M_2` that the restriction counts, linked by roles whose inverses
 are under `S` and holding `B`, have one instance each and the two instances are one,
 since both are the `S`-neighbour in `B` of `N`'s element. The two contexts exchange their
-subsumers, backward links with what they know of each predecessor, and loops, now and as
-they come, and the two roles are checked against the disjoint and asymmetric roles, as R5
+subsumers, Horn successors, backward links with what they know of each predecessor, and
+loops, now and as they come, and the two roles are checked against the disjoint and asymmetric roles, as R5
 checks the roles of merged successors. A loop of `N` by a role under `S` counts `N`
 itself among the neighbours when `N` holds `B`, and then `N` and a real counted
 predecessor exchange the same way, where the loop case of R6 today gives the predecessor
@@ -905,13 +911,15 @@ context derives a nominal beside `a`'s own. R8 has two cases, both at a singular
 `N` and both unconditional, since each concludes that a context is empty. Two backward
 links into `N` from one source `M` by roles that clash make `M` unsatisfiable, since
 every instance of `M` would have both roles to `N`'s one element. A forward link from `N`
-to a context `X` by `r_1` and a backward link from `X` by `r_2`, where `r_1` and `r_2⁻`
-clash, make `N` unsatisfiable, since `N`'s element would have an `r_1`-successor in `X`
-and every instance of `X` has `r_2` to `N`'s element. The second case covers the
-asymmetric example at `a`, whose forward link goes to `A` and whose backward link comes
-from `A`. The first covers the disjoint example at `a`, whose two backward links come
-from `A`. It also covers two sources that are one element, since the exchange gives
-either the other's links, and two targets that stand for one individual, since each
+to a context `X` by `r_1`, among the successors of its existential restrictions or its
+Horn successors, and a backward link from `X` by `r_2`, where `r_1` and `r_2⁻` clash,
+make `N` unsatisfiable, since `N`'s element would have an `r_1`-successor in `X` and
+every instance of `X` has `r_2` to `N`'s element. The second case covers the asymmetric
+example at `a`, whose forward link goes to `A` and whose backward link comes from `A`,
+without a chain in the ontology. The first covers the disjoint example at `a`, whose two
+backward links come from `A`. It also covers two sources that are one element, since the
+exchange gives either the other's subsumers and Horn successors, so that the target sees
+both links from one source, and two targets that stand for one individual, since each
 gives the individual its backward links. R8 runs on a singular context's own state and
 sends only `owl:Nothing`.
 
@@ -933,18 +941,24 @@ the rounds, and every other rule, R8 included, runs the same in the global satur
 in a world. A world for a class makes the class and what it reaches real, so a class
 whose global subsumers are incomplete reaches a context that one of these rules would
 read as real. Each such context is a witness. A context that is not real, derives an
-individual and has a subsumer or a loop that the individual lacks is one, which extends
-today's witness by the loops. A context that is not real and that an at-most restriction
-of a singular context counts as a predecessor is one, since R7 identifies it with another
-predecessor only where it has an instance. A context that is not real and holds a fact's
-restriction on a universal role is one, as today. The keys apply to named individuals,
-which are real, so they need no witness beyond these. The simplest case of R7 shows the
+individual and has a subsumer, a Horn successor or a loop that the individual lacks is
+one, which extends today's witness by the Horn successors and the loops. A context that
+is not real and that an at-most restriction of a singular context counts as a
+predecessor is one, since R7 identifies it with another predecessor only where it has an
+instance. A context that is not real and holds a fact's restriction on a universal role
+is one, as today. The keys read the links of a real context to named individuals and its
+data values, which come from its subsumers and its Horn successors, so a context that
+derives an individual and is not real adds a key record only when it has a subsumer or a
+Horn successor the individual lacks, which makes it a witness of the first kind. The
+world's check that no real context is unsatisfiable reads realness too, and an
+unsatisfiable context that a class reaches makes the class unsatisfiable by the EL rule
+for `owl:Nothing` already. The simplest case of R7 shows the
 second kind, since `A` is not real in the global saturation, derives no individual and
 reaches no context that does, so without it `A` would get no world and `A ⊑ {b}` would be
 missed. The kinds are sufficient, by the list of rules that read realness, and not
 necessary, since `A ⊑ ∃r.{a}` with an inverse functional `r` alone makes `A` a witness
-whose world finds nothing. A cheaper criterion needs an argument of its own and is a
-follow-up. A run with the Horn rules marks the real contexts whenever the ontology has
+whose world finds nothing. A cheaper criterion needs an argument of its own, which item
+868 holds. A run with the Horn rules marks the real contexts whenever the ontology has
 individuals, where a run of the EL rules does so only after a merge, a key or a universal
 role, because R7 reads the real predecessors of the global state.
 
@@ -978,11 +992,13 @@ individual's context derives the other and is real.
 
 **Completeness.** The argument is Kazakov's with the identifications below, and this
 section states it as an argument and not as a proof. For a named class `D`, take the
-world of `D`, in which `D` is real, or the global saturation when `D` reaches no witness,
-where by the list of rules that read realness the world would add nothing to `D`'s
-subsumers. Build a model from the real contexts of that state as the paper's Theorem 4
+world of `D`, in which `D` is real, whether or not the run executes it. When `D` reaches
+no witness, the list of rules that read realness says that the world's subsumers of `D`
+are the global saturation's, which is what the run answers, so the model below serves
+for both. Build a model from the real contexts of `D`'s world as the paper's Theorem 4
 does, with the paper's choice of the successor that holds the most and its reuse of the
-predecessor where it serves, and with three identifications. Each individual is one
+predecessor where it serves, and with three identifications. `D` has an element in it,
+which is what a subsumption the world does not derive needs. Each individual is one
 element, which every real context that derives the individual stands for, and these
 contexts agree on their subsumers, backward links and loops by the exchange, with their
 ids and bookkeeping apart. Each real singular context that derives no individual has one
@@ -1040,8 +1056,8 @@ rules keep every refusal of individuals, data properties and top properties, and
 
 **Out of scope.** Enumerations of several individuals in a positive position need case
 analysis and stay with the rooted run. At-least restrictions above one beside
-individuals, chains through the top property and a cheaper witness criterion are
-follow-up items. Anonymous individuals stay with the reader's rules. Data cardinalities
+individuals are item 867, a cheaper witness criterion is item 868, and chains through the
+top property stay in item 663. Anonymous individuals stay with the reader's rules. Data cardinalities
 and keys over data properties beside the disjunctive rules stay with item 768, counting
 with item 728 and incremental runs after a change with item 753.
 
