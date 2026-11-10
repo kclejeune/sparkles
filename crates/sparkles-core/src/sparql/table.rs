@@ -489,6 +489,11 @@ impl<'ctx> Materialized<'ctx> {
         ctx: &'ctx super::ctx::Ctx,
         vars: &[VarId],
     ) -> crate::Result<Self> {
+        // A table that already has these columns in this order keeps its backing and
+        // its owner unchanged, as a paid projection would after moving them twice.
+        if self.table.vars == vars {
+            return Ok(self);
+        }
         let held = ctx.charge(0)?;
         let kind = self.adopt_input(ctx, &held)?;
         if kind == InputCredit::Plain {

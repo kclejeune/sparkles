@@ -274,7 +274,8 @@ impl Variables {
             }
             (bytes, longest)
         };
-        let star = super::is_select_star(query);
+        // The eager path passes no query text, so it skips the pattern match.
+        let star = !query.is_empty() && super::is_select_star(query);
         // Existing star ordering may retain its order and cached keys together,
         // plus two pattern strings. No transient names/IDs are cloned here.
         let workspace = if star {
@@ -347,11 +348,20 @@ impl Variables {
                 if copied.capacity() != text.len() {
                     return Err(Error::invalid("cursor name capacity exceeds admission"));
                 }
-                for (at, character) in text.chars().enumerate() {
-                    if at > 0 && at.is_multiple_of(CHECK_EVERY) {
-                        ctx.check()?;
+                // Copy whole runs of up to CHECK_EVERY bytes, checking between runs, so
+                // a short name is one copy and a long one still polls.
+                let mut rest = text;
+                loop {
+                    let mut end = rest.len().min(CHECK_EVERY);
+                    while !rest.is_char_boundary(end) {
+                        end -= 1;
                     }
-                    copied.push(character);
+                    copied.push_str(&rest[..end]);
+                    rest = &rest[end..];
+                    if rest.is_empty() {
+                        break;
+                    }
+                    ctx.check()?;
                 }
                 names.push(copied);
                 ids.push(id);
