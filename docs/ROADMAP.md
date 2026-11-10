@@ -181,9 +181,8 @@ DL Query tab, the SKOS editor, the web UI shell of item 632 and the visual SHACL
 editor of item 617 come these, in order:
 1. Inferred axioms in entity frames (622), with the inferred property and individual
    trees of item 609. Their explanation links wait for F24's justifications.
-2. Watches (619), after the notifications of item 46.
-3. Pattern-based axiom generation (623).
-4. Vocabulary governance and change requests (627), after item 459.
+2. Pattern-based axiom generation (623).
+3. Vocabulary governance and change requests (627), after item 459.
 
 Tagging documents with concepts (628) belongs to Wave B's ingest work, and real-time
 co-editing (629) comes last.
