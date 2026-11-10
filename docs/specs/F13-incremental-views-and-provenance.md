@@ -1528,8 +1528,13 @@ The ignored test `aggregate_pass_against_recompute` of
 `crates/sparkles-core/tests/incr_bench.rs`, which `mise run bench:incr` runs with the
 other view tests, measures four such views over the benchmark's people data, and the
 [writes benchmark](../benchmarks/writes/RESULTS.md#aggregates-and-correlated-exists-in-views)
-has its table. Item 418 changed no code of the query engine, and the writes screen with
-four table views ran as [ROADMAP](../ROADMAP.md) item 17 asks.
+has its table. On a laptop at 200,000 people, the `MIN` and `MAX`, `HAVING` and
+`GROUP_CONCAT` and `SAMPLE` views cost a pass of 10 to 18 µs after a one- or two-quad
+commit, and the correlated `EXISTS` view 2.5 ms at the median, against 22.5 s for its
+query. A commit that touches a pattern of the condition without an outer variable
+evaluates the condition for every row again, at about the query's cost, which is the
+view's p95 and what item 906 scopes further. Item 418 changed no code of the query engine,
+and the writes screen with four table views ran as [ROADMAP](../ROADMAP.md) item 17 asks.
 
 ### Maintained assessments and conservative dependencies
 
