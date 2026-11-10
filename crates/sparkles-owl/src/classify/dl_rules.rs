@@ -1740,10 +1740,12 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
         && let Some(i) = roles.inv(t)
     {
         st.props.push((i, c));
-        for (r, srcs) in &st.back {
-            if roles.sub(*r, i) {
-                for &e in &srcs.list {
-                    out.send(e, Concl::Sub(c));
+        if !out.defer() {
+            for (r, srcs) in &st.back {
+                if roles.sub(*r, i) {
+                    for &e in &srcs.list {
+                        out.send(e, Concl::Sub(c));
+                    }
                 }
             }
         }

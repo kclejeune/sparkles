@@ -1,0 +1,1386 @@
+{
+ "suite": "el-classification",
+ "kind": "measurement",
+ "scale": "ore_ont_8737 of the ORE 2015 DL development set, GO 2026-07-26, ChEBI lite 256, ore_ont_3836 and ore_ont_13482 of the ORE 2015 EL sample on atlas",
+ "host": {
+  "name": "atlas",
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "ram_mib": 15620,
+  "kernel": "7.2.9"
+ },
+ "manifest": {
+  "sides": {
+   "base": "321508fe, origin/main",
+   "a": "181e9c95, the delivery filter of every held kind",
+   "b": "fb894c98, a plus the link products sent in runs",
+   "b3": "bd924609, b plus the flush that returns at once when nothing is pending and the fixes of review round 1, the lane's final saturation code"
+  },
+  "build": "mbx build --release -p sparkles-owl --example el_classify on stanley, copied to atlas",
+  "konclude": "Konclude 0.7.0-1138 from nix/reasoners, copied to atlas, through scripts/elk-compare/konclude.py",
+  "scripts": [
+   "slot818.sh.txt",
+   "ab.sh.txt",
+   "konclude818.sh.txt",
+   "record818.py.txt"
+  ]
+ },
+ "settings": {
+  "memory_runs": "one el_classify process per side and thread count in a 13 GiB scope, no swap, no pinning, wall time and peak RSS from GNU time",
+  "ab_runs": "ab.sh, six rounds of rotating order, five classifications per process, one-thread runs pinned to CPU 4 and the others to CPUs 0-11"
+ },
+ "method": "Every part ran under ~/lanes/.heavy.lock on atlas with no other benchmark or gate on the host. slot818.sh ran one classification of ore_ont_8737 per side on 4, 12 and 1 threads, then ab.sh with six rounds of rotating order, one process per side, file and thread count with --repeat 5, whose median classification is the round's value. The first slot ran the base, a and b, the second slot the base and b3, and konclude818.sh ran Konclude after the first slot. The stanley member holds the profiles and message counters taken on the laptop while other work ran there, so only their shares and counts are evidence.",
+ "slots": {
+  "slot-20261110T190336Z": {
+   "binary_sha256_prefix": {
+    "base": "d08ea7915a897c64",
+    "a": "6295063ead49a83b",
+    "b": "3783615b1d63075f"
+   },
+   "started": "2026-11-10T19:03:36Z",
+   "ended": "2026-11-10T19:21:27Z",
+   "ore_ont_8737": {
+    "a.t1": {
+     "classify_s": 74.77,
+     "saturation_s": 73.88,
+     "wall_s": 77.86,
+     "peak_rss_gib": 3.61,
+     "peak_estimate_gib": 1.69,
+     "conclusions": 1620530766,
+     "taxonomy": "69ffb80499088147",
+     "tier": "horn"
+    },
+    "a.t12": {
+     "classify_s": 12.76,
+     "saturation_s": 12.35,
+     "wall_s": 16.07,
+     "peak_rss_gib": 6.44,
+     "peak_estimate_gib": 2.75,
+     "conclusions": 1300879089,
+     "taxonomy": "69ffb80499088147",
+     "tier": "horn"
+    },
+    "a.t4": {
+     "classify_s": 22.42,
+     "saturation_s": 21.95,
+     "wall_s": 25.67,
+     "peak_rss_gib": 5.54,
+     "peak_estimate_gib": 2.65,
+     "conclusions": 1308035793,
+     "taxonomy": "69ffb80499088147",
+     "tier": "horn"
+    },
+    "b.t1": {
+     "classify_s": 44.81,
+     "saturation_s": 43.97,
+     "wall_s": 47.84,
+     "peak_rss_gib": 3.76,
+     "peak_estimate_gib": 1.7,
+     "conclusions": 1622016820,
+     "taxonomy": "69ffb80499088147",
+     "tier": "horn"
+    },
+    "b.t12": {
+     "classify_s": 9.23,
+     "saturation_s": 8.84,
+     "wall_s": 12.49,
+     "peak_rss_gib": 7.36,
+     "peak_estimate_gib": 3.3,
+     "conclusions": 1301208149,
+     "taxonomy": "69ffb80499088147",
+     "tier": "horn"
+    },
+    "b.t4": {
+     "classify_s": 13.63,
+     "saturation_s": 13.16,
+     "wall_s": 17.47,
+     "peak_rss_gib": 4.66,
+     "peak_estimate_gib": 2.06,
+     "conclusions": 1272434579,
+     "taxonomy": "69ffb80499088147",
+     "tier": "horn"
+    },
+    "base.t1": {
+     "classify_s": 84.02,
+     "saturation_s": 83.14,
+     "wall_s": 87.16,
+     "peak_rss_gib": 5.91,
+     "peak_estimate_gib": 3.21,
+     "conclusions": 2238430644,
+     "taxonomy": "69ffb80499088147",
+     "tier": "horn"
+    },
+    "base.t12": {
+     "classify_s": 17.27,
+     "saturation_s": 16.87,
+     "wall_s": 20.77,
+     "peak_rss_gib": 8.44,
+     "peak_estimate_gib": 4.36,
+     "conclusions": 2139248072,
+     "taxonomy": "69ffb80499088147",
+     "tier": "horn"
+    },
+    "base.t4": {
+     "classify_s": 29.01,
+     "saturation_s": 28.55,
+     "wall_s": 32.27,
+     "peak_rss_gib": 7.58,
+     "peak_estimate_gib": 4.2,
+     "conclusions": 2101886975,
+     "taxonomy": "69ffb80499088147",
+     "tier": "horn"
+    }
+   },
+   "ab": {
+    "out-20261110T190920Z": {
+     "env": [
+      "host=atlas",
+      "cpu=13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus=20",
+      "kernel=7.2.9",
+      "binary_sha256 base=d08ea7915a897c649d105e60c0f103d16e03c0d2ee9bd5ad8de424fa65053b61",
+      "binary_sha256 a=6295063ead49a83bc55d085d6d4402b602df4c2a5963363518a8d18765d4cb1d",
+      "binary_sha256 b=3783615b1d63075f29f7dcd74d020ab87b0ba4c699b39674ddfbc5c74012b066",
+      "data_sha256 go.ofn=fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375",
+      "data_sha256 chebi_lite.ofn=be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4",
+      "data_sha256 ore-el/ore_ont_3836.owl=fc559045f566b2837188505b707480dc3416b3e699c5188632fa5be3d4cf2473",
+      "data_sha256 ore-el/ore_ont_13482.owl=f732cc7d4ebdb45099e421d062e05d64837b22e60b53d6848a723aa8f0e8d971",
+      "rounds=6 threads=1 4 12 repeat=5 pin1=4 pinn=0-11",
+      "started=2026-11-10T19:09:21Z load=3.17 3.63 3.73",
+      "ended=2026-11-10T19:21:07Z load=3.90 4.20 4.01",
+      ""
+     ],
+     "results": {
+      "chebi_lite t1 a": {
+       "classify_median_ms": 1055.45,
+       "saturation_ms": 700.45,
+       "index_ms": 125.65,
+       "rounds_ms": [
+        1055.79,
+        1062.74,
+        1054.79,
+        1053.21,
+        1056.3,
+        1055.11
+       ],
+       "failed": 0
+      },
+      "chebi_lite t1 b": {
+       "classify_median_ms": 1085.48,
+       "saturation_ms": 731.02,
+       "index_ms": 122.72,
+       "rounds_ms": [
+        1086.81,
+        1084.64,
+        1083.14,
+        1083.77,
+        1086.32,
+        1089.36
+       ],
+       "failed": 0
+      },
+      "chebi_lite t1 base": {
+       "classify_median_ms": 1055.35,
+       "saturation_ms": 698.56,
+       "index_ms": 124.82,
+       "rounds_ms": [
+        1057.24,
+        1056.16,
+        1054.54,
+        1053.82,
+        1060.2,
+        1052.04
+       ],
+       "failed": 0
+      },
+      "chebi_lite t4 a": {
+       "classify_median_ms": 427.03,
+       "saturation_ms": 258.7,
+       "index_ms": 79.2,
+       "rounds_ms": [
+        419.1,
+        431.98,
+        423.17,
+        430.89,
+        430.91,
+        420.77
+       ],
+       "failed": 0
+      },
+      "chebi_lite t4 b": {
+       "classify_median_ms": 439.14,
+       "saturation_ms": 257.43,
+       "index_ms": 78.25,
+       "rounds_ms": [
+        442.34,
+        464.24,
+        433.48,
+        456.92,
+        430.67,
+        435.93
+       ],
+       "failed": 0
+      },
+      "chebi_lite t4 base": {
+       "classify_median_ms": 418.07,
+       "saturation_ms": 230.46,
+       "index_ms": 78.89,
+       "rounds_ms": [
+        418.33,
+        427.28,
+        420.73,
+        417.81,
+        414.05,
+        417.63
+       ],
+       "failed": 0
+      },
+      "chebi_lite t12 a": {
+       "classify_median_ms": 421.16,
+       "saturation_ms": 290.44,
+       "index_ms": 71.16,
+       "rounds_ms": [
+        415.16,
+        405.26,
+        439.63,
+        486.78,
+        422.85,
+        419.47
+       ],
+       "failed": 0
+      },
+      "chebi_lite t12 b": {
+       "classify_median_ms": 445.68,
+       "saturation_ms": 308.88,
+       "index_ms": 70.94,
+       "rounds_ms": [
+        515.74,
+        418.48,
+        422.29,
+        515.83,
+        400.64,
+        469.08
+       ],
+       "failed": 0
+      },
+      "chebi_lite t12 base": {
+       "classify_median_ms": 426.78,
+       "saturation_ms": 280.22,
+       "index_ms": 70.98,
+       "rounds_ms": [
+        409.66,
+        452.79,
+        440.54,
+        403.97,
+        443.69,
+        413.01
+       ],
+       "failed": 0
+      },
+      "go t1 a": {
+       "classify_median_ms": 308.18,
+       "saturation_ms": 246.78,
+       "index_ms": 31.64,
+       "rounds_ms": [
+        308.33,
+        308.82,
+        307.45,
+        308.03,
+        307.96,
+        308.55
+       ],
+       "failed": 0
+      },
+      "go t1 b": {
+       "classify_median_ms": 309.76,
+       "saturation_ms": 248.86,
+       "index_ms": 31.21,
+       "rounds_ms": [
+        309.54,
+        309.29,
+        323.91,
+        310.21,
+        309.99,
+        309.52
+       ],
+       "failed": 0
+      },
+      "go t1 base": {
+       "classify_median_ms": 309.69,
+       "saturation_ms": 247.57,
+       "index_ms": 31.38,
+       "rounds_ms": [
+        308.07,
+        312.86,
+        307.37,
+        313.02,
+        309.7,
+        309.68
+       ],
+       "failed": 0
+      },
+      "go t4 a": {
+       "classify_median_ms": 107.15,
+       "saturation_ms": 65.28,
+       "index_ms": 24.72,
+       "rounds_ms": [
+        107.02,
+        107.41,
+        106.6,
+        107.34,
+        107.27,
+        106.8
+       ],
+       "failed": 0
+      },
+      "go t4 b": {
+       "classify_median_ms": 105.63,
+       "saturation_ms": 64.85,
+       "index_ms": 24.43,
+       "rounds_ms": [
+        104.96,
+        106.08,
+        105.7,
+        105.55,
+        105.29,
+        105.95
+       ],
+       "failed": 0
+      },
+      "go t4 base": {
+       "classify_median_ms": 106.67,
+       "saturation_ms": 66.06,
+       "index_ms": 24.71,
+       "rounds_ms": [
+        106.64,
+        106.53,
+        106.69,
+        106.85,
+        106.07,
+        107.44
+       ],
+       "failed": 0
+      },
+      "go t12 a": {
+       "classify_median_ms": 78.38,
+       "saturation_ms": 40.5,
+       "index_ms": 24.58,
+       "rounds_ms": [
+        78.67,
+        78.57,
+        78.02,
+        80.91,
+        78.2,
+        77.06
+       ],
+       "failed": 0
+      },
+      "go t12 b": {
+       "classify_median_ms": 77.22,
+       "saturation_ms": 40.13,
+       "index_ms": 24.7,
+       "rounds_ms": [
+        78.73,
+        76.98,
+        77.34,
+        77.18,
+        77.19,
+        77.26
+       ],
+       "failed": 0
+      },
+      "go t12 base": {
+       "classify_median_ms": 77.41,
+       "saturation_ms": 40.32,
+       "index_ms": 23.97,
+       "rounds_ms": [
+        79.3,
+        77.69,
+        76.98,
+        75.91,
+        77.13,
+        77.8
+       ],
+       "failed": 0
+      },
+      "ore_ont_13482 t1 a": {
+       "classify_median_ms": 921.23,
+       "saturation_ms": 541.56,
+       "index_ms": 329.9,
+       "rounds_ms": [
+        916.91,
+        911.88,
+        921.35,
+        957.03,
+        922.81,
+        921.11
+       ],
+       "failed": 0
+      },
+      "ore_ont_13482 t1 b": {
+       "classify_median_ms": 933.02,
+       "saturation_ms": 562.1,
+       "index_ms": 325.74,
+       "rounds_ms": [
+        935.38,
+        932.7,
+        933.35,
+        957.94,
+        930.77,
+        905.3
+       ],
+       "failed": 0
+      },
+      "ore_ont_13482 t1 base": {
+       "classify_median_ms": 906.1,
+       "saturation_ms": 539.5,
+       "index_ms": 316.04,
+       "rounds_ms": [
+        899.18,
+        908.57,
+        904.8,
+        906.82,
+        907.87,
+        905.38
+       ],
+       "failed": 0
+      },
+      "ore_ont_13482 t4 a": {
+       "classify_median_ms": 398.65,
+       "saturation_ms": 144.84,
+       "index_ms": 217.83,
+       "rounds_ms": [
+        398.97,
+        425.86,
+        396.02,
+        397.19,
+        401.33,
+        398.32
+       ],
+       "failed": 0
+      },
+      "ore_ont_13482 t4 b": {
+       "classify_median_ms": 405.87,
+       "saturation_ms": 156.93,
+       "index_ms": 211.73,
+       "rounds_ms": [
+        409.14,
+        409.19,
+        402.61,
+        424.75,
+        394.27,
+        396.71
+       ],
+       "failed": 0
+      },
+      "ore_ont_13482 t4 base": {
+       "classify_median_ms": 390.94,
+       "saturation_ms": 138.17,
+       "index_ms": 212.81,
+       "rounds_ms": [
+        384.64,
+        394.45,
+        391.39,
+        390.5,
+        389.67,
+        393.97
+       ],
+       "failed": 0
+      },
+      "ore_ont_13482 t12 a": {
+       "classify_median_ms": 297.12,
+       "saturation_ms": 84.1,
+       "index_ms": 170.11,
+       "rounds_ms": [
+        296.82,
+        297.43,
+        296.09,
+        299.43,
+        301.18,
+        294.39
+       ],
+       "failed": 0
+      },
+      "ore_ont_13482 t12 b": {
+       "classify_median_ms": 294.36,
+       "saturation_ms": 83.5,
+       "index_ms": 168.89,
+       "rounds_ms": [
+        294.25,
+        293.59,
+        296.44,
+        293.34,
+        294.47,
+        299.38
+       ],
+       "failed": 0
+      },
+      "ore_ont_13482 t12 base": {
+       "classify_median_ms": 299.93,
+       "saturation_ms": 83.72,
+       "index_ms": 170.18,
+       "rounds_ms": [
+        299.9,
+        299.98,
+        297.17,
+        294.91,
+        304.99,
+        299.95
+       ],
+       "failed": 0
+      },
+      "ore_ont_3836 t1 a": {
+       "classify_median_ms": 589.79,
+       "saturation_ms": 129.05,
+       "index_ms": 430.0,
+       "rounds_ms": [
+        589.6,
+        589.98,
+        591.02,
+        588.18,
+        589.48,
+        597.32
+       ],
+       "failed": 0
+      },
+      "ore_ont_3836 t1 b": {
+       "classify_median_ms": 582.57,
+       "saturation_ms": 131.39,
+       "index_ms": 421.07,
+       "rounds_ms": [
+        584.39,
+        586.04,
+        580.94,
+        581.2,
+        576.4,
+        583.94
+       ],
+       "failed": 0
+      },
+      "ore_ont_3836 t1 base": {
+       "classify_median_ms": 586.67,
+       "saturation_ms": 129.2,
+       "index_ms": 427.5,
+       "rounds_ms": [
+        590.16,
+        590.25,
+        583.61,
+        576.34,
+        586.62,
+        586.72
+       ],
+       "failed": 0
+      },
+      "ore_ont_3836 t4 a": {
+       "classify_median_ms": 249.25,
+       "saturation_ms": 34.29,
+       "index_ms": 189.3,
+       "rounds_ms": [
+        255.67,
+        250.99,
+        242.52,
+        247.51,
+        252.63,
+        244.03
+       ],
+       "failed": 0
+      },
+      "ore_ont_3836 t4 b": {
+       "classify_median_ms": 251.95,
+       "saturation_ms": 35.63,
+       "index_ms": 190.58,
+       "rounds_ms": [
+        254.01,
+        247.45,
+        244.14,
+        253.08,
+        253.77,
+        250.83
+       ],
+       "failed": 0
+      },
+      "ore_ont_3836 t4 base": {
+       "classify_median_ms": 250.52,
+       "saturation_ms": 33.75,
+       "index_ms": 192.79,
+       "rounds_ms": [
+        255.88,
+        256.41,
+        246.55,
+        252.6,
+        248.12,
+        248.45
+       ],
+       "failed": 0
+      },
+      "ore_ont_3836 t12 a": {
+       "classify_median_ms": 196.31,
+       "saturation_ms": 18.68,
+       "index_ms": 151.86,
+       "rounds_ms": [
+        198.63,
+        194.11,
+        197.15,
+        194.13,
+        198.14,
+        195.47
+       ],
+       "failed": 0
+      },
+      "ore_ont_3836 t12 b": {
+       "classify_median_ms": 195.74,
+       "saturation_ms": 18.07,
+       "index_ms": 151.62,
+       "rounds_ms": [
+        197.05,
+        196.43,
+        199.85,
+        195.04,
+        192.66,
+        195.02
+       ],
+       "failed": 0
+      },
+      "ore_ont_3836 t12 base": {
+       "classify_median_ms": 196.06,
+       "saturation_ms": 17.81,
+       "index_ms": 152.47,
+       "rounds_ms": [
+        196.12,
+        195.99,
+        194.78,
+        197.32,
+        196.67,
+        194.97
+       ],
+       "failed": 0
+      }
+     },
+     "taxonomy_sha256": [
+      "16cef2fe9a395a52d0ab20bef22a7d8e31f2fc9394d035ffa15914d20a888fc6  chebi_lite.a.t12.txt",
+      "16cef2fe9a395a52d0ab20bef22a7d8e31f2fc9394d035ffa15914d20a888fc6  chebi_lite.a.t1.txt",
+      "16cef2fe9a395a52d0ab20bef22a7d8e31f2fc9394d035ffa15914d20a888fc6  chebi_lite.a.t4.txt",
+      "16cef2fe9a395a52d0ab20bef22a7d8e31f2fc9394d035ffa15914d20a888fc6  chebi_lite.base.t12.txt",
+      "16cef2fe9a395a52d0ab20bef22a7d8e31f2fc9394d035ffa15914d20a888fc6  chebi_lite.base.t1.txt",
+      "16cef2fe9a395a52d0ab20bef22a7d8e31f2fc9394d035ffa15914d20a888fc6  chebi_lite.base.t4.txt",
+      "16cef2fe9a395a52d0ab20bef22a7d8e31f2fc9394d035ffa15914d20a888fc6  chebi_lite.b.t12.txt",
+      "16cef2fe9a395a52d0ab20bef22a7d8e31f2fc9394d035ffa15914d20a888fc6  chebi_lite.b.t1.txt",
+      "16cef2fe9a395a52d0ab20bef22a7d8e31f2fc9394d035ffa15914d20a888fc6  chebi_lite.b.t4.txt",
+      "e8828808260eb2a4da591024601538ee17aafd52e923458dddc04202eed05652  go.a.t12.txt",
+      "e8828808260eb2a4da591024601538ee17aafd52e923458dddc04202eed05652  go.a.t1.txt",
+      "e8828808260eb2a4da591024601538ee17aafd52e923458dddc04202eed05652  go.a.t4.txt",
+      "e8828808260eb2a4da591024601538ee17aafd52e923458dddc04202eed05652  go.base.t12.txt",
+      "e8828808260eb2a4da591024601538ee17aafd52e923458dddc04202eed05652  go.base.t1.txt",
+      "e8828808260eb2a4da591024601538ee17aafd52e923458dddc04202eed05652  go.base.t4.txt",
+      "e8828808260eb2a4da591024601538ee17aafd52e923458dddc04202eed05652  go.b.t12.txt",
+      "e8828808260eb2a4da591024601538ee17aafd52e923458dddc04202eed05652  go.b.t1.txt",
+      "e8828808260eb2a4da591024601538ee17aafd52e923458dddc04202eed05652  go.b.t4.txt",
+      "134e4dc12a8fc0007ff87e88843a498ae7737b778c6c2aedc6c67d9b62c3dff6  ore_ont_13482.a.t12.txt",
+      "134e4dc12a8fc0007ff87e88843a498ae7737b778c6c2aedc6c67d9b62c3dff6  ore_ont_13482.a.t1.txt",
+      "134e4dc12a8fc0007ff87e88843a498ae7737b778c6c2aedc6c67d9b62c3dff6  ore_ont_13482.a.t4.txt",
+      "134e4dc12a8fc0007ff87e88843a498ae7737b778c6c2aedc6c67d9b62c3dff6  ore_ont_13482.base.t12.txt",
+      "134e4dc12a8fc0007ff87e88843a498ae7737b778c6c2aedc6c67d9b62c3dff6  ore_ont_13482.base.t1.txt",
+      "134e4dc12a8fc0007ff87e88843a498ae7737b778c6c2aedc6c67d9b62c3dff6  ore_ont_13482.base.t4.txt",
+      "134e4dc12a8fc0007ff87e88843a498ae7737b778c6c2aedc6c67d9b62c3dff6  ore_ont_13482.b.t12.txt",
+      "134e4dc12a8fc0007ff87e88843a498ae7737b778c6c2aedc6c67d9b62c3dff6  ore_ont_13482.b.t1.txt",
+      "134e4dc12a8fc0007ff87e88843a498ae7737b778c6c2aedc6c67d9b62c3dff6  ore_ont_13482.b.t4.txt",
+      "8e65785e3163d2ca696be33fa3f6d3cbd6c9df094b40806734cfba9ffe7f9975  ore_ont_3836.a.t12.txt",
+      "8e65785e3163d2ca696be33fa3f6d3cbd6c9df094b40806734cfba9ffe7f9975  ore_ont_3836.a.t1.txt",
+      "8e65785e3163d2ca696be33fa3f6d3cbd6c9df094b40806734cfba9ffe7f9975  ore_ont_3836.a.t4.txt",
+      "8e65785e3163d2ca696be33fa3f6d3cbd6c9df094b40806734cfba9ffe7f9975  ore_ont_3836.base.t12.txt",
+      "8e65785e3163d2ca696be33fa3f6d3cbd6c9df094b40806734cfba9ffe7f9975  ore_ont_3836.base.t1.txt",
+      "8e65785e3163d2ca696be33fa3f6d3cbd6c9df094b40806734cfba9ffe7f9975  ore_ont_3836.base.t4.txt",
+      "8e65785e3163d2ca696be33fa3f6d3cbd6c9df094b40806734cfba9ffe7f9975  ore_ont_3836.b.t12.txt",
+      "8e65785e3163d2ca696be33fa3f6d3cbd6c9df094b40806734cfba9ffe7f9975  ore_ont_3836.b.t1.txt",
+      "8e65785e3163d2ca696be33fa3f6d3cbd6c9df094b40806734cfba9ffe7f9975  ore_ont_3836.b.t4.txt",
+      ""
+     ]
+    }
+   },
+   "konclude": {
+    "konclude.t1": {
+     "threads": 1,
+     "parseMs": [
+      13682.0
+     ],
+     "classifyMs": [
+      9494.0
+     ],
+     "totalMs": [
+      23176.0
+     ],
+     "wallMs": [
+      24478.3
+     ],
+     "peakRssKib": [
+      6993064
+     ],
+     "classes": 136612,
+     "consistent": true
+    },
+    "konclude.t12": {
+     "threads": 12,
+     "parseMs": [
+      13739.0
+     ],
+     "classifyMs": [
+      9733.0
+     ],
+     "totalMs": [
+      23472.0
+     ],
+     "wallMs": [
+      24779.0
+     ],
+     "peakRssKib": [
+      6998404
+     ],
+     "classes": 136612,
+     "consistent": true
+    },
+    "konclude.t4": {
+     "threads": 4,
+     "parseMs": [
+      14159.0
+     ],
+     "classifyMs": [
+      9646.0
+     ],
+     "totalMs": [
+      23805.0
+     ],
+     "wallMs": [
+      25125.1
+     ],
+     "peakRssKib": [
+      6999656
+     ],
+     "classes": 136612,
+     "consistent": true
+    }
+   },
+   "log": [
+    "2026-11-10T19:03:36Z start host=atlas load=2.03 2.52 3.42",
+    "2026-11-10T19:03:40Z sha base d08ea7915a897c64",
+    "2026-11-10T19:03:40Z sha a 6295063ead49a83b",
+    "2026-11-10T19:03:40Z sha b 3783615b1d63075f",
+    "2026-11-10T19:04:12Z mem base t4 rc=0 tax=69ffb80499088147 wall=32.27 rss_kib=7948040",
+    "2026-11-10T19:04:38Z mem a t4 rc=0 tax=69ffb80499088147 wall=25.67 rss_kib=5810004",
+    "2026-11-10T19:04:56Z mem b t4 rc=0 tax=69ffb80499088147 wall=17.47 rss_kib=4887472",
+    "2026-11-10T19:05:17Z mem base t12 rc=0 tax=69ffb80499088147 wall=20.77 rss_kib=8848012",
+    "2026-11-10T19:05:34Z mem a t12 rc=0 tax=69ffb80499088147 wall=16.07 rss_kib=6748980",
+    "2026-11-10T19:05:47Z mem b t12 rc=0 tax=69ffb80499088147 wall=12.49 rss_kib=7721116",
+    "2026-11-10T19:07:14Z mem base t1 rc=0 tax=69ffb80499088147 wall=87.16 rss_kib=6196448",
+    "2026-11-10T19:08:32Z mem a t1 rc=0 tax=69ffb80499088147 wall=77.86 rss_kib=3780668",
+    "2026-11-10T19:09:20Z mem b t1 rc=0 tax=69ffb80499088147 wall=47.84 rss_kib=3947280",
+    "2026-11-10T19:09:20Z mem done",
+    "AB-DONE out-20261110T190920Z",
+    "2026-11-10T19:21:23Z ab done",
+    "2026-11-10T19:21:27Z SLOT-DONE"
+   ]
+  },
+  "slot-20261110T204137Z": {
+   "binary_sha256_prefix": {
+    "base": "d08ea7915a897c64",
+    "b3": "e9040df38cdecd29"
+   },
+   "started": "2026-11-10T20:41:37Z",
+   "ended": "2026-11-10T20:53:29Z",
+   "ore_ont_8737": {
+    "b3.t1": {
+     "classify_s": 45.92,
+     "saturation_s": 45.04,
+     "wall_s": 49.12,
+     "peak_rss_gib": 3.76,
+     "peak_estimate_gib": 1.7,
+     "conclusions": 1622016820,
+     "taxonomy": "69ffb80499088147",
+     "tier": "horn"
+    },
+    "b3.t12": {
+     "classify_s": 9.4,
+     "saturation_s": 9.01,
+     "wall_s": 12.93,
+     "peak_rss_gib": 7.86,
+     "peak_estimate_gib": 3.48,
+     "conclusions": 1321337222,
+     "taxonomy": "69ffb80499088147",
+     "tier": "horn"
+    },
+    "b3.t4": {
+     "classify_s": 14.0,
+     "saturation_s": 13.53,
+     "wall_s": 17.28,
+     "peak_rss_gib": 5.07,
+     "peak_estimate_gib": 2.15,
+     "conclusions": 1264989105,
+     "taxonomy": "69ffb80499088147",
+     "tier": "horn"
+    },
+    "base.t1": {
+     "classify_s": 83.89,
+     "saturation_s": 83.0,
+     "wall_s": 87.2,
+     "peak_rss_gib": 5.91,
+     "peak_estimate_gib": 3.21,
+     "conclusions": 2238430644,
+     "taxonomy": "69ffb80499088147",
+     "tier": "horn"
+    },
+    "base.t12": {
+     "classify_s": 18.85,
+     "saturation_s": 18.46,
+     "wall_s": 22.53,
+     "peak_rss_gib": 9.91,
+     "peak_estimate_gib": 5.39,
+     "conclusions": 2155695391,
+     "taxonomy": "69ffb80499088147",
+     "tier": "horn"
+    },
+    "base.t4": {
+     "classify_s": 25.6,
+     "saturation_s": 25.15,
+     "wall_s": 28.8,
+     "peak_rss_gib": 6.87,
+     "peak_estimate_gib": 3.46,
+     "conclusions": 2116525680,
+     "taxonomy": "69ffb80499088147",
+     "tier": "horn"
+    }
+   },
+   "ab": {
+    "out-20261110T204521Z": {
+     "env": [
+      "host=atlas",
+      "cpu=13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus=20",
+      "kernel=7.2.9",
+      "binary_sha256 base=d08ea7915a897c649d105e60c0f103d16e03c0d2ee9bd5ad8de424fa65053b61",
+      "binary_sha256 b3=e9040df38cdecd293242ff4dd51079aa5944043cf17e780ed6da1bad0828a116",
+      "data_sha256 go.ofn=fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375",
+      "data_sha256 chebi_lite.ofn=be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4",
+      "data_sha256 ore-el/ore_ont_3836.owl=fc559045f566b2837188505b707480dc3416b3e699c5188632fa5be3d4cf2473",
+      "data_sha256 ore-el/ore_ont_13482.owl=f732cc7d4ebdb45099e421d062e05d64837b22e60b53d6848a723aa8f0e8d971",
+      "rounds=6 threads=1 4 12 repeat=5 pin1=4 pinn=0-11",
+      "started=2026-11-10T20:45:22Z load=3.36 3.64 3.41",
+      "ended=2026-11-10T20:53:14Z load=3.93 4.26 3.82",
+      ""
+     ],
+     "results": {
+      "chebi_lite t1 b3": {
+       "classify_median_ms": 1077.21,
+       "saturation_ms": 722.32,
+       "index_ms": 122.65,
+       "rounds_ms": [
+        1077.89,
+        1075.8,
+        1076.54,
+        1082.11,
+        1076.51,
+        1080.84
+       ],
+       "failed": 0
+      },
+      "chebi_lite t1 base": {
+       "classify_median_ms": 1057.17,
+       "saturation_ms": 701.16,
+       "index_ms": 124.97,
+       "rounds_ms": [
+        1074.03,
+        1060.84,
+        1057.5,
+        1055.82,
+        1056.77,
+        1056.84
+       ],
+       "failed": 0
+      },
+      "chebi_lite t4 b3": {
+       "classify_median_ms": 439.57,
+       "saturation_ms": 255.43,
+       "index_ms": 78.75,
+       "rounds_ms": [
+        435.51,
+        437.12,
+        442.02,
+        454.72,
+        451.84,
+        424.75
+       ],
+       "failed": 0
+      },
+      "chebi_lite t4 base": {
+       "classify_median_ms": 436.01,
+       "saturation_ms": 249.29,
+       "index_ms": 78.53,
+       "rounds_ms": [
+        432.84,
+        423.48,
+        439.18,
+        446.1,
+        429.08,
+        446.68
+       ],
+       "failed": 0
+      },
+      "chebi_lite t12 b3": {
+       "classify_median_ms": 444.85,
+       "saturation_ms": 345.67,
+       "index_ms": 71.27,
+       "rounds_ms": [
+        405.72,
+        403.75,
+        522.12,
+        411.63,
+        478.06,
+        540.05
+       ],
+       "failed": 0
+      },
+      "chebi_lite t12 base": {
+       "classify_median_ms": 404.89,
+       "saturation_ms": 334.06,
+       "index_ms": 71.1,
+       "rounds_ms": [
+        403.41,
+        413.8,
+        409.14,
+        404.28,
+        400.9,
+        405.49
+       ],
+       "failed": 0
+      },
+      "go t1 b3": {
+       "classify_median_ms": 308.92,
+       "saturation_ms": 247.03,
+       "index_ms": 31.07,
+       "rounds_ms": [
+        308.63,
+        306.16,
+        308.41,
+        309.37,
+        309.22,
+        309.55
+       ],
+       "failed": 0
+      },
+      "go t1 base": {
+       "classify_median_ms": 308.75,
+       "saturation_ms": 247.25,
+       "index_ms": 31.49,
+       "rounds_ms": [
+        309.07,
+        308.42,
+        309.71,
+        308.23,
+        309.07,
+        308.09
+       ],
+       "failed": 0
+      },
+      "go t4 b3": {
+       "classify_median_ms": 105.29,
+       "saturation_ms": 64.33,
+       "index_ms": 24.55,
+       "rounds_ms": [
+        105.89,
+        105.92,
+        105.12,
+        105.45,
+        105.04,
+        104.47
+       ],
+       "failed": 0
+      },
+      "go t4 base": {
+       "classify_median_ms": 106.68,
+       "saturation_ms": 65.81,
+       "index_ms": 24.72,
+       "rounds_ms": [
+        107.36,
+        106.67,
+        106.69,
+        106.14,
+        106.88,
+        106.68
+       ],
+       "failed": 0
+      },
+      "go t12 b3": {
+       "classify_median_ms": 78.05,
+       "saturation_ms": 40.27,
+       "index_ms": 24.45,
+       "rounds_ms": [
+        77.89,
+        78.23,
+        78.04,
+        78.07,
+        79.45,
+        77.04
+       ],
+       "failed": 0
+      },
+      "go t12 base": {
+       "classify_median_ms": 78.08,
+       "saturation_ms": 41.03,
+       "index_ms": 24.44,
+       "rounds_ms": [
+        78.03,
+        77.24,
+        78.55,
+        76.88,
+        80.08,
+        78.13
+       ],
+       "failed": 0
+      },
+      "ore_ont_13482 t1 b3": {
+       "classify_median_ms": 941.67,
+       "saturation_ms": 568.63,
+       "index_ms": 329.91,
+       "rounds_ms": [
+        947.09,
+        939.75,
+        946.53,
+        940.65,
+        942.68,
+        939.46
+       ],
+       "failed": 0
+      },
+      "ore_ont_13482 t1 base": {
+       "classify_median_ms": 910.58,
+       "saturation_ms": 539.85,
+       "index_ms": 317.89,
+       "rounds_ms": [
+        917.21,
+        910.73,
+        915.57,
+        907.24,
+        907.92,
+        910.44
+       ],
+       "failed": 0
+      },
+      "ore_ont_13482 t4 b3": {
+       "classify_median_ms": 403.26,
+       "saturation_ms": 154.64,
+       "index_ms": 211.6,
+       "rounds_ms": [
+        394.73,
+        398.18,
+        401.73,
+        404.79,
+        407.36,
+        405.85
+       ],
+       "failed": 0
+      },
+      "ore_ont_13482 t4 base": {
+       "classify_median_ms": 391.2,
+       "saturation_ms": 143.16,
+       "index_ms": 211.15,
+       "rounds_ms": [
+        389.84,
+        392.25,
+        394.08,
+        383.97,
+        397.61,
+        390.15
+       ],
+       "failed": 0
+      },
+      "ore_ont_13482 t12 b3": {
+       "classify_median_ms": 297.48,
+       "saturation_ms": 85.07,
+       "index_ms": 170.19,
+       "rounds_ms": [
+        299.59,
+        298.33,
+        297.74,
+        297.22,
+        293.71,
+        296.3
+       ],
+       "failed": 0
+      },
+      "ore_ont_13482 t12 base": {
+       "classify_median_ms": 295.92,
+       "saturation_ms": 84.33,
+       "index_ms": 169.92,
+       "rounds_ms": [
+        295.27,
+        295.34,
+        300.39,
+        296.49,
+        295.12,
+        298.05
+       ],
+       "failed": 0
+      },
+      "ore_ont_3836 t1 b3": {
+       "classify_median_ms": 587.22,
+       "saturation_ms": 133.12,
+       "index_ms": 423.81,
+       "rounds_ms": [
+        590.74,
+        587.06,
+        590.52,
+        585.85,
+        580.67,
+        587.39
+       ],
+       "failed": 0
+      },
+      "ore_ont_3836 t1 base": {
+       "classify_median_ms": 588.66,
+       "saturation_ms": 129.48,
+       "index_ms": 428.74,
+       "rounds_ms": [
+        585.59,
+        587.13,
+        658.3,
+        589.66,
+        587.66,
+        590.29
+       ],
+       "failed": 0
+      },
+      "ore_ont_3836 t4 b3": {
+       "classify_median_ms": 248.6,
+       "saturation_ms": 37.04,
+       "index_ms": 186.59,
+       "rounds_ms": [
+        248.84,
+        249.08,
+        247.44,
+        248.36,
+        247.9,
+        249.49
+       ],
+       "failed": 0
+      },
+      "ore_ont_3836 t4 base": {
+       "classify_median_ms": 250.32,
+       "saturation_ms": 34.06,
+       "index_ms": 189.52,
+       "rounds_ms": [
+        249.85,
+        252.58,
+        247.78,
+        253.42,
+        248.71,
+        250.78
+       ],
+       "failed": 0
+      },
+      "ore_ont_3836 t12 b3": {
+       "classify_median_ms": 192.19,
+       "saturation_ms": 18.04,
+       "index_ms": 149.22,
+       "rounds_ms": [
+        191.62,
+        194.67,
+        191.63,
+        193.61,
+        191.39,
+        192.76
+       ],
+       "failed": 0
+      },
+      "ore_ont_3836 t12 base": {
+       "classify_median_ms": 194.17,
+       "saturation_ms": 18.25,
+       "index_ms": 149.95,
+       "rounds_ms": [
+        194.51,
+        194.71,
+        193.29,
+        193.82,
+        192.08,
+        196.78
+       ],
+       "failed": 0
+      }
+     },
+     "taxonomy_sha256": [
+      "16cef2fe9a395a52d0ab20bef22a7d8e31f2fc9394d035ffa15914d20a888fc6  chebi_lite.b3.t12.txt",
+      "16cef2fe9a395a52d0ab20bef22a7d8e31f2fc9394d035ffa15914d20a888fc6  chebi_lite.b3.t1.txt",
+      "16cef2fe9a395a52d0ab20bef22a7d8e31f2fc9394d035ffa15914d20a888fc6  chebi_lite.b3.t4.txt",
+      "16cef2fe9a395a52d0ab20bef22a7d8e31f2fc9394d035ffa15914d20a888fc6  chebi_lite.base.t12.txt",
+      "16cef2fe9a395a52d0ab20bef22a7d8e31f2fc9394d035ffa15914d20a888fc6  chebi_lite.base.t1.txt",
+      "16cef2fe9a395a52d0ab20bef22a7d8e31f2fc9394d035ffa15914d20a888fc6  chebi_lite.base.t4.txt",
+      "e8828808260eb2a4da591024601538ee17aafd52e923458dddc04202eed05652  go.b3.t12.txt",
+      "e8828808260eb2a4da591024601538ee17aafd52e923458dddc04202eed05652  go.b3.t1.txt",
+      "e8828808260eb2a4da591024601538ee17aafd52e923458dddc04202eed05652  go.b3.t4.txt",
+      "e8828808260eb2a4da591024601538ee17aafd52e923458dddc04202eed05652  go.base.t12.txt",
+      "e8828808260eb2a4da591024601538ee17aafd52e923458dddc04202eed05652  go.base.t1.txt",
+      "e8828808260eb2a4da591024601538ee17aafd52e923458dddc04202eed05652  go.base.t4.txt",
+      "134e4dc12a8fc0007ff87e88843a498ae7737b778c6c2aedc6c67d9b62c3dff6  ore_ont_13482.b3.t12.txt",
+      "134e4dc12a8fc0007ff87e88843a498ae7737b778c6c2aedc6c67d9b62c3dff6  ore_ont_13482.b3.t1.txt",
+      "134e4dc12a8fc0007ff87e88843a498ae7737b778c6c2aedc6c67d9b62c3dff6  ore_ont_13482.b3.t4.txt",
+      "134e4dc12a8fc0007ff87e88843a498ae7737b778c6c2aedc6c67d9b62c3dff6  ore_ont_13482.base.t12.txt",
+      "134e4dc12a8fc0007ff87e88843a498ae7737b778c6c2aedc6c67d9b62c3dff6  ore_ont_13482.base.t1.txt",
+      "134e4dc12a8fc0007ff87e88843a498ae7737b778c6c2aedc6c67d9b62c3dff6  ore_ont_13482.base.t4.txt",
+      "8e65785e3163d2ca696be33fa3f6d3cbd6c9df094b40806734cfba9ffe7f9975  ore_ont_3836.b3.t12.txt",
+      "8e65785e3163d2ca696be33fa3f6d3cbd6c9df094b40806734cfba9ffe7f9975  ore_ont_3836.b3.t1.txt",
+      "8e65785e3163d2ca696be33fa3f6d3cbd6c9df094b40806734cfba9ffe7f9975  ore_ont_3836.b3.t4.txt",
+      "8e65785e3163d2ca696be33fa3f6d3cbd6c9df094b40806734cfba9ffe7f9975  ore_ont_3836.base.t12.txt",
+      "8e65785e3163d2ca696be33fa3f6d3cbd6c9df094b40806734cfba9ffe7f9975  ore_ont_3836.base.t1.txt",
+      "8e65785e3163d2ca696be33fa3f6d3cbd6c9df094b40806734cfba9ffe7f9975  ore_ont_3836.base.t4.txt",
+      ""
+     ]
+    }
+   },
+   "konclude": {},
+   "log": [
+    "2026-11-10T20:41:37Z start host=atlas load=3.00 3.05 3.16",
+    "2026-11-10T20:41:42Z sha base d08ea7915a897c64",
+    "2026-11-10T20:41:42Z sha b3 e9040df38cdecd29",
+    "2026-11-10T20:42:11Z mem base t4 rc=0 tax=69ffb80499088147 wall=28.80 rss_kib=7207256",
+    "2026-11-10T20:42:28Z mem b3 t4 rc=0 tax=69ffb80499088147 wall=17.28 rss_kib=5313800",
+    "2026-11-10T20:42:51Z mem base t12 rc=0 tax=69ffb80499088147 wall=22.53 rss_kib=10386920",
+    "2026-11-10T20:43:04Z mem b3 t12 rc=0 tax=69ffb80499088147 wall=12.93 rss_kib=8246060",
+    "2026-11-10T20:44:32Z mem base t1 rc=0 tax=69ffb80499088147 wall=87.20 rss_kib=6201016",
+    "2026-11-10T20:45:21Z mem b3 t1 rc=0 tax=69ffb80499088147 wall=49.12 rss_kib=3942948",
+    "2026-11-10T20:45:21Z mem done",
+    "AB-DONE out-20261110T204521Z",
+    "2026-11-10T20:53:25Z ab done",
+    "2026-11-10T20:53:29Z SLOT-DONE"
+   ]
+  }
+ },
+ "stanley": {
+  "host": "stanley, Intel Core Ultra X7 358H, 16 cores, 30 GiB, Linux 7.3.0, other lanes' builds and tests running",
+  "note": "approximate timings; the laptop was shared, so only the profile shares and the counters are evidence",
+  "runs": {
+   "base.t4.stanley1": {
+    "saturation_s": 26.52,
+    "classify_s": 26.93,
+    "wall_s": 29.64,
+    "peak_rss_gib": 6.66,
+    "peak_estimate_gib": 3.41,
+    "conclusions": 2127205657,
+    "tier": "horn"
+   },
+   "a.t4.stanley1": {
+    "saturation_s": 39.48,
+    "classify_s": 40.16,
+    "wall_s": 44.31,
+    "peak_rss_gib": 4.74,
+    "peak_estimate_gib": 2.12,
+    "conclusions": 1303772824,
+    "tier": "horn"
+   },
+   "b.t4.stanley1": {
+    "saturation_s": 15.09,
+    "classify_s": 15.62,
+    "wall_s": 21.9,
+    "peak_rss_gib": 4.97,
+    "peak_estimate_gib": 2.24,
+    "conclusions": 1252502535,
+    "tier": "horn"
+   },
+   "base.t8.stanley1": {
+    "saturation_s": 20.83,
+    "classify_s": 21.25,
+    "wall_s": 26.11,
+    "peak_rss_gib": 7.3,
+    "peak_estimate_gib": 3.8,
+    "conclusions": 2123331568,
+    "tier": "horn"
+   },
+   "b.t8.stanley1": {
+    "saturation_s": 14.59,
+    "classify_s": 15.26,
+    "wall_s": 21.78,
+    "peak_rss_gib": 5.59,
+    "peak_estimate_gib": 2.48,
+    "conclusions": 1288670210,
+    "tier": "horn"
+   },
+   "stats.t4.stanley1": {
+    "saturation_s": 44.45,
+    "classify_s": 45.18,
+    "wall_s": 51.74,
+    "peak_rss_gib": 7.53,
+    "peak_estimate_gib": 3.9,
+    "conclusions": 2124278830,
+    "tier": "horn"
+   }
+  },
+  "profile_cycles_percent": {
+   "base.t4": {
+    "<sparkles_owl::classify::saturate::Run>::deliver": 26.07,
+    "<sparkles_owl::classify::saturate::Run>::deliver_new": 18.34,
+    "<sparkles_owl::classify::saturate::Out as sparkles_owl::classify::saturate::Sink>::send": 11.6,
+    "<sparkles_owl::classify::saturate::Small<u32>>::contains": 10.57,
+    "<sparkles_owl::classify::saturate::Run>::worker::<sparkles_owl::classify::saturate::Plain>": 9.53,
+    "<hashbrown::map::HashMap<(u32, u32), (), rustc_hash::FxBuildHasher>>::insert": 6.23,
+    "__memmove_avx_unaligned_erms": 4.38,
+    "<sparkles_owl::classify::saturate::State>::holds": 2.47,
+    "0000000000000000": 1.38,
+    "<sparkles_owl::classify::saturate::Small<(u32, u32)>>::insert": 0.73,
+    "<sparkles_owl::classify::saturate::Small<u32>>::insert": 0.76,
+    "<sparkles_owl::ofn_read::Reader>::lex": 0.67
+   },
+   "b.t4": {
+    "<sparkles_owl::classify::saturate::Out as sparkles_owl::classify::saturate::Sink>::send": 22.16,
+    "<sparkles_owl::classify::saturate::State>::holds": 17.13,
+    "<sparkles_owl::classify::saturate::Small<u32>>::contains": 12.37,
+    "<sparkles_owl::classify::saturate::Run>::deliver_new": 7.96,
+    "<hashbrown::map::HashMap<(u32, u32), (), rustc_hash::FxBuildHasher>>::insert": 6.61,
+    "<sparkles_owl::classify::saturate::Run>::worker::<sparkles_owl::classify::saturate::Plain>": 6.38,
+    "__memmove_avx_unaligned_erms": 5.94,
+    "<sparkles_owl::classify::saturate::Run>::flush_links": 3.83,
+    "<sparkles_owl::classify::saturate::Run>::deliver": 1.75,
+    "0000000000000000": 1.31,
+    "<sparkles_owl::classify::saturate::Small<u32>>::insert": 0.92,
+    "<sparkles_owl::classify::index::Interner>::class": 0.86,
+    "<sparkles_owl::classify::saturate::Small<(u32, u32)>>::insert": 0.67,
+    "core::slice::sort::stable::quicksort::quicksort::<sparkles_owl::classify::saturate::Dest, <[sparkles_owl::classify::saturate::Dest]>::sort_by_key<u32, <sparkles_owl::classify::saturate::Outbox>::group::{closure#0}>::{closure#0}>": 0.66,
+    "__memcmp_avx2_movbe": 0.62,
+    "<alloc::collections::btree::set::BTreeSet<sparkles_owl::model::Entity>>::insert": 0.51,
+    "<sparkles_owl::ofn_read::Reader>::lex": 1.57,
+    "<oxiri::IriParser<oxiri::VoidOutputBuffer, false>>::parse_authority": 0.84,
+    "<oxiri::IriParser<oxiri::VoidOutputBuffer, false>>::parse_path::<false>": 0.81,
+    "<oxiri::IriParser<oxiri::VoidOutputBuffer, false>>::parse_host": 0.71,
+    "oxiri::is_iunreserved_or_sub_delims": 0.51
+   }
+  },
+  "message_counters_base_t4": {
+   "sent_sub": 0,
+   "sent_back": 1491345914,
+   "sent_fwd": 1488801128,
+   "sent_other": 0,
+   "deliver_calls": 738588,
+   "groups": 225806566,
+   "msgs_filter_on": 2890886925,
+   "msgs_busy": 20280548,
+   "msgs_uninit": 61248653,
+   "msgs_checked": 2809357724,
+   "dropped_sub": 0,
+   "dropped_back": 876608090,
+   "dropped_fwd": 0,
+   "msgs_filter_off": 89260117,
+   "deliver_idle": 2,
+   "dropped_other": 0
+  },
+  "counter_patch": "variant-stats.diff, built as commit 9404d46d in a detached worktree, never merged",
+  "taxonomy_sweep": {
+   "files": 300,
+   "differing": 0,
+   "failed": 0,
+   "sides": [
+    "base",
+    "b"
+   ],
+   "threads": [
+    1,
+    8
+   ],
+   "hashes": "measure/tax/hashes.txt"
+  }
+ }
+}
