@@ -791,12 +791,13 @@ conclusions on four threads against 2.12 billion, and peaks at 5.1 GiB of reside
 on four threads against 6.9 GiB, with the same taxonomy on every thread count. In an earlier
 slot the base took 28.6 s on four threads and the filter alone 22.0 s, and the runs take the
 rest. Konclude 0.7.0 classifies the ontology on `atlas` in 9.5 to 9.7 s with one, four or
-twelve workers, at 7.0 GB, so the run on twelve threads is now faster than Konclude and the
-run on four threads takes 1.4 times its time in two thirds of its memory. The 298 ORE 2015 EL
+twelve workers, at 6.7 GiB, so the run on twelve threads is now faster than Konclude and the
+run on four threads takes 1.4 times its time in three quarters of its memory. The 298 ORE 2015 EL
 files, GO and ChEBI lite give the same taxonomies on one and eight threads. GO and
 `ore_ont_3836` classify within 1% of the base on one, four and twelve threads, ChEBI lite
-1.9% slower on one thread and within its spread on four and twelve, and `ore_ont_13482` 3.4%
-slower on one thread and 3.1% on four, which item 890 follows. The
+1.9% slower on one thread, within its spread on four and slower in three of six rounds on
+twelve, and `ore_ont_13482` 3.4% slower on one thread and 3.1% on four, which item 890
+follows for both files. The
 remaining cycles of a four-thread run are the sends, 22%, the filter's probes of the
 destination's tables, 29%, and the to-do list copies, 8%, which item 889 follows.
 

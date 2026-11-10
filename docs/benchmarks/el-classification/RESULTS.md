@@ -856,7 +856,7 @@ all of it the radix sort of the outbox's messages by destination, 18% in the fil
 `Run::deliver_new`, 12% in `Out::send`, 11% in the hash lookups of the filter and about 30%
 in the rules.
 
-The lane makes two changes. A congested delivery drops every kind of conclusion that
+Item 818 makes two changes. A congested delivery drops every kind of conclusion that
 `State::holds` answers, forward links and loops included. And the rules of `Back`, `Fwd` and
 the existential subsumers store their link and leave its products, the subsumer each
 propagation gives each source and the links the chains compose from each pair, to the
@@ -864,14 +864,14 @@ activation, which sends them once its to-do list is empty, or when idle workers 
 pairing what is new since its last flush with everything and what is old with what is new.
 The products for one source or target leave the context together, the outbox records these
 runs and sorts the run headers rather than the messages, and a delivery checks a long run
-against one context's state. In the lane's profile on four threads `Run::deliver` takes 2%,
+against one context's state. In the profile of commit bd924609 on four threads `Run::deliver` takes 2%,
 the sends 22%, the filter's lookups 29% and the rules about 15%.
 
 These measurements ran on `atlas`, which has the benchmark host's hardware, with no other
 benchmark or gate on the host and no swap in use. The base is commit 321508fe, a is the
 filter alone, commit 181e9c95, b adds the runs, commit fb894c98, and b3 adds a flush that
-returns at once when the activation stored nothing and the fixes of the review, commit
-bd924609, which is the saturation code of the lane. A first slot ran the base, a and b, and
+returns at once when the activation stored nothing and builds its run in chunks, commit
+bd924609, which is the saturation code that landed. A first slot ran the base, a and b, and
 a second slot the base and b3. One run of each side and thread count classified
 `ore_ont_8737` in a scope with a 13 GiB cap.
 
@@ -895,18 +895,18 @@ a second slot the base and b3. One run of each side and thread count classified
 
 The base's run on four threads took 28.6 s in the first slot and 25.2 s in the second, with
 peaks of 7.6 and 6.9 GiB, as the threads' timing decides which contexts are free when their
-messages arrive, and the lane's runs vary less.
+messages arrive, and the runs of b and b3 vary less.
 
 Every run gave the taxonomy of the base. Konclude 0.7.0-1138 classified the same file on
 `atlas` in 9.49 s with one worker, 9.65 s with four and 9.73 s with twelve, after 13.7 to
-14.2 s of parsing, at 7.0 GB of resident memory, so its classification does not use the
-workers. The lane's run on twelve threads is faster than Konclude's classification, and its
-run on four threads takes 1.4 times Konclude's time in 0.7 of its memory.
+14.2 s of parsing, at 6.7 GiB of resident memory, so its classification does not use the
+workers. The run of b3 on twelve threads is faster than Konclude's classification, and its
+run on four threads takes 1.4 times Konclude's time in three quarters of its memory.
 
 The same slot ran six interleaved rounds of GO, ChEBI lite, `ore_ont_3836` and
 `ore_ont_13482` on one, four and twelve threads, five classifications per process, the
 one-thread runs pinned to one CPU and the others to twelve. The table gives the median of
-the rounds in milliseconds and the lane's ratio to the base.
+the rounds in milliseconds and the ratio of b3 to the base.
 
 | File | Threads | Base, ms | b3, ms | b3 / base |
 |---|---:|---:|---:|---:|
@@ -923,14 +923,15 @@ the rounds in milliseconds and the lane's ratio to the base.
 | `ore_ont_13482` | 4 | 391.2 | 403.3 | 1.031 |
 | `ore_ont_13482` | 12 | 295.9 | 297.5 | 1.005 |
 
-ChEBI lite's twelve-thread rounds of b3 spread from 404 to 540 ms against 401 to 414 for
-the base, so its ratio there is one round's outlier. `ore_ont_13482` is 3.1 to 3.4% slower on
-one and four threads, which roadmap item 890 follows. In the first slot, before the flush
+ChEBI lite's twelve-thread rounds of b3 were 406, 404, 522, 412, 478 and 540 ms against
+401 to 414 ms for the base, so three of six rounds are slower, and its one-thread run is
+1.9% slower. `ore_ont_13482` is 3.1 to 3.4% slower on one and four threads. Roadmap item
+890 follows both files. In the first slot, before the flush
 returned at once when nothing is pending, b had been 2.9% slower than the base on ChEBI
 lite on one thread and 5.0% on four, and 3.0 and 3.8% slower on `ore_ont_13482`.
 
 Every side gave the same taxonomy on every file and thread count. On the laptop the 298 ORE
-2015 EL files, GO and ChEBI lite gave the base's taxonomies with the lane on one and eight
+2015 EL files, GO and ChEBI lite gave the base's taxonomies with b, commit fb894c98, on one and eight
 threads, and `ore_ont_8737` gave it on one, four, eight and twelve threads.
 
 ## Records

@@ -633,13 +633,14 @@ and the new build is 0.6% faster to 0.9% slower than the one before on them, ite
 A context of the EL saturation sends the products of its backward links with its forward
 links and propagations once its to-do list is empty, in one run per source or target, and
 the outbox sorts these runs rather than its messages, while a congested delivery drops every
-kind of conclusion the context holds, forward links included (roadmap item 818). On atlas
+kind of conclusion the context holds, forward links included, for roadmap item 818. On atlas
 the saturation of `ore_ont_8737`, a transitive closure of 2.5 million existential
 restrictions, takes 13.5 s on four threads instead of 25.2 s, 9.0 s on twelve instead of
 18.5 s and 45.0 s on one instead of 83.0 s, and peaks at 5.1 instead of 6.9 GiB on four
-threads, with the same taxonomies on 300 files. Konclude 0.7.0 classifies it on atlas in 9.5 to 9.7 s at 7.0 GB with any number
+threads, with the same taxonomies on 300 files. Konclude 0.7.0 classifies it on atlas in 9.5 to 9.7 s at 6.7 GiB with any number
 of workers. GO and ore_ont_3836 are unchanged, ChEBI lite is 1.9% slower on one thread
-and ore_ont_13482 3% slower on one and four threads, item 890.
+and slower in half of its twelve-thread rounds, and ore_ont_13482 3% slower on one and
+four threads, item 890.
 
 A congested EL saturation drops the subsumptions and backward links it delivers to a
 context that already holds them (roadmap item 695). The peak resident set of

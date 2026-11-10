@@ -755,9 +755,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   restrictions over a transitive symmetric role derives each link of the transitive
   closure once per intermediate class, so it sends three billion messages for 32 million
   conclusions. On `atlas` it takes 13.5 s on four threads and 9 s on twelve, and peaks at
-  5.1 GiB on four threads. Konclude 0.7.0 classifies it in 9.5 s on the same host at 7.0 GB, with any
-  number of workers, so a run on four threads is 1.4 times slower and a run on twelve
-  faster. Roadmap item 889 follows the rest of the
+  5.1 GiB on four threads. Konclude 0.7.0 classifies it in 9.5 s on the same host at 6.7 GiB, with any
+  number of workers, so a run on four threads is 1.4 times slower in three quarters of
+  the memory and a run on twelve faster. Roadmap item 889 follows the rest of the
   message cost.
 * A small ontology's first classification in a process on several threads starts its
   helper threads after 0.5 ms of work, and later ones after as long as the last start of
