@@ -106,3 +106,65 @@ fn a_serial_commit_tells_the_guard_before_it_is_published() {
     );
     s.set_failpoint("commit-published", None);
 }
+
+/// The bulk rebuild publishes through the same tail, so its guard learns of the commit
+/// before the new generation's snapshot is current, where it used to learn of it after
+/// the old generation was removed.
+#[test]
+fn a_bulk_commit_tells_the_guard_before_it_is_published() {
+    let dir = tempfile::tempdir().unwrap();
+    let nt = dir.path().join("in.nt");
+    std::fs::write(&nt, "<urn:a> <urn:p> <urn:o> .\n").unwrap();
+    let s = Arc::new(
+        Store::open(
+            &dir.path().join("db"),
+            StoreOptions {
+                group_commit: false,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    let guard = Arc::new(Told {
+        seq: AtomicU64::new(0),
+        head_when_told: AtomicU64::new(u64::MAX),
+        store: Default::default(),
+    });
+    guard.store.set(Arc::downgrade(&s)).unwrap();
+    s.set_guard(Some(guard.clone()));
+    let (published_tx, published_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let go_rx = Mutex::new(go_rx);
+    s.set_failpoint(
+        "commit-published",
+        Some(Arc::new(move |_: &Store| {
+            published_tx.send(()).unwrap();
+            go_rx.lock().recv().unwrap();
+        })),
+    );
+    let committer = {
+        let s = s.clone();
+        // a load into an empty store builds a generation: the bulk path
+        thread::spawn(move || s.load(&[Source::from_path(&nt, None).unwrap()]).unwrap())
+    };
+    let mut commits = s.subscribe_commits();
+    published_rx.recv().unwrap();
+    while *commits.borrow_and_update() < 1 {
+        thread::yield_now();
+    }
+    let head = s.snapshot();
+    assert_eq!((head.commit, head.len()), (1, 1));
+    let told = guard.seq.load(Ordering::SeqCst);
+    let head_when_told = guard.head_when_told.load(Ordering::SeqCst);
+    go_tx.send(()).unwrap();
+    assert_eq!(committer.join().unwrap(), 1);
+    assert_eq!(
+        told, 1,
+        "the guard was not told of the bulk commit before it was published"
+    );
+    assert_eq!(
+        head_when_told, 0,
+        "the guard was told after the snapshot of the bulk commit was current"
+    );
+    s.set_failpoint("commit-published", None);
+}

@@ -5733,9 +5733,8 @@ impl Store {
         );
         // a new generation needs its own spatial base
         self.rebuild_geo_locked(&mut new_snap, snap);
-        // The bulk commit was validated on the built generation and has no change list,
-        // so the tail tells the guard nothing and announces no delta. It schedules its
-        // own index work below.
+        // The bulk commit has no change list, so the tail announces no delta, and it
+        // schedules its own index work below.
         self.publish_committed(Publication::Commit(Committed {
             info: head,
             snapshot: Arc::new(new_snap),
@@ -5743,7 +5742,7 @@ impl Store {
             log_end: None,
             changes: None,
             change,
-            validated: false,
+            validated: validation.is_some(),
         }));
         // and its own vector indexes, built in the background
         self.vectors_switched(snap);
@@ -5783,9 +5782,6 @@ impl Store {
                     let _ = std::fs::remove_dir_all(old);
                 }
             }
-        }
-        if validation.is_some() {
-            self.guard_committed(head.seq);
         }
         // a linked branch that rebuilt no longer reads its upstream's files
         self.release_link_if_rebuilt();

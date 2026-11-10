@@ -12,8 +12,13 @@
 //! The guard learns of a commit before the commit is published. A writer that waits for
 //! the publication of commit N and then validates must check against the state that N
 //! left, and only this order guarantees it. The compaction tap is not part of the tail:
-//! the serial and group paths push it under the writer lock before their write, and a
-//! tail that ran after the fence would change that contract.
+//! the serial path pushes it under the writer lock once its write has returned and the
+//! group path under the same lock before it enqueues, and a tail that the group leader
+//! runs after the fence, without the lock, would change that contract.
+//!
+//! The caller serializes publication. The serial, bulk and compaction paths hold the
+//! writer lock, and the group coordinator publishes a prefix's commits in order while
+//! the writer lock is free, so no two publications run at once.
 
 use super::*;
 
@@ -76,8 +81,8 @@ impl Store {
             })
     }
 
-    /// Publish a commit whose durable write has returned (see the module documentation).
-    /// Call with the writer lock held.
+    /// Publish a commit whose durable write has returned (see the module documentation
+    /// for what serializes the callers).
     pub(super) fn publish_committed(&self, p: Publication<'_>) {
         match p {
             Publication::Commit(c) => self.publish_commit(c),

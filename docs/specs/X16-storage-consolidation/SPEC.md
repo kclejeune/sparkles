@@ -568,14 +568,18 @@ opened generation and the previous snapshot, and the seven struct-update literal
 `Store::publish_committed` in `store/publish.rs` takes a logical commit from the serial
 path, the group leader and the bulk rebuild, and a generation switch from the compaction
 switch, which calls `guard.rekey` between `current.store` and `send_replace`. The tail
-notifies the guard before `current.store` on every path, and a regression test holds a
-serial committer right after its publication while a waiter woken through `commits`
-reads what the guard knows. The compaction tap stays under the writer lock in each path,
-and the quota accounting stays with each path's write, since the serial path counts the
-growth of its files and the group leader settles a prefix's reservations. The bulk path
-adds the generation's prefixes before the tail appends its catalog entry, so a failed
-prefix write leaves the catalog and the snapshot in step. No write moved, and no on-disk
-format changed.
+notifies the guard of a logical commit before `current.store`, which the group path did
+and the serial and bulk paths did after, and a regression test holds a serial committer
+and a bulk committer right after their publication while a waiter woken through
+`commits` reads what the guard knows. The compaction tap stays under the writer lock in
+each path, and the quota accounting stays with each path's write, since the serial path
+counts the growth of its files and the group leader settles a prefix's reservations. No
+write that makes a commit durable moved, and no synchronization changed order. The
+bookkeeping around the publication did change places. The compaction clock and the
+writer head move before the catalog append on the serial and group paths, and the bulk
+path writes the generation's prefixes before the tail appends its catalog entry, so a
+failed prefix write leaves the catalog and the snapshot in step. No on-disk format
+changed.
 
 [Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the
