@@ -113,9 +113,11 @@ that fall back are SERVICE, text search, vector and hybrid search, the five spat
 path search, history changes, view reads, algorithm calls, the predicate-table
 `PatternScan`, `CountJoin`, an index-order top-k without the heap, a path of an
 unsupported shape, remote LATERAL, a registered property function whose registration does
-not declare `prefix_output`, and any node whose EXISTS does not stream, which
-`streams_natively` decides with a depth cap of four and which refuses a LeftJoin
-condition with EXISTS. Several of these kinds have two forms. The `needs_input` methods
+not declare `prefix_output`, and any node one of whose EXISTS patterns cannot itself be
+built without materialization, which `exists_streams` decides by building each pattern
+under the strict policy. The depth cap of four and the refusal of a LeftJoin condition
+with EXISTS belong to `streams_natively`, the admission predicate of automatic execution,
+and not to the fallback. Several of these kinds have two forms. The `needs_input` methods
 of `TextSpec`, `VectorSpec`, `HybridSpec`, `HistorySpec`, `AlgoSpec`, `SpatialPfSpec` and
 `PathSearchSpec` say whether a node reads variables its input binds, and the planner
 places a node that does above its input.
@@ -485,8 +487,9 @@ The phase classifies each node by its form rather than its kind, with the `needs
 method of its specification. A form that reads no input, a SERVICE without input
 variables, a text search with a constant query string, a vector search with a constant
 vector and no candidate join, a hybrid search, history changes, a view read, an algorithm
-call or a spatial scan with constant arguments, and `CountJoin`, answers a whole table
-from the index or a remote endpoint. Whether such a form may become a charged
+call, a spatial scan with constant arguments or a path search between a constant source
+and a constant target, and `CountJoin`, answers a whole table from the index or a remote
+endpoint. Whether such a form may become a charged
 materialized leaf, which runs its kernel once into a `Buffer` charged to the budget and
 serves it batch by batch as `State::Fallback` without inputs does today, is the
 maintainer's [question](#open-decisions), and this half of the phase waits for the
@@ -500,29 +503,38 @@ A form that reads its input, a SERVICE or text, vector, hybrid, history, algorit
 spatial node whose `needs_input` is true, remote LATERAL, path search with input, a path
 of an unsupported shape and a registered property function without `prefix_output`,
 becomes an expanding operator in the manner of `cursor/expand.rs`, which runs the eager
-kernel over each input batch and serves the result. It keeps what the eager kernel does
-per batch, the grouping of distinct query strings of a text search, the candidate
-restriction of a vector search and the correlation of a SERVICE with its input rows, and
-a registered property function without the declaration still collects its whole input,
-since its calls may have effects. A form whose eager kernel needs the whole input, such
-as a spatial join whose build side is the input, builds over the input's batches as the
-hash kernel of item 825 does. An index-order top-k without the heap takes the heap of
-`cursor/topk.rs` with its runtime fallback.
+kernel over each input batch and serves the result where a batch's output is the output
+of its rows. A text search groups the distinct query strings of a batch as the eager
+kernel groups them, a SERVICE keeps its correlation with its input rows, and a registered
+property function without the declaration still collects its whole input, since its calls
+may have effects. A vector or hybrid search whose candidates come from its input is not
+such a form, because `exec::vector_search` collects the candidate subjects of the whole
+group before it asks for its global `k`, so two candidates split across batches would
+both be returned where one search returns the winner. That form accumulates its
+candidates across the input's batches under a charge, ranks them once when the input is
+exhausted, and then serves its `k` results, as a sort does. A form whose eager kernel
+needs the whole input for another reason, such as a spatial join whose build side is the
+input, builds over the input's batches as the hash kernel of item 825 does. An
+index-order top-k without the heap takes the heap of `cursor/topk.rs` with its runtime
+fallback.
 
-After the phase, `State::Fallback` builds only for a node whose EXISTS does not stream,
-and `mise run test:w3c:streaming` records no eager fallback for the W3C query suites.
-The EXISTS that does not stream, an EXISTS deeper than four levels, a LeftJoin condition
-with EXISTS and an EXISTS inside a larger expression, is item 7's remaining work. The
-merge gives it an operator that evaluates its pattern per key through the collected
-cursor of the pattern, so the fallback concept is not needed for it, and until then it is
-a maintained limitation that the streaming record names.
+After the phase, every kind has a cursor, so an EXISTS pattern builds under the strict
+policy as well and `exists_streams` can fail only on a budget, cancellation or timeout
+error. `State::Fallback` therefore goes in this phase, and
+`mise run test:w3c:streaming` records no eager fallback for the W3C query suites. The
+EXISTS shapes that automatic execution keeps eager through `streams_natively`, an EXISTS
+deeper than four levels, a LeftJoin condition with EXISTS and an EXISTS inside a larger
+expression, are item 7's remaining work and an admission choice rather than a fallback,
+and the merge removes the admission with the mode.
 
 The regression tests that fail before the change are a test in `tests/query_cursor.rs`
 that a streaming request over each former fallback form returns a cursor plan without a
-materializing subtree, and a differential test per form at a batch size of one. The edge
-cases are a remote SERVICE that fails after its first batch, which aborts the transfer
-as X05 specifies, a text search whose hits exceed `maxHits`, a spatial join with an empty
-input, a view read during a view rebuild, and an algorithm call inside a transaction.
+materializing subtree, a differential test per form at a batch size of one, and a test
+that a vector search with `k` of one over candidates split across two input batches
+returns the one global winner. The edge cases are a remote SERVICE that fails after its
+first batch, which aborts the transfer as X05 specifies, a text search whose hits exceed
+`maxHits`, a spatial join with an empty input, a view read during a view rebuild, and an
+algorithm call inside a transaction.
 
 Its gates are the W3C streaming count, the differential tests, `tests/exists_service.rs`,
 `tests/service_enhancer.rs`, `tests/geo_join.rs` and the text and vector test suites,
@@ -530,10 +542,14 @@ and a performance comparison of its base and its tip on atlas over the queries o
 `scripts/bench-text.sh`, `scripts/bench-geo.sh` and `scripts/bench-vector.sh`. Those
 scripts compare engines and index variants and send no `execution` parameter, so the
 phase first gives them an `EXECUTION` setting that their server requests carry, as
-`scripts/nsc-bench-remote.sh` has, and then runs each at its standard scale with 12
-threads and with one, in both modes, with the scripts' existing answer checks and the
-forge rule's 5% as its threshold on wall time, since the leaves write while they read.
-The matrix has no query of these kinds, so this comparison is the phase's evidence.
+`scripts/nsc-bench-remote.sh` has, carried by their timing requests and their
+correctness requests alike, and then runs each at its standard scale with 12 threads and
+with one, in both modes, with the forge rule's 5% as its threshold on wall time, since
+the leaves write while they read. The text and geo scripts check their answers against
+fixed expectations, and the vector script measures each run's recall against exact
+answers it computes itself, so the phase adds a fingerprint of the exact answers that the
+base, the tip and both modes must share before a timing counts. The matrix has no query
+of these kinds, so this comparison is the phase's evidence.
 
 ### The reference evaluator, item 512
 
@@ -566,7 +582,7 @@ kernels. This is the parallelism eager execution has today, and whether exchange
 operators and partitioned hash builds across pipelines are part of this phase or a later
 one is the maintainer's [question](#open-decisions). The phase then deletes `run_node`
 and the eager executor, the admission layer from `auto_streaming` to
-`fits_without_spill`, `State::Fallback`, `retry_as_cursor` with the `eagerMemoryRetry`
+`fits_without_spill`, `retry_as_cursor` with the `eagerMemoryRetry`
 plan counter and the `sparkles_spill_eager_retries_total` metric, the mode branch of
 `query_execution_with_plan`, `Accounting::Collect`, the `streams` flag and its
 bounded-reads test, the `execution` parameter's effect on how a query runs, and the mode
@@ -608,19 +624,28 @@ forge's hardware, as an interleaved A/B of its base and its tip through
 `scripts/nsc-bench-remote.sh` with `EXECUTION` set per cell, in at least eight rounds of
 A,B,B,A in each order, and treats a confirmed 5% as the gate. After the push of the batch
 that ends a stage, the coordinator runs the matrix on forge with a binary built elsewhere
-inside `nix develop` without learned incremental reuse, as item 677 records, through
-`mise run bench:executors -- --commit REV --build-config "$(scripts/bench-gate.py build-config --cargo 'build --release -p sparkles-server --bin sparkles')" BIN`
-under the host's benchmark and heavy locks, and compares the record with the baseline
-through `scripts/bench-gate.py compare BASELINE RECORD --keys '/exec$'` and
-`--keys '/wall$' --floor 5`. The floor leaves out wall times under 5 ms, whose queries
-the execution times cover. The baselines are the forge record after stage 4,
-`docs/benchmarks/synthetic/runs/2026-11-02-executor-matrix-forge-9d086646`, for the
-12-thread cells, and the record of
+inside `nix develop` without learned incremental reuse, as item 677 records. The build
+host writes the build configuration with
+`scripts/bench-gate.py build-config --cargo 'build --release -p sparkles-server --bin sparkles'`
+in the build's own environment, since the command reads the checkout, the environment and
+Boxington's policy where it runs and cannot recover them from a binary, and the JSON
+travels with the binary to forge, where
+`mise run bench:executors -- --commit REV --build-config "$CONFIG" BIN` runs under the
+host's benchmark and heavy locks. The record is compared with the baseline through
+`scripts/bench-gate.py compare BASELINE RECORD --keys '/exec$'`, then
+`--keys '/wall$' --floor 5` for the large answers and `--keys '/wall$'` without the floor
+for the rest, since the response cost that item 534 follows lies outside the execution
+time and a wall time of a few milliseconds still counts. The baselines are the forge
+record after stage 4, `docs/benchmarks/synthetic/runs/2026-11-02-executor-matrix-forge-9d086646`,
+for the 12-thread cells, and the record of
 `docs/benchmarks/synthetic/runs/2026-11-02-executor-matrix-forge-e52937ca` for the
-one-thread cells, until a later stage's record replaces them. `compare` pairs metrics by
-key, so a comparison under both mode keys is how the merge is held to the faster mode. A
-flagged query is rerun as an interleaved A/B of the two builds on the same host and
-counts as a regression only when the A/B confirms it. A regression a phase accepts gets
+one-thread cells, until a later stage's record replaces them. The two records differ in
+their run settings and in the digest of Boxington's policy, so a comparison with either
+passes `--allow-different`, lists the differences it accepted beside the result, and
+keeps every answer check, and a new baseline recorded after a stage removes the need.
+`compare` pairs metrics by key, so a comparison under both mode keys is how the merge is
+held to the faster mode. A flagged query is rerun as an interleaved A/B of the two builds
+on the same host and counts as a regression only when the A/B confirms it. A regression a phase accepts gets
 its own roadmap item in the same change, and a regression the forge record confirms after
 the push is bisected across the batch and fixed forward. Raw records stay immutable, and
 every answer check counts in every comparison.
