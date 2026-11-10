@@ -331,7 +331,6 @@ fn each_removed_form_is_refused_from_a_minimal_file() {
 /// torn creation, and is refused as corrupt. A headerless log with records is the
 /// pre-release form, which the migration plan refuses with dump and reload.
 #[test]
-#[ignore = "lane format-cutoff-479 continuation: the torn-header cases still write the first record at offset 0, see the lane report"]
 fn a_torn_log_header_is_recreated_and_a_zeroed_one_with_records_is_corrupt() {
     for torn in [&[][..], &[0u8; 33][..], &b"\x89SPKWAL\n\x01"[..]] {
         let tmp = tempfile::tempdir().unwrap();

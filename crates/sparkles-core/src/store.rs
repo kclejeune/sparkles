@@ -2403,24 +2403,24 @@ impl Store {
             let r = replay_wal(&from, &buf, &mut |_, _| Ok(()), &mut |observation| {
                 configuration_references.observation(observation)
             })?;
-            if r.good != buf.len() {
+            // A log the replay cut to nothing, one that began with a torn header record
+            // included, gets this release's records only: it is strictly framed from 0.
+            headerless = r.good == 0 || buf.first() != Some(&WAL_HEADER);
+            wal_len = r.good as u64;
+            if r.good == 0 {
+                // No complete header record, so no committed record either: an empty
+                // file, or the header record a crash tore at the log's creation, whether
+                // it left zeros or a prefix of the header. The log holds nothing, so it
+                // is created again below with its header, and the writer starts after
+                // that header. A complete header counts as the log's first good part.
+                std::fs::remove_file(&wal_path)?;
+                sync_dir(&root.join(&name))?;
+            } else if r.good != buf.len() {
                 OpenOptions::new()
                     .write(true)
                     .open(&wal_path)?
                     .set_len(r.good as u64)?;
                 truncated = true;
-            }
-            // A log the replay cut to nothing, one that began with a torn header record
-            // included, gets this release's records only: it is strictly framed from 0.
-            headerless = r.good == 0 || buf.first() != Some(&WAL_HEADER);
-            wal_len = r.good as u64;
-            if r.good == 0 && buf.first() != Some(&WAL_HEADER) {
-                // The header record a crash tore at the log's creation, or an empty
-                // file: the log holds nothing, so it is created again below with its
-                // header, and the writer starts after that header.
-                std::fs::remove_file(&wal_path)?;
-                sync_dir(&root.join(&name))?;
-                truncated = false;
             }
             wal_index = r.index;
             delta = r.delta;
