@@ -663,7 +663,14 @@ stay as they were.
 
 A hash join's OPTIONAL condition is tested once over the gathered candidate rows of a
 chunk in both modes, so the generic conditional OPTIONAL over two inputs that share no
-variable no longer materializes their product. The `merge_left_join` switch selects the
+variable no longer materializes their product. The condition of a join, in the hash,
+keyed and merge forms of both modes, is evaluated from the ids of its candidate rows and
+never has their terms decoded first as a FILTER over a large table has. The first kernel
+tested conditions through the FILTER path, and decoding the 300,000 candidate rows of
+item 570's eager OPTIONAL at 1M people, whose `?o != ex:x` the ids decide, took the
+query from 28 ms to 120 ms on the laptop and to five times its server time on the Intel
+worker. A unit test holds the conditional OPTIONAL over 20,000 rows, in both forms, to the
+memory of the OPTIONAL without the condition. The `merge_left_join` switch selects the
 merge OPTIONAL without a condition in both modes, and EXPLAIN names the algorithm that
 ran, `[merge on ?k]` or `[hash join]`, in both. An OPTIONAL with a condition over two
 sorted inputs still merges only in eager execution, where its condition is tested over

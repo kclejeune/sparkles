@@ -644,7 +644,7 @@ impl Join<'_> {
         // The merged candidate rows, and which of them pass the condition.
         let mut merged = Table::new(vars.to_vec());
         gather(&mut merged, columns, self.probe, self.build, &cl, &cr);
-        let pass = exec::filter_mask(ctx, &merged, std::slice::from_ref(expression))?;
+        let pass = exec::condition_mask(ctx, &merged, expression)?;
         drop(merged);
         for (i, &(row, begin, complete)) in rows.iter().enumerate() {
             let end = rows.get(i + 1).map_or(cl.len() as u32, |next| next.1);

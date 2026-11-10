@@ -575,3 +575,64 @@ fn an_algorithm_join_of_a_few_rows_fits_its_admitted_capacity() {
         }
     }
 }
+
+/// A join's condition is tested from the ids of its candidate rows, in the merge and
+/// the hash form of an OPTIONAL. The FILTER path decodes the terms of a large table
+/// first, and doing so for a condition cost an OPTIONAL over 300,000 candidate rows four
+/// times its run, so the conditional OPTIONAL over more rows than that path decodes
+/// holds no more memory than the OPTIONAL without the condition.
+#[test]
+fn a_join_condition_decodes_no_terms() {
+    const ROWS: usize = 20_000;
+    let s = Store::in_memory(StoreOptions::default());
+    let mut text = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..ROWS {
+        text.push_str(&format!("ex:s{i} a ex:C0 ; ex:p0 ex:o{i} .\n"));
+    }
+    load(&s, &text);
+    let snap = s.snapshot();
+    let plain = "SELECT * WHERE { ?s a ex:C0 OPTIONAL { ?s ex:p0 ?o } }";
+    let conditional = "SELECT * WHERE { ?s a ex:C0 OPTIONAL { ?s ex:p0 ?o FILTER(?o != ex:x) } }";
+    for (how, opt) in [
+        ("merge", Optimizations::ALL),
+        (
+            "hash",
+            Optimizations {
+                merge_left_join: false,
+                ..Optimizations::ALL
+            },
+        ),
+    ] {
+        let without = run(&snap, plain, opt);
+        let with = run(&snap, conditional, opt);
+        assert_eq!(with.rows().len(), ROWS, "{how}");
+        assert!(
+            has_note(
+                &with.plan,
+                "OptionalJoin",
+                if how == "merge" {
+                    "[merge on"
+                } else {
+                    "[flat hash table"
+                }
+            ),
+            "{how}: {}",
+            with.plan.description
+        );
+        // The condition's mask and its merged rows of two columns at most, and the hash
+        // kernel's scratch for a chunk of candidate pairs. Decoding the 20,000 terms of
+        // ?o takes about 2 MiB more.
+        let chunk = if how == "hash" {
+            super::exec::KEYED_CHUNK as u64 * (2 * 8 + 24) + 256
+        } else {
+            0
+        };
+        let slack = ROWS as u64 * (1 + 2 * 8) + chunk + 1024;
+        assert!(
+            with.mem_peak_bytes <= without.mem_peak_bytes + slack,
+            "{how}: the condition took the peak from {} to {} bytes",
+            without.mem_peak_bytes,
+            with.mem_peak_bytes
+        );
+    }
+}

@@ -4228,7 +4228,7 @@ fn hash_pairs(ctx: &Ctx, join: &Join, w: usize) -> Result<(Vec<u32>, Vec<u32>)> 
 }
 
 /// The candidate pairs a join with a condition tests at a time.
-const KEYED_CHUNK: usize = 1 << 16;
+pub(super) const KEYED_CHUNK: usize = 1 << 16;
 
 /// The pairs of a join with a condition over the whole probe table of `join`, as (probe
 /// rows, build rows), with the number of candidate pairs the condition was tested on.
@@ -5087,7 +5087,7 @@ fn keyed_join(
             left_join(ctx, l, r, Some(expr), note)
         } else {
             let mut t = cross(ctx, l, r)?;
-            let keep = filter_mask(ctx, &t, std::slice::from_ref(expr))?;
+            let keep = condition_mask(ctx, &t, expr)?;
             t.filter_rows(&keep);
             Ok(t)
         }
@@ -5147,7 +5147,7 @@ fn merge_left_join(
             .map(|(&i, &j)| (i, j))
             .unzip();
         let joined = materialize(l, r, lay, &matched_l, &matched_r);
-        let mut keep = filter_mask(ctx, &joined, std::slice::from_ref(e))?.into_iter();
+        let mut keep = condition_mask(ctx, &joined, e)?.into_iter();
         drop(joined);
         let (mut li2, mut rj2) = (Vec::with_capacity(li.len()), Vec::with_capacity(li.len()));
         let mut k = 0;
@@ -5588,7 +5588,8 @@ pub(super) fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) -> Result<E
     Ok(report)
 }
 
-/// Evaluate the filter row by row.
+/// Evaluate the filter row by row. A large table has the terms its expressions need
+/// decoded once per distinct value first (see [`decode_for`]).
 pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bool>> {
     // `EXISTS { P }` from the key set of P, as an OPTIONAL condition tests it
     if let [e] = exprs
@@ -5605,6 +5606,30 @@ pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bo
     let t0 = Instant::now();
     let dec = decode_for(ctx, t, &exprs.iter().collect::<Vec<_>>());
     tracing::debug!(target: "sparkles::sparql::exec", "decoded values in {:?}", t0.elapsed());
+    evaluate_mask(ctx, t, exprs, Decoded::cols(&dec))
+}
+
+/// Which merged candidate rows `t` of a join pass its condition `e`, from their ids. A
+/// condition is not decoded first as a FILTER's expressions are in [`filter_mask`],
+/// because the candidate rows of a join come in chunks of a probe and the common
+/// conditions, such as `?o != <term>` or a comparison with a bound variable, are decided
+/// by the ids: decoding the terms of 300,000 candidate rows cost an OPTIONAL four times
+/// its run. A condition `EXISTS { P }` is answered from the key set of P.
+pub(super) fn condition_mask(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<bool>> {
+    if let Some(mask) = super::exists::mask(ctx, t, e)? {
+        return Ok(mask);
+    }
+    evaluate_mask(ctx, t, std::slice::from_ref(e), None)
+}
+
+/// Evaluate `exprs` on every row of `t`, with the decoded columns `dec` when there are
+/// any, in parallel when the expressions allow it and the rows are enough.
+fn evaluate_mask(
+    ctx: &Ctx,
+    t: &Table,
+    exprs: &[Expr],
+    dec: Option<&super::expr::DecodedCols>,
+) -> Result<Vec<bool>> {
     let t0 = Instant::now();
     let map = t.var_map(ctx.nvars());
     let test = |i: usize| {
@@ -5612,7 +5637,7 @@ pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bo
             table: t,
             i,
             map: &map,
-            dec: Decoded::cols(&dec),
+            dec,
         };
         exprs.iter().all(|e| ebv(e, &row, ctx).unwrap_or(false))
     };
