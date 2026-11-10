@@ -74,6 +74,9 @@ pub(crate) struct Graph {
     /// emit them again: at most [`IN_BASE_SHARD`] per shard
     pub(crate) in_base: Vec<FxHashSet<Triple>>,
     live: usize,
+    /// the first fact of a tail that [`merge_unindexed`](Self::merge_unindexed) appended
+    /// to the columns and the triple index but not to the orders yet
+    pending: Option<usize>,
     /// the graph's heap, charged to the run's budget
     held: Held,
     /// predicates of bookkeeping facts (the magic facts of a demand program) that atoms
@@ -91,6 +94,7 @@ impl Default for Graph {
             index: shards(),
             in_base: shards(),
             live: 0,
+            pending: None,
         }
     }
 }
@@ -333,7 +337,7 @@ impl Graph {
     /// new triples. The base tier is not consulted: the caller adds facts that are not in
     /// it.
     pub fn add_batch(&mut self, ts: impl IntoIterator<Item = Triple>) -> usize {
-        let n = self.add_rows(ts, false, true);
+        let n = self.add_rows(ts, false, true, true);
         n.expect("charges that may pass the limit do not fail")
     }
 
@@ -343,7 +347,7 @@ impl Graph {
         &mut self,
         ts: impl IntoIterator<Item = Triple>,
     ) -> Result<usize, MemoryExceeded> {
-        self.add_rows(ts, true, true)
+        self.add_rows(ts, true, true, true)
     }
 
     /// Protect the derived facts from id `floor` on from compaction, until the next call:
@@ -355,12 +359,14 @@ impl Graph {
 
     /// Add facts in one batch. A `batch` added between runs may be the delta a later run
     /// starts from, so it lowers the compaction floor to its first id, and the engine's
-    /// merges set the floor themselves.
+    /// merges set the floor themselves. Without `index`, the new facts wait for
+    /// [`index_pending`](Self::index_pending) to enter the orders.
     fn add_rows(
         &mut self,
         ts: impl IntoIterator<Item = Triple>,
         strict: bool,
         batch: bool,
+        index: bool,
     ) -> Result<usize, MemoryExceeded> {
         let start = self.tier.count();
         let budget = self.held.budget().clone();
@@ -398,7 +404,7 @@ impl Graph {
         })();
         let new = self.tier.count() - start;
         self.live += new;
-        let r = r.and_then(|()| self.tier.index_new(start, &mut m));
+        let r = r.and_then(|()| self.index_from(start, index, &mut m));
         if batch && new > 0 {
             self.tier.lower_floor(self.offset() + start as u32);
         }
@@ -426,15 +432,58 @@ impl Graph {
     /// allocated; a charge past the limit fails the merge, and the graph is unusable
     /// after an error.
     pub fn merge(&mut self, outs: Vec<Vec<Triple>>, outs_held: Held) -> anyhow::Result<usize> {
-        let n = self.merge_charged(outs, outs_held)?;
+        let n = self.merge_charged(outs, outs_held, true)?;
         self.try_settle()?;
         Ok(n)
+    }
+
+    /// [`merge`](Self::merge) of one batch of a larger whole, such as a closure that an
+    /// operator emits in batches: the new facts enter the columns and the triple index,
+    /// which deduplicates the next batch against them, and wait for
+    /// [`index_pending`](Self::index_pending) to enter the orders as one run per order,
+    /// as one merge of the whole would have added them. No probe may read the graph
+    /// before that, so the caller keeps it to itself meanwhile.
+    pub fn merge_unindexed(&mut self, out: Vec<Triple>, out_held: Held) -> anyhow::Result<usize> {
+        let n = self.merge_charged(vec![out], out_held, false)?;
+        self.try_settle()?;
+        Ok(n)
+    }
+
+    /// Sort the facts [`merge_unindexed`](Self::merge_unindexed) appended into their
+    /// relations' orders, charging the sort's scratch and the runs first.
+    pub fn index_pending(&mut self) -> Result<(), MemoryExceeded> {
+        let Some(start) = self.pending.take() else {
+            return Ok(());
+        };
+        let budget = self.held.budget().clone();
+        let mut m = Meter::new(&budget, true);
+        let r = self.tier.index_new(start, &mut m);
+        self.held.adopt(m.into_bytes());
+        r?;
+        self.try_settle()
+    }
+
+    /// Index the facts from column index `start` on, or note them as pending.
+    fn index_from(
+        &mut self,
+        start: usize,
+        index: bool,
+        m: &mut Meter<'_>,
+    ) -> Result<(), MemoryExceeded> {
+        if index {
+            debug_assert!(self.pending.is_none(), "a merge over an unindexed tail");
+            self.tier.index_new(start, m)
+        } else {
+            self.pending = Some(self.pending.map_or(start, |p| p.min(start)));
+            Ok(())
+        }
     }
 
     fn merge_charged(
         &mut self,
         mut outs: Vec<Vec<Triple>>,
         outs_held: Held,
+        index: bool,
     ) -> anyhow::Result<usize> {
         outs.retain(|o| !o.is_empty());
         let total: usize = outs.iter().map(Vec::len).sum();
@@ -442,7 +491,7 @@ impl Graph {
             || outs.len() >= u32::MAX as usize
             || outs.iter().any(|o| o.len() >= u32::MAX as usize)
         {
-            let n = self.add_rows(outs.into_iter().flatten(), true, false)?;
+            let n = self.add_rows(outs.into_iter().flatten(), true, false, index)?;
             drop(outs_held);
             return Ok(n);
         }
@@ -682,10 +731,18 @@ impl Graph {
         let new = n as usize;
         let start = self.tier.count();
         let first_id = self.len();
-        // the grown columns and index tables, while the old ones are alive
+        // the grown columns and index tables, while the old ones are alive; the columns
+        // double at least, as `add_rows` grows them, since the operators merge a closure
+        // in batches
         let mut grow = 0;
-        if start + new > self.tier.capacity() {
-            grow += (start + new) * ROW;
+        let cap = self.tier.capacity();
+        let next = if start + new > cap {
+            (start + new).max(cap * 2)
+        } else {
+            cap
+        };
+        if next > cap {
+            grow += next * ROW;
         }
         for (tbl, ks) in self.index.iter().zip(&kept) {
             if tbl.len() + ks.len() > tbl.capacity() {
@@ -696,7 +753,9 @@ impl Graph {
             }
         }
         work.try_grow(grow)?;
-        self.tier.reserve_exact(new);
+        if next > cap {
+            self.tier.reserve_exact(next - start);
+        }
         let mut item = 0;
         for (i, &w) in bits.iter().enumerate() {
             let mut w = w;
@@ -735,7 +794,7 @@ impl Graph {
         drop(kept);
         self.live += new;
         let mut m = Meter::new(&budget, true);
-        let filled = self.tier.index_new(start, &mut m);
+        let filled = self.index_from(start, index, &mut m);
         work.adopt(m.into_bytes());
         filled?;
         tracing::trace!(
@@ -862,6 +921,7 @@ impl Graph {
         lo: u32,
         hi: u32,
     ) -> Cands<'_> {
+        debug_assert!(self.pending.is_none(), "a probe over an unindexed tail");
         let lo = lo.max(self.offset());
         if lo >= hi {
             return Cands::empty();
@@ -895,6 +955,7 @@ impl Graph {
     /// Number of triples with predicate `p` in `[lo, hi)` (an upper bound for the base
     /// tier, and dead facts counted).
     pub fn count_p(&self, p: u64, lo: u32, hi: u32) -> usize {
+        debug_assert!(self.pending.is_none(), "a count over an unindexed tail");
         let base = match &self.base {
             Some(b) if self.reads_base(lo, hi) => b.count_p(p) as usize,
             _ => 0,

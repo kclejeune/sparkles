@@ -23,6 +23,13 @@
 //! new edges the operator reads only the nodes that reach a new edge and the nodes they
 //! reach, through the graph's indexes. With many new edges it reads the whole relation.
 //!
+//! The pairs an operator emits flow into the graph in batches of at most [`BATCH`]
+//! triples (roadmap item 865): a batch is merged, and its ids given, as soon as it is
+//! full, so the operator's output buffer and the merge's tables and buffers are sized to
+//! a batch and not to the closure, whose pairs can outnumber the facts of the run so far.
+//! Merging the batches in the order they are emitted gives every pair the id one merge
+//! of all of them would have given it.
+//!
 //! `notEqual` compares literal values, so a filter of reflexive pairs differs from a
 //! comparison of ids when two literals with distinct ids and equal values meet in one
 //! relation. The operator then gives the rule back to the ordinary evaluator for the rest
@@ -39,7 +46,7 @@ use oxrdf::vocab::rdf;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::mem::size_of;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Inner steps between two polls of the cancellation flag.
 const POLL_EVERY: usize = 1 << 16;
@@ -68,6 +75,26 @@ impl<'a> Poll<'a> {
     }
 }
 
+/// Pairs of a closure per merge into the graph, unless [`set_batch`] chose another size.
+const BATCH: usize = 1 << 22;
+
+/// The batch size a test or a measurement chose, or zero for [`BATCH`].
+static CHOSEN_BATCH: AtomicUsize = AtomicUsize::new(0);
+
+/// Merge the operators' pairs into the graph every `n` pairs, or every [`BATCH`] with
+/// zero. For tests and measurements; it applies to every run of the process.
+#[doc(hidden)]
+pub fn set_batch(n: usize) {
+    CHOSEN_BATCH.store(n, Ordering::Relaxed);
+}
+
+fn batch() -> usize {
+    match CHOSEN_BATCH.load(Ordering::Relaxed) {
+        0 => BATCH,
+        n => n,
+    }
+}
+
 /// An operator's pairs passed the room left for an iteration's candidates.
 #[derive(Debug)]
 struct Overflow;
@@ -80,24 +107,109 @@ impl std::fmt::Display for Overflow {
 
 impl std::error::Error for Overflow {}
 
-/// Push a pair of the closure onto `out`, which holds at most `room` pairs, charging each
-/// growth of its buffer before it is reserved.
-#[inline]
-fn emit(out: &mut Vec<Triple>, t: Triple, held: &mut Held, room: usize) -> anyhow::Result<()> {
-    if out.len() >= room {
-        return Err(Overflow.into());
-    }
-    if out.len() == out.capacity() {
-        let before = out.capacity();
-        let cap = (before * 2).max(1024).min(room);
-        held.try_grow((cap - before) * size_of::<Triple>())?;
-        out.reserve_exact(cap - out.len());
-        if out.capacity() > cap {
-            held.try_grow((out.capacity() - cap) * size_of::<Triple>())?;
+/// Where an operator's pairs go: a buffer of at most [`batch`] pairs, charged as it grows
+/// and merged into the graph's columns and triple index when it is full, which
+/// deduplicates the next batch against it. The predicate's new facts enter its orders
+/// once, when [`finish`](Self::finish) ends the predicate, as one merge of the whole
+/// closure would have added them. The sink holds the graph while it lives, so no probe
+/// reads the facts before they are indexed. `room` bounds the pairs of the operator's
+/// step over its predicates, as `max_out` bounds the candidates of an iteration, and the
+/// check comes before a pair is buffered, so a step that passes the room has merged
+/// nothing of its last batch.
+struct Sink<'g> {
+    g: &'g mut Graph,
+    out: Vec<Triple>,
+    /// the charge of `out`
+    held: Held,
+    /// pairs emitted so far in the operator's step, the buffered ones included
+    total: usize,
+    room: usize,
+    batch: usize,
+    /// merges done, for the log
+    merges: usize,
+}
+
+impl<'g> Sink<'g> {
+    fn new(g: &'g mut Graph, budget: &Arc<Budget>, total: usize, room: usize) -> Sink<'g> {
+        Sink {
+            held: Held::new(budget),
+            g,
+            out: Vec::new(),
+            total,
+            room,
+            batch: batch(),
+            merges: 0,
         }
     }
-    out.push(t);
-    Ok(())
+
+    fn budget(&self) -> &Arc<Budget> {
+        self.held.budget()
+    }
+
+    /// Buffer a pair, charging each growth of the buffer before it is reserved, and merge
+    /// the buffer once it holds a batch.
+    #[inline]
+    fn emit(&mut self, t: Triple) -> anyhow::Result<()> {
+        if self.total >= self.room {
+            return Err(Overflow.into());
+        }
+        if self.out.len() == self.out.capacity() {
+            // at most a batch, and at most what the room still allows
+            let left = self.room - self.total + self.out.len();
+            let before = self.out.capacity();
+            let cap = (before * 2).max(1024).min(self.batch).min(left);
+            self.held.try_grow((cap - before) * size_of::<Triple>())?;
+            self.out.reserve_exact(cap - self.out.len());
+            if self.out.capacity() > cap {
+                self.held
+                    .try_grow((self.out.capacity() - cap) * size_of::<Triple>())?;
+            }
+        }
+        self.out.push(t);
+        self.total += 1;
+        if self.out.len() >= self.batch {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Merge the buffered pairs and index the predicate's new facts.
+    fn finish(mut self) -> anyhow::Result<usize> {
+        self.flush()?;
+        self.g.index_pending()?;
+        Ok(self.total)
+    }
+
+    /// Drop the buffered pairs, which are not merged, and index the predicate's new
+    /// facts, which follow from the rules.
+    fn discard(mut self) -> anyhow::Result<()> {
+        self.out = Vec::new();
+        self.held = Held::new(self.budget());
+        self.g.index_pending()?;
+        Ok(())
+    }
+
+    /// Merge the buffered pairs. The buffer's charge goes with it and is released when the
+    /// merge has copied the new facts into the tier.
+    fn flush(&mut self) -> anyhow::Result<()> {
+        if self.out.is_empty() {
+            return Ok(());
+        }
+        let out = std::mem::take(&mut self.out);
+        let fresh = Held::new(self.budget());
+        let held = std::mem::replace(&mut self.held, fresh);
+        tracing::debug!(
+            outputs = out.len(),
+            merges = self.merges,
+            used_bytes = held.budget().used(),
+            peak_bytes = held.budget().peak(),
+            tier_bytes = self.g.heap_bytes(),
+            "closure operator outputs before their merge"
+        );
+        self.g.merge_unindexed(out, held)?;
+        self.merges += 1;
+        Ok(())
+    }
 }
 
 /// Insert `x` into `set`, charging a growth of its table to `held` before it is reserved.
@@ -399,8 +511,7 @@ impl Closures {
             if want > kept.bytes() {
                 kept.try_set(want)?;
             }
-            let mut outs: Vec<Vec<Triple>> = Vec::new();
-            let mut held = Held::new(budget);
+            let before = g.len();
             let mut done: Vec<u64> = Vec::new();
             let mut total = 0usize;
             let mut back = false;
@@ -414,23 +525,31 @@ impl Closures {
                     continue;
                 }
                 let local = Local::build(g, q, mark, now, op.shape, budget, cancel)?;
-                let room = max_out.saturating_sub(total);
-                let out = match op.shape {
+                let mut sink = Sink::new(g, budget, total, max_out);
+                let closed = match op.shape {
                     Shape::Transitive => {
                         if op.irreflexive && local.literal_subject(terms) {
-                            Ok(None)
+                            Ok(false)
                         } else {
                             local
-                                .transitive(q, op.irreflexive, &mut held, cancel, room)
-                                .map(Some)
+                                .transitive(q, op.irreflexive, &mut sink, cancel)
+                                .map(|()| true)
                         }
                     }
                     Shape::Equivalence => {
-                        local.equivalence(q, op.irreflexive, terms, &mut held, cancel, room)
+                        local.equivalence(q, op.irreflexive, terms, &mut sink, cancel)
                     }
                 };
-                let out = match out {
-                    Ok(out) => out,
+                drop(local);
+                match closed {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // the pairs not merged yet are dropped; those merged already
+                        // follow from the rules
+                        sink.discard()?;
+                        back = true;
+                        break;
+                    }
                     Err(e) if e.is::<Overflow>() => {
                         return Err(crate::InferredLimitExceeded {
                             limit,
@@ -442,49 +561,21 @@ impl Closures {
                         .into());
                     }
                     Err(e) => return Err(e),
-                };
-                let Some(out) = out else {
-                    back = true;
-                    break;
-                };
+                }
                 if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                     anyhow::bail!("reasoning cancelled");
                 }
-                total += out.len();
-                if total > max_out {
-                    return Err(crate::InferredLimitExceeded {
-                        limit,
-                        context: format!(
-                            " (the closure of rule '{}' produced {total} candidate triples)",
-                            rules[op.rules[0]].name
-                        ),
-                    }
-                    .into());
-                }
+                total = sink.finish()?;
                 done.push(q);
-                if !out.is_empty() {
-                    outs.push(out);
-                }
             }
+            let after = g.len();
+            stepped.added += (after - before) as usize;
             if back {
                 tracing::debug!(rule = %rules[op.rules[0]].name, "closure operator gives its rules back");
                 op.off = true;
                 stepped.refresh.extend(op.rules.iter().copied());
                 continue;
             }
-            let before = g.len();
-            if !outs.is_empty() {
-                tracing::debug!(
-                    outputs = outs.iter().map(Vec::len).sum::<usize>(),
-                    used_bytes = held.budget().used(),
-                    peak_bytes = held.budget().peak(),
-                    tier_bytes = g.heap_bytes(),
-                    "closure operator outputs before their merge"
-                );
-                g.merge(outs, held)?;
-            }
-            let after = g.len();
-            stepped.added += (after - before) as usize;
             for q in done {
                 op.marks.insert(q, after);
             }
@@ -903,22 +994,21 @@ impl Local {
     }
 
     /// The pairs `(x, z)` of the transitive closure, for the nodes that emit, that are
-    /// not edges, without `x = z` when `irreflexive`.
+    /// not edges, without `x = z` when `irreflexive`, into `sink`.
     fn transitive(
         &self,
         q: u64,
         irreflexive: bool,
-        held: &mut Held,
+        sink: &mut Sink<'_>,
         cancel: Option<&AtomicBool>,
-        room: usize,
-    ) -> anyhow::Result<Vec<Triple>> {
+    ) -> anyhow::Result<()> {
         let n = self.ids.len();
         let mut poll = Poll::new(cancel);
-        let (comp, ncomp) = self.components(held.budget(), &mut poll)?;
+        let (comp, ncomp) = self.components(sink.budget(), &mut poll)?;
         // comp, members, stamp and set by node; moff, fill, readers, the successor stamp
         // and succ by component; and the outer vector of the reachable sets
         let mut work = Held::try_new(
-            held.budget(),
+            sink.budget(),
             n * 4 * size_of::<u32>()
                 + ncomp * (4 * size_of::<u32>() + size_of::<usize>() + size_of::<Vec<u32>>()),
         )?;
@@ -956,7 +1046,6 @@ impl Local {
         stamp.iter_mut().for_each(|s| *s = u32::MAX);
         // per component: the nodes reachable from it, itself included
         let mut reach: Vec<Vec<u32>> = (0..ncomp).map(|_| Vec::new()).collect();
-        let mut out: Vec<Triple> = Vec::new();
         let mut succ: Vec<usize> = Vec::with_capacity(ncomp);
         let mut seen_succ = vec![u32::MAX; ncomp];
         let mut set: Vec<u32> = Vec::with_capacity(n);
@@ -1024,12 +1113,7 @@ impl Local {
                     if h < have.len() && have[h] == z {
                         continue;
                     }
-                    emit(
-                        &mut out,
-                        [self.ids[x as usize], q, self.ids[z as usize]],
-                        held,
-                        room,
-                    )?;
+                    sink.emit([self.ids[x as usize], q, self.ids[z as usize]])?;
                 }
             }
             if readers[c] > 0 {
@@ -1043,7 +1127,7 @@ impl Local {
                 reach[c] = r;
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Tarjan's strongly connected components, iteratively: the component of each node
@@ -1120,22 +1204,22 @@ impl Local {
     }
 
     /// The pairs `(x, y)` of the classes of the symmetric and transitive closure, for the
-    /// nodes that emit, that are not edges, without `x = y` when `irreflexive`. `None`
-    /// when a class holds two literals with distinct ids and equal values, where the
-    /// rules' `notEqual` differs from a comparison of ids.
+    /// nodes that emit, that are not edges, without `x = y` when `irreflexive`, into
+    /// `sink`. `false` when a class holds two literals with distinct ids and equal values,
+    /// where the rules' `notEqual` differs from a comparison of ids: the pairs of the
+    /// classes before it, which the check passed, may have been merged already.
     fn equivalence(
         &self,
         q: u64,
         irreflexive: bool,
         terms: &Terms,
-        held: &mut Held,
+        sink: &mut Sink<'_>,
         cancel: Option<&AtomicBool>,
-        room: usize,
-    ) -> anyhow::Result<Option<Vec<Triple>>> {
+    ) -> anyhow::Result<bool> {
         let n = self.ids.len();
         let mut poll = Poll::new(cancel);
         // parent, roots, moff, members and fill
-        let _work = Held::try_new(held.budget(), (n * 5 + 1) * size_of::<u32>())?;
+        let _work = Held::try_new(sink.budget(), (n * 5 + 1) * size_of::<u32>())?;
         let mut parent: Vec<u32> = (0..n as u32).collect();
         fn find(parent: &mut [u32], mut x: u32) -> u32 {
             while parent[x as usize] != x {
@@ -1171,7 +1255,6 @@ impl Local {
             fill[r as usize] += 1;
         }
         drop(fill);
-        let mut out: Vec<Triple> = Vec::new();
         for r in 0..n {
             poll.tick(1)?;
             let class = &members[moff[r] as usize..moff[r + 1] as usize];
@@ -1183,14 +1266,14 @@ impl Local {
                 let id = self.ids[x as usize];
                 if terms.kind(id) == Kind::Literal {
                     if literals.len() == 64 {
-                        return Ok(None);
+                        return Ok(false);
                     }
                     literals.push(id);
                 }
             }
             for (i, &a) in literals.iter().enumerate() {
                 if literals[i + 1..].iter().any(|&b| same_value(terms, a, b)) {
-                    return Ok(None);
+                    return Ok(false);
                 }
             }
             // members are in ascending local order, as the adjacency is
@@ -1211,15 +1294,10 @@ impl Local {
                     if h < have.len() && have[h] == z {
                         continue;
                     }
-                    emit(
-                        &mut out,
-                        [self.ids[x as usize], q, self.ids[z as usize]],
-                        held,
-                        room,
-                    )?;
+                    sink.emit([self.ids[x as usize], q, self.ids[z as usize]])?;
                 }
             }
         }
-        Ok(Some(out))
+        Ok(true)
     }
 }

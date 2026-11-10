@@ -311,6 +311,44 @@ fn cliques_and_chains() {
     }
 }
 
+/// An operator's pairs reach the graph in batches (roadmap item 865). With batches of a
+/// thousand pairs, a transitive chain of 300 classes, five transitive cliques and a
+/// `sameAs` clique of 150 nodes derive the facts the rules derive, in the order one merge
+/// of each closure gives them, so every fact keeps its id.
+#[test]
+fn batched_closures_keep_the_facts_and_their_order() {
+    let mut t = String::from("ex:home a owl:SymmetricProperty , owl:TransitiveProperty .\n");
+    for g in 0..5 {
+        for i in 0..20 {
+            t += &format!("ex:g{g}p{i} ex:home ex:g{g}p{} .\n", (i * 7 + 3) % 20);
+        }
+    }
+    for i in 0..300 {
+        t += &format!("ex:C{i} rdfs:subClassOf ex:C{} .\n", i + 1);
+    }
+    for i in 0..150 {
+        t += &format!("ex:s{i} owl:sameAs ex:s{} .\n", (i + 1) % 150);
+    }
+    t += "ex:x a ex:C0 .\n";
+    let s = store(&t);
+    let p = Profile::OwlRl;
+    let (whole, _) = infer(s.snapshot(), &p, &options(true)).unwrap();
+    sparkles_reasoner::set_closure_batch(1000);
+    let batched = infer(s.snapshot(), &p, &options(true));
+    sparkles_reasoner::set_closure_batch(0);
+    let (batched, _) = batched.unwrap();
+    assert!(whole.len() > 60_000, "{} facts", whole.len());
+    assert_eq!(batched.len(), whole.len());
+    let first = batched.iter().zip(&whole).position(|(a, b)| a != b);
+    assert_eq!(
+        first, None,
+        "the batched run's facts differ from id {first:?} on"
+    );
+    let rules: BTreeSet<String> = facts(&s, &p, false);
+    let ours: BTreeSet<String> = batched.iter().map(|t| t.to_string()).collect();
+    assert_eq!(ours, rules);
+}
+
 /// A rule program with `noValue` keeps the ordinary evaluation, whose result depends on
 /// the order of derivation.
 #[test]

@@ -21,6 +21,8 @@ pub mod analysis;
 mod budget;
 mod builtins;
 mod closure;
+#[doc(hidden)]
+pub use closure::set_batch as set_closure_batch;
 mod demand;
 pub mod diagnostics;
 mod engine;

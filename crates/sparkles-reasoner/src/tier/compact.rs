@@ -117,7 +117,7 @@ mod tests {
             let ids: Vec<u32> = r.collect();
             runs.push(Run::new(sorted(&ids, &key), &key1));
         }
-        let keep = |id: u32| id % 11 != 0;
+        let keep = |id: u32| !id.is_multiple_of(11);
         let want = {
             let ids: Vec<u32> = (0..300).filter(|&id| keep(id)).collect();
             sorted(&ids, &key)

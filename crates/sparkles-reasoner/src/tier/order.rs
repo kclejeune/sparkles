@@ -78,11 +78,13 @@ impl Order {
     }
 
     /// Whether a fact with an id of `lo` or more is in the order.
+    #[cfg(test)]
     pub fn since(&self, lo: u32) -> bool {
         self.runs.iter().any(|r| r.hi() > lo)
     }
 
     /// Entries whose id is in `[lo, hi)`.
+    #[cfg(test)]
     pub fn count_in(&self, lo: u32, hi: u32) -> usize {
         self.runs
             .iter()
