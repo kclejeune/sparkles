@@ -225,15 +225,25 @@ lstat, and its content is never read by this package. Jobs never use it.
 Boat jobs build with MBX in local-only mode. The worker's configuration names the
 read-only remote cache, and the job environment sets `MBX_REMOTE_URL` to an empty value,
 which overrides it, so no job reads the remote cache or its token. The job shell also
-drops any inherited `MBX_REMOTE_TOKEN_FILE` or `MBX_REMOTE_TOKEN`. The local store stays
-in MBX's default cache directory under the worker home, which the normal stop's snapshot
-keeps, so a later resume starts with the store warm. `MBX_GC_MAX_TOTAL_SIZE` is 64 GiB,
+drops any inherited `MBX_REMOTE_TOKEN_FILE` or `MBX_REMOTE_TOKEN`.
+
+The provider documents that a snapshot saves the worker home but not `~/.cache`, where
+it keeps only the Playwright browsers and the Deno cache, so MBX's default cache
+directory is empty after every resume. The job environment therefore sets `MBX_CACHE_DIR` to
+`~/.local/share/mbx-cache`, and every job on the worker uses that one directory. It holds
+the worker's single shared store with its managed targets and incremental state, and the
+normal stop's snapshot keeps it, so a later resume starts with the store warm. A resume
+runs on a new machine and downloads the snapshot's files in the background, and a build
+that reads a store object before its download ends waits for that object. `admit` asks
+the pinned `mbx` for its effective cache directory and refuses any other, and a gate's
+unit forwards the setting with the others. `MBX_GC_MAX_TOTAL_SIZE` is 64 GiB,
 which holds two release builds and the workspace test builds in one budget for the store,
 managed targets and incremental state. `MBX_GC_MIN_FREE_SIZE` is 45 GiB, which keeps the
 40 GiB of free disk that the metadata probe requires at the next qualification.
 `remote-executor.py admit` asks the pinned `mbx` for its effective `remote.url`,
-`gc.max_total_size` and `gc.min_free_size` through the job environment and refuses a
-remote URL, a token setting or another budget by name. A gate's service unit starts
+`cache_dir`, `gc.max_total_size` and `gc.min_free_size` through the job environment and
+refuses a remote URL, a token setting, another cache directory or another budget by
+name. A gate's service unit starts
 with an empty environment, so `gate-start.sh` forwards these settings when its caller
 set them. Qualification still checks the provisioned read-only configuration and the
 token metadata, since they describe the development environment rather than the job. The reviewed setup hook's own
