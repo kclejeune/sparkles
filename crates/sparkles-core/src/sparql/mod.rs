@@ -1616,13 +1616,24 @@ fn execute_prepared(
 fn select_output(
     ctx: &Arc<Ctx>,
     pattern: &GraphPattern,
+    bound: &[(table::VarId, Id)],
     materialized: table::Materialized<'_>,
-) -> Result<(Arc<cursor::Variables>, table::RetainedMaterialized)> {
+    result: &mut ResultParts,
+) -> Result<()> {
     let variables = cursor::Variables::new(ctx, pattern, &materialized.table.vars, "")?;
     let retained = materialized
         .project(ctx, &variables.ids)?
         .into_retained(ctx)?;
-    Ok((variables, retained))
+    result.variables = Some(variables);
+    result.table = retained.table;
+    result._table_credit = retained.credit;
+    // substituted variables report their bound value
+    for (v, id) in bound {
+        if let Some(c) = result.table.col_of(*v) {
+            result.table.cols[c].iter_mut().for_each(|x| *x = *id);
+        }
+    }
+    Ok(())
 }
 
 fn execute_prepared_parts(
@@ -1688,17 +1699,8 @@ fn execute_prepared_parts(
     };
     match parsed {
         Query::Select { .. } => {
-            let (variables, retained) = select_output(&ctx, &pattern, materialized)
+            select_output(&ctx, &pattern, &bound, materialized, &mut result)
                 .map_err(|error| failed(error, None, None))?;
-            result.variables = Some(variables);
-            result.table = retained.table;
-            result._table_credit = retained.credit;
-            // substituted variables report their bound value
-            for (v, id) in &bound {
-                if let Some(c) = result.table.col_of(*v) {
-                    result.table.cols[c].iter_mut().for_each(|x| *x = *id);
-                }
-            }
         }
         Query::Ask { .. } => {
             result.boolean = !materialized.table.is_empty();
