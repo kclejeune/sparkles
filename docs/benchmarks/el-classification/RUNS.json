@@ -160,7 +160,7 @@
      },
      "ended": "2026-11-02T20:50:54Z",
      "lock_note": "Each process took the bench lock and the heavy lock for itself. env.txt gives the time and load average when each took them. Another lane's benchmark jobs ran between the processes and never beside them.",
-     "reference": "ELK 0.6.0 with OWL API 5.1.20, the harness of commit 3d8fd876 (ElkClassify.java sha256 036a7224…, pins.tsv sha256 4d470f93…), Temurin 17.0.20+8",
+     "reference": "ELK 0.6.0 with OWL API 5.1.20, the harness of commit 3d8fd876 (ElkClassify.java sha256 036a7224\u2026, pins.tsv sha256 4d470f93\u2026), Temurin 17.0.20+8",
      "started": "2026-11-02T17:11:55Z"
     },
     "settings": {
@@ -262,7 +262,7 @@
      "binary": "crates/sparkles-owl/examples/el_classify.rs",
      "binary_sha256": "21ea154f772d48d70c60026e67bd5c8db20845f73d3cb3ee9472634efc7c7c06",
      "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on wally, copied to the benchmark host",
-     "reference": "ELK 0.6.0 with OWL API 5.1.20 through scripts/elk-compare/elk.sh (ElkClassify.java sha256 8bc9178d…, pins.tsv sha256 4d470f93…), openjdk version \"17.0.20\" 2026-07-21 OpenJDK Runtime Environment Temurin-17.0.20+8 (build 17.0.20+8) OpenJDK 64-Bit Server VM Temurin-17.0.20+8 (build 17.0.20+8, mixed mode, sharing)",
+     "reference": "ELK 0.6.0 with OWL API 5.1.20 through scripts/elk-compare/elk.sh (ElkClassify.java sha256 8bc9178d\u2026, pins.tsv sha256 4d470f93\u2026), openjdk version \"17.0.20\" 2026-07-21 OpenJDK Runtime Environment Temurin-17.0.20+8 (build 17.0.20+8) OpenJDK 64-Bit Server VM Temurin-17.0.20+8 (build 17.0.20+8, mixed mode, sharing)",
      "data": {
       "chebi_lite": {
        "sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
@@ -1290,6 +1290,49 @@
     }
    },
    "metadata_note": "A manual measurement record of roadmap items 720, 721 and 722 on atlas, which has the benchmark host's hardware: cold and warm runs of the 12 small files, one-, four- and eight-thread rounds on five larger files, instruction counts and the memory runs of ore_ont_8737."
+  },
+  {
+   "run_id": "sha256-8df152614d806336dea552fc67134594efc3b0531c77adc0db13e04c908d0af8",
+   "path": "runs/2026-11-10-el-threads-atlas-bd924609/record.json",
+   "sha256": "8df152614d806336dea552fc67134594efc3b0531c77adc0db13e04c908d0af8",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "ore_ont_8737 of the ORE 2015 DL development set, GO 2026-07-26, ChEBI lite 256, ore_ont_3836 and ore_ont_13482 of the ORE 2015 EL sample on atlas",
+    "manifest": {
+     "sides": {
+      "base": "321508fe, origin/main",
+      "a": "181e9c95, the delivery filter of every held kind",
+      "b": "fb894c98, a plus the link products sent in runs",
+      "b3": "bd924609, b plus the flush that returns at once when nothing is pending and the fixes of review round 1, the lane's final saturation code"
+     },
+     "build": "mbx build --release -p sparkles-owl --example el_classify on stanley, copied to atlas",
+     "konclude": "Konclude 0.7.0-1138 from nix/reasoners, copied to atlas, through scripts/elk-compare/konclude.py",
+     "scripts": [
+      "slot818.sh.txt",
+      "ab.sh.txt",
+      "konclude818.sh.txt",
+      "record818.py.txt"
+     ]
+    },
+    "settings": {
+     "memory_runs": "one el_classify process per side and thread count in a 13 GiB scope, no swap, no pinning, wall time and peak RSS from GNU time",
+     "ab_runs": "ab.sh, six rounds of rotating order, five classifications per process, one-thread runs pinned to CPU 4 and the others to CPUs 0-11"
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "atlas",
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "ram_mib": 15620,
+      "kernel": "7.2.9"
+     },
+     "method": "Every part ran under ~/lanes/.heavy.lock on atlas with no other benchmark or gate on the host. slot818.sh ran one classification of ore_ont_8737 per side on 4, 12 and 1 threads, then ab.sh with six rounds of rotating order, one process per side, file and thread count with --repeat 5, whose median classification is the round's value. The first slot ran the base, a and b, the second slot the base and b3, and konclude818.sh ran Konclude after the first slot. The stanley member holds the profiles and message counters taken on the laptop while other work ran there, so only their shares and counts are evidence.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "Manual record of roadmap item 818 on atlas: ore_ont_8737 of every side on one, four and twelve threads in two slots, Konclude 0.7.0 on the same host, the rounds of GO, ChEBI lite, ore_ont_3836 and ore_ont_13482, and the profiles and message counters taken on the laptop."
   }
  ]
 }
