@@ -39,12 +39,72 @@ use sparkles_core::id::Id;
 use sparkles_core::store::Snapshot;
 use std::mem::size_of;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A run that cannot be maintained incrementally and must materialize in full.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{0}")]
 pub(crate) struct Fallback(pub String);
+
+/// The rule instances that the deletion of an update may visit for each fact of the
+/// closure before the run gives up the update and materializes in full (see [`Visits`]).
+const VISITS_PER_FACT: u64 = 4;
+
+/// The fewest rule instances that the deletion of an update may visit, so that a small
+/// closure is not materialized in full for a deletion of ordinary cost.
+const MIN_VISITS: u64 = 1 << 20;
+
+/// The rule instances a search counts on its own before it adds them to [`Visits`].
+const VISIT_BATCH: u64 = 1 << 10;
+
+/// The rule instances that the deletion of one update has visited, in its searches for
+/// other proofs and in the steps that find the consequences of deleted facts, and the
+/// bound on them.
+///
+/// A full run derives every fact of the closure at least once, so its cost grows at least
+/// with the size of the closure. The searches can cost far more. In a clique of a
+/// symmetric and transitive property each fact has a derivation through every member, and
+/// a search for another proof of a removed edge visits most of the closure through each
+/// of them. Past the bound the update stops with a [`Fallback`], its state is dropped, and
+/// the run materializes in full. With the same number of threads an update counts the
+/// same visits on every run, so whether it reaches the bound does not depend on timing.
+pub(crate) struct Visits {
+    done: AtomicU64,
+    limit: u64,
+}
+
+impl Visits {
+    /// The bound for an update of `c`, before the update changes it.
+    pub(crate) fn for_closure(c: &Closure) -> Visits {
+        let facts = c.graph.offset() as u64 + c.graph.live() as u64;
+        Visits::new(facts.saturating_mul(VISITS_PER_FACT).max(MIN_VISITS))
+    }
+
+    pub(crate) fn new(limit: u64) -> Visits {
+        Visits {
+            done: AtomicU64::new(0),
+            limit,
+        }
+    }
+
+    /// The rule instances visited so far.
+    pub(crate) fn done(&self) -> u64 {
+        self.done.load(Ordering::Relaxed)
+    }
+
+    /// Count `n` more visits, and give way to a full run when they pass the bound.
+    fn add(&self, n: u64) -> Result<(), Fallback> {
+        let done = self.done.fetch_add(n, Ordering::Relaxed).saturating_add(n);
+        if done <= self.limit {
+            return Ok(());
+        }
+        Err(Fallback(format!(
+            "the deletion visited more than {} rule instances, {VISITS_PER_FACT} for each fact of \
+             the closure, which costs more than a full run",
+            self.limit
+        )))
+    }
+}
 
 /// A materialization: the input graphs of a snapshot as the base tier of its graph (see
 /// [`crate::facts`]), and the derived facts in memory as its derived tier.
@@ -425,6 +485,8 @@ pub(crate) struct Update {
     pub added_from: u32,
     /// facts whose provability was searched for
     pub checked: u64,
+    /// rule instances the deletion visited (see [`Visits`])
+    pub visited: u64,
     /// semi-naive iterations of the insertion
     pub iterations: usize,
     /// the charge of the update's buffers that remain, `deleted` among them
@@ -495,6 +557,16 @@ pub(crate) fn update(
     // before they are used, also when nothing is inserted
     budget.check()?;
     let mut held = Held::new(budget);
+    let visits = Visits::for_closure(c);
+    // PROBE-798
+    let probe = std::env::var_os("PROBE798").is_some();
+    let visits = if std::env::var_os("PROBE798_NOLIMIT").is_some() {
+        Visits::new(u64::MAX)
+    } else {
+        visits
+    };
+    let probe_facts = c.graph.offset() as u64 + c.graph.live() as u64;
+    let probe_t0 = std::time::Instant::now();
 
     // the inserted facts the derived tier holds are explicit from the start, as the base
     // tier's copies of them are
@@ -544,7 +616,16 @@ pub(crate) fn update(
             if rayon::current_num_threads() > 1 && queue.len() >= PAR_SEARCH {
                 // the searches of a round are independent: see `prove_all`
                 let facts: Vec<Triple> = queue.drain(..).filter(|t| seen.insert(*t)).collect();
-                dead = prove_all(c, rules, &plans, &abort, limits, &mut search, &facts)?;
+                dead = prove_all(
+                    c,
+                    rules,
+                    &plans,
+                    &abort,
+                    limits,
+                    &visits,
+                    &mut search,
+                    &facts,
+                )?;
             } else {
                 let cx = Cx {
                     c: &*c,
@@ -553,6 +634,7 @@ pub(crate) fn update(
                     abort: &abort,
                     cancel: limits.cancel.as_deref(),
                     budget,
+                    visits: &visits,
                     known: None,
                 };
                 for t in queue.drain(..) {
@@ -569,7 +651,7 @@ pub(crate) fn update(
             if dead.is_empty() {
                 break;
             }
-            let (next, next_held) = consequences(c, rules, &plans, &dead, limits)?;
+            let (next, next_held) = consequences(c, rules, &plans, &dead, limits, Some(&visits))?;
             queue = next;
             step.absorb(next_held);
             for t in &dead {
@@ -594,6 +676,19 @@ pub(crate) fn update(
         }
         drop(queue_held);
         out.checked = search.checked;
+        out.visited = visits.done();
+        if probe {
+            eprintln!(
+                "PROBE798 facts={probe_facts} visited={} ratio={:.4} removed={} checked={} deleted={} secs={:.3} peak={}",
+                out.visited,
+                out.visited as f64 / probe_facts as f64,
+                removed.len(),
+                out.checked,
+                out.deleted.len(),
+                probe_t0.elapsed().as_secs_f64(),
+                budget.peak()
+            );
+        }
         held.absorb(deleted);
         if cancelled(limits) {
             anyhow::bail!("reasoning cancelled");
@@ -671,7 +766,7 @@ pub(crate) fn dred_overdeletion(
         .collect();
     while !frontier.is_empty() {
         let (next, _held) =
-            consequences(c, rules, &plans, &frontier, limits).expect("an unlimited budget");
+            consequences(c, rules, &plans, &frontier, limits, None).expect("an unlimited budget");
         for t in &frontier {
             c.graph.kill(t);
         }
@@ -804,13 +899,14 @@ impl Plans {
 }
 
 /// The heads (in the closure) of the rule instances with a body atom in `dead`, whose
-/// rows are still live.
+/// rows are still live. Each instance counts as a visit of `visits`.
 fn consequences(
     c: &Closure,
     rules: &[CRule],
     plans: &Plans,
     dead: &[Triple],
     limits: &Limits,
+    visits: Option<&Visits>,
 ) -> anyhow::Result<(Vec<Triple>, Held)> {
     let g = &c.graph;
     let rows: Vec<u32> = dead.iter().filter_map(|t| g.position(t)).collect();
@@ -842,7 +938,7 @@ fn consequences(
             .sum(),
     )?;
     type Heads = (Vec<Triple>, Held, Option<anyhow::Error>);
-    let heads: Vec<Heads> = work
+    let mut heads: Vec<Heads> = work
         .par_iter()
         .map(|(ri, d, rows)| {
             let r = &rules[*ri];
@@ -865,7 +961,13 @@ fn consequences(
             (out, h, ev.err.take())
         })
         .collect();
+    if let Some(e) = heads.iter_mut().find_map(|h| h.2.take()) {
+        return Err(e);
+    }
     let n: usize = heads.iter().map(|h| h.0.len()).sum();
+    if let Some(v) = visits {
+        v.add(n as u64)?;
+    }
     // the heads, deduplicated
     held.try_grow(
         n * size_of::<Triple>() + table_bytes(table_grown(0, 0, n), size_of::<Triple>()),
@@ -901,12 +1003,14 @@ const PAR_SEARCH: usize = 2;
 /// learn joins `search` afterwards. The chunks repeat some work that one search would
 /// share, and they read the base tier on every thread, which matters most when its
 /// blocks are not decoded yet.
+#[allow(clippy::too_many_arguments)]
 fn prove_all(
     c: &Closure,
     rules: &[CRule],
     plans: &Plans,
     abort: &AtomicBool,
     limits: &Limits,
+    visits: &Visits,
     search: &mut Search,
     facts: &[Triple],
 ) -> anyhow::Result<Vec<Triple>> {
@@ -923,6 +1027,7 @@ fn prove_all(
             abort,
             cancel: limits.cancel.as_deref(),
             budget,
+            visits,
             known: Some(&*search),
         };
         facts
@@ -956,6 +1061,12 @@ fn prove_all(
         search.absorb(s)?;
     }
     if let Some(e) = first_err {
+        eprintln!(
+            "PROBE798 prove_all err visits={} used={} peak={} err={e:#}",
+            visits.done(),
+            budget.used(),
+            budget.peak()
+        ); // PROBE-798
         return Err(e);
     }
     if cancelled(limits) {
@@ -999,6 +1110,8 @@ struct Cx<'a> {
     abort: &'a AtomicBool,
     cancel: Option<&'a AtomicBool>,
     budget: &'a Arc<Budget>,
+    /// the deletion's visits of rule instances and their bound
+    visits: &'a Visits,
     /// what the searches of earlier rounds learned, when this search is one of a round's
     /// parallel ones
     known: Option<&'a Search>,
@@ -1019,8 +1132,11 @@ struct Search {
     held: Held,
     /// of `held`: the nodes' lists of uses, freed when a search starts
     uses: usize,
-    /// the first refusal, or the first error of an evaluation
+    /// the first refusal, the first error of an evaluation, or the [`Fallback`] of a
+    /// deletion past its bound
     err: Option<anyhow::Error>,
+    /// the rule instances visited and not yet added to [`Cx::visits`]
+    pending: u64,
     /// the base-tier blocks the search's evaluations read last, lent to each in turn:
     /// the blocks of a snapshot do not change, and the evaluations of one search read
     /// near each other
@@ -1060,7 +1176,20 @@ impl Search {
             held: Held::new(budget),
             uses: 0,
             err: None,
+            pending: 0,
             memo: Memo::default(),
+        }
+    }
+
+    /// Add the visits counted on their own to the deletion's; false when they pass its
+    /// bound, and the search stops with the [`Fallback`].
+    fn flush(&mut self, cx: &Cx<'_>) -> bool {
+        match cx.visits.add(std::mem::take(&mut self.pending)) {
+            Ok(()) => true,
+            Err(f) => {
+                self.err.get_or_insert(f.into());
+                false
+            }
         }
     }
 
@@ -1174,6 +1303,9 @@ impl Search {
             if self.nodes[n as usize].state == State::Fresh {
                 self.expand(cx, n, root, 0);
             }
+        }
+        if self.err.is_none() {
+            self.flush(cx);
         }
         if self.err.is_some() {
             return false;
@@ -1357,6 +1489,10 @@ impl Search {
         implicit: &[Triple],
     ) -> bool {
         if self.err.is_some() {
+            return false;
+        }
+        self.pending += 1;
+        if self.pending >= VISIT_BATCH && !self.flush(cx) {
             return false;
         }
         let t = self.nodes[n as usize].t;

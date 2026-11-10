@@ -914,7 +914,11 @@ fn deleting_edges_of_a_clique_stays_within_a_full_runs_memory() {
     ttl(&s, &text);
     let p = Profile::OwlRl;
     let opts = ReasonOptions {
-        max_memory: Some(LIMIT),
+        max_memory: if std::env::var_os("PROBE798_NOMEM").is_some() {
+            None
+        } else {
+            Some(LIMIT)
+        }, // PROBE-798
         ..ReasonOptions::default()
     };
     let go = |since| {
@@ -931,6 +935,15 @@ fn deleting_edges_of_a_clique_stays_within_a_full_runs_memory() {
     let since = Some(full.receipt.as_ref().unwrap().commit.seq);
     let del: Vec<Triple> = edges.iter().step_by(50).cloned().collect();
     change(&s, &[], &del);
+    let t0 = std::time::Instant::now(); // PROBE-798
     let r = go(since).unwrap_or_else(|e| panic!("the run after the deletion: {e:#}"));
+    eprintln!(
+        "PROBE798 full peak={} after: method={:?} fallback={:?} peak={} secs={:.3}",
+        full.peak_bytes,
+        r.method,
+        r.fallback,
+        r.peak_bytes,
+        t0.elapsed().as_secs_f64()
+    ); // PROBE-798
     check(&s, &p, &r, "after deleting edges of the clique");
 }
