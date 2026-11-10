@@ -13981,9 +13981,12 @@ decision and child report its input read as `prov:used`, and its footprint also 
 policy's decisions and supports graphs and the proposal graphs the principal may read, so
 a reader who may not read them is not admitted. A refresh rewrites a report whose
 recorded claim was withdrawn, reversed or superseded, and that report's ancestors,
-whatever the fraction. The automatic refresh also starts after a new policy version, a
-change of `reviewPolicy`, or a change of the policy's decisions or supports that the
-principal's change feed lists. A report without a policy has none of these members.
+whatever the fraction. The automatic refresh also starts after a new policy version or a
+change of `reviewPolicy`. After a change of the policy's decisions or supports, a
+withdrawal, a settings-only change of the evidence configuration, a reload of the access
+policy or a server start, it first checks privately, without a model call, commit or
+task, whether a report's input changed, and starts a refresh only when one did. A report
+without a policy has none of these members.
 
 `POST /$/graphrag/{ds}/memberships` takes `{"nodes": ["<iri>", …], "level": 0}` with at
 most 20,000 IRIs and answers which communities hold each node, at the given level or at

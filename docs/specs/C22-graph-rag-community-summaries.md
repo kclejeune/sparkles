@@ -406,6 +406,12 @@ between two refreshes. A commit
 that the feed lists with counts only marks every community stale and schedules a full
 rebuild under the budget, since its changes are not known per community.
 
+Under `reviewPolicy`, a report's input can change through evidence that the principal's
+feed does not list. The loop then runs the private check of
+[C25](C25-evidence-and-assessments.md#refresh), a refresh's preparation and plan with no
+model call, commit or task, and starts a refresh only when the plan finds a changed
+input.
+
 ## 6. Access control
 
 A report summarizes facts as the settings' `principal` read them at the build's commit.

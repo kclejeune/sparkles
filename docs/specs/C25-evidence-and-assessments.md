@@ -2232,16 +2232,36 @@ written by an interrupted run under a policy is rewritten even when the state do
 record it. The UI's GraphRAG settings take the policy name, and a report under a
 policy shows it with each finding's accepted claims and decisions.
 
-The private check of the automatic refresh is not built, and roadmap item 652 adds it.
-The loop counts the changes of the output graph that the principal's feed lists, as it
-counts those of the projection's graphs. It starts a refresh for any change of the
-policy's decisions or supports graph and any withdrawal in a proposal graph that the feed
-lists, and it compares the settings' policy and the Head view's policy version with the
-last build's once a debounce period, without waiting for a commit. A decision, support
-or withdrawal hidden from the principal, a settings-only change of the evidence
-configuration, a reload of the access policy and a state left behind by a crash wait for
-the next change that the feed lists or for a manual refresh, which then rewrites what
-they changed.
+The private check of the automatic refresh ships in
+`crates/sparkles-server/src/graphrag/refresh.rs`, with the plan it reads in the build
+module. For a dataset whose settings name a policy, the loop reads the change feed
+without the principal's view, restricted to the policy's decisions and supports graphs
+and the configured proposal graphs, from the head it last read. A commit that changes the
+decisions or supports graph or adds an `ev:Withdrawal` to a proposal graph makes a check
+due, and so does a commit that the feed lists with counts only, a feed that cannot list
+the commits, another selected configuration generation, another generation of the
+access policy, which a reload moves, and the first sight of the dataset after the server
+starts. The principal's feed no longer starts a refresh for a decision, support or
+withdrawal, and when it cannot count the changes of a dataset with a policy, the check
+decides in its place. The settings' policy and the Head view's policy version are still
+compared with the last build's once a debounce period, and a difference starts a refresh
+directly.
+
+The check admits the run as a refresh would, loads the state and runs the refresh's
+preparation and plan as the principal at the Head view. It makes no estimate, model call,
+commit or state change and starts no task. The plan records why it decided each
+community. A report rewritten because its facts or children changed past the fraction,
+because a pair ended or because its policy, version or state does not match is a reason,
+and so is a report that the state names and the graph no longer links. A parent counts
+toward the fraction only the children rewritten for one of these reasons, so a pending
+child never makes its parent a reason. A community that the plan adds, removes or gives
+other members or another parent is a reason, and so is a community of the reports graph
+that the run no longer has. Pending, failed and stale reports are not reasons. A check
+that finds a reason starts a refresh whose task names only that a check found reports
+whose input changed, and the check stays due until that refresh ends well. A check that
+finds none starts nothing. A check that fails is logged at debug level and retried after
+its own backoff, which doubles from one debounce period up to 64, and it never holds back
+a refresh that the principal's feed or the policy comparison starts.
 
 The claims behind a parent's entity lines that only its children's findings name are
 known once the children are written. The bound of 10,000 occurrences is therefore checked
@@ -2266,7 +2286,15 @@ its pairs, a state that names another report than the graph links, `/community` 
 reports through earlier edits and of generated replacements. A hidden support under a
 triple protection, supports past the record bound that are all hidden, a label shared by
 many communities, an edited parent whose consumed child is replaced across a refresh and
-a global answer through the router have no test.
+a global answer through the router have no test. The router test
+`private_checks_start_refreshes_only_for_changed_inputs` covers the private check at
+server start, after a withdrawal in a proposal graph the principal cannot read, after a
+decision of an unrelated claim, after a settings-only change of the evidence
+configuration and after a reload of the access policy, each of which leaves the reports
+graph, the state, the head commit, the model requests and the task list unchanged. It
+also covers a withdrawal behind a cited claim and a state left behind the reports graph
+at the next server start, each of which starts one refresh. A hidden superseding decision
+under a triple protection has no test of the check.
 
 ### Scope changes
 

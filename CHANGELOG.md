@@ -49,9 +49,16 @@ decisions and supports graphs and the readable proposal graphs. A withdrawal, re
 superseding decision rewrites the reports that read it and their ancestors at the next
 refresh, and a new policy version rewrites every report. `GET /$/graphrag/{ds}/community`,
 `community_reports` and a global answer's `reports` carry `reviewPolicy` and each
-finding's `claims` and `decisions`. The automatic refresh notices only the evidence
-changes that the principal's change feed lists, and roadmap item 652 adds a private check
-for the others.
+finding's `claims` and `decisions`.
+
+The automatic refresh of reports read under a review policy runs a private check (item
+652). A change of the policy's decisions or supports graph, a withdrawal in a proposal
+graph, read from the change feed without the principal's view, another evidence
+configuration, a reload of the access policy and a server start each make a check due,
+and so does a principal's feed that cannot count the changes. The check runs a refresh's
+preparation and plan with no model call, commit, state change or task, and starts a
+refresh only when a report's input or the hierarchy changed. The principal's feed no
+longer starts a refresh by itself for a decision, support or withdrawal it lists.
 
 Roadmap item 791 adds Nemo 0.10.1 as the reference for the `owl-rl` materialization. The
 flake builds it from its checksum-pinned release binaries as `.#nemo`, and
