@@ -1708,8 +1708,10 @@ fn props_to_dpreds<S: Sink>(ix: &Index, me: Ex, st: &mut State, s: Role, c: Ex, 
     }
     let id = prop_id(x, s, c, out);
     for &(u, e) in &x.dpreds {
-        // the root as predecessor finds the role premises itself, with every role over f(u)
-        if counting || dix(ix).is_root(u) || role_of(ix, e).is_some_and(|r| ix.roles.sub(r, s)) {
+        // a predecessor of a rooted run may reach the context over f_e(u) and finds the
+        // role premises itself, with every role over f_e(u)
+        if counting || dix(ix).root.is_some() || role_of(ix, e).is_some_and(|r| ix.roles.sub(r, s))
+        {
             out.send(u, Concl::PredC(me, id));
         }
     }
@@ -1825,8 +1827,9 @@ pub fn hyp<S: Sink>(st: &mut State, a: Ex, out: &mut S) -> bool {
 pub fn dedge<S: Sink>(ix: &Index, me: Ex, st: &mut State, u: Ex, e: Ex, out: &mut S) -> bool {
     let bottom = st.bottom;
     let props: Vec<(Role, Ex)> = st.props.clone();
-    // the root as predecessor finds the role premises itself, with every role over f(u)
-    let any = dix(ix).counting || dix(ix).is_root(u);
+    // a predecessor of a rooted run may reach the context over f_e(u) and finds the role
+    // premises itself, with every role over f_e(u)
+    let any = dix(ix).counting || dix(ix).root.is_some();
     let x = ds(st);
     if x.dpreds.contains(&(u, e)) {
         return false;
@@ -1873,25 +1876,50 @@ fn reaching(dx: &DlIx, st: &State, v: Ex, out: &mut Vec<Ex>) {
     out.dedup();
 }
 
-/// A clause over the predecessor from the successor `v`: Pred with each existential
-/// restriction that reaches v.
-pub fn pred_c<S: Sink>(ix: &Index, st: &mut State, v: Ex, cid: u32, out: &mut S) -> bool {
+/// A clause over the predecessor from the successor `v`, in the context `me`: Pred with
+/// each existential restriction that reaches v over `f_e(x)`, and in a rooted run along
+/// each of the context's edges over `f_e(u)` to v, once per clause.
+pub fn pred_c<S: Sink>(ix: &Index, me: Ex, st: &mut State, v: Ex, cid: u32, out: &mut S) -> bool {
     if st.bottom {
         return false;
     }
+    let dx = dix(ix);
     let x = ds(st);
+    let (seen, table) = (x.pred_seen.capacity(), x.pred_in.capacity());
     if !x.pred_seen.insert((v, cid)) {
         return false;
     }
-    x.pred_in.entry(v).or_default().push(cid);
-    let c = out.dl().table.get(cid).clone();
-    let mut es = Vec::new();
-    reaching(dix(ix), st, v, &mut es);
-    let mut found = Found::default();
-    for e in es {
-        pred(ix, st, e, &c, None, &mut found, &out.dl().lits);
+    let list = x.pred_in.entry(v).or_default();
+    let cap = list.capacity();
+    list.push(cid);
+    let grown = (list.capacity() - cap) * 4
+        + table_bytes(x.pred_seen.capacity(), 8).saturating_sub(table_bytes(seen, 8))
+        + table_bytes(x.pred_in.capacity(), 32).saturating_sub(table_bytes(table, 32));
+    if grown > 0 {
+        out.dl().grow(grown);
     }
-    drain(ix, st, found, out);
+    let pairs: Vec<(Ex, u32)> = x
+        .root
+        .as_deref()
+        .map_or(Vec::new(), |r| r.edges_to(v).to_vec());
+    let c = out.dl().table.get(cid).clone();
+    let mut found = Found::default();
+    let root = dx.is_root(me);
+    if !root {
+        let mut es = Vec::new();
+        reaching(dx, st, v, &mut es);
+        for e in es {
+            pred(ix, st, e, &c, None, &mut found, &out.dl().lits);
+        }
+    }
+    for (e, u) in pairs {
+        super::dl_root::root_pred(ix, st, e, u, &c, None, &mut found, &out.dl().lits);
+    }
+    if root {
+        drain_with(ix, st, found, out, super::dl_root::derive);
+    } else {
+        drain(ix, st, found, out);
+    }
     true
 }
 
@@ -2062,6 +2090,9 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
         if grown > 0 {
             out.dl().grow(grown);
         }
+        if dx.root.is_some() {
+            super::dl_root::index_consts(ix, x, &max, id, out);
+        }
         n += 1;
         let c = x.store.clauses[id as usize].c.clone();
         process(ix, me, st, id, &c, &max, out);
@@ -2103,8 +2134,10 @@ fn process<S: Sink>(
             drain(ix, st, found, out);
             return;
         };
+        // a predecessor of a rooted run may reach the context over f_e(u) and finds the
+        // role premises itself, with every role over f_e(u)
         for &(u, e) in &x.dpreds {
-            if dx.is_root(u) || role_of(ix, e).is_some_and(|r| meets(ix, c, r)) {
+            if rooted || role_of(ix, e).is_some_and(|r| meets(ix, c, r)) {
                 out.send(u, Concl::PredC(me, cid));
             }
         }
