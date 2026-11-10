@@ -262,6 +262,24 @@ fn merge_joins_on_two_keys_count_only_compatible_pairs_against_the_row_limit() {
             .enumerate()
             .all(|(i, v)| *v == Id(100 + i as u64))
     );
+    // A right run longer than a probe piece, of which each left row matches one row,
+    // within a row limit below the run's length.
+    let long = 40_000usize;
+    ctx.max_rows = long - 5_000;
+    let mut r = Table::new(vec![k, x]);
+    for i in 0..long {
+        r.push_row(&[Id(7), Id(100 + i as u64)]);
+    }
+    r.sorted = vec![k, x];
+    let mut l = Table::new(vec![k, x]);
+    for i in [0usize, long / 2, long - 1] {
+        l.push_row(&[Id(7), Id(100 + i as u64)]);
+    }
+    l.sorted = vec![k, x];
+    let joined = super::exec::join_tables(&ctx, &l, &r, &[k], true).unwrap();
+    assert_eq!(joined.len(), 3);
+    let optional = left_join(&ctx, &l, &r, None, &mut None).unwrap();
+    assert_eq!(optional.len(), 3);
 }
 
 /// The zippers of merge left joins and anti joins, alone, side by side over parts of the
