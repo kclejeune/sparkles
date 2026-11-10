@@ -493,7 +493,11 @@ impl DlSt {
             + table_bytes(self.sent.capacity(), 8)
             + table_bytes(self.props.capacity(), 12)
             + table_bytes(self.promoted.capacity(), 16)
-            + self.promoted.iter().map(|h| h.len() * 4).sum::<usize>()
+            + self
+                .promoted
+                .iter()
+                .map(|h| h.len() * std::mem::size_of::<Lit>())
+                .sum::<usize>()
             + self.root.as_ref().map_or(0, |r| r.bytes())
     }
 
@@ -1166,7 +1170,7 @@ fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: 
         if x.promoted.insert(head.clone().into_boxed_slice()) {
             let grown = table_bytes(x.promoted.capacity(), 16)
                 .saturating_sub(table_bytes(before, 16))
-                + head.len() * 4;
+                + head.len() * std::mem::size_of::<Lit>();
             out.dl().grow(grown);
             let cid = out.dl().table.push(Clause::new(Vec::new(), head));
             out.send(root, Concl::RFact(cid));

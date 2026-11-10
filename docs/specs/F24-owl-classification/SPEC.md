@@ -1171,8 +1171,9 @@ its conditions as maximal literals. The root therefore computes the consequences
 ontology at `u` under every subset of the ground atoms that any context has ever found
 maximal, which is the second measured cause, and the fifth condition of Definition 7 keeps
 every ground atom maximal so that each one can become a marker, which the first cause
-needs. The three departures below remove the markers, order the ground literals and block
-the equalities with `x` outside query contexts. Each is an inference restriction or an
+needs. The four departures below remove the markers, order the ground literals, block
+the equalities with `x` outside query contexts and select the ground literals of bodies
+outside the root. Each is an inference restriction or an
 extension by sound instances of the ontology's clauses, so the run stays sound by the
 argument of the journal's Theorem 1, and the soundness of each is argued in its place.
 The journal's completeness proof does not carry over to the departures as it stands. Each

@@ -381,3 +381,78 @@ fn a_rooted_run_past_its_bound_answers_without_the_rooted_rules() {
     assert!(!out.stats.dl_rooted_over);
     assert!(!out.stats.dl_over_budget);
 }
+
+/// The bound's stop is the run's own, not the caller's, so a run that may answer in part
+/// still falls back to the default answer, complete, instead of a partial answer.
+#[test]
+fn a_rooted_run_past_its_bound_falls_back_though_it_may_answer_in_part() {
+    let body = "ClassAssertion(ObjectUnionOf(:B :C) :a)
+                ClassAssertion(ObjectComplementOf(:C) :a)
+                SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:a)))
+                SubClassOf(ObjectSomeValuesFrom(:r :B) :D)";
+    let ax = axioms(body);
+    for threads in [1, 4] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                rooted: true,
+                partial: true,
+                dl_work: Some(1),
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(out.stats.dl_rooted_over, "{threads} threads");
+        assert!(out.stats.dl_over_budget);
+        assert!(
+            out.complete,
+            "{threads} threads: a partial answer instead of the fallback"
+        );
+        assert!(out.incomplete.is_empty());
+        assert_eq!(out.consistency, Consistency::Consistent);
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
+        assert!(!k.excluded().is_empty());
+    }
+}
+
+/// A rooted run that counts keeps the counting bound: past it the run starts again
+/// without counting, with the rooted bound, and past that one without the rooted rules.
+#[test]
+fn a_rooted_run_that_counts_falls_back_twice_past_a_tiny_bound() {
+    let body = "ClassAssertion(ObjectUnionOf(:B :C) :a)
+                ClassAssertion(ObjectComplementOf(:C) :a)
+                SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:a)))
+                SubClassOf(:A ObjectMaxCardinality(1 :r))
+                SubClassOf(ObjectSomeValuesFrom(:r :B) :D)";
+    let ax = axioms(body);
+    for (threads, partial) in [(1, false), (4, false), (1, true), (4, true)] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                rooted: true,
+                counting: true,
+                partial,
+                dl_work: Some(1),
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(
+            out.stats.dl_counting_over,
+            "{threads} threads, partial {partial}"
+        );
+        assert!(
+            out.stats.dl_rooted_over,
+            "{threads} threads, partial {partial}"
+        );
+        assert!(out.stats.dl_over_budget);
+        assert!(out.complete);
+        assert_eq!(out.consistency, Consistency::Consistent);
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
+        assert!(!k.excluded().is_empty());
+    }
+    // with a bound the run finishes within, it answers in full with counting
+    let out = rooted(body, true, &[("A", "D")]);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+    assert!(!out.stats.dl_over_budget);
+}

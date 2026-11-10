@@ -27,7 +27,10 @@
 //! datatype that the classifier cannot compare, or with a property chain through the top
 //! property, is used as far as the calculus goes and reported as partial. Every
 //! subsumption the classifier answers is entailed. It derives every entailed subsumption
-//! between named classes when no axiom is reported as partial or left out.
+//! between named classes when no axiom is reported as partial or left out, except in a
+//! rooted run ([`Limits::rooted`], off by default), whose calculus departs from the
+//! published rules and whose completeness is not proved, so that its finished answer and
+//! `complete` say only that the run ended and left nothing out.
 //!
 //! [`Saturation`] keeps the saturated contexts between runs over axioms that the caller
 //! keeps, such as those of an open ontology, and reads them in place on each run.
@@ -1746,7 +1749,13 @@ impl Saturation {
             }
             stats.dl_testing = tests_start.elapsed();
         }
-        if !partial && let Some(h) = halted.take() {
+        // A stop at Tier D's bound on derived conclusions is the run's own and not the
+        // caller's, so it is not a partial answer: it goes back as the error that the
+        // fallback chain of `run_with` takes to the run that starts again, with counting
+        // or the rooted rules left out, and the caller gets that run's answer.
+        if (!partial || self.dl_worked.load(Ordering::Relaxed))
+            && let Some(h) = halted.take()
+        {
             return Err(h);
         }
         // the dependency record of a partial answer: the classes it leaves open and the

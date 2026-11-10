@@ -400,6 +400,35 @@ fn the_rooted_run_is_exact_on_the_shoi_fixtures_within_its_bound() {
                     !k.excluded().is_empty(),
                     "{stem}: nothing reported after the fallback"
                 );
+                // the fallback's answer is the answer of a run without the option
+                let mut plain = Classifier::of(&doc.axioms);
+                let want = plain
+                    .classify(&Limits {
+                        threads,
+                        expansion,
+                        ..Limits::default()
+                    })
+                    .unwrap();
+                let mut plain_got = BTreeSet::new();
+                for a in &classes {
+                    for b in &classes {
+                        if want
+                            .taxonomy
+                            .is_subclass(&Class::new(a.as_str()), &Class::new(b.as_str()))
+                        {
+                            plain_got.insert((a.clone(), b.clone()));
+                        }
+                    }
+                }
+                if got != plain_got
+                    || out.consistency != want.consistency
+                    || k.excluded().len() != plain.excluded().len()
+                    || out.stats.tier != want.stats.tier
+                {
+                    failures.push(format!(
+                        "{stem} {threads} {expansion:?}: the fallback differs from the default answer"
+                    ));
+                }
             } else {
                 if !k.excluded().is_empty() {
                     failures.push(format!(
