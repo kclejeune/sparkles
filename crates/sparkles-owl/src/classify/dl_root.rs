@@ -49,7 +49,8 @@
 
 use super::dl_clause::{Clause, Lit, Made, RTerm, Rooted, XL, XLit, terms_of};
 use super::dl_rules::{
-    DlIx, Found, Side, alls, dix, dl, drain, drain_with, ds, merge, pred_id, side, unit, with,
+    DlIx, Found, Side, alls, dix, dl, drain, drain_with, ds, merge, pred_id, restricted, side,
+    unit, with,
 };
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Sink, State, table_bytes};
@@ -274,7 +275,7 @@ fn process<S: Sink>(ix: &Index, st: &mut State, c: &Clause, max: &[Lit], out: &m
             query: None,
         };
         q.on_max(st, l, &prem, &mut found);
-        join_head(st, c, l, &prem, &mut found);
+        join_head(ix, st, c, l, &prem, &mut found, &out.dl().lits);
         let v = out.dl().lits.view(l, inv_of(ix, dx));
         if ground_trigger(v) {
             ground_out(ix, st, l, out);
@@ -355,8 +356,16 @@ fn partners_at<S: Sink>(ix: &Index, st: &State, out: &S, a: Ex, u: u32) -> Vec<S
     partners(st, atom(ix, out, a, u))
 }
 
+/// Adds the conclusion `s` of a ground inference, unless the restriction on ground
+/// inferences leaves it out.
+fn put<S: Sink>(ix: &Index, out: &S, found: &mut Found, s: Side) {
+    if !restricted(&out.dl().lits, inv_of(ix, dix(ix)), &s) {
+        found.push(s);
+    }
+}
+
 /// Hyper on a new premise `prem` of `d(u)`: the ontology clauses with d in the body, with
-/// their x bound to u.
+/// their x bound to u. A conclusion is a ground inference's unless it holds x or y.
 fn hyper_at<S: Sink>(
     ix: &Index,
     st: &State,
@@ -371,21 +380,21 @@ fn hyper_at<S: Sink>(
     let h = ix.head(d);
     match h.node {
         Node::Conj(a, b) => {
-            found.push(with(prem, at(a)));
-            found.push(with(prem, at(b)));
+            put(ix, out, found, with(prem, at(a)));
+            put(ix, out, found, with(prem, at(b)));
         }
         Node::Exist(r, _) => {
             let f = RTerm::Fc(d, u);
             for l in [XLit::Role(r, RTerm::C(u), f), XLit::Atom(h.succ, f)] {
                 if let Made::Lit(l) = lit(ix, out, l) {
-                    found.push(with(prem, l));
+                    put(ix, out, found, with(prem, l));
                 }
             }
         }
         // N_v(x) → x ≈ v
         Node::Nominal(v) if v != u => {
             if let Made::Lit(l) = lit(ix, out, XLit::Eq(RTerm::C(v), RTerm::C(u))) {
-                found.push(with(prem, l));
+                put(ix, out, found, with(prem, l));
             }
         }
         _ => {}
@@ -395,24 +404,24 @@ fn hyper_at<S: Sink>(
         for (i, &a) in es.iter().enumerate() {
             for &b in &es[i + 1..] {
                 if let Made::Lit(n) = lit(ix, out, XLit::Ne(RTerm::Fc(a, u), RTerm::Fc(b, u))) {
-                    found.push(with(prem, n));
+                    put(ix, out, found, with(prem, n));
                 }
             }
         }
     }
     for &t in ix.told_of(h) {
-        found.push(with(prem, at(t)));
+        put(ix, out, found, with(prem, at(t)));
     }
     for &(p, k) in ix.conj_of(h) {
         for q in partners_at(ix, st, out, p, u) {
-            found.push(with(&merge(prem, &q), at(k)));
+            put(ix, out, found, with(&merge(prem, &q), at(k)));
         }
     }
     for &set in ix.disjoint_of(h) {
         for &m in &dx.sets[set as usize] {
             if m != d {
                 for q in partners_at(ix, st, out, m, u) {
-                    found.push(merge(prem, &q));
+                    put(ix, out, found, merge(prem, &q));
                 }
             }
         }
@@ -431,7 +440,7 @@ fn hyper_at<S: Sink>(
                 })
                 .collect();
             let base: Side = (Vec::new(), head.iter().map(|&a| at(a)).collect());
-            found.products(lists, base);
+            found.ground_products(lists, base);
         }
     }
     // the universals d stands for, over the role atoms from u
@@ -457,7 +466,7 @@ fn hyper_at<S: Sink>(
                     if dx.sub(ix, t, a)
                         && let Made::Lit(m) = lit(ix, out, XLit::Atom(b, f))
                     {
-                        found.push(with(&merge(prem, &side(&s.c, l)), m));
+                        put(ix, out, found, with(&merge(prem, &side(&s.c, l)), m));
                     }
                 }
             }
@@ -483,7 +492,8 @@ fn from(v: XLit, inv: impl Fn(Role) -> Option<Role>) -> Vec<(u32, Role, RTerm)> 
 }
 
 /// Hyper on a new premise `prem` of the role atom `s(u, f)`: the universals of the holders
-/// of u, `owl:Thing` included, and the disjoint roles.
+/// of u, `owl:Thing` included, and the disjoint roles. The inference is ground when f is a
+/// constant or a successor term of one, and the restriction then applies.
 #[allow(clippy::too_many_arguments)]
 fn on_role<S: Sink>(
     ix: &Index,
@@ -497,6 +507,12 @@ fn on_role<S: Sink>(
 ) {
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
+    let ground = matches!(f, RTerm::C(_) | RTerm::Fc(..));
+    let add = |found: &mut Found, c: Side| {
+        if !ground || !restricted(&out.dl().lits, inv, &c) {
+            found.push(c);
+        }
+    };
     let mut ps = Vec::new();
     let over = |b: Ex, q: &Side, ps: &mut Vec<(Role, Ex)>, found: &mut Found| {
         alls(ix, b, ps);
@@ -504,7 +520,7 @@ fn on_role<S: Sink>(
             if dx.sub(ix, s, t)
                 && let Made::Lit(m) = lit(ix, out, XLit::Atom(c, f))
             {
-                found.push(with(&merge(prem, q), m));
+                add(found, with(&merge(prem, q), m));
             }
         }
     };
@@ -536,7 +552,7 @@ fn on_role<S: Sink>(
                 for &l in x.store.maxima(i) {
                     for (w, t, g) in from(out.dl().lits.view(l, inv), inv) {
                         if w == u && g == f && dx.sub(ix, t, b) {
-                            found.push(merge(prem, &side(&c.c, l)));
+                            add(found, merge(prem, &side(&c.c, l)));
                         }
                     }
                 }
@@ -593,10 +609,21 @@ fn is_marker(c: &Clause) -> bool {
 /// Join on a new premise `prem` of the clause `c`, whose maximal literal is `l`: when l is a
 /// ground atom or an equality of constants, the processed clauses with l in the body. A
 /// marker is no premise on either side, since its conclusion would be the other premise.
-pub(super) fn join_head(st: &State, c: &Clause, l: Lit, prem: &Side, found: &mut Found) {
+/// A Join of two clauses that hold neither x nor y is a ground inference, and its
+/// conclusion then holds neither, so the restriction applies to the conclusion.
+pub(super) fn join_head(
+    ix: &Index,
+    st: &State,
+    c: &Clause,
+    l: Lit,
+    prem: &Side,
+    found: &mut Found,
+    lits: &super::dl_clause::Lits,
+) {
     if is_marker(c) {
         return;
     }
+    let inv = inv_of(ix, dix(ix));
     let Some(x) = dl(st) else { return };
     for &i in x.store.by_ground.get(&l).into_iter().flatten() {
         let s = &x.store.clauses[i as usize];
@@ -607,7 +634,10 @@ pub(super) fn join_head(st: &State, c: &Clause, l: Lit, prem: &Side, found: &mut
             s.c.body().iter().copied().filter(|&m| m != l).collect(),
             s.c.head().to_vec(),
         );
-        found.push(merge(prem, &rest));
+        let c = merge(prem, &rest);
+        if !restricted(lits, inv, &c) {
+            found.push(c);
+        }
     }
 }
 
@@ -636,7 +666,10 @@ pub(super) fn join_body(
         for &i in x.store.by_xl.get(&l).into_iter().flatten() {
             let s = &x.store.clauses[i as usize];
             if !s.dead && !is_marker(&s.c) {
-                found.push(merge(&side(&s.c, l), &rest));
+                let c = merge(&side(&s.c, l), &rest);
+                if !restricted(lits, inv, &c) {
+                    found.push(c);
+                }
             }
         }
     }
@@ -678,7 +711,7 @@ pub(super) fn on_max<S: Sink>(
     if ground_trigger(v) {
         ground_out(ix, st, l, out);
     }
-    join_head(st, c, l, prem, found);
+    join_head(ix, st, c, l, prem, found, &out.dl().lits);
     at_consts(ix, me, st, l, v, prem, found, out);
 }
 
@@ -2462,6 +2495,165 @@ mod tests {
                 "another predecessor, register first {register_first}"
             );
         }
+    }
+
+    /// A probe run of the context `me` over the clauses `seed`, flushed, with the live
+    /// clauses of its store in general form.
+    fn probe_flush(
+        s: Sig,
+        me: impl Fn(Ex) -> Ex,
+        seed: impl Fn(&Index, &dyn Fn(XLit) -> Lit) -> Vec<(Vec<XLit>, Vec<XLit>)>,
+    ) -> Vec<(Vec<XLit>, Vec<XLit>)> {
+        let (ix, root) = probe_ix(s);
+        let run = DlRun::new(false, Default::default());
+        let mut out = Probe {
+            run: &run,
+            sent: Vec::new(),
+            mine: Vec::new(),
+        };
+        let inv = inv_of(&ix, dix(&ix));
+        let l = |v: XLit| match run.lits.lit(v, inv) {
+            Made::Lit(l) => l,
+            _ => panic!("a literal"),
+        };
+        let mut st = State {
+            init: true,
+            ..State::default()
+        };
+        for (b, h) in seed(&ix, &l) {
+            ds(&mut st).store.add(Clause::new(
+                b.iter().copied().map(l).collect(),
+                h.iter().copied().map(l).collect(),
+            ));
+        }
+        let me = me(root);
+        if me == root {
+            flush(&ix, &mut st, &mut out, 100);
+        } else {
+            super::super::dl_rules::flush(&ix, me, &mut st, &mut out, 100);
+        }
+        let v = |ls: &[Lit]| ls.iter().map(|&l| run.lits.view(l, inv)).collect();
+        dl(&st)
+            .unwrap()
+            .store
+            .clauses
+            .iter()
+            .filter(|c| !c.dead)
+            .map(|c| (v(c.c.body()), v(c.c.head())))
+            .collect()
+    }
+
+    #[test]
+    fn a_context_makes_no_ground_clause_with_a_body_from_its_markers() {
+        // the markers A(a) → A(a) and B(a) → B(a) and A ⊓ B ⊑ H: Hyper at a would give
+        // A(a) ∧ B(a) → H(a), a ground clause with a body, which the restriction on ground
+        // inferences leaves out
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let [a, b, h, z] = ["A", "B", "H", "Z"].map(|n| s.class(n));
+        s.dl.clauses.push((vec![a, b], vec![h]));
+        let cs = probe_flush(
+            s,
+            |_| z,
+            |ix, _| {
+                let u = c(na, ix);
+                vec![
+                    (vec![XLit::Atom(a, u)], vec![XLit::Atom(a, u)]),
+                    (vec![XLit::Atom(b, u)], vec![XLit::Atom(b, u)]),
+                ]
+            },
+        );
+        let made = cs.iter().any(|(bd, hd)| {
+            bd.len() == 2 && hd.iter().any(|l| matches!(l, XLit::Atom(k, _) if *k == h))
+        });
+        assert_eq!(made, !super::super::dl_rules::ground_restrict(), "{cs:?}");
+    }
+
+    #[test]
+    fn a_disjoint_role_clash_over_x_keeps_its_ground_condition() {
+        // A(a) → s(a, x) and ⊤ → t(a, x) with s and t disjoint: the Hyper binds y to x, so
+        // it is no ground inference, and A(a) → ⊥ is made with the restriction on
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let [a, z] = ["A", "Z"].map(|n| s.class(n));
+        let r = s.role("s");
+        let t = s.role("t");
+        s.dl.rdis.push((r, t));
+        let cs = probe_flush(
+            s,
+            |_| z,
+            |ix, _| {
+                let u = c(na, ix);
+                vec![
+                    (vec![XLit::Atom(a, u)], vec![XLit::Role(r, u, RTerm::X)]),
+                    (vec![], vec![XLit::Role(t, u, RTerm::X)]),
+                ]
+            },
+        );
+        assert!(
+            cs.iter().any(|(bd, hd)| hd.is_empty()
+                && bd.len() == 1
+                && matches!(bd[0], XLit::Atom(k, _) if k == a)),
+            "{cs:?}"
+        );
+    }
+
+    #[test]
+    fn an_equality_over_a_successor_term_keeps_its_ground_condition() {
+        // A(a) → f(x) ≈ u and ⊤ → B(f(x)): the equality holds x, so Eq is no ground
+        // inference, and A(a) → B(u) is made with the restriction on
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let nu = s.ind("u");
+        let [a, b, k, z] = ["A", "B", "K", "Z"].map(|n| s.class(n));
+        let r = s.role("r");
+        let e = s.some_h(r, k);
+        let cs = probe_flush(
+            s,
+            |_| z,
+            |ix, _| {
+                let (ua, uu) = (c(na, ix), c(nu, ix));
+                vec![
+                    (vec![XLit::Atom(a, ua)], vec![XLit::Eq(RTerm::Fx(e), uu)]),
+                    (vec![], vec![XLit::Atom(b, RTerm::Fx(e))]),
+                ]
+            },
+        );
+        assert!(
+            cs.iter().any(|(bd, hd)| {
+                bd.len() == 1
+                    && matches!(bd[0], XLit::Atom(k, _) if k == a)
+                    && matches!(hd.as_slice(), [XLit::Atom(k, RTerm::C(_))] if *k == b)
+            }),
+            "{cs:?}"
+        );
+    }
+
+    #[test]
+    fn the_root_discharges_a_ground_body_by_join() {
+        // ⊤ → A(a) and A(a) → D(a) in the root, as Pred along an edge over a constant
+        // leaves a successor's marker in the body: Join gives ⊤ → D(a), which has no body
+        // and so passes the restriction on ground inferences
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let [a, dd] = ["A", "D"].map(|n| s.class(n));
+        let cs = probe_flush(
+            s,
+            |root| root,
+            |ix, _| {
+                let u = c(na, ix);
+                vec![
+                    (vec![], vec![XLit::Atom(a, u)]),
+                    (vec![XLit::Atom(a, u)], vec![XLit::Atom(dd, u)]),
+                ]
+            },
+        );
+        assert!(
+            cs.iter()
+                .any(|(bd, hd)| bd.is_empty()
+                    && matches!(hd.as_slice(), [XLit::Atom(k, _)] if *k == dd)),
+            "{cs:?}"
+        );
     }
 
     /// A context of the class `at`, or the root, seeded with `seeds` and flushed, with its

@@ -738,13 +738,39 @@ fn partners_rf(ix: &Index, st: &State, t: Role) -> Vec<(Ex, Vec<Side>)> {
     out
 }
 
+/// Whether a ground inference makes no clause that holds neither x nor y and has a body,
+/// item 804's first departure's restriction (F24). `SPARKLES_ROOTED_GROUND_RESTRICT=0`
+/// turns it off, for measurement.
+pub fn ground_restrict() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_GROUND_RESTRICT").is_none_or(|v| v != "0"))
+}
+
+/// Whether the restriction on ground inferences leaves out the conclusion `s` of one: it
+/// has a body and holds neither x nor y, so that every literal is over constants and
+/// successor terms `f_e(u)` of constants.
+pub(super) fn restricted(lits: &Lits, inv: impl Fn(Role) -> Option<Role> + Copy, s: &Side) -> bool {
+    use super::dl_clause::terms_of;
+    ground_restrict()
+        && !s.0.is_empty()
+        && s.0.iter().chain(&s.1).all(|&l| {
+            l.kind() == XL && {
+                let (ts, n) = terms_of(lits.view(l, inv));
+                ts[..n]
+                    .iter()
+                    .all(|t| matches!(t, RTerm::C(_) | RTerm::Fc(..)))
+            }
+        })
+}
+
 /// What the rules on one clause or unit give: single conclusions, and choices of one
 /// premise from every list of a product, which [`drain`] derives one at a time so that a
-/// wide case analysis is never held whole.
+/// wide case analysis is never held whole. A product of a ground inference is marked, and
+/// the choices that the restriction on ground inferences leaves out are not derived.
 #[derive(Default)]
 pub(super) struct Found {
     one: Vec<Side>,
-    prods: Vec<(Vec<Vec<Side>>, Side)>,
+    prods: Vec<(Vec<Vec<Side>>, Side, bool)>,
     /// set when an inference has more choices than a context enumerates, which passes the
     /// run's bound on derived conclusions instead
     over: bool,
@@ -755,14 +781,21 @@ impl Found {
         self.one.push(s);
     }
     /// Each choice of one premise from every list, merged with `base`.
-    pub(super) fn products(&mut self, mut lists: Vec<Vec<Side>>, base: Side) {
+    pub(super) fn products(&mut self, lists: Vec<Vec<Side>>, base: Side) {
+        self.products_of(lists, base, false);
+    }
+    /// [`Found::products`] for a ground inference, whose choices the restriction filters.
+    pub(super) fn ground_products(&mut self, lists: Vec<Vec<Side>>, base: Side) {
+        self.products_of(lists, base, true);
+    }
+    fn products_of(&mut self, mut lists: Vec<Vec<Side>>, base: Side, ground: bool) {
         if lists.iter().any(|l| l.is_empty()) {
             return;
         }
         for l in &mut lists {
             prune(l);
         }
-        self.prods.push((lists, base));
+        self.prods.push((lists, base, ground));
     }
 }
 
@@ -825,7 +858,9 @@ pub(super) fn drain_with<S: Sink>(
             }
         }
     }
-    for (lists, base) in found.prods {
+    let dx = ix.dl.as_deref();
+    let inv = |r: Role| dx.and_then(|d| d.inv(ix, r));
+    for (lists, base, ground) in found.prods {
         let mut at = vec![0usize; lists.len()];
         'choices: loop {
             if out.stopped() {
@@ -837,7 +872,9 @@ pub(super) fn drain_with<S: Sink>(
                 s.0.extend_from_slice(&l[i].0);
                 s.1.extend_from_slice(&l[i].1);
             }
-            derive(ix, st, s, out);
+            if !ground || !restricted(&out.dl().lits, inv, &s) {
+                derive(ix, st, s, out);
+            }
             let x = ds(st);
             x.choices += 1;
             if x.choices as usize >= PRODUCT_POLL {

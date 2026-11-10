@@ -19,12 +19,16 @@
 //! and 22 use. The equality is still a rewritten literal, so `u ≈ v` turns `x ≈ u` into
 //! `x ≈ v`, and Factor takes it as any equality.
 //!
+//! An Eq or Factor whose equality and rewritten literal hold neither `x` nor `y` is a ground
+//! inference, and the restriction on ground inferences (F24, item 804's first departure)
+//! leaves out its conclusion when the conclusion has a body and holds neither.
+//!
 //! The premises in place of a context other than the root are its units: the atoms `B(x)`
 //! of its subsumers, and the role atom and core of a unit existential restriction over its
 //! successor term.
 
 use super::dl_clause::{Lit, Lits, Made, RTerm, Rooted, XLit, rank, terms_of};
-use super::dl_rules::{DlIx, Found, Side, dl, merge, side, unit, with};
+use super::dl_rules::{DlIx, Found, Side, dl, merge, restricted, side, unit, with};
 use super::index::{Ex, Index, Role, TOP};
 use super::saturate::State;
 use std::sync::OnceLock;
@@ -210,7 +214,7 @@ impl Eqs<'_> {
                     }
                     made.clear();
                     self.rewrites(*v2, s1, t1, &mut made);
-                    push(found, prem, c2, &made);
+                    self.push(found, prem, c2, &made, no_xy(v) && no_xy(*v2));
                 }
             }
         }
@@ -264,7 +268,7 @@ impl Eqs<'_> {
                         }
                         made.clear();
                         self.rewrites(v, s1, t1, &mut made);
-                        push(found, &c1, prem, &made);
+                        self.push(found, &c1, prem, &made, no_xy(self.view(e)) && no_xy(v));
                     }
                 }
             }
@@ -295,21 +299,40 @@ impl Eqs<'_> {
                 Made::False => {}
                 Made::True => continue,
             }
-            found.push(c);
+            if !(no_xy(XLit::Eq(s, t1)) && no_xy(XLit::Eq(s, t0)))
+                || !restricted(self.lits, self.inv(), &c)
+            {
+                found.push(c);
+            }
+        }
+    }
+
+    /// The conclusions of rewriting `c2` with `c1`, one for each literal made: a false
+    /// literal leaves the clause without it, and a true one makes no conclusion. The
+    /// restriction on ground inferences applies when `ground`.
+    fn push(&self, found: &mut Found, c1: &Side, c2: &Side, made: &[Made], ground: bool) {
+        let mut add = |c: Side| {
+            if !ground || !restricted(self.lits, self.inv(), &c) {
+                found.push(c);
+            }
+        };
+        for &m in made {
+            match m {
+                Made::Lit(l) => add(with(&merge(c1, c2), l)),
+                Made::False => add(merge(c1, c2)),
+                Made::True => {}
+            }
         }
     }
 }
 
-/// The conclusions of rewriting `c2` with `c1`, one for each literal made: a false literal
-/// leaves the clause without it, and a true one makes no conclusion.
-fn push(found: &mut Found, c1: &Side, c2: &Side, made: &[Made]) {
-    for &m in made {
-        match m {
-            Made::Lit(l) => found.push(with(&merge(c1, c2), l)),
-            Made::False => found.push(merge(c1, c2)),
-            Made::True => {}
-        }
-    }
+/// Whether a literal holds neither x nor y, so that its terms are constants and successor
+/// terms of constants.
+fn no_xy(v: XLit) -> bool {
+    let (ts, n) = terms_of(v);
+    ts[..n]
+        .iter()
+        .all(|t| matches!(t, RTerm::C(_) | RTerm::Fc(..)))
 }
 
 /// The literals over `f_e(x)` that a unit existential restriction e holds, its role and its
