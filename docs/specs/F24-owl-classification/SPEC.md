@@ -1009,9 +1009,10 @@ Two ground literals are compared by one order that every context shares, and oth
 a function-free atom that mentions `y` or a constant is above only what Definition 7's
 fifth condition allows. Named classes over `x` are incomparable with one another and with
 every ground atom. Each context of a named class is then a query
-context that meets condition C2 of the journal's Theorem 2, and its unit subsumers are
-complete without the candidate tests of the rules above, whose model construction ignores
-ground atoms. A clause can have several incomparable maximal literals, so the clause store
+context that meets condition C2 of the journal's Theorem 2, and under the journal's rules
+its unit subsumers are complete without the candidate tests of the rules above, whose
+model construction ignores ground atoms. With item 804's departures below that
+completeness is the open obligation they record. A clause can have several incomparable maximal literals, so the clause store
 indexes every one of them. A clause keeps a canonical literal order for hashing, apart from
 the order that selects its premises.
 
@@ -1075,7 +1076,8 @@ through the automata of the rules above, and h is not a named individual for key
 the taxonomy.
 
 The run relies on the journal's Theorem 1 for soundness, Theorem 2 with condition C2 for
-the completeness of each named class's context, and Theorem 5 for termination with an
+the completeness of each named class's context under the journal's rules, which item
+804's departures below leave as an open obligation, and Theorem 5 for termination with an
 admissible expansion strategy. The hypothetical successors of the cautious strategy are
 admissible under Definitions 5 and 9 once one edge covers every ground trigger as above. A
 run that stops at its bound is not saturated. The dependency record of the rules above
@@ -1172,12 +1174,20 @@ under every combination of markers.
 The literals of a context other than the root are those over `x`, `y` and `f(x)` of the
 rules above, the ground literals, which are `B(u)`, `S(u, v)`, `u ≈ v` and `u ≉ v`, the
 role atoms `S(x, u)` and `S(u, x)`, the equalities `x ≈ u` and `f(x) ≈ u`, and the
-literals over `f(u)` that the root holds, `B(f(u))`, `S(u, f(u))`, `S(f(u), v)` and
-`f(u) ≈ v`. A constant that Eq rewrites is rewritten at every occurrence in the selected
-literal, in every context, as Table 2 has the root do, so that `S(u, f(u))` rewritten by
-`u ≈ v` is `S(v, f(v))` and a literal never mixes a constant with a successor term of
-another constant. The order groups a literal over `f(u)` with the literals over successor
-terms, which are totally ordered as above.
+literals over `f(u)` that the root holds, which are `B(f(u))`, a role atom between `f(u)`
+and any constant in either direction, `f(u) ≈ v`, and the inequalities `f_i(u) ≉ f_j(u)`
+of a minimum restriction with counting. The set is closed under the rules. Hyper at a
+constant `u` makes literals over `u` and `f(u)` only. Pred along an edge for `f(u)` reads
+`x` as `f(u)`, `y` as `u` and keeps the constants, so a successor's head over `x`, `y` and
+constants becomes one of the forms listed, among them `S(v, f(u))` from `S(v, x)`, which
+is a Hyper premise for the universal restrictions of `v`'s holders and no successor
+trigger, since Definition 4's `S(y, x)` reads as `S(u, f(u))` along that edge. Eq rewrites
+a constant at every occurrence in the selected literal, in every context, as Table 2 has
+the root do, so that `S(u, f(u))` rewritten by `u ≈ v` is `S(v, f(v))` and `f(u)` never
+appears beside a rewritten form of `u`, and Factor makes inequalities of the a-terms
+already present. The order groups every literal over `f(u)` with the literals over
+successor terms, which are totally ordered as above by the greatest successor term, the
+role, the predicate and the terms.
 
 Successors still take markers. When Succ fires, the successor gets `A → A` for every
 ground literal `A` of Definition 4's successor triggers that is maximal in a processed
@@ -1212,10 +1222,11 @@ those inferences has a counterpart in `v` with the actual premises in place of t
 markers, since `v` has the same rules at constants and the same successor for `f(u)`.
 The counterpart's conclusion carries the residual disjunctions `Δ_i`, which can leave an
 intermediate ground literal below a greater one, so that the next inference of the chain
-is not made in `v` while the root made it. That is the case ordered resolution leaves
-out on purpose. The clause is satisfied by its greatest literal in the model that a
-saturated set gives, and the inference on the smaller literal is needed only once the
-greater one is resolved away, after which the chain continues. The restriction leaves
+is not made in `v` while the root made it. Ordered resolution leaves such an inference
+out and stays complete by a model construction, in which a clause whose greatest literal
+the construction makes true needs no inference on a smaller one, and whether that
+construction carries over to the contexts of the departed run is the open obligation
+below, so this is a motivation and not an argument. The restriction leaves
 out a ground conclusion under hypotheses, and the argument for it is that the context
 which holds a marked literal in an actual clause can derive the ground conclusion from
 its actual clause and the other premises, which reach it as root facts by registration or
@@ -1253,12 +1264,11 @@ incomparable. The journal explains the condition by the literals that Pred carri
 predecessor, which must not block a literal that only the context itself can resolve, and
 that part of the condition the departure keeps, since a ground atom never blocks an atom
 over `x` or `y`. Two ground atoms of one clause both go to the predecessor whatever their
-order, and Succ's markers follow the order on purpose, since a ground trigger that is not
-yet maximal is not yet a hypothesis the successor needs, and so no inference of the
-departed run depends on a ground atom being maximal beside another one. A context then
-resolves its ground literals one at a time by the order, as ordered resolution does, and
-a ground literal that is never maximal is one the context never needs to resolve. The
-journal's proof needs more than that. Its Appendix D chooses the ground order of each
+order, and Succ's markers follow the order, so a ground trigger that is not yet maximal
+is not yet a hypothesis of its successors, which the departure conjectures to be
+dispensable and does not show. A context then resolves its ground literals one at a time
+by the order, as ordered resolution does, which is the motivation for the departure and
+not an argument. The journal's proof needs more than that. Its Appendix D chooses the ground order of each
 model fragment from the literals already made false, under its properties O1 to O3, and
 the fifth condition is what lets every such order extend the context order. A context
 order that fixes the order of two ground atoms can contradict the order a fragment would
