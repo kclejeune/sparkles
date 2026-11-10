@@ -529,8 +529,6 @@ fn lazy_start() -> Duration {
         ns => Duration::from_nanos(ns).max(LAZY_MIN).min(LAZY_START),
     }
 }
-/// The activations between the first worker's checks of [`lazy_start`].
-const LAZY_EVERY: u32 = 16;
 
 #[cfg(test)]
 thread_local! {
@@ -1232,7 +1230,6 @@ impl<'a> Run<'a> {
             start();
         }
         let began = others.map(|_| (Instant::now(), lazy_start()));
-        let mut activations = 0u32;
         let mut mine: VecDeque<Ex> = VecDeque::new();
         let mut chunk: Vec<Ex> = Vec::new();
         let mut round = 0usize;
@@ -1300,14 +1297,13 @@ impl<'a> Run<'a> {
                 return;
             }
             self.process::<R>(next, &mut mine, &mut tally, &mut local, &mut outbox);
-            if let Some(start) = others {
-                activations += 1;
-                if activations.is_multiple_of(LAZY_EVERY)
-                    && began.is_some_and(|(b, wait)| b.elapsed() >= wait)
-                {
-                    others = None;
-                    start();
-                }
+            // a Horn or disjunctive activation can take tens of microseconds, so the
+            // first worker looks at the clock after each
+            if let Some(start) = others
+                && began.is_some_and(|(b, wait)| b.elapsed() >= wait)
+            {
+                others = None;
+                start();
             }
             if !outbox.is_empty() && self.idle.load(Ordering::Relaxed) > 0 {
                 self.deliver(&mut outbox, &mut mine);
