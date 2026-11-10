@@ -1,11 +1,17 @@
 """Check scripts/rl-reference/rl_terms.py, the term encoding and the closure comparison of
 the OWL 2 RL reference: the datatypes it gives each literal (the rule dt-type2), the
-round trip of encoded terms, the split of an N-Quads dump, and the differ's verdicts."""
+round trip of encoded terms, the split of an N-Quads dump, and the differ's verdicts, which
+must match those of a comparison of two in-memory sets."""
 
+import contextlib
 import importlib.util
+import io
 import json
+import random
+import re
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -180,6 +186,108 @@ class Diff(unittest.TestCase):
         self.assertEqual(rc, 0)
         rc, _ = self.run_diff("", "<urn:a> <urn:p> <urn:b> .\n", subset=True)
         self.assertEqual(rc, 1)
+
+
+def set_diff(sparkles, reference, known_rows, subset):
+    """The comparison of two in-memory sets that rl_terms.diff replaces with a sort on disk,
+    as the report and the stderr lines it gives."""
+    known = [(s, re.compile(p), w) for s, p, w in known_rows]
+
+    def load(path):
+        return {f"{s} {p} {o} ." for s, p, o in rl.triples(path)}
+
+    a, b = load(sparkles), load(reference)
+    result = {"sparkles": len(a), "reference": len(b), "common": len(a & b), "subset": subset, "differences": {}}
+    unexplained = []
+    for side, only in (("sparkles", a - b), ("reference", b - a)):
+        by_why, by_pred, examples = Counter(), Counter(), {}
+        for line in sorted(only):
+            by_pred[rl.terms(line, 2)[0][1]] += 1
+            why = next((w for s, r, w in known if s == side and r.search(line)), None)
+            if why is None:
+                why = "unexplained"
+                if not (subset and side == "sparkles"):
+                    unexplained.append(f"{side} only: {line}")
+            by_why[why] += 1
+            if len(examples.setdefault(why, [])) < 5:
+                examples[why].append(line)
+        result["differences"][side] = {
+            "total": len(only),
+            "by_explanation": dict(by_why.most_common()),
+            "by_predicate": dict(by_pred.most_common()),
+            "examples": examples,
+        }
+    result["unexplained"] = len(unexplained)
+    summary = (
+        f"sparkles {len(a)}, reference {len(b)}, common {len(a & b)}, "
+        f"sparkles only {len(a - b)}, reference only {len(b - a)}, unexplained {len(unexplained)}"
+    )
+    return result, [summary] + unexplained[:20]
+
+
+class DiffMatchesSets(unittest.TestCase):
+    """The sorted comparison gives the report, the examples and the stderr lines of the
+    comparison of two sets on unsorted input with duplicates, non-ASCII terms, padding and
+    more than twenty unexplained differences."""
+
+    def graph(self, rng, n):
+        subjects = ["<urn:a>", "<urn:b>", "<urn:\u00e9>", "<urn:z\u4e2d>", "_:b1", "<urn:\U0001f600>"]
+        preds = ["<urn:p>", "<urn:q>", "<urn:chain4>", "<urn:\u00e9p>"]
+        objs = ['"x"', '"\u00e9"@fr', '"1"^^<urn:int>', "<urn:o>", "_:b2", '"a\\"b"', "<urn:O>"]
+        lines = []
+        for _ in range(n):
+            s, p, o = rng.choice(subjects), rng.choice(preds), rng.choice(objs)
+            lines.append(f"{s}  {p} {o}." if rng.random() < 0.2 else f"{s} {p} {o} .")
+        return "\n".join(lines) + "\n"
+
+    def test_random_graphs(self):
+        known_rows = [("reference", "<urn:chain4>", "a chain of four properties"), ("sparkles", "_:b1 ", "a blank subject")]
+        known = "".join(f"{s}\t{p}\t{w}\n" for s, p, w in known_rows)
+        for seed in range(12):
+            rng = random.Random(seed)
+            a, b = self.graph(rng, rng.randrange(0, 150)), self.graph(rng, rng.randrange(0, 150))
+            for subset in (False, True):
+                with self.subTest(seed=seed, subset=subset), tempfile.TemporaryDirectory() as d:
+                    d = Path(d)
+                    (d / "a.nt").write_text(a, encoding="utf-8")
+                    (d / "b.nt").write_text(b, encoding="utf-8")
+                    (d / "known.tsv").write_text(known, encoding="utf-8")
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        rc = rl.diff(str(d / "a.nt"), str(d / "b.nt"), str(d / "r.json"), str(d / "known.tsv"), subset)
+                    want, want_err = set_diff(str(d / "a.nt"), str(d / "b.nt"), known_rows, subset)
+                    self.assertEqual(json.loads((d / "r.json").read_text()), want)
+                    self.assertEqual(err.getvalue().splitlines(), want_err)
+                    self.assertEqual(rc, 1 if want["unexplained"] else 0)
+                    self.assertEqual(sorted(p.name for p in d.iterdir()), ["a.nt", "b.nt", "known.tsv", "r.json"])
+
+    def test_decode_sorts_by_code_point_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "terms.tsv").write_text('<urn:x-lit:0>\t"\u00e9"\n<urn:x-bnode:1>\t_:b\n', encoding="utf-8")
+            lines = [
+                "<urn:\U0001f600> <urn:p> <urn:x-lit:0> .",
+                "<urn:\u00e9> <urn:p> <urn:o> .",
+                "<urn:x-bnode:1> <urn:p> <urn:o> .",
+                "<urn:z> <urn:p> <urn:x-lit:0> .",
+                "<urn:\u00e9> <urn:p> <urn:o> .",
+                "<urn:Z> <urn:p> <urn:o> .",
+            ]
+            (d / "nemo.nt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()):
+                rl.decode(str(d), str(d / "nemo.nt"), str(d / "out.nt"))
+            m = {"<urn:x-lit:0>": '"\u00e9"', "<urn:x-bnode:1>": "_:b"}
+            want = sorted({" ".join(m.get(t, t) for t in ln.split(" ")) for ln in lines})
+            self.assertEqual((d / "out.nt").read_text(encoding="utf-8").splitlines(), want)
+
+    def test_a_failed_decode_writes_no_output(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "terms.tsv").write_text("")
+            (d / "nemo.nt").write_text("<urn:s> <urn:p> <urn:o> .\n<urn:x-lit:7> <urn:p> <urn:o> .\n")
+            with self.assertRaises(ValueError):
+                rl.decode(str(d), str(d / "nemo.nt"), str(d / "out.nt"))
+            self.assertEqual(sorted(p.name for p in d.iterdir()), ["nemo.nt", "terms.tsv"])
 
 
 if __name__ == "__main__":
