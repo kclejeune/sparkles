@@ -2787,8 +2787,9 @@ mod tests {
     /// A saturation records its start of the helper threads as soon as they start, so
     /// that a saturation that starts while it runs waits as long (roadmap item 720). The
     /// cancellation hook, which the helpers poll at their checks of the bounds, looks at
-    /// the record while they run. The steps outside the saturation run on the calling
-    /// thread for so small an ontology.
+    /// the record while they run, and holds the first worker until a helper has looked.
+    /// The steps outside the saturation run on the calling thread for so small an
+    /// ontology.
     #[test]
     fn a_saturation_records_its_start_of_the_helpers_while_they_run() {
         let c = |i: usize| ClassExpression::Class(Class::new(format!("http://ex.org/C{i}")));
@@ -2809,10 +2810,19 @@ mod tests {
         let hook = {
             let seen = seen.clone();
             move || {
-                if std::thread::current().id() != caller
-                    && started.load(std::sync::atomic::Ordering::Relaxed) > 0
-                {
-                    seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                let on = started.load(std::sync::atomic::Ordering::Relaxed) > 0;
+                if std::thread::current().id() != caller {
+                    if on {
+                        seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                } else if on {
+                    // the first worker waits for a helper to look, which the helpers do
+                    // at their checks of the bounds as they take roots of their own
+                    let until = Instant::now() + std::time::Duration::from_secs(5);
+                    while !seen.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < until
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                 }
                 false
             }
