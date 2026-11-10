@@ -4470,22 +4470,30 @@ fn merge_expand(
             &mut rj,
         )?;
         if done == 0 {
-            // a run longer than a piece: admit it whole, then expand it alone
+            // a run longer than a piece: expand it a piece at a time, checking the pairs
+            // it gives against the output limits as they grow
             let at = first[from] as usize;
-            let n = run_end(b, at) - at;
-            ctx.check_output(li.len().saturating_add(n), w)?;
-            from += merge::expand(
-                ctx,
-                a,
-                b,
-                &first,
-                from,
-                optional,
-                n,
-                &compatible,
-                &mut li,
-                &mut rj,
-            )?;
+            let end = run_end(b, at);
+            let before = li.len();
+            let mut pos = at;
+            while pos < end {
+                ctx.check()?;
+                pos = merge::expand_run(
+                    ctx,
+                    from,
+                    pos..end,
+                    PROBE_PIECE,
+                    &compatible,
+                    &mut li,
+                    &mut rj,
+                )?;
+                ctx.check_output(li.len(), w)?;
+            }
+            if optional && li.len() == before {
+                li.push(from as u32);
+                rj.push(NO_ROW);
+            }
+            from += 1;
         } else {
             from += done;
         }

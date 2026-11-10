@@ -44,6 +44,9 @@ pub(crate) fn expand(
     let limit = lrows.len().saturating_add(room);
     let mut run = (usize::MAX, 0usize);
     let mut done = 0;
+    // candidates tested since the last cancellation check, since a rejected candidate
+    // takes no room
+    let mut steps = 0usize;
     for (j, (&at, &key)) in first[from..].iter().zip(&lk[from..]).enumerate() {
         if j.is_multiple_of(4096) {
             ctx.check()?;
@@ -61,6 +64,10 @@ pub(crate) fn expand(
             }
             let before = lrows.len();
             for right in at..run.1 {
+                steps += 1;
+                if steps.is_multiple_of(POLL) {
+                    ctx.check()?;
+                }
                 if compatible(left, right) {
                     lrows.push(row);
                     rrows.push(right as u32);
@@ -80,6 +87,38 @@ pub(crate) fn expand(
         done = j + 1;
     }
     Ok(done)
+}
+
+/// Candidates tested between two checks of cancellation and the deadline.
+const POLL: usize = 4096;
+
+/// Pair the left row `left` with the right rows `rows`, one run of its key, from
+/// `rows.start`, as [`expand`] does for a run that fits its room, but at most `room`
+/// candidates at a time: the pairs that `compatible` accepts are appended, and the
+/// position after the last candidate tested is returned, so that the caller resumes a
+/// run longer than its room there and checks its output between the calls. The caller
+/// extends an OPTIONAL row that no candidate of the whole run matched.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn expand_run(
+    ctx: &Ctx,
+    left: usize,
+    rows: std::ops::Range<usize>,
+    room: usize,
+    compatible: impl Fn(usize, usize) -> bool,
+    lrows: &mut Vec<u32>,
+    rrows: &mut Vec<u32>,
+) -> Result<usize> {
+    let end = rows.end.min(rows.start.saturating_add(room.max(1)));
+    for right in rows.start..end {
+        if (right - rows.start).is_multiple_of(POLL) {
+            ctx.check()?;
+        }
+        if compatible(left, right) {
+            lrows.push(left as u32);
+            rrows.push(right as u32);
+        }
+    }
+    Ok(end)
 }
 
 /// How many rows the join of `lk` and `rk` has, given the lower bounds `first` of the
@@ -241,6 +280,67 @@ mod tests {
             }
             assert_eq!(l.into_iter().zip(r).collect::<Vec<_>>(), want);
         }
+    }
+
+    /// A run expanded a piece at a time through `expand_run` gives the pairs `expand`
+    /// gives it whole, and a run of rejected candidates stops at a cancellation within
+    /// one poll of candidates, whatever room the caller gave.
+    #[test]
+    fn a_run_expands_in_pieces_and_stops_at_a_cancellation() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let lk = ids(&[5]);
+        let rk = ids(&vec![5i64; 10_000]);
+        let first = bounds(&ctx, &lk, &rk).unwrap();
+        let odd = |_: usize, r: usize| r % 2 == 1;
+        let (mut l, mut r) = (Vec::new(), Vec::new());
+        assert_eq!(
+            expand(
+                &ctx,
+                &lk,
+                &rk,
+                &first,
+                0,
+                false,
+                rk.len(),
+                odd,
+                &mut l,
+                &mut r
+            )
+            .unwrap(),
+            1
+        );
+        let (mut pl, mut pr) = (Vec::new(), Vec::new());
+        let mut at = 0;
+        while at < rk.len() {
+            at = expand_run(&ctx, 0, at..rk.len(), 300, odd, &mut pl, &mut pr).unwrap();
+        }
+        assert_eq!((pl, pr), (l, r));
+        let tested = std::cell::Cell::new(0usize);
+        let cancelling = |_: usize, _: usize| {
+            tested.set(tested.get() + 1);
+            if tested.get() == 10 {
+                ctx.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            false
+        };
+        let (mut l, mut r) = (Vec::new(), Vec::new());
+        let stopped = expand(
+            &ctx,
+            &lk,
+            &rk,
+            &first,
+            0,
+            false,
+            rk.len(),
+            cancelling,
+            &mut l,
+            &mut r,
+        );
+        assert!(matches!(stopped, Err(Error::Cancelled)), "{stopped:?}");
+        assert!(tested.get() <= 10 + POLL, "{}", tested.get());
+        let stopped = expand_run(&ctx, 0, 0..rk.len(), rk.len(), cancelling, &mut l, &mut r);
+        assert!(matches!(stopped, Err(Error::Cancelled)), "{stopped:?}");
     }
 
     #[test]
