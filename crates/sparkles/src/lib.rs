@@ -23,6 +23,7 @@ pub mod evidence;
 pub mod fmt;
 pub mod forms;
 pub mod handles;
+pub mod jobs;
 pub mod overview;
 pub mod querybuilder;
 pub mod reasoning;

@@ -174,6 +174,9 @@ pub struct DatasetState {
     pub(crate) pool: Option<Arc<crate::sparql::pool::QueryPool>>,
     pub store: StoreHandle,
     pub name: Option<String>,
+    /// the process-local state of the durable jobs (`jobs.json`): the boot epoch and
+    /// the leases this process granted
+    pub(crate) jobs: crate::jobs::Runtime,
     /// the stored queries (`queries.json`)
     pub queries: crate::stored::Catalog,
     /// the stored mappings (`mappings.json`)
@@ -432,6 +435,7 @@ impl Dataset {
             entity_search: Default::default(),
             objects_cache: Mutex::new(ObjectsCache::default()),
             origin,
+            jobs: Default::default(),
             store,
         });
         Dataset {
