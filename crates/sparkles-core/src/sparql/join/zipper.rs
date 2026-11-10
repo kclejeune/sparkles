@@ -1,10 +1,10 @@
 //! Lower bounds of one sorted id column in another, the first step of merge left joins
 //! and merge anti joins.
 
-use super::ctx::Ctx;
-use super::exec::gallop;
+use super::gallop;
 use crate::error::Result;
 use crate::id::Id;
+use crate::sparql::ctx::Ctx;
 
 /// Zipper steps between cancellation checks.
 const ZIP_CHECK_STEPS: usize = 65536;
@@ -24,13 +24,13 @@ const ZIP_LANES_MIN_ROWS: usize = 4096;
 /// their loads. Each part's rows of `b` end at the lower bound of the next part's first
 /// row of `a`, which bounds every lower bound inside the part. The inner loops stop for a
 /// cancellation check every [`ZIP_CHECK_STEPS`] steps and make no calls.
-pub(super) fn lower_bounds(ctx: &Ctx, a: &[Id], b: &[Id]) -> Result<Vec<u32>> {
+pub(crate) fn lower_bounds(ctx: &Ctx, a: &[Id], b: &[Id]) -> Result<Vec<u32>> {
     let mut first = vec![b.len() as u32; a.len()];
     if b.len() > 8 * a.len() {
         let mut j = 0;
         for (i, &x) in a.iter().enumerate() {
             if j < b.len() && b[j] < x {
-                j = gallop(b, j, x);
+                j = gallop(b, j, |y| *y < x);
             }
             first[i] = j as u32;
         }

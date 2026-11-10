@@ -10,9 +10,9 @@ use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::sparql::ctx::{Ctx, RetainedCharge};
 use crate::sparql::exec;
+use crate::sparql::join::{gallop, zipper};
 use crate::sparql::plan::{JoinAlgo, Kind, Node};
 use crate::sparql::table::{Table, VarId};
-use crate::sparql::zipper;
 use crate::spill::{SpillKind, SpillReader, SpillRun, SpillWriter};
 use std::cmp::Ordering;
 use std::ops::Range;
@@ -91,20 +91,11 @@ pub(super) struct Merge {
     _charge: Option<RetainedCharge>,
 }
 
-/// Nearby unmatched keys are common in interleaved graph relations. Probe a
-/// bounded neighborhood before bisecting a long gap; the current key is known
-/// to precede `key` and is included in the returned count.
+/// How many rows of `column` from `at` precede `key`: the current key is known to
+/// precede `key` and is included in the count.
 #[inline]
 fn before(column: &[Id], at: usize, key: Id) -> usize {
-    let stop = at.saturating_add(8).min(column.len());
-    let mut next = at + 1;
-    while next < stop {
-        if column[next] >= key {
-            return next - at;
-        }
-        next += 1;
-    }
-    next + column[next..].partition_point(|id| *id < key) - at
+    gallop(column, at + 1, |id| *id < key) - at
 }
 
 impl Input {

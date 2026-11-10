@@ -3,6 +3,7 @@
 use super::ctx::Ctx;
 use super::expr::{Expr, Row, Val, ebv, eval};
 use super::exprcache::Report as ExprReport;
+use super::join::gallop;
 use super::plan::{
     Agg, GraphFilter, JoinAlgo, Kind, Node, OrderedTopK, PathEnd, PathSpec, RangeSpec, ScanSpec,
 };
@@ -4113,20 +4114,6 @@ fn has_undef(t: &Table, c: usize) -> bool {
     t.cols[c].iter().any(|v| v.is_undef())
 }
 
-/// Exponential + binary search for the first index `>= target` starting at `from`.
-#[inline]
-pub(super) fn gallop(col: &[Id], from: usize, target: Id) -> usize {
-    let mut step = 1;
-    let mut hi = from;
-    while hi < col.len() && col[hi] < target {
-        hi = from + step;
-        step *= 2;
-    }
-    let lo = from + step / 4;
-    let hi = hi.min(col.len());
-    lo.min(hi) + col[lo.min(hi)..hi].partition_point(|x| *x < target)
-}
-
 /// The rows of a hash join's build side grouped by key. Within a partition, `map` finds
 /// the span of `rows` that holds a key's rows in row order (the key is the id of a single
 /// key column, or a hash of several). A partition is laid out by counting each key's rows
@@ -4346,8 +4333,8 @@ fn join_pairs(
                 ctx.check_output(pairs.len(), w)?;
             }
             match a[i].cmp(&b[j]) {
-                Ordering::Less => i = gallop(a, i, b[j]),
-                Ordering::Greater => j = gallop(b, j, a[i]),
+                Ordering::Less => i = gallop(a, i, |x| *x < b[j]),
+                Ordering::Greater => j = gallop(b, j, |x| *x < a[i]),
                 Ordering::Equal => {
                     let ie = run_end(a, i);
                     let je = run_end(b, j);
@@ -4470,8 +4457,8 @@ fn join_count(ctx: &Ctx, l: &Table, r: &Table, merge: bool) -> Result<u64> {
             let (mut i, mut j, mut n) = (0usize, 0usize, 0u64);
             while i < a.len() && j < b.len() {
                 match a[i].cmp(&b[j]) {
-                    Ordering::Less => i = gallop(a, i, b[j]),
-                    Ordering::Greater => j = gallop(b, j, a[i]),
+                    Ordering::Less => i = gallop(a, i, |x| *x < b[j]),
+                    Ordering::Greater => j = gallop(b, j, |x| *x < a[i]),
                     Ordering::Equal => {
                         let ie = run_end(a, i);
                         let je = run_end(b, j);
@@ -5202,7 +5189,7 @@ fn merge_left_join(
 ) -> Result<Table> {
     let (a, b) = (&l.cols[lc], &r.cols[rc]);
     // `first[i]`: the first right row whose key is at least left row i's
-    let first = super::zipper::lower_bounds(ctx, a, b)?;
+    let first = super::join::zipper::lower_bounds(ctx, a, b)?;
     // each left row with the right rows of its key, or with none
     let w = lay.vars.len() + 1;
     let mut li: Vec<u32> = Vec::with_capacity(a.len());
@@ -5516,7 +5503,7 @@ fn anti_join(
     let rsorted = r.sorted.first().is_some_and(|v| r.col_of(*v) == Some(rc));
     if lsorted && rsorted {
         // a left row is kept when the first right id not less than its own differs
-        let first = super::zipper::lower_bounds(ctx, a, b)?;
+        let first = super::join::zipper::lower_bounds(ctx, a, b)?;
         let keep = a
             .iter()
             .zip(&first)

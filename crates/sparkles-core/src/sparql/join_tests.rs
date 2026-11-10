@@ -264,7 +264,7 @@ fn merge_lower_bounds_match_a_binary_search() {
             .iter()
             .map(|x| b.partition_point(|y| y < x) as u32)
             .collect();
-        let got = super::zipper::lower_bounds(&ctx, &a, &b).unwrap();
+        let got = super::join::zipper::lower_bounds(&ctx, &a, &b).unwrap();
         assert_eq!(got, want, "round {round}: {an} x {bn} in 1..={domain}");
     }
 }
