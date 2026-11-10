@@ -1691,7 +1691,7 @@ export interface paths {
         get: operations["getJobsSettings"];
         /**
          * Set the jobs settings
-         * @description Needs `admin` on the dataset. Records complete settings, protects the ledger graph `urn:x-sparkles:jobs:ledger` and raises the dataset reader to 9 durably on the first configuration. Editing a definition changes its revision, and a run accepted under an older revision is not claimed until the definition is restored. Disabling jobs while runs are queued, leased or waiting to retry is a `409` that writes nothing, as is a configuration that races with another change of the registry. A disabled configuration keeps the ledger graph protected and hidden under the same nonce, so a run that was admitted as jobs were disabled waits, untouched, until they are enabled. `maxQueued` is at most 4096 and the definitions' `concurrency` adds up to at most 4096.
+         * @description Needs `admin` on the dataset. Records complete settings, protects the ledger graph `urn:x-sparkles:jobs:ledger` and raises the dataset reader to 9 durably on the first configuration. Editing a definition changes its revision, and a run accepted under an older revision keeps that revision's attempts and retry horizon and is not claimed, and not ended by an expiry or a restart, until the definition is restored. Disabling jobs while runs are queued, leased or waiting to retry is a `409` that writes nothing, as is a configuration that races with another change of the registry. A disabled configuration keeps the ledger graph protected and hidden under the same nonce, so a run that was admitted as jobs were disabled waits, untouched, until they are enabled. `maxQueued` is at most 4096 and the definitions' `concurrency` adds up to at most 4096.
          */
         put: operations["putJobsSettings"];
         post?: never;
@@ -1792,7 +1792,7 @@ export interface paths {
         put?: never;
         /**
          * Renew a lease
-         * @description Needs `write` through the update endpoint and the lease token in `Sparkles-Job-Lease`. Extends the lease by `extendMs`, at most the definition's largest extension. `409 lease-lost` for a token whose generation was superseded, whose lease expired, whose process restarted, whose run is no longer leased or whose definition was removed, disabled, edited or no longer lists the worker, `412 precondition-failed` for another `expectedVersion`, and `401 lease-missing` without the header.
+         * @description Needs `write` through the update endpoint and the lease token in `Sparkles-Job-Lease`. Extends the lease by `extendMs`, at most the definition's largest extension. `409 lease-lost` for a token whose generation was superseded, whose lease expired, whose process restarted, whose run is no longer leased or whose definition was removed, disabled, edited or no longer lists the worker, `404` for a caller that is neither an administrator, the submitter nor a worker of the run, `412 precondition-failed` for another `expectedVersion`, and `401 lease-missing` without the header.
          */
         post: operations["renewJobLease"];
         delete?: never;
