@@ -2709,7 +2709,7 @@ mod tests {
                 reidentified_dataset_bytes(&raw, old, destination, 42, 2000, &preparation).unwrap();
             let value: serde_json::Value = serde_json::from_slice(&output.value).unwrap();
             // this build never accepts an imported destination it cannot read
-            assert!(IMPORTED_DESTINATION_READER > DATASET_READER);
+            const { assert!(IMPORTED_DESTINATION_READER > DATASET_READER) };
             assert!(matches!(
                 check_dataset_value_as(&value, DATASET_READER),
                 Err(Error::Unsupported(_))

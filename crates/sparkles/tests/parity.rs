@@ -452,6 +452,40 @@ fn entries() -> Vec<(&'static str, Entry)> {
                 &any(),
             );
         }),
+        // ------------------------------------------------------------ durable jobs
+        op!("getJobsSettings", "jobs.settings", |ds| {
+            let _ = ds.jobs().settings();
+        }),
+        op!("putJobsSettings", "jobs.configure", |ds| {
+            let _ = ds.jobs().configure(&any());
+        }),
+        op!("submitJob", "jobs.submit", |ds| {
+            let _ = ds.jobs().submit(&any(), &any());
+        }),
+        op!("claimJob", "jobs.claim", |ds| {
+            let _ = ds.jobs().claim(&[], &any());
+        }),
+        op!("renewJobLease", "jobs.renew", |ds| {
+            let _ = ds.jobs().renew(any(), "", None, None, &any());
+        }),
+        op!("publishJob", "jobs.publish", |ds| {
+            let _ = ds.jobs().publish(any(), "", &any(), &any());
+        }),
+        op!("failJob", "jobs.fail", |ds| {
+            let _ = ds.jobs().fail(any(), "", &any(), None, &any());
+        }),
+        op!("cancelJob", "jobs.cancel", |ds| {
+            let _ = ds.jobs().cancel(any(), &any());
+        }),
+        op!("retryJob", "jobs.retry", |ds| {
+            let _ = ds.jobs().retry(any(), "", &any());
+        }),
+        op!("getJob", "jobs.get", |ds| {
+            let _ = ds.jobs().get(any(), &any());
+        }),
+        op!("listJobs", "jobs.list", |ds| {
+            let _ = ds.jobs().list(&any(), &any());
+        }),
         op!("withdrawClaims", "evidence.withdraw", |ds| {
             let _ = sparkles::evidence::withdraw(ds, ds, &[], &any(), &mut |_, _| None, &any());
         }),
