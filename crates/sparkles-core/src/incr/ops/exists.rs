@@ -200,8 +200,8 @@ impl Probes {
                     }
                 };
                 // a GRAPH inside a GRAPH still ranges over every graph, and a GRAPH
-                // whose body reads no triple depends on which graphs exist
-                if self.nested {
+                // whose body can match without a quad depends on which graphs exist
+                if self.nested || matches_without_quads(inner) {
                     self.unscoped = true;
                 }
                 let before = self.probes.len();
@@ -229,10 +229,16 @@ impl Probes {
                 for (_, a) in aggregates {
                     match a {
                         AggregateExpression::FunctionCall { expr, .. } => self.expr(expr, g, cols),
-                        AggregateExpression::Fold { expr, value, .. } => {
+                        AggregateExpression::Fold {
+                            expr, value, order, ..
+                        } => {
                             self.expr(expr, g, cols);
                             if let Some(v) = value {
                                 self.expr(v, g, cols);
+                            }
+                            for o in order {
+                                let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
+                                self.expr(e, g, cols);
                             }
                         }
                         AggregateExpression::CountSolutions { .. } => {}
@@ -267,6 +273,40 @@ impl Probes {
         for p in found {
             self.walk(p, g, cols);
         }
+    }
+}
+
+/// Whether `gp` can have a solution that matches no quad, such as an empty group, an
+/// `OPTIONAL` over one, `VALUES` or an implicit group, so that a `GRAPH` around it has a
+/// solution for every graph that exists.
+pub(in crate::incr) fn matches_without_quads(gp: &GraphPattern) -> bool {
+    use GraphPattern as GP;
+    match gp {
+        GP::Bgp { patterns } => patterns.is_empty(),
+        GP::Path { .. } => false,
+        GP::Join { left, right } | GP::Lateral { left, right } => {
+            matches_without_quads(left) && matches_without_quads(right)
+        }
+        GP::LeftJoin { left, .. } | GP::Minus { left, .. } | GP::AntiJoin { left, .. } => {
+            matches_without_quads(left)
+        }
+        GP::SemiJoin { left, right } => matches_without_quads(left) && matches_without_quads(right),
+        GP::Union { left, right } => matches_without_quads(left) || matches_without_quads(right),
+        GP::Filter { inner, .. }
+        | GP::Extend { inner, .. }
+        | GP::Assign { inner, .. }
+        | GP::Unfold { inner, .. }
+        | GP::Graph { inner, .. }
+        | GP::Project { inner, .. }
+        | GP::Distinct { inner }
+        | GP::Reduced { inner }
+        | GP::Slice { inner, .. }
+        | GP::OrderBy { inner, .. } => matches_without_quads(inner),
+        GP::Group {
+            inner, variables, ..
+        } => variables.is_empty() || matches_without_quads(inner),
+        GP::Values { .. } => true,
+        _ => true,
     }
 }
 

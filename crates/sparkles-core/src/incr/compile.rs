@@ -549,9 +549,13 @@ fn footprint_of(gp: &GP, scope: &Scope, fp: &mut Footprint) {
             };
             let before = (fp.entries.len(), fp.all);
             footprint_of(inner, &s, fp);
-            // a group that reads no triple still depends on which graphs exist, and so
-            // does a group whose triples a GRAPH inside it reads from other graphs
-            if (fp.entries.len(), fp.all) == before || nested_graph(inner) {
+            // a group that reads no triple, or can match without one, still depends on
+            // which graphs exist, and so does a group whose triples a GRAPH inside it
+            // reads from other graphs
+            if (fp.entries.len(), fp.all) == before
+                || nested_graph(inner)
+                || super::ops::exists::matches_without_quads(inner)
+            {
                 any_quad(&s, fp);
             }
             // the special graphs of ARQ read other graphs
@@ -603,8 +607,24 @@ fn footprint_of(gp: &GP, scope: &Scope, fp: &mut Footprint) {
             inner, aggregates, ..
         } => {
             for (_, a) in aggregates {
-                if let AggregateExpression::FunctionCall { expr: e, .. } = a {
-                    expr(e, scope, fp);
+                match a {
+                    AggregateExpression::FunctionCall { expr: e, .. } => expr(e, scope, fp),
+                    AggregateExpression::Fold {
+                        expr: e,
+                        value,
+                        order,
+                        ..
+                    } => {
+                        expr(e, scope, fp);
+                        if let Some(v) = value {
+                            expr(v, scope, fp);
+                        }
+                        for o in order {
+                            let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
+                            expr(e, scope, fp);
+                        }
+                    }
+                    AggregateExpression::CountSolutions { .. } => {}
                 }
             }
             footprint_of(inner, scope, fp);

@@ -1500,11 +1500,12 @@ maintained, and `HAVING` follows the aggregates it reads.
   condition's triple patterns, and a match binds the outer variables the pattern names,
   so only rows with those bindings, or without them, are evaluated again. A pattern
   without an outer variable, a property path, a property function, one of ARQ's special
-  graphs, a `GRAPH` whose body reads no triple or that holds another `GRAPH`, `SERVICE`
-  or an extension sends every row to the engine again, which the plan reports as `every
-  row on a change`. The variables of a subquery inside the condition count as outer only
-  when the subquery projects them, as the engine substitutes them, and the expressions
-  of aggregates and `ORDER BY` inside the condition are read for nested `EXISTS`.
+  graphs, a `GRAPH` whose body can match without a quad or that holds another `GRAPH`,
+  `SERVICE` or an extension sends every row to the engine again, which the plan reports
+  as `every row on a change`. The variables of a subquery inside the condition count as
+  outer only when the subquery projects them, as the engine substitutes them, and the
+  expressions of aggregates, `FOLD` and `ORDER BY` inside the condition are read for
+  nested `EXISTS`, by the footprint as well as by the probes.
   Finding the rows a change touches scans the operator's rows, and item 906 indexes
   them when a measurement asks for it.
 - An `EXISTS` in a `BIND`, in an `OPTIONAL` filter or in an aggregate's argument, and a

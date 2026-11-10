@@ -683,6 +683,15 @@ fn concat_separators_follow_the_oracle() {
             "|",
         ),
         (
+            "SELECT ?t (GROUP_CONCAT(?l; SEPARATOR=\"; \") AS ?ls) WHERE { ?p :memberOf ?t . ?p rdfs:label ?l } GROUP BY ?t",
+            "; ",
+        ),
+        // the cells are N-Triples strings, so a tab separator shows as its escape
+        (
+            "SELECT ?t (GROUP_CONCAT(?l; SEPARATOR=\"\\t\") AS ?ls) WHERE { ?p :memberOf ?t . ?p rdfs:label ?l } GROUP BY ?t",
+            "\\t",
+        ),
+        (
             "SELECT ?t (GROUP_CONCAT(DISTINCT ?l; SEPARATOR=\"|\") AS ?ls) WHERE { ?p :memberOf ?t . ?p rdfs:label ?l } GROUP BY ?t",
             "|",
         ),
@@ -708,6 +717,28 @@ fn concat_separators_follow_the_oracle() {
                 })
                 .collect();
             assert_eq!(got, want, "{what}: {q}");
+            if sep.is_empty() {
+                // the same characters in another order: every part of the engine's
+                // string is a part of the circuit's
+                let engine = oracle(&s, q, &c.columns(), c.kind);
+                let labels = oracle(
+                    &s,
+                    "SELECT ?t ?l WHERE { ?p :memberOf ?t . ?p rdfs:label ?l }",
+                    &["t".into(), "l".into()],
+                    Kind::Select,
+                );
+                for (row, erow) in result(c).iter().zip(&engine) {
+                    let (t, cell) = row.split_once(' ').expect("two columns");
+                    assert_eq!(t, erow.split_once(' ').expect("two columns").0);
+                    for l in labels
+                        .iter()
+                        .filter_map(|x| x.strip_prefix(&format!("{t} ")))
+                    {
+                        let part = l.trim_matches('"');
+                        assert!(cell.contains(part), "{what}: {cell} lacks {part}");
+                    }
+                }
+            }
         };
         compare(&c, "after the build");
         for u in [
@@ -753,6 +784,26 @@ fn review_findings_of_item_418_follow_the_oracle() {
             "INSERT DATA { GRAPH :g { :s :p :o } }",
             "DELETE DATA { GRAPH :g { :s :p :o } }",
         ],
+    );
+    // a body that matches without a quad has a solution for every graph
+    run(
+        "SELECT ?x WHERE { VALUES ?x { :a } FILTER(EXISTS { GRAPH ?g { OPTIONAL { :s :p :o } } } || false) }",
+        &[],
+        &[
+            "INSERT DATA { GRAPH :g { :unrelated :q :o } }",
+            "DELETE DATA { GRAPH :g { :unrelated :q :o } }",
+        ],
+    );
+    // an EXISTS in a FOLD and in an ORDER BY of the condition's subquery
+    run(
+        "SELECT ?x WHERE { VALUES ?x { :a } FILTER(EXISTS { { SELECT (FOLD(IF(EXISTS { :s :p :o }, 1, 0)) AS ?l) WHERE {} } FILTER(STR(?l) = \"[1]\") } || false) }",
+        &[],
+        &["INSERT DATA { :s :p :o }", "DELETE DATA { :s :p :o }"],
+    );
+    run(
+        "SELECT ?x WHERE { VALUES ?x { :a } FILTER(EXISTS { { SELECT ?y WHERE { VALUES ?y { 1 2 } } ORDER BY IF(EXISTS { :s :p :o }, ?y, -?y) LIMIT 1 } FILTER(?y = 1) } || false) }",
+        &[],
+        &["INSERT DATA { :s :p :o }", "DELETE DATA { :s :p :o }"],
     );
     // an EXISTS inside an aggregate's argument and a HAVING of the condition's subquery
     run(
@@ -825,12 +876,14 @@ fn review_findings_of_item_418_follow_the_oracle() {
     upd(&s, &format!("{PREFIX}INSERT DATA {{ :q :v 1 }}")).unwrap();
     step(&s, &mut c);
     let before = result(&c);
+    let mut holder = ":p".to_string();
     for i in 0..20 {
         upd(
             &s,
-            &format!("{PREFIX}DELETE DATA {{ :p :v 2 }} ; INSERT DATA {{ :r{i} :v 2 }} ; DELETE DATA {{ :r{i} :v 2 }} ; INSERT DATA {{ :p :v 2 }}"),
+            &format!("{PREFIX}DELETE DATA {{ {holder} :v 2 }} ; INSERT DATA {{ :r{i} :v 2 }}"),
         )
         .unwrap();
+        holder = format!(":r{i}");
         step(&s, &mut c);
         assert_eq!(result(&c), before, "the value 2 remained in the group");
     }
