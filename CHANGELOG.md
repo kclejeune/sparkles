@@ -593,6 +593,23 @@ eight, with the same taxonomies. Warm runs of five of them take about 0.5 ms lon
 eight threads, which roadmap item 720 follows, and ChEBI lite and `ore_ont_13482`
 classify 1.0 to 1.6% slower on one thread from code layout, item 722.
 
+A classification on several threads that has already started helper threads in its
+process starts them, for a saturation of fewer than 4,096 roots, after as long as its
+first worker took to start them the last time, between 20 and 500 us, instead of after
+0.5 ms (roadmap item 720). Later threads start much faster than a process's first ones.
+Warm runs on eight threads on atlas of five small ORE 2015 DL files whose saturation takes
+1.8 to 4 ms take 0.04 to 0.21 ms longer than before item 709, where they had been 0.4
+to 0.6 ms longer, and cold runs keep item 709's gain. Warm runs of the smallest files
+take 0.01 to 0.05 ms longer, item 819.
+
+A congested EL saturation on one thread sends through its outbox, so that its deliveries
+drop the messages their contexts hold (roadmap item 721). The one-thread run of
+`ore_ont_8737` peaks at 5.9 instead of 9.3 GiB on atlas and takes 90.7 instead of 95.8 s,
+with the same taxonomy. Its time on four threads, 28 s against Konclude's 11 s, is item
+818. The one-thread times of five larger files move by up to 2% with the code's layout,
+and the new build is 0.6% faster to 0.9% slower than the one before on them, item
+722.
+
 A congested EL saturation drops the subsumptions and backward links it delivers to a
 context that already holds them (roadmap item 695). The peak resident set of
 `ore_ont_8737`, with 2.5 million existential restrictions, falls from 10.5 to 7.5 GiB on

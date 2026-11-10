@@ -674,8 +674,8 @@ eight, from 0.25 to 1.07 times per file on four threads and from 0.17 to 1.05 on
 The 12 files take 41.9 ms on four threads against 50.6 ms. A whole process, which reads the file and starts and ends the runtime,
 takes 0.86 of the base's time on four and eight threads. On one thread the times are the
 base's within 0.1 ms. Five files whose saturation takes 1.8 to 4 ms on one thread became
-0.4 to 0.6 ms slower in warm runs on eight threads, since their helper threads start 0.5 ms later, and
-roadmap item 720 follows them. On four threads the warm runs take 0.86 of the
+0.4 to 0.6 ms slower in warm runs on eight threads, since their helper threads start 0.5 ms later.
+The [helper starts](#helper-starts) section gives their times since item 720. On four threads the warm runs take 0.86 of the
 base's time. Seven more rounds of the base, commit 6b4c8e87 and the final commit
 47c13a51 gave the cold runs of 47c13a51 0.74 of the base's time on four threads and 0.67
 on eight, against 0.75 and 0.67 for 6b4c8e87 in the same rounds.
@@ -705,8 +705,8 @@ On one thread ChEBI lite's saturation is 1.1% slower than the base's, beyond the
 spread of its rounds, and a second run of five rounds put ChEBI lite 1.5% and
 `ore_ont_13482` 1.6% above the base. One thread runs none of the new code. A build whose
 one-thread worker leaves out the lazy start's check left them 0.9 and 1.4% slower and
-made `ore_ont_3836` 0.5% slower, so the difference comes from code layout, and roadmap
-item 722 follows it. [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md)
+made `ore_ont_3836` 0.5% slower, so the difference comes from code layout, which the
+[helper starts](#helper-starts) section measures again on `atlas`. [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md)
 records that build.
 
 A screen of the 161 development files under 20 MB on a Namespace instance, three rounds
@@ -748,11 +748,104 @@ the development set comparison, which it passed before. A run on one thread deli
 batches, since its activations put their messages in the to-do lists directly, so its
 peak is the base's. On four threads the peak estimate is still nine times the stored
 conclusions, and the run takes 29 s, where Konclude 0.7.0 took 11 s with 7 GB on the
-laptop. Roadmap item 721 follows both. Three other ways to bound the waiting
+laptop. The [helper starts](#helper-starts) section gives the run on one thread since
+item 721. Three other ways to bound the waiting
 messages measured no better and are in
 [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md).
 
+<a id="helper-starts"></a>
+
+### Helper starts, one-thread congestion and layout
+
+A process's first helper threads take much longer to start than later ones, whose stacks
+it keeps. A saturation of fewer than 4,096 roots on several threads therefore waits 0.5
+ms before its first start of the helpers in a process, and after that as long as its
+first worker took to start them in the process's last start, between 20 and 500 us.
+The first worker looks at the clock after each activation until the helpers start. A
+run on one thread sends through its outbox once it is congested, so that its deliveries
+drop the subsumptions and backward links that their contexts hold, as those of several
+threads do.
+
+These measurements ran on `atlas`, which has the benchmark host's hardware, with no other
+benchmark or gate on the host and no swap in use. The base is commit dbac7667, before is
+the base without the lazy start of item 709 and the delivery filter of item 695, and the
+lane is commit 5dca16bd. The table gives the median over nine rounds of rotating order,
+in ms, with four and eight threads pinned to the performance cores 0 to 11, as in the
+section above.
+
+| File | Cold, 8 threads, before | Cold, 8 threads, base | Cold, 8 threads, lane | Warm, 8 threads, before | Warm, 8 threads, base | Warm, 8 threads, lane | Warm, 4 threads, before | Warm, 4 threads, base | Warm, 4 threads, lane |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `ore_ont_1445` | 3.47 | 3.78 | 3.73 | 2.04 | 2.60 | 2.25 | 2.50 | 2.46 | 2.01 |
+| `ore_ont_2775` | 1.55 | 0.69 | 0.64 | 0.29 | 0.20 | 0.21 | 0.23 | 0.19 | 0.20 |
+| `ore_ont_3231` | 4.65 | 4.34 | 4.49 | 2.63 | 3.07 | 2.67 | 3.86 | 2.88 | 2.62 |
+| `ore_ont_5564` | 1.83 | 0.96 | 0.95 | 0.76 | 0.64 | 0.67 | 0.68 | 0.64 | 0.66 |
+| `ore_ont_5940` | 2.31 | 1.21 | 1.21 | 0.92 | 0.74 | 0.75 | 0.85 | 0.74 | 0.79 |
+| `ore_ont_6855` | 1.94 | 0.40 | 0.37 | 0.41 | 0.22 | 0.23 | 0.37 | 0.22 | 0.23 |
+| `ore_ont_7584` | 4.05 | 3.90 | 3.74 | 2.17 | 2.73 | 2.30 | 3.58 | 2.58 | 2.21 |
+| `ore_ont_7663` | 1.19 | 0.80 | 0.80 | 0.51 | 0.37 | 0.38 | 0.45 | 0.37 | 0.39 |
+| `ore_ont_8203` | 8.23 | 7.79 | 7.60 | 3.68 | 3.86 | 3.78 | 4.98 | 4.25 | 3.79 |
+| `ore_ont_8273` | 17.23 | 17.39 | 17.20 | 14.22 | 14.56 | 14.15 | 15.94 | 14.60 | 14.31 |
+| `ore_ont_9096` | 2.93 | 1.92 | 1.91 | 1.27 | 1.27 | 1.28 | 1.29 | 1.25 | 1.27 |
+| `ore_ont_13581` | 3.49 | 3.65 | 3.57 | 2.00 | 2.53 | 2.14 | 2.67 | 2.40 | 2.04 |
+
+Warm runs of the five files whose saturation takes 1.8 to 4 ms on one thread take 0.04 to
+0.21 ms longer on eight threads than before, against 0.18 to 0.56 ms for the base, and
+on four threads they are faster than both. Cold runs take 0.67 of the time before in
+geometric mean on eight threads and 0.77 on four, against 0.69 and 0.78 for the base.
+Warm runs of the smallest files, which never start the helpers, take 0.01 to 0.05 ms
+longer than the base's, within the spread of their rounds on eight threads, and roadmap
+item 819 follows them with the rest of the five files.
+
+On one thread six rounds of the same sides gave the following times in ms, with one
+thread pinned to CPU 4.
+
+| Ontology | Before | Base | Lane | Lane / base |
+|---|---:|---:|---:|---:|
+| GO | 304.0 | 309.0 | 311.8 | 1.009 |
+| ChEBI lite | 1,068 | 1,058 | 1,058 | 1.000 |
+| `ore_ont_3836` | 581.8 | 588.4 | 585.0 | 0.994 |
+| `ore_ont_13482` | 910.4 | 910.9 | 915.9 | 1.006 |
+| `ore_ont_7914` | 316.5 | 315.5 | 314.8 | 0.998 |
+
+The rounds spread by 0.5 to 2%. A run on one thread that is not congested reads the batching
+flag at each message it sends to another context, as it did before, and adds a comparison
+of the waiting messages with the stored conclusions to each check of the bounds. The times
+also move with the code's layout. Commit 70a5234c, whose run on one thread is the lane's
+and which differs from it only in code that runs on several threads, gave in ten rounds of an earlier run 0.998 of the time before
+on GO, 0.998 on ChEBI lite, 1.000 on `ore_ont_3836`, 1.005 on `ore_ont_13482` and 1.003 on
+`ore_ont_7914`, with the same user-space cycle counts as before within 0.3%. The base
+spent 1.3% more cycles than before on GO and 2.2% more on `ore_ont_3836`. Roadmap item
+722 follows the layout. On four and eight threads the lane is within the spread of the
+base's rounds on all five files, and ChEBI lite's eight-thread rounds spread by 9 to 13%.
+
+One run of `ore_ont_8737` of each side in a scope with a 13 GiB cap gave the following
+times and memory. The lane's runs are those of commit 70a5234c, whose saturation on one
+thread and congested runs are the lane's.
+
+| Side | Threads | Time, s | Peak resident set, GiB | Peak estimate, GiB | Conclusions taken, billions |
+|---|---:|---:|---:|---:|---:|
+| Base | 1 | 95.8 | 9.34 | 5.84 | 3.00 |
+| Lane | 1 | 90.7 | 5.88 | 3.21 | 2.24 |
+| Base | 4 | 28.5 | 6.77 | 3.51 | 2.13 |
+| Lane | 4 | 28.2 | 7.92 | 4.07 | 2.10 |
+
+On one thread the peak resident set falls by 37% and the conclusions the rules take by
+25%. A run on four threads does the same work on both builds, and its peak varies from
+6.8 to 7.9 GiB between runs of the same code, as the threads' timing decides which
+contexts are free when their messages arrive. Konclude 0.7.0 took 11 s with 7 GB on the
+laptop, and roadmap item 818 follows the time on several threads. The base's one-thread
+run comes from the reproduction before the lane's changes, in the same session on the
+same host. Every side gave the same taxonomies in every round. On the laptop the 298 ORE
+2015 EL files, GO and ChEBI lite gave the base's taxonomies on one and eight threads, and
+`ore_ont_8737` gave the base's taxonomy on one and four threads.
+
 ## Records
+
+The [helper starts record](runs/2026-11-10-el-cost-atlas-5dca16bd/record.json) holds every
+cold and warm time of the 12 small files, the rounds on GO, ChEBI lite, `ore_ont_3836`,
+`ore_ont_13482` and `ore_ont_7914` on one, four and eight threads with their taxonomy
+hashes, the instruction and cycle counts, the runs of `ore_ont_8737`, the variants that
+measured no better and the scripts that ran on `atlas`.
 
 The [small files and memory record](runs/2026-11-04-el-small-files-forge-47c13a51/record.json)
 holds every cold and warm time of the 12 small files on one, four and eight threads, the

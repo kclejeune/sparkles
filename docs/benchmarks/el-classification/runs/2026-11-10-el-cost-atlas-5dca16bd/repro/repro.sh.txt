@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# repro.sh: item 720-722 reproduction on atlas at base dbac7667, sides base and pre (base with
+# the lazy start of item 709 and the delivery filter of item 695 removed). Holds the heavy lock
+# for the whole run. Ends log.txt with REPRO-DONE.
+set -uo pipefail
+D=$HOME/lanes/el-cost-720
+cd "$D"
+exec 8> "$HOME/lanes/.heavy.lock"
+flock 8
+O=$D/repro-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$O"; cd "$O"
+ln -s ../bin bin; ln -s ../data data
+log() { echo "$(date -u +%FT%TZ) $*" >> "$O/log.txt"; }
+log "start host=$(hostname) load=$(cut -d' ' -f1-3 /proc/loadavg)"
+for b in base pre; do log "sha $b $(sha256sum bin/$b | cut -c1-16)"; done
+SMALL="dev/ore_ont_1445.owl dev/ore_ont_2775.owl dev/ore_ont_3231.owl dev/ore_ont_5564.owl dev/ore_ont_5940.owl dev/ore_ont_6855.owl dev/ore_ont_7584.owl dev/ore_ont_7663.owl dev/ore_ont_8203.owl dev/ore_ont_8273.owl dev/ore_ont_9096.owl dev/ore_ont_13581.owl"
+for t in 8 4; do
+  THREADS=$t PINN=0-11 PIN1=4 bash ../scripts/cold.sh "$O" 7 "$SMALL" "base pre" >> "$O/log.txt" 2>&1
+  log "cold t$t done"
+done
+THREADS="1 4 8" PIN1=4 PINN=0-11 REPEAT=5 bash ../scripts/ab.sh "$O" 5 "go.ofn chebi_lite.ofn ore-el/ore_ont_3836.owl ore-el/ore_ont_13482.owl dev/ore_ont_7914.owl" "base pre" >> "$O/log.txt" 2>&1
+log "ab done"
+P=/nix/store/bw8frr0nk26m740a2mwaw5yi06mgxakb-perf-linux-7.3.1/bin/perf
+mkdir -p perf
+for r in 1 2 3; do for f in go.ofn chebi_lite.ofn ore-el/ore_ont_3836.owl ore-el/ore_ont_13482.owl; do for b in base pre; do
+  n=$(basename "${f%.*}")
+  taskset -c 4 $P stat -x, -e instructions:u,cycles:u,branch-misses:u,L1-icache-load-misses:u -o perf/$n.$b.r$r.csv bin/$b --threads 1 --repeat 5 data/$f > perf/$n.$b.r$r.json 2>> perf/err.txt
+done; done; done
+log "perf done"
+mkdir -p mem
+for s in base:4 base:1; do
+  b=${s%:*}; t=${s#*:}
+  systemd-run --user --scope --quiet -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+    timeout 900 bin/$b --threads $t data/dev/ore_ont_8737.owl > mem/$b.t$t.json 2> mem/$b.t$t.err
+  log "mem $b t$t rc=$?"
+done
+log "REPRO-DONE"
