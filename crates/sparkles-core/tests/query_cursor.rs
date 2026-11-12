@@ -4696,7 +4696,13 @@ fn graph_writers_flush_after_their_first_batch() {
 /// execution, and both plans name the algorithm that ran.
 #[test]
 fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
-    let s = Store::in_memory(StoreOptions::default());
+    // The plans must show the algorithm that ran, so no node may come from the result
+    // cache. With the cache on, a busy host can take a millisecond on the first query,
+    // cache its result and leave the later plans naming a cached node instead.
+    let s = Store::in_memory(StoreOptions {
+        result_cache_bytes: 0,
+        ..StoreOptions::default()
+    });
     let data = (0..200)
         .map(|i| {
             let mut t = format!("<urn:s:{i}> <urn:p> {i} .\n");
