@@ -576,8 +576,10 @@ and `check` also read a log of zeros longer than one record as that torn creatio
 the prover refuses it, a conservative difference for a read-only reader. The fixture
 `testsuite/formats/35e7cae4` was written at the cutoff commit, and the two pre-release
 fixtures stay for their refusal tests in the engine and through the command line. Items
-847 and 848 record the follow-ups, a required `Segments` and `Sparse` without an `Option`
-and a full key check of `vocab.idx` at open. The gates were the format fixture tests,
+847, 848 and 849 record the follow-ups, a required `Segments` and `Sparse` without an
+`Option`, a full key check of `vocab.idx` at open, and allocation admission tests of the
+historical base lookup on the segmented layout, which replace the two whole-column tests
+that went with the refused layout. The gates were the format fixture tests,
 `tests/power_loss.rs`, `group_runs`, the `sparkles-core` lib tests, the `bench:insn`
 instruction screen and the review rounds recorded in the lane's audit directory. The
 screen compared the cutoff with its base on 17 metrics and flagged none, with the WAL
