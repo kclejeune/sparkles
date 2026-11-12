@@ -11,12 +11,12 @@
 //! deadline, cancellation and memory budget and a limit of derived facts.
 
 use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_capacity};
-use crate::demand::{self, Key, KeyP, Pass, Program, TransformError, Vocab};
+use crate::demand::{self, ConeStats, Key, KeyP, Pass, Program, TransformError, Vocab};
 use crate::engine::{self, Atom, CHead, CRule, Slot};
 use crate::facts::Base;
 use crate::graph::{Graph, Triple};
 use crate::inputs::{self, Inputs};
-use crate::parser::Rule;
+use crate::parser::{Direction, Rule};
 use crate::tables::{self, Chunk, Table};
 use crate::terms::{LocalTerm, Terms};
 use crate::{Extras, InferredLimitExceeded, Profile};
@@ -25,6 +25,7 @@ use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles_core::error::ComponentError;
 use sparkles_core::id::{Id, Tag};
+use sparkles_core::index::Perm;
 use sparkles_core::sparql::reasoning::{
     Demand, DemandInfo, DemandReport, DemandTerm, Derived, LocalTerm as OutTerm, ReasoningProvider,
     ReasoningSession, Report, SessionRequest,
@@ -139,6 +140,12 @@ impl QueryReasoner {
         &self.shared.extras
     }
 
+    /// The digest of the rules ([`crate::rules_digest`]), which a materialization with
+    /// the same rules records.
+    pub fn digest(&self) -> u64 {
+        self.shared.digest
+    }
+
     /// This reasoner as the provider [`QueryOptions::reasoning`] takes.
     ///
     /// [`QueryOptions::reasoning`]: sparkles_core::sparql::QueryOptions::reasoning
@@ -214,6 +221,46 @@ fn short(t: &Term) -> String {
         }
     }
     t.to_string()
+}
+
+/// The statistics of a snapshot for the cone estimate of a demand (spec F17 §4.3): the
+/// generation's predicate statistics with the delta's, over every graph, since the
+/// input graphs' share of the store is not known before the program runs.
+struct SnapStats<'a> {
+    snap: &'a Snapshot,
+}
+
+impl ConeStats for SnapStats<'_> {
+    fn predicate(&self, p: u64) -> (f64, f64, f64) {
+        let count = self
+            .snap
+            .predicate_count(Perm::Pso, &[p])
+            .unwrap_or_else(|| self.snap.estimate(Perm::Pso, &[p]));
+        let base = self.snap.generation.stats.predicate(p);
+        let delta = self.snap.delta.predicate(p);
+        let mut ds =
+            base.map_or(0, |s| s.distinct_subjects) + delta.map_or(0, |d| d.distinct_subjects);
+        let mut dos =
+            base.map_or(0, |s| s.distinct_objects) + delta.map_or(0, |d| d.distinct_objects);
+        // a store without statistics: every fact counts as its own subject and object
+        if ds == 0 {
+            ds = count;
+        }
+        if dos == 0 {
+            dos = count;
+        }
+        (count as f64, ds as f64, dos as f64)
+    }
+
+    fn totals(&self) -> (f64, f64, f64) {
+        let s = &self.snap.generation.stats;
+        let n = s.quads + self.snap.delta.inserts() as u64;
+        (
+            n as f64,
+            s.distinct_subjects.max(1) as f64,
+            s.distinct_predicates.max(1) as f64,
+        )
+    }
 }
 
 /// Which rows of a range of the derived tier [`Session::export_rows`] returns.
@@ -1519,11 +1566,13 @@ impl ReasoningSession for Session {
             });
         }
         // the program is made at the first derivation, which a cached table may spare
+        let stats = SnapStats { snap: &self.snap };
         let infos = demands
             .iter()
             .zip(&self.keys)
             .zip(&self.consts)
-            .map(|((d, k), c)| {
+            .enumerate()
+            .map(|(i, ((d, k), c))| {
                 let pred = match &d.p {
                     DemandTerm::Const(t) => short(t),
                     _ => "?p".to_string(),
@@ -1533,9 +1582,33 @@ impl ReasoningSession for Session {
                     _ => Slot::Var(i),
                 };
                 let pattern = (slot(&d.s, 0), slot(&d.p, 1), slot(&d.o, 2));
+                let cone = demand::cone_indices(&self.rules, pattern);
+                // the materializer skips top-level backward rules (spec F17 §5.1), so a
+                // materialization lacks the facts of a cone that holds one
+                let materialized = !cone.iter().any(|&r| {
+                    self.shared
+                        .rules
+                        .get(self.infos[r].parsed)
+                        .is_some_and(|p| p.direction == Direction::Backward)
+                });
+                let seeded = [
+                    matches!(d.s, DemandTerm::Seeded),
+                    false,
+                    matches!(d.o, DemandTerm::Seeded),
+                ];
+                let estimate = demand::estimate_cone(&self.rules, pattern, seeded, &stats);
+                let cached = self.seeded[i] == Seeded::None
+                    && self.table_key(i, &[]).is_some_and(|key| tables::peek(&key));
+                let mut rules: Vec<String> =
+                    cone.iter().map(|&r| self.rules[r].name.clone()).collect();
+                rules.sort();
+                rules.dedup();
                 DemandInfo {
                     adornment: format!("{pred}^{}", k.adornment()),
-                    rules: demand::cone(&self.rules, pattern).into_iter().collect(),
+                    rules,
+                    estimate,
+                    materialized,
+                    cached,
                 }
             })
             .collect();

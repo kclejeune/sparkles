@@ -49,7 +49,7 @@ use crate::engine::{Atom, CBuiltin, CHead, CRule, Slot, Step};
 use crate::graph::Triple;
 use crate::terms::Terms;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -210,21 +210,207 @@ pub(crate) fn intensional(rules: &[CRule], a: (Slot, Slot, Slot)) -> bool {
 }
 
 /// The rules whose facts a pattern may read, through the rules whose heads give facts of
-/// their body atoms: the dependency cone of a demand before its program is made.
-pub(crate) fn cone(rules: &[CRule], a: (Slot, Slot, Slot)) -> BTreeSet<String> {
+/// their body atoms: the dependency cone of a demand before its program is made, as the
+/// indices of the rules in the order the walk found them.
+pub(crate) fn cone_indices(rules: &[CRule], a: (Slot, Slot, Slot)) -> Vec<usize> {
     let mut seen = vec![false; rules.len()];
     let mut todo = vec![a];
-    let mut out = BTreeSet::new();
+    let mut out = Vec::new();
     while let Some(p) = todo.pop() {
         for (i, r) in rules.iter().enumerate() {
             if !seen[i] && r.head.iter().any(|h| unifies(p, head_slots(h))) {
                 seen[i] = true;
-                out.insert(r.name.clone());
+                out.push(i);
                 todo.extend(r.atoms.iter().map(|b| (b.s, b.p, b.o)));
             }
         }
     }
     out
+}
+
+/// The statistics of the input graphs that [`estimate_cone`] reads.
+pub(crate) trait ConeStats {
+    /// The facts of predicate `p` and their distinct subjects and objects.
+    fn predicate(&self, p: u64) -> (f64, f64, f64);
+    /// The facts of the input graphs, their distinct subjects and their distinct
+    /// predicates.
+    fn totals(&self) -> (f64, f64, f64);
+}
+
+/// How deep [`estimate_cone`] follows the atoms that rules give.
+const ESTIMATE_DEPTH: usize = 6;
+/// The largest estimate, so that products do not overflow to infinity.
+const ESTIMATE_CAP: f64 = 1e15;
+
+/// The facts a derivation for the pattern `a` is estimated to produce, with the
+/// positions `bound` bound (a constant of the pattern, or a seed), before the program is
+/// made (spec F17 §4.3). The estimate walks the dependency cone from the pattern. For
+/// each rule whose head gives the pattern, the body is joined in a greedy order, bound
+/// positions first, and each atom multiplies the join by the facts it matches per
+/// binding, from the statistics. The join's size counts as the facts the rule gives.
+/// A body atom that rules give is estimated in turn, with the positions the join has
+/// bound so far, once per rule and adornment, so recursion is counted once and the
+/// walk ends. The free-adornment strata (`noValue` patterns, equality) are among the
+/// atoms the cone reaches with no position bound.
+pub(crate) fn estimate_cone(
+    rules: &[CRule],
+    a: (Slot, Slot, Slot),
+    bound: [bool; 3],
+    stats: &dyn ConeStats,
+) -> f64 {
+    let mut seen: FxHashSet<(usize, u8)> = FxHashSet::default();
+    let (_, total) = estimate_pattern(rules, a, bound, stats, &mut seen, 0);
+    if total.is_finite() {
+        total.min(ESTIMATE_CAP)
+    } else {
+        ESTIMATE_CAP
+    }
+}
+
+/// The facts of the pattern itself that the rules give per binding of its bound
+/// positions, and every fact derived in its cone for them.
+fn estimate_pattern(
+    rules: &[CRule],
+    a: (Slot, Slot, Slot),
+    bound: [bool; 3],
+    stats: &dyn ConeStats,
+    seen: &mut FxHashSet<(usize, u8)>,
+    depth: usize,
+) -> (f64, f64) {
+    if depth > ESTIMATE_DEPTH {
+        return (0.0, 0.0);
+    }
+    let is_bound = |s: Slot, pos: usize| matches!(s, Slot::Const(_)) || bound[pos];
+    let adornment =
+        (is_bound(a.0, 0) as u8) | (is_bound(a.1, 1) as u8) << 1 | (is_bound(a.2, 2) as u8) << 2;
+    let mut own = 0.0;
+    let mut total = 0.0;
+    for (i, r) in rules.iter().enumerate() {
+        let Some(h) = r.head.iter().map(head_slots).find(|h| unifies(a, *h)) else {
+            continue;
+        };
+        if !seen.insert((i, adornment)) {
+            continue;
+        }
+        // the variables the head binds from the pattern's bound positions, and the
+        // constants the pattern fixes in the body
+        let mut vars = vec![false; r.nvars];
+        let mut consts: FxHashMap<usize, u64> = FxHashMap::default();
+        for (pos, hs) in [h.0, h.1, h.2].into_iter().enumerate() {
+            let Slot::Var(v) = hs else { continue };
+            let pattern = [a.0, a.1, a.2][pos];
+            if let Slot::Const(c) = pattern {
+                consts.insert(v, c);
+            }
+            if is_bound(pattern, pos) {
+                vars[v] = true;
+            }
+        }
+        let sub = |s: Slot| match s {
+            Slot::Var(v) => consts.get(&v).map_or(s, |c| Slot::Const(*c)),
+            s => s,
+        };
+        let mut left: Vec<Atom> = r
+            .atoms
+            .iter()
+            .map(|b| Atom {
+                s: sub(b.s),
+                p: sub(b.p),
+                o: sub(b.o),
+            })
+            .collect();
+        let mut size = 1.0f64;
+        while !left.is_empty() {
+            let score = |b: &Atom| {
+                let n = [b.s, b.p, b.o]
+                    .iter()
+                    .filter(|s| match s {
+                        Slot::Const(_) => true,
+                        Slot::Var(v) => vars.get(*v).copied().unwrap_or(false),
+                        Slot::Any => false,
+                    })
+                    .count();
+                (n, std::cmp::Reverse(atom_estimate(b, &vars, stats) as u64))
+            };
+            let k = (0..left.len())
+                .max_by_key(|&k| score(&left[k]))
+                .expect("atoms left");
+            let b = left.remove(k);
+            let mut per = atom_estimate(&b, &vars, stats);
+            // an atom that rules give derives its facts for the join's bindings, and
+            // the join reads the stored facts or the derived ones, whichever are more
+            let slots = (b.s, b.p, b.o);
+            if intensional(rules, slots) {
+                let bound_now = [b.s, b.p, b.o].map(|s| match s {
+                    Slot::Var(v) => vars.get(v).copied().unwrap_or(false),
+                    Slot::Const(_) => true,
+                    Slot::Any => false,
+                });
+                let (atom_own, atom_total) =
+                    estimate_pattern(rules, slots, bound_now, stats, seen, depth + 1);
+                total += (atom_total * size).min(ESTIMATE_CAP);
+                per = per.max(atom_own);
+            }
+            size = (size * per).min(ESTIMATE_CAP);
+            for s in [b.s, b.p, b.o] {
+                if let Slot::Var(v) = s
+                    && v < vars.len()
+                {
+                    vars[v] = true;
+                }
+            }
+        }
+        own += size;
+        total += size;
+        if total >= ESTIMATE_CAP {
+            return (own.min(ESTIMATE_CAP), ESTIMATE_CAP);
+        }
+    }
+    (own, total)
+}
+
+/// The stored facts an atom matches per binding of the variables `bound`, from the
+/// statistics, as the demand transformation's own estimate does: a constant predicate
+/// from its statistics, another by the facts per subject or per predicate of the store.
+fn atom_estimate(b: &Atom, bound: &[bool], stats: &dyn ConeStats) -> f64 {
+    let is = |s: Slot| match s {
+        Slot::Const(_) => true,
+        Slot::Var(v) => bound.get(v).copied().unwrap_or(false),
+        Slot::Any => false,
+    };
+    let (sb, pb, ob) = (is(b.s), is(b.p), is(b.o));
+    let (n, subjects, predicates) = stats.totals();
+    let n = n.max(1.0);
+    let fan = (n / subjects.max(1.0)).max(1.0);
+    let per_p = (n / predicates.max(1.0)).max(1.0);
+    match b.p {
+        Slot::Const(p) => {
+            let (cnt, ds, dos) = stats.predicate(p);
+            match (sb, ob) {
+                (true, true) => cnt.min(1.0),
+                (true, false) => (cnt / ds.max(1.0)).min(cnt),
+                (false, true) => (cnt / dos.max(1.0)).min(cnt),
+                (false, false) => cnt,
+            }
+        }
+        _ => match (sb, ob) {
+            (true, true) => 1.0,
+            (true, false) | (false, true) => {
+                if pb {
+                    fan
+                } else {
+                    fan * 4.0
+                }
+            }
+            (false, false) => {
+                if pb {
+                    per_p
+                } else {
+                    n * 2.0
+                }
+            }
+        },
+    }
 }
 
 pub(crate) fn clone_builtin(b: &CBuiltin) -> CBuiltin {
@@ -2479,5 +2665,68 @@ mod schema_completeness_tests {
         assert!(budget.used() < before_drop);
         let _occupied = Held::try_new(&budget, budget.available()).unwrap();
         assert!(compact_roots(&terms, &[root]).is_err());
+    }
+
+    struct FlatStats;
+
+    impl ConeStats for FlatStats {
+        fn predicate(&self, p: u64) -> (f64, f64, f64) {
+            // predicate 9 has 1,000 facts over 100 subjects and 10 objects; predicate 11
+            // has 50 facts, one per subject and object
+            match p {
+                9 => (1000.0, 100.0, 10.0),
+                11 => (50.0, 50.0, 50.0),
+                _ => (0.0, 0.0, 0.0),
+            }
+        }
+        fn totals(&self) -> (f64, f64, f64) {
+            (1050.0, 100.0, 2.0)
+        }
+    }
+
+    /// The cone estimate multiplies each rule's body by the facts its atoms match per
+    /// binding, follows the atoms that rules give once per adornment, and shrinks with
+    /// bound positions (spec F17 §4.3).
+    #[test]
+    fn cone_estimates_follow_the_statistics_and_the_bound_positions() {
+        // (?x 9 ?y) -> (?x 10 ?y); (?x 10 ?y) -> (?x 20 ?y); (?x 20 ?y), (?x 11 ?z) -> (?x 30 ?z)
+        let mut join = rule(
+            Slot::Const(30),
+            Slot::Var(2),
+            vec![(20, Slot::Var(1)), (11, Slot::Var(2))],
+        );
+        join.nvars = 3;
+        let rules = vec![
+            rule(Slot::Const(10), Slot::Var(1), vec![(9, Slot::Var(1))]),
+            rule(Slot::Const(20), Slot::Var(1), vec![(10, Slot::Var(1))]),
+            join,
+        ];
+        let free = (Slot::Var(0), Slot::Const(30), Slot::Var(2));
+        let all = estimate_cone(&rules, free, [false; 3], &FlatStats);
+        // 1,000 facts of 10, as many of 20, and the join of 20 with 11: 1,000 × 1
+        assert!(all >= 3000.0 && all < 3100.0, "{all}");
+        let bound = estimate_cone(&rules, free, [true, false, false], &FlatStats);
+        // per subject: 10 facts of 9, so 10 of 10 and 20, and 10 × 1 of the join
+        assert!(bound >= 30.0 && bound < 31.0, "{bound}");
+        assert!(bound < all);
+        let none = estimate_cone(
+            &rules,
+            (Slot::Var(0), Slot::Const(99), Slot::Var(2)),
+            [false; 3],
+            &FlatStats,
+        );
+        assert_eq!(none, 0.0);
+        // a recursive rule is counted once per adornment and the walk ends
+        let recursive = vec![
+            rule(Slot::Const(10), Slot::Var(1), vec![(9, Slot::Var(1))]),
+            rule(Slot::Const(10), Slot::Var(1), vec![(10, Slot::Var(1))]),
+        ];
+        let r = estimate_cone(
+            &recursive,
+            (Slot::Var(0), Slot::Const(10), Slot::Var(1)),
+            [false; 3],
+            &FlatStats,
+        );
+        assert!(r.is_finite() && r >= 1000.0, "{r}");
     }
 }

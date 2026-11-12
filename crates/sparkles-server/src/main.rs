@@ -1120,6 +1120,12 @@ enum Cmd {
         /// setting is kept like one made with PUT /$/rdfs/{ds}
         #[arg(long, value_name = "NAME=FILE")]
         rdfs: Vec<String>,
+        /// Set a dataset's query-time reasoning profile at startup (NAME=PROFILE,
+        /// repeatable; spec F17 §2.2): rdfs, rdfs-simple, owl-rl or a Jena rules file as
+        /// rules:FILE. The setting is kept like one made with PUT /$/reason/{ds}/query,
+        /// and a setting the dataset already has keeps its other members
+        #[arg(long, value_name = "NAME=PROFILE")]
+        query_reasoning: Vec<String>,
         /// Memory for each dataset's spatial index, in MiB; a build that would exceed it
         /// is refused and queries run without the index
         #[arg(long, default_value_t = 4096)]
@@ -2070,6 +2076,10 @@ enum Cmd {
         /// text or json (with --check also turtle)
         #[arg(long, default_value = "text")]
         format: String,
+        /// Set the dataset's query-time reasoning default (spec F17 §2.2): auto, demand,
+        /// materialized or false. Alone, it materializes nothing
+        #[arg(long, value_name = "MODE", conflicts_with_all = ["clear", "status", "diff"])]
+        query_default: Option<String>,
         /// Timeout of the checks, or of --why, in seconds
         #[arg(long)]
         timeout: Option<f64>,
@@ -2771,6 +2781,7 @@ fn run() -> Result<()> {
             mut geo,
             validate,
             mut rdfs,
+            query_reasoning,
             geo_mb,
             geo_op_vertices,
             no_geo_rewrite,
@@ -3292,6 +3303,13 @@ fn run() -> Result<()> {
                     for r in rdfs.iter().filter(|r| open("--rdfs", r)) {
                         stop.check()?;
                         rdfs::configure(st, r)?;
+                    }
+                    for q in query_reasoning
+                        .iter()
+                        .filter(|q| open("--query-reasoning", q))
+                    {
+                        stop.check()?;
+                        reasoning::configure_query(st, q)?;
                     }
                     if let Some(f) = &fuseki {
                         fuseki_config::start(st, f, stop)?;
@@ -4513,6 +4531,7 @@ fn run() -> Result<()> {
             graphs,
             closure,
             format,
+            query_default,
             timeout,
             data_graphs,
             ontology_graphs,
@@ -4599,6 +4618,17 @@ fn run() -> Result<()> {
                 bail!("{} is not a Sparkles database (no CURRENT)", loc.display());
             }
             let store = open_for_write(&loc, opts, no_validate)?;
+            if let Some(mode) = &query_default {
+                use sparkles::reasoning::setting;
+                let mut s = setting::read(&loc).unwrap_or_default();
+                s.default = Some(mode.clone());
+                s.validate()?;
+                setting::write(&loc, Some(&s))?;
+                eprintln!("query-time reasoning default set to {mode}");
+                if profile.is_none() && rules.is_none() && !check && extras.is_empty() {
+                    return Ok(());
+                }
+            }
             if status {
                 return print_reasoning_status(&loc, &store, &format);
             }
@@ -6128,8 +6158,8 @@ fn print_patterns(s: &sparkles::store::Snapshot) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The options of `sparkles query` with its `--reasoning`, `--profile`, `--rules` and
-/// `--max-derived` (spec F17).
+/// The options of `sparkles query` with its `--reasoning` (`materialized`, `demand`,
+/// `auto` or `false`), `--profile`, `--rules` and `--max-derived` (spec F17).
 fn query_reasoning_options(
     ds: &sparkles::Dataset,
     qopts: QueryOptions,
@@ -6142,15 +6172,15 @@ fn query_reasoning_options(
     let mode = match reasoning {
         None => ReasoningMode::Materialized,
         Some(name) => match ReasoningMode::parse(name) {
-            Some(ReasoningMode::Auto) | None => {
-                bail!("--reasoning must be materialized, demand or false, not {name}")
+            None => {
+                bail!("--reasoning must be materialized, demand, auto or false, not {name}")
             }
             Some(mode) => mode,
         },
     };
     let mut qopts = qopts;
     match mode {
-        ReasoningMode::Demand(_) => {
+        ReasoningMode::Demand(_) | ReasoningMode::Auto(_) => {
             #[cfg(feature = "reasoning")]
             {
                 let profile = match (profile, rules) {
@@ -6166,8 +6196,11 @@ fn query_reasoning_options(
                     // zero lifts the limit
                     max_derived: max_derived.map(|n| if n == 0 { usize::MAX } else { n }),
                 };
-                ds.inference_view(ReasoningMode::Demand(demand))?
-                    .apply(&mut qopts);
+                let mode = match mode {
+                    ReasoningMode::Auto(_) => ReasoningMode::Auto(demand),
+                    _ => ReasoningMode::Demand(demand),
+                };
+                ds.inference_view(mode)?.apply(&mut qopts);
                 Ok(qopts)
             }
             #[cfg(not(feature = "reasoning"))]
@@ -6180,7 +6213,7 @@ fn query_reasoning_options(
             if mode == ReasoningMode::Materialized
                 && (profile.is_some() || rules.is_some() || max_derived.is_some())
             {
-                bail!("--profile, --rules and --max-derived need --reasoning demand");
+                bail!("--profile, --rules and --max-derived need --reasoning demand or auto");
             }
             ds.stored_inference_view(mode.reads_inferences())
                 .apply(&mut qopts);

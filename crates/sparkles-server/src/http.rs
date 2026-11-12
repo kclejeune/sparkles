@@ -250,6 +250,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/$/reason/{ds}/auto",
             axum::routing::put(reason_auto_set).delete(reason_auto_clear),
         )
+        .route(
+            "/$/reason/{ds}/query",
+            get(reason_query_get)
+                .put(reason_query_set)
+                .delete(reason_query_clear),
+        )
         .route("/$/reason/{ds}/diagnostics", get(reason_diagnostics))
         .route("/$/reason/{ds}/explain", post(explain::explain))
         .route("/$/reason/{ds}/diff", get(entailments::diff))
@@ -1460,17 +1466,22 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
     caller::request_options(st, ds, params)
 }
 
-/// The reasoning mode a request's `reasoning` parameter names. An absent or unknown value
-/// reads the dataset's materialized inferences, and `false` reads the asserted data alone.
-pub(crate) fn reasoning_mode(params: &Params) -> sparkles::reasoning::ReasoningMode {
-    sparkles::reasoning::ReasoningMode::from_param(params.get("reasoning"))
+/// The reasoning mode a request's `reasoning` parameter names. An unknown value reads
+/// the dataset's materialized inferences, `false` reads the asserted data alone, and an
+/// absent value is the dataset's query-time default (spec F17 §2.2), which is
+/// materialized reasoning unless the dataset sets one.
+pub(crate) fn reasoning_mode(ds: &Dataset, params: &Params) -> sparkles::reasoning::ReasoningMode {
+    match params.get("reasoning") {
+        Some(v) => sparkles::reasoning::ReasoningMode::from_param(Some(v)),
+        None => ds.dataset.default_reasoning_mode(),
+    }
 }
 
-/// Query-time reasoning a query asks for with `reasoning=demand` (spec F17 Phase 1): the
-/// reasoner of the dataset, with the profile `reasoningProfile` names or the last
-/// materialization's, and at most `maxDerived` derived facts, never more than the
-/// server's `--reason-max-derived`. `reasoning=auto` is refused until the cost-based
-/// choice of Phase 2 exists.
+/// Query-time reasoning a query asks for with `reasoning=demand` or `reasoning=auto`
+/// (spec F17 §2.1): the reasoner of the dataset, with the profile `reasoningProfile`
+/// names, else the dataset's query-time setting's or the last materialization's, and at
+/// most `maxDerived` derived facts, else the setting's budget, never more than the
+/// server's `--reason-max-derived`.
 fn query_reasoning(
     st: &AppState,
     ds: &Dataset,
@@ -1478,16 +1489,9 @@ fn query_reasoning(
     opts: &mut QueryOptions,
 ) -> ApiResult<()> {
     use sparkles::reasoning::ReasoningMode;
-    match reasoning_mode(params) {
-        ReasoningMode::Demand(_) => {}
-        ReasoningMode::Auto => {
-            return Err(err_code(
-                StatusCode::BAD_REQUEST,
-                "reasoning-mode",
-                "reasoning=auto is not available yet; use demand, materialized or false",
-            ));
-        }
-        _ => return Ok(()),
+    let mode = reasoning_mode(ds, params);
+    if mode.demand().is_none() {
+        return Ok(());
     }
     #[cfg(feature = "reasoning")]
     {
@@ -1497,8 +1501,12 @@ fn query_reasoning(
                 err_code(StatusCode::BAD_REQUEST, "reasoning-profile", e.to_string())
             })?),
         };
+        let setting_max = ds
+            .dataset
+            .query_reasoning()
+            .and_then(|s| s.budget.max_derived);
         let max = match params.get("maxDerived") {
-            None => st.reason_max_derived,
+            None => setting_max.map_or(st.reason_max_derived, |n| n.min(st.reason_max_derived)),
             Some(v) => match v.parse::<usize>() {
                 Ok(n) if n > 0 => n.min(st.reason_max_derived),
                 _ => {
@@ -1513,9 +1521,11 @@ fn query_reasoning(
             profile,
             max_derived: Some(max),
         };
-        ds.dataset
-            .inference_view(ReasoningMode::Demand(demand))?
-            .apply(opts);
+        let mode = match mode {
+            ReasoningMode::Auto(_) => ReasoningMode::Auto(demand),
+            _ => ReasoningMode::Demand(demand),
+        };
+        ds.dataset.inference_view(mode)?.apply(opts);
         Ok(())
     }
     #[cfg(not(feature = "reasoning"))]
@@ -1534,7 +1544,8 @@ pub(crate) fn with_reasoning(
     applied: Option<&sparkles::sparql::reasoning::Applied>,
 ) -> Response {
     if let Some(a) = applied
-        && let Ok(v) = header::HeaderValue::from_str(&a.header())
+        && let Some(h) = a.header()
+        && let Ok(v) = header::HeaderValue::from_str(&h)
     {
         r.headers_mut().insert(SPARKLES_REASONING, v);
     }
@@ -2169,7 +2180,12 @@ pub(crate) async fn run_query(
     // freshness is reported for the live state only
     let mut resp = match &resolved {
         Some(r) if r.historical => resp,
-        _ => with_inferences(resp, &ds, with_extra && derived.is_none(), seq),
+        _ => with_inferences(
+            resp,
+            &ds,
+            with_extra && derived.as_ref().is_none_or(|a| a.reads_inferred()),
+            seq,
+        ),
     };
     if let Some(abort) = abort {
         resp.extensions_mut().insert(abort);
@@ -5469,6 +5485,74 @@ async fn set_auto(
     Ok(Json(crate::reasoning::status_json(st, &ds)))
 }
 
+/// `PUT /$/reason/{ds}/query`: the dataset's query-time reasoning setting (spec F17
+/// §2.2): the mode of a query that names none, the profile and rules that derive on
+/// demand, the input graphs, the derivation budget and whether `auto` reads a stale
+/// materialization. Answers with the setting as `GET` does.
+async fn reason_query_set(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    AdminBody(body): AdminBody,
+) -> ApiResult<Json<J>> {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let ds = dataset(&st, &name)?;
+    let setting: sparkles::reasoning::QuerySetting = serde_json::from_slice(&body)
+        .map_err(|e| err_code(StatusCode::BAD_REQUEST, "reasoning-setting", e.to_string()))?;
+    setting
+        .validate()
+        .map_err(|e| err_code(StatusCode::BAD_REQUEST, "reasoning-setting", e.to_string()))?;
+    let ds2 = ds.clone();
+    blocking(move || Ok(ds2.dataset.set_query_reasoning(Some(setting))?)).await?;
+    Ok(Json(query_setting_json(&ds, &p)))
+}
+
+/// `GET /$/reason/{ds}/query`: the query-time reasoning setting, with the status of the
+/// cache of derived tables for callers with the metrics permission.
+async fn reason_query_get(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+) -> ApiResult<Json<J>> {
+    let ds = dataset(&st, &name)?;
+    Ok(Json(query_setting_json(&ds, &p)))
+}
+
+/// `DELETE /$/reason/{ds}/query`: queries read the materialized inferences again, and
+/// derivation on demand needs a profile or a materialization.
+async fn reason_query_clear(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+) -> ApiResult<Json<J>> {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let ds = dataset(&st, &name)?;
+    let ds2 = ds.clone();
+    blocking(move || Ok(ds2.dataset.set_query_reasoning(None)?)).await?;
+    Ok(Json(query_setting_json(&ds, &p)))
+}
+
+/// The query-time reasoning setting as `GET /$/reason/{ds}/query` answers it: the
+/// setting's members, and `tables`, the process-wide cache of derived tables, for a
+/// caller with the metrics permission.
+fn query_setting_json(ds: &Dataset, p: &Principal) -> J {
+    let mut body = ds
+        .dataset
+        .query_reasoning()
+        .and_then(|s| serde_json::to_value(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    if p.has(ServerPerm::Metrics)
+        && let Some(tables) = crate::server_memory::derived_table_cache_stats()
+    {
+        body["tables"] = tables;
+    }
+    body
+}
+
 /// `GET /$/reason/{ds}`: the reasoning status, with the freshness of the inferences.
 async fn reason_status(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
@@ -5962,7 +6046,7 @@ async fn shacl(
                 .unwrap_or(ReportFormat::Rdf(RdfFormat::Turtle))
         }
     };
-    let use_inferred = reasoning_mode(&params).reads_inferences();
+    let use_inferred = reasoning_mode(&ds, &params).reads_inferences();
     let has_inferred = ds.reasoning.read().is_some();
     let timeout = timeout_param(&st, &params);
     let at = history::at_param(&params)?;

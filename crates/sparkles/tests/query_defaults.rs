@@ -138,7 +138,7 @@ fn describe_follows_the_setting_unless_the_caller_sets_it() {
 /// One inference view per reasoning mode chooses what a query reads: the materialized
 /// inferences and RDFS on read for materialized reasoning, the asserted data alone when
 /// reasoning is off, and the same inferred data for incremental views. Automatic
-/// reasoning is refused.
+/// reasoning needs a profile, as demand reasoning does.
 #[test]
 fn inference_views_select_the_inferred_data() {
     use sparkles::reasoning::ReasoningMode;
@@ -203,13 +203,19 @@ fn inference_views_select_the_inferred_data() {
             .rdfs
             .is_some()
     );
-    let auto = ds.inference_view(ReasoningMode::Auto).unwrap_err();
-    assert!(auto.to_string().contains("reasoning=auto"), "{auto}");
+    let auto = ds
+        .inference_view(ReasoningMode::Auto(Default::default()))
+        .unwrap_err();
+    assert!(
+        auto.to_string().contains("needs a profile")
+            || auto.to_string().contains("`reasoning` feature"),
+        "{auto}"
+    );
     for (name, mode) in [
         ("false", ReasoningMode::Off),
         ("true", ReasoningMode::Materialized),
         ("materialized", ReasoningMode::Materialized),
-        ("auto", ReasoningMode::Auto),
+        ("auto", ReasoningMode::Auto(Default::default())),
     ] {
         assert_eq!(ReasoningMode::parse(name), Some(mode.clone()));
         assert_eq!(ReasoningMode::from_param(Some(name)), mode);

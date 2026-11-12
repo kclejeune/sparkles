@@ -97,6 +97,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/backup/{ds}", &["POST"]),
     ("/$/reason/{ds}", &["GET", "POST", "DELETE"]),
     ("/$/reason/{ds}/auto", &["PUT", "DELETE"]),
+    ("/$/reason/{ds}/query", &["GET", "PUT", "DELETE"]),
     ("/$/reason/{ds}/diagnostics", &["GET"]),
     ("/$/reason/{ds}/explain", &["POST"]),
     ("/$/reason/{ds}/diff", &["GET"]),
@@ -567,6 +568,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/graphql/{ds}/versions"
         | "/$/graphql/{ds}/draft" => Dataset(Read),
         "/$/reason/{ds}"
+        | "/$/reason/{ds}/query"
         | "/$/text/{ds}"
         | "/$/geo/{ds}"
         | "/$/vector/{ds}/{name}"
@@ -592,6 +594,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/quota/{ds}" => Server(ServerPerm::ServerAdmin),
         "/$/reason/{ds}"
         | "/$/reason/{ds}/auto"
+        | "/$/reason/{ds}/query"
         | "/$/text/{ds}"
         | "/$/text/{ds}/rebuild"
         | "/$/geo/{ds}"
@@ -787,6 +790,7 @@ pub fn whole_dataset(route: &str, method: &Method) -> bool {
         | "/{ds}/shacl"
         | "/{ds}/shex" => true,
         "/$/reason/{ds}"
+        | "/$/reason/{ds}/query"
         | "/$/text/{ds}"
         | "/$/geo/{ds}"
         | "/$/vector/{ds}/{name}"
