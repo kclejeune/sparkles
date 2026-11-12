@@ -2720,21 +2720,35 @@ mod tests {
         assert!(
             reidentified_dataset_bytes(&raw, old, uuid::Uuid::nil(), 0, 0, &preparation).is_err()
         );
-        for future in [
-            serde_json::json!({"format":2,"id":false}),
-            serde_json::json!({"format":1,"minimumReader":u64::MAX,"id":false}),
+        // a newer format and a newer reader capability are refused as a newer release's
+        // before the malformed identity is decoded, and a pre-release form with the
+        // dump-and-reload message
+        for (unsupported, wording) in [
+            (
+                serde_json::json!({"format": DATASET_FORMAT + 1, "minimumReader": DATASET_READER, "id": false}),
+                "newer release",
+            ),
+            (
+                serde_json::json!({"format": DATASET_FORMAT, "minimumReader": DATASET_READER + 1, "id": false}),
+                "newer release",
+            ),
+            (
+                serde_json::json!({"format": 1, "minimumReader": 1, "id": false}),
+                "sparkles dump",
+            ),
         ] {
-            assert!(matches!(
-                reidentified_dataset_bytes(
-                    &serde_json::to_vec(&future).unwrap(),
-                    old,
-                    new,
-                    0,
-                    0,
-                    &preparation
-                ),
-                Err(Error::Unsupported(_))
-            ));
+            let Err(error) = reidentified_dataset_bytes(
+                &serde_json::to_vec(&unsupported).unwrap(),
+                old,
+                new,
+                0,
+                0,
+                &preparation,
+            ) else {
+                panic!("an unsupported dataset.json is refused: {unsupported}");
+            };
+            assert!(matches!(error, Error::Unsupported(_)), "{error}");
+            assert!(error.to_string().contains(wording), "{error}");
         }
         assert_eq!(preparation.room(), room);
         let control = Control::none();
