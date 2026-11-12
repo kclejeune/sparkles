@@ -102,6 +102,54 @@ record. Aggregate counts and change events follow that exclusion too. The backup
 offline integrity paths use a distinct trusted capture capability. External workers
 never receive that capability or the raw control snapshot.
 
+#### Where the exclusion is enforced
+
+Phase 1 enforces the exclusion per surface. The registry's owner entry names the hidden
+graphs, the store answers them through `Store::hidden_graphs`, and every read surface
+subtracts them from the caller's graph view, through `Dataset::hide_owner_graphs`, the
+query defaults or the principal's per-dataset hidden graphs. Surfaces that report counts
+redact them under `Principal::partial_view`. Three review rounds each found surfaces that
+read a snapshot without this subtraction, so three structural alternatives were compared.
+
+The first alternative masks the snapshot itself. `Store::snapshot` and the historical
+and branch snapshot accessors would return the snapshot with the ledger's quads taken out
+as delta deletions, the mechanism that triple-level access views already use
+(`access::triples::apply`). A trusted accessor would return the raw snapshot to the
+writer, compaction, merge, backup, integrity and the jobs owner. Every quad-reading
+surface, including statistics, listings, export and library callers of `Dataset::store`,
+would then exclude the ledger without its own code. This alternative fits the current
+model, but it is not adopted. About 600 snapshot reads inside the core would each have to
+be classified as raw or public, and a writer that took a masked base would commit the
+mask's deletions as real ones. The masked delta holds every ledger quad, so a snapshot
+costs work proportional to the ledger at each commit and every scan of a predicate the
+ledger shares, such as `rdf:type`, merges a large deletion set. A masked snapshot also
+turns off predicate-pattern planning and some result caches, which would slow every query
+on a dataset with jobs. Finally, `GraphAccess::masked` leaves an already masked snapshot
+unchanged, so triple-level protections would need a composed mask first, or they would
+silently stop applying. Commit counts, the change log and history are not snapshot reads
+and would still need their per-surface redaction.
+
+The second alternative keeps the ledger out of the RDF index. Ledger records would be
+stored in a separate keyed control space of the same store, written in the same log
+record and checkpoint as the business quads and read only through the typed jobs API and
+the trusted capture path. Query, statistics, listings, export, indexes, history and
+commit counts would never see them, and no read pays for them. It is the structural
+answer, but it changes this specification's model. Section 2.1 stores jobs as RDF records
+in reserved graphs, and the log record, checkpoint, backup and reader 9 formats would all
+change. It also has to be coordinated with the storage format cutoff of X16.
+
+The third alternative is a read-view type at the library and server boundary that pairs a
+snapshot with the effective graph view and is the only way facades obtain a snapshot.
+`Dataset::store` stays public, so raw library reads would keep depending on the caller,
+and counting surfaces that read a snapshot's sizes would still need their own redaction.
+It narrows the per-surface work without closing it.
+
+The second alternative is the decided direction. Roadmap item 905 builds it after item
+479 sets the format cutoff, and it amends section 2.1 and the log record, checkpoint,
+backup and reader formats. Until then the per-surface exclusion stays, every surface a
+review finds gets a regression test, and the library's raw `Store` remains a trusted
+interface whose callers supply the exclusion, as roadmap item 902 records.
+
 Business effects still pass the worker run's current effective data grants, write guard,
 quotas and protected-branch checks. Internal access to job records cannot authorize a
 business quad. The proposed internal publisher is not a general write bypass.

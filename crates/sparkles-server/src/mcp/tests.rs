@@ -2513,7 +2513,7 @@ async fn the_hidden_ledger_leaves_every_mcp_tool() {
     let ds = server.state.get("d").unwrap();
     let ledger = sparkles::jobs::LEDGER_GRAPH;
     assert!(
-        ds.dataset.snapshot().len() > 0,
+        !ds.dataset.snapshot().is_empty(),
         "the ledger holds control records"
     );
     let mut c = Client::start(server);

@@ -331,7 +331,7 @@ async fn seeded() -> (tempfile::TempDir, Arc<AppState>, Router) {
 async fn aggregates_and_listings_leave_the_hidden_ledger_out() {
     let (_dir, state, app) = seeded().await;
     let ledger = sparkles::jobs::LEDGER_GRAPH;
-    assert!(state.get("d").unwrap().dataset.snapshot().len() > 0);
+    assert!(!state.get("d").unwrap().dataset.snapshot().is_empty());
     // statistics
     let (s, j, _) = call(&app, "GET", "/$/stats/d", None, None).await;
     assert_eq!(s, StatusCode::OK, "{j}");
