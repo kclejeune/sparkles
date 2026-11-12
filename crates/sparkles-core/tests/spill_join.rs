@@ -4,7 +4,7 @@
 use oxrdfio::RdfFormat;
 use sparkles_core::io::Source;
 use sparkles_core::sparql::{
-    CursorOptions, CursorStatus, FallbackPolicy, QueryOptions, query, select_cursor,
+    CursorOptions, CursorStatus, FallbackPolicy, QueryOptions, QueryResult, query, select_cursor,
 };
 use sparkles_core::spill::{Fault, Spill, SpillOptions};
 use sparkles_core::store::{Store, StoreOptions};
@@ -127,6 +127,21 @@ fn eager(s: &Store, q: &str) -> Vec<String> {
             .map(|r| format!("{r:?}"))
             .collect(),
     )
+}
+
+/// The rows of the eager result `r`, sorted and decoded a page of a thousand rows at a
+/// time. A decoded page is charged to the query's memory budget, so a budget that holds
+/// the result's table need not hold its whole decoded answer at once. A page the budget
+/// refuses fails the test rather than leaving rows out.
+fn decoded(r: &QueryResult) -> Vec<String> {
+    let mut rows = Vec::with_capacity(r.len());
+    for start in (0..r.len()).step_by(1000) {
+        let page = r
+            .rows_range(start..(start + 1000).min(r.len()))
+            .unwrap_or_else(|e| panic!("rows {start}.. of {}: {e:?}", r.len()));
+        rows.extend(page.into_iter().map(|row| format!("{row:?}")));
+    }
+    sorted(rows)
 }
 
 /// The names in `dir`'s process directories other than their markers.
@@ -707,8 +722,8 @@ fn a_limit_below_an_order_free_grouping_keeps_its_input_order() {
 
 /// An eager join whose build does not fit the memory budget of a query that may spill
 /// partitions its inputs to disk through the cursor's join and gives the eager answer,
-/// where without spill the same budget fails it. The output fits the budget, so the
-/// build alone decides.
+/// where without spill the same budget fails it. The output's table fits the budget,
+/// so the build alone decides, and the answer is decoded a page at a time.
 #[test]
 fn an_eager_join_whose_build_does_not_fit_spills_instead_of_failing() {
     let s = store(30_000, false);
@@ -735,10 +750,7 @@ fn an_eager_join_whose_build_does_not_fit_spills_instead_of_failing() {
         ..options(Some(spill.clone()))
     };
     let r = query(s.snapshot(), q, &spilled).unwrap();
-    assert_eq!(
-        sorted(r.rows().into_iter().map(|row| format!("{row:?}")).collect()),
-        expected
-    );
+    assert_eq!(decoded(&r), expected);
     assert!(
         r.mem_peak_bytes <= EAGER_BUILD_MEMORY,
         "{}",
@@ -768,6 +780,53 @@ fn an_eager_join_whose_build_does_not_fit_spills_instead_of_failing() {
 }
 
 /// A budget the hash table of the MINUS's right input, 60,000 rows of about 50,000 keys,
-/// does not fit beside the two inputs of about 1.4 MiB, while the output of 10,000
-/// rows does.
+/// does not fit beside the two inputs of about 1.4 MiB, while the table of the output's
+/// 10,000 rows does. Their decoded terms do not fit all at once.
 const EAGER_BUILD_MEMORY: u64 = 3 << 20;
+
+/// Each eager join kind whose build does not fit [`EAGER_BUILD_MEMORY`] gives the eager
+/// answer through the partitioned join. The inner join, the OPTIONAL with and without
+/// a filter, and a MINUS whose right input is a join each fail the budget without spill.
+/// The right inputs of the first three are a UNION, which keeps them out of key order,
+/// so that the join hashes them.
+#[test]
+fn every_eager_join_kind_whose_build_does_not_fit_spills_to_its_answer() {
+    let s = store(30_000, false);
+    let tmp = tempfile::tempdir().unwrap();
+    let union = "{ ?b <urn:x2> ?v } UNION { ?b <urn:x3> ?v }";
+    let queries = [
+        format!("SELECT ?a ?v ?b {{ ?a <urn:x1> ?v {{ {union} }} }}"),
+        format!("SELECT ?a ?v ?b {{ ?a <urn:x1> ?v OPTIONAL {{ {union} }} }}"),
+        format!("SELECT ?a ?v ?b {{ ?a <urn:x1> ?v OPTIONAL {{ {union} FILTER(?b != ?a) }} }}"),
+        "SELECT ?a ?v { ?a <urn:x1> ?v MINUS { ?b <urn:x2> ?v . ?b <urn:w> ?w } }".to_string(),
+    ];
+    let options = |spill| QueryOptions {
+        max_memory_bytes: Some(EAGER_BUILD_MEMORY),
+        spill,
+        no_cache: true,
+        ..Default::default()
+    };
+    for q in &queries {
+        let expected = eager(&s, q);
+        assert!(expected.len() > 1000, "{q}: {}", expected.len());
+        let failed = query(s.snapshot(), q, &options(None));
+        assert!(
+            matches!(&failed, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+            "{q}: {:?}",
+            failed.err()
+        );
+        let spill = spill(tmp.path());
+        let r = query(s.snapshot(), q, &options(Some(spill.clone()))).unwrap();
+        assert_eq!(decoded(&r), expected, "{q}");
+        assert!(
+            r.mem_peak_bytes <= EAGER_BUILD_MEMORY,
+            "{q}: {}",
+            r.mem_peak_bytes
+        );
+        let plan = serde_json::to_string(r.plan()).unwrap();
+        assert!(plan.contains("partitioned to disk"), "{q}: {plan}");
+        drop(r);
+        assert_eq!(spill.reserved_bytes(), 0, "{q}");
+        assert!(leftovers(tmp.path()).is_empty(), "{q}");
+    }
+}
