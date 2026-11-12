@@ -5,9 +5,9 @@
 //!
 //! Every subsumption between named classes that the classifier answers must be one that
 //! HermiT entails, on every case, and on a case the classifier takes whole, with no axiom
-//! left out, it must answer exactly HermiT's subsumptions. The cases of the Horn families
-//! and the Horn hand cases that the Horn rules take whole are listed in
-//! [`HORN_WHOLE`]'s count, so that a rule that stops taking a case shows.
+//! left out, it must answer exactly HermiT's subsumptions. The cases of the two Horn
+//! families that the classifier takes whole are counted in [`HORN_WHOLE`], so that a rule
+//! that stops taking a case shows.
 
 use sparkles_owl::classify::{Classifier, Expansion, Limits};
 use sparkles_owl::model::*;
@@ -19,9 +19,10 @@ const THING: &str = "http://www.w3.org/2002/07/owl#Thing";
 const NOTHING: &str = "http://www.w3.org/2002/07/owl#Nothing";
 
 /// The cases of the families `horn-shiq` and `horn-sroiq` that the classifier takes
-/// whole. The others name individuals, which the Horn rules of this phase leave to a
-/// later step.
-const HORN_WHOLE: usize = 54;
+/// whole: all 50 of `horn-shiq` and the 35 of `horn-sroiq` without an at-least restriction
+/// above one, since the Horn rules with individuals leave such a restriction out beside
+/// individuals (roadmap item 867).
+const HORN_WHOLE: usize = 85;
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603")

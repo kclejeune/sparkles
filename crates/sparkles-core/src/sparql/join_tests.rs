@@ -235,6 +235,67 @@ fn merge_left_joins_keep_the_left_order_and_the_rows_of_hash_left_joins() {
     assert!(merged > 400);
 }
 
+/// A merge join on two shared variables tests the second one on each pair of the first
+/// key's runs before the pair counts, so a constant first key with unique second keys
+/// gives one row per left row within a row limit that the product of the runs exceeds.
+#[test]
+fn merge_joins_on_two_keys_count_only_compatible_pairs_against_the_row_limit() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ctx = ctx_with(&s, Optimizations::ALL);
+    ctx.max_rows = 4096;
+    let [k, x] = ["k", "x"].map(|n| ctx.var(n));
+    let rows = 1000usize;
+    let side = |vars: Vec<VarId>| {
+        let mut t = Table::new(vars);
+        for i in 0..rows {
+            t.push_row(&[Id(7), Id(100 + i as u64)]);
+        }
+        t.sorted = vec![k, x];
+        t
+    };
+    let (l, r) = (side(vec![k, x]), side(vec![k, x]));
+    let joined = super::exec::join_tables(&ctx, &l, &r, &[k], true).unwrap();
+    assert_eq!(joined.len(), rows);
+    assert!(
+        joined.cols[1]
+            .iter()
+            .enumerate()
+            .all(|(i, v)| *v == Id(100 + i as u64))
+    );
+    // A right run longer than a probe piece, of which each left row matches one row,
+    // within a row limit below the run's length.
+    let long = 40_000usize;
+    ctx.max_rows = long - 5_000;
+    let mut r = Table::new(vec![k, x]);
+    for i in 0..long {
+        r.push_row(&[Id(7), Id(100 + i as u64)]);
+    }
+    r.sorted = vec![k, x];
+    let mut l = Table::new(vec![k, x]);
+    for i in [0usize, long / 2, long - 1] {
+        l.push_row(&[Id(7), Id(100 + i as u64)]);
+    }
+    l.sorted = vec![k, x];
+    let joined = super::exec::join_tables(&ctx, &l, &r, &[k], true).unwrap();
+    assert_eq!(joined.len(), 3);
+    // The merge OPTIONAL shares the key alone, so every pair of the long run is a match
+    // and the run is expanded a piece at a time within a limit above its product.
+    let y = ctx.var("y");
+    ctx.max_rows = 200_000;
+    let mut r = Table::new(vec![k, y]);
+    for i in 0..long {
+        r.push_row(&[Id(7), Id(100 + i as u64)]);
+    }
+    r.sorted = vec![k, y];
+    let mut note = None;
+    let optional = left_join(&ctx, &l, &r, None, &mut note).unwrap();
+    assert_eq!(optional.len(), 3 * long);
+    assert!(
+        note.as_deref().is_some_and(|n| n.starts_with("[merge on")),
+        "{note:?}"
+    );
+}
+
 /// The zippers of merge left joins and anti joins, alone, side by side over parts of the
 /// inputs, or galloping, give every left id's lower bound in the right column. The inputs
 /// include runs of duplicates, gaps that leave a part without rows on one side, and sizes
@@ -245,9 +306,9 @@ fn merge_lower_bounds_match_a_binary_search() {
     let ctx = ctx_with(&s, Optimizations::ALL);
     let mut next = xorshift(0x2545_f491_4f6c_dd1d);
     for round in 0..400 {
-        let an = (next() % [10, 300, 3000, 20_000][round % 4]) as usize;
-        let bn = (next() % [10, 300, 6000, 40_000][(round / 4) % 4]) as usize;
-        let domain = [3, 50, 10_000, u64::MAX / 2][(round / 16) % 4];
+        let an = (next() % [10, 300, 3000, 20_000, 60_000][round % 5]) as usize;
+        let bn = (next() % [10, 300, 6000, 40_000][(round / 5) % 4]) as usize;
+        let domain = [3, 50, 10_000, u64::MAX / 2][(round / 20) % 4];
         let column = |n: usize, next: &mut dyn FnMut() -> u64| {
             let mut c: Vec<Id> = (0..n).map(|_| Id(1 + next() % domain)).collect();
             c.sort();
@@ -264,7 +325,7 @@ fn merge_lower_bounds_match_a_binary_search() {
             .iter()
             .map(|x| b.partition_point(|y| y < x) as u32)
             .collect();
-        let got = super::zipper::lower_bounds(&ctx, &a, &b).unwrap();
+        let got = super::join::zipper::lower_bounds(&ctx, &a, &b).unwrap();
         assert_eq!(got, want, "round {round}: {an} x {bn} in 1..={domain}");
     }
 }
@@ -488,4 +549,92 @@ fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_5_of_6() {
 #[test]
 fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_6_of_6() {
     galloping_index_joins_part(5, 6);
+}
+
+/// An algorithm join admits the bytes of the table it is about to build and refuses a
+/// table whose capacity differs. A join of one to a few rows must therefore gather its
+/// columns at exactly that length, since a column grown from empty takes the allocator's
+/// minimum capacity of four instead.
+#[test]
+fn an_algorithm_join_of_a_few_rows_fits_its_admitted_capacity() {
+    let store = Store::in_memory(StoreOptions::default());
+    let ctx = Ctx::new(store.snapshot());
+    let [k, a, b] = ["k", "a", "b"].map(|n| ctx.var(n));
+    for n in 1..=6u64 {
+        let mut l = Table::new(vec![a, k]);
+        let mut r = Table::new(vec![k, b]);
+        for i in 1..=n {
+            l.push_row(&[Id(10 + i), Id(i)]);
+            r.push_row(&[Id(i), Id(20 + i)]);
+        }
+        let out = super::exec::join_algorithm_tables(&ctx, &l, &r)
+            .unwrap_or_else(|e| panic!("{n} rows: {e}"));
+        assert_eq!(out.table.len(), n as usize);
+        for col in &out.table.cols {
+            assert_eq!(col.capacity(), n as usize, "{n} rows");
+        }
+    }
+}
+
+/// A join's condition is tested from the ids of its candidate rows, in the merge and
+/// the hash form of an OPTIONAL. The FILTER path decodes the terms of a large table
+/// first, and doing so for a condition cost an OPTIONAL over 300,000 candidate rows four
+/// times its run, so the conditional OPTIONAL over more rows than that path decodes
+/// holds no more memory than the OPTIONAL without the condition.
+#[test]
+fn a_join_condition_decodes_no_terms() {
+    const ROWS: usize = 20_000;
+    let s = Store::in_memory(StoreOptions::default());
+    let mut text = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..ROWS {
+        text.push_str(&format!("ex:s{i} a ex:C0 ; ex:p0 ex:o{i} .\n"));
+    }
+    load(&s, &text);
+    let snap = s.snapshot();
+    let plain = "SELECT * WHERE { ?s a ex:C0 OPTIONAL { ?s ex:p0 ?o } }";
+    let conditional = "SELECT * WHERE { ?s a ex:C0 OPTIONAL { ?s ex:p0 ?o FILTER(?o != ex:x) } }";
+    for (how, opt) in [
+        ("merge", Optimizations::ALL),
+        (
+            "hash",
+            Optimizations {
+                merge_left_join: false,
+                ..Optimizations::ALL
+            },
+        ),
+    ] {
+        let without = run(&snap, plain, opt);
+        let with = run(&snap, conditional, opt);
+        assert_eq!(with.rows().len(), ROWS, "{how}");
+        assert!(
+            has_note(
+                &with.plan,
+                "OptionalJoin",
+                if how == "merge" {
+                    "[merge on"
+                } else {
+                    "[flat hash table"
+                }
+            ),
+            "{how}: {}",
+            with.plan.description
+        );
+        // The condition's mask and its merged rows of two columns at most, the parallel
+        // map's collector with its 1 KiB per pool thread, and the hash kernel's scratch
+        // for a chunk of candidate pairs. Decoding the 20,000 terms of ?o takes about
+        // 2 MiB more.
+        let chunk = if how == "hash" {
+            super::exec::KEYED_CHUNK as u64 * (2 * 8 + 24) + 256
+        } else {
+            0
+        };
+        let threads = rayon::current_num_threads() as u64 * 1024;
+        let slack = ROWS as u64 * (1 + 2 * 8) + threads + chunk + 1024;
+        assert!(
+            with.mem_peak_bytes <= without.mem_peak_bytes + slack,
+            "{how}: the condition took the peak from {} to {} bytes",
+            without.mem_peak_bytes,
+            with.mem_peak_bytes
+        );
+    }
 }

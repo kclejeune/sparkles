@@ -704,3 +704,70 @@ fn a_limit_below_an_order_free_grouping_keeps_its_input_order() {
     assert_eq!(spill.reserved_bytes(), 0);
     assert!(leftovers(tmp.path()).is_empty());
 }
+
+/// An eager join whose build does not fit the memory budget of a query that may spill
+/// partitions its inputs to disk through the cursor's join and gives the eager answer,
+/// where without spill the same budget fails it. The output fits the budget, so the
+/// build alone decides.
+#[test]
+fn an_eager_join_whose_build_does_not_fit_spills_instead_of_failing() {
+    let s = store(30_000, false);
+    let tmp = tempfile::tempdir().unwrap();
+    let q = "SELECT ?a ?v { ?a <urn:x1> ?v MINUS { { ?b <urn:x2> ?v } UNION { ?b <urn:x3> ?v } } }";
+    let expected = eager(&s, q);
+    assert!(expected.len() > 1000, "{}", expected.len());
+    let options = |spill| QueryOptions {
+        max_memory_bytes: Some(EAGER_BUILD_MEMORY),
+        spill,
+        no_cache: true,
+        ..Default::default()
+    };
+    let failed = query(s.snapshot(), q, &options(None));
+    assert!(
+        matches!(&failed, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{:?}",
+        failed.err()
+    );
+    let spill = spill(tmp.path());
+    let work = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let spilled = QueryOptions {
+        work: Some(work.clone()),
+        ..options(Some(spill.clone()))
+    };
+    let r = query(s.snapshot(), q, &spilled).unwrap();
+    assert_eq!(
+        sorted(r.rows().into_iter().map(|row| format!("{row:?}")).collect()),
+        expected
+    );
+    assert!(
+        r.mem_peak_bytes <= EAGER_BUILD_MEMORY,
+        "{}",
+        r.mem_peak_bytes
+    );
+    let plan = serde_json::to_string(&r.plan).unwrap();
+    assert!(plan.contains("partitioned to disk"), "{plan}");
+    assert_eq!(spill.reserved_bytes(), 0);
+    assert!(leftovers(tmp.path()).is_empty());
+    // The spilled join produces the rows the eager join produces, once: its inputs and
+    // its output are the eager operators', and the cursor tree that runs it counts none.
+    let unspilled = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    query(
+        s.snapshot(),
+        q,
+        &QueryOptions {
+            work: Some(unspilled.clone()),
+            no_cache: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        work.load(std::sync::atomic::Ordering::Relaxed),
+        unspilled.load(std::sync::atomic::Ordering::Relaxed)
+    );
+}
+
+/// A budget the hash table of the MINUS's right input, 60,000 rows of about 50,000 keys,
+/// does not fit beside the two inputs of about 1.4 MiB, while the output of 10,000
+/// rows does.
+const EAGER_BUILD_MEMORY: u64 = 3 << 20;
