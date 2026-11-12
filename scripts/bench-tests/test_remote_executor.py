@@ -433,6 +433,24 @@ class Admission(unittest.TestCase):
         self.assertNotIn('MBX_REMOTE_TOKEN_FILE=',build)
         self.assertIn('MBX_REMOTE_URL MBX_CACHE_DIR MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE; do',build)
 
+    def test_gate_start_makes_its_files_private_whatever_the_login_umask(self):
+        """A worker whose login umask is 002 still gets a gate worktree, out directory and unit at umask 022."""
+        text=(ROOT/'scripts/gate/remote/gate-start.sh').read_text();lines=text.splitlines()
+        first=lambda p:next(i for i,l in enumerate(lines) if p(l))
+        umask=first(lambda l:l=='umask 022')
+        self.assertLess(umask,first(lambda l:l.startswith('mkdir ')))
+        self.assertLess(umask,first(lambda l:'worktree add' in l))
+        unit=first(lambda l:l.startswith('systemd-run --user --unit "$unit"'))
+        self.assertIn('-p UMask=0022',lines[unit+1])
+
+    def test_setup_host_stages_the_suites_without_links(self):
+        """The Boat transport refuses a link in an outbound archive, so the staged suites carry none."""
+        lines=(ROOT/'scripts/gate/setup-host.sh').read_text().splitlines()
+        pull=next(i for i,l in enumerate(lines) if 'rx_sync -- -a "$src:gate/suites/" "$stage/"' in l)
+        push=next(i for i,l in enumerate(lines) if 'rx_sync -- -a "$stage/" "$host:gate/suites/"' in l)
+        drop=next(i for i,l in enumerate(lines) if l.strip()=='find "$stage" -type l -delete')
+        self.assertLess(pull,drop);self.assertLess(drop,push)
+
     def test_admit_renders_its_probe_and_names_a_missing_worker_tool(self):
         """The admit probe parses as shell, carries its formatted values, and checks every worker tool."""
         import subprocess as sp
