@@ -12,6 +12,17 @@ restriction above one beside individuals is left out and reported (roadmap item 
 On the development files with individuals the rules take 1.2 to 1.6 times the time of
 the EL rules alone, and more on assertion-heavy files, which roadmap item 869 follows.
 
+With counting, an exact or minimum cardinality in a negative position, the form of a
+definition's right-to-left direction, is the calculus's own at-most clause with the
+neighbours in its body, in place of a clause of every context with a holder, and an exact
+cardinality of one is an existential restriction in a negative position, so that no
+context speculates about its predecessor's type. A product of the at-most and predecessor
+rules derives each distinct conclusion once and charges its record to the memory budget.
+The new clauses take the simple-role check that the at-most clauses take. Counting
+stays off by default, since the three counting files of the ORE 2015 DL development set
+still pass its bound and classify again without it. This is roadmap item 728, and the
+calculus change that remains is item 894.
+
 ### Compatibility
 
 The adopted HTTP, CLI and public library compatibility policy is documented.

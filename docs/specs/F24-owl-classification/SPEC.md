@@ -105,6 +105,16 @@ gives its default answer, and 45 of the 50 `shoi` fixtures exact against HermiT.
 fixtures that pass the bound are item 822, the default is item 823, and keys and the
 universal property are item 805.
 
+Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
+and their record. With counting, an exact or minimum cardinality in a negative position
+is the calculus's own at-most clause with the neighbours in its body, an exact
+cardinality of one is an existential restriction in a negative position, and a product
+derives each distinct conclusion once with its record charged to the memory budget. The
+three files of the item still pass the bound of the counting run and classify again
+without counting, so counting stays off by default, and the calculus change for the
+equality reasoning over conditional successors that remains is item 894, which also takes
+the design's third part, the witnesses' shared context.
+
 The bounded named-class read phase of items 588 and 622, and the availability route
 of item 726, publish an immutable completed result beside the incremental saturation.
 `GET /$/ontology/{ds}/classification` and the Rust, Python, Node.js and JVM read adapters
@@ -1170,8 +1180,10 @@ that need counting out and reports them, and takes a minimum as the existential
 restriction it implies, so it costs what the classifier cost before counting. The reason
 is the cost on real ontologies, since no file of the ORE 2015 DL development set finishes
 with counting and the five that attempt it spend 2 to 30 times the time of the run
-without it before they give up where that run finishes, item 728. Turning counting on is the work of
-that item. A run that counts when asked takes a number restriction that the Horn rules
+without it before they give up where that run finishes. Item 728 replaced the clauses of
+every context and the hypothesis about the predecessor, as [its subsection](#item-728s-clauses-for-counting-over-definitions)
+records, and the three files still give up, so turning counting on is the work of item
+894, the calculus change for the equality reasoning that remains. A run that counts when asked takes a number restriction that the Horn rules
 cannot take, a functional or inverse functional property, disjoint properties or an
 asymmetric property. The terms of a clause then include
 equalities of the successor terms and of a successor with the predecessor, and the order
@@ -1238,7 +1250,8 @@ minimum cardinality `=n r.F` and `≥n r.F` by `∃r.F`, with `owl:Thing` for an
 filler, does not finish in 120 s on one thread on the build before counting, and takes
 105 s with the premise index and the Pred check below. A copy that replaces only the exact
 cardinalities classifies in 44 to 50 ms but leaves its four minimums of two out. Item 728
-holds the choice among the remedies.
+chose among the remedies, as its subsection below records, and item 894 holds the
+calculus change that remains.
 The normalization of a clause with a universal or a maximum
 beside a class or an existential restriction keeps the class in the clause's body, which
 classifies BioTop in 56 ms on one thread and 27 ms on four against 940 and 350 ms before.
@@ -1275,6 +1288,392 @@ one thread on the benchmark host. Each rule set now has a worker of its own that
 its activation, and with `sparkles-owl` in one codegen unit GO classifies on one thread in
 0.99 of the time of the build before and ChEBI lite in 0.98, with the same taxonomies, as
 the [code layout results](../../benchmarks/el-classification/RESULTS.md#code-layout) give.
+
+#### Item 728's clauses for counting over definitions
+
+This subsection is the design of item 728, written before its code. It decides how a run
+that counts, without the root of a rooted run, takes an exact or minimum cardinality in a
+negative position, which is the form the right-to-left direction of a definition such as
+`AcylGroup ≡ CarbonAtom ⊓ =1 hasDoubleBondWith.OxygenAtom ⊓ =2 hasSingleBondWith.OrganicGroup`
+gives, and where the witnesses of a minimum saturate, so that ore_ont_6485, ore_ont_6952
+and ore_ont_10140 of the ORE 2015 DL sample classify with counting on. The three files are
+in the `dl-q` stratum. The first has 15 definitions of this shape over the symmetric bond
+properties, with the union fillers `HeteroAtom`, `HalogenAtom` and `CarbonGroup` and
+pairwise disjoint atom classes. The other two are versions of the Protein Ontology with
+1,014 and 1,020 cardinalities in 30,363 definitions such as
+`PR_000024883 ≡ =3 has_component.MOD_00041 ⊓ PR_000024871` over 83,036 classes, six
+transitive properties, 26 unions and no universal restriction. Rooted runs keep their
+order, their rules and their witnesses as the section on nominals describes, and nothing
+here changes them.
+
+The normalization before this item follows the paper's Table 1 after the structural
+transformation. `=n r.F ⊑ y` becomes the clause of every context `⊤ → y ⊔ M ⊔ H`, where
+`M` is a fresh class that holds `≤(n-1) r.F` through the at-most clause DL4,
+`M(x) ∧ r_B(x, z_1) ∧ … ∧ r_B(x, z_n) → ⋁ z_i ≈ z_j`, with `r_B` the qualified role of
+`r` and the negative form `B` of `F`, and `H` is the conjunction of `n+1` existential
+restrictions with fresh pairwise disjoint fillers below `F`, which is the paper's DL2 with
+the inequalities read as disjointness. For `n = 1` the maximum is the universal
+restriction `∀r.N` in place of `M`, where `N` is the fresh complement class of `F`,
+disjoint with `B`. A minimum `≥n r.F` in a positive position makes `n` witnesses in the
+same way, `∃r.b_i` with fresh `b_i ⊑ F` pairwise disjoint, and each witness has the
+context of its own filler `b_i` as its successor, since the index gives an existential
+restriction its filler's context. The paper names this translation as the source of its
+own reasoner's difficulty with number restrictions, where each application of an at-most
+clause to the clauses that define the neighbours gives a complex clause that gives rise
+to numerous others, and it writes that the problem seems inherent in transforming number
+restrictions as Table 1 shows.
+
+The traces of the counting attempts, at the bound of 262,144 conclusions, show two
+different costs. On ore_ont_6485 the attempt derives 281,019 conclusions in 137 contexts,
+90,522 of the universal rule over successors, 38,264 of the at-most rule, 32,118 of the
+unfolding, 30,341 of the qualified-role clauses, 26,229 of the disjointness certificates,
+21,808 of the universal rule over the predecessor and 17,089 paramodulations, and every
+context begins with the 20 body-less clauses. The form costs in three ways there. The
+clause has an empty body, so Hyper derives it in every context. For `n = 1` the disjunct
+`∀r.N` sends the marker `N` to every `r`-successor of the context and, since the bond
+properties are symmetric, derives `N` of the predecessor. `H` is an expression, which the
+order of atoms ranks above every fresh and named class, so it is the maximal literal of
+the derived clause and Succ makes its hypothetical successors in every context. Those
+successors share one context per fresh existential restriction and gather the markers of
+every predecessor, each counts its predecessor over the symmetric role, and the equalities
+of the at-most clauses rewrite the literals of a known successor onto a hypothetical one,
+which sends them down the chain as markers. Absorbing the definition's named conjuncts
+into the body of the clause, the experiment that PERFORMANCE-EXPERIMENTS.md records, cut
+the stored clauses at the bound from 285,856 to 56,635 and still passed the bound, because
+the named guard holds in every context of a carbon atom and the clause still spawned `H`
+and sent `N` from each. On ore_ont_6952 the attempt derives 280,093 conclusions in 4,870
+contexts against 214 without counting, 156,882 of the unfolding of the transitive
+properties and 107,536 of Pred, and only two body-less clauses fire in a context. The
+extra contexts are the witnesses, 1,575 of the minimums in a positive position and 2,589 of
+the `H` disjuncts, and each repeats the unfolding of its filler's transitive properties in
+a context of its own and sends the clauses back through Pred.
+
+The decision has three parts, the clause, the rank of `H` and the context of a witness.
+All three are choices the paper's calculus leaves open, and none departs from it.
+
+The first part writes the at-most disjunct of such a clause as the paper's at-most clause
+itself, with the neighbours in the body and no holder. With counting, an exact
+cardinality `=n r.F` in a negative position with `n ≥ 1` becomes the DL-clause
+
+`r_B(x, z_1) ∧ … ∧ r_B(x, z_n) → y ⊔ H ⊔ ⋁_{i<j} z_i ≈ z_j`
+
+and a minimum `≥n r.F` in a negative position that stands alone, with `n ≥ 2`, becomes
+
+`r_B(x, z_1) ∧ … ∧ r_B(x, z_n) → y ⊔ ⋁_{i<j} z_i ≈ z_j`,
+
+where `B`, `r_B` and `H` are as above and the `z_i` range over distinct neighbour terms,
+the successor terms and the predecessor. Distinct variables do not assert distinct
+elements, since the equalities in the head cover two variables that name one neighbour,
+and an instance that repeats a term is a tautology, so the rule enumerates the subsets of
+distinct terms. Both clauses are DL-clauses of the paper's Section 2.4, whose bodies may
+hold atoms `S(x, z_j)` over neighbour variables and whose heads may hold any DL-literal,
+with each `z_j` in the body, and the paper states that DL-clauses outside Table 1 are
+handled correctly by its algorithm. For `n ≥ 2` the clause is the resolvent on `M` of the
+two clauses it replaces, and `M` occurs in no other clause, so the two sets have the same
+models over the ontology's signature. A model of the new clause satisfies the old pair
+when `M` is read as `¬y ⊓ ¬H`, since where `M` holds with `n` qualified neighbours the new
+clause gives `y`, `H` or an equality, and the first two are false. For `n = 1` there is
+no holder to resolve on, and the clause is `r_B(x, z) → y ⊔ H`, which replaces
+`⊤ → y ⊔ ∀r.N ⊔ H` together with `N ⊓ B ⊑ ⊥`. Where `y` and `H` are false the old pair
+puts every `r`-neighbour in `N` and so outside `B`, and the new clause forbids every
+`r`-neighbour in `B`, which is the same constraint, and where one of them holds both are
+satisfied, so the two forms agree on every model of the normalized signature once `N` is
+read as `¬B`, with `B` and whatever constraints it has kept as they are. Each form relates
+to the original axiom through the structural transformation as the old one did, whose
+models extend to the fresh names and restrict back to the original signature. The change
+for `n = 1` is therefore a change of proof shape and not of meaning. The old form derives `N` of each successor and of the predecessor as markers,
+and the new form waits for a neighbour's own context to derive that it is in `B`, which
+the qualified-role clause of DL4 turns into `r_B` and Pred carries back. Soundness is the
+paper's Theorem 8 and completeness its Theorem 9, which hold for any set of DL-clauses,
+any expansion strategy and any context term order in the sense of its Definition 3, for
+a query whose conditions C2 and C3 hold. The runs of this spec test subsumption through
+refutation, in a context whose core holds the class and the candidate's complement and
+whose query has an empty head, so C2 is vacuous and C3 is the Core rule. The rules that
+apply the clause exist, since the at-most clauses of the holders already take their
+candidates from the qualified-role literals over the successor terms and over the
+predecessor, make one product per subset of `n` candidates under the bounds on the widest
+clause, the subsets and the payload, and cut an equality that a disjointness certificate
+contradicts. The new clause is such a product with an empty holder and with `y` and `H`
+added to its head. It is derived whenever a new premise of a qualified-role literal over a
+successor term arrives, with that premise fixed in the product, as the holders' clauses
+are now, so that a term first counted under a conditional premise is counted again under
+a later unconditional one, and for `n = 1` also once when a context starts, for the
+predecessor alone.
+
+The measurement revised the `n = 1` case. The clause `r_B(x, y) → y ⊔ H` with the
+predecessor as its one neighbour is a hypothesis about the predecessor's type, and the
+engine's hypotheses are the paper's markers `A → A`, which Pred discharges in the
+predecessor, so every context that carries the inverse of the role speculates on it, and
+with the symmetric bond properties of ore_ont_6485 that is every atom context for every
+one of the fifteen definitions. Under the present rank `H` is maximal there and Succ
+makes its witnesses everywhere, which a functional holder then equates with the
+predecessor and with each other, and under the low rank `y` is resolved into the
+definition's class wherever its guard holds, whose own holder then counts every
+hypothetical witness in the context. Both attempts passed the bound, and the traces are
+in the lane record. The `n = 1` case therefore takes the form `∃r.F ⊑ y ⊔ H`, which is
+`=1 r.F ⊑ y` written as `⊤ ⊑ y ⊔ ∀r.¬F ⊔ H` with the universal restriction moved to the
+left, and an existential restriction in a negative position as any other of the
+normalization. A context derives `y ⊔ H` once it knows a neighbour in `F`, a successor
+through the successor's own context and Pred, or the predecessor through the universal
+rule over the predecessor, which derives `∃r.B(y)` in the neighbour's context from `B`
+and the edge and sends it back, and never from a hypothesis. The two regressions of the
+acceptance cover the predecessor as the only neighbour and beside a successor. The lazy
+clause with the neighbours in the body remains the form for `n ≥ 2`, where it fires only
+with `n` qualified neighbours, the predecessor among them.
+
+The predecessor is a candidate neighbour whenever the context carries the inverse of the
+qualified role, as a premise `r_B(x, y)` in the body of the product and not as a fact, so
+the new clause for `n = 1` is derived with the body `r_B(x, y)` in every context that
+carries the inverse, which with symmetric roles is every context the role reaches. That
+clause does not go to the predecessor, since a clause goes there only when it has no
+maximal literal of its own, every head literal being over the predecessor, and this head
+is over `x`, and it has a body, so it never takes part in the canonical model. What it can
+do is give its maximal literal to the rules, and under the present rank that literal is
+`H`, so Succ would make `H`'s hypothetical successors from a conditional body in every such
+context, and the first part alone would not stop the expansion of `H` on the symmetric
+bond properties. The second part of the decision therefore ranks `H` below every fresh
+class and every named class, as the lowest rank of the atoms over `x` in the order of a
+run without the root, for the at-least conjunction of every clause that a cardinality in
+a negative position makes, the exact cardinality's, the minimum's and the maximum's
+`≥(n+1) r.F`. The paper's Definition 3 leaves the order of the atoms over `x` free, and
+its Theorem 9 holds for every order the definition admits. The rooted order keeps the
+named classes minimal and incomparable for its own completeness argument, and the second
+part does not touch it. Under the new rank the derived clause `Γ → y ⊔ H ⊔ E` with `E` the
+equalities first resolves its equalities, which rank above every atom over `x`, through
+Eq, Ineq and Factor with the certificates, and then has `y` as its maximal literal. Hyper
+takes `y` into the definition's clause `G ∧ y ∧ … → A`, whose conclusion has the named
+class `A` and then `A`'s told subsumers as its maximal literals, and `H` becomes maximal
+only once every literal above it is resolved away. The rank delays the expansion of `H`
+and does not confine it. A class context resolves the literals above `H` away when it
+holds a complement, as a context of `X ⊑ ¬A` does for `→ A ⊔ H` through the disjointness
+of `A` and its complement, or a universal restriction or a negative existential
+restriction that makes a case false, and then expands `H` itself, and a clause whose head
+still holds a literal over a successor term or an equality above `y` keeps that literal as
+its maximum. Where nothing resolves them, the clause `→ y ⊔ H` with an empty body enters
+the canonical model of the context, which is built from such clauses in the order of the
+literals, and makes `y` true when no other atom of its head already holds, so the
+definition's class becomes true when its other conjuncts hold, and a candidate of the
+context. The test context of that candidate holds its complement, resolves the class
+away, and is left with `Γ → H ⊔ …` where `H` is maximal, so Succ makes `H`'s successors
+there, the holder's at-most clause equates them with the known neighbours, the
+inequalities of DL2 refute the equalities, and the test derives `⊥` when the count is
+exact and stays satisfiable when it is not. This is the order in which the hypertableau
+explores the disjunction, where the at-least restriction is expanded only when the other
+disjuncts fail. The expectation is that most expansions of `H` move from the contexts that
+have the neighbours to the tests, and the measurements record how many conditional
+predecessor clauses each rank derives and how many hypothetical successors they make. A
+candidate adds a test and never a subsumption, so the rank carries no soundness risk, and
+the completeness obligation is the one the runs already meet, that candidates come from a
+model of the context and that no required test is missed. The present rank is measured
+beside the new one as the control.
+
+The measurement of the rank. The low rank stays behind `SPARKLES_DL_LOW_H=1`, off by
+default. On the fixture sriq-010 it diverges where the present rank finishes, because the
+ontology's own clause `⊤ → ∃r1⁻.¬(C2 ⊔ C5) ⊔ ∀r0.¬C0 ⊔ ≥2 r1.C1` shares a clause with `H`
+after Hyper, and once `H` ranks lowest the `≥2 r1.C1` witnesses are the maximal literal
+in its place, Succ makes two more successor terms, and the functional role equates them
+with the other neighbours, which multiplies the at-most products and the paramodulations
+by about ten in one context. The rank moves the exploration onto the other disjuncts of
+such a clause rather than delaying it. On the three files of this item both ranks pass
+the bound, with the clauses of the first part and with the `n = 1` revision above, and
+the products of one shared hypothetical successor context are the cost that remains.
+That context, the hypothetical successor of `∃hasSingleBondWith.HeteroAtom`, is
+registered by fourteen predecessors, holds the markers of all of them, and resolves the
+union cases of `HeteroAtom` and `HalogenAtom` against every disjoint marker and the
+predecessor-direction existential restrictions into tens of thousands of distinct clauses
+over the predecessor, whose bodies combine the role atoms of different predecessors. Their
+Pred products in one class context, with the at-most products and paramodulations they
+feed, pass three million conclusions. A product now derives each distinct conclusion once,
+since two choices whose premises share their literals merged to one conclusion and each
+counted toward the bound, and that alone removed two thirds of the Pred conclusions of
+that context. The product's record of the conclusions it has derived lives until the
+product ends and is charged to the run's memory budget as it grows, so a wide product
+whose conclusions are all redundant still stops the run at its budget. The remedy this leaves is the one named below, a hypothetical successor
+keyed by the predecessor's restriction, so that no context combines the markers of
+different predecessors.
+
+The measurement of the keyed successor. The keyed successor was built and measured and
+is not kept, and PERFORMANCE-EXPERIMENTS.md records it. A run that counts, without the
+root, sent a conditional existential restriction to a context made during the run and
+keyed by the predecessor's own existential restriction, when the predecessor is a
+hypothetical successor, and by the predecessor's context otherwise, against the shared
+context as the control. On ore_ont_6952 and ore_ont_10140 the two choices take the same
+time and both pass the bound, since their cost is the witnesses' unfolding and not the
+shared markers. On ore_ont_6485 both choices pass the default bound and the bound of four
+million conclusions. With the keyed successor the
+cost moves out of the hypothetical successors into one EL successor context, the
+successor of a witness `∃r.b_i` whose fresh filler lies below a union, which derives 1.9
+million paramodulations and 1.7 million lazy products of the four million. Its clauses
+hold the union's cases, each case's existential restrictions as conditional successor
+terms, eighteen of them, the lazy clauses equate the conditional qualified successors
+under the cases, and each equality, maximal in its clause since the terms rank above the
+atoms over x, rewrites every stored clause whose maximal literal is over the larger term,
+and the rewritten qualified-role literals feed the products again. Without the keyed
+successor the same four million spread over three class contexts. The keyed successor
+removes the combination of predecessors' markers and leaves this cost, which is the
+equality reasoning over conditional successors that the paper's Section 7 names as
+inherent in its translation of number restrictions, so it is not a remedy for this file.
+
+The third part gives the witnesses of one filler one context. A minimum `≥n r.F` in a
+positive position keeps its `n` witnesses `∃r.b_i` with fresh fillers `b_i ⊑ F` pairwise
+disjoint, since the terms must differ and the disjointness is what certifies that they
+do, but each witness takes the context of `∃r.F`'s successor, the filler `F` with the
+role's range, as its successor in place of a context of its own. The facts of a witness's
+term and the core of its successor context are two different things, and the design
+keeps them apart. The facts of the term `f_i(x)` are `b_i`, `F` and the role's range, and
+the predecessor holds them in both paths that make a successor. For a unit witness it
+holds them as unit clauses `⊤ → b_i(f_i(x))`, `⊤ → F(f_i(x))` and `⊤ → range(f_i(x))`,
+which are DL2's `B_1 → B_2(f_i(x))` with `b_i ⊑ F` and the range unfolded, and for a
+witness of `H` it holds them under the clause's body and beside its other head literals,
+as `Γ → Δ ⊔ b_i(f_i(x))` and so on, since the unfolding of a conditional existential
+restriction must give the term's own facts and not only the shared successor's. The
+disjointness certificates read `b_i(f_i(x))` and `b_j(f_j(x))` from those clauses, unit
+or conditional, so a clause `Γ → H` whose two witnesses of a maximum of one are equated
+still derives `Γ → ⊥`. In both paths `b_i` goes to the shared context as a marker, which
+the unit path must send as well, since making an EL successor sends a backward link and
+no marker today. The selection is the paper's Definition 7 applied as its cautious
+strategy applies it to DL2, whose witnesses all have `B_2(f_i(x))` as their one certain
+atom and all take the context `v_{B_2}`, and the fresh filler changes only the name of the
+term. The definition's condition is on the set `K_1` of the Succ rule, the successor
+triggers that the predecessor holds as unit clauses over `f_i(x)`, and on the chosen
+context's core being equal to the chosen subset of `K_1`. For a unit witness `K_1` holds
+`b_i`, `F`, the range and the components of the flattened conjunction of `F` and the
+range, since the predecessor holds each as a unit clause, and the chosen context's core
+is exactly `F` with the range, the core the index gives `∃r.F`'s successor, so the
+condition holds by the predecessor's premises and not by entailment. For a witness of `H`
+the chosen context has the empty core, which is a subset of whatever `K_1` holds, and a
+witness that later becomes a unit, through unit premises of its own, takes the unit
+contract above from then on. The
+marker `b_i` has no rule of its own beyond `b_i ⊑ F`, which the core satisfies, and its
+disjointness with its siblings, which gives the clause `b_i ∧ b_j → ⊥` in the shared
+context and nothing else. The witnesses of `H` are conditional, so nothing is certain of them and
+their core is empty, and the hypothetical successors of all the witnesses over one role
+and one filler share one context in place of one per fresh filler, which the definition
+allows since an empty core is a subset of anything. Sharing is measured against one
+context per witness, and the measured one is kept. The sharing follows what the trace of
+ore_ont_6952 shows, that the witnesses repeat their filler's unfolding 4,164 times, and it
+leaves each predecessor its copy of the shared context's clauses over the predecessor for
+each witness term, which Pred makes once per term as DL2 requires.
+
+Counting meets a union filler through the qualified roles, and only through clauses that
+Pred can carry. The atom `r_B(x, z)` for a neighbour `z` is derived in the neighbour's
+context from DL4's clause `r(y, x) ∧ B(x) → r_B(y, x)` and reaches `x` through Pred, so a
+neighbour counts toward `=n r.F` only when its own context has derived that it is in `B`,
+and the qualified-role clauses apply for every qualified role of a filler the neighbour
+derives, whatever role the edge from the predecessor has. When the neighbour's filler is
+a union, as `HeteroAtom → HalogenAtom ⊔ NitrogenAtom ⊔ OxygenAtom ⊔ SulfurAtom`, Hyper
+resolves each case that has a qualified role in use into that role's atom over the
+predecessor, and a conclusion goes to the predecessor once it has no literal of its own
+left, as a disjunction of qualified-role atoms such as `r_B(y, x) ⊔ r_C(y, x)` or of
+qualified-role atoms with other atoms over the predecessor. A case that is still an atom
+over the neighbour's own element blocks that clause, and the case is resolved by the
+neighbour's further inferences, Hyper, a disjointness, a universal restriction or a
+negative existential restriction, which can remove it or turn it into an atom over the
+predecessor, or stays and keeps the clause in the neighbour's context, where its canonical
+model settles it. In ore_ont_6485 the qualified roles are those of the fillers of the
+at-most restrictions, `OxygenAtom` over the double bond and `BromineAtom`,
+`HalogenAtom`, `OrganicGroup`, `HydrogenAtom`, `Alkyl`, `CarbonAtom` and `CarbonGroup`
+over the single bond, so a hetero atom gives a qualified-role atom under the halogen case
+and under the oxygen case over the double bond, and the nitrogen and sulfur cases have
+none, so a clause that holds them stays until something resolves them. The case analysis
+therefore runs in the neighbour's context and, when a clause crosses, in the predecessor's
+products, and not in every context of the ontology. One application of the at-most rule
+is bounded in the number of its subsets, the width of its clause and the literals of its
+products, and each subset's conclusions are the product of the premise lists of its
+candidates, so a neighbour with several conditional premises multiplies them, which the
+bound on derived conclusions covers as it does now. A disjointness certificate cuts an
+equality only when the certificate's body and head fit the conclusion, so two cases known
+to be disjoint cut the equality of two neighbours only once each neighbour's case is in the
+clause. In ore_ont_6485 every pair of atom classes is disjoint, so fillers of different
+cases are cut once their cases are derived.
+
+The paths of the normalization that the decision leaves as they are. A minimum
+`≥n r.F` beside named conjuncts in a negative position moves to the head as the holder of
+`≤(n-1) r.F` with the named conjuncts as the body, as `dual` does now, so the four nested
+minimums of two in ore_ont_6485, as in
+`SulfurAtom ⊓ ∃d.OxygenAtom ⊓ ∃s.HeteroAtom ⊓ ≥2 d.OxygenAtom ⊑ y'`, give
+`SulfurAtom ∧ ∃d.OxygenAtom ∧ ∃s.HeteroAtom → M ⊔ y'`, whose holder fires its at-most
+clause only with two qualified neighbours and so is already lazy. A maximum `≤n r.F` in a
+negative position keeps `⊤ → y ⊔ H` with `H` for `≥(n+1) r.F`, which the second part
+ranks lowest as well, so that the clause makes `y` true in the model and expands `H`
+where `y` is resolved away. Without counting a minimum in a negative position still reads
+as the existential restriction. The eager strategy is not the remedy, since the
+hypothetical successors of `H` have no certain core beyond the filler and the range, so
+the strategy chooses the same shared context, which its measurement past the bound
+showed.
+
+The bounds and the fallback are unchanged. A run that passes the bound on derived
+conclusions, the widest at-most clause, its subsets or its payload starts again as the
+section above says, on one thread and then without counting, and reports it through
+`Stats::dl_counting_over`. Every inference of the design is an inference of the paper's
+calculus on DL-clauses, so a run that finishes is complete, and a run that does not finish
+falls back and is sound. What the decision removes from the trace of ore_ont_6485 is the
+body-less clauses, their holder premises in the products, and the universal rule's
+propagation of `N`, and from the trace of ore_ont_6952 the repeated unfolding of the
+witnesses' fillers, and what it leaves is the qualified-role clauses, the resolution of
+the unions, the at-most products, the equality reasoning, Pred's copies per witness term
+and the expansion of `H` where a test or a context with a maximal `H` asks for it. The
+share of the universal rules in the first trace is not a predicted saving, since those
+rules also serve the universal restrictions the ontology states. If the measurements show
+the hypothetical successors of `H` still dominate, the next remedy is a hypothetical
+successor keyed by the pair of the predecessor's own existential restriction, or its
+class, and the successor's existential restriction, in place of one shared by every
+predecessor of that restriction, which the paper's Definition 7 allows since a strategy
+may return a fresh context for each application of Succ, and whose contexts are bounded
+by the finite set of such pairs, with its context count and memory measured. A filter that
+would derive the new clause only in a context whose clauses mention an at-most holder over
+a role above `r` is not a remedy this design admits, since the argument that a model with
+`n` successors and no such holder extends to one with `n+1` by a copy of a successor's
+subtree fails with inverse roles, where a filler with an at-most restriction over an
+inverse role forces every such successor to be a neighbour over another role that the
+context does bound. Items 727, 729 and 731 keep their scope.
+
+The acceptance is the gate of the roadmap row. The three files classify with counting on,
+with `Stats::dl_counting_over` and `Stats::dl_over_budget` false and every axiom that
+needs counting taken, so that neither the fallback of the bound nor the fallback of the
+budget passes as a success, and no development file of the ORE 2015 DL sample costs more
+than twice its run without counting, so that counting can be on by default. The
+development files, the generated fixtures and the `shoi` and nominal fixtures give the
+taxonomies of HermiT with no new timeout, on one and four threads, under both ranks, both
+strategies and both choices of the witnesses' contexts. Two regressions cover the
+predecessor, one where the predecessor is the only qualifying neighbour and one where it
+counts beside a successor, and two cover the shared witness context, one where a maximum
+of one equates two conditional witnesses of `H` and the certificates must derive `⊥`
+under the clause's body, and one where a unit witness's marker must reach the shared
+context. The two large files are measured apart from the first, with
+the time of their normalization, their saturation, their candidate tests and the
+completion of their counting, and the counts of the conditional predecessor clauses and
+of the hypothetical successors under each rank are recorded.
+
+The item ends with its gate not met, and it ships its clauses and its record. The first
+part is kept, with the `n = 1` revision above, so an exact or minimum cardinality of two
+or more in a negative position is the at-most clause with the neighbours in its body, an
+exact cardinality of one is `∃r.F ⊑ y ⊔ H`, and rooted runs keep their former translation.
+A lazy clause over a non-simple role fails the simple-role check as an at-most clause does,
+and the run then leaves every disjunctive axiom out and reports it, as it did before the
+item. The `n = 1` form needs no such check, since it counts no neighbours. The second part,
+the low rank of `H`, stays behind `SPARKLES_DL_LOW_H`, off, since it diverges on `sriq-010`
+and finishes none of the three files. The third part, the witnesses' shared context, is
+not built, since the keyed successor's measurement showed that the cost of ore_ont_6485
+lies in the equality reasoning over conditional successors, which no choice of the
+witnesses' contexts touches, and it goes to item 894 with the two versions of the Protein
+Ontology, whose cost it addresses. The product dedup and its memory charge are kept. On
+`atlas` on one thread, release, with the binary of the keyed experiment set to the shared
+contexts and the control rank, which is the path the revert keeps, the whole classification
+of ore_ont_6485 takes 11 ms without counting and 190 ms with counting requested, where the
+attempt passes its bound and the run classifies again without it, ore_ont_6952 takes 907
+and 1,105 ms, and ore_ont_10140 927 and 1,128 ms, each with `Stats::dl_counting_over` set
+and the answer of the run without counting. The generated fixtures with the 150 counting
+cases and the `shoi` and nominal fixtures keep their results against HermiT on one and
+four classifier workers, with the five `shoi` fixtures of item 822 falling back as before,
+and the Tier D suite holds the regressions of the predecessor, of the simple-role check,
+of the rooted translation and of the product record's charge. The development files of
+the ORE 2015 DL sample were measured for time and not compared again against HermiT in
+this item, since counting stays off and the run without counting is unchanged. The two
+regressions of the shared witness context go to item 894 with the third part. Item 894 is
+the calculus change for the equality reasoning that remains, from published calculi only,
+with the hypertableau's merging of equated terms and Kazakov and Klinov's exploration as
+the candidates named above, and its design precedes its code.
 
 ### Nominals in the disjunctive rules
 
@@ -1425,7 +1824,7 @@ The phase's gate is the `dl-o` stratum of the ORE 2015 DL development set, the n
 fixtures that need no counting and the hand cases. Of the six development files in `dl-o`,
 ore_ont_15803 and ore_ont_14924 have no data properties and both name the top object
 property. The other four use data properties and join the gate with item 768. The `dl-oiq`
-stratum needs counting and the Nom rule and joins the gate after item 728. The fixtures in
+stratum needs counting and the Nom rule and joins the gate after item 894. The fixtures in
 the gate are the 50 `shoi` cases, `sroiq-048` and the hand cases `nominal-disjunction`,
 `nominal-ripple`, `nominal-ripple-conditional`, `key-disjunction`, `top-forall` and
 `top-forall-conditional`, each on the rules that take it. Those hand cases that are Horn

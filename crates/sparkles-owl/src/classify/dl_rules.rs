@@ -84,6 +84,12 @@ pub struct DlIx {
     atmost: FxHashMap<Ex, (u32, Role)>,
     /// the holders, bounds and roles of the at-most restrictions
     atmosts: Vec<(Ex, u32, Role)>,
+    /// item 728's clauses of a cardinality in a negative position, without a holder: the
+    /// bound the at-most rule counts to, the qualified role and the head's atoms over x
+    lazy: Vec<(u32, Role, Box<[Ex]>)>,
+    /// for each expression, whether it is an at-least conjunction that the order of a run
+    /// without the root ranks below every class, item 728
+    low: Vec<bool>,
     /// the pairs of disjoint roles, closed under inverses and order
     pub(super) rdis: Vec<(Role, Role)>,
     /// with counting, for each role and qualified role t, whether a role literal below t
@@ -141,7 +147,12 @@ impl DlIx {
                 }
             }
         }
-        for &(_, _, s, b) in &dl.atmost {
+        for (s, b) in dl
+            .atmost
+            .iter()
+            .map(|&(_, _, s, b)| (s, b))
+            .chain(dl.lazy.iter().map(|&(_, s, b, _)| (s, b)))
+        {
             let r = if b == TOP { Some(s) } else { ix.roles.inv(s) };
             if let Some(w) = r.and_then(|r| wanted.get_mut(r as usize)) {
                 *w = true;
@@ -202,8 +213,8 @@ impl DlIx {
         // flips its last bit
         d.base = (n as Role + 1) & !1;
         let mut qual: FxHashMap<(Role, Ex), Role> = FxHashMap::default();
-        for &(m, k, s, b) in &dl.atmost {
-            let q = if b == TOP {
+        let mut qualified = |d: &mut DlIx, s: Role, b: Ex| {
+            if b == TOP {
                 s
             } else {
                 *qual.entry((s, b)).or_insert_with(|| {
@@ -212,9 +223,22 @@ impl DlIx {
                     d.quals_of.entry(b).or_default().push(q);
                     q
                 })
-            };
+            }
+        };
+        for &(m, k, s, b) in &dl.atmost {
+            let q = qualified(&mut d, s, b);
             d.atmost.insert(m, (k, q));
             d.atmosts.push((m, k, q));
+        }
+        for (k, s, b, head) in &dl.lazy {
+            let q = qualified(&mut d, *s, *b);
+            d.lazy.push((*k, q, head.clone().into_boxed_slice()));
+        }
+        d.low = vec![false; nodes];
+        for &h in &dl.low {
+            if let Some(x) = d.low.get_mut(h as usize) {
+                *x = true;
+            }
         }
         for &(a, b) in &dl.rdis {
             let mut add = |x: Role, y: Role| {
@@ -332,6 +356,14 @@ impl DlIx {
     /// The core of the successor that the EL rules give e.
     pub(super) fn core(&self, e: Ex) -> &[Ex] {
         self.cores.get(&e).map_or(&[][..], |c| c)
+    }
+
+    /// Whether `a` is an at-least conjunction of item 728's clauses that the order of a
+    /// run without the root ranks below every class, which `SPARKLES_DL_LOW_H=1` asks for
+    /// and is off by default until [`low_h`]'s measurement.
+    #[inline]
+    pub fn is_low(&self, a: Ex) -> bool {
+        self.root.is_none() && low_h() && self.low.get(a as usize).copied().unwrap_or(false)
     }
 
     /// Whether `me` is the root of a rooted run.
@@ -792,6 +824,15 @@ pub fn promote() -> bool {
 
 /// Whether a context other than the root selects the ground literals in its bodies, item
 /// 804's selection (F24). `SPARKLES_ROOTED_SELECT_GROUND=0` turns it off, for measurement.
+/// Whether the at-least conjunctions of item 728's clauses rank below every class, which
+/// `SPARKLES_DL_LOW_H=1` turns on. It is off until its measurement, since with it
+/// `sriq-010` of the counting fixtures passes a bound of 8 million conclusions on one
+/// thread where the present rank finishes it.
+pub fn low_h() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_DL_LOW_H").is_some_and(|v| v == "1"))
+}
+
 pub fn select_ground() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_SELECT_GROUND").is_none_or(|v| v != "0"))
@@ -908,6 +949,10 @@ fn prune(l: &mut Vec<Side>) {
 /// The choices of a product between two checks of the run's bounds.
 const PRODUCT_POLL: usize = 256;
 
+/// The most bytes of a product's record of its conclusions that may go uncharged when the
+/// product ends between two checks of the bounds; a larger tail is charged at the end.
+const RECORD_SLACK: usize = 64 * 1024;
+
 /// Derives what the rules found: the single conclusions, then each product's choices in
 /// the order of their lists, the last list fastest. The run's bounds are checked after
 /// every [`PRODUCT_POLL`] choices the context derives, counted across calls, and a stop of
@@ -959,9 +1004,18 @@ pub(super) fn drain_with<S: Sink>(
     let inv = |r: Role| dx.and_then(|d| d.inv(ix, r));
     for (lists, base, ground, rule) in found.prods {
         let mut at = vec![0usize; lists.len()];
+        // two choices whose premises share their literals merge to one conclusion, as
+        // when one role premise fits two places of a Pred body or two needs share their
+        // premise lists, and the product derives each conclusion once. Its record of the
+        // conclusions, kept or redundant, lives until the product ends, so it is charged
+        // to the memory budget as it grows and released at the end, and a conclusion the
+        // ground restriction rejects is not recorded
+        let mut seen: FxHashSet<(Vec<Lit>, Vec<Lit>)> = FxHashSet::default();
+        let (mut charged, mut pending) = (0usize, 0usize);
         'choices: loop {
             if out.stopped() {
                 ds(st).store.interrupted = true;
+                out.release_data(charged);
                 return;
             }
             let mut s = base.clone();
@@ -969,7 +1023,27 @@ pub(super) fn drain_with<S: Sink>(
                 s.0.extend_from_slice(&l[i].0);
                 s.1.extend_from_slice(&l[i].1);
             }
-            if !ground || !restricted(&out.dl().lits, inv, &s) {
+            let mut fresh = !ground || !restricted(&out.dl().lits, inv, &s);
+            if fresh {
+                let mut key = (s.0.clone(), s.1.clone());
+                key.0.sort_unstable();
+                key.0.dedup();
+                key.1.sort_unstable();
+                key.1.dedup();
+                let bytes = (key.0.capacity() + key.1.capacity()) * std::mem::size_of::<Lit>();
+                let cap = seen.capacity();
+                fresh = seen.insert(key);
+                if fresh {
+                    // charged at the next check of the bounds, so that the record adds
+                    // no checks of its own within a product, with the table's buckets
+                    // counted as the other tables are
+                    let key_size = std::mem::size_of::<(Vec<Lit>, Vec<Lit>)>();
+                    pending += bytes
+                        + table_bytes(seen.capacity(), key_size)
+                            .saturating_sub(table_bytes(cap, key_size));
+                }
+            }
+            if fresh {
                 if trace {
                     let lits = &out.dl().lits;
                     eprintln!(
@@ -985,10 +1059,17 @@ pub(super) fn drain_with<S: Sink>(
             x.choices += 1;
             if x.choices as usize >= PRODUCT_POLL {
                 x.choices = 0;
-                if !out.go_on() {
+                let go = if pending > 0 {
+                    charged += pending;
+                    out.reserve_data(std::mem::take(&mut pending))
+                } else {
+                    out.go_on()
+                };
+                if !go {
                     // the stop can come after the last choice, and the mark then only
                     // keeps the context open
                     ds(st).store.interrupted = true;
+                    out.release_data(charged);
                     return;
                 }
             }
@@ -1005,6 +1086,19 @@ pub(super) fn drain_with<S: Sink>(
                 at[k] = 0;
             }
         }
+        // the record's tail since the last check is charged while the record is live when
+        // it is large, so that a short product with wide conclusions meets the budget too,
+        // and a small tail is left uncharged rather than add a check of the bounds to
+        // every product, which bounds what one product holds unseen by RECORD_SLACK
+        if pending >= RECORD_SLACK {
+            charged += pending;
+            if !out.reserve_data(std::mem::take(&mut pending)) {
+                ds(st).store.interrupted = true;
+                out.release_data(charged);
+                return;
+            }
+        }
+        out.release_data(charged);
     }
 }
 
@@ -1405,6 +1499,7 @@ fn univ_over(ix: &Index, st: &State, f: Ex, r: Role, prem: &Side, found: &mut Fo
 /// with a premise for each and for the holder, gives the equalities of every pair (DL4).
 /// The predecessor is a neighbour through the body atom `q(x, y)`. `fixed` is a new premise
 /// of one successor term, which the inference must use, and `holder` the holder's premises.
+#[allow(clippy::too_many_arguments)]
 fn at_most(
     ix: &Index,
     st: &State,
@@ -1412,9 +1507,10 @@ fn at_most(
     q: Role,
     holder: Vec<Side>,
     fixed: Option<(Ex, &Side)>,
+    extra: &[Ex],
     found: &mut Found,
 ) {
-    found.rule = "atmost";
+    found.rule = if extra.is_empty() { "atmost" } else { "lazy" };
     let dx = dix(ix);
     if holder.is_empty() {
         return;
@@ -1453,6 +1549,13 @@ fn at_most(
     // each subset's product holds its premise lists and the equalities of every pair
     let payload = subsets.saturating_mul(k * (k - 1) / 2 + k + 1);
     if k > AT_MOST_WIDEST || subsets > AT_MOST_SUBSETS || payload > AT_MOST_PAYLOAD {
+        if tracing() {
+            eprintln!(
+                "TR OVER {} q={q} k={k} cands={} subsets={subsets} payload={payload}",
+                tr_ctx(st, false),
+                cands.len()
+            );
+        }
         found.over = true;
         return;
     }
@@ -1461,7 +1564,7 @@ fn at_most(
     loop {
         if must.is_none_or(|m| pick.contains(&m)) {
             let mut lists: Vec<Vec<Side>> = vec![holder.clone()];
-            let mut eqs: Vec<Lit> = Vec::new();
+            let mut eqs: Vec<Lit> = extra.iter().map(|&a| Lit::x(a)).collect();
             for (a, &i) in pick.iter().enumerate() {
                 lists.push(cands[i].1.clone());
                 for &j in &pick[a + 1..] {
@@ -1532,9 +1635,16 @@ fn on_rl(ix: &Index, st: &State, f: Ex, s: Role, prem: &Side, found: &mut Found)
     }
     for &(m, n, q) in &dx.atmosts {
         if dx.sub(ix, s, q) {
-            at_most(ix, st, n, q, partners_x(st, m), Some((f, prem)), found);
+            at_most(ix, st, n, q, partners_x(st, m), Some((f, prem)), &[], found);
         }
     }
+    // item 728's clauses, with the new premise fixed in the product
+    for (n, q, head) in &dx.lazy {
+        if dx.sub(ix, s, *q) {
+            at_most(ix, st, *n, *q, vec![unit()], Some((f, prem)), head, found);
+        }
+    }
+    found.rule = "qual";
     for (k, &(r, b)) in dx.quals.iter().enumerate() {
         let q = dx.base + 2 * k as Role;
         if let Some(i) = dx.inv(ix, r)
@@ -1545,6 +1655,7 @@ fn on_rl(ix: &Index, st: &State, f: Ex, s: Role, prem: &Side, found: &mut Found)
             }
         }
     }
+    found.rule = "rdis";
     for &(a, b) in &dx.rdis {
         if dx.sub(ix, s, a) {
             for p in partners_rl(ix, dx, st, f, b) {
@@ -1686,6 +1797,14 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
         out.me(Concl::Sub(BOTTOM));
         return;
     }
+    if d == me && tracing() {
+        // the trace's context label joined to the context's id
+        eprintln!(
+            "TR CTX {} me={me} {}",
+            tr_ctx(st, false),
+            tr(ix, &out.dl().lits, &[Lit::x(me)])
+        );
+    }
     let dx = dix(ix);
     let roles = &ix.roles;
     let mut found = Found::default();
@@ -1765,7 +1884,7 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
     }
     if dx.counting {
         if let Some(&(n, q)) = dx.atmost.get(&d) {
-            at_most(ix, st, n, q, vec![unit.clone()], None, &mut found);
+            at_most(ix, st, n, q, vec![unit.clone()], None, &[], &mut found);
         }
         on_filler(ix, st, d, &unit, &mut found);
     }
@@ -2054,6 +2173,13 @@ pub fn dedge<S: Sink>(ix: &Index, me: Ex, st: &mut State, u: Ex, e: Ex, out: &mu
     // a predecessor of a rooted run may reach the context over f_e(u) and finds the role
     // premises itself, with every role over f_e(u)
     let any = dix(ix).counting || dix(ix).root.is_some();
+    if tracing() {
+        eprintln!(
+            "TR REG {} me={me} hyp={:?} u={u} e={e}",
+            tr_ctx(st, false),
+            dix(ix).of_hyp.get(&me)
+        );
+    }
     let x = ds(st);
     x.empty_core = dix(ix).of_hyp.contains_key(&me);
     if x.dpreds.contains(&(u, e)) {
@@ -2486,7 +2612,7 @@ fn process<S: Sink>(
                 }
                 if dx.counting {
                     if let Some(&(n, q)) = dx.atmost.get(&d) {
-                        at_most(ix, st, n, q, vec![prem.clone()], None, &mut found);
+                        at_most(ix, st, n, q, vec![prem.clone()], None, &[], &mut found);
                     }
                     on_filler(ix, st, d, &prem, &mut found);
                 }
