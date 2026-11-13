@@ -73,14 +73,14 @@ impl Order {
     }
 
     /// An order of one run, built over facts with `keys` distinct first keys of which
-    /// `ghosts`, sorted, are left without a fact in the run, the ghosts charged to `m`.
+    /// `ghosts`, sorted, are left without a fact in the run. The ghosts are charged to
+    /// `m` already, as [`compact::sorted_live`](super::compact::sorted_live) made them.
     pub fn built(
         run: Run,
         keys: usize,
         ghosts: Vec<u64>,
         m: &mut Meter<'_>,
     ) -> Result<Order, MemoryExceeded> {
-        m.add(ghosts.capacity() * size_of::<u64>())?;
         let mut o = Order {
             ghosts,
             ..Order::default()
@@ -99,51 +99,39 @@ impl Order {
     }
 
     /// Keep as ghosts the keys of `dropped`, sorted and without repeats, that no run
-    /// holds any more, charging the list's growth to `m`.
+    /// holds any more. The new list of ghosts is charged to `m` before it is made, and
+    /// the old one released after.
     pub fn keep_ghosts(
         &mut self,
         dropped: &[u64],
         key1: &impl Fn(u32) -> u64,
         m: &mut Meter<'_>,
     ) -> Result<(), MemoryExceeded> {
-        let gone: Vec<u64> = dropped
-            .iter()
-            .copied()
-            .filter(|&k| !self.runs.iter().any(|r| r.holds(k, key1)))
-            .collect();
-        if gone.is_empty() {
+        let runs = &self.runs;
+        let gone = |k: &u64| !runs.iter().any(|r| r.holds(*k, key1));
+        // counted first, so that the merged list is the only one made
+        let fresh = dropped.iter().filter(|k| gone(k)).count();
+        if fresh == 0 {
             return Ok(());
         }
-        let (cap, n) = (self.ghosts.capacity(), self.ghosts.len() + gone.len());
+        let (cap, n) = (self.ghosts.capacity(), self.ghosts.len() + fresh);
         m.add(n * size_of::<u64>())?;
         let mut all = Vec::with_capacity(n);
-        let (mut i, mut j) = (0, 0);
-        while i < self.ghosts.len() || j < gone.len() {
-            let k = match (self.ghosts.get(i), gone.get(j)) {
-                (Some(&a), Some(&b)) if a < b => {
-                    i += 1;
-                    a
+        let mut new = dropped.iter().copied().filter(|k| gone(k)).peekable();
+        let mut old = self.ghosts.iter().copied().peekable();
+        loop {
+            let k = match (old.peek(), new.peek()) {
+                (Some(&a), Some(&b)) if a < b => old.next(),
+                (Some(&a), Some(&b)) if b < a => new.next(),
+                (Some(_), Some(_)) => {
+                    new.next();
+                    old.next()
                 }
-                (Some(&a), Some(&b)) if b < a => {
-                    j += 1;
-                    b
-                }
-                (Some(&a), Some(_)) => {
-                    i += 1;
-                    j += 1;
-                    a
-                }
-                (Some(&a), None) => {
-                    i += 1;
-                    a
-                }
-                (None, Some(&b)) => {
-                    j += 1;
-                    b
-                }
-                (None, None) => unreachable!(),
+                (Some(_), None) => old.next(),
+                (None, Some(_)) => new.next(),
+                (None, None) => break,
             };
-            all.push(k);
+            all.extend(k);
         }
         self.ghosts = all;
         m.sub(cap * size_of::<u64>());

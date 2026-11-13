@@ -10,6 +10,7 @@
 //! is made at the size [`sort_bytes`] or [`merge_bytes`] charges for and never grows.
 
 use super::run::Run;
+use crate::budget::{MemoryExceeded, Meter};
 use rayon::prelude::*;
 
 /// Batches smaller than this are sorted on the calling thread.
@@ -150,44 +151,56 @@ pub(crate) fn sorted(
     (Run::from_sorted(e.iter().copied()), n)
 }
 
-/// The run of the ids among `ids`, which ascend, that `keep` accepts, sorted by `key`
-/// and then id, with the distinct keys of all of `ids` and those of them that only
-/// refused ids have, sorted. The entries of all of `ids` are sorted, so the sort's
-/// buffers are those of `ids.len()` entries.
-pub(crate) fn sorted_live(
-    ids: &[u32],
-    key: &(impl Fn(u32) -> u64 + Sync),
-    keep: &(impl Fn(u32) -> bool + Sync),
-) -> (Run, usize, Vec<u64>) {
-    let mut e = sorted_entries(ids, key);
-    let (mut keys, mut ghosts) = (0, Vec::new());
+/// Each key of sorted entries once, with whether `keep` accepts an id that has it.
+fn key_groups<'a>(
+    e: &'a [Entry],
+    keep: &'a impl Fn(u32) -> bool,
+) -> impl Iterator<Item = (u64, bool)> + 'a {
     let mut i = 0;
-    while i < e.len() {
-        let k = e[i].0;
+    std::iter::from_fn(move || {
+        let k = e.get(i)?.0;
         let mut live = false;
         while i < e.len() && e[i].0 == k {
             live |= keep(e[i].1);
             i += 1;
         }
-        keys += 1;
-        if !live {
-            ghosts.push(k);
-        }
-    }
-    e.retain(|x| keep(x.1));
-    (Run::from_sorted(e.iter().copied()), keys, ghosts)
+        Some((k, live))
+    })
 }
 
-/// The keys of the ids of `runs` that `keep` refuses, sorted and without repeats.
+/// The run of the ids among `ids`, which ascend, that `keep` accepts, sorted by `key`
+/// and then id, with the distinct keys of all of `ids` and those of them that only
+/// refused ids have, sorted, in a list charged to `m` before it is made. The entries of
+/// all of `ids` are sorted, so the sort's buffers are those of `ids.len()` entries.
+pub(crate) fn sorted_live(
+    ids: &[u32],
+    key: &(impl Fn(u32) -> u64 + Sync),
+    keep: &(impl Fn(u32) -> bool + Sync),
+    m: &mut Meter<'_>,
+) -> Result<(Run, usize, Vec<u64>), MemoryExceeded> {
+    let mut e = sorted_entries(ids, key);
+    let (keys, dead) =
+        key_groups(&e, keep).fold((0, 0), |(n, d), (_, live)| (n + 1, d + usize::from(!live)));
+    m.add(dead * size_of::<u64>())?;
+    let mut ghosts = Vec::with_capacity(dead);
+    ghosts.extend(key_groups(&e, keep).filter(|g| !g.1).map(|g| g.0));
+    e.retain(|x| keep(x.1));
+    Ok((Run::from_sorted(e.iter().copied()), keys, ghosts))
+}
+
+/// The keys of the ids of `runs` that `keep` refuses, `dropped` of them, sorted and
+/// without repeats, in a list of capacity `dropped`.
 pub(crate) fn dropped_keys(
     runs: &[Run],
     key: &impl Fn(u32) -> u64,
     keep: &impl Fn(u32) -> bool,
+    dropped: usize,
 ) -> Vec<u64> {
-    let mut k: Vec<u64> = runs
-        .iter()
-        .flat_map(|r| r.ids().iter().copied().filter(|&id| !keep(id)).map(key))
-        .collect();
+    let mut k: Vec<u64> = Vec::with_capacity(dropped);
+    for r in runs {
+        k.extend(r.ids().iter().copied().filter(|&id| !keep(id)).map(key));
+    }
+    debug_assert_eq!(k.len(), dropped);
     k.sort_unstable();
     k.dedup();
     k

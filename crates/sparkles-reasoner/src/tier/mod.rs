@@ -663,9 +663,9 @@ impl Tier {
         m.add(n * size_of::<u32>() + compact::sort_bytes(n) + Run::bytes_for(live))?;
         let ids: Vec<u32> = (off..off + n as u32).collect();
         let (run, keys, ghosts) = if subjects {
-            compact::sorted_live(&ids, &|id: u32| rows[(id - off) as usize].s, &keep)
+            compact::sorted_live(&ids, &|id: u32| rows[(id - off) as usize].s, &keep, m)?
         } else {
-            compact::sorted_live(&ids, &|id: u32| rows[(id - off) as usize].o, &keep)
+            compact::sorted_live(&ids, &|id: u32| rows[(id - off) as usize].o, &keep, m)?
         };
         drop(ids);
         m.sub(n * size_of::<u32>() + compact::sort_bytes(n));
@@ -848,7 +848,7 @@ fn compaction(
     let dropped = total - run.len();
     let gone = if dropped > 0 {
         m.add(dropped * size_of::<u64>())?;
-        compact::dropped_keys(runs, key, keep)
+        compact::dropped_keys(runs, key, keep, dropped)
     } else {
         Vec::new()
     };
@@ -856,6 +856,7 @@ fn compaction(
     m.sub(scratch + old);
     if dropped > 0 {
         order.keep_ghosts(&gone, key, m)?;
+        drop(gone);
         m.sub(dropped * size_of::<u64>());
     }
     Ok((dropped, total))
@@ -975,6 +976,45 @@ mod tests {
         assert_eq!(ids(t.cands(Some(1), Some(10), None, 0, 5)), [0]);
         assert_eq!(t.count_p(10, 0, 5), 4);
         assert!(!t.alive(1));
+    }
+
+    /// The ghosts a compaction or a whole-tier order keeps for the keys of dead facts are
+    /// charged before they are made: the heap at the peak stays within the charge.
+    #[test]
+    fn ghosts_are_charged() {
+        let n = 8192u64;
+        // two merges of facts with distinct subjects and objects, all of them then dead
+        let mut t = Tier::new(0);
+        for i in 0..n / 2 {
+            t.push([i, 10, n + i]);
+        }
+        let b = Budget::unlimited();
+        t.index_new(0, &mut Meter::new(&b, true)).unwrap();
+        for i in n / 2..n {
+            t.push([i, 10, n + i]);
+        }
+        t.index_new(n as usize / 2, &mut Meter::new(&b, true))
+            .unwrap();
+        for id in 0..n as u32 {
+            t.kill(id);
+        }
+        // the whole-tier order over dead facts alone
+        let b = Budget::unlimited();
+        let mut m = Meter::new(&b, true);
+        let (r, heap) = crate::alloc_probe::peak_of(|| t.ensure_order(true, &mut m));
+        r.unwrap();
+        assert!(heap <= b.peak(), "order: heap {heap}, charged {}", b.peak());
+        assert_eq!(t.distinct_subjects(), Some(n as usize));
+        // a merge whose compaction rebuilds the relation and drops every dead fact
+        t.set_compaction_floor(u32::MAX);
+        t.push([n, 10, 2 * n]);
+        let b = Budget::unlimited();
+        let mut m = Meter::new(&b, true);
+        let (r, heap) = crate::alloc_probe::peak_of(|| t.index_new(n as usize, &mut m));
+        r.unwrap();
+        assert!(heap <= b.peak(), "merge: heap {heap}, charged {}", b.peak());
+        assert_eq!(t.rels()[0].subj.len(), 1);
+        assert_eq!(t.pstats(10), (n as usize + 1, n as usize + 1));
     }
 
     #[test]
