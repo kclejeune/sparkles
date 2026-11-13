@@ -352,6 +352,30 @@ fn run(snap: &Arc<crate::store::Snapshot>, q: &str, opt: Optimizations) -> Query
     query(snap.clone(), &format!("{PREFIXES}{q}"), &opts).unwrap_or_else(|e| panic!("{q}: {e}"))
 }
 
+/// The solutions as sorted rows of term numbers, the same multiset as [`answer`] gives
+/// with each distinct id decoded once instead of once per row. `terms` numbers the terms,
+/// and the results compared share it. A row holds at most four columns, and unused ones
+/// read `u32::MAX`. Results of a million rows compare in a fraction of the time that
+/// decoding and sorting them as text takes.
+fn interned_answer(
+    r: &QueryResult,
+    terms: &mut rustc_hash::FxHashMap<Option<oxrdf::Term>, u32>,
+) -> Vec<[u32; 4]> {
+    assert!(r.table.cols.len() <= 4, "{} columns", r.table.cols.len());
+    let mut v = vec![[u32::MAX; 4]; r.table.len()];
+    for (c, col) in r.table.cols.iter().enumerate() {
+        let mut ids = rustc_hash::FxHashMap::<crate::id::Id, u32>::default();
+        for (row, &id) in v.iter_mut().zip(col.iter()) {
+            row[c] = *ids.entry(id).or_insert_with(|| {
+                let next = terms.len() as u32;
+                *terms.entry(r.term(id)).or_insert(next)
+            });
+        }
+    }
+    v.sort_unstable();
+    v
+}
+
 fn answer(r: &QueryResult) -> Vec<String> {
     let mut v: Vec<String> = r
         .rows()
@@ -500,7 +524,8 @@ fn galloping_index_joins_part(part: usize, parts: usize) {
                 if i % parts != part {
                     continue;
                 }
-                let want = answer(&run(&snap, &q, Optimizations::NONE));
+                let mut terms = rustc_hash::FxHashMap::default();
+                let want = interned_answer(&run(&snap, &q, Optimizations::NONE), &mut terms);
                 for walk in [Some(true), Some(false)] {
                     for opt in [Optimizations::ALL, gallop_off] {
                         super::indexjoin::FORCE_INDEX_JOIN.with(|f| f.set(true));
@@ -508,11 +533,13 @@ fn galloping_index_joins_part(part: usize, parts: usize) {
                         let r = run(&snap, &q, opt);
                         super::indexjoin::FORCE_INDEX_JOIN.with(|f| f.set(false));
                         super::indexjoin::FORCE_WALK.with(|f| f.set(None));
-                        assert_eq!(
-                            answer(&r),
-                            want,
-                            "pass {pass}, {walk:?}, gallop {}: {q}",
-                            opt.gallop_index_join
+                        let got = interned_answer(&r, &mut terms);
+                        assert!(
+                            got == want,
+                            "pass {pass}, {walk:?}, gallop {}: {} rows against {}: {q}",
+                            opt.gallop_index_join,
+                            got.len(),
+                            want.len()
                         );
                     }
                 }
