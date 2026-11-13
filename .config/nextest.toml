@@ -106,7 +106,7 @@ every_syntax_and_codec_agree_in_all_parse_modes|\
 exists_evaluated_per_key_stays_eager_and_matches|\
 f16_keeping_after_commit_stays_within_limit|\
 sparql::opt_tests::range_filters_read_only_matching_id_ranges|\
-schema_heavy_demand_answers_like_materialization|\
+schema_heavy_demand_answers_like_materialization_part_[1-3]_of_3|\
 incremental::tests::owl_rl_matches_full|\
 ask_over_a_large_keyed_join_reads_both_sides_alternately|\
 http::pool_tests::dropping_a_default_streamed_body_releases_its_query_grant\
