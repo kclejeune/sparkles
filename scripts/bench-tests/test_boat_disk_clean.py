@@ -204,6 +204,15 @@ class Clean(unittest.TestCase):
                 p.send_signal(sig); p.wait(10)
                 self.assertTrue(self.gone(child), 'mbx gc outlived the cleanup')
 
+    def test_a_command_whose_parent_died_before_its_setup_never_runs(self):
+        """A cleanup that died between the fork and the death signal leaves a child of another parent."""
+        marker = Path(self.tmp.name) / 'ran'
+        with patch.object(disk_clean.os, 'getpid', return_value=1):
+            code, _ = disk_clean.run_command(['sh', '-c', 'touch %s' % marker], None, 10)
+        self.assertNotEqual(code, 0); self.assertFalse(marker.exists())
+        code, _ = disk_clean.run_command(['sh', '-c', 'touch %s' % marker], None, 10)
+        self.assertEqual(code, 0); self.assertTrue(marker.exists())
+
     def test_the_command_line_refuses_bad_values(self):
         for argv in [[], ['--if-above', '0'], ['--if-above', '101'], ['--force', '--env', '["x"]'], ['--force', '--if-above', '90'],
                      ['--force', '--deadline-seconds', '0']]:

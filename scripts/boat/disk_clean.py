@@ -58,13 +58,21 @@ def usage(path, statvfs=os.statvfs):
 RUNNING = set()
 
 
-def _die_with_parent():
-    # PR_SET_PDEATHSIG: the kernel kills the command if this program dies, even by SIGKILL.
-    try:
-        import ctypes
-        ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0)
-    except (OSError, AttributeError):
-        pass
+def die_with(parent):
+    """The child's setup before exec: die with this program, or not start at all.
+
+    PR_SET_PDEATHSIG makes the kernel kill the command when this program dies, even by
+    SIGKILL. A program that died between the fork and that call is no longer the parent,
+    so the child then exits before it runs the command."""
+    def setup():
+        try:
+            import ctypes
+            ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0)
+        except (OSError, AttributeError):
+            os._exit(125)
+        if os.getppid() != parent:
+            os._exit(125)
+    return setup
 
 
 def kill_group(pid):
@@ -86,7 +94,7 @@ def run_command(argv, env=None, seconds=60):
         return 'no_time', ''
     try:
         p = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=_die_with_parent)
+                             stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=die_with(os.getpid()))
     except OSError:
         return 'unavailable', ''
     RUNNING.add(p.pid)
