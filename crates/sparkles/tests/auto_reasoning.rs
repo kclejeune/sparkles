@@ -398,20 +398,49 @@ fn auto_does_not_mix_a_materialization_with_negation_over_backward_rules() {
     assert_eq!(auto, demand);
 }
 
-/// `makeTemp` makes a new node on every run, so the materialization's node and a
-/// derivation's node would both answer (review round 1).
+/// `makeTemp`, `makeSkolem` and a blank node in a head make a new node on every run, so
+/// the materialization's node and a derivation's node would both answer (review rounds 1
+/// and 2).
 #[test]
 fn auto_does_not_mix_fresh_witnesses() {
+    for make in [
+        "[f: (?x ex:seed ?v), makeTemp(?n) -> (?x ex:node ?n)]",
+        "[f: (?x ex:seed ?v), makeSkolem(?n, ?x, ?v) -> (?x ex:node ?n)]",
+        "[f: (?x ex:seed ?v) -> (?x ex:node _:w)]",
+    ] {
+        let rules = format!(
+            "@prefix ex: <http://ex.org/>.
+            {make}
+            [b: (?x ex:answer ?n) <- (?x ex:node ?n)]"
+        );
+        let (auto, demand) = auto_and_demand(
+            "@prefix ex: <http://ex.org/> . ex:a ex:seed ex:b .",
+            &rules,
+            "PREFIX ex: <http://ex.org/> SELECT ?n { ex:a ex:node ?n . ex:a ex:answer ?answer }",
+        );
+        assert_eq!(demand.len(), 1, "{make}: {demand:?}");
+        assert_eq!(auto.len(), demand.len(), "{make}: {auto:?}");
+    }
+}
+
+/// A list builtin reads the list links that backward rules can add, so the list the
+/// materialization saw can differ from the one a derivation sees and both lengths would
+/// answer (review round 2).
+#[test]
+fn auto_does_not_mix_lists_that_backward_rules_extend() {
     let rules = "@prefix ex: <http://ex.org/>.
-        [f: (?x ex:seed ?v), makeTemp(?n) -> (?x ex:node ?n)]
-        [b: (?x ex:answer ?n) <- (?x ex:node ?n)]";
+        [early: (?l rdf:rest ex:t) <- (?l ex:seed ex:a)]
+        [delay: (?l ex:seed ex:a) -> (?l ex:step ex:a)]
+        [links: (?l ex:step ex:a) -> (?l rdf:first ex:a), (?l rdf:rest rdf:nil), (?l ex:ready ex:yes)]
+        [length: (?l ex:ready ex:yes), listLength(?l, ?n) -> (?l ex:length ?n)]";
     let (auto, demand) = auto_and_demand(
-        "@prefix ex: <http://ex.org/> . ex:a ex:seed ex:b .",
+        "@prefix ex: <http://ex.org/> . ex:l ex:seed ex:a .
+         ex:t <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> ex:b ;
+              <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> .",
         rules,
-        "PREFIX ex: <http://ex.org/> SELECT ?n { ex:a ex:node ?n . ex:a ex:answer ?answer }",
+        "PREFIX ex: <http://ex.org/> SELECT ?n { ex:l ex:length ?n }",
     );
-    assert_eq!(demand.len(), 1, "{demand:?}");
-    assert_eq!(auto.len(), demand.len(), "{auto:?}");
+    assert_eq!(auto, demand);
 }
 
 /// A query whose dataset leaves out the default graph reads a fresh materialization

@@ -15,6 +15,13 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
 fn reasoning(put: &mut dyn FnMut(&str, J)) {
     let graphs =
         json!({ "type": "array", "items": string(), "description": "`default` or graph IRIs." });
+    let location_mapping = array(json!({
+        "anyOf": [
+            obj(&["name", "altName"], json!({ "name": string(), "altName": string() })),
+            obj(&["prefix", "altPrefix"], json!({ "prefix": string(), "altPrefix": string() })),
+        ],
+    }));
+    let imports = string_enum(&["none", "dataset", "fetch"]);
     put(
         "ReasonRequest",
         doc(
@@ -28,14 +35,9 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
                     "rerun": { "type": "boolean", "description": "Re-run the recorded profile, rules, extras and input graphs." },
                     "full": { "type": "boolean", "description": "A full run instead of an incremental one." },
                     "dataGraphs": graphs.clone(),
-                    "ontologyGraphs": graphs,
-                    "imports": string_enum(&["none", "dataset", "fetch"]),
-                    "locationMapping": array(json!({
-                        "anyOf": [
-                            obj(&["name", "altName"], json!({ "name": string(), "altName": string() })),
-                            obj(&["prefix", "altPrefix"], json!({ "prefix": string(), "altPrefix": string() })),
-                        ],
-                    })),
+                    "ontologyGraphs": graphs.clone(),
+                    "imports": imports.clone(),
+                    "locationMapping": location_mapping.clone(),
                     "refreshImports": { "type": "boolean", "description": "Load again the imports that earlier runs fetched." },
                     "threads": { "type": "integer", "minimum": 1, "description": "Threads the run evaluates rules on, at most those of the server's reasoning pool." },
                     "maxInferred": { "type": "integer", "minimum": 1, "description": "The derived triples the run may produce before it fails, at most the server's `--reason-max-inferred`, which is also the default." },
@@ -70,7 +72,16 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
                     "default": string_enum(&["auto", "demand", "materialized", "false"]),
                     "profile": string_enum(&["rdfs", "rdfs-simple", "owl-rl", "rules"]),
                     "rules": { "type": "string", "description": "The Jena rule text of the profile `rules`." },
-                    "inputs": { "type": "object", "description": "The input graphs, as a reasoning request names them." },
+                    "inputs": {
+                        "type": "object",
+                        "description": "The input graphs, as a reasoning request names them.",
+                        "properties": {
+                            "dataGraphs": graphs.clone(),
+                            "ontologyGraphs": graphs,
+                            "imports": imports,
+                            "locationMapping": location_mapping,
+                        },
+                    },
                     "budget": {
                         "type": "object",
                         "properties": {
@@ -79,7 +90,7 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
                         },
                     },
                     "stale": string_enum(&["derive", "allow"]),
-                    "tables": { "type": "object", "description": "The process-wide cache of derived tables, for callers with the metrics permission (responses only)." },
+                    "tables": { "type": "object", "additionalProperties": true, "description": "The process-wide cache of derived tables, for callers with the metrics permission (responses only)." },
                 }),
             ),
             "The dataset's query-time reasoning setting: the mode of a query that names none, the profile and rules that derive on demand, the input graphs, the budget of a derivation and the policy for a stale materialization.",

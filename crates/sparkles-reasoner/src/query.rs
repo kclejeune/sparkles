@@ -147,35 +147,69 @@ impl QueryReasoner {
     }
 
     /// Why the facts of a materialization of these rules cannot be read beside facts
-    /// derived for a query, when the rules hold a top-level backward rule: a builtin whose
-    /// answer can change when the backward rules give more facts (`noValue`,
-    /// `listNotContains`, `listForAll`), so that the materialization can hold conclusions
-    /// the whole program does not, or a builtin that makes a new term on every run
-    /// (`makeTemp`, `now`), so that the two sources disagree on the terms (spec F17 §4.3 as
-    /// built). `None` when the two can be read together.
+    /// derived for a query, when the rules hold a top-level backward rule (spec F17 §4.3
+    /// as built). The two sources agree only when the program is monotone and makes no
+    /// terms, so that the materialization, which skips the backward rules, holds a subset
+    /// of what the whole program derives. Any builtin outside the pure tests and functions
+    /// of their arguments therefore counts as a hazard: `noValue` and the list builtins
+    /// read facts the backward rules can add, so their answers can change, and `makeTemp`,
+    /// `makeSkolem` and `now` make terms that differ between the two runs. A head that
+    /// holds a blank-node constant, a functor or a list action does the same. An unknown
+    /// builtin counts as a hazard too. `None` when the two can be read together.
     pub fn mixing_hazard(&self) -> Option<String> {
+        use crate::builtins::{BuiltinKind as B, HeadAction};
+        use crate::parser::{Clause, Node};
         if !self.has_backward_rules() {
             return None;
         }
-        fn find(clauses: &[crate::parser::Clause]) -> Option<&str> {
+        fn pure(kind: B) -> bool {
+            !matches!(
+                kind,
+                B::NoValue
+                    | B::MakeTemp
+                    | B::MakeSkolem
+                    | B::Now
+                    | B::ListMember
+                    | B::ListContains
+                    | B::ListNotContains
+                    | B::ListLength
+                    | B::ListEntry
+                    | B::ListForAll
+            )
+        }
+        fn makes_terms(n: &Node) -> bool {
+            matches!(
+                n,
+                Node::Const(oxrdf::Term::BlankNode(_)) | Node::Functor(..)
+            )
+        }
+        fn find(clauses: &[Clause], head: bool) -> Option<String> {
             clauses.iter().find_map(|c| match c {
-                crate::parser::Clause::Builtin(b) => matches!(
-                    b.name.as_str(),
-                    "noValue" | "listNotContains" | "listForAll" | "makeTemp" | "now"
-                )
-                .then_some(b.name.as_str()),
-                crate::parser::Clause::Rule(r) => find(&r.body).or_else(|| find(&r.head)),
-                crate::parser::Clause::Triple(_) => None,
+                Clause::Builtin(b) if head => matches!(HeadAction::from_name(&b.name), Some(Ok(_)))
+                    .then(|| format!("calls {}", b.name)),
+                Clause::Builtin(b) => {
+                    (!B::from_name(&b.name).is_some_and(pure)).then(|| format!("calls {}", b.name))
+                }
+                Clause::Rule(r) => find(&r.body, false).or_else(|| find(&r.head, true)),
+                Clause::Triple(t) => (head
+                    && [&t.subject, &t.predicate, &t.object]
+                        .into_iter()
+                        .any(makes_terms))
+                .then(|| "makes a blank node or functor in its head".to_string()),
             })
         }
         self.shared
             .rules
             .iter()
-            .find_map(|r| find(&r.body).or_else(|| find(&r.head)).map(|b| (r, b)))
+            .find_map(|r| {
+                find(&r.body, false)
+                    .or_else(|| find(&r.head, true))
+                    .map(|b| (r, b))
+            })
             .map(|(r, b)| {
                 format!(
-                    "rule '{}' calls {b}, so the materialization, which skips the backward \
-                     rules, cannot be read beside derived facts",
+                    "rule '{}' {b}, so the materialization, which skips the backward rules, \
+                     cannot be read beside derived facts",
                     r.label()
                 )
             })

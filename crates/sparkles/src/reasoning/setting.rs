@@ -154,6 +154,8 @@ impl QuerySetting {
     /// The mode of a query that names none, when the setting names one.
     pub fn default_mode(&self) -> Option<ReasoningMode> {
         let d = self.default.as_deref()?;
+        // `Demand` has a profile only with the reasoner
+        #[allow(clippy::needless_update)]
         let demand = Demand {
             max_derived: self.budget.max_derived,
             ..Demand::default()
