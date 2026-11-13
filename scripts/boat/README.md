@@ -475,9 +475,11 @@ timer runs again after a resume.
 
 A job also refuses to start without room for its build. With `--need-free-gib N` the
 cleanup runs only when less than N GiB are free and exits 3 when less is still free
-afterwards. A lane CI job runs it under the heavy lock with `REMOTE_CI_MIN_FREE_GIB`, and a
-Boat gate start runs it before it creates its worktree with `GATE_BOAT_MIN_FREE_GIB`, both
-110 by default. A Boat gate also cleans at 90% after its run, and keeps the records as
+afterwards. A lane CI job runs it under the heavy lock with `REMOTE_CI_MIN_FREE_GIB`, 85 by
+default, which is the 67.8 GiB that a cold workspace test build of the lane CI added to the
+large worker's disk plus 25%. A Boat gate start runs it before it creates its worktree, and
+the gate again under the heavy lock, with `GATE_BOAT_MIN_FREE_GIB`, 110 by default, because
+a gate also builds the conformance suites. A Boat gate also cleans at 90% after its run, and keeps the records as
 `disk-clean-start.json` and `disk-clean-end.json` in its results.
 
 Every stop after a Root handoff needs a fresh job-closure receipt, so the forced cleanup

@@ -257,8 +257,11 @@ activation, the job also stops its own unit at that end and takes every wait fro
 unit's shutdown is bounded at 60 seconds, so the closure watch finds the job closed. Starts on
 one host are serialized, and a job of the same name starts only after the earlier unit has
 fully stopped. Under the heavy lock a job on a Boat worker needs `REMOTE_CI_MIN_FREE_GIB`
-free after the disk cleanup, 110 by default, and ends with exit 4 rather than start with
-less. The worker's disk timer stops any running job at 95% use, which is a recovery rather
+free after the disk cleanup, 85 by default, and ends with exit 4 rather than start with
+less. A cold workspace test build of the lane CI added 67.8 GiB to the large worker's disk,
+and the default adds 25% to that. The build cache does not help a second run on the large
+worker, because the test build stores about 48 GiB, more than the store's 40 GiB budget, so
+a rerun of the same commit measured 3 hits in 343 lookups and grew the disk by 65.7 GiB. The worker's disk timer stops any running job at 95% use, which is a recovery rather
 than a guarantee, since it checks once a minute and a build can fill the disk sooner. A job on an ssh host may run 6
 hours. The benchmark host is refused. `SPARKLES_REMOTE_CI_HOST` sets the default host. Results
 land in `.artifacts/remote-ci/NAME`, with the exit status and the logs.

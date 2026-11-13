@@ -21,7 +21,8 @@
 # from that end immediately before systemd-run and refuses to start with under
 # REMOTE_CI_MIN_SECONDS left, 600 by default. On an ssh host the job may run 6 hours.
 # Under the heavy lock, a job on a Boat worker first needs REMOTE_CI_MIN_FREE_GIB free after
-# the disk cleanup, 110 by default, and refuses with exit 4 otherwise.
+# the disk cleanup, 85 by default, and refuses with exit 4 otherwise. A cold workspace test
+# build of the lane CI grew the disk by 67.8 GiB on the large worker, and 85 adds 25%.
 # Results land in .artifacts/remote-ci/NAME, with ci.exit, ci.log and the ci or premerge logs.
 # A Boat worker needs SPARKLES_BOAT_PROFILE and SPARKLES_BOAT_ADMISSION, as every Boat
 # command does. The host needs ~/gate from scripts/gate/setup-host.sh.
@@ -137,7 +138,7 @@ case $host in
     ;;
 esac
 min=${REMOTE_CI_MIN_SECONDS:-600}
-case ${REMOTE_CI_MIN_FREE_GIB:-110} in '' | *[!0-9]* | 0)
+case ${REMOTE_CI_MIN_FREE_GIB:-85} in '' | *[!0-9]* | 0)
   echo "remote-ci.sh: REMOTE_CI_MIN_FREE_GIB must be a positive number of GiB" >&2
   exit 2
   ;;
@@ -168,7 +169,7 @@ systemd-run --user --unit gate-$name --collect -q \"\${forward[@]}\" \\
   -p MemoryMax=\${GATE_MEMORY_MAX:-13G} -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec=\$rt -p TimeoutStopSec=60 -p UMask=0022 \\
   --setenv=HOME=\"\$HOME\" --setenv=USER=\"\$USER\" --setenv=PATH=\"\$p\" --setenv=SPARKLES_REMOTE_EXECUTOR=$executor \\
   --setenv=CARGO_BUILD_JOBS=6 --setenv=CARGO_INCREMENTAL=0 \\
-  --setenv=NEED_GIB=${REMOTE_CI_MIN_FREE_GIB:-110} --setenv=NAME=$name --setenv=FULL=$full --setenv=BASE=$bfull --setenv=MODE=$mode --setenv=END=$end \\
+  --setenv=NEED_GIB=${REMOTE_CI_MIN_FREE_GIB:-85} --setenv=NAME=$name --setenv=FULL=$full --setenv=BASE=$bfull --setenv=MODE=$mode --setenv=END=$end \\
   /bin/bash \"\$o/ci-job.sh\"
 echo \"started gate-$name, ending by \$(date -u -d @$end +%FT%TZ)\"" < "$here/gate/remote/ci-job.sh"
 [ "$wait" = 1 ] || {
