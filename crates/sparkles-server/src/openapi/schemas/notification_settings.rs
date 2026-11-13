@@ -82,6 +82,7 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
         "password",
         "from",
         "to",
+        "watchers",
     ];
     let props = json!({
         "type": titled(string_enum(&["webhook", "ntfy", "email"]), "Type", "How the channel delivers: a webhook POST, an ntfy publish or an email over SMTP."),
@@ -117,10 +118,11 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
         "password": types(unset(secret_ref("Password", "A secret that holds the SMTP password, sent with SASL PLAIN. It needs a user name.", "The secret that holds the password."), "no authentication"), EMAIL),
         "from": types(titled(string(), "From", "The sender's mail address."), EMAIL),
         "to": types({
-            let mut v = titled(strings(), "To", "The recipients' mail addresses, 1 to 20.");
+            let mut v = titled(strings(), "To", "The recipients' mail addresses for the events the routes send, at most 20. A channel that carries watches may have none, and the routes cannot then name it.");
             v["items"]["minLength"] = json!(1);
             v
         }, EMAIL),
+        "watchers": types(default(titled(boolean(), "Watchers", "The channel also mails the owners of watches on entities, each at the address that the auth configuration or the identity provider verified, never through the routes."), json!(false)), EMAIL),
     });
     let mut channel = ordered(&["type"], &order, props);
     channel["title"] = "Channel".into();
@@ -146,6 +148,21 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
         );
         v["title"] = "Delivery".into();
         v["description"] = "The retries and timeout of each delivery.".into();
+        v
+    };
+    let watches = {
+        let mut v = ordered(
+            &[],
+            crate::notify::config::WATCH_MEMBERS,
+            json!({
+                "maxAncestors": default(bounded(titled(int(), "Ancestors per walk", "The most ancestors one upward walk of a subtree watch visits."), 1.0, 1_000_000.0), json!(10_000)),
+                "largeCommit": default(bounded(titled(int(), "Large commit", "The most members of one watch a commit can name before its match becomes one summary entry."), 1.0, 1_000_000.0), json!(1_000)),
+                "identityMaxAgeDays": default(bounded(titled(int(), "Identity age", "Days after an OIDC or proxy owner's last sign-in after which its watches are told only in the web UI."), 1.0, 3650.0), json!(30)),
+                "batchSecs": default(bounded(titled(int(), "Batch window", "Seconds that gather one owner's matches in one dataset into one message."), 10.0, 86_400.0), json!(300)),
+            }),
+        );
+        v["title"] = "Watches".into();
+        v["description"] = "The bounds of watches on entities.".into();
         v
     };
     let mut settings = ordered(
@@ -183,6 +200,7 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
                 "additionalProperties": titled(strings(), "Channels", "The channels this route sends to."),
             },
             "delivery": delivery,
+            "watches": watches,
         }),
     );
     settings["title"] = "Notification configuration".into();

@@ -1894,6 +1894,17 @@ impl Index {
                 ix.universal.push((f, x));
             }
         }
+        // a universal restriction on a universal role, which the Horn rules of roadmap
+        // item 692 can hold: its filler holds everywhere once a real context holds it
+        if top.is_some() && ax.horn.is_some() {
+            for (e, n) in it.nodes.iter().enumerate() {
+                if let Node::Forall(r, a) = *n
+                    && top.is_some_and(|t| ix.roles.sub(t, r))
+                {
+                    ix.universal.push((e as Ex, a));
+                }
+            }
+        }
         ix.universal.sort_unstable();
         ix.universal.dedup();
         // the data value of a data restriction is in its range and the role's
@@ -2125,11 +2136,14 @@ fn horn_index(
     // fresh class; the universals the automata make are not unfolded again
     let mut flags = vec![0u8; it.nodes.len()];
     for (e, n) in it.nodes.iter().enumerate() {
-        if let Node::Forall(r, f) = *n
-            && h.autos.contains_key(&r)
-        {
-            flags[e] |= super::horn::HornIx::UNFOLDED;
-            unfold.push((e as Ex, r, f));
+        if let Node::Forall(r, f) = *n {
+            if ix.is_universal(r) {
+                // a fact of a universal role, which `Index::build` lists
+                flags[e] |= super::horn::HornIx::GLOBAL;
+            } else if h.autos.contains_key(&r) {
+                flags[e] |= super::horn::HornIx::UNFOLDED;
+                unfold.push((e as Ex, r, f));
+            }
         }
     }
     // each state of an automaton without ε-transitions is a class: the holder for the

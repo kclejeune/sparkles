@@ -1,0 +1,8 @@
+               total        used        free      shared  buff/cache   available
+Mem:              15           1          12           0           2          13
+Swap:              7           0           7
+procs -----------memory---------- ---swap-- -----io---- -system-- -------cpu-------
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st gu
+ 0  2   1096 12614976 110296 2014052 172 293 4894 11394 13671   9  5  1 88  6  0  0
+ 1  2   1096 12630628 110296 2013896 0    0     0     0  726  862  0  0 90 10  0  0
+ 0  2   1096 12641040 110296 2013896 0    0     0     0  617  741  0  0 90 10  0  0

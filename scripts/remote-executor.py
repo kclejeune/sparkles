@@ -107,11 +107,18 @@ def command(host, text):
     return [*SSH, host, text]
 
 
+def printable(text):
+    """Text that is safe inside a double-quoted shell refusal message."""
+    return text.replace('"','?').replace('$','?').replace('`','?').replace('\\','?')
+
+
 def tool_check(profile):
     """Resolve mbx and rustc through the job environment and refuse a pin mismatch by name.
 
     Boat jobs build with MBX in local-only mode, so the check also asks the pinned mbx
     for its effective remote URL and local budget and refuses a remote cache or token.
+    It also asks for the cache directory and refuses any but the worker's one shared
+    store outside ~/.cache, which the provider's snapshot does not keep.
     """
     mbx,rust=profile['tool_versions']['mbx'],profile['tool_versions']['rust']
     pinned=boat_environment.pinned_mbx(profile)
@@ -128,12 +135,15 @@ total=$("$physical" settings get gc.max_total_size 2>/dev/null) || true
 test "$total" = {total} || refuse "mbx local budget is $total, pinned {total}"
 floor=$("$physical" settings get gc.min_free_size 2>/dev/null) || true
 test "$floor" = {floor} || refuse "mbx free-space floor is $floor, pinned {floor}"
+store=$("$physical" settings get cache_dir 2>/dev/null) || true
+test "$store" = {store} || refuse "mbx cache directory is $store, pinned {store_text}"
 command -v rustc >/dev/null || refuse 'rustc is not on the job PATH'
 version=$(rustc --version 2>/dev/null | awk '{{print $2}}') || true
 test "$version" = {rust} || refuse "rustc reports $version, pinned {rust} (RUSTUP_TOOLCHAIN=${{RUSTUP_TOOLCHAIN:-unset}})"
-""".format(pinned=shlex.quote(pinned),pinned_text=pinned.replace('"','?').replace('$','?').replace('`','?').replace('\\','?'),
+""".format(pinned=shlex.quote(pinned),pinned_text=printable(pinned),
            mbx=shlex.quote(mbx),rust=shlex.quote(rust),
-           total=shlex.quote(local['MBX_GC_MAX_TOTAL_SIZE']),floor=shlex.quote(local['MBX_GC_MIN_FREE_SIZE']))
+           total=shlex.quote(local['MBX_GC_MAX_TOTAL_SIZE']),floor=shlex.quote(local['MBX_GC_MIN_FREE_SIZE']),
+           store=shlex.quote(local['MBX_CACHE_DIR']),store_text=printable(local['MBX_CACHE_DIR']))
 
 
 # Commands the query, write and Jena screens and the remote build run on the worker,
@@ -182,6 +192,12 @@ def admit(host, minimum):
         fail('worker is not ready')
     if worker.get('setupStatus') in ('failed', 'error') or worker.get('setupError'):
         fail('worker setup failed')
+    # A resume runs on a new machine and downloads the snapshot's files in the
+    # background. A file whose content arrives during a build changes under the
+    # compiler, and mbx then discards the result and fails the build, so no job is
+    # admitted until the provider reports every file downloaded.
+    if worker.get('hydrated') is not True:
+        fail('worker is still restoring its files after a resume; wait for hydrated')
     # setupStatus=null alone is no readiness evidence. The owner binds startup
     # quiescence and guard lifetime; these physical checks detect subsequent drift.
     probe = """set -euo pipefail
@@ -201,7 +217,7 @@ IFS= read -r child_mbx < "$target_record"
 test -f "$child_mbx"
 test "$(sha256sum "$child_mbx" | cut -d' ' -f1)" = 4b0c0fcfc9329a9d76fd6bdefc1ee34822580864f5f5ba2f0b47dcbbffce2eca
 test "$(sha256sum "$physical" | cut -d' ' -f1)" = 4b0c0fcfc9329a9d76fd6bdefc1ee34822580864f5f5ba2f0b47dcbbffce2eca
-for name in MBX_CACHE_DIR CARGO_TARGET_DIR CARGO_BUILD_TARGET RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER; do test -z "${{!name:-}}"; done
+for name in CARGO_TARGET_DIR CARGO_BUILD_TARGET RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER; do test -z "${{!name:-}}"; done
 """ + worker_tools_check()).format(envfile=shlex.quote(data['worker_env_path']), envhash=shlex.quote(data['worker_env_sha256']),
            bootstrap=shlex.quote(data['bootstrap_lock_path']), manifest=shlex.quote(data['toolchain_manifest_path']),
            digest=shlex.quote(data['toolchain_manifest_sha256']))

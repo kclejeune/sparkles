@@ -212,16 +212,46 @@ fn axioms_outside_el_are_reported() {
     assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
     // classes of axioms left out are still in the taxonomy
     assert!(out.taxonomy.node_of(&c("B")).is_some());
+    // the Horn rules take the inverse properties beside the individual (item 692), and
+    // the union needs case analysis
     let ex = k.excluded();
-    assert_eq!(ex.len(), 2, "{ex:#?}");
+    assert_eq!(ex.len(), 1, "{ex:#?}");
     let outside: Vec<&Excl> = ex
         .iter()
         .filter(|e| matches!(e.gap, Gap::Outside { .. }))
         .collect();
-    assert_eq!(outside.len(), 2);
+    assert_eq!(outside.len(), 1);
+    assert!(out.taxonomy.is_subclass(&c("E"), &c("E")));
 }
 
 type Excl = sparkles_owl::classify::Excluded;
+
+/// With `Limits::rooted`, the rooted run of Tier D takes the same axioms, which an ontology
+/// with an individual otherwise leaves out, and reports nothing.
+#[test]
+fn a_rooted_run_takes_the_axioms_outside_el_beside_an_individual() {
+    let mut k = Classifier::of(&[
+        sub(c("A"), ClassExpression::or([ce("B"), ce("C")])),
+        sub(c("A"), c("D")),
+        sub(
+            c("E"),
+            ClassExpression::ObjectHasValue(ope("r"), Individual::named("http://ex.org/i")),
+        ),
+        ax(AxiomKind::InverseObjectProperties(ope("r"), ope("s"))),
+    ]);
+    let out = k
+        .classify(&Limits {
+            rooted: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(out.complete);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+    assert!(out.taxonomy.node_of(&c("B")).is_some());
+    assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+    assert_eq!(out.stats.tier, sparkles_owl::classify::Tier::Disjunctive);
+    assert!(!out.stats.dl_rooted_over);
+}
 
 #[test]
 fn chains_against_the_range_restriction_are_left_out() {
@@ -236,9 +266,19 @@ fn chains_against_the_range_restriction_are_left_out() {
             [ce("D"), some("s", and([ce("X"), ce("R")]))].into(),
         )),
     ];
-    // with an individual, the run has only the EL rules
+    // with an individual the Horn rules take the chain too (item 692), and under the
+    // ELK mode the chain against the range stays out
     let mut k = Classifier::of(axioms.iter().chain(&[is_a("E", "i")]));
     let out = k.classify(&Limits::default()).unwrap();
+    assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+    let mut k = Classifier::of(axioms.iter().chain(&[is_a("E", "i")]));
+    let out = k
+        .classify(&Limits {
+            el_only: true,
+            ..Limits::default()
+        })
+        .unwrap();
     let ex = k.excluded();
     assert_eq!(ex.len(), 1);
     assert!(matches!(&ex[0].gap, Gap::Outside { rule, .. } if rule.contains("2.2.6")));

@@ -1071,6 +1071,13 @@ fn entries() -> Vec<(&'static str, Entry)> {
         // C21: outbound notifications are a server-wide settings kind with its own worker
         server_only!("getNotifications", Process),
         server_only!("testNotification", Process),
+        // U12 watches: a file of the server's data directory, kept per principal and
+        // followed by the server's own thread
+        server_only!("listWatches", Process),
+        server_only!("createWatch", Process),
+        server_only!("deleteWatch", Process),
+        server_only!("listWatchMatches", Process),
+        server_only!("markWatchSeen", Process),
         // C30: the resource catalog is a file of the server's data directory, and its
         // header read and install act on the server's datasets through their HTTP state
         server_only!("listResources", Process),

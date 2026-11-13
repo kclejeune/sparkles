@@ -29,13 +29,18 @@ diff SPARKLES.nt REFERENCE.nt REPORT.json [--known KNOWN.tsv] [--subset]
     the N-Triples line, and the explanation. The command fails when a difference matches
     no row, and the report counts the differences by side, predicate and explanation.
     With --subset only the reference's triples that Sparkles lacks must be explained.
+    Both graphs are sorted on disk beside REPORT.json and then merged, so the memory
+    use stays near the sort buffer of GNU sort whatever the size of the graphs.
 
 The N-Triples reader takes one triple per line, as `sparkles dump` and Nemo write them.
 """
 
 import json
+import os
 import re
+import subprocess
 import sys
+import tempfile
 from collections import Counter
 from decimal import Decimal, InvalidOperation
 
@@ -354,16 +359,16 @@ def load_terms(d):
 
 def decode(d, src, dst):
     m = load_terms(d)
-    out = set()
-    for s, p, o in triples(src):
-        for t in (s, p, o):
-            if t.startswith(("<" + LIT, "<" + BNODE)) and t not in m:
-                raise ValueError(f"{src} has the encoded term {t}, which {d}/terms.tsv does not name")
-        out.add(f"{m.get(s, s)} {m.get(p, p)} {m.get(o, o)} .")
-    with open(dst, "w", encoding="utf-8") as f:
-        for line in sorted(out):
-            f.write(line + "\n")
-    print(f"decoded {len(out)} triples", file=sys.stderr)
+
+    def lines():
+        for s, p, o in triples(src):
+            for t in (s, p, o):
+                if t.startswith(("<" + LIT, "<" + BNODE)) and t not in m:
+                    raise ValueError(f"{src} has the encoded term {t}, which {d}/terms.tsv does not name")
+            yield f"{m.get(s, s)} {m.get(p, p)} {m.get(o, o)} ."
+
+    n = sort_unique(lines(), dst)
+    print(f"decoded {n} triples", file=sys.stderr)
 
 
 def split(src, base, derived, graph):
@@ -417,6 +422,61 @@ def delta(src, every, delta_out, rest_out, insert_ru, delete_ru):
     print(f"chose {len(chosen)} of {n} eligible triples", file=sys.stderr)
 
 
+# The buffer of each external sort. GNU sort spills to temporary files beside its output
+# beyond it, so a comparison of two closures of tens of millions of triples needs about
+# this much memory and no more.
+SORT_BUFFER = "1G"
+
+
+def sort_unique(lines, dst):
+    """Writes the lines, each without its newline, to DST sorted by code point and without
+    duplicates, and returns their number. DST appears only when the sort succeeds. GNU
+    sort in the C locale orders UTF-8 bytewise, which is code point order, so the order is
+    that of Python's sorted()."""
+    part = dst + ".part"
+    cmd = ["sort", "-u", "-S", SORT_BUFFER, "-T", os.path.dirname(os.path.abspath(dst)), "-o", part]
+    try:
+        with subprocess.Popen(cmd, stdin=subprocess.PIPE, env=dict(os.environ, LC_ALL="C")) as proc:
+            with open(proc.stdin.fileno(), "w", encoding="utf-8", newline="\n", closefd=False) as w:
+                for line in lines:
+                    w.write(line + "\n")
+            proc.stdin.close()
+        if proc.returncode != 0:
+            raise RuntimeError(f"sort ended with status {proc.returncode} while writing {dst}")
+        os.replace(part, dst)
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
+    n = 0
+    with open(dst, "rb") as f:
+        for _ in f:
+            n += 1
+    return n
+
+
+def sorted_lines(path):
+    with open(path, encoding="utf-8", newline="\n") as f:
+        for line in f:
+            yield line[:-1] if line.endswith("\n") else line
+
+
+def merge(a, b):
+    """Walks two sorted iterators of distinct lines and yields (side, line) for each line
+    of only one of them, side 0 for A and 1 for B, and (None, line) for a line of both."""
+    end = object()
+    x, y = next(a, end), next(b, end)
+    while x is not end or y is not end:
+        if y is end or (x is not end and x < y):
+            yield 0, x
+            x = next(a, end)
+        elif x is end or y < x:
+            yield 1, y
+            y = next(b, end)
+        else:
+            yield None, x
+            x, y = next(a, end), next(b, end)
+
+
 def diff(sparkles, reference, report, known_path=None, subset=False):
     known = []
     if known_path:
@@ -427,43 +487,61 @@ def diff(sparkles, reference, report, known_path=None, subset=False):
                 side, pattern, why = line.rstrip("\n").split("\t")
                 known.append((side, re.compile(pattern), why))
 
-    def load(path):
-        return {f"{s} {p} {o} ." for s, p, o in triples(path)}
-
-    a, b = load(sparkles), load(reference)
-    result = {"sparkles": len(a), "reference": len(b), "common": len(a & b), "subset": subset, "differences": {}}
-    unexplained = []
-    for side, only in (("sparkles", a - b), ("reference", b - a)):
-        by_why, by_pred = Counter(), Counter()
-        examples = {}
-        for line in sorted(only):
+    # Each graph is sorted without duplicates into a file of its own, and the two files
+    # are merged, so memory stays bounded by the sort buffer whatever the graphs' size.
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.abspath(report))) as tmp:
+        sorted_paths = []
+        for i, path in enumerate((sparkles, reference)):
+            out = os.path.join(tmp, f"{i}.nt")
+            sort_unique((f"{s} {p} {o} ." for s, p, o in triples(path)), out)
+            sorted_paths.append(out)
+        sides = ("sparkles", "reference")
+        totals = {side: 0 for side in sides}
+        common = 0
+        by_why = {side: Counter() for side in sides}
+        by_pred = {side: Counter() for side in sides}
+        examples = {side: {} for side in sides}
+        unexplained = {side: 0 for side in sides}
+        shown = {side: [] for side in sides}
+        for which, line in merge(*(sorted_lines(p) for p in sorted_paths)):
+            if which is None:
+                common += 1
+                continue
+            side = sides[which]
+            totals[side] += 1
             pred = terms(line, 2)[0][1]
-            by_pred[pred] += 1
+            by_pred[side][pred] += 1
             why = next((w for s, r, w in known if s == side and r.search(line)), None)
             if why is None:
                 why = "unexplained"
                 if not (subset and side == "sparkles"):
-                    unexplained.append(f"{side} only: {line}")
-            by_why[why] += 1
-            if len(examples.setdefault(why, [])) < 5:
-                examples[why].append(line)
+                    unexplained[side] += 1
+                    if len(shown[side]) < 20:
+                        shown[side].append(f"{side} only: {line}")
+            by_why[side][why] += 1
+            if len(examples[side].setdefault(why, [])) < 5:
+                examples[side][why].append(line)
+    na, nb = totals["sparkles"] + common, totals["reference"] + common
+    result = {"sparkles": na, "reference": nb, "common": common, "subset": subset, "differences": {}}
+    for side in sides:
         result["differences"][side] = {
-            "total": len(only),
-            "by_explanation": dict(by_why.most_common()),
-            "by_predicate": dict(by_pred.most_common()),
-            "examples": examples,
+            "total": totals[side],
+            "by_explanation": dict(by_why[side].most_common()),
+            "by_predicate": dict(by_pred[side].most_common()),
+            "examples": examples[side],
         }
-    result["unexplained"] = len(unexplained)
+    n_unexplained = sum(unexplained.values())
+    result["unexplained"] = n_unexplained
     with open(report, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=1)
     print(
-        f"sparkles {len(a)}, reference {len(b)}, common {len(a & b)}, "
-        f"sparkles only {len(a - b)}, reference only {len(b - a)}, unexplained {len(unexplained)}",
+        f"sparkles {na}, reference {nb}, common {common}, "
+        f"sparkles only {totals['sparkles']}, reference only {totals['reference']}, unexplained {n_unexplained}",
         file=sys.stderr,
     )
-    for line in unexplained[:20]:
+    for line in (shown["sparkles"] + shown["reference"])[:20]:
         print(line, file=sys.stderr)
-    return 1 if unexplained else 0
+    return 1 if n_unexplained else 0
 
 
 def main(argv):

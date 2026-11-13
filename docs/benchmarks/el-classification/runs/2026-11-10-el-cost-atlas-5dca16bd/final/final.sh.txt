@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# final.sh: item 720-722 final verification on atlas, sides base (dbac7667), pre (before items
+# 709 and 695), g (71f4fa5d: the start delay of the first worker's spawn time) and g2 (g with a
+# look at the clock after every activation). Holds the heavy lock. Ends log.txt with FINAL-DONE.
+set -uo pipefail
+D=$HOME/lanes/el-cost-720
+cd "$D"
+exec 8> "$HOME/lanes/.heavy.lock"
+flock 8
+O=$D/final-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$O"; cd "$O"
+ln -s ../bin bin; ln -s ../data data
+log() { echo "$(date -u +%FT%TZ) $*" >> "$O/log.txt"; }
+log "start host=$(hostname) load=$(cut -d' ' -f1-3 /proc/loadavg)"
+{ free -g; vmstat 1 3; } > "$O/host-before.txt" 2>&1
+vmstat 10 > "$O/vmstat.txt" 2>&1 &
+VM=$!
+for b in base pre g g2; do log "sha $b $(sha256sum bin/$b | cut -c1-16)"; done
+SMALL="dev/ore_ont_1445.owl dev/ore_ont_2775.owl dev/ore_ont_3231.owl dev/ore_ont_5564.owl dev/ore_ont_5940.owl dev/ore_ont_6855.owl dev/ore_ont_7584.owl dev/ore_ont_7663.owl dev/ore_ont_8203.owl dev/ore_ont_8273.owl dev/ore_ont_9096.owl dev/ore_ont_13581.owl"
+for t in 8 4; do
+  THREADS=$t PINN=0-11 PIN1=4 bash ../scripts/cold.sh "$O" 9 "$SMALL" "base pre g g2" >> "$O/log.txt" 2>&1
+  log "cold t$t done"
+done
+THREADS="1" PIN1=4 REPEAT=5 bash ../scripts/ab.sh "$O" 6 "go.ofn chebi_lite.ofn ore-el/ore_ont_3836.owl ore-el/ore_ont_13482.owl dev/ore_ont_7914.owl" "base pre g g2" >> "$O/log.txt" 2>&1
+log "ab t1 done"
+THREADS="4 8" PINN=0-11 REPEAT=5 bash ../scripts/ab.sh "$O" 3 "go.ofn chebi_lite.ofn ore-el/ore_ont_3836.owl ore-el/ore_ont_13482.owl dev/ore_ont_7914.owl" "base pre g g2" >> "$O/log.txt" 2>&1
+log "ab t4 t8 done"
+kill $VM
+{ free -g; vmstat 1 3; } > "$O/host-after.txt" 2>&1
+log "FINAL-DONE"

@@ -160,7 +160,7 @@ echo "$(date -u +%FT%TZ) queued $full part=$part jobs=$jobs cargo_jobs=$cargo_jo
 # mbx in local-only mode, so its mbx and Rust settings are forwarded when the caller set
 # them, even to an empty value. An ssh host sets none of them and keeps its own mode.
 forward=()
-for n in MBX_REMOTE_URL MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE RUSTUP_TOOLCHAIN RUSTUP_AUTO_INSTALL; do
+for n in MBX_REMOTE_URL MBX_CACHE_DIR MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE RUSTUP_TOOLCHAIN RUSTUP_AUTO_INSTALL; do
   [ -z "${!n+x}" ] || forward+=("--setenv=$n=${!n}")
 done
 systemd-run --user --unit "$unit" --collect -q "${forward[@]}" \

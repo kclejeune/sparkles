@@ -199,14 +199,25 @@ fn q6_fixture_matches_an_independent_oracle_with_and_without_the_key() {
 fn q6_pairs_by_the_condition_equality_instead_of_the_product() {
     let store = fixture();
     // Both sides hold about 190 rows, so their product of about 36,000 rows exceeds
-    // this limit. The pairs of rows with the same author and the result do not.
+    // this limit. The pairs of rows with the same author and the result do not, and
+    // the keyed plan reports how many candidate pairs it tested.
     let limit = 4096;
     let r = query(store.snapshot(), Q6, &options(limit, true)).unwrap();
     assert_eq!(bag(r.rows()), oracle());
     let notes = keyed_candidates(&r.plan);
     assert_eq!(notes.len(), 1, "{notes:?}");
-    let generic = query(store.snapshot(), Q6, &options(limit, false));
-    assert!(generic.is_err(), "the product should exceed {limit} rows");
+    let candidates: u64 = notes[0]
+        .split(": ")
+        .nth(1)
+        .and_then(|n| n.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .expect("a count of candidate pairs");
+    assert!(candidates < 4096, "{}", notes[0]);
+    // The generic plan tests the condition on the product a chunk at a time, so it
+    // answers within the limit too and reports no candidate pairs.
+    let generic = query(store.snapshot(), Q6, &options(limit, false)).unwrap();
+    assert_eq!(bag(generic.rows()), oracle());
+    assert!(keyed_candidates(&generic.plan).is_empty());
 }
 
 /// A store whose values of ?x and ?y mix IRIs, blank nodes, numbers that are equal by

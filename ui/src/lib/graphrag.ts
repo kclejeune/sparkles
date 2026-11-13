@@ -64,6 +64,17 @@ export type Finding = {
   about: string[];
   cites: string[];
   unmatchedNames: string[];
+  /** Under a review policy, the accepted claims behind the cited facts. */
+  claims?: string[];
+  /** Under a review policy, those claims' current decisions. */
+  decisions?: string[];
+};
+
+/** The review policy a report was read under (spec C25, reports on accepted evidence). */
+export type ReviewPolicy = {
+  iri: string;
+  version: number | null;
+  configuration: string | null;
 };
 
 export type Report = {
@@ -78,6 +89,7 @@ export type Report = {
   droppedUnsupported: number | null;
   sourceCommit: number | null;
   activity?: { model: string; inputTokens: number; outputTokens: number; startedAt: string };
+  reviewPolicy?: ReviewPolicy;
   findings: Finding[];
 };
 

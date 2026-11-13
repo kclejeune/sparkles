@@ -23,12 +23,15 @@ pub const MEMBERS: &[&str] = &[
     "maxFactsPerCommunity",
     "refresh",
     "budget",
+    "reviewPolicy",
 ];
 
 /// The namespace of reports graphs. Every graph under it is guarded by the disclosure
 /// guard of C22 §6, so a reports graph must be named inside it.
 pub const GUARDED_PREFIX: &str = "urn:x-sparkles:graphrag:";
 
+/// The longest `reviewPolicy` name, in bytes.
+pub const MAX_POLICY_NAME_BYTES: usize = 256;
 /// The deepest level a build may keep, from 0 (coarsest).
 pub const MAX_LEVELS: u32 = 7;
 /// The most facts a leaf community's input may hold.
@@ -236,6 +239,10 @@ pub struct GraphragSettings {
     pub refresh: Refresh,
     #[serde(default)]
     pub budget: Budget,
+    /// the review policy of the dataset's evidence settings whose accepted projection
+    /// the reports read (spec C25, "Reports on accepted evidence")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_policy: Option<String>,
 }
 
 impl Default for GraphragSettings {
@@ -252,6 +259,7 @@ impl Default for GraphragSettings {
             max_facts_per_community: max_facts(),
             refresh: Refresh::default(),
             budget: Budget::default(),
+            review_policy: None,
         }
     }
 }
@@ -347,12 +355,22 @@ impl GraphragSettings {
                 ));
             }
         }
+        if let Some(p) = &self.review_policy
+            && (p.trim().is_empty() || p.len() > MAX_POLICY_NAME_BYTES)
+        {
+            return Err(format!(
+                "reviewPolicy must name a review policy in 1 to {MAX_POLICY_NAME_BYTES} bytes"
+            ));
+        }
         if self.enabled {
             if self.principal.trim().is_empty() {
                 return Err("principal is required when GraphRAG is enabled".into());
             }
-            if self.projection.graphs.is_empty() {
-                return Err("projection.graphs must name at least one graph".into());
+            // a review policy's output graph is read whether or not the projection names it
+            if self.projection.graphs.is_empty() && self.review_policy.is_none() {
+                return Err(
+                    "projection.graphs must name at least one graph, unless reviewPolicy names a review policy whose output graph the reports read".into(),
+                );
             }
         }
         Ok(())
@@ -454,6 +472,18 @@ mod tests {
         ] {
             assert!(parse(bad.clone()).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_review_policy_stands_in_for_the_projection_graphs() {
+        let s =
+            parse(json!({ "enabled": true, "principal": "p", "reviewPolicy": "main" })).unwrap();
+        assert_eq!(s.review_policy.as_deref(), Some("main"));
+        assert!(parse(json!({ "reviewPolicy": "" })).is_err());
+        assert!(parse(json!({ "reviewPolicy": "x".repeat(MAX_POLICY_NAME_BYTES + 1) })).is_err());
+        // a dataset without a policy serializes as before
+        let v = serde_json::to_value(GraphragSettings::default()).unwrap();
+        assert!(v.get("reviewPolicy").is_none());
     }
 
     #[test]

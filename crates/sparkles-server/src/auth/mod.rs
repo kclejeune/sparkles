@@ -690,6 +690,38 @@ impl Identity {
     }
 }
 
+/// What a provider or proxy said about an identity's mail address when it vouched
+/// for the identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EmailClaim {
+    /// an address it verified
+    Verified(String),
+    /// no verified address: the address is unverified, malformed or absent
+    Unverified,
+    /// nothing either way
+    Unknown,
+}
+
+impl EmailClaim {
+    /// The OIDC `email` claim when `email_verified` is true (OIDC Core 5.1); some
+    /// providers send the flag as the string `"true"`.
+    pub fn of_claims(claims: &serde_json::Map<String, serde_json::Value>) -> EmailClaim {
+        let Some(email) = claims.get("email").and_then(serde_json::Value::as_str) else {
+            return EmailClaim::Unknown;
+        };
+        let verified = match claims.get("email_verified") {
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::String(s)) => s == "true",
+            _ => false,
+        };
+        if verified && crate::notify::config::check_address(email).is_ok() {
+            EmailClaim::Verified(email.to_string())
+        } else {
+            EmailClaim::Unverified
+        }
+    }
+}
+
 /// Details of an authenticated principal beyond its permissions.
 #[derive(Clone, Debug, Default)]
 pub struct PrincipalInfo {

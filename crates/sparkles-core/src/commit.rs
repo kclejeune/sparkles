@@ -1865,7 +1865,9 @@ pub(crate) const WAL_FLAG_CONFIGURATION: u8 = 4;
 /// Fill bytes 9..33 of a WAL commit record (`rec[0]` = op, `rec[1..9]` = next blank
 /// node): seq, timestamp, kind, version, flags (byte 27) and a CRC over the
 /// transaction's data records followed by bytes 0..29 of this record. Byte 28 is zero,
-/// which says that every commit before this one was durable when it was written.
+/// which says that every commit before this one was durable when it was written. The
+/// writers seal through [`crate::store::wal::encode_txn`], and tests use this form.
+#[cfg(test)]
 pub(crate) fn seal_wal_commit(
     rec: &mut [u8; 33],
     seq: u64,

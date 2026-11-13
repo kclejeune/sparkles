@@ -1409,6 +1409,13 @@ impl Ctx {
         *self.owner.lock() = Weak::new();
     }
 
+    /// The shared context, for an eager join that runs the cursor's partitioned join
+    /// over its inputs when its build does not fit. `None` for a context that was never
+    /// shared, such as one a test builds alone.
+    pub(super) fn shared(&self) -> Option<Arc<Ctx>> {
+        self.owner.lock().upgrade()
+    }
+
     /// The cursor's own context, for state that runs a cursor operator tree of its own
     /// (the key set of an EXISTS pattern). `None` in eager execution.
     pub(super) fn cursor_owner(&self) -> Option<Arc<Ctx>> {

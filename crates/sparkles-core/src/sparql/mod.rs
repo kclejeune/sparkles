@@ -28,6 +28,7 @@ pub mod georewrite;
 pub mod history_svc;
 pub mod hybrid;
 pub mod indexjoin;
+mod join;
 mod joinorder;
 mod keyfilter;
 mod keyprobe;
@@ -57,7 +58,6 @@ pub mod value;
 mod valuespush;
 mod vectortopk;
 pub mod viewsvc;
-mod zipper;
 
 use crate::error::{Error, Result};
 use crate::id::Id;

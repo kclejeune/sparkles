@@ -20,7 +20,9 @@ pub trait CommitGuard: Send + Sync {
     /// aborts the commit (the store turns it into [`crate::Error::Rejected`]); an error
     /// aborts it too.
     fn check(&self, c: &Candidate<'_>) -> Result<ValidationSummary>;
-    /// Called after a commit the guard saw was published (with its sequence number).
+    /// Called for a commit the guard saw once its write is durable and just before the
+    /// store publishes its snapshot (with its sequence number), so a writer that waits
+    /// for the publication checks against the state the commit left.
     fn committed(&self, _seq: u64) {}
     /// Called when a write bypassed the guard. `seq` is the commit number the
     /// bypassing write will take.

@@ -19,6 +19,7 @@
 
 use super::ctx::Ctx;
 use super::expr::Expr;
+use super::join::{gallop_to, search};
 use super::plan::{GraphFilter, Kind, Node, ScanSpec};
 use super::table::{Table, VarId};
 use crate::error::{Error, Result};
@@ -1001,46 +1002,6 @@ impl Ranges<'_> {
         }
         a
     }
-}
-
-/// The first index in `[from, n)` for which `before` is false, or `n`, where `before`
-/// holds for a prefix of the indices: steps of doubling length from `from`, then a
-/// binary search in the last step. Finding a position `d` places on costs about
-/// `2 log2 d` tests, so a sorted batch of keys searched from each previous position
-/// costs little per key when the keys are close.
-#[inline]
-pub(super) fn gallop_to(from: usize, n: usize, before: impl Fn(usize) -> bool) -> usize {
-    if from >= n || !before(from) {
-        return from;
-    }
-    // `before(lo)` holds; the answer is in `(lo, hi]`
-    let (mut lo, mut step) = (from, 1);
-    let hi = loop {
-        let hi = lo + step;
-        if hi >= n {
-            break n;
-        }
-        if !before(hi) {
-            break hi;
-        }
-        lo = hi;
-        step *= 2;
-    };
-    search(lo + 1, hi, before)
-}
-
-/// The first index in `[lo, hi)` for which `before` is false, or `hi`, by binary search.
-#[inline]
-fn search(mut lo: usize, mut hi: usize, before: impl Fn(usize) -> bool) -> usize {
-    while lo < hi {
-        let m = lo + (hi - lo) / 2;
-        if before(m) {
-            lo = m + 1;
-        } else {
-            hi = m;
-        }
-    }
-    lo
 }
 
 /// The blocks `[b0, b1)` of `idx` that can hold keys in `[lo, hi]`, searched from the

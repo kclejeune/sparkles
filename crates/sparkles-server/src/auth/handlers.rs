@@ -630,6 +630,11 @@ async fn oidc_callback(
     if groups_claim.is_some() {
         auth.refresh_owner(&who);
     }
+    auth.vouched(
+        &who,
+        groups_claim.is_some(),
+        &super::EmailClaim::of_claims(&claims),
+    );
     let log = who.log_name();
     let text = |k: &str| {
         claims

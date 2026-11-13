@@ -35,13 +35,21 @@ def pinned_mbx(profile):
 
 # Jobs build with MBX in local-only mode. The worker's own configuration names the
 # read-only remote cache, and an empty MBX_REMOTE_URL overrides it, so no job reads the
-# remote or its token. The local store stays in MBX's default cache directory in the
-# worker home, which the normal stop's snapshot keeps for the next resume. Its shared
-# budget for the store, managed targets and incremental state holds two release builds
-# and the workspace test builds. The free-space floor keeps the 40 GiB that the
-# metadata probe requires at the next qualification on the large worker's disk.
+# remote or its token. The provider's snapshot saves the worker home except ~/.cache,
+# so MBX's default cache directory is empty after every resume. Every job therefore
+# names one cache directory outside ~/.cache, which holds the worker's single shared
+# store with its managed targets and incremental state, and the normal stop's snapshot
+# keeps it for the next resume. Its shared budget holds two release builds and the
+# workspace test builds. The free-space floor keeps the 40 GiB that the metadata probe
+# requires at the next qualification on the large worker's disk.
+LOCAL_STORE_DIR = '.local/share/mbx-cache'
 LOCAL_STORE_TOTAL = '64GiB'
 LOCAL_STORE_MIN_FREE = '45GiB'
+
+
+def local_store(profile):
+    """The worker's one shared MBX cache directory, in a path the snapshot keeps."""
+    return profile['worker_home']+'/'+LOCAL_STORE_DIR
 
 
 def environment(profile):
@@ -53,6 +61,7 @@ def environment(profile):
             'RUSTUP_TOOLCHAIN': profile['tool_versions']['rust'],
             'RUSTUP_AUTO_INSTALL': '0',
             'MBX_REMOTE_URL': '',
+            'MBX_CACHE_DIR': local_store(profile),
             'MBX_GC_MAX_TOTAL_SIZE': LOCAL_STORE_TOTAL,
             'MBX_GC_MIN_FREE_SIZE': LOCAL_STORE_MIN_FREE}
 

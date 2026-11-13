@@ -4395,7 +4395,7 @@ fn assist(p: &mut Paths) {
     let server_body = |o: super::Op| {
         o.body(
             true,
-            "Fields of the kind: `providers`, `roles` and `routing` of `models` (`ModelsSettings`), or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes` and `delivery` of `notifications`.",
+            "Fields of the kind: `providers`, `roles` and `routing` of `models` (`ModelsSettings`), or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes`, `delivery` and `watches` of `notifications`.",
             json!({ "application/json": { "schema": { "type": "object" } } }),
         )
         .header(
@@ -4465,6 +4465,56 @@ fn assist(p: &mut Paths) {
             .see("notifications")
             .json("200", "The channel accepted the notification.", "NotificationTest")
             .errors(&[404, 502]),
+    );
+    p.add(
+        op(GET, "/$/watches", "listWatches", "Server", "List your watches")
+            .doc("The caller's watches on entities, with their unread counts, limited to the graphs the caller can read now on each watch's branch. Watches belong to a user, an OIDC or proxy account, or a minted token's owner. A watches file that this server cannot read answers `503` with `watches-unavailable` and is left as it is.")
+            .see("watches")
+            .query("dataset", s(), "Only the watches on this dataset.")
+            .query("entity", s(), "Only the watches of this entity.")
+            .query("graph", s(), "Only the watches in this graph, `default` for the default graph.")
+            .json("200", "The watches.", "WatchList")
+            .errors(&[403, 503]),
+    );
+    p.add(
+        op(POST, "/$/watches", "createWatch", "Server", "Watch an entity")
+            .doc("Watches an entity, or its asserted subtree, in one graph of a branch. It needs read access to the graph through the history endpoint, and is refused with `409` and `watch-unsupported-protections` while triple protections limit what the caller reads in the dataset. The same watch made again is answered with `200`. An owner has at most 200 watches and the server at most 20,000, beyond which the answer is `409` with `watch-limit`.")
+            .see("watches")
+            .json_body(true, "WatchCreate")
+            .json("201", "The new watch.", "Watch")
+            .json("200", "The same watch already existed.", "Watch")
+            .errors(&[400, 403, 404, 409, 503]),
+    );
+    p.add(
+        op(
+            DELETE,
+            "/$/watches/{id}",
+            "deleteWatch",
+            "Server",
+            "Remove a watch",
+        )
+        .doc("Removes one of the caller's watches.")
+        .see("watches")
+        .no_content("Removed.")
+        .errors(&[404, 503]),
+    );
+    p.add(
+        op(GET, "/$/watches/{id}/matches", "listWatchMatches", "Server", "List the commits a watch matched")
+            .doc("The commits that changed the watched entity or its subtree, newest first. A watch keeps its 200 newest matches. The caller must still read the watched graph, or the answer is `403` with `watch-access-lost`.")
+            .see("watches")
+            .query("after", int(), "Only commits above this one.")
+            .query("before", int(), "Only commits below this one, for the next page.")
+            .query("limit", json!({ "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }), "The most matches listed.")
+            .json("200", "The matches.", "WatchMatches")
+            .errors(&[400, 403, 404, 503]),
+    );
+    p.add(
+        op(POST, "/$/watches/{id}/seen", "markWatchSeen", "Server", "Mark a watch's matches as read")
+            .doc("Marks the matches up to the commit as read. A commit below the current mark leaves it as it is, and one above the branch's head is refused.")
+            .see("watches")
+            .json_body(true, "WatchSeen")
+            .json("200", "The watch.", "Watch")
+            .errors(&[400, 403, 404, 503]),
     );
     p.add(
         op(GET, "/$/asks/{ds}", "listAsks", tag, "List your asked questions")

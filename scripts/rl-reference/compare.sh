@@ -22,17 +22,19 @@
 # is 0 when every difference is explained, 1 when one is not and 2 when a step fails.
 #
 # Env: SPARKLES (default target/release/sparkles), NMO (default the flake's nemo package),
-# KNOWN, PYTHON (default python3), ROOT and WORK for the package resolution of
+# KNOWN, MAX_INFERRED (the --max-inferred of `sparkles infer`, default 0 for no limit),
+# PYTHON (default python3), ROOT and WORK for the package resolution of
 # scripts/bench-tools.sh.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=${ROOT:-$(cd "$HERE/../.." && pwd)}
 PYTHON=${PYTHON:-python3}
 KNOWN=${KNOWN:-$HERE/known.tsv}
+MAX_INFERRED=${MAX_INFERRED:-0}
 INFERRED=urn:x-sparkles:inferred
 
 [ $# -eq 2 ] || {
-  sed -n '2,20p' "$0" >&2
+  sed -n '2,27p' "$0" >&2
   exit 2
 }
 input=$(realpath "$1")
@@ -55,7 +57,7 @@ fi
 cd "$work"
 rm -rf db enc nemo-aligned nemo-core
 "$SPARKLES" load --loc db "$input" > load.log 2>&1 || fail "sparkles load failed, see $work/load.log"
-"$SPARKLES" infer --loc db --profile owl-rl > infer.log 2>&1 || fail "sparkles infer failed, see $work/infer.log"
+"$SPARKLES" infer --loc db --profile owl-rl --max-inferred "$MAX_INFERRED" > infer.log 2>&1 || fail "sparkles infer failed, see $work/infer.log"
 "$SPARKLES" dump --loc db --format nq --out all.nq > dump.log 2>&1 || fail "sparkles dump failed, see $work/dump.log"
 rm -rf db
 "$PYTHON" -I "$HERE/rl_terms.py" split all.nq base.nt sparkles-derived.nt "$INFERRED" 2> split.log ||

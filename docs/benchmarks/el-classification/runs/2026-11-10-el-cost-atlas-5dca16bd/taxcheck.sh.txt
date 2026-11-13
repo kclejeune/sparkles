@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# taxcheck.sh OUT SIDES THREADS: classifies every ORE 2015 EL file, GO and ChEBI lite with each
+# side on each thread count and writes the sorted taxonomy's hash per file, side and thread count
+# to OUT/hashes.txt, then lists the files whose hashes differ between sides or thread counts.
+set -uo pipefail
+L=$(cd "$(dirname "$0")/.." && pwd)
+OUT=$1 SIDES=($2) THREADS=($3)
+mkdir -p "$OUT"; : > "$OUT/hashes.txt"
+T=$(mktemp -d)
+for f in "$L"/data/ore-el/*.owl "$L"/data/go.ofn "$L"/data/chebi_lite.ofn; do
+  n=$(basename "${f%.*}")
+  for s in "${SIDES[@]}"; do for t in "${THREADS[@]}"; do
+    if timeout 600 "$L/bin/$s" --threads "$t" --taxonomy "$T/x" "$f" > /dev/null 2>> "$OUT/err.txt"; then
+      h=$(sort "$T/x" | sha256sum | cut -c1-16)
+    else h=FAILED; fi
+    echo "$n $s $t $h" >> "$OUT/hashes.txt"; rm -f "$T/x"
+  done; done
+done
+rm -rf "$T"
+awk '{k[$1]=k[$1]" "$4} END {for (f in k) {n=split(k[f],a," "); d=0; for(i=2;i<=n;i++) if(a[i]!=a[1]) d=1; if(d) print "DIFF", f, k[f]}}' "$OUT/hashes.txt" > "$OUT/diff.txt"
+echo "files=$(cut -d' ' -f1 "$OUT/hashes.txt" | sort -u | wc -l) differing=$(wc -l < "$OUT/diff.txt") failed=$(grep -c FAILED "$OUT/hashes.txt")" | tee "$OUT/summary.txt"

@@ -99,7 +99,8 @@ pub use propose::{
 };
 pub use review::claims::{
     self, ClaimOccurrence, ClaimOrigin, ClaimState, MAX_CLAIM_SCAN, MAX_CLAIMS, MEM_INSTRUCTIONS,
-    PolicyClaims, PolicyRef, check_matching_policy, claim_states, with_policy_claims,
+    PolicyClaims, PolicyRef, check_matching_policy, claim_states, recorded_settings,
+    with_policy_claims,
 };
 pub use review::dependents::{
     self, Dependence, Dependent, Dependents, MAX_CHANGED, dependents as find_dependents,

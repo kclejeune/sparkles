@@ -33,8 +33,9 @@
 #
 # Env: RUNS (default 3), THREADS (default all cores), DELTA_EVERY (default 100), MEM_MAX
 # (default 24G), RUN_TIMEOUT (default 3600), KILL_AFTER (seconds from TERM to KILL at the
-# deadline, default 30), SCOPE, SPARKLES (default target/release/sparkles), NMO (default
-# the flake's nemo package), PYTHON.
+# deadline, default 30), MAX_INFERRED (the --max-inferred of every `sparkles infer`, here
+# and in compare.sh, default 0 for no limit), SCOPE, SPARKLES (default
+# target/release/sparkles), NMO (default the flake's nemo package), PYTHON.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -44,10 +45,11 @@ THREADS=${THREADS:-$(nproc)}
 DELTA_EVERY=${DELTA_EVERY:-100}
 MEM_MAX=${MEM_MAX:-24G}
 RUN_TIMEOUT=${RUN_TIMEOUT:-3600}
+MAX_INFERRED=${MAX_INFERRED:-0}
 INFERRED=urn:x-sparkles:inferred
 
 [ $# -eq 3 ] || {
-  sed -n '2,37p' "$0" >&2
+  sed -n '2,38p' "$0" >&2
   exit 2
 }
 suite=$1 scale=$2
@@ -151,7 +153,7 @@ SPARKLES=$(stage_binary "${SPARKLES:-$ROOT/target/release/sparkles}")
 [ -x "$SPARKLES" ] || die "no Sparkles binary at $SPARKLES; build it or set SPARKLES"
 NMO=${NMO:-$(nixexe nemo nmo)} || die "cannot build the nemo package"
 GTIME=$(gnu_time)
-export SPARKLES NMO
+export SPARKLES NMO MAX_INFERRED
 
 cd "$WORK"
 RECORD=results/runs.jsonl
@@ -211,10 +213,10 @@ rm -f "$RECORD"
 log "materializing the databases for the incremental runs"
 rm -rf full.db minus.db
 cp -a --reflink=auto base.db full.db
-capped prepare-full "$SPARKLES" infer --loc full.db --profile owl-rl --full || die "materializing full.db ended with $CAPPED_STATUS, see logs/prepare-full.log"
+capped prepare-full "$SPARKLES" infer --loc full.db --profile owl-rl --full --max-inferred "$MAX_INFERRED" || die "materializing full.db ended with $CAPPED_STATUS, see logs/prepare-full.log"
 cp -a --reflink=auto base.db minus.db
 "$SPARKLES" update --loc minus.db --update delete.ru > logs/prepare-minus-update.log 2>&1 || die "deleting the change failed"
-capped prepare-minus "$SPARKLES" infer --loc minus.db --profile owl-rl --full || die "materializing minus.db ended with $CAPPED_STATUS, see logs/prepare-minus.log"
+capped prepare-minus "$SPARKLES" infer --loc minus.db --profile owl-rl --full --max-inferred "$MAX_INFERRED" || die "materializing minus.db ended with $CAPPED_STATUS, see logs/prepare-minus.log"
 
 # ------------------------------------------------------------------------------ rounds
 for round in $(seq 1 "$RUNS"); do
@@ -222,7 +224,7 @@ for round in $(seq 1 "$RUNS"); do
     rm -rf run.db
     cp -a --reflink=auto base.db run.db
     sync
-    run "sparkles-full-t$t-r$round" "$round" "$t" "$SPARKLES" infer --loc run.db --profile owl-rl --full --threads "$t"
+    run "sparkles-full-t$t-r$round" "$round" "$t" "$SPARKLES" infer --loc run.db --profile owl-rl --full --threads "$t" --max-inferred "$MAX_INFERRED"
   done
   nemo_run full "$round" enc-full
   nemo_run minus "$round" enc-minus
@@ -231,14 +233,14 @@ for round in $(seq 1 "$RUNS"); do
   cp -a --reflink=auto minus.db run.db
   "$SPARKLES" update --loc run.db --update insert.ru > "logs/insert-update-r$round.log" 2>&1 || die "inserting the change failed"
   sync
-  run "sparkles-insert-r$round" "$round" "$THREADS" "$SPARKLES" infer --loc run.db --profile owl-rl --threads "$THREADS"
+  run "sparkles-insert-r$round" "$round" "$THREADS" "$SPARKLES" infer --loc run.db --profile owl-rl --threads "$THREADS" --max-inferred "$MAX_INFERRED"
   [ "$round" != 1 ] || check_closure run.db nemo-full enc-full insert
 
   rm -rf run.db
   cp -a --reflink=auto full.db run.db
   "$SPARKLES" update --loc run.db --update delete.ru > "logs/delete-update-r$round.log" 2>&1 || die "deleting the change failed"
   sync
-  run "sparkles-delete-r$round" "$round" "$THREADS" "$SPARKLES" infer --loc run.db --profile owl-rl --threads "$THREADS"
+  run "sparkles-delete-r$round" "$round" "$THREADS" "$SPARKLES" infer --loc run.db --profile owl-rl --threads "$THREADS" --max-inferred "$MAX_INFERRED"
   [ "$round" != 1 ] || check_closure run.db nemo-minus enc-minus delete
 done
 rm -rf run.db nemo-full nemo-minus

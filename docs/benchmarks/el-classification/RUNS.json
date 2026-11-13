@@ -1237,6 +1237,59 @@
     }
    },
    "metadata_note": "A manual measurement record of items 709 and 695 on the benchmark host and atlas: cold and warm runs of the 12 small ORE 2015 DL files, rounds on GO, ChEBI lite, two ORE 2015 EL files and six larger development files, runs of an experimental one-thread worker and of the final commit, the memory of ore_ont_8737 and the identity sweeps' taxonomy hashes."
+  },
+  {
+   "run_id": "sha256-e93013d73764d7a97b4ab9a785dff0dadf84b80687019da4da3823d2bfa8ef88",
+   "path": "runs/2026-11-10-el-cost-atlas-5dca16bd/record.json",
+   "sha256": "e93013d73764d7a97b4ab9a785dff0dadf84b80687019da4da3823d2bfa8ef88",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "The 12 small ORE 2015 DL files of roadmap item 709, GO 2026-07-26, ChEBI lite 256, ore_ont_3836 and 13482 of the ORE 2015 EL sample, ore_ont_7914 and ore_ont_8737 of the ORE 2015 DL development set on atlas",
+    "manifest": {
+     "commit": "5dca16bd",
+     "base_commit": "dbac7667",
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": {
+      "base": "f4cb9400c6e39b342277f8a8901171ba91f6cf9c65bf68a549ec0496ae89f98d",
+      "pre": "787890dd15869755093d25632074fa0ba2640ba7382a43cfdd46269078ddb2e9"
+     },
+     "build": "mbx build --release -p sparkles-owl --example el_classify on stanley, copied to atlas. The full hashes of every side are in each part's env.txt and log.txt.",
+     "sides": {
+      "base": "dbac7667, local main when the lane started",
+      "pre": "dbac7667 with the lazy start of item 709 and the delivery filter of item 695 removed, the build before those items",
+      "f": "70a5234c: one-thread batching once congested and a start delay of the time until the last helper ran",
+      "b": "9159097c: f with the deduplication of congested deliveries, an experiment",
+      "g": "the tree of 71f4fa5d before its comments and names changed: the start delay of the first worker's time in the spawns",
+      "h": "70a5234c with a fixed 100 us delay once a start has happened, the experiment cb41dc13",
+      "g2": "5dca16bd, the lane: g with a look at the clock after every activation until the helpers start"
+     }
+    },
+    "settings": {
+     "threads": [
+      1,
+      4,
+      8
+     ],
+     "repeat": 5,
+     "pin_one_thread": "CPU 4",
+     "pin_threads": "CPUs 0-11",
+     "memory_cap": "13 GiB scope without swap"
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "atlas",
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "ram_mib": 15620,
+      "kernel": "7.2.9"
+     },
+     "method": "Each part ran under ~/lanes/.heavy.lock on atlas with no other benchmark or gate on the host. cold.sh ran, per round, file and side in rotating order, one process with one classification, whose time is the cold one, and one with ten, whose last nine give the warm median. ab.sh ran one process per side, file and thread count with --repeat 5 in rotating order, and each round's value is the process's median classification. perf ran one-thread processes pinned to CPU 4 under perf stat. mem ran one classification of ore_ont_8737 per side and thread count. repro is the reproduction before any change, slot the run of f and b, variants the cold rounds of f, g and h, and final the run of g and g2.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual measurement record of roadmap items 720, 721 and 722 on atlas, which has the benchmark host's hardware: cold and warm runs of the 12 small files, one-, four- and eight-thread rounds on five larger files, instruction counts and the memory runs of ore_ont_8737."
   }
  ]
 }

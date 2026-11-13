@@ -1,0 +1,5 @@
+host=atlas start=2026-11-10T10:16:50-05:00
+ 10:16:50  up 18 days 18:03,  0 users,  load average: 5.66, 5.44, 5.12
+               total        used        free      shared  buff/cache   available
+Mem:              15           1           9           0           4          13
+Swap:              7           0           7

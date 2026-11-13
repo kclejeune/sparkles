@@ -62,6 +62,8 @@ export const routes = {
   adminServer: () => `${base}/admin/server`,
   adminBackups: (params: Params = {}) => `${base}/admin/backups${q(params)}`,
   adminTokens: () => `${base}/admin/tokens`,
+  /** The caller's watches on entities. */
+  watches: (params: Params = {}) => `${base}/watches${q(params)}`,
   /** Similar's Search page. */
   similar: (ds: string | null, params: Params = {}) => `${base}/similar${q({ ds, ...params })}`,
   /** Similar's Map page: the embedding map of a vector index. */

@@ -4690,3 +4690,51 @@ fn graph_writers_flush_after_their_first_batch() {
         check(&format!("{format:?}"), probe);
     }
 }
+
+/// An OPTIONAL over two inputs sorted on their shared variable merges when the
+/// `merge_left_join` switch is on and hashes when it is off, in the cursor as in eager
+/// execution, and both plans name the algorithm that ran.
+#[test]
+fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
+    let s = Store::in_memory(StoreOptions::default());
+    let data = (0..200)
+        .map(|i| {
+            let mut t = format!("<urn:s:{i}> <urn:p> {i} .\n");
+            if i % 3 != 0 {
+                t.push_str(&format!("<urn:s:{i}> <urn:q> \"{i}\" .\n"));
+            }
+            t
+        })
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let q = "SELECT ?s ?o ?x WHERE { ?s <urn:p> ?o OPTIONAL { ?s <urn:q> ?x } }";
+    let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+    for merge in [true, false] {
+        let opts = QueryOptions {
+            optimizations: Some(sparkles_core::sparql::Optimizations {
+                merge_left_join: merge,
+                ..sparkles_core::sparql::Optimizations::ALL
+            }),
+            ..Default::default()
+        };
+        let eager = query(s.snapshot(), q, &opts).unwrap();
+        let eager_plan = serde_json::to_string(&eager.plan).unwrap();
+        let c = select_cursor(s.snapshot(), q, &opts, &options(7)).unwrap();
+        let plan = c.plan_json().unwrap();
+        for (mode, plan) in [("eager", &eager_plan), ("cursor", &plan)] {
+            assert_eq!(
+                plan.contains("[merge on ?s]"),
+                merge,
+                "{mode} plan with merge_left_join {merge}: {plan}"
+            );
+        }
+        assert_eq!(plan.contains("[hash join]"), !merge, "{plan}");
+        assert_eq!(bag(all(c)), expected, "merge_left_join {merge}");
+        assert_eq!(bag(eager.rows()), expected);
+    }
+}

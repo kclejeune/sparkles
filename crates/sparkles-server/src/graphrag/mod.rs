@@ -14,6 +14,8 @@ pub mod build;
 pub mod cli;
 #[cfg(all(test, feature = "mcp"))]
 mod consumers_tests;
+#[cfg(feature = "mcp")]
+pub mod evidence;
 pub mod guard;
 pub mod hierarchy;
 #[cfg(feature = "mcp")]

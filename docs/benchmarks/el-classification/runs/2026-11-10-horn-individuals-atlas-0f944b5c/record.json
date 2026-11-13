@@ -1,0 +1,1209 @@
+{
+ "suite": "el-classification",
+ "kind": "measurement",
+ "scale": "the 47 Horn files with individuals, functional data properties or top properties of the ORE 2015 DL development set (affected-files.txt), the 73 files of the Horn stratum, the 298 ORE 2015 EL files and 300 generated Horn ontologies",
+ "host": {
+  "name": "atlas",
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "ram_mib": 15620,
+  "kernel": "7.2.9"
+ },
+ "manifest": {
+  "commit": "0f944b5c",
+  "base_commit": "9bf52956",
+  "binary": "crates/sparkles-owl/examples/el_classify.rs",
+  "binary_sha256": {
+   "bin/base": "d08ea7915a897c649d105e60c0f103d16e03c0d2ee9bd5ad8de424fa65053b61",
+   "bin/lane": "e80c8ed134a4307771116b9e50a8737fedc06301b27629037f5528cb3fae70b6"
+  },
+  "build": "mbx build --release -p sparkles-owl --example el_classify on stanley, the lane at 0f944b5c in its worktree and the base at 9bf52956, whose engine code is that of the branch point 87902aa3, in horn-individuals-692-review; both copied to atlas.",
+  "data": "the ORE 2015 sample from Zenodo record 18578 (ore2015_sample.zip), the Horn stratum selected by scripts/elk-compare/ore-dl.py, HermiT 1.4.5.519 references through scripts/elk-compare/elk.sh with a 1200 s limit per file (hermit-references.log.txt), and 300 ontologies from gen-horn.py.txt with seed 692"
+ },
+ "settings": {
+  "repeat": 3,
+  "rounds": 3,
+  "threads": [
+   4
+  ],
+  "memory_max": "13G"
+ },
+ "method": "time-atlas.sh.txt runs under flock ~/lanes/.heavy.lock in a systemd scope of 13G: three rounds over affected-files.txt, the base and the lane in turn with the order alternating by round, one process of three classifications each on four threads, which reports the median of its three. The table takes the median over the rounds. before/after hold uptime and free -g (atlas-before.txt, atlas-after.txt). The gates ran on stanley with gate.sh.txt: the Horn stratum on four threads against HermiT, the EL files on one and eight threads, and the generated ontologies on one and eight threads, judged by scripts/elk-compare/ours-compare.py.",
+ "started": "2026-11-10T15:16:50Z",
+ "ended": "2026-11-10T15:35:44Z",
+ "results": {
+  "ore_ont_8737": {
+   "base": 25545.334,
+   "base_rounds": [
+    27178.965076,
+    25545.33382,
+    25396.333737999998
+   ],
+   "lane": 34378.416,
+   "lane_rounds": [
+    35714.854112,
+    33660.780029,
+    34378.415654000004
+   ],
+   "ratio": 1.346,
+   "conclusions_base": 2101403004,
+   "conclusions_lane": 2118579266,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 8710356,
+   "peak_rss_kib_lane": 10668720,
+   "index_ms_base": 402.509,
+   "index_ms_lane": 602.057,
+   "horn_over_budget_lane": true,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_16744": {
+   "base": 5907.621,
+   "base_rounds": [
+    5933.842061,
+    5660.124124,
+    5907.62125
+   ],
+   "lane": 43374.227,
+   "lane_rounds": [
+    43374.226521,
+    45692.230917,
+    42488.729111
+   ],
+   "ratio": 7.342,
+   "conclusions_base": 545674901,
+   "conclusions_lane": 3771668749,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 3831744,
+   "peak_rss_kib_lane": 11499732,
+   "index_ms_base": 433.736,
+   "index_ms_lane": 430.601,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 2
+  },
+  "ore_ont_5481": {
+   "base": 642.455,
+   "base_rounds": [
+    640.425608,
+    648.364505,
+    642.455119
+   ],
+   "lane": 893.524,
+   "lane_rounds": [
+    885.883338,
+    893.523695,
+    894.536538
+   ],
+   "ratio": 1.391,
+   "conclusions_base": 1704715,
+   "conclusions_lane": 1704715,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 608120,
+   "peak_rss_kib_lane": 603224,
+   "index_ms_base": 604.544,
+   "index_ms_lane": 857.783,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_10073": {
+   "base": 640.583,
+   "base_rounds": [
+    646.6706949999999,
+    640.583427,
+    638.853532
+   ],
+   "lane": 886.683,
+   "lane_rounds": [
+    885.915866,
+    892.570015,
+    886.683427
+   ],
+   "ratio": 1.384,
+   "conclusions_base": 1704715,
+   "conclusions_lane": 1704715,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 561836,
+   "peak_rss_kib_lane": 595080,
+   "index_ms_base": 596.456,
+   "index_ms_lane": 856.753,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_3914": {
+   "base": 550.87,
+   "base_rounds": [
+    579.219882,
+    534.314636,
+    550.8701179999999
+   ],
+   "lane": 863.291,
+   "lane_rounds": [
+    863.2908,
+    852.033263,
+    869.9126
+   ],
+   "ratio": 1.567,
+   "conclusions_base": 27651599,
+   "conclusions_lane": 30713108,
+   "conjunctions_lane": 6,
+   "peak_rss_kib_base": 1167452,
+   "peak_rss_kib_lane": 1598704,
+   "index_ms_base": 221.384,
+   "index_ms_lane": 194.124,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 1
+  },
+  "ore_ont_1370": {
+   "base": 334.198,
+   "base_rounds": [
+    334.19778,
+    340.31628800000004,
+    331.06677299999996
+   ],
+   "lane": 499.578,
+   "lane_rounds": [
+    499.83257199999997,
+    494.173735,
+    499.57775399999997
+   ],
+   "ratio": 1.495,
+   "conclusions_base": 2074571,
+   "conclusions_lane": 2074571,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 420676,
+   "peak_rss_kib_lane": 420832,
+   "index_ms_base": 296.003,
+   "index_ms_lane": 452.923,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_4755": {
+   "base": 321.958,
+   "base_rounds": [
+    319.414607,
+    321.957697,
+    327.885554
+   ],
+   "lane": 442.785,
+   "lane_rounds": [
+    438.80082799999997,
+    442.784605,
+    443.98510699999997
+   ],
+   "ratio": 1.375,
+   "conclusions_base": 1316196,
+   "conclusions_lane": 1316196,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 377800,
+   "peak_rss_kib_lane": 363632,
+   "index_ms_base": 284.924,
+   "index_ms_lane": 401.724,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_4572": {
+   "base": 238.899,
+   "base_rounds": [
+    237.85518199999999,
+    240.431011,
+    238.899073
+   ],
+   "lane": 323.858,
+   "lane_rounds": [
+    349.890229,
+    323.857943,
+    321.011171
+   ],
+   "ratio": 1.356,
+   "conclusions_base": 2206719,
+   "conclusions_lane": 4650214,
+   "conjunctions_lane": 10244,
+   "peak_rss_kib_base": 413032,
+   "peak_rss_kib_lane": 511024,
+   "index_ms_base": 149.651,
+   "index_ms_lane": 158.458,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 1
+  },
+  "ore_ont_12414": {
+   "base": 196.068,
+   "base_rounds": [
+    196.067735,
+    195.333906,
+    200.204434
+   ],
+   "lane": 271.281,
+   "lane_rounds": [
+    272.160818,
+    271.280803,
+    265.975094
+   ],
+   "ratio": 1.384,
+   "conclusions_base": 727386,
+   "conclusions_lane": 727386,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 302488,
+   "peak_rss_kib_lane": 325004,
+   "index_ms_base": 176.741,
+   "index_ms_lane": 301.078,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_4510": {
+   "base": 120.382,
+   "base_rounds": [
+    119.581886,
+    122.227209,
+    120.38211
+   ],
+   "lane": 433.608,
+   "lane_rounds": [
+    455.660542,
+    381.080949,
+    433.608488
+   ],
+   "ratio": 3.602,
+   "conclusions_base": 2427529,
+   "conclusions_lane": 19150344,
+   "conjunctions_lane": 42249,
+   "peak_rss_kib_base": 345084,
+   "peak_rss_kib_lane": 463736,
+   "index_ms_base": 46.671,
+   "index_ms_lane": 49.728,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 135
+  },
+  "ore_ont_12448": {
+   "base": 119.013,
+   "base_rounds": [
+    119.012535,
+    119.49468300000001,
+    117.109288
+   ],
+   "lane": 152.787,
+   "lane_rounds": [
+    150.768462,
+    152.787353,
+    153.733859
+   ],
+   "ratio": 1.284,
+   "conclusions_base": 822520,
+   "conclusions_lane": 822520,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 253368,
+   "peak_rss_kib_lane": 257344,
+   "index_ms_base": 102.437,
+   "index_ms_lane": 133.005,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_12901": {
+   "base": 96.803,
+   "base_rounds": [
+    101.07965800000001,
+    96.802829,
+    95.10996800000001
+   ],
+   "lane": 306.858,
+   "lane_rounds": [
+    288.820736,
+    307.90043000000003,
+    306.858362
+   ],
+   "ratio": 3.17,
+   "conclusions_base": 1925362,
+   "conclusions_lane": 12716523,
+   "conjunctions_lane": 29993,
+   "peak_rss_kib_base": 314264,
+   "peak_rss_kib_lane": 383528,
+   "index_ms_base": 36.858,
+   "index_ms_lane": 38.176,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 117
+  },
+  "ore_ont_11110": {
+   "base": 86.381,
+   "base_rounds": [
+    85.79203100000001,
+    89.336901,
+    86.380765
+   ],
+   "lane": 102.957,
+   "lane_rounds": [
+    102.956803,
+    105.96607900000001,
+    102.420311
+   ],
+   "ratio": 1.192,
+   "conclusions_base": 543694,
+   "conclusions_lane": 543694,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 177524,
+   "peak_rss_kib_lane": 181760,
+   "index_ms_base": 71.891,
+   "index_ms_lane": 91.026,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_6478": {
+   "base": 71.549,
+   "base_rounds": [
+    72.70253699999999,
+    71.54872399999999,
+    71.115607
+   ],
+   "lane": 86.56,
+   "lane_rounds": [
+    86.56009200000001,
+    87.183528,
+    86.51110700000001
+   ],
+   "ratio": 1.21,
+   "conclusions_base": 82182,
+   "conclusions_lane": 82182,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 167116,
+   "peak_rss_kib_lane": 163108,
+   "index_ms_base": 69.823,
+   "index_ms_lane": 81.922,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_11311": {
+   "base": 68.153,
+   "base_rounds": [
+    68.153177,
+    68.82381,
+    66.901949
+   ],
+   "lane": 71.001,
+   "lane_rounds": [
+    71.227155,
+    70.140714,
+    71.00124600000001
+   ],
+   "ratio": 1.042,
+   "conclusions_base": 2598381,
+   "conclusions_lane": 1217021,
+   "conjunctions_lane": 561,
+   "peak_rss_kib_base": 241028,
+   "peak_rss_kib_lane": 171272,
+   "index_ms_base": 36.679,
+   "index_ms_lane": 47.914,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 3
+  },
+  "ore_ont_15733": {
+   "base": 45.365,
+   "base_rounds": [
+    45.142426,
+    45.486849,
+    45.365379999999995
+   ],
+   "lane": 35.338,
+   "lane_rounds": [
+    35.048912,
+    35.33779,
+    35.641993
+   ],
+   "ratio": 0.779,
+   "conclusions_base": 2181081,
+   "conclusions_lane": 407361,
+   "conjunctions_lane": 2,
+   "peak_rss_kib_base": 202164,
+   "peak_rss_kib_lane": 111948,
+   "index_ms_base": 19.667,
+   "index_ms_lane": 25.227,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 3
+  },
+  "ore_ont_12317": {
+   "base": 31.116,
+   "base_rounds": [
+    34.033818000000004,
+    27.426237,
+    31.115530999999997
+   ],
+   "lane": 29.773,
+   "lane_rounds": [
+    32.008373999999996,
+    24.945324000000003,
+    29.772978
+   ],
+   "ratio": 0.957,
+   "conclusions_base": 152216,
+   "conclusions_lane": 152216,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 157044,
+   "peak_rss_kib_lane": 142584,
+   "index_ms_base": 21.175,
+   "index_ms_lane": 19.519,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 2
+  },
+  "ore_ont_14375": {
+   "base": 20.202,
+   "base_rounds": [
+    20.201663,
+    19.872925,
+    21.586571
+   ],
+   "lane": 59.945,
+   "lane_rounds": [
+    52.515416,
+    59.94548,
+    61.788348
+   ],
+   "ratio": 2.967,
+   "conclusions_base": 364763,
+   "conclusions_lane": 2467444,
+   "conjunctions_lane": 5678,
+   "peak_rss_kib_base": 134572,
+   "peak_rss_kib_lane": 146884,
+   "index_ms_base": 8.061,
+   "index_ms_lane": 8.204,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 186
+  },
+  "ore_ont_7858": {
+   "base": 18.794,
+   "base_rounds": [
+    18.793539000000003,
+    17.10247,
+    19.303476
+   ],
+   "lane": 21.605,
+   "lane_rounds": [
+    21.036606,
+    21.604828,
+    24.364377
+   ],
+   "ratio": 1.15,
+   "conclusions_base": 33341,
+   "conclusions_lane": 33341,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 99800,
+   "peak_rss_kib_lane": 95484,
+   "index_ms_base": 14.333,
+   "index_ms_lane": 18.502,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_14776": {
+   "base": 18.628,
+   "base_rounds": [
+    30.748874,
+    18.628089,
+    17.744678999999998
+   ],
+   "lane": 25.481,
+   "lane_rounds": [
+    25.887188,
+    25.480789,
+    21.043590000000002
+   ],
+   "ratio": 1.368,
+   "conclusions_base": 134412,
+   "conclusions_lane": 134412,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 136512,
+   "peak_rss_kib_lane": 132288,
+   "index_ms_base": 21.218,
+   "index_ms_lane": 11.51,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 2
+  },
+  "ore_ont_2491": {
+   "base": 18.276,
+   "base_rounds": [
+    11.365506,
+    23.692699,
+    18.276325
+   ],
+   "lane": 11.431,
+   "lane_rounds": [
+    11.431289000000001,
+    16.338003999999998,
+    9.818533
+   ],
+   "ratio": 0.625,
+   "conclusions_base": 71740,
+   "conclusions_lane": 71740,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 105864,
+   "peak_rss_kib_lane": 109900,
+   "index_ms_base": 6.918,
+   "index_ms_lane": 5.783,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 2
+  },
+  "ore_ont_4662": {
+   "base": 17.462,
+   "base_rounds": [
+    17.410888,
+    18.591334,
+    17.462168
+   ],
+   "lane": 22.013,
+   "lane_rounds": [
+    22.013446,
+    21.309811,
+    24.50244
+   ],
+   "ratio": 1.261,
+   "conclusions_base": 33341,
+   "conclusions_lane": 33341,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 109920,
+   "peak_rss_kib_lane": 97548,
+   "index_ms_base": 14.07,
+   "index_ms_lane": 18.348,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_7251": {
+   "base": 17.429,
+   "base_rounds": [
+    14.629564,
+    18.027588,
+    17.428821
+   ],
+   "lane": 20.922,
+   "lane_rounds": [
+    17.876044,
+    20.921925,
+    22.56079
+   ],
+   "ratio": 1.2,
+   "conclusions_base": 40691,
+   "conclusions_lane": 40691,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 101492,
+   "peak_rss_kib_lane": 93452,
+   "index_ms_base": 11.987,
+   "index_ms_lane": 15.397,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_7195": {
+   "base": 16.813,
+   "base_rounds": [
+    16.813172,
+    12.298897,
+    20.160808
+   ],
+   "lane": 14.231,
+   "lane_rounds": [
+    17.926434,
+    13.976359,
+    14.230703
+   ],
+   "ratio": 0.846,
+   "conclusions_base": 120823,
+   "conclusions_lane": 120823,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 77132,
+   "peak_rss_kib_lane": 81160,
+   "index_ms_base": 10.15,
+   "index_ms_lane": 13.134,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_2624": {
+   "base": 16.018,
+   "base_rounds": [
+    16.206966,
+    16.018009,
+    15.249439
+   ],
+   "lane": 16.776,
+   "lane_rounds": [
+    16.414013,
+    17.903273000000002,
+    16.775894
+   ],
+   "ratio": 1.047,
+   "conclusions_base": 123520,
+   "conclusions_lane": 123520,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 77316,
+   "peak_rss_kib_lane": 74996,
+   "index_ms_base": 9.121,
+   "index_ms_lane": 12.276,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_9761": {
+   "base": 14.259,
+   "base_rounds": [
+    15.113602,
+    14.259005,
+    9.450576
+   ],
+   "lane": 12.823,
+   "lane_rounds": [
+    11.961946,
+    14.053764999999999,
+    12.82254
+   ],
+   "ratio": 0.899,
+   "conclusions_base": 85377,
+   "conclusions_lane": 85377,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 77228,
+   "peak_rss_kib_lane": 70984,
+   "index_ms_base": 7.076,
+   "index_ms_lane": 9.564,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_8347": {
+   "base": 13.831,
+   "base_rounds": [
+    10.250252,
+    13.831313,
+    14.189222
+   ],
+   "lane": 10.684,
+   "lane_rounds": [
+    10.683746,
+    16.617745,
+    10.067458
+   ],
+   "ratio": 0.772,
+   "conclusions_base": 42986,
+   "conclusions_lane": 42988,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 116264,
+   "peak_rss_kib_lane": 97528,
+   "index_ms_base": 6.677,
+   "index_ms_lane": 9.113,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 4
+  },
+  "ore_ont_10951": {
+   "base": 13.582,
+   "base_rounds": [
+    11.640377,
+    14.299748,
+    13.581875
+   ],
+   "lane": 33.486,
+   "lane_rounds": [
+    33.48618,
+    33.237291,
+    40.058556
+   ],
+   "ratio": 2.466,
+   "conclusions_base": 176238,
+   "conclusions_lane": 1689814,
+   "conjunctions_lane": 3147,
+   "peak_rss_kib_base": 93708,
+   "peak_rss_kib_lane": 124176,
+   "index_ms_base": 3.724,
+   "index_ms_lane": 4.083,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 137
+  },
+  "ore_ont_3529": {
+   "base": 12.226,
+   "base_rounds": [
+    10.354454,
+    12.225760000000001,
+    15.007974
+   ],
+   "lane": 12.831,
+   "lane_rounds": [
+    12.959059,
+    11.338846,
+    12.831164000000001
+   ],
+   "ratio": 1.05,
+   "conclusions_base": 72435,
+   "conclusions_lane": 72435,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 83292,
+   "peak_rss_kib_lane": 89356,
+   "index_ms_base": 6.194,
+   "index_ms_lane": 7.612,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_3905": {
+   "base": 9.338,
+   "base_rounds": [
+    5.8605469999999995,
+    9.337998,
+    10.268315
+   ],
+   "lane": 6.799,
+   "lane_rounds": [
+    6.099458,
+    6.799097,
+    10.647403
+   ],
+   "ratio": 0.728,
+   "conclusions_base": 45962,
+   "conclusions_lane": 51034,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 52612,
+   "peak_rss_kib_lane": 52708,
+   "index_ms_base": 1.876,
+   "index_ms_lane": 2.399,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 143
+  },
+  "ore_ont_10123": {
+   "base": 9.252,
+   "base_rounds": [
+    6.022481,
+    9.252322,
+    9.767397
+   ],
+   "lane": 11.378,
+   "lane_rounds": [
+    11.378091999999999,
+    12.403882,
+    10.397244
+   ],
+   "ratio": 1.23,
+   "conclusions_base": 66044,
+   "conclusions_lane": 81178,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 99696,
+   "peak_rss_kib_lane": 85436,
+   "index_ms_base": 3.438,
+   "index_ms_lane": 2.946,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 18
+  },
+  "ore_ont_4527": {
+   "base": 8.342,
+   "base_rounds": [
+    5.393638,
+    8.62848,
+    8.34195
+   ],
+   "lane": 9.04,
+   "lane_rounds": [
+    9.247741,
+    6.258316,
+    9.040478
+   ],
+   "ratio": 1.084,
+   "conclusions_base": 17126,
+   "conclusions_lane": 17126,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 46424,
+   "peak_rss_kib_lane": 50548,
+   "index_ms_base": 3.304,
+   "index_ms_lane": 6.794,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_13755": {
+   "base": 7.045,
+   "base_rounds": [
+    10.142571,
+    5.649025,
+    7.044965
+   ],
+   "lane": 7.916,
+   "lane_rounds": [
+    9.387888,
+    7.915779,
+    5.03045
+   ],
+   "ratio": 1.124,
+   "conclusions_base": 17617,
+   "conclusions_lane": 17617,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 58480,
+   "peak_rss_kib_lane": 60604,
+   "index_ms_base": 4.726,
+   "index_ms_lane": 2.902,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_14450": {
+   "base": 5.945,
+   "base_rounds": [
+    6.1281620000000006,
+    5.38868,
+    5.944565
+   ],
+   "lane": 6.63,
+   "lane_rounds": [
+    6.630329,
+    12.077086000000001,
+    6.322418
+   ],
+   "ratio": 1.115,
+   "conclusions_base": 47357,
+   "conclusions_lane": 52671,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 52616,
+   "peak_rss_kib_lane": 54560,
+   "index_ms_base": 2.79,
+   "index_ms_lane": 2.695,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 147
+  },
+  "ore_ont_8203": {
+   "base": 5.796,
+   "base_rounds": [
+    9.148009,
+    5.10577,
+    5.796113
+   ],
+   "lane": 5.297,
+   "lane_rounds": [
+    6.178829,
+    5.296903,
+    5.0957
+   ],
+   "ratio": 0.914,
+   "conclusions_base": 139621,
+   "conclusions_lane": 139621,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 56644,
+   "peak_rss_kib_lane": 54500,
+   "index_ms_base": 2.162,
+   "index_ms_lane": 1.57,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_10781": {
+   "base": 4.165,
+   "base_rounds": [
+    4.164621,
+    4.517485,
+    2.754191
+   ],
+   "lane": 5.79,
+   "lane_rounds": [
+    5.790111,
+    8.451125000000001,
+    3.9484339999999998
+   ],
+   "ratio": 1.39,
+   "conclusions_base": 31145,
+   "conclusions_lane": 78730,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 28028,
+   "peak_rss_kib_lane": 48332,
+   "index_ms_base": 1.556,
+   "index_ms_lane": 1.332,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 4
+  },
+  "ore_ont_6817": {
+   "base": 3.236,
+   "base_rounds": [
+    3.236008,
+    3.684768,
+    3.201461
+   ],
+   "lane": 3.746,
+   "lane_rounds": [
+    3.7035430000000003,
+    5.376907999999999,
+    3.74627
+   ],
+   "ratio": 1.158,
+   "conclusions_base": 14794,
+   "conclusions_lane": 14794,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 33896,
+   "peak_rss_kib_lane": 34052,
+   "index_ms_base": 2.704,
+   "index_ms_lane": 3.178,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_15231": {
+   "base": 1.482,
+   "base_rounds": [
+    1.57334,
+    1.482496,
+    1.3615249999999999
+   ],
+   "lane": 1.951,
+   "lane_rounds": [
+    1.9420590000000002,
+    1.9512909999999999,
+    2.0298629999999998
+   ],
+   "ratio": 1.316,
+   "conclusions_base": 1765,
+   "conclusions_lane": 1765,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 21528,
+   "peak_rss_kib_lane": 21324,
+   "index_ms_base": 1.232,
+   "index_ms_lane": 1.323,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_7663": {
+   "base": 1.282,
+   "base_rounds": [
+    1.280036,
+    1.283368,
+    1.2822470000000001
+   ],
+   "lane": 1.584,
+   "lane_rounds": [
+    1.461403,
+    1.656061,
+    1.584203
+   ],
+   "ratio": 1.235,
+   "conclusions_base": 1501,
+   "conclusions_lane": 1501,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 19476,
+   "peak_rss_kib_lane": 19308,
+   "index_ms_base": 0.871,
+   "index_ms_lane": 1.072,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_13762": {
+   "base": 0.753,
+   "base_rounds": [
+    0.753088,
+    0.805465,
+    0.27664099999999997
+   ],
+   "lane": 0.878,
+   "lane_rounds": [
+    0.460042,
+    1.4189289999999999,
+    0.878234
+   ],
+   "ratio": 1.166,
+   "conclusions_base": 1236,
+   "conclusions_lane": 2124,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 17480,
+   "peak_rss_kib_lane": 17328,
+   "index_ms_base": 0.398,
+   "index_ms_lane": 0.227,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 27
+  },
+  "ore_ont_6855": {
+   "base": 0.532,
+   "base_rounds": [
+    0.53246,
+    0.417401,
+    0.752437
+   ],
+   "lane": 5.847,
+   "lane_rounds": [
+    4.022348,
+    6.380408,
+    5.847068
+   ],
+   "ratio": 10.981,
+   "conclusions_base": 2369,
+   "conclusions_lane": 19733,
+   "conjunctions_lane": 19,
+   "peak_rss_kib_base": 11304,
+   "peak_rss_kib_lane": 21740,
+   "index_ms_base": 0.223,
+   "index_ms_lane": 0.238,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 37
+  },
+  "ore_ont_2456": {
+   "base": 0.496,
+   "base_rounds": [
+    0.49639300000000003,
+    1.341811,
+    0.477375
+   ],
+   "lane": 1.035,
+   "lane_rounds": [
+    1.011308,
+    1.034612,
+    1.84561
+   ],
+   "ratio": 2.084,
+   "conclusions_base": 1942,
+   "conclusions_lane": 1942,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 19496,
+   "peak_rss_kib_lane": 19260,
+   "index_ms_base": 0.325,
+   "index_ms_lane": 0.509,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 0
+  },
+  "ore_ont_2775": {
+   "base": 0.486,
+   "base_rounds": [
+    0.486031,
+    1.266118,
+    0.384496
+   ],
+   "lane": 0.557,
+   "lane_rounds": [
+    0.43333,
+    0.90681,
+    0.556656
+   ],
+   "ratio": 1.145,
+   "conclusions_base": 1438,
+   "conclusions_lane": 1438,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 15316,
+   "peak_rss_kib_lane": 15212,
+   "index_ms_base": 0.21,
+   "index_ms_lane": 0.174,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 1
+  },
+  "ore_ont_3260": {
+   "base": 0.363,
+   "base_rounds": [
+    0.362683,
+    0.362869,
+    0.365603
+   ],
+   "lane": 0.823,
+   "lane_rounds": [
+    0.84778,
+    0.651508,
+    0.8230190000000001
+   ],
+   "ratio": 2.268,
+   "conclusions_base": 147,
+   "conclusions_lane": 378,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 13272,
+   "peak_rss_kib_lane": 13156,
+   "index_ms_base": 0.249,
+   "index_ms_lane": 0.684,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 30
+  },
+  "ore_ont_7417": {
+   "base": 0.276,
+   "base_rounds": [
+    0.234765,
+    0.308304,
+    0.27553
+   ],
+   "lane": 0.281,
+   "lane_rounds": [
+    0.281066,
+    0.34518899999999997,
+    0.23705500000000002
+   ],
+   "ratio": 1.02,
+   "conclusions_base": 1089,
+   "conclusions_lane": 1183,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 11292,
+   "peak_rss_kib_lane": 11160,
+   "index_ms_base": 0.132,
+   "index_ms_lane": 0.166,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 1
+  },
+  "ore_ont_3775": {
+   "base": 0.245,
+   "base_rounds": [
+    0.24491999999999997,
+    0.347786,
+    0.156203
+   ],
+   "lane": 0.388,
+   "lane_rounds": [
+    0.387814,
+    0.45028599999999996,
+    0.264518
+   ],
+   "ratio": 1.583,
+   "conclusions_base": 306,
+   "conclusions_lane": 1122,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 11352,
+   "peak_rss_kib_lane": 11120,
+   "index_ms_base": 0.162,
+   "index_ms_lane": 0.199,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 13
+  },
+  "ore_ont_580": {
+   "base": 0.156,
+   "base_rounds": [
+    0.156333,
+    0.11163000000000001,
+    0.18314000000000002
+   ],
+   "lane": 0.234,
+   "lane_rounds": [
+    0.200444,
+    0.366682,
+    0.23410099999999998
+   ],
+   "ratio": 1.497,
+   "conclusions_base": 102,
+   "conclusions_lane": 122,
+   "conjunctions_lane": 0,
+   "peak_rss_kib_base": 11192,
+   "peak_rss_kib_lane": 11204,
+   "index_ms_base": 0.114,
+   "index_ms_lane": 0.135,
+   "horn_over_budget_lane": false,
+   "outside_taken_lane": 1
+  }
+ },
+ "checks": {
+  "horn_stratum_t4": {
+   "lane": {
+    "equal": 34,
+    "sound": 33,
+    "refused": 1,
+    "no_reference": 5
+   },
+   "base": {
+    "equal": 23,
+    "sound": 44,
+    "refused": 1,
+    "no_reference": 5
+   },
+   "differs_or_unsound": 0,
+   "still_sound_exclusions": "exclusions.txt: anonymous individuals in 29 files, datatypes outside OWL 2 EL or data cardinalities in 4",
+   "refused": "ore_ont_9881, invalid IRI in the reader",
+   "unaffected_files_identical": 25,
+   "affected_taxonomy_changed": [
+    "ore_ont_580"
+   ]
+  },
+  "el_identity": {
+   "files": 298,
+   "identical_t1": 298,
+   "identical_t8": 298,
+   "lane_t1_equals_t8": 298
+  },
+  "generated": {
+   "files": 300,
+   "lane_t1_equal": 300,
+   "lane_t8_equal": 300,
+   "base_t1": {
+    "sound": 290,
+    "equal": 10
+   }
+  },
+  "timing_taxonomies": "the gate's taxonomies of the 47 files are in taxonomy.sha256; the timing runs wrote none"
+ },
+ "notes": [
+  "The load average on atlas was 5.66 when the run started and 5.44 when it ended; top showed only the timed process during the run.",
+  "HermiT gave no reference for ore_ont_11311 and ore_ont_786 (1200 s limit) and ore_ont_16744, ore_ont_8737 and ore_ont_9855 (HermiT exit 1).",
+  "ore_ont_16744 and ore_ont_8737 name the top property only in SubObjectPropertyOf(RO_0002204 owl:topObjectProperty) and SubObjectPropertyOf(RO_0002205 owl:topObjectProperty), which made the base refuse their two Horn axioms. On stanley on four threads under a 13G scope beside a CI run, the lane classifies ore_ont_16744 without the two inclusions in 43.2 s and the base in 51.1 s, both with the Horn rules, and the lane on the original file passed the Horn budget and finished by the EL rules in 35.8 s.",
+  "ab-table.md is the full table of the 47 files with every round."
+ ]
+}

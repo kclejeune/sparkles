@@ -91,8 +91,19 @@ including values beyond 128 bits. Construction and copied storage obey the class
 resource controls, and large values share immutable storage until their last owner
 releases it. XML namespace conformance is checked without canonicalizing XML values.
 Canonical XML values, ill-typed literal semantics, datatypes outside the supported map
-and chains through the top object property remain in item 663. Horn reasoning with
-individuals remains in item 692, and the shared hierarchical budget remains in item 675.
+and chains through the top object property remain in item 663. Item 692 runs the Horn
+rules on ontologies with individuals, functional data properties and top properties, as
+[The Horn rules with individuals](#the-horn-rules-with-individuals) describes, and the
+shared hierarchical budget remains in item 675.
+
+Item 804 delivers the sixth phase's rooted run as the option `Limits::rooted`, off by
+default, as [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rules) and
+[item 804's departures](#item-804s-departures-from-the-journals-rules) describe. With it,
+ontologies with individuals and nominals take the case analysis through a root context,
+with four recorded departures from the journal's rules, a work bound past which the run
+gives its default answer, and 45 of the 50 `shoi` fixtures exact against HermiT. The five
+fixtures that pass the bound are item 822, the default is item 823, and keys and the
+universal property are item 805.
 
 The bounded named-class read phase of items 588 and 622, and the availability route
 of item 726, publish an immutable completed result beside the incremental saturation.
@@ -518,13 +529,14 @@ chains and transitive properties through the automata of Horrocks, Kutz and Satt
 disjoint, asymmetric and irreflexive properties, and complements, unions and universal
 restrictions that move to the other side of an axiom as their duals. An at-least
 restriction of up to 64 becomes that many existential restrictions with fresh, pairwise
-disjoint fillers, as the paper's Lemma 2 does. The rules run when one of them can fire
-and the ontology has no individuals, functional data properties or top properties, and
-not at all under `Limits::el_only`, the ELK mode, which leaves every axiom outside OWL 2
-EL out as ELK does and gives ELK's taxonomy. With
-any of these the axioms outside OWL 2 EL stay left out and reported, and Horn reasoning
-with individuals is item 692. So do axioms that are not Horn, property hierarchies
-that are not regular, automata of more than 65,536 states and data restrictions outside
+disjoint fillers, as the paper's Lemma 2 does. The rules run when one of them can fire,
+and not at all under `Limits::el_only`, the ELK mode, which leaves every axiom outside
+OWL 2 EL out as ELK does and gives ELK's taxonomy. An ontology with individuals,
+functional data properties or top properties runs them beside the EL rules of
+individuals, as the section
+[The Horn rules with individuals](#the-horn-rules-with-individuals) describes (item
+692). Axioms that are not Horn stay left out and reported, and so do property
+hierarchies that are not regular, automata of more than 65,536 states and data restrictions outside
 OWL 2 EL. `Stats::tier` says which rules a run needed, `Stats::outside_el` counts the
 axioms outside OWL 2 EL and those taken, and `Stats::conjunctions` counts the contexts
 the rules created.
@@ -728,6 +740,32 @@ the [small files and memory results](../../benchmarks/el-classification/RESULTS.
 give the numbers. Five variants that measured no better are in
 [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md).
 
+Items 720, 721 and 722 measured these follow-ups on `atlas`, which has the benchmark
+host's hardware. A process's first helper threads take much longer to start than later
+ones, whose stacks it keeps. A warm run on eight threads that starts no helper takes 0.21
+ms on `ore_ont_2775` against 0.29 ms when it starts them at once, and a cold run takes
+0.64 against 1.55 ms. The saturation therefore records how long its first worker took to
+start the helpers, and a later saturation of fewer than 4,096 roots starts them once the
+first worker has worked that long, between 20 and 500 us. The first saturation of a
+process still waits 0.5 ms. The first worker looks at the clock after each activation
+until then, since an activation of the Horn or disjunctive rules can take tens of
+microseconds. Warm runs of the five files of item 720 on eight threads take 2.1 to 3.8
+ms, 0.04 to 0.21 ms longer than with the build before item 709 against 0.4 to 0.6 ms
+before, and item 819 follows the rest. Cold runs keep item 709's gain. A run on one thread sends through its outbox
+once it is congested, so that its deliveries drop the messages their contexts hold as
+those of several threads do. A run that is not congested reads the batching flag at
+each message it sends to another context, as before, and adds a comparison of its
+waiting messages with its stored conclusions to each check of the bounds. On one thread `ore_ont_8737` peaks at 5.9 GiB against 9.3
+GiB and takes 90.7 against 95.8 s, while its run on four threads keeps its 28 s and 6.8
+to 7.9 GiB, which item 818 follows against Konclude's 11 s. The one-thread times of GO,
+ChEBI lite, `ore_ont_3836`, `ore_ont_13482` and `ore_ont_7914` moved by up to 2% between
+builds that differ only in code that one thread never runs. The build of item 720 is 0.6%
+faster to 0.9% slower than the base on them, and item 722 stays open for the layout.
+Two more variants that measured no better are in
+[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md), together with a
+deduplication of congested deliveries that slowed the one-thread run of `ore_ont_8737`
+to 119 s.
+
 The references disagree on two files of the set. On ore_ont_15516, Konclude's parsers all
 failed at the first SWRL rule and it classified an empty ontology. HermiT found the
 ontology inconsistent, which its rules cannot cause, since the properties in their heads
@@ -741,6 +779,301 @@ second equivalence follows from the first, so Konclude's answer stands for both.
 The functional-syntax reader refuses a document with a SWRL rule. A read with
 `ofn_read::Options::skip_rules` passes over the rules and counts them, which the
 classification comparison uses to report them as left out.
+
+### The Horn rules with individuals
+
+Item 692 runs the Horn rules on ontologies with individuals, functional data properties
+and top properties, as this section describes. The design keeps two promises. The answers equal HermiT's on the Horn files
+with individuals of the ORE 2015 DL sample, and an ontology without individuals,
+functional data properties or top properties is unaffected, so that its taxonomy is byte
+for byte what it was. The second promise is about the taxonomy and the code the run
+chooses, not about its time, which code layout can move.
+
+A Horn ontology with individuals classifies by default with the Horn rules, in the same
+run as the EL rules of individuals. Nothing changes for an ontology without individuals,
+functional data properties or top properties, whose run chooses the code it chose before,
+and nothing changes under `Limits::el_only`. The disjunctive rules keep a condition of
+their own, which is the Horn rules' condition today and refuses an ontology with
+individuals, data properties or top properties, so that lifting the Horn rules' condition
+changes nothing for them. `Limits::rooted` lifts the refusal of individuals for the
+disjunctive rules under the further conditions of its section, as it does today. When the
+disjunctive rules decline an ontology, the Horn rules take what they can of it, with its
+individuals, and leave out and report the axioms that need case analysis and the axioms
+they left out before, which are at-least restrictions above 64, data restrictions outside
+OWL 2 EL, and axioms over property hierarchies that are not regular or whose automata
+pass the bound. A run with individuals also leaves out at-least restrictions above one,
+for the reason the normalization paragraph gives, which item 867 follows, and chains
+through the top property stay partial, as item 663 records.
+
+**One saturation.** Kazakov's rules read a context as the set of instances of its
+conjunction, and every conclusion of a context holds of each of its instances. The EL
+rules of individuals read a context the same way, so the two rule sets run in one
+saturation. The saturation has four instantiations of its rules today, with and without
+the rules of individuals, with the Horn rules and with the disjunctive rules, and gets a
+fifth, with the rules of individuals, universal roles and functional data roles beside
+the Horn rules, which it chooses when the index has the Horn rules and is not plain. The
+four stay as they are.
+
+The Horn normalization takes a singleton `ObjectOneOf` and an `ObjectHasValue` wherever
+it takes a class, as the EL index's nominal and the existential restriction to it, and an
+enumeration of several individuals in a negative position as the union of their
+singletons, which becomes a fresh class above each of them, so that an at-most
+restriction over such a filler counts the individuals together. An enumeration of several
+individuals in a positive position is not Horn and stays with the disjunctive rules. The
+normalization takes a class assertion `C(a)` as `{a} ⊑ C`, so that a Horn class
+expression in an assertion reaches the rules, and an object property assertion over an
+inverse property as the assertion over the property the other way round. The other
+assertions are EL axioms already. A run with individuals leaves out and reports an
+at-least restriction above one, where a run without them unfolds it as the paper's Lemma
+2 does into fresh, pairwise disjoint fillers. The lemma's argument expands a model of
+the ontology to one of the unfolding, and it colours each element's successors with the
+fresh fillers, which it can do because the paper's models are trees in which no two
+elements share a successor. A nominal is a shared successor, and the argument is not
+made here for models with them, though no Horn axiom bounds an element's successors to
+a finite set, so an expansion that adds fresh successors may exist. Leaving the
+restriction out is a sound weakening that the run reports, no file of the lane's gate
+has such a restriction beside individuals, and item 867 holds the argument or the
+rule that takes them. Lemma 2 stays for runs without individuals.
+
+Three mechanisms of the EL rules of individuals have to reach the links and contexts of
+the Horn rules.
+
+- A real context's successors are real. The rule for an existential restriction sends
+  `Real` to the EL successor, and the Horn rules send it to the successors they create
+  when the context that links to them is real, which are the conjunction that R3 extends
+  a successor to, the conjunction that R5 merges successors into and the link that R6
+  gives a predecessor. A context that becomes real tells its Horn successors as well as
+  its EL ones.
+- A context that derives an individual stands for the individual wherever it has an
+  instance, and the two exchange their subsumers today, from the individual to the
+  context always and from the context to the individual while the context is real. In a
+  run with the Horn rules the context also gives the individual its backward links, with
+  what it knows of each predecessor, real or not, since a link from `P` by `r` to a
+  context that stands for `a` is a link from `P` to `a` whether or not the context has an
+  instance. While real it gives the individual its loops and its Horn successors too,
+  since its one instance is `a`, and takes the individual's subsumers, Horn successors
+  and loops, as it takes the subsumers today. A Horn successor is a link that R6 gives a
+  predecessor without an existential restriction among its subsumers, so a partner that
+  takes only subsumers would miss it, and it travels as the `Succ` conclusion it is.
+  What a context knows of a predecessor is whether the predecessor holds each at-most
+  filler, which `PredIn` carries, and whether it is real, which the conclusion below
+  carries, and both go with the link and as they come later.
+- A universal restriction `∀t.A` on a universal role `t` held by a real context is a
+  fact that holds everywhere, as a negative `∃t.F ⊑ x` whose `F` is real is today. The
+  index lists the restriction among the facts of universal roles, the rounds between
+  saturations and the worlds apply it as they apply the negative restrictions, and the
+  Horn rules pass over it, since R3 and R4 would only spread `A` along links. An at-most
+  or self restriction on a universal role, which OWL 2 DL forbids because the property
+  is not simple, is left out and reported. The universal role is its own inverse in the
+  role box. The top data property needs nothing new, since its rules are the EL index's,
+  and so do the functional data properties, whose rule is local to a context and runs in
+  the conjunction contexts as in any other.
+
+**Singular contexts.** A context is singular when it has at most one instance. A context
+that derives an individual is singular. A context `M` that links by `r` to a singular
+context `N` holding `≤1 S.B`, with `r⁻` under `S`, and that holds `B` is singular too,
+since every instance of `M` is an `S`-neighbour in `B` of `N`'s one element, and `M` is
+empty when `N` is. A context keeps the flag and tells each predecessor that it is
+singular, when it becomes singular and when a predecessor comes later, and a predecessor
+that one of its at-most restrictions counts takes the flag from it. Singularity says
+nothing about having an instance, which `Real` says.
+
+**R7, the predecessors of a singular context.** Kazakov's rules have no rule over two
+predecessors of one context, because without nominals the contexts of a Horn ontology
+unravel into trees in which every element has one predecessor, and R5 and R6 cover the
+successors and the predecessor of each element. A nominal is one element with any number
+of predecessors, and so is every context that singularity reaches from it. This is the
+interaction that HermiT's NI rule and the Nom rule of the rooted calculus handle, and the
+earlier design work on this item recorded its simplest case, `A ⊑ ∃r.{a}`, `B ⊑ ∃r.{a}`,
+an inverse functional `r` and `B(b)`, which entail `A ⊑ {b}` and which no rule above
+derives. R7 closes it. At a singular context `N` holding `≤1 S.B`, two real
+predecessors `M_1` and `M_2` that the restriction counts, linked by roles whose inverses
+are under `S` and holding `B`, have one instance each and the two instances are one,
+since both are the `S`-neighbour in `B` of `N`'s element. The two contexts exchange their
+subsumers, Horn successors, backward links with what they know of each predecessor, and
+loops, now and as they come, and the two roles are checked against the disjoint and asymmetric roles, as R5
+checks the roles of merged successors. A loop of `N` by a role under `S` counts `N`
+itself among the neighbours when `N` holds `B`, and then `N` and a real counted
+predecessor exchange the same way, where the loop case of R6 today gives the predecessor
+`N`'s core and loops only. R7 creates no context and no fresh individual. A context learns
+that a predecessor is real from the predecessor, through a conclusion beside `Real` that a
+real context sends to each successor it links to and that a context sends to its
+successors when it becomes real. Only the fifth instantiation sends it.
+
+**R8, role clashes at a singular context.** Disjoint and asymmetric roles clash on a pair
+of elements, and the Horn rules check them today where R5, R6 or a loop puts two roles
+between one pair. A nominal puts two roles between one pair without any of these, which
+the design review of this section found. With `r` and `s` disjoint, `A ⊑ ∃r.{a}` and
+`A ⊑ ∃s.{a}` make `A` unsatisfiable, and with `r` asymmetric, `{a} ⊑ ∃r.A` and
+`A ⊑ ∃r.{a}` make the ontology inconsistent, while no at-most restriction fires and no
+context derives a nominal beside `a`'s own. R8 has two cases, both at a singular context
+`N` and both unconditional, since each concludes that a context is empty. Two backward
+links into `N` from one source `M` by roles that clash make `M` unsatisfiable, since
+every instance of `M` would have both roles to `N`'s one element. A forward link from `N`
+to a context `X` by `r_1`, among the successors of its existential restrictions or its
+Horn successors, and a backward link from `X` by `r_2`, where `r_1` and `r_2⁻` clash,
+make `N` unsatisfiable, since `N`'s element would have an `r_1`-successor in `X` and
+every instance of `X` has `r_2` to `N`'s element. The second case covers the asymmetric
+example at `a`, whose forward link goes to `A` and whose backward link comes from `A`,
+without a chain in the ontology. The first covers the disjoint example at `a`, whose two
+backward links come from `A`. It also covers two sources that are one element, since the
+exchange gives either the other's subsumers and Horn successors, so that the target sees
+both links from one source, and two targets that stand for one individual, since each
+gives the individual its backward links. R8 runs on a singular context's own state and
+sends only `owl:Nothing`.
+
+The soundness of the additions follows the reading of a context. A conclusion moves
+between two contexts only when every instance of each is the same element, which the
+exchange between a real context and its individual and the exchange R7 makes both
+establish, and a backward link moves to a context without that condition only when the
+link holds of the context's individual, which `P ⊑ ∃r.M` and `M ⊑ {a}` give.
+Singularity propagates along a link into a singular context through an at-most
+restriction, and the argument above is the whole of it. R7 needs both predecessors real
+because `M_1 ⊑ X` for a subsumer `X` of `M_2` holds only when `M_2` has the instance that
+every instance of `M_1` equals. R8 concludes emptiness, which needs no instance.
+
+**Witnesses and worlds.** The reachability condition of the EL rules of individuals stays
+the mechanism that makes a conclusion that depends on a class having an instance hold
+only where it does. The rules that read whether a context is real are the exchange from
+a context to its individual, R7 and the facts of universal roles, and the keys between
+the rounds, and every other rule, R8 included, runs the same in the global saturation and
+in a world. A world for a class makes the class and what it reaches real, so a class
+whose global subsumers are incomplete reaches a context that one of these rules would
+read as real. Each such context is a witness. A context that is not real, derives an
+individual and has a subsumer, a Horn successor or a loop that the individual lacks is
+one, which extends today's witness by the Horn successors and the loops. A context that
+is not real and that an at-most restriction of a singular context counts as a
+predecessor is one, since R7 identifies it with another predecessor only where it has an
+instance. A context that is not real and holds a fact's restriction on a universal role
+is one, as today. The keys read the links of a real context to named individuals and its
+data values, which come from its subsumers and its Horn successors, so a context that
+derives an individual and is not real adds a key record only when it has a subsumer or a
+Horn successor the individual lacks, which makes it a witness of the first kind. The
+world's check that no real context is unsatisfiable reads realness too, and an
+unsatisfiable context that a class reaches makes the class unsatisfiable by the EL rule
+for `owl:Nothing` already. The simplest case of R7 shows the
+second kind, since `A` is not real in the global saturation, derives no individual and
+reaches no context that does, so without it `A` would get no world and `A ⊑ {b}` would be
+missed. The kinds are sufficient, by the list of rules that read realness, and not
+necessary, since `A ⊑ ∃r.{a}` with an inverse functional `r` alone makes `A` a witness
+whose world finds nothing. A cheaper criterion needs an argument of its own, which item
+868 holds. A run with the Horn rules marks the real contexts whenever the ontology has
+individuals, where a run of the EL rules does so only after a merge, a key or a universal
+role, because R7 reads the real predecessors of the global state.
+
+Each named class whose context reaches a witness is classified again in a world, as
+before, and the worlds extend to the conjunction contexts. The global table of
+conjunctions outlives the saturation, which it does today for the statistics, the views
+over the contexts include its contexts, and the witnesses and the classes reaching them
+are found over them too. A world has a table of its own for the conjunctions that its
+rules create, whose ids lie above the global table's. The world's sink looks a
+conjunction up in the global table first, which no world changes, and then in its own,
+and reads a conjunction's core from whichever table holds it. A core is a sorted set of
+the index's expressions and never names a conjunction context, so a world's table is
+bounded as the global one is. The world's copies, its table and the states of its own
+contexts count against the world budget beside the saturated state, as the copies do
+today, and the Horn budget and its fallback to the EL rules cover the world's bytes and
+the global table as they cover the first saturation. A world makes a context real from
+the global state without a copy today, and then sends `Real` to its EL successors and its
+subsumers to its individuals. In a run with the Horn rules it also sends `Real` to the
+Horn successors and the predecessor's realness to every successor, and a context that
+the world copies does so through the rules. The world runs the fifth instantiation of the
+rules on one thread, keeps only the conclusions the global state lacks, and flushes the
+pending work of R3 and R5 at the end of each activation as the saturation does. Its
+answer, the class's subsumers and whether it is unsatisfiable, is the same in any order of
+delivery, since every rule derives a consequence of the ontology and the fixpoint is the
+least one over the conclusions, while the set of conjunction contexts a run makes on the
+way can depend on the order, as it does in the global saturation today. The facts of
+universal roles and the merges of keys apply in a world between its saturations as
+before, and in a run with the Horn rules a key merge exchanges the two individuals'
+backward links and loops with their subsumers, through the exchange above, since each
+individual's context derives the other and is real.
+
+**Completeness.** The argument is Kazakov's with the identifications below, and this
+section states it as an argument and not as a proof. For a named class `D`, take the
+world of `D`, in which `D` is real, whether or not the run executes it. When `D` reaches
+no witness, the list of rules that read realness says that the world's subsumers of `D`
+are the global saturation's, which is what the run answers, so the model below serves
+for both. Build a model from the real contexts of `D`'s world as the paper's Theorem 4
+does, with the paper's choice of the successor that holds the most and its reuse of the
+predecessor where it serves, and with three identifications. `D` has an element in it,
+which is what a subsumption the world does not derive needs. Each individual is one
+element, which every real context that derives the individual stands for, and these
+contexts agree on their subsumers, backward links and loops by the exchange, with their
+ids and bookkeeping apart. Each real singular context that derives no individual has one
+element, which the contexts R7 identified it with share, and they agree the same way.
+Every other real context unravels into trees from these elements. The told axioms hold
+at each element by the paper's argument for the axioms without nominals. A nominal `{a}`
+holds at `a`'s element alone, and every context that derives it maps there. An at-most
+restriction `≤1 S.B` at an element counts its successors, which R5 merged into one, its
+predecessor in a tree, which R6 identified with the successors, its loops, and, at a
+singular element, every predecessor, all of which are real and which R7 identified
+pairwise, so they are one element. Disjoint and asymmetric roles hold on each pair by the
+checks of R5, R6, the loops and R8, which together cover every pair that two roles can
+share, since a pair shares two roles only through a merge, a loop or a singular element.
+A universal restriction holds through R3, R4 and the automata as before, and one on a
+universal role holds everywhere through its fact. The data restrictions hold by the EL
+rules' argument, and the keys by the rounds. The gate below is evidence for the argument
+on the ORE 2015 DL sample and on generated ontologies, and not a proof.
+
+**Termination and cost.** The normalized vocabulary is finite, so a run has at most
+exponentially many conjunction cores, each with finitely many subsumers, links, loops,
+flags and partners, and the rules add conclusions only, so a fair saturation ends, in a
+world as in the global saturation. R7 and the exchange add no symbol, and the conclusions
+they move can make R3 and R5 create contexts, which the same bound covers. The number of
+worlds is at most the number of named classes, and each can approach a Horn saturation of
+its own, so the Horn budget counts them, and the scans of R7 and R8 over a singular
+context's predecessors, which are quadratic in their number, poll the run's stop as the
+long rules do. `Stats` gains no count of the witnesses and the worlds, since the API
+compatibility check guards the struct, and item 868 adds the count it needs. An ontology without
+individuals, functional data properties or top properties runs the code it ran before,
+which the EL identity gate checks byte for byte, and the Horn files without individuals of
+the development set are checked the same way. The Horn files with individuals were
+measured against the build that left their Horn axioms out, in interleaved rounds on
+`atlas`, which the gate paragraph below and the
+[benchmark report](../../benchmarks/el-classification/RESULTS.md#horn-individuals) give.
+
+**Gate.** The gate is the Horn stratum of the ORE 2015 DL development set, 73 files, of
+which HermiT 1.4.5.519 classifies 68 within 1200 s, and among them the 47 files with
+individuals, functional data properties or top properties, whose Horn axioms the
+comparison before this item left out, 44 of which have a reference. On four threads the
+classifier's taxonomy equals
+HermiT's on 34 files and is sound on 33, with no difference against HermiT on any file,
+where the build before the item was equal on 23 and sound on 44. Every axiom the 33 files
+still leave out is outside the Horn rules' scope: anonymous individuals in 29 files, and
+datatypes outside OWL 2 EL or data cardinalities in 4. The reader refuses `ore_ont_9881`
+for an invalid IRI in both builds. The 25 Horn files without individuals and the 298 EL
+files of the EL identity gate keep their taxonomies byte for byte, on one and eight
+threads for the EL files, and the disjunctive rules keep every refusal of individuals,
+data properties and top properties. Hand cases cover each rule above, on one and eight
+threads, each with HermiT's answer: the simplest case of R7, a cascade of three singular
+contexts, a loop that an at-most restriction counts at a nominal, the two examples of R8
+and their forms through a context that derives the individual and through two contexts
+R7 identified, R5 and R6 with a nominal on either side and with a nominal acquired by a
+merge, a universal restriction on the top property and on its inverse held by a real
+context and by one that is not, a functional data property beside a universal
+restriction, a key beside an inverse functional property, a Horn class assertion, a
+conjunction context that a world creates, an at-least restriction of two with a nominal
+filler, and a world whose first new conclusion is `Real`. Three unit tests deliver the
+conclusions of one context in each order a saturation can produce them, for a Horn
+successor made after its source became real, a member registering after its individual
+has loops and Horn successors, and the filler of a counted loop arriving last. A
+differential run of 300 generated Horn ontologies with nominals, inverse roles,
+functionality, universals, self restrictions and disjoint and asymmetric roles, written by
+the dl603 fixture generator with a family of its own and seed 692, equals HermiT's
+taxonomy on every file on one and eight threads, where the build before the item left
+axioms out on 290 of them. The `dl_*` suites and the `sparkles-owl` library tests pass.
+The [record](../../benchmarks/el-classification/runs/2026-11-10-horn-individuals-atlas-0f944b5c/record.json)
+holds the judgements, the exclusions, the generator and the timings, which the
+[benchmark report](../../benchmarks/el-classification/RESULTS.md#horn-individuals)
+discusses.
+
+**Out of scope.** Enumerations of several individuals in a positive position need case
+analysis and stay with the rooted run. At-least restrictions above one beside
+individuals are item 867, a cheaper witness criterion is item 868, and chains through the
+top property stay in item 663. Anonymous individuals stay with the reader's rules. Data cardinalities
+and keys over data properties beside the disjunctive rules stay with item 768, counting
+with item 728 and incremental runs after a change with item 753.
 
 ### The disjunctive rules
 
@@ -947,13 +1280,15 @@ the [code layout results](../../benchmarks/el-classification/RESULTS.md#code-lay
 
 This section is the design of item 603's sixth phase, which extends the disjunctive rules
 to nominals. The rules it describes are built, apart from keys and the universal property,
-which item 805 builds. They run only when the constant `ROOTED_RUNS` in `classify/mod.rs`
-is true, and it is false, because 19 of the 50 `shoi` fixtures of the phase's gate time
-out.
-The disjunctive rules therefore still refuse ontologies with individuals and nominals as
-the section above says, and every other run takes the paths it took before these rules
-existed. The measurements and the redesign that item 804 follows are at the end of this
-section.
+which item 805 builds. They run when `Limits::rooted` asks for them, and it is off by
+default, because the completeness of the calculus as item 804 departed from the journal's
+rules is not proved and five of the 50 `shoi` fixtures of the phase's gate pass the work
+bound of a rooted run, which item 822 follows. Without the option the disjunctive rules
+refuse ontologies with individuals and nominals as the section above says, and every run
+takes the paths it took before these rules existed. The option changes nothing for an
+ontology without individuals. The measurements of the journal's rules are at the end of
+this section, and the departures of item 804 that follow them are the design the run
+follows where this section says so.
 
 A run of the disjunctive rules with nominals uses the general rooted calculus of Tena
 Cucala, Cuenca Grau and Horrocks in the journal version, *Pay-As-You-Go Consequence-Based
@@ -1003,12 +1338,15 @@ ontology inconsistent.
 
 Every context of a rooted run uses an order that is admissible in the sense of the
 journal's Definition 7, built as its Appendix A builds it from one total order on function
-symbols and constants. Named classes over `x` are incomparable with one another and with
-every ground atom, and a function-free atom that mentions `y` or a constant is above only
-what Definition 7's fifth condition allows. Each context of a named class is then a query
-context that meets condition C2 of the journal's Theorem 2, and its unit subsumers are
-complete without the candidate tests of the rules above, whose model construction ignores
-ground atoms. A clause can have several incomparable maximal literals, so the clause store
+symbols and constants, with one strengthening that item 804's departures below describe.
+Two ground literals are compared by one order that every context shares, and otherwise
+a function-free atom that mentions `y` or a constant is above only what Definition 7's
+fifth condition allows. Named classes over `x` are incomparable with one another and with
+every ground atom. Each context of a named class is then a query
+context that meets condition C2 of the journal's Theorem 2, and under the journal's rules
+its unit subsumers are complete without the candidate tests of the rules above, whose
+model construction ignores ground atoms. With item 804's departures below that
+completeness is the open obligation they record. A clause can have several incomparable maximal literals, so the clause store
 indexes every one of them. A clause keeps a canonical literal order for hashing, apart from
 the order that selects its premises.
 
@@ -1019,19 +1357,21 @@ its head is greater.
 | Rule | In the rooted run |
 |---|---|
 | Core | A context's core atoms are units, as now. The root's core is empty, and a hypothetical successor's id is not a core atom. |
-| Hyper | Outside the root the ontology clause's `x` is `x`. In the root it is a constant, so the rule matches ground atoms. |
+| Hyper | In every context the ontology clause's `x` is `x` or a constant, so the rule matches ground atoms wherever they are. The journal binds `x` to a constant in the root only, and the departure below says why every context does. In the root `x` is always a constant. |
 | Eq, Ineq and Factor | They run whenever the run is rooted, with counting on or off, and rewrite constants as well as successor terms. Eq keeps the journal's conditions on the rewriting equality, on a rewritten `x` and on rewriting every occurrence of a constant in the root. |
 | Elim | Subsumption and tautology elimination work as now. A marker `A → A` stays. |
 | Join | It resolves a maximal ground atom or equality of constants in one clause's head with the same literal in another clause's body, in any context. It is indexed by ground body literal so that either premise can arrive first. |
-| Succ | It creates or reuses a successor for a maximal literal over `f(x)`, or over `f(u)` in the root, where the edge also records the constant. One edge must cover every successor trigger of the journal's Definition 4, the ground atoms and constant equalities included. |
-| Pred | A successor's clause carries its ground body atoms and its ground head literals to the predecessor unchanged and resolves its other body atoms there. A predecessor that is the root also resolves the successor's core atoms against its own maximal premises, since an edge out of the root holds only for its constant. |
-| r-Succ | A maximal literal `Aσ` in a context other than the root, with A a root successor trigger and σ mapping `y` to `x`, adds an edge to the root labelled by A's constant and the marker `A → A` there. So `S(x, u)` gives the root the marker `S(y, u) → S(y, u)`, and the root never gets `A` as a fact. |
-| r-Pred | A root clause whose body atoms are root successor triggers returns to each context with edges to the root for their constants. That context resolves every body atom `C` as `Cσ` against its own maximal premises and receives the head with `y` read as `x`. The conjunction `A_i` that the journal's typeset rule adds to the conclusion is not introduced by its premises and is read as empty. |
+| Succ | It creates or reuses a successor for a maximal literal over `f(x)`, or over `f(u)` in any context, where the edge also records the constant. One edge must cover every successor trigger of the journal's Definition 4, the ground atoms and constant equalities included. The ground triggers are every ground atom and equality of constants, a superset of Definition 4's, which only adds markers that no inference asks for. |
+| Pred | A successor's clause carries its ground body atoms and its ground head literals to the predecessor unchanged and resolves its other body atoms there. Along an edge that records a constant the predecessor reads `y` as the constant and `x` as `f(u)`, and also resolves the successor's core atoms against its own maximal premises, since such an edge holds only for its constant. |
+| r-Succ | Not used. A context reasons about its own ground literals, as the departure below says, so the root holds no markers. |
+| r-Pred | Only for the root's processed clauses with an empty body, which reach the contexts registered for one of their constants, as below. A root clause with a body stays in the root, where Join resolves its ground body literals. |
 
 The journal's r-Pred sends a root clause without a body to every context. The rooted run
 sends it only to the contexts that hold one of its constants in a maximal literal or in a
-body. A context that resolves such a clause with one of its own clauses has a premise that
-mentions one of the clause's constants, so it already holds the clause. Some inferences
+body, and a context registers with the root for the constants of every maximal literal of
+its processed clauses and of every ground literal in their bodies. A context that resolves
+such a clause with one of its own clauses has a premise that mentions one of the clause's
+constants, so it already holds the clause. Some inferences
 are still left out, such as the marker that Succ would pass on to a successor of a context
 that never mentions the constant. Their conclusions matter only to a context that mentions
 the constant, and that context takes the clause itself once it does. The journal's system
@@ -1070,7 +1410,8 @@ through the automata of the rules above, and h is not a named individual for key
 the taxonomy.
 
 The run relies on the journal's Theorem 1 for soundness, Theorem 2 with condition C2 for
-the completeness of each named class's context, and Theorem 5 for termination with an
+the completeness of each named class's context under the journal's rules, which item
+804's departures below leave as an open obligation, and Theorem 5 for termination with an
 admissible expansion strategy. The hypothetical successors of the cautious strategy are
 admissible under Definitions 5 and 9 once one edge covers every ground trigger as above. A
 run that stops at its bound is not saturated. The dependency record of the rules above
@@ -1096,7 +1437,7 @@ consistency. Regressions with one disjunctive axiom added check that an irreflex
 property beside a nominal is left out while the run takes the rest, and that a stopped rooted run reports its consistency
 as unknown.
 
-With the switch on, the rooted run finishes 132 of the 200 runs of the 50 `shoi` fixtures,
+With the journal's rules as first built, the rooted run finishes 132 of the 200 runs of the 50 `shoi` fixtures,
 on one and four threads under both strategies, within 5 s each in a debug build, and each
 taxonomy it finishes equals HermiT's. It times out at least once on 19 fixtures. The
 smallest case, three axioms reduced from `shoi-000`, gives no answer within 200 s. Two
@@ -1114,11 +1455,294 @@ selected per clause as its Section 7.3.1 describes and without the ground
 markers to successors. The root then spends its work on clauses whose bodies join up to
 five r-Succ markers, which is the calculus's own conditional reasoning. A read-only
 consult found that the growth follows Tables 2 and 3 rather than a wrong inference, and
-recommended Sequoia's nominal contexts in place of the single root. Item 804 redesigns the
-rooted run to meet the gate. It may depart from the journal's rules, with Sequoia's nominal
-contexts, Eq blocking and query-atom order or an order of ground atoms across predicates,
-and this section is to record each departure with its rationale, its argument for
-soundness and completeness and its measured effect.
+recommended Sequoia's nominal contexts in place of the single root. Item 804 departs from
+the journal's rules instead as the next subsection records, with the rationale, the
+argument for soundness and completeness and the measured effect of each departure.
+
+#### Item 804's departures from the journal's rules
+
+The journal's root reasons about markers. A context that derives `Γ → Δ ∨ B(u)` tells the
+root only that `B(u)` may hold, as the marker `B(u) → B(u)`, and the root derives what
+follows at `u` from every combination of the markers it holds, under those markers as
+conditions, so that r-Pred can hand each conditional clause to every context that holds
+its conditions as maximal literals. The root therefore computes the consequences of the
+ontology at `u` under every subset of the ground atoms that any context has ever found
+maximal, which is the second measured cause, and the fifth condition of Definition 7 keeps
+every ground atom maximal so that each one can become a marker, which the first cause
+needs. The four departures below remove the markers, order the ground literals, block
+the equalities with `x` outside query contexts and select the ground literals of bodies
+outside the root. Each is an inference restriction or an
+extension by sound instances of the ontology's clauses, so the run stays sound by the
+argument of the journal's Theorem 1, and the soundness of each is argued in its place.
+The journal's completeness proof does not carry over to the departures as it stands. Each
+departure therefore records the argument for its completeness, the obligations of the
+journal's proof that the argument leaves open, and its measured effect, and the run keeps
+a departure only when the gate needs it. The gate, exact taxonomies and consistency on
+every fixture, is regression evidence for completeness and not a proof of it, and a
+further check classifies freshly generated ontologies of the gate's families against
+HermiT.
+
+**A context reasons about its own ground literals.** Hyper binds the ontology clause's `x`
+to a constant in every context, not only in the root, with the other variables bound to
+`x`, `y`, a successor term or a constant as the context's literals allow, and it binds the
+clause's `x` to the context's `x` with a role atom's other end bound to a constant, so
+that a holder of `∀t.C` over `x` and `t(x, u)` give `C(u)` whichever comes first. A maximal
+literal over `f(u)` takes Succ in any context. The edge records the predecessor, the
+existential restriction, the constant and the successor, and is distinct from the edge
+for `f(x)` of the same restriction even when both reach the same successor. Pred along
+such an edge reads `y` as `u` and `x` as `f(u)`, resolves the successor's core atoms as
+it does for the root and admits the head forms that Table 3 admits for the root, among
+them a role atom between the successor's `x` and a constant, and it replays for an edge
+or a premise that comes later. The run uses neither r-Succ nor the r-Pred of a root
+clause with a body, and the root holds no markers. The root is the context of the
+unconditional ground facts, which the assertions, the singleton classes and the clauses
+with the body `owl:Thing` give it, saturated with Hyper at the constants, Succ over
+`f(u)` and the equality rules. Its processed clauses with an empty body reach the
+contexts registered for their constants as above, whether the registration or the
+clause comes first, and a context registers for the constants of every maximal literal
+of its processed clauses, inside `f(u)` included, for the constants of `x ≈ u` and for
+those of the ground literals in its bodies. The empty clause in the root has no constant
+to route it by, so the root's bottom is the run's inconsistency and reaches the answer
+without registration. A context's own ground literals are conditional on its core and
+on its bodies, so the root cannot take them, and the context derives their consequences
+at `u` itself from the actual disjunctions it holds, where the root would derive them
+under every combination of markers.
+
+The literals of a context other than the root are those over `x`, `y` and `f(x)` of the
+rules above, the ground literals, which are `B(u)`, `S(u, v)`, `u ≈ v` and `u ≉ v`, the
+role atoms `S(x, u)` and `S(u, x)`, the equalities `x ≈ u` and `f(x) ≈ u`, and the
+literals over `f(u)` that the root holds, which are `B(f(u))`, a role atom between `f(u)`
+and any constant in either direction, `f(u) ≈ v`, and the inequalities `f_i(u) ≉ f_j(u)`
+of a minimum restriction with counting. The set is closed under the rules. Hyper at a
+constant `u` makes literals over `u` and `f(u)` only. Pred along an edge for `f(u)` reads
+`x` as `f(u)`, `y` as `u` and keeps the constants, so a successor's head over `x`, `y` and
+constants becomes one of the forms listed, among them `S(v, f(u))` from `S(v, x)`, which
+is a Hyper premise for the universal restrictions of `v`'s holders and no successor
+trigger, since Definition 4's `S(y, x)` reads as `S(u, f(u))` along that edge. Eq rewrites
+a constant at every occurrence in the selected literal, in every context, as Table 2 has
+the root do, so that `S(u, f(u))` rewritten by `u ≈ v` is `S(v, f(v))` and `f(u)` never
+appears beside a rewritten form of `u`, and Factor makes inequalities of the a-terms
+already present. The order groups every literal over `f(u)` with the literals over
+successor terms, which are totally ordered as above by the greatest successor term, the
+role, the predicate and the terms.
+
+Successors still take markers. When Succ fires, the successor gets `A → A` for every
+ground literal `A` of Definition 4's successor triggers that is maximal in a processed
+clause of the predecessor, as the journal's rule K2 says, and a context sends a later
+trigger to the successors it already has. A hypothetical successor with the empty core
+takes its predecessors' hypotheses as markers and nothing as a core unit, and keeps every
+guard when several predecessors share it. The triggers are every ground atom and
+equality of constants, a superset of Definition 4's, since a told subsumption puts its
+subclass in a body and so nearly every predicate qualifies, and a marker that no
+inference asks for costs one clause in the successor's store.
+
+The run also restricts the ground inferences. A ground inference is a Hyper whose body
+atoms are all bound to constants, an Eq or Factor whose equality and rewritten literal
+hold neither `x` nor `y`, or a Join of two clauses that hold neither `x` nor `y`, and
+its conclusion has a body only when a premise carries a hypothesis. Such a conclusion, a
+clause that holds neither `x` nor `y` and has a body, is not made in any context. The
+restriction keeps a successor from computing the ground closure of the ontology under
+the markers of all its predecessors, which would be the root's explosion again, one
+successor at a time, and it keeps a hypothesis from creating successors of `u` in a
+context that holds it only as a marker. What a marker contributes is what follows for
+the successor's own element from the hypothesis, through Hyper with a body atom bound to
+`x` or `y`, which may conclude a ground clause with a body, such as `A(u) → B(u)` from
+`D(x) ∧ S(x, u)` and a universal restriction, and through the ground inferences whose
+conclusions mention `x` or `y`. The ground consequences of a hypothesis alone are left to
+the context that holds the marked literal in an actual clause.
+
+The argument for completeness is the one for ordered resolution. A root clause `A_1 ∧ … ∧
+A_n → Δ` that r-Pred would hand to a context `v`, where `v` holds each `A_iσ` as a
+maximal literal in `Γ_i → Δ_i ∨ A_iσ`, is derived in the root by Hyper at constants, Eq,
+Join, Succ over `f(u)` and Pred from the markers and the ontology clauses, and each of
+those inferences has a counterpart in `v` with the actual premises in place of the
+markers, since `v` has the same rules at constants and the same successor for `f(u)`.
+The counterpart's conclusion carries the residual disjunctions `Δ_i`, which can leave an
+intermediate ground literal below a greater one, so that the next inference of the chain
+is not made in `v` while the root made it. Ordered resolution leaves such an inference
+out and stays complete by a model construction, in which a clause whose greatest literal
+the construction makes true needs no inference on a smaller one, and whether that
+construction carries over to the contexts of the departed run is the open obligation
+below, so this is a motivation and not an argument. The restriction leaves
+out a ground conclusion under hypotheses, and the argument for it is that the context
+which holds a marked literal in an actual clause can derive the ground conclusion from
+its actual clause and the other premises, which reach it as root facts by registration or
+as ground heads that Pred carries, and sends each literal of the conclusion as a marker
+once it is maximal there. The argument is not a proof. The journal's Appendix D builds
+its model one term at a time with a ground order chosen from the literals it has already
+made false, under its properties O1 to O3, and lifts the ground clauses to context
+clauses with its Lemmas 7 and 8, which exclude `f(u)` from a context other than the root.
+The departure leaves open the lifting with `f(u)` in every context and the discharge of
+hypotheses across a successor that several predecessors share and across chains of
+successors, where no one context holds every actual premise of a left-out inference. The
+restriction is therefore kept only if the gate needs it, and its effect is measured
+with it on and off. Termination holds as in the journal's Theorem 5. The terms of a
+context are `x`, `y`, `f(x)`, the constants and `f(u)`, and a successor's `x` stands for
+`f(x)` or `f(u)` of its predecessor, so no context holds a nested term and the set of
+literals of each context is finite.
+
+**One order of ground literals.** Every context compares two ground literals by one
+order that every context shares. The order is on terms first. The constants are ordered
+by the one total order on function symbols and constants that Definition 7 starts from,
+and the ground atoms, which are terms of the sort of the predicates, by the lexicographic
+path order of a precedence that puts every predicate above every constant, the roles
+above the classes and then the predicates by their ids. Two ground atoms thus compare by
+predicate first and then by their constants from the left. The equalities and
+inequalities of constants compare as Definition 7 has them, by the multiset extension of
+the order on constants, and a ground atom is above every equality and inequality of
+constants, since a predicate is above every constant. Everything else follows Definition
+7 and the Sequoia construction as above. A ground atom is above `x`, `y`, the constants
+and the equalities `x ≈ u` and `y ≈ u`, and it stays incomparable with every atom over
+`x` or `y`, so a clause that holds both a ground atom and an atom over `x` still
+resolves on either.
+
+The fifth condition of Definition 7 leaves ground atoms of different predicates
+incomparable. The journal explains the condition by the literals that Pred carries to a
+predecessor, which must not block a literal that only the context itself can resolve, and
+that part of the condition the departure keeps, since a ground atom never blocks an atom
+over `x` or `y`. Two ground atoms of one clause both go to the predecessor whatever their
+order, and Succ's markers follow the order, so a ground trigger that is not yet maximal
+is not yet a hypothesis of its successors, which the departure conjectures to be
+dispensable and does not show. A context then resolves its ground literals one at a time
+by the order, as ordered resolution does, which is the motivation for the departure and
+not an argument. The journal's proof needs more than that. Its Appendix D chooses the ground order of each
+model fragment from the literals already made false, under its properties O1 to O3, and
+the fifth condition is what lets every such order extend the context order. A context
+order that fixes the order of two ground atoms can contradict the order a fragment would
+choose, so the proof's construction does not carry over, and whether the departed run is
+complete under the shared order is an open obligation. The departure is kept only if the
+gate needs it, and its effect is measured against the admissible order with the other
+departures in place.
+
+**Equalities with `x` in query contexts.** The rewriting equality `x ≈ u` rewrites `x` to
+`u` only in a unit clause whose atom is a core atom of a query context, which is the
+context of a named class, and rewrites `u` to `x` only in a named-class atom over `u` and
+only in a query context. Elsewhere Eq does not rewrite with `x ≈ u`. Every other rule
+stays. Factor takes `x ≈ u` and `x ≈ v` in one head as Table 2 says, and an equality of
+constants `u ≈ v` rewrites the constant in `x ≈ u` to give `x ≈ v`, since it is the
+rewriting equality and `x ≈ u` only the rewritten literal, and `f(x) ≈ u` rewrites as
+usual. The journal's Section 7.2.3 reports that its completeness proof needs `x ≈ u` as
+the rewriting equality only in query contexts and only on query atoms, and its Lemmas 21
+and 22 use exactly the two forms kept. Lemma 21 rewrites a unit `Γ_0 → A(x)` with `A(x)`
+in the query body, which for classification is the context's core atom, so that the
+constant's facts include `A(u)` and the consequences at `u` follow from the ontology's
+clauses there, and Lemma 22 rewrites `x ≈ u` by `u ≈ v` and then needs a clause with
+`x ≈ u` maximal beside named atoms, which the second form rewrites back to `x`. A
+successor context has no query and needs neither form. Its element's equality to a
+constant reaches the predecessor as `f(x) ≈ u`, where Eq rewrites `f(x)` to `u` as usual
+and the predecessor reasons at `u`. Sequoia blocks the same inferences. The journal's
+observation is about its own calculus, and that it carries over to the run without the
+root's markers is part of the open obligation above. Without the blocking the run
+rewrites every clause over `x` of a context that holds `x ≈ u`, and in the earlier
+experiments the blocking was on in every configuration that finished.
+
+**Selection of the ground literals in bodies.** In a context other than the root, a
+clause whose body holds a literal with neither `x` nor `y` is selected, a marker `A(u) →
+A(u)` included. A selected clause is a premise only of an inference local to the context,
+of Join on its ground body literal as the side with the body, of Pred and of Succ, and it
+still sends the hypotheses and markers of its maximal literals. An inference is local when
+it is on a literal that holds a successor term of the context or on a role atom between
+`x` or `y` and a constant or a successor term of a constant, since no predecessor sees
+such a literal and no other context can make the inference. Hyper over `x` and `y`, Hyper
+at a constant and Eq or Factor of ground or `x` literals on a selected clause are left to
+the predecessor, which receives the clause by Pred, discharges the ground body by Join
+against its actual clauses and sends the hypotheses and markers that let the context go
+on. One exception stays in the context. A selected clause whose head holds an atom over
+`x` cannot go to the predecessor, since Pred carries no such head, so it takes the Hyper
+over `x` itself, with the unselected clauses as its partners. Partner lookups leave out
+selected clauses the same way, so an inference between two clauses fires or not whatever
+their order of processing. The rationale is the measured cause of the remaining work
+after the first three departures. In shoi-005's dominant context 13,731 of 17,384 distinct
+clauses held a ground literal in the body and 9,731 two or more, which is the root's
+marker explosion moved into one context, since the context combined the markers of all
+its predecessors in bodies. A restriction of inferences is sound. The argument for
+completeness is that of ordered resolution with selection, where a clause with a selected
+literal resolves only on it, and the predecessor that holds the marked literal in an
+actual clause makes the inference the context leaves out. What the argument leaves open is
+the return path. The predecessor's clause after Join holds the context's literals over
+`f(x)` and sends them as hypotheses, and whether every inference the context leaves out
+comes back this way across a shared successor or a chain of successors is not shown. A
+consult proposed the ontology `Q ⊑ ∃s.D`, `Q ⊑ ∃t.{a}`, `Q ⊑ ∀t.∀r.A`, `D ⊑ ∃r⁻.{a}`,
+`A ⊑ ⊥` as a case where the exception is needed, and it is a regression test, which
+passes. The selection is measured with it on and off, and the run keeps it only if the
+gate needs it.
+
+**The facts of a hypothetical successor go to the root.** A hypothetical successor has the
+empty core and no denied class, and its hypotheses and markers are in the bodies of its
+clauses, so a clause of its with an empty body holds of every element under no assumption.
+Such a clause whose literals hold neither `x` nor `y`, which are over constants and their
+successor terms, holds in every model of the ontology, and it goes to the root as a fact,
+once per distinct head, instead of staying in the context. The root derives it as its own
+clause, with its redundancy, processes it and offers it to the contexts registered for its
+constants as it does its other facts, this context included when it is registered. The
+root's own facts stay in the context that takes them. The empty clause with an empty body
+takes no such path, since it has no constant, and makes the context unsatisfiable, which
+reaches its predecessors and the root by Pred as before. The rule is sound by the argument
+above. For completeness, the inferences on a clause over constants and their successor
+terms are Hyper at the constants, Join, Eq, Factor and Succ over `f(u)`, which the root
+makes on the same clause with the same rules, and the context's inferences that need the
+clause as a partner, Join on a ground body literal and Hyper or Eq with a mixed clause,
+need a clause of the context that mentions one of the fact's constants in a maximal
+literal or a body, which registers the context for that constant, so the fact comes back
+before the inference is due. The rationale is measured. A hypothetical successor derived
+2,956 pure ground clauses with an empty body in one second of shoi-005 after the
+selection, two thirds of them over a successor term of a constant, where the root derived
+197 distinct clauses in the same second, and the context ran Hyper at the constants, Succ
+and Pred over them again. With the rule, shoi-015 answers in 0.5 s where it timed out
+before.
+
+**Measured effect.** The measurements are on a debug build on the laptop under load, with
+one thread unless noted, and the counts of conclusions come from the derivation trace
+(`DLTRACE`), which labels each conclusion by context and rule before normalization and
+each processed clause. With the journal's rules, the smallest case gives
+no answer in 200 s and 19 of 50 `shoi` fixtures time out. With the first three departures,
+the smallest case answers in 2.9 ms, and 44 of 50 `shoi` fixtures give HermiT's taxonomy
+in every one of the four configurations, one and four threads under both strategies, in 5
+s, with 0 wrong anywhere, and six time out, shoi-005, 015, 022, 027, 032 and 042. With
+the selection and the promotion of facts, 45 of 50 pass in every configuration, 180 of
+200 runs, with 0 wrong, shoi-015 answers in 0.5 s, and shoi-005, 022, 027, 032 and 042
+time out in every configuration at 5 s and at 10 s. The remaining work is attributed. In
+one second of shoi-005 the dominant context, a hypothetical successor shared by several
+predecessors with the hypotheses `N_a0(x)`, `∃r0⁻.C3(x)` and `∃r3.{a0}(x)`, derives
+24,286 distinct conclusions, 21,665 of them mixed, with literals over `x` beside ground
+literals in the head, and 18,524 of the mixed conclusions are Eq inferences whose
+rewriting equality is `f(x) ≈ u`, for the successor term of `∃r3.{a0}` and the constants
+that `{a2} ⊔ {a0}` and `{a3} ⊔ {a2}` make it equal to. 433 processed clauses with such an
+equality maximal, each with its own residue of ground literals, hypotheses and markers,
+each rewrite about 180 clauses that hold `f(x)` in a maximal literal, each with its own
+residue, and the rewritten clauses hold ground atoms over the constant beside the
+residue's literals over `x`, so the context then reasons at the constant once per residue.
+Every other rule contributes under a thousand conclusions. The product is ordered
+paramodulation on `f(x) ≈ u` as Table 2 has it, and the journal's calculus makes the same
+inferences in the same context, since the successor's `x ≈ u` reaches the predecessor as
+`f(x) ≈ u` there too. Sequoia's nominal contexts of Section 7.2.2 fragment the root by
+constant and keep the journal's markers, so they do not touch this context's work. A
+restriction that leaves these inferences out needs an argument that the knowledge about
+`f(x)` reaches the constant another way, and the run has none yet, so the five fixtures
+go to item 822 with this attribution and the candidate restrictions, which are to treat
+`f(x) ≈ u` like `x ≈ u` under the third departure with another route for the successor's
+knowledge to the constant, to order the literals over `f(x)` below the ground literals of
+a mixed clause so that it processes on its ground part first, which changes the lifting of
+Pred and Succ, and demodulation where `f(x) ≈ u` is a unit under the hypotheses, which the
+disjunctive equalities here do not give.
+
+**The landed run.** Item 804 lands the rooted run as the option `Limits::rooted`, off by
+default, under the policy that it becomes the default only after 0 taxonomy differences on
+the ORE 2015 DL sample, several thousand generated fixtures against HermiT and the `shoi`
+and nominal fixtures, which item 823 holds. A rooted run without counting has a bound of
+524,288 derived conclusions, which `Limits::dl_work` changes, since the 45 fixtures that
+finish derive under 190,000 on one and on four threads and the five that do not derive
+millions. A run that passes it classifies again without the rooted rules, which leaves the
+axioms outside OWL 2 EL out and reports them as a run without the option does, and sets
+`Stats::dl_rooted_over` and `dl_over_budget`, so an ontology that the run cannot finish
+gets its default answer after the bound's work. A rooted run that counts keeps the
+counting bound and its retry without counting, which then has the rooted bound. Over the
+50 `shoi` fixtures with the option on, 45 give HermiT's taxonomy in every configuration
+and the other five fall back to their default answer, with 0 wrong, which the `dl_fixtures`
+suite checks on one thread under the cautious strategy and four threads under the eager
+one. The share of the work that the duplication of ground reasoning across contexts
+costs will be measured on ore_ont_15803 with its two top-property axioms removed, since
+the file itself waits on item 805.
 
 ### ROBOT-compatible commands
 

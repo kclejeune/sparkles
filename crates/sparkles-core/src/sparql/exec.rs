@@ -3,6 +3,10 @@
 use super::ctx::Ctx;
 use super::expr::{Expr, Row, Val, ebv, eval};
 use super::exprcache::Report as ExprReport;
+use super::join::hash::{
+    self, EqualityIndex, HashIndex, Join, Mode, NO_ROW, PROBE_PIECE, Probe, gather,
+};
+use super::join::merge;
 use super::plan::{
     Agg, GraphFilter, JoinAlgo, Kind, Node, OrderedTopK, PathEnd, PathSpec, RangeSpec, ScanSpec,
 };
@@ -1163,8 +1167,12 @@ fn run_node(
                         },
                         None => cross(ctx, &l, &r)?,
                     },
-                    JoinAlgo::Merge => join_noted(ctx, &l, &r, true, &mut note)?,
-                    JoinAlgo::Hash => join_noted(ctx, &l, &r, false, &mut note)?,
+                    JoinAlgo::Merge => join_or_spill(ctx, n, l, r, &mut note, |l, r, note| {
+                        join_noted(ctx, l, r, true, note)
+                    })?,
+                    JoinAlgo::Hash => join_or_spill(ctx, n, l, r, &mut note, |l, r, note| {
+                        join_noted(ctx, l, r, false, note)
+                    })?,
                 }
             }
         }
@@ -1232,7 +1240,9 @@ fn run_node(
                 }
                 None => child(1, infos)?,
             };
-            let t = left_join(ctx, &l, &r, expr.as_ref(), &mut note)?;
+            let t = join_or_spill(ctx, n, l, r, &mut note, |l, r, note| {
+                left_join(ctx, l, r, expr.as_ref(), note)
+            })?;
             if let Some(e) = expr {
                 let (exists, c) = super::exists::explain(ctx, std::slice::from_ref(e));
                 if let Some(x) = exists {
@@ -1245,6 +1255,7 @@ fn run_node(
         Kind::KeyedLeftJoin { expr, left, right } => {
             let l = child(0, infos)?;
             let r = child(1, infos)?;
+            // a keyed join partitions in neither mode, since its sides share no variable
             keyed_left_join(ctx, &l, &r, expr, (*left, *right), &mut note)?
         }
         Kind::KeyedJoin {
@@ -1257,12 +1268,14 @@ fn run_node(
         Kind::Minus => {
             let l = child(0, infos)?;
             let r = child(1, infos)?;
-            minus(ctx, l, &r, &mut note)?
+            join_or_spill(ctx, n, l, r, &mut note, |l, r, note| minus(ctx, l, r, note))?
         }
         Kind::HalfJoin { anti } => {
             let l = child(0, infos)?;
             let r = child(1, infos)?;
-            half_join(ctx, l, &r, *anti)?
+            join_or_spill(ctx, n, l, r, &mut note, |l, r, _| {
+                half_join(ctx, l, r, *anti)
+            })?
         }
         Kind::Union => {
             let mut out = Table::new(n.vars.clone());
@@ -4044,6 +4057,72 @@ fn scan_into(
 
 // ------------------------------------------------------------------ joins ------
 
+/// Run `join` over the tables `l` and `r` of the binary join `n`, and when it fails on a
+/// memory budget that a query with spill answers by spilling, join them again as the
+/// cursor's partitioned hash join over the two tables, so that an eager join whose
+/// build does not fit spills instead of failing.
+fn join_or_spill(
+    ctx: &Ctx,
+    n: &Node,
+    l: Table,
+    r: Table,
+    note: &mut Option<String>,
+    join: impl FnOnce(&Table, &Table, &mut Option<String>) -> Result<Table>,
+) -> Result<Table> {
+    match join(&l, &r, note) {
+        Err(error) if hash::spills(ctx, &error) => spilled_join(ctx, n, l, r, note, error),
+        other => other,
+    }
+}
+
+/// The join `n` of the tables `l` and `r` through the cursor's partitioned hash join,
+/// after the eager join failed with `error`. A context that is not shared, or a join
+/// the cursor cannot run, keeps the eager failure.
+fn spilled_join(
+    ctx: &Ctx,
+    n: &Node,
+    l: Table,
+    r: Table,
+    note: &mut Option<String>,
+    error: Error,
+) -> Result<Table> {
+    let Some(shared) = ctx.shared() else {
+        return Err(error);
+    };
+    let leaf = |t: Table| {
+        let certain: Vec<VarId> = t
+            .vars
+            .iter()
+            .enumerate()
+            .filter(|&(c, _)| !has_undef(&t, c))
+            .map(|(_, v)| *v)
+            .collect();
+        let sorted = t.sorted.clone();
+        let vars = t.vars.clone();
+        let est = t.len() as f64;
+        let mut leaf = Node::leaf(Kind::Values(t), vars, est, String::new());
+        leaf.certain = certain;
+        leaf.sorted = sorted;
+        leaf
+    };
+    let mut node = Node::leaf(n.kind.clone(), n.vars.clone(), n.est, String::new());
+    node.certain.clone_from(&n.certain);
+    node.children = vec![leaf(l), leaf(r)];
+    let mut out = Table::new(n.vars.clone());
+    match super::cursor::spilled_join(&shared, node, &mut out) {
+        Ok(()) => {}
+        // the cursor could not run the join, so the eager failure stands
+        Err(Error::Unsupported(_)) => return Err(error),
+        Err(other) => return Err(other),
+    }
+    let spilled = "[build did not fit: partitioned to disk]";
+    *note = Some(match note.take() {
+        Some(note) => format!("{note} {spilled}"),
+        None => spilled.to_string(),
+    });
+    Ok(out)
+}
+
 /// Output layout of a join: left vars, then right-only vars.
 struct JoinLayout {
     vars: Vec<VarId>,
@@ -4081,207 +4160,224 @@ fn compatible(l: &Table, r: &Table, i: usize, j: usize, shared: &[(usize, usize)
     })
 }
 
-fn materialize(l: &Table, r: &Table, lay: &JoinLayout, pairs: &[(u32, u32)]) -> Table {
-    let mut cols: Vec<Vec<Id>> = Vec::with_capacity(lay.vars.len());
-    for (lc, col) in l.cols.iter().enumerate() {
-        let fill = lay.shared.iter().find(|(x, _)| *x == lc).map(|(_, rc)| *rc);
-        cols.push(
-            pairs
-                .iter()
-                .map(|&(i, j)| {
-                    let v = col[i as usize];
-                    match (v.is_undef(), fill) {
-                        (true, Some(rc)) => r.cols[rc][j as usize],
-                        _ => v,
-                    }
-                })
-                .collect(),
-        );
+/// The rows of a join from left row indices `li` and right row indices `rj` (`NO_ROW`
+/// for none). The left side's unbound shared variables take the right row's values. Each
+/// column is allocated at exactly the row count, since the algorithm join admits the
+/// table's bytes before it is built and a column grown from empty would take the
+/// allocator's minimum capacity instead for a few rows.
+fn materialize(l: &Table, r: &Table, lay: &JoinLayout, li: &[u32], rj: &[u32]) -> Table {
+    let mut t = Table::new(lay.vars.clone());
+    for col in &mut t.cols {
+        col.reserve_exact(li.len());
     }
-    for &rc in &lay.right_only {
-        cols.push(pairs.iter().map(|&(_, j)| r.cols[rc][j as usize]).collect());
-    }
-    Table {
-        vars: lay.vars.clone(),
-        cols,
-        len: pairs.len(),
-        sorted: Vec::new(),
-    }
+    let columns = hash::columns(&lay.vars, &l.vars, &r.vars);
+    gather(&mut t, &columns, l, r, li, rj);
+    t
 }
 
 fn has_undef(t: &Table, c: usize) -> bool {
     t.cols[c].iter().any(|v| v.is_undef())
 }
 
-/// Exponential + binary search for the first index `>= target` starting at `from`.
-#[inline]
-pub(super) fn gallop(col: &[Id], from: usize, target: Id) -> usize {
-    let mut step = 1;
-    let mut hi = from;
-    while hi < col.len() && col[hi] < target {
-        hi = from + step;
-        step *= 2;
+/// Run `piece` over the rows `0..n` of a probe in pieces of [`PROBE_PIECE`] rows, in
+/// parallel when there are at least two, and collect the pieces in row order.
+fn probe_pieces<T: Send>(
+    n: usize,
+    piece: impl Fn(usize, usize) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    if n < 2 * PROBE_PIECE {
+        return Ok(vec![piece(0, n)?]);
     }
-    let lo = from + step / 4;
-    let hi = hi.min(col.len());
-    lo.min(hi) + col[lo.min(hi)..hi].partition_point(|x| *x < target)
+    (0..n.div_ceil(PROBE_PIECE))
+        .into_par_iter()
+        .map(|p| piece(p * PROBE_PIECE, ((p + 1) * PROBE_PIECE).min(n)))
+        .collect()
 }
 
-/// The rows of a hash join's build side grouped by key. Within a partition, `map` finds
-/// the span of `rows` that holds a key's rows in row order (the key is the id of a single
-/// key column, or a hash of several). A partition is laid out by counting each key's rows
-/// and then placing every row, so the build allocates a few arrays instead of a list per
-/// key. A build side of [`PART_MIN`] rows or more is split by bits of a hash of the key
-/// into partitions of about [`PART_ROWS`] rows, whose tables stay in the CPU caches while
-/// they are built, in parallel.
-struct KeyGroups {
-    /// the partition of a key is its mixed hash shifted right by this (64: one)
-    shift: u32,
-    parts: Vec<KeyPart>,
+/// The pairs of an inner or OPTIONAL join without a condition over the whole probe
+/// table of `join`, as (probe rows, build rows), found in parallel pieces. The pairs of
+/// all pieces are checked against the output limits of `w` columns as they grow.
+fn hash_pairs(ctx: &Ctx, join: &Join, w: usize) -> Result<(Vec<u32>, Vec<u32>)> {
+    let total = AtomicUsize::new(0);
+    let pieces = probe_pieces(join.probe.len(), |s, e| {
+        let mut at = Probe::new(s..e);
+        let (mut lp, mut rp) = (Vec::new(), Vec::new());
+        let mut counted = 0;
+        while at.row < e {
+            ctx.check()?;
+            join.pairs(ctx, &mut at, PROBE_PIECE, &mut lp, &mut rp)?;
+            let n = lp.len() - counted;
+            counted = lp.len();
+            let all = total.fetch_add(n, AtomicOrdering::Relaxed) + n;
+            ctx.check_output(all, w)?;
+        }
+        Ok((lp, rp))
+    })?;
+    Ok(match pieces.len() {
+        1 => pieces.into_iter().next().expect("one piece"),
+        _ => {
+            let n = pieces.iter().map(|(lp, _)| lp.len()).sum();
+            let (mut lp, mut rp) = (Vec::with_capacity(n), Vec::with_capacity(n));
+            for (l, r) in pieces {
+                lp.extend_from_slice(&l);
+                rp.extend_from_slice(&r);
+            }
+            (lp, rp)
+        }
+    })
 }
 
-struct KeyPart {
-    map: FxHashMap<u64, (u32, u32)>,
-    rows: Vec<u32>,
-}
+/// The candidate pairs a join with a condition tests at a time.
+pub(super) const KEYED_CHUNK: usize = 1 << 16;
 
-/// Rows per partition of a hash join's build side: a partition's table of about 24 bytes
-/// per row fits in the per-core cache.
-const PART_ROWS: usize = 8192;
-
-/// Build sides with fewer rows have one partition, built on one thread: their table fits
-/// in the caches anyway, and handing pieces to other threads costs more than it saves.
-const PART_MIN: usize = 1 << 16;
-
-/// Probe rows per parallel piece of a hash join.
-const PROBE_PIECE: usize = 1 << 15;
-
-impl KeyGroups {
-    fn build(ctx: &Ctx, t: &Table, cols: &[usize]) -> Result<KeyGroups> {
-        let n = t.len();
-        let keys: Vec<u64> = map_rows(ctx, n, n >= PART_MIN, |i| Self::key_of(t, cols, i))?;
-        let bits = if n < PART_MIN {
-            0
-        } else {
-            (n / PART_ROWS).next_power_of_two().trailing_zeros().min(12)
-        };
-        let shift = 64 - bits;
-        if bits == 0 {
-            let part = KeyPart::build(&keys, (0..n as u32).collect());
-            return Ok(KeyGroups {
-                shift,
-                parts: vec![part],
-            });
-        }
-        // the rows of each partition, in row order (a counting sort on the partition)
-        let part_of = |k: u64| (mix(k) >> shift) as usize;
-        let mut count = vec![0u32; 1 << bits];
-        for &k in &keys {
-            count[part_of(k)] += 1;
-        }
-        let mut at: Vec<u32> = Vec::with_capacity(count.len() + 1);
-        let mut sum = 0u32;
-        at.push(0);
-        for c in &count {
-            sum += c;
-            at.push(sum);
-        }
-        let mut next = at.clone();
-        let mut order = vec![0u32; n];
-        for (i, &k) in keys.iter().enumerate() {
-            let p = &mut next[part_of(k)];
-            order[*p as usize] = i as u32;
-            *p += 1;
-        }
+/// The pairs of a join with a condition over the whole probe table of `join`, as (probe
+/// rows, build rows), with the number of candidate pairs the condition was tested on.
+/// The condition is tested on the merged rows of a chunk of candidates at a time, and a
+/// chunk takes at most a quarter of the room the query has left.
+fn hash_condition(
+    ctx: &Ctx,
+    join: &Join,
+    lay: &JoinLayout,
+    expr: &Expr,
+) -> Result<(Vec<u32>, Vec<u32>, u64)> {
+    let w = lay.vars.len() + 1;
+    let columns = hash::columns(&lay.vars, &join.probe.vars, &join.build.vars);
+    let per_pair = 8 + w as u64 * 8 + 1;
+    let room = usize::try_from(ctx.memory_room() / 4 / per_pair).unwrap_or(usize::MAX);
+    let cap = KEYED_CHUNK.min(room).max(1);
+    let mut at = Probe::new(0..join.probe.len());
+    let (mut lp, mut rp) = (Vec::new(), Vec::new());
+    let mut candidates = 0u64;
+    while at.row < at.end {
         ctx.check()?;
-        let parts = (0..count.len())
-            .into_par_iter()
-            .map(|p| KeyPart::build(&keys, order[at[p] as usize..at[p + 1] as usize].to_vec()))
-            .collect();
-        Ok(KeyGroups { shift, parts })
+        candidates += join.condition(
+            ctx, &mut at, &columns, &lay.vars, expr, cap, &mut lp, &mut rp,
+        )? as u64;
+        ctx.check_output(lp.len(), w)?;
     }
+    Ok((lp, rp, candidates))
+}
 
-    /// The table key of row `i` of `t` on the key columns `cols`.
-    #[inline]
-    fn key_of(t: &Table, cols: &[usize], i: usize) -> u64 {
-        match cols {
-            [c] => t.cols[*c][i].0,
-            _ => {
+/// Which probe rows of `join`, a semi, anti or MINUS join, pass, found in parallel
+/// pieces.
+fn hash_filter(ctx: &Ctx, join: &Join) -> Result<Vec<bool>> {
+    let n = join.probe.len();
+    let pieces = probe_pieces(n, |s, e| {
+        let mut at = Probe::new(s..e);
+        let mut lp = Vec::new();
+        while at.row < e {
+            ctx.check()?;
+            join.filter(ctx, &mut at, PROBE_PIECE, false, &mut lp)?;
+        }
+        Ok(lp)
+    })?;
+    let mut keep = vec![false; n];
+    for lp in pieces {
+        for row in lp {
+            keep[row as usize] = true;
+        }
+    }
+    Ok(keep)
+}
+
+/// The hash table of an eager join's build side: the table itself, the probe side's
+/// composite keys when the table is keyed on several columns, and the charge of the
+/// keys while the probe runs.
+struct EagerIndex<'a> {
+    index: Option<HashIndex>,
+    probe_keys: Option<Vec<Id>>,
+    _keys: Option<super::ctx::Charge<'a>>,
+}
+
+impl EagerIndex<'_> {
+    /// The kernel's view of the probe table `probe` against `build` in `mode`.
+    fn join<'a>(
+        &'a self,
+        mode: Mode,
+        probe: &'a Table,
+        build: &'a Table,
+        shared: &'a [(usize, usize)],
+    ) -> Join<'a> {
+        Join {
+            mode,
+            probe,
+            build,
+            shared,
+            index: self.index.as_ref(),
+            probe_keys: self.probe_keys.as_deref(),
+            equality: None,
+        }
+    }
+}
+
+/// The hash table of `build` for the shared columns `shared` (probe column, build
+/// column). Two or more shared columns that neither side leaves unbound key the table
+/// on a hash of them all, so that a probe row meets about the rows of its own key, and
+/// the kernel checks the columns themselves on each candidate. Otherwise the table is
+/// keyed on the one column the kernel chooses, or there is none and every probe row
+/// visits every build row. The note names the table.
+fn hash_index<'a>(
+    ctx: &'a Ctx,
+    probe: &Table,
+    build: &Table,
+    shared: &[(usize, usize)],
+    note: &mut Option<String>,
+) -> Result<EagerIndex<'a>> {
+    if build.is_empty() {
+        // nothing to find: every probe row visits the no rows there are
+        return Ok(EagerIndex {
+            index: None,
+            probe_keys: None,
+            _keys: None,
+        });
+    }
+    let exact: Vec<(usize, usize)> = shared
+        .iter()
+        .copied()
+        .filter(|&(p, b)| !has_undef(probe, p) && !has_undef(build, b))
+        .collect();
+    let (index, probe_keys, keys) = if let [(p, b)] = exact[..] {
+        // the one column neither side leaves unbound is the key
+        (Some(HashIndex::new(ctx, build, b, p)?), None, None)
+    } else if exact.len() > 1 {
+        let keys = ctx.charge((probe.len() + build.len()) as u64 * 8 + 64)?;
+        let composite = |t: &Table, cols: &[usize]| -> Result<Vec<Id>> {
+            map_rows(ctx, t.len(), t.len() >= PAR_THRESHOLD, |i| {
                 use std::hash::{Hash, Hasher};
                 let mut h = rustc_hash::FxHasher::default();
                 for &c in cols {
                     t.cols[c][i].0.hash(&mut h);
                 }
-                h.finish()
-            }
-        }
-    }
-
-    /// The build rows of key `k`, in row order (none for a key not in the table).
-    #[inline]
-    fn rows(&self, k: u64) -> &[u32] {
-        let part = if self.shift == 64 {
-            &self.parts[0]
-        } else {
-            &self.parts[(mix(k) >> self.shift) as usize]
+                Id(h.finish())
+            })
         };
-        match part.map.get(&k) {
-            Some(&(s, e)) => &part.rows[s as usize..e as usize],
-            None => &[],
+        let bcols: Vec<usize> = exact.iter().map(|&(_, b)| b).collect();
+        let pcols: Vec<usize> = exact.iter().map(|&(p, _)| p).collect();
+        let build_keys = composite(build, &bcols)?;
+        let index = HashIndex::from_keys(ctx, &build_keys, usize::MAX)?;
+        drop(build_keys);
+        (Some(index), Some(composite(probe, &pcols)?), Some(keys))
+    } else {
+        match hash::key_column(ctx, probe, build, shared)? {
+            Some((p, b)) => (Some(HashIndex::new(ctx, build, b, p)?), None, None),
+            None => (None, None, None),
         }
+    };
+    if let Some(index) = &index {
+        *note = Some(format!(
+            "[flat hash table: {} keys in {} parts]",
+            index.keys(),
+            index.partitions()
+        ));
     }
-
-    fn len(&self) -> usize {
-        self.parts.iter().map(|p| p.map.len()).sum()
-    }
+    Ok(EagerIndex {
+        index,
+        probe_keys,
+        _keys: keys,
+    })
 }
 
-impl KeyPart {
-    /// The groups of the rows `rows` (in row order) of the keys `keys`.
-    fn build(keys: &[u64], rows: Vec<u32>) -> KeyPart {
-        // each key's number while counting, then the span of its rows
-        let mut map: FxHashMap<u64, (u32, u32)> = FxHashMap::default();
-        map.reserve(rows.len().min(PART_MIN));
-        let mut group: Vec<u32> = Vec::with_capacity(rows.len());
-        let mut count: Vec<u32> = Vec::new();
-        for &i in &rows {
-            let next = count.len() as u32;
-            let g = map.entry(keys[i as usize]).or_insert((next, 0)).0;
-            if g == next {
-                count.push(0);
-            }
-            count[g as usize] += 1;
-            group.push(g);
-        }
-        // `start[g]`: where the rows of key `g` begin
-        let mut start: Vec<u32> = Vec::with_capacity(count.len());
-        let mut at = 0u32;
-        for c in &count {
-            start.push(at);
-            at += c;
-        }
-        for v in map.values_mut() {
-            let g = v.0 as usize;
-            *v = (start[g], start[g] + count[g]);
-        }
-        let mut placed = vec![0u32; rows.len()];
-        for (&i, &g) in rows.iter().zip(&group) {
-            let p = &mut start[g as usize];
-            placed[*p as usize] = i;
-            *p += 1;
-        }
-        KeyPart { map, rows: placed }
-    }
-}
-
-/// A hash of an id for choosing its partition, unlike the hash tables' own hash (whose
-/// high bits pick the slots' tags).
-#[inline]
-fn mix(k: u64) -> u64 {
-    (k ^ (k >> 29)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-}
-
-/// Pairs of compatible rows (inner join).
+/// Pairs of compatible rows (inner join), as (left rows, right rows).
 fn join_pairs(
     ctx: &Ctx,
     l: &Table,
@@ -4289,23 +4385,22 @@ fn join_pairs(
     lay: &JoinLayout,
     merge: bool,
     note: &mut Option<String>,
-) -> Result<Vec<(u32, u32)>> {
-    let mut pairs: Vec<(u32, u32)> = Vec::new();
+) -> Result<(Vec<u32>, Vec<u32>)> {
     // a pair per output row now, the materialized row later
     let w = lay.vars.len() + 1;
     if lay.shared.is_empty() {
         // the product size is known up front: reject it before allocating anything
-        ctx.check_output(l.len().saturating_mul(r.len()), w)?;
+        let n = l.len().saturating_mul(r.len());
+        ctx.check_output(n, w)?;
+        let (mut li, mut rj) = (Vec::with_capacity(n), Vec::with_capacity(n));
         for i in 0..l.len() {
             if i % 1024 == 0 {
                 ctx.check()?;
             }
-            for j in 0..r.len() {
-                pairs.push((i as u32, j as u32));
-            }
-            ctx.check_output(pairs.len(), w)?;
+            li.extend(std::iter::repeat_n(i as u32, r.len()));
+            rj.extend(0..r.len() as u32);
         }
-        return Ok(pairs);
+        return Ok((li, rj));
     }
     // key columns without UNDEF on both sides can be matched by equality
     let exact: Vec<(usize, usize)> = lay
@@ -4314,148 +4409,122 @@ fn join_pairs(
         .copied()
         .filter(|&(lc, rc)| !has_undef(l, lc) && !has_undef(r, rc))
         .collect();
-    if exact.is_empty() {
-        // nested loop with compatibility check (UNDEF on join columns)
-        for i in 0..l.len() {
-            if i % 1024 == 0 {
-                ctx.check()?;
-            }
-            for j in 0..r.len() {
-                if compatible(l, r, i, j, &lay.shared) {
-                    pairs.push((i as u32, j as u32));
-                }
-            }
-            ctx.check_output(pairs.len(), w)?;
-        }
-        return Ok(pairs);
-    }
-    let (lk, rk) = exact[0];
-    let lsorted = l.sorted.first().is_some_and(|v| l.col_of(*v) == Some(lk));
-    let rsorted = r.sorted.first().is_some_and(|v| r.col_of(*v) == Some(rk));
-    if merge && lsorted && rsorted {
-        // zipper join with galloping (QLever)
-        let (a, b) = (&l.cols[lk], &r.cols[rk]);
-        // most merge joins match each row of the smaller side about once
-        pairs.reserve(a.len().min(b.len()));
-        let (mut i, mut j) = (0usize, 0usize);
-        let mut steps = 0usize;
-        while i < a.len() && j < b.len() {
-            steps += 1;
-            if steps.is_multiple_of(4096) {
-                ctx.check()?;
-                ctx.check_output(pairs.len(), w)?;
-            }
-            match a[i].cmp(&b[j]) {
-                Ordering::Less => i = gallop(a, i, b[j]),
-                Ordering::Greater => j = gallop(b, j, a[i]),
-                Ordering::Equal => {
-                    let ie = run_end(a, i);
-                    let je = run_end(b, j);
-                    // an equal-key run emits up to the product of its lengths: with a
-                    // single key that is exact, so an oversized run fails before it is
-                    // expanded; otherwise the budget is checked while expanding. Small
-                    // runs are covered by the periodic check above.
-                    let run = (ie - i).saturating_mul(je - j);
-                    if lay.shared.len() == 1 && run > 64 {
-                        ctx.check_output(pairs.len().saturating_add(run), w)?;
-                    }
-                    for ii in i..ie {
-                        if (ii - i) % 1024 == 1023 {
-                            ctx.check()?;
-                            ctx.check_output(pairs.len(), w)?;
-                        }
-                        for jj in j..je {
-                            if lay.shared.len() == 1 || compatible(l, r, ii, jj, &lay.shared) {
-                                pairs.push((ii as u32, jj as u32));
-                            }
-                        }
-                    }
-                    i = ie;
-                    j = je;
-                }
-            }
-        }
-        return Ok(pairs);
+    if merge
+        && let Some(&(lk, rk)) = exact.first()
+        && sorted_on(l, lk)
+        && sorted_on(r, rk)
+    {
+        return merge_pairs(ctx, l, r, lay, (lk, rk), w);
     }
     // hash join: build on the smaller side, probe preserves the larger side's order
     let build_left = l.len() < r.len();
-    let (bt, pt) = if build_left { (l, r) } else { (r, l) };
-    let bcols: Vec<usize> = exact
+    let (probe, build) = if build_left { (r, l) } else { (l, r) };
+    let shared: Vec<(usize, usize)> = lay
+        .shared
         .iter()
-        .map(|&(lc, rc)| if build_left { lc } else { rc })
+        .map(|&(lc, rc)| if build_left { (rc, lc) } else { (lc, rc) })
         .collect();
-    let pcols: Vec<usize> = exact
-        .iter()
-        .map(|&(lc, rc)| if build_left { rc } else { lc })
-        .collect();
-    let others_needed = exact.len() < lay.shared.len();
-    let emit = |bi: usize, pi: usize, pairs: &mut Vec<(u32, u32)>| {
-        let (i, j) = if build_left { (bi, pi) } else { (pi, bi) };
-        if !others_needed || compatible(l, r, i, j, &lay.shared) {
-            pairs.push((i as u32, j as u32));
-        }
-    };
-    let groups = KeyGroups::build(ctx, bt, &bcols)?;
-    let single = bcols.len() == 1;
-    // with several key columns the table is keyed by a hash of them, so a key's
-    // rows can include rows of other keys with the same hash
-    let same = |bi: usize, pi: usize| {
-        single
-            || bcols
-                .iter()
-                .zip(&pcols)
-                .all(|(&b, &p)| bt.cols[b][bi] == pt.cols[p][pi])
-    };
-    // the pairs of the probe rows `[s, e)`, in probe order; `total` counts the pairs
-    // of all pieces for the output limits
-    let total = AtomicUsize::new(0);
-    let pcol = single.then(|| &pt.cols[pcols[0]]);
-    let piece = |s: usize, e: usize| -> Result<Vec<(u32, u32)>> {
-        let mut out = Vec::new();
-        let mut counted = 0;
-        for pi in s..e {
-            if (pi - s) % 4096 == 4095 {
-                let n = out.len() - counted;
-                counted = out.len();
-                let all = total.fetch_add(n, AtomicOrdering::Relaxed) + n;
-                ctx.check()?;
-                ctx.check_output(all, w)?;
-            }
-            let k = match pcol {
-                Some(c) => c[pi].0,
-                None => KeyGroups::key_of(pt, &pcols, pi),
-            };
-            let m = groups.rows(k);
-            if m.len() > 1024 {
-                let all = total.load(AtomicOrdering::Relaxed);
-                ctx.check_output(all.saturating_add(out.len() - counted + m.len()), w)?;
-            }
-            for &bi in m {
-                if same(bi as usize, pi) {
-                    emit(bi as usize, pi, &mut out);
-                }
-            }
-        }
-        total.fetch_add(out.len() - counted, AtomicOrdering::Relaxed);
-        Ok(out)
-    };
-    let n = pt.len();
-    if n < 2 * PROBE_PIECE {
-        pairs = piece(0, n)?;
+    let index = hash_index(ctx, probe, build, &shared, note)?;
+    let join = index.join(Mode::Inner, probe, build, &shared);
+    let (lp, rp) = hash_pairs(ctx, &join, w)?;
+    Ok(if build_left { (rp, lp) } else { (lp, rp) })
+}
+
+/// The pairs of a merge join of `l` and `r` on the key columns `(lk, rk)`, which both
+/// sides are sorted on and neither leaves unbound, as (left rows, right rows). Rows of
+/// the two sides that agree on the key are paired run by run, and pairs that disagree on
+/// another shared variable are dropped.
+fn merge_pairs(
+    ctx: &Ctx,
+    l: &Table,
+    r: &Table,
+    lay: &JoinLayout,
+    (lk, rk): (usize, usize),
+    w: usize,
+) -> Result<(Vec<u32>, Vec<u32>)> {
+    let (a, b) = (&l.cols[lk], &r.cols[rk]);
+    // most merge joins match each row of the smaller side about once
+    let (mut li, mut rj) = (
+        Vec::with_capacity(a.len().min(b.len())),
+        Vec::with_capacity(a.len().min(b.len())),
+    );
+    let admit = |pairs: usize| ctx.check_output(pairs, w);
+    if lay.shared.len() > 1 {
+        let same = |i: usize, j: usize| compatible(l, r, i, j, &lay.shared);
+        merge::zip(ctx, a, b, false, same, admit, &mut li, &mut rj)?;
     } else {
-        let parts: Vec<Vec<(u32, u32)>> = (0..n.div_ceil(PROBE_PIECE))
-            .into_par_iter()
-            .map(|p| piece(p * PROBE_PIECE, ((p + 1) * PROBE_PIECE).min(n)))
-            .collect::<Result<_>>()?;
-        ctx.check_output(parts.iter().map(Vec::len).sum(), w)?;
-        pairs = parts.concat();
+        merge::zip(ctx, a, b, true, |_, _| true, admit, &mut li, &mut rj)?;
     }
-    *note = Some(format!(
-        "[flat hash table: {} keys in {} parts]",
-        groups.len(),
-        groups.parts.len()
-    ));
-    Ok(pairs)
+    ctx.check_output(li.len(), w)?;
+    Ok((li, rj))
+}
+
+/// Every left row of the sorted key column `a` with the right rows of the sorted key
+/// column `b` that hold its key, or alone with [`NO_ROW`] when `optional`, as (left
+/// rows, right rows). The pairs are checked against the output limits of `w` columns
+/// a piece at a time, and a run too long for a piece is checked before it is expanded.
+fn merge_expand(
+    ctx: &Ctx,
+    a: &[Id],
+    b: &[Id],
+    optional: bool,
+    w: usize,
+    compatible: impl Fn(usize, usize) -> bool,
+) -> Result<(Vec<u32>, Vec<u32>)> {
+    // `first[i]`: the first right row whose key is at least left row i's
+    let _bounds = ctx.charge(a.len() as u64 * 4 + 64)?;
+    let first = merge::bounds(ctx, a, b)?;
+    // most merge joins match each row of the smaller side about once
+    let (mut li, mut rj) = (
+        Vec::with_capacity(a.len().min(b.len())),
+        Vec::with_capacity(a.len().min(b.len())),
+    );
+    let mut from = 0;
+    while from < a.len() {
+        ctx.check()?;
+        let done = merge::expand(
+            ctx,
+            a,
+            b,
+            &first,
+            from,
+            optional,
+            PROBE_PIECE,
+            &compatible,
+            &mut li,
+            &mut rj,
+        )?;
+        if done == 0 {
+            // a run longer than a piece: expand it a piece at a time, checking the pairs
+            // it gives against the output limits as they grow
+            let at = first[from] as usize;
+            let end = run_end(b, at);
+            let before = li.len();
+            let mut pos = at;
+            while pos < end {
+                ctx.check()?;
+                pos = merge::expand_run(
+                    ctx,
+                    from,
+                    pos..end,
+                    PROBE_PIECE,
+                    &compatible,
+                    &mut li,
+                    &mut rj,
+                )?;
+                ctx.check_output(li.len(), w)?;
+            }
+            if optional && li.len() == before {
+                li.push(from as u32);
+                rj.push(NO_ROW);
+            }
+            from += 1;
+        } else {
+            from += done;
+        }
+        ctx.check_output(li.len(), w)?;
+    }
+    Ok((li, rj))
 }
 
 /// Number of join results; merge joins on a single exact key count run products.
@@ -4467,24 +4536,12 @@ fn join_count(ctx: &Ctx, l: &Table, r: &Table, merge: bool) -> Result<u64> {
         let rsorted = r.sorted.first().is_some_and(|v| r.col_of(*v) == Some(rk));
         if lsorted && rsorted && !has_undef(l, lk) && !has_undef(r, rk) {
             let (a, b) = (&l.cols[lk], &r.cols[rk]);
-            let (mut i, mut j, mut n) = (0usize, 0usize, 0u64);
-            while i < a.len() && j < b.len() {
-                match a[i].cmp(&b[j]) {
-                    Ordering::Less => i = gallop(a, i, b[j]),
-                    Ordering::Greater => j = gallop(b, j, a[i]),
-                    Ordering::Equal => {
-                        let ie = run_end(a, i);
-                        let je = run_end(b, j);
-                        n += ((ie - i) * (je - j)) as u64;
-                        i = ie;
-                        j = je;
-                    }
-                }
-            }
-            return Ok(n);
+            let _bounds = ctx.charge(a.len() as u64 * 4 + 64)?;
+            let first = merge::bounds(ctx, a, b)?;
+            return merge::count(ctx, a, b, &first, false);
         }
     }
-    Ok(join_pairs(ctx, l, r, &lay, merge, &mut None)?.len() as u64)
+    Ok(join_pairs(ctx, l, r, &lay, merge, &mut None)?.0.len() as u64)
 }
 
 /// Decompose RDF 1.2 triple terms: rows whose `t` is not a triple term, or whose
@@ -4555,10 +4612,10 @@ pub(super) fn join_tables(
 pub(super) fn join_algorithm_tables(ctx: &Ctx, l: &Table, r: &Table) -> Result<Materialized> {
     use crate::algo::memory;
     let lay = layout(l, r);
-    let pairs = join_pairs(ctx, l, r, &lay, false, &mut None)?;
-    ctx.check_output(pairs.len(), lay.vars.len() + 1)?;
-    let sorted_len = kept_order_iter(l, r, &lay, &pairs).count();
-    let col = memory::bytes::<Id>(pairs.len())?;
+    let (li, rj) = join_pairs(ctx, l, r, &lay, false, &mut None)?;
+    ctx.check_output(li.len(), lay.vars.len() + 1)?;
+    let sorted_len = kept_order_iter(l, r, &lay, &li, &rj).count();
+    let col = memory::bytes::<Id>(li.len())?;
     let bytes = memory::sum(&[
         col.checked_mul(lay.vars.len() as u64)
             .ok_or_else(|| Error::invalid("algorithm join capacity overflows"))?,
@@ -4572,7 +4629,7 @@ pub(super) fn join_algorithm_tables(ctx: &Ctx, l: &Table, r: &Table) -> Result<M
         table: Table::empty(Vec::new()),
         lease: Some(ctx.output_lease(bytes)?),
     };
-    out.table = materialize(l, r, &lay, &pairs);
+    out.table = materialize(l, r, &lay, &li, &rj);
     let ctl = crate::algo::Control::with_cancellation(
         ctx.cancel.clone(),
         ctx.cancellation.clone(),
@@ -4580,7 +4637,7 @@ pub(super) fn join_algorithm_tables(ctx: &Ctx, l: &Table, r: &Table) -> Result<M
         u64::MAX,
     );
     let mut sorted = memory::allocate("algorithm-join-order", sorted_len, &ctl)?;
-    for v in kept_order_iter(l, r, &lay, &pairs) {
+    for v in kept_order_iter(l, r, &lay, &li, &rj) {
         sorted.push(v);
     }
     out.table.sorted = sorted;
@@ -4601,10 +4658,10 @@ pub(super) fn join_noted(
     note: &mut Option<String>,
 ) -> Result<Table> {
     let lay = layout(l, r);
-    let pairs = join_pairs(ctx, l, r, &lay, merge, note)?;
-    ctx.check_output(pairs.len(), lay.vars.len() + 1)?;
-    let mut t = materialize(l, r, &lay, &pairs);
-    t.sorted = kept_order(l, r, &lay, &pairs);
+    let (li, rj) = join_pairs(ctx, l, r, &lay, merge, note)?;
+    ctx.check_output(li.len(), lay.vars.len() + 1)?;
+    let mut t = materialize(l, r, &lay, &li, &rj);
+    t.sorted = kept_order(l, r, &lay, &li, &rj);
     Ok(t)
 }
 
@@ -4612,25 +4669,30 @@ pub(super) fn join_noted(
 /// the order of the side it probes, so that side's sort variables stay sorted, up to the
 /// first one shared with the other side where the side holds unbound values (the other
 /// side fills them).
-fn kept_order(l: &Table, r: &Table, lay: &JoinLayout, pairs: &[(u32, u32)]) -> Vec<VarId> {
-    kept_order_iter(l, r, lay, pairs).collect()
+fn kept_order(l: &Table, r: &Table, lay: &JoinLayout, li: &[u32], rj: &[u32]) -> Vec<VarId> {
+    kept_order_iter(l, r, lay, li, rj).collect()
 }
 fn kept_order_iter<'a>(
     l: &'a Table,
     r: &'a Table,
     lay: &'a JoinLayout,
-    pairs: &[(u32, u32)],
+    li: &[u32],
+    rj: &[u32],
 ) -> impl Iterator<Item = VarId> + 'a {
-    let (t, left) = if pairs.windows(2).all(|w| w[0].0 <= w[1].0) {
+    let left_ordered = li.windows(2).all(|w| w[0] <= w[1]);
+    let right_ordered = rj.windows(2).all(|w| w[0] <= w[1]);
+    let (t, left) = if left_ordered {
         (l, true)
-    } else if pairs.windows(2).all(|w| w[0].1 <= w[1].1) {
+    } else if right_ordered {
         (r, false)
     } else {
         (l, false)
     };
-    let ordered =
-        pairs.windows(2).all(|w| w[0].0 <= w[1].0) || pairs.windows(2).all(|w| w[0].1 <= w[1].1);
-    let sorted = if ordered { &t.sorted[..] } else { &[] };
+    let sorted = if left_ordered || right_ordered {
+        &t.sorted[..]
+    } else {
+        &[]
+    };
     sorted
         .iter()
         .take_while(move |v| {
@@ -4952,37 +5014,13 @@ fn materialize_candidates(
 fn cross(ctx: &Ctx, l: &Table, r: &Table) -> Result<Table> {
     let lay = layout(l, r);
     ctx.check_output(l.len().saturating_mul(r.len()), lay.vars.len() + 1)?;
-    let pairs = join_pairs(ctx, l, r, &lay, false, &mut None)?;
-    Ok(materialize(l, r, &lay, &pairs))
+    let (li, rj) = join_pairs(ctx, l, r, &lay, false, &mut None)?;
+    Ok(materialize(l, r, &lay, &li, &rj))
 }
 
 /// Whether `t` is sorted on its column `c` first.
 fn sorted_on(t: &Table, c: usize) -> bool {
     t.sorted.first().is_some_and(|v| t.col_of(*v) == Some(c))
-}
-
-/// Which rows of `joined` pass the OPTIONAL's FILTER `e`.
-fn left_filter(ctx: &Ctx, joined: &Table, e: &Expr) -> Result<Vec<bool>> {
-    // a condition `EXISTS { P }` from the key set of P
-    if let Some(mask) = super::exists::mask(ctx, joined, e)? {
-        return Ok(mask);
-    }
-    let map = joined.var_map(ctx.nvars());
-    Ok((0..joined.len())
-        .map(|i| {
-            ebv(
-                e,
-                &Row {
-                    table: joined,
-                    i,
-                    map: &map,
-                    dec: None,
-                },
-                ctx,
-            )
-            .unwrap_or(false)
-        })
-        .collect())
 }
 
 pub(super) fn left_join(
@@ -5003,40 +5041,17 @@ pub(super) fn left_join(
         *note = Some(format!("[merge on ?{}]", ctx.var_name(l.vars[lc])));
         return merge_left_join(ctx, l, r, &lay, (lc, rc), expr);
     }
-    let mut pairs = join_pairs(ctx, l, r, &lay, false, note)?;
-    let mut joined = materialize(l, r, &lay, &pairs);
-    if let Some(e) = expr {
-        let keep = left_filter(ctx, &joined, e)?;
-        joined.filter_rows(&keep);
-        let mut k = keep.iter();
-        pairs.retain(|_| *k.next().unwrap());
-    }
-    let mut matched = vec![false; l.len()];
-    for (i, _) in &pairs {
-        matched[*i as usize] = true;
-    }
-    append_unmatched(l, &mut joined, &matched);
-    Ok(joined)
+    let index = hash_index(ctx, l, r, &lay.shared, note)?;
+    let join = index.join(Mode::Optional, l, r, &lay.shared);
+    let (li, rj) = match expr {
+        Some(e) => {
+            let (li, rj, _) = hash_condition(ctx, &join, &lay, e)?;
+            (li, rj)
+        }
+        None => hash_pairs(ctx, &join, lay.vars.len() + 1)?,
+    };
+    Ok(materialize(l, r, &lay, &li, &rj))
 }
-
-/// Append to `joined` each row of `l` that `matched` does not mark, with the right
-/// side's variables unbound.
-fn append_unmatched(l: &Table, joined: &mut Table, matched: &[bool]) {
-    let missing: Vec<usize> = (0..l.len()).filter(|&i| !matched[i]).collect();
-    if missing.is_empty() {
-        return;
-    }
-    for (c, col) in l.cols.iter().enumerate() {
-        joined.cols[c].extend(missing.iter().map(|&i| col[i]));
-    }
-    for c in l.width()..joined.width() {
-        joined.cols[c].extend(std::iter::repeat_n(Id::UNDEF, missing.len()));
-    }
-    joined.len += missing.len();
-}
-
-/// The candidate pairs a keyed OPTIONAL tests its condition on at a time.
-const KEYED_CHUNK: usize = 1 << 16;
 
 /// OPTIONAL keyed on its condition's conjunct `?a = ?b` (see [`Kind::KeyedLeftJoin`]).
 pub(super) fn keyed_left_join(
@@ -5066,14 +5081,13 @@ fn keyed_join(
     optional: bool,
     note: &mut Option<String>,
 ) -> Result<Table> {
-    use super::eqkey::{EqKey, eq_key};
     let lay = layout(l, r);
     let generic = |note: &mut Option<String>| {
         if optional {
             left_join(ctx, l, r, Some(expr), note)
         } else {
             let mut t = cross(ctx, l, r)?;
-            let keep = left_filter(ctx, &t, expr)?;
+            let keep = condition_mask(ctx, &t, expr)?;
             t.filter_rows(&keep);
             Ok(t)
         }
@@ -5084,110 +5098,29 @@ fn keyed_join(
     if !lay.shared.is_empty() {
         return generic(note);
     }
-    // The right rows by key, sorted, and the rows of loose values in row order. Both are
-    // charged before they are allocated, the second for its growth.
-    let _index = ctx.charge((r.len() as u64).saturating_mul(16 + 8))?;
-    let mut keyed: Vec<(Id, u32)> = Vec::with_capacity(r.len());
-    let mut loose: Vec<u32> = Vec::new();
-    for (j, &v) in r.cols[rc].iter().enumerate() {
-        if j % 65536 == 0 {
-            ctx.check()?;
-        }
-        match eq_key(ctx, v)? {
-            EqKey::Unbound => {}
-            EqKey::Key(k) => keyed.push((k, j as u32)),
-            EqKey::Loose => loose.push(j as u32),
-        }
-    }
-    keyed.sort_unstable();
-    let w = lay.vars.len() + 1;
-    // A chunk's pairs, their merged rows and their verdicts, and a mark per left row.
-    // The chunk takes at most a quarter of the room the query has left.
-    let per_pair = 8 + w as u64 * 8 + 1;
-    let room = usize::try_from(ctx.memory_room() / 4 / per_pair).unwrap_or(usize::MAX);
-    let cap = KEYED_CHUNK
-        .min(l.len().saturating_mul(r.len()))
-        .min(room)
-        .max(1);
-    let _scratch = ctx.charge(
-        (cap as u64)
-            .saturating_mul(per_pair)
-            .saturating_add(l.len() as u64),
-    )?;
-    let mut matched = if optional {
-        vec![false; l.len()]
-    } else {
-        Vec::new()
+    let index = EqualityIndex::new(ctx, r, rc, lc)?;
+    let join = Join {
+        mode: if optional {
+            Mode::Optional
+        } else {
+            Mode::Inner
+        },
+        probe: l,
+        build: r,
+        shared: &[],
+        index: None,
+        probe_keys: None,
+        equality: Some((lc, &index)),
     };
-    let mut out = Table::new(lay.vars.clone());
-    let mut chunk: Vec<(u32, u32)> = Vec::with_capacity(cap);
-    let mut candidates = 0u64;
-    let flush =
-        |chunk: &mut Vec<(u32, u32)>, out: &mut Table, matched: &mut [bool]| -> Result<()> {
-            ctx.check()?;
-            ctx.check_output(out.len().saturating_add(chunk.len()), w)?;
-            let mut joined = materialize(l, r, &lay, chunk);
-            let keep = left_filter(ctx, &joined, expr)?;
-            if optional {
-                for (k, &(i, _)) in keep.iter().zip(chunk.iter()) {
-                    if *k {
-                        matched[i as usize] = true;
-                    }
-                }
-            }
-            joined.filter_rows(&keep);
-            out.append(joined);
-            chunk.clear();
-            Ok(())
-        };
-    for (i, &v) in l.cols[lc].iter().enumerate() {
-        if i % 4096 == 0 {
-            ctx.check()?;
-        }
-        let rows: &[u32] = match eq_key(ctx, v)? {
-            EqKey::Unbound => continue,
-            EqKey::Key(k) => {
-                let s = keyed.partition_point(|&(x, _)| x < k);
-                let e = s + keyed[s..].partition_point(|&(x, _)| x == k);
-                for &(_, j) in &keyed[s..e] {
-                    chunk.push((i as u32, j));
-                    if chunk.len() >= cap {
-                        candidates += chunk.len() as u64;
-                        flush(&mut chunk, &mut out, &mut matched)?;
-                    }
-                }
-                continue;
-            }
-            EqKey::Loose => &loose,
-        };
-        for &j in rows {
-            chunk.push((i as u32, j));
-            if chunk.len() >= cap {
-                candidates += chunk.len() as u64;
-                flush(&mut chunk, &mut out, &mut matched)?;
-            }
-        }
-    }
-    if !chunk.is_empty() {
-        candidates += chunk.len() as u64;
-        flush(&mut chunk, &mut out, &mut matched)?;
-    }
-    if optional {
-        append_unmatched(l, &mut out, &matched);
-    }
-    ctx.check_output(out.len(), lay.vars.len())?;
+    let (li, rj, candidates) = hash_condition(ctx, &join, &lay, expr)?;
     *note = Some(format!(
         "[keyed on ?{} = ?{}: {} candidate pairs]",
         ctx.var_name(a),
         ctx.var_name(b),
         candidates
     ));
-    Ok(out)
+    Ok(materialize(l, r, &lay, &li, &rj))
 }
-
-/// A right row index standing for no row: the left row is kept with the right side's
-/// variables unbound.
-const NO_ROW: u32 = u32::MAX;
 
 /// OPTIONAL by a merge on the key columns `(lc, rc)`, which both sides are sorted on and
 /// neither leaves unbound. The output keeps the left side's rows in order, each one with
@@ -5201,46 +5134,20 @@ fn merge_left_join(
     expr: Option<&Expr>,
 ) -> Result<Table> {
     let (a, b) = (&l.cols[lc], &r.cols[rc]);
-    // `first[i]`: the first right row whose key is at least left row i's
-    let first = super::zipper::lower_bounds(ctx, a, b)?;
-    // each left row with the right rows of its key, or with none
     let w = lay.vars.len() + 1;
-    let mut li: Vec<u32> = Vec::with_capacity(a.len());
-    let mut rj: Vec<u32> = Vec::with_capacity(a.len());
-    let mut run = (usize::MAX, 0);
-    for (i, (&x, &s)) in a.iter().zip(&first).enumerate() {
-        if i % 65536 == 65535 {
-            ctx.check()?;
-            ctx.check_output(li.len(), w)?;
-        }
-        let s = s as usize;
-        if s < b.len() && b[s] == x {
-            if run.0 != s {
-                run = (s, run_end(b, s));
-            }
-            let e = run.1;
-            if e - s > 1024 {
-                ctx.check_output(li.len().saturating_add(e - s), w)?;
-            }
-            li.extend(std::iter::repeat_n(i as u32, e - s));
-            rj.extend(s as u32..e as u32);
-        } else {
-            li.push(i as u32);
-            rj.push(NO_ROW);
-        }
-    }
-    drop(first);
+    // each left row with the right rows of its key, or with none
+    let (mut li, mut rj) = merge_expand(ctx, a, b, true, w, |_, _| true)?;
     if let Some(e) = expr {
         // the FILTER is tested on the matched rows; a left row none of whose matches
         // pass is kept alone
-        let matched: Vec<(u32, u32)> = li
+        let (matched_l, matched_r): (Vec<u32>, Vec<u32>) = li
             .iter()
             .zip(&rj)
             .filter(|(_, j)| **j != NO_ROW)
             .map(|(&i, &j)| (i, j))
-            .collect();
-        let joined = materialize(l, r, lay, &matched);
-        let mut keep = left_filter(ctx, &joined, e)?.into_iter();
+            .unzip();
+        let joined = materialize(l, r, lay, &matched_l, &matched_r);
+        let mut keep = condition_mask(ctx, &joined, e)?.into_iter();
         drop(joined);
         let (mut li2, mut rj2) = (Vec::with_capacity(li.len()), Vec::with_capacity(li.len()));
         let mut k = 0;
@@ -5265,51 +5172,9 @@ fn merge_left_join(
         (li, rj) = (li2, rj2);
     }
     ctx.check_output(li.len(), w)?;
-    let mut t = materialize_left(l, r, lay, &li, &rj);
+    let mut t = materialize(l, r, lay, &li, &rj);
     t.sorted = l.sorted.clone();
     Ok(t)
-}
-
-/// The rows of a left join from left row indices and right row indices (`NO_ROW` for
-/// none). The left side's unbound shared variables take the right row's values.
-fn materialize_left(l: &Table, r: &Table, lay: &JoinLayout, li: &[u32], rj: &[u32]) -> Table {
-    // every left row once, in order: the left columns are copied whole
-    let whole = li.len() == l.len() && li.iter().enumerate().all(|(n, &i)| n == i as usize);
-    let mut cols: Vec<Vec<Id>> = Vec::with_capacity(lay.vars.len());
-    for (lc, col) in l.cols.iter().enumerate() {
-        let fill = lay.shared.iter().find(|(x, _)| *x == lc).map(|(_, rc)| *rc);
-        let fill = fill.filter(|_| has_undef(l, lc));
-        cols.push(match fill {
-            None if whole => col.clone(),
-            None => li.iter().map(|&i| col[i as usize]).collect(),
-            Some(rc) => li
-                .iter()
-                .zip(rj)
-                .map(|(&i, &j)| {
-                    let v = col[i as usize];
-                    if v.is_undef() && j != NO_ROW {
-                        r.cols[rc][j as usize]
-                    } else {
-                        v
-                    }
-                })
-                .collect(),
-        });
-    }
-    for &rc in &lay.right_only {
-        let col = &r.cols[rc];
-        cols.push(
-            rj.iter()
-                .map(|&j| col.get(j as usize).copied().unwrap_or(Id::UNDEF))
-                .collect(),
-        );
-    }
-    Table {
-        vars: lay.vars.clone(),
-        cols,
-        len: li.len(),
-        sorted: Vec::new(),
-    }
 }
 
 /// ARQ's `LET (?v := e)` where ?v may be bound (`QueryIterAssign`): `col` holds the
@@ -5413,127 +5278,80 @@ fn unfold(
 /// ARQ's SEMIJOIN and ANTIJOIN (`QueryIterHalfJoin`): the rows of `l` compatible with a
 /// row of `r` (with none, when `anti`), each once and unchanged. Unlike MINUS, a row of
 /// `r` that shares no bound variable with a row of `l` is compatible with it.
-fn half_join(ctx: &Ctx, mut l: Table, r: &Table, anti: bool) -> Result<Table> {
-    let lay = layout(&l, r);
-    let r_undef = lay.shared.iter().any(|&(_, rc)| has_undef(r, rc));
-    let set: FxHashSet<Vec<Id>> = if r_undef {
-        FxHashSet::default()
-    } else {
-        (0..r.len())
-            .map(|j| lay.shared.iter().map(|&(_, rc)| r.cols[rc][j]).collect())
-            .collect()
-    };
-    let mut keep = vec![false; l.len()];
-    for (i, k) in keep.iter_mut().enumerate() {
-        if i % 4096 == 0 {
-            ctx.check()?;
-        }
-        let all_defined = lay.shared.iter().all(|&(lc, _)| !l.cols[lc][i].is_undef());
-        let matched = if r.is_empty() {
-            false
-        } else if lay.shared.is_empty() {
-            true
-        } else if !r_undef && all_defined {
-            let key: Vec<Id> = lay.shared.iter().map(|&(lc, _)| l.cols[lc][i]).collect();
-            set.contains(&key)
-        } else {
-            (0..r.len()).any(|j| compatible(&l, r, i, j, &lay.shared))
-        };
-        *k = matched != anti;
-    }
-    let sorted = l.sorted.clone();
-    l.filter_rows(&keep);
-    l.sorted = sorted;
-    Ok(l)
+fn half_join(ctx: &Ctx, l: &Table, r: &Table, anti: bool) -> Result<Table> {
+    let lay = layout(l, r);
+    let index = hash_index(ctx, l, r, &lay.shared, &mut None)?;
+    let join = index.join(
+        if anti { Mode::Anti } else { Mode::Semi },
+        l,
+        r,
+        &lay.shared,
+    );
+    let keep = hash_filter(ctx, &join)?;
+    drop(index);
+    kept_rows(ctx, l, &keep)
 }
 
-fn minus(ctx: &Ctx, mut l: Table, r: &Table, note: &mut Option<String>) -> Result<Table> {
-    let lay = layout(&l, r);
+/// The rows of `l` that `keep` marks, in order, with its sort order.
+fn kept_rows(ctx: &Ctx, l: &Table, keep: &[bool]) -> Result<Table> {
+    let n = keep.iter().filter(|k| **k).count();
+    ctx.check_output(n, l.width())?;
+    let mut t = Table::new(l.vars.clone());
+    for (column, source) in t.cols.iter_mut().zip(&l.cols) {
+        column.reserve_exact(n);
+        column.extend(
+            source
+                .iter()
+                .zip(keep)
+                .filter(|(_, k)| **k)
+                .map(|(v, _)| *v),
+        );
+    }
+    t.len = n;
+    t.sorted = l.sorted.clone();
+    Ok(t)
+}
+
+fn minus(ctx: &Ctx, l: &Table, r: &Table, note: &mut Option<String>) -> Result<Table> {
+    let lay = layout(l, r);
     if lay.shared.is_empty() || r.is_empty() {
-        return Ok(l);
+        return Ok(l.clone());
     }
-    let r_undef = lay.shared.iter().any(|&(_, rc)| has_undef(r, rc));
-    if ctx.opt.anti_join
-        && let [(lc, rc)] = lay.shared[..]
-        && !r_undef
-        && !has_undef(&l, lc)
-    {
-        let (keep, how) = anti_join(ctx, &l, lc, r, rc)?;
-        *note = Some(format!(
-            "[anti-join on ?{} by {how}]",
-            ctx.var_name(l.vars[lc])
-        ));
-        let sorted = l.sorted.clone();
-        l.filter_rows(&keep);
-        l.sorted = sorted;
-        return Ok(l);
-    }
-    let set: FxHashSet<Vec<Id>> = if r_undef {
-        FxHashSet::default()
-    } else {
-        (0..r.len())
-            .map(|j| lay.shared.iter().map(|&(_, rc)| r.cols[rc][j]).collect())
-            .collect()
+    // One shared variable that neither side leaves unbound: compatibility is equality
+    // of the key, so a merge of two sorted sides or the hash kernel decides each row.
+    let anti = match lay.shared[..] {
+        [(lc, rc)] if ctx.opt.anti_join && !has_undef(l, lc) && !has_undef(r, rc) => Some((lc, rc)),
+        _ => None,
     };
-    let mut keep = vec![true; l.len()];
-    for (i, k) in keep.iter_mut().enumerate() {
-        if i % 4096 == 0 {
-            ctx.check()?;
+    let keep = match anti {
+        Some((lc, rc)) if sorted_on(l, lc) && sorted_on(r, rc) => {
+            *note = Some(format!(
+                "[anti-join on ?{} by merge]",
+                ctx.var_name(l.vars[lc])
+            ));
+            merge_anti_join(ctx, &l.cols[lc], &r.cols[rc])?
         }
-        let all_defined = lay.shared.iter().all(|&(lc, _)| !l.cols[lc][i].is_undef());
-        let removed = if !r_undef && all_defined {
-            let key: Vec<Id> = lay.shared.iter().map(|&(lc, _)| l.cols[lc][i]).collect();
-            set.contains(&key)
-        } else {
-            (0..r.len()).any(|j| {
-                compatible(&l, r, i, j, &lay.shared)
-                    && lay
-                        .shared
-                        .iter()
-                        .any(|&(lc, rc)| !l.cols[lc][i].is_undef() && !r.cols[rc][j].is_undef())
-            })
-        };
-        *k = !removed;
-    }
-    let sorted = l.sorted.clone();
-    l.filter_rows(&keep);
-    l.sorted = sorted;
-    Ok(l)
+        _ => {
+            let index = hash_index(ctx, l, r, &lay.shared, &mut None)?;
+            let join = index.join(Mode::Minus, l, r, &lay.shared);
+            if let Some((lc, _)) = anti {
+                *note = Some(format!(
+                    "[anti-join on ?{} by hash]",
+                    ctx.var_name(l.vars[lc])
+                ));
+            }
+            hash_filter(ctx, &join)?
+        }
+    };
+    kept_rows(ctx, l, &keep)
 }
 
-/// The rows of `l` whose id in column `lc` is not in column `rc` of `r` (neither column
-/// holds UNDEF, so compatibility is equality): a galloping merge when both sides are
-/// sorted on the key, else a probe of the right side's ids. Also names the method.
-fn anti_join(
-    ctx: &Ctx,
-    l: &Table,
-    lc: usize,
-    r: &Table,
-    rc: usize,
-) -> Result<(Vec<bool>, &'static str)> {
-    let (a, b) = (&l.cols[lc], &r.cols[rc]);
-    let lsorted = l.sorted.first().is_some_and(|v| l.col_of(*v) == Some(lc));
-    let rsorted = r.sorted.first().is_some_and(|v| r.col_of(*v) == Some(rc));
-    if lsorted && rsorted {
-        // a left row is kept when the first right id not less than its own differs
-        let first = super::zipper::lower_bounds(ctx, a, b)?;
-        let keep = a
-            .iter()
-            .zip(&first)
-            .map(|(&x, &j)| b.get(j as usize) != Some(&x))
-            .collect();
-        return Ok((keep, "merge"));
-    }
-    let _held = ctx.charge((b.len() * 16) as u64)?;
-    let set: FxHashSet<Id> = b.iter().copied().collect();
-    ctx.check()?;
-    Ok((
-        a.par_iter()
-            .with_min_len(PAR_MIN_LEN)
-            .map(|id| !set.contains(id))
-            .collect(),
-        "hash",
-    ))
+/// Which ids of the sorted column `a` are not in the sorted column `b`: a left row is
+/// kept when the first right id not less than its own differs.
+fn merge_anti_join(ctx: &Ctx, a: &[Id], b: &[Id]) -> Result<Vec<bool>> {
+    let _bounds = ctx.charge(a.len() as u64 * 4 + 64)?;
+    let first = merge::bounds(ctx, a, b)?;
+    Ok(merge::filter(a, b, &first, false))
 }
 
 // ------------------------------------------------------------ expressions ------
@@ -5770,7 +5588,8 @@ pub(super) fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) -> Result<E
     Ok(report)
 }
 
-/// Evaluate the filter row by row.
+/// Evaluate the filter row by row. A large table has the terms its expressions need
+/// decoded once per distinct value first (see [`decode_for`]).
 pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bool>> {
     // `EXISTS { P }` from the key set of P, as an OPTIONAL condition tests it
     if let [e] = exprs
@@ -5787,6 +5606,30 @@ pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bo
     let t0 = Instant::now();
     let dec = decode_for(ctx, t, &exprs.iter().collect::<Vec<_>>());
     tracing::debug!(target: "sparkles::sparql::exec", "decoded values in {:?}", t0.elapsed());
+    evaluate_mask(ctx, t, exprs, Decoded::cols(&dec))
+}
+
+/// Which merged candidate rows `t` of a join pass its condition `e`, from their ids. A
+/// condition is not decoded first as a FILTER's expressions are in [`filter_mask`],
+/// because the candidate rows of a join come in chunks of a probe and the common
+/// conditions, such as `?o != <term>` or a comparison with a bound variable, are decided
+/// by the ids: decoding the terms of 300,000 candidate rows cost an OPTIONAL four times
+/// its run. A condition `EXISTS { P }` is answered from the key set of P.
+pub(super) fn condition_mask(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<bool>> {
+    if let Some(mask) = super::exists::mask(ctx, t, e)? {
+        return Ok(mask);
+    }
+    evaluate_mask(ctx, t, std::slice::from_ref(e), None)
+}
+
+/// Evaluate `exprs` on every row of `t`, with the decoded columns `dec` when there are
+/// any, in parallel when the expressions allow it and the rows are enough.
+fn evaluate_mask(
+    ctx: &Ctx,
+    t: &Table,
+    exprs: &[Expr],
+    dec: Option<&super::expr::DecodedCols>,
+) -> Result<Vec<bool>> {
     let t0 = Instant::now();
     let map = t.var_map(ctx.nvars());
     let test = |i: usize| {
@@ -5794,7 +5637,7 @@ pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bo
             table: t,
             i,
             map: &map,
-            dec: Decoded::cols(&dec),
+            dec,
         };
         exprs.iter().all(|e| ebv(e, &row, ctx).unwrap_or(false))
     };

@@ -20,53 +20,47 @@
 //! a root literal. Join resolves a maximal ground atom or equality of constants with the
 //! same literal in another clause's body, in the root and in every other context.
 //!
-//! A context other than the root whose maximal literal is a root successor trigger of the
-//! journal's Definition 4 read with y as x, `B(u)`, `S(x, u)`, `S(u, x)`, `S(u1, u2)` or
-//! `u1 ≈ u2`, sends the root the trigger's marker `A → A` over y and registers with the root
-//! for each of its constants (r-Succ). A processed root clause whose body atoms are such
-//! triggers and whose head literals are ground or root predecessor triggers goes back to
-//! each context registered for every constant of its body, or for a constant of its head
-//! when the body is empty (r-Pred). That context resolves each body atom, read with y as x,
-//! with its own clauses where it is maximal, and takes the head with y read as x. The
-//! journal's r-Pred has a clause without a body reach every context. Here a context also
-//! registers for the constants of every other maximal literal, such as `x ≈ u`, and of the
-//! ground literals in its bodies, and a clause without a body reaches the contexts
-//! registered for one of its constants. A rule that resolves such a clause with a clause
-//! of the context has a premise of the context that mentions one of the clause's
-//! constants in a maximal literal or in its body, since the premises meet at a shared
-//! literal or at a term that an ontology clause's role atom binds, so the context holds
-//! the clause. An inference between two root clauses happens in the root, whose conclusion
-//! is routed the same way. What the restriction leaves out, such as the marker that Succ
-//! would pass to a successor of a context that never mentions the constant, matters only
-//! to a context that mentions the constant, which then registers and takes the clause.
-//! The journal's system Sequoia holds back asserted ground facts in a similar way (its
-//! Section 7.3.2).
+//! Every context reasons about its own ground literals (F24, item 804's first departure).
+//! Hyper binds the ontology clause's x to a constant in every context, so that a premise is
+//! any clause whose maximal literal is a ground atom `B(u)`, and a role atom with a constant
+//! at an end meets the universal restrictions of the constant's holders in the context that
+//! holds it. Each context keeps its processed clauses by the constants of their maximal
+//! literals for these rules, as the root does. The root holds the unconditional facts, and
+//! its processed clauses with an empty body go to the contexts registered for one of
+//! their constants, whether the registration or the clause comes first. A context
+//! registers with the root for the constants of every maximal literal of its processed
+//! clauses, inside `f_e(u)` included, and for those of the ground literals in its bodies.
+//! The run uses no markers in the root, no r-Succ and no r-Pred of a root clause with a
+//! body. A conditional ground clause of a context, such as `⊤ → B(u) ∨ C(x)`, has its
+//! consequences at u derived in that context from the actual disjunction, where the
+//! journal's root derives them under every combination of markers.
 //!
-//! A maximal literal over `f_e(u)` in the root takes Succ: the root registers with e's
+//! A maximal literal over `f_e(u)` in any context takes Succ: the context registers with e's
 //! hypothetical successor, which has the empty core, records the constant u for the edge and
-//! sends the successor the markers of the atoms over `f_e(u)`. The successor's clauses over
-//! its predecessor come back with y read as u and x as `f_e(u)` (Pred), for every constant
-//! the root reached it by, and a role atom between x and a constant comes back too, as
-//! Table 3 admits for the root. Every context sends each of its successors the markers of
-//! its maximal ground atoms and equalities of constants, so that one edge covers every
-//! successor trigger of Definition 4. A context that holds a ground literal in a body
-//! registers with the root for its constants, so that the root's clauses over them reach it.
+//! sends the successor the markers of the atoms over `f_e(u)`. The edge is identified by the
+//! context, the restriction and the constant, and is distinct from the context's edge for
+//! `f_e(x)`. The successor's clauses over its predecessor come back with y read as u and x as
+//! `f_e(u)` (Pred), for every constant the context reached it by, and a role atom between x
+//! and a constant comes back too, as Table 3 admits for the root. Every context sends each
+//! of its successors the markers of its maximal ground atoms and equalities of constants,
+//! so that one edge covers every successor trigger of Definition 4 (the journal's K2).
 //!
 //! The at-most restrictions and the qualified roles of counting are not read in the root.
 
 use super::dl_clause::{Clause, Lit, Made, RTerm, Rooted, XL, XLit, terms_of};
 use super::dl_rules::{
-    DlIx, Found, Side, alls, dix, dl, drain, drain_with, ds, merge, pred_id, side, unit, with,
+    DlIx, Found, Side, alls, dix, dl, drain, drain_with, ds, merge, pred_id, restricted, side,
+    unit, with,
 };
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Sink, State, table_bytes};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::Ordering;
 
-/// What a context of a rooted run keeps for the rules that involve the root. The root keeps
-/// its processed clauses by constant, the contexts registered with it, its markers and the
-/// clauses that r-Pred sends. Another context keeps the markers it sent the root and the
-/// root's clauses it received.
+/// What a context of a rooted run keeps for the rules at the constants and over `f_e(u)`.
+/// Every context keeps its processed clauses by constant and its edges over `f_e(u)`. The
+/// root keeps the contexts registered with it and the facts it sends them, and another
+/// context keeps the root's facts it received and the constants it registered for.
 #[derive(Default, Clone)]
 pub struct RootSt {
     /// the processed clauses with a maximal ground atom `B(u)`, by u
@@ -78,18 +72,11 @@ pub struct RootSt {
     edges: FxHashMap<u32, Vec<Ex>>,
     /// in the root, the same registrations as pairs of context and constant
     edge_set: FxHashSet<(Ex, u32)>,
-    /// in the root, the markers it holds
-    markers: FxHashSet<Lit>,
-    /// in the root, the processed clauses that r-Pred sends, by each constant of their
-    /// bodies, or of their heads when the body is empty
+    /// in the root, the processed clauses with an empty body, by each constant of their
+    /// heads
     ready: FxHashMap<u32, Vec<u32>>,
-    /// in another context, the markers it sent the root
-    sent: FxHashSet<Lit>,
     /// in another context, the root's clauses it received, by table id
     seen: FxHashSet<u32>,
-    /// in another context, the root's clauses it received, by each body literal read with
-    /// y as x
-    waiting: FxHashMap<Lit, Vec<u32>>,
     /// in another context, the constants it registered with the root for
     edged: FxHashSet<u32>,
     /// the context's maximal ground atoms and equalities of constants, in the order found,
@@ -100,14 +87,20 @@ pub struct RootSt {
     gsent: FxHashSet<(Ex, Lit)>,
     /// in another context, the ground markers it holds
     gmarks: FxHashSet<Lit>,
-    /// in the root, its edges by existential restriction and constant
+    /// the context's edges over `f_e(u)`, by existential restriction and constant
     succ_set: FxHashSet<(Ex, u32)>,
-    /// in the root, the existential restrictions and constants of the edges to each
-    /// successor
+    /// the existential restrictions and constants of the context's edges over `f_e(u)` to
+    /// each successor
     by_succ: FxHashMap<Ex, Vec<(Ex, u32)>>,
 }
 
 impl RootSt {
+    /// The existential restrictions and constants of the context's edges over `f_e(u)` to
+    /// the successor w.
+    pub(super) fn edges_to(&self, w: Ex) -> &[(Ex, u32)] {
+        self.by_succ.get(&w).map_or(&[][..], |v| v)
+    }
+
     pub fn bytes(&self) -> usize {
         let lists = |m: &FxHashMap<u32, Vec<u32>>| {
             table_bytes(m.capacity(), 32) + m.values().map(|v| v.capacity() * 4).sum::<usize>()
@@ -117,16 +110,8 @@ impl RootSt {
             + lists(&self.roles_of)
             + lists(&self.edges)
             + table_bytes(self.edge_set.capacity(), 8)
-            + table_bytes(self.markers.capacity(), 8)
             + lists(&self.ready)
-            + table_bytes(self.sent.capacity(), 8)
             + table_bytes(self.seen.capacity(), 4)
-            + table_bytes(self.waiting.capacity(), 32)
-            + self
-                .waiting
-                .values()
-                .map(|v| v.capacity() * 4)
-                .sum::<usize>()
             + table_bytes(self.edged.capacity(), 4)
             + self.ground.capacity() * 8
             + table_bytes(self.ground_set.capacity(), 8)
@@ -194,9 +179,11 @@ pub fn init<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
     st.init = true;
     root_of(ds(st), out);
     let mut found = Found::default();
+    found.root = true;
+    found.rule = "init";
     for &(u, n) in &dix(ix).consts {
         found.push((Vec::new(), vec![atom(ix, out, n, u)]));
-        hyper_at(ix, st, out, TOP, u, &unit(), &mut found);
+        hyper_at(ix, st, out, TOP, u, &unit(), &mut found, false);
     }
     drain_with(ix, st, found, out, derive);
 }
@@ -220,31 +207,18 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
                 ix,
                 lits: &out.dl().lits,
                 inv: &inv,
+                ground_total: super::dl_clause::ground_total(),
             };
             x.store.next(ix, Some(&o), &mut max)
         };
         let Some(id) = id else {
             break;
         };
-        let mut grown = x.store.take_grown();
-        // the indexes by constant, before the rules, so that a clause meets itself
-        let r = root_of(x, out);
-        for &l in &max {
-            match out.dl().lits.view(l, inv) {
-                XLit::Atom(_, RTerm::C(u)) => grown += RootSt::push(&mut r.by_const, u, id),
-                XLit::Role(_, a, b) => {
-                    for t in [a, b] {
-                        if let RTerm::C(u) = t {
-                            grown += RootSt::push(&mut r.roles_of, u, id);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        let grown = x.store.take_grown();
         if grown > 0 {
             out.dl().grow(grown);
         }
+        index_consts(ix, x, &max, id, out);
         n += 1;
         let c = x.store.clauses[id as usize].c.clone();
         process(ix, st, &c, &max, out);
@@ -256,10 +230,51 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
     n
 }
 
+/// Lists the processed clause `id` of a context by the constants of its maximal literals
+/// `max`, in the context's indexes by constant, before the rules so that a clause meets
+/// itself.
+pub(super) fn index_consts<S: Sink>(
+    ix: &Index,
+    x: &mut super::dl_rules::DlSt,
+    max: &[Lit],
+    id: u32,
+    out: &S,
+) {
+    let inv = inv_of(ix, dix(ix));
+    let mut grown = 0;
+    let r = root_of(x, out);
+    for &l in max {
+        match out.dl().lits.view(l, inv) {
+            XLit::Atom(_, RTerm::C(u)) => grown += RootSt::push(&mut r.by_const, u, id),
+            XLit::Role(_, a, b) => {
+                for t in [a, b] {
+                    if let RTerm::C(u) = t {
+                        grown += RootSt::push(&mut r.roles_of, u, id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if grown > 0 {
+        out.dl().grow(grown);
+    }
+}
+
 /// The rules on one clause of the root's store, whose maximal literals are `max`.
 fn process<S: Sink>(ix: &Index, st: &mut State, c: &Clause, max: &[Lit], out: &mut S) {
     let dx = dix(ix);
+    let me = dx.root.expect("a rooted run");
     let mut found = Found::default();
+    found.root = true;
+    if super::dl_rules::tracing() {
+        let lits = &out.dl().lits;
+        eprintln!(
+            "TR P R - {} -> {}",
+            super::dl_rules::tr(ix, lits, c.body()),
+            super::dl_rules::tr(ix, lits, c.head())
+        );
+    }
     join_body(ix, st, c, &mut found, &out.dl().lits);
     for &l in max {
         let prem = side(c, l);
@@ -268,55 +283,173 @@ fn process<S: Sink>(ix: &Index, st: &mut State, c: &Clause, max: &[Lit], out: &m
             dx,
             lits: &out.dl().lits,
             root: true,
+            query: None,
         };
-        q.on_max(st, l, &prem, &mut found);
-        join_head(st, c, l, &prem, &mut found);
+        q.on_max(st, l, &prem, &mut found, false);
+        join_head(ix, st, c, l, &prem, &mut found, &out.dl().lits, false);
         let v = out.dl().lits.view(l, inv_of(ix, dx));
         if ground_trigger(v) {
             ground_out(ix, st, l, out);
         }
-        let (ts, n) = terms_of(v);
-        for k in 0..n {
-            let RTerm::Fc(e, u) = ts[k] else { continue };
-            if ts[..k].contains(&ts[k]) {
-                continue;
-            }
-            let w = succ_at(ix, st, e, u, &mut found, out);
-            if let XLit::Atom(a, _) = v {
-                super::dl_rules::send_hyp(ix, st, w, a, out);
-            }
-            let cids = dl(st)
-                .and_then(|x| x.pred_in.get(&w))
-                .cloned()
-                .unwrap_or_default();
-            for cid in cids {
-                let c = out.dl().table.get(cid);
-                root_pred(
-                    ix,
-                    st,
-                    e,
-                    u,
-                    c,
-                    Some((l, &prem)),
-                    &mut found,
-                    &out.dl().lits,
-                );
-            }
-        }
-        match v {
-            XLit::Atom(d, RTerm::C(u)) => hyper_at(ix, st, out, d, u, &prem, &mut found),
-            v @ XLit::Role(..) => {
-                for (u, s, t) in from(v, inv_of(ix, dx)) {
-                    on_role(ix, st, out, s, u, t, &prem, &mut found);
-                }
-            }
-            _ => {}
-        }
+        at_consts(ix, me, st, l, v, &prem, &mut found, out, false);
     }
     drain_with(ix, st, found, out, derive);
 }
 
-/// The premises in the root whose maximal literal is `l`.
+/// The rules at the constants on a new premise `prem` of the context `me` whose maximal
+/// literal is `l`, viewed as `v`: Succ over each successor term `f_e(u)` of v, with the
+/// markers of an atom over it and Pred with the clauses the successor already sent, Hyper
+/// with x bound to u on a ground atom `B(u)`, and the universal restrictions of the
+/// constant's holders on a role atom with a constant at an end.
+#[allow(clippy::too_many_arguments)]
+fn at_consts<S: Sink>(
+    ix: &Index,
+    me: Ex,
+    st: &mut State,
+    l: Lit,
+    v: XLit,
+    prem: &Side,
+    found: &mut Found,
+    out: &mut S,
+    sel: bool,
+) {
+    let dx = dix(ix);
+    let (ts, n) = terms_of(v);
+    for k in 0..n {
+        let RTerm::Fc(e, u) = ts[k] else { continue };
+        if ts[..k].contains(&ts[k]) {
+            continue;
+        }
+        let w = succ_at(ix, me, st, e, u, found, out);
+        if let XLit::Atom(a, _) = v {
+            super::dl_rules::send_hyp(ix, st, w, a, out);
+        }
+        let cids = dl(st)
+            .and_then(|x| x.pred_in.get(&w))
+            .cloned()
+            .unwrap_or_default();
+        for cid in cids {
+            let c = out.dl().table.get(cid);
+            root_pred(ix, st, e, u, c, Some((l, prem)), found, &out.dl().lits);
+        }
+    }
+    match v {
+        XLit::Atom(d, RTerm::C(u)) => hyper_at(ix, st, out, d, u, prem, found, sel),
+        v @ XLit::Role(..) => {
+            for (u, s, t) in from(v, inv_of(ix, dx)) {
+                on_role(ix, st, out, s, u, t, prem, found, sel);
+            }
+            if let Some((s, u)) = to_const(v, inv_of(ix, dx)) {
+                univ_to_const(ix, st, out, s, u, prem, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The role atom `v` read from `x` to a constant: `(s, u)` for `s(x, u)`, by the inverse
+/// role when x is its second term.
+fn to_const(v: XLit, inv: impl Fn(Role) -> Option<Role>) -> Option<(Role, u32)> {
+    match v {
+        XLit::Role(s, RTerm::X, RTerm::C(u)) => Some((s, u)),
+        XLit::Role(s, RTerm::C(u), RTerm::X) => inv(s).map(|i| (i, u)),
+        _ => None,
+    }
+}
+
+/// Hyper on a new premise `prem` of the role atom `s(x, u)` with the universal restrictions
+/// that the holders of `x` stand for: `∀t.C(x) ∧ s(x, u) → C(u)` for `s ⊑ t`, with the
+/// unit holders and the clauses whose maximal literal is a holder over `x`. The inference
+/// is local to the context, since no predecessor sees `s(x, u)`, so a selected premise
+/// takes part.
+fn univ_to_const<S: Sink>(
+    ix: &Index,
+    st: &State,
+    out: &S,
+    s: Role,
+    u: u32,
+    prem: &Side,
+    found: &mut Found,
+) {
+    found.rule = "univc";
+    let dx = dix(ix);
+    let mut ps = Vec::new();
+    let mut over = |b: Ex, q: &Side, found: &mut Found| {
+        alls(ix, b, &mut ps);
+        for &(t, c) in ps.iter() {
+            if dx.sub(ix, s, t)
+                && let Made::Lit(m) = lit(ix, out, XLit::Atom(c, RTerm::C(u)))
+            {
+                found.push(with(&merge(prem, q), m));
+            }
+        }
+    };
+    over(TOP, &unit(), found);
+    for &b in &st.subs {
+        if b != TOP {
+            over(b, &unit(), found);
+        }
+    }
+    let Some(d) = dl(st) else { return };
+    let mut holders: Vec<Ex> = d.store.by_x.keys().copied().collect();
+    holders.sort_unstable();
+    for b in holders {
+        if st.subs.contains(&b) {
+            continue;
+        }
+        for i in d.store.with_x(b) {
+            let p = side(&d.store.clauses[i as usize].c, Lit::x(b));
+            over(b, &p, found);
+        }
+    }
+}
+
+/// Hyper on a new premise `prem` of a holder `d(x)` of universal restrictions with the
+/// processed role atoms from `x` to a constant: `∀t.C(x) ∧ s(x, u) → C(u)` for `s ⊑ t`,
+/// the other arrival order of [`univ_to_const`].
+pub(super) fn univ_from_x(
+    ix: &Index,
+    st: &State,
+    lits: &super::dl_clause::Lits,
+    d: Ex,
+    prem: &Side,
+    found: &mut Found,
+) {
+    found.rule = "univx";
+    let dx = dix(ix);
+    let mut ps = Vec::new();
+    alls(ix, d, &mut ps);
+    if ps.is_empty() {
+        return;
+    }
+    let Some(x) = dl(st) else { return };
+    let Some(r) = x.root.as_deref() else { return };
+    let inv = inv_of(ix, dx);
+    let mut ids: Vec<u32> = r.roles_of.values().flatten().copied().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    for i in ids {
+        let c = &x.store.clauses[i as usize];
+        if c.dead {
+            continue;
+        }
+        for &l in x.store.maxima(i) {
+            let Some((s, u)) = to_const(lits.view(l, inv), inv) else {
+                continue;
+            };
+            for &(t, b) in &ps {
+                if dx.sub(ix, s, t)
+                    && let Made::Lit(m) = lits.lit(XLit::Atom(b, RTerm::C(u)), inv)
+                {
+                    found.push(with(&merge(prem, &side(&c.c, l)), m));
+                }
+            }
+        }
+    }
+}
+
+/// The premises of a ground inference whose maximal literal is `l`, the selected clauses
+/// and the markers left out.
 fn partners(st: &State, l: Lit) -> Vec<Side> {
     let Some(d) = dl(st) else {
         return Vec::new();
@@ -326,7 +459,10 @@ fn partners(st: &State, l: Lit) -> Vec<Side> {
         .get(&l)
         .into_iter()
         .flatten()
-        .filter(|&&i| !d.store.clauses[i as usize].dead)
+        .filter(|&&i| {
+            let s = &d.store.clauses[i as usize];
+            !s.dead && !s.sel
+        })
         .map(|&i| side(&d.store.clauses[i as usize].c, l))
         .collect()
 }
@@ -340,8 +476,19 @@ fn partners_at<S: Sink>(ix: &Index, st: &State, out: &S, a: Ex, u: u32) -> Vec<S
     partners(st, atom(ix, out, a, u))
 }
 
+/// Adds the conclusion `s` of a ground inference, unless the restriction on ground
+/// inferences leaves it out.
+fn put<S: Sink>(ix: &Index, out: &S, found: &mut Found, s: Side) {
+    if !restricted(&out.dl().lits, inv_of(ix, dix(ix)), &s) {
+        found.push(s);
+    }
+}
+
 /// Hyper on a new premise `prem` of `d(u)`: the ontology clauses with d in the body, with
-/// their x bound to u.
+/// their x bound to u. A conclusion is a ground inference's unless it holds x or y. A
+/// selected premise, a marker included, takes only the universals over the role atoms
+/// from u that are local to the context ([`super::dl_rules::local`]).
+#[allow(clippy::too_many_arguments)]
 fn hyper_at<S: Sink>(
     ix: &Index,
     st: &State,
@@ -350,27 +497,33 @@ fn hyper_at<S: Sink>(
     u: u32,
     prem: &Side,
     found: &mut Found,
+    sel: bool,
 ) {
+    found.rule = "hyperc";
     let dx = dix(ix);
+    if sel {
+        hyper_roles(ix, st, out, d, u, prem, found, sel);
+        return;
+    }
     let at = |a: Ex| atom(ix, out, a, u);
     let h = ix.head(d);
     match h.node {
         Node::Conj(a, b) => {
-            found.push(with(prem, at(a)));
-            found.push(with(prem, at(b)));
+            put(ix, out, found, with(prem, at(a)));
+            put(ix, out, found, with(prem, at(b)));
         }
         Node::Exist(r, _) => {
             let f = RTerm::Fc(d, u);
             for l in [XLit::Role(r, RTerm::C(u), f), XLit::Atom(h.succ, f)] {
                 if let Made::Lit(l) = lit(ix, out, l) {
-                    found.push(with(prem, l));
+                    put(ix, out, found, with(prem, l));
                 }
             }
         }
         // N_v(x) → x ≈ v
         Node::Nominal(v) if v != u => {
             if let Made::Lit(l) = lit(ix, out, XLit::Eq(RTerm::C(v), RTerm::C(u))) {
-                found.push(with(prem, l));
+                put(ix, out, found, with(prem, l));
             }
         }
         _ => {}
@@ -380,24 +533,24 @@ fn hyper_at<S: Sink>(
         for (i, &a) in es.iter().enumerate() {
             for &b in &es[i + 1..] {
                 if let Made::Lit(n) = lit(ix, out, XLit::Ne(RTerm::Fc(a, u), RTerm::Fc(b, u))) {
-                    found.push(with(prem, n));
+                    put(ix, out, found, with(prem, n));
                 }
             }
         }
     }
     for &t in ix.told_of(h) {
-        found.push(with(prem, at(t)));
+        put(ix, out, found, with(prem, at(t)));
     }
     for &(p, k) in ix.conj_of(h) {
         for q in partners_at(ix, st, out, p, u) {
-            found.push(with(&merge(prem, &q), at(k)));
+            put(ix, out, found, with(&merge(prem, &q), at(k)));
         }
     }
     for &set in ix.disjoint_of(h) {
         for &m in &dx.sets[set as usize] {
             if m != d {
                 for q in partners_at(ix, st, out, m, u) {
-                    found.push(merge(prem, &q));
+                    put(ix, out, found, merge(prem, &q));
                 }
             }
         }
@@ -416,10 +569,28 @@ fn hyper_at<S: Sink>(
                 })
                 .collect();
             let base: Side = (Vec::new(), head.iter().map(|&a| at(a)).collect());
-            found.products(lists, base);
+            found.ground_products(lists, base);
         }
     }
-    // the universals d stands for, over the role atoms from u
+    hyper_roles(ix, st, out, d, u, prem, found, sel);
+}
+
+/// The universals `d(u)` stands for, over the role atoms from u in the context. A role atom
+/// whose other end is a constant or a successor term of one makes a ground inference, which
+/// takes no selected premise, and any other is local and takes every premise.
+#[allow(clippy::too_many_arguments)]
+fn hyper_roles<S: Sink>(
+    ix: &Index,
+    st: &State,
+    out: &S,
+    d: Ex,
+    u: u32,
+    prem: &Side,
+    found: &mut Found,
+    sel: bool,
+) {
+    found.rule = "hyperr";
+    let dx = dix(ix);
     let mut ps = Vec::new();
     alls(ix, d, &mut ps);
     if ps.is_empty() {
@@ -438,11 +609,14 @@ fn hyper_at<S: Sink>(
                 if w != u {
                     continue;
                 }
+                if matches!(f, RTerm::C(_) | RTerm::Fc(..)) && (sel || s.sel) {
+                    continue;
+                }
                 for &(a, b) in &ps {
                     if dx.sub(ix, t, a)
                         && let Made::Lit(m) = lit(ix, out, XLit::Atom(b, f))
                     {
-                        found.push(with(&merge(prem, &side(&s.c, l)), m));
+                        put(ix, out, found, with(&merge(prem, &side(&s.c, l)), m));
                     }
                 }
             }
@@ -468,7 +642,9 @@ fn from(v: XLit, inv: impl Fn(Role) -> Option<Role>) -> Vec<(u32, Role, RTerm)> 
 }
 
 /// Hyper on a new premise `prem` of the role atom `s(u, f)`: the universals of the holders
-/// of u, `owl:Thing` included, and the disjoint roles.
+/// of u, `owl:Thing` included, and the disjoint roles. The inference is ground when f is a
+/// constant or a successor term of one, and the restriction then applies and no selected
+/// premise takes part; otherwise it is local and every premise takes part.
 #[allow(clippy::too_many_arguments)]
 fn on_role<S: Sink>(
     ix: &Index,
@@ -479,9 +655,20 @@ fn on_role<S: Sink>(
     f: RTerm,
     prem: &Side,
     found: &mut Found,
+    sel: bool,
 ) {
+    found.rule = "onrole";
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
+    let ground = matches!(f, RTerm::C(_) | RTerm::Fc(..));
+    if ground && sel {
+        return;
+    }
+    let add = |found: &mut Found, c: Side| {
+        if !ground || !restricted(&out.dl().lits, inv, &c) {
+            found.push(c);
+        }
+    };
     let mut ps = Vec::new();
     let over = |b: Ex, q: &Side, ps: &mut Vec<(Role, Ex)>, found: &mut Found| {
         alls(ix, b, ps);
@@ -489,7 +676,7 @@ fn on_role<S: Sink>(
             if dx.sub(ix, s, t)
                 && let Made::Lit(m) = lit(ix, out, XLit::Atom(c, f))
             {
-                found.push(with(&merge(prem, q), m));
+                add(found, with(&merge(prem, q), m));
             }
         }
     };
@@ -498,7 +685,7 @@ fn on_role<S: Sink>(
     if let Some(r) = x.root.as_deref() {
         for &i in r.by_const.get(&u).into_iter().flatten() {
             let c = &x.store.clauses[i as usize];
-            if c.dead {
+            if c.dead || ground && c.sel {
                 continue;
             }
             for &l in x.store.maxima(i) {
@@ -515,13 +702,13 @@ fn on_role<S: Sink>(
             }
             for &i in r.roles_of.get(&u).into_iter().flatten() {
                 let c = &x.store.clauses[i as usize];
-                if c.dead {
+                if c.dead || ground && c.sel {
                     continue;
                 }
                 for &l in x.store.maxima(i) {
                     for (w, t, g) in from(out.dl().lits.view(l, inv), inv) {
                         if w == u && g == f && dx.sub(ix, t, b) {
-                            found.push(merge(prem, &side(&c.c, l)));
+                            add(found, merge(prem, &side(&c.c, l)));
                         }
                     }
                 }
@@ -533,7 +720,7 @@ fn on_role<S: Sink>(
 /// Adds a clause the root's rules derived: the empty clause makes the root unsatisfiable,
 /// and any other clause goes to the store unless it is redundant. The root has no units
 /// over x, so even a unit is stored.
-fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: &mut S) {
+pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: &mut S) {
     if st.bottom {
         return;
     }
@@ -577,11 +764,27 @@ fn is_marker(c: &Clause) -> bool {
 
 /// Join on a new premise `prem` of the clause `c`, whose maximal literal is `l`: when l is a
 /// ground atom or an equality of constants, the processed clauses with l in the body. A
-/// marker is no premise on either side, since its conclusion would be the other premise.
-pub(super) fn join_head(st: &State, c: &Clause, l: Lit, prem: &Side, found: &mut Found) {
-    if is_marker(c) {
+/// marker is no premise on either side, since its conclusion would be the other premise,
+/// and a selected clause is no premise on the side of the head, as ordered resolution
+/// with selection has it. A Join of two clauses that hold neither x nor y is a ground
+/// inference, and its conclusion then holds neither, so the restriction applies to the
+/// conclusion.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn join_head(
+    ix: &Index,
+    st: &State,
+    c: &Clause,
+    l: Lit,
+    prem: &Side,
+    found: &mut Found,
+    lits: &super::dl_clause::Lits,
+    sel: bool,
+) {
+    found.rule = "joinh";
+    if is_marker(c) || sel {
         return;
     }
+    let inv = inv_of(ix, dix(ix));
     let Some(x) = dl(st) else { return };
     for &i in x.store.by_ground.get(&l).into_iter().flatten() {
         let s = &x.store.clauses[i as usize];
@@ -592,7 +795,10 @@ pub(super) fn join_head(st: &State, c: &Clause, l: Lit, prem: &Side, found: &mut
             s.c.body().iter().copied().filter(|&m| m != l).collect(),
             s.c.head().to_vec(),
         );
-        found.push(merge(prem, &rest));
+        let c = merge(prem, &rest);
+        if !restricted(lits, inv, &c) {
+            found.push(c);
+        }
     }
 }
 
@@ -605,6 +811,7 @@ pub(super) fn join_body(
     found: &mut Found,
     lits: &super::dl_clause::Lits,
 ) {
+    found.rule = "joinb";
     if is_marker(c) {
         return;
     }
@@ -620,74 +827,31 @@ pub(super) fn join_body(
         let Some(x) = dl(st) else { return };
         for &i in x.store.by_xl.get(&l).into_iter().flatten() {
             let s = &x.store.clauses[i as usize];
-            if !s.dead && !is_marker(&s.c) {
-                found.push(merge(&side(&s.c, l), &rest));
+            if !s.dead && !s.sel && !is_marker(&s.c) {
+                let c = merge(&side(&s.c, l), &rest);
+                if !restricted(lits, inv, &c) {
+                    found.push(c);
+                }
             }
         }
     }
 }
 
-/// The constants of a literal.
+/// The constants of a literal, inside `f_e(u)` included.
 fn consts(v: XLit, out: &mut Vec<u32>) {
     let (ts, n) = terms_of(v);
     for t in &ts[..n] {
-        if let RTerm::C(u) = t {
+        if let RTerm::C(u) | RTerm::Fc(_, u) = t {
             out.push(*u);
         }
     }
 }
 
-/// A literal with every y read as x.
-fn over_x(v: XLit) -> XLit {
-    let t = |t: RTerm| if t == RTerm::Y { RTerm::X } else { t };
-    match v {
-        XLit::Atom(a, b) => XLit::Atom(a, t(b)),
-        XLit::Role(r, a, b) => XLit::Role(r, t(a), t(b)),
-        XLit::Eq(a, b) => XLit::Eq(t(a), t(b)),
-        XLit::Ne(a, b) => XLit::Ne(t(a), t(b)),
-    }
-}
-
-/// The root successor trigger of the journal's Definition 4 whose instance under
-/// σ = {y ↦ x} is `v`: `B(u)`, `S(x, u)`, `S(u, x)`, `S(u1, u2)` or `u1 ≈ u2` give `B(u)`,
-/// `S(y, u)`, `S(u, y)`, `S(u1, u2)` and `u1 ≈ u2`.
-fn trigger_of(v: XLit) -> Option<XLit> {
-    use RTerm::{C, X, Y};
-    match v {
-        XLit::Atom(_, C(_)) | XLit::Eq(C(_), C(_)) | XLit::Role(_, C(_), C(_)) => Some(v),
-        XLit::Role(s, X, b @ C(_)) => Some(XLit::Role(s, Y, b)),
-        XLit::Role(s, a @ C(_), X) => Some(XLit::Role(s, a, Y)),
-        _ => None,
-    }
-}
-
-/// Whether a root literal is a root successor trigger: `B(u)`, `S(y, u)`, `S(u, y)`,
-/// `S(u1, u2)` or `u1 ≈ u2`.
-fn is_trigger(v: XLit) -> bool {
-    use RTerm::{C, Y};
-    matches!(
-        v,
-        XLit::Atom(_, C(_))
-            | XLit::Eq(C(_), C(_))
-            | XLit::Role(_, C(_), C(_))
-            | XLit::Role(_, Y, C(_))
-            | XLit::Role(_, C(_), Y)
-    )
-}
-
-/// Whether r-Pred takes a head literal of a root clause: a ground literal, or a root
-/// predecessor trigger, which is a root successor trigger, `B(y)` or `y ≈ u`.
-fn returns(v: XLit) -> bool {
-    use RTerm::{C, Y};
-    v.is_ground()
-        || is_trigger(v)
-        || matches!(v, XLit::Atom(_, Y) | XLit::Eq(Y, C(_)) | XLit::Eq(C(_), Y))
-}
-
-/// The rules between a context other than the root and the root on a new premise `prem` of
-/// the context, whose maximal literal is the interned literal `l`: r-Succ sends the root the
-/// marker of a root successor trigger, Join resolves a ground l with the clauses that have
-/// it in the body, and r-Pred resolves l with the root's clauses that wait for it.
+/// The rules of a context other than the root on a new premise `prem` of the clause `c`,
+/// whose maximal literal is the interned literal `l`: the context registers with the root
+/// for the constants of l, sends its successors the marker of a ground l, resolves a ground
+/// l with the clauses that have it in the body (Join), and runs the rules at the constants
+/// of l, Hyper with x bound to a constant and Succ over `f_e(u)`, with its own clauses.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn on_max<S: Sink>(
     ix: &Index,
@@ -698,34 +862,11 @@ pub(super) fn on_max<S: Sink>(
     prem: &Side,
     found: &mut Found,
     out: &mut S,
+    sel: bool,
 ) {
     let dx = dix(ix);
     let v = out.dl().lits.view(l, inv_of(ix, dx));
-    if let Some(a) = trigger_of(v)
-        && let Made::Lit(m) = lit(ix, out, a)
-        && let Some(root) = dx.root
-    {
-        let mut grown = 0;
-        let r = root_of(ds(st), out);
-        if let Some(b) = RootSt::ins(&mut r.sent, m, 8) {
-            out.send(root, Concl::RHyp(me, m.xid()));
-            grown += b;
-            let mut us = Vec::new();
-            consts(a, &mut us);
-            for u in us {
-                grown += RootSt::ins(&mut r.edged, u, 4).unwrap_or(0);
-            }
-        }
-        if grown > 0 {
-            out.dl().grow(grown);
-        }
-    }
-    // a maximal literal over a constant that is no root successor trigger, such as x ≈ u,
-    // registers the context for its constants, so that the root's clauses without a body
-    // over them reach it
-    if let Some(root) = dx.root
-        && trigger_of(v).is_none()
-    {
+    if let Some(root) = dx.root {
         let mut us = Vec::new();
         consts(v, &mut us);
         edge_to(root, me, st, us, out);
@@ -733,128 +874,60 @@ pub(super) fn on_max<S: Sink>(
     if ground_trigger(v) {
         ground_out(ix, st, l, out);
     }
-    join_head(st, c, l, prem, found);
-    let Some(cids) = dl(st)
-        .and_then(|x| x.root.as_deref())
-        .and_then(|r| r.waiting.get(&l))
-        .cloned()
-    else {
-        return;
-    };
-    for cid in cids {
-        rpred(
-            ix,
-            st,
-            out.dl().table.get(cid),
-            Some((l, prem)),
-            found,
-            &out.dl().lits,
-        );
-    }
+    join_head(ix, st, c, l, prem, found, &out.dl().lits, sel);
+    at_consts(ix, me, st, l, v, prem, found, out, sel);
 }
 
-/// r-Pred with the root's clause `c` in a context other than the root: each body atom, read
-/// with y as x, takes a premise of the context where it is maximal, and the head is read
-/// with y as x. `fixed` is the premise that a new clause gives for one of the body atoms.
-fn rpred(
-    ix: &Index,
-    st: &State,
-    c: &Clause,
-    fixed: Option<(Lit, &Side)>,
-    found: &mut Found,
-    lits: &super::dl_clause::Lits,
-) {
-    let inv = inv_of(ix, dix(ix));
-    let mut keys = Vec::with_capacity(c.body().len());
-    for &l in c.body() {
-        match lits.lit(over_x(lits.view(l, inv)), inv) {
-            Made::Lit(k) => keys.push(k),
-            // a body literal that holds is no premise, and one that cannot makes the
-            // clause hold
-            Made::True => {}
-            Made::False => return,
-        }
-    }
-    if let Some((p, _)) = fixed
-        && !keys.contains(&p)
-    {
-        return;
-    }
-    let mut head = Vec::with_capacity(c.head().len());
-    for &l in c.head() {
-        match lits.lit(over_x(lits.view(l, inv)), inv) {
-            Made::Lit(m) => head.push(m),
-            Made::False => {}
-            Made::True => return,
-        }
-    }
-    let lists: Vec<Vec<Side>> = keys
-        .iter()
-        .map(|&k| match fixed {
-            Some((p, s)) if p == k => vec![s.clone()],
-            _ => partners(st, k),
-        })
-        .collect();
-    found.products(lists, (Vec::new(), head));
-}
-
-/// r-Pred: a context other than the root takes a clause the root sent.
+/// A context other than the root takes a clause the root sent, a processed root clause with
+/// an empty body over one of the constants the context registered for, once.
 pub fn rpred_c<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool {
     if st.bottom {
         return false;
     }
-    let inv = inv_of(ix, dix(ix));
-    let mut grown = 0;
     let r = root_of(ds(st), out);
     match RootSt::ins(&mut r.seen, cid, 4) {
-        Some(b) => grown += b,
+        Some(b) => out.dl().grow(b),
         None => return false,
     }
-    let c = out.dl().table.get(cid).clone();
-    for &l in c.body() {
-        let lits = &out.dl().lits;
-        if let Made::Lit(k) = lits.lit(over_x(lits.view(l, inv)), inv) {
-            let table = table_bytes(r.waiting.capacity(), 32);
-            let w = r.waiting.entry(k).or_default();
-            let cap = w.capacity();
-            w.push(cid);
-            grown += (w.capacity() - cap) * 4
-                + table_bytes(r.waiting.capacity(), 32).saturating_sub(table);
-        }
-    }
-    out.dl().grow(grown);
+    let c = out.dl().table.get(cid);
+    debug_assert!(c.body().is_empty(), "the root sends its facts");
     let mut found = Found::default();
-    rpred(ix, st, &c, None, &mut found, &out.dl().lits);
+    found.rule = "rpred";
+    found.push((Vec::new(), c.head().to_vec()));
+    ds(st).taking_fact = true;
     drain(ix, st, found, out);
+    ds(st).taking_fact = false;
     true
 }
 
-/// r-Succ in the root: the context v sends the marker of the root successor trigger with id
-/// `xid`. The root registers v for each of the marker's constants, takes the marker, and
-/// sends v the clauses that r-Pred gives it for the new registrations.
-pub fn rhyp<S: Sink>(ix: &Index, st: &mut State, v: Ex, xid: u32, out: &mut S) -> bool {
-    let l = Lit::xl(xid);
-    let mut us = Vec::new();
-    consts(out.dl().lits.view(l, inv_of(ix, dix(ix))), &mut us);
-    register(ix, st, v, us, Some(l), out)
+/// The root takes a fact that a hypothetical successor derived, a clause with an empty
+/// body whose literals hold neither `x` nor `y`: the successor has the empty core and no
+/// assumption, so its clauses hold of every element, and this one holds in every model of
+/// the ontology. The root derives it as its own, and the redundancy of its store leaves out
+/// one that it holds already.
+pub fn rfact<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool {
+    if st.bottom {
+        return false;
+    }
+    let c = out.dl().table.get(cid);
+    debug_assert!(c.body().is_empty(), "a promoted fact has no body");
+    let mut found = Found::default();
+    found.root = true;
+    found.rule = "rfact";
+    found.push((Vec::new(), c.head().to_vec()));
+    drain_with(ix, st, found, out, derive);
+    true
 }
 
-/// The context v registers with the root for the constant u, which a ground literal in one
-/// of its bodies mentions.
-pub fn redge<S: Sink>(ix: &Index, st: &mut State, v: Ex, u: u32, out: &mut S) -> bool {
-    register(ix, st, v, vec![u], None, out)
+/// The context v registers with the root for the constant u, which a maximal literal of
+/// one of its clauses or a ground literal in one of its bodies mentions.
+pub fn redge<S: Sink>(st: &mut State, v: Ex, u: u32, out: &mut S) -> bool {
+    register(st, v, vec![u], out)
 }
 
-/// The root registers v for the constants `us` and takes the marker of `l` when given, and
-/// v gets the clauses that r-Pred gives it for the new registrations.
-fn register<S: Sink>(
-    ix: &Index,
-    st: &mut State,
-    v: Ex,
-    mut us: Vec<u32>,
-    l: Option<Lit>,
-    out: &mut S,
-) -> bool {
+/// The root registers v for the constants `us`, and v gets the root's facts over the new
+/// ones.
+fn register<S: Sink>(st: &mut State, v: Ex, mut us: Vec<u32>, out: &mut S) -> bool {
     us.sort_unstable();
     us.dedup();
     let bottom = st.bottom;
@@ -868,22 +941,11 @@ fn register<S: Sink>(
             new.push(u);
         }
     }
-    let mut marked = false;
-    if !bottom
-        && let Some(l) = l
-        && let Some(b) = RootSt::ins(&mut r.markers, l, 8)
-    {
-        grown += b;
-        marked = true;
-        if let Some(b) = x.store.add(Clause::new(vec![l], vec![l])) {
-            grown += b;
-        }
-    }
     if grown > 0 {
         out.dl().grow(grown);
     }
     if new.is_empty() {
-        return marked;
+        return false;
     }
     // an unsatisfiable root sends the empty clause to every context registered with it
     if bottom {
@@ -891,15 +953,12 @@ fn register<S: Sink>(
         out.send(v, Concl::RPred(id));
         return true;
     }
-    let lits = &out.dl().lits;
-    let inv = inv_of(ix, dix(ix));
     let mut ids: Vec<u32> = Vec::new();
     {
         let r = x.root.as_deref().expect("made above");
         for &u in &new {
             for &i in r.ready.get(&u).into_iter().flatten() {
-                let s = &x.store.clauses[i as usize];
-                if !s.dead && registered(r, lits, inv, &s.c, v) {
+                if !x.store.clauses[i as usize].dead {
                     ids.push(i);
                 }
             }
@@ -915,46 +974,16 @@ fn register<S: Sink>(
     true
 }
 
-/// Whether the context v is registered with the root for every constant of the body of the
-/// root's clause c. A clause without a body is listed by the constants of its head, each of
-/// which it is sent for.
-fn registered(
-    r: &RootSt,
-    lits: &super::dl_clause::Lits,
-    inv: impl Fn(Role) -> Option<Role> + Copy,
-    c: &Clause,
-    v: Ex,
-) -> bool {
-    let mut us = Vec::new();
-    for &l in c.body() {
-        consts(lits.view(l, inv), &mut us);
-    }
-    us.iter().all(|&u| r.edge_set.contains(&(v, u)))
-}
-
-/// r-Pred from the root: a processed clause whose body atoms are root successor triggers and
-/// whose head literals r-Pred takes goes to the contexts registered for the constants of its
-/// body, or for a constant of its head when the body is empty, and is listed for the
-/// contexts that register later. A marker stays in the root, since its conclusion would be
-/// the context's premise.
+/// A processed root clause with an empty body goes to the contexts registered for one of
+/// the constants of its head, and is listed for the contexts that register later.
 fn offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S) {
-    if st.bottom || is_marker(c) {
+    if st.bottom || !c.body().is_empty() {
         return;
     }
     let inv = inv_of(ix, dix(ix));
     let lits = &out.dl().lits;
-    if !c.body().iter().all(|&l| is_trigger(lits.view(l, inv)))
-        || !c.head().iter().all(|&l| returns(lits.view(l, inv)))
-    {
-        return;
-    }
     let mut keys = Vec::new();
-    let from = if c.body().is_empty() {
-        c.head()
-    } else {
-        c.body()
-    };
-    for &l in from {
+    for &l in c.head() {
         consts(lits.view(l, inv), &mut keys);
     }
     keys.sort_unstable();
@@ -974,7 +1003,6 @@ fn offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S) 
         .collect();
     to.sort_unstable();
     to.dedup();
-    to.retain(|&v| registered(r, lits, inv, c, v));
     if to.is_empty() {
         return;
     }
@@ -1028,8 +1056,8 @@ fn root_of<'a, S: Sink>(x: &'a mut super::dl_rules::DlSt, out: &S) -> &'a mut Ro
     x.root.get_or_insert_with(Box::default)
 }
 
-/// The successors of a context: those it registered with, the EL successors of its unit
-/// existential restrictions, and in the root those of its successor terms.
+/// The successors of a context: those it registered with over `f_e(x)` and over `f_e(u)`,
+/// and the EL successors of its unit existential restrictions.
 fn successors(ix: &Index, st: &State) -> Vec<Ex> {
     let mut v: Vec<Ex> = Vec::new();
     if let Some(x) = dl(st) {
@@ -1139,21 +1167,22 @@ fn edge_to<S: Sink>(root: Ex, me: Ex, st: &mut State, us: Vec<u32>, out: &mut S)
     }
 }
 
-/// Succ in the root for the successor term `f_e(u)`: the successor is e's hypothetical
-/// successor, which has the empty core. A new edge registers the root with it, sends it
-/// the markers of the root's ground literals when it is a new successor, and replays the
-/// clauses it already sent for the new constant.
+/// Succ in the context `me` for the successor term `f_e(u)`: the successor is e's
+/// hypothetical successor, which has the empty core. A new edge registers the context with
+/// it, sends it the markers of the context's ground literals when it is a new successor,
+/// and replays the clauses it already sent for the new constant.
 fn succ_at<S: Sink>(
     ix: &Index,
+    me: Ex,
     st: &mut State,
     e: Ex,
     u: u32,
     found: &mut Found,
     out: &mut S,
 ) -> Ex {
+    found.rule = "succ";
     let dx = dix(ix);
     let w = dx.hyp.get(&e).copied().unwrap_or(TOP);
-    let me = dx.root.expect("a rooted run");
     let r = rst(st, out);
     let Some(b) = RootSt::ins(&mut r.succ_set, (e, u), 8) else {
         return w;
@@ -1190,14 +1219,14 @@ fn succ_at<S: Sink>(
     w
 }
 
-/// Pred into the root with the clause `c` of the successor of `f_e(u)`: y is read as u and x
-/// as `f_e(u)`. Each body atom `B(x)` takes a premise whose maximal literal is `B(f_e(u))`,
-/// each role atom `s(y, x)` one whose maximal literal is a role atom below s from u to
-/// `f_e(u)`, and the ground body literals stay. `fixed` is the premise that a new clause
-/// gives for one of these literals. The successor's core is empty, so no core atom is
-/// resolved.
+/// Pred along the edge over `f_e(u)` with the clause `c` of its successor, in any context:
+/// y is read as u and x as `f_e(u)`. Each body atom `B(x)` takes a premise whose maximal
+/// literal is `B(f_e(u))`, each role atom `s(y, x)` one whose maximal literal is a role
+/// atom below s from u to `f_e(u)`, and the ground body literals stay. `fixed` is the
+/// premise that a new clause gives for one of these literals. The successor's core is
+/// empty, so no core atom is resolved.
 #[allow(clippy::too_many_arguments)]
-fn root_pred(
+pub(super) fn root_pred(
     ix: &Index,
     st: &State,
     e: Ex,
@@ -1207,6 +1236,7 @@ fn root_pred(
     found: &mut Found,
     lits: &super::dl_clause::Lits,
 ) {
+    found.rule = "rpredc";
     use super::dl_clause::{RY, X as KX};
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
@@ -1303,41 +1333,6 @@ fn root_pred(
             }
         }
     }
-}
-
-/// Pred into the root: the successor w sent a clause over its predecessor, which the root
-/// takes for each constant it reaches w by.
-pub fn pred_c<S: Sink>(ix: &Index, st: &mut State, w: Ex, cid: u32, out: &mut S) -> bool {
-    if st.bottom {
-        return false;
-    }
-    let x = ds(st);
-    let (seen, table) = (x.pred_seen.capacity(), x.pred_in.capacity());
-    if !x.pred_seen.insert((w, cid)) {
-        return false;
-    }
-    let list = x.pred_in.entry(w).or_default();
-    let cap = list.capacity();
-    list.push(cid);
-    let grown = (list.capacity() - cap) * 4
-        + table_bytes(x.pred_seen.capacity(), 8).saturating_sub(table_bytes(seen, 8))
-        + table_bytes(x.pred_in.capacity(), 32).saturating_sub(table_bytes(table, 32));
-    if grown > 0 {
-        out.dl().grow(grown);
-    }
-    let pairs = x
-        .root
-        .as_deref()
-        .and_then(|r| r.by_succ.get(&w))
-        .cloned()
-        .unwrap_or_default();
-    let mut found = Found::default();
-    let c = out.dl().table.get(cid);
-    for (e, u) in pairs {
-        root_pred(ix, st, e, u, c, None, &mut found, &out.dl().lits);
-    }
-    drain_with(ix, st, found, out, derive);
-    true
 }
 
 #[cfg(test)]
@@ -1638,10 +1633,12 @@ mod tests {
 
     #[test]
     fn a_universal_over_a_disjunction_keeps_its_case() {
-        // {a} ⊑ ∃r.E, {a} ⊑ A ⊔ B, A ⊑ ∀r.H: A(a) ∨ B(a) gives H(f(a)) ∨ B(a)
+        // {a} ⊑ ∃r.E, {a} ⊑ A ⊔ B, A ⊑ ∀r.H: A(a) ∨ B(a) gives H(f(a)) ∨ B(a), with A
+        // declared after B so that A(a) is the maximal literal under the shared ground
+        // order of item 804
         let mut s = Sig::new();
         let na = s.ind("a");
-        let [e, a, b, h] = ["E", "A", "B", "H"].map(|n| s.class(n));
+        let [e, b, a, h] = ["E", "B", "A", "H"].map(|n| s.class(n));
         let r = s.role("r");
         let some = s.some(r, e);
         let all_h = s.all(r, h);
@@ -1723,27 +1720,39 @@ mod tests {
     }
 
     #[test]
-    fn an_equality_in_a_disjunction_keeps_its_case() {
-        // {a} ⊑ {b} ⊔ C, B(b), with a and b different only under D: B(a) ∨ C(a)
-        let mut s = Sig::new();
-        let na = s.ind("a");
-        let nb = s.ind("b");
-        let [b, cc] = ["B", "C"].map(|n| s.class(n));
-        s.sub(nb, b);
-        s.dl.clauses.push((vec![na], vec![nb, cc]));
-        let d = saturate_root(s);
-        let (ua, ub) = (c(na, &d.ix), c(nb, &d.ix));
-        let lo = ua.min(ub);
-        let hi = ua.max(ub);
-        // B holds of a when a is b, so B(lo) ∨ C(a) when a is the smaller
-        assert!(
-            d.clauses().iter().any(|(bd, h)| bd.is_empty()
-                && h.contains(&XLit::Eq(lo, hi))
-                && h.contains(&XLit::Atom(cc, ua))),
-            "a ≈ b ∨ C(a)"
-        );
-        assert!(!d.has(&[XLit::Atom(b, ua)]) || ua == ub);
-        assert!(!d.bottom());
+    fn an_equality_below_a_ground_atom_waits_for_the_atom() {
+        // {a} ⊑ {b} ⊔ C, B(b): under the shared ground order of item 804 the atom C(a) is
+        // above a ≈ b, so a ≈ b ∨ C(a) stands, and once C ⊑ ⊥ resolves C(a) away the unit
+        // a ≈ b rewrites B(b) to B of the smaller constant
+        for bottom in [false, true] {
+            let mut s = Sig::new();
+            // B and C before the individuals, so that N_b(a) is maximal beside C(a)
+            let [b, cc] = ["B", "C"].map(|n| s.class(n));
+            let na = s.ind("a");
+            let nb = s.ind("b");
+            s.sub(nb, b);
+            if bottom {
+                s.sub(cc, BOTTOM);
+            }
+            s.dl.clauses.push((vec![na], vec![nb, cc]));
+            let d = saturate_root(s);
+            let (ua, ub) = (c(na, &d.ix), c(nb, &d.ix));
+            let lo = ua.min(ub);
+            let hi = ua.max(ub);
+            if !bottom {
+                assert!(
+                    d.clauses().iter().any(|(bd, h)| bd.is_empty()
+                        && h.contains(&XLit::Eq(lo, hi))
+                        && h.contains(&XLit::Atom(cc, ua))),
+                    "a ≈ b ∨ C(a)"
+                );
+                assert!(!d.bottom());
+                continue;
+            }
+            assert!(d.has(&[XLit::Eq(lo, hi)]));
+            assert!(d.has(&[XLit::Atom(b, lo)]));
+            assert!(!d.bottom());
+        }
     }
 
     #[test]
@@ -1779,9 +1788,66 @@ mod tests {
         assert!(d.has(&[XLit::Eq(RTerm::X, o)]), "x ≈ o");
         assert!(d.has(&[XLit::Atom(a, o)]), "A(o)");
         assert!(d.has(&[XLit::Atom(no, o)]), "N_o(o)");
-        assert!(d.has(&[XLit::Atom(b, o), XLit::Atom(cc, RTerm::X)]));
-        assert!(d.has(&[XLit::Atom(b, RTerm::X), XLit::Atom(cc, o)]));
+        // with the blocking of item 804's third departure x ≈ o rewrites the core unit
+        // A(x) only, and the disjunction over x stays over x
+        let mixed = d.has(&[XLit::Atom(b, o), XLit::Atom(cc, RTerm::X)])
+            && d.has(&[XLit::Atom(b, RTerm::X), XLit::Atom(cc, o)]);
+        assert_eq!(mixed, !super::super::dl_eq::eq_block());
         assert!(!d.has(&[XLit::Atom(b, o)]));
+    }
+
+    #[test]
+    fn a_root_fact_of_a_named_class_is_rewritten_back_over_x_in_a_query_context() {
+        // A ⊑ {o}, and the root holds B(o) and F(o) for a fresh F: A's context takes both
+        // and rewrites B(o) to the unit B(x) with o ↦ x. With the blocking, the fresh atom
+        // stays over o, since only a named-class atom is rewritten back.
+        let mut s = Sig::new();
+        let no = s.ind("o");
+        let [a, b] = ["A", "B"].map(|n| s.class(n));
+        let f = s.it.fresh_class();
+        s.sub(a, no);
+        let d = saturate_after(s, &[ROOT], Some(a), |ix, _| {
+            let o = c(no, ix);
+            vec![
+                (vec![], vec![XLit::Atom(b, o)]),
+                (vec![], vec![XLit::Atom(f, o)]),
+            ]
+        });
+        let o = c(no, &d.ix);
+        assert!(d.has(&[XLit::Atom(a, o)]), "A(o)");
+        assert!(d.has(&[XLit::Atom(b, o)]), "B(o) reached A's context");
+        assert!(d.has(&[XLit::Atom(f, o)]), "F(o) reached A's context");
+        assert!(d.subs(b), "B(x)");
+        assert_eq!(d.subs(f), !super::super::dl_eq::eq_block());
+    }
+
+    #[test]
+    fn a_hypothetical_successor_rewrites_nothing_with_an_equality_to_a_constant() {
+        // A ⊑ ∃r.B ⊔ C, B ⊑ {o}, B ⊑ G: the hypothetical successor of ∃r.B holds the
+        // marker B(x) → B(x), B(x) → x ≈ o and B(x) → G(x). With the blocking, x ≈ o
+        // rewrites nothing there, since the successor is no query context; without it,
+        // B(x) → G(o) and B(x) → B(o) follow.
+        let mut s = Sig::new();
+        let no = s.ind("o");
+        let [a, b, cc, g] = ["A", "B", "C", "G"].map(|n| s.class(n));
+        let r = s.role("r");
+        let e = s.some_h(r, b);
+        s.dl.clauses.push((vec![a], vec![e, cc]));
+        s.sub(b, no);
+        s.sub(b, g);
+        let d = saturate_at(s, Some(a));
+        let h = dix(&d.ix).hyp[&e];
+        let o = c(no, &d.ix);
+        let cs = d.clauses_of(h);
+        let bx = XLit::Atom(b, RTerm::X);
+        let has = |head: XLit| {
+            cs.iter()
+                .any(|(bd, hd)| bd == &vec![bx] && hd == &vec![head])
+        };
+        assert!(has(XLit::Eq(RTerm::X, o)), "B(x) → x ≈ o in {cs:?}");
+        assert!(has(XLit::Atom(g, RTerm::X)), "B(x) → G(x)");
+        let ground = has(XLit::Atom(g, o)) || has(XLit::Atom(b, o));
+        assert_eq!(ground, !super::super::dl_eq::eq_block(), "{cs:?}");
     }
 
     #[test]
@@ -1923,6 +1989,7 @@ mod tests {
             ix: &ix,
             lits: &lits,
             inv: &inv,
+            ground_total: false,
         };
         let Made::Lit(l) = lits.lit(XLit::Atom(TOP, RTerm::C(0)), inv) else {
             unreachable!()
@@ -2089,7 +2156,8 @@ mod tests {
         for head_first in [true, false] {
             let mut s = Sig::new();
             let no = s.ind("o");
-            let [b, cc, dd, ee] = ["B", "C", "D", "E"].map(|n| s.class(n));
+            // E before B, so that B(o) is maximal beside E(o) under the shared ground order
+            let [ee, b, cc, dd] = ["E", "B", "C", "D"].map(|n| s.class(n));
             let d = saturate_seeded(s, None, |ix, _| {
                 let o = c(no, ix);
                 let at = |a: Ex| XLit::Atom(a, o);
@@ -2186,51 +2254,165 @@ mod tests {
     }
 
     #[test]
-    fn a_root_clause_that_comes_first_waits_for_its_premise() {
-        // the root's r(y, o) → B(y) reaches A's context before A has r(x, o): the premise
-        // that comes later meets it, and A ⊑ B
+    fn a_context_derives_the_consequences_of_its_own_ground_disjunction() {
+        // Z's context holds ⊤ → C(a) ∨ C(b) and C ⊑ D: Hyper at the greater constant gives
+        // ⊤ → D(a) ∨ C(b) or ⊤ → C(a) ∨ D(b) in Z's context itself, and the root holds no
+        // clause with a body, since the run has no markers in the root
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let nb = s.ind("b");
+        let [cc, dd, z] = ["C", "D", "Z"].map(|n| s.class(n));
+        s.sub(cc, dd);
+        let d = saturate_after(s, &[z], Some(z), |ix, _| {
+            vec![(
+                vec![],
+                vec![XLit::Atom(cc, c(na, ix)), XLit::Atom(cc, c(nb, ix))],
+            )]
+        });
+        let (a, b) = (c(na, &d.ix), c(nb, &d.ix));
+        let cs = d.clauses_of(z);
+        let has = |h: &[XLit]| {
+            cs.iter().any(|(bd, hd)| {
+                bd.is_empty() && hd.len() == h.len() && h.iter().all(|l| hd.contains(l))
+            })
+        };
+        let (hi, lo) = if Rooted::a_gt(a, b) { (a, b) } else { (b, a) };
+        assert!(has(&[XLit::Atom(dd, hi), XLit::Atom(cc, lo)]), "{cs:?}");
+        if super::super::dl_clause::ground_total() {
+            assert!(!has(&[XLit::Atom(cc, hi), XLit::Atom(dd, lo)]), "{cs:?}");
+        }
+        let root = dix(&d.ix).root.unwrap();
+        assert!(
+            d.clauses_of(root).iter().all(|(bd, _)| bd.is_empty()),
+            "{:?}",
+            d.clauses_of(root)
+        );
+    }
+
+    #[test]
+    fn a_root_fact_reaches_a_context_that_mentions_the_constant_inside_a_successor_term() {
+        // {o} ⊑ G, and Z's context holds ⊤ → K(f_e(o)): Z registers for o and takes the
+        // root's G(o)
         let mut s = Sig::new();
         let no = s.ind("o");
-        let [a, b] = ["A", "B"].map(|n| s.class(n));
+        let [g, k, z] = ["G", "K", "Z"].map(|n| s.class(n));
         let r = s.role("r");
-        let root = s.it.fresh_class();
-        s.dl.root = Some(root);
-        s.ax.dl = Some(Box::new(std::mem::take(&mut s.dl)));
-        let ix = Index::build(&s.ax, &mut s.it, None, &|| false).unwrap();
-        let run = DlRun::new(false, Default::default());
-        let mut out = Probe {
-            run: &run,
-            sent: Vec::new(),
-            mine: Vec::new(),
-        };
-        let o = c(no, &ix);
-        let inv = inv_of(&ix, dix(&ix));
-        let l = |v: XLit| match run.lits.lit(v, inv) {
-            Made::Lit(l) => l,
-            _ => panic!("a literal"),
-        };
-        let k = run.table.push(Clause::new(
-            vec![l(XLit::Role(r, RTerm::Y, o))],
-            vec![l(XLit::Atom(b, RTerm::Y))],
-        ));
-        let mut st = State {
-            init: true,
-            ..State::default()
-        };
-        assert!(rpred_c(&ix, &mut st, k, &mut out));
+        let e = s.some_h(r, k);
+        s.sub(no, g);
+        let d = saturate_after(s, &[z], Some(z), |ix, _| {
+            let RTerm::C(o) = c(no, ix) else { panic!() };
+            vec![(vec![], vec![XLit::Atom(k, RTerm::Fc(e, o))])]
+        });
+        let o = c(no, &d.ix);
+        let cs = d.clauses_of(z);
         assert!(
-            !rpred_c(&ix, &mut st, k, &mut out),
-            "a clause is taken once"
+            cs.iter()
+                .any(|(bd, hd)| bd.is_empty() && hd == &vec![XLit::Atom(g, o)]),
+            "{cs:?}"
         );
-        assert!(out.mine.is_empty());
-        ds(&mut st)
-            .store
-            .add(Clause::new(Vec::new(), vec![l(XLit::Role(r, RTerm::X, o))]));
-        super::super::dl_rules::flush(&ix, a, &mut st, &mut out, 100);
-        assert!(out.mine.contains(&Concl::Sub(b)));
-        // the premise sent the root the marker r(y, o)
-        let m = l(XLit::Role(r, RTerm::Y, o));
-        assert!(out.sent.contains(&(root, Concl::RHyp(a, m.xid()))));
+    }
+
+    #[test]
+    fn a_context_takes_a_successor_over_a_constant_through_its_own_edge() {
+        // Z's context holds ⊤ → B(a) ∨ E(x), B ⊑ ∃r.C and C ⊑ ⊥: Z's own Succ over f(a)
+        // reaches the hypothetical successor, which refutes C, and Pred along the edge
+        // gives ⊤ → E(x), so Z ⊑ E
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let [b, cc, ee, z] = ["B", "C", "E", "Z"].map(|n| s.class(n));
+        let r = s.role("r");
+        let e = s.some_h(r, cc);
+        s.sub(b, e);
+        s.sub(cc, BOTTOM);
+        let d = saturate_after(s, &[z], Some(z), |ix, _| {
+            vec![(
+                vec![],
+                vec![XLit::Atom(b, c(na, ix)), XLit::Atom(ee, RTerm::X)],
+            )]
+        });
+        assert!(d.subs(ee), "{:?}", d.clauses_of(z));
+        assert!(!d.bottom());
+    }
+
+    #[test]
+    fn pred_along_an_edge_over_a_constant_replays_in_either_order() {
+        // the successor's clauses C(x) → ⊥ and C(x) → s(v, x) reach Z before or after Z
+        // has ⊤ → B(a) ∨ E(x) with B ⊑ ∃r.C: Z derives ⊤ → E(x) and ⊤ → s(v, f(a)) ∨ E(x)
+        // either way, the role atom between a constant and x returning along an edge over
+        // a constant as Table 3 admits for the root
+        for clause_first in [true, false] {
+            let mut s = Sig::new();
+            let na = s.ind("a");
+            let nv = s.ind("v");
+            let [b, cc, ee, z] = ["B", "C", "E", "Z"].map(|n| s.class(n));
+            let r = s.role("r");
+            let t = s.role("s");
+            let e = s.some_h(r, cc);
+            s.sub(b, e);
+            let (ix, _) = probe_ix(s);
+            let h = dix(&ix).hyp[&e];
+            let run = DlRun::new(false, Default::default());
+            let mut out = Probe {
+                run: &run,
+                sent: Vec::new(),
+                mine: Vec::new(),
+            };
+            let (a, v) = (c(na, &ix), c(nv, &ix));
+            let inv = inv_of(&ix, dix(&ix));
+            let l = |w: XLit| match run.lits.lit(w, inv) {
+                Made::Lit(l) => l,
+                _ => panic!("a literal"),
+            };
+            let k1 = run.table.push(Clause::new(vec![Lit::x(cc)], Vec::new()));
+            let k2 = run.table.push(Clause::new(
+                vec![Lit::x(cc)],
+                vec![l(XLit::Role(t, v, RTerm::X))],
+            ));
+            let mut st = State {
+                init: true,
+                ..State::default()
+            };
+            let send = |st: &mut State, out: &mut Probe| {
+                assert!(super::super::dl_rules::pred_c(&ix, z, st, h, k1, out));
+                assert!(super::super::dl_rules::pred_c(&ix, z, st, h, k2, out));
+                assert!(
+                    !super::super::dl_rules::pred_c(&ix, z, st, h, k1, out),
+                    "a clause is taken once"
+                );
+            };
+            if clause_first {
+                send(&mut st, &mut out);
+                assert!(out.mine.is_empty());
+            }
+            ds(&mut st).store.add(Clause::new(
+                Vec::new(),
+                vec![l(XLit::Atom(b, a)), Lit::x(ee)],
+            ));
+            super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
+            if !clause_first {
+                send(&mut st, &mut out);
+                super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
+            }
+            assert!(
+                out.mine.contains(&Concl::Sub(ee)),
+                "clause first {clause_first}: {:?}",
+                out.mine
+            );
+            assert!(
+                out.sent.contains(&(h, Concl::DEdge(z, e))),
+                "the edge, clause first {clause_first}"
+            );
+            let RTerm::C(ua) = a else { panic!() };
+            let want = l(XLit::Role(t, v, RTerm::Fc(e, ua)));
+            let store = &dl(&st).unwrap().store;
+            assert!(
+                store
+                    .clauses
+                    .iter()
+                    .any(|c| c.c.body().is_empty() && c.c.head().contains(&want)),
+                "s(v, f(a)) ∨ E(x), clause first {clause_first}"
+            );
+        }
     }
 
     #[test]
@@ -2306,6 +2488,130 @@ mod tests {
         assert!(d.bottom());
     }
 
+    #[test]
+    fn a_hypothetical_successor_s_unconditional_ground_fact_goes_to_the_root() {
+        // the hypothetical successor of ∃r.D holds ⊤ → t(x, b) ∨ E(x) and ⊤ → t(x, b) under
+        // ⊤ ⊑ ∀t.G: the clause with E(x) gives ⊤ → G(b) ∨ E(x), which the context keeps,
+        // and the other gives the fact ⊤ → G(b), which goes to the root and is not kept
+        let mut s = Sig::new();
+        let nb = s.ind("b");
+        let [dd, ee, g] = ["D", "E", "G"].map(|n| s.class(n));
+        let r = s.role("r");
+        let t = s.role("t");
+        let er = s.some_h(r, dd);
+        let ag = s.all(t, g);
+        s.sub(TOP, ag);
+        let (ix, root) = probe_ix(s);
+        let h = dix(&ix).hyp[&er];
+        let run = DlRun::new(false, Default::default());
+        let mut out = Probe {
+            run: &run,
+            sent: Vec::new(),
+            mine: Vec::new(),
+        };
+        let ub = c(nb, &ix);
+        let inv = inv_of(&ix, dix(&ix));
+        let l = |w: XLit| match run.lits.lit(w, inv) {
+            Made::Lit(l) => l,
+            _ => panic!("a literal"),
+        };
+        let mut st = State {
+            init: true,
+            ..State::default()
+        };
+        st.subs.insert(TOP);
+        st.subs.insert(ag);
+        let tb = l(XLit::Role(t, RTerm::X, ub));
+        let gb = l(XLit::Atom(g, ub));
+        let kept = |st: &State, head: &[Lit]| {
+            dl(st).unwrap().store.clauses.iter().any(|c| {
+                !c.dead && c.c.body().is_empty() && {
+                    let mut h = c.c.head().to_vec();
+                    h.sort_unstable();
+                    let mut w = head.to_vec();
+                    w.sort_unstable();
+                    h == w
+                }
+            })
+        };
+        ds(&mut st)
+            .store
+            .add(Clause::new(Vec::new(), vec![tb, Lit::x(ee)]));
+        super::super::dl_rules::flush(&ix, h, &mut st, &mut out, 100);
+        assert!(kept(&st, &[gb, Lit::x(ee)]), "⊤ → G(b) ∨ E(x) is kept");
+        assert!(
+            !out.sent.iter().any(|(_, c)| matches!(c, Concl::RFact(_))),
+            "a clause over x stays: {:?}",
+            out.sent
+        );
+        ds(&mut st).store.add(Clause::new(Vec::new(), vec![tb]));
+        super::super::dl_rules::flush(&ix, h, &mut st, &mut out, 100);
+        let facts: Vec<&Clause> = out
+            .sent
+            .iter()
+            .filter_map(|(to, c)| match c {
+                Concl::RFact(cid) if *to == root => Some(run.table.get(*cid)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(facts.len(), 1, "one fact to the root: {:?}", out.sent);
+        assert!(
+            facts[0].body().is_empty() && facts[0].head() == [gb],
+            "⊤ → G(b)"
+        );
+        assert!(!kept(&st, &[gb]), "the fact is not kept");
+    }
+
+    #[test]
+    fn an_inconsistency_a_hypothetical_successor_finds_without_assumptions_reaches_the_root() {
+        // {a} ⊑ ∃r.D, ⊤ ⊑ ∃t.{b}, ⊤ ⊑ ∀t.E, E ⊑ ⊥: every element has b as a t-successor, so
+        // b is in E and the ontology is inconsistent, which the root's successor for f(a)
+        // finds as the empty clause with an empty body
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let nb = s.ind("b");
+        let [dd, ee] = ["D", "E"].map(|n| s.class(n));
+        let r = s.role("r");
+        let t = s.role("t");
+        let er = s.some_h(r, dd);
+        let et = s.some_h(t, nb);
+        let ae = s.all(t, ee);
+        s.sub(na, er);
+        s.sub(TOP, et);
+        s.sub(TOP, ae);
+        s.sub(ee, BOTTOM);
+        let d = saturate_root(s);
+        assert!(d.bottom());
+    }
+
+    #[test]
+    fn a_selected_clause_headed_by_an_atom_over_x_still_takes_the_hyper_over_x() {
+        // Q ⊑ ∃s.D, Q ⊑ ∃t.{a}, Q ⊑ ∀t.∀r.A, D ⊑ ∃r⁻.{a}, A ⊑ ⊥: a Q has ∀r.A at a and a D
+        // reached from a by r, which is in A, so Q is unsatisfiable. The D context holds
+        // the marker of ∀r.A(a) and the local role atom r(a, x), whose Hyper gives the
+        // selected clause ∀r.A(a) → A(x), which Pred cannot carry, so the context itself
+        // takes the Hyper over x to ∀r.A(a) → ⊥
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let [q, dd, aa] = ["Q", "D", "A"].map(|n| s.class(n));
+        let r = s.role("r");
+        let t = s.role("t");
+        let sr = s.role("s");
+        let ri = s.it.role(RoleName::Inverse(ObjectProperty::new("urn:t:r")));
+        let es = s.some_h(sr, dd);
+        let et = s.some_h(t, na);
+        let ara = s.all(r, aa);
+        let atra = s.all(t, ara);
+        let eri = s.some_h(ri, na);
+        s.sub(q, es);
+        s.sub(q, et);
+        s.sub(q, atra);
+        s.sub(dd, eri);
+        s.sub(aa, BOTTOM);
+        let d = saturate_at(s, Some(q));
+        assert!(d.bottom(), "Q ⊑ ⊥");
+    }
+
     /// The index and a probe over a signature whose root is made here.
     fn probe_ix(mut s: Sig) -> (Index, Ex) {
         let root = s.it.fresh_class();
@@ -2375,10 +2681,11 @@ mod tests {
     }
 
     #[test]
-    fn the_root_takes_a_clause_over_any_role_of_its_successor() {
-        // a successor of the root by r, with r not below s, holds s(y, x) → K(y): the root
-        // gets it whether it registers before or after the clause, and another
-        // predecessor by r does not
+    fn every_predecessor_of_a_rooted_run_takes_a_clause_over_any_role_of_its_successor() {
+        // a successor by r, with r not below s, holds s(y, x) → K(y): the root and another
+        // predecessor by r get it whether they register before or after the clause, since
+        // a predecessor may reach the successor over f_e(u) and finds the role premises
+        // itself, and Pred over f_e(x) refuses the clause at the predecessor
         for register_first in [true, false] {
             let mut s = Sig::new();
             let _ = s.ind("a");
@@ -2418,7 +2725,7 @@ mod tests {
             };
             assert!(to(root), "the root, register first {register_first}");
             assert!(
-                !to(a),
+                to(a),
                 "another predecessor, register first {register_first}"
             );
         }
@@ -2443,19 +2750,22 @@ mod tests {
         };
         ds(&mut st);
         let before = run.bytes();
-        assert!(pred_c(&ix, &mut st, b, cid, &mut out));
+        let root = dix(&ix).root.unwrap();
+        assert!(super::super::dl_rules::pred_c(
+            &ix, root, &mut st, b, cid, &mut out
+        ));
         assert!(
-            !pred_c(&ix, &mut st, b, cid, &mut out),
+            !super::super::dl_rules::pred_c(&ix, root, &mut st, b, cid, &mut out),
             "a clause is taken once"
         );
         assert!(run.bytes() > before);
     }
 
     #[test]
-    fn the_root_takes_a_propagation_over_any_role_of_its_successor() {
-        // B's context by r, with r not below s, holds ∀s⁻.K as a unit: the root gets
-        // s(y, x) → K(y) whether it registers before or after the unit, and another
-        // predecessor by r does not
+    fn every_predecessor_of_a_rooted_run_takes_a_propagation_over_any_role_of_its_successor() {
+        // B's context by r, with r not below s, holds ∀s⁻.K as a unit: the root and another
+        // predecessor by r get s(y, x) → K(y) whether they register before or after the
+        // unit, as above
         for register_first in [true, false] {
             let mut s = Sig::new();
             let _ = s.ind("a");
@@ -2492,10 +2802,169 @@ mod tests {
             };
             assert!(to(root), "the root, register first {register_first}");
             assert!(
-                !to(a),
+                to(a),
                 "another predecessor, register first {register_first}"
             );
         }
+    }
+
+    /// A probe run of the context `me` over the clauses `seed`, flushed, with the live
+    /// clauses of its store in general form.
+    fn probe_flush(
+        s: Sig,
+        me: impl Fn(Ex) -> Ex,
+        seed: impl Fn(&Index, &dyn Fn(XLit) -> Lit) -> Vec<(Vec<XLit>, Vec<XLit>)>,
+    ) -> Vec<(Vec<XLit>, Vec<XLit>)> {
+        let (ix, root) = probe_ix(s);
+        let run = DlRun::new(false, Default::default());
+        let mut out = Probe {
+            run: &run,
+            sent: Vec::new(),
+            mine: Vec::new(),
+        };
+        let inv = inv_of(&ix, dix(&ix));
+        let l = |v: XLit| match run.lits.lit(v, inv) {
+            Made::Lit(l) => l,
+            _ => panic!("a literal"),
+        };
+        let mut st = State {
+            init: true,
+            ..State::default()
+        };
+        for (b, h) in seed(&ix, &l) {
+            ds(&mut st).store.add(Clause::new(
+                b.iter().copied().map(l).collect(),
+                h.iter().copied().map(l).collect(),
+            ));
+        }
+        let me = me(root);
+        if me == root {
+            flush(&ix, &mut st, &mut out, 100);
+        } else {
+            super::super::dl_rules::flush(&ix, me, &mut st, &mut out, 100);
+        }
+        let v = |ls: &[Lit]| ls.iter().map(|&l| run.lits.view(l, inv)).collect();
+        dl(&st)
+            .unwrap()
+            .store
+            .clauses
+            .iter()
+            .filter(|c| !c.dead)
+            .map(|c| (v(c.c.body()), v(c.c.head())))
+            .collect()
+    }
+
+    #[test]
+    fn a_context_makes_no_ground_clause_with_a_body_from_its_markers() {
+        // the markers A(a) → A(a) and B(a) → B(a) and A ⊓ B ⊑ H: Hyper at a would give
+        // A(a) ∧ B(a) → H(a), a ground clause with a body, which the restriction on ground
+        // inferences leaves out
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let [a, b, h, z] = ["A", "B", "H", "Z"].map(|n| s.class(n));
+        s.dl.clauses.push((vec![a, b], vec![h]));
+        let cs = probe_flush(
+            s,
+            |_| z,
+            |ix, _| {
+                let u = c(na, ix);
+                vec![
+                    (vec![XLit::Atom(a, u)], vec![XLit::Atom(a, u)]),
+                    (vec![XLit::Atom(b, u)], vec![XLit::Atom(b, u)]),
+                ]
+            },
+        );
+        let made = cs.iter().any(|(bd, hd)| {
+            bd.len() == 2 && hd.iter().any(|l| matches!(l, XLit::Atom(k, _) if *k == h))
+        });
+        assert_eq!(made, !super::super::dl_rules::ground_restrict(), "{cs:?}");
+    }
+
+    #[test]
+    fn a_disjoint_role_clash_over_x_keeps_its_ground_condition() {
+        // A(a) → s(a, x) and ⊤ → t(a, x) with s and t disjoint: the Hyper binds y to x, so
+        // it is no ground inference, and A(a) → ⊥ is made with the restriction on
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let [a, z] = ["A", "Z"].map(|n| s.class(n));
+        let r = s.role("s");
+        let t = s.role("t");
+        s.dl.rdis.push((r, t));
+        let cs = probe_flush(
+            s,
+            |_| z,
+            |ix, _| {
+                let u = c(na, ix);
+                vec![
+                    (vec![XLit::Atom(a, u)], vec![XLit::Role(r, u, RTerm::X)]),
+                    (vec![], vec![XLit::Role(t, u, RTerm::X)]),
+                ]
+            },
+        );
+        assert!(
+            cs.iter().any(|(bd, hd)| hd.is_empty()
+                && bd.len() == 1
+                && matches!(bd[0], XLit::Atom(k, _) if k == a)),
+            "{cs:?}"
+        );
+    }
+
+    #[test]
+    fn an_equality_over_a_successor_term_keeps_its_ground_condition() {
+        // A(a) → f(x) ≈ u and ⊤ → B(f(x)): the equality holds x, so Eq is no ground
+        // inference, and A(a) → B(u) is made with the restriction on
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let nu = s.ind("u");
+        let [a, b, k, z] = ["A", "B", "K", "Z"].map(|n| s.class(n));
+        let r = s.role("r");
+        let e = s.some_h(r, k);
+        let cs = probe_flush(
+            s,
+            |_| z,
+            |ix, _| {
+                let (ua, uu) = (c(na, ix), c(nu, ix));
+                vec![
+                    (vec![XLit::Atom(a, ua)], vec![XLit::Eq(RTerm::Fx(e), uu)]),
+                    (vec![], vec![XLit::Atom(b, RTerm::Fx(e))]),
+                ]
+            },
+        );
+        assert!(
+            cs.iter().any(|(bd, hd)| {
+                bd.len() == 1
+                    && matches!(bd[0], XLit::Atom(k, _) if k == a)
+                    && matches!(hd.as_slice(), [XLit::Atom(k, RTerm::C(_))] if *k == b)
+            }),
+            "{cs:?}"
+        );
+    }
+
+    #[test]
+    fn the_root_discharges_a_ground_body_by_join() {
+        // ⊤ → A(a) and A(a) → D(a) in the root, as Pred along an edge over a constant
+        // leaves a successor's marker in the body: Join gives ⊤ → D(a), which has no body
+        // and so passes the restriction on ground inferences
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let [a, dd] = ["A", "D"].map(|n| s.class(n));
+        let cs = probe_flush(
+            s,
+            |root| root,
+            |ix, _| {
+                let u = c(na, ix);
+                vec![
+                    (vec![], vec![XLit::Atom(a, u)]),
+                    (vec![XLit::Atom(a, u)], vec![XLit::Atom(dd, u)]),
+                ]
+            },
+        );
+        assert!(
+            cs.iter()
+                .any(|(bd, hd)| bd.is_empty()
+                    && matches!(hd.as_slice(), [XLit::Atom(k, _)] if *k == dd)),
+            "{cs:?}"
+        );
     }
 
     /// A context of the class `at`, or the root, seeded with `seeds` and flushed, with its

@@ -61,14 +61,30 @@ pub(crate) fn report_json(r: &ReportRef) -> Value {
         "status": r.status.as_str(),
         "rating": r.rating,
         "memberCount": r.member_count,
-        "findings": r.findings.iter().map(|f| json!({
-            "iri": f.iri,
-            "text": f.text,
-            "cites": f.cites,
-        })).collect::<Vec<_>>(),
+        "findings": r.findings.iter().map(|f| {
+            let mut x = json!({
+                "iri": f.iri,
+                "text": f.text,
+                "cites": f.cites,
+            });
+            // a report read under a review policy names the claims and decisions each
+            // finding cites (spec C25, "Reports on accepted evidence")
+            if r.review_policy.is_some() {
+                x["claims"] = json!(f.claims);
+                x["decisions"] = json!(f.decisions);
+            }
+            x
+        }).collect::<Vec<_>>(),
     });
     if let Some(s) = r.score {
         v["score"] = json!(s);
+    }
+    if let Some(p) = &r.review_policy {
+        v["reviewPolicy"] = json!({
+            "iri": p.iri,
+            "version": p.version,
+            "configuration": p.configuration,
+        });
     }
     v
 }

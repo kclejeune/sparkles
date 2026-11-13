@@ -91,8 +91,9 @@ safe, and defines the tests and measurements that gate the switch.
    leader seals immediately, and commits that arrive during the fence form the next
    prefix.
 3. If the sync succeeds, the leader publishes every commit of the prefix in order
-   (`publish_group_prefix`: WAL end, WAL index, change log, catalog, compaction clock,
-   current snapshot, commit watch) and sets their tickets. If it fails, the coordinator
+   (`publish_group_prefix`: the compaction clock, then through the shared tail
+   `Store::publish_committed` of X16 the WAL end, WAL index, change log, catalog, guard
+   notification, current snapshot and commit watch) and sets their tickets. If it fails, the coordinator
    fails, every queued and in-flight ticket fails, and the writer is poisoned
    (`Error::Poisoned`: later writes are refused until the store is reopened; reads go
    on).

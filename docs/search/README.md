@@ -25,9 +25,9 @@ rest of a query. Entity search answers the typeahead of ontology browsers and ed
   German, Dutch, Russian, Swedish and CJK text can be selected per language instead. With
   them, 1,576 of 1,590 stemmed searches in nine languages find the same literals as
   Fuseki, and the other 14 consist of stop words alone.
-* The tokenizer of those analyzers follows the grammar of Lucene's `StandardTokenizer`
-  over Unicode 12.1, emoji and South East Asian scripts included, and agrees with Lucene
-  on every code point.
+* Those analyzers tokenize by the grammar of Lucene's `StandardTokenizer` over Unicode
+  12.1, emoji and South East Asian scripts included, and agree with Lucene on every code
+  point.
 * Japanese, Chinese and Korean text can be segmented into words with a dictionary
   through the `ja-dict`, `zh-dict` and `ko-dict` analyzers. `ja-dict` and `ko-dict`
   produce the tokens of Lucene's Kuromoji and Nori analyzers on every line of their
@@ -63,11 +63,11 @@ rest of a query. Entity search answers the typeahead of ontology browsers and ed
   of definitions. Within a tier the ranking prefers fewer edits, entities that are not
   deprecated and the caller's languages, and it breaks ties by length, text and IRI, so
   the same request on the same commit gives the same page.
-* Each branch keeps its own index in memory. The first search of a branch builds it from
+* Each branch keeps its own index in memory. A branch's first search builds it from
   the head, and a later search applies the commits made since, so a commit costs nothing
   until the next search. A change too large to apply, a head that moved back or an
   unavailable change record rebuilds the index, and a restarted server builds it again
-  at the first search. The index of ChEBI lite holds 238,190 entities in about 233 MiB,
+  at the first search. ChEBI lite's index holds 238,190 entities in about 233 MiB,
   292 MiB resident, and is built in 1.3 s. That memory buys typeahead that answers
   within 8.3 ms at the 99th percentile ([entity search
   benchmark](../benchmarks/entity-search/README.md)).
@@ -85,12 +85,12 @@ rest of a query. Entity search answers the typeahead of ontology browsers and ed
   `candidates:join`. `ORDER BY DESC(spk:cosine(?v, C)) LIMIT k` over one pattern runs as
   an exact vector search.
 * Vector indexes pack one predicate's vectors and build an HNSW graph over them in the
-  background ([API.md](../API.md#vector-indexes)). `vector.json`, `/$/vector/{ds}/{name}` and
-  `sparkles vector` manage them. The graph is a file of the generation that is mapped
-  after a restart. New rows are inserted into it after each commit, and a compaction
-  carries it over, so neither waits for a full rebuild. Searches overlay deleted and
-  not-yet-inserted vectors exactly, past commits are searched exactly, and `M`,
-  `efConstruction` and `efSearch` are set per index.
+  background ([API.md](../API.md#vector-indexes)). They are managed through `vector.json`,
+  `/$/vector/{ds}/{name}` and `sparkles vector`. The graph is a file of the generation
+  that is mapped after a restart. New rows are inserted into it after each commit, and a
+  compaction carries it over, so neither waits for a full rebuild. Searches overlay
+  deleted and not-yet-inserted vectors exactly, past commits are searched exactly, and
+  `M`, `efConstruction` and `efSearch` are set per index.
 * An index can compute embeddings on write ([API.md](../API.md#embeddings-on-write)). It
   names the literals to embed, by predicate, language, class or a SELECT query, and an
   OpenAI-compatible endpoint such as OpenAI, Ollama or vLLM. A background worker embeds
@@ -132,8 +132,9 @@ rest of a query. Entity search answers the typeahead of ontology browsers and ed
 
 ### Graph algorithms
 
-* `SERVICE algo:<name>`, `sparkles algo` and `POST /$/algo/{ds}/run` run graph
-  algorithms ([API.md](../API.md#graph-algorithms), [F14](../specs/F14-graph-algorithms.md#outcome)).
+* Graph algorithms run through `SERVICE algo:<name>`, `sparkles algo` and
+  `POST /$/algo/{ds}/run` ([API.md](../API.md#graph-algorithms),
+  [F14](../specs/F14-graph-algorithms.md#outcome)).
   The MCP tool `graph_algorithm` and the Python and Node.js bindings expose them too.
 * The algorithms are PageRank and personalized PageRank, betweenness, weakly and strongly
   connected components, label propagation, Louvain and Leiden with hierarchy levels, node
@@ -228,10 +229,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 ### Search and graph algorithms
 
 * The entity search keeps its index in memory only, so the first search of each branch
-  after a start builds it, item 657. It reads the head and refuses `at` and
-  `inferences`, item 658. Words are split at spaces, punctuation, camel case and
+  after a start builds it. Roadmap item 657. It reads the head and refuses `at` and
+  `inferences`. Roadmap item 658. Words are split at spaces, punctuation, camel case and
   digits, so a label in a script written without spaces matches only as a whole text or
-  its prefix, item 659.
+  its prefix. Roadmap item 659.
 * Full-text search uses Tantivy's Snowball stemmers by default, and the analyzers that
   reproduce Lucene's are selected per language. Lucene's analyzers for other languages,
   such as Greek and Arabic, have no counterpart. Roadmap item 251.
@@ -245,9 +246,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Enabling or reconfiguring a full-text index builds it while writes wait. A write
   transaction cannot search the full-text index after it changes data, because the index
   covers committed data only. Roadmap item 23.
-* A vector index has no quantization, so its packed vectors take 4 bytes per dimension,
-  roadmap item 34. Each pass that inserts new rows into a vector index's graph scans all
-  rows inserted since the last compaction, item 82.
+* A vector index has no quantization, so its packed vectors take 4 bytes per dimension.
+  Roadmap item 34. Each pass that inserts new rows into a vector index's graph scans all
+  rows inserted since the last compaction. Roadmap item 82.
 * A weighted shortest search with `path:maxLength` lists paths in order of cost until one
   is short enough, so a pair whose short paths are all dear runs until the visit limit.
   The UI's path finder always sends a length limit and stops at a million visits. Roadmap
@@ -258,26 +259,25 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   `path:kShortest`, run Dijkstra's algorithm from one end. Roadmap item 492.
 * Weighted costs are double-double sums, which are exact only while a path's weights lie
   within a factor of about 2^28 of each other. With weights further apart a sum can round,
-  so two equally cheap paths can rank apart and one of them is missed. Roadmap item
-  493.
+  so two equally cheap paths can rank apart and one of them is missed. Roadmap
+  item 493.
 * Graph algorithms match the Graphalytics reference outputs for BFS, WCC and PageRank on
   the two small official example graphs, through `scripts/graphalytics-reference.py`.
   There is no full Graphalytics driver, no run on the larger datasets, no reference check
   of CDLP, LCC or SSSP, and no certification. Roadmap item 8.
 * The UI cannot complete `algo:` names, and openCypher procedures wait for the openCypher
-  frontend of item 20, which belongs to additional query languages. Write-back commits through
-  the ordinary writer rather than a bulk writer. A write-back run has no deadline unless
-  the request or `--update-timeout` gives one. Thread admission has no queue order, so a
-  call that needs several threads can wait while one-thread calls take the free slots. A
-  background view-only run reports progress by phase only. Roadmap item 8.
+  frontend, which belongs to additional query languages. Roadmap item 20. Write-back
+  commits through the ordinary writer rather than a bulk writer. A write-back run has no
+  deadline unless the request or `--update-timeout` gives one. Thread admission has no
+  queue order, so a call that needs several threads can wait while one-thread calls take
+  the free slots. A background view-only run reports progress by phase only. Roadmap
+  item 8.
 * Betweenness requires finite, strictly positive edge weights, while SSSP accepts zero
-  weights and PageRank non-negative ones. Roadmap item 79, an optional extension outside
-  the completion of paths and graph algorithms.
+  weights and PageRank non-negative ones. This is an optional extension. Roadmap item 79.
 * Weighted betweenness refuses a distance addition that cannot keep a strict increase at
   `f64` precision and refuses non-finite distances. Accepted distances and path counts are
   approximate, including rounded path ties, and sampling checks only the selected source
-  searches. Roadmap item 80, an optional extension outside the completion of paths and graph
-  algorithms.
+  searches. This is an optional extension. Roadmap item 80.
 
 
 ### GeoSPARQL
@@ -285,18 +285,18 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * EPSG codes come from a table of proj4 definitions rather than the EPSG database, and
   the library includes the table only with its `geo-epsg` feature. Geographic CRSs on
   datums other than WGS 84, grid-based datum shifts and curved GML segments are not
-  supported, and Helmert datum shifts are approximate. Roadmap item 24 adds exact
+  supported, and Helmert datum shifts are approximate. A planned change adds exact
   Helmert shifts, other geographic datums, opt-in grid shifts from operator-supplied grid
   files that still refuse when a needed grid is missing, and curved segments densified
-  within a stated tolerance.
+  within a stated tolerance. Roadmap item 24.
 * A nearest-neighbour search takes its query geometry as a constant and cannot bind it per
   row, and QLever's `spatialSearch:` syntax, metric-property rewrites and polygon
   approximations beyond the cell grid are missing. Roadmap item 24.
 * Sparkles does not support GML solids, 3D constructions or exact arithmetic on curves,
   and geometry constructions return 2D results. Unions of crossing lines keep the covered
   points but do not split the lines at each crossing, unlike Jena's JTS engine, and
-  Sparkles has no Jena-compatible mode. [COMPARISON.md](../COMPARISON.md#geosparql) lists
-  where results differ from Jena.
+  Sparkles has no Jena-compatible mode. See [COMPARISON.md](../COMPARISON.md#geosparql)
+  for where results differ from Jena.
 
 ## Configuration and usage
 

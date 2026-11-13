@@ -51,20 +51,35 @@ Development credentials stay on the owned development worker. They are excluded 
 source packets, result manifests and reusable snapshot seeds. GitHub Actions retains
 its separate OIDC authentication. A mode-0600 worker environment file contains only
 literal PATH, `RUSTUP_TOOLCHAIN`, `RUSTUP_AUTO_INSTALL`, `MBX_REMOTE_URL`,
-`MBX_GC_MAX_TOTAL_SIZE` and `MBX_GC_MIN_FREE_SIZE` assignments. Admission binds the
-environment file by digest.
+`MBX_CACHE_DIR`, `MBX_GC_MAX_TOTAL_SIZE` and `MBX_GC_MIN_FREE_SIZE` assignments.
+Admission binds the environment file by digest.
 
 Boat jobs build with MBX in local-only mode. The empty `MBX_REMOTE_URL` overrides the
 worker's configured remote cache, and the job shell drops any inherited token setting.
-The local store stays in MBX's default cache directory in the worker home. The normal
-stop's snapshot keeps the worker's checkouts and build directories but not that cache
-directory, so each resume starts with an empty store and its first build is a cold one.
-Later builds in the same lifetime reuse that build's entries. Roadmap item 812 covers a store location that the snapshot keeps. Within
-one lifetime the store keeps every build warm. Its 64 GiB budget holds two release
-builds and the workspace test builds, and its 45 GiB free-space floor keeps the disk
-headroom that qualification requires. `admit` asks the pinned `mbx` for these effective
-settings and refuses a remote URL, a token setting or another budget. Laptops, gate
-hosts and other ssh hosts keep their own MBX configuration.
+The provider's snapshot saves the worker home but not `~/.cache`, so MBX's default cache
+directory would be empty after every resume. Every job therefore sets `MBX_CACHE_DIR` to
+`~/.local/share/mbx-cache`, which holds the worker's single shared store with its managed
+targets and incremental state, and the normal stop's snapshot keeps it. Its 64 GiB budget
+holds two release builds and the workspace test builds, and its 45 GiB free-space floor
+keeps the disk headroom that qualification requires. `admit` asks the pinned `mbx` for
+these effective settings and refuses a remote URL, a token setting, another cache
+directory or another budget. Laptops, gate hosts and other ssh hosts keep their own MBX
+configuration.
+
+A cold server build on the 8-vCPU worker takes about 29 minutes, and the store then holds
+about 5 GiB of objects and a 5 GiB managed target. After a normal stop and a
+resume onto a new machine, the store comes back unchanged, and a rebuild of the same
+commit at its stable path takes about 4 minutes with no misses and gives the same binary.
+The snapshot holds the store's files, so a full 64 GiB store takes most of the 111 GB of
+own files that the provider restores on a large worker, and roadmap item 858 covers
+keeping the saved files under that limit.
+
+A resume runs on a new machine and downloads the snapshot's files in the background. A
+file whose content arrives while a build reads it changes under the compiler, and mbx
+then discards the result and fails the build. `admit` therefore refuses a worker until
+the provider reports it `hydrated`, which took about 90 seconds for a 45 GB snapshot. A
+job started sooner is refused, and its caller admits it again once the worker is
+hydrated.
 
 ## Qualification and job admission
 

@@ -15,18 +15,24 @@ use crate::history::At;
 impl Store {
     /// The author the change log recorded for commit `seq` (`None` when it recorded
     /// none, or the log does not hold the commit).
-    pub(crate) fn commit_author(&self, seq: u64) -> Option<Arc<str>> {
+    pub fn commit_author(&self, seq: u64) -> Option<Arc<str>> {
+        self.commit_record(seq).and_then(|c| c.author)
+    }
+
+    /// The change log's record of commit `seq`, with its time, author and message
+    /// (`None` when the log does not hold the commit).
+    pub fn commit_record(&self, seq: u64) -> Option<changelog::ChangeCommit> {
         let log = self.changelog.as_ref().filter(|l| l.is_enabled())?;
         log.flush(false).ok()?;
-        let mut author = None;
+        let mut record = None;
         log.commits(seq, seq, &mut || Ok(()), &mut |c| {
             if let LogCommit::Changes(c, _) | LogCommit::Summary(c) = c {
-                author = c.author.clone();
+                record = Some(changelog::ChangeCommit::clone(&c));
             }
             Ok(false)
         })
         .ok()?;
-        author
+        record
     }
 
     /// Replay the commits of the source's first-parent chain after `base` onto the

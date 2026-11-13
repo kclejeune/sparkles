@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# cold.sh DIR ROUNDS "FILES" "SIDES": for each file and side, in rotating order, one process
+# with --repeat 10 on THREADS (default 4): the first classification is the cold one, the
+# median of the rest the warm one, and the process's wall time is taken around it. JSON lines
+# to DIR/cold-STAMP/runs.jsonl. Holds the heavy lock (and the bench lock when LOCKS=bench).
+set -euo pipefail
+D=$1 R=$2 FILES=$3 SIDES=($4) LOCKS=${LOCKS:-heavy}
+cd "$D"
+OUT=cold-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$OUT"
+cp "$0" "$OUT/cold.sh.txt"
+{ echo "host=$(hostname) threads=${THREADS:-4} rounds=$R pin1=${PIN1:-none} pinn=${PINN:-none}"; for s in "${SIDES[@]}"; do echo "binary_sha256 $s=$(sha256sum "bin/$s" | cut -d' ' -f1)"; done
+  echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg)"; } > "$OUT/env.txt"
+n=${#SIDES[@]}
+for round in $(seq 1 "$R"); do
+  for f in $FILES; do
+    b=$(basename "${f%.*}")
+    for k in $(seq 0 $((n - 1))); do
+      side=${SIDES[$(( (k + round) % n ))]}
+      pin=(); if [ "${THREADS:-4}" = 1 ] && [ -n "${PIN1:-}" ]; then pin=(taskset -c "$PIN1"); fi
+      if [ "${THREADS:-4}" != 1 ] && [ -n "${PINN:-}" ]; then pin=(taskset -c "$PINN"); fi
+      for rep in 1 10; do
+        "${pin[@]}" python3 - "$side" "$b" "$round" "$rep" bin/$side --threads ${THREADS:-4} --repeat $rep "data/$f" >> "$OUT/runs.jsonl" 2>> "$OUT/err.txt" <<'PY'
+import json, subprocess, sys, time
+side, name, rnd, rep, *cmd = sys.argv[1:]
+t = time.perf_counter()
+p = subprocess.run(cmd, capture_output=True, text=True)
+wall = (time.perf_counter() - t) * 1000
+r = json.loads(p.stdout) if p.returncode == 0 else {"failed": p.returncode}
+c = r.get("classifyMs", [])
+warm = sorted(c[1:])[len(c[1:]) // 2] if len(c) > 1 else None
+keep = {k: r.get(k) for k in ("readMs", "indexMs", "saturationMs", "taxonomyMs", "tier", "peakRssKib", "conclusions", "failed")}
+print(json.dumps(dict(side=side, file=name, round=int(rnd), repeat=int(rep), wallMs=wall, coldMs=c[0] if c else None, warmMs=warm, **keep)))
+PY
+      done
+    done
+  done
+done
+echo "ended=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$OUT/env.txt"
+echo "COLD-DONE $OUT"

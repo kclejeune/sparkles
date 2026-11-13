@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Writes small Horn ontologies with nominals, inverse roles, functionality, universals,
+self restrictions and disjoint and asymmetric roles for the differential run of roadmap
+item 692, with the generator of the dl603 fixture suite and a family of its own. The at-least
+restrictions of horn-sroiq are left out, since a run with individuals leaves them out.
+
+Usage: gen-horn.py DIR [COUNT] [SEED]
+"""
+import random
+import sys
+
+sys.path.insert(0, "/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-individuals-692/crates/sparkles-owl/tests/fixtures/dl603")
+import generate as g  # noqa: E402
+
+g.FAMILIES["horn-roles"] = (
+    ["forall", "max1", "nominal", "self"],
+    ["horn", "horn", "role_sub", "role_inverse_sub", "inverses", "functional",
+     "inverse_functional", "asymmetric", "role_disjoint", "domain", "range",
+     "class_assertion", "role_assertion", "different"],
+    True,
+)
+
+d = sys.argv[1]
+count = int(sys.argv[2]) if len(sys.argv) > 2 else 300
+seed = int(sys.argv[3]) if len(sys.argv) > 3 else 692
+r = random.Random(f"{seed}:horn-roles")
+for n in range(count):
+    with open(f"{d}/horn-roles-{n:03}.ofn", "w") as f:
+        f.write(g.random_case("horn-roles", r, n))

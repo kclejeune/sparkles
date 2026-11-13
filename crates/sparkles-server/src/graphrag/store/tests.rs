@@ -58,6 +58,7 @@ fn report(body: Body) -> NewReport {
         }),
         revision_of: None,
         body,
+        evidence: None,
     }
 }
 
@@ -296,5 +297,124 @@ fn unreachable_reports_go_and_cited_ones_stay() {
     assert!(
         !left.iter().any(|r| r[0].starts_with("<urn:r:old-")),
         "{left:?}"
+    );
+}
+
+/// Under a review policy, a kept report's activity keeps the child reports it used, and
+/// a person's edit keeps the report it revises with that report's activity and
+/// children, through earlier edits. A report a run wrote in place of another does not
+/// keep it, and an edit without a policy keeps nothing (spec C25, "Reports on accepted
+/// evidence").
+#[test]
+fn policy_reports_keep_what_their_provenance_names() {
+    let ins = |s: &str, p: &str, o: &str| {
+        Quad::new(
+            NamedNode::new_unchecked(s),
+            NamedNode::new_unchecked(p),
+            NamedNode::new_unchecked(o),
+            GraphName::NamedNode(NamedNode::new_unchecked(G)),
+        )
+    };
+    let t = RDF_TYPE;
+    let rep = gr("Report");
+    let rev = format!("{PROV}wasRevisionOf");
+    let generated_by = format!("{PROV}wasGeneratedBy");
+    let used = format!("{PROV}used");
+    let pol = gr("reviewPolicy");
+    let mut quads = Vec::new();
+    // a generated report, with its activity, used children and predecessor
+    let mut generated = |r: &str, prev: Option<&str>, children: &[&str]| {
+        let act = activity_iri(r);
+        quads.push(ins(r, t, &rep));
+        quads.push(ins(r, &pol, "urn:policy:main"));
+        quads.push(ins(r, &generated_by, &act));
+        quads.push(ins(&act, t, "http://www.w3.org/ns/prov#Activity"));
+        quads.push(ins(&act, &used, "urn:claim:1"));
+        for c in children {
+            quads.push(ins(&act, &used, c));
+        }
+        if let Some(p) = prev {
+            quads.push(ins(r, &rev, p));
+        }
+    };
+    // a parent whose activity used an uncited child; the child community moved on
+    generated("urn:r:parent", None, &["urn:r:used-child"]);
+    generated("urn:r:used-child", None, &[]);
+    generated("urn:r:new-child", Some("urn:r:used-child"), &[]);
+    // an edit of a generated report that replaced another, edited again
+    generated(
+        "urn:r:edited",
+        Some("urn:r:replaced"),
+        &["urn:r:edited-child"],
+    );
+    generated("urn:r:replaced", None, &[]);
+    generated("urn:r:edited-child", None, &[]);
+    generated("urn:r:replacement", Some("urn:r:old"), &[]);
+    generated("urn:r:old", None, &[]);
+    // a parent whose activity used a person's edit of its child, whose community has a
+    // new report since: the edit stays through the parent, and so does what it edits
+    generated("urn:r:edit-parent", None, &["urn:r:used-edit"]);
+    generated("urn:r:edit-source", None, &[]);
+    generated("urn:r:edit-successor", Some("urn:r:used-edit"), &[]);
+    // a report without a policy, which a person edits below
+    quads.push(ins("urn:r:plain", t, &rep));
+    let mut edit = |r: &str, of: &str, policy: bool| {
+        quads.push(ins(r, t, &rep));
+        quads.push(ins(r, &rev, of));
+        if policy {
+            quads.push(ins(r, &pol, "urn:policy:main"));
+            quads.push(ins(r, &gr("editOf"), of));
+        }
+    };
+    edit("urn:r:edit-1", "urn:r:edited", true);
+    edit("urn:r:edit-2", "urn:r:edit-1", true);
+    edit("urn:r:used-edit", "urn:r:edit-source", true);
+    edit("urn:r:plain-edit", "urn:r:plain", false);
+    for (c, r) in [
+        ("urn:c:parent", "urn:r:parent"),
+        ("urn:c:child", "urn:r:new-child"),
+        ("urn:c:edited", "urn:r:edit-2"),
+        ("urn:c:replaced", "urn:r:replacement"),
+        ("urn:c:plain", "urn:r:plain-edit"),
+        ("urn:c:edit-parent", "urn:r:edit-parent"),
+        ("urn:c:edit-child", "urn:r:edit-successor"),
+    ] {
+        quads.push(ins(c, &gr("report"), r));
+    }
+    let s = load(&quads);
+    sparql::update::update(&s, &delete_unreachable_reports(G), &QueryOptions::default()).unwrap();
+    let left: BTreeSet<String> = rows(
+        &s,
+        &format!("SELECT DISTINCT ?s WHERE {{ GRAPH <{G}> {{ ?s a <{rep}> }} }}"),
+    )
+    .into_iter()
+    .map(|r| r[0].trim_matches(['<', '>']).to_string())
+    .collect();
+    for kept in [
+        "urn:r:parent",
+        "urn:r:used-child",
+        "urn:r:new-child",
+        "urn:r:edit-2",
+        "urn:r:edit-1",
+        "urn:r:edited",
+        "urn:r:edited-child",
+        "urn:r:replacement",
+        "urn:r:plain-edit",
+        "urn:r:used-edit",
+        "urn:r:edit-source",
+    ] {
+        assert!(left.contains(kept), "{kept} was removed: {left:?}");
+    }
+    for gone in ["urn:r:replaced", "urn:r:old", "urn:r:plain"] {
+        assert!(!left.contains(gone), "{gone} was kept: {left:?}");
+    }
+    // the kept edited report keeps its activity
+    assert_eq!(
+        rows(
+            &s,
+            &format!("SELECT ?a WHERE {{ GRAPH <{G}> {{ ?a <{used}> <urn:r:edited-child> }} }}")
+        )
+        .len(),
+        1
     );
 }

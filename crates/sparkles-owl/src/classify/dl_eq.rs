@@ -5,27 +5,50 @@
 //! An equality `s₁ ≈ t₁` that is maximal in its clause, read in either direction for which
 //! `t₁` is not above `s₁` and which is not `x ≈ y` or `y ≈ u`, rewrites an occurrence of
 //! `s₁` in a maximal literal `s₂ ⋈ t₂` of another clause, where `t₂` is not above `s₂`. An
-//! occurrence that is x must be in a side that holds no successor term and no y. In the root
-//! a constant is rewritten everywhere in the side, inside `f(u)` included, and elsewhere one
-//! position at a time. The run's literals hold no `t ≉ t`, since [`Lits::lit`] makes it
+//! occurrence that is x must be in a side that holds no successor term and no y. A constant
+//! is rewritten everywhere in the side, inside `f(u)` included, in every context, as Table 2
+//! has the root do, so that `S(u, f(u))` rewritten by `u ≈ v` is `S(v, f(v))` (F24, item
+//! 804's departures), and a successor term is rewritten one position at a time. The run's
+//! literals hold no `t ≉ t`, since [`Lits::lit`] makes it
 //! false, which is the Ineq rule. Factor takes two equalities with one left side in a head.
+//!
+//! The equality `x ≈ u` as the rewriting equality is blocked outside query contexts (F24,
+//! item 804's third departure, behind `SPARKLES_ROOTED_EQ_BLOCK`): it rewrites `x` to `u`
+//! only in the unit of a core atom of the context of a named class, and `u` to `x` only
+//! in a named-class atom over `u` in such a context, the two forms the journal's Lemmas 21
+//! and 22 use. The equality is still a rewritten literal, so `u ≈ v` turns `x ≈ u` into
+//! `x ≈ v`, and Factor takes it as any equality.
+//!
+//! An Eq or Factor whose equality and rewritten literal hold neither `x` nor `y` is a ground
+//! inference, and the restriction on ground inferences (F24, item 804's first departure)
+//! leaves out its conclusion when the conclusion has a body and holds neither.
 //!
 //! The premises in place of a context other than the root are its units: the atoms `B(x)`
 //! of its subsumers, and the role atom and core of a unit existential restriction over its
 //! successor term.
 
-use super::dl_clause::{Lit, Lits, Made, RTerm, Rooted, XLit, terms_of};
-use super::dl_rules::{DlIx, Found, Side, dl, merge, side, unit, with};
+use super::dl_clause::{Lit, Lits, Made, RTerm, Rooted, XLit, rank, terms_of};
+use super::dl_rules::{DlIx, Found, Side, dl, local, merge, no_xy, restricted, side, unit, with};
 use super::index::{Ex, Index, Role, TOP};
 use super::saturate::State;
+use std::sync::OnceLock;
+
+/// Whether `x ≈ u` rewrites only in the two forms of a query context, item 804's third
+/// departure. `SPARKLES_ROOTED_EQ_BLOCK=0` turns the blocking off, for measurement.
+pub fn eq_block() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_EQ_BLOCK").is_none_or(|v| v != "0"))
+}
 
 /// What the equality rules read beside a context's state: the index, the run's literals,
-/// and whether the context is the root.
+/// whether the context is the root, and the named class of a query context, which is its
+/// core atom.
 pub(super) struct Eqs<'a> {
     pub ix: &'a Index,
     pub dx: &'a DlIx,
     pub lits: &'a Lits,
     pub root: bool,
+    pub query: Option<Ex>,
 }
 
 impl Eqs<'_> {
@@ -48,11 +71,33 @@ impl Eqs<'_> {
         !Rooted::a_gt(t1, s1) && !matches!((s1, t1), (X, Y) | (Y, X) | (Y, C(_)) | (C(_), Y))
     }
 
+    /// Whether Eq with `s₁ ↦ t₁` may rewrite the literal `v` of the premise `prem` (the
+    /// premise without v). An equality other than `x ≈ u` always may. `x ↦ u` rewrites the
+    /// unit of a query context's core atom, and `u ↦ x` a named-class atom over u in a
+    /// query context, and nothing else when the blocking is on.
+    fn admits(&self, s1: RTerm, t1: RTerm, v: XLit, prem: &Side) -> bool {
+        use RTerm::*;
+        match (s1, t1) {
+            (X, C(_)) => {
+                !eq_block()
+                    || self.query.is_some_and(|me| {
+                        prem.0.is_empty() && prem.1.is_empty() && v == XLit::Atom(me, X)
+                    })
+            }
+            (C(u), X) => {
+                !eq_block()
+                    || self.query.is_some()
+                        && matches!(v, XLit::Atom(b, C(w)) if w == u && rank(self.ix, b).0 == 1)
+            }
+            _ => true,
+        }
+    }
+
     /// The literals `v` rewrites to with `s₁ ↦ t₁`, one for each position the rule allows.
     fn rewrites(&self, v: XLit, s1: RTerm, t1: RTerm, out: &mut Vec<Made>) {
         use RTerm::*;
-        // in the root, a constant everywhere in the side, inside f(u) too
-        let everywhere = self.root && matches!(s1, C(_));
+        // a constant everywhere in the side, inside f(u) too, in every context
+        let everywhere = matches!(s1, C(_));
         let sub = |t: RTerm| -> RTerm {
             match (t, s1, t1) {
                 _ if t == s1 => t1,
@@ -109,23 +154,24 @@ impl Eqs<'_> {
         }
     }
 
-    /// The premises whose maximal literals mention `t`, each with its literal: the stored
-    /// clauses, and the units in place of a context other than the root.
-    fn targets(&self, st: &State, t: RTerm, out: &mut Vec<(Side, XLit)>) {
+    /// The premises whose maximal literals mention `t`, each with its literal and whether
+    /// its clause is selected: the stored clauses, and the units in place of a context
+    /// other than the root.
+    fn targets(&self, st: &State, t: RTerm, out: &mut Vec<(Side, XLit, bool)>) {
         out.clear();
         if !self.root {
             match t {
                 RTerm::X => {
                     for &a in &st.subs {
                         if a != TOP {
-                            out.push((unit(), XLit::Atom(a, RTerm::X)));
+                            out.push((unit(), XLit::Atom(a, RTerm::X), false));
                         }
                     }
                 }
                 RTerm::Fx(e) => {
                     let mut us = Vec::new();
                     unit_lits(self, st, e, &mut us);
-                    out.extend(us.into_iter().map(|l| (unit(), l)));
+                    out.extend(us.into_iter().map(|l| (unit(), l, false)));
                 }
                 _ => {}
             }
@@ -140,15 +186,18 @@ impl Eqs<'_> {
                 continue;
             }
             for &l in d.store.maxima(i) {
-                out.push((side(&s.c, l), self.view(l)));
+                out.push((side(&s.c, l), self.view(l), s.sel));
             }
         }
     }
 
     /// The rules on a new premise `prem` whose maximal literal is `l`: as an equality it
     /// rewrites the premises that mention its side and factors with its own head, and as
-    /// any literal it is rewritten by the stored equalities of its terms.
-    pub fn on_max(&self, st: &State, l: Lit, prem: &Side, found: &mut Found) {
+    /// any literal it is rewritten by the stored equalities of its terms. A selected
+    /// premise, `sel`, takes only the inferences local to its context, those on a literal
+    /// that [`super::dl_rules::local`] admits, and so does a selected stored premise.
+    pub fn on_max(&self, st: &State, l: Lit, prem: &Side, found: &mut Found, sel: bool) {
+        found.rule = "eqmax";
         let v = self.view(l);
         let mut made = Vec::new();
         let mut ts = Vec::new();
@@ -158,32 +207,40 @@ impl Eqs<'_> {
                     continue;
                 }
                 // Factor has no exclusions of x ≈ y and y ≈ u, which only Eq has
-                self.factor(prem, l, s1, t1, found);
+                if !sel || local(v) {
+                    self.factor(prem, l, s1, t1, found);
+                }
+                found.rule = "eq";
                 if !Eqs::orients(s1, t1) {
                     continue;
                 }
                 self.targets(st, s1, &mut ts);
-                for (c2, v2) in &ts {
-                    if *v2 == v && c2 == prem {
+                for (c2, v2, sel2) in &ts {
+                    if *v2 == v && c2 == prem || !self.admits(s1, t1, *v2, c2) {
+                        continue;
+                    }
+                    if (sel || *sel2) && !(local(v) || local(*v2)) {
                         continue;
                     }
                     made.clear();
                     self.rewrites(*v2, s1, t1, &mut made);
-                    push(found, prem, c2, &made);
+                    self.push(found, prem, c2, &made, no_xy(v) && no_xy(*v2));
                 }
             }
         }
-        self.into(st, v, prem, found);
+        self.into(st, v, prem, found, sel);
     }
 
     /// A new premise in place `prem` of `v`, a unit of a context other than the root: the
     /// stored equalities of its terms rewrite it.
     pub fn on_unit(&self, st: &State, v: XLit, found: &mut Found) {
-        self.into(st, v, &unit(), found);
+        found.rule = "equnit";
+        self.into(st, v, &unit(), found, false);
     }
 
     /// The stored equalities whose side is a term of `v` rewrite `prem`'s `v`.
-    fn into(&self, st: &State, v: XLit, prem: &Side, found: &mut Found) {
+    fn into(&self, st: &State, v: XLit, prem: &Side, found: &mut Found, sel: bool) {
+        found.rule = "eqinto";
         let Some(d) = dl(st) else { return };
         let Some(by) = d.store.terms.as_deref() else {
             return;
@@ -193,9 +250,7 @@ impl Eqs<'_> {
         let mut made = Vec::new();
         for &t in &ts[..n] {
             let mut look = vec![t];
-            if let RTerm::Fc(_, u) = t
-                && self.root
-            {
+            if let RTerm::Fc(_, u) = t {
                 look.push(RTerm::C(u));
             }
             for s1 in look {
@@ -216,13 +271,19 @@ impl Eqs<'_> {
                         if (a != s1 && b != s1) || !Eqs::orients(s1, t1) {
                             continue;
                         }
+                        if !self.admits(s1, t1, v, prem) {
+                            continue;
+                        }
+                        if (sel || s.sel) && !(local(v) || local(self.view(e))) {
+                            continue;
+                        }
                         let c1 = side(&s.c, e);
                         if self.view(e) == v && &c1 == prem {
                             continue;
                         }
                         made.clear();
                         self.rewrites(v, s1, t1, &mut made);
-                        push(found, &c1, prem, &made);
+                        self.push(found, &c1, prem, &made, no_xy(self.view(e)) && no_xy(v));
                     }
                 }
             }
@@ -232,6 +293,7 @@ impl Eqs<'_> {
     /// Factor: `Γ → Δ ∨ s ≈ t₀ ∨ s ≈ t₁`, with `s ≈ t₁` maximal and read as `s ↦ t₁`,
     /// gives `Γ → Δ ∨ t₀ ≉ t₁ ∨ s ≈ t₁`.
     fn factor(&self, prem: &Side, l: Lit, s: RTerm, t1: RTerm, found: &mut Found) {
+        found.rule = "factor";
         for &o in &prem.1 {
             let XLit::Eq(a, b) = self.view(o) else {
                 continue;
@@ -253,19 +315,29 @@ impl Eqs<'_> {
                 Made::False => {}
                 Made::True => continue,
             }
-            found.push(c);
+            if !(no_xy(XLit::Eq(s, t1)) && no_xy(XLit::Eq(s, t0)))
+                || !restricted(self.lits, self.inv(), &c)
+            {
+                found.push(c);
+            }
         }
     }
-}
 
-/// The conclusions of rewriting `c2` with `c1`, one for each literal made: a false literal
-/// leaves the clause without it, and a true one makes no conclusion.
-fn push(found: &mut Found, c1: &Side, c2: &Side, made: &[Made]) {
-    for &m in made {
-        match m {
-            Made::Lit(l) => found.push(with(&merge(c1, c2), l)),
-            Made::False => found.push(merge(c1, c2)),
-            Made::True => {}
+    /// The conclusions of rewriting `c2` with `c1`, one for each literal made: a false
+    /// literal leaves the clause without it, and a true one makes no conclusion. The
+    /// restriction on ground inferences applies when `ground`.
+    fn push(&self, found: &mut Found, c1: &Side, c2: &Side, made: &[Made], ground: bool) {
+        let mut add = |c: Side| {
+            if !ground || !restricted(self.lits, self.inv(), &c) {
+                found.push(c);
+            }
+        };
+        for &m in made {
+            match m {
+                Made::Lit(l) => add(with(&merge(c1, c2), l)),
+                Made::False => add(merge(c1, c2)),
+                Made::True => {}
+            }
         }
     }
 }

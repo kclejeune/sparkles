@@ -22,6 +22,14 @@ pub const MEMBERS: &[&str] = &[
     "channels",
     "routes",
     "delivery",
+    "watches",
+];
+
+pub const WATCH_MEMBERS: &[&str] = &[
+    "maxAncestors",
+    "largeCommit",
+    "identityMaxAgeDays",
+    "batchSecs",
 ];
 
 pub const DELIVERY_MEMBERS: &[&str] = &["attempts", "backoffSecs", "maxBackoffSecs", "timeoutSecs"];
@@ -38,6 +46,8 @@ pub const NTFY_SH: &str = "https://ntfy.sh";
 /// The most channels the kind holds. Each channel has a delivery thread of its own,
 /// so the cap bounds the threads.
 pub const MAX_CHANNELS: usize = 32;
+/// The event that tells the owner of a watch about changes; no route carries it.
+pub const WATCH_EVENT: &str = "entity.changed";
 
 /// The shortest repeat interval, in days (one minute).
 const MIN_REPEAT_DAYS: f64 = 1.0 / 1440.0;
@@ -73,6 +83,9 @@ pub struct NotifySettings {
     pub routes: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub delivery: Delivery,
+    /// the bounds of watches on entities (spec U12, item 619)
+    #[serde(default)]
+    pub watches: WatchSettings,
 }
 
 impl Default for NotifySettings {
@@ -85,6 +98,7 @@ impl Default for NotifySettings {
             channels: BTreeMap::new(),
             routes: BTreeMap::new(),
             delivery: Delivery::default(),
+            watches: WatchSettings::default(),
         }
     }
 }
@@ -116,14 +130,22 @@ impl Channel {
                 (None, None) => String::new(),
             },
             Channel::Ntfy(n) => format!("{}/{}", n.server.trim_end_matches('/'), n.topic),
-            Channel::Email(e) => format!(
-                "{} port {} ({}) to {}",
-                e.host,
-                e.port(),
-                e.tls.as_str(),
-                e.to.join(", ")
-            ),
+            Channel::Email(e) => {
+                let mut to = e.to.join(", ");
+                if e.watchers {
+                    if !to.is_empty() {
+                        to.push_str(" and ");
+                    }
+                    to.push_str("the owners of watches");
+                }
+                format!("{} port {} ({}) to {to}", e.host, e.port(), e.tls.as_str())
+            }
         }
+    }
+
+    /// Whether the channel mails the owners of watches.
+    pub fn carries_watches(&self) -> bool {
+        matches!(self, Channel::Email(e) if e.watchers)
     }
 
     /// The secrets the channel names.
@@ -214,7 +236,14 @@ pub struct Email {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<SecretRef>,
     pub from: String,
+    /// the recipients of the events the routes send; a channel that only carries
+    /// watches has none
+    #[serde(default)]
     pub to: Vec<String>,
+    /// the channel also mails the owners of watches on entities, each at its own
+    /// verified address (spec U12)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub watchers: bool,
 }
 
 impl Email {
@@ -256,6 +285,68 @@ pub fn check_address(s: &str) -> Result<(), String> {
         Err(format!(
             "{s:?} is not a mail address such as ops@example.org"
         ))
+    }
+}
+
+/// `watches`: the bounds of matching commits against watches on entities, and of
+/// telling their owners.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WatchSettings {
+    /// the most ancestors one upward walk of a subtree watch visits
+    #[serde(default = "WatchSettings::max_ancestors")]
+    pub max_ancestors: u32,
+    /// the most members of one watch a commit names before its match becomes a summary
+    #[serde(default = "WatchSettings::large_commit")]
+    pub large_commit: u32,
+    /// an OIDC or proxy owner whose groups are older than this many days is not told
+    /// outside the UI
+    #[serde(default = "WatchSettings::identity_max_age_days")]
+    pub identity_max_age_days: u32,
+    /// the window that gathers one owner's matches in one dataset into one message
+    #[serde(default = "WatchSettings::batch_secs")]
+    pub batch_secs: u32,
+}
+
+impl WatchSettings {
+    fn max_ancestors() -> u32 {
+        10_000
+    }
+    fn large_commit() -> u32 {
+        1_000
+    }
+    fn identity_max_age_days() -> u32 {
+        30
+    }
+    fn batch_secs() -> u32 {
+        300
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if !(1..=1_000_000).contains(&self.max_ancestors) {
+            return Err("watches.maxAncestors: from 1 to 1000000".into());
+        }
+        if !(1..=1_000_000).contains(&self.large_commit) {
+            return Err("watches.largeCommit: from 1 to 1000000".into());
+        }
+        if !(1..=3650).contains(&self.identity_max_age_days) {
+            return Err("watches.identityMaxAgeDays: from 1 to 3650".into());
+        }
+        if !(10..=86_400).contains(&self.batch_secs) {
+            return Err("watches.batchSecs: from 10 to 86400".into());
+        }
+        Ok(())
+    }
+}
+
+impl Default for WatchSettings {
+    fn default() -> WatchSettings {
+        WatchSettings {
+            max_ancestors: Self::max_ancestors(),
+            large_commit: Self::large_commit(),
+            identity_max_age_days: Self::identity_max_age_days(),
+            batch_secs: Self::batch_secs(),
+        }
     }
 }
 
@@ -438,6 +529,7 @@ impl NotifySettings {
             check_url(b, true).map_err(|e| format!("baseUrl: {e}"))?;
         }
         days("repeatEvery", &self.repeat_every)?;
+        self.watches.validate()?;
         if self.channels.len() > MAX_CHANNELS {
             return Err(format!(
                 "channels: at most {MAX_CHANNELS} channels, not {}",
@@ -469,8 +561,10 @@ impl NotifySettings {
                         return Err(at("port: a port from 1 to 65535".into()));
                     }
                     check_address(&e.from).map_err(|m| at(format!("from: {m}")))?;
-                    if e.to.is_empty() || e.to.len() > MAX_RECIPIENTS {
-                        return Err(at(format!("to: 1 to {MAX_RECIPIENTS} mail addresses")));
+                    if (e.to.is_empty() && !e.watchers) || e.to.len() > MAX_RECIPIENTS {
+                        return Err(at(format!(
+                            "to: 1 to {MAX_RECIPIENTS} mail addresses, or none when the channel carries watches"
+                        )));
                     }
                     for t in &e.to {
                         check_address(t).map_err(|m| at(format!("to: {m}")))?;
@@ -536,9 +630,20 @@ impl NotifySettings {
                     "routes: {key:?} is not an event type, a prefix such as backup.* or *"
                 ));
             }
+            if key == WATCH_EVENT || key == "entity.*" {
+                return Err(format!(
+                    "routes: {WATCH_EVENT} goes only to the owners of watches, through email channels with watchers"
+                ));
+            }
             for c in chans {
-                if !self.channels.contains_key(c) {
-                    return Err(format!("routes.{key}: no channel named {c:?}"));
+                match self.channels.get(c) {
+                    None => return Err(format!("routes.{key}: no channel named {c:?}")),
+                    Some(Channel::Email(e)) if e.to.is_empty() => {
+                        return Err(format!(
+                            "routes.{key}: channel {c:?} has no recipients of its own; it only carries watches"
+                        ));
+                    }
+                    Some(_) => {}
                 }
             }
         }
@@ -574,6 +679,10 @@ impl NotifySettings {
     /// key that matches it, each once, in name order.
     pub fn route(&self, event: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
+        // only the owners of watches are told of it, never the channels of a route
+        if event == WATCH_EVENT {
+            return out;
+        }
         for (key, chans) in &self.routes {
             let hit = key == "*"
                 || key == event
@@ -607,6 +716,12 @@ pub fn check_lock(p: &[String]) -> Result<(), String> {
         && !DELIVERY_MEMBERS.contains(&m.as_str())
     {
         return Err(format!("delivery has no member {m:?}"));
+    }
+    if top == "watches"
+        && let Some(m) = p.get(1)
+        && !WATCH_MEMBERS.contains(&m.as_str())
+    {
+        return Err(format!("watches has no member {m:?}"));
     }
     Ok(())
 }

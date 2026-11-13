@@ -39,6 +39,7 @@ import { handleDescribe } from './describe.mjs';
 import { PathError, pathSearch } from './paths.mjs';
 import { handleModels } from './models.mjs';
 import { handleNotifications } from './notifications.mjs';
+import { handleWatches, recordWatchMatches } from './watches.mjs';
 import { handleAsk, isAdmin, ORG_MEMORY, ORG_PREFIXES, orgTrig, whoamiFor } from './memory.mjs';
 import { handleAssistant } from './assistant.mjs';
 import { handleFacets } from './facets.mjs';
@@ -169,12 +170,12 @@ function commitWrite(ds, kind, before, opts = {}) {
   for (const q of before) if (!after.has(q)) deleted++;
   const committed = inserted + deleted > 0;
   const commit = committed ? addCommit(ds, kind, inserted, deleted, opts) : headCommit(ds);
-  if (committed)
-    recordChanges(
-      commit,
-      [...after].filter((q) => !before.has(q)),
-      [...before].filter((q) => !after.has(q)),
-    );
+  if (committed) {
+    const added = [...after].filter((q) => !before.has(q));
+    const removed = [...before].filter((q) => !after.has(q));
+    recordChanges(commit, added, removed);
+    recordWatchMatches(ds, commit, added, removed, ox);
+  }
   return { dataset: ds.name, datasetId: ds.id, committed, commit };
 }
 
@@ -2486,6 +2487,17 @@ const server = http.createServer(async (req, res) => {
     if (handleModels(req, res, seg, { send, fail })) return;
     // outbound notifications: the kind, the status and test sends (mock/notifications.mjs)
     if (handleNotifications(req, res, seg, { send, fail })) return;
+    // watches on entities and their matched commits (mock/watches.mjs)
+    if (
+      await handleWatches(req, res, url, seg, {
+        send,
+        fail,
+        readBody,
+        datasets,
+        headSeq: (d) => headCommit(d).seq,
+      })
+    )
+      return;
     // the facets of a set (mock/facets.mjs)
     if (await handleFacets(req, res, seg, { datasets, send, fail, readBody })) return;
     // GraphRAG community reports (mock/graphrag.mjs)

@@ -1,0 +1,10 @@
+# started on Mon Nov  9 20:16:24 2026
+
+<not counted>,,cpu_atom/instructions/u,0,0.00,,
+60489687382,,cpu_core/instructions/u,5837551909,100.00,,
+<not counted>,,cpu_atom/cycles/u,0,0.00,,
+22313832391,,cpu_core/cycles/u,5837551909,100.00,,
+<not counted>,,cpu_atom/branch-misses/u,0,0.00,,
+95723383,,cpu_core/branch-misses/u,5837551909,100.00,,
+<not counted>,,cpu_atom/L1-icache-load-misses/u,0,0.00,,
+3659611,,cpu_core/L1-icache-load-misses/u,5837551909,100.00,,

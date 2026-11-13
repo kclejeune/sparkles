@@ -140,6 +140,78 @@ pub(crate) fn append_configuration(
     }
 }
 
+/// What seals a transaction's commit record (see [`commit::seal_wal_commit_unfenced`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Seal {
+    pub seq: u64,
+    pub timestamp_ms: i64,
+    pub kind: CommitKind,
+    /// the commit flags the path decides, such as `WAL_FLAG_UNVALIDATED` and
+    /// `WAL_FLAG_ANNOTATED`; the configuration flag is the encoder's
+    pub flags: u8,
+    /// how many commits just before this one may not be durable when the record is
+    /// written: zero for a commit written after the one before it was synchronized
+    pub unfenced: u8,
+}
+
+impl Seal {
+    /// The seal of commit `c` with `flags` and `unfenced`, which the caller's contract
+    /// decides (a bypassed check sets `WAL_FLAG_UNVALIDATED` here).
+    pub(crate) fn of(c: &CommitInfo, flags: u8, unfenced: u8) -> Seal {
+        Seal {
+            seq: c.seq,
+            timestamp_ms: c.timestamp_ms,
+            kind: c.kind,
+            flags: flags
+                | if c.unvalidated {
+                    commit::WAL_FLAG_UNVALIDATED
+                } else {
+                    0
+                },
+            unfenced,
+        }
+    }
+}
+
+/// The records of one transaction, ready to be written: a data record per operation of
+/// `ops` in order, the configuration record when `configuration` is known, then the
+/// commit record carrying `next_bnode` and sealed by `seal` over the data before it. The
+/// serial, group and compaction writers all encode through here, and the compaction
+/// writer passes its translated ids. Nothing is written: the caller decides the handle,
+/// the position and the synchronization.
+pub(crate) fn encode_txn(
+    ops: &[(u8, [Id; 4])],
+    configuration: crate::history::ConfigurationBinding,
+    next_bnode: u64,
+    seal: Seal,
+) -> Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(
+        (ops.len() + 1 + usize::from(configuration.configuration().is_some())) * WAL_REC,
+    );
+    let mut rec = [0u8; WAL_REC];
+    for (op, q) in ops {
+        rec[0] = *op;
+        for j in 0..4 {
+            rec[1 + j * 8..9 + j * 8].copy_from_slice(&q[j].0.to_le_bytes());
+        }
+        data.extend_from_slice(&rec);
+    }
+    let configuration_flags = append_configuration(&mut data, configuration)?;
+    rec[0] = WAL_COMMIT;
+    rec[1..9].copy_from_slice(&next_bnode.to_le_bytes());
+    commit::seal_wal_commit_unfenced(
+        &mut rec,
+        seal.seq,
+        seal.timestamp_ms,
+        seal.kind,
+        configuration_flags | seal.flags,
+        seal.unfenced,
+        &data,
+    );
+    data.extend_from_slice(&rec);
+    Ok(data)
+}
+
 /// Decode the header from the caller's actual descriptor, never another path open.
 pub(crate) fn descriptor_version(file: &mut File, path: &Path) -> Result<u32> {
     let position = file.stream_position()?;
@@ -1431,6 +1503,112 @@ fn allocation_refused(limit: &crate::history::ReadLimit<'_>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The encoder lays out a transaction as the readers expect: the data records in
+    /// order, the configuration record only for a known binding with its flag, and a
+    /// commit record whose seal covers the data and carries the caller's flags and
+    /// unfenced count, which the commit reader decodes.
+    #[test]
+    fn encode_txn_round_trips_through_the_commit_reader() {
+        let ops = [
+            (WAL_INSERT, [Id(1), Id(2), Id(3), Id(4)]),
+            (WAL_DELETE, [Id(5), Id(6), Id(7), Id(u64::MAX)]),
+        ];
+        let c = CommitInfo {
+            seq: 42,
+            timestamp_ms: 1_700_000_000_123,
+            kind: CommitKind::Update,
+            inserted: 1,
+            deleted: 1,
+            quads: 10,
+            generation: 1,
+            bulk: false,
+            exact: true,
+            reconstructed: false,
+            default_graph: true,
+            unvalidated: true,
+        };
+        let identity = crate::history::ConfigurationIdentity {
+            dataset_id: uuid::Uuid::from_u128(1),
+            lineage_id: uuid::Uuid::from_u128(2),
+            generation: crate::evidence::Sha256Digest::from_digest_bytes([9; 32]),
+        };
+        let known = crate::history::ConfigurationBinding::Known {
+            configuration: identity,
+        };
+        let data =
+            encode_txn(&ops, known, 77, Seal::of(&c, commit::WAL_FLAG_ANNOTATED, 3)).unwrap();
+        assert_eq!(data.len(), 4 * WAL_REC);
+        let recs = data.as_chunks::<WAL_REC>().0;
+        for (i, (op, q)) in ops.iter().enumerate() {
+            assert_eq!(recs[i][0], *op);
+            for j in 0..4 {
+                let id = u64::from_le_bytes(recs[i][1 + j * 8..9 + j * 8].try_into().unwrap());
+                assert_eq!(id, q[j].0);
+            }
+        }
+        assert_eq!(recs[2][0], WAL_CONFIGURATION);
+        assert_eq!(&recs[2][1..], &[9; 32]);
+        let rec = &recs[3];
+        assert_eq!(rec[0], WAL_COMMIT);
+        assert_eq!(u64::from_le_bytes(rec[1..9].try_into().unwrap()), 77);
+        let body = &data[..3 * WAL_REC];
+        let (seq, ts, kind, flags) = commit::open_wal_commit(rec, body)
+            .expect("a sealed record")
+            .expect("a matching checksum");
+        assert_eq!((seq, ts, kind), (42, 1_700_000_000_123, CommitKind::Update));
+        assert_eq!(
+            flags,
+            commit::WAL_FLAG_CONFIGURATION
+                | commit::WAL_FLAG_ANNOTATED
+                | commit::WAL_FLAG_UNVALIDATED
+        );
+        assert_eq!(commit::wal_commit_unfenced(rec), 3);
+        assert_eq!(
+            configuration_records(body, 2, flags).unwrap(),
+            Some(identity.generation)
+        );
+        // a byte of the data breaks the seal
+        let mut torn = data.clone();
+        torn[1] ^= 1;
+        assert!(
+            commit::open_wal_commit(&torn[3 * WAL_REC..], &torn[..3 * WAL_REC])
+                .unwrap()
+                .is_err()
+        );
+
+        // without a known binding: no configuration record and no flag, and a validated
+        // commit written after a synchronized one carries neither flag nor count
+        let validated = CommitInfo {
+            unvalidated: false,
+            ..c
+        };
+        let data = encode_txn(
+            &ops,
+            crate::history::ConfigurationBinding::LegacyUnbound,
+            77,
+            Seal::of(&validated, 0, 0),
+        )
+        .unwrap();
+        assert_eq!(data.len(), 3 * WAL_REC);
+        let rec = &data[2 * WAL_REC..];
+        let (_, _, _, flags) = commit::open_wal_commit(rec, &data[..2 * WAL_REC])
+            .unwrap()
+            .unwrap();
+        assert_eq!(flags, 0);
+        assert_eq!(commit::wal_commit_unfenced(rec), 0);
+
+        // an imported binding is no binding a new commit can carry
+        assert!(
+            encode_txn(
+                &ops,
+                crate::history::ConfigurationBinding::ImportedUnbound { source: identity },
+                77,
+                Seal::of(&validated, 0, 0),
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn configuration_wal_checks_sealed_placement_flags_and_version() {

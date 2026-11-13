@@ -1171,12 +1171,14 @@ arg "[workdir]" help="data, databases, logs and results/ (default .artifacts/ben
 flag "--runs <n>" default="3" help="timed rounds"
 flag "--threads <n>" help="Sparkles' threads beside 1 (default: all cores)"
 flag "--delta-every <n>" default="100" help="the change of the incremental runs is every n-th data triple"
+flag "--max-inferred <n>" default="0" help="the --max-inferred of every sparkles infer (0: no limit)"
 '''
 run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 # Built again inside this lease, so collection cannot remove the binary before it runs.
 mbx build --release -p sparkles-server
 RUNS="$usage_runs" THREADS="${usage_threads:-$(nproc)}" DELTA_EVERY="$usage_delta_every" \
+MAX_INFERRED="$usage_max_inferred" \
 scripts/rl-reference/bench.sh "$usage_suite" "$usage_scale" \
   "$(realpath -m "${usage_workdir:-.artifacts/bench-rl-reference/$usage_suite-$usage_scale}")"
 SPARKLES_TASK

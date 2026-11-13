@@ -597,7 +597,7 @@ matter when building on it:
 | Encryption | F11 partially implements optional encrypted backup repositories and operator key workflows. Live dataset files remain unencrypted by Sparkles. Content-defined chunking and KMS-backed dataset encryption are not implemented. |
 | Execution | Automatic execution streams many plans, and the rest run eagerly. Sorts, groupings, DISTINCT and joins spill to disk by default on the server, and `--spill off` turns it off. Eager operators still hold their whole state and can exceed a budget. |
 | Query languages | Read-only GraphQL is implemented with limitations on nested query cost. Cypher remains [specified only](specs/F01-cypher.md). There is no implemented property-graph frontend. |
-| Reasoning and shapes | Materialization plus RDFS on read is implemented, without a general backward rule engine or ontology object API. Incremental reasoning has full-run fallbacks. ShEx 2.2 and SHACL 1.2 node expressions remain absent. |
+| Reasoning and shapes | Materialization plus RDFS on read is implemented, without a general backward rule engine or ontology object API. Incremental reasoning has full-run fallbacks. ShEx 2.2 and SHACL 1.2 node expressions are implemented within the [compatibility boundaries](FEATURES.md#compatibility-boundaries). |
 | Agents and settings | Model clients are tested against mock endpoints, and there is no evaluation matrix against real models. C18 Phase 6 is not built. |
 | Packaging and scale | Bindings are implemented but unpublished to package registries. The engine has no browser WASM build. Published measurements reach 1.24 billion triples on one machine. They do not establish larger or distributed behavior. |
 

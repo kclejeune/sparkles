@@ -70,11 +70,12 @@ build community reports.
 
 ### Questions in plain language
 
-* `sparkles ask`, `POST /{ds}/ask` and the web UI's [Ask thread](#the-ask-thread) turn a
-  question into a checked SPARQL query ([C18](../specs/C18-natural-language-questions-and-ingest/README.md),
+* A question becomes a checked SPARQL query through `sparkles ask`, `POST /{ds}/ask` or
+  the web UI's [Ask thread](#the-ask-thread)
+  ([C18](../specs/C18-natural-language-questions-and-ingest/README.md),
   [USAGE.md](../USAGE.md#asking-questions-with-a-model),
-  [API.md](../API.md#natural-language-questions)). On DBpedia's billion quads, an Ask takes
-  about two seconds with under 512 MiB of anonymous memory.
+  [API.md](../API.md#natural-language-questions)). On DBpedia's billion quads, an Ask
+  takes about two seconds with under 512 MiB of anonymous memory.
 * The server knows model providers of three kinds, Ollama, the OpenAI protocol and
   Anthropic, with keys from named secrets and an ordered list of models for each role.
   `--model-config`, `GET /$/models` and `POST /$/models/{name}/test` configure and test
@@ -127,7 +128,7 @@ build community reports.
   for the W3C WGS84 vocabulary, and `wd`, `wdt` and `wikibase` for Wikidata. A prefix
   that the dataset binds to another namespace keeps the dataset's binding, and any other
   unknown prefix is still reported by the check.
-* The check of a draft reports a typed variable whose class has no instance with the
+* Checking a draft reports a typed variable whose class has no instance with the
   predicate the draft uses. That lookup names the class and the predicate in its query,
   and a lookup that passes the query memory budget leaves the pattern unjudged instead
   of failing the check. Its suggestions are the predicates that a sample of 200
@@ -161,9 +162,10 @@ The web UI asks through one thread component, shown as a page at `/ui/ask` and a
 drawer docked beside any page
 ([C18 §6.1](../specs/C18-natural-language-questions-and-ingest/SPEC.md#61-where-it-lives)).
 
-* `Shift+A`, the palette's Ask row and the rail's Ask page open it when the dataset has an
-  assistant. The drawer docks at the right of a wide window, floats over a medium one and
-  is a bottom sheet on a phone, and **Open as page** moves the thread to `/ui/ask`.
+* The thread opens from `Shift+A`, the palette's Ask row or the rail's Ask page when the
+  dataset has an assistant. The drawer docks at the right of a wide window, floats over a
+  medium one and is a bottom sheet on a phone, and **Open as page** moves the thread to
+  `/ui/ask`.
 * A Browse, Ontology, Thesaurus or Explore page passes its resource, and the Query page its
   query, as a context chip with questions that suit it. The request carries the resource
   as `about`, so the history keeps the person's own words, and the chip can be removed.
@@ -258,11 +260,11 @@ checks current MCP and HTTP memory workflows with independently specified source
 occurrences, correction, withdrawal, retained-commit recall, graph visibility, branch
 separation and citation fidelity. It uses explicit entity seeds and does not establish
 retrieval quality, model accuracy or latency. Shared-profile independence, accepted
-support ownership and dependent freshness remain under items 81 and 340.
+support ownership and dependent freshness remain planned. Roadmap items 81 and 340.
 
 Idle scratch branches expire after the dataset's `memory.scratchBranches.ttl`, over HTTP
 and in a `sparkles mcp --loc --allow-update` session. A limit per principal, warnings
-before a branch expires and a way to keep one branch remain under item 435.
+before a branch expires and a way to keep one branch remain planned. Roadmap item 435.
 
 ### Document ingestion
 
@@ -411,7 +413,8 @@ inputs changed. A review or withdrawal names what it changed, such as withdrawn 
 ended supports and the map revision a split follows, and `POST /{ds}/claims/dependents`
 or `sparkles::evidence::find_dependents` answers the authenticated assessments in the
 proposal graphs the caller can read that depend on them, optionally transitively. The
-answer marks nothing stale by itself. Maintained analyses that act on it are item 340.
+answer marks nothing stale by itself. Maintained analyses that act on it are planned.
+Roadmap item 340.
 
 `recall` and `POST /{ds}/recall` cite claims under a named policy. With `reviewPolicy`,
 a fact of the policy's output graph cites the claim occurrences of its live acceptance
@@ -496,8 +499,9 @@ The Rust controlled permission helper can prepare graph, predicate and class mas
 and the built-in disclosure guard under one memory cap and `Control`. It explicitly
 refuses unsupported providers, unresolved providers nested in retained rules and
 protection-pattern planning. Evidence resolution uses it, and guarded Dataset queries
-still require caller adoption under [item 395](../ROADMAP.md). A prepared visibility view provides no source authenticity,
-managed-write authority or proof that an unavailable reference is absent.
+still require caller adoption. [Roadmap item 395](../ROADMAP.md). A prepared visibility
+view provides no source authenticity, managed-write authority or proof that an
+unavailable reference is absent.
 
 Source revisions, renditions and passages retain exact identities and digests. Claim
 occurrences describe a proposition with an RDF 1.2 triple term without asserting it.
@@ -522,14 +526,15 @@ library mode the capability guards against mistakes, not against code in the sam
 process. No typed evidence operation uses it so far, so profile records in managed
 graphs are protected from ordinary writes but remain unauthenticated RDF.
 
-These resources are ordinary caller-visible data under the existing access policy.
-Their shapes check structure, while the fixtures independently check source bytes and
-selectors. Loading a review decision or receipt does not authenticate it, admit facts
-or enable execution. A claims ingestion through `POST /$/ingest/{ds}` with
-`mode: "claims"` proposes extracted facts through the same typed writer, with its source
-registration in the same commit, as [document ingestion](#document-ingestion) describes. Existing `assert_facts` and source registration keep their current
-behavior. [C25](../specs/C25-evidence-and-assessments.md#outcome) records the exact phase
-boundary and remaining managed operations.
+These resources are ordinary caller-visible data under the existing access policy. Their
+shapes check structure, while the fixtures independently check source bytes and selectors.
+Loading a review decision or receipt does not authenticate it, admit facts or enable
+execution. A claims ingestion through `POST /$/ingest/{ds}` with `mode: "claims"` proposes
+extracted facts through the same typed writer, with its source registration in the same
+commit, as in [document ingestion](#document-ingestion). Existing `assert_facts` and
+source registration keep their current behavior.
+[C25](../specs/C25-evidence-and-assessments.md#outcome) records the exact phase boundary
+and remaining managed operations.
 
 ### Shared entity representation
 
@@ -595,16 +600,17 @@ adapter supports reported positive occurrences in the declared synthetic series 
 selects its unique terminal source revision. Unsupported headers or rules refuse or
 remain explicit unknowns. The separate Cargo.lock version 4 adapter checks supplied
 family and version bindings against the existing software-inventory bytes, whose
-manifest digests a test recomputes. Roadmap item 407 owns the review of that corpus. These
+manifest digests a test recomputes. Reviewing that corpus is tracked separately. Roadmap
+item 407. These
 bindings do not establish release, build, artifact or deployment evidence. The CLI
 emits resolution comparisons, while these evolution and mapping helpers are exercised
 through the [replay tests](../../crates/sparkles/tests/shared_entity_replay.rs).
 
-All review and availability declarations in this reference remain simulated. A
-separately supplied public scope demonstrates isolation without implementing real
-authorization. Roadmap item 396 retains managed integration with actual C25 review and
-protected records, C27 authenticated availability, C26 durable publication and F22
-freshness. Synthetic count examples define no operational health policy or connector.
+All review and availability declarations in this reference remain simulated. A separately
+supplied public scope demonstrates isolation without implementing real authorization.
+Managed integration with C25 review and protected records, C27 authenticated availability,
+C26 durable publication and F22 freshness remains planned. Roadmap item 396. Synthetic
+count examples define no operational health policy or connector.
 
 ### Community reports (GraphRAG)
 
@@ -621,6 +627,11 @@ freshness. Synthetic count examples define no operational health policy or conne
   every request against per-build and daily budgets. A refresh rewrites only the reports
   of communities that changed, and `refresh.mode: auto` starts one when enough facts
   change.
+* With `reviewPolicy` in the settings, the reports read a review policy's accepted
+  projection. A finding cites the accepted claims and current decisions behind its facts,
+  the report's activity names every claim, decision and child report it read with
+  `prov:used`, and a withdrawn, reversed or superseded claim rewrites the reports that
+  read it ([C25](../specs/C25-evidence-and-assessments.md#reports-on-accepted-evidence)).
 * Ask answers questions about the whole dataset from the reports by map-reduce, and falls
   back to a query for callers who may not read them. The MCP tool `community_reports`,
   `recall` with `communities`, the brief, `sparkles graphrag` and the UI's Communities tab
@@ -646,7 +657,7 @@ or refuse client backdating of an ordinary RDF timestamp. That A4 acceptance req
 needs C25's planned server-owned receipts and the shared protected-write boundary, or
 a separately reviewed runtime helper. Publication dates and arbitrary receipt triples
 do not establish a knowledge cutoff. The projection helper, event-time UI and expiry
-integration remain planned under item 341.
+integration remain planned. Roadmap item 341.
 
 ## Known gaps
 
@@ -656,44 +667,44 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 ### AI and agents
 
 * A question asked with a context chip reaches the model as the question followed by
-  `(about <IRI>)`, as a typed suffix would. Grounding does not yet seed entity linking or
-  predicate use from the structured `about` resource, which roadmap item 717 adds.
+  `(about <IRI>)`, as a typed suffix would. Grounding does not seed entity linking or
+  predicate use from the structured `about` resource. Roadmap item 717.
 * A stored Ask answer records what it read only when every step read one head that did
   not move. An ask pinned to an earlier state, or one during which the dataset changed,
   keeps its answer for unrestricted readers only, so a reader with limited grants sees
-  such a turn without its answer when the thread reopens. Roadmap item 718
-  records each state the steps read.
-* ChatGPT-plan model access is planned in [C28](../specs/C28-chatgpt-model-access.md),
-  roadmap item 344. The existing OpenAI-compatible provider uses Chat Completions with
-  configured API credentials. It does not accept a ChatGPT subscription as model access.
+  such a turn without its answer when the thread reopens. Recording each state the steps
+  read is planned. Roadmap item 718.
+* ChatGPT-plan model access is planned in [C28](../specs/C28-chatgpt-model-access.md).
+  The existing OpenAI-compatible provider uses Chat Completions with configured API
+  credentials. It does not accept a ChatGPT subscription as model access. Roadmap
+  item 344.
 * Ask has been evaluated with Anthropic models only, on the demo set, CK25, QALD-9-plus
   and 74 DBpedia-only questions
   ([C18](../specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12),
   [BENCHMARKS.md](../benchmarks/natural-language/RESULTS.md#ask-grounding-from-predicate-use)).
   With the current build, on 150 held-out QALD-9-plus training questions that no tuning
-  step read, Opus 5.5 answers 114, GPT-6.1 Terra 111, GPT-6.1 Sol 109, Haiku 5.5 102
-  and GPT-6 Luna 101 under projected-column scoring, against 41 to 72 for the build
-  before predicate-use grounding. Sonnet 5.5 answered 106 with the build before the check
-  fixes and the projection rule. Luna and Haiku are within the noise of Sol but not of
-  Opus ([results](../benchmarks/natural-language/RESULTS.md#ask-on-the-cheapest-models)).
-  Luna costs $0.0019 per question, Sonnet $0.029 and Opus $0.060. With the earlier
-  build, on the 107 retained QALD-9-plus test questions, which Ask
-  grounding was tuned on, Opus answers 60, Sonnet 55 and Luna 47, and on the 74 retained
-  Text2SPARQL'25 DBpedia questions 46, 45 and 40
+  step read, Opus 5.5 answers 114, GPT-6.1 Terra 111, GPT-6.1 Sol 109, Haiku 5.5 102 and
+  GPT-6 Luna 101 under projected-column scoring, against 41 to 72 for the build before
+  predicate-use grounding. Sonnet 5.5 answered 106 with the build before the check fixes
+  and the projection rule. Luna and Haiku are within the noise of Sol but not of Opus
+  ([results](../benchmarks/natural-language/RESULTS.md#ask-on-the-cheapest-models)). Luna
+  costs $0.0019 per question, Sonnet $0.029 and Opus $0.060. With the earlier build, on
+  the 107 retained QALD-9-plus test questions, which Ask grounding was tuned on, Opus
+  answers 60, Sonnet 55 and Luna 47, and on the 74 retained Text2SPARQL'25 DBpedia
+  questions 46, 45 and 40
   ([results](../benchmarks/natural-language/RESULTS.md#ask-across-providers)). The
   `openai` provider preset starts with Luna and the `anthropic` preset with Sonnet, the
   cheapest models per correct answer within the noise of the best one in the provider
   comparison. When accuracy matters more than cost, choose GPT-6.1 Terra, which answers
-  about 74% of the held-out questions strictly, within the noise of Opus, at about 9
-  times Luna's cost. A gold resource
-  missing from the prompt causes about half of the wrong answers, and wrong query shape
-  most of the rest. Property path evaluation runs within Ask's query memory budget and
-  timeout, so a generated query with a property path fails with the usual error rather
-  than exhausting memory. Model-dependent
-  accuracy and contextual namesake resolution remain roadmap item 263, and the higher
-  median end-to-end latency is item 318. Local and OpenAI-compatible models, LC-QuAD 2.0,
-  which needs a Wikidata load from the full dump, and an evaluation of independent roles
-  have not run. Roadmap item 6.
+  about 74% of the held-out questions strictly, within the noise of Opus, at about 9 times
+  Luna's cost. A gold resource missing from the prompt causes about half of the wrong
+  answers, and wrong query shape most of the rest. Property path evaluation runs within
+  Ask's query memory budget and timeout, so a generated query with a property path fails
+  with the usual error rather than exhausting memory. Model-dependent accuracy and
+  contextual namesake resolution remain open. Roadmap item 263. The median end-to-end
+  latency is also higher. Roadmap item 318. Local and OpenAI-compatible models, LC-QuAD
+  2.0, which needs a Wikidata load from the full dump, and an evaluation of independent
+  roles have not run. Roadmap item 6.
 * Prompt caching has not been measured against Anthropic. Neither the cache hit rate of
   real calls nor Ask's accuracy with its grounding reordered for the cache has run.
   Roadmap item 503.
@@ -711,32 +722,44 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   exactly or after folding case and spacing. A value with several matches keeps a minted
   IRI until a person chooses, and the lookup reports only the first variant of an
   ambiguous group. Roadmap item 15.
-* Evidence ingestion into claim proposals, reports on accepted evidence and maintained
-  analyses remain planned under roadmap items 651, 652 and 340 of
-  [C25](../specs/C25-evidence-and-assessments.md). Ordinary RDF shape validation does not
-  establish the runtime guarantees of the typed evidence operations.
+* Maintained analyses remain planned in [C25](../specs/C25-evidence-and-assessments.md).
+  Ordinary RDF shape validation does not establish the runtime guarantees of the typed
+  evidence operations. Roadmap item 340.
+* The automatic refresh of reports read under a review policy notices only the changes
+  of the policy's evidence that the principal's change feed lists. A hidden decision,
+  support or withdrawal, a settings-only change of the evidence configuration, a reload
+  of the access policy and a state left behind by a crash wait for the next visible
+  change or a manual refresh. Roadmap item 652.
+* A report waiting for a rewrite after its claim was withdrawn keeps its earlier
+  citations while the daily budget holds the rewrite back, without a `stale` mark.
+  Roadmap item 809.
+* No search lists the reports whose activity used a changed claim or decision, as
+  `claims/dependents` does for assessments. Roadmap item 810.
+* A global answer refuses `reviewPolicy`, and reports do not resolve identities through
+  a matching policy. Roadmap item 811.
 * Recall finds the claims about its entities by reading each boundary proposal graph,
   and refuses past one million quads, because no index maps a proposition's terms to its
   claims. Roadmap item 766.
 * `sparkles ask` and the bindings do not take `reviewPolicy` or `matchingPolicy`. Roadmap
   items 767 and 509.
 * Durable jobs, worker leases, collection checkpoints and a transactional delivery outbox
-  are planned in [C26](../specs/C26-durable-jobs-and-delivery.md), roadmap item 339. Current
-  server tasks and operator notifications do not provide the proposed recovery contract.
+  are planned in [C26](../specs/C26-durable-jobs-and-delivery.md). Current server tasks and
+  operator notifications do not provide the proposed recovery contract. Roadmap item 339.
 * Maintained analysis records with reproducible inputs, read dependencies and guarded
-  result publication are planned in [F22](../specs/F22-analysis-lifecycle.md), roadmap item
-  340. Existing reasoner and view maintenance does not provide that application lifecycle.
+  result publication are planned in [F22](../specs/F22-analysis-lifecycle.md). Existing
+  reasoner and view maintenance does not provide that application lifecycle. Roadmap
+  item 340.
 * The [valid-time profile](#valid-time-profile) supplies static resources and temporal
   queries. C27 Phase 1 remains incomplete until server-owned availability and backdating
   refusal pass A4, dependent on C25 Phase 2 and protected writes. The runtime projection
-  helper, event-time control and expiry integration remain roadmap item 341.
+  helper, event-time control and expiry integration remain planned. Roadmap item 341.
 * A dataset has one GraphRAG configuration, so readers with different views cannot each
-  have reports built from their own view, roadmap item 100. The evaluation of global
-  answering covers one generated question set on the demo graph, compares it with BM25
-  rather than vector retrieval and has no samples checked by a person, items 260 and 261.
-  `auto` mode answers about half of the questions about the whole graph locally, item
-  262. An automatic refresh counts changes from the change feed rather than from an
-  incremental view, item 12.
+  have reports built from their own view. Roadmap item 100. Global answering is evaluated
+  on one generated question set on the demo graph, compared with BM25 rather than vector
+  retrieval, with no samples checked by a person. Roadmap items 260 and 261. `auto` mode
+  answers about half of the questions about the whole graph locally. Roadmap item 262. An
+  automatic refresh counts changes from the change feed rather than from an incremental
+  view. Roadmap item 12.
 
 ## Configuration and usage
 

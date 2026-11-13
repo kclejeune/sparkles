@@ -20,7 +20,7 @@ pub mod http;
 mod sign;
 mod smtp;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use crate::state::AppState;
 use chrono::{DateTime, TimeDelta, Utc};
@@ -165,6 +165,9 @@ struct Job {
     delivery: Delivery,
     attempt: u32,
     due: Instant,
+    /// a delivery to the owner of watches: its message and address are built at each
+    /// attempt from these references, and `envelope` holds only its id
+    watcher: Option<Arc<crate::watches::deliver::Batch>>,
 }
 
 /// A lasting condition that was notified (§6.3).
@@ -337,7 +340,7 @@ fn host_name() -> String {
 }
 
 /// The envelope of §3.2.
-fn envelope(cfg: &NotifySettings, ev: &Event, now: DateTime<Utc>) -> Value {
+pub(crate) fn envelope(cfg: &NotifySettings, ev: &Event, now: DateTime<Utc>) -> Value {
     let mut v = json!({
         "version": 1,
         "id": uuid::Uuid::new_v4().to_string(),
@@ -526,11 +529,65 @@ fn raise_with(
                 delivery: cfg.delivery,
                 attempt: 1,
                 due: Instant::now(),
+                watcher: None,
             })
         })
         .collect();
     n.enqueue(st, jobs, cfg.channels.len());
     Some(Raised::Queued(channels))
+}
+
+/// Queue batch `b` of matches for its owner on each of `channels`, the email channels
+/// that carry watches. Unlike [`raise`], no route decides the channels, and the
+/// message is built at each attempt.
+pub(crate) fn queue_watcher(
+    st: &Arc<AppState>,
+    cfg: &NotifySettings,
+    channels: &[String],
+    b: Arc<crate::watches::deliver::Batch>,
+) {
+    let id = uuid::Uuid::new_v4().to_string();
+    let env = Arc::new(json!({ "id": id, "type": crate::watches::deliver::EVENT }));
+    let jobs = channels
+        .iter()
+        .filter_map(|name| {
+            Some(Job {
+                envelope: env.clone(),
+                event: crate::watches::deliver::EVENT,
+                channel: name.clone(),
+                config: cfg.channels.get(name)?.clone(),
+                delivery: cfg.delivery,
+                attempt: 1,
+                due: Instant::now(),
+                watcher: Some(b.clone()),
+            })
+        })
+        .collect();
+    st.notifier.enqueue(st, jobs, cfg.channels.len());
+}
+
+/// One attempt of a delivery to the owner of watches: the channel must still be on
+/// and carry watches, and the message is built from the watches as they are now.
+fn watcher_attempt(st: &AppState, job: &Job, b: &crate::watches::deliver::Batch) -> Attempt {
+    let cfg = settings(st);
+    if !cfg.enabled {
+        return Attempt::Dropped("notifications are off".into());
+    }
+    let e = match cfg.channels.get(&job.channel) {
+        Some(Channel::Email(e)) if e.watchers => e,
+        _ => {
+            return Attempt::Dropped(format!("channel {} no longer carries watches", job.channel));
+        }
+    };
+    let id = job.envelope["id"].as_str().unwrap_or_default();
+    match crate::watches::deliver::build(st, &cfg, b, id, Utc::now()) {
+        Err(why) => Attempt::Dropped(why),
+        Ok((env, to)) => {
+            let mut e = e.clone();
+            e.to = vec![to];
+            attempt(st, &job.channel, &Channel::Email(e), &env, &job.delivery)
+        }
+    }
 }
 
 /// The condition `key` cleared: the next event with it is notified at once.
@@ -601,6 +658,9 @@ enum Attempt {
     Retry(String, Option<f64>),
     Failed(String),
     Refused(String),
+    /// nothing to send: a delivery to the owner of watches that the owner's access,
+    /// address or the settings no longer allow
+    Dropped(String),
 }
 
 /// The worker of channel `name`: it sends the deliveries of the channel's queue in
@@ -662,7 +722,10 @@ fn worker(shared: Arc<Shared>, weak: Weak<AppState>, name: String) {
             removed = empty && !effective(&st).is_ok_and(|c| c.channels.contains_key(&name));
             continue;
         };
-        let outcome = attempt(&st, &job.channel, &job.config, &job.envelope, &job.delivery);
+        let outcome = match job.watcher.clone() {
+            None => attempt(&st, &job.channel, &job.config, &job.envelope, &job.delivery),
+            Some(b) => watcher_attempt(&st, &job, &b),
+        };
         drop(st);
         idle_since = Instant::now();
         let mut g = shared.inner.lock();
@@ -690,6 +753,11 @@ fn worker(shared: Arc<Shared>, weak: Weak<AppState>, name: String) {
                 tracing::warn!(target: "sparkles::notify", channel = job.channel.as_str(), event = job.event,
                     "notification refused by the outbound policy: {e}");
                 g.record(&job, "refused", json!({ "error": e }), job.attempt);
+            }
+            Attempt::Dropped(e) => {
+                tracing::info!(target: "sparkles::notify", channel = job.channel.as_str(), event = job.event,
+                    "notification not sent: {e}");
+                g.record(&job, "dropped", json!({ "error": e }), job.attempt);
             }
         }
         // a retry waits in the channel's own queue, in the place its attempt held
@@ -821,6 +889,7 @@ fn attempt(
                 Attempt::Retry(m, a) => Attempt::Retry(scrub(m, &refs), a),
                 Attempt::Failed(m) => Attempt::Failed(scrub(m, &refs)),
                 Attempt::Refused(m) => Attempt::Refused(scrub(m, &refs)),
+                Attempt::Dropped(m) => Attempt::Dropped(m),
             };
         }
         Channel::Ntfy(n) => {
@@ -918,6 +987,7 @@ pub fn test_send(st: &AppState, channel: &str) -> Result<Value, (&'static str, S
         delivery: cfg.delivery,
         attempt: 1,
         due: Instant::now(),
+        watcher: None,
     };
     let started = Instant::now();
     let outcome = attempt(st, channel, c, &env, &cfg.delivery);
@@ -939,7 +1009,7 @@ pub fn test_send(st: &AppState, channel: &str) -> Result<Value, (&'static str, S
             g.record(&job, "refused", json!({ "error": e }), 1);
             Err(("outbound-refused", e))
         }
-        Attempt::Retry(e, _) | Attempt::Failed(e) => {
+        Attempt::Retry(e, _) | Attempt::Failed(e) | Attempt::Dropped(e) => {
             g.record(&job, "failed", json!({ "error": e }), 1);
             Err(("delivery-failed", e))
         }
@@ -992,6 +1062,8 @@ pub fn status_json(st: &AppState) -> Value {
         "queued": g.queued(),
         "active": active,
         "recent": g.recent.iter().cloned().collect::<Vec<_>>(),
+        // the number of watches per dataset, without their owners or entities
+        "watches": st.watches.counts(st).unwrap_or_default(),
     })
 }
 

@@ -113,6 +113,13 @@ pub(super) fn view_settings(view: &BoundEvidenceView) -> Result<Settings> {
     }
 }
 
+/// The evidence settings that `view`'s configuration records, or the default settings
+/// when it records none. A reader compares them with the current settings to notice a
+/// configuration change during a long read.
+pub fn recorded_settings(view: &BoundEvidenceView) -> Result<Settings> {
+    view_settings(view)
+}
+
 /// The refusal of a review policy the caller cannot use: unknown at the view, a
 /// matching policy, or one whose graphs it may not read. The answer is the same in
 /// each case, so a caller cannot tell a hidden policy from a missing one.

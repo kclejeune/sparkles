@@ -532,6 +532,7 @@ mod tests {
         drop(ds);
         let restoring = st.reserve("ds", ReservationKind::Restore, "1").unwrap();
         let old = st.detach_for_swap("ds").unwrap();
+        assert_eq!(st.closed(), ["ds"]);
         st.create("other", &CreateDataset::default()).unwrap();
         assert_eq!(registered(dir.path()), ["ds", "other"]);
         st.rename("other", "renamed").unwrap();

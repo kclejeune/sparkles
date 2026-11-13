@@ -30,9 +30,10 @@ pages, completions, OpenAPI, license notices and separate debug symbols. Its gat
 require a manylinux 2.28 build and installed query and persistence checks in pinned
 Rocky Linux 8 and Debian 11 containers. Those gates have not established platform
 support. Published server downloads, signed provenance, the other server platforms
-and published container images remain open under [item 59](../ROADMAP.md). Candidate
-build records are unsigned metadata. [DEVELOPMENT](../DEVELOPMENT.md#server-artifact-candidates)
-describes the commands and evidence boundaries.
+and published container images remain open. [Roadmap item 59](../ROADMAP.md). Candidate
+build records are unsigned metadata. The
+[commands and evidence boundaries](../DEVELOPMENT.md#server-artifact-candidates) are in
+DEVELOPMENT.
 The archive bundles no CA certificates. A host needs the system CA certificates, the
 `ca-certificates` package on Debian, Ubuntu and Rocky Linux, because the built-in HTTP
 client loads them when it starts, even for a loopback command such as `sparkles ping`.
@@ -104,7 +105,7 @@ callers and records the selected numeric user in its receipt.
   all operators produce ([C01](../specs/C01-observability-and-budgets.md)). A request can
   lower a budget but never raise it, and a query over budget fails with `507`. Queries and
   writes stop when their client disconnects.
-* The memory estimate of a query counts its decoded value cache, which holds at most
+* A query's memory estimate counts its decoded value cache, which holds at most
   64 MiB or an eighth of the query's memory budget, its computed terms and memos, its
   parsed geometries and the working space of dictionary decoding, whether it runs eagerly
   or as a cursor. A query close to its limit can therefore fail where an estimate without
@@ -193,7 +194,7 @@ callers and records the selected numeric user in its receipt.
   configures, with `--mem`, `--loc`, `--validate` or `--text` for example, answers as
   opening until startup has installed its configuration. A dataset whose derived index
   is unavailable is not reported separately, and the opening reports no progress through
-  a log replay, under [item 402](../ROADMAP.md).
+  a log replay. [Roadmap item 402](../ROADMAP.md).
 * Health checks use `/$/ping` for liveness and for a startup check that waits for the
   process, so nothing restarts a server that is opening large datasets or is degraded,
   and `/$/ready` for readiness. Deployments that serve several datasets and should keep
@@ -212,7 +213,7 @@ public library APIs. HTTP descriptions and the standard CLI command tree are che
 against a development commit baseline. That baseline does not represent a published
 release. Existing router, authorization, response and protocol tests remain separate.
 Library and binding comparisons, CLI JSON and exit-code coverage, MCP and metrics
-guards, deprecation signals and released-artifact checks remain under roadmap item 60.
+guards, deprecation signals and released-artifact checks remain planned. Roadmap item 60.
 The on-disk reader window remains separate from API compatibility.
 
 ## Known gaps

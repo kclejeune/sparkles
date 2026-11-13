@@ -2,7 +2,7 @@
 //! reference reasoner and the measurements of `docs/benchmarks/el-classification`.
 //!
 //! ```text
-//! el_classify [--threads N] [--counting] [--dl-work N] [--ofn-out FILE] [--taxonomy FILE] [--repeat N] [--heap] [--owned] INPUT
+//! el_classify [--threads N] [--counting] [--rooted] [--dl-work N] [--ofn-out FILE] [--taxonomy FILE] [--repeat N] [--heap] [--owned] INPUT
 //! ```
 //!
 //! INPUT is functional-style syntax (`.ofn`, or any file that starts with `Prefix(` or
@@ -86,6 +86,7 @@ fn main() {
     let mut eager = false;
     let mut dl_work: Option<usize> = None;
     let mut counting = false;
+    let mut rooted = false;
     let mut input = None;
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -98,13 +99,14 @@ fn main() {
             "--el-only" => el_only = true,
             "--eager" => eager = true,
             "--counting" => counting = true,
+            "--rooted" => rooted = true,
             "--dl-work" => dl_work = args.next().and_then(|v| v.parse().ok()),
             _ => input = Some(a),
         }
     }
     let Some(input) = input else {
         eprintln!(
-            "usage: el_classify [--threads N] [--counting] [--dl-work N] [--el-only] [--eager] [--ofn-out FILE] [--taxonomy FILE] INPUT"
+            "usage: el_classify [--threads N] [--counting] [--rooted] [--dl-work N] [--el-only] [--eager] [--ofn-out FILE] [--taxonomy FILE] INPUT"
         );
         std::process::exit(2);
     };
@@ -161,6 +163,7 @@ fn main() {
         },
         dl_work,
         counting,
+        rooted,
         ..Limits::default()
     };
     let mut times = Vec::new();
@@ -286,6 +289,7 @@ fn main() {
             "dlStored": s.dl_stored,
             "dlWork": s.dl_work,
             "dlCountingOver": s.dl_counting_over,
+            "dlRootedOver": s.dl_rooted_over,
             "dlTestsHeld": s.dl_tests_held,
             "dlTestingMs": s.dl_testing.as_secs_f64() * 1000.0,
             "partial": partial,

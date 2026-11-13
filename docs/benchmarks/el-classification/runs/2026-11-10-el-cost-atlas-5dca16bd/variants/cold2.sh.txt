@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# cold2.sh: item 720 variants on atlas: cold and warm rounds of the 12 small files on eight and
+# four threads, sides base, pre, f (start delay of the last helper's entry), g (of the first
+# worker's spawn time) and h (100 us once a start has happened). Holds the heavy lock.
+set -uo pipefail
+D=$HOME/lanes/el-cost-720
+cd "$D"
+exec 8> "$HOME/lanes/.heavy.lock"
+flock 8
+O=$D/cold2-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$O"; cd "$O"
+ln -s ../bin bin; ln -s ../data data
+log() { echo "$(date -u +%FT%TZ) $*" >> "$O/log.txt"; }
+log "start host=$(hostname) load=$(cut -d' ' -f1-3 /proc/loadavg)"
+{ free -g; vmstat 1 3; } > "$O/host-before.txt" 2>&1
+for b in base pre f g h; do log "sha $b $(sha256sum bin/$b | cut -c1-16)"; done
+SMALL="dev/ore_ont_1445.owl dev/ore_ont_2775.owl dev/ore_ont_3231.owl dev/ore_ont_5564.owl dev/ore_ont_5940.owl dev/ore_ont_6855.owl dev/ore_ont_7584.owl dev/ore_ont_7663.owl dev/ore_ont_8203.owl dev/ore_ont_8273.owl dev/ore_ont_9096.owl dev/ore_ont_13581.owl"
+for t in 8 4; do
+  THREADS=$t PINN=0-11 PIN1=4 bash ../scripts/cold.sh "$O" 9 "$SMALL" "base pre f g h" >> "$O/log.txt" 2>&1
+  log "cold t$t done"
+done
+log "COLD2-DONE"

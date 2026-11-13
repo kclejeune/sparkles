@@ -225,6 +225,7 @@ mod tests {
         };
         assert!(m.contains("registers it as /before"), "{m}");
         assert!(cat.get("before").is_none() && cat.get("after").is_none());
+        assert_eq!(cat.closed(), ["before"]);
         // the name stays taken, and later saves keep the registration
         assert!(matches!(
             cat.create("before", &Default::default()),

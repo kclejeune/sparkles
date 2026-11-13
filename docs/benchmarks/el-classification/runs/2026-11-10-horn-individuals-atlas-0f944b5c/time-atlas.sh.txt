@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Interleaved timing of the lane and the base on the Horn files with individuals, on atlas:
+# three rounds, each file classified by the base and the lane in turn with the order
+# alternating by round, four threads, three repeats per call. Runs under the heavy lock
+# and a 13G scope, which the caller wraps.
+set -u
+D=$HOME/lanes/horn-individuals-692
+OUT=$D/out
+mkdir -p "$OUT"
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; free -g; } > "$OUT/before.txt"
+for round in 1 2 3; do
+  order="base lane"; [ $((round % 2)) -eq 0 ] && order="lane base"
+  while read -r n; do
+    for tag in $order; do
+      mkdir -p "$OUT/r$round/$tag"
+      timeout 900 "$D/bin/$tag" --threads 4 --repeat 3 "$D/files/$n.owl" > "$OUT/r$round/$tag/$n.json" 2> "$OUT/r$round/$tag/$n.err"
+      echo "r$round $tag $n status=$?" >> "$OUT/log.txt"
+    done
+  done < "$D/affected.txt"
+done
+{ echo "end=$(date -Is)"; uptime; free -g; } > "$OUT/after.txt"
+echo TIME-DONE >> "$OUT/log.txt"

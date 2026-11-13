@@ -102,6 +102,7 @@ mod validation_common;
 mod vector;
 mod vector_cmd;
 mod warm;
+mod watches;
 mod write_validation;
 
 use anyhow::{Context, Result, bail};
@@ -3406,6 +3407,7 @@ fn run() -> Result<()> {
                 assistant::spawn_pruning(st.clone());
                 // the lasting conditions of outbound notifications (C21 §6.4)
                 notify::events::spawn(st.clone());
+                watches::spawn(&st);
                 // scheduled consolidation and retention of agent memory (C18 §8.3, §8.4)
                 #[cfg(feature = "mcp")]
                 ingest::maintain::spawn_schedule(st.clone());
