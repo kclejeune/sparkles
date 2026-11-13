@@ -42,7 +42,9 @@ fn auto(ds: &Dataset, profile: Option<Profile>) -> QueryOptions {
     .query_options()
 }
 
-fn answers(ds: &Dataset, opts: &QueryOptions) -> (Vec<String>, Option<String>, u64) {
+/// The answer, the `Sparkles-Reasoning` header and whether the query read the inferred
+/// graph.
+fn answers(ds: &Dataset, opts: &QueryOptions) -> (Vec<String>, Option<String>, bool) {
     let r = ds.query_with(Q, opts).unwrap();
     let rows: Vec<String> = r
         .rows()
@@ -50,7 +52,7 @@ fn answers(ds: &Dataset, opts: &QueryOptions) -> (Vec<String>, Option<String>, u
         .map(|row| row[0].as_ref().unwrap().to_string())
         .collect();
     let applied = r.ctx.reasoning.clone().expect("auto applies");
-    (rows, applied.header(), applied.read)
+    (rows, applied.header(), applied.reads_inferred())
 }
 
 /// The `Reason` node of an EXPLAIN and its `Derive` children.
@@ -88,7 +90,18 @@ fn auto_reads_a_fresh_materialization_and_derives_over_a_stale_one() {
         header, None,
         "a fresh materialization answers without derivation"
     );
-    assert_eq!(read, 1);
+    assert!(read);
+    let applied = ds
+        .query_with(Q, &opts)
+        .unwrap()
+        .ctx
+        .reasoning
+        .clone()
+        .unwrap();
+    assert!(
+        applied.nodes.is_empty() && applied.report.tables == 0,
+        "rdfs holds no backward rule, so the query starts no session: {applied:?}"
+    );
     let plan = reason_node(&ds, &opts);
     assert_eq!(counter(&plan, "materialization"), "fresh");
     let nodes = derive_nodes(&plan);
@@ -120,7 +133,7 @@ fn auto_reads_a_fresh_materialization_and_derives_over_a_stale_one() {
     );
     let header = header.expect("derived");
     assert!(header.starts_with("auto; derived="), "{header}");
-    assert_eq!(read, 0);
+    assert!(!read);
     let plan = reason_node(&ds, &opts);
     assert_eq!(counter(&plan, "materialization"), "not read");
     assert!(plan.description.contains("stale"), "{}", plan.description);
@@ -146,7 +159,7 @@ fn auto_reads_a_fresh_materialization_and_derives_over_a_stale_one() {
         ]
     );
     assert_eq!(header, None);
-    assert_eq!(read, 1);
+    assert!(read);
 }
 
 /// A materialization with another profile, or with rules the query's program lacks, is
@@ -161,7 +174,7 @@ fn auto_derives_what_the_materialization_cannot_hold() {
     let (rows, header, read) = answers(&ds, &owl);
     assert_eq!(rows, ["<http://ex.org/x>", "<http://ex.org/z>"]);
     assert!(header.is_some(), "derived under another profile");
-    assert_eq!(read, 0);
+    assert!(!read);
     let plan = reason_node(&ds, &owl);
     assert!(plan.description.contains("profile"), "{}", plan.description);
 
@@ -174,7 +187,7 @@ fn auto_derives_what_the_materialization_cannot_hold() {
     let (rows, header, read) = answers(&ds, &opts);
     assert_eq!(rows, ["<http://ex.org/x>", "<http://ex.org/z>"]);
     assert_eq!(header, None);
-    assert_eq!(read, 1);
+    assert!(read);
     let both =
         "PREFIX ex: <http://ex.org/> SELECT ?x ?y { ?x a ex:B . ?x ex:knows ?y } ORDER BY ?x ?y";
     let r = ds.query_with(both, &opts).unwrap();
@@ -253,7 +266,7 @@ fn the_query_setting_names_the_default_mode_and_the_stale_policy() {
         "read stale"
     );
     assert_eq!(header, None);
-    assert_eq!(read, 1);
+    assert!(read);
     let plan = reason_node(&ds, &opts);
     assert_eq!(counter(&plan, "materialization"), "stale, read");
     let applied = ds

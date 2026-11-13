@@ -146,6 +146,16 @@ impl QueryReasoner {
         self.shared.digest
     }
 
+    /// Whether the rules hold a top-level backward rule, whose facts a materialization
+    /// lacks since the materializer skips such rules (spec F17 §5.1). The profiles
+    /// `rdfs`, `rdfs-simple` and `owl-rl` hold none.
+    pub fn has_backward_rules(&self) -> bool {
+        self.shared
+            .rules
+            .iter()
+            .any(|r| r.direction == Direction::Backward)
+    }
+
     /// This reasoner as the provider [`QueryOptions::reasoning`] takes.
     ///
     /// [`QueryOptions::reasoning`]: sparkles_core::sparql::QueryOptions::reasoning

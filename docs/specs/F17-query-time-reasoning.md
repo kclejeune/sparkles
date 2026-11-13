@@ -1035,14 +1035,14 @@ commits (§6.2), the MCP argument, the UI selector and the G08 mapping remain in
   equal the query-time program's, C08's freshness is fresh at the snapshot's commit, and
   the caller can read the inferred graph. The engine (`sparql/reasoning.rs`) keeps the
   inferred graph in the query's default graph while the materialization can answer and
-  takes it out otherwise. For each intensional pattern it then compares the estimated
-  cost of reading with the estimated cost of deriving, reads when reading is estimated no
-  more expensive, and derives the others into the overlay as under `demand`. Both sources
-  give facts of one closure, so the union answers as a fresh materialization does. A
-  pattern whose dependency cone holds a top-level backward rule derives, since the
-  materializer skips those rules although the rules digest covers them. A pattern with a
-  variable predicate reads. A seeded pattern is decided when its seeds are known, from the
-  join's fan-out per seed and the estimate per seed.
+  takes it out otherwise. While the materialization can answer, an intensional pattern
+  reads it unless its dependency cone holds a top-level backward rule, and such a pattern
+  derives into the overlay as under `demand`, since the materializer skips those rules
+  although the rules digest covers them. Both sources give facts of one closure, so the
+  union answers as a fresh materialization does. When the program holds no backward rule,
+  as `rdfs`, `rdfs-simple` and `owl-rl` do not, a query that executes starts no reasoner
+  session at all (`ReasoningProvider::reads_all`) and runs as materialized reasoning does.
+  EXPLAIN starts the session to show each pattern's estimate and costs.
 * **The estimate.** `demand::estimate_cone` walks the dependency cone from the pattern
   with its bound positions. For each rule whose head gives the pattern, the body is joined
   in a greedy order, bound positions first, and each atom multiplies the join by the facts
@@ -1050,9 +1050,26 @@ commits (§6.2), the MCP argument, the UI selector and the G08 mapping remain in
   join's size counts as the rule's facts, a body atom that rules give is estimated in turn
   with the positions the join has bound, once per rule and adornment, and the walk stops
   at depth six. The free-adornment strata are the atoms the cone reaches with no position
-  bound. The costs are `READ_BASE + rows` and `DERIVE_BASE + facts × DERIVE_FACT`, or
-  `READ_BASE + facts × CACHED_FACT` for a table the cache holds, in the planner's unit of
-  one scanned row, with the constants in `sparql::reasoning::cost`.
+  bound. EXPLAIN gives the read cost `READ_BASE + rows` and the derivation cost, which is
+  the read cost plus `DERIVE_BASE + facts × DERIVE_FACT`, or plus `READ_BASE + facts ×
+  CACHED_FACT` for a table the cache holds, in the planner's unit of one scanned row,
+  with the constants in `sparql::reasoning::cost`. The costs inform and do not decide,
+  as the next paragraph explains.
+* **Why reading always wins.** §4.3 has the planner compare the two estimates per pattern
+  and derive where deriving is cheaper. In this engine a derived pattern still reads the
+  inferred graph, which stays in the query's default graph while the materialization
+  answers, and its derived facts only join an overlay. Deriving therefore costs the read
+  and the derivation, and is never the cheaper source. Leaving the inferred graph out per
+  pattern would not change that, since a derivation of a pattern's facts costs at least
+  reading them from the store's indexes. The measurements agree. On LUBM at one
+  university, the reasoner-latency harness on stanley gives materialized reading from
+  0.06 to 1.7 ms per query with `owl-rl` and 0.14 to 1.7 ms with `rdfs`, and derivation on
+  demand at least 150 ms and 0.3 ms with the tables cached. The per-pattern comparison
+  with a derivation charged for its read, which always reads, also cost 1 to 8 ms per
+  query in reasoner setup and estimates, so `auto` reads by rule instead and keeps the
+  estimates for EXPLAIN. Roadmap item 910 revisits a per-pattern choice once a separate
+  derived layer (item 9, F16) makes reading inferences costlier than an index probe.
+
 * **The setting.** `crates/sparkles/src/reasoning/setting.rs` holds `default`, `profile`,
   `rules`, `inputs`, `budget` and `stale`, in `query-reasoning.json` with the version
   member `queryReasoningFormat`. `PUT`, `GET` and `DELETE /$/reason/{ds}/query` change it,
@@ -1080,17 +1097,17 @@ commits (§6.2), the MCP argument, the UI selector and the G08 mapping remain in
 4. The setting is not yet locked through C19's declared settings, whose kinds own their
    files through the server's settings layer while the library owns this one. Roadmap
    item 909 covers the lock.
-5. Under `auto` with a readable materialization, the per-pattern comparison decides a
-   seeded pattern only once its seeds are known, so EXPLAIN without a run shows the
-   comparison of its constants alone.
+5. Under `auto` with a readable materialization, a pattern reads unless a backward rule
+   lies in its cone, rather than by the comparison of §4.3, for the reasons and
+   measurements above.
 
 **Acceptance.** A4 and A5 hold in `auto_reads_a_fresh_materialization_and_derives_over_a_stale_one`
 (`crates/sparkles/tests/auto_reasoning.rs`) and over HTTP in
 `auto_reasoning_and_the_query_setting_over_http`. The backward-rule and profile cases
 hold in `auto_derives_what_the_materialization_cannot_hold`, the setting in
 `the_query_setting_names_the_default_mode_and_the_stale_policy` and
-`the_setting_budget_bounds_a_derivation`, the cost rule in
-`auto_chooses_the_cheaper_source_within_the_rules` and the estimate in
+`the_setting_budget_bounds_a_derivation`, the rule in
+`auto_reads_what_the_materialization_holds` and the estimate in
 `cone_estimates_follow_the_statistics_and_the_bound_positions`.
 
 ### Roadmap follow-ups

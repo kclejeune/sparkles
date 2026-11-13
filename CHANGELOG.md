@@ -49,8 +49,9 @@ it.
 `reasoning=auto` chooses per pattern between the materialized inferences and derivation
 on demand (item 19, spec F17 Phase 2). A fresh materialization with the query-time
 profile, rules and inputs is read, a stale or absent one is derived around, a pattern
-whose rules include a Jena backward rule is derived, and the choice between the two
-sources follows estimated costs that EXPLAIN shows. `PUT /$/reason/{ds}/query` sets the
+whose rules include a Jena backward rule is derived, and EXPLAIN shows each pattern's
+source with estimated costs. A query over a fresh materialization whose rules hold no
+backward rule starts no reasoner session. `PUT /$/reason/{ds}/query` sets the
 dataset's query-time reasoning: the default mode of a query that names none, the profile
 and rules, the input graphs, a derivation budget and whether `auto` may read a stale
 materialization. `serve --query-reasoning NAME=PROFILE`, `sparkles infer --query-default

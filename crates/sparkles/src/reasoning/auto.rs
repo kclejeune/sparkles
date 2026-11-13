@@ -5,8 +5,10 @@
 //! decides for the snapshot the query reads whether the materialized inferences can
 //! answer at all: the materialization must have the query-time profile, rules and input
 //! graphs, be fresh at the snapshot's commit (C08's freshness), and be readable by the
-//! caller. The engine then chooses per pattern between reading and deriving by cost
-//! (`sparkles_core::sparql::reasoning::choose`). A stale materialization is never read
+//! caller. A pattern then reads the materialization unless a backward rule lies in its
+//! cone, and derives otherwise (`sparkles_core::sparql::reasoning::choose`). With no
+//! backward rule in the program, as under `rdfs` and `owl-rl`, the query starts no
+//! session at all ([`ReasoningProvider::reads_all`]). A stale materialization is never read
 //! unless the dataset's setting says `"stale": "allow"`, and then the response carries
 //! `Sparkles-Inferences`.
 //!
@@ -117,6 +119,20 @@ impl ReasoningProvider for AutoReasoner {
         true
     }
 
+    /// A materialization that can answer answers every pattern when the rules hold no
+    /// backward rule, so the query starts no session.
+    fn reads_all(&self, req: &SessionRequest) -> Option<Materialization> {
+        if self.inner.has_backward_rules() {
+            return None;
+        }
+        let m = self.materialization(req);
+        matches!(
+            m,
+            Materialization::Fresh | Materialization::StaleRead { .. }
+        )
+        .then_some(m)
+    }
+
     fn start(&self, req: SessionRequest) -> Result<Box<dyn ReasoningSession>> {
         let materialization = self.materialization(&req);
         let inner = self.inner.start(req)?;
@@ -187,6 +203,10 @@ impl ReasoningProvider for Limited {
 
     fn auto(&self) -> bool {
         self.inner.auto()
+    }
+
+    fn reads_all(&self, req: &SessionRequest) -> Option<Materialization> {
+        self.inner.reads_all(req)
     }
 
     fn start(&self, mut req: SessionRequest) -> Result<Box<dyn ReasoningSession>> {

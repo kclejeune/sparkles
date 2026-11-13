@@ -9207,22 +9207,23 @@ materialization with another profile is never read, so a query that names
 `reasoningProfile` differently from the dataset's materialization derives everything. A
 stale materialization is not read either, so the answer of `auto` is never silently
 stale, and the query derives the facts its patterns need while the inferred graph is left
-out of its default graph. When the materialization can answer, the planner compares, for
-each pattern that rules can give facts for, the estimated cost of reading its facts from
-the inferred graph with the estimated cost of deriving them, from the dependency cone of
-the pattern and the statistics of the store, and reads when reading is estimated no more
-expensive. A pattern whose cone holds a Jena backward rule derives, since the materializer
-skips those rules, and a pattern with a variable predicate reads. Both sources give facts
-of the same closure, so a query that reads some patterns and derives others answers as a
-fresh materialization would.
+out of its default graph. When the materialization can answer, every pattern reads it
+except a pattern whose rules include a Jena backward rule, which derives, since the
+materializer skips those rules. Both sources give facts of the same closure, so a query
+that reads some patterns and derives others answers as a fresh materialization would. A
+derived pattern still reads the inferred graph, so deriving where the materialization
+holds the facts would only add work. With `rdfs`, `rdfs-simple` and `owl-rl`, which have
+no backward rules, a query over a fresh materialization runs as `reasoning=materialized`
+does.
 
 * The response carries `Sparkles-Reasoning: auto; derived=…; tables=…; cached=…` when a
   pattern was derived, and no such header when the inferred graph answered every pattern.
   `Sparkles-Inferences` appears only when a stale materialization was read, which the
   dataset's setting must allow.
 * EXPLAIN's `Reason` node says whether the materialization was fresh, stale or absent,
-  and each `Derive` node gives `source` (`materialized` or `derived`), `readCost`,
-  `deriveCost`, `estimatedDerived` and `reason`.
+  and each `Derive` node gives `source` (`materialized` or `derived`), `reason`, and the
+  estimates `estimatedDerived`, `readCost` and `deriveCost` from the pattern's dependency
+  cone and the store's statistics.
 * `sparkles query --reasoning auto` takes the same `--profile`, `--rules` and
   `--max-derived` as `demand`.
 
