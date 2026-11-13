@@ -18,9 +18,11 @@ The remote build checkouts under ~/lanes/nsc-build-work are left alone. A build 
 sources there before its scope is listed, and their managed targets are in the store,
 which `mbx gc` bounds.
 
---deadline-seconds bounds the whole cleanup. Each command runs in its own process group,
-which is killed when the command's share of the deadline ends, and no step starts after
-the deadline, so no process of the cleanup outlives it by more than a few seconds.
+--deadline-seconds bounds the whole cleanup. Each command, the removals included, runs in
+its own process group, which is killed when the command's share of the deadline ends, and
+no step starts after the deadline. SIGTERM, SIGHUP or SIGINT kill the running command's
+group and end the program, and each command dies with the program even if it is killed
+outright, so no process of the cleanup outlives it by more than a few seconds.
 
 It prints one JSON record with the disk use before and after, and --log appends the same
 record to a file.
@@ -30,7 +32,6 @@ import fcntl
 import json
 import os
 import re
-import shutil
 import signal
 import stat
 import subprocess
@@ -53,25 +54,59 @@ def usage(path, statvfs=os.statvfs):
     return {'used_pct': pct, 'used_bytes': used, 'avail_bytes': avail, 'size_bytes': fs.f_blocks * fs.f_frsize}
 
 
+# The process group of the command that runs now, which a cancellation kills.
+RUNNING = set()
+
+
+def _die_with_parent():
+    # PR_SET_PDEATHSIG: the kernel kills the command if this program dies, even by SIGKILL.
+    try:
+        import ctypes
+        ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0)
+    except (OSError, AttributeError):
+        pass
+
+
+def kill_group(pid):
+    # A group of 0 or 1 would be this program's own or init's, never a command's.
+    if pid <= 1:
+        return
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def run_command(argv, env=None, seconds=60):
-    """Run argv in a new process group for at most seconds, and kill the group after that."""
+    """Run argv in a new process group for at most seconds, and kill the group after that.
+
+    The group is also killed when this program is cancelled, and the command itself dies
+    with this program, so no command outlives it."""
     if seconds <= 0:
         return 'no_time', ''
     try:
         p = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+                             stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=_die_with_parent)
     except OSError:
         return 'unavailable', ''
+    RUNNING.add(p.pid)
     try:
         out, _ = p.communicate(timeout=seconds)
         return p.returncode, out.decode(errors='replace')
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(p.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        kill_group(p.pid)
         p.communicate()
         return 'timeout', ''
+    finally:
+        kill_group(p.pid)
+        RUNNING.discard(p.pid)
+
+
+def cancel(signum, frame):
+    """End the cleanup on SIGTERM, SIGHUP or SIGINT, killing the command that runs."""
+    for pid in list(RUNNING):
+        kill_group(pid)
+    os._exit(128 + signum)
 
 
 def active_units(run):
@@ -90,8 +125,9 @@ def plain_directory(path):
         return False
 
 
-def remove_tree(path):
-    shutil.rmtree(path, ignore_errors=True)
+def remove_tree(path, run, seconds):
+    """Remove path with rm in a bounded, owned process. rm never follows a link it meets."""
+    run(['rm', '-rf', '--one-file-system', '--', path], None, seconds)
     return not os.path.lexists(path)
 
 
@@ -139,7 +175,7 @@ def clean(home, threshold=None, force=False, env=None, deadline_seconds=600, run
             if left(1) <= 0:
                 record['deadline_reached'] = True
                 break
-            if remove_tree(path):
+            if remove_tree(path, run, left(deadline_seconds)):
                 record['removed'].append({'kind': kind, 'path': path})
         if plain_directory(repo):
             run(['git', '-C', repo, 'worktree', 'prune'], None, left(60))
@@ -169,6 +205,8 @@ def main(argv=None):
         parser.error('--env takes a JSON object of strings')
     if not 1 <= a.deadline_seconds <= 3600:
         parser.error('--deadline-seconds takes 1 to 3600')
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(signum, cancel)
     record = clean(a.home, a.if_above, a.force, env, a.deadline_seconds)
     line = json.dumps(record, sort_keys=True)
     if a.log and record['ran']:

@@ -39,6 +39,8 @@ class FakeWorker:
         self.calls.append((argv, env, seconds))
         if argv[:2] == ['systemctl', '--user']:
             return self.list_exit, ''.join(u + ' loaded active running x\n' for u in self.units)
+        if argv[:2] == ['rm', '-rf']:
+            import shutil; shutil.rmtree(argv[-1], ignore_errors=True); return 0, ''
         if argv == ['mbx', 'gc']:
             if self.disk:
                 self.disk.used -= self.gc_frees * GIB
@@ -95,16 +97,13 @@ class Clean(unittest.TestCase):
         def slow(argv, env=None, seconds=60):
             t[0] += 4; return real(argv, env, seconds)
         worker.run = slow
-        removals = []
-        def remove(path):
-            removals.append(path); t[0] += 3; return disk_clean.shutil.rmtree(path) or True
-        with patch.object(disk_clean, 'remove_tree', remove):
-            record = self.clean(worker, disk, deadline_seconds=10, clock=lambda: t[0])
-        # The unit list took 4 seconds and one removal 3, so the second removal and the
-        # later commands found too little time.
-        self.assertEqual(len(removals), 2); self.assertTrue(all(c[2] <= 10 for c in worker.calls))
-        self.assertEqual([c[0][:2] for c in worker.calls][0], ['systemctl', '--user'])
-        self.assertLessEqual(worker.calls[-1][2], 0 + 10 - 4 - 6)
+        record = self.clean(worker, disk, deadline_seconds=10, clock=lambda: t[0])
+        # Each command took 4 seconds. The unit list and one removal left 2 seconds, so the
+        # second removal ran with that share and nothing started after the deadline.
+        self.assertTrue(all(c[2] <= 10 for c in worker.calls))
+        self.assertEqual([c[0][:2] for c in worker.calls][:3], [['systemctl', '--user'], ['rm', '-rf'], ['rm', '-rf']])
+        self.assertEqual([c[2] for c in worker.calls][:3], [10, 6, 2])
+        self.assertTrue(record['deadline_reached'] or all(c[2] == 0 for c in worker.calls[3:]))
         record = self.clean(FakeWorker(disk=disk), disk, deadline_seconds=1, clock=lambda: 5.0)
         self.assertTrue(record['ran'])
 
@@ -159,15 +158,51 @@ class Clean(unittest.TestCase):
         started = []
         class Popen:
             def __init__(self, argv, env=None, **kw):
-                started.append((argv, env, kw)); self.returncode = 0; self.pid = 0
+                started.append((argv, env, kw)); self.returncode = 0; self.pid = -1
             def communicate(self, timeout=None):
                 return b'', None
-        with patch('os.statvfs', disk.statvfs), patch('subprocess.Popen', Popen), contextlib.redirect_stdout(out):
+        # The program installs its cancellation handlers, which must not stay in this test process.
+        with patch('os.statvfs', disk.statvfs), patch('subprocess.Popen', Popen), patch('signal.signal') as handlers, contextlib.redirect_stdout(out):
             exec(compile(source, 'remote', 'exec'), {'__name__': '__main__'})
         record = json.loads(out.getvalue())
         self.assertTrue(record['ran']); self.assertEqual(json.loads(log.read_text()), record)
         argv, gc_env, kw = started[-1]
         self.assertEqual(argv, ['mbx', 'gc']); self.assertEqual(gc_env['MBX_CACHE_DIR'], '/c'); self.assertTrue(kw['start_new_session'])
+        import signal
+        self.assertEqual({c.args[0] for c in handlers.call_args_list}, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
+
+    def helper(self, extra_sleep_name):
+        """Start the cleanup as a program whose mbx gc sleeps and writes its pid."""
+        import subprocess, time
+        bindir = Path(self.tmp.name) / 'bin'; bindir.mkdir(exist_ok=True); pidfile = Path(self.tmp.name) / extra_sleep_name
+        (bindir / 'mbx').write_text('#!/bin/sh\necho $$ > %s\nexec sleep 60\n' % pidfile); (bindir / 'mbx').chmod(0o755)
+        (bindir / 'systemctl').write_text('#!/bin/sh\nexit 0\n'); (bindir / 'systemctl').chmod(0o755)
+        environ = dict(os.environ, PATH=str(bindir) + ':' + os.environ['PATH'])
+        p = subprocess.Popen([sys.executable, '-I', disk_clean.__file__, '--home', str(self.home), '--force', '--deadline-seconds', '120'],
+                             env=environ, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(100):
+            if pidfile.exists() and pidfile.read_text().strip():
+                return p, int(pidfile.read_text())
+            time.sleep(0.1)
+        p.kill(); self.fail('mbx gc did not start')
+
+    def gone(self, pid):
+        import time
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            time.sleep(0.1)
+        os.kill(pid, 9); return False
+
+    def test_a_cancelled_or_killed_cleanup_leaves_no_command(self):
+        import signal
+        for name, sig in [('term', signal.SIGTERM), ('hup', signal.SIGHUP), ('kill', signal.SIGKILL)]:
+            with self.subTest(signal=name):
+                p, child = self.helper(name)
+                p.send_signal(sig); p.wait(10)
+                self.assertTrue(self.gone(child), 'mbx gc outlived the cleanup')
 
     def test_the_command_line_refuses_bad_values(self):
         for argv in [[], ['--if-above', '0'], ['--if-above', '101'], ['--force', '--env', '["x"]'], ['--force', '--if-above', '90'],
