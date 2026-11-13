@@ -36,7 +36,13 @@ impl<'a> CallerContext<'a> {
         endpoint: crate::auth::Endpoint,
     ) -> QueryOptions {
         let mut opts = request_options(self.st, self.ds, params);
-        crate::auth::restrict(&mut opts, self.principal, name, endpoint);
+        crate::auth::restrict(
+            &mut opts,
+            self.principal,
+            name,
+            endpoint,
+            &self.ds.store.hidden_graphs(),
+        );
         opts
     }
 
@@ -70,12 +76,15 @@ impl<'a> CallerContext<'a> {
             self.principal,
             &self.ds.name,
             crate::auth::Endpoint::Query,
+            &self.ds.store.hidden_graphs(),
         );
         #[cfg(not(feature = "auth"))]
         {
-            opts.graphs = self
-                .principal
-                .view(&self.ds.name, crate::auth::Endpoint::Query);
+            opts.graphs = sparkles::access::GraphAccess::hiding_graphs(
+                self.principal
+                    .view(&self.ds.name, crate::auth::Endpoint::Query),
+                &self.ds.store.hidden_graphs(),
+            );
         }
     }
 }

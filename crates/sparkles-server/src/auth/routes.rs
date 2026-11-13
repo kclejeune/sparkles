@@ -1326,12 +1326,26 @@ pub async fn middleware(State(st): State<Arc<AppState>>, mut req: Request, next:
         .extensions()
         .get::<MatchedPath>()
         .map(|m| m.as_str().to_string());
-    let p = match route {
-        Some(route) => hiding_owner_graphs(&st, &route, req.uri(), Principal::local()),
-        None => Principal::local(),
+    let (p, partial) = match route {
+        Some(route) => {
+            let p = hiding_owner_graphs(&st, &route, req.uri(), Principal::local());
+            let partial = partial_for(&route, req.uri(), &p);
+            (p, partial)
+        }
+        None => (Principal::local(), false),
     };
     req.extensions_mut().insert(p);
-    next.run(req).await
+    crate::http::history::redact_gone(next.run(req).await, partial)
+}
+
+/// Whether figures that count every graph of the request's dataset leave the response
+/// of `p`: when `p` reads only some of its graphs, or when the request names no dataset
+/// and `p` reads only some graphs anywhere.
+fn partial_for(route: &str, uri: &Uri, p: &Principal) -> bool {
+    match ds_of(route, uri) {
+        Some(ds) => p.partial_view(&ds),
+        None => !p.hidden_patterns().is_empty(),
+    }
 }
 
 #[cfg(feature = "auth")]
@@ -1727,8 +1741,9 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
     // pass, with the dataset's hidden control graphs out of the principal's views
     let p = hiding_owner_graphs(st, &route, req.uri(), p);
     let report = report_of(&p, None);
+    let partial = partial_for(&route, req.uri(), &p);
     req.extensions_mut().insert(p);
-    let mut resp = next.run(req).await;
+    let mut resp = crate::http::history::redact_gone(next.run(req).await, partial);
     if route.starts_with("/$/") && !resp.headers().contains_key(header::CACHE_CONTROL) {
         resp.headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));

@@ -686,10 +686,43 @@ impl Store {
         let snap = tgt.snapshot();
         o.progress.report(0.5, "finding conflicts");
         let exempt = exempt_keys(set, o);
-        let plan = plan_merge(&snap, t_o, t_t, o, &exempt)?;
-        report.inserted = plan.changes.values().filter(|i| **i).count() as u64;
-        report.deleted = plan.changes.len() as u64 - report.inserted;
-        report.conflicts_found = plan.found;
+        let mut plan = plan_merge(&snap, t_o, t_t, o, &exempt)?;
+        // The report leaves the target's hidden control graphs out (spec C26 §2.3): their
+        // changes are not counted and their conflicts are not shown. A merge that would
+        // change one is refused at its commit by the managed-graph boundary, and one whose
+        // only conflicts are in such a graph is refused here.
+        let hidden: Vec<Vec<u8>> = tgt
+            .hidden_graphs()
+            .iter()
+            .map(|g| crate::id::iri_key(g))
+            .collect();
+        let shown = |g: &[u8]| !hidden.iter().any(|h| h.as_slice() == g);
+        let (mut ins, mut del) = (0u64, 0u64);
+        for (k, i) in &plan.changes {
+            if shown(&k[0]) {
+                if *i { ins += 1 } else { del += 1 }
+            }
+        }
+        report.inserted = ins;
+        report.deleted = del;
+        let mut found = plan.found;
+        if !hidden.is_empty() {
+            let before = plan.remaining.len();
+            let first_hidden = plan
+                .remaining
+                .iter()
+                .find(|(gk, _)| !shown(&gk.0))
+                .and_then(|(gk, _)| nt(&gk.0));
+            plan.remaining.retain(|(gk, _)| shown(&gk.0));
+            found = found.saturating_sub((before - plan.remaining.len()) as u64);
+            if plan.remaining.is_empty()
+                && let Some(g) = first_hidden
+            {
+                let iri = g.trim_start_matches('<').trim_end_matches('>');
+                return Err(crate::managed::protected(iri));
+            }
+        }
+        report.conflicts_found = found;
         report.conflicts_resolved = plan.resolved;
         report.inferences_excluded = plan.excluded;
         if !plan.remaining.is_empty() {

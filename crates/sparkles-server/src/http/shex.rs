@@ -558,6 +558,18 @@ mod enabled {
     fn guard_validation(r: GuardRun<'_>) -> ApiResult {
         let bad = |m: String| err(StatusCode::BAD_REQUEST, m);
         let (schema, guard_map, opts) = r.guard.validation_inputs(&r.snap);
+        // the dataset's hidden control graphs (spec C26 §2.3) are never read, and a hidden
+        // data graph is one that does not exist
+        let hidden = r.ds.dataset.store().hidden_graphs();
+        let opts = opts.and_then(|mut o| {
+            crate::validation_common::hide_graphs(
+                &mut o.data_graph,
+                &mut o.extra_graphs,
+                &mut o.exclude_graphs,
+                &hidden,
+            )
+            .then_some(o)
+        });
         let text = match (&r.p.map, &r.p.node) {
             (Some(m), _) => m.clone(),
             (None, Some(n)) => format!("{n}@{}", r.p.shape.as_deref().unwrap_or("START")),

@@ -1110,6 +1110,24 @@ struct DsGauges {
     commit: sparkles::store::CommitMetrics,
 }
 
+/// The quads of `snap` and its delta's inserts and deletes outside the hidden control
+/// graphs of `store` (spec C26 §2.3). When a count cannot be read the sizes are zero, so
+/// that a hidden graph is never counted.
+pub(crate) fn visible_sizes(
+    snap: &sparkles::store::Snapshot,
+    store: &sparkles::store::Store,
+) -> (u64, u64, u64) {
+    let hidden = store.hidden_graphs();
+    if hidden.is_empty() {
+        return (
+            snap.len(),
+            snap.delta.inserts() as u64,
+            snap.delta.deletes() as u64,
+        );
+    }
+    snap.sizes_without(&hidden).unwrap_or((0, 0, 0))
+}
+
 fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
     let datasets: Vec<_> = st.datasets().values().cloned().collect();
     let mut out: BTreeMap<String, DsGauges> = BTreeMap::new();
@@ -1127,9 +1145,11 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         let g = out.entry(label).or_default();
         let snap = d.store.snapshot();
         let (c, r) = (d.store.cache(), d.store.result_cache());
-        g.quads += snap.len();
-        g.delta_inserts += snap.delta.inserts() as u64;
-        g.delta_deletes += snap.delta.deletes() as u64;
+        // the hidden control graphs (spec C26 §2.3) are not counted
+        let (quads, inserts, deletes) = visible_sizes(&snap, &d.store);
+        g.quads += quads;
+        g.delta_inserts += inserts;
+        g.delta_deletes += deletes;
         g.wal_bytes += d.store.wal_bytes();
         // measured at most once a second, like the quota checks of commits
         let quota = d.dataset.settings().quota().get();

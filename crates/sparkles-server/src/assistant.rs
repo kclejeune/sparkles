@@ -1590,7 +1590,13 @@ async fn list_asks(
         #[cfg_attr(not(feature = "auth"), allow(unused_mut))]
         let mut opts = ds.dataset.query_options();
         #[cfg(feature = "auth")]
-        crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
+        crate::auth::restrict(
+            &mut opts,
+            &p,
+            &ds.name,
+            crate::auth::Endpoint::Query,
+            &ds.store.hidden_graphs(),
+        );
         let out: Vec<Value> = list
             .into_iter()
             .map(|mut r| {

@@ -711,6 +711,28 @@ impl Snapshot {
         self.len() == 0
     }
 
+    /// The quads of this snapshot and the delta's inserted and deleted quads outside the
+    /// named graphs `graphs`, such as a dataset's hidden control graphs (spec C26 §2.3):
+    /// [`len`](Self::len) and the delta's sizes less what those graphs hold. Each graph
+    /// costs one prefix count.
+    pub fn sizes_without(&self, graphs: &[String]) -> Result<(u64, u64, u64)> {
+        let (mut quads, mut ins, mut del) = (
+            self.len(),
+            self.delta.inserts() as u64,
+            self.delta.deletes() as u64,
+        );
+        for iri in graphs {
+            let Some(g) = self.lookup_iri(iri) else {
+                continue;
+            };
+            let (b, i, d) = self.count_split(Perm::Gspo, &[g.0])?;
+            quads = quads.saturating_sub((b + i).saturating_sub(d));
+            ins = ins.saturating_sub(i);
+            del = del.saturating_sub(d);
+        }
+        Ok((quads, ins, del))
+    }
+
     // ---------------------------------------------------------------- terms ------
 
     /// Id of a term if it exists in this snapshot (inline, base vocab or delta vocab).

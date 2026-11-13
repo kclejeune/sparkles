@@ -664,12 +664,19 @@ impl ApiError {
             Some(o) => (o.remove("_validationHeader"), o.remove("_turtle")),
             None => (None, None),
         };
+        let gone = self.0 == StatusCode::GONE
+            && body.get("code").and_then(J::as_str) == Some("history-gone");
         let mut resp = RequestReport {
             outcome,
             budget,
             ..Default::default()
         }
         .attach((self.0, Json(body.clone())).into_response());
+        // the authorization layer redacts its commit counts for a partial view
+        if gone {
+            resp.extensions_mut()
+                .insert(history::GoneBody(body.clone()));
+        }
         if let Some(h) = vheader.as_ref().and_then(J::as_str)
             && let Ok(v) = header::HeaderValue::from_str(h)
         {
@@ -2848,7 +2855,13 @@ async fn update_endpoint(
         ..Default::default()
     };
     budgets::Overrides::parse(&params)?.apply(&mut opts);
-    crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Update);
+    crate::auth::restrict(
+        &mut opts,
+        &p,
+        &ds.name,
+        crate::auth::Endpoint::Update,
+        &ds.store.hidden_graphs(),
+    );
     // a SERVICE call to this server in the update's WHERE runs in process, as this caller
     self_service::install(&st, &mut opts, &p);
     opts.write = validation::write_options(&st, &params, &headers, opts.timeout)?;
@@ -5998,8 +6011,19 @@ async fn shacl(
         let inferred = has_inferred.then_some(INFERRED_GRAPH);
         // the shapes, and the data graph they are validated on
         let (shapes, mut opts) = if let Some(g) = &guard_shapes {
-            // the guard's shapes as they are now, on its data graph at the state read
-            let Some(o) = g.data_graph_options(&snap) else {
+            // the guard's shapes as they are now, on its data graph at the state read,
+            // without the dataset's hidden control graphs (spec C26 §2.3), and a hidden
+            // data graph is one that does not exist
+            let hidden = ds.dataset.store().hidden_graphs();
+            let Some(o) = g.data_graph_options(&snap).and_then(|mut o| {
+                crate::validation_common::hide_graphs(
+                    &mut o.data_graph,
+                    &mut o.extra_graphs,
+                    &mut o.exclude_graphs,
+                    &hidden,
+                )
+                .then_some(o)
+            }) else {
                 // none of the guard's data graphs exists: nothing to validate
                 let empty = sparkles_shacl::ValidationReport {
                     conforms: true,

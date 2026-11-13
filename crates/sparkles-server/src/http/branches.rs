@@ -84,9 +84,10 @@ pub(crate) fn metrics(st: &AppState, out: &mut String) {
             let label = if i < cap { name } else { "$other".to_string() };
             let snap = s.snapshot();
             let e = per.entry((ds.clone(), label)).or_default();
-            e[0] += snap.len();
-            e[1] += snap.delta.inserts() as u64;
-            e[2] += snap.delta.deletes() as u64;
+            let (quads, inserts, deletes) = crate::obs::visible_sizes(&snap, s);
+            e[0] += quads;
+            e[1] += inserts;
+            e[2] += deletes;
             e[3] += s.wal_bytes();
             e[4] += s.branch_own_bytes();
         }

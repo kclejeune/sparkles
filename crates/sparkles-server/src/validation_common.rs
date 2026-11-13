@@ -101,6 +101,31 @@ impl ValidationInputs {
     }
 }
 
+/// Leave the graphs `hidden` names, a dataset's hidden control graphs (spec C26 §2.3), out
+/// of a validation's data: out of its extra graphs and into its excluded graphs. False
+/// when its data graph is one of them, which a validation answers as a data graph that
+/// does not exist.
+pub fn hide_graphs(
+    data_graph: &mut Option<String>,
+    extra_graphs: &mut Vec<String>,
+    exclude_graphs: &mut Vec<String>,
+    hidden: &[String],
+) -> bool {
+    if hidden.is_empty() {
+        return true;
+    }
+    if data_graph.as_ref().is_some_and(|g| hidden.contains(g)) {
+        return false;
+    }
+    extra_graphs.retain(|g| !hidden.contains(g));
+    for h in hidden {
+        if !exclude_graphs.contains(h) {
+            exclude_graphs.push(h.clone());
+        }
+    }
+    true
+}
+
 /// Does the named graph exist (hold at least one quad)?
 pub fn graph_exists(snap: &Snapshot, iri: &str) -> bool {
     snap.lookup_iri(iri)

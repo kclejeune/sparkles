@@ -129,7 +129,13 @@ pub(super) async fn model(
     let writable = at.is_none() && may_save(&st, &p, &name, &target, exists);
     // what is writable follows the grants of the update endpoint on the branch saves go to
     let mut wq = QueryOptions::default();
-    crate::auth::restrict(&mut wq, &p, &on_branch(&name, &target), Endpoint::Update);
+    crate::auth::restrict(
+        &mut wq,
+        &p,
+        &on_branch(&name, &target),
+        Endpoint::Update,
+        &main.store.hidden_graphs(),
+    );
     let lang = params.get("lang").map(str::to_string);
     let nested = match params.get("nested") {
         None | Some("false") | Some("0") => false,

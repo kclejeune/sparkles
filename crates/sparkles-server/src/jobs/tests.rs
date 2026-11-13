@@ -415,3 +415,215 @@ async fn validation_never_reads_the_hidden_ledger() {
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn snapshot_creation_and_history_gone_leave_the_commit_counts_out() {
+    let (_dir, state, app) = seeded().await;
+    let (status, j, _) = call(
+        &app,
+        "POST",
+        "/$/snapshots/d",
+        None,
+        Some(json!({"name": "s1", "at": "head"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{j}");
+    assert!(j["commit"].get("inserted").is_none(), "{j}");
+    assert!(j["commit"].get("quads").is_none(), "{j}");
+
+    let ds = state.get("d").unwrap();
+    let seq = ds.store.head_commit().seq;
+    ds.store.set_retention(Default::default()).unwrap();
+    ds.dataset
+        .update("INSERT DATA { <urn:s> <urn:p> <urn:o> }")
+        .unwrap();
+    ds.dataset.compact().unwrap();
+    let q = enc("ASK { ?s ?p ?o }");
+    let (status, j, _) = call(
+        &app,
+        "GET",
+        &format!("/d/query?at=commit:{seq}&query={q}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::GONE, "{j}");
+    assert_eq!(j["metadata"]["seq"], seq, "{j}");
+    assert!(j["metadata"].get("inserted").is_none(), "{j}");
+    assert!(j["metadata"].get("quads").is_none(), "{j}");
+}
+
+#[tokio::test]
+async fn metrics_count_only_the_visible_quads() {
+    let (_dir, _state, app) = seeded().await;
+    let (status, j, _) = call(&app, "GET", "/$/metrics?format=json", None, None).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let d = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "d")
+        .unwrap();
+    assert_eq!(d["quads"].as_u64().unwrap_or(0), 0, "{d}");
+    let res = app
+        .clone()
+        .oneshot(Request::get("/$/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    for line in text.lines().filter(|l| {
+        (l.starts_with("sparkles_dataset_quads") || l.starts_with("sparkles_branch_quads"))
+            && l.contains("\"d\"")
+    }) {
+        assert!(line.ends_with(" 0"), "{line}");
+    }
+}
+
+#[tokio::test]
+async fn a_merge_preview_leaves_the_hidden_changes_out() {
+    let (_dir, state, app) = seeded().await;
+    let ds = state.get("d").unwrap();
+    ds.dataset
+        .update("INSERT DATA { <urn:s> <urn:p> <urn:base> }")
+        .unwrap();
+    ds.store.create_branch("b", &Default::default()).unwrap();
+    ds.dataset
+        .update("DELETE DATA { <urn:s> <urn:p> <urn:base> }; INSERT DATA { <urn:s> <urn:p> <urn:main> }")
+        .unwrap();
+    let b = state.branch_dataset(&ds, "b").unwrap();
+    b.dataset
+        .update("DELETE DATA { <urn:s> <urn:p> <urn:base> }; INSERT DATA { <urn:s> <urn:p> <urn:branch> }")
+        .unwrap();
+    let (status, j, _) = call(
+        &app,
+        "POST",
+        "/$/jobs/d",
+        None,
+        Some(json!({"definition": "collect", "idempotencyKey": "k2"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{j}");
+    let (status, j, _) = call(&app, "GET", "/$/merge/d?source=main&target=b", None, None).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    // the business cell conflicts, and the new run's records are not counted
+    assert_eq!(j["changes"]["inserted"].as_u64().unwrap_or(0), 0, "{j}");
+    assert_eq!(j["conflictCount"], 1, "{j}");
+    assert!(!j.to_string().contains("urn:x-sparkles:jobs:"), "{j}");
+}
+
+#[tokio::test]
+async fn a_local_service_call_keeps_the_target_ledger_hidden() {
+    let (_dir, state, app) = seeded().await;
+    state.attach("e", DbType::Mem, None).unwrap();
+    state
+        .listener
+        .set(crate::http::self_service::Listener {
+            scheme: "http",
+            ip: "127.0.0.1".parse().unwrap(),
+            port: 17739,
+        })
+        .unwrap();
+    let q = format!(
+        "SELECT ?s ?p ?o WHERE {{ SERVICE <http://127.0.0.1:17739/d/query> {{ GRAPH <{}> {{ ?s ?p ?o }} }} }}",
+        sparkles::jobs::LEDGER_GRAPH
+    );
+    let (status, j, _) = call(
+        &app,
+        "GET",
+        &format!("/e/query?query={}", enc(&q)),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(j["results"]["bindings"].as_array().unwrap().len(), 0, "{j}");
+}
+
+#[tokio::test]
+async fn a_resource_header_keeps_the_selected_dataset_ledger_hidden() {
+    let (_dir, state, app) = seeded().await;
+    let ds = state.get("d").unwrap();
+    let n = |s: &str| oxrdf::NamedNode::new(s).unwrap();
+    ds.dataset
+        .reasoning()
+        .rdfs()
+        .set(sparkles::reasoning::rdfs::NewSchema::Triples(vec![
+            oxrdf::Triple::new(
+                n("urn:x-sparkles:jobs:Run"),
+                n("http://www.w3.org/2000/01/rdf-schema#subClassOf"),
+                n("http://www.w3.org/2002/07/owl#Ontology"),
+            ),
+            oxrdf::Triple::new(
+                n("urn:x-sparkles:jobs:payload"),
+                n("http://www.w3.org/2000/01/rdf-schema#subPropertyOf"),
+                n("http://purl.org/dc/terms/title"),
+            ),
+        ]))
+        .unwrap();
+    let cfg = json!({
+        "id": "ledger", "kind": "vocabulary", "title": "Test", "license": "CC-BY-4.0",
+        "namespaces": [{"prefix": "test", "iri": "urn:test:"}],
+        "graphs": [{"dataset": "d", "graph": sparkles::jobs::LEDGER_GRAPH}]
+    });
+    let (status, j, _) = call(&app, "POST", "/$/resources", None, Some(cfg)).await;
+    assert_eq!(status, StatusCode::CREATED, "{j}");
+    let (status, j, _) = call(&app, "GET", "/$/resources/ledger/header", None, None).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert!(!j.to_string().contains("urn:x-sparkles:jobs:run:"), "{j}");
+}
+
+async fn text_of(app: &Router, req: Request) -> (StatusCode, String) {
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_guard_validation_never_reads_the_hidden_ledger() {
+    let (_dir, _state, app) = seeded().await;
+    let shapes = "@prefix sh: <http://www.w3.org/ns/shacl#> . <urn:S> a sh:NodeShape ; sh:targetClass <urn:x-sparkles:jobs:Run> ; sh:property [ sh:path <urn:x-sparkles:jobs:state> ; sh:maxCount 0 ] .";
+    let cfg = json!({"mode": "warn", "dataGraph": "union", "shapes": {"inline": shapes}});
+    let (status, j, _) = call(&app, "PUT", "/$/validation/d", None, Some(cfg)).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let req = Request::post("/d/shacl?shapes=guard")
+        .header("accept", "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = text_of(&app, req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("urn:x-sparkles:jobs:run:"), "{body}");
+}
+
+#[cfg(feature = "shex")]
+#[tokio::test]
+async fn shex_guard_validation_never_selects_a_ledger_focus() {
+    let (_dir, state, app) = seeded().await;
+    let ds = state.get("d").unwrap();
+    let admin = sparkles::jobs::Caller::admin(oxrdf::NamedNode::new("urn:admin").unwrap());
+    let runs = ds.dataset.jobs().list(&Default::default(), &admin).unwrap();
+    let run = format!("urn:x-sparkles:jobs:run:{}", runs[0].id);
+    let schema = "<urn:S> { <urn:x-sparkles:jobs:state> [<urn:never>] }";
+    let cfg = json!({"language": "shex", "mode": "warn", "dataGraph": "union",
+        "schema": {"inline": schema, "format": "shexc"},
+        "shapeMap": "{FOCUS a <urn:x-sparkles:jobs:Run>}@<urn:S>"});
+    let (status, j, _) = call(&app, "PUT", "/$/validation/d", None, Some(cfg)).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let req = Request::post(format!(
+        "/d/shex?schema=guard&node={}",
+        enc(&format!("<{run}>"))
+    ))
+    .header("content-type", "text/plain")
+    .header("accept", "application/json")
+    .body(Body::empty())
+    .unwrap();
+    let (status, body) = text_of(&app, req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("nonconformant"), "{body}");
+}

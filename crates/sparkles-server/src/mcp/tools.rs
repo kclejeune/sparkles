@@ -717,7 +717,11 @@ impl Tools<'_> {
         let mut opts = request.build();
         // SERVICE and LOAD are the principal's server permissions, and the graphs its
         // grants cover, as over HTTP
-        crate::auth::restrict(&mut opts, &self.call.principal, ds, endpoint);
+        let hidden = dataset
+            .as_ref()
+            .map(|d| d.store.hidden_graphs())
+            .unwrap_or_default();
+        crate::auth::restrict(&mut opts, &self.call.principal, ds, endpoint, &hidden);
         Ok(opts)
     }
 
