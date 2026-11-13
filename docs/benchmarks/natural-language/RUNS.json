@@ -322,6 +322,37 @@
           "schema": 1
         }
       }
+    },
+    {
+      "run_id": "sha256-c55e10015b5f0cff33829b238be21bceb01589c9b976789f1366a8465ab21edd",
+      "path": "runs/2026-11-13-ask-latency-paid/record.json",
+      "sha256": "c55e10015b5f0cff33829b238be21bceb01589c9b976789f1366a8465ab21edd",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": {
+          "effort": "medium",
+          "contextTokens": 200000,
+          "askDeadlineSecs": 300,
+          "queryTimeoutSecs": 60,
+          "askTokenBudget": 100000,
+          "clarifications": "answer",
+          "batch": false,
+          "jobs": 1,
+          "maxOutputTokens": {
+            "anthropic": 4096,
+            "openai": 16384
+          }
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": "stanley, a 16-thread laptop with 30 GiB of RAM running other lanes' builds and tests",
+          "kind": "paid interleaved A/B, one child per ask",
+          "schema": 1
+        }
+      }
     }
   ]
 }

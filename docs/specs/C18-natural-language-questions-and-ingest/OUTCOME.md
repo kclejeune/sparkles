@@ -2034,6 +2034,74 @@ fixtures do not measure model accuracy, establish general contextual resolution 
 claim a latency improvement. Item 263 remains open for the broader evidence and
 model-dependent evaluation contract. No paid provider was called.
 
+## Ask median latency, item 318
+
+The retained 2026-10-25 repeat had a higher median wall time than the 2026-10-24
+baseline, 14.78 s against 12.27 s for Haiku and 14.98 s against 12.98 s for Sonnet. Most
+of the difference was outside the model. An initial ask that ends in a clarification
+calls no model, and its median rose from 3.6 to 5.2 s for Haiku and from 3.2 to 4.8 s
+for Sonnet. Replayed with the fake provider on 2026-11-13, one child per ask as the paid
+runs did, the 2026-10-25 binary was not slower than the 2026-10-24 one. Its initial
+clarification took a median of 1.27 s against 1.97 s, and its local time per question
+2.4 s against 3.7 s. The paid runs had measured those clarifications at three to four
+times the replayed time, on a laptop that was running other work while it served a
+32 GB database from 30 GiB of memory. The retained difference therefore came from host
+load, the page cache and provider variation, not from the grounding change.
+
+Stage profiles of the current pipeline found one avoidable cost. Of the 107 QALD-9-plus
+questions, 84 begin with a clarification, and that first ask read both schema
+projections, the stored examples, the predicate use and the community reports before
+it asked, although the clarification uses only the linker's candidates. In a fresh
+process those reads took about 600 ms of a 1.0 to 1.2 s clarification, and in a warm
+batch child about 140 ms of 290 ms. Ask now links the mentions first when type hints
+are off, and an ambiguous mention returns the clarification before the rest of the
+grounding runs. With type hints the linker reads the schema's classes, so the schema is
+read first and only the examples, predicate use and recall are skipped. The context of a
+draft keeps its order, and in fake-provider runs of all 107 questions every draft
+prompt was byte-identical between the builds. A clarification's `ground` event lists the
+linked entities only, and its usage reports no schema terms or examples.
+
+| Fake provider, QALD-9-plus 107 | Before | After |
+|---|---|---|
+| Initial clarification, one process per ask, two runs each | 1.04 and 1.21 s | 0.45 and 0.45 s |
+| Local time per question, one process per ask | 1.94 and 2.23 s | 1.58 and 1.61 s |
+| Initial clarification, warm batch child | 0.29 s | 0.15 s |
+| Local time per question, warm batch child | 0.42 s | 0.32 s |
+
+Part of the saving moves to the answered second ask. The first ask no longer warms the
+caches and pages that the second one reads, so the second ask's local time rose by a
+median of about 0.1 to 0.3 s. A person who abandons a clarification saves the whole
+cost.
+
+The paid check ran each model's questions in blocks, alternating the builds as base,
+candidate, candidate and base across blocks, with one child per ask and a page cache
+already warmed by the offline runs. Haiku ran all 107 questions, Sonnet a fixed sample of
+64 chosen by a hash of the question ids, and GPT-6 Luna all 107 twice per build.
+
+| Paid, per build | Haiku 5.5, 107 | Sonnet 5.5, 64 | GPT-6 Luna, 107 twice |
+|---|---|---|---|
+| Strict correct, before and after | 46 and 46 | 35 and 35 | 100 and 96 of 214 |
+| Paired strict difference, 95% interval | 0.0, -4.7 to 4.7 points | 0.0, -6.2 to 6.2 points | -1.9, -4.7 to 0.9 points |
+| Initial clarification, median paired change | -0.56 s | -0.60 s | -0.88 and -1.04 s |
+| Local time per question, median paired change | -0.43 s, -0.49 to -0.05 | +0.06 s, -0.28 to 0.60 | -0.50 s, -0.81 to -0.16, and -0.80 s, -1.25 to -0.55 |
+| Wall time median, before and after | 11.94 and 12.61 s | 8.75 and 9.60 s | 16.98 and 15.11 s |
+
+Model calls take about three quarters of the wall time, and the paired interval of the
+median wall difference spans 2 to 6 s per model, so these runs cannot resolve a change of
+half a second in the end-to-end median. Luna's second pair of runs shows a wall median
+2.7 s lower with the change, an interval that excludes zero, but its first pair shows
+0.7 s with an interval of 5 s, and the pooled interval of the four runs includes zero.
+The local time and the time to a clarification fall as the offline runs predict. Strict
+accuracy shows no difference beyond the run-to-run noise, since every draft prompt is
+unchanged and each paired interval includes zero. The paid runs cost $0.47 for Haiku, $2.49 for Sonnet and $0.49 for Luna. The
+[offline record](../../benchmarks/natural-language/runs/2026-11-13-ask-latency-offline/record.json) and the
+[paid record](../../benchmarks/natural-language/runs/2026-11-13-ask-latency-paid/record.json) hold the runs, the host
+load before and after each block, and the per-question times.
+
+A fresh process still spends about 0.5 s computing the schema report and sampling the
+object kinds of the common predicates, which a running server keeps between asks.
+Roadmap item 914 records keeping them across processes.
+
 ## Ask threads in the web UI
 
 The Ask bar on the query page became one `AskThread` component, shown as a page at

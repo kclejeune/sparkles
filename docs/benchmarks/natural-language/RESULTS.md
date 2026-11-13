@@ -512,6 +512,52 @@ lists for its question, and drafts copied that shape. The library was not kept. 
 [paid record](../2026-11-02-ask-cheap-tier-paid.json) holds every run of this round, the
 per-case results, the mechanism counts, the intervals and the ledgers.
 
+#### Ask latency
+
+An initial ask that ends in a clarification now links the question's mentions and asks
+before it reads the schema, the stored examples and the predicate use. The comparison
+runs release builds of commit 06ca04ef and of the change, 9d5e683c, with the same
+compiler, on the QALD-9-plus questions and the database above.
+
+| Measurement context | |
+|---|---|
+| Date and host | 2026-11-13 on a development laptop with 30 GiB of RAM that was running other work, with the load average and free memory recorded before and after each block |
+| Settings | Effort `medium`, a 200,000-token context, answered clarifications and one process per ask, as the earlier paid runs used |
+| Order | Each model's questions run in four blocks, in the order base and change, change and base, change and base, then base and change, after offline runs had read the database into the page cache |
+| Cost | $0.47 for Haiku, $2.49 for Sonnet and $0.49 for GPT-6 Luna, against caps of $8 for Anthropic and $10 for OpenAI |
+
+| Set and model | Strict correct, before and after | Initial clarification, median paired change | Local time per question, median paired change | Wall time median, before and after |
+|---|---|---|---|---|
+| Fake provider, all 107, two runs per build | 105 of 107 in every run | -0.55 and -0.69 s | -0.28 and -0.53 s | 2.16 and 2.49 s before, 1.78 and 1.86 s after |
+| Fake provider, all 107, warm batch child | 105 and 105 | -0.12 s | -0.08 s | 0.43 and 0.33 s |
+| QALD-9-plus, all 107, Haiku 5.5 | 46 and 46 | -0.56 s | -0.43 s | 11.94 and 12.61 s |
+| QALD-9-plus, 64 sampled, Sonnet 5.5 | 35 and 35 | -0.60 s | +0.06 s | 8.75 and 9.60 s |
+| QALD-9-plus, all 107, two runs, GPT-6 Luna | 50 and 46, then 50 and 50 | -0.88 and -1.04 s | -0.50 and -0.80 s | 15.59 and 14.87 s, then 18.36 and 15.64 s |
+
+Every draft prompt of the fake-provider runs was byte-identical between the builds, so
+the change leaves what a model sees untouched. The paired strict difference is zero for
+both Anthropic models, inside 95% intervals of about 5 points for Haiku and 6 points for
+Sonnet. Luna answered 100 of 214 before and 96 after over its four runs, a paired
+difference of -1.9 points with an interval of -4.7 to 0.9. A clarification arrives about
+0.6 s sooner in a fresh process and 0.12 s sooner in a warm batch child, where its median
+falls from 0.29 to 0.15 s. Part of that time moves to the answered second ask, which no
+longer finds the first ask's reads in the caches, so the local time of a whole question
+falls by less. Model calls take about three quarters of
+the wall time, and the paired interval of the median wall difference spans 2 to 6 s per
+model, so these runs cannot resolve a change of half a second in the end-to-end median.
+The Sonnet sample is the 64 questions with the smallest SHA-256 of
+`ask-latency-318-sonnet/` and the question id.
+
+Replayed with the fake provider in the same way, the 2026-10-25 binary of the repeat
+above took 1.27 s for an initial clarification against 1.97 s for the 2026-10-24
+baseline, although the paid runs had measured 5.2 s against 3.6 s for Haiku. The higher
+median of that repeat came from the loaded host and its page cache, not from the code.
+The [offline record](runs/2026-11-13-ask-latency-offline/record.json) and the
+[paid record](runs/2026-11-13-ask-latency-paid/record.json) give the stage profiles, the
+host load of every block and the per-question times, and
+[C18](../../specs/C18-natural-language-questions-and-ingest/OUTCOME.md#ask-median-latency-item-318)
+describes the change.
+
 ### Global answering
 
 Sonnet 5.5 answered 30 generated questions about the whole demo organisation graph four
