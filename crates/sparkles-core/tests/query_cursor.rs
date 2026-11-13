@@ -4853,9 +4853,9 @@ fn graph_writers_flush_after_their_first_batch() {
 
 /// An OPTIONAL over two inputs sorted on their shared variable merges when the
 /// `merge_left_join` switch is on and hashes when it is off, in the cursor as in eager
-/// execution, and both plans name the algorithm that ran. The store caches every result,
-/// and the switched queries read none, since the plan of a result read from the cache
-/// names no join.
+/// execution, and both plans name the algorithm that ran. The first query fills the
+/// result cache whatever its execution time, and the switched queries bypass the cache,
+/// so that their plans name the join that ran.
 #[test]
 fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
     let s = Store::in_memory(StoreOptions {
