@@ -1,7 +1,7 @@
 //! A schema pass whose rules read `now` or make blank nodes can give each session its own
-//! schema facts, and a session prepared again holds the facts of its earlier
-//! derivations, so a schema completeness proof made in one session does not hold in
-//! another (spec F17, item 911). The tests empty the process-wide table cache, so they
+//! schema facts, an explanation's pass gives other facts than a query's, and a session
+//! prepared again holds the facts of its earlier derivations, so a schema completeness
+//! proof made in one session does not hold in another (spec F17, item 911). The tests empty the process-wide table cache, so they
 //! have a binary of their own and run one at a time.
 
 use oxsdatatypes::{DateTime, DayTimeDuration};
@@ -9,6 +9,7 @@ use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::sparql::reasoning::{Demand, DemandTerm, SessionRequest};
 use sparkles_core::sparql::{QueryOptions, query};
 use sparkles_core::store::{Store, StoreOptions};
+use sparkles_reasoner::explain::{DemandInput, ExplainOptions, Explained, explain_demand};
 use sparkles_reasoner::query::QueryReasoner;
 use sparkles_reasoner::{Extras, Inputs, Profile, tables};
 use std::sync::{Arc, Mutex};
@@ -45,7 +46,7 @@ fn reasoner(conditional: &str) -> QueryReasoner {
     QueryReasoner::new(Profile::Rules(rules), &Extras::default(), Inputs::default()).unwrap()
 }
 
-/// The answer, which follows from `ex:seed` whatever the conditional rule does. `pad`
+/// The answer, which the rules entail whatever the conditional rule does. `pad`
 /// adds a union branch with a constant the store lacks, which the session interns before
 /// its schema pass.
 fn answer(s: &Store, qr: &QueryReasoner, pad: bool, when: &str) {
@@ -61,7 +62,7 @@ fn answer(s: &Store, qr: &QueryReasoner, pad: bool, when: &str) {
         "SELECT ?v { <http://ex.org/answer> <http://ex.org/value> ?v }"
     };
     let r = query(s.snapshot(), q, &options).unwrap_or_else(|e| panic!("{when}: {e}"));
-    assert_eq!(r.len(), 1, "{when}: the answer follows from ex:seed");
+    assert_eq!(r.len(), 1, "{when}: the rules entail the answer");
 }
 
 /// Before a cutoff, a rule that reads `now` gives the schema fact the schema pass holds,
@@ -162,4 +163,70 @@ fn a_proof_of_a_session_prepared_again_is_not_reused() {
     }
     drop(session);
     answer(&s, &qr, false, "a fresh session that reads the table");
+}
+
+/// An explanation's session keeps linear recursion as the rules state it, so its lower
+/// stages give intermediate facts a query's session does not, and its schema pass can
+/// derive schema facts from them. A query's session must not use a proof made over the
+/// explanation's schema, in either order.
+#[test]
+fn a_proof_does_not_pass_between_explanation_and_query_schemas() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let rules = "@prefix ex: <http://ex.org/> .
+         [exit: (?x ex:edge ?y) -> (?x ex:path ?y)]
+         [rec: (?x ex:edge ?y), (?y ex:path ?z) -> (?x ex:path ?z)]
+         [lower: noValue(ex:a, ex:path) -> (ex:t rdfs:domain ex:D)]
+         [schema: (?x ex:path ex:d) -> (?x rdfs:subClassOf ex:C)]
+         [answer: (ex:b rdfs:subClassOf ex:C) -> (ex:answer ex:value ex:yes)]";
+    let iri = |i: &str| oxrdf::Term::from(oxrdf::NamedNode::new_unchecked(i));
+    let target = [
+        iri("http://ex.org/answer"),
+        iri("http://ex.org/value"),
+        iri("http://ex.org/yes"),
+    ];
+    for explanation_first in [true, false] {
+        let qr = QueryReasoner::new(
+            Profile::Rules(rules.into()),
+            &Extras::default(),
+            Inputs::default(),
+        )
+        .unwrap();
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            b"<http://ex.org/a> <http://ex.org/edge> <http://ex.org/b> .
+              <http://ex.org/b> <http://ex.org/edge> <http://ex.org/c> .
+              <http://ex.org/c> <http://ex.org/edge> <http://ex.org/d> ."
+                .to_vec(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let explain = || {
+            let e = explain_demand(
+                &DemandInput {
+                    reasoner: &qr,
+                    snap: s.snapshot(),
+                    readable: None,
+                },
+                &target,
+                &ExplainOptions::default(),
+            )
+            .unwrap();
+            assert!(
+                !matches!(e, Explained::NotFound),
+                "the explanation finds the answer"
+            );
+        };
+        if explanation_first {
+            explain();
+            tables::clear();
+            answer(&s, &qr, false, "a query's pass after an explanation");
+            answer(&s, &qr, false, "the table of that pass");
+        } else {
+            answer(&s, &qr, false, "a query's pass");
+            tables::clear();
+            explain();
+            answer(&s, &qr, false, "a query after an explanation's pass");
+        }
+    }
 }
