@@ -62,10 +62,6 @@ pub struct DlAx {
     /// the at-least conjunctions `H` that a cardinality in a negative position makes,
     /// which the order of a run without the root ranks below every class
     pub low: Vec<Ex>,
-    /// item 894's cases: for each existential restriction over a union filler that a run
-    /// with counting distributes, the case restrictions `∃r.(F ⊓ C_m)` of its clause
-    /// `x → E_1 ⊔ … ⊔ E_k`, whose at-most products over two cases are redundant
-    pub cases: Vec<Vec<Ex>>,
 }
 
 impl DlAx {
@@ -83,25 +79,8 @@ impl DlAx {
                 .iter()
                 .map(|(_, es)| es.capacity() * 4)
                 .sum::<usize>()
-            + self
-                .cases
-                .iter()
-                .map(|es| 24 + es.capacity() * 4)
-                .sum::<usize>()
     }
 }
-
-/// Whether a run with counting and without the root distributes an existential restriction
-/// over a union filler into one restriction per case, item 894, which `SPARKLES_DL_CASES=1`
-/// turns on while the part is measured.
-pub fn cases_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SPARKLES_DL_CASES").is_some_and(|v| v == "1"))
-}
-
-/// The most cases of a union filler that are distributed; a wider union keeps the former
-/// translation.
-const MAX_CASES: usize = 16;
 
 /// Why an axiom stays left out.
 type Why = &'static str;
@@ -150,8 +129,6 @@ struct Out {
     lazy: Vec<(u32, Role, Ex, Vec<Ex>)>,
     /// the at-least conjunctions ranked lowest, as [`DlAx::low`]
     low: Vec<Ex>,
-    /// item 894's case restrictions, as [`DlAx::cases`]
-    cases: Vec<Vec<Ex>>,
     /// whether an inverse property occurs, which a symmetric or inverse functional
     /// property also makes
     inverse: bool,
@@ -171,7 +148,6 @@ impl Out {
         self.ne.extend(o.ne);
         self.lazy.extend(o.lazy);
         self.low.extend(o.low);
-        self.cases.extend(o.cases);
         self.inverse |= o.inverse;
     }
 }
@@ -185,13 +161,6 @@ struct Norm<'a> {
     /// whether the run has individuals, so that it is rooted: nominals become the
     /// singleton classes `N_u`, and what their rules leave out is refused
     rooted: bool,
-    /// whether an existential restriction over a union filler is distributed over its
-    /// cases, item 894: a run with counting and without the root, with [`cases_on`]
-    cases: bool,
-    /// the told unions of the named classes, `A ⊑ C_1 ⊔ … ⊔ C_k` with two to
-    /// [`MAX_CASES`] members, from an equivalence, a disjoint union or an inclusion with a
-    /// union on the right
-    unions: &'a FxHashMap<Class, Vec<ClassExpression>>,
 }
 
 /// The largest minimum that becomes that many existential restrictions.
@@ -420,75 +389,7 @@ impl Norm<'_> {
         Ok(es)
     }
 
-    /// The cases of a filler `f` that item 894 distributes an existential restriction over,
-    /// when the run does: a union `C_1 ⊔ … ⊔ C_k` written in place, or a named class `A`
-    /// with a told union, whose cases are `A ⊓ C_m`. The answer holds the class the cases
-    /// are below, `A` or `owl:Thing` for a union in place, and the cases themselves, two to
-    /// [`MAX_CASES`] of them, none `owl:Thing`; a filler with other cases is not distributed.
-    fn union_cases(&mut self, f: &ClassExpression, d: usize) -> Option<(Ex, Vec<Ex>)> {
-        use ClassExpression as C;
-        if !self.cases {
-            return None;
-        }
-        let (below, members): (Ex, Vec<ClassExpression>) = match f {
-            C::ObjectUnionOf(cs) if cs.len() >= 2 => (TOP, cs.iter().cloned().collect()),
-            C::Class(a) => match self.unions.get(a) {
-                Some(cs) => (self.it.class(a), cs.clone()),
-                None => return None,
-            },
-            _ => return None,
-        };
-        if members.len() > MAX_CASES {
-            return None;
-        }
-        // a member the rules leave out keeps the former translation of the restriction, so
-        // that the distribution never refuses an axiom the former translation takes
-        let Ok(mut es) = members
-            .iter()
-            .map(|c| self.pos(c, d))
-            .collect::<Result<Vec<Ex>, Why>>()
-        else {
-            return None;
-        };
-        if es.iter().any(|&e| e == TOP || e == below) {
-            return None;
-        }
-        es.retain(|&e| e != BOTTOM);
-        es.sort_unstable();
-        es.dedup();
-        if es.len() < 2 {
-            return None;
-        }
-        Some((below, es))
-    }
-
-    /// `x` with `x ⊑ ∃r.G_1 ⊔ … ⊔ ∃r.G_k` for the fillers of the cases of a distributed
-    /// restriction, item 894: a fresh class whose clause holds the case restrictions, which
-    /// the index records as one group.
-    fn case_restrictions(&mut self, r: Role, fillers: Vec<Ex>) -> Ex {
-        let mut es: Vec<Ex> = fillers
-            .into_iter()
-            .filter(|&g| g != BOTTOM)
-            .map(|g| self.it.node(Node::Exist(r, g)))
-            .collect();
-        es.sort_unstable();
-        es.dedup();
-        match es.len() {
-            0 => BOTTOM,
-            1 => es[0],
-            _ => {
-                let x = self.it.fresh_class();
-                self.out.clauses.push((vec![x], es.clone()));
-                self.out.cases.push(es);
-                x
-            }
-        }
-    }
-
-    /// `∃p.f` in a positive position. With counting and without the root, a filler that is a
-    /// union or a named class with a told union is distributed over its cases, item 894:
-    /// `∃r.(C_1 ⊔ … ⊔ C_k)` is `∃r.C_1 ⊔ … ⊔ ∃r.C_k` and `∃r.A` with `A ⊑ C_1 ⊔ … ⊔ C_k` is
-    /// `∃r.(A ⊓ C_1) ⊔ … ⊔ ∃r.(A ⊓ C_k)`, each case with a function symbol of its own.
+    /// `∃p.f` in a positive position.
     fn some(
         &mut self,
         p: &ObjectPropertyExpression,
@@ -496,13 +397,6 @@ impl Norm<'_> {
         d: usize,
     ) -> Result<Ex, Why> {
         let r = self.role(p)?;
-        if let Some((below, cases)) = self.union_cases(f, d) {
-            let fillers = cases
-                .into_iter()
-                .map(|c| self.conj(vec![below, c]))
-                .collect();
-            return Ok(self.case_restrictions(r, fillers));
-        }
         let f = self.pos(f, d)?;
         Ok(if f == BOTTOM {
             BOTTOM
@@ -525,17 +419,9 @@ impl Norm<'_> {
             return Err("a minimum cardinality above 64");
         }
         let r = self.role(p)?;
-        // a witness's fresh filler below a union is distributed over the union's cases,
-        // item 894: `∃r.b_i` is `∃r.(b_i ⊓ C_1) ⊔ … ⊔ ∃r.(b_i ⊓ C_k)`, and the fillers
-        // `b_i` stay pairwise disjoint
-        let cases = match f {
-            Some(f) if !self.rooted => self.union_cases(f, d),
-            _ => None,
-        };
-        let fill = match (f, &cases) {
-            (_, Some((below, _))) => *below,
-            (Some(f), None) => self.pos(f, d)?,
-            (None, None) => TOP,
+        let fill = match f {
+            Some(f) => self.pos(f, d)?,
+            None => TOP,
         };
         if fill == BOTTOM {
             return Ok(BOTTOM);
@@ -548,13 +434,7 @@ impl Norm<'_> {
                 self.out.subs.push((b, fill));
             }
             bs.push(b);
-            match &cases {
-                Some((_, cs)) => {
-                    let fillers = cs.iter().map(|&c| self.conj(vec![b, c])).collect();
-                    es.push(self.case_restrictions(r, fillers));
-                }
-                None => es.push(self.it.node(Node::Exist(r, b))),
-            }
+            es.push(self.it.node(Node::Exist(r, b)));
         }
         if self.rooted {
             // fillers disjoint everywhere are unsound once a nominal can merge them, so
@@ -1145,9 +1025,7 @@ impl Norm<'_> {
 /// that needs case analysis, or when the role inclusions are not regular or their automata
 /// pass the limit, and then `ax` is as it was, the interner aside. The answer's flags say
 /// which axioms were taken. A run that does not allow counting leaves the axioms that need
-/// it out, as the normalization did before it counted. `cases_allowed` lets a run with
-/// counting and without the root distribute an existential restriction over a union filler,
-/// item 894, which [`cases_on`] decides for a classification.
+/// it out, as the normalization did before it counted.
 pub fn normalize(
     axioms: &[&AxiomKind],
     it: &mut Interner,
@@ -1156,7 +1034,6 @@ pub fn normalize(
     stop: &dyn Fn() -> bool,
     counting_allowed: bool,
     rooted_allowed: bool,
-    cases_allowed: bool,
 ) -> Result<Option<(Vec<bool>, DlAx)>, Halt> {
     let mut taken = vec![false; axioms.len()];
     // individuals make the run rooted: those the EL part interned before the
@@ -1167,12 +1044,6 @@ pub fn normalize(
                 .iter()
                 .any(|k| crate::model::Signature::names_individual(k)));
     let counting = counting_allowed && axioms.iter().any(|k| axiom_counts(k, rooted));
-    let cases = cases_allowed && counting && !rooted;
-    let unions = if cases {
-        told_unions(axioms)
-    } else {
-        FxHashMap::default()
-    };
     // every object property has its inverse
     let named: Vec<ObjectProperty> = it
         .roles
@@ -1195,8 +1066,6 @@ pub fn normalize(
             out: Out::default(),
             counting,
             rooted,
-            cases,
-            unions: &unions,
         };
         if n.role_axiom(k).is_ok() {
             all.extend(n.out);
@@ -1213,8 +1082,6 @@ pub fn normalize(
             out: Out::default(),
             counting,
             rooted,
-            cases,
-            unions: &unions,
         };
         if n.axiom(k).is_ok() {
             if !super::dl::shape(k).horn {
@@ -1314,7 +1181,6 @@ pub fn normalize(
         ne: all.ne,
         lazy: all.lazy,
         low: all.low,
-        cases: all.cases,
         ..DlAx::default()
     };
     // the hypothetical successor of each existential restriction
@@ -1333,40 +1199,6 @@ pub fn normalize(
         dl.root = Some(it.fresh_class());
     }
     Ok(Some((taken, dl)))
-}
-
-/// The told unions of the named classes, item 894: `A ⊑ C_1 ⊔ … ⊔ C_k` from an equivalence
-/// with a union member, a disjoint union or an inclusion with a union on the right, with
-/// two to [`MAX_CASES`] members, the narrowest when a class has several.
-fn told_unions(axioms: &[&AxiomKind]) -> FxHashMap<Class, Vec<ClassExpression>> {
-    use AxiomKind as K;
-    use ClassExpression as C;
-    let mut unions: FxHashMap<Class, Vec<ClassExpression>> = FxHashMap::default();
-    let mut add = |a: &Class, cs: &std::collections::BTreeSet<ClassExpression>| {
-        if (2..=MAX_CASES).contains(&cs.len()) && unions.get(a).is_none_or(|v| v.len() > cs.len()) {
-            unions.insert(a.clone(), cs.iter().cloned().collect());
-        }
-    };
-    for k in axioms {
-        match k {
-            K::SubClassOf(C::Class(a), C::ObjectUnionOf(cs)) => add(a, cs),
-            K::DisjointUnion(a, ds) => add(a, ds),
-            K::EquivalentClasses(cs) => {
-                for a in cs.iter().filter_map(|c| match c {
-                    C::Class(a) => Some(a),
-                    _ => None,
-                }) {
-                    for u in cs {
-                        if let C::ObjectUnionOf(ds) = u {
-                            add(a, ds);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    unions
 }
 
 /// The universals on roles that are not simple, unfolded by the roles' automata: those that
@@ -1451,7 +1283,7 @@ mod tests {
         let mut it = Interner::new();
         let mut ax = Axioms::default();
         let refs: Vec<&AxiomKind> = axioms.iter().collect();
-        normalize(&refs, &mut it, &mut ax, None, &|| false, true, false, false)
+        normalize(&refs, &mut it, &mut ax, None, &|| false, true, false)
             .unwrap()
             .map(|(t, d)| (t, d, ax, it))
     }
@@ -1467,18 +1299,9 @@ mod tests {
         let mut it = Interner::new();
         let mut ax = Axioms::default();
         let refs: Vec<&AxiomKind> = axioms.iter().collect();
-        normalize(
-            &refs,
-            &mut it,
-            &mut ax,
-            None,
-            &|| false,
-            counting,
-            true,
-            false,
-        )
-        .unwrap()
-        .map(|(t, d)| (t, d, ax, it))
+        normalize(&refs, &mut it, &mut ax, None, &|| false, counting, true)
+            .unwrap()
+            .map(|(t, d)| (t, d, ax, it))
     }
 
     fn ind(s: &str) -> Individual {
@@ -1848,247 +1671,5 @@ mod tests {
             .filter(|&&(_, x)| matches!(it.nodes[x as usize], Node::Forall(..)))
             .count();
         assert!(foralls >= 1, "{foralls}");
-    }
-
-    /// A run with counting and without the root, with item 894's cases on or off.
-    fn run_cases(axioms: &[AxiomKind], cases: bool) -> Option<(Vec<bool>, DlAx, Axioms, Interner)> {
-        let mut it = Interner::new();
-        let mut ax = Axioms::default();
-        let refs: Vec<&AxiomKind> = axioms.iter().collect();
-        normalize(&refs, &mut it, &mut ax, None, &|| false, true, false, cases)
-            .unwrap()
-            .map(|(t, d)| (t, d, ax, it))
-    }
-
-    fn prop(s: &str) -> ObjectPropertyExpression {
-        ObjectPropertyExpression::Property(ObjectProperty::new(format!("http://ex.org/{s}")))
-    }
-
-    fn set(cs: &[&str]) -> ClassExpression {
-        ClassExpression::ObjectUnionOf(cs.iter().map(|s| c(s)).collect())
-    }
-
-    /// `A ⊑ ≤1 r`, which turns counting on.
-    fn at_most_one() -> AxiomKind {
-        AxiomKind::SubClassOf(
-            c("A"),
-            ClassExpression::ObjectMaxCardinality(1, prop("r"), None),
-        )
-    }
-
-    /// The fillers of a case group, each flattened to its sorted atoms.
-    fn fillers(it: &Interner, es: &[Ex]) -> Vec<Vec<Ex>> {
-        es.iter()
-            .map(|&e| {
-                let Node::Exist(_, f) = it.nodes[e as usize] else {
-                    panic!("a case restriction")
-                };
-                let mut out = Vec::new();
-                let mut stack = vec![f];
-                while let Some(x) = stack.pop() {
-                    match it.nodes[x as usize] {
-                        Node::Conj(a, b) => {
-                            stack.push(a);
-                            stack.push(b);
-                        }
-                        _ => out.push(x),
-                    }
-                }
-                out.sort_unstable();
-                out
-            })
-            .collect()
-    }
-
-    #[test]
-    fn a_restriction_over_a_told_union_is_distributed_over_its_cases() {
-        let axioms = [
-            AxiomKind::SubClassOf(c("U"), set(&["C", "D"])),
-            AxiomKind::SubClassOf(
-                c("A"),
-                ClassExpression::ObjectSomeValuesFrom(prop("r"), Box::new(c("U"))),
-            ),
-            at_most_one(),
-        ];
-        let (t, d, ax, mut it) = run_cases(&axioms, true).unwrap();
-        assert_eq!(t, vec![true, true, true]);
-        assert_eq!(d.cases.len(), 1, "one distributed restriction");
-        let group = &d.cases[0];
-        let (u, cc, dd) = (
-            it.class(&Class::new("http://ex.org/U")),
-            it.class(&Class::new("http://ex.org/C")),
-            it.class(&Class::new("http://ex.org/D")),
-        );
-        let mut fs = fillers(&it, group);
-        fs.sort();
-        let mut want = vec![vec![u, cc], vec![u, dd]];
-        for w in &mut want {
-            w.sort_unstable();
-        }
-        want.sort();
-        assert_eq!(fs, want, "the cases are U ⊓ C and U ⊓ D");
-        // the clause of the cases, under a fresh class that A is told below
-        let x = d
-            .clauses
-            .iter()
-            .find(|(_, h)| **h == **group)
-            .map(|(b, _)| b.clone())
-            .expect("the cases' clause");
-        assert_eq!(x.len(), 1);
-        let a = it.class(&Class::new("http://ex.org/A"));
-        assert!(ax.subs.contains(&(a, x[0])), "A ⊑ x");
-        // and no restriction over U itself remains
-        assert!(
-            !it.nodes
-                .iter()
-                .any(|n| matches!(n, Node::Exist(_, f) if *f == u)),
-            "∃r.U is not made"
-        );
-        // with the cases off the former translation stands
-        let (_, d, _, mut it) = run_cases(&axioms, false).unwrap();
-        assert!(d.cases.is_empty());
-        let u = it.class(&Class::new("http://ex.org/U"));
-        assert!(
-            it.nodes
-                .iter()
-                .any(|n| matches!(n, Node::Exist(_, f) if *f == u)),
-            "∃r.U is made"
-        );
-    }
-
-    #[test]
-    fn a_restriction_over_a_union_in_place_takes_the_members_as_cases() {
-        let axioms = [
-            AxiomKind::SubClassOf(
-                c("A"),
-                ClassExpression::ObjectSomeValuesFrom(prop("r"), Box::new(set(&["C", "D"]))),
-            ),
-            at_most_one(),
-        ];
-        let (_, d, _, mut it) = run_cases(&axioms, true).unwrap();
-        assert_eq!(d.cases.len(), 1);
-        let (cc, dd) = (
-            it.class(&Class::new("http://ex.org/C")),
-            it.class(&Class::new("http://ex.org/D")),
-        );
-        let mut fs = fillers(&it, &d.cases[0]);
-        fs.sort();
-        assert_eq!(fs, vec![vec![cc], vec![dd]]);
-    }
-
-    #[test]
-    fn an_equivalence_and_a_disjoint_union_give_told_unions() {
-        let some = AxiomKind::SubClassOf(
-            c("A"),
-            ClassExpression::ObjectSomeValuesFrom(prop("r"), Box::new(c("U"))),
-        );
-        let eq = AxiomKind::EquivalentClasses([c("U"), set(&["C", "D", "E"])].into());
-        let (_, d, _, _) = run_cases(&[eq, some.clone(), at_most_one()], true).unwrap();
-        assert_eq!(d.cases.len(), 1);
-        assert_eq!(d.cases[0].len(), 3);
-        let du = AxiomKind::DisjointUnion(Class::new("http://ex.org/U"), [c("C"), c("D")].into());
-        let (_, d, _, _) = run_cases(&[du, some, at_most_one()], true).unwrap();
-        assert_eq!(d.cases.len(), 1);
-        assert_eq!(d.cases[0].len(), 2);
-    }
-
-    #[test]
-    fn a_witness_below_a_union_is_distributed_and_keeps_its_disjoint_filler() {
-        let axioms = [
-            AxiomKind::SubClassOf(c("U"), set(&["C", "D"])),
-            AxiomKind::SubClassOf(
-                c("A"),
-                ClassExpression::ObjectMinCardinality(2, prop("r"), Some(Box::new(c("U")))),
-            ),
-            at_most_one(),
-        ];
-        let (t, d, ax, mut it) = run_cases(&axioms, true).unwrap();
-        assert_eq!(t, vec![true, true, true]);
-        assert_eq!(d.cases.len(), 2, "one group per witness");
-        let u = it.class(&Class::new("http://ex.org/U"));
-        let mut bs = Vec::new();
-        for group in &d.cases {
-            assert_eq!(group.len(), 2);
-            let fs = fillers(&it, group);
-            // each case is b_i ⊓ C_m, with one fresh filler for the whole group
-            let b: Vec<Ex> = fs[0]
-                .iter()
-                .copied()
-                .filter(|&x| matches!(it.nodes[x as usize], Node::Fresh(_)))
-                .collect();
-            assert_eq!(b.len(), 1, "{fs:?}");
-            assert!(fs.iter().all(|f| f.contains(&b[0])));
-            assert!(ax.subs.contains(&(b[0], u)), "b_i ⊑ U");
-            bs.push(b[0]);
-        }
-        bs.sort_unstable();
-        assert!(
-            ax.disjoint.iter().any(|s| {
-                let mut s = s.clone();
-                s.sort_unstable();
-                s == bs
-            }),
-            "the fillers are disjoint"
-        );
-    }
-
-    #[test]
-    fn a_rooted_run_and_a_run_without_counting_keep_the_former_translation() {
-        let axioms = [
-            AxiomKind::SubClassOf(c("U"), set(&["C", "D"])),
-            AxiomKind::SubClassOf(
-                c("A"),
-                ClassExpression::ObjectSomeValuesFrom(prop("r"), Box::new(c("U"))),
-            ),
-            at_most_one(),
-        ];
-        let mut it = Interner::new();
-        let mut ax = Axioms::default();
-        let refs: Vec<&AxiomKind> = axioms.iter().collect();
-        // the run without counting takes no cases and leaves the maximum out
-        let (t, d) = normalize(&refs, &mut it, &mut ax, None, &|| false, false, false, true)
-            .unwrap()
-            .unwrap();
-        assert_eq!(t, vec![true, true, false]);
-        assert!(d.cases.is_empty());
-        // a rooted run keeps its translation
-        let mut with_ind = axioms.to_vec();
-        with_ind.push(AxiomKind::ClassAssertion(
-            c("A"),
-            Individual::Named(NamedIndividual::new("http://ex.org/a")),
-        ));
-        let mut it = Interner::new();
-        let mut ax = Axioms::default();
-        let refs: Vec<&AxiomKind> = with_ind.iter().collect();
-        let (_, d) = normalize(&refs, &mut it, &mut ax, None, &|| false, true, true, true)
-            .unwrap()
-            .unwrap();
-        assert!(d.root.is_some());
-        assert!(d.cases.is_empty());
-    }
-
-    #[test]
-    fn a_union_of_more_than_sixteen_cases_keeps_the_former_translation() {
-        let wide: Vec<String> = (0..17).map(|i| format!("C{i}")).collect();
-        let wide: Vec<&str> = wide.iter().map(|s| s.as_str()).collect();
-        let axioms = [
-            AxiomKind::SubClassOf(c("U"), set(&wide)),
-            AxiomKind::SubClassOf(
-                c("A"),
-                ClassExpression::ObjectSomeValuesFrom(prop("r"), Box::new(c("U"))),
-            ),
-            at_most_one(),
-        ];
-        let (_, d, _, _) = run_cases(&axioms, true).unwrap();
-        assert!(d.cases.is_empty());
-        let sixteen: Vec<&str> = wide[..16].to_vec();
-        let axioms = [
-            AxiomKind::SubClassOf(c("U"), set(&sixteen)),
-            axioms[1].clone(),
-            at_most_one(),
-        ];
-        let (_, d, _, _) = run_cases(&axioms, true).unwrap();
-        assert_eq!(d.cases.len(), 1);
-        assert_eq!(d.cases[0].len(), 16);
     }
 }
