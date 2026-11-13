@@ -210,6 +210,10 @@ class Clean(unittest.TestCase):
         with patch.object(disk_clean.os, 'getpid', return_value=1):
             code, _ = disk_clean.run_command(['sh', '-c', 'touch %s' % marker], None, 10)
         self.assertNotEqual(code, 0); self.assertFalse(marker.exists())
+        # A death signal that cannot be set stops the command too.
+        with patch.object(disk_clean, 'prctl', return_value=-1):
+            code, _ = disk_clean.run_command(['sh', '-c', 'touch %s' % marker], None, 10)
+        self.assertNotEqual(code, 0); self.assertFalse(marker.exists())
         code, _ = disk_clean.run_command(['sh', '-c', 'touch %s' % marker], None, 10)
         self.assertEqual(code, 0); self.assertTrue(marker.exists())
 

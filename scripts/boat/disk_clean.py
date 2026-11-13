@@ -58,19 +58,23 @@ def usage(path, statvfs=os.statvfs):
 RUNNING = set()
 
 
+def prctl(*args):
+    import ctypes
+    return ctypes.CDLL(None, use_errno=True).prctl(*args)
+
+
 def die_with(parent):
     """The child's setup before exec: die with this program, or not start at all.
 
     PR_SET_PDEATHSIG makes the kernel kill the command when this program dies, even by
     SIGKILL. A program that died between the fork and that call is no longer the parent,
-    so the child then exits before it runs the command."""
+    so the child then exits before it runs the command, as it does when the call fails."""
     def setup():
         try:
-            import ctypes
-            ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0)
+            armed = prctl(1, signal.SIGKILL, 0, 0, 0) == 0
         except (OSError, AttributeError):
-            os._exit(125)
-        if os.getppid() != parent:
+            armed = False
+        if not armed or os.getppid() != parent:
             os._exit(125)
     return setup
 

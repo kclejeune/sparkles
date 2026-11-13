@@ -31,9 +31,9 @@
       "sha256": "1357773f350ee3d84643305af285432440806439dabf3ab222e2564b84d32fb6"
     },
     "disk_clean.py": {
-      "bytes": 9378,
+      "bytes": 9472,
       "mode": 420,
-      "sha256": "cd35f2a08c74b60893caff318e57fa426ebc0d14a42f8602b6bb3348209c18b4"
+      "sha256": "de06a9a8729e9ffc72817672adf54ce921dc6e986193ad25e17975e8d5fbc267"
     },
     "job-closure.FALSE.json": {
       "bytes": 269,
