@@ -146,6 +146,41 @@ impl<'a> Cands<'a> {
         })
     }
 
+    /// Calls `f` with the ids in order until it returns false, and returns false then.
+    /// An evaluation's scan visits its candidates this way: each piece is a plain loop
+    /// over a slice or a range, so the loop around a candidate is a few instructions
+    /// and the processor keeps the memory reads of several candidates in flight.
+    #[inline(always)]
+    pub fn try_each(&self, mut f: impl FnMut(u32) -> bool) -> bool {
+        let (lo, hi) = (self.lo, self.hi);
+        for p in &self.parts {
+            match *p {
+                Part::Ids(s, false) => {
+                    for &id in s {
+                        if !f(id) {
+                            return false;
+                        }
+                    }
+                }
+                Part::Ids(s, true) => {
+                    for &id in s {
+                        if id >= lo && id < hi && !f(id) {
+                            return false;
+                        }
+                    }
+                }
+                Part::Range(a, b) => {
+                    for id in a..b {
+                        if !f(id) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// The first `n` candidates and the rest.
     pub fn split_at(&self, n: usize) -> (Cands<'a>, Cands<'a>) {
         let (mut head, mut tail) = (

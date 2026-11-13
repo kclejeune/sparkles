@@ -1081,17 +1081,17 @@ impl<'a> Eval<'a> {
     /// Match the atom of step `k` against derived facts, in ascending id order, which the
     /// order of first derivation of the heads follows.
     fn rows(&mut self, k: usize, atom: usize, b: &mut [u64], cands: Cands<'_>) {
-        for row in cands.iter() {
+        cands.try_each(|row| {
             if self.aborted() {
-                return;
+                return false;
             }
             self.stats[0] += 1;
-            if !self.g.alive(row) {
-                continue;
+            if self.g.alive(row) {
+                let t = self.g.triple(row);
+                self.fact(k, atom, b, t);
             }
-            let t = self.g.triple(row);
-            self.fact(k, atom, b, t);
-        }
+            true
+        });
     }
 
     /// Match the atom of step `k` against the base tier, or a share of its scan.
