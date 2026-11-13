@@ -202,8 +202,10 @@ each child with `RUST_LOG=warn,sparkles::ask::profile=debug` and `--log-format j
 the child's `stderr` holds one JSON line per completed Ask stage. These lines carry no
 question, label, IRI, prompt or error message, and
 [Ask stage diagnostics](../../docs/ai/README.md#ask-stage-diagnostics) describes their
-fields. A batch child numbers its asks in the order the runner sends them, which with
-`--jobs 1` is question order with each clarified case's second ask after its first.
+fields. With `--jobs 1` a batch child numbers its asks in the order the runner sends
+them, which is question order with each clarified case's second ask after its first.
+With more jobs the numbers follow the order in which the asks start, which need not
+match the input order.
 
 The self-test drives the real CLI through the proxy against a local fake API. It covers
 chunked and close-delimited replies, structured-output retries, a downgrade, a
