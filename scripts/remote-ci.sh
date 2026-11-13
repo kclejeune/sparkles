@@ -5,7 +5,8 @@
 # Usage: scripts/remote-ci.sh [--host H] [--base REV] [--premerge] [--no-wait] [REV]
 #        scripts/remote-ci.sh [--host H] --status NAME | --fetch NAME
 #   --host      boat:bx_ID or an ssh gate host such as wally (default SPARKLES_REMOTE_CI_HOST)
-#   --base      the base of --changed (default origin/main); ignored with --premerge
+#   --base      the base of --changed (default origin/main), of which the job uses the merge
+#               base with REV; ignored with --premerge
 #   --premerge  run scripts/premerge.sh instead of ci.sh
 #   --no-wait   start the job and return; --status and --fetch follow it
 #   REV         the commit to check (default HEAD); it must be committed
@@ -105,10 +106,12 @@ fi
 
 full=$(git rev-parse --verify "$rev^{commit}")
 if [ "$mode" = ci ]; then
-  bfull=$(git rev-parse --verify "$base^{commit}")
+  # The changed set is taken from the merge base, which the tip's own history holds, so the
+  # host has it whenever it has the tip, even when the base branch moved on.
+  bfull=$(git merge-base "$full" "$(git rev-parse --verify "$base^{commit}")")
   name=ci-${full:0:8}-${bfull:0:8}
 else
-  bfull=$(git rev-parse --verify "origin/main^{commit}")
+  bfull=$full
   name=pm-${full:0:8}
 fi
 now=$(date +%s)
@@ -117,7 +120,7 @@ case $host in
     obs=$(mktemp)
     trap 'rm -f "$obs"' EXIT
     rx_admit "$host" --minimum "${SPARKLES_REMOTE_MIN_LIFETIME:-2400}" > "$obs"
-    rx_bundle "$host" "$full" "$bfull" > /dev/null
+    if [ "$bfull" = "$full" ]; then rx_bundle "$host" "$full" > /dev/null; else rx_bundle "$host" "$full" "$bfull" > /dev/null; fi
     runtime=$(rx_runtime "$obs" --reserve "${REMOTE_CI_RESERVE:-1200}")
     end=$(($(date +%s) + runtime))
     executor=boat
@@ -138,6 +141,7 @@ systemctl --user reset-failed gate-$name 2> /dev/null || true
 if [ -d \"\$o\" ]; then mv \"\$o\" \"\$o.old-\$(date +%s)\"; fi
 mkdir -p \"\$o\"; cat > \"\$o/ci-job.sh\"
 git -C \"\$G/repo.git\" cat-file -e $full^{commit}
+git -C \"\$G/repo.git\" cat-file -e $bfull^{commit}
 rt=\$(($end - \$(date +%s)))
 if [ \"\$rt\" -lt $min ]; then echo \"only \$rt s left before the job's end; not starting\" >&2; exit 3; fi
 forward=()

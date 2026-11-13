@@ -14,7 +14,7 @@ RX_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 rx_exec() { shift; HOME=$FAKE_HOME PATH=$FAKE_BIN:$PATH bash -c "$1"; }
 rx_admit() { echo "admit $*" >> "$FAKE_LOG"; echo '{}'; }
 rx_runtime() { echo "runtime $*" >> "$FAKE_LOG"; echo "${FAKE_RUNTIME:-5000}"; }
-rx_bundle() { echo "bundle $*" >> "$FAKE_LOG"; git -C "$FAKE_HOME/gate/repo.git" fetch -q "$FAKE_SRC" "$2"; git -C "$FAKE_HOME/gate/repo.git" fetch -q "$FAKE_SRC" "$3"; }
+rx_bundle() { echo "bundle $*" >> "$FAKE_LOG"; git -C "$FAKE_HOME/gate/repo.git" fetch -q "$FAKE_SRC" "$2"; }
 rx_sync() { :; }
 rx_get() { cp -r "$FAKE_HOME/$2/." "$3/"; }
 '''
@@ -95,6 +95,18 @@ class RemoteCI(unittest.TestCase):
         self.assertTrue((out / 'ci/logs/test.log').exists())
         # The job removed its worktree and kept its results.
         self.assertFalse((self.home / 'gate' / ('wt-' + name)).exists())
+
+    def test_a_base_that_moved_on_uses_the_merge_base_the_tip_carries(self):
+        g = ['git', '-C', str(self.src), '-c', 'user.name=t', '-c', 'user.email=t@t']
+        mb = self.rev('origin/main')
+        subprocess.run(g + ['checkout', '-q', '-b', 'side', 'origin/main'], check=True)
+        subprocess.run(g + ['commit', '-q', '--allow-empty', '-m', 'main moved'], check=True)
+        subprocess.run(g + ['update-ref', 'refs/remotes/origin/main', 'HEAD'], check=True)
+        subprocess.run(g + ['checkout', '-q', '-'], check=True)
+        r = self.run_ci('--base', 'origin/main')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = self.home / 'gate/out' / ('ci-%s-%s' % (self.rev('HEAD')[:8], mb[:8]))
+        self.assertIn('ci --fast --changed ' + mb, (out / 'ci.log').read_text())
 
     def test_a_failing_ci_returns_its_exit_code(self):
         r = self.run_ci(FAKE_CI_EXIT='1')
