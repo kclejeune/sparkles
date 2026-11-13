@@ -216,7 +216,7 @@ fn q6_pairs_by_the_condition_equality_instead_of_the_product() {
     // The generic plan tests the condition on the product a chunk at a time, so it
     // answers within the limit too and reports no candidate pairs.
     let generic = query(store.snapshot(), Q6, &options(limit, false)).unwrap();
-    assert_eq!(bag(generic.rows()), oracle());
+    assert_eq!(bag(generic.rows().unwrap()), oracle());
     assert!(keyed_candidates(generic.plan()).is_empty());
 }
 
