@@ -1138,6 +1138,10 @@ pub(crate) fn brief_lines(v: &Value, budget: usize) -> String {
     out
 }
 
+/// What the branches resource's state hashes of one branch: its name, head, own
+/// commits, whether it is kept, its expiry and whether that is within the window.
+pub(crate) type BranchState = (String, Option<u64>, u64, bool, Option<i64>, bool);
+
 /// The state of the branches resource for `p`, which changes when one of its scratch
 /// branches is created, deleted, written, kept or enters the warning window.
 pub(crate) fn own_branches_state(
@@ -1145,10 +1149,7 @@ pub(crate) fn own_branches_state(
     ds: &Dataset,
     p: &Principal,
     default: Option<Duration>,
-) -> (
-    Option<String>,
-    Vec<(String, Option<u64>, u64, bool, Option<i64>, bool)>,
-) {
+) -> (Option<String>, Vec<BranchState>) {
     let notify_before = crate::assist::memory_settings(st, ds)
         .scratch_branches
         .and_then(|s| s.notify_before);
