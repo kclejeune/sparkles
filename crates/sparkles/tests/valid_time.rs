@@ -390,8 +390,9 @@ fn retained_commits_exclude_late_imports_and_preserve_corrections_without_assert
     );
     assert!(!ds.query("ASK { GRAPH <urn:test:claims> { <urn:test:item> <urn:test:relatedTo> <urn:test:thing> } }").unwrap().boolean);
     assert!(ds.query("ASK { GRAPH <urn:test:claims> { <urn:test:revision-original> <urn:x-sparkles:evidence:firstAvailableAt> ?arbitraryClientValue } }").unwrap().boolean);
-    // This explicitly demonstrates that ordinary RDF accepts the value. It proves
-    // snapshot isolation, NOT the missing A4 authenticated backdating refusal.
+    // Ordinary RDF in an unowned graph accepts any value. This test proves snapshot
+    // isolation only. The `availability` tests below cover A4's server-owned
+    // availability and the refusal of backdating in owned graphs.
 }
 
 #[cfg(feature = "shacl")]
@@ -544,4 +545,369 @@ fn normalization_shapes_reject_unsupported_normalized_calendar_and_unpinned_fold
     assert!(!conforms(
         &valid.replace("vt:tzdbVersion \"2025b\"", "vt:methodVersion \"1\"")
     ));
+}
+
+/// A4 through the authenticated evidence writer (spec C27 §4.3): local availability is
+/// the time of the commit that publishes a revision, an as-known state selected by time
+/// excludes later imports whatever their publication dates, and every attempt to
+/// backdate availability is refused before it publishes.
+mod availability {
+    use super::*;
+    use oxrdf::{NamedNode, Triple};
+    use sparkles::access::GraphAccess;
+    use sparkles::evidence::resolve::{RecordKind, RecordRequest, Resolution};
+    use sparkles::evidence::{
+        self, ClaimInput, ClaimKind, EvidenceInput, Polarity, ProposeOptions, Proposed, RecordKey,
+        RecordRef, RecordVersion, Settings, Sha256Digest, SourceContent, SourceRevisionInput,
+        SourceTimes,
+    };
+    use sparkles::task::Control;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    const SOURCES: &str = "urn:ev:sources";
+    const CLAIMS: &str = "urn:ev:claims";
+    const EV: &str = "urn:x-sparkles:evidence:";
+    // A new dataset's root commit carries the wall clock, and commit times never
+    // decrease, so the test clock runs in 2100, after any wall clock it meets.
+    const PUBLISHED: &str = "2100-01-05T00:00:00Z";
+    const JANUARY: i64 = 4_103_654_400_000;
+    const FEBRUARY: i64 = 4_106_332_800_000;
+    const MARCH: i64 = 4_108_752_000_000;
+    const MARCH_LEXICAL: &str = "2100-03-15T00:00:00.000Z";
+
+    fn iri(s: &str) -> NamedNode {
+        NamedNode::new(s).unwrap()
+    }
+
+    fn key(s: &str) -> RecordKey {
+        RecordKey::new(s).unwrap()
+    }
+
+    #[track_caller]
+    fn code<T: std::fmt::Debug>(r: sparkles::Result<T>) -> String {
+        match r {
+            Err(e) => e.code().to_string(),
+            Ok(v) => panic!("accepted: {v:?}"),
+        }
+    }
+
+    /// A test clock the store reads for every commit time.
+    fn clock(ds: &Dataset, at: i64) -> Arc<AtomicI64> {
+        let now = Arc::new(AtomicI64::new(at));
+        let read = now.clone();
+        ds.store()
+            .set_clock(Arc::new(move || read.load(Ordering::SeqCst)));
+        now
+    }
+
+    fn configure(ds: &Dataset) {
+        let settings = Settings {
+            enabled: true,
+            source_records: vec![SOURCES.into()],
+            proposals: vec![CLAIMS.into()],
+            ..Settings::default()
+        };
+        evidence::configure(ds, &settings, &Control::none()).unwrap();
+    }
+
+    /// A revision published in January and a claim about it, imported now.
+    fn import(source: &str) -> EvidenceInput {
+        EvidenceInput {
+            revisions: vec![SourceRevisionInput {
+                version: RecordVersion::V1,
+                key: key("rev"),
+                source: iri(&format!("urn:test:{source}")),
+                source_key: key(source),
+                upstream_version: None,
+                content: SourceContent::MetadataOnly {
+                    digest: Sha256Digest::of_bytes(source.as_bytes(), &Control::none()).unwrap(),
+                },
+                metadata: Default::default(),
+                times: SourceTimes {
+                    published_at: Some(Literal::new_typed_literal(
+                        PUBLISHED,
+                        iri("http://www.w3.org/2001/XMLSchema#dateTime"),
+                    )),
+                    reported_available_at: None,
+                },
+                lineage: Default::default(),
+            }],
+            claims: vec![ClaimInput {
+                version: RecordVersion::V1,
+                key: key("claim"),
+                occurrence_key: key(source),
+                revision: RecordRef::Local(key("rev")),
+                proposition: Triple::new(
+                    iri("urn:test:release"),
+                    iri("urn:test:affectedBy"),
+                    iri(&format!("urn:test:{source}-issue")),
+                ),
+                kind: ClaimKind::Reported,
+                polarity: Polarity::Positive,
+                attributed_author: iri("urn:test:publisher"),
+                scope: Default::default(),
+                confidence: Default::default(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn propose(ds: &Dataset, input: &EvidenceInput) -> sparkles::Result<Proposed> {
+        evidence::propose(
+            None,
+            ds,
+            ds,
+            input,
+            &ProposeOptions::new(iri("urn:x-sparkles:principal:importer")),
+            &mut |_, _| Some(Arc::new(GraphAccess::all())),
+            &Control::none(),
+        )
+    }
+
+    fn record_iri(p: &Proposed, alias: &str) -> NamedNode {
+        p.records
+            .iter()
+            .find(|r| r.key == alias)
+            .unwrap()
+            .iri
+            .clone()
+    }
+
+    fn resolve(ds: &Dataset, record: &NamedNode) -> sparkles::Result<u64> {
+        Resolution::new(Control::none())
+            .unwrap()
+            .record(
+                "r",
+                ds,
+                ds,
+                Some(Arc::new(GraphAccess::all())),
+                &RecordRequest {
+                    iri: record.clone(),
+                    kinds: vec![RecordKind::SourceRevision],
+                    content_digest: None,
+                },
+            )
+            .map(|v| v.receipt.commit)
+    }
+
+    /// The state selected by `at`, as the claim template sees it with every verdict.
+    fn claims_at(ds: &Dataset, at: At) -> BTreeMap<String, String> {
+        let (snap, _) = ds.store().snapshot_at(&at, &Default::default()).unwrap();
+        let resource = &profile(1).unwrap().queries[0];
+        let mut given: BTreeMap<String, Value> =
+            serde_json::from_value(json!({"validAt": PUBLISHED, "policy": "all"})).unwrap();
+        given.insert("claimGraph".into(), json!(CLAIMS));
+        let opts = QueryOptions {
+            initial_bindings: definition(0).bind(&given, &BTreeMap::new()).unwrap(),
+            ..Default::default()
+        };
+        verdicts(sparkles::sparql::query(snap, resource.query, &opts).unwrap())
+    }
+
+    /// The `ev:firstAvailableAt` values of `revision` at the head.
+    fn availability(ds: &Dataset, revision: &NamedNode) -> Vec<String> {
+        let r = ds
+            .query(&format!(
+                "SELECT ?t {{ GRAPH <{SOURCES}> {{ <{}> <{EV}firstAvailableAt> ?t }} }}",
+                revision.as_str()
+            ))
+            .unwrap();
+        r.rows()
+            .into_iter()
+            .map(|row| match row[0].as_ref().unwrap() {
+                Term::Literal(l) => l.value().to_string(),
+                t => panic!("{t}"),
+            })
+            .collect()
+    }
+
+    /// Every way a client can try to write availability into the source-record graph.
+    fn backdating_attempts(ds: &Dataset, revision: &NamedNode) {
+        let rev = revision.as_str();
+        let early = "\"2100-01-15T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>";
+        let head = ds.store().head_commit();
+        let before = availability(ds, revision);
+        let updates = [
+            format!(
+                "INSERT DATA {{ GRAPH <{SOURCES}> {{ <{rev}> <{EV}firstAvailableAt> {early} }} }}"
+            ),
+            format!(
+                "DELETE {{ GRAPH <{SOURCES}> {{ <{rev}> <{EV}firstAvailableAt> ?t }} }}
+                 INSERT {{ GRAPH <{SOURCES}> {{ <{rev}> <{EV}firstAvailableAt> {early} }} }}
+                 WHERE {{ GRAPH <{SOURCES}> {{ <{rev}> <{EV}firstAvailableAt> ?t }} }}"
+            ),
+            format!("DROP GRAPH <{SOURCES}>"),
+        ];
+        for u in &updates {
+            assert_eq!(code(ds.update(u)), "profile-managed-graph", "{u}");
+        }
+        let patch = format!("TX .\nA <{rev}> <{EV}firstAvailableAt> {early} <{SOURCES}> .\nTC .\n");
+        assert_eq!(
+            code(ds.apply_patch(patch.as_bytes(), false)),
+            "profile-managed-graph"
+        );
+        assert_eq!(
+            code(ds.load_str_into(
+                &format!("<{rev}> <{EV}firstAvailableAt> {early} ."),
+                RdfFormat::NTriples,
+                SOURCES,
+            )),
+            "profile-managed-graph"
+        );
+        // an open claim scope cannot carry it through the typed writer either
+        let mut forged = import("forged");
+        forged.claims[0].scope.insert(
+            format!("{EV}firstAvailableAt"),
+            vec![
+                Literal::new_typed_literal(
+                    "2100-01-15T00:00:00Z",
+                    iri("http://www.w3.org/2001/XMLSchema#dateTime"),
+                )
+                .into(),
+            ],
+        );
+        assert_eq!(code(propose(ds, &forged)), "invalid");
+        // no refusal left a trace
+        assert_eq!(ds.store().head_commit(), head);
+        assert_eq!(availability(ds, revision), before);
+    }
+
+    #[test]
+    fn a_march_import_about_january_is_absent_from_the_february_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        let now = clock(&ds, JANUARY);
+        ds.update("INSERT DATA { GRAPH <urn:test:other> { <urn:test:a> <urn:test:b> 1 } }")
+            .unwrap();
+        configure(&ds);
+        now.store(MARCH, Ordering::SeqCst);
+        let p = propose(&ds, &import("advisory")).unwrap();
+        assert!(p.committed);
+        let revision = record_iri(&p, "rev");
+        // availability is the publishing commit's time, assigned by the server
+        let commit = ds.store().commit(p.commit).unwrap();
+        assert_eq!(commit.timestamp_ms, MARCH);
+        assert_eq!(availability(&ds, &revision), [MARCH_LEXICAL]);
+        assert_eq!(resolve(&ds, &revision).unwrap(), p.commit);
+        // the claim is visible now, with unknown validity
+        let claim = record_iri(&p, "claim");
+        let now_rows = claims_at(&ds, At::Head);
+        assert_eq!(
+            now_rows.get(claim.as_str()).map(String::as_str),
+            Some("unknown")
+        );
+        // the as-known February state predates its availability, though the revision
+        // was published in January: publication alone admits nothing
+        assert!(claims_at(&ds, At::Time(FEBRUARY)).is_empty());
+        // selection by time admits the claim exactly from its availability on
+        assert_eq!(
+            claims_at(&ds, At::Time(MARCH))
+                .get(claim.as_str())
+                .map(String::as_str),
+            Some("unknown")
+        );
+        assert!(claims_at(&ds, At::Time(MARCH - 1)).is_empty());
+        let (feb, _) = ds
+            .store()
+            .snapshot_at(&At::Time(FEBRUARY), &Default::default())
+            .unwrap();
+        let ask = format!("ASK {{ GRAPH ?g {{ <{}> ?p ?o }} }}", revision.as_str());
+        assert!(
+            !sparkles::sparql::query(feb, &ask, &Default::default())
+                .unwrap()
+                .boolean
+        );
+        // every backdating attempt is refused and leaves no trace
+        backdating_attempts(&ds, &revision);
+        assert!(claims_at(&ds, At::Time(FEBRUARY)).is_empty());
+    }
+
+    #[test]
+    fn availability_written_outside_the_typed_writer_never_authenticates_or_backdates() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        let now = clock(&ds, JANUARY);
+        ds.update("INSERT DATA { GRAPH <urn:test:other> { <urn:test:a> <urn:test:b> 1 } }")
+            .unwrap();
+        configure(&ds);
+        now.store(MARCH, Ordering::SeqCst);
+        let p = propose(&ds, &import("advisory")).unwrap();
+        let revision = record_iri(&p, "rev");
+        // an administrator detaches the graph, rewrites availability to January and
+        // protects the graph again
+        evidence::detach(&ds, SOURCES).unwrap();
+        ds.update(&format!(
+            "DELETE {{ GRAPH <{SOURCES}> {{ ?r <{EV}firstAvailableAt> ?t }} }}
+             INSERT {{ GRAPH <{SOURCES}> {{ ?r <{EV}firstAvailableAt> \"2100-01-15T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime> }} }}
+             WHERE {{ GRAPH <{SOURCES}> {{ ?r <{EV}firstAvailableAt> ?t }} }}"
+        ))
+        .unwrap();
+        configure(&ds);
+        // the rewritten record no longer authenticates
+        assert_eq!(code(resolve(&ds, &revision)), "origin-not-reproduced");
+        // and the rewrite is a commit of its own time, so February still lacks it
+        assert!(ds.store().head_commit().timestamp_ms >= MARCH);
+        assert!(claims_at(&ds, At::Time(FEBRUARY)).is_empty());
+        // ordinary RDF in an unowned graph claiming January availability is still only
+        // data recorded in March
+        ds.update(&format!(
+            "INSERT DATA {{ GRAPH <urn:test:copy> {{ <urn:test:copy-rev> a <{EV}SourceRevision> ; <{EV}firstAvailableAt> \"2100-01-15T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime> ; <{EV}availabilityReceipt> <{}> }} }}",
+            p.operation.as_str()
+        ))
+        .unwrap();
+        assert_eq!(
+            code(resolve(&ds, &iri("urn:test:copy-rev"))),
+            "evidence-unavailable"
+        );
+        let (feb, _) = ds
+            .store()
+            .snapshot_at(&At::Time(FEBRUARY), &Default::default())
+            .unwrap();
+        assert!(
+            !sparkles::sparql::query(
+                feb,
+                "ASK { GRAPH <urn:test:copy> { ?s ?p ?o } }",
+                &Default::default()
+            )
+            .unwrap()
+            .boolean
+        );
+    }
+
+    #[test]
+    fn availability_and_refusals_survive_restart_and_a_clock_set_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, revision) = {
+            let ds = Dataset::open(dir.path()).unwrap();
+            let now = clock(&ds, JANUARY);
+            ds.update("INSERT DATA { GRAPH <urn:test:other> { <urn:test:a> <urn:test:b> 1 } }")
+                .unwrap();
+            configure(&ds);
+            now.store(MARCH, Ordering::SeqCst);
+            let p = propose(&ds, &import("advisory")).unwrap();
+            (p.commit, record_iri(&p, "rev"))
+        };
+        let ds = Dataset::open(dir.path()).unwrap();
+        // the recovered history keeps the publishing commit's time and the receipt
+        assert_eq!(ds.store().commit(first).unwrap().timestamp_ms, MARCH);
+        assert_eq!(availability(&ds, &revision), [MARCH_LEXICAL]);
+        assert_eq!(resolve(&ds, &revision).unwrap(), first);
+        assert!(claims_at(&ds, At::Time(FEBRUARY)).is_empty());
+        // the reopened registry still refuses every backdating attempt
+        backdating_attempts(&ds, &revision);
+        // a server clock set back to January after the restart cannot stamp a later
+        // import before the recovered head
+        clock(&ds, JANUARY);
+        let later = propose(&ds, &import("follow-up")).unwrap();
+        let follow = record_iri(&later, "rev");
+        assert_eq!(ds.store().commit(later.commit).unwrap().timestamp_ms, MARCH);
+        assert_eq!(availability(&ds, &follow), [MARCH_LEXICAL]);
+        assert!(claims_at(&ds, At::Time(FEBRUARY)).is_empty());
+        assert_eq!(claims_at(&ds, At::Head).len(), 2);
+        // both imports share the recovered head's time, so the selector at exactly that
+        // time holds both and the millisecond before holds neither
+        assert_eq!(claims_at(&ds, At::Time(MARCH)).len(), 2);
+        assert!(claims_at(&ds, At::Time(MARCH - 1)).is_empty());
+    }
 }

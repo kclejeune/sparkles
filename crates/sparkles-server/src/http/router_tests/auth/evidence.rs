@@ -363,6 +363,142 @@ async fn a_token_revoked_before_publication_writes_nothing() {
     assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
 }
 
+/// C27 A4 over HTTP (spec C27 §4.3): an authenticated proposal's availability is the
+/// server's commit time, the as-known state before it excludes the import whatever its
+/// publication date, and a client cannot backdate availability through the proposal
+/// body, SPARQL Update or the Graph Store.
+#[tokio::test]
+async fn authenticated_availability_is_server_owned_and_cannot_be_backdated() {
+    // commit times never decrease from the root commit's wall clock, so the test
+    // clock runs in 2100
+    const JANUARY: i64 = 4_103_654_400_000;
+    const MARCH: i64 = 4_108_752_000_000;
+    let s = proposal_server();
+    let ds = s.state.get("ev").unwrap();
+    let now = Arc::new(std::sync::atomic::AtomicI64::new(JANUARY));
+    let read = now.clone();
+    ds.store.set_clock(Arc::new(move || {
+        read.load(std::sync::atomic::Ordering::SeqCst)
+    }));
+    ds.dataset
+        .update("INSERT DATA { GRAPH <urn:g> { <urn:a> <urn:p> <urn:o> } }")
+        .unwrap();
+    now.store(MARCH, std::sync::atomic::Ordering::SeqCst);
+    let mut body = revision_and_claim("c1");
+    body["revisions"][0]["publishedAt"] = "2100-01-05T00:00:00Z".into();
+    // a client-supplied availability is refused while the body is read
+    let head = ds.store.head_commit();
+    for forged in [
+        {
+            let mut b = body.clone();
+            b["revisions"][0]["firstAvailableAt"] = "2100-01-15T00:00:00Z".into();
+            b
+        },
+        {
+            let mut b = body.clone();
+            b["firstAvailableAt"] = "2100-01-15T00:00:00Z".into();
+            b
+        },
+    ] {
+        let r = propose(&s, &b("evw"), &forged).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+        assert_eq!(r.json()["code"], "invalid-proposal");
+        assert_eq!(ds.store.head_commit(), head, "nothing was written");
+    }
+    let r = propose(&s, &b("evw"), &body).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let v = r.json();
+    let commit = v["commit"].as_u64().unwrap();
+    assert_eq!(ds.store.commit(commit).unwrap().timestamp_ms, MARCH);
+    assert_eq!(
+        v["firstAvailableAt"],
+        sparkles::commit::rfc3339_ms(MARCH).as_str()
+    );
+    let rev = v["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "rev")
+        .unwrap()["iri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // the receipt names the authenticated principal
+    assert!(
+        ds.dataset
+            .ask(&format!(
+                "ASK {{ GRAPH <urn:ev:sources> {{ <{rev}> <urn:x-sparkles:evidence:availabilityReceipt> ?op . ?op <http://www.w3.org/ns/prov#wasAssociatedWith> <urn:x-sparkles:principal:user:evw> }} }}"
+            ))
+            .unwrap()
+    );
+    // the as-known February state lacks the January-published revision
+    let ask = |at: &'static str| {
+        let s = &s;
+        let rev = rev.clone();
+        async move {
+            let r = call(
+                &s.app,
+                "POST",
+                &format!("/ev/sparql{at}"),
+                &[
+                    ("authorization", &b("evw")),
+                    ("content-type", "application/sparql-query"),
+                    ("accept", "application/sparql-results+json"),
+                ],
+                &format!("ASK {{ GRAPH ?g {{ <{rev}> ?p ?o }} }}"),
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            r.json()["boolean"].as_bool().unwrap()
+        }
+    };
+    assert!(ask("").await);
+    assert!(!ask("?at=time:2100-02-15T00:00:00Z").await);
+    // direct writes of availability are refused before they publish
+    let head = ds.store.head_commit();
+    let early = "\"2100-01-15T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>";
+    let update = format!(
+        "INSERT DATA {{ GRAPH <urn:ev:sources> {{ <{rev}> <urn:x-sparkles:evidence:firstAvailableAt> {early} }} }}"
+    );
+    let r = call(
+        &s.app,
+        "POST",
+        "/ev/update",
+        &[
+            ("authorization", &b("evw")),
+            ("content-type", "application/sparql-update"),
+        ],
+        &update,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(r.json()["code"], "profile-managed-graph");
+    let r = call(
+        &s.app,
+        "POST",
+        "/ev/data?graph=urn:ev:sources",
+        &[
+            ("authorization", &b("evw")),
+            ("content-type", "application/n-triples"),
+        ],
+        &format!("<{rev}> <urn:x-sparkles:evidence:firstAvailableAt> {early} .\n"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(r.json()["code"], "profile-managed-graph");
+    assert_eq!(ds.store.head_commit(), head, "nothing was written");
+    assert_eq!(
+        ds.dataset
+            .query(&format!(
+                "SELECT ?t {{ GRAPH <urn:ev:sources> {{ <{rev}> <urn:x-sparkles:evidence:firstAvailableAt> ?t }} }}"
+            ))
+            .unwrap()
+            .rows()
+            .len(),
+        1
+    );
+}
+
 /// A claims ingestion (spec C25, "Ingestion into claim proposals") needs `write` on the
 /// update endpoint and update grants on the evidence graphs it writes, and a caller
 /// without them is refused before any model call.

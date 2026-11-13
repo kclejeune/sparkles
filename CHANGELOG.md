@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Valid time
+
+C27 Phase 1 is complete (roadmap item 341). An authenticated claim proposal records each
+new source revision's first availability as the server time of the commit that
+publishes it, and an as-known read with `at=time:` excludes revisions imported after
+its cutoff whatever their publication dates. Attempts to backdate availability through
+the proposal body, SPARQL Update, the Graph Store, RDF Patch or a load are refused
+before anything is written. A clone's root commit is no longer earlier than the commit
+it copies when the server clock runs behind. Validity intervals through the
+authenticated writer are roadmap item 925.
+
 ### OWL classification
 
 The Horn rules classify ontologies with individuals, functional data properties and top
