@@ -407,3 +407,38 @@ fn a_cancelled_file_clone_leaves_nothing() {
             .all(|g| g.held_by == [Hold::Head])
     );
 }
+
+/// A clone's root commit is no earlier than the commit it copies, and it takes its time
+/// from the store's clock: a clock behind the copied commit cannot give the clone a
+/// state that precedes the copied writes (spec C27 §4.3).
+#[test]
+fn clone_roots_never_precede_the_copied_commit() {
+    // 2100-01-01: later than any wall clock this test runs under
+    const LATE: i64 = 4_102_444_800_000;
+    let dir = tempfile::tempdir().unwrap();
+    let src = Store::open(&dir.path().join("src"), StoreOptions::default()).unwrap();
+    src.set_clock(Arc::new(|| LATE));
+    upd(&src, "INSERT DATA { <urn:s> <urn:p> 1 }");
+    let copied = src.head_commit();
+    assert_eq!(copied.timestamp_ms, LATE);
+    // the clock runs back behind the copied commit
+    src.set_clock(Arc::new(|| 1_000));
+    let out = dir.path().join("clone");
+    src.clone_to(&out, &CloneOptions::default()).unwrap();
+    let c = Store::open(&out, StoreOptions::default()).unwrap();
+    assert_eq!(c.head_commit().timestamp_ms, LATE);
+    let (m, _) = src
+        .clone_to_memory(&CloneOptions::default(), StoreOptions::default())
+        .unwrap();
+    assert_eq!(m.head_commit().timestamp_ms, LATE);
+    // a past state's clone is bounded by the commit it copies, not by the head
+    upd(&src, "INSERT DATA { <urn:s> <urn:p> 2 }");
+    src.set_clock(Arc::new(|| LATE + 5_000));
+    let at = CloneOptions {
+        at: Some(crate::history::At::Commit(copied.seq)),
+        ..Default::default()
+    };
+    let (m, _) = src.clone_to_memory(&at, StoreOptions::default()).unwrap();
+    // a clock ahead of the copied commit is the root's time
+    assert_eq!(m.head_commit().timestamp_ms, LATE + 5_000);
+}
