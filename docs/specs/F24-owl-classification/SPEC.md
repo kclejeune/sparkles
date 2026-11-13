@@ -2472,14 +2472,14 @@ tree, and colours the neighbours of each element with the fresh fillers from the
 down. An element's neighbours over a simple role are its predecessor and its successors,
 the predecessor carries at most one filler of a group when the element is reached, and
 the element is free in the fillers of its successors, so the colouring exists. Let `O⁺`
-be the clause set with the names, the inclusions `G ⊑ W` and the relations. Replacing each
-name by its conjunction in the clauses without the relations gives `O` back, so `O⁺`
-entails every consequence of `O`. In the other direction, the coloured tree model becomes
-a model of `O⁺` when each `G` is read as the set of elements with `n` neighbours over `r`
-in `F`. Every such element has its witnesses by the colouring, the told inclusions between
-names hold because the closures hold in the model, and a name and a maximum's holder that
-it contradicts share no element. So `O⁺` has the consequences of `T` between the
-ontology's classes and no others.
+be the clause set with the names, the inclusions `G ⊑ W` and the relations. In one
+direction every model of `O⁺` satisfies `T`, which the next paragraph shows for a weaker
+clause set. In the other direction, the coloured tree model becomes a model of `O⁺` when
+each `G` is read as the set of elements with `n` neighbours over `r` in `F`. Every such
+element has its witnesses by the colouring, the told inclusions between names hold because
+the closures hold in the model, and a name and a maximum's holder that it contradicts
+share no element. So `O⁺` has the consequences of `T` between the ontology's classes and
+no others.
 
 For blocking, let `O'` be `O⁺` with each clause `G_2(x) → W_2(x)` replaced by
 `G_2(x) → W_2(x) ∨ ⋁ G_1(x)` over the blockers `G_1` of `G_2`. `O⁺` entails `O'`, so `O'`
@@ -2500,9 +2500,10 @@ behind, and a unit is never withdrawn. For a name `G_2` that is told below a blo
 leaves the name's witnesses out everywhere. Without this, a cardinality that two axioms
 state made two groups of witnesses in a context that holds both only under a clause, such
 as a hypothetical successor, where no minimum is a unit and nothing was blocked. The
-paper's Theorem 9 holds for any set of DL-clauses and therefore for `O'`, with the order of atoms unchanged apart from the rank
-of the names. The cut is the Hyper conclusion of the clause, the unit and the disjointness
-set. It is a consequence of the context's clauses and it subsumes the clause it replaces.
+paper's Theorem 9 holds for any set of DL-clauses and therefore for `O'`, with the order
+of atoms unchanged apart from the rank of the names. The cut is the Hyper conclusion of
+the clause, the unit and the disjointness set. It is a consequence of the context's
+clauses and it subsumes the clause it replaces.
 In a hypothetical successor and in a test context the units it reads are conclusions of
 that context, relative to its core, and never the markers of a hypothesis.
 
@@ -2518,7 +2519,7 @@ The measurements are of commit 35fb0f31 on `atlas`, with one process at a time i
 scope, as medians of five classifications in one process, and for Konclude 0.7.0 of three
 processes. The whole run is the wall time of one process, with reading the file. The
 taxonomies with the order equal HermiT 1.4.5.519's and Konclude's on both versions of the
-Protein Ontology, where HermiT takes 392 and 228 s. Without counting each differs from
+Protein Ontology, where HermiT takes 392 and 228 s on the laptop. Without counting each differs from
 them by four missing and four extra edges.
 
 | File | Threads | Without counting | Counting without the order | Counting with the order | Whole run with the order | Konclude, classification | Konclude, whole run |
@@ -2564,10 +2565,10 @@ derives `y ∨ H` with `H` maximal and makes `n + 1` hypothetical witnesses. The
 nine such restrictions over the symmetric bond roles, and a witness has a known neighbour,
 its predecessor, so it derives the same alternatives. Three hypothetical successors
 derive 69,109, 63,521 and 58,201 of the attempt's 281,121 conclusions. Two ideas are
-untried. A minimum could be blocked by a strictly stronger one that holds
-under the same clause and not only as a unit. A positive `∃r.F` whose negative name the context
-already holds could stay unexpanded, which needs a proof that the name is witnessed in the
-model. Both, and the default of counting, are item 896. Two other changes to the clause
+untried. A minimum could be blocked by a strictly stronger one that holds under the same
+clause and not only as a unit. A positive `∃r.F` whose negative name the context already
+holds could stay unexpanded, which needs a proof that the name is witnessed in the model.
+Both, and the default of counting, are item 896. Two other changes to the clause
 set were measured with the order and are not kept, one name per compound expression and
 a name of its own for a negative existential restriction, as
 [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md) records.
@@ -2595,8 +2596,8 @@ fillers, minimums under clauses, a refused axiom, every bound on the relations a
 predecessor case above. The 206 fixtures of item 603 with a minimum or exact cardinality
 of two or more run with the order on one thread and on four with the eager strategy. Each
 answer is among HermiT's subsumptions, each case taken whole has exactly HermiT's, no case
-that stays in the bound without the order leaves it with the order, and 202 stay in it on
-one thread against 200. `shq-041` is one of the two gained, so of item 729's two fixtures
+that stays in the bound without the order leaves it with the order, and two more stay in
+it on one thread. `shq-041` is one of the two gained, so of item 729's two fixtures
 `shiq-028` remains. A fuzz of 300 generated ontologies with related cardinalities, role
 hierarchies, an equivalent, an inverse and a symmetric role, judged against HermiT on the
 296 that HermiT finishes in 60 s, gives 264 equal and 31 sound answers with the order on
