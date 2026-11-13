@@ -9213,9 +9213,11 @@ materializer skips those rules. Both sources give facts of the same closure, so 
 that reads some patterns and derives others answers as a fresh materialization would. A
 rule file with backward rules leaves the materialization out entirely, and every pattern
 derives, when a rule calls a builtin that reads facts outside its patterns (`noValue` or a
-list builtin) or makes terms (`makeTemp`, `makeSkolem` or `now`), or when a head holds a
-list action or a blank node. The materialization's answers could then differ from those of
-the whole program. A
+list builtin), makes fresh or time-dependent terms (`makeTemp`, `makeSkolem` or `now`) or
+is unknown to Sparkles, or when a head holds a list action, a blank node or a functor. The
+materialization's answers could then differ from those of the whole program. Tests and
+functions whose results follow from their arguments, such as `notEqual` or `strConcat`,
+keep the materialization readable. A
 derived pattern still reads the inferred graph, so deriving where the materialization
 holds the facts would only add work. With `rdfs`, `rdfs-simple` and `owl-rl`, which have
 no backward rules, a query over a fresh materialization runs as `reasoning=materialized`
