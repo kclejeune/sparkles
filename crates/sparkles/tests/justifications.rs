@@ -249,7 +249,12 @@ fn classes_all_follows_the_relevant_superclass_cone() {
         "ex:CatDog rdfs:subClassOf ex:Cat, ex:Dog . ex:Deeper rdfs:subClassOf ex:CatDog . ex:Cat owl:disjointWith ex:Dog . ex:Harmless a owl:Class .",
     );
     let mut request = options(JustifyTarget::AllClasses);
+    // The allowance of oracle checks bounds the work, which is 163 checks and about 6 s
+    // in a debug build on a quiet host. The analysis's default 30 s timeout stopped it on
+    // loaded hosts, and a complete report must not depend on the host, so the deadline is
+    // far past the run's time.
     request.max_checks = 2000;
+    request.analysis.timeout = Some(std::time::Duration::from_secs(600));
     let report = dataset.reasoning().justify(&request).unwrap();
     assert!(report.complete);
     let classes: std::collections::BTreeSet<_> = report
