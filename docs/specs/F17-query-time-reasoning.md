@@ -1149,7 +1149,10 @@ commits (§6.2), the MCP argument, the UI selector and the G08 mapping remain in
   the read cost plus `DERIVE_BASE + facts × DERIVE_FACT`, or plus `READ_BASE + facts ×
   CACHED_FACT` for a table the cache holds, in the planner's unit of one scanned row,
   with the constants in `sparql::reasoning::cost`. The costs inform and do not decide,
-  as the next paragraph explains. The derivation constants are provisional and are
+  as the next paragraph explains. The walk costs about as much as a narrow derivation,
+  so a session makes the estimate only for EXPLAIN and for `auto` when it reads a
+  materialization. An executed `demand` query's `Derive` nodes carry no estimate, as
+  decision 5 of Phase 1 states (item 911). The derivation constants are provisional and are
   measured once roadmap item 911 repairs the demand path.
 * **Why reading always wins.** §4.3 has the planner compare the two estimates per pattern
   and derive where deriving is cheaper. In this engine a derived pattern still reads the
