@@ -72,8 +72,9 @@ pub struct DlAx {
     /// with the order, for a minimum's name, the names of the minimums that entail it, a
     /// minimum at least as large over a role below its role and a filler below its
     /// filler: a context that holds one of them as a unit does not make the witnesses of
-    /// this one. The relation is a strict order, two minimums that entail each other
-    /// being ordered by their names.
+    /// this one. The relation has no cycle, since it lies within a strict order, two
+    /// minimums that entail each other being ordered by their names. It need not hold
+    /// every pair of that order.
     pub blockers: FxHashMap<Ex, Vec<Ex>>,
 }
 
@@ -1084,6 +1085,19 @@ pub fn normalize(
     stop: &dyn Fn() -> bool,
     allowed: Allowed,
 ) -> Result<Option<(Vec<bool>, DlAx)>, Halt> {
+    normalize_within(axioms, it, ax, limit, stop, allowed, ORDER_RELATIONS)
+}
+
+/// [`normalize`] with the most relations that [`number_order`] adds.
+fn normalize_within(
+    axioms: &[&AxiomKind],
+    it: &mut Interner,
+    ax: &mut Axioms,
+    limit: Option<usize>,
+    stop: &dyn Fn() -> bool,
+    allowed: Allowed,
+    relations: usize,
+) -> Result<Option<(Vec<bool>, DlAx)>, Halt> {
     let mut taken = vec![false; axioms.len()];
     // individuals make the run rooted: those the EL part interned before the
     // normalization, and those the axioms outside it name
@@ -1225,7 +1239,7 @@ pub fn normalize(
         ax.subs.push((TOP, e));
     }
     let blockers = if order {
-        number_order(it, ax, &all.least, &all.atmost, stop)?
+        number_order(it, ax, &all.least, &all.atmost, relations, stop)?
     } else {
         FxHashMap::default()
     };
@@ -1263,7 +1277,8 @@ pub fn normalize(
 
 /// The most told inclusions, disjointness sets and blockers that [`number_order`] adds.
 /// Each is a consequence of the ontology that the run can do without, so past the bound
-/// the rest are left out.
+/// the rest are left out. The sorts and the cycle check that follow are linear in the
+/// minimums and in this bound, up to a logarithm, and do not poll the stop.
 const ORDER_RELATIONS: usize = 1 << 20;
 
 /// The order of entailment between the number restrictions of a run that counts without
@@ -1277,13 +1292,20 @@ const ORDER_RELATIONS: usize = 1 << 20;
 /// least name stands for them: each of the others is told equivalent to it and has it as
 /// its only blocker. Between the representatives, the stronger minimum gets the weaker one
 /// as a told subsumer, and the answer lists for each name those that entail it, with two
-/// that entail each other ordered by name, so that the blockers are a strict order. A
-/// minimum and a maximum that it contradicts are a disjointness set.
+/// that entail each other ordered by name, so that the blockers lie within a strict order
+/// and have no cycle. A minimum and a maximum that it contradicts are a disjointness set.
+///
+/// The told inclusions, blockers and disjointness sets together number at most `bound`.
+/// Each is a consequence of the ontology that the run can do without, and a minimum
+/// without a blocker makes its witnesses, so the rest are left out. A minimum that is told
+/// equivalent to its representative gets both inclusions and the blocker together or
+/// none of them.
 fn number_order(
     it: &Interner,
     ax: &mut Axioms,
     least: &[(Ex, Ex, u32, Role, Ex)],
     atmost: &[(Ex, u32, Role, Ex)],
+    bound: usize,
     stop: &dyn Fn() -> bool,
 ) -> Result<FxHashMap<Ex, Vec<Ex>>, Halt> {
     let mut out: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
@@ -1364,9 +1386,10 @@ fn number_order(
     let mut subs: Vec<(Ex, Ex)> = Vec::new();
     let mut relations = 0usize;
     for &(r, f, n, g) in &hs {
+        poll(1)?;
         match reps.last() {
             Some(&(r0, f0, n0, g0)) if (r0, f0, n0) == (r, f, n) => {
-                if relations < ORDER_RELATIONS {
+                if relations + 3 <= bound {
                     relations += 3;
                     subs.push((g, g0));
                     subs.push((g0, g));
@@ -1395,27 +1418,30 @@ fn number_order(
             for &g in &up[&a.1] {
                 poll(1)?;
                 for &(n, b) in mins.get(&(s, g)).map_or(&[][..], |v| v.as_slice()) {
+                    poll(1)?;
                     if b == a.3 || a.2 < n {
                         continue;
                     }
-                    if relations >= ORDER_RELATIONS {
+                    let blocks = !entails(&(s, g, n, b), a) || a.3 < b;
+                    if relations + 1 + usize::from(blocks) > bound {
                         break 'reps;
                     }
                     relations += 1;
                     subs.push((a.3, b));
-                    if !entails(&(s, g, n, b), a) || a.3 < b {
+                    if blocks {
                         relations += 1;
                         out.entry(b).or_default().push(a.3);
                     }
                 }
                 for &(k, m) in maxs.get(&(s, g)).map_or(&[][..], |v| v.as_slice()) {
+                    poll(1)?;
                     if a.2 <= k {
                         continue;
                     }
                     for &h in std::iter::once(&a.3)
                         .chain(stands.get(&a.3).map_or(&[][..], |v| v.as_slice()))
                     {
-                        if relations >= ORDER_RELATIONS {
+                        if relations >= bound {
                             break 'reps;
                         }
                         relations += 1;
@@ -1431,8 +1457,9 @@ fn number_order(
         v.sort_unstable();
         v.dedup();
     }
-    // entailment is a preorder, so the blockers have no cycle; a cycle would leave a
-    // minimum without witnesses, so the run blocks nothing if one shows
+    // entailment is a preorder, so the blockers, which follow strict entailment and
+    // otherwise the names, have no cycle; a cycle would leave a minimum without
+    // witnesses, so the run blocks nothing if one shows
     if !acyclic(&out) {
         debug_assert!(
             false,
@@ -1620,6 +1647,17 @@ mod tests {
     /// `http://ex.org/`. A maximum over a role of its own makes the run count, which
     /// minimums in positive positions alone do not, and a union makes it disjunctive.
     fn run_order(body: &str, order: bool) -> (DlAx, Axioms, Interner) {
+        let (taken, d, ax, it) = run_order_within(body, order, ORDER_RELATIONS);
+        assert!(taken.iter().all(|&t| t));
+        (d, ax, it)
+    }
+
+    /// As [`run_order`], with the most relations that the order adds and the axioms taken.
+    fn run_order_within(
+        body: &str,
+        order: bool,
+        relations: usize,
+    ) -> (Vec<bool>, DlAx, Axioms, Interner) {
         let doc = crate::ofn_read::parse(&format!(
             "Prefix(:=<http://ex.org/>)\nPrefix(owl:=<http://www.w3.org/2002/07/owl#>)\n\
              Ontology(\n{body}\nSubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
@@ -1634,11 +1672,18 @@ mod tests {
             rooted: false,
             order,
         };
-        let (taken, d) = normalize(&kinds, &mut it, &mut ax, None, &|| false, allowed)
-            .unwrap()
-            .unwrap();
-        assert!(taken.iter().all(|&t| t));
-        (d, ax, it)
+        let (taken, d) = normalize_within(
+            &kinds,
+            &mut it,
+            &mut ax,
+            None,
+            &|| false,
+            allowed,
+            relations,
+        )
+        .unwrap()
+        .unwrap();
+        (taken, d, ax, it)
     }
 
     /// The name of the minimum that `class` is told to be below.
@@ -1741,6 +1786,111 @@ mod tests {
         assert!(!d.blockers.contains_key(&names[0]));
         assert_eq!(d.blockers.get(&names[1]), Some(&vec![names[0]]));
         assert_eq!(d.blockers.get(&names[2]), Some(&vec![names[0], names[1]]));
+    }
+
+    /// An axiom that the normalization refuses leaves no minimum in the order: the name
+    /// that its first conjunct made goes with the axiom's other outputs, and the same
+    /// minimum in a later axiom is ordered alone.
+    #[test]
+    fn a_refused_axiom_leaves_no_minimum_in_the_order() {
+        let (taken, d, ax, mut it) = run_order_within(
+            "SubClassOf(:A ObjectIntersectionOf(ObjectMinCardinality(2 :r :F)
+               ObjectMinCardinality(65 :r :F)))
+             SubClassOf(:B ObjectMinCardinality(2 :r :F))
+             SubClassOf(:C ObjectMinCardinality(3 :r :F))",
+            true,
+            ORDER_RELATIONS,
+        );
+        assert_eq!(taken, vec![false, true, true, true, true]);
+        assert_eq!(d.least.len(), 2);
+        let (b, c) = (
+            least_of(&d, &ax, &mut it, "B"),
+            least_of(&d, &ax, &mut it, "C"),
+        );
+        assert_eq!(d.blockers.len(), 1);
+        assert_eq!(d.blockers.get(&b), Some(&vec![c]));
+        // the told inclusions into a minimum's name are those of the two classes and of
+        // the larger minimum
+        let names: Vec<Ex> = d.least.iter().map(|l| l.0).collect();
+        let into: Vec<(Ex, Ex)> = ax
+            .subs
+            .iter()
+            .copied()
+            .filter(|(_, y)| names.contains(y))
+            .collect();
+        assert_eq!(into.len(), 3);
+        assert!(into.contains(&(c, b)));
+    }
+
+    /// Under any bound on its relations the order is a part of the whole one, with no
+    /// cycle, and a minimum that is told equivalent to its representative has both
+    /// inclusions and the representative as its blocker, or none of the three.
+    #[test]
+    fn a_bound_on_the_relations_keeps_a_part_of_the_order() {
+        use std::collections::BTreeSet;
+        let body = "SubClassOf(:F :G) SubObjectPropertyOf(:r :s)
+             SubClassOf(:A1 ObjectMinCardinality(3 :r :F))
+             SubClassOf(:A2 ObjectMinCardinality(3 :r :F))
+             SubClassOf(:A3 ObjectMinCardinality(3 :r :F))
+             SubClassOf(:B1 ObjectMinCardinality(2 :r :F))
+             SubClassOf(:B2 ObjectMinCardinality(2 :r :F))
+             SubClassOf(:C ObjectMinCardinality(2 :s :G))
+             SubClassOf(:D ObjectMaxCardinality(1 :s :G))
+             SubClassOf(:E ObjectMaxCardinality(2 :r :F))";
+        // the inclusions, disjointness sets and blockers that a bound admits, beside those
+        // of a run that admits none
+        let (_, _, none, _) = run_order_within(body, true, 0);
+        let base_subs: BTreeSet<(Ex, Ex)> = none.subs.iter().copied().collect();
+        let base_sets: BTreeSet<Vec<Ex>> = none.disjoint.iter().cloned().collect();
+        type Part = (
+            BTreeSet<(Ex, Ex)>,
+            BTreeSet<Vec<Ex>>,
+            FxHashMap<Ex, Vec<Ex>>,
+        );
+        let part = |bound: usize| -> Part {
+            let (taken, d, ax, _) = run_order_within(body, true, bound);
+            assert!(taken.iter().all(|&t| t));
+            assert_eq!(d.least.len(), 6);
+            let subs = ax
+                .subs
+                .iter()
+                .copied()
+                .filter(|p| !base_subs.contains(p))
+                .collect();
+            let sets = ax
+                .disjoint
+                .iter()
+                .filter(|s| !base_sets.contains(*s))
+                .cloned()
+                .collect();
+            (subs, sets, d.blockers)
+        };
+        let size = |p: &Part| p.0.len() + p.1.len() + p.2.values().map(Vec::len).sum::<usize>();
+        let whole = part(ORDER_RELATIONS);
+        // three names told equivalent to a representative, three pairs of
+        // representatives, and nine pairs of a minimum and a smaller maximum
+        assert_eq!(size(&whole), 24);
+        assert!(part(0).0.is_empty() && part(0).1.is_empty() && part(0).2.is_empty());
+        for bound in 0..=24 {
+            let cut = part(bound);
+            assert!(size(&cut) <= bound, "bound {bound}");
+            assert!(cut.0.is_subset(&whole.0) && cut.1.is_subset(&whole.1));
+            assert!(acyclic(&cut.2));
+            for (g, hs) in &cut.2 {
+                assert!(hs.iter().all(|h| whole.2[g].contains(h)));
+            }
+            for &(a, b) in &cut.0 {
+                if whole.0.contains(&(b, a)) {
+                    assert!(cut.0.contains(&(b, a)), "bound {bound}");
+                    assert!(
+                        cut.2.get(&a) == Some(&vec![b]) || cut.2.get(&b) == Some(&vec![a]),
+                        "bound {bound}"
+                    );
+                }
+            }
+        }
+        let all = part(24);
+        assert!(all.0 == whole.0 && all.1 == whole.1 && all.2 == whole.2);
     }
 
     #[test]

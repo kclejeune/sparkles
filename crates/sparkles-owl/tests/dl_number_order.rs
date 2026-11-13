@@ -2,8 +2,8 @@
 //! (roadmap item 894, F24's "The order between number restrictions"), which
 //! `Limits::number_order` asks for: `≥m r.F` entails `≥n s.G` when `m ≥ n`, `r ⊑ s` and
 //! `F ⊑ G` are told, and contradicts `≤k s.G` when `m > k`. Each case classifies with the
-//! order and without it, on one thread and on eight, and where both runs finish their
-//! answers are the same.
+//! order on one thread and on eight and without it on one thread, and where the run
+//! without the order finishes its answer is the same.
 
 use sparkles_owl::classify::{Classification, Classifier, Expansion, Limits, Tier};
 use sparkles_owl::model::*;
@@ -279,11 +279,12 @@ fn equivalent_and_wider_roles_order_their_minimums() {
 }
 
 /// Over a symmetric role an element's predecessor is one of its neighbours. Each witness
-/// of the root's minimum of three has the root among its exactly two neighbours in `F`.
-/// A witness is in one of three disjoint classes of the root's minimum, and its own
-/// minimum of two has two classes of its own, so the root can be either of its two. Names
-/// shared between the two minimums, the first two of three, would make the third witness
-/// unsatisfiable, and the root with it.
+/// of the root's minimum of three is in one of the minimum's three disjoint classes and
+/// has a successor in `Leaf`, which has exactly two neighbours in `F`, the witness among
+/// them. `Leaf`'s minimum of two has two classes of its own, so the witness can be either
+/// of its two. Names shared between the two minimums, the first two of three, would give
+/// the third witness's successor three neighbours in `F`, and make it, the witness and
+/// the root unsatisfiable.
 #[test]
 fn a_predecessor_over_a_symmetric_role_counts_for_a_smaller_minimum() {
     check(
@@ -426,6 +427,25 @@ fn a_minimum_in_a_disjunction() {
         "the order saved no work: {} against {}",
         on.stats.dl_work,
         off.stats.dl_work
+    );
+}
+
+/// A minimum under a clause whose name is not the representative of its strength: `X`
+/// states the minimum first, so its name stands for the one in `A`'s union. In `A` neither
+/// holds as a unit, so nothing blocks the alternative, whose witnesses over the
+/// unsatisfiable filler refute it and leave `P`.
+#[test]
+fn a_minimum_under_a_clause_makes_its_witnesses_without_its_representative() {
+    check(
+        &format!(
+            "SubClassOf(:X ObjectMinCardinality(2 :r :F))
+             SubClassOf(:A ObjectUnionOf(:P ObjectMinCardinality(2 :r :F)))
+             SubClassOf(:F ObjectIntersectionOf(:F1 :F2)) DisjointClasses(:F1 :F2)
+             SubClassOf(:M ObjectMaxCardinality(5 :q))
+             {UNION}"
+        ),
+        &[("A", "P"), ("X", "Nothing"), ("F", "Nothing")],
+        &[("A", "Nothing"), ("P", "Nothing")],
     );
 }
 
