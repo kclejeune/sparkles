@@ -81,19 +81,17 @@ pub fn cors_allowed(st: &AppState, origin: &str) -> bool {
 /// Outbound requests and local files are server capabilities: SERVICE and
 /// `LOAD <http…>` need `federate`, `LOAD <file:…>` needs `server-admin`. The graphs
 /// the request reads and writes are those the principal's grants on `ds` cover through
-/// endpoint `e`, without the graphs `hidden` names: the selected dataset's hidden control
-/// graphs (spec C26 §2.3), which leave the view whichever way the dataset was selected.
+/// endpoint `e`.
 pub fn restrict(
     opts: &mut sparkles::sparql::QueryOptions,
     p: &Principal,
     ds: &str,
     e: super::Endpoint,
-    hidden: &[String],
 ) {
     opts.forbid_service = !p.has(ServerPerm::Federate);
     opts.forbid_remote_load = !p.has(ServerPerm::Federate);
     opts.forbid_file_load = !p.has(ServerPerm::ServerAdmin);
-    opts.graphs = sparkles::access::GraphAccess::hiding_graphs(p.view(ds, e), hidden);
+    opts.graphs = p.view(ds, e);
     opts.write.graphs = opts.graphs.clone();
     // remote results cached for one caller and endpoint are never read by another
     opts.service_scope = Some(format!("{}\u{1f}{e:?}", p.id()).into());

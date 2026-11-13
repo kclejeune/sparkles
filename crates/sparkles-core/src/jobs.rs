@@ -1,9 +1,10 @@
-//! Durable jobs: the `jobs.json` settings file, the ledger vocabulary and the lease
-//! token primitives (spec C26 §2, §4 and §7).
+//! Durable jobs: the `jobs.json` settings file, the ledger's limits and the lease token
+//! primitives (spec C26 §2, §4 and §7).
 //!
-//! The jobs owner ([`crate::managed::OwnerKind::Jobs`]) manages one control graph,
-//! [`LEDGER_GRAPH`], in the dataset's managed-graph registry. Its settings file holds the
-//! registered definitions:
+//! The ledger is held in the dataset's control keyspace ([`crate::control`]), outside the
+//! RDF dataset. The jobs owner ([`crate::managed::OwnerKind::Jobs`]) keeps an entry in the
+//! managed-graph registry for its settings file, and it owns no graph. The settings file
+//! holds the registered definitions:
 //!
 //! ```json
 //! {"format": 1, "profile": 1, "enabled": true, "maxQueued": 1024,
@@ -39,11 +40,8 @@ pub const PROFILE: u32 = 1;
 /// `dataset.json`).
 pub const READER: u32 = 9;
 
-/// The `job:` namespace of the ledger vocabulary and record IRIs.
+/// The `job:` namespace of the jobs vocabulary, such as the principal of a worker.
 pub const NAMESPACE: &str = "urn:x-sparkles:jobs:";
-
-/// The control graph that holds every ledger record of the dataset.
-pub const LEDGER_GRAPH: &str = "urn:x-sparkles:jobs:ledger";
 
 /// The largest `jobs.json` this build reads, in bytes.
 pub const MAX_SETTINGS_BYTES: usize = 1 << 20;
@@ -93,6 +91,11 @@ pub struct Settings {
     /// run.
     #[serde(default = "default_max_queued")]
     pub max_queued: u32,
+    /// The most bytes the dataset's control state may hold before a submission is
+    /// refused with `jobs-overloaded`. It bounds admission only: a transition of an
+    /// admitted run is never refused for the size of the control state (spec C26 §7).
+    #[serde(default = "default_max_control_bytes")]
+    pub max_control_bytes: u64,
     /// The registered definitions by name.
     #[serde(default)]
     pub definitions: BTreeMap<String, Definition>,
@@ -102,6 +105,16 @@ fn default_max_queued() -> u32 {
     1024
 }
 
+/// The default bound of the control state, 256 MiB.
+pub const DEFAULT_MAX_CONTROL_BYTES: u64 = 256 << 20;
+
+/// The largest bound of the control state this build accepts, 16 GiB.
+pub const MAX_CONTROL_BYTES: u64 = 16 << 30;
+
+fn default_max_control_bytes() -> u64 {
+    DEFAULT_MAX_CONTROL_BYTES
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -109,6 +122,7 @@ impl Default for Settings {
             profile: PROFILE,
             enabled: false,
             max_queued: default_max_queued(),
+            max_control_bytes: default_max_control_bytes(),
             definitions: BTreeMap::new(),
         }
     }
@@ -303,6 +317,11 @@ impl Settings {
                 "{FILE}: maxQueued is 0 or more than {MAX_RUNS_PER_STATE}"
             )));
         }
+        if self.max_control_bytes < 1 << 20 || self.max_control_bytes > MAX_CONTROL_BYTES {
+            return Err(Error::invalid(format!(
+                "{FILE}: maxControlBytes is less than 1 MiB or more than {MAX_CONTROL_BYTES}"
+            )));
+        }
         let mut leases: u64 = 0;
         for (name, d) in &self.definitions {
             d.validate(name)?;
@@ -323,15 +342,6 @@ impl Settings {
         let mut out = serde_json::to_vec_pretty(&sorted(value)).expect("settings serialize");
         out.push(b'\n');
         out
-    }
-
-    /// The graphs the owner manages once jobs were configured: the ledger graph, also
-    /// while the settings are disabled, so that disabling jobs stops admission and
-    /// claims without lifting the ledger's write fence, showing it to readers or changing
-    /// its protection nonce. A run accepted before jobs were disabled is dispatched again
-    /// once they are enabled.
-    pub fn managed_graphs(&self) -> Vec<String> {
-        vec![LEDGER_GRAPH.to_string()]
     }
 }
 
@@ -568,8 +578,6 @@ mod tests {
         s.definitions
             .insert("more".into(), Definition::quads(vec!["urn:h".into()]));
         assert!(s.validate().is_err());
-        let off = Settings::default();
-        assert_eq!(off.managed_graphs(), vec![LEDGER_GRAPH.to_string()]);
     }
 
     #[test]

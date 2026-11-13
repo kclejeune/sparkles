@@ -133,9 +133,7 @@ impl GraphQl {
     /// A mapping schema drafted from SHACL shapes or from the data, with the commit it
     /// read. The data graph is the installed configuration's, and the shapes are those
     /// of `req.shapes_graph` or of the write guard.
-    pub fn draft(&self, name: &str, mut req: DraftRequest) -> Result<(draft::Draft, u64)> {
-        // the dataset's hidden control graphs are never drafted from (spec C26 §2.3)
-        req.view = self.ds.hide_owner_graphs(req.view.take());
+    pub fn draft(&self, name: &str, req: DraftRequest) -> Result<(draft::Draft, u64)> {
         let data_graph = self
             .get(None)
             .map(|s| s.config.data_graph)
@@ -162,18 +160,6 @@ pub fn guard_shapes(
         return None;
     };
     let cfg = g.config().clone();
-    // a guard that reads its shapes from a hidden control graph (spec C26 §2.3) is
-    // answered as no guard, so no draft or warning quotes a control record
-    let hidden = store.hidden_graphs();
-    if cfg
-        .shapes
-        .graphs
-        .iter()
-        .flatten()
-        .any(|g| hidden.contains(g))
-    {
-        return None;
-    }
     let mut graph = oxrdf::Graph::new();
     let snap = store.snapshot();
     for name in cfg.shapes.graphs.iter().flatten() {

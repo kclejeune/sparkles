@@ -14011,8 +14011,12 @@
             "type": "string"
           },
           "commit": {
-            "description": "The commit that holds the quads, the record and the state.",
+            "description": "The commit that holds the quads, the record and the state, or the head the publication followed when it made no commit.",
             "type": "integer"
+          },
+          "committed": {
+            "description": "Whether the publication made a commit. One whose result changed no quad makes none.",
+            "type": "boolean"
           },
           "deleted": {
             "type": "integer"
@@ -14039,6 +14043,7 @@
           "attempt",
           "digest",
           "commit",
+          "committed",
           "inserted",
           "deleted",
           "publishedMs"
@@ -14099,7 +14104,12 @@
         },
         "properties": {
           "commit": {
+            "description": "The commit the publication made, or the head it followed when its result changed no quad.",
             "type": "integer"
+          },
+          "committed": {
+            "description": "Whether the publication made a commit.",
+            "type": "boolean"
           },
           "deleted": {
             "type": "integer"
@@ -14129,10 +14139,129 @@
           "run",
           "publication",
           "commit",
+          "committed",
           "version",
           "inserted",
           "deleted",
           "replayed"
+        ],
+        "type": "object"
+      },
+      "JobRecover": {
+        "additionalProperties": false,
+        "description": "A request of the recovery route.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "format": {
+            "const": 1
+          },
+          "resume": {
+            "description": "The paused runs to resume, at most 256. Empty reports the recovery.",
+            "items": {
+              "description": "A paused run of the restored set.",
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "JobRecovery": {
+        "additionalProperties": false,
+        "description": "The recovery of a restored dataset's jobs.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "properties": {
+          "recovery": {
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "cancelled": {
+                    "description": "The paused runs cancelled so far.",
+                    "type": "integer"
+                  },
+                  "captureCommit": {
+                    "description": "The commit the backup captured.",
+                    "type": "integer"
+                  },
+                  "captureLabel": {
+                    "type": "string"
+                  },
+                  "captureMs": {
+                    "description": "When the backup was captured.",
+                    "type": "integer"
+                  },
+                  "ended": {
+                    "description": "Whether no paused run is left, which ends the recovery.",
+                    "type": "boolean"
+                  },
+                  "id": {
+                    "description": "The recovery's id.",
+                    "format": "uuid",
+                    "type": "string"
+                  },
+                  "paused": {
+                    "description": "The restored runs still paused.",
+                    "type": "integer"
+                  },
+                  "phase": {
+                    "enum": [
+                      "pausing",
+                      "awaiting-decision"
+                    ],
+                    "type": "string"
+                  },
+                  "resumed": {
+                    "description": "The runs resumed so far.",
+                    "type": "integer"
+                  },
+                  "sourceDataset": {
+                    "description": "The dataset the restored backup was taken of.",
+                    "format": "uuid",
+                    "type": "string"
+                  },
+                  "startedMs": {
+                    "description": "When the recovery started.",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "id",
+                  "sourceDataset",
+                  "captureCommit",
+                  "captureMs",
+                  "phase",
+                  "startedMs",
+                  "paused",
+                  "resumed",
+                  "cancelled",
+                  "ended"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resumed": {
+            "description": "The runs this request resumed.",
+            "items": {
+              "description": "A resumed run.",
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "recovery",
+          "resumed"
         ],
         "type": "object"
       },
@@ -14399,7 +14528,7 @@
             "type": "array"
           },
           "message": {
-            "description": "The commit message of the submission.",
+            "description": "A message for the submission. A submission makes no commit, so it is not recorded.",
             "type": "string"
           },
           "payload": {
@@ -14422,7 +14551,7 @@
         },
         "properties": {
           "commit": {
-            "description": "The commit that recorded the run, or the head when the key was replayed.",
+            "description": "The head of the dataset that the submission's ledger record follows. A submission makes no commit.",
             "type": "integer"
           },
           "replayed": {
@@ -14550,6 +14679,10 @@
           "format": {
             "const": 1
           },
+          "maxControlBytes": {
+            "description": "The size of the dataset's control state past which a submission is refused with `jobs-overloaded`. It bounds admission only. Default 256 MiB.",
+            "type": "integer"
+          },
           "maxQueued": {
             "description": "The most runs waiting in `queued` or `retry-wait` at once. Default 1024.",
             "type": "integer"
@@ -14567,11 +14700,15 @@
       },
       "JobsSettingsStatus": {
         "additionalProperties": false,
-        "description": "The settings and their protection.",
+        "description": "The settings and the state of the ledger's control keyspace.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
         },
         "properties": {
+          "control": {
+            "description": "Whether the dataset's control keyspace, which holds the job ledger outside the RDF dataset, is enabled.",
+            "type": "boolean"
+          },
           "digest": {
             "oneOf": [
               {
@@ -14582,10 +14719,6 @@
                 "type": "null"
               }
             ]
-          },
-          "protected": {
-            "description": "Whether the ledger graph is protected from ordinary writes.",
-            "type": "boolean"
           },
           "revision": {
             "description": "The revision of the dataset's managed-graph registry.",
@@ -14605,7 +14738,7 @@
         "required": [
           "settings",
           "revision",
-          "protected",
+          "control",
           "revisions"
         ],
         "type": "object"
@@ -37379,7 +37512,7 @@
         "x-sparkles-permission": "read"
       },
       "post": {
-        "description": "Needs `write` on the dataset through the update endpoint, and to be among the definition's submitters when it names any. Records the run in the dataset's job ledger as one commit and answers `202` with its `Location` once that commit is durable. The key is scoped to the dataset, the branch, the caller, the definition's name and revision and the operation kind. The same `idempotencyKey` with the same payload, `checkpoint`, `inputs` and retried run answers `200` with the existing run and `replayed`; JSON whitespace, member order and the order of `inputs` do not change the request's digest. Refusals write nothing: `400` for a malformed submission or more than 4096 `inputs`, `403` when the caller's own grants do not reach a graph of the definition, `404` for an unknown definition, `409 idempotency-conflict` for a known key with another request, `409` for a disabled definition or one that changed while the submission was prepared, and `429 jobs-overloaded` when the dataset's bound on waiting runs is reached.",
+        "description": "Needs `write` on the dataset through the update endpoint, and to be among the definition's submitters when it names any. Records the run in the dataset's job ledger, which is no commit of the dataset, and answers `202` with its `Location` once the record is durable. The key is scoped to the dataset, the branch, the caller, the definition's name and revision and the operation kind. The same `idempotencyKey` with the same payload, `checkpoint`, `inputs` and retried run answers `200` with the existing run and `replayed`; JSON whitespace, member order and the order of `inputs` do not change the request's digest. Refusals write nothing: `400` for a malformed submission or more than 4096 `inputs`, `403` when the caller's own grants do not reach a graph of the definition, `404` for an unknown definition, `409 idempotency-conflict` for a known key with another request, `409` for a disabled definition or one that changed while the submission was prepared, `409 jobs-recovering` while the jobs recovery of a restored dataset pauses its restored work, and `429 jobs-overloaded` when the dataset's bound on waiting runs or on the size of its control state is reached.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
         },
@@ -37560,6 +37693,87 @@
         "x-sparkles-permission": "write"
       }
     },
+    "/$/jobs/{ds}/recover": {
+      "post": {
+        "description": "Needs `admin` on the dataset. A restored dataset's jobs recovery pauses every run its backup held before any claim, and those runs wait for this route. It resumes the paused runs listed in `resume`, each of which must belong to the restored set, and the recovery ends once none of them is left paused. An operator resumes work only after mapping principals and secret references and deciding whether uncertain external effects may happen again. With an empty `resume` it reports the recovery. `409 jobs-recovering` while the recovery is still pausing, and `409` for a run that the recovery did not pause.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
+        },
+        "operationId": "recoverJobs",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobRecover"
+              }
+            }
+          },
+          "description": "",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRecovery"
+                }
+              }
+            },
+            "description": "The recovery and the runs resumed."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Resume restored work",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
     "/$/jobs/{ds}/settings": {
       "get": {
         "description": "Needs `admin` on the dataset. Answers the disabled defaults before the first configuration.",
@@ -37606,7 +37820,7 @@
         "x-sparkles-permission": "admin"
       },
       "put": {
-        "description": "Needs `admin` on the dataset. Records complete settings, protects the ledger graph `urn:x-sparkles:jobs:ledger` and raises the dataset reader to 9 durably on the first configuration. Editing a definition changes its revision, and a run accepted under an older revision keeps that revision's attempts and retry horizon and is not claimed, and not ended by an expiry or a restart, until the definition is restored. Disabling jobs while runs are queued, leased or waiting to retry is a `409` that writes nothing, as is a configuration that races with another change of the registry. A disabled configuration keeps the ledger graph protected and hidden under the same nonce, so a run that was admitted as jobs were disabled waits, untouched, until they are enabled. `maxQueued` is at most 4096 and the definitions' `concurrency` adds up to at most 4096.",
+        "description": "Needs `admin` on the dataset. Records complete settings, and on the first configuration raises the dataset reader to 9 durably and enables the dataset's control keyspace, which holds the job ledger outside the RDF dataset. Editing a definition changes its revision, and a run accepted under an older revision keeps that revision's attempts and retry horizon and is not claimed, and not ended by an expiry or a restart, until the definition is restored. Disabling jobs while runs are queued, leased or waiting to retry is a `409` that writes nothing, as is a configuration that races with another change of the registry. A disabled configuration keeps the control keyspace, so a run that was admitted as jobs were disabled waits, untouched, until they are enabled. `maxQueued` is at most 4096, the definitions' `concurrency` adds up to at most 4096, and `maxControlBytes`, the size of the control state past which a submission is refused, is between 1 MiB and 16 GiB with a default of 256 MiB.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
         },
@@ -37902,7 +38116,7 @@
     },
     "/$/jobs/{ds}/{id}/publish": {
       "post": {
-        "description": "Needs `write` through the update endpoint, update grants on every graph the result writes and the lease token in `Sparkles-Job-Lease`. Commits the result's quads, the publication record, the checkpoint and the run's completion in one commit of the dataset, so a crash leaves all of them or none. A repeated `operation` with the same quads and checkpoint answers the original receipt with `replayed`, even after the lease ended, and another result under the same `operation` is `409 publication-conflict`. Refusals write nothing: `400` for malformed quads or more quads than the definition allows, `403` for a graph outside the definition's graphs or the caller's grants, `409 profile-managed-graph` for a managed graph, `409 lease-lost`, `412 precondition-failed` and `401 lease-missing`.",
+        "description": "Needs `write` through the update endpoint, update grants on every graph the result writes and the lease token in `Sparkles-Job-Lease`. Commits the result's quads, the publication record, the checkpoint and the run's completion in one commit of the dataset, so a crash leaves all of them or none. A result that changes no quad makes no commit: its receipt names the head it follows with `committed` false. A repeated `operation` with the same quads and checkpoint answers the original receipt with `replayed`, even after the lease ended, and another result under the same `operation` is `409 publication-conflict`. Refusals write nothing: `400` for malformed quads or more quads than the definition allows, `403` for a graph outside the definition's graphs or the caller's grants, `409 profile-managed-graph` for a managed graph, `409 lease-lost`, `412 precondition-failed` and `401 lease-missing`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#durable-jobs"
         },

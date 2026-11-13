@@ -136,7 +136,7 @@ pub(super) async fn timeline(
     let hi = hi.min(head);
     let wanted = range_len(lo, hi, st.limits.max_timeline_commits)?;
     let (cancel, _cancel_on_drop) = cancel_on_drop();
-    let restricted = p.partial_view(&ds.name);
+    let restricted = p.restricted(&ds.name);
     let (width, first, last, count, out) = blocking({
         let ds = ds.clone();
         move || {

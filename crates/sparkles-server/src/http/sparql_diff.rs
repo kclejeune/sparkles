@@ -358,7 +358,7 @@ pub(super) async fn sparql_diff(
     let max_bytes = asked.result_limit(st.limits.max_result_bytes);
     let (cancel, _cancel_on_drop) = cancel_on_drop();
     opts.cancel = Some(cancel.clone());
-    let restricted = p.partial_view(&ds.name);
+    let restricted = p.restricted(&ds.name);
     let timeout = opts.timeout;
     let out = blocking({
         let ds = ds.clone();

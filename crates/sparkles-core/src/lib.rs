@@ -9,6 +9,7 @@ pub mod builder;
 pub mod check;
 pub mod codec;
 pub mod commit;
+pub mod control;
 pub mod disk;
 pub mod duration;
 pub mod error;

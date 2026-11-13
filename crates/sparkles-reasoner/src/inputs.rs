@@ -271,31 +271,6 @@ impl Inputs {
         out
     }
 
-    /// These inputs without the named graphs `excluded` lists, for a run that never
-    /// reads them (the dataset's hidden control graphs, spec C26 §2.3).
-    pub fn without(&self, excluded: &[String]) -> Inputs {
-        let keep = |g: &GraphRef| match g {
-            GraphRef::Named(n) => !excluded.contains(n),
-            _ => true,
-        };
-        Inputs {
-            data_graphs: self
-                .data_graphs
-                .iter()
-                .filter(|g| keep(g))
-                .cloned()
-                .collect(),
-            ontology_graphs: self
-                .ontology_graphs
-                .iter()
-                .filter(|g| keep(g))
-                .cloned()
-                .collect(),
-            imports: self.imports,
-            location_mapping: self.location_mapping.clone(),
-        }
-    }
-
     /// An error for a configuration that reads no graph or reads the inferred graph.
     pub fn validate(&self) -> anyhow::Result<()> {
         let all = self.configured();
@@ -399,27 +374,6 @@ fn imports_in(snap: &Snapshot, g: Id, warnings: &mut Vec<String>) -> Vec<String>
 /// The graphs `inputs` reads in `snap`, with the imports resolved.
 pub fn resolve(snap: &Snapshot, inputs: &Inputs) -> Resolved {
     resolve_readable(snap, inputs, &|_| true)
-}
-
-/// [`resolve`] for a run that never reads the graphs `excluded` names, whatever `inputs`
-/// says, such as the dataset's hidden control graphs (spec C26 §2.3). An excluded input
-/// graph is left out with a warning, and imports are not followed through one.
-pub fn resolve_excluding(snap: &Snapshot, inputs: &Inputs, excluded: &[String]) -> Resolved {
-    if excluded.is_empty() {
-        return resolve(snap, inputs);
-    }
-    let kept = inputs.without(excluded);
-    let ids: Vec<Id> = excluded.iter().filter_map(|g| snap.lookup_iri(g)).collect();
-    let mut r = resolve_readable(snap, &kept, &|id| !ids.contains(&id));
-    for g in inputs.configured() {
-        if !kept.configured().contains(&g) {
-            r.warnings.push(format!(
-                "the input graph <{}> is not readable and was left out",
-                g.as_str()
-            ));
-        }
-    }
-    r
 }
 
 /// [`resolve`] for a caller who reads only the graphs `readable` admits. Imports are
@@ -741,8 +695,7 @@ pub fn fetch_imports(
         load(iri, &location, true, &mut out)?;
     }
     loop {
-        // the store's hidden control graphs (spec C26 §2.3) name no import
-        let r = resolve_excluding(&store.snapshot(), inputs, &store.hidden_graphs());
+        let r = resolve(&store.snapshot(), inputs);
         let mut tried = false;
         for i in r.imports.iter().filter(|i| i.graph.is_none()) {
             tried |= load(&i.iri, i.source(), false, &mut out)?;

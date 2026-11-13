@@ -82,68 +82,10 @@ pub fn inputs(
     Ok(i)
 }
 
-impl ValidationInputs {
-    /// These inputs without the graphs `hidden` names, the dataset's hidden control
-    /// graphs (spec C26 §2.3): a validation never reads them, so no shape can quote a
-    /// control record in its report. The data graph itself is never one of them, since
-    /// a request that names one is answered as for a graph that does not exist.
-    pub fn excluding(mut self, hidden: &[String]) -> ValidationInputs {
-        if hidden.is_empty() {
-            return self;
-        }
-        self.extra_graphs.retain(|g| !hidden.contains(g));
-        for h in hidden {
-            if !self.exclude_graphs.contains(h) {
-                self.exclude_graphs.push(h.clone());
-            }
-        }
-        self
-    }
-}
-
-/// Leave the graphs `hidden` names, a dataset's hidden control graphs (spec C26 §2.3), out
-/// of a validation's data: out of its extra graphs and into its excluded graphs. False
-/// when its data graph is one of them, which a validation answers as a data graph that
-/// does not exist.
-pub fn hide_graphs(
-    data_graph: &mut Option<String>,
-    extra_graphs: &mut Vec<String>,
-    exclude_graphs: &mut Vec<String>,
-    hidden: &[String],
-) -> bool {
-    if hidden.is_empty() {
-        return true;
-    }
-    if data_graph.as_ref().is_some_and(|g| hidden.contains(g)) {
-        return false;
-    }
-    extra_graphs.retain(|g| !hidden.contains(g));
-    for h in hidden {
-        if !exclude_graphs.contains(h) {
-            exclude_graphs.push(h.clone());
-        }
-    }
-    true
-}
-
-/// Whether a write-time guard reads its shapes or schema from one of the graphs `hidden`
-/// names, a dataset's hidden control graphs (spec C26 §2.3). A validation answers such a
-/// guard as one the dataset does not have, so no report quotes a control record as a
-/// shape or a schema.
-pub fn source_hidden(sources: Option<&Vec<String>>, hidden: &[String]) -> bool {
-    sources.into_iter().flatten().any(|g| hidden.contains(g))
-}
-
 /// Does the named graph exist (hold at least one quad)?
 pub fn graph_exists(snap: &Snapshot, iri: &str) -> bool {
     snap.lookup_iri(iri)
         .is_some_and(|g| snap.count(sparkles::index::Perm::Gspo, &[g.0]).unwrap_or(0) > 0)
-}
-
-/// [`graph_exists`] for a request of `ds`: a hidden control graph (spec C26 §2.3) is
-/// answered as a graph that does not exist, whatever it holds.
-pub fn graph_visible(ds: &sparkles::Dataset, snap: &Snapshot, iri: &str) -> bool {
-    !ds.store().hidden_graphs().iter().any(|h| h == iri) && graph_exists(snap, iri)
 }
 
 /// The fewest bytes one result takes in any report format (the one-line text form).

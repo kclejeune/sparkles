@@ -27,7 +27,7 @@ fn durable_after<R: Read + Seek>(
             budget.key_step("WAL durability record", index)?;
             reader.read_exact(&mut record)?;
             match record[0] {
-                WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION => crc.update(&record),
+                WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION | WAL_CONTROL => crc.update(&record),
                 WAL_COMMIT => {
                     match commit::open_wal_commit_with_crc(&record, crc) {
                         Some(Ok((s, ..)))
@@ -698,7 +698,7 @@ fn prove_prefix_bounded<R: Read + Seek, F: FnMut(u64, &[u8; WAL_REC]) -> Result<
                 });
                 needed = needed.max(delta_ids_end(std::iter::once(&quad)));
             }
-            WAL_CONFIGURATION => {
+            WAL_CONFIGURATION | WAL_CONTROL => {
                 configuration.data(&record);
                 crc.update(&record);
             }

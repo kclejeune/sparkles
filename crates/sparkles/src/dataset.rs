@@ -830,59 +830,9 @@ impl Dataset {
             views: Some(Arc::new(crate::handles::views::Source {
                 state: self.inner.reference.clone(),
             })),
-            graphs: self.hide_owner_graphs(None),
             defaults_applied: true,
             ..Default::default()
         }
-    }
-
-    /// `graphs` without the dataset's hidden managed graphs (spec C26 §2.3), such as the
-    /// job ledger, which only their owner's typed inspection renders. `None` stays `None`
-    /// while nothing is hidden, so the common case costs one registry load.
-    pub fn hide_owner_graphs(
-        &self,
-        graphs: Option<Arc<crate::access::GraphAccess>>,
-    ) -> Option<Arc<crate::access::GraphAccess>> {
-        crate::access::GraphAccess::hiding_graphs(graphs, &self.inner.store.hidden_graphs())
-    }
-
-    /// `opts` with the dataset's hidden managed graphs (spec C26 §2.3) out of its read and
-    /// write views, for a facade that takes the caller's options as they are. Borrowed
-    /// while nothing is hidden.
-    pub(crate) fn without_owner_graphs<'o>(&self, opts: &'o QueryOptions) -> Cow<'o, QueryOptions> {
-        if self.inner.store.hidden_graphs().is_empty() {
-            return Cow::Borrowed(opts);
-        }
-        let mut o = opts.clone();
-        o.graphs = self.hide_owner_graphs(o.graphs.take());
-        Cow::Owned(o)
-    }
-
-    /// A validation's data graphs without the dataset's hidden managed graphs (spec C26
-    /// §2.3): out of its extra graphs and into its excluded graphs. False when its data
-    /// graph is one of them, which a validation answers as a data graph that does not
-    /// exist.
-    #[cfg_attr(not(any(feature = "shacl", feature = "shex")), allow(dead_code))]
-    pub(crate) fn hide_validation_graphs(
-        &self,
-        data_graph: &Option<String>,
-        extra_graphs: &mut Vec<String>,
-        exclude_graphs: &mut Vec<String>,
-    ) -> bool {
-        let hidden = self.inner.store.hidden_graphs();
-        if hidden.is_empty() {
-            return true;
-        }
-        if data_graph.as_ref().is_some_and(|g| hidden.contains(g)) {
-            return false;
-        }
-        extra_graphs.retain(|g| !hidden.contains(g));
-        for h in hidden {
-            if !exclude_graphs.contains(&h) {
-                exclude_graphs.push(h);
-            }
-        }
-        true
     }
 
     /// `opts` under the dataset's memory pool, unless they name a pool or a grant.
@@ -905,19 +855,10 @@ impl Dataset {
     /// options as given, because the defaults change only what queries read.
     pub fn with_query_defaults<'o>(&self, opts: &'o QueryOptions) -> Cow<'o, QueryOptions> {
         if opts.defaults_applied {
-            // The hidden graphs are an invariant of every execution, not a default:
-            // options made before an owner hid a graph, or whose view was replaced
-            // since, still leave it out.
-            if self.inner.store.hidden_graphs().is_empty() {
-                return Cow::Borrowed(opts);
-            }
-            let mut o = opts.clone();
-            o.graphs = self.hide_owner_graphs(o.graphs.take());
-            return Cow::Owned(o);
+            return Cow::Borrowed(opts);
         }
         let defaults = self.query_options();
         let mut o = opts.clone();
-        o.graphs = self.hide_owner_graphs(o.graphs.take());
         if o.rdfs.is_none() {
             o.rdfs = defaults.rdfs;
         }

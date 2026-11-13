@@ -117,7 +117,7 @@ pub fn valid_blob_id(s: &str) -> bool {
 }
 
 /// Files at the database root that a backup may hold.
-pub const ROOT_FILES: [&str; 21] = [
+pub const ROOT_FILES: [&str; 23] = [
     "CURRENT",
     "dataset.json",
     "commits.bin",
@@ -139,6 +139,8 @@ pub const ROOT_FILES: [&str; 21] = [
     "graphql.json",
     "managed.json",
     "evidence.json",
+    "jobs.json",
+    "control.bin",
 ];
 
 /// A manifest file path: one of [`ROOT_FILES`], or `gen-NNNN/<file>` with 4 to 8 digits

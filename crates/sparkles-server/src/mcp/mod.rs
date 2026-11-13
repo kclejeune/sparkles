@@ -315,21 +315,6 @@ pub struct Call {
     pub grant: Option<Arc<sparkles::sparql::pool::PoolGrant>>,
 }
 
-impl Call {
-    /// This call made by `principal` instead.
-    pub(crate) fn with_principal(&self, principal: Principal) -> Call {
-        Call {
-            arrived: self.arrived,
-            cancel: self.cancel.clone(),
-            request_id: self.request_id.clone(),
-            principal,
-            headers: self.headers.clone(),
-            held: self.held.clone(),
-            grant: self.grant.clone(),
-        }
-    }
-}
-
 impl McpServer {
     pub fn new(state: Arc<AppState>, cfg: McpConfig) -> McpServer {
         let read_only = state.read_only;
@@ -418,17 +403,6 @@ impl McpServer {
     pub(crate) fn exposed(&self, name: &str) -> bool {
         let patterns = &self.shared.cfg.datasets;
         patterns.is_empty() || patterns.iter().any(|p| crate::auth::glob(p, name))
-    }
-
-    /// `call` with the hidden control graphs of every dataset this server holds (spec
-    /// C26 §2.3) hidden from its principal's reads of that dataset, as the HTTP
-    /// middleware hides them for a request that names its dataset in its path.
-    pub(crate) fn hiding_owner_graphs(&self, call: &Call) -> Call {
-        let mut p = call.principal.clone();
-        for ds in self.state.datasets().values() {
-            p = p.hiding_graphs_in(&ds.name, ds.dataset.store().hidden_graphs());
-        }
-        call.with_principal(p)
     }
 
     /// The datasets `p` may read through MCP, in name order.

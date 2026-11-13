@@ -159,35 +159,6 @@ impl Store {
         }
     }
 
-    /// The managed graphs that leave every caller's read view: those of owners whose
-    /// visibility is `hidden`. Empty without a registry. A registry this build cannot
-    /// enforce answers the graphs its file still names as hidden, when the file reads,
-    /// together with the graphs that every owner whose settings file is present always
-    /// hides, so that a damaged or unreadable registry does not disclose them.
-    pub fn hidden_graphs(&self) -> Vec<String> {
-        match self.managed_state().as_deref() {
-            None => Vec::new(),
-            Some(ManagedState::Installed(i)) => i.graphs.hidden_graphs(),
-            Some(ManagedState::Unavailable { .. }) => {
-                let Some(root) = self.managed_root() else {
-                    return Vec::new();
-                };
-                let mut hidden = std::fs::read(root.join(crate::managed::FILE))
-                    .ok()
-                    .and_then(|bytes| crate::managed::hidden_graphs_of_file(&bytes))
-                    .unwrap_or_default();
-                for owner in OwnerKind::ALL {
-                    if root.join(owner.settings_file()).is_file() {
-                        hidden.extend(owner.always_hidden_graphs());
-                    }
-                }
-                hidden.sort_unstable();
-                hidden.dedup();
-                hidden
-            }
-        }
-    }
-
     /// The managed graphs of this store's dataset, `None` when no owner manages any.
     /// Fails with `managed-unavailable` when the registry cannot be enforced.
     pub fn managed_graphs(&self) -> Result<Option<ManagedGraphs>> {
@@ -534,31 +505,6 @@ impl Store {
             (i, _, _) => i,
         };
         let (mut next, written) = change(installed)?;
-        // The write guard checks every commit under this writer lock with the hidden
-        // graphs of the registry it finds, so it never reads one it does not know is
-        // hidden. A change that would hide a graph the guard reads by name is refused
-        // (spec C26 §2.3).
-        let sorted = |mut g: Vec<String>| {
-            g.sort_unstable();
-            g.dedup();
-            g
-        };
-        let hidden_before = sorted(self.hidden_graphs());
-        let hidden_after = sorted(next.graphs.hidden_graphs());
-        let guard = (hidden_before != hidden_after)
-            .then(|| self.guard())
-            .flatten();
-        if let Some(g) = &guard {
-            let reads = g.reads_graphs();
-            if let Some(x) = hidden_after
-                .iter()
-                .find(|h| !hidden_before.contains(h) && reads.contains(h))
-            {
-                return Err(Error::Conflict(format!(
-                    "the write guard reads <{x}>, which this change would hide; configure the guard without it first"
-                )));
-            }
-        }
         for (owner, entry) in &next.graphs.owners {
             let matches = next
                 .settings
@@ -723,9 +669,6 @@ impl Store {
             .managed
             .store(Some(Arc::new(ManagedState::Installed(next))));
         fence.armed = false;
-        if let Some(g) = &guard {
-            g.hidden_changed(&hidden_after);
-        }
         drop(w);
         self.managed_barrier()?;
         Ok(graphs)

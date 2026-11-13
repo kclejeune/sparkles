@@ -614,11 +614,7 @@ impl Tools<'_> {
                 .preview_merge(&source, &target, &o)
                 .map_err(refused)?;
             out["expect"] = json!({ "source": fields.source.seq, "target": fields.target.seq });
-            let mut m = crate::http::branches::merge_json(
-                &fields,
-                None,
-                crate::http::branches::redacts(&p, &tq, &ds),
-            );
+            let mut m = crate::http::branches::merge_json(&fields, None);
             if restricted && let Some(obj) = m.as_object_mut() {
                 obj.retain(|k, _| !matches!(k.as_str(), "cells" | "graphs"));
             }
@@ -654,11 +650,7 @@ impl Tools<'_> {
                 Err(e)
             }
             MergeOutcome::UpToDate(r) | MergeOutcome::Merged(r) => {
-                let mut j = crate::http::branches::merge_json(
-                    &r,
-                    None,
-                    crate::http::branches::redacts(&p, &tq, &ds),
-                );
+                let mut j = crate::http::branches::merge_json(&r, None);
                 j["dataset"] = ds.name.clone().into();
                 j["committed"] = r.merged.into();
                 j["elapsedMs"] = elapsed().into();

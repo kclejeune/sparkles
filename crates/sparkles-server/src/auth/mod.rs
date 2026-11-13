@@ -14,7 +14,6 @@
 #![cfg_attr(not(feature = "auth"), allow(dead_code, unused_imports))]
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 mod api;
@@ -773,10 +772,6 @@ pub struct Principal {
     /// graph IRIs or `*` patterns hidden from this principal's reads on top of its
     /// grants (`reviewedOnly` of `POST /{ds}/ask` hides agent memory)
     hidden: Option<Arc<[String]>>,
-    /// graph IRIs hidden from this principal's reads in one dataset, by dataset name:
-    /// the hidden control graphs (spec C26 §2.3) of each dataset a call without a
-    /// dataset in its path may select, such as an MCP call
-    hidden_in: Option<Arc<BTreeMap<String, Vec<String>>>>,
     /// the disclosure guard of reports graphs (spec C22 §6); without one, no guarded
     /// graph is proven for a restricted view
     guard: Option<Arc<crate::graphrag::guard::Guard>>,
@@ -809,7 +804,6 @@ impl Principal {
             info: Arc::default(),
             branch: None,
             hidden: None,
-            hidden_in: None,
             guard: None,
             epoch: None,
         });
@@ -825,7 +819,6 @@ impl Principal {
             info: Arc::default(),
             branch: None,
             hidden: None,
-            hidden_in: None,
             guard: None,
             epoch: None,
         }
@@ -894,32 +887,11 @@ impl Principal {
         self.is_ambient()
     }
 
-    /// The graph patterns hidden from this principal's reads so far.
-    pub fn hidden_patterns(&self) -> &[String] {
-        self.hidden.as_deref().unwrap_or(&[])
-    }
-
     /// This principal with the graphs that `patterns` match hidden from its reads, in
     /// every dataset, whatever its grants say.
     #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub fn hiding_graphs(mut self, patterns: &[String]) -> Principal {
         self.hidden = (!patterns.is_empty()).then(|| patterns.into());
-        self
-    }
-
-    /// This principal with the graphs `graphs` names hidden from its reads of dataset
-    /// `ds` and its branches, whatever its grants say: the dataset's hidden control
-    /// graphs (spec C26 §2.3), for a call that selects its dataset outside the request
-    /// path. Nothing changes when `graphs` is empty.
-    pub fn hiding_graphs_in(mut self, ds: &str, graphs: Vec<String>) -> Principal {
-        if graphs.is_empty() {
-            return self;
-        }
-        let mut map = self.hidden_in.as_deref().cloned().unwrap_or_default();
-        map.entry(split_branch(ds).0.to_string())
-            .or_default()
-            .extend(graphs);
-        self.hidden_in = Some(Arc::new(map));
         self
     }
 
@@ -978,46 +950,26 @@ impl Principal {
     }
 
     /// The graphs of `ds` this principal reads and writes through endpoint `e`, when
-    /// its grants, or the graphs hidden from it, do not cover every graph (`None`
-    /// otherwise, and without auth when nothing is hidden).
+    /// its grants do not cover every graph (`None` otherwise, and always without auth).
     pub fn view(&self, ds: &str, e: Endpoint) -> Option<Arc<sparkles::access::GraphAccess>> {
-        let view = self.grant_view(ds, e);
-        let hidden_in = self.hidden_in(ds);
-        if self.hidden.is_none() && hidden_in.is_empty() {
+        let qualified = self.qualified(ds);
+        let view = if self.is_local() {
+            None
+        } else {
+            self.access.view(&qualified, e, self.caller())
+        };
+        // reports graphs are readable only when the guard proves the view covers what
+        // their builds read; an unrestricted view has nothing to prove
+        let view = view.map(|v| crate::graphrag::guard::apply(v, self.guard.as_ref()));
+        let Some(hidden) = &self.hidden else {
             return view.map(Arc::new);
-        }
+        };
         let mut v = view.unwrap_or_else(sparkles::access::GraphAccess::all);
-        for p in self.hidden_patterns() {
+        for p in hidden.iter() {
             v.read = v.read.without_pattern(p);
             v.write = v.write.without_pattern(p);
         }
-        for g in hidden_in {
-            v.read = v.read.without_iri(g);
-            v.write = v.write.without_iri(g);
-        }
         Some(Arc::new(v))
-    }
-
-    /// The view of `ds` through endpoint `e` that this principal's grants alone give it,
-    /// with the guard of reports graphs applied: `None` when they cover every graph, and
-    /// always for the local principal. The graphs hidden from it are not considered.
-    fn grant_view(&self, ds: &str, e: Endpoint) -> Option<sparkles::access::GraphAccess> {
-        if self.is_local() {
-            return None;
-        }
-        let qualified = self.qualified(ds);
-        let view = self.access.view(&qualified, e, self.caller());
-        // reports graphs are readable only when the guard proves the view covers what
-        // their builds read; an unrestricted view has nothing to prove
-        view.map(|v| crate::graphrag::guard::apply(v, self.guard.as_ref()))
-    }
-
-    /// The graph IRIs hidden from this principal in dataset `ds`, on any branch.
-    fn hidden_in(&self, ds: &str) -> &[String] {
-        self.hidden_in
-            .as_ref()
-            .and_then(|m| m.get(split_branch(ds).0))
-            .map_or(&[], Vec::as_slice)
     }
 
     /// What a protection's pattern may know of this caller: its name (the owner's for
@@ -1050,23 +1002,12 @@ impl Principal {
         }
     }
 
-    /// Whether this principal's grants show it only some graphs of `ds` at some
-    /// endpoint. Operations that act on a whole dataset, such as branches, merges and
-    /// source holds, need grants that are not restricted. The control graphs a dataset
-    /// hides from every caller (spec C26 §2.3) do not restrict a grant; see
-    /// [`partial_view`](Self::partial_view) for what they change.
+    /// Whether some endpoint of `ds` shows this principal only some of its graphs.
     pub fn restricted(&self, ds: &str) -> bool {
         !self.is_local()
             && Endpoint::ALL
                 .into_iter()
-                .any(|e| self.grant_view(ds, e).is_some())
-    }
-
-    /// Whether this principal reads only some graphs of `ds`, through its grants or
-    /// through the graphs hidden from it, so that a figure that counts every graph, such
-    /// as the quads a commit inserted, must be left out of what it is shown.
-    pub fn partial_view(&self, ds: &str) -> bool {
-        self.restricted(ds) || self.hidden.is_some() || !self.hidden_in(ds).is_empty()
+                .any(|e| self.view(ds, e).is_some())
     }
 
     /// How this principal's grants limit `ds`, for `whoami`: whether some endpoint sees
@@ -1252,79 +1193,6 @@ mod tests {
         assert!(p.can("x", Level::Admin));
         assert_eq!(p.access("x"), None);
         assert_eq!(p.log_name(), None);
-    }
-
-    #[test]
-    fn hidden_control_graphs_do_not_restrict_a_grant() {
-        let ledger = "urn:x-sparkles:jobs:ledger".to_string();
-        let ledger_term = oxrdf::Term::NamedNode(oxrdf::NamedNode::new(&ledger).unwrap());
-        let p = Principal::new(
-            Kind::User,
-            "ops",
-            Scheme::None,
-            Access::of(Grants {
-                datasets: vec![("d".into(), Level::Admin)],
-                ..Default::default()
-            }),
-        );
-        assert!(!p.restricted("d"));
-        assert!(!p.partial_view("d"));
-        assert!(p.view("d", Endpoint::Query).is_none());
-        assert!(p.admin_everywhere("d"));
-        // the middleware hides a dataset's control graphs for one request
-        let hidden = p.clone().hiding_graphs(std::slice::from_ref(&ledger));
-        assert!(
-            !hidden.restricted("d"),
-            "a hidden control graph is not a grant restriction"
-        );
-        assert!(hidden.partial_view("d"), "but the reads leave a graph out");
-        assert!(
-            hidden.admin_everywhere("d"),
-            "whole-dataset operations stay allowed"
-        );
-        let v = hidden.view("d", Endpoint::Query).unwrap();
-        assert!(!v.read.allows(Some(&ledger_term)));
-        assert!(v.read.allows(Some(&oxrdf::Term::NamedNode(
-            oxrdf::NamedNode::new("urn:g").unwrap()
-        ))));
-        // a call without a dataset in its path hides them per dataset
-        let in_d = p.clone().hiding_graphs_in("d", vec![ledger.clone()]);
-        assert!(!in_d.restricted("d"));
-        assert!(in_d.partial_view("d"));
-        assert!(!in_d.partial_view("e"));
-        assert!(
-            !in_d
-                .view("d", Endpoint::Query)
-                .unwrap()
-                .read
-                .allows(Some(&ledger_term))
-        );
-        assert!(
-            !in_d
-                .view("d@work", Endpoint::Query)
-                .unwrap()
-                .read
-                .allows(Some(&ledger_term))
-        );
-        assert!(in_d.view("e", Endpoint::Query).is_none());
-        assert_eq!(
-            p.hiding_graphs_in("d", Vec::new())
-                .view("d", Endpoint::Query),
-            None
-        );
-        // the local principal too
-        let local = Principal::local().hiding_graphs_in("d", vec![ledger.clone()]);
-        assert!(!local.restricted("d"));
-        assert!(local.partial_view("d"));
-        assert!(local.admin_everywhere("d"));
-        assert!(
-            !local
-                .view("d", Endpoint::Info)
-                .unwrap()
-                .read
-                .allows(Some(&ledger_term))
-        );
-        assert!(local.view("e", Endpoint::Info).is_none());
     }
 }
 

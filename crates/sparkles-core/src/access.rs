@@ -447,25 +447,6 @@ impl GraphAccess {
         }
     }
 
-    /// `view` without the named graphs `hidden` lists, in its reads and its writes: a
-    /// dataset's hidden control graphs (spec C26 §2.3), which only their owner's typed
-    /// inspection renders. `None` stays `None` while nothing is hidden, so the common
-    /// case costs nothing.
-    pub fn hiding_graphs(
-        view: Option<Arc<GraphAccess>>,
-        hidden: &[String],
-    ) -> Option<Arc<GraphAccess>> {
-        if hidden.is_empty() {
-            return view;
-        }
-        let mut v = view.map(|g| (*g).clone()).unwrap_or_else(GraphAccess::all);
-        for h in hidden {
-            v.read = v.read.without_iri(h);
-            v.write = v.write.without_iri(h);
-        }
-        Some(Arc::new(v))
-    }
-
     /// This view with its undecided guards decided against `snap`, the snapshot the
     /// request reads (spec C22 §6.3). A view without undecided guards is returned as it
     /// is.

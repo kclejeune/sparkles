@@ -327,16 +327,13 @@ fn capabilities_admit_only_their_owner_and_registry() {
             .is_err()
     );
     drop(t);
-    // a hidden owner's graphs leave every caller's read view, and a public one's do not
+    // reserved entry members are refused
     let mut hidden = entry(&[M], SETTINGS);
     hidden.visibility = crate::managed::Visibility::Hidden;
-    s.enable_managed(OwnerKind::Evidence, hidden, SETTINGS)
-        .unwrap();
-    assert_eq!(s.hidden_graphs(), vec![M.to_string()]);
-    s.enable_managed(OwnerKind::Evidence, entry(&[M], SETTINGS), SETTINGS)
-        .unwrap();
-    assert!(s.hidden_graphs().is_empty());
-    // the reserved merge policy is refused
+    assert_eq!(
+        managed_code(s.enable_managed(OwnerKind::Evidence, hidden, SETTINGS)),
+        "unsupported-profile"
+    );
     let mut exclude = entry(&[M], SETTINGS);
     exclude.merge = crate::managed::MergePolicy::Exclude;
     assert_eq!(

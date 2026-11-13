@@ -52,9 +52,14 @@ pub const HEADER_READER: u32 = 5;
 /// Constant-size transaction state for forward, reverse and cold-prefix readers.
 /// Structural refusal is evaluated only after the transaction checksum succeeds,
 /// preserving existing torn-tail treatment for an uncommitted damaged suffix.
+///
+/// It also checks the placement of control records (spec C26 §7): they follow the
+/// quads, precede the configuration record, appear only in a log of version 3, and the
+/// commit's control flag is set exactly when they are present.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ConfigurationRecords {
     digest: Option<[u8; 32]>,
+    control: bool,
     invalid: bool,
 }
 
@@ -67,8 +72,14 @@ impl ConfigurationRecords {
                 }
                 self.digest = Some(record[1..WAL_REC].try_into().expect("whole WAL record"));
             }
-            WAL_INSERT | WAL_DELETE => {
+            WAL_CONTROL => {
                 if self.digest.is_some() {
+                    self.invalid = true;
+                }
+                self.control = true;
+            }
+            WAL_INSERT | WAL_DELETE => {
+                if self.digest.is_some() || self.control {
                     self.invalid = true;
                 }
             }
@@ -83,16 +94,22 @@ impl ConfigurationRecords {
     ) -> Result<Option<crate::evidence::Sha256Digest>> {
         crate::formats::WAL.check("configuration transaction", version, None)?;
         let required = flags & commit::WAL_FLAG_CONFIGURATION != 0;
-        let allowed = commit::WAL_FLAG_UNVALIDATED
+        let control = flags & commit::WAL_FLAG_CONTROL != 0;
+        let mut allowed = commit::WAL_FLAG_UNVALIDATED
             | commit::WAL_FLAG_ANNOTATED
             | commit::WAL_FLAG_CONFIGURATION;
+        if version >= crate::formats::WAL_CONTROL_VERSION {
+            allowed |= commit::WAL_FLAG_CONTROL;
+        }
         if self.invalid
             || required != self.digest.is_some()
+            || control != self.control
             || (version < 2 && (required || self.digest.is_some()))
+            || (version < crate::formats::WAL_CONTROL_VERSION && (control || self.control))
             || (version >= 2 && flags & !allowed != 0)
         {
             return Err(Error::Corrupt(
-                "invalid sealed WAL configuration binding".into(),
+                "invalid sealed WAL configuration or control binding".into(),
             ));
         }
         Ok(self
@@ -182,8 +199,24 @@ pub(crate) fn encode_txn(
     next_bnode: u64,
     seal: Seal,
 ) -> Result<Vec<u8>> {
+    encode_txn_with_control(ops, &[], configuration, next_bnode, seal)
+}
+
+/// [`encode_txn`] with the encoded control `frame` of the transaction, when it is not
+/// empty, in `WAL_CONTROL` records after the quads and before the configuration record,
+/// sealed with [`commit::WAL_FLAG_CONTROL`] (spec C26 §7). Only the serial writer of a
+/// store with a control keyspace passes a frame, into a log of version 3.
+pub(crate) fn encode_txn_with_control(
+    ops: &[(u8, [Id; 4])],
+    frame: &[u8],
+    configuration: crate::history::ConfigurationBinding,
+    next_bnode: u64,
+    seal: Seal,
+) -> Result<Vec<u8>> {
+    let control_records = frame.len().div_ceil(crate::control::CHUNK);
     let mut data = Vec::with_capacity(
-        (ops.len() + 1 + usize::from(configuration.configuration().is_some())) * WAL_REC,
+        (ops.len() + control_records + 1 + usize::from(configuration.configuration().is_some()))
+            * WAL_REC,
     );
     let mut rec = [0u8; WAL_REC];
     for (op, q) in ops {
@@ -193,7 +226,16 @@ pub(crate) fn encode_txn(
         }
         data.extend_from_slice(&rec);
     }
-    let configuration_flags = append_configuration(&mut data, configuration)?;
+    let mut control_flags = 0;
+    if !frame.is_empty() {
+        for chunk in crate::control::chunks(frame) {
+            rec[0] = WAL_CONTROL;
+            rec[1..].copy_from_slice(&chunk);
+            data.extend_from_slice(&rec);
+        }
+        control_flags = commit::WAL_FLAG_CONTROL;
+    }
+    let configuration_flags = append_configuration(&mut data, configuration)? | control_flags;
     rec[0] = WAL_COMMIT;
     rec[1..9].copy_from_slice(&next_bnode.to_le_bytes());
     commit::seal_wal_commit_unfenced(
@@ -242,8 +284,17 @@ pub(crate) const PLAIN_VERSION: u32 = 1;
 /// The version of a new log in a store whose configuration history is
 /// `activated`. Only activated stores write version 2, whose sealed
 /// configuration records need the dataset reader that activation records.
+/// A store with a control keyspace writes version 3 instead (see [`version_with`]).
 pub(crate) fn version_for(activated: bool) -> u32 {
-    if activated {
+    version_with(activated, false)
+}
+
+/// The version of a new log: 3 for a store with a control keyspace, activated or not,
+/// 2 for an activated store without one and 1 for a plain store (spec C26 §7).
+pub(crate) fn version_with(activated: bool, control: bool) -> u32 {
+    if control {
+        crate::formats::WAL_CONTROL_VERSION
+    } else if activated {
         crate::formats::WAL_VERSION
     } else {
         PLAIN_VERSION
@@ -908,7 +959,7 @@ impl WalCursor {
             }
             offset += WAL_REC as u64;
             match rec[0] {
-                WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION => {
+                WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION | WAL_CONTROL => {
                     if let Some((limit, held)) = limited
                         && self.txn.len() + WAL_REC > self.txn.capacity()
                     {
@@ -933,11 +984,15 @@ impl WalCursor {
                 WAL_COMMIT => break,
                 // the header record where the log starts
                 WAL_HEADER if offset == WAL_REC as u64 => {
-                    if header_version(&rec, &self.path)? != self.version {
+                    // enablement of the control keyspace may upgrade the header in place
+                    // to version 3, a superset of the version the cursor opened with
+                    let found = header_version(&rec, &self.path)?;
+                    if found != self.version && found != crate::formats::WAL_CONTROL_VERSION {
                         return Err(Error::Corrupt(
                             "WAL header changed during cursor read".into(),
                         ));
                     }
+                    self.version = found;
                 }
                 // the log's end: its preallocated space, or a torn last transaction
                 _ if is_zero_record(&rec) => return Ok(None),
@@ -966,6 +1021,21 @@ impl WalCursor {
         let seq = match metadata {
             Some(Ok((seq, _, _, flags))) => {
                 self.configuration = configuration_records(&self.txn, self.version, flags)?;
+                if flags & commit::WAL_FLAG_CONTROL != 0 {
+                    // The control frame was sealed with the quads and checked above. The
+                    // cursor's readers decode quads, so it hands them the transaction
+                    // without its control records (spec C26 §2.3).
+                    let n = self.txn.len() / WAL_REC;
+                    let mut kept = 0;
+                    for r in 0..n {
+                        if self.txn[r * WAL_REC] != WAL_CONTROL {
+                            self.txn
+                                .copy_within(r * WAL_REC..(r + 1) * WAL_REC, kept * WAL_REC);
+                            kept += 1;
+                        }
+                    }
+                    self.txn.truncate(kept * WAL_REC);
+                }
                 if seq != prev + 1 {
                     return Err(Error::Corrupt(format!(
                         "{}: commit {seq} follows commit {prev}",
@@ -1057,7 +1127,7 @@ pub(crate) fn apply_forward(
             )));
         };
         for rec in txn.as_chunks::<WAL_REC>().0 {
-            if rec[0] == WAL_CONFIGURATION {
+            if !wal_is_quad(rec[0]) {
                 continue;
             }
             let q = record_quad(rec);
@@ -1116,7 +1186,7 @@ pub(crate) fn apply_forward_limited(
             )));
         };
         for record in txn.as_chunks::<WAL_REC>().0 {
-            if record[0] == WAL_CONFIGURATION {
+            if !wal_is_quad(record[0]) {
                 continue;
             }
             // Each changed quad can add one key to every permutation. Check before
@@ -1204,7 +1274,7 @@ pub(crate) fn apply_backward(
             }
         }
         for r in data {
-            if r[0] == WAL_CONFIGURATION {
+            if !wal_is_quad(r[0]) {
                 continue;
             }
             let q = record_quad(r);
@@ -1236,7 +1306,9 @@ pub(crate) fn apply_backward(
                     }
                     commit = Some(*rec);
                 }
-                WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION if commit.is_some() => data.push(*rec),
+                WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION | WAL_CONTROL if commit.is_some() => {
+                    data.push(*rec)
+                }
                 op => {
                     return Err(corrupt(format!(
                         "unexpected record type {op} before byte {end}"
@@ -1341,7 +1413,7 @@ pub(crate) fn apply_backward_limited(
             }
         }
         for r in data {
-            if r[0] == WAL_CONFIGURATION {
+            if !wal_is_quad(r[0]) {
                 continue;
             }
             limit.check(
@@ -1416,7 +1488,7 @@ pub(crate) fn apply_backward_limited(
                     }
                     commit = Some(*rec);
                 }
-                WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION if commit.is_some() => {
+                WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION | WAL_CONTROL if commit.is_some() => {
                     if data.len() == data.capacity() {
                         let next = data.capacity().saturating_mul(2).max(1);
                         limit.check(

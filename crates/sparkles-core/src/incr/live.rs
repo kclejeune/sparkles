@@ -244,13 +244,8 @@ impl Shared {
             q.closed = true;
         }
         drop(q);
-        if end {
-            // the stream ends: every waiter sees the error or the closed stream
-            self.wake_all();
-        } else {
-            self.cv.notify_all();
-            self.notify.notify_one();
-        }
+        self.cv.notify_all();
+        self.notify.notify_one();
     }
 
     pub(crate) fn close(&self) {

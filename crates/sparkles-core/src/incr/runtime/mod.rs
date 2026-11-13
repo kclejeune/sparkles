@@ -240,7 +240,6 @@ impl Runtime {
     /// next round.
     pub fn set_host(&self, host: Arc<dyn Host>) {
         let _operation = Operation::enter();
-        self.host_epoch.store(host.epoch(), Ordering::Release);
         *self.host.write() = Some(host);
         self.kick();
     }

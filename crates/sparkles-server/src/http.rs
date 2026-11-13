@@ -664,19 +664,12 @@ impl ApiError {
             Some(o) => (o.remove("_validationHeader"), o.remove("_turtle")),
             None => (None, None),
         };
-        let gone = self.0 == StatusCode::GONE
-            && body.get("code").and_then(J::as_str) == Some("history-gone");
         let mut resp = RequestReport {
             outcome,
             budget,
             ..Default::default()
         }
         .attach((self.0, Json(body.clone())).into_response());
-        // the authorization layer redacts its commit counts for a partial view
-        if gone {
-            resp.extensions_mut()
-                .insert(history::GoneBody(body.clone()));
-        }
         if let Some(h) = vheader.as_ref().and_then(J::as_str)
             && let Ok(v) = header::HeaderValue::from_str(h)
         {
@@ -2750,7 +2743,7 @@ async fn list_commits(
     } else {
         next
     };
-    if p.partial_view(&ds.name) {
+    if p.restricted(&ds.name) {
         commits.iter_mut().for_each(redact_commit_json);
     }
     Ok(Json(json!({
@@ -2800,7 +2793,7 @@ async fn get_commit(
         Err(e) => return Err(e.into()),
     };
     let mut commit = json!(detail);
-    if p.partial_view(&ds.name) {
+    if p.restricted(&ds.name) {
         redact_commit_json(&mut commit);
     }
     Ok(Json(json!({
@@ -2855,13 +2848,7 @@ async fn update_endpoint(
         ..Default::default()
     };
     budgets::Overrides::parse(&params)?.apply(&mut opts);
-    crate::auth::restrict(
-        &mut opts,
-        &p,
-        &ds.name,
-        crate::auth::Endpoint::Update,
-        &ds.store.hidden_graphs(),
-    );
+    crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Update);
     // a SERVICE call to this server in the update's WHERE runs in process, as this caller
     self_service::install(&st, &mut opts, &p);
     opts.write = validation::write_options(&st, &params, &headers, opts.timeout)?;
@@ -4223,13 +4210,8 @@ fn dataset_info_for(st: &AppState, d: &Dataset, p: &Principal) -> J {
     if let Some(a) = p.access(&d.name) {
         info["access"] = a.as_str().into();
     }
-    // the caller's view, and the dataset's hidden control graphs (spec C26 §2.3), which
-    // a listing without the dataset in its path does not get from the middleware
-    let view = d
-        .dataset
-        .hide_owner_graphs(p.view(&d.name, crate::auth::Endpoint::Info));
-    if let Some(v) = view {
-        redact_dataset_info(&mut info, p.restricted(&d.name));
+    if let Some(v) = p.view(&d.name, crate::auth::Endpoint::Info) {
+        redact_dataset_info(&mut info);
         // the quads the caller can read, its guarded graphs decided at the snapshot
         let snap = d.store.snapshot();
         let v = v.bound(&snap);
@@ -4241,10 +4223,9 @@ fn dataset_info_for(st: &AppState, d: &Dataset, p: &Principal) -> J {
 }
 
 /// Leave out of a `DatasetInfo` the figures that count every graph (quads, index
-/// entries, inferences), for a caller who reads only some graphs, through its grants or
-/// because the dataset hides a control graph; `graphs: "limited"` says so when `limited`,
-/// that is when the grants are the reason. The caller fills in the quads it can read.
-pub(crate) fn redact_dataset_info(info: &mut J, limited: bool) {
+/// entries, inferences), for a caller whose grants cover only some graphs; `graphs:
+/// "limited"` says so. The caller fills in the quads it can read.
+pub(crate) fn redact_dataset_info(info: &mut J) {
     if let Some(m) = info.as_object_mut() {
         m.remove("quads");
         for k in ["text", "geo", "reasoning"] {
@@ -4257,9 +4238,7 @@ pub(crate) fn redact_dataset_info(info: &mut J, limited: bool) {
                 });
             }
         }
-        if limited {
-            m.insert("graphs".into(), "limited".into());
-        }
+        m.insert("graphs".into(), "limited".into());
     }
 }
 
@@ -5708,21 +5687,8 @@ fn task_visible(st: &AppState, p: &Principal, t: &crate::state::Task) -> bool {
 /// A task as `p` sees it: without `server-admin`, absolute paths in its message and in
 /// the strings of its `detail` are cut to their last component (`backup written to
 /// …/wiki_2026-01-01.nq.zst`).
-fn task_for(st: &AppState, p: &Principal, t: &crate::state::Task) -> crate::state::Task {
+fn task_for(p: &Principal, t: &crate::state::Task) -> crate::state::Task {
     let mut t = t.clone();
-    // the commit of a merge's result carries figures that count every graph: left out
-    // for a reader who sees only some graphs and on a dataset that hides graphs, as the
-    // reader and the dataset are now, whenever the task ran (spec C26 §2.3)
-    if matches!(t.kind.as_str(), "merge" | "revert" | "cherry-pick")
-        && let Some(commit) = t.detail.as_mut().and_then(|d| d.get_mut("commit"))
-        && commit.is_object()
-        && (p.partial_view(&t.dataset)
-            || st
-                .get(&t.dataset)
-                .is_none_or(|d| !d.store.hidden_graphs().is_empty()))
-    {
-        redact_commit_json(commit);
-    }
     if !p.has(crate::auth::ServerPerm::ServerAdmin) {
         if let Some(m) = &t.message {
             t.message = Some(redact_paths(m));
@@ -5784,7 +5750,7 @@ async fn list_tasks(State(st): St, Extension(p): Extension<Principal>) -> Json<J
         .lock()
         .iter()
         .filter(|t| task_visible(&st, &p, t))
-        .map(|t| task_for(&st, &p, t))
+        .map(|t| task_for(&p, t))
         .collect();
     Json(serde_json::to_value(tasks).unwrap())
 }
@@ -5798,7 +5764,7 @@ async fn get_task(
         .lock()
         .iter()
         .find(|t| t.id == id && task_visible(&st, &p, t))
-        .map(|t| Json(serde_json::to_value(task_for(&st, &p, t)).unwrap()))
+        .map(|t| Json(serde_json::to_value(task_for(&p, t)).unwrap()))
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such task"))
 }
 
@@ -5841,7 +5807,7 @@ async fn cancel_task(
         return Ok(crate::auth::forbidden(&p, &msg));
     }
     match st.cancel_task(&id) {
-        Some(Ok(t)) => Ok((StatusCode::ACCEPTED, Json(task_for(&st, &p, &t))).into_response()),
+        Some(Ok(t)) => Ok((StatusCode::ACCEPTED, Json(task_for(&p, &t))).into_response()),
         Some(Err(t)) => {
             let why = if t.active() {
                 "does not accept cancellation"
@@ -5932,17 +5898,6 @@ async fn shacl(
                 ));
             }
             match ds.validation.read().clone() {
-                Some(crate::write_validation::Validation::Shacl(g))
-                    if crate::validation_common::source_hidden(
-                        g.config().shapes.graphs.as_ref(),
-                        &ds.dataset.store().hidden_graphs(),
-                    ) =>
-                {
-                    return Err(err(
-                        StatusCode::NOT_FOUND,
-                        format!("/{} has no write-time validation", ds.name),
-                    ));
-                }
                 Some(crate::write_validation::Validation::Shacl(g)) => Some(g),
                 #[cfg(feature = "shex")]
                 Some(crate::write_validation::Validation::Shex(_)) => {
@@ -6035,21 +5990,8 @@ async fn shacl(
         let inferred = has_inferred.then_some(INFERRED_GRAPH);
         // the shapes, and the data graph they are validated on
         let (shapes, mut opts) = if let Some(g) = &guard_shapes {
-            // the guard's shapes as they are now, on its data graph at the state read,
-            // without the dataset's hidden control graphs (spec C26 §2.3), and a hidden
-            // data graph is one that does not exist
-            let hidden = ds.dataset.store().hidden_graphs();
-            // the hidden graphs are applied below, so that a hidden data graph answers
-            // as one that does not exist
-            let Some(o) = g.data_graph_options(&snap, &[]).and_then(|mut o| {
-                crate::validation_common::hide_graphs(
-                    &mut o.data_graph,
-                    &mut o.extra_graphs,
-                    &mut o.exclude_graphs,
-                    &hidden,
-                )
-                .then_some(o)
-            }) else {
+            // the guard's shapes as they are now, on its data graph at the state read
+            let Some(o) = g.data_graph_options(&snap) else {
                 // none of the guard's data graphs exists: nothing to validate
                 let empty = sparkles_shacl::ValidationReport {
                     conforms: true,
@@ -6064,7 +6006,7 @@ async fn shacl(
         } else {
             let shapes = match &shapes_graph {
                 Some(iri) => {
-                    if !crate::validation_common::graph_visible(&ds.dataset, &snap, iri) {
+                    if !crate::validation_common::graph_exists(&snap, iri) {
                         return Err(err(
                             StatusCode::NOT_FOUND,
                             format!("no such shapes graph: <{iri}>"),
@@ -6091,7 +6033,7 @@ async fn shacl(
                 }
             };
             if let GraphParam::Named(iri) = &graph
-                && !crate::validation_common::graph_visible(&ds.dataset, &snap, iri)
+                && !crate::validation_common::graph_exists(&snap, iri)
             {
                 return Err(err(
                     StatusCode::NOT_FOUND,
@@ -6099,13 +6041,10 @@ async fn shacl(
                 ));
             }
             let mut opts = crate::shacl::validate_options(&snap, &graph, inferred, use_inferred)?;
-            // a shapes graph of the dataset is not part of the data it validates, and
-            // the dataset's hidden control graphs never are (spec C26 §2.3)
+            // a shapes graph of the dataset is not part of the data it validates
             if let Some(iri) = &shapes_graph {
                 opts.exclude_graphs.push(iri.clone());
             }
-            opts.exclude_graphs
-                .extend(ds.dataset.store().hidden_graphs());
             (std::sync::Arc::new(shapes), opts)
         };
         opts.timeout = Some(timeout);

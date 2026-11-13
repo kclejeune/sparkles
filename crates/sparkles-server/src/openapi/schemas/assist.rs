@@ -38,6 +38,7 @@ pub(super) fn jobs(put: &mut dyn FnMut(&str, J)) {
                     "profile": { "const": 1 },
                     "enabled": boolean(),
                     "maxQueued": with_desc(int(), "The most runs waiting in `queued` or `retry-wait` at once. Default 1024."),
+                    "maxControlBytes": with_desc(int(), "The size of the dataset's control state past which a submission is refused with `jobs-overloaded`. It bounds admission only. Default 256 MiB."),
                     "definitions": {
                         "type": "object",
                         "maxProperties": 256,
@@ -71,16 +72,16 @@ pub(super) fn jobs(put: &mut dyn FnMut(&str, J)) {
         "JobsSettingsStatus",
         doc(
             closed(
-                &["settings", "revision", "protected", "revisions"],
+                &["settings", "revision", "control", "revisions"],
                 json!({
                     "settings": sref("JobsSettings"),
                     "digest": or_null(with_desc(string(), "The SHA-256 digest of the recorded `jobs.json`, or null before the first configuration.")),
                     "revision": with_desc(int(), "The revision of the dataset's managed-graph registry."),
-                    "protected": with_desc(boolean(), "Whether the ledger graph is protected from ordinary writes."),
+                    "control": with_desc(boolean(), "Whether the dataset's control keyspace, which holds the job ledger outside the RDF dataset, is enabled."),
                     "revisions": with_desc(json!({ "type": "object", "additionalProperties": string() }), "The revision digest of each definition."),
                 }),
             ),
-            "The settings and their protection.",
+            "The settings and the state of the ledger's control keyspace.",
             "durable-jobs",
         ),
     );
@@ -96,7 +97,7 @@ pub(super) fn jobs(put: &mut dyn FnMut(&str, J)) {
                     "idempotencyKey": with_desc(json!({ "type": "string", "maxLength": 256 }), "Scoped to the dataset, the branch, the caller and the definition revision."),
                     "checkpoint": with_desc(string(), "The source checkpoint the run starts from."),
                     "inputs": with_desc(array(closed(&["branchId", "seq"], json!({ "branchId": uuid("The branch by id."), "seq": int() }))), "Commits the run reads, pinned by a source hold until the run is terminal."),
-                    "message": with_desc(string(), "The commit message of the submission."),
+                    "message": with_desc(string(), "A message for the submission. A submission makes no commit, so it is not recorded."),
                 }),
             ),
             "A run to submit.",
@@ -111,7 +112,7 @@ pub(super) fn jobs(put: &mut dyn FnMut(&str, J)) {
                 json!({
                     "run": uuid("The run's id."),
                     "version": int(),
-                    "commit": with_desc(int(), "The commit that recorded the run, or the head when the key was replayed."),
+                    "commit": with_desc(int(), "The head of the dataset that the submission's ledger record follows. A submission makes no commit."),
                     "replayed": with_desc(boolean(), "Whether the key was known with the same payload."),
                     "state": state.clone(),
                 }),
@@ -159,6 +160,7 @@ pub(super) fn jobs(put: &mut dyn FnMut(&str, J)) {
                     "attempt",
                     "digest",
                     "commit",
+                    "committed",
                     "inserted",
                     "deleted",
                     "publishedMs",
@@ -167,7 +169,8 @@ pub(super) fn jobs(put: &mut dyn FnMut(&str, J)) {
                     "id": uuid("The publication operation id."),
                     "attempt": uuid("The attempt that published."),
                     "digest": with_desc(string(), "The digest of the published result."),
-                    "commit": with_desc(int(), "The commit that holds the quads, the record and the state."),
+                    "commit": with_desc(int(), "The commit that holds the quads, the record and the state, or the head the publication followed when it made no commit."),
+                    "committed": with_desc(boolean(), "Whether the publication made a commit. One whose result changed no quad makes none."),
                     "inserted": int(),
                     "deleted": int(),
                     "checkpoint": string(),
@@ -342,6 +345,7 @@ pub(super) fn jobs(put: &mut dyn FnMut(&str, J)) {
                     "run",
                     "publication",
                     "commit",
+                    "committed",
                     "version",
                     "inserted",
                     "deleted",
@@ -350,7 +354,8 @@ pub(super) fn jobs(put: &mut dyn FnMut(&str, J)) {
                 json!({
                     "run": uuid("The run's id."),
                     "publication": uuid("The publication operation id."),
-                    "commit": int(),
+                    "commit": with_desc(int(), "The commit the publication made, or the head it followed when its result changed no quad."),
+                    "committed": with_desc(boolean(), "Whether the publication made a commit."),
                     "version": int(),
                     "inserted": int(),
                     "deleted": int(),
@@ -389,6 +394,49 @@ pub(super) fn jobs(put: &mut dyn FnMut(&str, J)) {
                 }),
             ),
             "An explicit retry of a failed or cancelled run.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobRecover",
+        doc(
+            closed(
+                &[],
+                json!({
+                    "format": { "const": 1 },
+                    "resume": with_desc(array(uuid("A paused run of the restored set.")), "The paused runs to resume, at most 256. Empty reports the recovery."),
+                }),
+            ),
+            "A request of the recovery route.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobRecovery",
+        doc(
+            closed(
+                &["recovery", "resumed"],
+                json!({
+                    "recovery": or_null(closed(
+                        &["id", "sourceDataset", "captureCommit", "captureMs", "phase", "startedMs", "paused", "resumed", "cancelled", "ended"],
+                        json!({
+                            "id": uuid("The recovery's id."),
+                            "sourceDataset": uuid("The dataset the restored backup was taken of."),
+                            "captureCommit": with_desc(int(), "The commit the backup captured."),
+                            "captureLabel": string(),
+                            "captureMs": ms("When the backup was captured."),
+                            "phase": string_enum(&["pausing", "awaiting-decision"]),
+                            "startedMs": ms("When the recovery started."),
+                            "paused": with_desc(int(), "The restored runs still paused."),
+                            "resumed": with_desc(int(), "The runs resumed so far."),
+                            "cancelled": with_desc(int(), "The paused runs cancelled so far."),
+                            "ended": with_desc(boolean(), "Whether no paused run is left, which ends the recovery."),
+                        }),
+                    )),
+                    "resumed": with_desc(array(uuid("A resumed run.")), "The runs this request resumed."),
+                }),
+            ),
+            "The recovery of a restored dataset's jobs.",
             "durable-jobs",
         ),
     );

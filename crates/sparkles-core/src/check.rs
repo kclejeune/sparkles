@@ -32,7 +32,9 @@ use crate::index::{
     BLOCK_ROWS, BlockMeta, Key, META_BYTES, Perm, SEG_ENTRY, decode_column, decode_frame_into,
     read_varint_checked, supported_segment_rows,
 };
-use crate::store::{WAL_COMMIT, WAL_CONFIGURATION, WAL_DELETE, WAL_HEADER, WAL_INSERT, WAL_REC};
+use crate::store::{
+    WAL_COMMIT, WAL_CONFIGURATION, WAL_CONTROL, WAL_DELETE, WAL_HEADER, WAL_INSERT, WAL_REC,
+};
 use crate::vocab::{FC_BLOCK, parse_delta};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -392,6 +394,7 @@ pub fn check(root: &Path, opts: &CheckOptions) -> Result<CheckReport> {
         let text = crate::text::probe(root, c.full);
         let text_ms = t_text.elapsed().as_secs_f64() * 1000.0;
         c.wal_check(&dir, &gen_name);
+        c.control_keyspace();
         c.catalog(catalog);
         c.text(text);
         if let Some(t) = c.checks.iter_mut().find(|x| x.name == "text") {
@@ -514,11 +517,44 @@ mod text_probe_tests {
 }
 
 /// What the WAL holds, as replay would see it.
+impl Checker<'_> {
+    /// The control keyspace (spec C26 §7.2): the checkpoint, the control log and the
+    /// frames the write-ahead log's kept commits carry recover as an open would.
+    fn control_keyspace(&mut self) {
+        let t = Instant::now();
+        let mut run = Run::new("control");
+        let (frames, head) = match &self.wal {
+            Some(w) => (w.control.clone(), w.head),
+            None => (Vec::new(), self.base.map_or(0, |b| b.seq)),
+        };
+        let configured = self.root.join(crate::jobs::FILE).exists();
+        let summary =
+            match crate::store::control_store::recover_at_open(self.root, frames, head, configured)
+            {
+                Ok(None) => "no control keyspace".to_string(),
+                Ok(Some(opened)) => format!(
+                    "{} entries after control frame {}",
+                    opened.state.len(),
+                    opened.state.seq
+                ),
+                Err(e) => {
+                    run.add(Issue::error(e.to_string()));
+                    "the control keyspace does not recover".to_string()
+                }
+            };
+        let mut done = run.done(summary);
+        done.millis = t.elapsed().as_secs_f64() * 1000.0;
+        self.checks.push(done);
+    }
+}
+
 struct WalInfo {
     /// the last commit replay would keep
     head: u64,
     /// (seq, timestamp, kind code) of the commits replay would keep, in order
     commits: Vec<(u64, i64, u8)>,
+    /// the control frames of the commits replay would keep
+    control: Vec<crate::control::WalFrame>,
 }
 
 /// The vocabulary check, finished after the permutations report their id references.
@@ -1465,6 +1501,8 @@ impl Checker<'_> {
             .and_then(|id| crate::annotations::seqs_of(self.root, id));
         let (mut prev_seq, mut prev_ts) = (base_seq, base_ts);
         let mut commits: Vec<(u64, i64, u8)> = Vec::new();
+        let mut control: Vec<crate::control::WalFrame> = Vec::new();
+        let mut txn_control: Vec<u8> = Vec::new();
         let mut data_recs = 0usize;
         let mut txn_start = 0usize;
         let mut good = 0usize;
@@ -1515,6 +1553,7 @@ impl Checker<'_> {
                     }
                 }
                 WAL_CONFIGURATION => {}
+                WAL_CONTROL => txn_control.extend_from_slice(&rec[1..]),
                 WAL_COMMIT => {
                     let data = &buf[txn_start * WAL_REC..i * WAL_REC];
                     let n = i - txn_start;
@@ -1668,12 +1707,25 @@ impl Checker<'_> {
                             prev_seq = Some(seq);
                             prev_ts = prev_ts.max(ts);
                             commits.push((seq, ts, kind.code()));
+                            if !txn_control.is_empty() {
+                                match crate::control::Frame::from_chunks(&txn_control) {
+                                    Ok(frame) => control
+                                        .push(crate::control::WalFrame { commit: seq, frame }),
+                                    Err(e) => run.add(
+                                        Issue::error(format!("commit {seq}: {e}"))
+                                            .file(&file)
+                                            .offset(at)
+                                            .seq(seq),
+                                    ),
+                                }
+                            }
                         }
                         // a record without metadata ended the scan above
                         None => {}
                     }
                     good = (i + 1) * WAL_REC;
                     txn_start = i + 1;
+                    txn_control.clear();
                 }
                 op => {
                     if !torn_at(i, prev_seq) {
@@ -1754,7 +1806,11 @@ impl Checker<'_> {
         if self.full || data_recs > 0 {
             summary.push_str(&format!("; {ids_checked} ids checked"));
         }
-        self.wal = Some(WalInfo { head, commits });
+        self.wal = Some(WalInfo {
+            head,
+            commits,
+            control,
+        });
         self.checks.push(run.done(summary));
     }
 

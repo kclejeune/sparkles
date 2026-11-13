@@ -1391,7 +1391,10 @@ pub(crate) fn activate_copy(
             file.seek(SeekFrom::Start(0))?;
             file.write_all(&super::wal::configuration_header_record())?;
             file.sync_all()?;
-        } else if version != crate::formats::WAL_VERSION {
+        } else if version != crate::formats::WAL_VERSION
+            && version != crate::formats::WAL_CONTROL_VERSION
+        {
+            // version 3 already carries configuration records (spec C26 §7)
             return Err(unavailable("activation WAL version changed"));
         }
     }

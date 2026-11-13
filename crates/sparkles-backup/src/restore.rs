@@ -249,6 +249,8 @@ impl Repository {
                 .requires
                 .iter()
                 .any(|feature| feature == "evidence-configuration-history/1");
+            let control_required = m.requires.iter().any(|feature| feature == "control/1");
+            let (source, captured) = (m.dataset.id, m.commit.seq);
             blocking(move || {
                 // Refuse a newer dataset before reidentification or publication,
                 // including restores that request no integrity check.
@@ -258,6 +260,7 @@ impl Repository {
                     configuration_required,
                     &control,
                 )?;
+                sparkles_core::control::check_restored(&dir, control_required, source, captured)?;
                 if let Some(from) = forked_from {
                     if configuration_required {
                         // Imported prefix authority needs the versioned source

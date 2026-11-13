@@ -3,10 +3,11 @@
 //! idempotency key, `GET /$/jobs/{ds}` and `GET /$/jobs/{ds}/{id}` inspect visible runs,
 //! `POST /$/jobs/{ds}/claim` leases one eligible run to the calling worker, and the
 //! `renew`, `publish`, `fail`, `cancel` and `retry` routes under `/$/jobs/{ds}/{id}` move
-//! a run through its states.
+//! a run through its states. `POST /$/jobs/{ds}/recover` resumes selected work of a
+//! restored dataset that its jobs recovery paused (spec C26 §7.3).
 //!
-//! Authorization (the route table in `auth/routes.rs`): the settings need `admin` on
-//! `{ds}`, inspection needs `read`, and submission, claims and lease operations need
+//! Authorization (the route table in `auth/routes.rs`): the settings and the recovery
+//! route need `admin` on `{ds}`, inspection needs `read`, and submission, claims and lease operations need
 //! `write` through the update endpoint. The lease operations also need the bearer lease
 //! token in `Sparkles-Job-Lease`, which the claim returned once. Neither that header nor
 //! `Authorization` is written to a log, and no response echoes a token.
@@ -45,6 +46,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/$/jobs/{ds}/settings", get(get_settings).put(put_settings))
         .route("/$/jobs/{ds}", get(list).post(submit))
         .route("/$/jobs/{ds}/claim", post(claim))
+        .route("/$/jobs/{ds}/recover", post(recover))
         .route("/$/jobs/{ds}/{id}", get(get_run))
         .route("/$/jobs/{ds}/{id}/renew", post(renew))
         .route("/$/jobs/{ds}/{id}/publish", post(publish))
@@ -131,7 +133,7 @@ fn settings_json(status: sparkles::jobs::SettingsStatus) -> J {
         "settings": status.settings,
         "digest": status.digest,
         "revision": status.revision,
-        "protected": status.protected,
+        "control": status.control,
         "revisions": status.revisions,
     })
 }
@@ -486,6 +488,30 @@ async fn retry(
         Json(json!(s)),
     )
         .into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecoverRequest {
+    #[serde(default, rename = "format")]
+    _format: Option<u32>,
+    /// the paused runs of the restored set to resume
+    #[serde(default)]
+    resume: Vec<Uuid>,
+}
+
+async fn recover(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    AdminBody(bytes): AdminBody,
+) -> ApiResult<Json<J>> {
+    writable(&st)?;
+    let r: RecoverRequest = parse(&bytes, "recovery")?;
+    let ds = main_dataset(&st, &name)?;
+    let c = caller(&st, &name, &p);
+    let status = blocking(move || Ok(ds.dataset.jobs().resume(&r.resume, &c)?)).await?;
+    Ok(Json(json!(status)))
 }
 
 #[cfg(test)]

@@ -1,12 +1,13 @@
-//! Durable jobs (spec C26 Phase 1): a job ledger in a protected control graph of the
-//! dataset, fenced worker leases and atomic publication.
+//! Durable jobs (spec C26 Phase 1): a job ledger in the dataset's control keyspace,
+//! fenced worker leases and atomic publication.
 //!
 //! A run is submitted with an idempotency key, claimed by a worker that receives a
 //! bearer lease token, renewed, and published or failed under that token. Every
-//! transition is one ordinary commit of the dataset's main store under the jobs owner's
-//! managed-write capability, so a ledger record is durable exactly when its commit is,
-//! and a publication's business quads, publication record, checkpoint and completion
-//! state commit together or not at all (C26 §7.1).
+//! transition is one write transaction of the dataset's main store under the jobs
+//! owner's control capability. A transition that changes no quad is one frame of the
+//! store's control log and not a commit, and a publication's business quads,
+//! publication record, checkpoint and completion state are one commit whose log record
+//! carries the ledger records, so they are durable together or not at all (C26 §7.1).
 //!
 //! ```no_run
 //! use sparkles::Dataset;
@@ -25,7 +26,7 @@
 //! # Ok::<_, sparkles::Error>(())
 //! ```
 //!
-//! The ledger graph is write-protected and hidden: it leaves every caller's read view,
+//! The ledger holds no quad, so no query, graph listing, history or count can read it,
 //! and only the typed inspection of this module renders it. It stores no secrets: a
 //! lease token is never written, only its SHA-256 verifier, and failure diagnostics are
 //! bounded and redacted by the worker before they are recorded.
@@ -33,13 +34,14 @@
 mod ledger;
 mod ops;
 
-pub use ledger::{AttemptView, PublicationView, RunView, State};
+pub use ledger::{AttemptView, PublicationView, RecoveryPhase, RunView, State};
 pub use ops::{
-    Claimed, Failure, ListFilter, Publication, Published, Recovered, Renewed, Submission, Submitted,
+    Claimed, Failure, ListFilter, Publication, Published, Recovered, RecoveryStatus, RecoveryView,
+    Renewed, Submission, Submitted,
 };
 pub use sparkles_core::jobs::{
-    Definition, KIND_QUADS, LEDGER_GRAPH, MAX_IDEMPOTENCY_KEY_BYTES, NAMESPACE, PROFILE, READER,
-    Settings, canonical_json, operation_id,
+    Definition, KIND_QUADS, MAX_IDEMPOTENCY_KEY_BYTES, NAMESPACE, PROFILE, READER, Settings,
+    canonical_json, operation_id,
 };
 
 use crate::managed::{ManagedError, ManagedErrorKind, OwnerEntry, OwnerKind};
@@ -263,8 +265,8 @@ pub struct SettingsStatus {
     pub digest: Option<String>,
     /// The revision of the dataset's managed-graph registry, 0 when it has none.
     pub revision: u64,
-    /// Whether the ledger graph is protected.
-    pub protected: bool,
+    /// Whether the dataset's control keyspace, which holds the ledger, is enabled.
+    pub control: bool,
     /// The revision of each enabled definition.
     pub revisions: std::collections::BTreeMap<String, String>,
 }
@@ -290,6 +292,7 @@ pub(crate) fn recorded(bytes: &[u8]) -> Result<Settings> {
 fn status_from(
     graphs: Option<&crate::managed::ManagedGraphs>,
     bytes: Option<&[u8]>,
+    control: bool,
 ) -> Result<SettingsStatus> {
     let revision = graphs.map_or(0, |g| g.revision);
     let Some(bytes) = bytes else {
@@ -297,14 +300,11 @@ fn status_from(
             settings: Settings::default(),
             digest: None,
             revision,
-            protected: false,
+            control,
             revisions: Default::default(),
         });
     };
     let settings = recorded(bytes)?;
-    let protected = graphs
-        .and_then(|g| g.owners.get(&OwnerKind::Jobs))
-        .is_some_and(|e| e.graphs.iter().any(|g| g == LEDGER_GRAPH));
     let revisions = settings
         .definitions
         .iter()
@@ -314,7 +314,7 @@ fn status_from(
         settings,
         digest: Some(crate::managed::settings_digest(bytes)),
         revision,
-        protected,
+        control,
         revisions,
     })
 }
@@ -339,21 +339,25 @@ impl Jobs {
         let bytes = snapshot
             .as_ref()
             .and_then(|s| s.settings.get(&OwnerKind::Jobs).cloned());
-        status_from(snapshot.as_ref().map(|s| &s.graphs), bytes.as_deref())
+        let control = self.ds.store().control_enabled();
+        status_from(
+            snapshot.as_ref().map(|s| &s.graphs),
+            bytes.as_deref(),
+            control,
+        )
     }
 
-    /// Record `settings` as the dataset's jobs settings and protect the ledger graph.
-    /// The first configuration raises the dataset reader to 9 durably, before
+    /// Record `settings` as the dataset's jobs settings. The first configuration raises
+    /// the dataset reader to 9 durably and enables the control keyspace, before
     /// `jobs.json` and then `managed.json` are written. Disabling the settings while
     /// runs are not terminal is refused, and a disabled configuration of a dataset that
     /// was never configured writes nothing unless it differs from the defaults, which
     /// is refused. A configuration that races with another change of the registry is
     /// refused with a conflict.
     ///
-    /// Once configured, the ledger graph stays protected and hidden under its nonce
-    /// while jobs are disabled, so a submission that commits between the check of active
-    /// runs and the disabling registry change leaves a queued run that no ordinary write
-    /// can touch, that no claim takes while jobs are disabled, and that is dispatched
+    /// The control keyspace stays while jobs are disabled, so a submission that commits
+    /// between the check of active runs and the disabling registry change leaves a
+    /// queued run that no claim takes while jobs are disabled and that is dispatched
     /// again once they are enabled.
     ///
     /// Editing a definition changes its revision. An accepted run keeps the revision it
@@ -379,7 +383,11 @@ impl Jobs {
             if let Some(reason) = snapshot.as_ref().and_then(|s| s.unavailable.as_ref()) {
                 return Err(unavailable(reason.clone()));
             }
-            return status_from(snapshot.as_ref().map(|s| &s.graphs), None);
+            return status_from(
+                snapshot.as_ref().map(|s| &s.graphs),
+                None,
+                store.control_enabled(),
+            );
         }
         if current.is_some() && !settings.enabled {
             if self.has_active_runs()? {
@@ -389,25 +397,14 @@ impl Jobs {
             }
             store.failpoint("jobs-before-disable");
         }
-        if settings.enabled && store.root().is_some() {
-            // The reader rises before the first ledger byte can be written, and the
-            // settings file and the registry follow in `enable_managed_at`.
-            store.require_dataset_reader(READER)?;
+        if settings.enabled {
+            // The reader rises and the control keyspace is enabled before the settings
+            // file and the registry are written in `enable_managed_at` (spec C26 §7).
+            store.enable_control()?;
         }
-        let graphs = settings.managed_graphs();
-        let mut entry = OwnerEntry::for_settings(PROFILE, graphs, &canonical);
-        // the ledger leaves every caller's read view (C26 §2.3)
-        entry.visibility = crate::managed::Visibility::Hidden;
+        let entry = OwnerEntry::for_settings(PROFILE, Vec::new(), &canonical);
         let graphs = store.enable_managed_at(OwnerKind::Jobs, entry, &canonical, revision)?;
-        // The hidden graphs changed without a commit of the data. The views' worker of
-        // main and of every open branch resolves its access again and ends its live
-        // queries (spec C26 §2.3).
-        self.ds.state().views.kick();
-        let branches: Vec<Dataset> = self.ds.state().branches.lock().values().cloned().collect();
-        for b in branches {
-            b.state().views.kick();
-        }
-        status_from(Some(&graphs), Some(&canonical))
+        status_from(Some(&graphs), Some(&canonical), store.control_enabled())
     }
 
     /// The recorded settings, enabled, or the refusal of an operation on a dataset

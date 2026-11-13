@@ -1310,6 +1310,11 @@ fn check_gen_commit_value(path: &Path, value: &serde_json::Value) -> Result<()> 
 const MAGIC: &[u8; 8] = b"SPKCMTS\0";
 pub(crate) const REC: usize = 64;
 
+/// The CRC-32 of `parts` in order, as the write-ahead log and the control log use it.
+pub(crate) fn crc32_of(parts: &[&[u8]]) -> u32 {
+    crc32(parts)
+}
+
 fn crc32(parts: &[&[u8]]) -> u32 {
     let mut c = flate2::Crc::new();
     for p in parts {
@@ -1862,6 +1867,9 @@ pub(crate) const WAL_FLAG_ANNOTATED: u8 = 2;
 
 /// The commit seals exactly one final configuration reference data record.
 pub(crate) const WAL_FLAG_CONFIGURATION: u8 = 4;
+
+/// The commit seals one control frame in `WAL_CONTROL` records (log version 3 only).
+pub(crate) const WAL_FLAG_CONTROL: u8 = 8;
 
 /// Fill bytes 9..33 of a WAL commit record (`rec[0]` = op, `rec[1..9]` = next blank
 /// node): seq, timestamp, kind, version, flags (byte 27) and a CRC over the

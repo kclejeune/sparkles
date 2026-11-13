@@ -291,6 +291,20 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
             "configuration history needs its primary closure and managed.json".into(),
         );
     }
+    // The control closure (spec C26 §7.3): the feature and the jobs settings each need
+    // the checkpoint, and the checkpoint needs the feature. Its content is checked
+    // against the dataset before the restore reidentifies or publishes it.
+    let control_required = m.requires.iter().any(|feature| feature == "control/1");
+    let checkpoint = seen.contains(sparkles_core::control::CHECKPOINT_FILE);
+    if (control_required || seen.contains(sparkles_core::jobs::FILE)) && !checkpoint {
+        return bad(
+            "files",
+            "the control feature and the jobs settings need control.bin".into(),
+        );
+    }
+    if checkpoint && !control_required {
+        return bad("requires", "control.bin needs the feature control/1".into());
+    }
     Ok(())
 }
 
@@ -560,6 +574,29 @@ mod tests {
             f.path = f.path.replace("gen-0001/", "gen-0002/");
         }
         validate(&m, PIECE, &[2]).unwrap();
+    }
+
+    /// A22: the control feature and the jobs settings need the checkpoint, and the
+    /// checkpoint needs the feature (spec C26 §7.3).
+    #[test]
+    fn the_control_closure_needs_the_checkpoint_and_the_feature() {
+        let with = |paths: &[&str], feature: bool| {
+            let mut m = good();
+            for (i, p) in paths.iter().enumerate() {
+                m.files.push(file(p, &[40 + i as u64]));
+            }
+            if feature {
+                m.requires.push("control/1".into());
+            }
+            validate(&m, PIECE, &[2])
+        };
+        with(&["control.bin", "jobs.json"], true).unwrap();
+        with(&["control.bin"], true).unwrap();
+        assert!(with(&["jobs.json"], true).is_err());
+        assert!(with(&["jobs.json"], false).is_err());
+        assert!(with(&[], true).is_err());
+        assert!(with(&["control.bin"], false).is_err());
+        assert!(with(&["control.log", "control.bin"], true).is_err());
     }
 
     #[test]

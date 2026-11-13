@@ -1234,22 +1234,12 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<Opened> {
         req.validate()?;
-        // the dataset's hidden control graphs leave every view (spec C26 §2.3); a caller
-        // that reads every other graph still shares the kept ontology
-        let shared = opts.graphs.is_none();
-        // one reading of the hidden graphs serves both the view and the cache key, so an
-        // ontology opened across an owner's enablement is kept under the visibility it
-        // was read with
-        let hidden = self.ds.store().hidden_graphs();
-        let mut hiding = opts.clone();
-        hiding.graphs = crate::access::GraphAccess::hiding_graphs(hiding.graphs.take(), &hidden);
-        let opts = &hiding;
         let access = opts.graphs.as_ref().map(|a| a.bound(snap));
         let view = match &access {
             Some(a) => a.masked(snap)?,
             None => snap.clone(),
         };
-        let keep = shared && snap.cacheable;
+        let keep = access.is_none() && snap.cacheable;
         // an inferred view reads the inferred graph while the dataset records a
         // materialization; without one it reads the asserted axioms only (§7)
         let record = if req.inferences {
@@ -1257,9 +1247,7 @@ impl Ontologies {
         } else {
             None
         };
-        // the hidden graphs are part of the key: enabling an owner hides a graph without
-        // a new commit of the data
-        let key = format!("{}|{:?}", req.key(snap.commit, record.is_some()), hidden);
+        let key = req.key(snap.commit, record.is_some());
         if keep {
             let mut cache = self.ds.state().ontology_cache.lock();
             if let Some(i) = cache.iter().position(|e| e.key == key) {
@@ -2494,13 +2482,7 @@ pub fn rl_warnings(
         },
         location_mapping: inputs.location_mapping.clone(),
     };
-    // an import is followed only to a graph the view reads
-    let readable = |g: Id| {
-        opts.graphs
-            .as_ref()
-            .is_none_or(|a| a.bound(snap).readable_id(snap, g))
-    };
-    let resolved = sparkles_reasoner::inputs::resolve_readable(snap, &inputs, &readable);
+    let resolved = sparkles_reasoner::inputs::resolve_readable(snap, &inputs, &|_| true);
     let graph_ids: Vec<Option<Id>> = resolved.graphs.iter().map(|g| g.id(snap)).collect();
     let requested = inputs.data_graphs.len();
     let (ontology, _) = read_store(snap, &graph_ids, requested, Mode::Lenient, opts)?;
@@ -2546,10 +2528,8 @@ pub fn rl_warnings(
 pub fn rl_inspector(
     store: &crate::store::Store,
     inputs: &Inputs,
-    mut opts: QueryOptions,
+    opts: QueryOptions,
 ) -> sparkles_reasoner::InspectFn {
-    // the store's hidden control graphs (spec C26 §2.3) are never inspected
-    opts.graphs = crate::access::GraphAccess::hiding_graphs(opts.graphs, &store.hidden_graphs());
     let prefixes = store.prefixes();
     let inputs = inputs.clone();
     Arc::new(move |snap| Ok(rl_warnings(snap, &prefixes, &inputs, &opts)?))

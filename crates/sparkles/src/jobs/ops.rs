@@ -6,24 +6,77 @@
 //! See C26 §7.1 for why this ordering gives the acceptance cases.
 
 use super::ledger::{
-    self, Attempt, AttemptState, Changes, Ledger, Run, RunView, State, attempt_iri, epoch_iri,
-    integer, ms, now_ms, operation_iri, publication_iri, run_iri, string,
+    self, Attempt, AttemptState, Changes, Epoch, Ledger, Operation, PublicationRecord, Recovery,
+    RecoveryPhase, Run, RunInput, RunView, State, now_ms,
 };
 use super::{Caller, Jobs, managed};
-use crate::access::Preparation;
 use crate::branch::CommitRef;
 use crate::managed::{ManagedErrorKind, OwnerKind};
-use crate::store::{HoldPublication, WriteTxn};
-use crate::task::Control;
+use crate::store::{ControlOwner, HoldPublication, WriteTxn};
 use crate::{Error, Result};
 use oxrdf::{GraphName, NamedNode, Quad, Term};
+use sparkles_core::control::{ControlState, ORIGIN_KEY};
 use sparkles_core::jobs::{
-    Definition, LEDGER_GRAPH, MAX_IDEMPOTENCY_KEY_BYTES, MAX_INPUTS, OPERATION_RETRY,
-    OPERATION_SUBMIT, Settings, backoff_ms, canonical_json, digest_hex, new_token, operation_id,
-    token_matches,
+    Definition, MAX_IDEMPOTENCY_KEY_BYTES, MAX_INPUTS, OPERATION_RETRY, OPERATION_SUBMIT, Settings,
+    backoff_ms, canonical_json, digest_hex, new_token, operation_id, token_matches,
 };
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// The most runs one recovery frame pauses and one recovery request resumes.
+const PAUSE_BATCH: usize = 256;
+
+/// The recovery of restored work, as [`Jobs::resume`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryView {
+    pub id: Uuid,
+    /// The dataset the restored capture was taken of.
+    pub source_dataset: Uuid,
+    pub capture_commit: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_label: Option<String>,
+    pub capture_ms: i64,
+    pub phase: RecoveryPhase,
+    pub started_ms: i64,
+    /// The restored runs that are still paused.
+    pub paused: u64,
+    pub resumed: u64,
+    pub cancelled: u64,
+    /// Whether no paused run of the restored set is left, which ends the recovery.
+    pub ended: bool,
+}
+
+/// What a recovery request did.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryStatus {
+    /// The dataset's recovery of restored work, `None` when it has none.
+    pub recovery: Option<RecoveryView>,
+    /// The runs this request resumed.
+    pub resumed: Vec<Uuid>,
+}
+
+impl RecoveryStatus {
+    fn of(rec: &Recovery, left: u64, resumed: Vec<Uuid>) -> RecoveryStatus {
+        RecoveryStatus {
+            recovery: Some(RecoveryView {
+                id: rec.id,
+                source_dataset: rec.source_dataset,
+                capture_commit: rec.capture_commit,
+                capture_label: rec.capture_label.clone(),
+                capture_ms: rec.capture_ms,
+                phase: rec.phase,
+                started_ms: rec.started_ms,
+                paused: left,
+                resumed: rec.resumed,
+                cancelled: rec.cancelled,
+                ended: left == 0,
+            }),
+            resumed,
+        }
+    }
+}
 
 /// The longest retry delay, one hour.
 const MAX_BACKOFF_MS: u64 = 3_600_000;
@@ -217,7 +270,11 @@ impl Publication {
 pub struct Published {
     pub run: Uuid,
     pub publication: Uuid,
+    /// The commit the publication made, or the head it followed when its result changed
+    /// no quad and it made none.
     pub commit: u64,
+    /// Whether the publication made a commit (spec C26 §4.3).
+    pub committed: bool,
     pub version: u64,
     pub inserted: u64,
     pub deleted: u64,
@@ -293,10 +350,6 @@ fn refused(e: &Error) -> bool {
     )
 }
 
-fn preparation() -> Result<Preparation> {
-    Preparation::new(Control::none(), ledger::READS_BYTES)
-}
-
 /// The time the retries of `run` end under the policy it was accepted with (spec C26
 /// §4.4).
 fn retry_horizon(run: &Run) -> i64 {
@@ -347,12 +400,12 @@ fn after_failure(
     (State::RetryWait, Some(next), None)
 }
 
-/// A transaction under the jobs capability, with the recorded settings and the
-/// ledger graph's protection nonce.
+/// A transaction under the jobs owner's control capability, with the recorded settings
+/// and the control state it starts from.
 struct Begun<'s> {
     t: WriteTxn<'s>,
     settings: Settings,
-    protection: Uuid,
+    base: Arc<ControlState>,
 }
 
 /// What a submission checked before it took the writer.
@@ -371,7 +424,7 @@ struct Staging<'a> {
 /// A submission under the writer: its staged transaction, or the receipt of the run
 /// another submission of the key recorded.
 enum Staged<'s> {
-    Ready(Box<WriteTxn<'s>>),
+    Ready(Box<WriteTxn<'s>>, State),
     Replayed(Submitted),
 }
 
@@ -426,25 +479,31 @@ impl Jobs {
         message: Option<String>,
         before_publish: Option<crate::guard::PublishHook>,
     ) -> Result<Begun<'s>> {
+        let begun = self.begin_inner(operation, write, message, before_publish)?;
+        // A restored checkpoint's origin entry fences every transition but the first
+        // recovery frame, which removes it (spec C26 §7.3).
+        if begun.base.get(ORIGIN_KEY).is_some() {
+            return Err(managed(
+                ManagedErrorKind::JobsRecovering,
+                "the dataset was restored and its jobs recovery has not run yet; retry",
+            ));
+        }
+        Ok(begun)
+    }
+
+    fn begin_inner<'s>(
+        &'s self,
+        operation: Uuid,
+        write: Option<Arc<crate::access::GraphAccess>>,
+        message: Option<String>,
+        before_publish: Option<crate::guard::PublishHook>,
+    ) -> Result<Begun<'s>> {
         let ds = self.main()?;
         let (settings, bytes) = self.enabled_settings()?;
         let store = ds.store();
-        let capability = store.managed_writer(OwnerKind::Jobs, operation)?;
-        if capability.settings().as_deref() != Some(&bytes[..]) {
-            return Err(Error::Conflict(
-                "the jobs settings changed while the operation was prepared; retry".into(),
-            ));
-        }
-        let protection = capability.protection(LEDGER_GRAPH).ok_or_else(|| {
-            managed(
-                ManagedErrorKind::UnsupportedProfile,
-                "the job ledger graph is not protected; record the jobs settings again",
-            )
-        })?;
-        // The ledger graph lies outside every caller's view once it is hidden, so the
-        // store's own view check cannot run on a typed commit. The business quads of a
-        // publication are checked against the caller's view one by one in `publish`,
-        // and a view with triple rules is refused there.
+        let capability = store.control_writer(ControlOwner::Jobs)?;
+        // The business quads of a publication are checked against the caller's view one
+        // by one in `publish`, and a view with triple rules is refused there.
         let _ = write;
         let opts = crate::guard::WriteOptions {
             message: message.map(Arc::from),
@@ -453,22 +512,16 @@ impl Jobs {
             ..Default::default()
         };
         let mut t = store.try_write_with(crate::commit::CommitKind::Transaction, opts)?;
-        t.set_managed(capability)?;
-        Ok(Begun {
-            t,
-            settings,
-            protection,
-        })
-    }
-
-    fn authentic(&self, run: &Run, protection: Uuid) -> Result<()> {
-        if run.protection != Some(protection) {
-            return Err(Error::Corrupt(format!(
-                "run {} was not written under the ledger's current protection; dispatch is refused",
-                run.id
-            )));
+        // the settings this transaction was admitted under are the recorded ones
+        if store.managed_settings(OwnerKind::Jobs)?.as_deref() != Some(&bytes[..]) {
+            return Err(Error::Conflict(
+                "the jobs settings changed while the operation was prepared; retry".into(),
+            ));
         }
-        Ok(())
+        t.set_control(capability)?;
+        let _ = operation;
+        let base = t.control_base()?;
+        Ok(Begun { t, settings, base })
     }
 
     /// Record this process's boot epoch and interrupt the attempts of earlier epochs,
@@ -491,15 +544,16 @@ impl Jobs {
                 interrupted: Vec::new(),
             });
         }
+        // Restored work is paused before the epoch is installed, so no admission check
+        // passes before then (spec C26 §7.3).
+        self.pause_restored()?;
         let begun = self.begin(Uuid::new_v4(), None, Some("jobs: boot epoch".into()))?;
         let Begun {
             mut t,
             settings: _,
-            protection,
+            base,
         } = begun;
-        let base = t.base().clone();
-        let prep = preparation()?;
-        let mut l = Ledger::new(&prep, &base);
+        let mut l = Ledger::new(&base);
         if l.epoch()? == Some(rt.epoch()) {
             rt.mark_installed();
             return Ok(Recovered {
@@ -518,7 +572,6 @@ impl Jobs {
             let Some(run) = l.run_header(id)? else {
                 continue;
             };
-            self.authentic(&run, protection)?;
             let Some(attempt) = run.current_attempt else {
                 continue;
             };
@@ -528,30 +581,21 @@ impl Jobs {
             if attempt.epoch == rt.epoch() {
                 continue;
             }
-            let a = attempt_iri(attempt.id);
-            ch.set(
-                &mut l,
-                &a,
-                "attemptState",
-                Some(string(AttemptState::Interrupted.as_str())),
-            )?;
-            ch.set(
-                &mut l,
-                &a,
-                "diagnostic",
-                Some(string("interrupted by a restart of the dataset's process")),
-            )?;
+            let a = ch.attempt(&attempt);
+            a.state = AttemptState::Interrupted;
+            a.diagnostic = Some("interrupted by a restart of the dataset's process".into());
             let (state, next, reason) = after_failure(&run, now, true, None);
-            self.transition(&mut ch, &mut l, &run, state, next, reason)?;
+            self.transition(&mut ch, &run, state, next, reason);
             rt.revoke_through(run.id, run.version + 1);
             if state.terminal() {
                 ended.push(run.id);
             }
             interrupted.push(run.id);
         }
-        let e = epoch_iri();
-        ch.set(&mut l, &e, "epoch", Some(string(&rt.epoch().to_string())))?;
-        ch.set(&mut l, &e, "installedAtMs", Some(ms(now)))?;
+        ch.epoch(&Epoch {
+            epoch: rt.epoch(),
+            installed_ms: now,
+        });
         drop(l);
         ch.apply(&mut t)?;
         t.commit()?;
@@ -565,6 +609,190 @@ impl Jobs {
         })
     }
 
+    /// The published control state, read outside the writer. A dataset whose keyspace
+    /// is not enabled reads as an empty ledger.
+    fn published(&self) -> Result<Arc<ControlState>> {
+        Ok(self.main()?.store().control_state().unwrap_or_default())
+    }
+
+    /// Recover the work of a restored capture: consume the checkpoint's origin entry into
+    /// a `pausing` recovery record, then pause the restored runs in bounded frames, and
+    /// move the record to `awaiting-decision` once none is left. A crash between the
+    /// frames leaves the origin or the `pausing` record, so the next recovery continues
+    /// where this one stopped.
+    fn pause_restored(&self) -> Result<()> {
+        loop {
+            let Begun { mut t, base, .. } =
+                self.begin_inner(Uuid::new_v4(), None, Some("jobs: recovery".into()), None)?;
+            let mut l = Ledger::new(&base);
+            let now = now_ms();
+            let mut ch = Changes::default();
+            if let Some(origin) = base.origin()? {
+                t.control_consume_origin()?;
+                ch.recovery(Some(&Recovery {
+                    id: Uuid::new_v4(),
+                    source_dataset: origin.dataset,
+                    capture_commit: origin.commit,
+                    capture_label: Some(origin.label).filter(|l| !l.is_empty()),
+                    capture_ms: origin.time_ms,
+                    checkpoint_seq: base.seq,
+                    phase: RecoveryPhase::Pausing,
+                    started_ms: now,
+                    paused: 0,
+                    resumed: 0,
+                    cancelled: 0,
+                }));
+                drop(l);
+                ch.apply(&mut t)?;
+                t.commit()?;
+                self.ds.store().failpoint("jobs-recovery-started");
+                continue;
+            }
+            let Some(mut rec) = l.recovery()? else {
+                return Ok(());
+            };
+            if rec.phase != RecoveryPhase::Pausing {
+                return Ok(());
+            }
+            let mut paused = 0;
+            'states: for st in [State::Queued, State::RetryWait, State::Leased] {
+                for id in l.runs_in(st)?.ids {
+                    if paused == PAUSE_BATCH {
+                        break 'states;
+                    }
+                    let Some(run) = l.run_header(id)? else {
+                        continue;
+                    };
+                    if let Some(a) = run.current_attempt
+                        && let Some(a) = l.attempt(a)?
+                        && a.state == AttemptState::Active
+                    {
+                        let a = ch.attempt(&a);
+                        a.state = AttemptState::Interrupted;
+                        a.diagnostic = Some("interrupted by a restore of the dataset".into());
+                    }
+                    self.transition(
+                        &mut ch,
+                        &run,
+                        State::Paused,
+                        None,
+                        Some("paused by the recovery of a restored backup".into()),
+                    );
+                    ch.run(&run).recovery = Some(rec.id);
+                    paused += 1;
+                }
+            }
+            rec.paused += paused as u64;
+            if paused < PAUSE_BATCH {
+                rec.phase = RecoveryPhase::AwaitingDecision;
+            }
+            ch.recovery(Some(&rec));
+            drop(l);
+            ch.apply(&mut t)?;
+            t.commit()?;
+            self.ds.store().failpoint("jobs-recovery-paused");
+        }
+    }
+
+    /// Refuse `what` while a recovery is pausing restored work (spec C26 §7.3).
+    fn refuse_while_recovering(&self, l: &mut Ledger<'_>, what: &str) -> Result<()> {
+        if l.recovery()?
+            .is_some_and(|r| r.phase == RecoveryPhase::Pausing)
+        {
+            return Err(managed(
+                ManagedErrorKind::JobsRecovering,
+                format!("{what} is refused while the jobs recovery pauses restored work; retry"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resume the paused runs `runs` of the dataset's recovery of restored work, which
+    /// makes them eligible again (spec C26 §6 and §7.3). Only an administrator may, and
+    /// only once the recovery awaits a decision. Each run must be paused and belong to the
+    /// restored set. With no runs, it reports the recovery. Once no paused run of the
+    /// set is left, the recovery ends.
+    pub fn resume(&self, runs: &[Uuid], caller: &Caller) -> Result<RecoveryStatus> {
+        if !caller.admin {
+            return Err(Error::NotPermitted(
+                "resuming restored work needs administration of the dataset".into(),
+            ));
+        }
+        if runs.len() > PAUSE_BATCH {
+            return Err(Error::invalid(format!(
+                "a recovery request resumes at most {PAUSE_BATCH} runs"
+            )));
+        }
+        self.ensure_epoch()?;
+        let Begun { mut t, base, .. } =
+            self.begin(Uuid::new_v4(), None, Some("jobs: resume".into()))?;
+        let mut l = Ledger::new(&base);
+        let Some(mut rec) = l.recovery()? else {
+            if runs.is_empty() {
+                return Ok(RecoveryStatus::default());
+            }
+            return Err(Error::Conflict(
+                "the dataset has no recovery of restored work".into(),
+            ));
+        };
+        self.refuse_while_recovering(&mut l, "resuming restored work")?;
+        let mut ch = Changes::default();
+        let mut resumed = Vec::new();
+        for &id in runs {
+            if resumed.contains(&id) {
+                continue;
+            }
+            let run = l.run_header(id)?.ok_or_else(|| not_found(id))?;
+            if run.state != State::Paused || run.recovery != Some(rec.id) {
+                return Err(Error::Conflict(format!(
+                    "run {id} is not paused by the dataset's recovery"
+                )));
+            }
+            self.transition(
+                &mut ch,
+                &run,
+                State::Queued,
+                None,
+                Some(format!("resumed by {}", caller.principal.as_str())),
+            );
+            resumed.push(id);
+        }
+        rec.resumed += resumed.len() as u64;
+        let left = Self::paused_members(&mut l, &rec, &resumed)?;
+        let status = RecoveryStatus::of(&rec, left, resumed);
+        if left == 0 {
+            ch.recovery(None);
+        } else {
+            ch.recovery(Some(&rec));
+        }
+        drop(l);
+        if !ch.is_empty() {
+            ch.apply(&mut t)?;
+            t.commit()?;
+        }
+        Ok(status)
+    }
+
+    /// The paused runs of `rec`'s restored set, other than `leaving`.
+    fn paused_members(l: &mut Ledger<'_>, rec: &Recovery, leaving: &[Uuid]) -> Result<u64> {
+        let scan = l.runs_in(State::Paused)?;
+        let mut left = 0;
+        for id in &scan.ids {
+            if leaving.contains(id) {
+                continue;
+            }
+            if l.run_header(*id)?
+                .is_some_and(|r| r.recovery == Some(rec.id))
+            {
+                left += 1;
+            }
+        }
+        if scan.truncated {
+            left += 1;
+        }
+        Ok(left)
+    }
+
     fn ensure_epoch(&self) -> Result<()> {
         self.recover().map(|_| ())
     }
@@ -573,20 +801,18 @@ impl Jobs {
     fn transition(
         &self,
         ch: &mut Changes,
-        l: &mut Ledger<'_>,
         run: &Run,
         state: State,
         next_eligible_ms: Option<i64>,
         reason: Option<String>,
-    ) -> Result<()> {
-        let r = run_iri(run.id);
-        ch.set(l, &r, "state", Some(string(state.as_str())))?;
-        ch.set(l, &r, "version", Some(integer(run.version + 1)))?;
-        ch.set(l, &r, "nextEligibleAtMs", next_eligible_ms.map(ms))?;
+    ) {
+        let r = ch.run(run);
+        r.state = state;
+        r.version = run.version + 1;
+        r.next_eligible_ms = next_eligible_ms;
         if let Some(reason) = reason {
-            ch.set(l, &r, "reason", Some(string(&ledger::redacted(&reason))))?;
+            r.reason = Some(ledger::redacted(&reason));
         }
-        Ok(())
     }
 
     fn maybe_release_hold(&self, run: Uuid) {
@@ -608,9 +834,8 @@ impl Jobs {
 
     /// Whether any run is queued, leased or waiting to retry.
     pub(super) fn has_active_runs(&self) -> Result<bool> {
-        let snap = self.main()?.store().snapshot();
-        let prep = preparation()?;
-        let mut l = Ledger::new(&prep, &snap);
+        let state = self.published()?;
+        let mut l = Ledger::new(&state);
         for st in [State::Queued, State::Leased, State::RetryWait] {
             if !l.runs_in(st)?.ids.is_empty() {
                 return Ok(true);
@@ -708,11 +933,10 @@ impl Jobs {
         );
         // A repeated key answers before anything is held or locked.
         {
-            let snap = store.snapshot();
-            let prep = preparation()?;
-            let mut l = Ledger::new(&prep, &snap);
+            let state = self.published()?;
+            let mut l = Ledger::new(&state);
             if let Some(found) = l.operation(op)? {
-                return self.replay(&mut l, found, &digest, snap.commit);
+                return self.replay(&mut l, found, &digest, state.follows);
             }
         }
         let run = Uuid::new_v4();
@@ -759,8 +983,8 @@ impl Jobs {
             },
             hook,
         );
-        let t = match staged {
-            Ok(Staged::Ready(t)) => *t,
+        let (t, state) = match staged {
+            Ok(Staged::Ready(t, state)) => (*t, state),
             Ok(Staged::Replayed(r)) => {
                 // the run this submission would have made is not recorded
                 if held {
@@ -798,7 +1022,7 @@ impl Jobs {
             version: 1,
             commit: receipt.commit.seq,
             replayed: false,
-            state: State::Queued,
+            state,
         })
     }
 
@@ -814,7 +1038,7 @@ impl Jobs {
         let Begun {
             mut t,
             settings,
-            protection,
+            base,
         } = self.begin_with(st.op, None, st.s.message.clone(), hook)?;
         // The definition the request was checked against must be the one the admitted
         // settings hold, or a change between the two reads could revoke the submitter,
@@ -825,14 +1049,13 @@ impl Jobs {
                 st.s.definition
             )));
         }
-        let base = t.base().clone();
-        let prep = preparation()?;
-        let mut l = Ledger::new(&prep, &base);
+        let mut l = Ledger::new(&base);
         if let Some(found) = l.operation(st.op)? {
             return self
-                .replay(&mut l, found, st.digest, base.commit)
+                .replay(&mut l, found, st.digest, base.follows)
                 .map(Staged::Replayed);
         }
+        self.refuse_while_recovering(&mut l, "a submission")?;
         let waiting = Self::exact_count(&mut l, State::Queued)?
             + Self::exact_count(&mut l, State::RetryWait)?;
         if waiting >= settings.max_queued as usize {
@@ -844,63 +1067,91 @@ impl Jobs {
                 ),
             ));
         }
-        let (seq, time_ms) = t.managed_stamp()?;
+        let input = RunInput {
+            payload: st.payload.to_string(),
+            checkpoint: st.s.checkpoint.clone(),
+            inputs: st.inputs.to_vec(),
+        };
+        // Admission is bounded by the size of the control state, so that the memory it
+        // takes stays within the settings' bound. A transition of an admitted run is
+        // never refused for it (spec C26 §7).
+        let size = base.bytes() + ledger::encode(&input).len() as u64 + 2048;
+        if size > settings.max_control_bytes {
+            return Err(managed(
+                ManagedErrorKind::JobsOverloaded,
+                format!(
+                    "the job ledger would grow past the dataset's bound of {} bytes; no run was stored",
+                    settings.max_control_bytes
+                ),
+            ));
+        }
+        // An explicit retry of a member of a restored set that awaits a decision joins
+        // the set paused, so only the recovery route makes it eligible (spec C26 §7.3).
         let mut ch = Changes::default();
-        let o = operation_iri(st.op);
-        ch.add_type(&o, "Operation");
-        ch.add(&o, "run", string(&st.run.to_string()));
-        ch.add(&o, "requestDigest", string(st.digest));
-        ch.add(&o, "idempotencyKey", string(&st.s.idempotency_key));
-        ch.add(&o, "operationKind", string(st.s.operation_kind()));
-        ch.add(
-            &o,
-            "principal",
-            Term::NamedNode(st.caller.principal.clone()),
-        );
-        ch.add(&o, "definition", string(&st.s.definition));
-        ch.add(&o, "definitionRevision", string(st.revision));
-        ch.add(&o, "graphProtection", string(&protection.to_string()));
-        let r = run_iri(st.run);
-        ch.add_type(&r, "Run");
-        ch.add(&r, "definition", string(&st.s.definition));
-        ch.add(&r, "definitionRevision", string(st.revision));
-        ch.add(&r, "kind", string(&st.def.kind));
-        ch.add(&r, "kindVersion", integer(u64::from(st.def.version)));
-        ch.add(
-            &r,
-            "principal",
-            Term::NamedNode(st.caller.principal.clone()),
-        );
-        ch.add(&r, "datasetId", string(&ds.dataset_id().to_string()));
-        ch.add(&r, "branchId", string(&store.branch_id().to_string()));
-        ch.add(&r, "payload", string(st.payload));
-        ch.add(
-            &r,
-            "payloadDigest",
-            string(&digest_hex(st.payload.as_bytes())),
-        );
-        if let Some(c) = &st.s.checkpoint {
-            ch.add(&r, "sourceCheckpoint", string(c));
+        let mut joins = None;
+        if let Some(of) = st.s.retry_of
+            && let Some(mut rec) = l.recovery()?
+            && let Some(old) = l.run_header(of)?
+            && (old.submitted_seq <= rec.checkpoint_seq || old.recovery == Some(rec.id))
+        {
+            rec.paused += 1;
+            ch.recovery(Some(&rec));
+            joins = Some(rec.id);
         }
-        for i in st.inputs {
-            ch.add(&r, "input", string(&format!("{}@{}", i.branch_id, i.seq)));
-        }
-        ch.add(&r, "submittedAtMs", ms(time_ms));
-        ch.add(&r, "submittedCommit", integer(seq));
-        ch.add(&r, "state", string(State::Queued.as_str()));
-        ch.add(&r, "version", integer(1));
-        ch.add(&r, "attempts", integer(0));
-        ch.add(&r, "attemptsAllowed", integer(u64::from(st.def.attempts)));
-        ch.add(&r, "retryHorizonMs", integer(st.def.retry_horizon_ms));
-        ch.add(&r, "generation", integer(0));
-        ch.add(&r, "operation", string(&st.op.to_string()));
-        if let Some(of) = st.s.retry_of {
-            ch.add(&r, "retryOf", string(&of.to_string()));
-        }
-        ch.add(&r, "graphProtection", string(&protection.to_string()));
+        let state = if joins.is_some() {
+            State::Paused
+        } else {
+            State::Queued
+        };
+        let stamp = t.control_stamp()?;
+        ch.operation(
+            st.op,
+            &Operation {
+                run: st.run,
+                request_digest: st.digest.to_string(),
+                idempotency_key: st.s.idempotency_key.clone(),
+                operation_kind: st.s.operation_kind().to_string(),
+                principal: st.caller.principal.clone(),
+                definition: st.s.definition.clone(),
+                revision: st.revision.to_string(),
+            },
+        );
+        ch.new_run(
+            Run {
+                id: st.run,
+                definition: st.s.definition.clone(),
+                revision: st.revision.to_string(),
+                kind: st.def.kind.clone(),
+                kind_version: st.def.version,
+                principal: st.caller.principal.clone(),
+                dataset_id: ds.dataset_id(),
+                branch_id: store.branch_id(),
+                payload_digest: digest_hex(st.payload.as_bytes()),
+                submitted_ms: stamp.time_ms,
+                submitted_commit: stamp.head,
+                submitted_seq: stamp.seq,
+                state,
+                version: 1,
+                attempts: 0,
+                attempts_allowed: st.def.attempts,
+                retry_horizon_ms: st.def.retry_horizon_ms,
+                generation: 0,
+                current_attempt: None,
+                next_eligible_ms: None,
+                reason: None,
+                publication: None,
+                retry_of: st.s.retry_of,
+                operation: st.op,
+                recovery: joins,
+                payload: String::new(),
+                checkpoint: None,
+                inputs: Vec::new(),
+            },
+            &input,
+        );
         drop(l);
         ch.apply(&mut t)?;
-        Ok(Staged::Ready(Box::new(t)))
+        Ok(Staged::Ready(Box::new(t), state))
     }
 
     fn replay(
@@ -943,11 +1194,10 @@ impl Jobs {
         let Begun {
             mut t,
             settings,
-            protection,
+            base,
         } = self.begin(Uuid::new_v4(), None, Some("jobs: claim".into()))?;
-        let base = t.base().clone();
-        let prep = preparation()?;
-        let mut l = Ledger::new(&prep, &base);
+        let mut l = Ledger::new(&base);
+        self.refuse_while_recovering(&mut l, "a claim")?;
         let now = now_ms();
         let permitted = |def: &Definition, name: &str| {
             def.enabled
@@ -978,7 +1228,6 @@ impl Jobs {
                 let Some(run) = l.run_header(id)? else {
                     continue;
                 };
-                self.authentic(&run, protection)?;
                 let def = settings.definitions.get(&run.definition);
                 match run.state {
                     State::Queued => {}
@@ -990,12 +1239,11 @@ impl Jobs {
                         if now > retry_horizon(&run) {
                             self.transition(
                                 &mut ch,
-                                &mut l,
                                 &run,
                                 State::Failed,
                                 None,
                                 Some("the retry horizon passed".into()),
-                            )?;
+                            );
                             ended.push(run.id);
                             continue;
                         }
@@ -1013,19 +1261,14 @@ impl Jobs {
                             && let Some(a) = l.attempt(a)?
                             && a.state == AttemptState::Active
                         {
-                            ch.set(
-                                &mut l,
-                                &attempt_iri(a.id),
-                                "attemptState",
-                                Some(string(AttemptState::Expired.as_str())),
-                            )?;
+                            ch.attempt(&a).state = AttemptState::Expired;
                         }
                         let (state, next, reason) = after_failure(&run, now, true, None);
                         let reason = Some(match reason {
                             Some(why) => format!("the lease expired ({why})"),
                             None => "the lease expired".into(),
                         });
-                        self.transition(&mut ch, &mut l, &run, state, next, reason)?;
+                        self.transition(&mut ch, &run, state, next, reason);
                         rt.revoke_through(run.id, run.version + 1);
                         if state.terminal() {
                             ended.push(run.id);
@@ -1043,7 +1286,7 @@ impl Jobs {
                 candidates.push(run);
             }
         }
-        candidates.sort_by_key(|r| r.submitted_commit);
+        candidates.sort_by_key(|r| r.submitted_seq);
         let mut chosen = None;
         for run in candidates {
             let def = &settings.definitions[&run.definition];
@@ -1051,12 +1294,11 @@ impl Jobs {
                 // a waiting run that was recorded with its attempts used up ends here
                 self.transition(
                     &mut ch,
-                    &mut l,
                     &run,
                     State::Failed,
                     None,
                     Some(format!("{} attempts were exhausted", run.attempts_allowed)),
-                )?;
+                );
                 ended.push(run.id);
                 continue;
             }
@@ -1087,30 +1329,26 @@ impl Jobs {
         let generation = run.generation + 1;
         let number = run.attempts + 1;
         let expires = now.saturating_add(def.lease_ms as i64);
-        let r = run_iri(run.id);
-        ch.set(&mut l, &r, "state", Some(string(State::Leased.as_str())))?;
-        ch.set(&mut l, &r, "version", Some(integer(run.version + 1)))?;
-        ch.set(&mut l, &r, "generation", Some(integer(generation)))?;
-        ch.set(&mut l, &r, "attempts", Some(integer(u64::from(number))))?;
-        ch.set(
-            &mut l,
-            &r,
-            "currentAttempt",
-            Some(string(&attempt.to_string())),
-        )?;
-        ch.set(&mut l, &r, "nextEligibleAtMs", None)?;
-        let a = attempt_iri(attempt);
-        ch.add_type(&a, "Attempt");
-        ch.add(&a, "run", string(&run.id.to_string()));
-        ch.add(&a, "worker", Term::NamedNode(caller.principal.clone()));
-        ch.add(&a, "number", integer(u64::from(number)));
-        ch.add(&a, "generation", integer(generation));
-        ch.add(&a, "epoch", string(&rt.epoch().to_string()));
-        ch.add(&a, "tokenVerifier", string(&verifier));
-        ch.add(&a, "claimedAtMs", ms(now));
-        ch.add(&a, "leaseExpiresAtMs", ms(expires));
-        ch.add(&a, "attemptState", string(AttemptState::Active.as_str()));
-        ch.add(&a, "graphProtection", string(&protection.to_string()));
+        let r = ch.run(&run);
+        r.state = State::Leased;
+        r.version = run.version + 1;
+        r.generation = generation;
+        r.attempts = number;
+        r.current_attempt = Some(attempt);
+        r.next_eligible_ms = None;
+        ch.new_attempt(Attempt {
+            id: attempt,
+            run: run.id,
+            worker: caller.principal.clone(),
+            number,
+            generation,
+            epoch: rt.epoch(),
+            verifier,
+            claimed_ms: now,
+            lease_expires_ms: expires,
+            state: AttemptState::Active,
+            diagnostic: None,
+        });
         drop(l);
         ch.apply(&mut t)?;
         ds.store().failpoint("jobs-before-claim-commit");
@@ -1155,13 +1393,11 @@ impl Jobs {
         run: Uuid,
         token: &str,
         caller: &Caller,
-        protection: Uuid,
     ) -> Result<(Run, Attempt, Definition)> {
         let rt = self.runtime();
         let Some(run) = l.run(run)? else {
             return Err(not_found(run));
         };
-        self.authentic(&run, protection)?;
         // A caller that is not an administrator, the submitter or a worker of one of the
         // run's attempts learns nothing: an invisible run answers as an unknown one. The
         // worker of a superseded attempt still learns that its lease is lost.
@@ -1249,13 +1485,11 @@ impl Jobs {
         let Begun {
             mut t,
             settings,
-            protection,
+            base,
         } = self.begin(Uuid::new_v4(), None, Some("jobs: renew".into()))?;
-        let base = t.base().clone();
-        let prep = preparation()?;
-        let mut l = Ledger::new(&prep, &base);
-        let (run, attempt, def) =
-            self.check_lease(&mut l, &settings, run, token, caller, protection)?;
+        let mut l = Ledger::new(&base);
+        self.refuse_while_recovering(&mut l, "a renewal")?;
+        let (run, attempt, def) = self.check_lease(&mut l, &settings, run, token, caller)?;
         Self::expect_version(&run, expected_version)?;
         let extend = extend_ms
             .unwrap_or(def.lease_ms)
@@ -1264,18 +1498,8 @@ impl Jobs {
         let now = now_ms();
         let expires = now.saturating_add(extend as i64);
         let mut ch = Changes::default();
-        ch.set(
-            &mut l,
-            &attempt_iri(attempt.id),
-            "leaseExpiresAtMs",
-            Some(ms(expires)),
-        )?;
-        ch.set(
-            &mut l,
-            &run_iri(run.id),
-            "version",
-            Some(integer(run.version + 1)),
-        )?;
+        ch.attempt(&attempt).lease_expires_ms = expires;
+        ch.run(&run).version = run.version + 1;
         drop(l);
         ch.apply(&mut t)?;
         // The new deadline counts only once this commit's version is the committed one,
@@ -1308,9 +1532,8 @@ impl Jobs {
         self.ensure_epoch()?;
         let digest = p.digest();
         {
-            let snap = ds.store().snapshot();
-            let prep = preparation()?;
-            let mut l = Ledger::new(&prep, &snap);
+            let state = self.published()?;
+            let mut l = Ledger::new(&state);
             if let Some(found) = l.publication(p.operation)? {
                 return Self::replay_publication(&mut l, &found, run_id, token, caller, &digest);
             }
@@ -1318,16 +1541,14 @@ impl Jobs {
         let Begun {
             mut t,
             settings,
-            protection,
+            base,
         } = self.begin(p.operation, caller.write.clone(), p.message.clone())?;
-        let base = t.base().clone();
-        let prep = preparation()?;
-        let mut l = Ledger::new(&prep, &base);
+        let mut l = Ledger::new(&base);
         if let Some(found) = l.publication(p.operation)? {
             return Self::replay_publication(&mut l, &found, run_id, token, caller, &digest);
         }
-        let (run, attempt, def) =
-            self.check_lease(&mut l, &settings, run_id, token, caller, protection)?;
+        self.refuse_while_recovering(&mut l, "a publication")?;
+        let (run, attempt, def) = self.check_lease(&mut l, &settings, run_id, token, caller)?;
         Self::expect_version(&run, p.expected_version)?;
         let count = (p.insert.len() + p.delete.len()) as u64;
         if count > def.max_output_quads {
@@ -1342,7 +1563,7 @@ impl Jobs {
             ));
         }
         {
-            let capability = t.managed().expect("capability set");
+            let registry = ds.store().managed_snapshot()?;
             for q in p.insert.iter().chain(&p.delete) {
                 let GraphName::NamedNode(g) = &q.graph_name else {
                     return Err(Error::invalid(
@@ -1355,7 +1576,10 @@ impl Jobs {
                         g.as_str()
                     )));
                 }
-                if capability.managed_by_any(g.as_str()) {
+                if registry
+                    .as_ref()
+                    .is_some_and(|r| r.graphs.owner_of(g.as_str()).is_some())
+                {
                     return Err(managed(
                         ManagedErrorKind::Protected,
                         format!(
@@ -1381,38 +1605,25 @@ impl Jobs {
             let ids = t.encode_quad(q, &mut labels)?;
             t.insert(ids)?;
         }
-        let (seq, time_ms) = t.managed_stamp()?;
+        // A result that changes no quad makes no commit: its record names the head it
+        // follows, and its receipt says no commit was made (spec C26 §4.3).
+        let stamp = t.control_stamp()?;
         let mut ch = Changes::default();
-        let pb = publication_iri(p.operation);
-        ch.add_type(&pb, "Publication");
-        ch.add(&pb, "run", string(&run.id.to_string()));
-        ch.add(&pb, "attempt", string(&attempt.id.to_string()));
-        ch.add(&pb, "payloadDigest", string(&digest));
-        ch.add(&pb, "commit", integer(seq));
-        ch.add(&pb, "inserted", integer(p.insert.len() as u64));
-        ch.add(&pb, "deleted", integer(p.delete.len() as u64));
-        if let Some(c) = &p.checkpoint {
-            ch.add(&pb, "sourceCheckpoint", string(c));
-        }
-        ch.add(&pb, "publishedAtMs", ms(time_ms));
-        ch.add(&pb, "graphProtection", string(&protection.to_string()));
-        let r = run_iri(run.id);
-        self.transition(&mut ch, &mut l, &run, State::Succeeded, None, None)?;
-        ch.set(
-            &mut l,
-            &r,
-            "publication",
-            Some(string(&p.operation.to_string())),
-        )?;
-        if let Some(c) = &p.checkpoint {
-            ch.set(&mut l, &r, "sourceCheckpoint", Some(string(c)))?;
-        }
-        ch.set(
-            &mut l,
-            &attempt_iri(attempt.id),
-            "attemptState",
-            Some(string(AttemptState::Published.as_str())),
-        )?;
+        ch.publication(&PublicationRecord {
+            id: p.operation,
+            run: run.id,
+            attempt: attempt.id,
+            digest: digest.clone(),
+            commit: stamp.commit.unwrap_or(stamp.head),
+            committed: stamp.commit.is_some(),
+            inserted: p.insert.len() as u64,
+            deleted: p.delete.len() as u64,
+            checkpoint: p.checkpoint.clone(),
+            published_ms: stamp.time_ms,
+        });
+        self.transition(&mut ch, &run, State::Succeeded, None, None);
+        ch.run(&run).publication = Some(p.operation);
+        ch.attempt(&attempt).state = AttemptState::Published;
         drop(l);
         ch.apply(&mut t)?;
         ds.store().failpoint("jobs-before-publish-commit");
@@ -1426,6 +1637,7 @@ impl Jobs {
             run: run.id,
             publication: p.operation,
             commit: receipt.commit.seq,
+            committed: receipt.committed,
             version: run.version + 1,
             inserted: p.insert.len() as u64,
             deleted: p.delete.len() as u64,
@@ -1476,6 +1688,7 @@ impl Jobs {
             run: found.run,
             publication: found.id,
             commit: found.commit,
+            committed: found.committed,
             version,
             inserted: found.inserted,
             deleted: found.deleted,
@@ -1498,38 +1711,26 @@ impl Jobs {
         let Begun {
             mut t,
             settings,
-            protection,
+            base,
         } = self.begin(Uuid::new_v4(), None, Some("jobs: failure".into()))?;
-        let base = t.base().clone();
-        let prep = preparation()?;
-        let mut l = Ledger::new(&prep, &base);
-        let (run, attempt, _def) =
-            self.check_lease(&mut l, &settings, run_id, token, caller, protection)?;
+        let mut l = Ledger::new(&base);
+        self.refuse_while_recovering(&mut l, "a failure")?;
+        let (run, attempt, _def) = self.check_lease(&mut l, &settings, run_id, token, caller)?;
         Self::expect_version(&run, expected_version)?;
         let now = now_ms();
         let (state, next, why) = after_failure(&run, now, f.transient, f.retry_after_ms);
         let diagnostic = ledger::redacted(&f.reason);
         let mut ch = Changes::default();
-        let a = attempt_iri(attempt.id);
-        ch.set(
-            &mut l,
-            &a,
-            "attemptState",
-            Some(string(AttemptState::Failed.as_str())),
-        )?;
-        ch.set(
-            &mut l,
-            &a,
-            "diagnostic",
-            (!diagnostic.is_empty()).then(|| string(&diagnostic)),
-        )?;
+        let a = ch.attempt(&attempt);
+        a.state = AttemptState::Failed;
+        a.diagnostic = (!diagnostic.is_empty()).then(|| diagnostic.clone());
         let reason = match (&why, diagnostic.is_empty()) {
             (Some(w), false) => Some(format!("{diagnostic} ({w})")),
             (Some(w), true) => Some(w.clone()),
             (None, false) => Some(diagnostic.clone()),
             (None, true) => Some(String::new()),
         };
-        self.transition(&mut ch, &mut l, &run, state, next, reason)?;
+        self.transition(&mut ch, &run, state, next, reason);
         drop(l);
         ch.apply(&mut t)?;
         t.commit()?;
@@ -1550,15 +1751,12 @@ impl Jobs {
         let Begun {
             mut t,
             settings: _,
-            protection,
+            base,
         } = self.begin(Uuid::new_v4(), None, Some("jobs: cancel".into()))?;
-        let base = t.base().clone();
-        let prep = preparation()?;
-        let mut l = Ledger::new(&prep, &base);
+        let mut l = Ledger::new(&base);
         let Some(run) = l.run(run_id)? else {
             return Err(not_found(run_id));
         };
-        self.authentic(&run, protection)?;
         let attempt = match run.current_attempt {
             Some(a) => l.attempt(a)?,
             None => None,
@@ -1578,17 +1776,11 @@ impl Jobs {
         if let Some(a) = &attempt
             && a.state == AttemptState::Active
         {
-            ch.set(
-                &mut l,
-                &attempt_iri(a.id),
-                "attemptState",
-                Some(string(AttemptState::Cancelled.as_str())),
-            )?;
+            ch.attempt(a).state = AttemptState::Cancelled;
         }
         let uncertain = run.state == State::Leased;
         self.transition(
             &mut ch,
-            &mut l,
             &run,
             State::Cancelled,
             None,
@@ -1600,7 +1792,21 @@ impl Jobs {
             } else {
                 format!("cancelled by {}", caller.principal.as_str())
             }),
-        )?;
+        );
+        // a cancelled member of a restored set leaves the recovery's decision
+        if run.state == State::Paused
+            && let Some(mut rec) = l.recovery()?
+            && run.recovery == Some(rec.id)
+        {
+            rec.cancelled += 1;
+            if rec.phase == RecoveryPhase::AwaitingDecision
+                && Self::paused_members(&mut l, &rec, &[run.id])? == 0
+            {
+                ch.recovery(None);
+            } else {
+                ch.recovery(Some(&rec));
+            }
+        }
         drop(l);
         ch.apply(&mut t)?;
         t.commit()?;
@@ -1624,9 +1830,8 @@ impl Jobs {
             )));
         }
         let payload = {
-            let snap = self.main()?.store().snapshot();
-            let prep = preparation()?;
-            let mut l = Ledger::new(&prep, &snap);
+            let state = self.published()?;
+            let mut l = Ledger::new(&state);
             let run = l.run(run_id)?.ok_or_else(|| not_found(run_id))?;
             serde_json::from_str(&run.payload).map_err(|e| {
                 Error::Corrupt(format!("the payload of run {run_id} is not JSON: {e}"))
@@ -1649,9 +1854,8 @@ impl Jobs {
     /// The redacted state of `run`, `None` when it is unknown or not visible to the
     /// caller.
     pub fn get(&self, run_id: Uuid, caller: &Caller) -> Result<Option<RunView>> {
-        let snap = self.main()?.store().snapshot();
-        let prep = preparation()?;
-        let mut l = Ledger::new(&prep, &snap);
+        let state = self.published()?;
+        let mut l = Ledger::new(&state);
         let Some(run) = l.run(run_id)? else {
             return Ok(None);
         };
@@ -1672,9 +1876,8 @@ impl Jobs {
     /// The visible runs matching `filter`, newest first, at most the filter's limit
     /// (default 100, at most 1000). The scan reads at most 4096 runs per state.
     pub fn list(&self, filter: &ListFilter, caller: &Caller) -> Result<Vec<RunView>> {
-        let snap = self.main()?.store().snapshot();
-        let prep = preparation()?;
-        let mut l = Ledger::new(&prep, &snap);
+        let state = self.published()?;
+        let mut l = Ledger::new(&state);
         let states: Vec<State> = match filter.state {
             Some(s) => vec![s],
             None => State::ALL.to_vec(),
@@ -1706,7 +1909,7 @@ impl Jobs {
                 out.push(run.view(attempt.as_ref(), publication.as_ref()));
             }
         }
-        out.sort_by_key(|a| std::cmp::Reverse(a.submitted_commit));
+        out.sort_by_key(|a| std::cmp::Reverse((a.submitted_commit, a.submitted_ms)));
         out.truncate(limit);
         Ok(out)
     }
@@ -1716,14 +1919,13 @@ impl Jobs {
     /// hold and the submission commit. Returns the released hold ids.
     pub fn reconcile_holds(&self, grace_ms: i64) -> Result<Vec<Uuid>> {
         let ds = self.main()?;
-        let prep = preparation()?;
         // Each question reads the committed head of its moment: the store asks again
         // under the lock every publication takes, and that answer must see a run whose
         // commit published after the first question.
         ds.store()
             .reconcile_holds(OwnerKind::Jobs, grace_ms, &mut |hold| {
-                let snap = ds.store().snapshot();
-                let mut l = Ledger::new(&prep, &snap);
+                let state = ds.store().control_state().unwrap_or_default();
+                let mut l = Ledger::new(&state);
                 Ok(l.run_header(hold.id)?.is_some_and(|r| !r.state.terminal()))
             })
     }

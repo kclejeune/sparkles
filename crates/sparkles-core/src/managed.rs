@@ -121,18 +121,6 @@ impl OwnerKind {
         }
     }
 
-    /// The graphs this owner hides from every caller's read view whenever it is
-    /// configured, known without reading its registry entry, so that a registry that
-    /// cannot be read still hides them.
-    pub fn always_hidden_graphs(self) -> Vec<String> {
-        match self {
-            OwnerKind::Jobs => vec![crate::jobs::LEDGER_GRAPH.to_string()],
-            OwnerKind::Evidence => Vec::new(),
-            #[cfg(test)]
-            OwnerKind::Test => Vec::new(),
-        }
-    }
-
     /// Why this build cannot read the owner's settings `bytes` for `profile`, if it
     /// cannot: the settings file's envelope, its `format` and `profile` members, must
     /// be ones this build reads.
@@ -198,9 +186,8 @@ pub struct OwnerEntry {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub protections: BTreeMap<String, uuid::Uuid>,
     /// Who sees the graphs through the ordinary read surfaces: `public`, under the
-    /// caller's grants, or `hidden`, for owners whose control graphs only their typed
-    /// inspection renders (spec C26 §2.3). A hidden graph leaves every caller's read
-    /// view ([`ManagedGraphs::hidden_graphs`]).
+    /// caller's grants. `hidden` is reserved for owners whose control graphs only
+    /// their typed inspection renders (spec C26 §2.3), and this build refuses it.
     #[serde(default)]
     pub visibility: Visibility,
     /// What a merge does with changes to the graphs: `refuse` the merge. `exclude` is
@@ -216,8 +203,7 @@ pub struct OwnerEntry {
 pub enum Visibility {
     #[default]
     Public,
-    /// Left out of every caller's read view; only the owner's typed inspection renders
-    /// the graphs.
+    /// Reserved: refused by this build.
     Hidden,
 }
 
@@ -234,6 +220,9 @@ pub enum MergePolicy {
 impl OwnerEntry {
     /// The reason this build cannot enforce the entry's reserved members, if any.
     pub(crate) fn reserved(&self) -> Option<&'static str> {
+        if self.visibility != Visibility::Public {
+            return Some("visibility \"hidden\" is reserved and not supported by this build");
+        }
         if self.merge != MergePolicy::Refuse {
             return Some("merge \"exclude\" is reserved and not supported by this build");
         }
@@ -253,28 +242,6 @@ impl OwnerEntry {
             merge: MergePolicy::Refuse,
         }
     }
-}
-
-/// The graphs that a `managed.json` names under an owner whose visibility is `hidden`,
-/// read leniently from the raw file for a registry this build cannot enforce. `None`
-/// when the file is not JSON.
-pub(crate) fn hidden_graphs_of_file(bytes: &[u8]) -> Option<Vec<String>> {
-    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let owners = v.get("owners")?.as_object()?;
-    Some(
-        owners
-            .values()
-            .filter(|e| e.get("visibility").and_then(serde_json::Value::as_str) == Some("hidden"))
-            .flat_map(|e| {
-                e.get("graphs")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|g| g.as_str().map(str::to_string))
-                    .collect::<Vec<_>>()
-            })
-            .collect(),
-    )
 }
 
 /// `sha256:` and the lowercase hex SHA-256 digest of `bytes`.
@@ -299,16 +266,6 @@ pub struct ManagedGraphs {
 }
 
 impl ManagedGraphs {
-    /// The graphs of every owner whose visibility is `hidden`, which leave every
-    /// caller's read view.
-    pub fn hidden_graphs(&self) -> Vec<String> {
-        self.owners
-            .values()
-            .filter(|e| e.visibility == Visibility::Hidden)
-            .flat_map(|e| e.graphs.iter().cloned())
-            .collect()
-    }
-
     /// The owner of the graph `iri`, if it is managed.
     pub fn owner_of(&self, iri: &str) -> Option<OwnerKind> {
         self.owners
@@ -395,11 +352,14 @@ pub enum ManagedErrorKind {
     PublicationConflict,
     /// The dataset's bound on queued runs is reached, so no run was stored.
     JobsOverloaded,
+    /// The dataset was restored and its jobs recovery is pausing the restored work, so
+    /// the transition was refused (spec C26 §7.3).
+    JobsRecovering,
 }
 
 impl ManagedErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ManagedErrorKind; 26] = [
+    pub const ALL: [ManagedErrorKind; 27] = [
         ManagedErrorKind::Protected,
         ManagedErrorKind::Unavailable,
         ManagedErrorKind::UnsupportedProfile,
@@ -426,6 +386,7 @@ impl ManagedErrorKind {
         ManagedErrorKind::LeaseLost,
         ManagedErrorKind::PublicationConflict,
         ManagedErrorKind::JobsOverloaded,
+        ManagedErrorKind::JobsRecovering,
     ];
 
     /// The stable code of the kind.
@@ -457,6 +418,7 @@ impl ManagedErrorKind {
             ManagedErrorKind::LeaseLost => "lease-lost",
             ManagedErrorKind::PublicationConflict => "publication-conflict",
             ManagedErrorKind::JobsOverloaded => "jobs-overloaded",
+            ManagedErrorKind::JobsRecovering => "jobs-recovering",
         }
     }
 
@@ -490,7 +452,7 @@ pub struct ManagedError {
     /// `evidence-conflict`, `projection-unavailable` and `identity-conflict`,
     /// `configuration-history-inactive` for a historical evidence read of a store
     /// without activated configuration history, and the job codes `lease-lost`,
-    /// `publication-conflict` and `jobs-overloaded`
+    /// `publication-conflict`, `jobs-overloaded` and `jobs-recovering`
     pub code: &'static str,
     pub message: String,
 }
@@ -531,7 +493,8 @@ impl ManagedError {
             | ManagedErrorKind::IdentityConflict
             | ManagedErrorKind::ConfigurationHistoryInactive
             | ManagedErrorKind::LeaseLost
-            | ManagedErrorKind::PublicationConflict => 409,
+            | ManagedErrorKind::PublicationConflict
+            | ManagedErrorKind::JobsRecovering => 409,
             ManagedErrorKind::JobsOverloaded => 429,
             ManagedErrorKind::AuthorityChanged | ManagedErrorKind::ProjectionUnavailable => 503,
         }
@@ -1146,7 +1109,7 @@ mod tests {
         v["format"] = 3.into();
         let newer = serde_json::to_vec(&v).unwrap();
         let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
-        v["owners"]["jobs"] = v["owners"]["evidence"].clone();
+        v["owners"]["widgets"] = v["owners"]["evidence"].clone();
         let unknown_owner = serde_json::to_vec(&v).unwrap();
         let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
         v["owners"]["evidence"]["profile"] = 2.into();
@@ -1160,15 +1123,11 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
         v["owners"]["evidence"]["merge"] = "later".into();
         let unknown_merge = serde_json::to_vec(&v).unwrap();
-        // a hidden owner reads, and its graphs are the hidden ones
-        match decode(&hidden, |_| Ok(Some(b"{}".to_vec()))) {
-            ManagedState::Installed(i) => assert_eq!(i.graphs.hidden_graphs().len(), 1),
-            s => panic!("{s:?}"),
-        }
         for (bytes, repairable, settings) in [
             (&newer[..], false, Some(b"{}".to_vec())),
             (&unknown_owner, false, Some(b"{}".to_vec())),
             (&unknown_profile, false, Some(b"{}".to_vec())),
+            (&hidden, false, Some(b"{}".to_vec())),
             (&exclude, false, Some(b"{}".to_vec())),
             (&unknown_merge, false, Some(b"{}".to_vec())),
             (&good, true, Some(b"{ }".to_vec())),

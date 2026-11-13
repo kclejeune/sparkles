@@ -95,26 +95,6 @@ pub fn sha256_hex(b: &[u8]) -> String {
         .collect()
 }
 
-/// The key that a guard's kept state of the head is recorded under: the hash of its
-/// configuration, or, when the store hides managed graphs that the validation leaves out
-/// (spec C26 §2.3), the SHA-256 of that hash and those graphs. A state kept under
-/// another set of hidden graphs is then not trusted, and the next validated write
-/// validates in full.
-pub fn status_key(config_hash: &str, hidden: &[String]) -> String {
-    if hidden.is_empty() {
-        return config_hash.to_string();
-    }
-    let mut hidden = hidden.to_vec();
-    hidden.sort_unstable();
-    hidden.dedup();
-    let mut text = config_hash.to_string();
-    for g in &hidden {
-        text.push('\n');
-        text.push_str(g);
-    }
-    sha256_hex(text.as_bytes())
-}
-
 /// The time now, for `updated`.
 pub fn now_rfc3339() -> String {
     crate::commit::rfc3339_ms(
@@ -187,7 +167,7 @@ impl DataGraphSel {
 
     /// The graphs to validate over `snap`, with the inferred graph merged in or left
     /// out, and `exclude` never read; `None` when the selection is a list of graphs none
-    /// of which exists outside `exclude` (nothing to validate).
+    /// of which exists (nothing to validate).
     pub fn graphs(
         &self,
         snap: &Snapshot,
@@ -207,11 +187,7 @@ impl DataGraphSel {
             DataGraphSel::Named(n) if n == "union" => o.data_graph = Some(UNION_GRAPH_IRI.into()),
             DataGraphSel::Named(_) => {}
             DataGraphSel::Graphs(gs) => {
-                // a listed graph that is also excluded is never read
-                let exists = |g: &str| {
-                    (g == DEFAULT_GRAPH_IRI || snap.lookup_iri(g).is_some())
-                        && !exclude.iter().any(|x| x == g)
-                };
+                let exists = |g: &str| g == DEFAULT_GRAPH_IRI || snap.lookup_iri(g).is_some();
                 let mut present = gs.iter().filter(|g| exists(g));
                 o.data_graph = Some(present.next()?.clone());
                 o.extra_graphs.extend(present.cloned());

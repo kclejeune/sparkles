@@ -130,32 +130,6 @@ pub(super) fn gone_body(g: &sparkles::history::HistoryGone) -> J {
     j
 }
 
-/// The body of a `history-gone` response, kept beside it so that the authorization
-/// layer can leave out the commit counts of its metadata for a caller that reads only
-/// some graphs (spec C26 §2.3), since the error is rendered without the principal.
-#[derive(Clone)]
-pub(crate) struct GoneBody(pub(crate) J);
-
-/// `resp` with the commit counts of its `history-gone` metadata left out when
-/// `partial`. Other responses are returned as they are.
-pub(crate) fn redact_gone(mut resp: Response, partial: bool) -> Response {
-    let Some(GoneBody(mut body)) = resp.extensions_mut().remove::<GoneBody>() else {
-        return resp;
-    };
-    if !partial {
-        return resp;
-    }
-    if let Some(m) = body.get_mut("metadata")
-        && m.is_object()
-    {
-        super::redact_commit_json(m);
-    }
-    let (mut parts, _) = resp.into_parts();
-    parts.headers.remove(header::CONTENT_LENGTH);
-    let bytes = serde_json::to_vec(&body).unwrap_or_default();
-    Response::from_parts(parts, axum::body::Body::from(bytes))
-}
-
 fn ranges(r: &[(u64, u64)]) -> J {
     json!(
         r.iter()
@@ -344,7 +318,7 @@ pub(super) async fn list_snapshots(
     Extension(p): Extension<Principal>,
 ) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
-    let restricted = p.partial_view(&ds.name);
+    let restricted = p.restricted(&ds.name);
     let snaps: Vec<J> = ds
         .dataset
         .snapshots()
@@ -365,7 +339,6 @@ pub(super) async fn create_snapshot(
     Path(name): Path<String>,
     uri: Uri,
     headers: HeaderMap,
-    Extension(p): Extension<Principal>,
     AdminBody(body): AdminBody,
 ) -> ApiResult {
     if st.read_only {
@@ -431,11 +404,7 @@ pub(super) async fn create_snapshot(
         } else {
             StatusCode::OK
         };
-        let mut resp = (
-            status,
-            Json(snapshot_json_for(&snap, p.partial_view(&ds.name))),
-        )
-            .into_response();
+        let mut resp = (status, Json(snapshot_json(&snap))).into_response();
         if created
             && let Ok(v) =
                 header::HeaderValue::from_str(&format!("/$/snapshots/{}/{}", ds.name, snap_name))
@@ -460,7 +429,7 @@ pub(super) async fn get_snapshot(
             format!("no snapshot '{snap}' in dataset {name}"),
         )
     })?;
-    Ok(Json(snapshot_json_for(&s, p.partial_view(&ds.name))))
+    Ok(Json(snapshot_json_for(&s, p.restricted(&ds.name))))
 }
 
 pub(super) async fn delete_snapshot(

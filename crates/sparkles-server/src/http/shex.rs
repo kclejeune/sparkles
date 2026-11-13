@@ -36,7 +36,7 @@ mod enabled {
     use crate::auth::Principal;
     use crate::shex_cmd::{ShexFormat, write_report};
     use crate::state::AppState;
-    use crate::validation_common::{GraphParam, graph_visible};
+    use crate::validation_common::{GraphParam, graph_exists};
     use axum::extract::{Extension, Path};
     use axum::http::{HeaderMap, StatusCode, Uri, header};
     use axum::response::IntoResponse;
@@ -360,17 +360,6 @@ mod enabled {
         let at = super::super::history::at_param(&query)?;
         let guard = if p.guard {
             match ds.validation.read().clone() {
-                Some(crate::write_validation::Validation::Shex(g))
-                    if crate::validation_common::source_hidden(
-                        g.config().schema.graphs.as_ref(),
-                        &ds.dataset.store().hidden_graphs(),
-                    ) =>
-                {
-                    return Err(err(
-                        StatusCode::NOT_FOUND,
-                        format!("/{} has no write-time validation", ds.name),
-                    ));
-                }
                 Some(crate::write_validation::Validation::Shex(g)) => Some(g),
                 #[cfg(feature = "shacl")]
                 Some(crate::write_validation::Validation::Shacl(_)) => {
@@ -478,7 +467,7 @@ mod enabled {
                 MapText::Json(m) => ShapeMap::from_json(m).map_err(|e| syntax("shape map", &e))?,
             };
             if let GraphParam::Named(iri) = &p.graph
-                && !graph_visible(&ds.dataset, &snap, iri)
+                && !graph_exists(&snap, iri)
             {
                 return Err(err(
                     StatusCode::NOT_FOUND,
@@ -488,8 +477,7 @@ mod enabled {
             let inferred = has_inferred.then_some(INFERRED_GRAPH);
             let inputs =
                 crate::validation_common::inputs(&snap, &p.graph, inferred, p.use_inferred)
-                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?
-                    .excluding(&ds.dataset.store().hidden_graphs());
+                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             let opts = ValidateOptions {
                 data_graph: inputs.data_graph,
                 extra_graphs: inputs.extra_graphs,
@@ -568,21 +556,7 @@ mod enabled {
     /// label keeps it.
     fn guard_validation(r: GuardRun<'_>) -> ApiResult {
         let bad = |m: String| err(StatusCode::BAD_REQUEST, m);
-        // the hidden graphs are applied below, so that a hidden data graph answers as one
-        // that does not exist
-        let (schema, guard_map, opts) = r.guard.validation_inputs(&r.snap, &[]);
-        // the dataset's hidden control graphs (spec C26 §2.3) are never read, and a hidden
-        // data graph is one that does not exist
-        let hidden = r.ds.dataset.store().hidden_graphs();
-        let opts = opts.and_then(|mut o| {
-            crate::validation_common::hide_graphs(
-                &mut o.data_graph,
-                &mut o.extra_graphs,
-                &mut o.exclude_graphs,
-                &hidden,
-            )
-            .then_some(o)
-        });
+        let (schema, guard_map, opts) = r.guard.validation_inputs(&r.snap);
         let text = match (&r.p.map, &r.p.node) {
             (Some(m), _) => m.clone(),
             (None, Some(n)) => format!("{n}@{}", r.p.shape.as_deref().unwrap_or("START")),

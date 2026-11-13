@@ -120,6 +120,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/jobs/{ds}/settings", &["GET", "PUT"]),
     ("/$/jobs/{ds}", &["GET", "POST"]),
     ("/$/jobs/{ds}/claim", &["POST"]),
+    ("/$/jobs/{ds}/recover", &["POST"]),
     ("/$/jobs/{ds}/{id}", &["GET"]),
     ("/$/jobs/{ds}/{id}/renew", &["POST"]),
     ("/$/jobs/{ds}/{id}/publish", &["POST"]),
@@ -608,6 +609,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/geo/{ds}/rebuild"
         // the definitions name the graphs workers publish into
         | "/$/jobs/{ds}/settings"
+        // resuming restored work decides which uncertain effects may happen again
+        | "/$/jobs/{ds}/recover"
         // the settings name the protected graphs and review policies
         | "/$/evidence/{ds}/settings"
         | "/$/evidence/{ds}/detach"
@@ -1253,22 +1256,6 @@ pub(crate) fn protected_resource(
     ))
 }
 
-/// `p` with the hidden managed graphs of the request's dataset (spec C26 §2.3), such as
-/// the job ledger, left out of its read and write views on top of the graphs its grants
-/// and the server's configuration hide. A request that names no dataset, or one the
-/// server does not hold, is unchanged.
-fn hiding_owner_graphs(st: &AppState, route: &str, uri: &Uri, p: Principal) -> Principal {
-    let Some(ds) = ds_of(route, uri) else {
-        return p;
-    };
-    let Some(dataset) = st.get(&ds) else {
-        return p;
-    };
-    // by name in this dataset, as every other boundary subtracts them, so that the view
-    // a request reads under is the one a kept view of the dataset resolves to
-    p.hiding_graphs_in(&ds, dataset.dataset.store().hidden_graphs())
-}
-
 /// The `{ds}` segment of the request path.
 fn ds_of(route: &str, uri: &Uri) -> Option<String> {
     let pos = route.split('/').position(|s| s == "{ds}")?;
@@ -1316,32 +1303,8 @@ pub async fn middleware(State(st): State<Arc<AppState>>, mut req: Request, next:
         crate::http::add_request_id(&mut r, id);
         return r;
     }
-    // without authentication the local principal still loses the dataset's hidden
-    // control graphs (spec C26 §2.3)
-    let route = req
-        .extensions()
-        .get::<MatchedPath>()
-        .map(|m| m.as_str().to_string());
-    let (p, partial) = match route {
-        Some(route) => {
-            let p = hiding_owner_graphs(&st, &route, req.uri(), Principal::local());
-            let partial = partial_for(&route, req.uri(), &p);
-            (p, partial)
-        }
-        None => (Principal::local(), false),
-    };
-    req.extensions_mut().insert(p);
-    crate::http::history::redact_gone(next.run(req).await, partial)
-}
-
-/// Whether figures that count every graph of the request's dataset leave the response
-/// of `p`: when `p` reads only some of its graphs, or when the request names no dataset
-/// and `p` reads only some graphs anywhere.
-fn partial_for(route: &str, uri: &Uri, p: &Principal) -> bool {
-    match ds_of(route, uri) {
-        Some(ds) => p.partial_view(&ds),
-        None => !p.hidden_patterns().is_empty(),
-    }
+    req.extensions_mut().insert(Principal::local());
+    next.run(req).await
 }
 
 #[cfg(feature = "auth")]
@@ -1734,12 +1697,10 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         }
     }
 
-    // pass, with the dataset's hidden control graphs out of the principal's views
-    let p = hiding_owner_graphs(st, &route, req.uri(), p);
+    // pass
     let report = report_of(&p, None);
-    let partial = partial_for(&route, req.uri(), &p);
     req.extensions_mut().insert(p);
-    let mut resp = crate::http::history::redact_gone(next.run(req).await, partial);
+    let mut resp = next.run(req).await;
     if route.starts_with("/$/") && !resp.headers().contains_key(header::CACHE_CONTROL) {
         resp.headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));

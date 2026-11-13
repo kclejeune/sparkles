@@ -153,10 +153,7 @@ impl Dataset {
     }
 
     /// The counts of a state the caller has opened, which `at` resolved when it is a
-    /// past one. The dataset's hidden control graphs (spec C26 §2.3), such as the job
-    /// ledger, are left out of every figure that counts quads: the graph list, the quad,
-    /// base and delta totals, the predicate counts and the class instances. The
-    /// vocabulary size and the history figures describe the storage as a whole.
+    /// past one.
     pub fn stats_of(&self, snap: &Snapshot, at: Option<&Resolved>) -> Result<DatasetStats> {
         let gen_ = &snap.generation;
         let term = |id: u64| {
@@ -165,12 +162,8 @@ impl Dataset {
                 t => t.to_string(),
             })
         };
-        let hidden = Hidden::of(snap, &self.store().hidden_graphs())?;
         let mut graphs = Vec::new();
         for g in snap.distinct_first(Perm::Gspo)? {
-            if hidden.graph(g) {
-                continue;
-            }
             let quads = snap.count(Perm::Gspo, &[g])?;
             let name = if g == Id::DEFAULT_GRAPH.0 {
                 None
@@ -185,13 +178,7 @@ impl Dataset {
         // predicates: exact counts; distinct subjects and objects from build statistics
         let mut preds: Vec<(u64, u64)> = Vec::new();
         for p in snap.distinct_first(Perm::Pso)? {
-            let count = snap
-                .count(Perm::Pso, &[p])?
-                .saturating_sub(hidden.predicate(p));
-            if count == 0 {
-                continue;
-            }
-            preds.push((p, count));
+            preds.push((p, snap.count(Perm::Pso, &[p])?));
             if preds.len() >= MAX_PREDICATES {
                 break;
             }
@@ -202,20 +189,14 @@ impl Dataset {
             .take(TOP)
             .map(|&(p, count)| {
                 let ps = gen_.stats.predicate(p);
-                // less the subjects and objects only a hidden graph gives the predicate
-                let (hs, ho) = if hidden.counted(p) {
-                    hidden.hidden_terms(snap, p)?
-                } else {
-                    (0, 0)
-                };
-                Ok(PredicateCount {
+                PredicateCount {
                     iri: term(p).unwrap_or_default(),
                     count,
-                    distinct_subjects: ps.map_or(0, |s| s.distinct_subjects).saturating_sub(hs),
-                    distinct_objects: ps.map_or(0, |s| s.distinct_objects).saturating_sub(ho),
-                })
+                    distinct_subjects: ps.map_or(0, |s| s.distinct_subjects),
+                    distinct_objects: ps.map_or(0, |s| s.distinct_objects),
+                }
             })
-            .collect::<Result<_>>()?;
+            .collect();
         // classes: distinct subjects typed with each class over every graph, as the
         // build statistics count them; after updates, from one ordered pass over
         // POS[rdf:type], where a subject typed in several graphs counts once
@@ -247,7 +228,6 @@ impl Dataset {
             }
             v
         };
-        hidden.correct_classes(snap, &mut classes)?;
         classes.sort_by_key(|c| std::cmp::Reverse(c.1));
         let classes = classes
             .iter()
@@ -270,10 +250,10 @@ impl Dataset {
                 snapshots: h.snapshots,
                 oldest_reconstructable: h.oldest_reconstructable(),
             },
-            quads: snap.len().saturating_sub(hidden.quads()),
-            base_quads: gen_.meta.quads.saturating_sub(hidden.base),
-            delta_inserts: snap.delta.inserts().saturating_sub(hidden.inserts),
-            delta_deletes: snap.delta.deletes().saturating_sub(hidden.deletes),
+            quads: snap.len(),
+            base_quads: gen_.meta.quads,
+            delta_inserts: snap.delta.inserts(),
+            delta_deletes: snap.delta.deletes(),
             terms: gen_.vocab.len() + gen_.dvocab.len(),
             generation: gen_.name.clone(),
             graphs,
@@ -302,155 +282,5 @@ impl Dataset {
                 misses: rcache.service.misses(),
             },
         })
-    }
-}
-
-/// What the dataset's hidden control graphs hold in one snapshot (spec C26 §2.3), so that
-/// the statistics leave it out: their ids, their quads in the base and the delta, their
-/// quads per predicate and the (class, subject) pairs they type. A hidden graph is small
-/// next to the dataset, so one pass over it costs less than a pass over the visible
-/// graphs.
-#[derive(Default)]
-struct Hidden {
-    ids: Vec<u64>,
-    base: u64,
-    inserts: usize,
-    deletes: usize,
-    predicates: std::collections::BTreeMap<u64, u64>,
-    typed: std::collections::BTreeSet<(u64, u64)>,
-    /// the (predicate, subject) and (predicate, object) pairs of their quads in the base,
-    /// which the build statistics count among the distinct subjects and objects
-    subjects: std::collections::BTreeSet<(u64, u64)>,
-    objects: std::collections::BTreeSet<(u64, u64)>,
-}
-
-impl Hidden {
-    fn of(snap: &Snapshot, graphs: &[String]) -> Result<Hidden> {
-        let mut h = Hidden::default();
-        if graphs.is_empty() {
-            return Ok(h);
-        }
-        let rdf_type = snap
-            .lookup_iri(oxrdf::vocab::rdf::TYPE.as_str())
-            .map(|t| t.0);
-        for iri in graphs {
-            let Some(g) = snap.lookup_iri(iri).map(|g| g.0) else {
-                continue;
-            };
-            let (base, ins, del) = snap.count_split(Perm::Gspo, &[g])?;
-            h.base += base;
-            h.inserts += ins as usize;
-            h.deletes += del as usize;
-            // GSPO keys are [graph, subject, predicate, object]
-            let inserted = &snap.delta.ins[Perm::Gspo.index()];
-            let mut visit = |k: &crate::index::Key| {
-                *h.predicates.entry(k[2]).or_default() += 1;
-                if Some(k[2]) == rdf_type {
-                    h.typed.insert((k[3], k[1]));
-                }
-                if !inserted.contains(k) {
-                    h.subjects.insert((k[2], k[1]));
-                    h.objects.insert((k[2], k[3]));
-                }
-            };
-            snap.scan(Perm::Gspo, &[g], |c| {
-                match c {
-                    crate::store::Chunk::Block(b, s, e) => (s..e).for_each(|i| visit(&b.key(i))),
-                    crate::store::Chunk::Row(k) => visit(&k),
-                }
-                Ok(true)
-            })?;
-            // base quads the delta deletes are gone from the scan, but the build
-            // statistics still count their subjects and objects
-            for k in snap.delta.del[Perm::Gspo.index()]
-                .range([g, 0, 0, 0]..=[g, u64::MAX, u64::MAX, u64::MAX])
-            {
-                h.subjects.insert((k[2], k[1]));
-                h.objects.insert((k[2], k[3]));
-            }
-            h.ids.push(g);
-        }
-        Ok(h)
-    }
-
-    fn graph(&self, g: u64) -> bool {
-        self.ids.contains(&g)
-    }
-
-    fn quads(&self) -> u64 {
-        (self.base + self.inserts as u64).saturating_sub(self.deletes as u64)
-    }
-
-    fn predicate(&self, p: u64) -> u64 {
-        self.predicates.get(&p).copied().unwrap_or(0)
-    }
-
-    /// Whether a hidden graph's base gives predicate `p` subjects or objects that the
-    /// build statistics count, including base quads the delta has deleted.
-    fn counted(&self, p: u64) -> bool {
-        self.subjects.range((p, 0)..=(p, u64::MAX)).next().is_some()
-            || self.objects.range((p, 0)..=(p, u64::MAX)).next().is_some()
-    }
-
-    /// The distinct subjects and objects of predicate `p` that the build statistics count
-    /// and that only a hidden graph gives it: those of the base quads of the hidden
-    /// graphs that no visible quad of `p` shares.
-    fn hidden_terms(&self, snap: &Snapshot, p: u64) -> Result<(u64, u64)> {
-        let mut out = (0, 0);
-        // PSO keys are [predicate, subject, object, graph], POS keys
-        // [predicate, object, subject, graph]
-        for (pairs, perm, n) in [
-            (&self.subjects, Perm::Pso, &mut out.0),
-            (&self.objects, Perm::Pos, &mut out.1),
-        ] {
-            for &(_, t) in pairs.range((p, 0)..=(p, u64::MAX)) {
-                let mut visible = false;
-                snap.scan(perm, &[p, t], |c| {
-                    let in_visible = |k: &crate::index::Key| !self.graph(k[3]);
-                    visible = match c {
-                        crate::store::Chunk::Block(b, s, e) => {
-                            (s..e).any(|i| in_visible(&b.key(i)))
-                        }
-                        crate::store::Chunk::Row(k) => in_visible(&k),
-                    };
-                    Ok(!visible)
-                })?;
-                if !visible {
-                    *n += 1;
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// Take out of `classes`, which count the distinct subjects typed with each class
-    /// over every graph, the subjects that only a hidden graph types.
-    fn correct_classes(&self, snap: &Snapshot, classes: &mut Vec<(u64, u64)>) -> Result<()> {
-        if self.typed.is_empty() {
-            return Ok(());
-        }
-        let Some(t) = snap
-            .lookup_iri(oxrdf::vocab::rdf::TYPE.as_str())
-            .map(|t| t.0)
-        else {
-            return Ok(());
-        };
-        for &(class, subject) in &self.typed {
-            // POS keys are [predicate, object, subject, graph]
-            let mut visible = false;
-            snap.scan(Perm::Pos, &[t, class, subject], |c| {
-                let in_visible = |k: &crate::index::Key| !self.graph(k[3]);
-                visible = match c {
-                    crate::store::Chunk::Block(b, s, e) => (s..e).any(|i| in_visible(&b.key(i))),
-                    crate::store::Chunk::Row(k) => in_visible(&k),
-                };
-                Ok(!visible)
-            })?;
-            if !visible && let Some(c) = classes.iter_mut().find(|c| c.0 == class) {
-                c.1 = c.1.saturating_sub(1);
-            }
-        }
-        classes.retain(|c| c.1 > 0);
-        Ok(())
     }
 }

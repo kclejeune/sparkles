@@ -1,23 +1,26 @@
-//! The ledger vocabulary and record shapes, read under a snapshot and written as the
-//! quads of one transaction.
+//! The ledger's records and keys in the dataset's control keyspace (spec C26 §2.2), read
+//! from one control state and written as the control records of one transaction.
 //!
-//! Every record is a subject in [`LEDGER_GRAPH`] under the `job:` namespace. Mutable
-//! members of a run and an attempt are single-valued triples that a transition replaces
-//! in one commit. Times are `xsd:integer` milliseconds since the epoch in UTC. Each
-//! record carries the ledger graph's protection nonce, so a reader can tell a record
-//! written under the current protection from one planted while the graph was detached.
+//! Every record is a value under a key that starts with `jobs/` and names its kind and
+//! identifier. A value is the record version byte [`RECORD_VERSION`] followed by the
+//! record's JSON, whose members are fixed by the record kind. A reader refuses a record
+//! of another version or with a member it does not know, as an integrity failure that
+//! stops dispatch. A run's payload, inputs and submitted checkpoint are written once
+//! under a key of their own, so a transition rewrites only the run's small record. Index
+//! entries, such as `jobs/state/<state>/<run>`, are written in the same frame as the
+//! records they index. Times are milliseconds since the epoch in UTC.
 
-use crate::access::Preparation;
 use crate::branch::CommitRef;
-use crate::store::{Snapshot, WriteTxn};
+use crate::store::WriteTxn;
 use crate::{Error, Result};
-use oxrdf::{GraphName, Literal, NamedNode, Quad, Term};
-use sparkles_core::evidence::write::Reads;
-use sparkles_core::jobs::{LEDGER_GRAPH, MAX_INPUTS, MAX_RUNS_PER_STATE, NAMESPACE};
+use oxrdf::NamedNode;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use sparkles_core::control::ControlState;
+use sparkles_core::jobs::{MAX_INPUTS, MAX_RUNS_PER_STATE};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use uuid::Uuid;
-
-/// The memory a ledger read may use for its lookups.
-pub(super) const READS_BYTES: u64 = 16 << 20;
 
 /// The most runs one scan of a state reads. Settings validation bounds the waiting runs
 /// and the leases a dataset can hold to this number, so a scan that is cut short
@@ -27,48 +30,51 @@ pub(super) const MAX_SCAN: usize = MAX_RUNS_PER_STATE as usize;
 /// The most characters of a failure diagnostic that are kept.
 pub(super) const MAX_DIAGNOSTIC_CHARS: usize = 512;
 
-const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+/// The version byte of every record this build writes and reads.
+pub(super) const RECORD_VERSION: u8 = 1;
 
-pub(super) fn job(local: &str) -> NamedNode {
-    NamedNode::new_unchecked(format!("{NAMESPACE}{local}"))
+/// The value of an index entry: the version byte alone.
+const INDEX_VALUE: [u8; 1] = [RECORD_VERSION];
+
+pub(super) fn run_key(id: Uuid) -> Vec<u8> {
+    format!("jobs/run/{id}").into_bytes()
 }
 
-pub(super) fn graph() -> NamedNode {
-    NamedNode::new_unchecked(LEDGER_GRAPH)
+pub(super) fn input_key(id: Uuid) -> Vec<u8> {
+    format!("jobs/input/{id}").into_bytes()
 }
 
-pub(super) fn run_iri(id: Uuid) -> NamedNode {
-    job(&format!("run:{id}"))
+pub(super) fn attempt_key(id: Uuid) -> Vec<u8> {
+    format!("jobs/attempt/{id}").into_bytes()
 }
 
-pub(super) fn attempt_iri(id: Uuid) -> NamedNode {
-    job(&format!("attempt:{id}"))
+fn run_attempts_prefix(run: Uuid) -> Vec<u8> {
+    format!("jobs/run-attempt/{run}/").into_bytes()
 }
 
-pub(super) fn publication_iri(id: Uuid) -> NamedNode {
-    job(&format!("publication:{id}"))
+fn run_attempt_key(run: Uuid, attempt: Uuid) -> Vec<u8> {
+    format!("jobs/run-attempt/{run}/{attempt}").into_bytes()
 }
 
-pub(super) fn operation_iri(id: Uuid) -> NamedNode {
-    job(&format!("operation:{id}"))
+pub(super) fn publication_key(id: Uuid) -> Vec<u8> {
+    format!("jobs/publication/{id}").into_bytes()
 }
 
-pub(super) fn epoch_iri() -> NamedNode {
-    job("epoch")
+pub(super) fn operation_key(id: Uuid) -> Vec<u8> {
+    format!("jobs/operation/{id}").into_bytes()
 }
 
-pub(super) fn string(v: &str) -> Term {
-    Literal::new_simple_literal(v).into()
+fn state_prefix(state: State) -> Vec<u8> {
+    format!("jobs/state/{}/", state.as_str()).into_bytes()
 }
 
-pub(super) fn integer(v: u64) -> Term {
-    Literal::new_typed_literal(v.to_string(), NamedNode::new_unchecked(XSD_INTEGER)).into()
+fn state_key(state: State, run: Uuid) -> Vec<u8> {
+    format!("jobs/state/{}/{run}", state.as_str()).into_bytes()
 }
 
-pub(super) fn ms(v: i64) -> Term {
-    Literal::new_typed_literal(v.to_string(), NamedNode::new_unchecked(XSD_INTEGER)).into()
-}
+pub(super) const EPOCH_KEY: &[u8] = b"jobs/epoch";
+
+pub(super) const RECOVERY_KEY: &[u8] = b"jobs/recovery";
 
 /// Milliseconds since the epoch in UTC.
 pub(super) fn now_ms() -> i64 {
@@ -77,16 +83,23 @@ pub(super) fn now_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
-fn text(t: &Term) -> Option<String> {
-    match t {
-        Term::Literal(l) => Some(l.value().to_string()),
-        Term::NamedNode(n) => Some(n.as_str().to_string()),
-        _ => None,
+/// IRIs as their string in a record.
+mod iri {
+    use oxrdf::NamedNode;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(n: &NamedNode, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(n.as_str())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<NamedNode, D::Error> {
+        let v = String::deserialize(d)?;
+        NamedNode::new(v).map_err(serde::de::Error::custom)
     }
 }
 
 /// The state of a run (spec C26 §4.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum State {
     Queued,
@@ -132,7 +145,7 @@ impl State {
 }
 
 /// The state of an attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AttemptState {
     Active,
@@ -154,36 +167,30 @@ impl AttemptState {
             AttemptState::Cancelled => "cancelled",
         }
     }
-
-    fn parse(s: &str) -> Option<AttemptState> {
-        [
-            AttemptState::Active,
-            AttemptState::Published,
-            AttemptState::Failed,
-            AttemptState::Interrupted,
-            AttemptState::Expired,
-            AttemptState::Cancelled,
-        ]
-        .into_iter()
-        .find(|st| st.as_str() == s)
-    }
 }
 
-/// A run as the ledger records it.
-#[derive(Clone, Debug)]
+/// A run as the ledger records it. The payload, the inputs and the checkpoint are in the
+/// run's write-once input record ([`RunInput`]) and are filled in only by a complete
+/// read ([`Ledger::run`]).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Run {
     pub id: Uuid,
     pub definition: String,
     pub revision: String,
     pub kind: String,
     pub kind_version: u32,
+    #[serde(with = "iri")]
     pub principal: NamedNode,
-    pub payload: String,
+    pub dataset_id: Uuid,
+    pub branch_id: Uuid,
     pub payload_digest: String,
-    pub checkpoint: Option<String>,
-    pub inputs: Vec<CommitRef>,
     pub submitted_ms: i64,
+    /// The business commit the submission's frame followed.
     pub submitted_commit: u64,
+    /// The control sequence number of the submission's frame, which orders submissions
+    /// and decides a restored run's membership in a recovery (spec C26 §7.3).
+    pub submitted_seq: u64,
     pub state: State,
     pub version: u64,
     pub attempts: u32,
@@ -198,14 +205,32 @@ pub(super) struct Run {
     pub publication: Option<Uuid>,
     pub retry_of: Option<Uuid>,
     pub operation: Uuid,
-    pub protection: Option<Uuid>,
+    /// The recovery that paused the run, while it is paused by one.
+    pub recovery: Option<Uuid>,
+    #[serde(skip)]
+    pub payload: String,
+    #[serde(skip)]
+    pub checkpoint: Option<String>,
+    #[serde(skip)]
+    pub inputs: Vec<CommitRef>,
+}
+
+/// The write-once part of a run: what its submission asked for.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct RunInput {
+    pub payload: String,
+    pub checkpoint: Option<String>,
+    pub inputs: Vec<CommitRef>,
 }
 
 /// An attempt as the ledger records it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Attempt {
     pub id: Uuid,
     pub run: Uuid,
+    #[serde(with = "iri")]
     pub worker: NamedNode,
     pub number: u32,
     pub generation: u64,
@@ -218,21 +243,79 @@ pub(super) struct Attempt {
 }
 
 /// A publication as the ledger records it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct PublicationRecord {
     pub id: Uuid,
     pub run: Uuid,
     pub attempt: Uuid,
     pub digest: String,
+    /// The commit the publication made, or the head it followed when its result
+    /// changed no quad and it made none (spec C26 §4.3).
     pub commit: u64,
+    pub committed: bool,
     pub inserted: u64,
     pub deleted: u64,
     pub checkpoint: Option<String>,
     pub published_ms: i64,
 }
 
+/// A submission operation: the run it created and the digest of its normalized request.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct Operation {
+    pub run: Uuid,
+    pub request_digest: String,
+    pub idempotency_key: String,
+    pub operation_kind: String,
+    #[serde(with = "iri")]
+    pub principal: NamedNode,
+    pub definition: String,
+    pub revision: String,
+}
+
+/// The boot epoch the last process that opened the dataset recorded.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct Epoch {
+    pub epoch: Uuid,
+    pub installed_ms: i64,
+}
+
+/// The phase of a recovery of restored work (spec C26 §7.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecoveryPhase {
+    /// The restored runs are being paused in bounded frames.
+    Pausing,
+    /// Every restored run is paused, and an operator decides what resumes.
+    AwaitingDecision,
+}
+
+/// A `job:Recovery` record: the capture the dataset was restored from and where the
+/// pause of its work stands.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct Recovery {
+    pub id: Uuid,
+    /// The dataset the capture was taken of.
+    pub source_dataset: Uuid,
+    pub capture_commit: u64,
+    pub capture_label: Option<String>,
+    pub capture_ms: i64,
+    /// The control sequence number of the restored checkpoint: the runs submitted at or
+    /// below it are the restored work.
+    pub checkpoint_seq: u64,
+    pub phase: RecoveryPhase,
+    pub started_ms: i64,
+    /// The runs paused so far, and those an operator resumed or cancelled.
+    pub paused: u64,
+    pub resumed: u64,
+    pub cancelled: u64,
+}
+
 /// The redacted state of a run for inspection.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunView {
     pub id: Uuid,
@@ -266,7 +349,7 @@ pub struct RunView {
 }
 
 /// The redacted state of an attempt. It never carries the token or its verifier.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttemptView {
     pub id: Uuid,
@@ -281,14 +364,18 @@ pub struct AttemptView {
     pub diagnostic: Option<String>,
 }
 
-/// A committed publication.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+/// A recorded publication.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicationView {
     pub id: Uuid,
     pub attempt: Uuid,
     pub digest: String,
+    /// The commit the publication made, or the head it followed when it made none.
     pub commit: u64,
+    /// Whether the publication made a commit. One whose result changed no quad makes
+    /// none.
+    pub committed: bool,
     pub inserted: u64,
     pub deleted: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -338,6 +425,7 @@ impl Run {
                 attempt: p.attempt,
                 digest: p.digest.clone(),
                 commit: p.commit,
+                committed: p.committed,
                 inserted: p.inserted,
                 deleted: p.deleted,
                 checkpoint: p.checkpoint.clone(),
@@ -347,10 +435,39 @@ impl Run {
     }
 }
 
-fn corrupt(what: &str, s: &str) -> Error {
+fn corrupt(key: &[u8], what: &str) -> Error {
     Error::Corrupt(format!(
-        "the job ledger record <{s}> is damaged: {what}; dispatch is refused until it is repaired"
+        "the job ledger record {} is damaged: {what}; dispatch is refused until it is repaired",
+        String::from_utf8_lossy(key)
     ))
+}
+
+/// The value of a record.
+pub(super) fn encode<T: Serialize>(record: &T) -> Arc<[u8]> {
+    let mut out = vec![RECORD_VERSION];
+    serde_json::to_writer(&mut out, record).expect("a ledger record serializes");
+    out.into()
+}
+
+fn decode<T: DeserializeOwned>(key: &[u8], value: &[u8]) -> Result<T> {
+    match value.split_first() {
+        Some((&RECORD_VERSION, json)) => {
+            serde_json::from_slice(json).map_err(|e| corrupt(key, &e.to_string()))
+        }
+        Some((v, _)) => Err(corrupt(key, &format!("record version {v} is unknown"))),
+        None => Err(corrupt(key, "the value is empty")),
+    }
+}
+
+/// The run id at the end of an index key.
+fn indexed(key: &[u8], value: &[u8], prefix: &[u8]) -> Result<Uuid> {
+    if value != INDEX_VALUE {
+        return Err(corrupt(key, "the index entry's version is unknown"));
+    }
+    std::str::from_utf8(&key[prefix.len()..])
+        .ok()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| corrupt(key, "the index key does not end in a UUID"))
 }
 
 /// The runs one scan of a state found.
@@ -361,275 +478,119 @@ pub(super) struct Scan {
     pub truncated: bool,
 }
 
-/// Reads of the ledger graph at one snapshot.
+/// Reads of the ledger at one control state.
 pub(super) struct Ledger<'a> {
-    reads: Reads<'a>,
+    state: &'a ControlState,
 }
 
 impl<'a> Ledger<'a> {
-    pub fn new(preparation: &'a Preparation, snap: &'a Snapshot) -> Ledger<'a> {
-        Ledger {
-            reads: Reads::new(preparation, snap),
-        }
+    pub fn new(state: &'a ControlState) -> Ledger<'a> {
+        Ledger { state }
     }
 
-    fn objects(&mut self, s: &str, p: &str, limit: usize) -> Result<Vec<Term>> {
-        Ok(self
-            .reads
-            .objects_up_to(s, &job(p).into_string(), LEDGER_GRAPH, limit)?
-            .0)
-    }
-
-    fn single(&mut self, s: &str, p: &str) -> Result<Option<Term>> {
-        let mut v = self.objects(s, p, 2)?;
-        match v.len() {
-            1 => Ok(v.pop()),
-            0 => Ok(None),
-            _ => Err(corrupt(&format!("{p} has several values"), s)),
-        }
-    }
-
-    pub fn str(&mut self, s: &str, p: &str) -> Result<Option<String>> {
-        Ok(self.single(s, p)?.as_ref().and_then(text))
-    }
-
-    pub fn int(&mut self, s: &str, p: &str) -> Result<Option<u64>> {
-        match self.str(s, p)? {
-            None => Ok(None),
-            Some(v) => v
-                .parse()
-                .map(Some)
-                .map_err(|_| corrupt(&format!("{p} is not an integer"), s)),
-        }
-    }
-
-    pub fn ms(&mut self, s: &str, p: &str) -> Result<Option<i64>> {
-        match self.str(s, p)? {
-            None => Ok(None),
-            Some(v) => v
-                .parse()
-                .map(Some)
-                .map_err(|_| corrupt(&format!("{p} is not a time"), s)),
-        }
-    }
-
-    pub fn uuid(&mut self, s: &str, p: &str) -> Result<Option<Uuid>> {
-        match self.str(s, p)? {
-            None => Ok(None),
-            Some(v) => Uuid::parse_str(&v)
-                .map(Some)
-                .map_err(|_| corrupt(&format!("{p} is not a UUID"), s)),
-        }
-    }
-
-    pub fn iri(&mut self, s: &str, p: &str) -> Result<Option<NamedNode>> {
-        match self.single(s, p)? {
-            Some(Term::NamedNode(n)) => Ok(Some(n)),
-            None => Ok(None),
-            Some(_) => Err(corrupt(&format!("{p} is not an IRI"), s)),
-        }
-    }
-
-    fn required_str(&mut self, s: &str, p: &str) -> Result<String> {
-        self.str(s, p)?
-            .ok_or_else(|| corrupt(&format!("{p} is missing"), s))
-    }
-
-    fn required_int(&mut self, s: &str, p: &str) -> Result<u64> {
-        self.int(s, p)?
-            .ok_or_else(|| corrupt(&format!("{p} is missing"), s))
-    }
-
-    fn required_ms(&mut self, s: &str, p: &str) -> Result<i64> {
-        self.ms(s, p)?
-            .ok_or_else(|| corrupt(&format!("{p} is missing"), s))
-    }
-
-    fn is_a(&mut self, s: &str, class: &str) -> Result<bool> {
-        self.reads
-            .contains(s, RDF_TYPE, &job(class).into(), LEDGER_GRAPH)
-    }
-
-    /// The subjects whose `p` is `o`, up to `limit`, and whether more exist.
-    pub fn subjects(&mut self, p: &str, o: &Term, limit: usize) -> Result<(Vec<NamedNode>, bool)> {
-        self.reads
-            .subjects_up_to(&job(p).into_string(), o, LEDGER_GRAPH, limit)
+    fn get<T: DeserializeOwned>(&self, key: &[u8]) -> Result<Option<T>> {
+        self.state.get(key).map(|v| decode(key, v)).transpose()
     }
 
     /// The ids of the runs in `state`, up to [`MAX_SCAN`], and whether the ledger holds
     /// more of them than the scan read.
     pub fn runs_in(&mut self, state: State) -> Result<Scan> {
-        let (subjects, truncated) = self.subjects("state", &string(state.as_str()), MAX_SCAN)?;
-        let prefix = format!("{NAMESPACE}run:");
-        Ok(Scan {
-            ids: subjects
-                .iter()
-                .filter_map(|s| s.as_str().strip_prefix(&prefix))
-                .filter_map(|id| Uuid::parse_str(id).ok())
-                .collect(),
-            truncated,
-        })
+        let prefix = state_prefix(state);
+        let mut ids = Vec::new();
+        let mut truncated = false;
+        for (k, v) in self.state.prefix(&prefix) {
+            if ids.len() == MAX_SCAN {
+                truncated = true;
+                break;
+            }
+            ids.push(indexed(k, v, &prefix)?);
+        }
+        Ok(Scan { ids, truncated })
     }
 
-    /// The complete record of run `id`, with its payload and inputs.
+    /// The complete record of run `id`, with its payload, inputs and checkpoint: the
+    /// checkpoint of its publication when it published one, and the submitted one
+    /// otherwise.
     pub fn run(&mut self, id: Uuid) -> Result<Option<Run>> {
-        self.read_run(id, true)
+        let Some(mut run) = self.run_header(id)? else {
+            return Ok(None);
+        };
+        let key = input_key(id);
+        let input: RunInput = self
+            .get(&key)?
+            .ok_or_else(|| corrupt(&key, "the run's input record is missing"))?;
+        if input.inputs.len() > MAX_INPUTS {
+            return Err(corrupt(
+                &key,
+                &format!("more than {MAX_INPUTS} inputs are recorded"),
+            ));
+        }
+        run.payload = input.payload;
+        run.inputs = input.inputs;
+        run.checkpoint = input.checkpoint;
+        if let Some(p) = run.publication
+            && let Some(p) = self.publication(p)?
+            && p.checkpoint.is_some()
+        {
+            run.checkpoint = p.checkpoint;
+        }
+        Ok(Some(run))
     }
 
     /// The record of run `id` without its payload, checkpoint and inputs, which a
     /// scheduling decision over many runs does not need and must not retain. `payload`
     /// is empty, `checkpoint` is `None` and `inputs` holds nothing in the result.
     pub fn run_header(&mut self, id: Uuid) -> Result<Option<Run>> {
-        self.read_run(id, false)
-    }
-
-    fn read_run(&mut self, id: Uuid, complete: bool) -> Result<Option<Run>> {
-        let iri = run_iri(id);
-        let s = iri.as_str();
-        if !self.is_a(s, "Run")? {
-            return Ok(None);
+        let key = run_key(id);
+        let run: Option<Run> = self.get(&key)?;
+        if let Some(r) = &run
+            && r.id != id
+        {
+            return Err(corrupt(&key, "the record names another run"));
         }
-        let state = self.required_str(s, "state")?;
-        let state = State::parse(&state).ok_or_else(|| corrupt("state is unknown", s))?;
-        let principal = self
-            .iri(s, "principal")?
-            .ok_or_else(|| corrupt("principal is missing", s))?;
-        let (payload, inputs) = if complete {
-            let inputs = self.objects(s, "input", MAX_INPUTS + 1)?;
-            if inputs.len() > MAX_INPUTS {
-                return Err(corrupt(
-                    &format!("more than {MAX_INPUTS} inputs are recorded"),
-                    s,
-                ));
-            }
-            let inputs = inputs
-                .iter()
-                .filter_map(text)
-                .map(|v| {
-                    let (b, seq) = v
-                        .split_once('@')
-                        .ok_or_else(|| corrupt("input is not branch@seq", s))?;
-                    Ok(CommitRef {
-                        branch_id: Uuid::parse_str(b).map_err(|_| corrupt("input branch", s))?,
-                        seq: seq.parse().map_err(|_| corrupt("input seq", s))?,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            (self.required_str(s, "payload")?, inputs)
-        } else {
-            (String::new(), Vec::new())
-        };
-        let operation = self
-            .uuid(s, "operation")?
-            .ok_or_else(|| corrupt("operation is missing", s))?;
-        Ok(Some(Run {
-            id,
-            definition: self.required_str(s, "definition")?,
-            revision: self.required_str(s, "definitionRevision")?,
-            kind: self.required_str(s, "kind")?,
-            kind_version: self.required_int(s, "kindVersion")? as u32,
-            principal,
-            payload,
-            payload_digest: self.required_str(s, "payloadDigest")?,
-            checkpoint: if complete {
-                self.str(s, "sourceCheckpoint")?
-            } else {
-                None
-            },
-            inputs,
-            submitted_ms: self.required_ms(s, "submittedAtMs")?,
-            submitted_commit: self.required_int(s, "submittedCommit")?,
-            state,
-            version: self.required_int(s, "version")?,
-            attempts: self.required_int(s, "attempts")? as u32,
-            attempts_allowed: self.required_int(s, "attemptsAllowed")? as u32,
-            retry_horizon_ms: self.required_int(s, "retryHorizonMs")?,
-            generation: self.required_int(s, "generation")?,
-            current_attempt: self.uuid(s, "currentAttempt")?,
-            next_eligible_ms: self.ms(s, "nextEligibleAtMs")?,
-            reason: self.str(s, "reason")?,
-            publication: self.uuid(s, "publication")?,
-            retry_of: self.uuid(s, "retryOf")?,
-            operation,
-            protection: self.uuid(s, "graphProtection")?,
-        }))
+        Ok(run)
     }
 
     pub fn attempt(&mut self, id: Uuid) -> Result<Option<Attempt>> {
-        let iri = attempt_iri(id);
-        let s = iri.as_str();
-        if !self.is_a(s, "Attempt")? {
-            return Ok(None);
+        let key = attempt_key(id);
+        let a: Option<Attempt> = self.get(&key)?;
+        if let Some(a) = &a
+            && a.id != id
+        {
+            return Err(corrupt(&key, "the record names another attempt"));
         }
-        let state = self.required_str(s, "attemptState")?;
-        let state = AttemptState::parse(&state).ok_or_else(|| corrupt("attemptState", s))?;
-        Ok(Some(Attempt {
-            id,
-            run: self
-                .uuid(s, "run")?
-                .ok_or_else(|| corrupt("run is missing", s))?,
-            worker: self
-                .iri(s, "worker")?
-                .ok_or_else(|| corrupt("worker is missing", s))?,
-            number: self.required_int(s, "number")? as u32,
-            generation: self.required_int(s, "generation")?,
-            epoch: self
-                .uuid(s, "epoch")?
-                .ok_or_else(|| corrupt("epoch is missing", s))?,
-            verifier: self.required_str(s, "tokenVerifier")?,
-            claimed_ms: self.required_ms(s, "claimedAtMs")?,
-            lease_expires_ms: self.required_ms(s, "leaseExpiresAtMs")?,
-            state,
-            diagnostic: self.str(s, "diagnostic")?,
-        }))
+        Ok(a)
     }
 
     pub fn publication(&mut self, id: Uuid) -> Result<Option<PublicationRecord>> {
-        let iri = publication_iri(id);
-        let s = iri.as_str();
-        if !self.is_a(s, "Publication")? {
-            return Ok(None);
+        let key = publication_key(id);
+        let p: Option<PublicationRecord> = self.get(&key)?;
+        if let Some(p) = &p
+            && p.id != id
+        {
+            return Err(corrupt(&key, "the record names another publication"));
         }
-        Ok(Some(PublicationRecord {
-            id,
-            run: self
-                .uuid(s, "run")?
-                .ok_or_else(|| corrupt("run is missing", s))?,
-            attempt: self
-                .uuid(s, "attempt")?
-                .ok_or_else(|| corrupt("attempt is missing", s))?,
-            digest: self.required_str(s, "payloadDigest")?,
-            commit: self.required_int(s, "commit")?,
-            inserted: self.required_int(s, "inserted")?,
-            deleted: self.required_int(s, "deleted")?,
-            checkpoint: self.str(s, "sourceCheckpoint")?,
-            published_ms: self.required_ms(s, "publishedAtMs")?,
-        }))
+        Ok(p)
     }
 
     /// The run and the normalized request digest a submission operation recorded.
     pub fn operation(&mut self, id: Uuid) -> Result<Option<(Uuid, String)>> {
-        let iri = operation_iri(id);
-        let s = iri.as_str();
-        if !self.is_a(s, "Operation")? {
-            return Ok(None);
-        }
-        let run = self
-            .uuid(s, "run")?
-            .ok_or_else(|| corrupt("run is missing", s))?;
-        let digest = self.required_str(s, "requestDigest")?;
-        Ok(Some((run, digest)))
+        Ok(self
+            .get::<Operation>(&operation_key(id))?
+            .map(|o| (o.run, o.request_digest)))
     }
 
     /// Whether `principal` worked on any attempt of run `run`, current or earlier.
     pub fn worked_on(&mut self, run: Uuid, principal: &NamedNode) -> Result<bool> {
-        let (subjects, _) = self.subjects("run", &string(&run.to_string()), MAX_SCAN)?;
-        let prefix = format!("{NAMESPACE}attempt:");
-        for s in &subjects {
-            if !s.as_str().starts_with(&prefix) {
-                continue;
-            }
-            if self.iri(s.as_str(), "worker")?.as_ref() == Some(principal) {
+        let prefix = run_attempts_prefix(run);
+        let ids: Vec<Uuid> = self
+            .state
+            .prefix(&prefix)
+            .take(MAX_SCAN)
+            .map(|(k, v)| indexed(k, v, &prefix))
+            .collect::<Result<_>>()?;
+        for id in ids {
+            if self.attempt(id)?.is_some_and(|a| &a.worker == principal) {
                 return Ok(true);
             }
         }
@@ -638,72 +599,98 @@ impl<'a> Ledger<'a> {
 
     /// The boot epoch the ledger records, if any process recorded one.
     pub fn epoch(&mut self) -> Result<Option<Uuid>> {
-        let iri = epoch_iri();
-        self.uuid(iri.as_str(), "epoch")
+        Ok(self.get::<Epoch>(EPOCH_KEY)?.map(|e| e.epoch))
+    }
+
+    /// The recovery of restored work, while one is open.
+    pub fn recovery(&mut self) -> Result<Option<Recovery>> {
+        self.get(RECOVERY_KEY)
     }
 }
 
-/// The quads one transition adds to and removes from the ledger graph.
+/// The records one transition writes, staged by kind and written as the control
+/// records of its transaction by [`apply`](Changes::apply).
 #[derive(Default)]
 pub(super) struct Changes {
-    insert: Vec<Quad>,
-    delete: Vec<Quad>,
+    /// changed runs, with the state their base record had (`None` for a new run)
+    runs: BTreeMap<Uuid, (Option<State>, Run)>,
+    attempts: BTreeMap<Uuid, (bool, Attempt)>,
+    other: BTreeMap<Vec<u8>, Option<Arc<[u8]>>>,
 }
 
 impl Changes {
     pub fn is_empty(&self) -> bool {
-        self.insert.is_empty() && self.delete.is_empty()
+        self.runs.is_empty() && self.attempts.is_empty() && self.other.is_empty()
     }
 
-    pub fn add(&mut self, s: &NamedNode, p: &str, o: Term) {
-        self.insert.push(Quad::new(
-            s.clone(),
-            job(p),
-            o,
-            GraphName::NamedNode(graph()),
-        ));
+    /// The staged copy of `base`, created from it on first use.
+    pub fn run(&mut self, base: &Run) -> &mut Run {
+        &mut self
+            .runs
+            .entry(base.id)
+            .or_insert_with(|| (Some(base.state), base.clone()))
+            .1
     }
 
-    pub fn add_type(&mut self, s: &NamedNode, class: &str) {
-        self.insert.push(Quad::new(
-            s.clone(),
-            NamedNode::new_unchecked(RDF_TYPE),
-            job(class),
-            GraphName::NamedNode(graph()),
-        ));
+    /// A new run and its write-once input record.
+    pub fn new_run(&mut self, run: Run, input: &RunInput) {
+        self.other.insert(input_key(run.id), Some(encode(input)));
+        self.runs.insert(run.id, (None, run));
     }
 
-    /// Replace every value of `p` on `s` with `o`, or remove them all.
-    pub fn set(
-        &mut self,
-        ledger: &mut Ledger<'_>,
-        s: &NamedNode,
-        p: &str,
-        o: Option<Term>,
-    ) -> Result<()> {
-        for old in ledger.objects(s.as_str(), p, 64)? {
-            self.delete.push(Quad::new(
-                s.clone(),
-                job(p),
-                old,
-                GraphName::NamedNode(graph()),
-            ));
-        }
-        if let Some(o) = o {
-            self.add(s, p, o);
-        }
-        Ok(())
+    /// The staged copy of `base`, created from it on first use.
+    pub fn attempt(&mut self, base: &Attempt) -> &mut Attempt {
+        &mut self
+            .attempts
+            .entry(base.id)
+            .or_insert_with(|| (false, base.clone()))
+            .1
     }
 
+    pub fn new_attempt(&mut self, a: Attempt) {
+        self.attempts.insert(a.id, (true, a));
+    }
+
+    pub fn publication(&mut self, p: &PublicationRecord) {
+        self.other.insert(publication_key(p.id), Some(encode(p)));
+    }
+
+    pub fn operation(&mut self, id: Uuid, o: &Operation) {
+        self.other.insert(operation_key(id), Some(encode(o)));
+    }
+
+    pub fn epoch(&mut self, e: &Epoch) {
+        self.other.insert(EPOCH_KEY.to_vec(), Some(encode(e)));
+    }
+
+    pub fn recovery(&mut self, r: Option<&Recovery>) {
+        self.other.insert(RECOVERY_KEY.to_vec(), r.map(encode));
+    }
+
+    /// Stage the records in `t`, with the index entries of every run whose state
+    /// changed and of every new attempt.
     pub fn apply(self, t: &mut WriteTxn<'_>) -> Result<()> {
-        let mut labels = std::collections::HashMap::new();
-        for q in &self.delete {
-            let ids = t.encode_quad(q, &mut labels)?;
-            t.delete(ids)?;
+        let index: Arc<[u8]> = INDEX_VALUE.as_slice().into();
+        for (id, (base, run)) in self.runs {
+            t.control_put(&run_key(id), encode(&run))?;
+            if base != Some(run.state) {
+                if let Some(b) = base {
+                    t.control_delete(&state_key(b, id))?;
+                }
+                t.control_put(&state_key(run.state, id), index.clone())?;
+            }
         }
-        for q in &self.insert {
-            let ids = t.encode_quad(q, &mut labels)?;
-            t.insert(ids)?;
+        for (id, (new, a)) in self.attempts {
+            t.control_put(&attempt_key(id), encode(&a))?;
+            if new {
+                t.control_put(&run_attempt_key(a.run, id), index.clone())?;
+            }
+        }
+        for (k, v) in self.other {
+            match v {
+                Some(v) => t.control_put(&k, v)?,
+                None => t.control_delete(&k)?,
+            }
         }
         Ok(())
     }

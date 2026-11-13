@@ -27,6 +27,8 @@ pub(crate) mod cold;
 mod commit_graph;
 mod commit_stats;
 mod compaction;
+pub(crate) mod control_store;
+pub use control_store::{ControlOwner, ControlStamp, ControlWrite};
 #[cfg(test)]
 mod compaction_tests;
 pub(crate) mod configuration_history;
@@ -64,6 +66,8 @@ mod managed;
 pub(crate) mod managed_history;
 pub use holds::{Acquired, HoldPublication};
 pub use managed::ManagedSnapshot;
+#[cfg(test)]
+mod control_tests;
 #[cfg(test)]
 mod managed_tests;
 mod mem_history;
@@ -711,28 +715,6 @@ impl Snapshot {
         self.len() == 0
     }
 
-    /// The quads of this snapshot and the delta's inserted and deleted quads outside the
-    /// named graphs `graphs`, such as a dataset's hidden control graphs (spec C26 §2.3):
-    /// [`len`](Self::len) and the delta's sizes less what those graphs hold. Each graph
-    /// costs one prefix count.
-    pub fn sizes_without(&self, graphs: &[String]) -> Result<(u64, u64, u64)> {
-        let (mut quads, mut ins, mut del) = (
-            self.len(),
-            self.delta.inserts() as u64,
-            self.delta.deletes() as u64,
-        );
-        for iri in graphs {
-            let Some(g) = self.lookup_iri(iri) else {
-                continue;
-            };
-            let (b, i, d) = self.count_split(Perm::Gspo, &[g.0])?;
-            quads = quads.saturating_sub((b + i).saturating_sub(d));
-            ins = ins.saturating_sub(i);
-            del = del.saturating_sub(d);
-        }
-        Ok((quads, ins, del))
-    }
-
     // ---------------------------------------------------------------- terms ------
 
     /// Id of a term if it exists in this snapshot (inline, base vocab or delta vocab).
@@ -1142,19 +1124,11 @@ impl Snapshot {
 
     /// Exact number of quads with a key prefix.
     pub fn count(&self, perm: Perm, prefix: &[u64]) -> Result<u64> {
-        let (base, ins, del) = self.count_split(perm, prefix)?;
-        Ok((base + ins).saturating_sub(del))
-    }
-
-    /// The parts of [`count`](Self::count): the quads with the prefix in the base
-    /// generation, those the delta inserted and those it deleted, for a reader that
-    /// reports the base and the delta separately.
-    pub fn count_split(&self, perm: Perm, prefix: &[u64]) -> Result<(u64, u64, u64)> {
         let base = self.perm(perm).count(&self.cache, prefix)?;
         let pi = perm.index();
         let ins = Delta::count_prefix(&self.delta.ins[pi], prefix);
         let del = Delta::count_prefix(&self.delta.del[pi], prefix);
-        Ok((base, ins, del))
+        Ok((base + ins).saturating_sub(del))
     }
 
     /// The exact number of quads of one predicate, from the generation's statistics and
@@ -1601,6 +1575,8 @@ struct WriterState {
     closed: bool,
     /// while a compaction runs: each commit's changes, for it to carry over
     tap: Option<compaction::Tap>,
+    /// the control log, in a persistent main store whose control keyspace is enabled
+    control_log: Option<control_store::ControlLog>,
 }
 
 impl WriterState {
@@ -1789,6 +1765,11 @@ pub struct Store {
     /// test hooks by failpoint name
     #[cfg(any(test, feature = "failpoints"))]
     failpoints: Mutex<BTreeMap<&'static str, backup::Failpoint>>,
+    /// a refusal the next control-only frame returns before it writes (tests only)
+    #[cfg(any(test, feature = "failpoints"))]
+    control_refusal: Mutex<Option<fn() -> Error>>,
+    /// the published control state (spec C26 §2.1), when the keyspace is enabled
+    control: arc_swap::ArcSwapOption<crate::control::ControlState>,
     /// Keep exclusion through Drop and every other owned field's destructor.
     /// Fields drop in declaration order. Only the family root lease follows this.
     _lock: Option<Arc<ProcessLock>>,
@@ -1943,6 +1924,20 @@ fn lock_dir(root: &Path) -> Result<ProcessLock> {
 pub(crate) const WAL_DELETE: u8 = 2;
 pub(crate) const WAL_COMMIT: u8 = 3;
 pub(crate) const WAL_CONFIGURATION: u8 = 4;
+/// The type byte of a record that carries 32 bytes of a control frame (spec C26 §7, see
+/// [`crate::control`]). Only a log of version 3 has them, after a transaction's quad
+/// records and before its configuration record, with commit flag
+/// [`commit::WAL_FLAG_CONTROL`].
+pub(crate) const WAL_CONTROL: u8 = 5;
+
+/// Whether a data record of a transaction is a quad (an insert or a delete). Every
+/// reader that decodes quads tests this rather than skipping the records it knows are
+/// not quads.
+#[inline]
+pub(crate) fn wal_is_quad(op: u8) -> bool {
+    op == WAL_INSERT || op == WAL_DELETE
+}
+
 /// The type byte of the header record that starts a log written by this release (see
 /// [`wal::header_record`]). It is never a data or commit record type.
 pub(crate) const WAL_HEADER: u8 = 0x89;
@@ -2051,6 +2046,10 @@ impl Store {
             limits.default_max_bytes = 64 << 20;
         }
         let changelog = Some(ChangeLog::memory(dataset_id, limits));
+        // an in-memory store's keyspace is enabled by its jobs handle, and lives as
+        // long as the store
+        let control_log = None;
+        let control_state = None;
         let store = Store {
             root: None,
             group: None,
@@ -2081,6 +2080,7 @@ impl Store {
                 staged: None,
                 closed: false,
                 tap: None,
+                control_log,
             })),
             cache,
             results,
@@ -2121,6 +2121,9 @@ impl Store {
             definitions: Default::default(),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
+            #[cfg(any(test, feature = "failpoints"))]
+            control_refusal: Default::default(),
+            control: arc_swap::ArcSwapOption::new(control_state),
             opts,
         };
         let set = branching::BranchSet::memory(
@@ -2397,6 +2400,7 @@ impl Store {
         let mut wal_index = wal::WalIndex::new(base.seq);
         let annotated = crate::annotations::seqs_of(root, dataset_id);
         let mut truncated = false;
+        let mut wal_control = Vec::new();
         if wal_path.exists() {
             let mut buf = Vec::new();
             File::open(&wal_path)?.read_to_end(&mut buf)?;
@@ -2437,6 +2441,7 @@ impl Store {
             replayed = r.commits;
             next_bnode = r.next_bnode.max(bnode_floor);
             wal_text = r.touched;
+            wal_control = r.control;
         }
         drop(configuration_references);
         drop(configuration_state);
@@ -2448,18 +2453,43 @@ impl Store {
             .last()
             .map(|c| catalog.get(c.seq).filter(|r| r.seq == c.seq).unwrap_or(*c))
             .unwrap_or(base);
+        // The control keyspace of the main store, recovered before anything is written:
+        // an integrity error changes no file (spec C26 §7.2). A branch has none.
+        let control_opened = if ctx.is_none() {
+            control_store::recover_at_open(
+                root,
+                std::mem::take(&mut wal_control),
+                head.seq,
+                control_store::jobs_configured(root, family.managed.load().as_deref()),
+            )?
+        } else if !wal_control.is_empty() {
+            return Err(Error::Corrupt(format!(
+                "{}: a branch's log carries control frames",
+                wal_path.display()
+            )));
+        } else {
+            None
+        };
         // The settings files were checked by the preflight after the lock, and every file
         // this open read is in a version this build reads. The release now writes the
         // database: record it in dataset.json, and require the reader of the
         // files it creates (a log with a header record) before it creates any.
         commit::note_writer(root)?;
         let wal_existed = wal_path.exists();
+        let control_on = control_opened.is_some();
+        if control_on
+            && wal_existed
+            && (1..crate::formats::WAL_CONTROL_VERSION).contains(&wal::file_version(&wal_path)?)
+        {
+            // an enablement stopped before it upgraded the current log's header
+            upgrade_wal_header_at(&wal_path)?;
+        }
         let wal = wal::open_for_append(
             &wal_path,
-            wal::version_for(managed_history::activated(
-                family.managed.load().as_deref(),
-                Some(root),
-            )),
+            wal::version_with(
+                managed_history::activated(family.managed.load().as_deref(), Some(root)),
+                control_on,
+            ),
         )?;
         if !wal_existed {
             // a new log starts with its header record
@@ -2484,6 +2514,12 @@ impl Store {
         gen_.dvocab.settle()?;
         #[cfg(test)]
         open_step("vocab-settled");
+        // the control log's accepted prefix is durable after the log it follows
+        let control_log = match &control_opened {
+            Some(o) => Some(control_store::settle_at_open(root, o)?),
+            None => None,
+        };
+        let control_state = control_opened.map(|o| Arc::new(o.state));
         *gen_.wal_index.lock() = Some(wal_index);
         let mut history = open_history(root, dataset_id, gen_no, head.seq, true, &catalog)?;
         // the dataset's source holds, which its branches share, before anything is
@@ -2578,6 +2614,7 @@ impl Store {
                 staged: None,
                 closed: false,
                 tap: None,
+                control_log,
             })),
             cache,
             results,
@@ -2629,6 +2666,9 @@ impl Store {
             definitions: Default::default(),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
+            #[cfg(any(test, feature = "failpoints"))]
+            control_refusal: Default::default(),
+            control: arc_swap::ArcSwapOption::new(control_state),
             opts,
         };
         *store.compaction.settings.lock() = compaction::read_settings(root)?;
@@ -4002,7 +4042,7 @@ impl Store {
                                 .as_chunks::<WAL_REC>()
                                 .0
                                 .iter()
-                                .filter(|record| record[0] != WAL_CONFIGURATION)
+                                .filter(|record| wal_is_quad(record[0]))
                                 .map(|r| wal::record_quad(r))
                                 .collect(),
                         ));
@@ -5034,6 +5074,7 @@ impl Store {
             configuration_expected: matches!(self.family.managed.load().as_deref(),
                 Some(crate::managed::ManagedState::Installed(i)) if i.configuration_history.is_some()),
             stamp: None,
+            control: None,
         }
     }
 
@@ -5133,16 +5174,12 @@ impl Store {
         };
         let view = view();
         let t0 = std::time::Instant::now();
-        let mut hidden = self.hidden_graphs();
-        hidden.sort_unstable();
-        hidden.dedup();
         let checked = g.check(&crate::guard::Candidate {
             base,
             view,
             kind,
             changes,
             opts,
-            hidden: &hidden,
         });
         if let Some(o) = &observer
             && opts.dry_run.is_none()
@@ -5630,7 +5667,7 @@ impl Store {
             )?;
             let wal = wal::open_for_append(
                 &dir.join("wal.log"),
-                wal::version_for(self.configuration_activated()),
+                wal::version_with(self.configuration_activated(), self.control_enabled()),
             )?;
             let wal_size = wal.metadata()?.len();
             sync_dir(&dir)?;
@@ -5713,6 +5750,7 @@ impl Store {
             change,
             validated: validation.is_some(),
         }));
+        self.disarm_switch(w);
         // and its own vector indexes, built in the background
         self.vectors_switched(snap);
         // a bulk commit has no log to schedule embeddings from
@@ -5899,6 +5937,22 @@ impl Store {
         root: &Path,
         name: &str,
     ) -> std::result::Result<(), SwitchFailed> {
+        // In a store with a control keyspace the checkpoint comes first, since the old
+        // log's frames go with its generation, and the writer stays poisoned from the
+        // switch until its publication, which [`Store::disarm_switch`] ends (spec C26
+        // §7.1). A failed checkpoint poisons the writer as well.
+        let armed = self.control_enabled();
+        if armed {
+            if let Err(error) = self.checkpoint_control(w) {
+                w.poisoned = true;
+                return Err(SwitchFailed {
+                    error,
+                    maybe_switched: false,
+                });
+            }
+            w.poisoned = true;
+            self.failpoint("control-switch-armed");
+        }
         let Err(error) = write_atomic(&root.join("CURRENT"), name.as_bytes()) else {
             return Ok(());
         };
@@ -5906,11 +5960,21 @@ impl Store {
             std::fs::read_to_string(root.join("CURRENT")).map_or(true, |c| c.trim() == name);
         if maybe_switched {
             w.poisoned = true;
+        } else if armed {
+            w.poisoned = false;
         }
         Err(SwitchFailed {
             error,
             maybe_switched,
         })
+    }
+
+    /// End the uncertainty of a generation switch once its snapshot is published.
+    fn disarm_switch(&self, w: &mut WriterState) {
+        if self.control_enabled() {
+            self.failpoint("control-switch-published");
+            w.poisoned = false;
+        }
     }
 
     /// Move the writer onto the log of the generation `gen_` that `CURRENT` now names.
@@ -6182,6 +6246,19 @@ pub(crate) fn dir_size(p: &Path) -> u64 {
 }
 
 /// [`crate::fsutil::write_atomic`] with the store's error type.
+/// Write the header record of a log at version 3 in place, and synchronize it, before
+/// the log is opened for writing (spec C26 §7).
+fn upgrade_wal_header_at(path: &Path) -> Result<()> {
+    let f = OpenOptions::new().write(true).open(path)?;
+    wal::write_all_at(
+        &f,
+        &wal::header_record_of(crate::formats::WAL_CONTROL_VERSION),
+        0,
+    )?;
+    f.sync_data()?;
+    Ok(())
+}
+
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(crate::fsutil::write_atomic(path, bytes)?)
 }
@@ -6292,6 +6369,8 @@ pub struct WriteTxn<'s> {
     configuration_expected: bool,
     /// the commit time fixed by [`Self::managed_stamp`]
     stamp: Option<i64>,
+    /// the control records staged by an owner ([`Self::set_control`])
+    control: Option<control_store::ControlTxn>,
 }
 
 impl Drop for WriteTxn<'_> {
@@ -6792,6 +6871,7 @@ impl WriteTxn<'_> {
         if (quads.len() as u64) < self.store.opts.bulk_threshold
             || self.requested.is_some()
             || self.managed.is_some()
+            || self.control.is_some()
         {
             for q in quads {
                 self.insert(q)?;
@@ -6888,11 +6968,21 @@ impl WriteTxn<'_> {
         }
         // a write cancelled (its client gone) or past its deadline publishes nothing
         self.opts.check()?;
+        if self.control.is_some() && !self.bulk.is_empty() {
+            return Err(Error::invalid(
+                "a bulk transaction cannot stage control records",
+            ));
+        }
         if self.bulk.is_empty() {
             if let Some(dr) = self.opts.dry_run.clone() {
                 return Err(Error::DryRun(Box::new(self.preview_log(&dr)?)));
             }
             if self.net_ins == 0 && self.net_del == 0 && !self.force {
+                if self.control_staged() {
+                    // control changes alone: a control-only frame, not a commit
+                    self.opts.check_publish()?;
+                    return self.publish_control_only();
+                }
                 // no net change: no commit, nothing to validate
                 return self.publish_log(None, sync);
             }
@@ -6961,7 +7051,12 @@ impl WriteTxn<'_> {
             Err(Some(why)) => Some(why),
             Ok(()) if !self.bulk.is_empty() => Some(Fallback::Bulk),
             // a managed commit is stamped with the sequence number after the head
-            Ok(()) if self.force || self.merge.is_some() || self.managed.is_some() => {
+            Ok(())
+                if self.force
+                    || self.merge.is_some()
+                    || self.managed.is_some()
+                    || self.control.is_some() =>
+            {
                 Some(Fallback::Kind)
             }
             Ok(()) if self.wal_bytes() > group::MAX_BYTES => Some(Fallback::Size),
@@ -7014,6 +7109,12 @@ impl WriteTxn<'_> {
             gen_.dvocab.sync()?;
         }
         let c = self.next_commit(validation.as_deref());
+        // the control frame the commit carries, which names it (spec C26 §7.1)
+        let control = self.control_frame(c.seq, c.timestamp_ms)?;
+        let control_bytes = match &control {
+            Some((frame, _)) => frame.encode()?,
+            None => Vec::new(),
+        };
         // the message and digest are durable before the commit is (see `annotations`)
         let annotation = self
             .store
@@ -7044,12 +7145,21 @@ impl WriteTxn<'_> {
             );
             // The records carry no `WAL_FLAG_ANNOTATED`: the annotation above is durable
             // before them, so replay never has to tell a torn one from a missing one.
-            let data = wal::encode_txn(
+            let data = wal::encode_txn_with_control(
                 &self.log,
+                &control_bytes,
                 self.configuration,
                 next_bnode,
                 wal::Seal::of(&c, 0, 0),
             )?;
+            // In a store with a control keyspace the writer stays poisoned from here
+            // until the snapshot and the control state are published, so that an error
+            // or an unwind in between leaves no writer whose head differs from what
+            // readers see (spec C26 §7.1).
+            if self.store.control_enabled() {
+                w.poisoned = true;
+                self.store.failpoint("control-commit-armed");
+            }
             // once the first byte is written, a failure leaves the WAL in an unknown
             // state: refuse further writes, so a seq can never be written twice
             let tail = w.tail.clone();
@@ -7134,6 +7244,9 @@ impl WriteTxn<'_> {
                 w.poisoned = true;
                 return Err(e);
             }
+            if control.is_some() {
+                self.store.failpoint("control-commit-synced");
+            }
             // the bytes the file grew by: the records past its end and any zeros after,
             // which the quota does not count
             // and the bytes the vocabulary file grew by
@@ -7194,6 +7307,13 @@ impl WriteTxn<'_> {
             change,
             validated: validation.is_some(),
         }));
+        if let Some((_, state)) = control {
+            self.store.control.store(Some(Arc::new(state)));
+        }
+        if self.store.control_enabled() && self.guard.wal.is_some() {
+            self.store.failpoint("control-commit-published");
+            self.guard.poisoned = false;
+        }
         Ok(Receipt {
             dataset_id: self.store.owner_dataset_id(),
             committed: true,
@@ -7206,6 +7326,7 @@ impl WriteTxn<'_> {
     /// The bytes the commit appends to the WAL.
     fn wal_bytes(&self) -> u64 {
         (self.log.len() as u64 + 1 + u64::from(self.configuration_expected)) * WAL_REC as u64
+            + self.control_wal_bytes()
     }
 
     /// The most this commit may preallocate in the WAL past its records (see
@@ -7746,7 +7867,7 @@ pub(crate) fn wal_end(dir: &Path, base: &CommitInfo) -> u64 {
     let (mut end, mut txn_start) = (base.seq, 0usize);
     for (i, rec) in recs.iter().enumerate() {
         match rec[0] {
-            WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION => {}
+            WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION | WAL_CONTROL => {}
             WAL_HEADER if i == 0 => txn_start = 1,
             WAL_COMMIT => {
                 match commit::open_wal_commit(rec, &buf[txn_start * WAL_REC..i * WAL_REC]) {
@@ -7804,6 +7925,8 @@ pub(crate) struct Replay {
     pub touched: Vec<(u64, Vec<[Id; 4]>)>,
     /// where the replayed commits end in the log
     pub index: wal::WalIndex,
+    /// the control frames of the replayed commits, in log order (spec C26 §7.2)
+    pub control: Vec<crate::control::WalFrame>,
 }
 
 /// Whether damage found at record `at` of a WAL, in the transaction that would be commit
@@ -7833,7 +7956,12 @@ pub(crate) fn wal_torn_from(buf: &[u8], at: usize, seq: u64) -> bool {
         // transaction starts after the run of data records before this one.
         let start = recs[at + 1..i]
             .iter()
-            .rposition(|r| !matches!(r[0], WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION))
+            .rposition(|r| {
+                !matches!(
+                    r[0],
+                    WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION | WAL_CONTROL
+                )
+            })
             .map_or(at + 1, |p| at + 2 + p);
         match commit::open_wal_commit(rec, &buf[start * WAL_REC..i * WAL_REC]) {
             // the damaged commit's own record, after damage among its data, fails
@@ -7874,8 +8002,11 @@ pub(crate) fn replay_wal(
         good: 0,
         touched: Vec::new(),
         index: wal::WalIndex::new(from.base.seq),
+        control: Vec::new(),
     };
     let mut pending: Vec<(u8, [Id; 4])> = Vec::new();
+    // the payloads of the transaction's control records
+    let mut control: Vec<u8> = Vec::new();
     let mut txn_start = 0usize;
     // whether each quad a transaction changes was present when it began (for the
     // commit's net counts), from its first change in the transaction
@@ -7914,6 +8045,7 @@ pub(crate) fn replay_wal(
         match rec[0] {
             WAL_INSERT | WAL_DELETE => pending.push((rec[0], q)),
             WAL_CONFIGURATION => {}
+            WAL_CONTROL => control.extend_from_slice(&rec[1..]),
             // the header record that starts the log, checked by `committed_version_of`
             // above: the replay accepts it as the log's first complete part
             WAL_HEADER if i == 0 => {
@@ -7954,6 +8086,19 @@ pub(crate) fn replay_wal(
                     wal_version,
                     flags,
                 )?;
+                // A sealed frame that does not decode is corruption as well.
+                let frame = if flags & commit::WAL_FLAG_CONTROL != 0 {
+                    Some(crate::control::Frame::from_chunks(&control).map_err(|e| {
+                        Error::Corrupt(format!(
+                            "{}: the control frame of the transaction ending at byte {}: {e}",
+                            from.path.display(),
+                            (i + 1) * WAL_REC
+                        ))
+                    })?)
+                } else {
+                    None
+                };
+                control.clear();
                 // A commit's new terms and its WAL records are synced at the same time
                 // (see `sync_commit_reused`): after a crash, a commit that was not durable yet
                 // may name terms that did not reach `delta.vocab`.
@@ -8040,6 +8185,10 @@ pub(crate) fn replay_wal(
                 });
                 if from.keep_touched {
                     out.touched.push((seq, touched));
+                }
+                if let Some(frame) = frame {
+                    out.control
+                        .push(crate::control::WalFrame { commit: seq, frame });
                 }
                 // The original framing/term/sequence rules accepted this
                 // complete event. A lost/orphan reference refuses here, before

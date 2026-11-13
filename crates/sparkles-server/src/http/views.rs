@@ -58,17 +58,10 @@ impl Host for ServerHost {
                     format!("the view principal {name} may not query /{}", self.dataset),
                 ));
             }
-            return Ok(sparkles::access::GraphAccess::hiding_graphs(
-                p.view(&self.dataset, Endpoint::Query),
-                &self.hidden(),
-            ));
+            return Ok(p.view(&self.dataset, Endpoint::Query));
         }
         let _ = principal;
-        // the dataset's hidden control graphs are never read (spec C26 §2.3)
-        Ok(sparkles::access::GraphAccess::hiding_graphs(
-            None,
-            &self.hidden(),
-        ))
+        Ok(None)
     }
 
     fn prefixes(&self) -> Vec<(String, String)> {
@@ -96,26 +89,11 @@ impl Host for ServerHost {
     }
 
     fn epoch(&self) -> u64 {
-        // a change of the hidden control graphs changes what every principal reads
-        let visibility = self
-            .state
-            .upgrade()
-            .map_or(0, |s| sparkles::handles::views::visibility_epoch(&s.store));
         #[cfg(feature = "auth")]
         if let Some(a) = &self.auth {
-            return a.epoch() ^ visibility.rotate_left(32);
+            return a.epoch();
         }
-        visibility
-    }
-}
-
-impl ServerHost {
-    /// The dataset's hidden control graphs (spec C26 §2.3).
-    fn hidden(&self) -> Vec<String> {
-        self.state
-            .upgrade()
-            .map(|s| s.store.hidden_graphs())
-            .unwrap_or_default()
+        0
     }
 }
 

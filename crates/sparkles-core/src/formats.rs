@@ -278,10 +278,34 @@ pub const DELTA_VOCAB: FileKind = FileKind {
 pub const WAL: FileKind = FileKind {
     id: "wal",
     files: "gen-*/wal.log",
-    marker: "a 33-byte header record (magic `\\x89SPKWAL\\n` and the version). Version 2 seals a final configuration-reference record with commit flag 4",
+    marker: "a 33-byte header record (magic `\\x89SPKWAL\\n` and the version). Version 2 seals a final configuration-reference record with commit flag 4, and version 3 also carries control records with commit flag 8",
     class: Class::Primary,
-    writes: WAL_VERSION,
-    reads: &[1, 2],
+    writes: WAL_CONTROL_VERSION,
+    reads: &[1, 2, 3],
+};
+
+/// The write-ahead log version a store with a control keyspace writes, activated or
+/// not: version 2 with `WAL_CONTROL` records (spec C26 §7).
+pub const WAL_CONTROL_VERSION: u32 = 3;
+
+/// The control log at the dataset root (spec C26 §7, [`crate::control`]).
+pub const CONTROL_LOG: FileKind = FileKind {
+    id: "control-log",
+    files: "control.log",
+    marker: "a 16-byte header (magic `\\x89SPKCTL\\n` and the version), then frames with their length and CRC-32",
+    class: Class::Primary,
+    writes: crate::control::LOG_VERSION,
+    reads: &[1],
+};
+
+/// The control checkpoint at the dataset root (spec C26 §7, [`crate::control`]).
+pub const CONTROL_CHECKPOINT: FileKind = FileKind {
+    id: "control-checkpoint",
+    files: "control.bin",
+    marker: "magic `\\x89SPKCKP\\n` and the version, the entries in key order and a SHA-256 trailer",
+    class: Class::Primary,
+    writes: crate::control::CHECKPOINT_VERSION,
+    reads: &[1],
 };
 
 /// Primary configuration binding of a generation's base data revision.
@@ -522,7 +546,11 @@ pub const BACKUP_DEFINITION: FileKind = FileKind {
 
 /// The features a backup manifest may require in `requires`, which this build reads.
 /// A manifest that requires another feature is refused before anything is written.
-pub const BACKUP_MANIFEST_FEATURES: &[&str] = &["definitions", "evidence-configuration-history/1"];
+pub const BACKUP_MANIFEST_FEATURES: &[&str] = &[
+    "definitions",
+    "evidence-configuration-history/1",
+    "control/1",
+];
 
 /// A kind of dataset-managed definition that backups and clones carry beside the data,
 /// at `DIR/NAME/FILE` under the dataset root. The file is the registered settings file
@@ -656,6 +684,8 @@ pub const KINDS: &[&FileKind] = &[
     &PLANNER_STATISTICS,
     &DELTA_VOCAB,
     &WAL,
+    &CONTROL_LOG,
+    &CONTROL_CHECKPOINT,
     &GENERATION_COMMIT,
     &CONFIGURATION_GENERATION,
     &CONFIGURATION_COVERAGE,
@@ -1040,6 +1070,20 @@ pub(crate) fn admit_configuration_version(
     Ok(())
 }
 
+/// Refuse `version` of `what`, a format only a store with a control keyspace writes (log
+/// version 3), in a dataset that records a reader below the one that enabling the
+/// keyspace raises it to (spec C26 §7).
+pub(crate) fn admit_control_version(recorded_reader: u32, what: &str, version: u32) -> Result<()> {
+    let reader = crate::jobs::READER;
+    if recorded_reader < reader {
+        return Err(Error::Unsupported(format!(
+            "{what} has version {version}, which a dataset records only with a control \
+             keyspace (reader {reader}); this dataset records reader {recorded_reader}"
+        )));
+    }
+    Ok(())
+}
+
 /// The reader that the dataset in `dir` records, when it has a `dataset.json`.
 fn recorded_reader(dir: &std::path::Path) -> Option<u32> {
     crate::commit::read_dataset_versions(dir)
@@ -1098,7 +1142,9 @@ pub(crate) fn check_configuration_versions(dir: &std::path::Path) -> Result<()> 
                 }
                 if read == header.len() && header[..8] == crate::store::wal::MAGIC {
                     let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
-                    if version > crate::store::wal::PLAIN_VERSION {
+                    if version == WAL_CONTROL_VERSION {
+                        admit_control_version(reader, &wal.display().to_string(), version)?;
+                    } else if version > crate::store::wal::PLAIN_VERSION {
                         admit_configuration_version(reader, &wal.display().to_string(), version)?;
                     }
                 }
@@ -1362,7 +1408,7 @@ mod tests {
             e.contains("sparkles dump") && e.contains("Sparkles 0.1.0"),
             "{e}"
         );
-        assert_eq!(WAL.readable(), "1 and 2");
+        assert_eq!(WAL.readable(), "1, 2 and 3");
         assert_eq!(list(&[0, 1, 2]), "0, 1 and 2");
     }
 

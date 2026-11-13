@@ -157,7 +157,16 @@ impl Runtime {
         };
         let mut reg = self.reg.lock();
         self.sync_inference(&mut reg, host.as_ref());
-        self.sync_epoch(&mut reg, host.as_ref());
+        let epoch = host.epoch();
+        if self.host_epoch.swap(epoch, Ordering::AcqRel) != epoch {
+            // grants may have changed: resolve every view's principal again
+            for e in reg.views.values_mut() {
+                e.error = None;
+                if let Some(c) = e.cell.take() {
+                    c.release_view();
+                }
+            }
+        }
         let pending: Vec<String> = reg
             .views
             .iter()
@@ -227,44 +236,11 @@ impl Runtime {
         }
     }
 
-    /// Resolve every view's principal again and end the live queries when the host's
-    /// epoch changed: grants or the dataset's hidden graphs may have changed, and a live
-    /// query's access was fixed when it subscribed.
-    fn sync_epoch(&self, reg: &mut Registry, host: &dyn Host) {
-        let epoch = host.epoch();
-        if self.host_epoch.swap(epoch, Ordering::AcqRel) != epoch {
-            // grants or the dataset's hidden graphs may have changed: resolve every
-            // view's principal again, and end the live queries, whose access was fixed
-            // when they subscribed
-            for e in reg.views.values_mut() {
-                e.error = None;
-                if let Some(c) = e.cell.take() {
-                    c.release_view();
-                }
-            }
-            for c in reg.cells.values() {
-                let mut st = c.state.lock();
-                for s in st.subs.drain(..) {
-                    if let Some(sh) = s.shared.upgrade() {
-                        sh.push(LiveEvent::Error {
-                            code: "forbidden".into(),
-                            message: "what the dataset's callers may read changed; subscribe again"
-                                .into(),
-                        });
-                    }
-                }
-            }
-        }
-    }
-
     /// [`sync_inference`](Self::sync_inference) for a reader, so that a read after a
     /// change of the setting never sees a circuit of the old mode as current.
     pub(super) fn sync_for_read(&self, reg: &mut Registry) {
         if let Some(host) = self.host.read().clone() {
             self.sync_inference(reg, host.as_ref());
-            // a read after a change of what the dataset's callers may read never serves
-            // a view resolved under the old access
-            self.sync_epoch(reg, host.as_ref());
         }
     }
 }

@@ -34,10 +34,6 @@ pub fn run(
 ) -> Result<Outcome, ToolError> {
     // `branch` (C17 Phase 1c): the call runs on that branch, with the caller's grants
     // checked there
-    // the hidden control graphs of every dataset the call may select (spec C26 §2.3):
-    // a call names its dataset in its arguments, not in a request path, so the
-    // middleware's subtraction does not reach its principal
-    let call = &server.hiding_owner_graphs(call);
     let mut args = args;
     let as_tool = if name == RECALL_PREFLIGHT {
         "recall"
@@ -717,11 +713,7 @@ impl Tools<'_> {
         let mut opts = request.build();
         // SERVICE and LOAD are the principal's server permissions, and the graphs its
         // grants cover, as over HTTP
-        let hidden = dataset
-            .as_ref()
-            .map(|d| d.store.hidden_graphs())
-            .unwrap_or_default();
-        crate::auth::restrict(&mut opts, &self.call.principal, ds, endpoint, &hidden);
+        crate::auth::restrict(&mut opts, &self.call.principal, ds, endpoint);
         Ok(opts)
     }
 
@@ -1736,7 +1728,7 @@ impl Tools<'_> {
         let limit = bounded("limit", a.limit, 10, 1, 100)? as usize;
         let ds = self.dataset(a.dataset.as_deref())?;
         self.info_endpoint(&ds.name)?;
-        let restricted = self.call.principal.partial_view(&ds.name);
+        let restricted = self.call.principal.restricted(&ds.name);
         let range = a.before.map_or(CommitRange::Latest, CommitRange::Before);
         let head = ds.store.head_commit().seq;
         let page = ds.store.commits(range, limit);

@@ -90,19 +90,25 @@ fn expire(ds: &Dataset, run: Uuid) {
 }
 
 #[test]
-fn configuration_protects_the_ledger_and_refuses_ordinary_writes() {
+fn configuration_enables_the_control_keyspace() {
     let ds = Dataset::memory();
     let status = ds.jobs().settings().unwrap();
     assert!(!status.settings.enabled);
     assert!(status.digest.is_none());
+    assert!(!status.control);
     configured(&ds);
     let status = ds.jobs().settings().unwrap();
-    assert!(status.protected);
+    assert!(status.control);
     assert!(status.revisions.contains_key("collect"));
-    let r = ds.update(&format!(
-        "INSERT DATA {{ GRAPH <{LEDGER_GRAPH}> {{ <urn:x> <urn:y> <urn:z> }} }}"
-    ));
-    assert_eq!(code(r), "profile-managed-graph");
+    // the jobs owner owns no graph, so an ordinary write anywhere stays ordinary
+    ds.update("INSERT DATA { GRAPH <urn:x-sparkles:jobs:ledger> { <urn:x> <urn:y> <urn:z> } }")
+        .unwrap();
+    assert!(
+        ds.store()
+            .managed_graphs()
+            .unwrap()
+            .is_none_or(|g| g.owner_of("urn:x-sparkles:jobs:ledger").is_none())
+    );
     // disabled settings of an unconfigured dataset write nothing, and an unknown
     // definition kind is refused
     let fresh = Dataset::memory();
@@ -122,259 +128,82 @@ fn submit_result(ds: &Dataset, key: &str) -> Result<Submitted> {
     )
 }
 
+/// The ledger lies outside the RDF dataset: no quad, graph, count or commit of the
+/// dataset shows a record, and a transition that changes no quad makes no commit (spec
+/// C26 §2.1 and §2.3).
 #[test]
-fn the_ledger_graph_leaves_every_query_view_while_typed_inspection_reads_it() {
+fn no_quad_count_or_history_surface_sees_the_ledger() {
     let ds = Dataset::memory();
+    ds.update("INSERT DATA { <urn:a> <urn:b> <urn:c> }")
+        .unwrap();
+    let head = ds.store().head_commit();
+    let quads = ds.store().snapshot().len();
     configured(&ds);
     let s = submit(&ds, "k1");
-    let hidden = ds.store().hidden_graphs();
-    assert_eq!(hidden, vec![LEDGER_GRAPH.to_string()]);
-    assert!(
-        !ds.ask(&format!("ASK {{ GRAPH <{LEDGER_GRAPH}> {{ ?s ?p ?o }} }}"))
-            .unwrap()
+    let w = worker("w");
+    let c = claim(&ds, &w);
+    ds.jobs().renew(c.run, &c.token, None, None, &w).unwrap();
+    // configuration, submission, claim and renewal are no commits
+    assert_eq!(ds.store().head_commit(), head);
+    assert!(!s.replayed);
+    assert_eq!(
+        s.commit, head.seq,
+        "the submission names the head it follows"
     );
-    assert!(!ds.ask("ASK { GRAPH ?g { ?s ?p ?o } }").unwrap());
-    let opts = crate::sparql::QueryOptions {
-        graphs: Some(Arc::new(crate::access::GraphAccess::all())),
-        ..Default::default()
-    };
-    let r = ds
-        .query_with(
-            &format!("ASK {{ GRAPH <{LEDGER_GRAPH}> {{ ?s ?p ?o }} }}"),
-            &opts,
-        )
+    assert_eq!(ds.store().snapshot().len(), quads);
+    let graphs = ds
+        .query("SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }")
+        .unwrap()
+        .rows();
+    assert_eq!(graphs.len(), 0, "no named graph holds a record");
+    let count = ds
+        .query("SELECT (COUNT(*) AS ?n) WHERE { { ?s ?p ?o } UNION { GRAPH ?g { ?s ?p ?o } } }")
+        .unwrap()
+        .rows();
+    assert_eq!(count.len(), 1);
+    // the publication is one commit whose counts are its business quads alone
+    let p = ds
+        .jobs()
+        .publish(c.run, &c.token, &publication(Uuid::new_v4(), 1), &w)
         .unwrap();
-    assert!(
-        !r.boolean,
-        "an explicit all-graphs view still leaves the ledger out"
+    assert!(p.committed);
+    let after = ds.store().head_commit();
+    assert_eq!(
+        (after.seq, after.inserted, after.deleted),
+        (head.seq + 1, 1, 0)
     );
-    // options with the defaults applied, and a replaced view, are no way around it
-    let mut applied = ds.query_options();
-    applied.graphs = Some(Arc::new(crate::access::GraphAccess::all()));
-    assert!(applied.defaults_applied);
-    let ask = format!("ASK {{ GRAPH <{LEDGER_GRAPH}> {{ ?s ?p ?o }} }}");
-    assert!(!ds.query_with(&ask, &applied).unwrap().boolean);
-    assert!(ds.jobs().get(s.run, &admin()).unwrap().is_some());
-    // options made before the ledger existed leave it out once it does
-    let fresh = Dataset::memory();
-    let early = fresh.query_options();
-    configured(&fresh);
-    submit(&fresh, "k1");
-    assert!(!fresh.query_with(&ask, &early).unwrap().boolean);
+    assert_eq!(ds.store().snapshot().len(), quads + 1);
+    // the typed inspection reads the record
+    let view = ds.jobs().get(c.run, &admin()).unwrap().unwrap();
+    assert_eq!(view.state, State::Succeeded);
+    assert_eq!(view.publication.unwrap().commit, after.seq);
 }
 
+/// A result that changes no quad makes no commit: the publication record names the
+/// head it follows, the receipt says so, and a retry returns the same receipt (spec C26
+/// §4.3).
 #[test]
-fn a_registry_that_does_not_read_still_hides_the_ledger() {
-    let dir = tempfile::tempdir().unwrap();
-    let ds = Dataset::open(dir.path()).unwrap();
-    configured(&ds);
-    submit(&ds, "k1");
-    drop(ds);
-    std::fs::write(dir.path().join("managed.json"), b"{").unwrap();
-    let ds = Dataset::open(dir.path()).unwrap();
-    assert_eq!(ds.store().hidden_graphs(), vec![LEDGER_GRAPH.to_string()]);
-    let ask = format!("ASK {{ GRAPH <{LEDGER_GRAPH}> {{ ?s ?p ?o }} }}");
-    let visible = ds.query(&ask).map(|r| r.boolean).unwrap_or(false);
-    assert!(!visible, "a damaged registry made the ledger visible");
-    assert!(!ds.ask("ASK { GRAPH ?g { ?s ?p ?o } }").unwrap());
-}
-
-#[test]
-fn statistics_count_only_the_visible_graphs() {
+fn a_publication_that_changes_no_quad_makes_no_commit() {
     let ds = Dataset::memory();
     configured(&ds);
     submit(&ds, "k1");
-    submit(&ds, "k2");
-    ds.update(&format!(
-        "INSERT DATA {{ GRAPH <{G}> {{ <urn:s1> a <urn:C> ; <urn:p> \"v\" }} <urn:s2> a <urn:C> }}"
-    ))
-    .unwrap();
-    let st = ds.stats(&Default::default()).unwrap();
-    assert_eq!(st.quads, 3, "{st:?}");
-    assert_eq!(st.base_quads, 0);
-    assert_eq!(st.delta_inserts, 3);
-    assert_eq!(st.delta_deletes, 0);
-    let names: Vec<Option<&str>> = st.graphs.iter().map(|g| g.name.as_deref()).collect();
-    assert_eq!(names, vec![None, Some(G)], "{st:?}");
-    assert!(
-        st.predicates
-            .iter()
-            .all(|p| !p.iri.starts_with("urn:x-sparkles:jobs:")),
-        "a ledger predicate is listed: {st:?}"
-    );
-    let rdf_type = st
-        .predicates
-        .iter()
-        .find(|p| p.iri == oxrdf::vocab::rdf::TYPE.as_str())
-        .expect("rdf:type is a visible predicate");
-    assert_eq!(rdf_type.count, 2, "the runs' types are left out: {st:?}");
-    assert_eq!(st.classes.len(), 1, "the run class is left out: {st:?}");
-    assert_eq!(st.classes[0].iri, "urn:C");
-    assert_eq!(st.classes[0].instances, 2);
-    // the figures of the raw snapshot differ, which is what the exclusion hides
-    assert!(ds.snapshot().len() > 3);
-}
-
-#[cfg(feature = "reasoning")]
-#[test]
-fn materialization_never_reads_the_ledger() {
-    use crate::reasoning::{ReasonRequest, reasoner::GraphRef};
-    let ds = Dataset::memory();
-    configured(&ds);
-    submit(&ds, "k1");
-    // a public schema triple over a ledger predicate: with the ledger as an input, RDFS
-    // would copy every run's definition name into the visible inferred graph
-    ds.update(
-        "INSERT DATA { <urn:x-sparkles:jobs:definition> \
-         <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> <urn:visible-definition> }",
-    )
-    .unwrap();
-    let req = ReasonRequest {
-        incremental: false,
-        threads: Some(1),
-        inputs: crate::reasoning::reasoner::Inputs {
-            data_graphs: vec![GraphRef::Default, GraphRef::Named(LEDGER_GRAPH.into())],
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    // the resolution the run uses leaves the ledger out, with a warning for the request
-    let hidden = ds.store().hidden_graphs();
-    let resolved =
-        crate::reasoning::reasoner::inputs::resolve_excluding(&ds.snapshot(), &req.inputs, &hidden);
-    assert_eq!(resolved.graphs, vec![GraphRef::Default]);
-    assert!(
-        resolved
-            .warnings
-            .iter()
-            .any(|w| w.contains(LEDGER_GRAPH) && w.contains("left out")),
-        "{:?}",
-        resolved.warnings
-    );
-    ds.reasoning().run(&req).unwrap();
-    assert!(
-        !ds.ask("ASK { ?run <urn:visible-definition> \"collect\" }")
-            .unwrap(),
-        "materialization copied a hidden ledger value into the inferred graph"
-    );
-    // the record describes what was read, so a job transition does not stale the closure
-    let record = ds.reasoning_record().expect("a record");
-    let recorded = record
-        .inputs
-        .as_ref()
-        .map(|i| i.to_string())
-        .unwrap_or_default();
-    assert!(!recorded.contains(LEDGER_GRAPH), "{record:?}");
-}
-
-#[test]
-fn predicate_distinct_counts_leave_the_hidden_subjects_and_objects_out() {
-    let dir = tempfile::tempdir().unwrap();
-    let ds = Dataset::open(dir.path()).unwrap();
-    configured(&ds);
-    submit(&ds, "k");
-    ds.update("INSERT DATA { <urn:public> a <urn:Public> }")
-        .unwrap();
-    ds.compact().unwrap();
-    let stats = ds.stats(&Default::default()).unwrap();
-    let p = stats
-        .predicates
-        .iter()
-        .find(|p| p.iri == oxrdf::vocab::rdf::TYPE.as_str())
-        .unwrap();
-    assert_eq!(p.count, 1);
-    assert_eq!((p.distinct_subjects, p.distinct_objects), (1, 1), "{p:?}");
-}
-
-#[test]
-fn the_schema_facade_never_reads_the_ledger() {
-    let ds = Dataset::memory();
-    configured(&ds);
-    submit(&ds, "k");
-    let mut req = crate::handles::ReportRequest::default();
-    req.options.graph = crate::schema::GraphSelection::Union;
-    let report = ds.schema().report(&req).unwrap();
-    let j = serde_json::to_string(report.report.as_ref()).unwrap();
-    assert!(!j.contains("urn:x-sparkles:jobs:"), "{j}");
-    // an explicit all-graphs view, the report of an opened state and the profiles
-    let mut opts = req.options.clone();
-    opts.graphs = Some(Arc::new(crate::access::GraphAccess::all()));
-    let (r, _) = ds.schema().report_at(&ds.snapshot(), &opts).unwrap();
-    let j = serde_json::to_string(r.as_ref()).unwrap();
-    assert!(!j.contains("urn:x-sparkles:jobs:"), "{j}");
-    let profiles = ds
-        .schema()
-        .profiles(&crate::schema::profile::ProfileOptions {
-            schema: opts,
-            classes: Vec::new(),
-        })
-        .unwrap();
-    let j = format!("{profiles:?}");
-    assert!(!j.contains("urn:x-sparkles:jobs:"), "{j}");
-}
-
-#[cfg(feature = "shacl")]
-#[test]
-fn library_validation_never_reads_the_ledger() {
-    let ds = Dataset::memory();
-    configured(&ds);
-    submit(&ds, "k");
-    let shapes = sparkles_shacl::Shapes::parse(
-        "@prefix sh: <http://www.w3.org/ns/shacl#> . <urn:S> a sh:NodeShape ; sh:targetClass <urn:x-sparkles:jobs:Run> ; sh:property [ sh:path <urn:x-sparkles:jobs:state> ; sh:maxCount 0 ] .",
-        sparkles_shacl::ShapesSyntax::default(),
-        None,
-    )
-    .unwrap();
-    for data_graph in ["urn:x-arq:UnionGraph", LEDGER_GRAPH] {
-        let opts = sparkles_shacl::ValidateOptions {
-            data_graph: Some(data_graph.into()),
-            ..Default::default()
-        };
-        let report = ds.validation().shacl(&shapes, &opts).unwrap();
-        assert!(report.conforms, "{data_graph}: {report:?}");
-    }
-}
-
-#[cfg(feature = "shacl")]
-#[test]
-fn library_forms_never_read_the_ledger() {
-    let ds = Dataset::memory();
-    configured(&ds);
-    let run = submit(&ds, "k").run;
-    ds.update("PREFIX sh: <http://www.w3.org/ns/shacl#> INSERT DATA { GRAPH <urn:shapes> { <urn:S> a sh:NodeShape ; sh:targetClass <urn:x-sparkles:jobs:Run> ; sh:property [ sh:path <urn:x-sparkles:jobs:state> ] } }")
-        .unwrap();
-    let settings = crate::forms::FormSettings {
-        shapes: crate::forms::ShapesSource::Graphs,
-        graphs: vec!["urn:shapes".into()],
-        ..Default::default()
-    };
-    let req = crate::forms::FormRequest::new(format!("urn:x-sparkles:jobs:run:{run}"), settings);
-    let model = ds.forms().model(&req, &Default::default()).unwrap();
-    let j = serde_json::to_string(&model).unwrap();
-    assert!(!j.contains("queued"), "{j}");
-}
-
-#[test]
-fn explanations_never_read_the_ledger() {
-    let ds = Dataset::memory();
-    configured(&ds);
-    let run = submit(&ds, "k").run;
-    ds.reasoning()
-        .rdfs()
-        .set(crate::reasoning::rdfs::NewSchema::Triples(vec![]))
-        .unwrap();
-    let term = |s: &str| oxrdf::Term::NamedNode(NamedNode::new(s).unwrap());
-    let req = crate::reasoning::explain::ExplainRequest::new([
-        term(&format!("urn:x-sparkles:jobs:run:{run}")),
-        term(oxrdf::vocab::rdf::TYPE.as_str()),
-        term("urn:x-sparkles:jobs:Run"),
-    ]);
-    let result = ds.reasoning().explain(&req).unwrap();
-    assert!(
-        matches!(result.explained, crate::explain::Explained::NotFound),
-        "{:?}",
-        result.explained
-    );
+    let w = worker("w");
+    let c = claim(&ds, &w);
+    let head = ds.store().head_commit();
+    let op = Uuid::new_v4();
+    let mut p = Publication::new(op);
+    p.checkpoint = Some("cursor".into());
+    let r = ds.jobs().publish(c.run, &c.token, &p, &w).unwrap();
+    assert!(!r.committed);
+    assert_eq!(r.commit, head.seq);
+    assert_eq!(ds.store().head_commit(), head);
+    let again = ds.jobs().publish(c.run, &c.token, &p, &w).unwrap();
+    assert!(again.replayed);
+    assert_eq!((again.commit, again.committed), (head.seq, false));
+    let view = ds.jobs().get(c.run, &admin()).unwrap().unwrap();
+    assert_eq!(view.state, State::Succeeded);
+    assert_eq!(view.checkpoint.as_deref(), Some("cursor"));
+    assert!(!view.publication.unwrap().committed);
 }
 
 #[test]
@@ -713,22 +542,15 @@ fn failures_retry_with_backoff_within_attempts_and_end_otherwise() {
 fn force_eligible(ds: &Dataset, run: Uuid) {
     let store = ds.store();
     let cap = store
-        .managed_writer(OwnerKind::Jobs, Uuid::new_v4())
+        .control_writer(crate::store::ControlOwner::Jobs)
         .unwrap();
     let mut t = store.write();
-    t.set_managed(cap).unwrap();
-    let base = t.base().clone();
-    let prep =
-        crate::access::Preparation::new(crate::task::Control::none(), ledger::READS_BYTES).unwrap();
-    let mut l = ledger::Ledger::new(&prep, &base);
+    t.set_control(cap).unwrap();
+    let base = t.control_base().unwrap();
+    let mut l = ledger::Ledger::new(&base);
+    let old = l.run_header(run).unwrap().unwrap();
     let mut ch = ledger::Changes::default();
-    ch.set(
-        &mut l,
-        &ledger::run_iri(run),
-        "nextEligibleAtMs",
-        Some(ledger::ms(0)),
-    )
-    .unwrap();
+    ch.run(&old).next_eligible_ms = Some(0);
     drop(l);
     ch.apply(&mut t).unwrap();
     t.commit().unwrap();
@@ -765,13 +587,6 @@ fn a12_invalid_results_publish_nothing_and_overload_stores_no_run() {
         ds.jobs().publish(c.run, &c.token, &p, &w),
         Err(Error::NotPermitted(_))
     ));
-    // the ledger graph itself, even when a definition names it
-    let mut s2 = s.clone();
-    s2.definitions
-        .get_mut("collect")
-        .unwrap()
-        .graphs
-        .push(LEDGER_GRAPH.into());
     assert_eq!(
         ds.store().head_commit().seq,
         head,
@@ -1133,10 +948,8 @@ fn a_run_header_carries_no_payload_or_inputs() {
         seq: ds.store().head_commit().seq,
     });
     let s = ds.jobs().submit(&sub, &admin()).unwrap();
-    let snap = ds.store().snapshot();
-    let prep =
-        crate::access::Preparation::new(crate::task::Control::none(), ledger::READS_BYTES).unwrap();
-    let mut l = ledger::Ledger::new(&prep, &snap);
+    let state = ds.store().control_state().unwrap();
+    let mut l = ledger::Ledger::new(&state);
     let header = l.run_header(s.run).unwrap().unwrap();
     assert!(header.payload.is_empty());
     assert!(header.inputs.is_empty());
@@ -1147,53 +960,6 @@ fn a_run_header_carries_no_payload_or_inputs() {
     assert_eq!(full.inputs.len(), 1);
     assert_eq!(full.checkpoint.as_deref().map(str::len), Some(1024));
     assert_eq!(full.payload_digest, header.payload_digest);
-}
-
-/// A commit guard that refuses the first commit it checks with a conflict.
-struct RefuseOnce(std::sync::atomic::AtomicBool);
-
-impl crate::guard::CommitGuard for RefuseOnce {
-    fn check(&self, _: &crate::guard::Candidate<'_>) -> Result<crate::guard::ValidationSummary> {
-        if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            return Err(Error::Conflict("refused once".into()));
-        }
-        Ok(crate::guard::ValidationSummary::empty(
-            crate::guard::GuardStatus::Passed,
-            crate::guard::GuardMode::Reject,
-            crate::guard::Severity::Violation,
-        ))
-    }
-    fn describe(&self) -> String {
-        "refuse once".into()
-    }
-}
-
-/// A commit guard that unwinds.
-struct PanicGuard;
-
-impl crate::guard::CommitGuard for PanicGuard {
-    fn check(&self, _: &crate::guard::Candidate<'_>) -> Result<crate::guard::ValidationSummary> {
-        panic!("the guard unwinds")
-    }
-    fn describe(&self) -> String {
-        "panic".into()
-    }
-}
-
-fn refuse_once() -> Arc<dyn crate::guard::CommitGuard> {
-    Arc::new(RefuseOnce(std::sync::atomic::AtomicBool::new(true)))
-}
-
-/// A commit guard that refuses every commit with the error `refusal` makes.
-struct RefuseWith(fn() -> Error);
-
-impl crate::guard::CommitGuard for RefuseWith {
-    fn check(&self, _: &crate::guard::Candidate<'_>) -> Result<crate::guard::ValidationSummary> {
-        Err((self.0)())
-    }
-    fn describe(&self) -> String {
-        "refuse with".into()
-    }
 }
 
 /// `f` on a new thread, whose next renewal or failure of `ds` pauses after its commit
@@ -1222,6 +988,7 @@ fn lease_ms(ds: &Dataset, ms: u64) {
     ds.jobs().configure(&s).unwrap();
 }
 
+#[cfg(feature = "failpoints")]
 #[test]
 fn a_refused_renewal_paused_after_the_writer_does_not_extend_the_lease() {
     let ds = Dataset::memory();
@@ -1229,7 +996,8 @@ fn a_refused_renewal_paused_after_the_writer_does_not_extend_the_lease() {
     lease_ms(&ds, 1500);
     submit(&ds, "k");
     let c = claim(&ds, &worker("w"));
-    ds.store().set_guard(Some(refuse_once()));
+    ds.store()
+        .refuse_next_control_frame(|| Error::Conflict("refused under the writer".into()));
     let (d, run, token) = (ds.clone(), c.run, c.token.clone());
     let (ready, resume, h) = paused(&ds, move || {
         d.jobs()
@@ -1248,13 +1016,13 @@ fn a_refused_renewal_paused_after_the_writer_does_not_extend_the_lease() {
     );
     resume.send(()).unwrap();
     assert!(h.join().unwrap().is_err());
-    ds.store().set_guard(None);
     assert!(
         code(published).contains("lease-lost"),
         "a refused renewal authorized a publication past the committed deadline"
     );
 }
 
+#[cfg(feature = "failpoints")]
 #[test]
 fn two_refused_renewals_do_not_revive_an_abandoned_deadline() {
     let ds = Dataset::memory();
@@ -1268,12 +1036,14 @@ fn two_refused_renewals_do_not_revive_an_abandoned_deadline() {
                 .renew(run, &token, Some(60_000), None, &worker("w"))
         })
     };
-    ds.store().set_guard(Some(refuse_once()));
+    ds.store()
+        .refuse_next_control_frame(|| Error::Conflict("refused under the writer".into()));
     let (a_ready, a_resume, a) = renew(&ds);
     if a_ready.recv_timeout(Duration::from_secs(30)).is_err() {
         panic!("renewal a did not reach its commit: {:?}", a.join());
     }
-    ds.store().set_guard(Some(refuse_once()));
+    ds.store()
+        .refuse_next_control_frame(|| Error::Conflict("refused under the writer".into()));
     let (b_ready, b_resume, b) = renew(&ds);
     if b_ready.recv_timeout(Duration::from_secs(30)).is_err() {
         panic!("renewal b did not reach its commit: {:?}", b.join());
@@ -1282,7 +1052,6 @@ fn two_refused_renewals_do_not_revive_an_abandoned_deadline() {
     assert!(a.join().unwrap().is_err());
     b_resume.send(()).unwrap();
     assert!(b.join().unwrap().is_err());
-    ds.store().set_guard(None);
     std::thread::sleep(Duration::from_millis(1600));
     assert!(
         code(ds.jobs().renew(c.run, &c.token, None, None, &worker("w"))).contains("lease-lost"),
@@ -1290,6 +1059,7 @@ fn two_refused_renewals_do_not_revive_an_abandoned_deadline() {
     );
 }
 
+#[cfg(feature = "failpoints")]
 #[test]
 fn a_refused_or_unwinding_lease_commit_leaves_the_deadlines_of_committed_leases() {
     // the runtime by itself: a deadline counts only at the version it was recorded
@@ -1336,12 +1106,12 @@ fn a_refused_or_unwinding_lease_commit_leaves_the_deadlines_of_committed_leases(
     let ds = Dataset::memory();
     configured(&ds);
     submit(&ds, "k1");
-    ds.store().set_guard(Some(refuse_once()));
+    ds.store()
+        .refuse_next_control_frame(|| Error::Conflict("refused under the writer".into()));
     assert!(matches!(
         ds.jobs().claim(&[], &worker("a")),
         Err(Error::Conflict(_))
     ));
-    ds.store().set_guard(None);
     let cb = claim(&ds, &worker("b"));
     assert_eq!(cb.generation, 1);
     ds.jobs()
@@ -1355,12 +1125,12 @@ fn a_refused_or_unwinding_lease_commit_leaves_the_deadlines_of_committed_leases(
     submit(&ds, "k1");
     let w = worker("w");
     let c = claim(&ds, &w);
-    ds.store().set_guard(Some(Arc::new(PanicGuard)));
+    ds.store()
+        .refuse_next_control_frame(|| panic!("the frame unwinds"));
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ds.jobs().renew(c.run, &c.token, Some(60_000), None, &w)
     }));
     assert!(r.is_err());
-    ds.store().set_guard(None);
     std::thread::sleep(Duration::from_millis(250));
     assert_eq!(
         code(ds.jobs().renew(c.run, &c.token, None, None, &w)),
@@ -1370,12 +1140,12 @@ fn a_refused_or_unwinding_lease_commit_leaves_the_deadlines_of_committed_leases(
     // and a refused renewal keeps the previous deadline
     submit(&ds, "k2");
     let c2 = claim(&ds, &w);
-    ds.store().set_guard(Some(refuse_once()));
+    ds.store()
+        .refuse_next_control_frame(|| Error::Conflict("refused under the writer".into()));
     assert!(matches!(
         ds.jobs().renew(c2.run, &c2.token, Some(60_000), None, &w),
         Err(Error::Conflict(_))
     ));
-    ds.store().set_guard(None);
     ds.jobs().renew(c2.run, &c2.token, None, None, &w).unwrap();
     std::thread::sleep(Duration::from_millis(250));
     assert_eq!(
@@ -1438,6 +1208,7 @@ fn an_expired_run_keeps_the_retry_policy_it_was_accepted_with() {
     );
 }
 
+#[cfg(feature = "failpoints")]
 #[test]
 fn a_refused_submission_commit_releases_its_hold() {
     let dir = tempfile::tempdir().unwrap();
@@ -1450,12 +1221,12 @@ fn a_refused_submission_commit_releases_its_hold() {
         branch_id: ds.store().branch_id(),
         seq: ds.store().head_commit().seq,
     });
-    ds.store().set_guard(Some(refuse_once()));
+    ds.store()
+        .refuse_next_control_frame(|| Error::Conflict("refused under the writer".into()));
     assert!(matches!(
         ds.jobs().submit(&sub, &admin()),
         Err(Error::Conflict(_))
     ));
-    ds.store().set_guard(None);
     assert!(ds.store().source_holds().unwrap().is_empty());
     assert!(
         ds.jobs()
@@ -1467,6 +1238,7 @@ fn a_refused_submission_commit_releases_its_hold() {
     assert_eq!(ds.store().source_holds().unwrap()[0].id, s.run);
 }
 
+#[cfg(feature = "failpoints")]
 #[test]
 fn a_storage_or_managed_refusal_of_a_submission_releases_its_hold() {
     let refusals: [fn() -> Error; 2] = [
@@ -1489,10 +1261,9 @@ fn a_storage_or_managed_refusal_of_a_submission_releases_its_hold() {
             branch_id: ds.store().branch_id(),
             seq: ds.store().head_commit().seq,
         });
-        ds.store().set_guard(Some(Arc::new(RefuseWith(refusal))));
+        ds.store().refuse_next_control_frame(refusal);
         let r = ds.jobs().submit(&sub, &admin());
         assert!(r.is_err(), "refusal {i}");
-        ds.store().set_guard(None);
         assert!(
             ds.store().source_holds().unwrap().is_empty(),
             "refusal {i} left the hold of {r:?}"
@@ -1808,20 +1579,10 @@ mod crashes {
     }
 
     #[test]
-    fn disabling_jobs_keeps_the_ledger_protected_under_a_run_that_slipped_in() {
+    fn disabling_jobs_keeps_a_run_that_slipped_in() {
         let dir = tempfile::tempdir().unwrap();
         let ds = Dataset::open(dir.path()).unwrap();
         configured(&ds);
-        let nonce = |ds: &Dataset| {
-            ds.store()
-                .managed_snapshot()
-                .unwrap()
-                .unwrap()
-                .graphs
-                .owners[&OwnerKind::Jobs]
-                .protections[LEDGER_GRAPH]
-        };
-        let before = nonce(&ds);
         // a submission commits after the check of active runs and before the registry
         // change that disables jobs
         let slipped = Arc::new(parking_lot::Mutex::new(None));
@@ -1838,28 +1599,15 @@ mod crashes {
         ds.store().set_failpoint("jobs-before-disable", None);
         let run = slipped.lock().unwrap();
         assert!(!status.settings.enabled);
-        assert!(status.protected, "disabling never lifts the write fence");
-        assert_eq!(nonce(&ds), before, "the nonce is kept");
-        assert_eq!(
-            ds.store().hidden_graphs(),
-            vec![LEDGER_GRAPH.to_string()],
-            "and the ledger stays hidden"
-        );
-        assert_eq!(
-            code(ds.update(&format!(
-                "INSERT DATA {{ GRAPH <{LEDGER_GRAPH}> {{ <urn:x> <urn:y> <urn:z> }} }}"
-            ))),
-            "profile-managed-graph"
-        );
+        assert!(status.control, "disabling keeps the control keyspace");
         // nothing is admitted or claimed while jobs are disabled, and the run waits
         assert_eq!(code(submit_result(&ds, "k2")), "unsupported-profile");
         assert_eq!(
             code(ds.jobs().claim(&[], &worker("w"))),
             "unsupported-profile"
         );
-        // enabling again dispatches the run under the same protection
+        // enabling again dispatches the run
         configured(&ds);
-        assert_eq!(nonce(&ds), before);
         let view = ds.jobs().get(run, &admin()).unwrap().unwrap();
         assert_eq!(view.state, State::Queued);
         let c = claim(&ds, &worker("w"));
@@ -2045,410 +1793,4 @@ fn a_failed_attempt_keeps_the_lease_of_the_claim_that_follows_it() {
         renewed.is_ok(),
         "the failed attempt's cleanup ended the later lease: {renewed:?}"
     );
-}
-
-#[test]
-fn constraints_answer_the_ledger_as_a_graph_that_does_not_exist() {
-    let ds = Dataset::memory();
-    configured(&ds);
-    submit(&ds, "k");
-    for view in [None, Some(Arc::new(crate::access::GraphAccess::all()))] {
-        let req = crate::handles::ConstraintsRequest {
-            shapes: crate::handles::ShapesRequest {
-                guard: Some(false),
-                graphs: vec![LEDGER_GRAPH.into()],
-            },
-            graphs: view.clone(),
-            ..Default::default()
-        };
-        let r = ds.schema().constraints(&req);
-        assert!(matches!(r, Err(Error::NotFound(_))), "{view:?}: {r:?}");
-        let snap = ds.snapshot();
-        let r = ds
-            .schema()
-            .constraints_at(&snap, &req.shapes, view.as_deref());
-        assert!(matches!(r, Err(Error::NotFound(_))), "{view:?}: {r:?}");
-    }
-}
-
-/// A quad of the ledger graph written under the jobs capability, as an owner would.
-fn ledger_cell(value: &str) -> Quad {
-    Quad::new(
-        NamedNode::new_unchecked("urn:hidden-subject"),
-        NamedNode::new_unchecked("urn:cell"),
-        Literal::new_simple_literal(value),
-        GraphName::NamedNode(NamedNode::new_unchecked(LEDGER_GRAPH)),
-    )
-}
-
-fn set_ledger_cell(ds: &Dataset, old: Option<&str>, new: &str) {
-    let cap = ds
-        .store()
-        .managed_writer(OwnerKind::Jobs, Uuid::new_v4())
-        .unwrap();
-    let mut tx = ds.store().write();
-    tx.set_managed(cap).unwrap();
-    let mut labels = Default::default();
-    if let Some(v) = old {
-        let ids = tx.encode_quad(&ledger_cell(v), &mut labels).unwrap();
-        tx.delete(ids).unwrap();
-    }
-    let ids = tx.encode_quad(&ledger_cell(new), &mut labels).unwrap();
-    tx.insert(ids).unwrap();
-    tx.commit().unwrap();
-}
-
-/// A dataset with jobs whose ledger cell conflicts between `main` and branch `work`,
-/// with a public conflict too when `public`.
-fn conflicting(public: bool) -> Dataset {
-    let ds = Dataset::memory();
-    configured(&ds);
-    submit(&ds, "k");
-    set_ledger_cell(&ds, None, "base");
-    if public {
-        ds.update("INSERT DATA { <urn:s> <urn:p> <urn:base> }")
-            .unwrap();
-    }
-    ds.create_branch("work", &Default::default()).unwrap();
-    let work = ds.branch("work").unwrap();
-    set_ledger_cell(&ds, Some("base"), "ours");
-    set_ledger_cell(&work, Some("base"), "theirs");
-    if public {
-        ds.update("DELETE DATA { <urn:s> <urn:p> <urn:base> }; INSERT DATA { <urn:s> <urn:p> <urn:ours> }")
-            .unwrap();
-        work.update("DELETE DATA { <urn:s> <urn:p> <urn:base> }; INSERT DATA { <urn:s> <urn:p> <urn:theirs> }")
-            .unwrap();
-    }
-    ds
-}
-
-#[test]
-fn resolved_ledger_conflicts_leave_the_merge_counters() {
-    use crate::branch::{MergeOptions, Resolution, Take};
-    // a rule for every conflict
-    let o = MergeOptions {
-        on_conflict: Some(Take::Ours),
-        ..Default::default()
-    };
-    let r = conflicting(false)
-        .preview_merge("work", "main", &o)
-        .unwrap();
-    assert_eq!((r.conflicts_found, r.conflicts_resolved), (0, 0), "{r:?}");
-    let r = conflicting(true).preview_merge("work", "main", &o).unwrap();
-    assert_eq!((r.conflicts_found, r.conflicts_resolved), (1, 1), "{r:?}");
-    // an explicit resolution of the ledger cell
-    let o = MergeOptions {
-        resolutions: vec![Resolution {
-            graph: GraphName::NamedNode(NamedNode::new_unchecked(LEDGER_GRAPH)),
-            subject: Some(NamedNode::new_unchecked("urn:hidden-subject").into()),
-            predicate: Some(NamedNode::new_unchecked("urn:cell")),
-            take: Take::Ours,
-        }],
-        ..Default::default()
-    };
-    let r = conflicting(false)
-        .preview_merge("work", "main", &o)
-        .unwrap();
-    assert_eq!((r.conflicts_found, r.conflicts_resolved), (0, 0), "{r:?}");
-    // the public conflict remains and is shown, the resolved ledger one is not counted
-    let r = conflicting(true).preview_merge("work", "main", &o).unwrap();
-    assert_eq!((r.conflicts_found, r.conflicts_resolved), (1, 0), "{r:?}");
-    assert_eq!(r.conflicts.as_ref().map(|c| c.conflicts), Some(1), "{r:?}");
-}
-
-#[test]
-fn unresolved_ledger_only_conflicts_are_refused_as_managed() {
-    let ds = conflicting(false);
-    for r in [
-        ds.preview_merge("work", "main", &Default::default())
-            .map(|_| ()),
-        ds.merge("work", "main", &Default::default()).map(|_| ()),
-    ] {
-        assert_eq!(r.unwrap_err().code(), "profile-managed-graph");
-    }
-}
-
-#[test]
-fn merges_without_hidden_graphs_count_and_resolve_every_conflict() {
-    use crate::branch::{MergeOptions, Take};
-    let ds = Dataset::memory();
-    ds.update("INSERT DATA { <urn:s> <urn:p> <urn:base> }")
-        .unwrap();
-    ds.create_branch("work", &Default::default()).unwrap();
-    let work = ds.branch("work").unwrap();
-    ds.update(
-        "DELETE DATA { <urn:s> <urn:p> <urn:base> }; INSERT DATA { <urn:s> <urn:p> <urn:ours> }",
-    )
-    .unwrap();
-    work.update(
-        "DELETE DATA { <urn:s> <urn:p> <urn:base> }; INSERT DATA { <urn:s> <urn:p> <urn:theirs> }",
-    )
-    .unwrap();
-    let r = ds
-        .preview_merge("work", "main", &Default::default())
-        .unwrap();
-    assert_eq!(r.conflicts_found, 1);
-    assert_eq!(r.conflicts.unwrap().conflicts, 1);
-    let o = MergeOptions {
-        on_conflict: Some(Take::Theirs),
-        ..Default::default()
-    };
-    let r = ds.preview_merge("work", "main", &o).unwrap();
-    assert_eq!(
-        (
-            r.inserted,
-            r.deleted,
-            r.conflicts_found,
-            r.conflicts_resolved
-        ),
-        (1, 1, 1, 1)
-    );
-    ds.merge("work", "main", &o).unwrap();
-    assert!(ds.ask("ASK { <urn:s> <urn:p> <urn:theirs> }").unwrap());
-}
-
-#[test]
-fn a_shared_schema_report_never_holds_the_ledger() {
-    let ds = Dataset::memory();
-    configured(&ds);
-    submit(&ds, "k");
-    ds.update("INSERT DATA { <urn:public> a <urn:Public> }")
-        .unwrap();
-    let mut req = crate::handles::ReportRequest::default();
-    req.options.graph = crate::schema::GraphSelection::Union;
-    let first = ds.schema().report(&req).unwrap();
-    let j = serde_json::to_string(first.report.as_ref()).unwrap();
-    assert!(!j.contains("urn:x-sparkles:jobs:"), "{j}");
-    let mut all = req.clone();
-    all.options.graphs = Some(Arc::new(crate::access::GraphAccess::all()));
-    let second = ds.schema().report(&all).unwrap();
-    assert_eq!(second.computed, crate::handles::Computed::Cached);
-    assert!(Arc::ptr_eq(&first.report, &second.report));
-    claim(&ds, &admin());
-    let third = ds.schema().report(&req).unwrap();
-    let j = serde_json::to_string(third.report.as_ref()).unwrap();
-    assert!(!j.contains("urn:x-sparkles:jobs:"), "{j}");
-    assert_eq!(third.report.totals.triples, 1);
-}
-
-#[test]
-fn live_queries_never_read_the_ledger() {
-    for access in [None, Some(Arc::new(crate::access::GraphAccess::all()))] {
-        let ds = Dataset::memory();
-        configured(&ds);
-        submit(&ds, "k");
-        let q = format!("SELECT ?s ?p ?o WHERE {{ GRAPH <{LEDGER_GRAPH}> {{ ?s ?p ?o }} }}");
-        let live = ds.live_as(&q, access, &Default::default()).unwrap();
-        match live
-            .next_timeout(Duration::from_secs(10))
-            .expect("a first event")
-        {
-            crate::incr::LiveEvent::Snapshot { rows, .. } => {
-                assert!(
-                    rows.is_empty(),
-                    "{} ledger rows: {:?}",
-                    rows.len(),
-                    rows.first()
-                )
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-    }
-}
-
-#[test]
-fn a_live_query_started_before_jobs_ends_when_they_are_enabled() {
-    let ds = Dataset::memory();
-    ds.update("INSERT DATA { <urn:public> <urn:p> <urn:o> }")
-        .unwrap();
-    let live = ds
-        .live_as(
-            "SELECT ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } }",
-            None,
-            &Default::default(),
-        )
-        .unwrap();
-    assert!(matches!(
-        live.next_timeout(Duration::from_secs(10)),
-        Some(crate::incr::LiveEvent::Snapshot { .. })
-    ));
-    configured(&ds);
-    submit(&ds, "k");
-    // what its callers may read changed: the subscription ends instead of showing a
-    // change of the ledger
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let e = live.next_timeout(Duration::from_secs(10));
-        match e {
-            Some(crate::incr::LiveEvent::Error { code, .. }) => {
-                assert_eq!(code, "forbidden");
-                break;
-            }
-            Some(crate::incr::LiveEvent::Snapshot { rows, .. }) => {
-                let j = format!("{rows:?}");
-                assert!(!j.contains("urn:x-sparkles:jobs:"), "{j}");
-            }
-            Some(other) => {
-                let j = format!("{other:?}");
-                assert!(!j.contains("urn:x-sparkles:jobs:"), "{j}");
-            }
-            None => panic!("the subscription neither ended nor changed"),
-        }
-        assert!(Instant::now() < deadline, "the subscription did not end");
-    }
-}
-
-#[test]
-fn kept_views_never_read_the_ledger() {
-    let ds = Dataset::memory();
-    configured(&ds);
-    submit(&ds, "k");
-    let q = format!("SELECT ?s ?p ?o WHERE {{ GRAPH <{LEDGER_GRAPH}> {{ ?s ?p ?o }} }}");
-    ds.views()
-        .put("ledger", crate::incr::ViewDef::table(q))
-        .unwrap();
-    ds.views()
-        .wait_built("ledger", Duration::from_secs(10))
-        .unwrap();
-    let rows = ds.views().read("ledger").unwrap();
-    assert!(rows.rows.is_empty(), "{:?}", rows.rows.first());
-}
-
-#[test]
-fn predicate_distinct_counts_leave_out_the_deleted_hidden_base_values() {
-    let dir = tempfile::tempdir().unwrap();
-    let ds = Dataset::open(dir.path()).unwrap();
-    configured(&ds);
-    submit(&ds, "k");
-    ds.update("INSERT DATA { <urn:public> <urn:x-sparkles:jobs:version> 100 }")
-        .unwrap();
-    ds.compact().unwrap();
-    let counts = |ds: &Dataset| {
-        let s = ds.stats(&Default::default()).unwrap();
-        let p = s
-            .predicates
-            .iter()
-            .find(|p| p.iri == "urn:x-sparkles:jobs:version")
-            .unwrap()
-            .clone();
-        (p.count, p.distinct_subjects, p.distinct_objects)
-    };
-    assert_eq!(counts(&ds), (1, 1, 1));
-    // the claim replaces the run's version in the ledger's base
-    claim(&ds, &admin());
-    assert_eq!(counts(&ds), (1, 1, 1));
-}
-
-#[cfg(feature = "ontology")]
-#[test]
-fn an_ontology_opened_before_jobs_are_enabled_is_not_reused_after() {
-    use crate::handles::ontology::OntologyRequest;
-    use crate::reasoning::reasoner::inputs::GraphRef;
-    let ds = Dataset::memory();
-    ds.update(&format!(
-        "INSERT DATA {{ GRAPH <{LEDGER_GRAPH}> {{ <urn:SecretClass> a <http://www.w3.org/2002/07/owl#Class> }} }}"
-    ))
-    .unwrap();
-    let req = OntologyRequest {
-        graphs: vec![GraphRef::Named(LEDGER_GRAPH.into())],
-        ..Default::default()
-    };
-    let snap = ds.snapshot();
-    let first = ds
-        .ontology()
-        .open_at(&snap, &req, &Default::default())
-        .unwrap();
-    assert_eq!(first.summary().triples, 1);
-    configured(&ds);
-    // the configuration writes no RDF commit, so only the hidden graphs changed
-    assert_eq!(ds.snapshot().commit, snap.commit);
-    let after = ds
-        .ontology()
-        .open_at(&ds.snapshot(), &req, &Default::default())
-        .unwrap();
-    assert_eq!(after.summary().triples, 0, "cached: {}", after.cached);
-}
-
-/// A dataset with jobs enabled whose guard names shapes kept in the ledger graph. Neither
-/// the guard configuration nor enablement admits that, so the configuration file is
-/// written by hand and the dataset opened again, as a damaged or edited directory would
-/// be.
-#[cfg(feature = "shacl")]
-fn ledger_shapes() -> (tempfile::TempDir, Dataset) {
-    let dir = tempfile::tempdir().unwrap();
-    {
-        let ds = Dataset::open(dir.path()).unwrap();
-        ds.update(&format!(
-            "PREFIX sh: <http://www.w3.org/ns/shacl#> INSERT DATA {{ <urn:person> a <urn:Public> . GRAPH <{LEDGER_GRAPH}> {{ <urn:SecretShape> a sh:NodeShape ; sh:targetClass <urn:Public> ; sh:property <urn:SecretPropertyShape> . <urn:SecretPropertyShape> sh:path <urn:secret-path> ; sh:minCount 1 }} }}"
-        ))
-        .unwrap();
-        configured(&ds);
-    }
-    std::fs::write(
-        dir.path().join(crate::guard::config::CONFIG_FILE),
-        serde_json::to_vec(&serde_json::json!({"format": 2, "language": "shacl",
-            "mode": "warn", "dataGraph": "default", "shapes": {"graphs": [LEDGER_GRAPH]}}))
-        .unwrap(),
-    )
-    .unwrap();
-    let ds = Dataset::open(dir.path()).unwrap();
-    assert!(ds.validation().guard().get().is_some());
-    (dir, ds)
-}
-
-#[cfg(feature = "shacl")]
-#[test]
-fn constraints_never_take_a_guard_whose_shapes_are_in_the_ledger() {
-    let (_dir, ds) = ledger_shapes();
-    let mut req = crate::handles::ConstraintsRequest::default();
-    req.shapes.guard = Some(true);
-    let r = ds.schema().constraints(&req);
-    assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
-    // without a required guard, the layer has no source
-    req.shapes.guard = None;
-    let layer = ds.schema().constraints(&req).unwrap();
-    assert!(!format!("{layer:?}").contains("secret-path"), "{layer:?}");
-}
-
-#[cfg(all(feature = "graphql", feature = "shacl"))]
-#[test]
-fn a_graphql_draft_never_takes_guard_shapes_from_the_ledger() {
-    let (_dir, ds) = ledger_shapes();
-    let r = ds.graphql().draft("d", Default::default());
-    if let Ok((draft, _)) = r {
-        let j = serde_json::to_string(&draft).unwrap();
-        assert!(
-            !j.contains("urn:SecretShape") && !j.contains("urn:secret-path"),
-            "{j}"
-        );
-    }
-}
-
-#[test]
-fn a_public_kept_view_stays_readable_on_a_dataset_with_jobs() {
-    let ds = Dataset::memory();
-    configured(&ds);
-    submit(&ds, "k");
-    ds.update("INSERT DATA { <urn:public> <urn:p> <urn:o> }")
-        .unwrap();
-    ds.views()
-        .put(
-            "public",
-            crate::incr::ViewDef::table("SELECT ?s WHERE { ?s <urn:p> <urn:o> }"),
-        )
-        .unwrap();
-    ds.views()
-        .wait_built("public", Duration::from_secs(10))
-        .unwrap();
-    let q = "PREFIX view: <urn:x-sparkles:view#> SELECT ?s WHERE { SERVICE view:read { [] view:name \"public\" ; view:bind ?s } }";
-    // as a caller who reads every visible graph, and as one with no view of its own
-    for graphs in [None, Some(Arc::new(crate::access::GraphAccess::all()))] {
-        let opts = crate::sparql::QueryOptions {
-            graphs,
-            ..Default::default()
-        };
-        if let Err(e) = ds.query_with(q, &opts) {
-            panic!("{e}");
-        }
-    }
 }

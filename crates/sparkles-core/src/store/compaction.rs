@@ -1262,6 +1262,10 @@ impl Store {
         if cancelled() {
             return Err(Error::Cancelled);
         }
+        // The version of the new log. A keyspace enabled during the build needs a log of
+        // version 3, so the compaction is then abandoned and runs again (spec C26 §7).
+        let candidate_version =
+            wal::version_with(self.configuration_activated(), self.control_enabled());
         let mut cu = CatchUp {
             gen_: gen_.clone(),
             cache: self.cache.clone(),
@@ -1269,7 +1273,7 @@ impl Store {
             wal: if persistent {
                 Some(BufWriter::new(wal::open_for_append(
                     &dir.join("wal.log"),
-                    wal::version_for(self.configuration_activated()),
+                    candidate_version,
                 )?))
             } else {
                 None
@@ -1293,6 +1297,11 @@ impl Store {
                 Some("a bulk commit rebuilt the dataset during the build".into())
             } else if w.poisoned {
                 Some("the store stopped taking writes".into())
+            } else if persistent
+                && self.control_enabled()
+                && candidate_version < crate::formats::WAL_CONTROL_VERSION
+            {
+                Some("the control keyspace was enabled during the build".into())
             } else {
                 None
             }
@@ -1426,6 +1435,8 @@ impl Store {
             previous: &view,
             snapshot: Arc::new(new_snap),
         });
+        // the switch is published: the writer that `switch_generation` armed is usable
+        self.disarm_switch(&mut w);
         self.vectors_switched(&view);
         self.compaction.rebased(base.seq, cu.oldest_ms);
         self.compaction

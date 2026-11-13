@@ -2508,38 +2508,23 @@ fn server_with_a_ledger() -> McpServer {
 }
 
 #[tokio::test]
-async fn the_hidden_ledger_leaves_every_mcp_tool() {
+async fn no_mcp_tool_reaches_the_ledger() {
     let server = server_with_a_ledger();
     let ds = server.state.get("d").unwrap();
-    let ledger = sparkles::jobs::LEDGER_GRAPH;
-    assert!(
-        !ds.dataset.snapshot().is_empty(),
-        "the ledger holds control records"
-    );
+    let ledger = "urn:x-sparkles:jobs:ledger";
+    // the ledger is in the control keyspace, so the snapshot holds none of its terms
+    let snap = ds.dataset.snapshot();
+    assert!(snap.lookup_iri(ledger).is_none());
+    assert!(ds.dataset.store().control_enabled());
     let mut c = Client::start(server);
     let r = c
         .text(
             "sparql_query",
             json!({"format": "json", "dataset": "d",
-                   "query": format!("SELECT ?s ?p ?o WHERE {{ GRAPH <{ledger}> {{ ?s ?p ?o }} }}")}),
+                   "query": "SELECT ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } FILTER(CONTAINS(STR(?o), 'collect') || STRSTARTS(STR(?g), 'urn:x-sparkles:jobs')) }"}),
         )
         .await;
-    assert!(
-        !r.contains("collect") && !r.contains("urn:x-sparkles:jobs:"),
-        "{r}"
-    );
-    let r = c
-        .text(
-            "sparql_query",
-            json!({"format": "json", "dataset": "d",
-                   "query": "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }"}),
-        )
-        .await;
-    assert!(!r.contains(ledger), "{r}");
-    let s = c
-        .structured("list_changes", json!({"dataset": "d", "graphs": [ledger]}))
-        .await;
-    assert_eq!(s["changes"].as_array().map(Vec::len), Some(0), "{s}");
+    assert!(!r.contains("urn:x-sparkles:jobs:"), "{r}");
     let s = c.structured("list_changes", json!({"dataset": "d"})).await;
     assert!(!s.to_string().contains("urn:x-sparkles:jobs:"), "{s}");
     let s = c.structured("list_datasets", json!({})).await;
@@ -2549,18 +2534,5 @@ async fn the_hidden_ledger_leaves_every_mcp_tool() {
         .iter()
         .find(|d| d["name"] == "d")
         .unwrap();
-    let snap = ds.dataset.snapshot();
-    let ledger_id = snap.lookup_iri(ledger).unwrap();
-    let hidden = snap
-        .count(sparkles::index::Perm::Gspo, &[ledger_id.0])
-        .unwrap();
-    assert!(hidden > 0);
-    assert_eq!(d["quads"], snap.len() - hidden, "{d}");
-    let s = c.structured("list_commits", json!({"dataset": "d"})).await;
-    let commits = s["commits"].as_array().unwrap();
-    assert!(!commits.is_empty());
-    assert!(
-        commits.iter().all(|c| c.get("inserted").is_none()),
-        "commit counts count the ledger's quads: {s}"
-    );
+    assert_eq!(d["quads"], snap.len(), "{d}");
 }

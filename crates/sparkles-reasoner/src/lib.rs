@@ -182,10 +182,6 @@ pub struct ReasonOptions {
     pub progress: Option<ProgressFn>,
     /// The graphs the rules read (the default graph and its imports by default).
     pub inputs: Inputs,
-    /// Named graphs the run never reads, whatever [`inputs`](Self::inputs) names: the
-    /// dataset's hidden control graphs (spec C26 §2.3). An excluded input graph is left
-    /// out with a warning, and imports are not followed through one. Empty by default.
-    pub excluded_graphs: Vec<String>,
     /// The estimated heap a run may use at any time, in bytes, before it fails. It
     /// covers the derived facts and their indexes, the local terms the rules make, the
     /// candidates and caches of rule evaluation, the previous closure of an incremental
@@ -232,7 +228,6 @@ impl Default for ReasonOptions {
             cancel: None,
             progress: None,
             inputs: Inputs::default(),
-            excluded_graphs: Vec::new(),
             max_memory: None,
             threads: None,
             pool: None,
@@ -251,7 +246,6 @@ impl fmt::Debug for ReasonOptions {
             .field("cancel", &self.cancel)
             .field("progress", &self.progress.as_ref().map(|_| "…"))
             .field("inputs", &self.inputs)
-            .field("excluded_graphs", &self.excluded_graphs)
             .field("max_memory", &self.max_memory)
             .field("threads", &self.threads)
             .field("pool", &self.pool.as_ref().map(|p| p.threads()))
@@ -936,8 +930,7 @@ fn materialize_admitted(
     opts: &ReasonOptions,
     t0: Instant,
 ) -> anyhow::Result<ReasonReport> {
-    let (mut txn, raw, resolved) =
-        lock_with_changes(store, inc, &opts.inputs, &opts.excluded_graphs);
+    let (mut txn, raw, resolved) = lock_with_changes(store, inc, &opts.inputs);
     let snap = txn.base().clone();
     let inspected = match &opts.inspect {
         Some(f) => {
@@ -1041,14 +1034,13 @@ fn lock_with_changes<'s>(
     store: &'s Store,
     inc: Incremental<'_>,
     inputs: &Inputs,
-    excluded: &[String],
 ) -> (
     sparkles_core::store::WriteTxn<'s>,
     Option<Result<maintain::RawChanges, String>>,
     Resolved,
 ) {
     let locked = |txn: sparkles_core::store::WriteTxn<'s>| {
-        let r = inputs::resolve_excluding(txn.base(), inputs, excluded);
+        let r = inputs::resolve(txn.base(), inputs);
         (txn, r)
     };
     let Some(since) = inc.since else {
@@ -1057,7 +1049,7 @@ fn lock_with_changes<'s>(
     };
     for _ in 0..3 {
         let live = store.snapshot();
-        let graphs = inputs::resolve_excluding(&live, inputs, excluded).graph_set();
+        let graphs = inputs::resolve(&live, inputs).graph_set();
         let raw = maintain::changes(store, since, &live, inc.cache, &graphs);
         let (txn, r) = locked(store.write_as(sparkles_core::commit::CommitKind::Reason));
         let raw = if r.graph_set() != graphs {
@@ -1856,7 +1848,7 @@ pub fn infer(
 ) -> anyhow::Result<(Vec<Triple>, ReasonReport)> {
     let t0 = Instant::now();
     opts.inputs.validate()?;
-    let resolved = inputs::resolve_excluding(&snap, &opts.inputs, &opts.excluded_graphs);
+    let resolved = inputs::resolve(&snap, &opts.inputs);
     let ids = resolved.ids(&snap);
     let d = admitted(opts, |exec| {
         derive(exec, snap, profile, &Extras::default(), &ids, opts)
@@ -1908,7 +1900,7 @@ pub fn bench_derive(
     derived: &dyn Fn(),
 ) -> anyhow::Result<(usize, usize, u64, u64)> {
     opts.inputs.validate()?;
-    let resolved = inputs::resolve_excluding(&snap, &opts.inputs, &opts.excluded_graphs);
+    let resolved = inputs::resolve(&snap, &opts.inputs);
     let ids = resolved.ids(&snap);
     let d = admitted(opts, |exec| {
         derive(exec, snap, profile, &Extras::default(), &ids, opts)

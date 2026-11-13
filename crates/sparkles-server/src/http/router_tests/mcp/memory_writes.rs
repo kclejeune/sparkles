@@ -862,62 +862,6 @@ async fn tools_read_and_write_branches() {
     assert_eq!(tool_error(&r), "no-such-branch", "{r}");
 }
 
-#[tokio::test]
-async fn a_merge_on_a_dataset_with_jobs_leaves_the_commit_counts_out() {
-    let s = mem_server(&["--mcp-allow-update"]);
-    let ds = s.state.get("mem").unwrap();
-    let mut settings = sparkles::jobs::Settings {
-        enabled: true,
-        ..Default::default()
-    };
-    settings.definitions.insert(
-        "collect".into(),
-        sparkles::jobs::Definition::quads(vec!["urn:g".into()]),
-    );
-    ds.dataset.jobs().configure(&settings).unwrap();
-    ds.dataset
-        .jobs()
-        .submit(
-            &sparkles::jobs::Submission::new("collect", json!({"page": 1}), "k1"),
-            &sparkles::jobs::Caller::admin(oxrdf::NamedNode::new("urn:s").unwrap()),
-        )
-        .unwrap();
-    let r = tool(&s.app, "create_branch", json!({"name": "try"}), &[]).await;
-    assert_eq!(r["isError"], false, "{r}");
-    let r = tool(
-        &s.app,
-        "sparql_update",
-        json!({"branch": "try", "update": "INSERT DATA { GRAPH <http://example.org/g> { <urn:x> <urn:y> <urn:z> } }"}),
-        &[],
-    )
-    .await;
-    assert_eq!(r["isError"], false, "{r}");
-    let r = tool(&s.app, "merge_branch", json!({"source": "try"}), &[]).await;
-    assert_eq!(r["isError"], false, "{r}");
-    let expect = r["structuredContent"]["expect"].clone();
-    let r = tool(
-        &s.app,
-        "merge_branch",
-        json!({"source": "try", "dryRun": false, "expect": expect}),
-        &[],
-    )
-    .await;
-    assert_eq!(r["isError"], false, "{r}");
-    let out = &r["structuredContent"];
-    assert_eq!(out["committed"], true, "{out}");
-    assert!(out["commit"]["seq"].is_u64(), "{out}");
-    for field in [
-        "inserted",
-        "deleted",
-        "quads",
-        "digest",
-        "exact",
-        "defaultGraph",
-    ] {
-        assert!(out["commit"].get(field).is_none(), "{field}: {out}");
-    }
-}
-
 #[cfg(feature = "auth")]
 mod auth {
     use super::*;

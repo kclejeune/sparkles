@@ -240,10 +240,6 @@ pub(crate) fn resolve(
 }
 
 pub fn diff(dataset: &Dataset, request: &DiffRequest) -> Result<EntailmentDiff> {
-    let request = &DiffRequest {
-        analysis: super::analysis::hiding(dataset, &request.analysis),
-        ..request.clone()
-    };
     let control = AnalysisControl::new(&request.analysis)?;
     let from = resolve_state(dataset, &request.from, &control)?;
     let to = resolve_state(dataset, &request.to, &control)?;
@@ -495,10 +491,6 @@ pub fn preview(
         .states
         .as_ref()
         .ok_or_else(|| crate::Error::invalid("the preview did not retain its complete states"))?;
-    let request = &DiffRequest {
-        analysis: super::analysis::hiding(dataset, &request.analysis),
-        ..request.clone()
-    };
     let control = AnalysisControl::new(&request.analysis)?;
     compare(dataset, &states.before, &states.after, request, &control)
 }

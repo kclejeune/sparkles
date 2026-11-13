@@ -302,12 +302,6 @@ impl Schema {
                 store.snapshot_at(at, &o)?.0
             }
         };
-        // the dataset's hidden control graphs leave every report (spec C26 §2.3)
-        let (options, shared) = self.hiding(&req.options);
-        let req = &ReportRequest {
-            options,
-            ..req.clone()
-        };
         // a state is its commit: a restart and a compaction keep it
         let current = snap.commit;
         let selection = selection(&req.options);
@@ -363,36 +357,24 @@ impl Schema {
         let mut opts = req.options.clone();
         opts.deadline = deadline(req.timeout, opts.deadline);
         let (report, computed) =
-            self.compute(&snap, current, selection, &opts, req.at.is_none(), shared)?;
+            self.compute(&snap, current, selection, &opts, req.at.is_none())?;
         Ok(outcome(report, computed, snap))
     }
 
     /// The schema report of a state the caller has opened: the dataset's kept report
     /// when it describes this state with the same selection, else a new one, which the
-    /// dataset keeps when `opts.graphs` is `None`. The dataset's hidden control graphs
-    /// (spec C26 §2.3) are left out whatever `opts.graphs` says.
+    /// dataset keeps when `opts.graphs` is `None`.
     pub fn report_at(
         &self,
         snap: &Arc<Snapshot>,
         opts: &SchemaOptions,
     ) -> Result<(Arc<SchemaReport>, Computed)> {
-        let (opts, shared) = self.hiding(opts);
         let identity = snap.commit;
-        let selection = selection(&opts);
+        let selection = selection(opts);
         if let Some(report) = self.kept(identity, selection, opts.term_totals) {
             return Ok((report, Computed::Cached));
         }
-        self.compute(snap, identity, selection, &opts, true, shared)
-    }
-
-    /// `opts` without the dataset's hidden control graphs (spec C26 §2.3), and whether
-    /// the caller reads every other graph, so that its report is the one the dataset
-    /// keeps for everyone.
-    fn hiding(&self, opts: &SchemaOptions) -> (SchemaOptions, bool) {
-        let shared = opts.graphs.is_none();
-        let mut o = opts.clone();
-        o.graphs = self.ds.hide_owner_graphs(o.graphs.take());
-        (o, shared)
+        self.compute(snap, identity, selection, opts, true)
     }
 
     /// What changed from the report of state `from` to the report `req` asks for
@@ -405,7 +387,7 @@ impl Schema {
             deadline,
         };
         let (old_snap, _) = self.ds.store().snapshot_at(from, &o)?;
-        let (mut opts, _) = self.hiding(&req.options);
+        let mut opts = req.options.clone();
         opts.deadline = deadline;
         let old = schema::discover(&old_snap, &opts).map_err(schema_error)?;
         let new = self.report(&ReportRequest {
@@ -431,9 +413,7 @@ impl Schema {
     /// opening a past state.
     pub fn profiles_at(&self, opts: &ProfileOptions, at: Option<&At>) -> Result<ClassProfiles> {
         let snap = self.state(at, opts.schema.deadline)?;
-        let mut opts = opts.clone();
-        opts.schema = self.hiding(&opts.schema).0;
-        schema::profile::profiles(&snap, &opts).map_err(schema_error)
+        schema::profile::profiles(&snap, opts).map_err(schema_error)
     }
 
     /// [`profiles_at`](Self::profiles_at) the head.
@@ -445,9 +425,7 @@ impl Schema {
     /// `opts.schema.deadline` also bounds opening a past state.
     pub fn draft_shapes_at(&self, opts: &DraftOptions, at: Option<&At>) -> Result<ShapesDraft> {
         let snap = self.state(at, opts.schema.deadline)?;
-        let mut opts = opts.clone();
-        opts.schema = self.hiding(&opts.schema).0;
-        schema::draft::draft_shapes(&snap, &opts).map_err(schema_error)
+        schema::draft::draft_shapes(&snap, opts).map_err(schema_error)
     }
 
     /// [`draft_shapes_at`](Self::draft_shapes_at) the head.
@@ -502,13 +480,11 @@ impl Schema {
     ) -> Result<Option<Arc<schema::PredicateObjects>>> {
         /// the most predicates kept for one state, over every selection
         const MAX_KEPT: usize = 4096;
-        let (opts, shared) = self.hiding(opts);
-        let opts = &opts;
         let state = (snap.commit, schema::snapshot_identity(snap));
         let key = (selection(opts) ^ max_rows.rotate_left(17), iri.to_string());
         // a caller limited to some graphs, and an uncommitted or synthetic view, measure
         // for themselves
-        let keep = shared && snap.cacheable;
+        let keep = opts.graphs.is_none() && snap.cacheable;
         if keep {
             let cache = self.ds.state().objects_cache.lock();
             if cache.state == state
@@ -570,7 +546,6 @@ impl Schema {
         selection: u64,
         opts: &SchemaOptions,
         maintain: bool,
-        shared: bool,
     ) -> Result<(Arc<SchemaReport>, Computed)> {
         let started = Instant::now();
         let updated = if maintain && opts.graphs.is_none() {
@@ -594,7 +569,7 @@ impl Schema {
             report.predicates.len()
         );
         // the dataset keeps the report everyone with access to every graph shares
-        if shared {
+        if opts.graphs.is_none() {
             let mut cache = self.ds.state().schema_cache.lock();
             // one entry per selection: the newer state replaces the older
             cache.retain(|e| e.selection != selection);
@@ -671,19 +646,14 @@ fn constraints_layer(
     view: Option<&GraphAccess>,
 ) -> Result<Option<ConstraintsLayer>> {
     let view = view.filter(|v| !v.reads_all());
-    // a hidden control graph (spec C26 §2.3) is never a source of constraints, whoever
-    // asks: a guard that reads its shapes from one is answered as one this caller may not
-    // read, and a named one as a graph that does not exist
-    let hidden = ds.store().hidden_graphs();
     let readable = |g: &str| {
-        !hidden.iter().any(|h| h == g)
-            && view.is_none_or(|v| {
-                if g == "default" {
-                    v.read.default_graph()
-                } else {
-                    v.read.allows_iri(g)
-                }
-            })
+        view.is_none_or(|v| {
+            if g == "default" {
+                v.read.default_graph()
+            } else {
+                v.read.allows_iri(g)
+            }
+        })
     };
     let mut layer = ConstraintsLayer::default();
     if req.guard != Some(false) {

@@ -57,7 +57,6 @@ pub fn check_consistency(
     options: &AnalysisOptions,
     answer: &mut WhyNot,
 ) -> Result<()> {
-    let options = &super::analysis::hiding(dataset, options);
     let WhyNot::NotEntailed {
         rules, hypotheses, ..
     } = answer
