@@ -776,6 +776,44 @@ Two more variants that measured no better are in
 deduplication of congested deliveries that slowed the one-thread run of `ore_ont_8737`
 to 119 s.
 
+Item 818 measured where the time of `ore_ont_8737` on several threads goes before it
+changed anything. The ontology is 2.5 million axioms `C ⊑ ∃r.D` over one transitive
+symmetric role with no class hierarchy, so its saturation composes a transitive closure
+through backward and forward links, and each link of a component of k classes is derived
+about k times. The run sends 3.0 billion messages, 1.49 billion backward links and 1.49
+billion forward links, for about 32 million stored conclusions, and 0.7% of them go to a
+context another worker holds, so the wait that the item's row supposed is not the cause. A
+profile on four threads put 26% of the cycles in the outbox's radix sort of its messages by
+destination, 18% in the congested delivery's filter, 12% in the sends and about 30% in the
+rules, and the filter of item 695 never looked at forward links, which it let through as
+repeats. Two changes follow. A congested delivery drops every kind of conclusion that
+`State::holds` answers, forward links and loops included, since every rule returns at once
+from a held conclusion. And the rules of `Back`, `Fwd` and the existential subsumers store
+their link and leave its products, the subsumer each propagation gives each source and the
+links the chains compose from each pair, to the activation, which sends them once its to-do
+list is empty, or when idle workers wait, pairing what is new since its last flush with
+everything and what is old with what is new, so that each pair is sent once as before. The
+products for one source or target leave together, the outbox records these runs and sorts
+the run headers rather than the messages, and a delivery then checks a long run against one
+context's state. The ownership argument is unchanged, since a flush reads only the state of
+the context its worker holds under the state's lock and sends through the same outbox and
+to-do lists, and a run that answers in part flushes before it gives its conclusions back.
+On `atlas` the saturation of `ore_ont_8737` takes 13.5 s on four threads against 25.2 s,
+9.0 s on twelve against 18.5 s and 45.0 s on one against 83.0 s, applies 1.26 billion
+conclusions on four threads against 2.12 billion, and peaks at 5.1 GiB of resident memory
+on four threads against 6.9 GiB, with the same taxonomy on every thread count. In an earlier
+slot the base took 28.6 s on four threads and the filter alone 22.0 s, and the runs take the
+rest. Konclude 0.7.0 classifies the ontology on `atlas` in 9.5 to 9.7 s with one, four or
+twelve workers, at 6.7 GiB, so the run on twelve threads is now faster than Konclude and the
+run on four threads takes 1.4 times its time in three quarters of its memory. The 298 ORE 2015 EL
+files, GO and ChEBI lite give the same taxonomies on one and eight threads. GO and
+`ore_ont_3836` classify within 1% of the base on one, four and twelve threads, ChEBI lite
+1.9% slower on one thread, within its spread on four and slower in three of six rounds on
+twelve, and `ore_ont_13482` 3.4% slower on one thread and 3.1% on four, which item 890
+follows for both files. The
+remaining cycles of a four-thread run are the sends, 22%, the filter's probes of the
+destination's tables, 29%, and the to-do list copies, 8%, which item 889 follows.
+
 The references disagree on two files of the set. On ore_ont_15516, Konclude's parsers all
 failed at the first SWRL rule and it classified an empty ontology. HermiT found the
 ontology inconsistent, which its rules cannot cause, since the properties in their heads

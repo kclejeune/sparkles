@@ -765,7 +765,7 @@ fn rl(
     qo.pool = opts.pool.clone();
     let select = |sparql: &str| -> Result<crate::dataset::Solutions> {
         let r = mem.query_with(sparql, &qo)?;
-        Ok(crate::dataset::Solutions::from_result(&r))
+        crate::dataset::Solutions::from_result(&r)
     };
     let iri = |t: Option<&Term>| match t {
         Some(Term::NamedNode(n)) => Some(n.as_str().to_string()),

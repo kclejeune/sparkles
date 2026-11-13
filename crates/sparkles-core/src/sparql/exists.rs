@@ -690,8 +690,14 @@ fn prepare(ctx: &Ctx, spec: &ExistsSpec, t: &Table) -> Result<Option<Arc<Build>>
 
 /// Evaluate the pattern and collect its distinct keys.
 fn build(ctx: &Ctx, node: &Node, keys: Vec<VarId>, risky: Vec<VarId>) -> Result<Build> {
-    let (t, _) = super::exec::execute(ctx, node)?;
-    let held = ctx.charge(t.mem_bytes())?;
+    // Compatibility estimates drop after the input backing. An actual paid
+    // materialization keeps its own owner and must not be charged a second time.
+    let held = ctx.charge(0)?;
+    let (input, _) = super::exec::execute_materialized(ctx, node)?;
+    let t = &input.table;
+    if !input.has_credit() {
+        held.add(t.mem_bytes())?;
+    }
     let cols: Vec<&[Id]> = keys
         .iter()
         .map(|&v| {
@@ -1166,5 +1172,40 @@ pub(super) fn annotate(ctx: &Ctx, info: &mut super::exec::PlanInfo, exprs: &[Exp
     }
     if counters.is_some() {
         info.counters = counters;
+    }
+}
+
+#[cfg(test)]
+mod borrowed_input_tests {
+    use super::*;
+
+    #[test]
+    fn reviewed_exists_build_keeps_borrowed_table_without_forced_ledger_or_duplicate_input() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.use_cache = false;
+        ctx.var("value");
+        let value = Id::from_i64(1).unwrap();
+        let table = Table {
+            vars: vec![0],
+            cols: vec![vec![value]],
+            len: 1,
+            sorted: Vec::new(),
+        };
+        let node = Node::leaf(
+            super::super::plan::Kind::Values(table),
+            vec![0],
+            1.0,
+            "exists input".into(),
+        );
+        let before = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        let built = build(&ctx, &node, vec![0], Vec::new()).unwrap();
+        assert_eq!(built.solutions, 1);
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            before
+        );
+        drop(built);
+        assert_eq!(ctx.live_bytes(), 0);
     }
 }

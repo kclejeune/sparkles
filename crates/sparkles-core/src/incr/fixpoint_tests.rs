@@ -96,7 +96,7 @@ fn oracle(store: &Store, q: &str, cols: &[String], kind: Kind) -> Vec<String> {
             }
         }
         Kind::Construct => r
-            .triples
+            .triples()
             .iter()
             .map(|t| {
                 format!(
@@ -110,9 +110,9 @@ fn oracle(store: &Store, q: &str, cols: &[String], kind: Kind) -> Vec<String> {
         Kind::Select => {
             let idx: Vec<usize> = cols
                 .iter()
-                .map(|c| r.vars.iter().position(|v| v == c).expect("column"))
+                .map(|c| r.variables().iter().position(|v| v == c).expect("column"))
                 .collect();
-            r.rows()
+            r.test_application_rows()
                 .iter()
                 .map(|row| {
                     idx.iter()
@@ -759,9 +759,9 @@ fn zero_length_rows_follow_access_and_the_union_graph() {
                         let cols = c.columns();
                         let idx: Vec<usize> = cols
                             .iter()
-                            .map(|c| r.vars.iter().position(|v| v == c).unwrap())
+                            .map(|c| r.variables().iter().position(|v| v == c).unwrap())
                             .collect();
-                        r.rows()
+                        r.test_application_rows()
                             .iter()
                             .map(|row| {
                                 idx.iter()

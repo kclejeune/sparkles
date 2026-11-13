@@ -13,20 +13,7 @@ pub(super) struct PrimaryReader {
 /// No payload, allocation or reservation escapes the synchronous check. The
 /// scalar header itself is charged separately in the parent ColdBudget.
 fn preparation(budget: &ColdBudget<'_>) -> Result<Preparation> {
-    let limit = budget.owned_limit()?;
-    Preparation::new(
-        crate::task::Control {
-            cancel: limit
-                .options
-                .cancel
-                .clone()
-                .map(crate::task::Cancel::from_flag)
-                .unwrap_or_default(),
-            deadline: limit.options.deadline,
-            ..Default::default()
-        },
-        budget.available(),
-    )
+    budget.owned_limit()?.options.temporary(budget.available())
 }
 
 impl PrimaryReader {

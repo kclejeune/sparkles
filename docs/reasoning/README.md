@@ -101,6 +101,12 @@ request or on every write, and the schema report counts what the data holds.
   the source of an explanation. A mode is read from the `reasoning` parameter of the HTTP
   endpoints, the `--reasoning` flag of `sparkles query` and the `reasoning` argument of
   the MCP tools. `Auto` is refused until a cost-based choice exists.
+* Embedded query providers implement `ReasoningSession::intensional` with a
+  `Result<bool>` return. Constant interning can refuse a memory reservation, and
+  callers propagate that refusal before preparing demands. Implementations that
+  previously returned a Boolean wrap successful values in `Ok` and return allocation
+  failures with `Err`. `AnalysisContext::new` returns `anyhow::Result<Arc<Self>>`.
+  A local reasoning limit still supports downcasting to `MemoryLimitExceeded`.
 * `POST /$/reason/{ds}/explain` returns derivation trees from materialized inferences,
   RDFS on read or the demand engine ([API.md](../API.md#explanations),
   [F18](../specs/F18-explanations-and-entailment-diffs.md#outcome)). A tree has well-founded
@@ -754,10 +760,13 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   and 4.0 seconds on one thread, against 0.7 and 0.8 for the EL rules alone. Roadmap
   item 693.
 * The EL saturation of one ORE 2015 DL ontology with 2.5 million existential
-  restrictions takes 28 s on four threads and peaks at 6.8 to 7.9 GiB, since many of its
-  waiting messages repeat what their contexts hold and wait while another thread holds
-  the context. Konclude 0.7.0 classifies it in 11 s. Its run on one thread peaks at 5.9
-  GiB. Roadmap item 818.
+  restrictions over a transitive symmetric role derives each link of the transitive
+  closure once per intermediate class, so it sends three billion messages for 32 million
+  conclusions. On `atlas` it takes 13.5 s on four threads and 9 s on twelve, and peaks at
+  5.1 GiB on four threads. Konclude 0.7.0 classifies it in 9.5 s on the same host at 6.7 GiB, with any
+  number of workers, so a run on four threads is 1.4 times slower in three quarters of
+  the memory and a run on twelve faster. Roadmap item 889 follows the rest of the
+  message cost.
 * A small ontology's first classification in a process on several threads starts its
   helper threads after 0.5 ms of work, and later ones after as long as the last start of
   the helpers took. Warm runs of some small files on eight threads take up to 0.2 ms

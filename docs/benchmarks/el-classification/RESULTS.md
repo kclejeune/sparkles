@@ -917,7 +917,107 @@ same host. Every side gave the same taxonomies in every round. On the laptop the
 2015 EL files, GO and ChEBI lite gave the base's taxonomies on one and eight threads, and
 `ore_ont_8737` gave the base's taxonomy on one and four threads.
 
+### Link products in runs
+
+Roadmap item 818 measured where the time of `ore_ont_8737` on several threads goes before
+it changed anything. The ontology is 2,544,786 axioms `C ⊑ ∃r.D` over one transitive
+symmetric role, with no class hierarchy, so its saturation composes a transitive closure
+through backward and forward links and derives each link of a component of k classes about
+k times. On four threads the base sends 2.98 billion messages, 1.49 billion backward links
+and 1.49 billion forward links, for about 32 million stored conclusions, in 738,588
+deliveries of about 13 messages per destination. Only 20 million of them, 0.7%, reach a
+context that another worker holds, and 61 million reach a context not yet started. The
+congested filter of item 695 checked 2.81 billion and dropped 877 million backward links,
+and no forward links, since it looked only at subsumptions and backward links. A profile of
+the base on four threads on the laptop put 26% of the user cycles in `Run::deliver`, almost
+all of it the radix sort of the outbox's messages by destination, 18% in the filter of
+`Run::deliver_new`, 12% in `Out::send`, 11% in the hash lookups of the filter and about 30%
+in the rules.
+
+Item 818 makes two changes. A congested delivery drops every kind of conclusion that
+`State::holds` answers, forward links and loops included. And the rules of `Back`, `Fwd` and
+the existential subsumers store their link and leave its products, the subsumer each
+propagation gives each source and the links the chains compose from each pair, to the
+activation, which sends them once its to-do list is empty, or when idle workers wait,
+pairing what is new since its last flush with everything and what is old with what is new.
+The products for one source or target leave the context together, the outbox records these
+runs and sorts the run headers rather than the messages, and a delivery checks a long run
+against one context's state. In the profile of commit bd924609 on four threads `Run::deliver` takes 2%,
+the sends 22%, the filter's lookups 29% and the rules about 15%.
+
+These measurements ran on `atlas`, which has the benchmark host's hardware, with no other
+benchmark or gate on the host and no swap in use. The base is commit 321508fe, a is the
+filter alone, commit 181e9c95, b adds the runs, commit fb894c98, and b3 adds a flush that
+returns at once when the activation stored nothing and builds its run in chunks, commit
+bd924609, which is the saturation code that landed. A first slot ran the base, a and b, and
+a second slot the base and b3. One run of each side and thread count classified
+`ore_ont_8737` in a scope with a 13 GiB cap.
+
+| Side | Threads | Saturation, s | Peak resident set, GiB | Peak estimate, GiB | Conclusions taken, billions |
+|---|---:|---:|---:|---:|---:|
+| Base | 1 | 83.1 | 5.91 | 3.21 | 2.24 |
+| a | 1 | 73.9 | 3.61 | 1.69 | 1.62 |
+| b | 1 | 44.0 | 3.76 | 1.70 | 1.62 |
+| Base | 4 | 28.6 | 7.58 | 4.20 | 2.10 |
+| a | 4 | 22.0 | 5.54 | 2.65 | 1.31 |
+| b | 4 | 13.2 | 4.66 | 2.06 | 1.27 |
+| Base | 12 | 16.9 | 8.44 | 4.36 | 2.14 |
+| a | 12 | 12.4 | 6.44 | 2.75 | 1.30 |
+| b | 12 | 8.8 | 7.36 | 3.30 | 1.30 |
+| Base, second slot | 1 | 83.0 | 5.91 | 3.21 | 2.24 |
+| b3 | 1 | 45.0 | 3.76 | 1.70 | 1.62 |
+| Base, second slot | 4 | 25.2 | 6.87 | 3.46 | 2.12 |
+| b3 | 4 | 13.5 | 5.07 | 2.15 | 1.26 |
+| Base, second slot | 12 | 18.5 | 9.91 | 5.39 | 2.16 |
+| b3 | 12 | 9.0 | 7.86 | 3.48 | 1.32 |
+
+The base's run on four threads took 28.6 s in the first slot and 25.2 s in the second, with
+peaks of 7.6 and 6.9 GiB, as the threads' timing decides which contexts are free when their
+messages arrive, and the runs of b and b3 vary less.
+
+Every run gave the taxonomy of the base. Konclude 0.7.0-1138 classified the same file on
+`atlas` in 9.49 s with one worker, 9.65 s with four and 9.73 s with twelve, after 13.7 to
+14.2 s of parsing, at 6.7 GiB of resident memory, so its classification does not use the
+workers. The run of b3 on twelve threads is faster than Konclude's classification, and its
+run on four threads takes 1.4 times Konclude's time in three quarters of its memory.
+
+The same slot ran six interleaved rounds of GO, ChEBI lite, `ore_ont_3836` and
+`ore_ont_13482` on one, four and twelve threads, five classifications per process, the
+one-thread runs pinned to one CPU and the others to twelve. The table gives the median of
+the rounds in milliseconds and the ratio of b3 to the base.
+
+| File | Threads | Base, ms | b3, ms | b3 / base |
+|---|---:|---:|---:|---:|
+| GO | 1 | 308.8 | 308.9 | 1.001 |
+| GO | 4 | 106.7 | 105.3 | 0.987 |
+| GO | 12 | 78.1 | 78.1 | 1.000 |
+| ChEBI lite | 1 | 1057.2 | 1077.2 | 1.019 |
+| ChEBI lite | 4 | 436.0 | 439.6 | 1.008 |
+| ChEBI lite | 12 | 404.9 | 444.9 | 1.099 |
+| `ore_ont_3836` | 1 | 588.7 | 587.2 | 0.998 |
+| `ore_ont_3836` | 4 | 250.3 | 248.6 | 0.993 |
+| `ore_ont_3836` | 12 | 194.2 | 192.2 | 0.990 |
+| `ore_ont_13482` | 1 | 910.6 | 941.7 | 1.034 |
+| `ore_ont_13482` | 4 | 391.2 | 403.3 | 1.031 |
+| `ore_ont_13482` | 12 | 295.9 | 297.5 | 1.005 |
+
+ChEBI lite's twelve-thread rounds of b3 were 406, 404, 522, 412, 478 and 540 ms against
+401 to 414 ms for the base, so three of six rounds are slower, and its one-thread run is
+1.9% slower. `ore_ont_13482` is 3.1 to 3.4% slower on one and four threads. Roadmap item
+890 follows both files. In the first slot, before the flush
+returned at once when nothing is pending, b had been 2.9% slower than the base on ChEBI
+lite on one thread and 5.0% on four, and 3.0 and 3.8% slower on `ore_ont_13482`.
+
+Every side gave the same taxonomy on every file and thread count. On the laptop the 298 ORE
+2015 EL files, GO and ChEBI lite gave the base's taxonomies with b, commit fb894c98, on one and eight
+threads, and `ore_ont_8737` gave it on one, four, eight and twelve threads.
+
 ## Records
+
+The [link products record](runs/2026-11-10-el-threads-atlas-bd924609/record.json) holds the
+runs of `ore_ont_8737` of every side on one, four and twelve threads, the Konclude runs, the
+rounds on GO, ChEBI lite, `ore_ont_3836` and `ore_ont_13482` with their taxonomy hashes, the
+scripts that ran on `atlas`, and the profiles and message counters taken on the laptop.
 
 The [helper starts record](runs/2026-11-10-el-cost-atlas-5dca16bd/record.json) holds every
 cold and warm time of the 12 small files, the rounds on GO, ChEBI lite, `ore_ont_3836`,

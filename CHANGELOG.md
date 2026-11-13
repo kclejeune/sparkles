@@ -25,6 +25,17 @@ calculus change that remains is item 894.
 
 ### Compatibility
 
+The experimental Rust memory-admission API uses an opaque `ParentHandle` in place
+of `Arc<dyn MemoryParent>`. Parent leases, live credit, query contexts and reasoner
+budgets accept that same handle. Consumers share it with `clone()` and compare
+parents with `same_parent()`; raw Arc and Weak conversion is unavailable. A paid
+backend uses `MemoryDomain::parent_with_header`, whose release callback borrows
+the live handle for reentrant admission. The compatibility `parent` constructor
+retains its two callback arguments but does not certify admission of separate
+captured allocations. This is an unreleased Rust source API change; HTTP and CLI
+wire contracts are unchanged.
+
+
 The adopted HTTP, CLI and public library compatibility policy is documented.
 HTTP descriptions and the standard CLI command tree have compatibility guards against
 a commit-labeled development baseline. No published release baseline exists.
@@ -57,6 +68,14 @@ it.
 
 ### Added
 
+Incremental views and live queries maintain `MIN`, `MAX`, `GROUP_CONCAT`, `SAMPLE`,
+`HAVING` over them and correlated `EXISTS` instead of evaluating the query again at each
+commit (item 418). The group operator keeps each group's values as an ordered multiset,
+and a correlated `EXISTS` is evaluated by the query engine for the rows a commit can have
+changed. A view's `GROUP_CONCAT` lists a group's values in their `ORDER BY` order. View
+checkpoints written by earlier releases for queries with these operators are refused by
+their compiler fingerprint and the views are built again.
+
 Community reports can read a review policy's accepted projection (item 652). The
 `graphrag` settings member `reviewPolicy` names a review policy of the dataset's evidence
 settings, and a build or refresh then reads the policy's output graph with the projection's
@@ -70,9 +89,16 @@ decisions and supports graphs and the readable proposal graphs. A withdrawal, re
 superseding decision rewrites the reports that read it and their ancestors at the next
 refresh, and a new policy version rewrites every report. `GET /$/graphrag/{ds}/community`,
 `community_reports` and a global answer's `reports` carry `reviewPolicy` and each
-finding's `claims` and `decisions`. The automatic refresh notices only the evidence
-changes that the principal's change feed lists, and roadmap item 652 adds a private check
-for the others.
+finding's `claims` and `decisions`.
+
+The automatic refresh of reports read under a review policy runs a private check (item
+652). A change of the policy's decisions or supports graph, a withdrawal in a proposal
+graph, read from the change feed without the principal's view, another evidence
+configuration, a reload of the access policy and a server start each make a check due,
+and so does a principal's feed that cannot count the changes. The check runs a refresh's
+preparation and plan with no model call, commit, state change or task, and starts a
+refresh only when a report's input or the hierarchy changed. The principal's feed no
+longer starts a refresh by itself for a decision, support or withdrawal it lists.
 
 Roadmap item 825 gives the eager executor and the cursor one join-kernel library. The
 hash, keyed and merge kernels of `sparql/join` and one galloping search serve both
@@ -659,6 +685,18 @@ with the same taxonomy. Its time on four threads, 28 s against Konclude's 11 s, 
 818. The one-thread times of five larger files move by up to 2% with the code's layout,
 and the new build is 0.6% faster to 0.9% slower than the one before on them, item
 722.
+
+A context of the EL saturation sends the products of its backward links with its forward
+links and propagations once its to-do list is empty, in one run per source or target, and
+the outbox sorts these runs rather than its messages, while a congested delivery drops every
+kind of conclusion the context holds, forward links included, for roadmap item 818. On atlas
+the saturation of `ore_ont_8737`, a transitive closure of 2.5 million existential
+restrictions, takes 13.5 s on four threads instead of 25.2 s, 9.0 s on twelve instead of
+18.5 s and 45.0 s on one instead of 83.0 s, and peaks at 5.1 instead of 6.9 GiB on four
+threads, with the same taxonomies on 300 files. Konclude 0.7.0 classifies it on atlas in 9.5 to 9.7 s at 6.7 GiB with any number
+of workers. GO and ore_ont_3836 are unchanged, ChEBI lite is 1.9% slower on one thread
+and slower in half of its twelve-thread rounds, and ore_ont_13482 3% slower on one and
+four threads, item 890.
 
 A congested EL saturation drops the subsumptions and backward links it delivers to a
 context that already holds them (roadmap item 695). The peak resident set of

@@ -657,7 +657,7 @@ fn guarded(s: &AuthServer, user: &str) -> crate::auth::Principal {
 /// A tool call as `user`.
 #[cfg(feature = "mcp")]
 fn tool_as(s: &AuthServer, user: &str, name: &str, args: serde_json::Value) -> serde_json::Value {
-    let call = crate::mcp::Call {
+    let mut call = crate::mcp::Call {
         arrived: std::time::Instant::now(),
         cancel: Default::default(),
         request_id: "t".into(),
@@ -665,13 +665,15 @@ fn tool_as(s: &AuthServer, user: &str, name: &str, args: serde_json::Value) -> s
         headers: None,
         held: None,
         grant: None,
+
+        preparation: None,
     };
     let serde_json::Value::Object(mut m) = args else {
         panic!("arguments are an object")
     };
     m.insert("dataset".into(), "rag".into());
     let server = crate::mcp::McpServer::new(s.state.clone(), crate::mcp::McpConfig::default());
-    match server.run_now(name, m, &call).unwrap() {
+    match server.run_now(name, m, &mut call).unwrap() {
         crate::mcp::Outcome::Structured(v) => v,
         crate::mcp::Outcome::Text(t) => {
             serde_json::from_str(&t).unwrap_or(serde_json::Value::String(t))

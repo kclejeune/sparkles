@@ -99,7 +99,11 @@ fn oracle(s: &Store, query: &str, graphs: Option<Arc<GraphAccess>>) -> Vec<Strin
         },
     )
     .expect("oracle");
-    let rows: Vec<(Vec<Option<Term>>, i64)> = r.rows().into_iter().map(|r| (r, 1)).collect();
+    let rows: Vec<(Vec<Option<Term>>, i64)> = r
+        .test_application_rows()
+        .into_iter()
+        .map(|r| (r, 1))
+        .collect();
     rows_of(&rows)
 }
 
@@ -997,7 +1001,7 @@ fn service_view_read_reads_rows() {
         ..Default::default()
     };
     let r = sparql::query(s.snapshot(), &text, &o).unwrap();
-    let rows = r.rows();
+    let rows = r.test_application_rows();
     assert_eq!(rows.len(), 1);
     assert_eq!(show(&rows[0][0]), "t1");
     assert_eq!(show(&rows[0][2]), s.snapshot().commit.to_string());
@@ -1278,7 +1282,11 @@ fn inferred_oracle(s: &Store, query: &str, inf: Option<&super::Inference>) -> Ve
         },
     )
     .expect("oracle");
-    let rows: Vec<(Vec<Option<Term>>, i64)> = r.rows().into_iter().map(|r| (r, 1)).collect();
+    let rows: Vec<(Vec<Option<Term>>, i64)> = r
+        .test_application_rows()
+        .into_iter()
+        .map(|r| (r, 1))
+        .collect();
     rows_of(&rows)
 }
 

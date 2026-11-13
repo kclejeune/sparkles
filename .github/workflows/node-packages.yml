@@ -22,6 +22,7 @@ on:
     paths: &paths
       - 'crates/sparkles/**'
       - 'crates/sparkles-alloc/**'
+      - 'crates/sparkles-budget/**'
       - 'crates/sparkles-backup/**'
       - 'crates/sparkles-client/**'
       - 'crates/sparkles-core/**'

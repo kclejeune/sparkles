@@ -32,8 +32,9 @@ fn check(s: &Store, expr: &str, want: &str) {
     };
     let rows = query(s.snapshot(), &q, &QueryOptions::default())
         .unwrap_or_else(|e| panic!("{expr}: {e}"))
-        .rows();
-    let row = &rows[0];
+        .rows()
+        .unwrap();
+    let row = &rows.row(0).unwrap().values();
     if want.is_empty() {
         assert!(row[0].is_none(), "{expr}: {:?}, want unbound", row[0]);
     } else {
@@ -203,8 +204,12 @@ fn uuids_are_fresh() {
     );
     let rows = query(s.snapshot(), &q, &QueryOptions::default())
         .unwrap()
-        .rows();
-    let v: Vec<String> = rows[0]
+        .rows()
+        .unwrap();
+    let v: Vec<String> = rows
+        .row(0)
+        .unwrap()
+        .values()
         .iter()
         .map(|t| match t {
             Some(Term::Literal(l)) => l.value().to_string(),
@@ -355,8 +360,9 @@ fn library_functions_match_arq() {
     let q = format!("{PREFIXES}SELECT (afn:version() AS ?v) WHERE {{}}");
     let rows = query(s.snapshot(), &q, &QueryOptions::default())
         .unwrap()
-        .rows();
+        .rows()
+        .unwrap();
     assert!(
-        matches!(&rows[0][0], Some(Term::Literal(l)) if l.value() == env!("CARGO_PKG_VERSION"))
+        matches!(&rows.row(0).unwrap().values()[0], Some(Term::Literal(l)) if l.value() == env!("CARGO_PKG_VERSION"))
     );
 }

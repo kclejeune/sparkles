@@ -655,6 +655,7 @@ impl ShexGuard {
         let (Some((vo, post_data)), Some((_, pre_data))) = (post, pre) else {
             return Ok(Propagation::Unknown);
         };
+        let output = crate::shapemap::output_root(&c.view, vo, vo.deadline)?;
         let r = m.plan.resolve(&c.view);
         let mut region: FxHashSet<Id> = FxHashSet::default();
         let mut queue: Vec<Id> = Vec::new();
@@ -691,9 +692,16 @@ impl ShexGuard {
                     Verdict::False => None,
                 }
             };
-            let (after, values) =
-                crate::engine::validate_typed(&c.view, &m.schema, &map, vo, Some(&fixed), &seeds)
-                    .map_err(engine_error)?;
+            let (after, values) = crate::engine::validate_typed_with_output(
+                &c.view,
+                &m.schema,
+                &map,
+                vo,
+                Some(&fixed),
+                &seeds,
+                Some(&output),
+            )
+            .map_err(engine_error)?;
             // a changed value is read by the pair's node and the nodes that refer to it;
             // those reached from them backwards join at once, so a change that runs
             // along a chain takes one more typing, not one per link
@@ -744,7 +752,9 @@ impl ShexGuard {
             match t.values.get(&(id, kind)).map(|v| v.holds()) {
                 Some(true) => {}
                 Some(false) => before.push(crate::ShapeResult {
-                    node: node.clone(),
+                    node: output.term(id)?.ok_or_else(|| {
+                        sparkles_core::Error::invalid("validated incremental node is missing")
+                    })?,
                     shape: a.shape.clone(),
                     status: crate::Status::Nonconformant,
                     reason: None,

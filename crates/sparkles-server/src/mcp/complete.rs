@@ -57,7 +57,10 @@ pub struct Completion {
 impl McpServer {
     /// `completion/complete` for `call.principal`. It runs on a blocking thread, since
     /// the graph names come from a query.
-    pub async fn complete(&self, req: Request, call: Call) -> Result<Completion, ContextError> {
+    pub async fn complete(&self, req: Request, mut call: Call) -> Result<Completion, ContextError> {
+        self.admit_call(&mut call)
+            .await
+            .map_err(ContextError::Tool)?;
         let server = self.clone();
         let request_id = call.request_id.clone();
         // a completion takes a slot of the tool calls, as its graph listing is a query
@@ -229,11 +232,12 @@ impl Tools<'_> {
         );
         let rows = sparkles::sparql::query(ds.store.snapshot(), &q, &opts)
             .map_err(failed)?
-            .rows();
+            .rows()
+            .map_err(failed)?;
         Ok(rows
             .into_iter()
-            .filter_map(|r| match r.into_iter().next().flatten() {
-                Some(Term::NamedNode(n)) => Some(n.into_string()),
+            .filter_map(|r| match r.values().first().and_then(Option::as_ref) {
+                Some(Term::NamedNode(n)) => Some(n.as_str().to_owned()),
                 _ => None,
             })
             .collect())

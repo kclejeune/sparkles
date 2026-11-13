@@ -16,8 +16,9 @@ use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{BlankNode, Literal, NamedNode, Term, Triple};
 use serde_json::{Value as J, json};
 use sparkles_core::Error;
-use sparkles_core::sparql::QueryOptions;
+use sparkles_core::sparql::output::{OwnedRow, OwnedRows, OwnedTerm};
 use sparkles_core::sparql::results::term_json;
+use sparkles_core::sparql::{QueryOptions, QueryResult};
 use sparkles_core::store::{Generation, Snapshot};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -822,7 +823,98 @@ struct Run<'a> {
     max_memory: Option<u64>,
 }
 
-type Row = BTreeMap<String, Term>;
+/// A diagnostic row keeps the genuine decoded payload and original names. Two
+/// fixed synthetic columns are separately receiving-owned, without a new name map.
+struct Row {
+    result: QueryResult,
+    values: OwnedRow,
+    extra: [Option<OwnedTerm>; 2],
+}
+impl Row {
+    fn get(&self, name: &str) -> Option<&Term> {
+        let extra = match name {
+            "range" => self.extra[0].as_ref(),
+            "via" => self.extra[1].as_ref(),
+            _ => None,
+        };
+        if let Some(value) = extra {
+            return Some(value.as_term());
+        }
+        let column = self.result.variables().iter().position(|v| v == name)?;
+        self.values.values().get(column)?.as_ref()
+    }
+    fn iter(&self) -> impl Iterator<Item = (&str, &Term)> {
+        self.result
+            .variables()
+            .iter()
+            .zip(self.values.values())
+            .filter(|(k, _)| {
+                !((k.as_str() == "range" && self.extra[0].is_some())
+                    || (k.as_str() == "via" && self.extra[1].is_some()))
+            })
+            .filter_map(|(k, v)| v.as_ref().map(|v| (k.as_str(), v)))
+            .chain(
+                [("range", &self.extra[0]), ("via", &self.extra[1])]
+                    .into_iter()
+                    .filter_map(|(k, v)| v.as_ref().map(|v| (k, v.as_term()))),
+            )
+    }
+}
+struct DecodedRows {
+    result: QueryResult,
+    values: OwnedRows,
+}
+impl DecodedRows {
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+    fn terms<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a Term> {
+        let column = self.result.variables().iter().position(|v| v == name);
+        (0..self.len())
+            .filter_map(move |i| self.values.row(i).ok()?.values().get(column?)?.as_ref())
+    }
+}
+struct DecodedRowIter {
+    rows: DecodedRows,
+    index: usize,
+}
+impl Iterator for DecodedRowIter {
+    type Item = Row;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.rows.len() {
+            return None;
+        }
+        let values = self
+            .rows
+            .values
+            .row_handle(self.index)
+            .expect("checked row");
+        self.index += 1;
+        Some(Row {
+            result: self.rows.result.clone(),
+            values,
+            extra: [None, None],
+        })
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.rows.len() - self.index;
+        (n, Some(n))
+    }
+}
+impl ExactSizeIterator for DecodedRowIter {}
+impl IntoIterator for DecodedRows {
+    type Item = Row;
+    type IntoIter = DecodedRowIter;
+    fn into_iter(self) -> Self::IntoIter {
+        DecodedRowIter {
+            rows: self,
+            index: 0,
+        }
+    }
+}
 
 /// The first and the largest page of candidate rows that [`Run::paged_findings`] reads.
 /// Pages double in size from the first to the largest.
@@ -1114,34 +1206,13 @@ impl Run<'_> {
         text: &str,
         inferences: bool,
         bindings: Vec<(String, Term)>,
-    ) -> sparkles_core::Result<Vec<Row>> {
+    ) -> sparkles_core::Result<DecodedRows> {
         let opts = self.options(inferences, bindings)?;
-        let r = sparkles_core::sparql::query(self.snap.clone(), text, &opts)?;
-        let mut rows = Vec::new();
-        let mut bytes = 0u64;
-        for i in 0..r.table.len() {
-            self.check()?;
-            let mut row = Row::new();
-            for (name, column) in r.vars.iter().zip(&r.table.cols) {
-                if let Some(term) = r.term(column[i]) {
-                    bytes = bytes.saturating_add(
-                        (64 + name.len() + sparkles_core::explain::term_bytes(&term)) as u64,
-                    );
-                    if let Some(limit) = self.max_memory
-                        && bytes > limit
-                    {
-                        return Err(Error::BudgetExceeded(sparkles_core::Budget {
-                            kind: sparkles_core::BudgetKind::Memory,
-                            limit,
-                            requested: bytes,
-                        }));
-                    }
-                    row.insert(name.clone(), term);
-                }
-            }
-            rows.push(row);
-        }
-        Ok(rows)
+        let result = sparkles_core::sparql::query(self.snap.clone(), text, &opts)?;
+        self.check()?;
+        let values = result.rows()?;
+        self.check()?;
+        Ok(DecodedRows { result, values })
     }
 
     /// The deduplicated findings (at most `limit`) and whether more remain.
@@ -1231,7 +1302,7 @@ impl Run<'_> {
         };
         let truncated = found.len() > max;
         let ids: Vec<sparkles_core::id::Id> = found.ids().take(max).collect();
-        let via = Term::Literal(Literal::new_simple_literal("datatype"));
+        let via = oxrdf::TermRef::Literal(oxrdf::LiteralRef::new_simple_literal("datatype"));
         for batch in ids.chunks(ILL_TYPED_BATCH) {
             let values: Vec<String> = ill_typed_literals(self.snap, batch)
                 .iter()
@@ -1250,9 +1321,10 @@ impl Run<'_> {
                 let Some(Term::Literal(l)) = row.get("lit") else {
                     continue;
                 };
-                let range = Term::NamedNode(l.datatype().into_owned());
-                row.insert("range".into(), range);
-                row.insert("via".into(), via.clone());
+                let budget = row.result.output_budget();
+                let range = budget.copy_term(oxrdf::TermRef::NamedNode(l.datatype()))?;
+                let via = budget.copy_term(via)?;
+                row.extra = [Some(range), Some(via)];
                 let Some(key) = self.key(&row) else { continue };
                 if seen.contains(&key) {
                     continue;
@@ -1278,7 +1350,7 @@ impl Run<'_> {
     fn occurs_asserted(&self, row: &Row) -> sparkles_core::Result<bool> {
         let bindings = ["x", "p", "lit"]
             .iter()
-            .filter_map(|v| Some((v.to_string(), row.get(*v)?.clone())))
+            .filter_map(|v| Some((v.to_string(), row.get(v)?.clone())))
             .collect();
         let rows = self.select("SELECT * WHERE { ?x ?p ?lit } LIMIT 1", false, bindings)?;
         Ok(!rows.is_empty())
@@ -1445,7 +1517,10 @@ impl Run<'_> {
     /// The same query with the row's bindings, over the asserted data only.
     fn holds_asserted(&self, row: &Row) -> sparkles_core::Result<bool> {
         let text = format!("{}\nLIMIT 1", self.text);
-        let bindings = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let bindings = row
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
         Ok(!self.select(&text, false, bindings)?.is_empty())
     }
 
@@ -1907,8 +1982,7 @@ SELECT ?m WHERE { ?c rdfs:subClassOf ?m . ?m rdfs:subClassOf* owl:Nothing . FILT
             let rows = self.select(STEP, self.inferences, vec![("c".into(), cur.clone())])?;
             // a direct step to owl:Nothing if there is one, else any unvisited step
             let next = rows
-                .iter()
-                .filter_map(|r| r.get("m"))
+                .terms("m")
                 .filter(|m| !seen.contains(*m))
                 .min_by_key(|m| **m != nothing)
                 .cloned();
@@ -2924,5 +2998,42 @@ mod paging_tests {
         assert!(Arc::ptr_eq(&s.snapshot().generation, &generation));
         assert_eq!(foci(&s, &[]), ["<http://ex.org/c>"]);
         assert_eq!(scans_of(&generation), 1);
+    }
+}
+
+#[cfg(test)]
+mod retained_diagnostic_rows_tests {
+    use super::*;
+    use sparkles_core::store::{Store, StoreOptions};
+    #[test]
+    fn rows_keep_real_names_cells_and_pool_after_source_and_other_rows_drop() {
+        let pool = sparkles_core::sparql::pool::QueryPool::new(16 << 20);
+        let store = Store::in_memory(StoreOptions::default());
+        let opts = QueryOptions {
+            pool: Some(pool.clone()),
+            max_memory_bytes: Some(4 << 20),
+            no_cache: true,
+            ..Default::default()
+        };
+        let text = format!(
+            "SELECT ?x ?v WHERE {{ VALUES (?x ?v) {{ (<urn:a> \"{}\") (<urn:b> \"y\") }} }}",
+            "x".repeat(32 << 10)
+        );
+        let result = sparkles_core::sparql::query(store.snapshot(), &text, &opts).unwrap();
+        let names = result.variables().as_ptr();
+        let values = result.rows().unwrap();
+        let mut iter = DecodedRows { result, values }.into_iter();
+        let first = iter.next().unwrap();
+        let other = iter.next().unwrap();
+        assert_eq!(first.result.variables().as_ptr(), names);
+        assert_eq!(other.result.variables().as_ptr(), names);
+        drop(other);
+        drop(iter);
+        drop(store);
+        assert!(matches!(first.get("v"),Some(Term::Literal(l)) if l.value().len()==32 << 10));
+        assert_eq!(first.get("x").unwrap().to_string(), "<urn:a>");
+        assert!(pool.granted() >= 32 << 10);
+        drop(first);
+        assert_eq!(pool.granted(), 0);
     }
 }

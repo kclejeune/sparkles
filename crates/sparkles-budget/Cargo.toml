@@ -1,0 +1,6 @@
+[package]
+name = "sparkles-budget"
+description = "Owned memory reservations shared by Sparkles subsystems"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

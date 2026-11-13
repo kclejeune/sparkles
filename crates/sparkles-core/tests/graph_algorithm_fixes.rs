@@ -41,11 +41,12 @@ fn rows(s: &Store, q: &str) -> Vec<BTreeMap<String, String>> {
     )
     .unwrap_or_else(|e| panic!("{q}: {e}"));
     r.rows()
+        .unwrap()
         .iter()
         .map(|row| {
-            r.vars
+            r.variables()
                 .iter()
-                .zip(row)
+                .zip(row.values())
                 .map(|(v, t)| (v.clone(), short(t)))
                 .collect()
         })

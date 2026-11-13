@@ -398,14 +398,31 @@ impl<'a> Pass<'a> {
         Ok(self.union_changes.as_deref().unwrap_or_default())
     }
 
-    fn ctx(&mut self) -> &Ctx {
+    /// The context expressions are evaluated in. An `EXISTS` in an expression reads
+    /// the snapshot as the circuit's principal reads it, through the same grant binding,
+    /// masking and dataset restriction as a one-off query, and keeps the pass's
+    /// deadline, cancellation and memory budget.
+    fn ctx(&mut self) -> Result<&Ctx> {
         if self.ctx.is_none() {
-            let mut c = Ctx::new(self.new.clone());
+            let graphs = self.access.as_ref().map(|a| a.bound(&self.new));
+            let snap = match &graphs {
+                Some(a) => a.masked(&self.new)?,
+                None => self.new.clone(),
+            };
+            let mut c = Ctx::new(snap);
             c.use_cache = false;
             c.base_iri = self.base.clone();
+            c.deadline = self.control.deadline;
+            c.cancel = self.control.cancel.flag();
+            if let Some(m) = self.max_memory_bytes {
+                c.mem_limit = m;
+            }
+            c.allow_service = false;
+            c.forbid_service = true;
+            crate::sparql::restrict_ctx(&mut c, graphs.as_ref())?;
             self.ctx = Some(c);
         }
-        self.ctx.as_ref().expect("made above")
+        Ok(self.ctx.as_ref().expect("made above"))
     }
 
     /// Evaluate `e` over rows of `schema` (circuit variables): the id of each value, or
@@ -423,7 +440,7 @@ impl<'a> Pass<'a> {
         }
         let vars = self.vars;
         let ctx_vars: Vec<VarId> = {
-            let ctx = self.ctx();
+            let ctx = self.ctx()?;
             schema.iter().map(|&v| ctx.var(&vars[v as usize])).collect()
         };
         // the rows as ids of the expression's context
@@ -437,7 +454,7 @@ impl<'a> Pass<'a> {
                 }
             }
         }
-        let ctx = self.ctx();
+        let ctx = self.ctx()?;
         let to_ctx: FxHashMap<Id, Id> = local
             .into_iter()
             .map(|(i, t)| (i, ctx.intern_term(&t)))
@@ -451,11 +468,18 @@ impl<'a> Pass<'a> {
             table.push_row(&row);
         }
         let empty = FxHashMap::default();
+        // an EXISTS is evaluated by substitution of the row's bindings, as the planner
+        // evaluates one in a one-off query
         let exists = |p: &GraphPattern| {
+            let mut names = Vec::new();
+            crate::sparql::plan::collect_pattern_vars(p, &mut names);
+            let mut vars: Vec<VarId> = names.iter().map(|n| ctx.var(n)).collect();
+            vars.sort_unstable();
+            vars.dedup();
             Arc::new(expr::ExistsSpec::new(
                 p.clone(),
                 crate::sparql::plan::ActiveGraph::Default,
-                Vec::new(),
+                vars,
                 Vec::new(),
             ))
         };
@@ -584,13 +608,13 @@ impl<'a> Pass<'a> {
         };
         let r = crate::sparql::execute_query(self.new.clone(), &q, &opts, 0.0)?;
         let snap = self.new.clone();
-        let width = r.table.width();
+        let width = r.table().width();
         let mut z = super::zset::ZSet::new();
         let mut decoded: FxHashMap<Id, Id> = FxHashMap::default();
-        for i in 0..r.table.len() {
+        for i in 0..r.table().len() {
             let mut row: Vec<Id> = Vec::with_capacity(width);
             for c in 0..width {
-                let id = r.table.cols[c][i];
+                let id = r.table().get(i, c)?;
                 let local = id.tag() == Tag::Local
                     || (id.tag() == Tag::BNode && id.payload() & Id::LOCAL_BNODE_BIT != 0);
                 if !local {
@@ -600,8 +624,8 @@ impl<'a> Pass<'a> {
                 let m = match decoded.get(&id) {
                     Some(m) => *m,
                     None => {
-                        let m = match r.term(id) {
-                            Some(t) => self.terms.intern(&snap, &t),
+                        let m = match r.term(id)? {
+                            Some(t) => self.terms.intern(&snap, t.as_term()),
                             None => Id::UNDEF,
                         };
                         decoded.insert(id, m);
@@ -618,7 +642,7 @@ impl<'a> Pass<'a> {
         }
         self.stats.recompute += t0.elapsed();
         self.stats.recomputes += 1;
-        if r.table.width() != vars.len() {
+        if r.table().width() != vars.len() {
             return Err(Error::Corrupt(
                 "a recompute node's evaluation returned other columns".into(),
             ));

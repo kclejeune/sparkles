@@ -4561,7 +4561,7 @@ mod imp {
                 &Default::default(),
             )
             .unwrap();
-            assert_eq!(query.rows().len(), 1);
+            assert_eq!(query.len(), 1);
             store.disable_text().unwrap();
             assert!(!root.path().join("text").exists());
         }
@@ -4721,7 +4721,6 @@ mod imp {
                 assert_eq!(
                     query(ready.clone(), q, &QueryOptions::default())
                         .unwrap()
-                        .rows()
                         .len(),
                     1
                 );
@@ -4747,7 +4746,6 @@ mod imp {
                     assert_eq!(
                         query(ready.clone(), q, &QueryOptions::default())
                             .unwrap()
-                            .rows()
                             .len(),
                         1
                     );

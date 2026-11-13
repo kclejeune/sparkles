@@ -55,8 +55,13 @@ fn run(s: &Store, text: &str, iri: &str, opt: Optimizations) -> (Vec<String>, us
         },
     )
     .unwrap();
-    let rows = r.rows().into_iter().map(|row| format!("{row:?}")).collect();
-    (rows, calls.load(Ordering::SeqCst), r.plan)
+    let rows = r
+        .rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| format!("{row:?}"))
+        .collect();
+    (rows, calls.load(Ordering::SeqCst), r.plan().clone())
 }
 
 fn has_desc(p: &PlanInfo, needle: &str) -> bool {

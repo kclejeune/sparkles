@@ -88,13 +88,13 @@ impl Direction {
 }
 
 /// One path of the result.
-struct Path {
-    source: Option<Term>,
-    target: Option<Term>,
-    length: Option<Term>,
-    cost: Option<Term>,
+struct Path<'a> {
+    source: Option<&'a Term>,
+    target: Option<&'a Term>,
+    length: Option<&'a Term>,
+    cost: Option<&'a Term>,
     /// (subject, predicate, object)
-    edges: Vec<[Option<Term>; 3]>,
+    edges: Vec<[Option<&'a Term>; 3]>,
 }
 
 impl Tools<'_> {
@@ -201,7 +201,8 @@ impl Tools<'_> {
             .map_err(|e| ctx.engine(e))?;
         let rows = sparql::query(snap.clone(), &query, &opts)
             .map_err(|e| ctx.engine(e))?
-            .rows();
+            .rows()
+            .map_err(|e| ctx.engine(e))?;
         // rows come per edge, in path order; a path of length 0 has one row without edges
         let source_term = |s: &Option<String>| {
             s.as_ref().and_then(|s| {
@@ -210,13 +211,15 @@ impl Tools<'_> {
                     .map(Term::NamedNode)
             })
         };
-        let mut paths: Vec<Path> = Vec::new();
-        let mut last: Option<Term> = None;
+        let fallback_source = source_term(&source);
+        let fallback_target = source_term(&target);
+        let mut paths: Vec<Path<'_>> = Vec::new();
+        let mut last: Option<&Term> = None;
         let mut edges = 0usize;
         let mut truncated = false;
-        for row in rows {
-            let mut row = row.into_iter();
-            let mut next = || row.next().flatten();
+        for index in 0..rows.len() {
+            let mut row = rows.row(index).map_err(|e| ctx.engine(e))?.values().iter();
+            let mut next = || row.next().and_then(Option::as_ref);
             let (index, _edge, s, p, o, length, cost, src, tgt) = (
                 next(),
                 next(),
@@ -230,8 +233,8 @@ impl Tools<'_> {
             );
             if paths.is_empty() || index != last {
                 paths.push(Path {
-                    source: src.or_else(|| source_term(&source)),
-                    target: tgt.or_else(|| source_term(&target)),
+                    source: src.or(fallback_source.as_ref()),
+                    target: tgt.or(fallback_target.as_ref()),
                     length,
                     cost,
                     edges: Vec::new(),
@@ -250,8 +253,8 @@ impl Tools<'_> {
             }
         }
         let mut terms = Terms::new(&prefixes, 500);
-        let mut t = |x: &Option<Term>| x.as_ref().map_or(Value::Null, |x| json!(terms.term(x)));
-        let number = |x: &Option<Term>| match x {
+        let mut t = |x: &Option<&Term>| x.map_or(Value::Null, |x| json!(terms.term(x)));
+        let number = |x: &Option<&Term>| match x {
             Some(Term::Literal(l)) => l.value().parse::<f64>().map_or(Value::Null, super::number),
             _ => Value::Null,
         };

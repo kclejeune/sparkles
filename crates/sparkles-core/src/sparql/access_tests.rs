@@ -115,10 +115,14 @@ fn statistics_shortcuts_through_a_view() {
                     solutions(&want),
                     "{names:?} step {step}: {q}"
                 );
-                assert!(!has_desc(&got.plan, "graphs not read"), "{:#?}", got.plan);
-                assert!(!has_desc(&got.plan, "delta quads"), "{:#?}", got.plan);
-                if has_op(&got.plan, "GroupCountFromMetadata")
-                    || has_desc(&got.plan, "[from statistics]")
+                assert!(
+                    !has_desc(got.plan(), "graphs not read"),
+                    "{:#?}",
+                    got.plan()
+                );
+                assert!(!has_desc(got.plan(), "delta quads"), "{:#?}", got.plan());
+                if has_op(got.plan(), "GroupCountFromMetadata")
+                    || has_desc(got.plan(), "[from statistics]")
                 {
                     from_statistics += 1;
                 }

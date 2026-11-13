@@ -10,10 +10,78 @@ pub(crate) fn prepare(
     snap: &Arc<Snapshot>,
     preparation: &Preparation,
 ) -> Result<PreparedView> {
+    prepare_input(Input::Legacy { original, snap }, preparation)
+}
+
+pub(crate) fn prepare_selected(
+    selected: crate::store::bound_read_source::PreparedRead,
+    preparation: &Preparation,
+) -> Result<PreparedView> {
+    prepare_input(Input::Selected(selected), preparation)
+}
+
+enum Input<'a> {
+    Legacy {
+        original: &'a GraphAccess,
+        snap: &'a Arc<Snapshot>,
+    },
+    Selected(crate::store::bound_read_source::PreparedRead),
+}
+
+impl Input<'_> {
+    fn original(&self) -> &GraphAccess {
+        match self {
+            Self::Legacy { original, .. } => original,
+            Self::Selected(selected) => selected.policy(),
+        }
+    }
+
+    fn snapshot(&self) -> &Arc<Snapshot> {
+        match self {
+            Self::Legacy { snap, .. } => snap,
+            Self::Selected(selected) => selected.snapshot(),
+        }
+    }
+
+    fn selected(self) -> Option<crate::store::bound_read_source::PreparedRead> {
+        match self {
+            Self::Legacy { .. } => None,
+            Self::Selected(selected) => Some(selected),
+        }
+    }
+}
+
+fn finish(
+    access: Arc<GraphAccess>,
+    snapshot: Arc<Snapshot>,
+    held: Reservation,
+    preparation: &Preparation,
+    input: Input<'_>,
+) -> Result<PreparedView> {
+    // Binding is complete, so the strict view drops its strong reference to the
+    // original policy and keeps only the admitted weak identity.
+    let selected = input.selected().map(|selected| selected.into_identity());
+    PreparedView::new_selected(access, snapshot, held, preparation, selected)
+}
+
+fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<PreparedView> {
+    // The legacy cache stores raw snapshots without their paid view owner.
+    // A strict Store-minted preparation must not install its newly paid mask
+    // there or consume that unowned cached alias as proof of retention.
+    let use_legacy_cache = matches!(&input, Input::Legacy { .. });
+    let original = input.original();
+    let snap = input.snapshot();
     preparation.stage("preparing permission view")?;
     // The input snapshot and its persistent delta belong to the caller. The returned
     // view is charged only for storage this preparation creates or keeps alive alone.
     let mut held = preparation.reserve(PreparedView::header_bytes()?)?;
+    if matches!(&input, Input::Selected(_)) {
+        // The strict view keeps only a weak identity of the invocation's original
+        // policy, so a replacement policy can be refused without extending the
+        // lifetime of its contents or opaque guard providers. The weak reference
+        // keeps the policy's Arc allocation, whose layout is admitted here.
+        held.merge(preparation.reserve(weak_policy_bytes()?)?);
+    }
     // Shared policy definitions are retained too. Inspect their sizes with controls
     // before taking the returned owner's Arc references.
     if let Some(rules) = &original.triples {
@@ -57,19 +125,8 @@ pub(crate) fn prepare(
     let Some(rules) = access.triples.as_ref().filter(|_| hides) else {
         // A policy that hides no triples keeps an existing mask, which only hides more.
         preparation.check()?;
-        return PreparedView::new(access, snap.clone(), held, preparation);
+        return finish(access, snap.clone(), held, preparation, input);
     };
-    for rule in &rules.rules {
-        preparation.check()?;
-        if rule.read.is_all() {
-            continue;
-        }
-        if rule.protection.pattern.is_some() {
-            return Err(Error::Unsupported(
-                "controlled permission preparation does not yet support protection pattern planning".into(),
-            ));
-        }
-    }
     let (key, key_held) = cache_key(&access, rules, preparation)?;
     if let Some(mask) = &snap.mask {
         // A mask left by another policy could show triples this policy hides, so only
@@ -79,16 +136,20 @@ pub(crate) fn prepare(
         }
         drop(key_held);
         preparation.check()?;
-        return PreparedView::new(access, snap.clone(), held, preparation);
+        return finish(access, snap.clone(), held, preparation, input);
     }
-    let existing = snap.counts.prepared_mask_slot(&key, preparation)?;
+    let existing = if use_legacy_cache {
+        snap.counts.prepared_mask_slot(&key, preparation)?
+    } else {
+        None
+    };
     if let Some(slot) = &existing {
         let slot = preparation.lock(slot)?;
         if let Some(cached) = &*slot {
             // The view may outlive the cache entry, so it owns the mask's own storage.
             held.merge(preparation.reserve(mask_storage(cached))?);
             preparation.check()?;
-            return PreparedView::new(access, cached.clone(), held, preparation);
+            return finish(access, cached.clone(), held, preparation, input);
         }
     }
     // Build outside the slot lock. User progress and controlled provider helpers
@@ -97,18 +158,20 @@ pub(crate) fn prepare(
     let (snapshot, derived) = apply_controlled(snap, hidden, &key, preparation)?;
     held.merge(derived);
     preparation.check()?;
-    if let Some(slot) = existing {
-        let mut slot = preparation.lock(&slot)?;
-        if slot.is_none() {
-            *slot = Some(snapshot.clone());
+    if use_legacy_cache {
+        if let Some(slot) = existing {
+            let mut slot = preparation.lock(&slot)?;
+            if slot.is_none() {
+                *slot = Some(snapshot.clone());
+            }
+        } else {
+            snap.counts
+                .cache_prepared_mask(key, snapshot.clone(), preparation)?;
         }
-    } else {
-        snap.counts
-            .cache_prepared_mask(key, snapshot.clone(), preparation)?;
     }
     drop(key_held);
     preparation.check()?;
-    PreparedView::new(access, snapshot, held, preparation)
+    finish(access, snapshot, held, preparation, input)
 }
 
 fn already_masked() -> Error {
@@ -143,6 +206,17 @@ fn strings_bytes(values: &Vec<String>, preparation: &Preparation) -> Result<u64>
             .saturating_add(64);
     }
     Ok(bytes)
+}
+
+/// The Arc allocation of a policy that a weak identity keeps after its
+/// contents are dropped.
+fn weak_policy_bytes() -> Result<u64> {
+    let counters = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>();
+    let (layout, _) = counters
+        .extend(std::alloc::Layout::new::<GraphAccess>())
+        .map_err(|_| Error::invalid("policy layout overflows"))?;
+    u64::try_from(layout.pad_to_align().size())
+        .map_err(|_| Error::invalid("policy layout overflows"))
 }
 
 fn graphs_bytes(graphs: &Graphs, preparation: &Preparation) -> Result<u64> {
@@ -446,6 +520,17 @@ fn hidden(
                 )
             })
             .transpose()?;
+        let pass = match &protection.pattern {
+            Some(pattern) => Some(passes(
+                snap,
+                protection,
+                pattern,
+                &rules.caller,
+                &rules.limits,
+                preparation,
+            )?),
+            None => None,
+        };
         let mut by_graph = Map::new(preparation)?;
         let mut visit = |quad: [Id; 4]| -> Result<bool> {
             preparation.check()?;
@@ -481,7 +566,7 @@ fn hidden(
                 by_graph.insert(graph.0, hide)?;
                 hide
             };
-            if hide {
+            if hide && !pass.as_ref().is_some_and(|pass| pass.passes(&quad)) {
                 if hidden.len() as u64 >= rules.limits.max_hidden {
                     return Err(too_many(
                         &rules.limits,
@@ -526,6 +611,228 @@ fn hidden(
     }
     hidden.truncate(kept);
     Ok(hidden)
+}
+
+/// The solutions of a protection's pattern, as [`super::Passes`] holds them for the
+/// legacy path, in a map charged to the preparation.
+enum Pass {
+    All,
+    None,
+    Keys {
+        cols: [bool; 3],
+        set: Map<[u64; 3], ()>,
+    },
+}
+
+impl Pass {
+    fn passes(&self, quad: &[Id; 4]) -> bool {
+        match self {
+            Self::All => true,
+            Self::None => false,
+            Self::Keys { cols, set } => {
+                let mut key = [0; 3];
+                for (index, on) in cols.iter().enumerate() {
+                    if *on {
+                        key[index] = quad[index].0;
+                    }
+                }
+                set.contains_key(&key)
+            }
+        }
+    }
+}
+
+/// Write the query of [`pattern_query`] into charged text: the same prefixes, the
+/// same projection and the caller's values as escaped literals. `None` when the caller
+/// lacks an attribute the pattern uses, so the pattern matches nothing.
+fn pattern_text(
+    text: &mut Text,
+    protection: &Protection,
+    pattern: &str,
+    caller: &Caller,
+) -> Result<Option<[bool; 3]>> {
+    for (prefix, iri) in &protection.prefixes {
+        for part in ["PREFIX ", prefix, ": <", iri, ">\n"] {
+            text.push_str(part)?;
+        }
+    }
+    let subject = if uses(pattern, "this") { "this" } else { "s" };
+    let cols = [
+        uses(pattern, subject),
+        uses(pattern, "p"),
+        uses(pattern, "o"),
+    ];
+    text.push_str("SELECT DISTINCT")?;
+    for (on, var) in cols.iter().zip([subject, "p", "o"]) {
+        if *on {
+            text.push_str(" ?")?;
+            text.push_str(var)?;
+        }
+    }
+    if !cols.iter().any(|on| *on) {
+        text.push_str(" (1 AS ?any)")?;
+    }
+    text.push_str(" WHERE {\n")?;
+    let user = caller.user.as_slice();
+    for (var, values) in [
+        ("user", user),
+        ("role", caller.roles.as_slice()),
+        ("group", caller.groups.as_slice()),
+    ] {
+        if !uses(pattern, var) {
+            continue;
+        }
+        if values.is_empty() {
+            return Ok(None);
+        }
+        text.push_str("  VALUES ?")?;
+        text.push_str(var)?;
+        text.push_str(" { ")?;
+        for (at, value) in values.iter().enumerate() {
+            if at != 0 {
+                text.push_str(" ")?;
+            }
+            push_literal(text, value)?;
+        }
+        text.push_str(" }\n")?;
+    }
+    text.push_str("  { ")?;
+    text.push_str(pattern)?;
+    text.push_str("\n  }\n}")?;
+    Ok(Some(cols))
+}
+
+/// A simple literal in SPARQL syntax, with runs of plain characters copied whole.
+fn push_literal(text: &mut Text, value: &str) -> Result<()> {
+    text.push_str("\"")?;
+    let mut start = 0;
+    for (at, c) in value.char_indices() {
+        let escaped = match c {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            c if c.is_control() => "",
+            _ => continue,
+        };
+        text.push_str(&value[start..at])?;
+        if escaped.is_empty() {
+            let mut code = [0u8; 6];
+            let code = hex_escape(c, &mut code);
+            text.push_str(code)?;
+        } else {
+            text.push_str(escaped)?;
+        }
+        start = at + c.len_utf8();
+    }
+    text.push_str(&value[start..])?;
+    text.push_str("\"")
+}
+
+/// The `\uXXXX` escape of a control character, which is always below U+10000.
+fn hex_escape(c: char, out: &mut [u8; 6]) -> &str {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let code = c as u32;
+    out[0] = b'\\';
+    out[1] = b'u';
+    for (at, shift) in [12, 8, 4, 0].into_iter().enumerate() {
+        out[2 + at] = HEX[((code >> shift) & 0xF) as usize];
+    }
+    std::str::from_utf8(out).expect("ASCII escape")
+}
+
+/// Evaluate a protection's pattern as [`super::passes`] does, with every graph merged
+/// into the default graph and `GRAPH` for the named ones. The query text, the list of
+/// named graphs and the pattern's query are charged to `preparation`, and the query
+/// runs under its controls on the unmasked snapshot.
+fn passes(
+    snap: &Arc<Snapshot>,
+    protection: &Protection,
+    pattern: &str,
+    caller: &Caller,
+    limits: &Limits,
+    preparation: &Preparation,
+) -> Result<Pass> {
+    preparation.check()?;
+    let mut text = Text::new(preparation)?;
+    let Some(cols) = pattern_text(&mut text, protection, pattern, caller)? else {
+        return Ok(Pass::None);
+    };
+    let (text, _text_held) = text.finish()?;
+    // The named graphs are merged into the default graph, as the legacy pattern reads
+    // them. Each name's storage is admitted before it is allocated.
+    let mut named = Buffer::new(preparation)?;
+    let mut names_held = preparation.reserve(0)?;
+    snap.for_each_graph_id_checked(
+        || preparation.check(),
+        |graph| {
+            preparation.with_term(snap, graph, |term| {
+                if let Some(Term::NamedNode(node)) = term {
+                    let iri = node.as_str();
+                    names_held.merge(preparation.reserve(iri.len() as u64)?);
+                    let mut name = String::new();
+                    name.try_reserve_exact(iri.len())
+                        .map_err(|_| preparation.exhausted())?;
+                    name.push_str(iri);
+                    named.push(name)?;
+                }
+                Ok(())
+            })
+        },
+    )?;
+    let (named, _named_held) = named.into_parts();
+    let opts = crate::sparql::QueryOptions {
+        default_graph_extra: named,
+        max_rows: Some(usize::try_from(limits.max_pattern_rows).unwrap_or(usize::MAX)),
+        ..preparation.nested_query_options()
+    };
+    let rows_refused = |requested| {
+        Error::BudgetExceeded(Budget {
+            kind: BudgetKind::Rows,
+            limit: limits.max_pattern_rows,
+            requested,
+        })
+    };
+    let view = GraphAccess::all().masked_controlled(snap, preparation)?;
+    let result = crate::sparql::query_prepared_source(view.read_source(), &text, &opts).map_err(
+        |error| match error {
+            Error::BudgetExceeded(Budget {
+                kind: BudgetKind::Rows,
+                ..
+            }) => rows_refused(limits.max_pattern_rows.saturating_add(1)),
+            Error::SparqlSyntax(error) => Error::invalid(format!(
+                "the pattern of protection '{}': {error}",
+                protection.name
+            )),
+            error => error,
+        },
+    )?;
+    let table = result.table();
+    if table.len() as u64 > limits.max_pattern_rows {
+        return Err(rows_refused(table.len() as u64));
+    }
+    if !cols.iter().any(|on| *on) {
+        return Ok(if table.is_empty() {
+            Pass::None
+        } else {
+            Pass::All
+        });
+    }
+    let mut set = Map::new(preparation)?;
+    for row in 0..table.len() {
+        preparation.check()?;
+        let mut key = [0; 3];
+        let mut column = 0;
+        for (index, on) in cols.iter().enumerate() {
+            if *on {
+                key[index] = table.get(row, column)?.0;
+                column += 1;
+            }
+        }
+        set.insert(key, ())?;
+    }
+    Ok(Pass::Keys { cols, set })
 }
 
 /// Lower the predicate statistics for the hidden quads the delta had inserted, by
@@ -1107,5 +1414,81 @@ mod tests {
             );
             assert_eq!(store.snapshot().len(), 1);
         }
+    }
+
+    fn owned_by(user: &str) -> GraphAccess {
+        GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::none(),
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "owned".into(),
+                        predicates: Some(vec!["urn:p".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: Some("?s <urn:owner> ?user".into()),
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller {
+                    user: Some(user.into()),
+                    ..Caller::default()
+                },
+                limits: Limits::default(),
+            },
+        )
+    }
+
+    fn quads(snap: &Snapshot) -> Vec<[Id; 4]> {
+        let mut out = Vec::new();
+        snap.for_each_quad(|q| {
+            out.push(*q);
+            Ok(())
+        })
+        .unwrap();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn protection_patterns_hide_what_the_legacy_mask_hides_and_key_their_caller() {
+        let store = crate::store::Store::in_memory(Default::default());
+        crate::sparql::update::update(
+            &store,
+            r#"INSERT DATA { <urn:a> <urn:p> 1 . <urn:b> <urn:p> 2 .
+                <urn:a> <urn:owner> "alice" . <urn:b> <urn:owner> "bob" .
+                <urn:d> <urn:p> 4 . <urn:d> <urn:owner> "q\"\\\n\u0000\u007Fx" .
+                GRAPH <urn:g> { <urn:c> <urn:p> 3 . <urn:c> <urn:owner> "alice" } }"#,
+            &Default::default(),
+        )
+        .unwrap();
+        let snap = store.snapshot();
+        let all = quads(&snap);
+        // The last caller's value needs escaping in the pattern's query and still reads
+        // as itself, so it sees its one triple.
+        for (user, expected) in [
+            ("alice", 2),
+            ("bob", 3),
+            ("carol", 4),
+            ("q\"\\\n\u{0}\u{7f}x", 3),
+        ] {
+            let access = owned_by(user);
+            let legacy = quads(&access.masked(&snap).unwrap());
+            let prep = Preparation::new(Control::none(), 8 << 20).unwrap();
+            let view = access.masked_controlled(&snap, &prep).unwrap();
+            assert_eq!(quads(view.snapshot()), legacy, "{user:?}");
+            assert_eq!(all.len() - legacy.len(), expected, "{user:?}");
+        }
+        let prep = Preparation::new(Control::none(), 8 << 20).unwrap();
+        let alice = owned_by("alice");
+        let bob = owned_by("bob");
+        let (a, _a_held) = cache_key(&alice, alice.triples.as_ref().unwrap(), &prep).unwrap();
+        let (b, _b_held) = cache_key(&bob, bob.triples.as_ref().unwrap(), &prep).unwrap();
+        assert_ne!(a, b, "a pattern's mask is keyed by its caller");
     }
 }

@@ -41,11 +41,12 @@ fn store() -> Store {
     s
 }
 
-fn run(s: &Store, q: &str) -> Vec<Vec<Option<Term>>> {
+fn run(s: &Store, q: &str) -> sparkles_core::sparql::output::OwnedRows {
     let text = format!("{PREFIXES}{q}");
     query(s.snapshot(), &text, &QueryOptions::default())
         .unwrap_or_else(|e| panic!("{q}: {e}"))
         .rows()
+        .unwrap()
 }
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
@@ -86,7 +87,7 @@ fn check(s: &Store, q: &str, want: &str) {
     assert_eq!(got.len(), want.len(), "{q}\n{got:?}");
     for (g, w) in got.iter().zip(&want) {
         assert_eq!(g.len(), w.len(), "{q}");
-        for (gc, wc) in g.iter().zip(w) {
+        for (gc, wc) in g.values().iter().zip(w) {
             assert!(matches(gc, wc), "{q}\ngot {g:?}\nwant {w:?}");
         }
     }
@@ -163,7 +164,10 @@ fn mode_matches_arq() {
         &s,
         r#"SELECT (MODE(?v) AS ?m) (MODE(DISTINCT ?v) AS ?d) WHERE { ?s :g "j" ; :v ?v }"#,
     );
-    assert!(matches(&rows[0][0], "9.0") && matches(&rows[0][1], "9.0"));
+    assert!(
+        matches(&rows.row(0).unwrap().values()[0], "9.0")
+            && matches(&rows.row(0).unwrap().values()[1], "9.0")
+    );
 }
 
 #[test]

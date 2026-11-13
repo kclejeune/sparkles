@@ -668,9 +668,9 @@ mod tests {
             .unwrap();
             assert!(result.boolean);
             if indexed {
-                assert!(find(&result.plan, "IndexJoin", "").is_some(), "{pattern}");
+                assert!(find(result.plan(), "IndexJoin", "").is_some(), "{pattern}");
             }
-            let scan = find(&result.plan, "IndexScan", "urn:p").unwrap();
+            let scan = find(result.plan(), "IndexScan", "urn:p").unwrap();
             observed.push((pattern, scan.actual_rows));
             assert!(scan.fidelity().stopped_early);
             let capped = query(
@@ -685,7 +685,7 @@ mod tests {
             .unwrap();
             assert!(capped.boolean);
             assert_eq!(
-                find(&capped.plan, "IndexScan", "urn:p")
+                find(capped.plan(), "IndexScan", "urn:p")
                     .unwrap()
                     .actual_rows,
                 64,
@@ -714,7 +714,7 @@ mod tests {
         .unwrap();
         assert!(changed.boolean);
         assert_eq!(
-            find(&changed.plan, "IndexScan", "urn:p")
+            find(changed.plan(), "IndexScan", "urn:p")
                 .unwrap()
                 .actual_rows,
             64,
@@ -889,7 +889,7 @@ mod tests {
                 }
             };
             assert!(result.boolean);
-            let mut todo = vec![&result.plan];
+            let mut todo = vec![result.plan()];
             while let Some(p) = todo.pop() {
                 if p.operator == "Values" {
                     assert_eq!(
@@ -939,7 +939,7 @@ mod tests {
             )
             .unwrap();
             assert!(result.boolean);
-            let mut todo = vec![&result.plan];
+            let mut todo = vec![result.plan()];
             while let Some(p) = todo.pop() {
                 if p.operator == "IndexScan" && p.description.contains("urn:false") {
                     assert_eq!(p.actual_rows, -1, "the nested false arm must stay skipped");
@@ -981,7 +981,7 @@ mod tests {
             )
             .unwrap();
             assert!(result.boolean);
-            let mut todo = vec![&result.plan];
+            let mut todo = vec![result.plan()];
             while let Some(p) = todo.pop() {
                 if p.operator == "IndexScan" && p.description.contains("urn:small") {
                     assert_eq!(p.actual_rows, -1, "the false operand must remain skipped");
@@ -1064,7 +1064,7 @@ mod tests {
             calls.load(Ordering::Relaxed) > 0,
             "the in-process SERVICE must actually execute"
         );
-        let mut todo = vec![&result.plan];
+        let mut todo = vec![result.plan()];
         let mut rows = None;
         while let Some(p) = todo.pop() {
             if p.operator == "Bind" && p.columns.iter().any(|v| v == "e") {
@@ -1113,7 +1113,7 @@ mod tests {
             }
             p.children.iter().find_map(wide)
         }
-        let wide = wide(&r.plan).expect("wide scan is retained in the physical plan");
+        let wide = wide(r.plan()).expect("wide scan is retained in the physical plan");
         assert_eq!(
             wide.actual_rows, -1,
             "the cheaper branch must answer ASK before any wide scan"
@@ -1126,7 +1126,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            selected.rows()[0]
+            selected.test_application_rows()[0]
                 .iter()
                 .any(|v| v.as_ref().is_some_and(|v| v.to_string().contains("urn:s")))
         );
@@ -1140,7 +1140,7 @@ mod tests {
             },
         )
         .unwrap();
-        let mut plans = vec![&explicit.plan];
+        let mut plans = vec![explicit.plan()];
         let mut read_wide = false;
         while let Some(p) = plans.pop() {
             if p.description.contains("urn:wide") && p.actual_rows > 0 {
@@ -1376,7 +1376,7 @@ mod tests {
         )
         .unwrap();
         assert!(one_row.boolean);
-        let mut plans = vec![&one_row.plan];
+        let mut plans = vec![one_row.plan()];
         let mut wide_rows = None;
         while let Some(p) = plans.pop() {
             if p.operator == "IndexScan" && p.description.contains("urn:wide") {
@@ -1414,7 +1414,7 @@ mod tests {
         )
         .unwrap();
         assert!(optimized.boolean);
-        let mut todo = vec![&optimized.plan];
+        let mut todo = vec![optimized.plan()];
         let mut input_rows = None;
         while let Some(p) = todo.pop() {
             if p.operator == "IndexScan" && p.description.contains("urn:wide") {

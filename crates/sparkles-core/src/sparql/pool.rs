@@ -11,10 +11,14 @@
 
 use crate::error::{Budget, BudgetKind, Error};
 use parking_lot::{Condvar, Mutex};
+use sparkles_budget::MemoryDomain;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+mod memory;
+pub use memory::DomainStats;
 
 /// The size in which grants grow and shrink.
 pub const GRANULE: u64 = 4 << 20;
@@ -52,6 +56,9 @@ struct Queue {
 /// A byte budget for the queries of one process or catalog.
 pub struct QueryPool {
     capacity: u64,
+    domain: MemoryDomain,
+    retained_capacity: u64,
+    retained_reserved: AtomicU64,
     granted: AtomicU64,
     /// requests waiting for admission, read without the queue's lock
     waiting: AtomicUsize,
@@ -82,15 +89,7 @@ pub struct PoolStats {
 
 impl QueryPool {
     pub fn new(capacity: u64) -> Arc<QueryPool> {
-        Arc::new(QueryPool {
-            capacity,
-            granted: AtomicU64::new(0),
-            waiting: AtomicUsize::new(0),
-            queue: Mutex::new(Queue::default()),
-            changed: Condvar::new(),
-            admitted: AtomicU64::new(0),
-            rejected: AtomicU64::new(0),
-        })
+        Self::with_retained_capacity(capacity, 0).expect("capacity plus zero cannot overflow")
     }
 
     pub fn capacity(&self) -> u64 {
@@ -192,6 +191,8 @@ impl QueryPool {
 
     /// Join the admission queue for an initial grant of `bytes`. `wake` is called when
     /// the pool's state changes, so that an async caller can poll again.
+    /// It runs synchronously during release, including Drop, and must not panic.
+    /// Callback panics are not contained.
     pub fn enter(self: &Arc<Self>, bytes: u64, wake: Option<Waker>) -> Ticket {
         let bytes = self.clamp(bytes);
         let mut q = self.queue.lock();
@@ -383,6 +384,33 @@ impl PoolGrant {
         self.used.load(Ordering::SeqCst)
     }
 
+    /// The bytes this grant could still charge now under the same growth rules as
+    /// [`PoolGrant::charge`]: whole granules of the pool's free capacity, capped by
+    /// half the pool while requests wait. This is a sizing observation only, since
+    /// other grants may take the free granules before a later charge.
+    pub(crate) fn growth_room(&self) -> u64 {
+        let capacity = self.pool.capacity;
+        let cur = self.granted.load(Ordering::SeqCst);
+        let used = self.used.load(Ordering::SeqCst);
+        let share = if self.pool.waiting() > 0 {
+            capacity / 2
+        } else {
+            capacity
+        };
+        let ceiling = share.max(INITIAL_GRANT.min(capacity));
+        let free = capacity.saturating_sub(self.pool.granted());
+        // The largest target `grow_locked` accepts: a whole granule within both the
+        // ceiling and the free capacity, or the capacity itself, which it uses as
+        // the final clamped granule when that fits.
+        let limit = ceiling.min(cur.saturating_add(free));
+        let best = if capacity <= limit {
+            capacity
+        } else {
+            limit - limit % GRANULE
+        };
+        best.max(cur).saturating_sub(used)
+    }
+
     /// The most bytes this grant has held at once.
     pub fn peak(&self) -> u64 {
         self.peak.load(Ordering::Relaxed)
@@ -475,12 +503,11 @@ impl PoolGrant {
         Ok(())
     }
 
-    /// Give back granules when the query holds well over what it uses. The pool wakes
-    /// waiting requests while the grant's lock is held, so a waker must never charge or
-    /// release this grant.
+    /// Give back granules when the query holds well over what it uses. Pool wake-ups
+    /// run after the grant's resize lock is released and may reenter this grant.
     #[cold]
     fn trim_slow(&self) {
-        let _lock = self.resize.lock();
+        let lock = self.resize.lock();
         let cur = self.granted.load(Ordering::SeqCst);
         let keep = |used: u64| round_up(used).max(INITIAL_GRANT.min(cur)).min(cur);
         let t1 = keep(self.used.load(Ordering::SeqCst));
@@ -499,6 +526,7 @@ impl PoolGrant {
         if t2 != t1 {
             self.granted.store(t2, Ordering::SeqCst);
         }
+        drop(lock);
         self.pool.release(cur - t2);
     }
 }
@@ -645,6 +673,29 @@ mod tests {
         let mut late = pool.enter(8 * MB, None);
         assert!(late.poll().is_none());
         assert!(head.poll().is_some());
+    }
+
+    #[test]
+    fn growth_room_matches_admitted_granule_rounding_while_requests_wait() {
+        let pool = QueryPool::new(68 * MB);
+        let g = pool.try_grant(16 * MB).unwrap();
+        let _other = pool.try_grant(20 * MB).unwrap();
+        let mut waiter = pool.enter(40 * MB, None);
+        assert!(waiter.poll().is_none());
+        // Half the pool is 34 MiB, so the largest admitted target is 32 MiB.
+        let room = g.growth_room();
+        assert_eq!(room, 32 * MB - g.used());
+        g.charge(room).unwrap();
+        assert!(g.charge(1).is_err());
+    }
+
+    #[test]
+    fn growth_room_includes_the_capacity_clamped_final_granule() {
+        let pool = QueryPool::new(10 * MB);
+        let g = pool.try_grant(4 * MB).unwrap();
+        let room = g.growth_room();
+        assert_eq!(room, 10 * MB - g.used());
+        g.charge(room).unwrap();
     }
 
     #[test]

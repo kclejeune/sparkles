@@ -146,7 +146,14 @@ fn options(d: PropertyDescriptor) -> QueryOptions {
     }
 }
 fn run(s: &Store, source: &str, opts: &QueryOptions) -> Vec<Vec<Option<Term>>> {
-    query(s.snapshot(), source, opts).unwrap().rows()
+    query(s.snapshot(), source, opts)
+        .unwrap()
+        .rows()
+        .unwrap()
+        .iter()
+        // Independent fixture assertion cells; these do not retain engine credit.
+        .map(|row| row.values().to_vec())
+        .collect()
 }
 
 #[test]
@@ -1620,7 +1627,7 @@ fn a_declared_prefix_output_streams_its_input() {
         let mut rows = Vec::new();
         while let Some(b) = c.next_batch()? {
             for i in 0..b.len() {
-                rows.push(b.row(i)?);
+                rows.push(b.row(i)?.values().to_vec());
             }
         }
         Ok(rows)

@@ -949,10 +949,13 @@ ex:A geo:sfTouches ex:p2 .
                     ..Default::default()
                 };
                 let r = query(s.snapshot(), &q, &o).unwrap();
-                let mut rows: Vec<String> =
-                    r.rows().into_iter().map(|r| format!("{r:?}")).collect();
+                let mut rows: Vec<String> = r
+                    .test_application_rows()
+                    .into_iter()
+                    .map(|r| format!("{r:?}"))
+                    .collect();
                 rows.sort();
-                (rows, index(&r.plan).unwrap())
+                (rows, index(r.plan()).unwrap())
             })
             .collect()
     }

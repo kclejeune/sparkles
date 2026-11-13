@@ -354,7 +354,7 @@ fn run(snap: &Arc<crate::store::Snapshot>, q: &str, opt: Optimizations) -> Query
 
 fn answer(r: &QueryResult) -> Vec<String> {
     let mut v: Vec<String> = r
-        .rows()
+        .test_application_rows()
         .into_iter()
         .map(|row| {
             row.into_iter()
@@ -424,7 +424,7 @@ fn optional_and_join_queries_give_the_same_rows_with_each_switch() {
                 ] {
                     let r = run(&snap, q, opt);
                     assert_eq!(answer(&r), want, "round {round} pass {pass}, {how}: {q}");
-                    if how == "all" && has_note(&r.plan, "OptionalJoin", "[merge on") {
+                    if how == "all" && has_note(r.plan(), "OptionalJoin", "[merge on") {
                         merges += 1;
                     }
                 }
@@ -605,10 +605,10 @@ fn a_join_condition_decodes_no_terms() {
     ] {
         let without = run(&snap, plain, opt);
         let with = run(&snap, conditional, opt);
-        assert_eq!(with.rows().len(), ROWS, "{how}");
+        assert_eq!(with.test_application_rows().len(), ROWS, "{how}");
         assert!(
             has_note(
-                &with.plan,
+                with.plan(),
                 "OptionalJoin",
                 if how == "merge" {
                     "[merge on"
@@ -617,7 +617,7 @@ fn a_join_condition_decodes_no_terms() {
                 }
             ),
             "{how}: {}",
-            with.plan.description
+            with.plan().description
         );
         // The condition's mask and its merged rows of two columns at most, the parallel
         // map's collector with its 1 KiB per pool thread, and the hash kernel's scratch

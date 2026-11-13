@@ -9,7 +9,7 @@
 use crate::error::{Error, Result};
 use crate::sparql::QueryOptions;
 use crate::store::{Snapshot, Store};
-use oxrdf::{BlankNode, NamedOrBlankNode, Term, Triple, Variable};
+use oxrdf::{Term, Triple, Variable};
 use spargebra::Query;
 use spargebra::algebra::GraphPattern;
 use spargebra::term::GroundTerm;
@@ -290,7 +290,7 @@ impl<'a> Runner<'a> {
         &mut self,
         vars: &[Variable],
         rows: Vec<Vec<Option<GroundTerm>>>,
-        sink: &mut dyn FnMut(Triple) -> Result<()>,
+        sink: &mut dyn FnMut(&Triple) -> Result<()>,
     ) -> Result<u64> {
         self.batch += 1;
         let values = GraphPattern::Values {
@@ -302,29 +302,19 @@ impl<'a> Runner<'a> {
             let q = self.template.with_values(i, values.clone());
             let r = crate::sparql::execute_query(self.snap.clone(), &q, &self.opts, 0.0)?;
             let (p, b) = (self.part, self.batch);
-            // the queries of one file share no blank nodes
-            let relabel =
-                |x: &BlankNode| BlankNode::new_unchecked(format!("t{p}b{b}q{i}x{}", x.as_str()));
-            for t in r.triples {
-                sink(relabel_triple(t, &relabel))?;
+            // Each separately admitted relabelled payload remains live through
+            // the complete borrowed callback; no query-owned Triple is detached.
+            for triple in r.triples() {
+                let value = r.output_budget().relabel_graph_triple(triple, p, b, i)?;
+                let Term::Triple(triple) = value.as_term() else {
+                    unreachable!("credited triple")
+                };
+                sink(triple)?;
                 n += 1;
             }
         }
         Ok(n)
     }
-}
-
-fn relabel_triple(t: Triple, f: &dyn Fn(&BlankNode) -> BlankNode) -> Triple {
-    let s = match t.subject {
-        NamedOrBlankNode::BlankNode(b) => NamedOrBlankNode::BlankNode(f(&b)),
-        s => s,
-    };
-    let o = match t.object {
-        Term::BlankNode(b) => Term::BlankNode(f(&b)),
-        Term::Triple(inner) => Term::Triple(Box::new(relabel_triple(*inner, f))),
-        o => o,
-    };
-    Triple::new(s, t.predicate, o)
 }
 
 /// Put `values` before the first element of the group `p`: the leftmost operand of the

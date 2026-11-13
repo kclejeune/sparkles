@@ -25,15 +25,20 @@ fn show(t: Option<&Term>, prefixes: &BTreeMap<String, String>) -> String {
 }
 
 /// Write the table of `vars` and `rows` (one optional term per variable).
-pub fn write_table(
+pub fn write_table<R: AsRef<[Option<Term>]>>(
     vars: &[String],
-    rows: &[Vec<Option<Term>>],
+    rows: impl IntoIterator<Item = R>,
     prefixes: &BTreeMap<String, String>,
     out: &mut impl Write,
 ) -> std::io::Result<()> {
     let rows: Vec<Vec<String>> = rows
-        .iter()
-        .map(|row| row.iter().map(|t| show(t.as_ref(), prefixes)).collect())
+        .into_iter()
+        .map(|row| {
+            row.as_ref()
+                .iter()
+                .map(|t| show(t.as_ref(), prefixes))
+                .collect()
+        })
         .collect();
     let mut widths: Vec<usize> = vars.iter().map(|v| v.chars().count() + 1).collect();
     for row in &rows {

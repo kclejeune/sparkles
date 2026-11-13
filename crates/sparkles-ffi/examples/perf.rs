@@ -31,11 +31,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let r = ds.query_with(q, &opts)?;
             // decode every cell, as a caller that reads the solutions would
             let mut n = 0;
-            for row in r.rows() {
-                n += row.iter().filter(|c| c.is_some()).count();
+            for row in r.rows()?.iter() {
+                n += row.values().iter().filter(|c| c.is_some()).count();
             }
             let ms = t.elapsed().as_secs_f64() * 1000.0;
-            rows = r.table.len();
+            rows = r.table().len();
             let _ = n;
             if i >= 3 {
                 times.push(ms);

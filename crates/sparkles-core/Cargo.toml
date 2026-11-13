@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+sparkles-budget.workspace = true
 oxrdf.workspace = true
 # the OWL 2 functional-style syntax reader (spec F21 Phase 3)
 sparkles-owl.workspace = true

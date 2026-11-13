@@ -3236,9 +3236,10 @@ impl<'a> Planner<'a> {
         if !scan.est.is_finite() || scan.est > POINT_ROWS || !spec.eqs.is_empty() {
             return Ok(None);
         }
-        let (rows, _) = super::exec::scan_limited(self.ctx, spec, &scan.vars, Some(2))?;
-        Ok(match (rows.len(), rows.col_of(v)) {
-            (1, Some(c)) => Some((v, rows.cols[c][0])).filter(|(_, id)| !id.is_undef()),
+        let (rows, _) =
+            super::exec::scan_limited(self.ctx, spec, &scan.vars, &scan.sorted, Some(2))?;
+        Ok(match (rows.table.len(), rows.table.col_of(v)) {
+            (1, Some(c)) => Some((v, rows.table.cols[c][0])).filter(|(_, id)| !id.is_undef()),
             _ => None,
         })
     }
@@ -3695,6 +3696,102 @@ pub(super) fn join_est(a: &Node, b: &Node, keys: &[VarId]) -> f64 {
     join_est_keys(a, b, keys, false)
 }
 
+/// [`join_est_keys`], dividing by each key's domain on either side at least (see
+/// [`domain`]): the keys of a pattern restricted by a constant are a sample of the
+/// predicate's values, not a superset of the other side's.
+pub(super) fn join_est_dom(a: &Node, b: &Node, keys: &[VarId], backoff: bool, ctx: &Ctx) -> f64 {
+    if keys.is_empty() {
+        return a.est * b.est;
+    }
+    let cap = (backoff && keys.len() > 1 && one_input_binds(a, keys) && one_input_binds(b, keys))
+        .then_some((a.est, b.est));
+    let denom = keys_denom(
+        keys.iter().map(|v| {
+            (
+                a.d(*v).max(domain(ctx, a, *v)),
+                b.d(*v).max(domain(ctx, b, *v)),
+            )
+        }),
+        backoff,
+        cap,
+    );
+    join_est_from(a.est, b.est, denom)
+}
+
+/// The domain of `v` in plan `n`: the distinct subjects or objects of a predicate whose
+/// pattern in `n` binds `v` and fixes the other column to a constant other than a class,
+/// the largest over such patterns, or 0 when `n` has none. `?v p <c>` keeps the subjects
+/// of `p` with the value `c`, a sample of all its subjects, so a join on `?v` keeps the
+/// share `rows / distinct subjects` of the other side, where dividing by the pattern's own
+/// distinct keys would take them for a superset of the other side's. Classes stay with
+/// the characteristic sets, which know which predicates their instances have. The walk
+/// descends through the joins, index joins, filters, sorts, projections and extends that
+/// bind `v`, the operators the join order builds over its inputs, and stops at any other,
+/// so that the plan builder, the join-order DP and the greedy path, which carry an
+/// input's domain up through the joins by maximum, see the same domains. It is unbounded,
+/// since a bound would let a deep subtree hide a scan that a summary remembers.
+pub(super) fn domain(ctx: &Ctx, n: &Node, v: VarId) -> f64 {
+    if !ctx.opt.domain_estimates || !ctx.snap.delta.is_empty() || !n.vars.contains(&v) {
+        return 0.0;
+    }
+    let rdf_type = super::charsets::rdf_type(ctx);
+    let mut best = 0.0f64;
+    domain_walk(ctx, n, v, rdf_type, &mut best);
+    best
+}
+
+fn domain_walk(ctx: &Ctx, n: &Node, v: VarId, rdf_type: Option<u64>, best: &mut f64) {
+    if !n.vars.contains(&v) {
+        return;
+    }
+    match &n.kind {
+        Kind::Scan(spec) | Kind::RangeScan(spec, _) => {
+            *best = best.max(scan_domain(ctx, spec, v, rdf_type));
+        }
+        Kind::IndexJoin(j) => {
+            for p in &j.probes {
+                *best = best.max(scan_domain(ctx, &p.scan, v, rdf_type));
+            }
+            domain_walk(ctx, &n.children[0], v, rdf_type, best);
+        }
+        Kind::Join { .. }
+        | Kind::Filter(_)
+        | Kind::Sort(_)
+        | Kind::Project(_)
+        | Kind::Extend(..) => {
+            for c in &n.children {
+                domain_walk(ctx, c, v, rdf_type, best);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// [`domain`] of `v` in the scan `spec`: the predicate's distinct values of the first
+/// free column when the prefix fixes the predicate and one of the subject and the object.
+fn scan_domain(ctx: &Ctx, spec: &ScanSpec, v: VarId, rdf_type: Option<u64>) -> f64 {
+    if spec.prefix.len() != 2 || spec.cols.first() != Some(&(2, v)) || spec.graph_col == 2 {
+        return 0.0;
+    }
+    let order = spec.perm.order();
+    let Some(pcol) = order[..2].iter().position(|c| *c == P) else {
+        return 0.0;
+    };
+    let p = spec.prefix[pcol];
+    if Some(p) == rdf_type {
+        return 0.0;
+    }
+    let Some(stat) = ctx.snap.generation.stats.predicate(p) else {
+        return 0.0;
+    };
+    let d = match order[2] {
+        S => stat.distinct_subjects,
+        O => stat.distinct_objects,
+        _ => 0,
+    };
+    d as f64
+}
+
 /// [`join_est`], with the keys combined by [`keys_denom`]'s back-off when `backoff`.
 pub(super) fn join_est_keys(a: &Node, b: &Node, keys: &[VarId], backoff: bool) -> f64 {
     if keys.is_empty() {
@@ -3808,7 +3905,7 @@ pub(super) fn join_est_with(
     ctx: &Ctx,
 ) -> (f64, Option<(VarId, JoinModel)>) {
     let [v] = keys else {
-        return (join_est_keys(a, b, keys, ctx.opt.key_backoff), None);
+        return (join_est_dom(a, b, keys, ctx.opt.key_backoff, ctx), None);
     };
     let probe = || {
         if !ctx.opt.probed_keys {
@@ -3837,7 +3934,7 @@ pub(super) fn join_est_with(
     };
     match model {
         Some(m) => (m.est(a.est, b.est), Some((*v, m))),
-        None => (join_est(a, b, keys), None),
+        None => (join_est_dom(a, b, keys, false, ctx), None),
     }
 }
 
@@ -6087,8 +6184,8 @@ pub fn eval_exists(ctx: &Ctx, spec: &ExistsSpec, key: &[Id], schema: &[VarId]) -
     };
     let node = p.plan(&spec.pattern, &graph, Vec::new())?;
     let node = slice(node, 0, Some(1), ctx);
-    let (t, _) = super::exec::execute(ctx, &node)?;
-    Ok(!t.is_empty())
+    let (input, _) = super::exec::execute_materialized(ctx, &node)?;
+    Ok(!input.table.is_empty())
 }
 
 /// Literal helper for tests.

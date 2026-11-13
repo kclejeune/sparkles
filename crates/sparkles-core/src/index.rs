@@ -2768,9 +2768,8 @@ impl PermIndex {
                 let workspace = (rows as u64).saturating_mul(52).saturating_add(1024);
                 // This reservation participates in the caller's single ledger.
                 let _held = preparation.reserve(workspace)?;
-                let options = preparation.history_options();
                 let limit = crate::history::ReadLimit {
-                    options: &options,
+                    options: preparation,
                     memory: Some(workspace),
                     held: 0,
                 };

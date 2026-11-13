@@ -90,7 +90,7 @@ fn spill(dir: &std::path::Path) -> Arc<Spill> {
     .unwrap()
 }
 
-fn bag(rows: Vec<Vec<Option<Term>>>) -> Vec<String> {
+fn bag(rows: impl IntoIterator<Item = impl std::fmt::Debug>) -> Vec<String> {
     let mut rows: Vec<String> = rows.into_iter().map(|r| format!("{r:?}")).collect();
     rows.sort();
     rows
@@ -112,7 +112,7 @@ fn cursor(
     let mut rows = Vec::new();
     while let Some(b) = c.next_batch()? {
         for i in 0..b.len() {
-            rows.push(b.row(i)?);
+            rows.push(b.row(i)?.values().to_vec());
         }
     }
     Ok((bag(rows), c.plan_json()?))
@@ -139,7 +139,8 @@ fn ordered_aggregates_stream_with_the_eager_answers() {
     for q in QUERIES {
         let expected = bag(query(s.snapshot(), q, &opts)
             .unwrap_or_else(|e| panic!("{q}: {e}"))
-            .rows());
+            .rows()
+            .unwrap());
         for batch_rows in [7, 1000] {
             let (rows, plan) = cursor(&s, q, &opts, batch_rows)
                 .unwrap_or_else(|e| panic!("{q}; {batch_rows}: {e}"));
@@ -168,7 +169,10 @@ fn ordered_aggregates_spill_their_sort() {
     let s = store(30_000, 4);
     let dir = tempfile::tempdir().unwrap();
     let q = "SELECT ?v (AGG <urn:test:sequence>(?s) AS ?a) (COUNT(*) AS ?n) { ?s <urn:p> ?w BIND(?w - FLOOR(?w / 3) * 3 AS ?v) } GROUP BY ?v";
-    let expected = bag(query(s.snapshot(), q, &options(None, None)).unwrap().rows());
+    let expected = bag(query(s.snapshot(), q, &options(None, None))
+        .unwrap()
+        .rows()
+        .unwrap());
     let memory = 24 << 20;
     let (rows, plan) = cursor(&s, q, &options(Some(memory), Some(spill(dir.path()))), 1000)
         .unwrap_or_else(|e| panic!("{e}"));
@@ -199,7 +203,7 @@ fn a_group_spanning_many_batches() {
     .unwrap();
     let opts = options(None, None);
     let q = "SELECT ?s (AGG <urn:test:sequence>(?v) AS ?a) (COUNT(*) AS ?n) { ?s <urn:p> ?v } GROUP BY ?s";
-    let expected = bag(query(s.snapshot(), q, &opts).unwrap().rows());
+    let expected = bag(query(s.snapshot(), q, &opts).unwrap().rows().unwrap());
     let (rows, _) = cursor(&s, q, &opts, 64).unwrap();
     assert_eq!(rows, expected);
 }

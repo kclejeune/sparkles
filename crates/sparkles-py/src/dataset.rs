@@ -218,9 +218,12 @@ pub fn result_to_py<'py>(
         QueryKind::Ask => pyo3::types::PyBool::new(py, r.boolean)
             .to_owned()
             .into_any(),
-        QueryKind::Construct | QueryKind::Describe => PyQueryTriples::new(r.triples, r.quads)
-            .into_pyobject(py)?
-            .into_any(),
+        // The binding keeps application copies of the result's graph.
+        QueryKind::Construct | QueryKind::Describe => {
+            { PyQueryTriples::new(r.triples().to_vec(), r.quads().to_vec()) }
+                .into_pyobject(py)?
+                .into_any()
+        }
     })
 }
 

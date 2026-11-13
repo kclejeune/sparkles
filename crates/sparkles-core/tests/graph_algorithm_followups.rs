@@ -67,7 +67,7 @@ fn integer_parameters_keep_their_exact_value() {
             "{PREFIXES}SELECT ?n ?e WHERE {{ SERVICE algo:fastRP {{ [] algo:predicate ex:p ; algo:dimension 8 ; algo:seed {seed} ; algo:node ?n ; algo:embedding ?e }} }} ORDER BY ?n"
         );
         let r = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
-        format!("{:?}", r.rows())
+        format!("{:?}", r.rows().unwrap())
     };
     let (a, b) = (embedding("9007199254740992"), embedding("9007199254740993"));
     assert_ne!(a, b, "seeds 2^53 and 2^53 + 1 ran the same");
@@ -229,6 +229,6 @@ fn a13_betweenness_over_the_node_limit() {
     let e = run("").err().expect("an error over the limit").to_string();
     assert!(e.contains("algo:samples"), "{e}");
     // sampling is allowed
-    assert!(!run(" algo:samples 2 ;").unwrap().rows().is_empty());
+    assert!(!run(" algo:samples 2 ;").unwrap().is_empty());
     sparkles_core::algo::pool::set_exact_betweenness_max(100_000);
 }

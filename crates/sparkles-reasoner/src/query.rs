@@ -10,7 +10,7 @@
 //! calls build on what earlier calls derived. Each derivation runs under the query's
 //! deadline, cancellation and memory budget and a limit of derived facts.
 
-use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_capacity};
+use crate::budget::{Budget, BudgetFailure, Held, WorkingWarnings, table_bytes, table_capacity};
 use crate::demand::{self, Key, KeyP, Pass, Program, TransformError, Vocab};
 use crate::engine::{self, Atom, CHead, CRule, Slot};
 use crate::facts::Base;
@@ -181,7 +181,16 @@ fn component(code: &str, msg: impl Into<String>) -> Error {
     Error::Component(Box::new(ComponentError::new("reasoner", code, msg)))
 }
 
-fn memory_error(e: MemoryExceeded, what: &str) -> Error {
+fn memory_error(e: BudgetFailure, what: &str) -> Error {
+    if let Some(core) = e.core_error() {
+        return core;
+    }
+    if matches!(&e, BudgetFailure::Parent { .. }) {
+        return component(
+            "reasoning-failed",
+            format!("memory ownership refusal while deriving {what}: {e}"),
+        );
+    }
     component(
         BUDGET_CODE,
         format!("query-time reasoning passed the query's memory budget while deriving {what}: {e}"),
@@ -252,9 +261,7 @@ pub(crate) struct Session {
     shared: Arc<Shared>,
     snap: Arc<Snapshot>,
     terms: Terms,
-    rules: Vec<CRule>,
-    /// what an explanation names of each rule
-    infos: Vec<engine::RuleInfo>,
+    compiled: engine::CompiledInfo,
     /// whether the demand program rewrites linear recursion (see [`demand::transform`])
     rewrite_linear: bool,
     graphs: Vec<Id>,
@@ -267,7 +274,7 @@ pub(crate) struct Session {
     /// the view key of the schema's table, which `nocache` does not bypass: like the
     /// compiled rules, the schema is the same for every query of the view
     schema_view: Option<String>,
-    warnings: Vec<String>,
+    warnings: WorkingWarnings,
     demands: Vec<Demand>,
     keys: Vec<Key>,
     /// the constants of each demand (0 where none), and its seeded position
@@ -336,14 +343,18 @@ impl Session {
         terms
             .set_budget(&budget)
             .map_err(|e| memory_error(e, "the rules"))?;
-        let mut warnings = shared.warnings.clone();
-        let (rules, infos) = engine::compile_info(&shared.rules, &terms, &mut warnings, true);
+        let mut warnings = WorkingWarnings::try_clone_from(&shared.warnings, &budget)
+            .map_err(|e| memory_error(e, "the rule warnings"))?;
+        let compiled = engine::compile_info(&shared.rules, &terms, &mut warnings, true)
+            .map_err(|e| memory_error(e, "the compiled rules"))?;
         // imports are followed only through the graphs the caller reads (spec F17 §4.5)
         let resolved = match &req.readable {
             Some(readable) => inputs::resolve_readable(&snap, &shared.inputs, &|g| readable(g)),
             None => inputs::resolve(&snap, &shared.inputs),
         };
-        warnings.extend(resolved.warnings.iter().cloned());
+        warnings
+            .extend_borrowed(&resolved.warnings)
+            .map_err(|e| memory_error(e, "input warnings"))?;
         let mut graphs = resolved.ids(&snap);
         tracing::debug!(target: "sparkles_reasoner::demand", "session: rules compiled and inputs resolved in {:?}", t0.elapsed());
         if let Some(readable) = &req.readable {
@@ -364,8 +375,7 @@ impl Session {
             shared,
             snap,
             terms,
-            rules,
-            infos,
+            compiled,
             rewrite_linear: true,
             graphs,
             absent,
@@ -408,8 +418,10 @@ impl Session {
         })
     }
 
-    fn id_of(&self, t: &Term) -> u64 {
-        self.terms.id_for(t)
+    fn id_of(&self, t: &Term) -> Result<u64> {
+        self.terms
+            .try_id_for(t)
+            .map_err(|e| memory_error(e, "pattern constants"))
     }
 
     /// The table cache's key of demand `d` with `seeds` (sorted), when it may be cached.
@@ -442,7 +454,7 @@ impl Session {
         let program = program.as_ref().expect("prepared");
         let compact = !pre && self.compact;
         let rules = if compact {
-            &self.rules
+            self.compiled.rules()
         } else {
             &program.stages[stage].rules
         };
@@ -514,8 +526,8 @@ impl Session {
                     ),
                 );
             }
-            if let Some(m) = e.downcast_ref::<MemoryExceeded>() {
-                return memory_error(m.clone(), what);
+            if let Some(m) = BudgetFailure::from_anyhow(&e) {
+                return memory_error(m, what);
             }
             let msg = format!("{e:#}");
             if msg.contains("did not reach a fixpoint") {
@@ -617,7 +629,7 @@ impl Session {
     /// of their own.
     fn equality_key(&self) -> Option<tables::Key> {
         // `now` is read once per session, so its facts are the session's own
-        let now = self.rules.iter().any(|r| {
+        let now = self.compiled.rules().iter().any(|r| {
             r.builtins
                 .iter()
                 .any(|b| b.kind == crate::builtins::BuiltinKind::Now)
@@ -753,8 +765,8 @@ impl Session {
     /// for a full-closure budget failure.
     fn prefer_compact(&self, expanded: usize) -> Result<bool> {
         let graph = self.graph.as_ref().expect("graph made");
-        if self.rules.len() > 256
-            || self.rules.iter().any(|r| {
+        if self.compiled.rules().len() > 256
+            || self.compiled.rules().iter().any(|r| {
                 r.atoms
                     .len()
                     .saturating_add(r.builtins.len())
@@ -762,10 +774,10 @@ impl Session {
                     > 64
             })
             || expanded < 4096
-            || expanded < self.rules.len().saturating_mul(32)
+            || expanded < self.compiled.rules().len().saturating_mul(32)
             || graph.len() > 64
             || !self.hidden.is_empty()
-            || !finite_positive(&self.rules, &self.terms)
+            || !finite_positive(self.compiled.rules(), &self.terms)
         {
             return Ok(false);
         }
@@ -782,7 +794,7 @@ impl Session {
         }
         let mut ids = [0u64; 128];
         let mut count = 0usize;
-        for rule in &self.rules {
+        for rule in self.compiled.rules() {
             (self.stop)()?;
             for atom in &rule.atoms {
                 for slot in [atom.s, atom.p, atom.o] {
@@ -882,8 +894,8 @@ impl Session {
         }
         self.compact = false;
         let iri = |s: &str| Term::NamedNode(oxrdf::NamedNode::new_unchecked(s));
-        let rdf_type = self.id_of(&iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"));
-        let vocab = Vocab::of(&self.rules, &self.terms);
+        let rdf_type = self.id_of(&iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"))?;
+        let vocab = Vocab::of(self.compiled.rules(), &self.terms);
         let roots = demand::schema_roots(&vocab, rdf_type);
         self.make_graph()?;
         let t0 = std::time::Instant::now();
@@ -891,13 +903,13 @@ impl Session {
         // bindings when ordinary demand later reaches the same rule. Keep these
         // non-idempotent programs in one demand derivation, with their complete
         // ordinary lower stages and existing result-table policy.
-        let fresh_witnesses = self.rules.iter().any(|r| {
+        let fresh_witnesses = self.compiled.rules().iter().any(|r| {
             r.builtins
                 .iter()
                 .any(|b| b.kind == crate::builtins::BuiltinKind::MakeTemp)
         });
         if roots.is_empty() || fresh_witnesses {
-            let program = self.transform(&self.rules, &self.keys, Pass::Plain)?;
+            let program = self.transform(self.compiled.rules(), &self.keys, Pass::Plain)?;
             self.hide(&program.magic_preds);
             self.program = Some(program);
             self.lower_done = false;
@@ -918,7 +930,7 @@ impl Session {
                 .map_err(|e| memory_error(e, "the schema"))?;
         } else {
             let keys: Vec<Key> = roots.iter().map(|r| r.0).collect();
-            let pre = self.transform(&self.rules, &keys, Pass::Schema)?;
+            let pre = self.transform(self.compiled.rules(), &keys, Pass::Schema)?;
             let expanded = pre.stages.iter().map(|stage| stage.rules.len()).sum();
             if self.prefer_compact(expanded)? {
                 drop(pre);
@@ -928,7 +940,7 @@ impl Session {
                 self.program = Some(program);
                 self.compact = true;
                 self.lower_done = false;
-                tracing::debug!(target: "sparkles_reasoner::demand", expanded, rules = self.rules.len(), "selected bounded compact positive evaluation");
+                tracing::debug!(target: "sparkles_reasoner::demand", expanded, rules = self.compiled.rules().len(), "selected bounded compact positive evaluation");
                 return Ok(());
             }
             self.hide(&pre.magic_preds);
@@ -970,10 +982,17 @@ impl Session {
         // Cached schema rows are valid seeds even when a relation is not yet
         // complete. Keep that vocabulary for exposure independently of closure.
         self.closed = Some(crate::specialize::closed(&vocab, rdf_type));
-        let same_as = self.id_of(&iri("http://www.w3.org/2002/07/owl#sameAs"));
+        let same_as = self.id_of(&iri("http://www.w3.org/2002/07/owl#sameAs"))?;
         let flag = AtomicBool::new(false);
         let (complete, stopped) = watched(&self.stop, &flag, || {
-            demand::complete_schema(&self.rules, &vocab, rdf_type, same_as, &self.budget, &flag)
+            demand::complete_schema(
+                self.compiled.rules(),
+                &vocab,
+                rdf_type,
+                same_as,
+                &self.budget,
+                &flag,
+            )
         });
         if let Some(error) = stopped {
             return Err(error);
@@ -984,7 +1003,7 @@ impl Session {
         let flag = AtomicBool::new(false);
         let (refined, stopped) = watched(&self.stop, &flag, || {
             demand::refine_schema(
-                &self.rules,
+                self.compiled.rules(),
                 &vocab,
                 &self.terms,
                 self.graph.as_ref().expect("graph made"),
@@ -996,9 +1015,9 @@ impl Session {
         if let Some(error) = stopped {
             return Err(error);
         }
-        refined.map_err(|e| match e.downcast::<MemoryExceeded>() {
-            Ok(e) => memory_error(e, "schema completeness"),
-            Err(e) => component("reasoning-failed", format!("{e:#}")),
+        refined.map_err(|e| match BudgetFailure::from_anyhow(&e) {
+            Some(error) => memory_error(error, "schema completeness"),
+            None => component("reasoning-failed", format!("{e:#}")),
         })?;
         let closed = &complete.closed;
         // RDF lists are read as stored unless a rule gives their facts
@@ -1009,8 +1028,10 @@ impl Session {
                     "http://www.w3.org/1999/02/22-rdf-syntax-ns#{l}"
                 )))
             })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
             .filter(|&p| {
-                !self.rules.iter().any(|r| {
+                !self.compiled.rules().iter().any(|r| {
                     r.head
                         .iter()
                         .any(|h| demand::head_slots(h).1 == Slot::Const(p))
@@ -1023,7 +1044,7 @@ impl Session {
         let flag = AtomicBool::new(false);
         let (rules, stopped) = watched(&self.stop, &flag, || {
             crate::specialize::specialize(
-                &self.rules,
+                self.compiled.rules(),
                 closed,
                 &lists,
                 g,
@@ -1067,8 +1088,8 @@ impl Session {
         Ok(Parts {
             graph: self.graph.as_mut().expect("graph made"),
             terms: &self.terms,
-            rules: &self.rules,
-            infos: &self.infos,
+            rules: self.compiled.rules(),
+            infos: self.compiled.infos(),
             sources: &self.shared.sources,
             geo_default: self.shared.geo_default,
             inputs: &self.graphs,
@@ -1124,11 +1145,11 @@ impl Session {
     }
 
     pub(crate) fn rules(&self) -> &[CRule] {
-        &self.rules
+        self.compiled.rules()
     }
 
     pub(crate) fn infos(&self) -> &[engine::RuleInfo] {
-        &self.infos
+        self.compiled.infos()
     }
 
     /// The profile or vocabulary of each parsed rule.
@@ -1473,12 +1494,15 @@ fn estimate(g: &Graph, a: &Atom, bound: &[bool]) -> (f64, f64) {
 }
 
 impl ReasoningSession for Session {
-    fn intensional(&self, s: Option<&Term>, p: Option<&Term>, o: Option<&Term>) -> bool {
+    fn intensional(&self, s: Option<&Term>, p: Option<&Term>, o: Option<&Term>) -> Result<bool> {
         let slot = |t: Option<&Term>, v: usize| match t {
-            Some(t) => Slot::Const(self.id_of(t)),
-            None => Slot::Var(v),
+            Some(t) => self.id_of(t).map(Slot::Const),
+            None => Ok(Slot::Var(v)),
         };
-        demand::intensional(&self.rules, (slot(s, 0), slot(p, 1), slot(o, 2)))
+        Ok(demand::intensional(
+            self.compiled.rules(),
+            (slot(s, 0)?, slot(p, 1)?, slot(o, 2)?),
+        ))
     }
 
     fn prepare(&mut self, demands: &[Demand]) -> Result<Vec<DemandInfo>> {
@@ -1488,23 +1512,23 @@ impl ReasoningSession for Session {
         self.seeded.clear();
         for d in demands {
             let mut c = [0u64; 3];
-            let mut val = |t: &DemandTerm, i: usize| -> bool {
-                match t {
+            let mut val = |t: &DemandTerm, i: usize| -> Result<bool> {
+                Ok(match t {
                     DemandTerm::Const(t) => {
-                        let id = self.terms.id_for(t);
+                        let id = self.id_of(t)?;
                         c[i] = id;
                         true
                     }
                     DemandTerm::Seeded => true,
                     DemandTerm::Var => false,
-                }
+                })
             };
-            let s = val(&d.s, 0);
-            let p = val(&d.p, 1);
-            let o = val(&d.o, 2);
+            let s = val(&d.s, 0)?;
+            let p = val(&d.p, 1)?;
+            let o = val(&d.o, 2)?;
             let kp = if p { KeyP::Const(c[1]) } else { KeyP::Free };
             let k = Key::new(s, kp, o);
-            let rdf_type = self.id_of(&Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()));
+            let rdf_type = self.id_of(&Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()))?;
             self.keys.push(match (&d.p, &d.o) {
                 (DemandTerm::Const(_), DemandTerm::Const(_)) if c[1] == rdf_type => {
                     k.with_class(c[2])
@@ -1535,7 +1559,9 @@ impl ReasoningSession for Session {
                 let pattern = (slot(&d.s, 0), slot(&d.p, 1), slot(&d.o, 2));
                 DemandInfo {
                     adornment: format!("{pred}^{}", k.adornment()),
-                    rules: demand::cone(&self.rules, pattern).into_iter().collect(),
+                    rules: demand::cone(self.compiled.rules(), pattern)
+                        .into_iter()
+                        .collect(),
                 }
             })
             .collect();
@@ -1671,7 +1697,8 @@ impl ReasoningSession for Session {
             tables: used.len() as u64,
             cached: used.iter().filter(|&&d| demands[d].cached).count() as u64,
             demands,
-            warnings: self.warnings.clone(),
+            // Existing infallible public Report output is a mandatory675 phase3 boundary.
+            warnings: self.warnings.as_slice().to_vec(),
         }
     }
 }
@@ -1747,16 +1774,20 @@ mod compact_tests {
         let session = dense();
         let rdf_type = session
             .terms
-            .id_for(&Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()));
-        let roots = demand::schema_roots(&Vocab::of(&session.rules, &session.terms), rdf_type);
+            .id_for(&Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()))
+            .unwrap();
+        let roots = demand::schema_roots(
+            &Vocab::of(session.compiled.rules(), &session.terms),
+            rdf_type,
+        );
         let keys: Vec<_> = roots.iter().map(|(key, _)| *key).collect();
         let program = session
-            .transform(&session.rules, &keys, Pass::Schema)
+            .transform(session.compiled.rules(), &keys, Pass::Schema)
             .unwrap();
         let expanded = program.stages.iter().map(|stage| stage.rules.len()).sum();
         eprintln!(
             "COMPACT_SELECTION schema_rules={expanded} original_rules={}",
-            session.rules.len()
+            session.compiled.rules().len()
         );
         assert!(session.prefer_compact(expanded).unwrap());
         assert!(!session.prefer_compact(4095).unwrap());
@@ -1815,16 +1846,16 @@ mod compact_tests {
                 "ex:s ex:p ex:o .",
                 Profile::Rules(format!("@prefix ex: <http://ex.org/> . {rule}")),
             );
-            assert!(!finite_positive(&s.rules, &s.terms), "{rule}");
+            assert!(!finite_positive(s.compiled.rules(), &s.terms), "{rule}");
         }
         let s = session("", Profile::OwlRl);
-        let mut rule = s.rules[0].clone_shallow();
+        let mut rule = s.compiled.rules()[0].clone_shallow();
         rule.head = vec![CHead::Action(
             crate::builtins::HeadAction::ListMapAsSubject,
             Vec::new(),
         )];
         assert!(!finite_positive(&[rule], &s.terms));
-        let mut wildcard = s.rules[0].clone_shallow();
+        let mut wildcard = s.compiled.rules()[0].clone_shallow();
         wildcard.head = vec![CHead::Triple(Slot::Any, Slot::Const(1), Slot::Const(2))];
         assert!(!finite_positive(&[wildcard], &s.terms));
     }
@@ -1873,7 +1904,7 @@ mod compact_tests {
             term("http://ex.org/p"),
             term("http://ex.org/o"),
         ]
-        .map(|term| session.terms.id_for(&term));
+        .map(|term| session.terms.id_for(&term).unwrap());
         session.add_facts(vec![extra]).unwrap();
         assert!(!session.compact_done && !session.compact);
         assert!(session.parts().unwrap().compact_rounds.is_empty());
@@ -1883,18 +1914,16 @@ mod compact_tests {
     #[test]
     fn compact_strategy_bounds_original_rule_count_and_width() {
         let mut session = dense();
-        let rule = session.rules[0].clone_shallow();
-        session.rules = (0..257).map(|_| rule.clone_shallow()).collect();
+        // Keep this structural strategy control on valid compiler-owned fixtures.
+        let mut warnings = WorkingWarnings::new(&session.budget);
+        let many = crate::parse_rules(&"[(?s ?p ?o) -> (?o ?p ?s)]\n".repeat(257)).unwrap();
+        session.compiled =
+            engine::compile_info(&many, &session.terms, &mut warnings, true).unwrap();
         assert!(!session.prefer_compact(50_000).unwrap());
-        session.rules = vec![rule];
-        session.rules[0].atoms = vec![
-            Atom {
-                s: Slot::Any,
-                p: Slot::Any,
-                o: Slot::Any
-            };
-            65
-        ];
+        let wide =
+            crate::parse_rules(&format!("[{} -> (?s ?p ?o)]", "(?s ?p ?o) ".repeat(65))).unwrap();
+        session.compiled =
+            engine::compile_info(&wide, &session.terms, &mut warnings, true).unwrap();
         assert!(!session.prefer_compact(8192).unwrap());
     }
 
@@ -1921,7 +1950,7 @@ mod compact_tests {
         ] {
             let rule = format!("@prefix ex: <http://ex.org/> . [r: (?s ex:p ?o) -> ({head})]");
             let s = session("ex:s ex:p ex:o .", Profile::Rules(rule));
-            assert!(!finite_positive(&s.rules, &s.terms), "{head}");
+            assert!(!finite_positive(s.compiled.rules(), &s.terms), "{head}");
         }
     }
 
@@ -1935,7 +1964,7 @@ mod compact_tests {
             term("http://www.w3.org/2000/01/rdf-schema#domain"),
             term("http://www.w3.org/2002/07/owl#SymmetricProperty"),
         ]
-        .map(|term| session.terms.id_for(&term));
+        .map(|term| session.terms.id_for(&term).unwrap());
         session.add_facts(vec![feedback]).unwrap();
         assert!(session.prefer_compact(8192).unwrap());
         let structural = [
@@ -1943,7 +1972,7 @@ mod compact_tests {
             term("http://ex.org/p"),
             term("http://www.w3.org/1999/02/22-rdf-syntax-ns#first"),
         ]
-        .map(|term| session.terms.id_for(&term));
+        .map(|term| session.terms.id_for(&term).unwrap());
         session.add_facts(vec![structural]).unwrap();
         assert!(!session.prefer_compact(8192).unwrap());
     }
@@ -2084,6 +2113,7 @@ mod equality_cache_tests {
             session
                 .terms
                 .id_for(&Term::NamedNode(oxrdf::NamedNode::new_unchecked(t)))
+                .unwrap()
         };
         let t = [
             id(s),
@@ -2141,6 +2171,7 @@ mod equality_cache_tests {
             hypothesis
                 .terms
                 .id_for(&Term::NamedNode(oxrdf::NamedNode::new_unchecked(t)))
+                .unwrap()
         };
         let extra = [
             id("http://ex.org/z"),
@@ -2200,6 +2231,7 @@ mod equality_workspace_tests {
             session
                 .terms
                 .id_for(&Term::NamedNode(oxrdf::NamedNode::new_unchecked(t)))
+                .unwrap()
         };
         let fact = [
             id("http://ex.org/a"),
@@ -2245,7 +2277,8 @@ mod equality_workspace_tests {
             .terms
             .id_for(&Term::NamedNode(oxrdf::NamedNode::new_unchecked(
                 "http://ex.org/p",
-            )));
+            )))
+            .unwrap();
         let mut keys = vec![vec![b'k'; 1 << 20]];
         keys.extend((0..3000).map(|i| format!("k{i}").into_bytes()));
         let ids: Vec<u64> = keys

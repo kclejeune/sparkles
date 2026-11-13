@@ -278,7 +278,7 @@ impl Run<'_, '_> {
         if !m.contains_key("timeoutSeconds") && !matches!(name, "create_branch" | "delete_branch") {
             m.insert("timeoutSeconds".into(), json!(secs));
         }
-        let call = Call {
+        let mut call = Call {
             arrived: Instant::now(),
             cancel: self.ctx.cancel.clone(),
             request_id: self.ctx.request_id.clone(),
@@ -286,8 +286,10 @@ impl Run<'_, '_> {
             headers: None,
             held: None,
             grant: crate::server_memory::current_grant(),
+
+            preparation: None,
         };
-        Ok(match self.ctx.server.run_now(name, m, &call)? {
+        Ok(match self.ctx.server.run_now(name, m, &mut call)? {
             Outcome::Structured(v) => v,
             Outcome::Text(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)),
         })

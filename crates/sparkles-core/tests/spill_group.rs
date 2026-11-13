@@ -1,6 +1,5 @@
 //! Cursor groupings and DISTINCT that pass the rows that do not fit to later passes
 //! through spill files (X08 §6.5).
-use oxrdf::Term;
 use oxrdfio::RdfFormat;
 use sparkles_core::io::Source;
 use sparkles_core::sparql::{CursorOptions, FallbackPolicy, QueryOptions, query, select_cursor};
@@ -69,7 +68,7 @@ fn run(
     let mut rows = Vec::new();
     while let Some(b) = c.next_batch()? {
         for i in 0..b.len() {
-            rows.push(format!("{:?}", b.row(i).unwrap()));
+            rows.push(format!("{:?}", b.row(i).unwrap().values()));
         }
     }
     rows.sort();
@@ -80,8 +79,9 @@ fn eager(s: &Store, q: &str) -> Vec<String> {
     let mut rows: Vec<String> = query(s.snapshot(), q, &Default::default())
         .unwrap()
         .rows()
+        .unwrap()
         .into_iter()
-        .map(|r: Vec<Option<Term>>| format!("{r:?}"))
+        .map(|r| format!("{r:?}"))
         .collect();
     rows.sort();
     rows
@@ -196,7 +196,7 @@ fn run_in_order(
     let mut rows = Vec::new();
     while let Some(b) = c.next_batch()? {
         for i in 0..b.len() {
-            rows.push(format!("{:?}", b.row(i).unwrap()));
+            rows.push(format!("{:?}", b.row(i).unwrap().values()));
         }
     }
     Ok(rows)
@@ -223,8 +223,9 @@ fn distinct_over_order_by_keeps_the_order_or_fails() {
         let expected: Vec<String> = query(s.snapshot(), q, &Default::default())
             .unwrap()
             .rows()
+            .unwrap()
             .into_iter()
-            .map(|r: Vec<Option<Term>>| format!("{r:?}"))
+            .map(|r| format!("{r:?}"))
             .collect();
         for memory in [256 << 10, 64 << 20] {
             match run_in_order(&s, q, memory, Some(spill.clone())) {
@@ -271,7 +272,7 @@ fn distinct_below_order_by_spills_and_keeps_the_order() {
         let mut rows = Vec::new();
         while let Some(b) = c.next_batch()? {
             for i in 0..b.len() {
-                rows.push(format!("{:?}", b.row(i).unwrap()));
+                rows.push(format!("{:?}", b.row(i).unwrap().values()));
             }
         }
         Ok::<_, Error>((rows, c.plan_json()?))
@@ -290,8 +291,9 @@ fn distinct_below_order_by_spills_and_keeps_the_order() {
         let eager: Vec<String> = query(s.snapshot(), q, &Default::default())
             .unwrap()
             .rows()
+            .unwrap()
             .into_iter()
-            .map(|r: Vec<Option<Term>>| format!("{r:?}"))
+            .map(|r| format!("{r:?}"))
             .collect();
         assert_eq!(expected, eager, "{q}");
         let (rows, plan) =

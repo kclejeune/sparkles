@@ -873,8 +873,11 @@ runtime into modules, was delivered on 2026-10-31, and so were the internal circ
 item 414, which [Internal circuits](#internal-circuits) records. The provenance algebra of
 item 415 was delivered on 2026-11-01, and [Provenance annotations](#provenance-annotations)
 records it. The fixed-point operator of item 417 was delivered on 2026-11-01, and
-[Fixed-point operator](#fixed-point-operator) records it. The rest of Phases 2 and 3 is
-not built, and [ROADMAP](../ROADMAP.md) item 17 tracks it as items 416 and 418 to 429.
+[Fixed-point operator](#fixed-point-operator) records it. The aggregates and the
+correlated `EXISTS` of item 418 were delivered on 2026-11-10, and
+[Aggregates and correlated EXISTS](#aggregates-and-correlated-exists) records them. The
+rest of Phases 2 and 3 is not built, and [ROADMAP](../ROADMAP.md) item 17 tracks it as
+items 416 and 419 to 429.
 
 - `crates/sparkles-core/src/incr/` holds the core. `zset.rs` keeps rows of ids with
   `i64` weights. `compile.rs` compiles the spargebra algebra into a circuit of the
@@ -925,10 +928,11 @@ not built, and [ROADMAP](../ROADMAP.md) item 17 tracks it as items 416 and 418 t
   footprint. These are paths with `?`, and the paths with `*` or `+` that the
   [fixed-point operator](#fixed-point-operator) does not take (paths without them are
   expanded into joins and unions of at most 16 alternatives), `LIMIT` and `OFFSET`, a dataset clause,
-  the aggregates other than `COUNT`, `SUM` and `AVG`, correlated `EXISTS`, `LATERAL` and
-  ARQ's other extensions, triple terms, property functions, a `GRAPH` inside another
-  `GRAPH`, and `MINUS`, aggregates, `DISTINCT`, `VALUES` and subqueries under
-  `GRAPH ?g`. `ORDER BY` without `LIMIT` does not change a view's rows and is ignored.
+  custom aggregates and `FOLD`, an `EXISTS` in a `BIND`, in an `OPTIONAL` filter, in an
+  aggregate's argument or under `GRAPH` when it is correlated, `LATERAL` and ARQ's other
+  extensions, triple terms, property functions, a `GRAPH` inside another `GRAPH`, and
+  `MINUS`, aggregates, `DISTINCT`, `VALUES` and subqueries under `GRAPH ?g`. `ORDER BY`
+  without `LIMIT` does not change a view's rows and is ignored.
 - `SUM` and `AVG` keep an exact integer sum, and value counts for decimals, floats and
   doubles. Decimals are summed exactly in 256 bits, and a sum outside the decimal range
   is unbound. A one-off evaluation adds the rows in order and can overflow on the way to
@@ -1038,10 +1042,10 @@ refuses changes to every view, so that a newer release's definitions are never
 overwritten.
 
 **Differential and recovery tests.** The differential tests of §11 draw queries from a
-grammar-driven generator in `incr/gen.rs`. It covers the fragment of §4.1 and the
-operators that compile to `recompute` nodes. It leaves out `SAMPLE`, `GROUP_CONCAT` and
-orders with ties under a `LIMIT`, since the engine may answer them in more than one
-way. The histories hold small and bulk transactions, transactions that add and remove
+grammar-driven generator in `incr/gen.rs`. It covers the fragment of §4.1, the
+aggregates and correlated `EXISTS` of §4.2 and the operators that compile to
+`recompute` nodes. It leaves out `SAMPLE`, `GROUP_CONCAT` and orders with ties under a
+`LIMIT`, since the engine may answer them in more than one way. The histories hold small and bulk transactions, transactions that add and remove
 one quad, deletes by pattern and compactions. Each generated case runs over every quad,
 and a second set runs as a random reader whose graph grants and protections by
 predicate or by subject class mask the oracle's snapshot. A failing case is shrunk to a
@@ -1448,6 +1452,92 @@ made a deletion inside a large `knows` component cost 441 ms, and
 [PERFORMANCE-EXPERIMENTS.md](../PERFORMANCE-EXPERIMENTS.md#incremental-views) records
 it. The [writes benchmark](../benchmarks/writes/RESULTS.md#property-path-views) has the
 table. Item 417 changed no code of the query engine, so no query screen ran.
+
+### Aggregates and correlated EXISTS
+
+Item 418 delivered the operators of §4.2 other than the ordered windows of item 419 on
+2026-11-10. `MIN`, `MAX`, `GROUP_CONCAT`, `SAMPLE` and a correlated `EXISTS` are
+maintained, and `HAVING` follows the aggregates it reads.
+
+- The group operator of `incr/ops/group.rs` keeps the values of a `MIN`, `MAX`,
+  `GROUP_CONCAT` or `SAMPLE` as an ordered multiset: a vector of the group's distinct
+  values in the order of `ORDER BY`, each with its count, 16 bytes per distinct value
+  and 40 bytes per group. Values the order does not tell apart, such as
+  `"01"^^xsd:integer` and `"1"^^xsd:integer`, form a run in the order they entered the
+  group, which a checkpoint and a generation switch keep because the order depends on
+  the terms and not on their ids. One state serves the four aggregates with and without
+  `DISTINCT`. Adding or removing a value finds its place with a binary search that
+  decodes about the logarithm of the group's distinct values and shifts the entries
+  after it. `MIN` and `MAX` read the ends, so removing the extreme value costs the same
+  as any other. A hash map of counts would take the same memory and make removing the
+  extreme value scan the group, which the vector trades for the shift of its entries. A
+  group of ten thousand distinct values costs about fourteen decodes and a move of at
+  most 160 KiB per changed value.
+- `MIN` and `MAX` leave out an unbound or failed argument, as the engine's running
+  aggregates do, and among values the order does not tell apart both report the one that
+  entered the group first, as the engine keeps the first of equal values. `GROUP_CONCAT` joins the group's values again for each changed group,
+  which is the recompute per changed group that §4.2 allows, in the multiset's order,
+  each value as often as the group holds it or once with `DISTINCT`. The engine joins
+  the values in the order its rows arrive, so a view's string and a one-off query's
+  hold the same parts in a possibly different order, and item 905 tracks one order for
+  both. An unbound or failed argument, or a value without a lexical form, makes it
+  unbound, as in a one-off evaluation. `SAMPLE` keeps the value it reported while the
+  group holds it after the pass, so a replacement of its row within one commit keeps it,
+  and then takes the smallest.
+- `HAVING` is a filter over the group's rows, which the compiler maintained already for
+  `COUNT`, `SUM` and `AVG`, so a `HAVING` over `MIN` or `MAX` is maintained now too.
+- A correlated `EXISTS`, which reads an outer variable that no join key carries, such as
+  one in a filter of its pattern or one the outer rows do not always bind, an `EXISTS`
+  whose `*` or `?` path ends at an outer variable, and an `EXISTS` inside an expression
+  compile to the operator of `incr/ops/exists.rs`, which the plan names `ExistsFilter`.
+  It keeps each input row with its weight and the condition's last answer. It evaluates
+  the condition with the query engine, with the row's bindings substituted as a one-off
+  query substitutes them, so the answer is the engine's own. The expression context of
+  a pass reads the snapshot as the circuit's principal reads it, through the same grant
+  binding, masking and dataset restriction as a one-off query, and keeps the pass's
+  deadline, cancellation and memory budget. A pass whose changes miss the condition's
+  footprint keeps every answer. A pass inside it matches each changed quad against the
+  condition's triple patterns, and a match binds the outer variables the pattern names,
+  so only rows with those bindings, or without them, are evaluated again. A pattern
+  without an outer variable, a property path, a property function, one of ARQ's special
+  graphs, a `GRAPH` whose body can match without a quad or that holds another `GRAPH`,
+  `SERVICE` or an extension sends every row to the engine again, which the plan reports
+  as `every row on a change`. The variables of a subquery inside the condition count as
+  outer only when the subquery projects them, as the engine substitutes them, and the
+  expressions of aggregates, `FOLD` and `ORDER BY` inside the condition are read for
+  nested `EXISTS`, by the footprint as well as by the probes.
+  Finding the rows a change touches scans the operator's rows, and item 906 indexes
+  them when a measurement asks for it.
+- An `EXISTS` in a `BIND`, in an `OPTIONAL` filter or in an aggregate's argument, and a
+  correlated `EXISTS` under `GRAPH`, are still `recompute` nodes, which item 904 tracks.
+  Rows a correlated `EXISTS` keeps carry unknown derivations under a provenance setting,
+  as the rows of a `recompute` node do, since the engine does not report why the
+  condition holds, and item 528 covers them.
+- The state encoding of the group operator gained the multiset, and `COMPILER` is
+  `f13-phase2-1`, so a checkpoint written by an earlier release, whose circuit held these
+  aggregates or conditions in `recompute` nodes, is refused by its fingerprint and the
+  view is built again. The checkpoint formats are unchanged.
+- The differential tests gained the aggregates with and without `DISTINCT`, over
+  expressions and unbound variables, `HAVING` over `MIN`, and five correlated
+  conditions, through fixed and random histories, checkpoints and a compaction, and a
+  test that compares `GROUP_CONCAT` up to the order of its parts and checks that a
+  `SAMPLE` is a member of its group and stays while it remains. The generator draws
+  `MIN`, `MAX` and a filter over outer variables inside `EXISTS`.
+
+The ignored test `aggregate_pass_against_recompute` of
+`crates/sparkles-core/tests/incr_bench.rs`, which `mise run bench:incr` runs with the
+other view tests, measures four such views over the benchmark's people data, and the
+[writes benchmark](../benchmarks/writes/RESULTS.md#aggregates-and-correlated-exists-in-views)
+has its table. On a laptop at 200,000 people, the `MIN` and `MAX`, `HAVING` and
+`GROUP_CONCAT` and `SAMPLE` views cost a pass of 10 to 18 µs after a one- or two-quad
+commit, and the correlated `EXISTS` view 2.5 ms at the median, against 22.5 s for its
+query. A commit that touches a pattern of the condition without an outer variable
+evaluates the condition for every row again, at about the query's cost, which is the
+view's p95 and what item 906 scopes further. Item 418 changed no code of the query engine.
+The writes screen with four table views, which [ROADMAP](../ROADMAP.md) item 17 asks for,
+ran three rounds on a Namespace instance with `serial-literal` at 0.85 of the base's
+transactions per second, `mixed` at 0.94 and `writers` at 1.23, with every range
+overlapping, which item 907 pins on the batch screen and forge.
 
 ### Maintained assessments and conservative dependencies
 

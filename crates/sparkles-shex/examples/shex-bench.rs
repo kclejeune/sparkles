@@ -141,7 +141,7 @@ fn main() -> anyhow::Result<()> {
         .iter()
         .filter(|e| e.shape == org)
         .take(1000)
-        .map(|e| e.node.clone())
+        .map(|e| e.node.as_term().clone())
         .collect();
     if !orgs.is_empty() {
         let opts = ValidateOptions {

@@ -18,6 +18,7 @@ use sparkles::task::Control;
 const ORG: &str = "urn:g:org";
 const SOURCES: &str = "urn:ev:sources";
 const CLAIMS: &str = "urn:ev:claims";
+const HIDDEN: &str = "urn:ev:hidden-claims";
 const DECISIONS: &str = "urn:ev:decisions";
 const SUPPORTS: &str = "urn:ev:supports";
 const ACCEPTED: &str = "urn:ev:accepted";
@@ -77,8 +78,9 @@ fn evidence_settings(version: u32) -> Settings {
 }
 
 /// `rad` administers the dataset and `rp`, the principal the reports read as, reads it
-/// all. `rnodec` cannot read the policy's decisions, and `rnoclaims` reads everything
-/// a report under the policy reads except the proposal graph.
+/// all. `rnodec` cannot read the policy's decisions, `rnoclaims` reads everything
+/// a report under the policy reads except the proposal graph, and `rhide` reads
+/// everything but the proposal graph [`HIDDEN`].
 fn users() -> String {
     let h = |u: &str| hash_password_with(&format!("{u}-pw"), 8, 1, 1).unwrap();
     format!(
@@ -105,11 +107,19 @@ password = "{}"
 dataset = "ev"
 level = "read"
 graphs = ["{ORG}", "{DECISIONS}", "{SUPPORTS}", "{ACCEPTED}", "{REPORTS}"]
+[[users]]
+name = "rhide"
+password = "{}"
+[[users.grants]]
+dataset = "ev"
+level = "read"
+graphs = ["{ORG}", "{SOURCES}", "{CLAIMS}", "{DECISIONS}", "{SUPPORTS}", "{ACCEPTED}", "{REPORTS}"]
 "#,
         h("rad"),
         h("rp"),
         h("rnodec"),
         h("rnoclaims"),
+        h("rhide"),
     )
 }
 
@@ -243,10 +253,12 @@ impl Env {
         )
         .unwrap()
         .rows()
+        .unwrap()
         .into_iter()
         .map(|r| {
-            r.into_iter()
-                .map(|t| t.map(|t| t.to_string()).unwrap_or_default())
+            r.values()
+                .iter()
+                .map(|t| t.as_ref().map(|t| t.to_string()).unwrap_or_default())
                 .collect()
         })
         .collect();
@@ -304,6 +316,25 @@ fn sha(t: &str) -> Sha256Digest {
 }
 
 fn propose(ds: &sparkles::Dataset, source: &str, t: Triple) -> (NamedNode, Sha256Digest) {
+    propose_in(ds, CLAIMS, source, t)
+}
+
+fn propose_in(
+    ds: &sparkles::Dataset,
+    graph: &str,
+    source: &str,
+    t: Triple,
+) -> (NamedNode, Sha256Digest) {
+    propose_by(ds, graph, source, t, iri("urn:publisher"))
+}
+
+fn propose_by(
+    ds: &sparkles::Dataset,
+    graph: &str,
+    source: &str,
+    t: Triple,
+    author: NamedNode,
+) -> (NamedNode, Sha256Digest) {
     let key = |k: &str| RecordKey::new(k).unwrap();
     let input = EvidenceInput {
         revisions: vec![SourceRevisionInput {
@@ -327,14 +358,14 @@ fn propose(ds: &sparkles::Dataset, source: &str, t: Triple) -> (NamedNode, Sha25
             proposition: t,
             kind: ClaimKind::Reported,
             polarity: Polarity::Positive,
-            attributed_author: iri("urn:publisher"),
+            attributed_author: author,
             scope: Default::default(),
             confidence: Default::default(),
         }],
         ..Default::default()
     };
     let mut o = ProposeOptions::new(iri("urn:principal:importer"));
-    o.proposal_graph = Some(iri(CLAIMS));
+    o.proposal_graph = Some(iri(graph));
     let p = evidence::propose(
         None,
         ds,
@@ -552,7 +583,7 @@ async fn reports_under_a_policy_cite_claims_and_decisions() {
 
 /// A tool call as `user` on dataset `ev`.
 fn tool_as(s: &AuthServer, user: &str, name: &str, args: serde_json::Value) -> serde_json::Value {
-    let call = crate::mcp::Call {
+    let mut call = crate::mcp::Call {
         arrived: std::time::Instant::now(),
         cancel: Default::default(),
         request_id: "t".into(),
@@ -564,13 +595,14 @@ fn tool_as(s: &AuthServer, user: &str, name: &str, args: serde_json::Value) -> s
         headers: None,
         held: None,
         grant: None,
+        preparation: None,
     };
     let serde_json::Value::Object(mut m) = args else {
         panic!("arguments are an object")
     };
     m.insert("dataset".into(), "ev".into());
     let server = crate::mcp::McpServer::new(s.state.clone(), crate::mcp::McpConfig::default());
-    match server.run_now(name, m, &call).unwrap() {
+    match server.run_now(name, m, &mut call).unwrap() {
         crate::mcp::Outcome::Structured(v) => v,
         crate::mcp::Outcome::Text(t) => {
             serde_json::from_str(&t).unwrap_or(serde_json::Value::String(t))
@@ -1053,4 +1085,236 @@ async fn an_interrupted_policy_run_is_rewritten_without_the_policy() {
         ))
         .is_empty()
     );
+}
+
+/// The private check of the automatic refresh (spec C25, "Refresh"). At server start,
+/// after a withdrawal in a proposal graph the principal cannot read, after an unrelated
+/// decision, after a settings-only change of the evidence configuration and after a
+/// reload of the access policy, the check runs and leaves every report, status, state,
+/// commit and task as it was. A withdrawal behind a cited claim and a state left behind
+/// a crash start a refresh that names no record.
+#[tokio::test(flavor = "multi_thread")]
+async fn private_checks_start_refreshes_only_for_changed_inputs() {
+    use crate::graphrag::refresh::{CHECK_REASON, Watch, tick_once};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    let e = Arc::new(env(true));
+    let e2 = e.clone();
+    tokio::task::spawn_blocking(move || {
+        let e = e2;
+        let ds = e.dataset();
+        let mut with_hidden = evidence_settings(1);
+        with_hidden.proposals.push(HIDDEN.into());
+        evidence::configure(&ds, &with_hidden, &Control::none()).unwrap();
+        let a = propose(&ds, "advisory", leads());
+        decide(&ds, &a, Disposition::Accepted, 1);
+        let hidden = propose_in(&ds, HIDDEN, "whisper", leads());
+        let unrelated = propose(&ds, "aside", Triple::new(ex("z0"), ex("knows"), ex("z1")));
+        let s = settings(serde_json::json!({
+            "principal": "rhide",
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 1.0 }
+        }));
+        e.run(s, Mode::Build).unwrap();
+        let tasks = || -> Vec<crate::state::Task> {
+            e.s.state
+                .tasks
+                .lock()
+                .iter()
+                .filter(|t| t.kind == build::TASK_KIND)
+                .cloned()
+                .collect()
+        };
+        let wait = || {
+            let end = Instant::now() + Duration::from_secs(60);
+            while e.s.state.active_task(build::TASK_KIND, "ev").is_some() {
+                assert!(Instant::now() < end, "the refresh did not finish");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let reports = || {
+            e.rows(&format!(
+                "SELECT ?s ?p ?o WHERE {{ GRAPH <{REPORTS}> {{ ?s ?p ?o }} }}"
+            ))
+        };
+        let state = || e.s.state.graphrag.state("ev");
+        let runs = |w: &HashMap<String, Watch>| w.get("ev").map_or(0, |w| w.private().runs);
+        let sec = Duration::from_secs(1);
+        let mut now = Instant::now();
+        let mut w: HashMap<String, Watch> = HashMap::new();
+        // everything a reader could see, which an empty check leaves alone
+        let seen = |e: &Env| (reports(), state(), e.mock.requests().len());
+        let before = seen(&e);
+        let quiet = |w: &mut HashMap<String, Watch>, now: &mut Instant, ticks: usize| {
+            for _ in 0..ticks {
+                *now += sec;
+                tick_once(&e.s.state, w, *now);
+            }
+        };
+        // the first sight of the dataset, as at server start, checks it
+        tick_once(&e.s.state, &mut w, now);
+        assert_eq!(runs(&w), 1);
+        quiet(&mut w, &mut now, 2);
+        assert_eq!(runs(&w), 1, "an idle dataset is checked once");
+        assert!(tasks().is_empty(), "{:?}", tasks());
+        assert_eq!(seen(&e), before);
+        // a withdrawal the principal cannot read, and a decision of an unrelated claim
+        for change in 0..2 {
+            let head = ds.store().head_commit().seq;
+            if change == 0 {
+                withdraw(&ds, &hidden);
+            } else {
+                decide(&ds, &unrelated, Disposition::Rejected, 1);
+            }
+            let after = ds.store().head_commit().seq;
+            assert!(after > head);
+            let n = runs(&w);
+            quiet(&mut w, &mut now, 3);
+            assert_eq!(runs(&w), n + 1, "change {change}");
+            assert!(tasks().is_empty(), "change {change}: {:?}", tasks());
+            assert_eq!(seen(&e), before, "change {change}");
+            assert_eq!(ds.store().head_commit().seq, after, "change {change}");
+        }
+        // a settings-only change of the evidence configuration, and an access reload
+        let mut wider = with_hidden.clone();
+        wider.source_records.push("urn:ev:more-sources".into());
+        evidence::configure(&ds, &wider, &Control::none()).unwrap();
+        let n = runs(&w);
+        quiet(&mut w, &mut now, 3);
+        assert_eq!(runs(&w), n + 1);
+        e.s.auth().reload().unwrap();
+        quiet(&mut w, &mut now, 2);
+        assert_eq!(runs(&w), n + 2);
+        assert!(tasks().is_empty(), "{:?}", tasks());
+        assert_eq!(seen(&e), before);
+        // a withdrawal behind the cited claim ends its pair: the check starts a refresh
+        let first = e.report_of("http://ex/x0");
+        withdraw(&ds, &a);
+        quiet(&mut w, &mut now, 3);
+        let started = tasks();
+        assert_eq!(started.len(), 1, "{started:?}");
+        wait();
+        let done = tasks();
+        assert_eq!(done[0].state, "done", "{:?}", done[0]);
+        let msg = done[0].message.clone().unwrap_or_default();
+        assert!(msg.contains(CHECK_REASON), "{msg}");
+        assert_ne!(e.report_of("http://ex/x0"), first);
+        // the refresh cleared the check, and its own commit starts nothing
+        quiet(&mut w, &mut now, 3);
+        assert!(!w["ev"].private().due);
+        assert_eq!(tasks().len(), 1);
+        // a state left behind the reports graph, found when the server starts again
+        let mut st = state();
+        for c in &mut st.last_build.as_mut().unwrap().communities {
+            c.report = Some("urn:uuid:00000000-0000-0000-0000-00000000dead".into());
+        }
+        e.s.state.graphrag.set_state("ev", st);
+        let mut w: HashMap<String, Watch> = HashMap::new();
+        tick_once(&e.s.state, &mut w, now);
+        assert_eq!(tasks().len(), 2, "{:?}", tasks());
+        wait();
+        assert!(tasks().iter().all(|t| t.state == "done"), "{:?}", tasks());
+    })
+    .await
+    .unwrap();
+}
+
+/// The change feed counts only the graphs that a run under the policy reads: a claim in
+/// a proposal graph that a wildcard of the projection names, attributed to a member,
+/// joins no community and changes no report's input.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_feed_counts_only_the_graphs_a_run_reads() {
+    let e = Arc::new(env(true));
+    let e2 = e.clone();
+    tokio::task::spawn_blocking(move || {
+        let e = e2;
+        let ds = e.dataset();
+        let a = propose(&ds, "advisory", leads());
+        decide(&ds, &a, Disposition::Accepted, 1);
+        let s = settings(serde_json::json!({
+            "projection": { "graphs": [ORG, "urn:ev:*"] },
+            "refresh": { "minChangedFraction": 1.0 }
+        }));
+        e.run(s.clone(), Mode::Build).unwrap();
+        let due = |e: &Env| {
+            crate::graphrag::refresh::due_reason(&e.s.state, &e.ds(), &s, &mut Default::default())
+                .unwrap()
+        };
+        assert_eq!(due(&e), None);
+        propose_by(
+            &ds,
+            CLAIMS,
+            "memo",
+            Triple::new(ex("z0"), ex("knows"), ex("z1")),
+            ex("x0"),
+        );
+        assert_eq!(due(&e), None);
+    })
+    .await
+    .unwrap();
+}
+
+/// Refreshes that private checks start and that keep failing back off further each
+/// time: a check finds the withdrawal, and a refresh without a model provider fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_refreshes_after_checks_back_off() {
+    use crate::graphrag::refresh::{Watch, tick_once};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    let e = Arc::new(env(true));
+    let e2 = e.clone();
+    tokio::task::spawn_blocking(move || {
+        let e = e2;
+        let ds = e.dataset();
+        let a = propose(&ds, "advisory", leads());
+        let m = propose(&ds, "mirror", leads());
+        decide(&ds, &a, Disposition::Accepted, 1);
+        decide(&ds, &m, Disposition::Accepted, 1);
+        let s = settings(serde_json::json!({
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 1.0 }
+        }));
+        e.run(s, Mode::Build).unwrap();
+        let tasks = || -> Vec<crate::state::Task> {
+            e.s.state
+                .tasks
+                .lock()
+                .iter()
+                .filter(|t| t.kind == build::TASK_KIND)
+                .cloned()
+                .collect()
+        };
+        let wait = || {
+            let end = Instant::now() + Duration::from_secs(60);
+            while e.s.state.active_task(build::TASK_KIND, "ev").is_some() {
+                assert!(Instant::now() < end, "the refresh did not finish");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let sec = Duration::from_secs(1);
+        let mut now = Instant::now();
+        let mut w: HashMap<String, Watch> = HashMap::new();
+        tick_once(&e.s.state, &mut w, now);
+        assert!(tasks().is_empty());
+        e.s.state.models.store(None);
+        withdraw(&ds, &a);
+        // the first refresh starts after the debounce, and fails
+        let mut started = Vec::new();
+        for t in 1..=40u32 {
+            now += sec;
+            tick_once(&e.s.state, &mut w, now);
+            if tasks().len() > started.len() {
+                started.push(t);
+                wait();
+                assert_eq!(tasks().last().unwrap().state, "failed");
+            }
+            if started.len() == 4 {
+                break;
+            }
+        }
+        // each retry waits twice as long as the one before
+        assert_eq!(started.len(), 4, "{started:?}");
+        let gaps: Vec<u32> = started.windows(2).map(|p| p[1] - p[0]).collect();
+        assert!(gaps.windows(2).all(|g| g[1] > g[0]), "{started:?}");
+    })
+    .await
+    .unwrap();
 }

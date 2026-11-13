@@ -35,5 +35,5 @@ fn main() {
         );
         p.children.iter().for_each(|c| pr(c, d + 1));
     }
-    pr(&r.plan, 0);
+    pr(r.plan(), 0);
 }

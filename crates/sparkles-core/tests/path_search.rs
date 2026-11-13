@@ -41,11 +41,12 @@ fn rows_with(s: &Store, q: &str, opts: &QueryOptions) -> Vec<BTreeMap<String, St
     let r =
         query(s.snapshot(), &format!("{PREFIXES}{q}"), opts).unwrap_or_else(|e| panic!("{q}: {e}"));
     r.rows()
+        .unwrap()
         .iter()
         .map(|row| {
-            r.vars
+            r.variables()
                 .iter()
-                .zip(row)
+                .zip(row.values())
                 .map(|(v, t)| (v.clone(), short(t)))
                 .collect()
         })
@@ -668,7 +669,7 @@ fn all_shortest_prunes_a_zero_weight_cycle_behind_the_target() {
          path:pathIndex ?path }} }}"
     );
     let r = query(s.snapshot(), &q, &opts).expect("the search finishes inside its deadline");
-    assert_eq!(r.rows().len(), 1);
+    assert_eq!(r.len(), 1);
     assert_eq!(sequences(&s, params), BTreeSet::from(["s a t".to_string()]));
     // with an unbound target the clique's paths are real output, and pruning keeps them
     let s = store_of(&clique_behind_target(4));

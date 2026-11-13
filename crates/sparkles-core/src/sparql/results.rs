@@ -574,7 +574,7 @@ fn solutions_to(
     send: Option<usize>,
     sent: &Cell<u64>,
 ) -> Result<()> {
-    r.ctx.check_memory_failure()?;
+    r.inner.ctx.check_memory_failure()?;
     let f = match fmt {
         SolutionsFormat::Json => QueryResultsFormat::Json,
         SolutionsFormat::Xml => QueryResultsFormat::Xml,
@@ -596,14 +596,14 @@ fn solutions_to(
         return Ok(());
     }
     let vars: Vec<Variable> = r
-        .vars
+        .variables()
         .iter()
         .map(|v| Variable::new_unchecked(v.clone()))
         .collect();
     let mut s = ser
         .serialize_solutions_to_writer(w, vars.clone())
         .map_err(io)?;
-    let n = send.map_or(r.table.len(), |s| s.min(r.table.len()));
+    let n = send.map_or(r.inner.table.len(), |s| s.min(r.inner.table.len()));
     if n <= DECODE_ROWS {
         // a result of one chunk is decoded row by row: under concurrent load that keeps
         // less memory live per request than a chunk's table of terms, and in the 10.5M
@@ -611,7 +611,7 @@ fn solutions_to(
         // Even a small answer's terms lie on scattered vocabulary pages. Keep
         // row-by-row decoding's small working set, but overlap those cold reads.
         if n >= 2 && crate::index::io_hints() {
-            prefetch_answer(r, n);
+            prefetch_answer(r, n)?;
         }
         let mut row = output::ScratchRow::new(r)?;
         for i in 0..n {
@@ -625,76 +625,162 @@ fn solutions_to(
             .map_err(io)?;
             sent.set(sent.get() + 1);
         }
-        r.ctx.check_memory_failure()?;
+        r.inner.ctx.check_memory_failure()?;
         s.finish().map_err(io)?;
         return Ok(());
     }
     let chunk = |start: usize| start..n.min(start + DECODE_ROWS);
+    // Scope and one live prefetch packet have fixed runtime headers. Stacks are
+    // process runtime memory, as documented by depth::with_stack, not heap DTOs.
+    let scope_header = r.inner.ctx.charge(4096)?;
+    // This guard must outlive the scope closure: caller unwinding drops that
+    // closure's locals before scope automatically joins its real workers.
+    let mut packet = None;
+    let failure = ChunkFailure::default();
     std::thread::scope(|sc| -> Result<()> {
-        let mut ids = Decoded::cells(r, chunk(0), true);
+        #[cfg(test)]
+        let _unwind_observer = ChunkCallerUnwindTrace(&r.inner.ctx);
+        let mut cells = Some(Decoded::try_cells(r, chunk(0), true)?);
         let mut start = 0;
         while start < n {
             let end = n.min(start + DECODE_ROWS);
-            let d = Decoded::new(r, std::mem::take(&mut ids));
-            // the next chunk's pages are asked for while this one is written
-            let next = (end < n).then(|| sc.spawn(move || Decoded::cells(r, chunk(end), true)));
+            let d = Decoded::try_new(r, cells.take().expect("owned next chunk"))?;
+            packet = if end < n {
+                Some(r.inner.ctx.charge(4096)?)
+            } else {
+                None
+            };
+            let failure_ref = &failure;
+            let next = (end < n).then(|| {
+                sc.spawn(move || {
+                    #[cfg(test)]
+                    let _trace = ChunkWorkerTrace {
+                        ctx: &r.inner.ctx,
+                        stage: "prefetch-end",
+                        count: end,
+                    };
+                    #[cfg(test)]
+                    r.inner.ctx.chunk_event("prefetch-start", end);
+                    #[cfg(test)]
+                    {
+                        use crate::algo::memory::probe;
+                        probe::at(probe::Point::Allocation("chunk-prefetch-worker", end));
+                        if probe::fails("chunk-prefetch-worker") {
+                            panic!("injected chunk prefetch worker panic");
+                        }
+                    }
+                    match Decoded::try_cells(r, chunk(end), true) {
+                        Ok(cells) => Some(cells),
+                        Err(error) => {
+                            failure_ref.record(error);
+                            None
+                        }
+                    }
+                })
+            });
             for i in start..end {
-                let terms: Vec<(usize, Cow<'_, Term>)> = r
-                    .table
-                    .cols
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(c, col)| d.term(r, c, i, col[i]).map(|t| (c, t)))
-                    .collect();
-                s.serialize(
-                    terms
+                if failure.failed() {
+                    break;
+                }
+                let row = match ChunkRow::decode(r, &d, i) {
+                    Ok(row) => row,
+                    Err(error) => {
+                        failure.record(error);
+                        break;
+                    }
+                };
+                if let Err(error) = s.serialize(
+                    row.terms
                         .iter()
-                        .map(|(c, t)| (vars[*c].as_ref(), t.as_ref().as_ref())),
-                )
-                .map_err(io)?;
+                        .map(|(c, term)| (vars[*c].as_ref(), term.as_ref().as_ref())),
+                ) {
+                    failure.record(io(error));
+                    #[cfg(test)]
+                    r.inner.ctx.chunk_event("io-failure-recorded", i);
+                    break;
+                }
                 sent.set(sent.get() + 1);
             }
-            if let Some(h) = next {
-                ids = h
-                    .join()
-                    .unwrap_or_else(|_| Decoded::cells(r, chunk(end), false));
+            let completed = next.and_then(|handle| match handle.join() {
+                Ok(cells) => cells,
+                Err(panic) => {
+                    tracing::warn!(target: "sparkles::sparql::results", "query output prefetch worker panicked");
+                    failure.record(Error::invalid("query output prefetch worker panicked"));
+                    // Do not destroy an arbitrary panic payload under a failure lock.
+                    drop(panic);
+                    None
+                }
+            });
+            drop(packet.take());
+            if let Some(error) = failure.take() {
+                return Err(error);
+            }
+            if end < n {
+                cells = Some(
+                    completed.ok_or_else(|| Error::invalid("missing completed prefetch chunk"))?,
+                );
             }
             start = end;
         }
+        r.inner.ctx.check()?;
         Ok(())
     })?;
+    drop(scope_header);
     s.finish().map_err(io)?;
     Ok(())
 }
 
 // Keep prefetch preparation out of the generic serializer's row loop and stack frame.
 #[inline(never)]
-fn prefetch_answer(r: &QueryResult, n: usize) {
+fn prefetch_answer(r: &QueryResult, n: usize) -> Result<()> {
     let ids = || {
-        r.table.cols.iter().flat_map(|col| {
+        r.inner.table.cols.iter().flat_map(|col| {
             col[..n.min(col.len())]
                 .iter()
                 .filter(|id| id.tag() == Tag::Vocab)
                 .map(|id| id.payload())
         })
     };
-    let vocab = &r.ctx.snap.generation.vocab;
-    if n < PREFETCH_BLOCKS_BELOW {
-        // A warm answer's blocks were all asked for before: one bit test per term then
-        // replaces collecting, sorting and filtering them (spec X07 §9, gate 4).
-        if vocab.prefetch_would_skip(ids()) {
-            return;
-        }
-        // A few hundred terms are cheap to sort, and asking for just their blocks reads
-        // far less than whole sparse-index groups. A cold 35-row star lookup at 1.05M
-        // made 93 page faults here one after another, which was most of its time.
-        let mut ids: Vec<u64> = ids().collect();
-        ids.sort_unstable();
-        ids.dedup();
-        vocab.prefetch_sorted(&ids);
-    } else {
-        vocab.prefetch_terms(ids());
+    let ctx = &r.inner.ctx;
+    // The answer's writers check only memory failures, so this is where a cancelled or
+    // timed-out query is refused before it serializes.
+    ctx.check()?;
+    let vocab = &ctx.snap.generation.vocab;
+    if n < PREFETCH_BLOCKS_BELOW && vocab.prefetch_would_skip(ids()) {
+        return Ok(());
     }
+    let count = ids().count();
+    if count == 0 {
+        return Ok(());
+    }
+    let scratch = ctx.charge(0)?;
+    if n < PREFETCH_BLOCKS_BELOW {
+        let held = ctx
+            .charge(chunk_bytes::<u64>(ctx, count)?)?
+            .into_output(ctx);
+        let mut sorted = chunk_storage(ctx, count, &held, "answer-prefetch-ids")?;
+        sorted.extend(ids());
+        sorted.sort_unstable();
+        sorted.dedup();
+        vocab.prefetch_sorted_checked(&sorted, |need| {
+            ctx.check()?;
+            scratch.resize(
+                scratch
+                    .bytes()
+                    .max(u64::try_from(need).map_err(|_| ctx.memory_exceeded(u64::MAX))?),
+            )
+        })?;
+    } else {
+        vocab.prefetch_terms_checked(ids(), count, |need| {
+            ctx.check()?;
+            scratch.resize(
+                scratch
+                    .bytes()
+                    .max(u64::try_from(need).map_err(|_| ctx.memory_exceeded(u64::MAX))?),
+            )
+        })?;
+    }
+    ctx.check()
 }
 
 /// Answers of fewer rows prefetch the exact vocabulary blocks of their terms rather
@@ -716,103 +802,498 @@ const PAR_DECODE_MIN: usize = 4 * DECODE_TASK;
 /// many requests at once, mostly in ascending runs of pages, rather than one random page
 /// fault at a time.
 struct Decoded {
-    /// the first row and the rows of the chunk
     start: usize,
     rows: usize,
-    /// the distinct terms, in id order
-    terms: Vec<Term>,
-    /// per cell (column-major: column `c`, row `i` at `c * rows + i - start`), the index of
-    /// its term, `u32::MAX` for an id outside the base vocabulary
+    terms: ChunkTerms,
     slot: Vec<u32>,
+    _credit: super::ctx::OutputCredit,
 }
 
-/// The base-vocabulary cells of a chunk of rows, sorted by id: `(id, cell)`.
+// Every partial/complete term vector destroys nested payload before its guard.
 #[derive(Default)]
+struct ChunkTerms {
+    values: Vec<Term>,
+    depth: usize,
+}
+impl std::ops::Deref for ChunkTerms {
+    type Target = [Term];
+    fn deref(&self) -> &[Term] {
+        &self.values
+    }
+}
+impl Drop for ChunkTerms {
+    fn drop(&mut self) {
+        super::depth::with_stack(self.depth, || self.values.clear());
+    }
+}
+struct ChunkPart<'a> {
+    terms: ChunkTerms,
+    credit: Option<super::ctx::Charge<'a>>,
+}
+#[cfg(test)]
+struct ChunkWorkerTrace<'a> {
+    ctx: &'a super::Ctx,
+    stage: &'static str,
+    count: usize,
+}
+#[cfg(test)]
+impl Drop for ChunkWorkerTrace<'_> {
+    fn drop(&mut self) {
+        self.ctx.chunk_event(self.stage, self.count);
+    }
+}
+
+#[cfg(test)]
+struct ChunkCallerUnwindTrace<'a>(&'a super::Ctx);
+#[cfg(test)]
+impl Drop for ChunkCallerUnwindTrace<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.chunk_event("caller-scope-unwind", 0);
+        }
+    }
+}
+
 struct Cells {
     start: usize,
     rows: usize,
     pairs: Vec<(u64, u32)>,
     prefetched: bool,
+    _credit: super::ctx::OutputCredit,
+}
+
+fn chunk_bytes<T>(ctx: &super::Ctx, count: usize) -> Result<u64> {
+    count
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|n| u64::try_from(n).ok())
+        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))
+}
+fn chunk_storage<T>(
+    ctx: &super::Ctx,
+    count: usize,
+    held: &super::ctx::OutputCredit,
+    site: &'static str,
+) -> Result<Vec<T>> {
+    let bytes = chunk_bytes::<T>(ctx, count)?;
+    if !held.belongs_to(ctx) || held.bytes() < bytes {
+        return Err(Error::invalid("missing concrete chunk storage admission"));
+    }
+    ctx.check()?;
+    #[cfg(test)]
+    {
+        use crate::algo::memory::probe;
+        probe::at(probe::Point::Allocation(site, count));
+        if probe::fails(site) {
+            return Err(Error::invalid("injected chunk storage allocation failure"));
+        }
+    }
+    let _ = site;
+    let mut out = Vec::new();
+    out.try_reserve_exact(count)
+        .map_err(|_| Error::invalid("chunk storage allocation failed"))?;
+    if out.capacity() != count {
+        return Err(Error::invalid("chunk capacity exceeds admission"));
+    }
+    ctx.check()?;
+    Ok(out)
+}
+
+// One scoped operation's selected failure; neither global nor an error classifier.
+// Secondary errors and their payloads are always destroyed after leaving the lock.
+#[derive(Default)]
+struct ChunkFailure(parking_lot::Mutex<Option<Error>>);
+impl ChunkFailure {
+    fn record(&self, error: Error) {
+        let secondary = {
+            let mut first = self.0.lock();
+            if first.is_none() {
+                *first = Some(error);
+                None
+            } else {
+                Some(error)
+            }
+        };
+        drop(secondary);
+    }
+    fn failed(&self) -> bool {
+        self.0.lock().is_some()
+    }
+    fn take(&self) -> Option<Error> {
+        self.0.lock().take()
+    }
 }
 
 impl Decoded {
-    /// The base-vocabulary cells of `rows`, sorted by id, with the pages of their terms
-    /// asked for when `ahead`.
+    #[cfg(test)]
     fn cells(r: &QueryResult, rows: std::ops::Range<usize>, ahead: bool) -> Cells {
+        Self::try_cells(r, rows, ahead).expect("positive bulk cell fixture admission")
+    }
+    #[cfg(test)]
+    fn new(r: &QueryResult, cells: Cells) -> Decoded {
+        Self::try_new(r, cells).expect("positive bulk decode fixture admission")
+    }
+
+    fn try_cells(r: &QueryResult, rows: std::ops::Range<usize>, ahead: bool) -> Result<Cells> {
         use rayon::prelude::*;
+        let ctx = &r.inner.ctx;
+        ctx.check()?;
         let n = rows.len();
-        let mut pairs: Vec<(u64, u32)> = Vec::new();
-        for (c, col) in r.table.cols.iter().enumerate() {
+        let slots = r
+            .inner
+            .table
+            .width()
+            .checked_mul(n)
+            .filter(|&n| n <= u32::MAX as usize)
+            .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+        // Count over borrowed columns without allocating a temporary index.
+        let mut count = 0usize;
+        for col in &r.inner.table.cols {
+            let col = col
+                .get(rows.clone())
+                .ok_or_else(|| Error::invalid("chunk row range exceeds its result"))?;
+            count = count
+                .checked_add(col.iter().filter(|id| id.tag() == Tag::Vocab).count())
+                .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+        }
+        let held = ctx
+            .charge(chunk_bytes::<(u64, u32)>(ctx, count)?)?
+            .into_output(ctx);
+        let mut pairs = chunk_storage(ctx, count, &held, "chunk-pairs")?;
+        for (c, col) in r.inner.table.cols.iter().enumerate() {
             for (j, id) in col[rows.clone()].iter().enumerate() {
                 if id.tag() == Tag::Vocab {
-                    pairs.push((id.payload(), (c * n + j) as u32));
+                    let cell = c
+                        .checked_mul(n)
+                        .and_then(|x| x.checked_add(j))
+                        .filter(|&x| x < slots)
+                        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+                    pairs.push((id.payload(), cell as u32));
                 }
             }
         }
         if pairs.len() < PAR_DECODE_MIN {
             pairs.sort_unstable();
         } else {
-            pairs.par_sort_unstable();
+            let tasks = pairs.len().div_ceil(DECODE_TASK);
+            let bytes = u64::try_from(tasks)
+                .ok()
+                .and_then(|n| n.checked_mul(4096))
+                .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+            let task_headers = ctx.charge(bytes)?;
+            let sorted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pairs.par_sort_unstable()
+            }));
+            drop(task_headers);
+            if let Err(panic) = sorted {
+                tracing::warn!(target: "sparkles::sparql::results", "query output sort worker panicked");
+                drop(panic);
+                return Err(Error::invalid("query output sort worker panicked"));
+            }
         }
         if ahead {
-            let mut ids: Vec<u64> = pairs.iter().map(|p| p.0).collect();
+            let ids_held = ctx
+                .charge(chunk_bytes::<u64>(ctx, pairs.len())?)?
+                .into_output(ctx);
+            let mut ids = chunk_storage(ctx, pairs.len(), &ids_held, "chunk-prefetch-ids")?;
+            ids.extend(pairs.iter().map(|p| p.0));
             ids.dedup();
-            r.ctx.snap.generation.vocab.prefetch_sorted(&ids);
+            let scratch = ctx.charge(0)?;
+            r.inner
+                .ctx
+                .snap
+                .generation
+                .vocab
+                .prefetch_sorted_checked(&ids, |need| {
+                    ctx.check()?;
+                    scratch.resize(
+                        scratch
+                            .bytes()
+                            .max(u64::try_from(need).map_err(|_| ctx.memory_exceeded(u64::MAX))?),
+                    )
+                })?;
         }
-        Cells {
+        ctx.check()?;
+        Ok(Cells {
             start: rows.start,
             rows: n,
             pairs,
             prefetched: ahead,
-        }
+            _credit: held,
+        })
     }
 
-    /// Decode the distinct ids of `cells`.
-    fn new(r: &QueryResult, cells: Cells) -> Decoded {
+    fn decode_part<'a>(
+        r: &'a QueryResult,
+        part: &[u64],
+        container: &super::ctx::OutputCredit,
+        ahead: bool,
+    ) -> Result<ChunkPart<'a>> {
+        let ctx = &r.inner.ctx;
+        #[cfg(test)]
+        let _trace = ChunkWorkerTrace {
+            ctx,
+            stage: "decode-end",
+            count: part.len(),
+        };
+        #[cfg(test)]
+        ctx.chunk_event("decode-start", part.len());
+        let vocab = &ctx.snap.generation.vocab;
+        let payload = ctx.charge(0)?;
+        let mut terms = ChunkTerms {
+            values: chunk_storage(ctx, part.len(), container, "chunk-term-container")?,
+            depth: 0,
+        };
+        let reconstruction = ctx.charge(0)?;
+        vocab.get_sorted_owned_with_ahead(
+            part,
+            |need| {
+                ctx.check()?;
+                let bytes = u64::try_from(need)
+                    .ok()
+                    .and_then(|n| n.checked_mul(2))
+                    .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+                reconstruction.resize(reconstruction.bytes().max(bytes))
+            },
+            |_, key| {
+                if terms.values.len() == terms.values.capacity() {
+                    return Err(Error::invalid("chunk decoded count exceeds admission"));
+                }
+                let term = ctx.output_key(key, &payload)?;
+                terms.depth = terms.depth.max(crate::sparql::output::term_depth(&term));
+                terms.values.push(term);
+                ctx.check()
+            },
+            ahead,
+        )?;
+        if terms.values.len() != part.len() {
+            return Err(Error::Corrupt(
+                "missing vocabulary id in output chunk".into(),
+            ));
+        }
+        ctx.check()?;
+        Ok(ChunkPart {
+            terms,
+            credit: Some(payload),
+        })
+    }
+
+    fn try_new(r: &QueryResult, cells: Cells) -> Result<Decoded> {
         use rayon::prelude::*;
-        let mut slot = vec![u32::MAX; r.table.cols.len() * cells.rows];
-        let mut ids: Vec<u64> = Vec::new();
+        let ctx = &r.inner.ctx;
+        if !cells._credit.belongs_to(ctx) {
+            return Err(Error::invalid("bulk cells belong to another query account"));
+        }
+        ctx.check()?;
+        let slots = r
+            .inner
+            .table
+            .width()
+            .checked_mul(cells.rows)
+            .filter(|&n| n <= u32::MAX as usize)
+            .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+        let distinct = cells
+            .pairs
+            .iter()
+            .map(|p| p.0)
+            .try_fold((0usize, None), |(n, old), id| {
+                n.checked_add(usize::from(old != Some(id)))
+                    .map(|n| (n, Some(id)))
+            })
+            .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?
+            .0;
+        let ids_held = ctx
+            .charge(chunk_bytes::<u64>(ctx, distinct)?)?
+            .into_output(ctx);
+        let mut ids = chunk_storage(ctx, distinct, &ids_held, "chunk-distinct-ids")?;
+        let tasks = if distinct < PAR_DECODE_MIN {
+            1
+        } else {
+            distinct.div_ceil(DECODE_TASK)
+        };
+        // Final and worker term-container capacity overlap while payloads move.
+        // Runtime task headers are bounded separately from process-owned stacks.
+        let containers = chunk_bytes::<u32>(ctx, slots)?
+            .checked_add(
+                chunk_bytes::<Term>(ctx, distinct)?
+                    .checked_mul(2)
+                    .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?,
+            )
+            .and_then(|n| {
+                n.checked_add(if distinct < PAR_DECODE_MIN {
+                    0
+                } else {
+                    (tasks as u64).checked_mul(4096)?
+                })
+            })
+            .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+        let mut final_credit = ctx.charge(containers)?.into_output(ctx);
+        let mut slot = chunk_storage(ctx, slots, &final_credit, "chunk-slots")?;
+        slot.resize(slots, u32::MAX);
         for &(id, cell) in &cells.pairs {
             if ids.last() != Some(&id) {
                 ids.push(id);
             }
-            slot[cell as usize] = (ids.len() - 1) as u32;
+            *slot
+                .get_mut(cell as usize)
+                .ok_or_else(|| Error::invalid("chunk slot exceeds admission"))? =
+                (ids.len() - 1) as u32;
         }
-        let vocab = &r.ctx.snap.generation.vocab;
         let ahead = !cells.prefetched;
-        // ids past the vocabulary (none in a consistent snapshot) end the decoding: they
-        // are a suffix, whose cells fall back to decoding one by one
-        let terms = if ids.len() < PAR_DECODE_MIN {
-            let mut terms = Vec::with_capacity(ids.len());
-            vocab.get_sorted_with_ahead(&ids, |_, k| terms.push(crate::id::key_to_term(k)), ahead);
-            terms
-        } else {
-            ids.par_chunks(DECODE_TASK)
-                .flat_map_iter(|c| {
-                    let mut out = Vec::with_capacity(c.len());
-                    vocab.get_sorted_with_ahead(
-                        c,
-                        |_, k| out.push(crate::id::key_to_term(k)),
-                        ahead,
-                    );
-                    out
-                })
-                .collect()
+        let mut terms = ChunkTerms {
+            values: chunk_storage(ctx, distinct, &final_credit, "chunk-final-terms")?,
+            depth: 0,
         };
-        Decoded {
-            start: cells.start,
-            rows: cells.rows,
+        if distinct < PAR_DECODE_MIN {
+            let mut part = Self::decode_part(r, &ids, &final_credit, ahead)?;
+            final_credit.absorb_charge(&mut part.credit)?;
+            terms.depth = part.terms.depth;
+            terms.values.append(&mut part.terms.values);
+        } else {
+            let failure = ChunkFailure::default();
+            let task_held = ctx
+                .charge(chunk_bytes::<Option<ChunkPart<'_>>>(ctx, tasks)?)?
+                .into_output(ctx);
+            let mut parts = chunk_storage(ctx, tasks, &task_held, "chunk-task-index")?;
+            parts.resize_with(tasks, || None);
+            let joined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ids.par_chunks(DECODE_TASK)
+                    .zip(parts.par_iter_mut())
+                    .for_each(|(ids, out)| {
+                        if failure.failed() {
+                            return;
+                        }
+                        match Self::decode_part(r, ids, &final_credit, ahead) {
+                            Ok(part) => *out = Some(part),
+                            Err(error) => failure.record(error),
+                        }
+                    });
+            }));
+            if let Err(panic) = joined {
+                tracing::warn!(target: "sparkles::sparql::results", "query output decode worker panicked");
+                failure.record(Error::invalid("query output decode worker panicked"));
+                drop(panic);
+            }
+            if let Some(error) = failure.take() {
+                return Err(error);
+            }
+            for part in &mut parts {
+                let part = part
+                    .as_mut()
+                    .ok_or_else(|| Error::invalid("missing completed chunk task"))?;
+                final_credit.absorb_charge(&mut part.credit)?;
+                terms.depth = terms.depth.max(part.terms.depth);
+                terms.values.append(&mut part.terms.values);
+            }
+        }
+        // Workspace/container capacity returns only after those allocations retire.
+        let start = cells.start;
+        let rows = cells.rows;
+        drop(cells);
+        drop(ids);
+        drop(ids_held);
+        let retained = chunk_bytes::<Term>(ctx, terms.values.capacity())?
+            .checked_add(chunk_bytes::<u32>(ctx, slot.capacity())?)
+            .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+        // Existing credit consists of the initial workspace quote plus adopted
+        // payload contributions; discard only the now-freed workspace portion.
+        let workspace = containers
+            .checked_sub(retained)
+            .ok_or_else(|| Error::invalid("chunk workspace accounting mismatch"))?;
+        final_credit.resize(
+            final_credit
+                .bytes()
+                .checked_sub(workspace)
+                .ok_or_else(|| Error::invalid("chunk retained accounting mismatch"))?,
+        )?;
+        ctx.check()?;
+        Ok(Decoded {
+            start,
+            rows,
             terms,
             slot,
-        }
+            _credit: final_credit,
+        })
     }
 
-    /// The term of id `id` in column `c` of row `i`.
-    fn term<'a>(&'a self, r: &QueryResult, c: usize, i: usize, id: Id) -> Option<Cow<'a, Term>> {
-        match self.slot[c * self.rows + i - self.start] {
-            s if (s as usize) < self.terms.len() => Some(Cow::Borrowed(&self.terms[s as usize])),
-            _ => r.term(id).map(Cow::Owned),
+    fn term<'a>(
+        &'a self,
+        r: &QueryResult,
+        c: usize,
+        i: usize,
+        id: Id,
+        row: &super::ctx::Charge<'_>,
+    ) -> Result<Option<Cow<'a, Term>>> {
+        if !self._credit.belongs_to(&r.inner.ctx) || !row.belongs_to(&r.inner.ctx) {
+            return Err(Error::invalid(
+                "bulk decoded row belongs to another query account",
+            ));
         }
+        let at = c
+            .checked_mul(self.rows)
+            .and_then(|n| n.checked_add(i.checked_sub(self.start)?))
+            .ok_or_else(|| Error::invalid("chunk row index overflow"))?;
+        match *self
+            .slot
+            .get(at)
+            .ok_or_else(|| Error::invalid("chunk row exceeds admission"))?
+        {
+            s if (s as usize) < self.terms.len() => {
+                Ok(Some(Cow::Borrowed(&self.terms[s as usize])))
+            }
+            _ => r.inner.ctx.output_term(id, row).map(|t| t.map(Cow::Owned)),
+        }
+    }
+}
+
+struct ChunkRow<'a> {
+    terms: Vec<(usize, Cow<'a, Term>)>,
+    depth: usize,
+    _credit: super::ctx::Charge<'a>,
+}
+impl<'a> ChunkRow<'a> {
+    fn decode(r: &'a QueryResult, decoded: &'a Decoded, index: usize) -> Result<Self> {
+        let ctx = &r.inner.ctx;
+        if !decoded._credit.belongs_to(ctx) {
+            return Err(Error::invalid("bulk row belongs to another query account"));
+        }
+        ctx.check()?;
+        let width = r.inner.table.width();
+        let credit = ctx.charge(chunk_bytes::<(usize, Cow<'a, Term>)>(ctx, width)?)?;
+        #[cfg(test)]
+        {
+            use crate::algo::memory::probe;
+            probe::at(probe::Point::Allocation("chunk-row", width));
+            if probe::fails("chunk-row") {
+                return Err(Error::invalid("injected chunk row allocation failure"));
+            }
+        }
+        let mut terms = Vec::new();
+        terms
+            .try_reserve_exact(width)
+            .map_err(|_| Error::invalid("chunk row allocation failed"))?;
+        if terms.capacity() != width {
+            return Err(Error::invalid("chunk row capacity exceeds admission"));
+        }
+        let mut row = Self {
+            terms,
+            depth: 0,
+            _credit: credit,
+        };
+        for (c, column) in r.inner.table.cols.iter().enumerate() {
+            if let Some(term) = decoded.term(r, c, index, column[index], &row._credit)? {
+                row.depth = row
+                    .depth
+                    .max(crate::sparql::output::term_depth(term.as_ref()));
+                row.terms.push((c, term));
+            }
+        }
+        ctx.check()?;
+        Ok(row)
+    }
+}
+impl Drop for ChunkRow<'_> {
+    fn drop(&mut self) {
+        super::depth::with_stack(self.depth, || self.terms.clear());
     }
 }
 
@@ -858,12 +1339,12 @@ fn graph_to(
         }
     }
     let mut s = ser.for_writer(w);
-    for t in &r.triples {
+    for t in &r.inner.triples {
         s.serialize_triple(t).map_err(io)?;
         sent.set(sent.get() + 1);
     }
     if fmt.supports_datasets() {
-        for q in &r.quads {
+        for q in &r.inner.quads {
             s.serialize_quad(q).map_err(io)?;
             sent.set(sent.get() + 1);
         }
@@ -904,14 +1385,14 @@ fn jena_graph_to(
     // count by subject as `finish_counted` writes them
     let deferred = fmt == crate::jena_formats::JenaFormat::RdfJson;
     let mut out = crate::jena_formats::RdfWriter::new(fmt, w);
-    for t in &r.triples {
+    for t in &r.inner.triples {
         out.triple(t).map_err(io)?;
         if !deferred {
             sent.set(sent.get() + 1);
         }
     }
     if fmt.quads() {
-        for q in &r.quads {
+        for q in &r.inner.quads {
             out.quad(q).map_err(io)?;
             if !deferred {
                 sent.set(sent.get() + 1);
@@ -969,7 +1450,7 @@ fn native_json_to(
     metadata: Option<NativeJsonMetadata<'_>>,
     sent: &Cell<u64>,
 ) -> Result<()> {
-    r.ctx.check_memory_failure()?;
+    r.inner.ctx.check_memory_failure()?;
     let n = send.map_or(r.len(), |s| s.min(r.len()));
     // Serde's error type cannot carry the engine's typed refusal. Keep the exact
     // first decode error at this one boundary instead of converting it into I/O.
@@ -979,6 +1460,7 @@ fn native_json_to(
         &NativeJson {
             r,
             n,
+            commit: None,
             metadata,
             started: Instant::now(),
             sent,
@@ -1248,6 +1730,7 @@ pub fn write_cursor_jena_graph(
 struct NativeJson<'a> {
     r: &'a QueryResult,
     n: usize,
+    commit: Option<u64>,
     metadata: Option<NativeJsonMetadata<'a>>,
     started: Instant,
     sent: &'a Cell<u64>,
@@ -1261,7 +1744,7 @@ impl Serialize for NativeJson<'_> {
         map.serialize_entry("queryType", &r.kind)?;
         match r.kind {
             QueryKind::Select => {
-                map.serialize_entry("vars", &r.vars)?;
+                map.serialize_entry("vars", &r.variables())?;
                 map.serialize_entry(
                     "rows",
                     &NativeRows {
@@ -1277,21 +1760,26 @@ impl Serialize for NativeJson<'_> {
                 map.serialize_entry(
                     "triples",
                     &NativeGraphRows {
-                        rows: GraphRows::Triples(&r.triples[..self.n.min(r.triples.len())]),
+                        rows: GraphRows::Triples(
+                            &r.inner.triples[..self.n.min(r.inner.triples.len())],
+                        ),
                         sent: self.sent,
                     },
                 )?;
-                if !r.quads.is_empty() {
-                    let n = self.n.saturating_sub(r.triples.len()).min(r.quads.len());
+                if !r.inner.quads.is_empty() {
+                    let n = self
+                        .n
+                        .saturating_sub(r.inner.triples.len())
+                        .min(r.inner.quads.len());
                     let rows = NativeGraphRows {
-                        rows: GraphRows::Quads(&r.quads[..n]),
+                        rows: GraphRows::Quads(&r.inner.quads[..n]),
                         sent: self.sent,
                     };
                     map.serialize_entry("quads", &rows)?;
                 }
             }
         }
-        if let Err(error) = r.ctx.check_memory_failure() {
+        if let Err(error) = r.inner.ctx.check_memory_failure() {
             return Err(native_refusal::<S::Error>(self.failure, error));
         }
         let mut timing = r.timing.clone();
@@ -1305,13 +1793,13 @@ impl Serialize for NativeJson<'_> {
                 total_rows: r.len(),
                 sent_rows: self.n,
                 timing: &timing,
-                plan: &r.plan,
+                plan: &r.inner.plan,
                 memory: NativeMemory {
                     peak_bytes: r.mem_peak_bytes,
-                    granted_bytes: r.ctx.grant().map(|g| g.peak()),
+                    granted_bytes: r.inner.ctx.grant().map(|g| g.peak()),
                 },
                 rows_produced: r.rows_produced,
-                commit: self.metadata.as_ref().map(|m| m.commit),
+                commit: self.metadata.as_ref().map(|m| m.commit).or(self.commit),
                 dataset_id: self.metadata.as_ref().map(|m| m.dataset_id),
                 io: self
                     .metadata
@@ -1362,9 +1850,10 @@ impl Serialize for NativeRows<'_> {
         let mut seq = s.serialize_seq(Some(self.n))?;
         // the terms of a small answer lie on scattered vocabulary pages: overlap their
         // cold reads as the other result writers do
-        let ahead = self.n.min(DECODE_ROWS).min(self.r.table.len());
+        let ahead = self.n.min(DECODE_ROWS).min(self.r.inner.table.len());
         if ahead >= 2 && crate::index::io_hints() {
-            prefetch_answer(self.r, ahead);
+            prefetch_answer(self.r, ahead)
+                .map_err(|error| native_refusal::<S::Error>(self.failure, error))?;
         }
         let mut row = output::ScratchRow::new(self.r)
             .map_err(|error| native_refusal::<S::Error>(self.failure, error))?;
@@ -1565,92 +2054,159 @@ pub fn term_json(t: &Term) -> J {
     }
 }
 
-/// The `application/x-sparkles+json` document (see docs/API.md).
-pub fn sparkles_json(r: &QueryResult, send: Option<usize>) -> J {
-    let total = r.len();
-    let n = send.map_or(total, |s| s.min(total));
-    let mut out = serde_json::Map::new();
-    out.insert("queryType".into(), serde_json::to_value(r.kind).unwrap());
-    match r.kind {
-        QueryKind::Select => {
-            out.insert("vars".into(), json!(r.vars));
-            let rows: Vec<J> = (0..n)
-                .map(|i| {
-                    J::Array(
-                        r.table
-                            .cols
-                            .iter()
-                            .map(|c| r.term(c[i]).map_or(J::Null, |t| term_json(&t)))
-                            .collect(),
-                    )
-                })
-                .collect();
-            out.insert("rows".into(), J::Array(rows));
+/// The retained `application/x-sparkles+json` document (see docs/API.md).
+/// Its final encoded bytes retain their original actual query account.
+pub fn sparkles_json(r: &QueryResult, send: Option<usize>) -> Result<super::output::OwnedJson> {
+    sparkles_document(r, send, None)
+}
+
+/// The same document with an explicit commit in its existing metadata object.
+/// This avoids an unowned parse-and-mutate copy at the asking-pipeline boundary.
+pub fn sparkles_json_with_commit(
+    r: &QueryResult,
+    send: Option<usize>,
+    commit: u64,
+) -> Result<super::output::OwnedJson> {
+    sparkles_document(r, send, Some(commit))
+}
+
+/// The same document with an explicit commit as an independent application value.
+/// It holds no query credit, as `sparkles_json` did before results became retained
+/// owners. Use it only where a consumer still needs a `serde_json::Value`. It is
+/// built directly from the document's serializer on a grown stack, so nesting
+/// that the engine accepts is not cut off by a parser recursion limit.
+pub fn sparkles_json_application_value(
+    r: &QueryResult,
+    send: Option<usize>,
+    commit: u64,
+) -> Result<J> {
+    let failure = RefCell::new(None);
+    let value = super::depth::with_stack(crate::nesting::MAX_TRIPLE_TERMS, || {
+        serde_json::to_value(NativeJson {
+            r,
+            n: send.map_or(r.len(), |n| n.min(r.len())),
+            commit: Some(commit),
+            metadata: None,
+            started: Instant::now(),
+            sent: &Cell::new(0),
+            failure: &failure,
+        })
+    });
+    if let Some(error) = failure.into_inner() {
+        return Err(error);
+    }
+    value.map_err(|e| Error::invalid(e.to_string()))
+}
+
+fn sparkles_document(
+    r: &QueryResult,
+    send: Option<usize>,
+    commit: Option<u64>,
+) -> Result<super::output::OwnedJson> {
+    let failure = RefCell::new(None);
+    let document = super::depth::with_stack(crate::nesting::MAX_TRIPLE_TERMS, || {
+        r.output_budget().json(&NativeJson {
+            r,
+            n: send.map_or(r.len(), |n| n.min(r.len())),
+            commit,
+            metadata: None,
+            started: Instant::now(),
+            sent: &Cell::new(0),
+            failure: &failure,
+        })
+    });
+    if let Some(error) = failure.into_inner() {
+        return Err(error);
+    }
+    document
+}
+
+#[cfg(test)]
+mod application_value_tests {
+    use super::*;
+
+    fn nested(depth: usize) -> QueryResult {
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut term = "<urn:a>".to_string();
+        for _ in 0..depth {
+            term = format!("<<( <urn:s> <urn:p> {term} )>>");
         }
-        QueryKind::Ask => {
-            out.insert("boolean".into(), r.boolean.into());
-        }
-        _ => {
-            let triples: Vec<J> = r
-                .triples
-                .iter()
-                .take(n)
-                .map(|t| {
-                    json!([
-                        term_json(&Term::from(t.subject.clone())),
-                        term_json(&Term::NamedNode(t.predicate.clone())),
-                        term_json(&t.object)
-                    ])
-                })
-                .collect();
-            out.insert("triples".into(), J::Array(triples));
-            if !r.quads.is_empty() {
-                // what the row budget leaves after the triples
-                let quads: Vec<J> = r
-                    .quads
-                    .iter()
-                    .take(n.saturating_sub(r.triples.len()))
-                    .map(|q| {
-                        json!([
-                            term_json(&Term::from(q.subject.clone())),
-                            term_json(&Term::NamedNode(q.predicate.clone())),
-                            term_json(&q.object),
-                            match &q.graph_name {
-                                oxrdf::GraphName::NamedNode(g) =>
-                                    term_json(&Term::NamedNode(g.clone())),
-                                oxrdf::GraphName::BlankNode(b) =>
-                                    term_json(&Term::BlankNode(b.clone())),
-                                oxrdf::GraphName::DefaultGraph => J::Null,
-                            }
-                        ])
-                    })
-                    .collect();
-                out.insert("quads".into(), J::Array(quads));
+        let data = format!("<urn:x> <urn:q> {term} .");
+        store
+            .load(&[crate::io::Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        crate::sparql::query(
+            store.snapshot(),
+            "SELECT ?t WHERE { ?x <urn:q> ?t }",
+            &Default::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn application_value_matches_the_retained_document() {
+        let r = nested(2);
+        let value = sparkles_json_application_value(&r, None, 7).unwrap();
+        let document = sparkles_json_with_commit(&r, None, 7).unwrap();
+        let parsed: J = serde_json::from_str(document.as_str()).unwrap();
+        // Timings differ, and the document prints a float that the value keeps
+        // at full precision, so every timing member is left out.
+        fn untimed(v: &mut J) {
+            match v {
+                J::Object(map) => {
+                    map.retain(|key, _| key != "timing" && key != "elapsedMs" && key != "timeMs");
+                    map.values_mut().for_each(untimed);
+                }
+                J::Array(items) => items.iter_mut().for_each(untimed),
+                _ => {}
             }
         }
+        let strip = |mut v: J| {
+            untimed(&mut v);
+            v
+        };
+        assert_eq!(strip(value), strip(parsed));
     }
-    let mut memory = json!({ "peakBytes": r.mem_peak_bytes });
-    // the most the query held of the server's memory pool
-    if let Some(g) = r.ctx.grant() {
-        memory["grantedBytes"] = json!(g.peak());
+
+    #[test]
+    fn deep_triple_terms_build_an_application_value_past_the_parser_limit() {
+        let r = nested(64);
+        let document = sparkles_json_with_commit(&r, None, 7).unwrap();
+        // A parser stops at its recursion limit for this accepted nesting.
+        assert!(serde_json::from_str::<J>(document.as_str()).is_err());
+        let value = sparkles_json_application_value(&r, None, 7).unwrap();
+        assert_eq!(value["meta"]["commit"], 7);
     }
-    out.insert(
-        "meta".into(),
-        json!({
-            "totalRows": total,
-            "sentRows": n,
-            "timing": r.timing,
-            "plan": r.plan,
-            "memory": memory,
-            "rowsProduced": r.rows_produced,
-        }),
-    );
-    J::Object(out)
 }
 
 #[cfg(test)]
 mod buffered_tests {
     use super::*;
+
+    /// The writers of a small answer check only memory failures, so the prefetch entry
+    /// is where a query cancelled after it ran is refused before it serializes. The test
+    /// calls it directly, because the I/O hints that enable it are process-wide.
+    #[test]
+    fn small_answer_cancelled_after_execution_refuses_to_serialize() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let r = crate::sparql::query(
+            store.snapshot(),
+            "SELECT ?s WHERE { VALUES ?s { <urn:a> <urn:b> } }",
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(r.len(), 2);
+        assert!(prefetch_answer(&r, 2).is_ok());
+        r.inner
+            .ctx
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(prefetch_answer(&r, 2), Err(Error::Cancelled)));
+    }
 
     /// A writer that takes `room` bytes and refuses the write that would pass them, as
     /// the response writer does at the result-size budget.
@@ -1830,7 +2386,7 @@ mod buffered_tests {
         write_jena_graph_counted(&r, JenaFormat::RdfJson, &mut whole, &sent).unwrap();
         assert_eq!(sent.get(), 4);
         let mut plain = RdfWriter::new(JenaFormat::RdfJson, Vec::new());
-        for t in &r.triples {
+        for t in &r.inner.triples {
             plain.triple(t).unwrap();
         }
         assert_eq!(plain.finish().unwrap(), whole);
@@ -1878,3 +2434,6 @@ mod buffered_tests {
 
 #[cfg(test)]
 mod output_boundary_tests;
+
+#[cfg(test)]
+mod chunk_ownership_tests;

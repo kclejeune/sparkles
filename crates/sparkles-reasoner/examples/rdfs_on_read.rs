@@ -97,7 +97,7 @@ fn main() {
                 let t = Instant::now();
                 let r = query(store.snapshot(), &q, &o).unwrap();
                 times.push(t.elapsed().as_secs_f64() * 1000.0);
-                count = r.rows()[0][0]
+                count = r.rows().unwrap().row(0).unwrap().values()[0]
                     .as_ref()
                     .map(|t| match t {
                         oxrdf::Term::Literal(l) => l.value().to_string(),
