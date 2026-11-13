@@ -460,6 +460,8 @@ impl Tools<'_> {
                 ));
             }
         }
+        // names and marks change only under the lock the expiry deletes under
+        let _marks = crate::assist::SCRATCH_MARKS.lock();
         ds.store.create_branch(&name, &o).map_err(|e| {
             actor.failed_branch("branch_created", Some(&ds.name), &name, e.code());
             store_error(e, rid)
@@ -749,6 +751,7 @@ impl Tools<'_> {
                 ds.name
             )));
         }
+        let _marks = crate::assist::SCRATCH_MARKS.lock();
         ds.dataset
             .delete_branch_with(
                 &name,
@@ -904,6 +907,11 @@ static CREATING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 pub(crate) type BeforeExpiry = Box<dyn Fn(&Dataset, &str) + Send>;
 #[cfg(test)]
 pub(crate) static BEFORE_EXPIRY: parking_lot::Mutex<Option<BeforeExpiry>> =
+    parking_lot::Mutex::new(None);
+
+/// A test's step between the expiry's second check and its deletion, under the lock.
+#[cfg(test)]
+pub(crate) static AFTER_RECHECK: parking_lot::Mutex<Option<BeforeExpiry>> =
     parking_lot::Mutex::new(None);
 
 /// Scratch branches the expiry deleted.
@@ -1208,10 +1216,15 @@ pub(crate) fn sweep(
             let _marks = crate::assist::SCRATCH_MARKS.lock();
             match ds.store.branch_info(&b.name) {
                 Ok(i)
-                    if i.scratch.as_ref().is_some_and(|s| !s.keep)
+                    if i.id == b.id
+                        && i.scratch.as_ref().is_some_and(|s| !s.keep)
                         && !i.broken
                         && last_activity_ms(&i) < cutoff => {}
                 _ => continue,
+            }
+            #[cfg(test)]
+            if let Some(f) = AFTER_RECHECK.lock().as_ref() {
+                f(ds, &b.name);
             }
             match ds.dataset.delete_branch_with(
                 &b.name,

@@ -85,8 +85,9 @@ pub const MIN_SCRATCH_TTL: Duration = Duration::from_secs(60);
 pub const MAX_SCRATCH_TTL: Duration = Duration::from_secs(3650 * 86_400);
 /// The `ttl` that turns expiry off for a dataset whatever the server flag says.
 pub const SCRATCH_TTL_OFF: &str = "off";
-/// Held while the server changes a scratch mark or deletes an expired scratch branch, so
-/// the expiry never deletes a branch whose mark was cleared after it chose the branch.
+/// Held while the server creates, renames or deletes a branch, changes a scratch mark, or
+/// deletes an expired scratch branch, so the expiry never deletes a branch whose mark was
+/// cleared, or another branch that took its name, after it chose the branch.
 pub static SCRATCH_MARKS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 /// The largest `scratchBranches.maxPerPrincipal`, the number of branch ordinals.
 pub const MAX_SCRATCH_PER_PRINCIPAL: u32 = 65_535;

@@ -816,7 +816,11 @@ async fn create_inner(
     // Failure ownership transfers from the authorized handler to its worker.
     *pending_failure = None;
     let info = blocking(move || {
-        let result: ApiResult<_> = ds.store.create_branch(&new, &o).map_err(Into::into);
+        let result: ApiResult<_> = {
+            // names change only under the lock the scratch-branch expiry deletes under
+            let _marks = crate::assist::SCRATCH_MARKS.lock();
+            ds.store.create_branch(&new, &o).map_err(Into::into)
+        };
         match &result {
             Ok(info) => crate::audit::dataset(
                 "branch_created",
@@ -932,6 +936,8 @@ pub(crate) async fn patch_branch(
     let d = ds.clone();
     let (b, r) = (branch.clone(), rename.clone());
     let info = blocking(move || {
+        // a rename and a cleared mark take the lock the scratch-branch expiry deletes under
+        let _marks = crate::assist::SCRATCH_MARKS.lock();
         let b = match &r {
             Some(new) => d.dataset.rename_branch(&b, new)?.name,
             None => b,
@@ -943,7 +949,6 @@ pub(crate) async fn patch_branch(
             d.store.set_branch_note(&b, note)?;
         }
         if unscratch && b != sparkles::branch::MAIN {
-            let _marks = crate::assist::SCRATCH_MARKS.lock();
             d.store.set_branch_scratch(&b, None)?;
         }
         Ok(d.store.branch_info(&b)?)
@@ -1038,7 +1043,10 @@ async fn delete_branch_inner(
     let identity = ds.store.dataset_id();
     blocking(move || {
         let result = (|| -> ApiResult {
-            ds.dataset.delete_branch_with(&branch, &o)?;
+            {
+                let _marks = crate::assist::SCRATCH_MARKS.lock();
+                ds.dataset.delete_branch_with(&branch, &o)?;
+            }
             ds.branches.lock().remove(&branch);
             #[cfg(feature = "mcp")]
             crate::mcp::memory::pending::touch(&st, &name);

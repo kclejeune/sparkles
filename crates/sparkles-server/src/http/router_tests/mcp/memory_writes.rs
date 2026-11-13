@@ -927,6 +927,84 @@ async fn item435_a_mark_cleared_during_expiry_keeps_the_branch() {
     assert_ne!(before, state());
 }
 
+/// Item 435, review round 2: requests that clear a mark, or delete a branch and create
+/// another under its name, while the expiry is between its second check and its deletion
+/// wait for the deletion, so the expiry deletes only the branch it chose and an
+/// administrator is never told that a branch it then deletes was kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn item435_lifecycle_requests_wait_for_the_expiry() {
+    type Pending = Arc<parking_lot::Mutex<Vec<std::thread::JoinHandle<Vec<StatusCode>>>>>;
+    let s = mem_server(&["--mcp-allow-update", "--mcp-scratch-branch-ttl", "1h"]);
+    let ds = s.state.get("mem").unwrap();
+    for name in ["patched-435", "renamed-435"] {
+        let r = tool(&s.app, "create_branch", json!({ "name": name }), &[]).await;
+        assert_eq!(r["isError"], false, "{r}");
+    }
+    let pending: Pending = Arc::default();
+    let (app, wait) = (s.app.clone(), pending.clone());
+    *crate::mcp::branches::AFTER_RECHECK.lock() = Some(Box::new(move |_, name| {
+        let app = app.clone();
+        let name = name.to_string();
+        let requests: Vec<(&str, String, Option<String>)> = if name == "patched-435" {
+            vec![(
+                "PATCH",
+                format!("/$/branches/mem/{name}"),
+                Some(r#"{"scratch":false}"#.into()),
+            )]
+        } else {
+            vec![
+                ("DELETE", format!("/$/branches/mem/{name}?force=true"), None),
+                (
+                    "POST",
+                    "/$/branches/mem".into(),
+                    Some(format!(r#"{{"name":"{name}"}}"#)),
+                ),
+            ]
+        };
+        wait.lock().push(std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let mut out = Vec::new();
+                for (method, uri, body) in requests {
+                    let req = Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.unwrap_or_default()))
+                        .unwrap();
+                    out.push(send(&app, req).await.status);
+                }
+                out
+            })
+        }));
+        // time for requests that did not wait to finish before the deletion
+        std::thread::sleep(Duration::from_millis(300));
+    }));
+    let st = s.state.clone();
+    let gone = tokio::task::spawn_blocking(move || {
+        crate::mcp::branches::sweep(
+            &st,
+            Duration::from_secs(3600),
+            crate::mcp::branches::now_ms() + 2 * 3_600_000,
+        )
+    })
+    .await
+    .unwrap();
+    *crate::mcp::branches::AFTER_RECHECK.lock() = None;
+    let mut gone = gone;
+    gone.sort();
+    assert_eq!(gone, ["mem@patched-435", "mem@renamed-435"]);
+    let handles: Vec<_> = pending.lock().drain(..).collect();
+    let statuses: Vec<Vec<StatusCode>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    // the PATCH waited and found the branch deleted, rather than answer 200 for it
+    assert_eq!(statuses[0], [StatusCode::NOT_FOUND], "{statuses:?}");
+    // the DELETE waited and found nothing, and the new branch of that name survives
+    assert_eq!(statuses[1][0], StatusCode::NOT_FOUND, "{statuses:?}");
+    assert!(statuses[1][1].is_success(), "{statuses:?}");
+    let replacement = ds.store.branch_info("renamed-435").unwrap();
+    assert!(replacement.scratch.is_none());
+}
+
 /// Item 435: `maxPerPrincipal` at its boundary, counted per creator with kept branches,
 /// a race-free count, and the admin route that clears a scratch mark.
 #[tokio::test(flavor = "multi_thread")]

@@ -1477,7 +1477,7 @@ it.
 **Delivered for item 435: limits, warnings and kept branches.** The rest of the design
 above is built, with these choices where it left the behaviour open.
 
-- **Kept branches.** `create_branch` takes `keep` (false by default). A kept branch stays
+- `create_branch` takes `keep` (false by default). A kept branch stays
   a scratch branch, so its creator keeps the rights of §5.7 over it, but `sweep` skips
   it and `list_branches` and `create_branch` report no `expires` for it.
   `sparkles::branch::Scratch` gains `keep`, which is written only when it is true. An
@@ -1485,22 +1485,24 @@ above is built, with these choices where it left the behaviour open.
   lists a kept branch is format 3 of `branches.json`, through
   `TableFile::stamped_format`, and the table returns to format 1 or 2 once no listed
   branch is kept.
-- **Clearing a mark.** The `admin` route is `PATCH /$/branches/{ds}/{name}` with
+- The `admin` route that clears a mark is `PATCH /$/branches/{ds}/{name}` with
   `{"scratch": false}`, beside the `protected`, `note` and `name` members that the route
   already takes. It needs `admin` on the branch, as `protected` does, and calls
   `Store::set_branch_scratch` with `None`. `scratch: true` is a `400`, since only
   `create_branch` makes scratch branches. Clearing a branch without a mark, or `main`,
-  changes nothing. Clearing a mark and the expiry's deletion take one lock in the server,
-  and the expiry reads the mark and the idle time again under it, so it never deletes a
-  branch whose mark an administrator cleared after the expiry chose it.
-- **The limit.** `maxPerPrincipal` is an integer from 1 to 65535, the number of branch
+  changes nothing. Creating, renaming and deleting a branch, clearing a mark and the
+  expiry's deletion take one lock in the server, and the expiry reads the branch's id,
+  mark and idle time again under it, so it never deletes a branch whose mark an
+  administrator cleared, or another branch that took its name, after it chose the
+  branch.
+- `maxPerPrincipal` is an integer from 1 to 65535, the number of branch
   ordinals. `create_branch` counts the scratch branches of the dataset whose creator is
   the caller, kept ones included, and fails with `scratch-branch-limit` (409) at the
   limit, before it creates anything. The count and the creation run under one lock in
   the server, so concurrent calls at the limit cannot both pass it. Branches made over
   HTTP and branches whose mark was cleared do not count. A merge keeps the source branch
   and its mark, so only a deletion or a cleared mark frees a place.
-- **The window.** `notifyBefore` is a duration from `1m` to `3650d`, as `ttl` is. A
+- `notifyBefore` is a duration from `1m` to `3650d`, as `ttl` is. A
   scratch branch is in the window when it is not kept, the dataset's TTL applies to it,
   and its expiry is at most `notifyBefore` from now, the boundary included. The spec
   names "the MCP resource of a caller's branches", which did not exist. It is the new
@@ -1512,7 +1514,7 @@ above is built, with these choices where it left the behaviour open.
   reads the branch table from the dataset's main, so it names them as well. The
   resource is listed for every dataset where the caller may read some branch, as
   `create_branch` allows. `list_branches` marks each branch in the window `expiresSoon`.
-- **The event.** A branch "holds unreviewed proposals" when it has commits of its own
+- A branch "holds unreviewed proposals" when it has commits of its own
   that its upstream does not have. `memory.review.pending` names such branches in the
   window as a condition of its own, `memory.review.pending/{ds}/scratch`, apart from the
   review branches of `notifyAfter`, so that neither suppresses the other. It repeats on
@@ -1520,7 +1522,7 @@ above is built, with these choices where it left the behaviour open.
   left, and fires only on a server that expires scratch branches, which is a writable
   `serve --mcp` with `--mcp-allow-update`. A branch that enters the window while the
   condition is suppressed is named at the next repeat.
-- **Format.** `memory.json` is format 3 while `scratchBranches` holds `maxPerPrincipal`
+- `memory.json` is format 3 while `scratchBranches` holds `maxPerPrincipal`
   or `notifyBefore`, and format 2 with `ttl` alone, through `formats::stamp_settings`.
 
 **Tests for item 435.** `store::branch_tests::kept_scratch_marks_need_table_format_three`
@@ -1537,7 +1539,10 @@ together at the limit. `auth::item435_limits_and_marks_per_principal` checks tha
 own count and resource, that a caller who reads only other branches than `main` gets
 the resource, and that only `admin` clears a mark.
 `item435_a_mark_cleared_during_expiry_keeps_the_branch` clears a mark between the
-expiry's choice and its deletion and checks that the resource's state follows a merge.
+expiry's choice and its deletion and checks that the resource's state follows a merge,
+and `item435_lifecycle_requests_wait_for_the_expiry` sends a `PATCH` that clears a mark,
+and a deletion followed by a creation under the same name, between the expiry's second
+check and its deletion.
 `mcp::import_tests::brief_names_expiring_scratch_branches` checks the brief, a brief
 that reads a branch and the smallest `maxChars` with long branch names, and
 `notify::tests::expiring_scratch_branches_with_commits_notify` checks the event.
