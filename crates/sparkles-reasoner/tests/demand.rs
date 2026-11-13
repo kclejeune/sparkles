@@ -1508,15 +1508,18 @@ fn schema_heavy_pattern(r: &mut Rng) -> String {
 
 /// For small schema-heavy views, the solutions under `demand` equal those over an OWL RL
 /// materialization. Some views make equality expand into a large closure, so each query
-/// runs under the reasoner's limit of derived facts. A query past it is counted and
-/// skipped, and the others must agree. The limit counts work, so the same queries are
-/// skipped on every host, where a deadline skipped more of them the busier the host was.
-/// The seeds run in three tests of three, in parallel.
+/// runs under the reasoner's limit of derived facts, which counts work and stops the same
+/// queries on every host. Every query of the fixed seeds answers within it. A query of
+/// other seeds past it is counted and skipped, and the others must agree. Any other
+/// error fails the test. The fixed seeds run in three tests of three, in parallel.
 fn schema_heavy_demand_answers_like_materialization(part: usize) {
-    let seeds: Vec<u64> = match std::env::var("SCHEMA_HEAVY_SEEDS") {
-        Ok(v) if part == 0 => v.split(',').map(|s| s.trim().parse().unwrap()).collect(),
-        Ok(_) => Vec::new(),
-        Err(_) => SCHEMA_HEAVY_SEEDS[3 * part..3 * part + 3].to_vec(),
+    let (seeds, fixed): (Vec<u64>, bool) = match std::env::var("SCHEMA_HEAVY_SEEDS") {
+        Ok(v) if part == 0 => (
+            v.split(',').map(|s| s.trim().parse().unwrap()).collect(),
+            false,
+        ),
+        Ok(_) => (Vec::new(), false),
+        Err(_) => (SCHEMA_HEAVY_SEEDS[3 * part..3 * part + 3].to_vec(), true),
     };
     let (mut checked, mut skipped) = (0usize, 0usize);
     for seed in seeds {
@@ -1538,7 +1541,8 @@ fn schema_heavy_demand_answers_like_materialization(part: usize) {
                     assert_eq!(rows(&got), want, "seed {seed}: {q}\n{ttl}");
                 }
                 Err(sparkles_core::Error::Component(c))
-                    if c.code == sparkles_reasoner::query::BUDGET_CODE =>
+                    if c.code == sparkles_reasoner::query::BUDGET_CODE
+                        && c.message.contains(" derived facts ") =>
                 {
                     skipped += 1
                 }
@@ -1551,6 +1555,9 @@ fn schema_heavy_demand_answers_like_materialization(part: usize) {
         checked >= 2 * skipped,
         "{checked} checked, {skipped} skipped"
     );
+    if fixed {
+        assert_eq!((checked, skipped), (24, 0));
+    }
 }
 
 #[test]

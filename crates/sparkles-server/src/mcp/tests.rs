@@ -1611,12 +1611,14 @@ async fn a_basic_graph_pattern_at_the_plan_limit() {
     // Planning the deepest plan takes about 10 s in a debug build on a quiet host, and
     // a loaded host stretches that past the default 30 s timeout. The test checks the
     // plan's size and depth limits, not planning time, so those calls get a timeout and
-    // a wait far past their run time.
-    let wait = Duration::from_secs(600);
+    // a wait far past their run time. An estimated plan has the default timeout, since
+    // `timeoutSeconds` is the deadline of a run, so the default is raised too.
+    let wait = Duration::from_secs(400);
     let mut c = Client::start(server_with(
         &[("t", &[FIXTURE])],
         McpConfig {
             max_timeout: wait,
+            default_timeout: wait,
             ..McpConfig::default()
         },
     ));
