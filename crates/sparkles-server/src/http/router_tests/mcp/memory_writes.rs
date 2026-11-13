@@ -933,7 +933,7 @@ async fn item435_a_mark_cleared_during_expiry_keeps_the_branch() {
 /// administrator is never told that a branch it then deletes was kept.
 #[tokio::test(flavor = "multi_thread")]
 async fn item435_lifecycle_requests_wait_for_the_expiry() {
-    type Pending = Arc<parking_lot::Mutex<Vec<std::thread::JoinHandle<Vec<StatusCode>>>>>;
+    type Pending = Arc<parking_lot::Mutex<Vec<std::thread::JoinHandle<(String, Vec<StatusCode>)>>>>;
     let s = mem_server(&["--mcp-allow-update", "--mcp-scratch-branch-ttl", "1h"]);
     let ds = s.state.get("mem").unwrap();
     for name in ["patched-435", "renamed-435"] {
@@ -942,7 +942,12 @@ async fn item435_lifecycle_requests_wait_for_the_expiry() {
     }
     let pending: Pending = Arc::default();
     let (app, wait) = (s.app.clone(), pending.clone());
-    *crate::mcp::branches::AFTER_RECHECK.lock() = Some(Box::new(move |_, name| {
+    // the hook is global: it acts only on this test's dataset and branches
+    let mine = Arc::as_ptr(&ds) as usize;
+    *crate::mcp::branches::AFTER_RECHECK.lock() = Some(Box::new(move |d, name| {
+        if d as *const _ as usize != mine || !["patched-435", "renamed-435"].contains(&name) {
+            return;
+        }
         let app = app.clone();
         let name = name.to_string();
         let requests: Vec<(&str, String, Option<String>)> = if name == "patched-435" {
@@ -961,7 +966,7 @@ async fn item435_lifecycle_requests_wait_for_the_expiry() {
                 ),
             ]
         };
-        wait.lock().push(std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 let mut out = Vec::new();
@@ -974,11 +979,16 @@ async fn item435_lifecycle_requests_wait_for_the_expiry() {
                         .unwrap();
                     out.push(send(&app, req).await.status);
                 }
-                out
+                (name, out)
             })
-        }));
-        // time for requests that did not wait to finish before the deletion
-        std::thread::sleep(Duration::from_millis(300));
+        });
+        // requests that do not wait for the lock finish here, before the deletion; ones
+        // that wait are still blocked when the bound runs out
+        let until = std::time::Instant::now() + Duration::from_secs(3);
+        while !handle.is_finished() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        wait.lock().push(handle);
     }));
     let st = s.state.clone();
     let gone = tokio::task::spawn_blocking(move || {
@@ -995,12 +1005,19 @@ async fn item435_lifecycle_requests_wait_for_the_expiry() {
     gone.sort();
     assert_eq!(gone, ["mem@patched-435", "mem@renamed-435"]);
     let handles: Vec<_> = pending.lock().drain(..).collect();
-    let statuses: Vec<Vec<StatusCode>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let statuses: std::collections::BTreeMap<String, Vec<StatusCode>> =
+        handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(statuses.len(), 2, "{statuses:?}");
     // the PATCH waited and found the branch deleted, rather than answer 200 for it
-    assert_eq!(statuses[0], [StatusCode::NOT_FOUND], "{statuses:?}");
+    assert_eq!(
+        statuses["patched-435"],
+        [StatusCode::NOT_FOUND],
+        "{statuses:?}"
+    );
     // the DELETE waited and found nothing, and the new branch of that name survives
-    assert_eq!(statuses[1][0], StatusCode::NOT_FOUND, "{statuses:?}");
-    assert!(statuses[1][1].is_success(), "{statuses:?}");
+    let renamed = &statuses["renamed-435"];
+    assert_eq!(renamed[0], StatusCode::NOT_FOUND, "{statuses:?}");
+    assert!(renamed[1].is_success(), "{statuses:?}");
     let replacement = ds.store.branch_info("renamed-435").unwrap();
     assert!(replacement.scratch.is_none());
 }
