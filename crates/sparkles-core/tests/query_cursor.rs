@@ -4853,10 +4853,15 @@ fn graph_writers_flush_after_their_first_batch() {
 
 /// An OPTIONAL over two inputs sorted on their shared variable merges when the
 /// `merge_left_join` switch is on and hashes when it is off, in the cursor as in eager
-/// execution, and both plans name the algorithm that ran.
+/// execution, and both plans name the algorithm that ran. The store caches every result,
+/// and the switched queries read none, since the plan of a result read from the cache
+/// names no join.
 #[test]
 fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
-    let s = Store::in_memory(StoreOptions::default());
+    let s = Store::in_memory(StoreOptions {
+        result_cache_min_ms: 0.0,
+        ..StoreOptions::default()
+    });
     let data = (0..200)
         .map(|i| {
             let mut t = format!("<urn:s:{i}> <urn:p> {i} .\n");
@@ -4882,6 +4887,8 @@ fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
                 merge_left_join: merge,
                 ..sparkles_core::sparql::Optimizations::ALL
             }),
+            // A cached result would name no join, since none ran.
+            no_cache: true,
             ..Default::default()
         };
         let eager = query(s.snapshot(), q, &opts).unwrap();
