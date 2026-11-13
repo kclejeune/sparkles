@@ -2182,20 +2182,21 @@ returns to this round with the exploration, which the next subsection takes up.
 #### Item 894's exploration round
 
 This round takes up the nondeterministic exploration of Kazakov and Klinov after the merge
-left the three files past the bound. It counts from the derivation traces how many
-branches the exploration would meet where the present calculus spends its bound, states
+left the three files past the bound, and weighs it against a narrower repair of the merge.
+It counts from the derivation traces what the contexts that spend the bound hold, states
 what counting inside a branch needs beyond the published calculus, and recommends how item
 894 ends. The traces come from debug builds of the reverted engine on one thread with
 counting, at the default bound, and for ore_ont_6952 and ore_ont_10140 also at a work bound
 of 4,194,304 with the again rule's experimental filter, so that those attempts reach the
-contexts behind the first one. The counts of models below read the processed clauses and
-the at-most and lazy conclusions of one context as ground clauses. An equality holds when
-its two terms are in one block of a partition of the successor terms, an atom over a
-successor term is read once per block, a successor term takes part only where its
-existential restriction holds, and the fillers of one minimum's witnesses are pairwise
-disjoint, as the normalization makes them. A model is a partition with values of the atoms
-that satisfies every clause, so the models are the merge outcomes in which a branch of the
-context can end.
+contexts behind the first one. The partition counts below read the processed clauses and
+the at-most and lazy conclusions of one context, as the trace holds them when the attempt
+stops, as ground clauses. An equality holds when its two terms are in one block of a
+partition of the successor terms, an atom over a successor term is read once per block, a
+successor term takes part only where its existential restriction holds, and the fillers of
+one minimum's witnesses are pairwise disjoint, as the normalization makes them. A partition
+counts when some values of the atoms satisfy every clause. These are exact counts for the
+clauses of each snapshot. They are not the branches of a finished exploration, since the
+ontology's other clauses and the neighbouring contexts can remove partitions or add choices.
 
 On both versions of the Protein Ontology the hottest context at the default bound is that
 of `PR_000024883`, a complex that the ontology defines as `PR_000024871` with exactly three
@@ -2207,114 +2208,157 @@ of `PR_000024901`, which allows at most two such components, gives the clauses t
 the context holds that class or three more witnesses with pairwise disjoint fillers exist.
 Two other definitions give alternatives with four such witnesses, and the trace holds the
 at-most conclusion over each group of four with no literal besides the alternative's
-guard, so neither four-witness alternative holds in any model. With `PR_000024901` true,
-the clauses of ore_ont_6952 have 3 models, in which the successor of the existential
-restriction joins one of the three witnesses. Without it they have 18, the 3! ways of
-merging the alternative's three witnesses with the minimum's three, times the 3 places of
-that successor. ore_ont_10140 also states the exact cardinality in a told
-`SubClassOf` axiom beside the definition, which gives the context a second group of three
-witnesses, so its clauses have 18 models with `PR_000024901` and 108 without it, 3! × 3! ×
-3. Every model has exactly three blocks. A search that merges a pair of the first four
-blocks while more than three remain, as the hypertableau's ≈-rule follows the at-most
-clause, visits 49 nodes on ore_ont_6952 and 319 on ore_ont_10140 and ends in the 18 and 108
-outcomes when it skips the pairs known to be different, and meets 138 and 948 more clashes
-when it tries them.
+guard, so no partition admits either four-witness alternative. With `PR_000024901` true,
+3 partitions of ore_ont_6952's terms admit the context's clauses, in which the successor
+of the existential restriction joins one of the three witnesses, although the class's own
+maximum of two refutes them once its definition is applied. Without it, 18 partitions
+admit them, the 3! ways of merging the alternative's three witnesses with the minimum's
+three, times the 3 places of that successor. ore_ont_10140 also states the exact
+cardinality in a told `SubClassOf` axiom beside the definition, which gives the context a
+second group of three witnesses, so 18 partitions admit its clauses with `PR_000024901` and
+108 without it, 3! × 3! × 3. Every such partition has exactly three blocks. A search that
+merges a pair of the first four blocks while more than three remain, as the hypertableau's
+≈-rule follows the at-most clause, visits 49 nodes on ore_ont_6952 and 319 on ore_ont_10140
+and ends in the 18 and 108 partitions when it skips the pairs known to be different, and
+meets 138 and 948 more clashes when it tries them.
 
 The larger bound with the filter shows the contexts that follow. The attempt on
 ore_ont_6952 derives 161,338 conclusions in the context of `PR_000024923`, which has the
-same shape and the same 3 and 18 models, 98,516 in that of `PR_000024883` and 57,088 in that
-of `PR_000026735`. The attempt on ore_ont_10140 derives 231,936 of its 254,317 conclusions
-in the context of `PR_000024883`. `PR_000026735` has exactly six components of `PR_P08034`
-and inherits exactly six components of `PR_000007997` from `PR_000026734`, and `PR_P08034`
-is a subclass of `PR_000007997`, so the six witnesses of each group must be the six of the
-other. The context's clauses have 720 models, the perfect matchings of the two groups, and
-its 55,466 paramodulations had not saturated it when the attempt stopped. A census over the
-told axioms takes, for each class, the groups of its stated and inherited exact
-cardinalities over `has_component`, and for each pair of groups whose qualifiers are equal
-or related by told subsumption it counts the ways of mapping the smaller group one to one
-into the larger, then multiplies these counts. It finds 72 classes with such a pair in
-ore_ont_6952 and 81 in ore_ont_10140. The largest products are 331,776 for `PR_000027411` and
+same shape and the same counts of 3 and 18 partitions, 98,516 in that of `PR_000024883` and
+57,088 in that of `PR_000026735`. The attempt on ore_ont_10140 derives 231,936 of its
+233,068 conclusions in the context of `PR_000024883`. `PR_000026735` has exactly six
+components of `PR_P08034` and inherits exactly six components of `PR_000007997` from
+`PR_000026734`, and `PR_P08034` is a subclass of `PR_000007997`, so the six witnesses of
+each group must be the six of the other. 720 partitions admit the context's clauses, the
+perfect matchings of the two groups, and none with fewer merges, while its 55,466
+paramodulations had not saturated it when the attempt stopped. A census over the told
+axioms takes, for each class, the groups of its stated and inherited exact cardinalities
+over `has_component`, and for each pair of groups whose qualifiers are equal or related by
+told subsumption it counts the ways of mapping the smaller group one to one into the
+larger, then multiplies these counts. It finds 72 classes with such a pair in ore_ont_6952
+and 81 in ore_ont_10140. The largest products are 331,776 for `PR_000027411` and
 `PR_000027412`, which each have four pairs of groups of four, 720 for `PR_000026735` and
-`PR_000026737`, and 120 for `PR_000027403`, and the census leaves out the candidates'
-alternatives, which add groups as they do for `PR_000024883`.
+`PR_000026737`, and 120 for `PR_000027403`. The products are counts of mappings and not
+measured searches, and they leave out the candidates' alternatives, which add groups as
+they do for `PR_000024883`.
 
-The two files therefore spend their bound on contexts whose clauses have a few dozen to a
-few hundred models. The Eq rule and paramodulation derive clauses that hold in every model
-together, through each combination of the terms' facts and equalities, and the merge
+The two files therefore spend their bound on contexts whose clauses admit a few dozen to a
+few hundred partitions. The Eq rule and paramodulation derive clauses that hold in all of
+them together, through each combination of the terms' facts and equalities, and the merge
 derived them through the combinations of conditional premises of its merged terms. A
-branch of the exploration takes one outcome at a time, with every fact of the branch
+branch of the exploration takes one partition at a time, with every fact of the branch
 unconditional. It stores no equality clause, so nothing is derived again when a
 certificate arrives, and an at-most step over `n + 1` present neighbours offers at most
 `n(n + 1)/2` merges of facts, with none of the products of conditional premise lists that
 gave the merge 12,768 conclusions from one role literal. The cost moves into the number of
-branches. A test that only needs one open branch, such as a candidate that does not hold,
-ends in the first outcome that survives. A candidate that holds in every branch, or
-classification that collects the subsumers common to all branches as the paper's branch
-exploration does, visits every outcome unless the search skips the choices that a clash
-does not depend on. Without that, the 331,776 outcomes of `PR_000027412`, with sixteen
-merges each, make about 5.3 million merges in one context, twenty times the default bound. The dependency-directed backtracking
-that HermiT adds to the hypertableau is such a skip, and the published exploration has
-none.
+branches. A test that needs one open branch, such as a candidate that does not hold, can
+end in the first partition that survives. A candidate that holds in every branch, or the
+collection of the subsumers common to all branches that the paper's branch exploration
+performs, visits every branch unless the search avoids some. As an illustration that
+assumes the four pairs of groups of `PR_000027412` are independent matchings, a search that
+skips known-different pairs takes 64 merges to enumerate the 24 matchings of one pair, and
+enumerating all four while keeping the shared prefixes takes 64 × (1 + 24 + 24² + 24³) =
+923,200 merges. Dependency-directed backtracking, which HermiT adds to the hypertableau,
+skips choices that a clash does not depend on, and the paper reduces classification work
+through the taxonomy, but neither is shown here to remove that enumeration, and the round
+does not establish how an exploration would charge such work against the present bound.
 
 ore_ont_6485's attempt at the default bound derives 258,378 conclusions, 140,857 of them in
 the hypothetical successor of `∃r.HeteroAtom` over one of the bond roles, which 21
 predecessors share, and 29,424 in the hypothetical successor of a restriction over the same
-role whose filler is a name of the normalization, which 4 predecessors share. In the first,
-109,560 derivations are the disj rule's, which takes the cases of unions such as
-`HeteroAtom`, a union of four classes one of which is the union of five halogens. It processes 19,901 clauses whose
-bodies hold one to five of 21 markers, the atoms over `x` that a predecessor can send, in
-267 distinct sets. The second processes 4,843 clauses, 148 with one marker, 4,485 with two
-and 210 with three, out of 12 markers in 36 distinct sets. The present calculus thus keeps
-one context and conditions its clauses on the sets of markers. The exploration instead
-makes a successor a conjunction of its filler and the facts that one branch of one
-predecessor sends, so each hypothetical successor becomes one conjunction for each set of
-markers that a predecessor's branch sends, each with branches of its own. The predecessors'
-contexts send every marker under a condition, 5 to 13 markers for each predecessor of the
-first successor and 10 for each predecessor of the second, so their branches can send up to
-14,208 and 4,096 sets. The bond roles are symmetric, so a successor also counts its
-predecessor in its own exact cardinalities, and a conjunction must state whether the
-predecessor has each qualifier that counts it. The ontology's exact cardinalities over the
-bond roles have the seven qualifiers `OxygenAtom`, `BromineAtom`, `HalogenAtom`,
-`HydrogenAtom`, `CarbonAtom`, `Alkyl` and `OrganicGroup`. Under its told disjointness and
-inclusions they allow 14 combinations for a predecessor, and the cardinalities of the
-classes of oxygen and nitrogen, with the qualifiers `HydrogenAtom`, `CarbonAtom` and
-`Alkyl`, allow 4. The conjunctions for the two successors are therefore bounded by 14,208 ×
-4 and 4,096 × 14, against the 267 and 36 sets of markers that the calculus uses, and the
+role whose filler is a name of the normalization, which 4 predecessors share. Neither
+context's cost is equality. In the first, 109,560 derivations are the disj rule's, which
+takes the cases of unions such as `HeteroAtom`, a union of four classes one of which is the
+union of five halogens. It processes 19,901 clauses whose bodies hold one to five of 21
+markers, the atoms over `x` that a predecessor can send, in 267 distinct sets. The second
+processes 4,843 clauses, 148 with one marker, 4,485 with two and 210 with three, out of 12
+markers in 36 distinct sets. The present calculus thus keeps one context and conditions its
+clauses on the sets of markers. The exploration instead makes a successor a conjunction of
+its filler and the facts that one branch of one predecessor sends, so each hypothetical
+successor becomes one conjunction for each set of markers that a predecessor's branch
+sends, each with branches of its own. In the processed clauses of the predecessors' contexts
+when the attempt stops, every marker is sent under a condition, 5 to 13 markers for each
+predecessor of the first successor and 10 for each predecessor of the second, so that
+snapshot allows up to 14,208 and 4,096 sets. A finished saturation could send more, and the
+conditions, inclusions and overlap between predecessors could make far fewer occur. The
+bond roles are symmetric, so a successor also counts its predecessor in its own exact
+cardinalities, and a conjunction must state whether the predecessor has each qualifier
+that counts it. The ontology's exact cardinalities over the bond roles have the seven
+qualifiers `OxygenAtom`, `BromineAtom`, `HalogenAtom`, `HydrogenAtom`, `CarbonAtom`,
+`Alkyl` and `OrganicGroup`. Under its told disjointness and inclusions, where `BromineAtom`
+is a halogen and `Alkyl` is a carbon atom and an organic group, they allow 13 combinations
+for a predecessor, and the cardinalities of the classes of oxygen and nitrogen, with the
+qualifiers `HydrogenAtom`, `CarbonAtom` and `Alkyl`, allow 4. For this snapshot the
+conjunctions of the two successors are therefore at most 14,208 × 4 = 56,832 and 4,096 ×
+13 = 53,248, against the 267 and 36 sets of markers that the calculus conditions on. The
 number that the predecessors' branches send in practice is known only from an
-implementation.
+implementation, so these figures show no pass and no failure.
 
-Counting inside a branch needs more than the published calculus, which is for ALCHI
-without number restrictions, equality or transitive roles. First, an at-most step over
-present neighbours with the hypertableau's merge, where two successors merged in a branch
-become the successor of the conjunction of both labels, which keeps no merged term and no
-transfer. Second, the qualification of each counted neighbour. A neighbour whose label the
-branch does not decide needs a guess between the qualifier and its negation, in the way
-that the paper's R←∃ rule guesses between `H ⊑ ∃S.C` and `H ⊑ ∃R.(K ⊓ ¬C)`, so each counted
-qualifier can double the successor conjunctions. Third, the predecessor in a count over an
-inverse or symmetric role, where the successor conjunction must carry a guess of the
-predecessor's qualification and the predecessor must refute the guesses that it does not
-satisfy, as the R←∀ rule does for universal restrictions. A merge of a successor's own
-successor with the predecessor sends facts back to the predecessor, which the guesses must
-also cover. Fourth, a proof that a set closed under these rules gives a model, extending
-the paper's Theorem 1 as Appendix C extends the Horn case, which no published work gives.
-The exploration also replaces the store of context clauses that the Pred rule, the
-hypothetical successors, item 728's lazy clauses and item 804's rooted run are built on, so
-it is a new Tier D beside the present one.
+Counting inside a branch needs more than the published calculus, whose rules are for ALCHI
+without number restrictions or equality and whose implementation takes transitive roles
+through an encoding. First, the branch needs an at-most step over present neighbours with
+the hypertableau's merge, where two successors merged in a branch become the successor of
+the conjunction of both labels and keep their distinctness from the other witnesses and
+the roles that reach them. Second, the step needs the qualification of each counted
+neighbour. A neighbour whose label the branch does not decide needs a guess between the
+qualifier and its negation, in the way that the paper's R←∃ rule guesses between `H ⊑ ∃S.C`
+and `H ⊑ ∃R.(K ⊓ ¬C)`, so each counted qualifier can double the successor conjunctions.
+Third, a count over an inverse or symmetric role needs the predecessor's part. The
+successor conjunction must carry a guess of the predecessor's qualification, and the
+predecessor must refute the guesses that it does not satisfy, as the R←∀ rule does for
+universal restrictions. A merge of a successor's own successor with the predecessor sends
+facts back to the predecessor, which the guesses must also cover, and the backtracking of
+one local branch must stay independent of the others after such a merge. Fourth, the
+counts must follow the role hierarchy, counting a qualified neighbour once across the
+subroles that reach it, keep the simple-role restriction, and keep the transitive roles'
+encoding apart from the counted roles. Fifth, the extension needs a finite vocabulary of
+conjunctions and neighbour configurations for termination, and a proof that a set closed
+under the rules gives a model, extending the paper's Theorem 1 as Appendix C of Bate and
+others proves Theorem 9 for the disjunctive calculus with number restrictions. None of the
+sources that this round reads gives that proof. The exploration also replaces the store of
+context clauses that the Pred rule, the hypothetical successors, item 728's lazy clauses
+and item 804's rooted run are built on, so it is a new Tier D beside the present one.
 
-The round predicts that the exploration would avoid the cost measured on the two versions
-of the Protein Ontology, whose contexts have few models, but only with a search that skips
-irrelevant choices, which makes it a hypertableau inside the contexts. It predicts no pass
-for ore_ont_6485, where the exploration turns the conditions on 36 and 267 sets of markers
-into conjunctions that the traces bound only in the thousands to tens of thousands, and
-where the predecessor's part in a count has no published calculus. Item 894 asks for the
-three files to classify so that counting can be on by default. A split that builds the
-exploration for the two versions of the Protein Ontology would leave ore_ont_6485 falling
-back, so counting would stay off by default after a new Tier D. The round therefore
-recommends closing item 894 at its measured outcome, with counting off by default and the
-axioms that need it left out and reported as they are now. Item 603 already names
-saturation with a tableau as the path where the calculus cannot finish, and the matchings
-and conjunction counts above are the measurements a follow-up item for counting by search
-would start from.
+The narrower repair keeps the merge and changes what its at-most rule counts. In the merge's
+traces, a merged term is a candidate beside the terms that its set covers, and the session
+that measured it proposed that a product never take two candidates one of whose sets
+strictly contains the other's. The member sets of the merged terms follow from the filler
+facts that the transfer moves into them, since each witness has its own filler. In the
+merge's hottest context of ore_ont_6952, 108,839 of its 168,148 at-most and lazy
+conclusions at the default bound take such a pair, which leaves 59,309, and in that of
+ore_ont_10140, 69,929 of the 211,345 conclusions whose merged terms are known take one,
+which leaves 141,416. The products that remain are those of merged terms whose sets are
+incomparable, such as the merged terms of one witness of each group, whose number grows
+with the matchings above, and the merge's attempt on ore_ont_6952 at the larger bound
+derived 1,170,975 at-most and lazy conclusions without finishing. The repair does not reach
+ore_ont_6485, whose cost in the reverted engine is not equality. Under the merge, that
+file's hottest context, the one of `AcylBromideGroup`, makes 219,761 at-most conclusions
+over maximums of one, and the attempt interns 15,284 merged terms. A maximum of one merges
+any two incomparable candidates, so the repair does not stop those unions. Its completeness argument looks
+provable. A merged term that is an element of the model has a true role literal, which
+the transfer derives only from a clause whose merged atom is then true, so it covers every
+term of a strictly smaller set. The elements of the model are thus pairwise incomparable,
+and the weaker property of Lemma 29 needs to hold only for `n + 1` neighbours with pairwise
+incomparable sets, which the restricted products still derive. The argument would state
+this restriction and check it against the lazy clauses.
+
+The options rank as follows, with their expected cost. Closing item 894 at its measured
+outcome, with counting off by default and the axioms that need it left out and reported as
+they are now, costs a change to F24, the roadmap row and a follow-up item, and it leaves
+item 894's acceptance unmet, which is a scope decision for the maintainer. Item 603
+already names saturation with a tableau as the path where the calculus cannot finish, and
+the partitions and conjunction counts above are what a follow-up item for counting by
+search would start from. The merge with the restricted products comes next. It costs one to
+two sessions, since the merge's code is one revert away and the change to the proof is
+small, and it is a bounded experiment whose snapshot leaves 35 and 67 percent of the
+at-most and lazy conclusions in the hottest contexts. It cannot reach ore_ont_6485, so it cannot by itself
+let counting be on by default. A split that builds the exploration for the two versions of
+the Protein Ontology costs a new Tier D with the counting extension above and its proof,
+and since ore_ont_6485 would still fall back, counting would stay off by default after it.
+Exploration for all three files costs the same with no demonstrated path for ore_ont_6485,
+whose snapshot alone allows tens of thousands of conjunctions for two successors. The round
+recommends closing the item, and treats the restricted merge as an optional experiment for
+the record rather than a path to the item's acceptance.
 
 ### Nominals in the disjunctive rules
 
