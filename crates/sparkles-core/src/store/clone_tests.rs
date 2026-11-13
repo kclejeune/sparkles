@@ -431,14 +431,19 @@ fn clone_roots_never_precede_the_copied_commit() {
         .clone_to_memory(&CloneOptions::default(), StoreOptions::default())
         .unwrap();
     assert_eq!(m.head_commit().timestamp_ms, LATE);
-    // a past state's clone is bounded by the commit it copies, not by the head
+    // a past state's clone is bounded by the commit it copies, not by the later head
+    src.set_clock(Arc::new(|| LATE + 10_000));
     upd(&src, "INSERT DATA { <urn:s> <urn:p> 2 }");
-    src.set_clock(Arc::new(|| LATE + 5_000));
+    assert_eq!(src.head_commit().timestamp_ms, LATE + 10_000);
+    src.set_clock(Arc::new(|| 1_000));
     let at = CloneOptions {
         at: Some(crate::history::At::Commit(copied.seq)),
         ..Default::default()
     };
     let (m, _) = src.clone_to_memory(&at, StoreOptions::default()).unwrap();
+    assert_eq!(m.head_commit().timestamp_ms, LATE);
     // a clock ahead of the copied commit is the root's time
+    src.set_clock(Arc::new(|| LATE + 5_000));
+    let (m, _) = src.clone_to_memory(&at, StoreOptions::default()).unwrap();
     assert_eq!(m.head_commit().timestamp_ms, LATE + 5_000);
 }

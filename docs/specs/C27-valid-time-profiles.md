@@ -222,9 +222,11 @@ resolves `at=time:T` to the last commit whose time is at most `T`. Suppose a rev
 first becomes visible at commit `c` with time `A`. When `A <= T`, the selected commit is
 `c` or a later one, so the revision is visible. When `A > T`, every commit from `c` on
 has a time of at least `A`, so the selected commit precedes `c` and the revision is
-absent. An as-known state therefore contains exactly the authenticated revisions whose
-availability is at most its cutoff, whatever their publication, validity or reported
-availability. A server clock that runs backward repeats the head's time and never stamps
+absent. A revision available after the cutoff therefore never enters the as-known state,
+whatever its publication, validity or reported availability. While a branch's owned
+graphs stay protected, the state also contains every authenticated revision available
+by the cutoff. An administrator who detaches a graph can still delete or rewrite such a
+record, and the record then no longer authenticates, as described below. A server clock that runs backward repeats the head's time and never stamps
 a commit earlier than one already visible. A clone starts a new lineage whose root time
 is no earlier than the commit it copies, so a cloned record cannot enter a state that
 precedes its availability. Its receipts keep naming the original dataset, branch and
@@ -240,13 +242,17 @@ Every other write path is refused before publication. Every commit point admits 
 candidate before it publishes, including SPARQL Update, Graph Store writes, uploads,
 bulk replacement, RDF Patch, merges, replays, cherry-picks and dry runs. A change to a
 source-record or proposal graph without the owner's capability answers
-`409 profile-managed-graph`, and the head, the write-ahead log and the graph stay
-unchanged. Merges of an owned graph are refused, so a record cannot reappear in another
+`409 profile-managed-graph`, and the refused commit changes neither the head, the
+write-ahead log nor the graph. A replay checks each commit separately, so the commits
+it replayed before the refused one stay published, and none of them changes an owned
+graph. Merges of an owned graph are refused, so a record cannot reappear in another
 branch's history under another time.
 
 A client can still write `ev:firstAvailableAt` into an unowned graph as ordinary RDF.
-Such a record has no receipt that carries its graph's protection nonce, so resolution
-answers `origin-not-reproduced`. Its own commit also bounds the earliest state that can
+Resolution looks for records only in the protected graphs, so such a record answers
+`evidence-unavailable` and never resolves as authenticated. A record found in a
+protected graph without a receipt that carries the graph's current protection nonce
+answers `origin-not-reproduced`. The unowned record's own commit also bounds the earliest state that can
 contain it. No template reads `ev:firstAvailableAt` as admission authority. An
 administrator who detaches a graph, edits it and protects it again gives the graph a
 new nonce, and the records written before then answer `origin-not-reproduced` until

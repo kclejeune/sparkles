@@ -791,6 +791,14 @@ mod availability {
         // the as-known February state predates its availability, though the revision
         // was published in January: publication alone admits nothing
         assert!(claims_at(&ds, At::Time(FEBRUARY)).is_empty());
+        // selection by time admits the claim exactly from its availability on
+        assert_eq!(
+            claims_at(&ds, At::Time(MARCH))
+                .get(claim.as_str())
+                .map(String::as_str),
+            Some("unknown")
+        );
+        assert!(claims_at(&ds, At::Time(MARCH - 1)).is_empty());
         let (feb, _) = ds
             .store()
             .snapshot_at(&At::Time(FEBRUARY), &Default::default())
@@ -888,5 +896,9 @@ mod availability {
         assert_eq!(availability(&ds, &follow), [MARCH_LEXICAL]);
         assert!(claims_at(&ds, At::Time(FEBRUARY)).is_empty());
         assert_eq!(claims_at(&ds, At::Head).len(), 2);
+        // both imports share the recovered head's time, so the selector at exactly that
+        // time holds both and the millisecond before holds neither
+        assert_eq!(claims_at(&ds, At::Time(MARCH)).len(), 2);
+        assert!(claims_at(&ds, At::Time(MARCH - 1)).is_empty());
     }
 }
