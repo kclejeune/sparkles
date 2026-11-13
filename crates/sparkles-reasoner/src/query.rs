@@ -1036,6 +1036,11 @@ impl Session {
             seeds: (0, 0),
         });
         let schema_from = self.graph.as_ref().expect("graph made").derived().len();
+        // A session prepared again holds the facts its earlier derivations gave, so its
+        // schema is more than a session of the view holds, and neither its schema's
+        // table nor its completeness proof is kept for other sessions (spec F17, item
+        // 911). Facts a session adds of its own make the same difference.
+        let fresh = schema_from == 0;
         let mut lower_end = schema_from;
         // where the schema came from, which the completeness proof's cache tells apart:
         // whether it came from the table, and whether a pass's table holds every schema
@@ -1112,7 +1117,7 @@ impl Session {
             g.try_add_batch(seeds)
                 .map_err(|e| memory_error(e, "the schema"))?;
             self.run(true, 0, start, "the schema")?;
-            if let Some(key) = key {
+            if let Some(key) = key.filter(|_| fresh) {
                 // the schema facts the lower stages gave belong to the schema, and their
                 // instance facts are derived again by the sessions that read the table
                 let closed = crate::specialize::closed(&vocab, rdf_type);
@@ -1147,7 +1152,7 @@ impl Session {
         let proof_key = self
             .schema_view
             .as_ref()
-            .filter(|_| !self.added_facts && !session_terms)
+            .filter(|_| fresh && !self.added_facts && !session_terms)
             .map(|v| (v.clone(), self.shared.digest, from_table));
         // the analysis's admission lasts while its closure sets are in use
         let mut _admission = None;

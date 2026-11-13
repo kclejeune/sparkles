@@ -1,15 +1,17 @@
 //! A schema pass whose rules read `now` or make blank nodes can give each session its own
-//! schema facts, so a schema completeness proof made in one session does not hold in
+//! schema facts, and a session prepared again holds the facts of its earlier
+//! derivations, so a schema completeness proof made in one session does not hold in
 //! another (spec F17, item 911). The tests empty the process-wide table cache, so they
 //! have a binary of their own and run one at a time.
 
 use oxsdatatypes::{DateTime, DayTimeDuration};
 use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::sparql::reasoning::{Demand, DemandTerm, SessionRequest};
 use sparkles_core::sparql::{QueryOptions, query};
 use sparkles_core::store::{Store, StoreOptions};
 use sparkles_reasoner::query::QueryReasoner;
 use sparkles_reasoner::{Extras, Inputs, Profile, tables};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The tests clear the table cache, so they do not run beside each other.
@@ -120,4 +122,44 @@ fn a_proof_over_a_schema_that_makes_blank_nodes_is_not_reused() {
         answer(&s, &qr, !first_pad, "a pass of the other label");
         answer(&s, &qr, !first_pad, "the table of that pass");
     }
+}
+
+/// A session prepared and derived twice holds, at its second schema acquisition, the
+/// domain fact its first derivation gave. A proof over that graph closes `rdfs:domain`,
+/// and a fresh session that reads the schema's table, which lacks the fact, must not use
+/// it. The literal-subject fact keeps the first pass's proof from the table's readers.
+#[test]
+fn a_proof_of_a_session_prepared_again_is_not_reused() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let qr = reasoner("[invalid: (?s ex:literal ?x) -> (?x rdfs:subClassOf ex:C)]");
+    let s = store();
+    s.load(&[Source::from_bytes(
+        b"<http://ex.org/a> <http://ex.org/literal> \"lit\" .".to_vec(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let mut session = qr
+        .provider()
+        .start(SessionRequest {
+            snap: s.snapshot(),
+            readable: None,
+            stop: Arc::new(|| Ok(())),
+            max_memory: None,
+            no_cache: true,
+        })
+        .unwrap();
+    let iri = |i: &str| DemandTerm::Const(oxrdf::NamedNode::new_unchecked(i).into());
+    let value = Demand {
+        s: iri("http://ex.org/answer"),
+        p: iri("http://ex.org/value"),
+        o: DemandTerm::Var,
+    };
+    for round in 0..2 {
+        session.prepare(std::slice::from_ref(&value)).unwrap();
+        session.derive(vec![(0, Vec::new())]).unwrap();
+        assert!(session.report().derived > 0 || round > 0, "round {round}");
+    }
+    drop(session);
+    answer(&s, &qr, false, "a fresh session that reads the table");
 }
