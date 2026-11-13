@@ -1918,23 +1918,24 @@ an inequality of a successor term each time a new certificate of that term is pr
 so that a certificate that comes after the clause still simplifies it. In the hottest
 context of ore_ont_6952, a protein complex with three successors of exact cardinalities
 over `has_component` beside the successors of its definition, the rule derives 46,709
-conclusions from 358 processed clauses at the default bound and 240,338 from 775 processed
+conclusions from 356 processed clauses at the default bound and 240,338 from 775 processed
 clauses at the larger one. A diagnostic build that reports each rederivation that changes
-the store found no such rederivation among 46,617. The count is about 0.4 times the square
-of the processed clauses, since each processed certificate derives every live equality
-clause over its term again and both sets grow as the context saturates, and each
-rederivation reads the certificates of both of its terms again, so the work grows faster
-than the square of the clauses. This is why the rule's cost grows with the bound and why a
-larger bound only stops the attempt at a context that has processed twice as many clauses.
-A filter that skips the rederivations that the new certificate cannot change, kept as an
-experiment and not adopted, removes all but 118 of them on ore_ont_6952 and all of them on
-ore_ont_10140. The attempts then spend the larger bound on paramodulation, 247,395 and
-223,556 derivations, in contexts that have processed 1,681 and 2,276 clauses and are still
-deriving. ore_ont_6485's attempt without the first part derives 1,522,033 conclusions at
-the larger bound, 575,550 of them paramodulations and 127,945 rederivations, and 1,065,930
-of them in one context. The three files therefore spend their bound on equality reasoning
-between successor terms, through the rederivation of the equality clauses that
-paramodulation makes and through paramodulation itself once the rederivation is filtered.
+the store found none among those 46,709, of which 46,617 are ones that the filter below
+skips. The count is between 0.37 and 0.40 times the square of the processed clauses, since
+each processed certificate derives every live equality clause over its term again and both
+sets grow as the context saturates, and each rederivation reads the certificates of both
+of its terms again, so the work grows faster than the square of the clauses. This is why
+the rule's cost grows with the bound and why a larger bound only stops the attempt at a
+context that has processed twice as many clauses. A filter that skips the rederivations
+that the new certificate cannot change, kept as an experiment and not adopted, removes all
+but 118 of them on ore_ont_6952 and all of them on ore_ont_10140. The attempts then spend
+the larger bound on paramodulation, 247,395 and 223,556 derivations, in contexts that have
+processed 1,681 and 2,276 clauses and are still deriving. ore_ont_6485's attempt without
+the first part derives 1,522,033 conclusions at the larger bound, 575,550 of them
+paramodulations and 127,945 rederivations, and 1,065,930 of them in one context. The three
+files therefore spend their bound on equality reasoning between successor terms, through
+the rederivation of the equality clauses that paramodulation makes and through
+paramodulation itself once the rederivation is filtered.
 
 The Eq rule makes this cost in two ways. It rewrites into the equality's clause every
 clause whose maximal literal is over the larger term, so that each equality clause
@@ -1943,104 +1944,213 @@ premises' bodies and heads, are premises of the next products and equalities. An
 equality is a literal of a stored clause, the certificates that refute it reach it only
 through the rederivation above. Merging, as Kazakov's Horn-SHIQ calculus merges two
 successors that an at-most restriction identifies, writes no equality between two
-successor terms. The at-most conclusion names one merged restriction for each pair, a
-merged restriction whose filler holds two disjoint classes is false when it is made, and
-each term's facts move to the merged term once, so neither the rewriting of every clause
-nor the rederivation exists. The exploration of Kazakov and Klinov instead keeps no
-disjunction and takes one branch of a context at a time, where an equality merges two
-terms as the hypertableau's ≈-rule does. Its published calculus is for ALCHI without
-number restrictions, transitive properties or nominals, and its completeness for an
-at-most restriction and for the predecessor's part in a count is not shown. It also
-replaces the store of context clauses that the Pred rule, the hypothetical successors,
-item 728's lazy clauses and item 804's rooted run are built on, so it is a new Tier D and
-not a rule of the present one.
+successor terms. Without such equalities the again rule has no clause to derive again, no
+equality is rewritten into another, and the Factor and Ineq rules have nothing to take,
+which the merge gives by construction. The transfer rule below still combines each clause
+of a merged atom with each clause of a fact of a term it merges, so a merged term with `k`
+clauses of its atom and `l` clauses of facts of its terms can take `k × l` transfers, and
+a fact moves to every merged term whose atom holds and whose set contains its restriction.
+That is the shape of the paramodulations of one equality. Whether the transfers and the
+merged terms' contexts cost less than the paramodulation they replace is therefore a
+hypothesis of this design, which the traces above do not show and the measurement below
+decides.
+
+The exploration of Kazakov and Klinov instead keeps no disjunction and takes one branch of
+a context at a time. Its published calculus is for ALCHI, with no number restrictions, no
+equality, no transitive properties and no nominals, so it says nothing of an at-most
+restriction or of the predecessor's part in a count. Taking counting into it would mean
+merging two terms within a branch, as the hypertableau's ≈-rule does, which would be an
+extension of ours with a completeness argument of its own. It also replaces the store of
+context clauses that the Pred rule, the hypothetical successors, item 728's lazy clauses
+and item 804's rooted run are built on, so it is a new Tier D and not a rule of the
+present one. Both paths change the inference system behind Theorem 9 and need an argument
+of completeness. The merge's argument is given below, and it keeps every rule of the
+calculus except the equalities of the at-most conclusions.
 
 The decision is the merge. It changes the rule whose cost the traces measure and keeps the
 calculus, its contexts and its other rules. The exploration stays the remaining path if
 the merge's measurement fails, and the questions above about counting and completeness are
-the design work it would then need. The merge applies in runs that count without the root,
-to an equality between two successor terms whatever rule makes it. The Eq rule keeps every
-equality with the predecessor and every equality of a rooted run.
+the design work it would then need. The merge applies in runs that count without the root.
+Those runs have no nominals, no self restrictions and no reflexive roles, so no clause
+holds a loop `S(x, x)` or an equality of `x`, and every equality is `f(x) ≈ y` or `f(x) ≈
+g(x)` for successor terms `f(x)` and `g(x)`. Rooted runs keep the Eq rule for every
+equality.
 
 A merged term is named by the set `S` of the existential restrictions of the normalized
-ontology whose successor terms it merges, and its restriction is `∃R_S.K_S`, with `R_S`
-the union of their roles and `K_S` the union of their fillers. The merge of two terms with
-the sets `S` and `T` is the term of `S ∪ T`, interned during the run in a table beside the
-Horn rules' table of conjunctions, and a merge with a term whose set contains the other's
-returns that term. The name is the set of restrictions and not the pair of unions, since
+ontology whose successor terms it merges, with the function symbol `m_S` and the merged
+atom `M_S`. A restriction `e` of the ontology has the set `{e}` and its own symbol `f_e`.
+The merge of two terms with the sets `S` and `T` is the term of `S ∪ T`, interned during
+the run in a table beside the Horn rules' table of conjunctions, so a merge with a term
+whose set contains the other's returns that term and a repeated merge makes no new symbol.
+The name is the set of restrictions and not a pair of unions of roles and fillers, since
 two different pairs can have one union, as `∃r.A` with `∃r.B` and `∃r.A` with `∃r.(A ⊓ B)`
-do, and the transfer below may move facts only from the terms that a merged term merges. A
-merged atom is a name of its own and never an existential restriction of the ontology, so
-it holds only where an equality of its terms holds. The merged terms are bounded by the
-subsets of the ontology's existential restrictions, an exponential bound like that of the
-calculus's own contexts, so the run terminates. The function symbols are ordered by the
-size of their set, then by its sorted members, with each restriction of the ontology a set
-of one, so the order is total and well founded as Definition 3 requires, and a merged
-symbol is above each term it merges.
+do, and the transfer below may move facts only from the terms of the restrictions in the
+set. A merged atom is a name of its own and never an existential restriction of the
+ontology, so the rules do not unfold it, and a merged term has the facts that the transfer
+and the calculus's other rules derive for it and no others. The merged symbols are bounded
+by the subsets of the ontology's existential restrictions, an exponential bound like that
+of the calculus's own contexts, so the run terminates. The function symbols are ordered by
+the size of their set, then by its sorted members. Each set names one symbol, so the order
+is total on finitely many symbols and well founded as Definition 3 requires, and a symbol
+is above every symbol whose set is a proper subset of its own. A merge that returns one of
+its inputs adds no symbol and no pair to the order. The context order places the merged
+atoms over `x` above the named classes, as it places every atom that the normalization
+makes, and no merged atom is a predecessor trigger, so condition 5 of Definition 3 holds
+as before.
 
-Where the at-most rule or a lazy clause would write the equality `f_i(x) ≈ f_j(x)` of two
-successor terms, it writes the atom `M_ij(x)` of the merge of the two terms, and the
-normalization of a conclusion does the same for such an equality that any other rule
-makes, so that no stored clause holds an equality between two successor terms. Each
-equality of an at-most conclusion over a maximum above one becomes a merged atom of its
-own, and the conclusion's other literals and its body stay as they are, so `Γ → Δ ∨ ⋁
-f_i(x) ≈ f_j(x)` becomes `Γ → Δ ∨ ⋁ M_ij(x)`. A merged atom whose filler holds two atoms
-of one disjointness set, or whose roles hold two disjoint properties, is false and leaves
-the head when it is made. This takes the place of the inequality certificates between the
-fillers of witnesses and decides the disjoint-role example above. A merged atom is a class
-atom over `x` that names an existential restriction, so the rules unfold it to the role
-literals of every role in `R` and the atoms of `K` over the merged term `m_ij(x)`, and the
-Succ rule makes its successor as for any existential restriction.
+The at-most rule and item 728's lazy clauses are the only rules of these runs that would
+write an equality between two successor terms. No clause of the ontology holds one, since
+a minimum is normalized to witnesses with pairwise disjoint fillers. The Eq rule rewrites
+a successor term only into the predecessor once such equalities are gone, and the Pred
+rule of these runs sends only atoms and role atoms over the predecessor, so neither rule
+makes one. Where the at-most rule or a lazy clause would write `s(x) ≈ t(x)` for two
+successor terms with the sets `S` and `T`, it writes the merged atom `M_{S ∪ T}(x)`, which
+is the atom of the larger term when one set contains the other. Each equality of an
+at-most conclusion over a maximum above one becomes a merged atom of its own, and the
+conclusion's equalities with the predecessor, its other literals and its body stay as they
+are, so `Γ → Δ ∨ ⋁ s_i(x) ≈ s_j(x)` becomes `Γ → Δ ∨ ⋁ M_{S_i ∪ S_j}(x)` with `Δ`
+unchanged. A merged atom leaves the head when it is made if two of its terms have
+certificates of classes in one disjointness set under the clause's body and the rest of
+its head, as the equality leaves it today. The disjoint-role rule derives the clash of two
+disjoint roles over the merged term once both role literals are transferred, which decides
+the disjoint-role example above. Neither needs a later rederivation, since a certificate
+that arrives after the merged atom reaches the merged term through the transfer, and the
+clash in the merged term's context returns to the atom's clause through the Pred rule.
 
-The merged term must carry the facts of both terms, which the requirements above call the
-identity of the element. The transfer rule derives from a clause `Γ_1 → Δ_1 ∨ M_ij(x)`
-whose maximal literal is the merged atom and a clause `Γ_2 → Δ_2 ∨ L(f_i(x))` whose
-maximal literal `L` is a class atom over `f_i(x)` or a role literal between `x` and
-`f_i(x)` in either direction, the clause `Γ_1 ∧ Γ_2 → Δ_1 ∨ Δ_2 ∨ L(m_ij(x))`, and the
-same for `f_j`. These are the only literals over a successor term that a context clause
-holds, since a body holds none. The transfer reads `M_ij(x)` as the statement that
-`f_i(x)` and `f_j(x)` are one element, which is what the at-most conclusion entails, and
-it is sound in the sense of the calculus's other rules with the merged term read as that
-element, since the interpretation of the fresh symbol `m_ij` is free. Unlike the Eq rule,
-it moves only the facts of a term and never a clause with another merged atom over the
-term into a new equality, so it makes no clause that the rederivation above would revisit,
-and the Succ rule sends the transferred facts to the merged term's successor as markers in
-the usual way. The merged terms are candidates of the at-most rule like any successor, so
-a count that needs three terms in one element merges a merged term again, and a merge of a
-term with a merged term that contains it is that merged term's own atom.
+The merged symbols are sound under definitions that add no consequence over the ontology's
+signature. Read `M_S(x)` as the statement that the terms `f_e(x)` of the restrictions `e`
+in `S` are one element, and `m_S(x)` as that element where `M_S(x)` holds. Where it does
+not, read `m_S(x)` as the element that corresponds to `f_e(x)`, for the least `e` in `S`,
+in another copy of the model. The disjoint union of a model with a copy of itself is again
+a model of the ontology, since these runs have no nominals, and no role relates an element
+to the other copy. The disjoint union of any model with its copy therefore has an
+expansion that satisfies the definitions, and it satisfies the same clauses over the
+ontology's signature as the model, so the definitions add no consequence there. A rule's
+conclusion is a consequence of the ontology with the definitions. A role literal of
+`m_S(x)` makes `M_S(x)` true, so an at-most conclusion's merged atom holds where its
+equality does, whether its terms are terms of the ontology's restrictions or merged terms,
+since the equality of `m_S(x)` with `f_e(x)` or with `m_T(x)` makes every term of `S ∪
+{e}` or of `S ∪ T` one element. A transfer holds since `M_T(x)` makes `f_e(x)`, for `e` in
+`T`, and `m_T(x)` one element, and the simplification by certificates holds since two
+terms in disjoint classes are two elements while `M_{S ∪ T}(x)` makes `m_S(x)` and
+`m_T(x)` one.
 
-The completeness argument follows the model construction of Theorem 9 and Kazakov's
-argument for at-most restrictions in Horn-SHIQ. For an element of the constructed model
-whose context's clauses give the interpretation `I` over its terms, call a successor term
-covered when a merged term whose atom is true in `I` merges its restriction with another,
-and build successors only for the uncovered terms whose role literals are true in `I`. A
-covered term is mapped to the element of an uncovered term that covers it through a chain
-of merges, and every fact of the covered term holds there, since the transfer applies
-along each step of the chain and the Succ rule sends the transferred facts as markers. If
-an at-most restriction `≤n S.C` had `n + 1` uncovered `S.C`-successors, the at-most rule
-applied to their role and qualification premises gives a clause that is in the store or
-redundant, and `I` satisfies it only through a merged atom of two of them, since the rest
-of its head and body are false or true as its premises' are, so one of them is covered,
-which contradicts the choice. Every clause over a covered term thus holds of the element
-it is mapped to, and every count holds over the uncovered terms, which is the obligation
-the requirements above state in place of the rewrite `f_1(x) ⇒ f_2(x)`. The Ineq and
-Factor rules keep their part for the equalities that stay, those with the predecessor, and
-an inequality between two successor terms is the false merged atom of the paragraph above.
-The design review checks this argument in particular against the qualification of a term
-by the counting qualifier through a conditional fact or a universal restriction, which the
-at-most rule reads from the premises it already reads, and against an equality that
-arrives through the Pred rule, which is over the predecessor and stays with the Eq rule.
+The transfer rule gives the merged term the facts of the terms in its set, which the
+requirements above call the identity of the element. From a clause `Γ_1 → Δ_1 ∨ M_T(x)`
+whose maximal literal is the merged atom and a clause `Γ_2 → Δ_2 ∨ L(f_e(x))` with `e` in
+`T`, whose maximal literal `L` is a class atom over `f_e(x)` or a role literal between `x`
+and `f_e(x)` in either direction, it derives `Γ_1 ∧ Γ_2 → Δ_1 ∨ Δ_2 ∨ L(m_T(x))`. A unit's
+literals over `f_e(x)` take part in place, as they do in the Eq rule. These are the
+literals over a successor term that a clause of these runs holds apart from the equality
+`f_e(x) ≈ y`, which the transfer does not move and need not, as the argument below shows.
+A merged term's own facts do not move to a larger merged term, since the model below maps
+only the terms of the ontology's restrictions, so every transfer starts at a term
+`f_e(x)`. The context of a merged term thus takes every fact of its terms, their
+certificates among them, and the universal restrictions of the predecessor reach it
+through its transferred role literals. The Succ rule makes the merged term's successor
+context as it does for any successor term and sends it the transferred facts as markers.
+The merged terms are candidates of the at-most rule like any successor, through their
+transferred role literals, so a count that needs three terms in one element merges a
+merged term again.
+
+The completeness argument extends the proof of Theorem 9 in Appendix C. Its model fragment
+`R_t` from the ground clauses `N_t` of the context of a term `t` (C.2), the unfolding of
+the context structure into the rewrite system `R` (C.3) and Lemmas 13 to 28 rest on the
+forms of context clauses, on the order of Definition 3 and on the saturation under the
+Core, Eq, Ineq, Factor, Pred and Succ rules. The merged atoms are unary atoms over `x` and
+the merged symbols are function symbols of sort a, the order extends as above, and those
+rules are kept, so `R` is built as there and the lemmas hold, with the merged symbols in
+its Herbrand universe. The proof uses this productive interpretation and not an arbitrary
+model of the clauses, since in `R` every atom that is true in `R_t*` and whose terms `R`
+does not reduce is the maximal literal of a generative clause of `N_t` whose other
+literals are false (Lemma 16), and such a clause is an instance of a context clause that
+can be a premise of the rules. Lemma 29 shows from the saturation under the Hyper rule
+that `R*` satisfies each clause of the ontology, and its proof holds unchanged for every
+clause except the at-most clause of DL4 and item 728's lazy clauses, which have its form
+with atoms over `x` added to the head and whose Hyper conclusions are changed. For these
+clauses the same proof gives a weaker property. If the body atoms over `t` and `S_B(t,
+u_i)` hold in `R*` for `n + 1` different neighbours `u_i` of `t` that `R` does not reduce,
+then Lemma 27 makes each of these atoms true in `R_t*`, the rule applies to the context
+clauses behind their generative clauses, and its conclusion is in `N_t` up to redundancy
+and true in `R_t*` (Lemmas 18 and 22) while its premises' other literals are false. One of
+its head literals is therefore true. It is an atom over `t`, an equality of a `u_i` with
+the predecessor, which would reduce `u_i`, or a merged atom `M_{U_i ∪ U_j}(t)` of two of
+the successor terms, where `U_i` is the set of `u_i`.
+
+The qualification of a term by the counting qualifier `B` is the first clause of DL4 at
+that term, which Lemma 29 covers at a merged term as at any other term, whether its `B`
+comes from a conditional fact, from a universal restriction of the predecessor applied to
+a transferred role literal, or from the term's own context. So `S_B(t, m_T(t))` holds in
+`R*` when `S(t, m_T(t))` and `B(m_T(t))` do, and Lemma 27 makes it true in `R_t*`, where
+the weaker property reads it.
+
+The model is then the part of `R*` that the merged terms leave uncovered. A successor term
+`u` of `t` that `R` does not reduce, with the set `U`, is covered when `R*` makes `M_T(t)`
+true for a set `T` that strictly contains `U`, so the atom of a merged term never covers
+that term itself. For a covered term choose a largest such `T` by inclusion. Then `m_T(t)`
+is not covered, since a true atom of a strictly larger set would contradict the choice,
+and since the sets are finite every covered term has such a representative. The
+interpretation `I` has as elements the terms that `R` does not reduce and that are reached
+from the constant `c` through successors that are not covered. Its atoms and role atoms
+are those of `R*` over these elements, and the value of a function symbol `f_e` at an
+element `t` is the normal form under `R` of `f_e(t)` when that term is not covered and of
+`m_T(t)` for the chosen `T` when it is. The representative occurs in `R_t`, since the
+transfer gives it the atoms of `f_e(t)`, so its normal form is an element of `I`.
+
+`I` satisfies the clauses of the ontology. A clause with no function symbol and no
+equality in its head, such as DL1, DL3, the first clause of DL4 and DL7 to DL9, holds in
+`I` since it holds in `R*` and `I` keeps the atoms of `R*` over a subset of the terms that
+`R` does not reduce, closed under predecessors, with the role atoms between neighbours as
+there. The at-least restrictions of these runs are witnesses with disjoint fillers, so the
+clauses of DL2 are `B_1(x) → S(x, f_e(x))` and `B_1(x) → B_2(f_e(x))`, and no clause of
+the ontology holds an inequality. At an element `t` with `B_1(t)` the proof of Lemma 29
+makes both atoms over `f_e(t)` true in `R_t*`. If `f_e(t)` is neither reduced nor covered,
+it is an element and both atoms hold of it. If `R` reduces `f_e(t)` to the predecessor,
+both hold of the predecessor as in Theorem 9. If `f_e(t)` is covered, each atom and the
+atom `M_T(t)` have generative clauses in `N_t`, the transfer of the context clauses behind
+them is in `N_t` up to redundancy and true in `R_t*`, and its other literals are false, so
+the atom holds of `m_T(t)` and of its normal form. For the at-most clause and a lazy
+clause, suppose that an element `t` with the body atoms and none of the head atoms over
+`t` had `n + 1` elements `u_i` with `S_B(t, u_i)` in `I`. Each is the predecessor of `t`
+or a successor that is not covered, and the weaker property makes `M_{U_i ∪ U_j}(t)` true
+for two of the successors. If `U_i ∪ U_j` strictly contains `U_i`, that atom covers `u_i`,
+and otherwise `U_j` is a proper subset of `U_i` and `M_{U_i}(t)` covers `u_j`. Either
+contradicts the choice of elements, so every count holds in `I`. `I` agrees with `R*` over
+`c`, so it does not satisfy the query clause, and the ontology does not entail it.
+
+The equalities and inequalities that remain need nothing more. An equality `f(x) ≈ y` of a
+stored clause needs no transfer. When `R` makes it true at `t`, `R` reduces `f(t)` to the
+predecessor, so the term is not covered and its value is the predecessor as in Theorem 9.
+A merged term that the at-most rule equates with the predecessor is reduced in the same
+way, and the terms it covers take the predecessor as their value, where the transferred
+atoms hold. When `R` makes the equality false, its clause holds in `R_t*` through another
+literal, and `I` need not keep the equality or its negation for a covered term, since `I`
+is checked against the clauses of the ontology and not against the context clauses, only
+the at-most and lazy clauses have equalities in their heads, and no clause of the ontology
+holds an inequality. The Ineq and Factor rules keep their part in Lemma 21 without work.
+Every equality of these runs is `f(x) ≈ y`, so two equalities of one term have one right
+side and Factor has no premise. No clause of the ontology holds an inequality, Factor is
+the only rule that makes one from equalities and the Eq rule makes one only from another,
+so no clause holds an inequality and Ineq has no premise. The Pred rule's trigger `x ≈ y`
+never fires, since no clause of these runs holds an equality of `x` and their Pred rule
+sends only clauses whose heads are atoms and role atoms over the predecessor.
 
 The merge is built behind a switch of the lane and measured on the three files at both
 bounds, with the tallies by rule and context above, on the generated fixtures and the
-`shoi` and nominal fixtures, before any timing on `atlas`. The again rule then has no
-equality clause between successor terms to derive again, so its experimental filter stays
-unadopted. The acceptance is the row's, as the design above states it. The regressions add
-a count that needs three terms in one element, a merge whose filler holds disjoint classes
-made by the at-most rule and by a lazy clause, a merged term that takes a conditional fact
-of each term, and a qualification that reaches a merged term only through the transfer,
-beside the regressions above. If the merge leaves a file past the bound, the item returns
-to this round with the exploration.
+`shoi` and nominal fixtures, before any timing on `atlas`. Beside the rule tallies the
+trace counts the transfer attempts, the transfers the store keeps, the transfers it
+already holds up to redundancy, the merged terms and their contexts, which test the
+hypothesis that the transfers cost less than the paramodulation they replace. The again
+rule then has no equality clause between successor terms to derive again, so its
+experimental filter stays unadopted. The acceptance is the row's, as the design above
+states it. The regressions add a count that needs three terms in one element, a merged
+atom refuted by certificates when it is made and one refuted by a certificate that arrives
+after it, made by the at-most rule and by a lazy clause, two true merged atoms whose sets
+overlap without a true atom of their union, a merged term equated with the predecessor, a
+merged term that takes a conditional fact of each term, and a qualification that reaches a
+merged term only through a transferred role literal and a universal restriction, beside
+the regressions above. If the merge leaves a file past the bound, the item returns to this
+round with the exploration.
 
 ### Nominals in the disjunctive rules
 

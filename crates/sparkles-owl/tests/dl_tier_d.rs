@@ -1741,14 +1741,14 @@ fn a_short_product_with_wide_conclusions_is_charged_before_its_record_is_dropped
     }
 }
 
-/// `U ⊑ C ⊔ D`, the told union that item 894 distributes a restriction over U into cases of.
+/// `U ⊑ C ⊔ D`, the told union of item 894's regressions of restrictions over U.
 const TOLD_UNION: &str = "SubClassOf(:U ObjectUnionOf(:C :D))";
 
 #[test]
 fn a_union_filler_whose_cases_overlap_keeps_the_identity() {
-    // the cases C and D are not disjoint, so A's one successor may be in both, which the
-    // distribution must not decide: it is in E and need not be in C ⊓ D; H's successors
-    // are one, in C and D (item 894)
+    // the cases C and D are not disjoint, so A's one successor may be in both and nothing
+    // makes it be: it is in E and need not be in C ⊓ D; H's successors are one, in C and D
+    // (item 894)
     check(
         &format!(
             "SubClassOf(:A ObjectIntersectionOf(ObjectSomeValuesFrom(:r :U) ObjectMaxCardinality(1 :r)))
@@ -1782,9 +1782,8 @@ fn two_witnesses_below_a_union_take_different_cases() {
 
 #[test]
 fn two_cases_a_context_supports_independently_keep_their_equality() {
-    // A holds both cases of ∃r.U as units and at most one r-successor, so the two case
-    // terms are equal and in the disjoint C and D: the lemma does not cover them and A
-    // is unsatisfiable (item 894)
+    // A has r-successors in U ⊓ C and in U ⊓ D and at most one r-successor, so the two
+    // successors are equal and in the disjoint C and D, and A is unsatisfiable (item 894)
     check(
         &format!(
             "SubClassOf(:A ObjectSomeValuesFrom(:r ObjectIntersectionOf(:U :C)))
@@ -1801,7 +1800,7 @@ fn two_cases_a_context_supports_independently_keep_their_equality() {
 #[test]
 fn two_cases_of_two_restrictions_whose_classes_overlap_are_equated() {
     // the one successor is in C ⊔ D and in C ⊔ E with D and E disjoint, so it is in C,
-    // which needs the equality of case terms of two different restrictions (item 894)
+    // which needs the equality of the successors of two different restrictions (item 894)
     check(
         &format!(
             "SubClassOf(:A ObjectSomeValuesFrom(:r ObjectUnionOf(:C :D)))
@@ -1815,10 +1814,9 @@ fn two_cases_of_two_restrictions_whose_classes_overlap_are_equated() {
 }
 
 #[test]
-fn a_conditional_inequality_certificate_holds_after_the_distribution() {
-    // ≥2 r.U is conditional in A, its witnesses are distributed over U's cases, and at
-    // most one r-successor equates them, which their disjoint fillers refute: A is E
-    // (item 894)
+fn a_conditional_inequality_certificate_holds_for_witnesses_below_a_union() {
+    // ≥2 r.U is conditional in A, and at most one r-successor equates its two witnesses,
+    // which their disjoint fillers refute: A is E (item 894)
     check(
         &format!(
             "SubClassOf(:A ObjectUnionOf(ObjectMinCardinality(2 :r :U) :E))
@@ -1833,8 +1831,8 @@ fn a_conditional_inequality_certificate_holds_after_the_distribution() {
 
 #[test]
 fn a_qualification_by_a_case_reaches_the_predecessor() {
-    // the case successor of ∃r.U is a B through its case, which Pred reports to A, where
-    // at most one r.B equates it with the B-successor in G: the successor is in U and G
+    // the successor of ∃r.U is a B in either case of U, which Pred reports to A, where at
+    // most one r.B equates it with the B-successor in G: the successor is in U and G
     // (item 894)
     check(
         &format!(
@@ -1868,9 +1866,9 @@ fn a_transitive_property_unfolds_under_a_case() {
 
 #[test]
 fn a_case_context_takes_another_case_and_an_exclusion_from_its_predecessors() {
-    // A and B share the conditional cases of ∃r.U, so their case contexts are
-    // hypothetical: A's universal puts its successor in D, so A's C case closes, and B's
-    // universal puts its successor outside C (item 894)
+    // A and B both have ∃r.U conditionally, so its successor is hypothetical: A's
+    // universal puts A's successor in D, so the case C closes, and B's universal puts B's
+    // successor outside C (item 894)
     check(
         &format!(
             "SubClassOf(:A ObjectUnionOf(ObjectSomeValuesFrom(:r :U) :Q))
@@ -1904,12 +1902,11 @@ fn disjoint_subroles_with_one_counted_successor_are_unsatisfiable() {
     );
 }
 
-/// The mixed supports of design round 2: A's cases of ∃r.U have the support from the
-/// cases' clause, which only the larger case's term gets since only the maximal literal
-/// unfolds, and the conditional supports `X ⊔ ∃r.(U ⊓ c₁)` and `Y ⊔ ∃r.(U ⊓ c₂)` of their
-/// own, which the told chain from A to P3 derives after the cases' clause. A source support
-/// with an independent one is redundant, and the two independent ones give
-/// `X ⊔ Y ⊔ f₁ ≈ f₂`, so that the disjoint cases put A in `X ⊔ Y`.
+/// The mixed supports of item 894's design: A has an r-successor in U and the conditional
+/// ones `X ⊔ ∃r.(U ⊓ c₁)` and `Y ⊔ ∃r.(U ⊓ c₂)`, which the told chain from A to P3 derives
+/// later, with c₁ and c₂ the disjoint cases of U. At most one r-successor equates the two
+/// conditional successors under `X ⊔ Y ⊔ f₁ ≈ f₂`, so that the disjoint cases put A in
+/// `X ⊔ Y`.
 fn mixed_supports(x: &str, y: &str, c1: &str, c2: &str) {
     check(
         &format!(
@@ -1927,10 +1924,8 @@ fn mixed_supports(x: &str, y: &str, c1: &str, c2: &str) {
 
 #[test]
 fn source_and_independent_conditional_supports_of_two_cases_keep_the_product() {
-    // a subset is skipped only when every pair of its supports is redundant, so a
-    // candidate with a source and an independent support keeps the product of the
-    // independent ones; the two orders of the names give the two orders of arrival, and
-    // a skip on one redundant pair fails both (item 894)
+    // the product of the two conditional supports must stay, whichever arrives first:
+    // the two orders of the names give the two orders of arrival (item 894)
     mixed_supports("X", "Y", "D", "C");
     mixed_supports("Y", "X", "C", "D");
 }
