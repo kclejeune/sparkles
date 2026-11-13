@@ -209,7 +209,7 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
                 inv: &inv,
                 ground_total: super::dl_clause::ground_total(),
             };
-            x.store.next(ix, Some(&o), None, &mut max)
+            x.store.next(ix, Some(&o), &mut max)
         };
         let Some(id) = id else {
             break;
@@ -1998,7 +1998,7 @@ mod tests {
         let before = st.bytes();
         let added = st.take_grown();
         let mut max = Vec::new();
-        st.next(&ix, Some(&o), None, &mut max);
+        st.next(&ix, Some(&o), &mut max);
         let grown = st.take_grown();
         assert!(added == 0);
         assert!(grown >= std::mem::size_of::<super::super::dl_clause::ByTerm>());

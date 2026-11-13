@@ -1931,9 +1931,9 @@ fn source_and_independent_conditional_supports_of_two_cases_keep_the_product() {
 }
 
 #[test]
-fn a_count_that_needs_three_terms_in_one_element_merges_a_merged_term() {
-    // the one r-successor is the three witnesses at once: two merges make a merged term,
-    // which the third merges again (item 894)
+fn a_count_that_needs_three_terms_in_one_element_equates_all_three() {
+    // the one r-successor is the three witnesses at once, which two equalities of pairs
+    // do not show alone (item 894)
     check(
         &format!(
             "SubClassOf(:A ObjectSomeValuesFrom(:r :B1)) SubClassOf(:A ObjectSomeValuesFrom(:r :B2))
@@ -1950,7 +1950,7 @@ fn a_count_that_needs_three_terms_in_one_element_merges_a_merged_term() {
 }
 
 #[test]
-fn a_merged_atom_that_certificates_refute_when_it_is_made_leaves_the_clause() {
+fn an_equality_of_successors_that_certificates_refute_when_it_is_made_leaves_the_clause() {
     // the two r-successors are in the disjoint C and D when the at-most rule and the lazy
     // clause of ≥2 r ⊑ G would make them one: A is unsatisfiable and B is a G (item 894)
     check(
@@ -1969,10 +1969,10 @@ fn a_merged_atom_that_certificates_refute_when_it_is_made_leaves_the_clause() {
 }
 
 #[test]
-fn a_merged_atom_that_a_later_certificate_refutes_closes_through_the_merged_term() {
-    // the successors of P and Q are merged first, and the case analysis of A puts P's in C
-    // only later, which the transfer takes to the merged term, whose context meets Q's D:
-    // A is unsatisfiable under the at-most rule and a G under the lazy clause (item 894)
+fn an_equality_of_successors_that_a_later_certificate_refutes_closes_the_context() {
+    // the successors of P and Q are equated first, and the case analysis of A puts P's in C
+    // only later, which meets Q's D in the one element: A is unsatisfiable under the
+    // at-most rule and a G under the lazy clause (item 894)
     check(
         &format!(
             "DisjointClasses(:C :D) SubClassOf(:Q :D)
@@ -1992,9 +1992,9 @@ fn a_merged_atom_that_a_later_certificate_refutes_closes_through_the_merged_term
 }
 
 #[test]
-fn two_overlapping_merged_terms_reach_the_element_of_their_union() {
+fn two_overlapping_equalities_reach_the_element_of_all_three_successors() {
     // at most one r.Q makes the successors of B1 and B2 one, at most one r.R those of B2
-    // and B3, so all three are one element, which neither merge alone shows (item 894)
+    // and B3, so all three are one element, which neither maximum alone shows (item 894)
     check(
         &format!(
             "SubClassOf(:B1 :Q) SubClassOf(:B2 :Q) SubClassOf(:B2 :R) SubClassOf(:B3 :R)
@@ -2013,7 +2013,7 @@ fn two_overlapping_merged_terms_reach_the_element_of_their_union() {
 }
 
 #[test]
-fn a_merged_term_equated_with_the_predecessor_gives_it_the_merged_facts() {
+fn successors_equated_with_each_other_and_the_predecessor_give_it_their_facts() {
     // K's s⁻-neighbours, its predecessor and the witnesses in B1 and B2, are one, so the
     // predecessor is in B1 and B2 and in E, which their conjunction gives (item 894)
     check(
@@ -2034,7 +2034,7 @@ fn a_merged_term_equated_with_the_predecessor_gives_it_the_merged_facts() {
 }
 
 #[test]
-fn a_merged_term_takes_a_conditional_fact_of_each_term() {
+fn one_element_of_two_successors_takes_a_conditional_fact_of_each() {
     // the r1- and r2-successors are one, which is in C1 unless X and in C2 unless Y, so A
     // is in X ⊔ Y ⊔ ∃r.E with E the conjunction of C1 and C2 (item 894)
     check(
@@ -2053,10 +2053,10 @@ fn a_merged_term_takes_a_conditional_fact_of_each_term() {
 }
 
 #[test]
-fn a_qualification_reaches_a_merged_term_through_a_transferred_role() {
-    // at most one t makes the r1- and r2-successors one, and the r1 role literal that the
-    // merged term takes puts it in B by A's universal on r1, so at most one r.B makes it
-    // the r3-successor too: the one element is in Q and G (item 894)
+fn a_qualification_reaches_an_equated_successor_through_the_other_ones_role() {
+    // at most one t makes the r1- and r2-successors one, which A's universal on r1 puts in
+    // B, so at most one r.B makes it the r3-successor too: the one element is in Q and G
+    // (item 894)
     check(
         &format!(
             "SubObjectPropertyOf(:r1 :t) SubObjectPropertyOf(:r2 :t)

@@ -434,14 +434,14 @@ impl Clause {
 
     /// The maximal literals of the head under the context order: the one literal over a
     /// successor term that is greatest, else the greatest atom over x. Empty when the head
-    /// is over y alone. `merged` orders the merged terms of item 894 and their atoms.
-    pub fn maximal(&self, ix: &Index, merged: Option<&Merged>, out: &mut Vec<Lit>) {
+    /// is over y alone.
+    pub fn maximal(&self, ix: &Index, out: &mut Vec<Lit>) {
         out.clear();
         let head = self.head();
         if let Some(&m) = head
             .iter()
             .filter(|l| matches!(l.kind(), F | RL | EQ | NE))
-            .max_by(|&&a, &&b| succ_cmp(merged, a, b))
+            .max_by_key(|l| l.succ_key())
         {
             out.push(m);
             return;
@@ -449,7 +449,7 @@ impl Clause {
         if let Some(&m) = head
             .iter()
             .filter(|l| l.kind() == X)
-            .max_by(|a, b| x_cmp(ix, merged, a.atom(), b.atom()))
+            .max_by_key(|l| rank(ix, l.atom()))
         {
             out.push(m);
         }
@@ -810,156 +810,6 @@ impl Table {
     }
 }
 
-/// The first function symbol of item 894's merged successor terms. A merged term `m_S(x)`
-/// has the symbol `MERGED + k` for the k-th set S that the run interned, and its merged atom
-/// `M_S(x)` is the atom over x with the same id, so that neither meets an expression of the
-/// index, whose ids stay below it.
-pub const MERGED: Ex = 1 << 28;
-
-/// Whether a function symbol, or an atom over x, is a merged term's or its merged atom.
-#[inline]
-pub fn is_merged(f: Ex) -> bool {
-    f >= MERGED
-}
-
-/// Whether the merge of successor terms replaces the equalities between them in runs that
-/// count without the root, item 894 (F24, "Item 894's decision between merging and
-/// exploration"). `SPARKLES_DL_MERGE=1` turns it on. It is off until its measurement.
-pub fn merge_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SPARKLES_DL_MERGE").is_some_and(|v| v == "1"))
-}
-
-/// The merged terms of a run, item 894: each set of two or more existential restrictions of
-/// the normalized ontology names one merged term, interned the first time a merge makes it,
-/// so that a repeated merge makes no new symbol. Entries never move, so a worker reads a
-/// set without a lock. The counters are the run's tallies of the transfer rule.
-#[derive(Default)]
-pub struct Merged {
-    ids: parking_lot::Mutex<FxHashMap<Box<[Ex]>, Ex>>,
-    sets: Segs<Box<[Ex]>>,
-    /// whether each merged term has its successor context
-    ctxs: Segs<()>,
-    next: AtomicU32,
-    bytes: AtomicUsize,
-    /// the merged terms that have a successor context
-    pub contexts: AtomicUsize,
-    /// the transfers derived
-    pub attempts: AtomicUsize,
-    /// the transfers the store kept
-    pub kept: AtomicUsize,
-    /// the transfers the store already held up to redundancy
-    pub known: AtomicUsize,
-}
-
-impl Merged {
-    /// The set of restrictions of the merged term `m`.
-    fn set(&self, m: Ex) -> &[Ex] {
-        self.sets
-            .slot(m - MERGED, &self.bytes)
-            .get()
-            .expect("a merged term the run interned")
-    }
-
-    /// The restrictions whose successor terms the term `f` stands for: `{f}` for the term of
-    /// a restriction of the ontology, and the set of a merged term.
-    pub fn members<'a>(&'a self, f: &'a Ex) -> &'a [Ex] {
-        if is_merged(*f) {
-            self.set(*f)
-        } else {
-            std::slice::from_ref(f)
-        }
-    }
-
-    /// The term of the union of the sets of `a` and `b`: one of them when its set holds the
-    /// other's, else the merged term of the union, made on first use. `None` when the run
-    /// has made as many merged terms as the symbols can number.
-    pub fn union(&self, a: Ex, b: Ex) -> Option<Ex> {
-        let (sa, sb) = (self.members(&a), self.members(&b));
-        let mut u: Vec<Ex> = Vec::with_capacity(sa.len() + sb.len());
-        u.extend_from_slice(sa);
-        u.extend_from_slice(sb);
-        u.sort_unstable();
-        u.dedup();
-        if u.len() == sa.len() {
-            return Some(a);
-        }
-        if u.len() == sb.len() {
-            return Some(b);
-        }
-        let mut ids = self.ids.lock();
-        if let Some(&m) = ids.get(&u[..]) {
-            return Some(m);
-        }
-        let k = self.next.load(Ordering::Relaxed);
-        if k >= MERGED {
-            return None;
-        }
-        self.next.store(k + 1, Ordering::Relaxed);
-        let cap = ids.capacity();
-        let set: Box<[Ex]> = u.into();
-        let _ = self.sets.slot(k, &self.bytes).set(set.clone());
-        let entry = std::mem::size_of::<(Box<[Ex]>, Ex)>();
-        self.bytes.fetch_add(
-            2 * set.len() * 4
-                + table_bytes(ids.capacity(), entry).saturating_sub(table_bytes(cap, entry)),
-            Ordering::Relaxed,
-        );
-        ids.insert(set, MERGED + k);
-        Some(MERGED + k)
-    }
-
-    /// The order of the function symbols: by the size of their sets, then by the sorted
-    /// members, so that the terms of the ontology's restrictions keep their order by id and
-    /// a symbol is above every symbol whose set is a proper subset of its own.
-    pub fn cmp_fun(&self, a: Ex, b: Ex) -> std::cmp::Ordering {
-        if a == b {
-            return std::cmp::Ordering::Equal;
-        }
-        if !is_merged(a) && !is_merged(b) {
-            return a.cmp(&b);
-        }
-        let (sa, sb) = (self.members(&a), self.members(&b));
-        sa.len().cmp(&sb.len()).then_with(|| sa.cmp(sb))
-    }
-
-    /// Counts the successor context of the merged term `m` once.
-    pub fn context_made(&self, m: Ex) {
-        if self.ctxs.slot(m - MERGED, &self.bytes).set(()).is_ok() {
-            self.contexts.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// The merged terms the run made.
-    pub fn len(&self) -> usize {
-        self.next.load(Ordering::Relaxed) as usize
-    }
-
-    pub fn bytes(&self) -> usize {
-        self.bytes.load(Ordering::Relaxed)
-    }
-}
-
-/// The order of two literals over successor terms: by the function symbols, as
-/// [`Merged::cmp_fun`] orders them when the run has merged terms, then by the kind and the
-/// atom, role or smaller term.
-fn succ_cmp(m: Option<&Merged>, a: Lit, b: Lit) -> std::cmp::Ordering {
-    let (fa, fb) = (a.fun(), b.fun());
-    let by_fun = match m {
-        Some(m) if fa != fb && (is_merged(fa) || is_merged(fb)) => m.cmp_fun(fa, fb),
-        _ => fa.cmp(&fb),
-    };
-    by_fun.then_with(|| a.succ_key().cmp(&b.succ_key()))
-}
-
-/// The order of two atoms over x: by [`rank`], and two merged atoms as their sets.
-fn x_cmp(ix: &Index, m: Option<&Merged>, a: Ex, b: Ex) -> std::cmp::Ordering {
-    match m {
-        Some(m) if is_merged(a) && is_merged(b) => m.cmp_fun(a, b),
-        _ => rank(ix, a).cmp(&rank(ix, b)),
-    }
-}
-
 /// A clause of a context's store.
 #[derive(Clone)]
 pub struct Stored {
@@ -1144,15 +994,8 @@ impl Store {
     }
 
     /// The next clause to process, which is marked processed and indexed by its maximal
-    /// literals, under the order of a rooted run when `rooted` is given, and with the order
-    /// of item 894's merged terms when `merged` is.
-    pub fn next(
-        &mut self,
-        ix: &Index,
-        rooted: Option<&Rooted>,
-        merged: Option<&Merged>,
-        max: &mut Vec<Lit>,
-    ) -> Option<u32> {
+    /// literals, under the order of a rooted run when `rooted` is given.
+    pub fn next(&mut self, ix: &Index, rooted: Option<&Rooted>, max: &mut Vec<Lit>) -> Option<u32> {
         while let Some(std::cmp::Reverse((_, id))) = self.queue.pop() {
             let s = &mut self.clauses[id as usize];
             if s.dead {
@@ -1160,7 +1003,7 @@ impl Store {
             }
             s.done = true;
             match rooted {
-                None => s.c.maximal(ix, merged, max),
+                None => s.c.maximal(ix, max),
                 Some(o) => s.c.maximal_rooted(o, max),
             }
             s.max = max.first().copied();
@@ -1581,7 +1424,7 @@ mod tests {
         // the order of the runs without constants never selects an interned literal
         let c = Clause::new(vec![], vec![Lit::x(3), g]);
         let mut max = Vec::new();
-        c.maximal(&Index::default(), None, &mut max);
+        c.maximal(&Index::default(), &mut max);
         assert!(max.iter().all(|l| l.kind() != XL), "{max:?}");
     }
 
@@ -1969,7 +1812,7 @@ mod tests {
         let mut counted = 0;
         for i in 0..2000 {
             s.add(Clause::new(vec![Lit::x(1000 + i)], vec![g]));
-            s.next(&ix, Some(&o), None, &mut max);
+            s.next(&ix, Some(&o), &mut max);
             counted += s.take_grown();
             assert!(
                 counted >= held(&s),
@@ -2010,8 +1853,8 @@ mod tests {
         };
         s.add(Clause::new(vec![], vec![fy, fu]));
         let mut max = Vec::new();
-        let i = s.next(&ix, Some(&o), None, &mut max).unwrap();
-        let j = s.next(&ix, Some(&o), None, &mut max).unwrap();
+        let i = s.next(&ix, Some(&o), &mut max).unwrap();
+        let j = s.next(&ix, Some(&o), &mut max).unwrap();
         let (i, j) = if s.maxima(i).len() == 3 {
             (i, j)
         } else {

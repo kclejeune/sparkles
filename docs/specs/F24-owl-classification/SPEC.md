@@ -2152,6 +2152,33 @@ merged term only through a transferred role literal and a universal restriction,
 the regressions above. If the merge leaves a file past the bound, the item returns to this
 round with the exploration.
 
+The merge was built as above behind a switch of the lane and measured, and it is not kept.
+It makes no file classify. The attempts of ore_ont_6485, ore_ont_6952 and ore_ont_10140 at
+the default bound derive 281,066, 186,129 and 242,027 conclusions and stop at the work
+bound, and at the larger bound they derive 562,845, 1,189,769 and 506,166, where
+ore_ont_6485 and ore_ont_10140 pass the at-most rule's width limit and ore_ont_6952 the
+work bound. The hypothesis holds for the part it names. The transfers are few, 21,086, 516
+and 270 at the default bound, of which the store keeps 8,696, 310 and 180, and the again
+rule and the paramodulation between successor terms are gone. The cost moves into the
+at-most rule and item 728's lazy clauses, which make 219,789, 168,148 and 219,295
+conclusions at the default bound and 499,544, 1,170,975 and 480,842 at the larger one.
+Each merged term is a candidate of the at-most products beside the terms in its set, and
+every at-most conclusion is a disjunction of merged atoms, four to six in the hottest
+context of ore_ont_6952, which the transfer carries into the role literals of the merged
+terms. In that context the 15 terms of the restrictions have one or two role literals each
+as premises and the 15 merged terms 2 to 20, so the products cross long lists of
+conditional premises, and one processed role literal of a merged term gives up to 12,768
+conclusions. The Eq rule rewrote an equated term into the other and so kept the candidates
+few, and the merge keeps every term and every merged term as a candidate. On ore_ont_6485
+the unions of these candidates make 15,284 merged terms at the default bound, 490 of
+them with a successor context. On the generated fixtures the merge gives no taxonomy that
+HermiT does not, and 42 of the 640 fixtures change, none for the better. Seven pass their
+bound and fall back, `shiq-006`, `shiq-013`, `shiq-036`, `shiq-045`, `shq-017`, `shq-047` and
+`sriq-010`, and the others derive 2 to 300 times as much, `shq-023` 145,915 conclusions in
+place of 684. The merge's code is reverted with an entry in PERFORMANCE-EXPERIMENTS.md, and
+its seven regressions stay in the Tier D suite, where the Eq rule passes them. The item
+returns to this round with the exploration, which the next subsection takes up.
+
 ### Nominals in the disjunctive rules
 
 This section is the design of item 603's sixth phase, which extends the disjunctive rules
