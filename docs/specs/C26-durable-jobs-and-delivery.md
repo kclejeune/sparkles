@@ -601,7 +601,10 @@ never read as an empty ledger. A `control.bin` without a `control.log` is accept
 states only. One is an interrupted enablement, whose checkpoint is at sequence zero with
 no `jobs.json` and no jobs entry in the registry. The other is a restored backup, whose
 checkpoint carries a valid origin entry. A writable open then creates the empty log
-durably before it admits a write. In every other state a missing `control.log` is an
+durably before it admits a write. The origin is consumed by a frame that a checkpoint
+follows at once, as §7.3 describes, so a checkpoint with an origin never has an
+acknowledged frame after it, and once that checkpoint is written a missing log is
+refused again. In every other state a missing `control.log` is an
 integrity error, since checkpoints replace the log by a rename and never leave it
 missing, and acknowledged control-only frames could have been lost with it. The open
 reads `control.bin` and never replaces it with an empty one. It replays the write-ahead
@@ -658,15 +661,19 @@ A restored dataset opens with that checkpoint and its origin entry. The origin e
 fences dispatch by itself. The first jobs recovery runs before it installs the process's
 boot epoch or returns any interrupted attempt to its retry policy, and it writes one
 small frame that removes the origin entry and records a `job:Recovery` record in the
-`pausing` phase. The restored set is every run and delivery that the checkpoint holds.
+`pausing` phase. Under the same writer lock, before the lock is released and before the
+recovery goes on, the store writes a checkpoint that holds that frame, so `control.bin`
+no longer carries the origin before any later frame can be written or any transition
+acknowledged. The restored set is every run and delivery that the checkpoint holds.
 The recovery pauses the nonterminal runs and the pending or leased deliveries of that set
 in bounded frames, each of which records how far it got, and a last frame moves the
 record to the `awaiting-decision` phase. A crash before the first frame leaves the origin
 entry, and a crash during the pausing leaves the `pausing` record, so the next recovery
-continues where it stopped. While an origin entry or a `pausing` record exists, a
-submission, a claim, a renewal, a publication, a failure under a lease and every delivery
-claim or send are refused under the writer, and a cancellation and a lookup of a recorded
-receipt are answered. The epoch is installed only after the record reaches
+continues where it stopped. While an origin entry exists, every transition other than
+that first recovery frame is refused under the writer, and a lookup of a recorded
+receipt is answered. While a `pausing` record exists, a submission, a claim, a renewal, a
+publication, a failure under a lease and every delivery claim or send are refused under
+the writer, and a cancellation and a receipt lookup are answered. The epoch is installed only after the record reaches
 `awaiting-decision`, so no admission check passes before then.
 
 Once the record is `awaiting-decision`, runs and deliveries outside the restored set are
@@ -750,7 +757,7 @@ the current implementation.
 | A21. A restore is interrupted, retried and recovered while workers and the operator act. | Nothing is claimed, sent or published before the restored set is paused, the recovery continues after a restart, and the recovery route refuses while pausing. |
 | A22. A backup keeps the control feature or settings without its checkpoint. | The restore refuses it before reidentification, also without an integrity check. |
 | A23. A bulk commit or a compaction unwinds after `CURRENT` switched. | The writer is poisoned, so no control-only frame follows a generation that is not published. |
-| A24. `control.log` is lost after a control-only submission that follows a generation switch. | The open refuses with an integrity error. |
+| A24. `control.log` is lost after a control-only submission that follows a generation switch, or after a restored dataset's recovery has consumed its origin and acknowledged a cancellation or a submission. | The open refuses with an integrity error. |
 | A25. A restored run is cancelled and retried, or a terminal restored run is retried, before a decision. | The new run is paused and belongs to the restored set until the recovery route resumes it. |
 | A26. A backup is captured before enablement and written after it, also incrementally. | The backup holds the old header, has no control files and restores as a dataset without jobs. |
 
