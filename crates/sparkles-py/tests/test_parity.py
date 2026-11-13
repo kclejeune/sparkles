@@ -62,6 +62,9 @@ DEFERRED = {
     "evidence.review",
     "evidence.settings",
     "evidence.withdraw",
+    "reasoning.query.clear",
+    "reasoning.query.get",
+    "reasoning.query.set",
 }
 
 
