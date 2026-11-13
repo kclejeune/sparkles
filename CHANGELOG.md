@@ -1839,6 +1839,18 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 
 ### Fixed
 
+Query-time reasoning with `reasoning=demand` no longer derives about the whole OWL RL type
+closure for every query (roadmap item 911). The schema completeness proof gave up on
+LUBM's schema and left every schema relation open, so LUBM query 1 took about 3.2 s at
+10 universities. The proof's abstraction now scales, its result is kept
+for each schema table, the schema pass reads the profile's axioms, a session estimates a
+demand's cone only for EXPLAIN and `auto`, and specialization compares rules by their
+structure. Query 1 now takes 1.9 ms with OWL RL and 1.2 ms with RDFS, against 1.8 ms and
+1.3 ms before the proof. Other OWL RL queries remain up to 1.35 times slower than before
+the proof, which item 911 follows. A query that runs and reads no
+materialization leaves `estimatedDerived` out of its `Derive` nodes, and an EXPLAIN that
+does not run the query still gives it.
+
 Reading the `main` branch's information no longer holds the dataset's branch table while
 it waits for the main writer. The periodic history collector takes the writer and then
 the branch table, so a branch listing that ran during a collection could deadlock both,

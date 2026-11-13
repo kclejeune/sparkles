@@ -957,13 +957,31 @@ to 1.6 ms and 2.1 to 2.5 ms. The first query of a view pays the proof, 25 ms und
 and 230 ms under `owl-rl`, most of it the `owl-rl` abstraction's joins over rules with a
 variable predicate.
 
-At ten universities on stanley, with two rounds of `reasoning_latency` for each build on
-the same host, LUBM q1 under `demand` takes 4.65 ms with `owl-rl` and 2.00 ms with
-`rdfs`, against 3,217 ms and 94.4 ms before these changes and 1.99 ms and 1.00 ms before
-item 191 (`6fae0eb2`). Every query's answers equal the materialized ones in all three
-builds. The narrow queries remain about twice as slow as before item 191, and the broad
-`owl-rl` queries q6, q8 and q9 take 2.9 to 3.0 s against 1.8 s. Item 911 stays open for
-that remainder.
+Two costs that every query paid remained after these changes, and both are gone.
+
+* **(d) Cone estimates only where they are read.** A session estimated each demand's
+  cone, its atoms and their sizes, whether or not anything read the estimate. The walk
+  costs about as much as a narrow derivation, and a profile of `owl-rl` LUBM q1 put
+  about 14% of the query's samples in it. A session now makes the estimates only for
+  EXPLAIN and for `auto` when it reads a materialization, and an executed `demand`
+  query's `Derive` nodes carry no estimate.
+* **(e) A structural key for specialized rules.** Specialization drops a rule that
+  another schema binding already made, with its atoms in another order. The key that
+  told such rules apart was the formatted text of the rule's atoms, builtins and head,
+  which the same profile showed among the query's costs. The key is now the sorted
+  atoms, the builtins and the head themselves.
+
+At ten universities on stanley, with three interleaved runs of `reasoning_latency` for
+each build, each of three rounds after a checked run, the medians of LUBM q1 under
+`demand` are 1.89 ms with `owl-rl` and 1.15 ms with `rdfs`, against 1.76 ms and 1.26 ms
+before item 191 (`6fae0eb2`). Before (d) and (e), q1 took 4.65 ms and 2.00 ms, and
+before (a) to (c) it took 3,217 ms and 94.4 ms. Every query's answers equal the
+materialized ones in both builds. The `rdfs` queries now take what they took before item
+191, within the runs' spread. The `owl-rl` queries take 0.9 to 1.35 times as long, and
+the broad queries q6, q8 and q9 take 1.95 to 1.99 s against 1.71 to 1.74 s. The
+specialized `owl-rl` program holds 589 rules for LUBM against 501 before item 191, since
+the axioms of (c) add reflexive schema facts that specialization expands. Item 911 stays
+open for the `owl-rl` remainder.
 
 Options that give up completeness were not taken. Trusting the preliminary schema pass,
 as before item 191, would again miss schema facts that only derived instance facts
@@ -1152,8 +1170,8 @@ commits (§6.2), the MCP argument, the UI selector and the G08 mapping remain in
   as the next paragraph explains. The walk costs about as much as a narrow derivation,
   so a session makes the estimate only for EXPLAIN and for `auto` when it reads a
   materialization. An executed `demand` query's `Derive` nodes carry no estimate, as
-  decision 5 of Phase 1 states (item 911). The derivation constants are provisional and are
-  measured once roadmap item 911 repairs the demand path.
+  decision 5 of Phase 1 states (item 911). The derivation constants are provisional and have
+  not been fitted to the demand path that item 911 repaired.
 * **Why reading always wins.** §4.3 has the planner compare the two estimates per pattern
   and derive where deriving is cheaper. In this engine a derived pattern still reads the
   inferred graph, which stays in the query's default graph while the materialization
@@ -1177,9 +1195,10 @@ commits (§6.2), the MCP argument, the UI selector and the G08 mapping remain in
   `rdfs` and 0.2 to 1.0 ms slower with `owl-rl`, a difference that roadmap item 912
   investigates. Over a stale materialization `auto` derives and takes what `demand` does,
   45 to 149 ms with `rdfs` and 1.9 to 3.1 s with `owl-rl`. These derivation times come
-  from the demand path that roadmap item 911 repairs. Since item 191's schema
-  completeness, an `owl-rl` demand derives about the whole closure, 1,232,447 facts at
-  10 universities, for every query.
+  from the demand path before item 911's changes, when an `owl-rl` demand derived about
+  the whole closure, 1,232,447 facts at 10 universities, for every query. The
+  [measurements of item 911](#schema-completeness-at-scale-item-911) give the repaired
+  path's times.
 
 * **The setting.** `crates/sparkles/src/reasoning/setting.rs` holds `default`, `profile`,
   `rules`, `inputs`, `budget` and `stale`, in `query-reasoning.json` with the version

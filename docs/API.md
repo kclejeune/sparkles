@@ -9228,9 +9228,10 @@ does.
   `Sparkles-Inferences` appears only when a stale materialization was read, which the
   dataset's setting must allow.
 * EXPLAIN's `Reason` node says whether the materialization was fresh, stale or absent,
-  and each `Derive` node gives `source` (`materialized` or `derived`), `reason`, and the
-  estimates `estimatedDerived`, `readCost` and `deriveCost` from the pattern's dependency
-  cone and the store's statistics.
+  and each `Derive` node gives `source` (`materialized` or `derived`), `reason`, and, when
+  the materialization is read, the estimates `estimatedDerived`, `readCost` and
+  `deriveCost` from the pattern's dependency cone and the store's statistics. An EXPLAIN
+  that does not run the query gives `estimatedDerived` for every pattern.
 * `sparkles query --reasoning auto` takes the same `--profile`, `--rules` and
   `--max-derived` as `demand`.
 
