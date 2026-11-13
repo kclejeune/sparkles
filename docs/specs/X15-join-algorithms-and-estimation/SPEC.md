@@ -209,8 +209,15 @@ longer on WatDiv `F4` and on short synthetic, WatDiv and DBpedia queries, 5% to 
 their time. Item 702 kept each group's holdings table and star factors across the
 candidate plans, which atlas measured no faster, and the
 [experiment](../../PERFORMANCE-EXPERIMENTS.md#query-execution) is recorded. Two synthetic queries with unchanged plans
-run 1.06 and 1.11 times as long in execution in eight rounds, and item 703 follows
-them up. Interleaved runs on atlas, an Intel host like forge, found the same slowdowns of
+ran 1.06 and 1.11 times as long in execution in eight rounds on forge. Item 703 counted
+the instructions and cache misses of their requests on atlas: three binaries retire the
+same instructions per request to within 0.04% for `f-regex-iri-join`,
+`f-expr-range-join`, `two-hop-count` and `births-by-decade`, with the same decoded-icache
+coverage, and the differences are cache misses that the host's state moves for every
+binary alike, plus the spread of the twelve-thread configuration, in which the four
+queries take 2 to 4 times as long as with one thread. The
+[record](../../benchmarks/engine/runs/2026-11-10-insn-703-atlas/README.md) has the
+counts, and item 878 takes up the twelve-thread cost. Interleaved runs on atlas, an Intel host like forge, found the same slowdowns of
 `S4-2`, `S4-4` and `F4`. The
 [engine results](../../benchmarks/engine/RESULTS.md#estimation-timing-on-forge) list every
 changed plan.

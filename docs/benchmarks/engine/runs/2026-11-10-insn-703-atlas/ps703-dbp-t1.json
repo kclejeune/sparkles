@@ -1,0 +1,1664 @@
+{
+ "settings": {
+  "store": "dbpedia-71d11ad0.db",
+  "rounds": 6,
+  "reps": 30,
+  "threads": "1",
+  "server_cpu": "2",
+  "client_cpu": "4",
+  "arms": [
+   [
+    "base",
+    "./sparkles-71d11ad0",
+    ""
+   ],
+   [
+    "main",
+    "./sparkles-321508fe",
+    ""
+   ],
+   [
+    "tip",
+    "./sparkles-ce993ece",
+    ""
+   ]
+  ],
+  "phases": {
+   "basic": [
+    "instructions:u",
+    "cycles:u",
+    "cache-misses:u",
+    "branch-misses:u",
+    "cpu_core/mem_load_retired.l3_miss/u",
+    "cpu_core/baclears.any/u"
+   ],
+   "front": [
+    "instructions:u",
+    "cycles:u",
+    "cpu_core/idq.dsb_uops/u",
+    "cpu_core/idq.mite_uops/u",
+    "cpu_core/frontend_retired.any_dsb_miss/u",
+    "cpu_core/dsb2mite_switches.penalty_cycles/u"
+   ],
+   "icache": [
+    "instructions:u",
+    "cycles:u",
+    "cpu_core/icache_data.stalls/u",
+    "cpu_core/icache_tag.stalls/u",
+    "L1-icache-load-misses:u",
+    "iTLB-load-misses:u"
+   ]
+  }
+ },
+ "results": {
+  "births-by-decade": {
+   "base": [
+    {
+     "plan": "616cb80769f7",
+     "idle_per_s": {
+      "instructions": 2588.0,
+      "cycles": 29314.0,
+      "cache-misses": 630.0,
+      "branch-misses": 70.0,
+      "mem_load_retired.l3_miss": 22.0,
+      "baclears.any": 76.0
+     },
+     "basic": {
+      "planMs": 0.0493565,
+      "execMs": 1.7293305,
+      "per_req": {
+       "instructions": 18552437.266666666,
+       "cycles": 7778895.8,
+       "cache-misses": 7968.133333333333,
+       "branch-misses": 24017.7,
+       "mem_load_retired.l3_miss": 241.5,
+       "baclears.any": 10053.833333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0497475,
+      "execMs": 1.7358155,
+      "per_req": {
+       "instructions": 18544102.4,
+       "cycles": 7874845.3,
+       "idq.dsb_uops": 17233215.566666666,
+       "idq.mite_uops": 662018.5,
+       "frontend_retired.any_dsb_miss": 66074.0,
+       "dsb2mite_switches.penalty_cycles": 66847.73333333334
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0482615,
+      "execMs": 1.730237,
+      "per_req": {
+       "instructions": 18549362.8,
+       "cycles": 7782150.333333333,
+       "icache_data.stalls": 211864.93333333332,
+       "icache_tag.stalls": 129989.53333333334,
+       "L1-icache-load-misses": 46780.566666666666,
+       "iTLB-load-misses": 776.1
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "08f53a3640de",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0473885,
+      "execMs": 1.745448,
+      "per_req": {
+       "instructions": 18551135.433333334,
+       "cycles": 7803691.9,
+       "cache-misses": 5166.9,
+       "branch-misses": 23903.466666666667,
+       "mem_load_retired.l3_miss": 198.43333333333334,
+       "baclears.any": 9972.966666666667
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.051552,
+      "execMs": 1.758499,
+      "per_req": {
+       "instructions": 18542575.166666668,
+       "cycles": 7969227.4,
+       "idq.dsb_uops": 17196834.4,
+       "idq.mite_uops": 651735.5,
+       "frontend_retired.any_dsb_miss": 65414.833333333336,
+       "dsb2mite_switches.penalty_cycles": 62532.0
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0491185,
+      "execMs": 1.7526195,
+      "per_req": {
+       "instructions": 18542886.033333335,
+       "cycles": 7839619.766666667,
+       "icache_data.stalls": 210821.8,
+       "icache_tag.stalls": 130800.13333333333,
+       "L1-icache-load-misses": 45941.7,
+       "iTLB-load-misses": 765.4333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "86159347bd8b",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0509655,
+      "execMs": 1.7389575,
+      "per_req": {
+       "instructions": 18557137.733333334,
+       "cycles": 7899734.066666666,
+       "cache-misses": 15690.5,
+       "branch-misses": 24217.8,
+       "mem_load_retired.l3_miss": 569.2,
+       "baclears.any": 10207.9
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0498755,
+      "execMs": 1.735906,
+      "per_req": {
+       "instructions": 18545814.866666667,
+       "cycles": 7853302.3,
+       "idq.dsb_uops": 17221714.633333333,
+       "idq.mite_uops": 657167.5,
+       "frontend_retired.any_dsb_miss": 65685.8,
+       "dsb2mite_switches.penalty_cycles": 62639.3
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.04967250000000001,
+      "execMs": 1.733584,
+      "per_req": {
+       "instructions": 18546825.666666668,
+       "cycles": 7833836.433333334,
+       "icache_data.stalls": 227574.8,
+       "icache_tag.stalls": 134524.26666666666,
+       "L1-icache-load-misses": 46688.9,
+       "iTLB-load-misses": 732.7666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "24f78aab34cb",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0476625,
+      "execMs": 1.748841,
+      "per_req": {
+       "instructions": 18550823.333333332,
+       "cycles": 7832130.6,
+       "cache-misses": 6999.9,
+       "branch-misses": 23777.133333333335,
+       "mem_load_retired.l3_miss": 255.3,
+       "baclears.any": 9956.9
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.051505499999999996,
+      "execMs": 1.755649,
+      "per_req": {
+       "instructions": 18542842.733333334,
+       "cycles": 7909958.2,
+       "idq.dsb_uops": 17259717.833333332,
+       "idq.mite_uops": 656856.3666666667,
+       "frontend_retired.any_dsb_miss": 66298.1,
+       "dsb2mite_switches.penalty_cycles": 61823.2
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0514205,
+      "execMs": 1.748923,
+      "per_req": {
+       "instructions": 18542989.1,
+       "cycles": 7858404.066666666,
+       "icache_data.stalls": 233818.5,
+       "icache_tag.stalls": 132305.06666666668,
+       "L1-icache-load-misses": 46098.46666666667,
+       "iTLB-load-misses": 784.8333333333334
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "ec4499676234",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.048542,
+      "execMs": 1.7290305,
+      "per_req": {
+       "instructions": 18550633.666666668,
+       "cycles": 7797387.2,
+       "cache-misses": 8746.166666666666,
+       "branch-misses": 23786.566666666666,
+       "mem_load_retired.l3_miss": 286.3333333333333,
+       "baclears.any": 10021.3
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.052388500000000005,
+      "execMs": 1.7410640000000002,
+      "per_req": {
+       "instructions": 18542646.9,
+       "cycles": 7917397.133333334,
+       "idq.dsb_uops": 17184211.466666665,
+       "idq.mite_uops": 659012.7333333333,
+       "frontend_retired.any_dsb_miss": 66756.46666666666,
+       "dsb2mite_switches.penalty_cycles": 66194.56666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.046810500000000005,
+      "execMs": 1.7220575,
+      "per_req": {
+       "instructions": 18542910.4,
+       "cycles": 7727352.466666667,
+       "icache_data.stalls": 204306.33333333334,
+       "icache_tag.stalls": 121517.86666666667,
+       "L1-icache-load-misses": 45265.6,
+       "iTLB-load-misses": 737.5333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "939e0ee58f6f",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.046239,
+      "execMs": 1.726115,
+      "per_req": {
+       "instructions": 18555534.133333333,
+       "cycles": 7775263.933333334,
+       "cache-misses": 6694.3,
+       "branch-misses": 24194.766666666666,
+       "mem_load_retired.l3_miss": 254.4,
+       "baclears.any": 10020.333333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.050890000000000005,
+      "execMs": 1.7394025,
+      "per_req": {
+       "instructions": 18543169.6,
+       "cycles": 7881983.1,
+       "idq.dsb_uops": 17217062.0,
+       "idq.mite_uops": 659972.3,
+       "frontend_retired.any_dsb_miss": 65773.33333333333,
+       "dsb2mite_switches.penalty_cycles": 66050.46666666666
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.04904850000000001,
+      "execMs": 1.732769,
+      "per_req": {
+       "instructions": 18543355.4,
+       "cycles": 7816721.633333334,
+       "icache_data.stalls": 222800.56666666668,
+       "icache_tag.stalls": 134745.7,
+       "L1-icache-load-misses": 45674.666666666664,
+       "iTLB-load-misses": 762.2333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "33f362fc4577",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.050193,
+      "execMs": 1.7272415,
+      "per_req": {
+       "instructions": 18551555.7,
+       "cycles": 7820189.733333333,
+       "cache-misses": 10206.3,
+       "branch-misses": 23743.7,
+       "mem_load_retired.l3_miss": 354.3,
+       "baclears.any": 10049.366666666667
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.049374,
+      "execMs": 1.729885,
+      "per_req": {
+       "instructions": 18543368.033333335,
+       "cycles": 7780766.866666666,
+       "idq.dsb_uops": 17218916.733333334,
+       "idq.mite_uops": 651432.4333333333,
+       "frontend_retired.any_dsb_miss": 66492.06666666667,
+       "dsb2mite_switches.penalty_cycles": 60293.3
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.049236,
+      "execMs": 1.7288830000000002,
+      "per_req": {
+       "instructions": 18543388.533333335,
+       "cycles": 7788482.033333333,
+       "icache_data.stalls": 224420.4,
+       "icache_tag.stalls": 130884.23333333334,
+       "L1-icache-load-misses": 45518.73333333333,
+       "iTLB-load-misses": 751.0666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "33d6da7769a8",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.05005949999999999,
+      "execMs": 1.7502140000000002,
+      "per_req": {
+       "instructions": 18550746.9,
+       "cycles": 7878996.166666667,
+       "cache-misses": 9555.466666666667,
+       "branch-misses": 24217.1,
+       "mem_load_retired.l3_miss": 391.4,
+       "baclears.any": 10036.2
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.049505,
+      "execMs": 1.750164,
+      "per_req": {
+       "instructions": 18542731.833333332,
+       "cycles": 7862181.0,
+       "idq.dsb_uops": 17228791.866666667,
+       "idq.mite_uops": 645041.9666666667,
+       "frontend_retired.any_dsb_miss": 66157.33333333333,
+       "dsb2mite_switches.penalty_cycles": 61788.566666666666
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0512715,
+      "execMs": 1.7525149999999998,
+      "per_req": {
+       "instructions": 18543083.9,
+       "cycles": 7883390.533333333,
+       "icache_data.stalls": 237879.43333333332,
+       "icache_tag.stalls": 138461.56666666668,
+       "L1-icache-load-misses": 45752.8,
+       "iTLB-load-misses": 810.5666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "b26961fbbd39",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.048804,
+      "execMs": 1.729595,
+      "per_req": {
+       "instructions": 18557089.2,
+       "cycles": 7812501.4,
+       "cache-misses": 9913.9,
+       "branch-misses": 24159.066666666666,
+       "mem_load_retired.l3_miss": 332.93333333333334,
+       "baclears.any": 10331.033333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.047489500000000004,
+      "execMs": 1.726195,
+      "per_req": {
+       "instructions": 18545968.766666666,
+       "cycles": 7759897.133333334,
+       "idq.dsb_uops": 17162347.733333334,
+       "idq.mite_uops": 662974.4333333333,
+       "frontend_retired.any_dsb_miss": 68667.7,
+       "dsb2mite_switches.penalty_cycles": 61814.73333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0477685,
+      "execMs": 1.7282245,
+      "per_req": {
+       "instructions": 18546935.0,
+       "cycles": 7763095.366666666,
+       "icache_data.stalls": 204795.4,
+       "icache_tag.stalls": 122271.33333333333,
+       "L1-icache-load-misses": 46501.1,
+       "iTLB-load-misses": 781.6666666666666
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "e6a4186553d3",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.047842499999999996,
+      "execMs": 1.723909,
+      "per_req": {
+       "instructions": 18551000.8,
+       "cycles": 7751222.5,
+       "cache-misses": 5243.733333333334,
+       "branch-misses": 24287.8,
+       "mem_load_retired.l3_miss": 190.3,
+       "baclears.any": 9970.366666666667
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.049305499999999995,
+      "execMs": 1.7347860000000002,
+      "per_req": {
+       "instructions": 18542444.2,
+       "cycles": 7843561.9,
+       "idq.dsb_uops": 17143961.033333335,
+       "idq.mite_uops": 663754.0,
+       "frontend_retired.any_dsb_miss": 68658.53333333334,
+       "dsb2mite_switches.penalty_cycles": 61927.066666666666
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.047893500000000006,
+      "execMs": 1.7282484999999999,
+      "per_req": {
+       "instructions": 18542448.666666668,
+       "cycles": 7772598.266666667,
+       "icache_data.stalls": 215339.8,
+       "icache_tag.stalls": 128763.8,
+       "L1-icache-load-misses": 44900.333333333336,
+       "iTLB-load-misses": 783.9666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "f2846f3dffca",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.049011,
+      "execMs": 1.727764,
+      "per_req": {
+       "instructions": 18550947.4,
+       "cycles": 7801255.966666667,
+       "cache-misses": 10031.3,
+       "branch-misses": 23770.0,
+       "mem_load_retired.l3_miss": 344.1666666666667,
+       "baclears.any": 10002.533333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0494905,
+      "execMs": 1.7292560000000001,
+      "per_req": {
+       "instructions": 18542599.1,
+       "cycles": 7787683.633333334,
+       "idq.dsb_uops": 17204491.7,
+       "idq.mite_uops": 656967.7333333333,
+       "frontend_retired.any_dsb_miss": 68293.0,
+       "dsb2mite_switches.penalty_cycles": 61411.7
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.049256999999999995,
+      "execMs": 1.7295794999999998,
+      "per_req": {
+       "instructions": 18542975.166666668,
+       "cycles": 7800692.166666667,
+       "icache_data.stalls": 230831.33333333334,
+       "icache_tag.stalls": 136266.86666666667,
+       "L1-icache-load-misses": 45593.13333333333,
+       "iTLB-load-misses": 786.0666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "4826a913e000",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0487865,
+      "execMs": 1.7273625000000001,
+      "per_req": {
+       "instructions": 18550704.1,
+       "cycles": 7807762.3,
+       "cache-misses": 10207.666666666666,
+       "branch-misses": 23387.366666666665,
+       "mem_load_retired.l3_miss": 464.3,
+       "baclears.any": 9955.3
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.050725000000000006,
+      "execMs": 1.7293,
+      "per_req": {
+       "instructions": 18543119.366666667,
+       "cycles": 7800196.566666666,
+       "idq.dsb_uops": 17171727.166666668,
+       "idq.mite_uops": 657939.5,
+       "frontend_retired.any_dsb_miss": 66737.26666666666,
+       "dsb2mite_switches.penalty_cycles": 63842.933333333334
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0510565,
+      "execMs": 1.7323385,
+      "per_req": {
+       "instructions": 18542502.0,
+       "cycles": 7816312.0,
+       "icache_data.stalls": 236055.06666666668,
+       "icache_tag.stalls": 134524.86666666667,
+       "L1-icache-load-misses": 45486.833333333336,
+       "iTLB-load-misses": 803.1
+      },
+      "pct_min": 100.0
+     }
+    }
+   ],
+   "main": [
+    {
+     "plan": "849ed57dccaa",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.048546,
+      "execMs": 1.74326,
+      "per_req": {
+       "instructions": 18557853.366666667,
+       "cycles": 7893054.0,
+       "cache-misses": 12113.4,
+       "branch-misses": 23438.3,
+       "mem_load_retired.l3_miss": 510.4,
+       "baclears.any": 10280.6
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.049102,
+      "execMs": 1.7486774999999999,
+      "per_req": {
+       "instructions": 18546470.833333332,
+       "cycles": 7897550.266666667,
+       "idq.dsb_uops": 17383458.633333333,
+       "idq.mite_uops": 649661.5666666667,
+       "frontend_retired.any_dsb_miss": 65433.8,
+       "dsb2mite_switches.penalty_cycles": 56689.7
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.049714499999999995,
+      "execMs": 1.7491955,
+      "per_req": {
+       "instructions": 18546707.966666665,
+       "cycles": 7896816.966666667,
+       "icache_data.stalls": 243428.7,
+       "icache_tag.stalls": 139345.83333333334,
+       "L1-icache-load-misses": 47243.4,
+       "iTLB-load-misses": 799.1666666666666
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "4dff9182966c",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.047060000000000005,
+      "execMs": 1.7382545,
+      "per_req": {
+       "instructions": 18552199.8,
+       "cycles": 7822087.866666666,
+       "cache-misses": 9102.0,
+       "branch-misses": 23228.933333333334,
+       "mem_load_retired.l3_miss": 372.56666666666666,
+       "baclears.any": 10019.666666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.047615,
+      "execMs": 1.7446329999999999,
+      "per_req": {
+       "instructions": 18542661.633333333,
+       "cycles": 7854129.833333333,
+       "idq.dsb_uops": 17359488.266666666,
+       "idq.mite_uops": 654865.1,
+       "frontend_retired.any_dsb_miss": 65529.7,
+       "dsb2mite_switches.penalty_cycles": 72791.3
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0496035,
+      "execMs": 1.7510865,
+      "per_req": {
+       "instructions": 18542760.833333332,
+       "cycles": 7931717.133333334,
+       "icache_data.stalls": 248367.76666666666,
+       "icache_tag.stalls": 147499.33333333334,
+       "L1-icache-load-misses": 46255.7,
+       "iTLB-load-misses": 764.6333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "7f13f48a76a9",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.048506,
+      "execMs": 1.7408405,
+      "per_req": {
+       "instructions": 18552113.933333334,
+       "cycles": 7856503.033333333,
+       "cache-misses": 10115.933333333332,
+       "branch-misses": 23589.033333333333,
+       "mem_load_retired.l3_miss": 461.8333333333333,
+       "baclears.any": 9998.7
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0484495,
+      "execMs": 1.745389,
+      "per_req": {
+       "instructions": 18542537.9,
+       "cycles": 7839973.9,
+       "idq.dsb_uops": 17333331.166666668,
+       "idq.mite_uops": 652506.7666666667,
+       "frontend_retired.any_dsb_miss": 66506.4,
+       "dsb2mite_switches.penalty_cycles": 57009.63333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0467935,
+      "execMs": 1.7408625,
+      "per_req": {
+       "instructions": 18542663.166666668,
+       "cycles": 7796920.8,
+       "icache_data.stalls": 206056.86666666667,
+       "icache_tag.stalls": 124202.23333333334,
+       "L1-icache-load-misses": 45221.9,
+       "iTLB-load-misses": 741.3
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "8d970e6e223b",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0494405,
+      "execMs": 1.744131,
+      "per_req": {
+       "instructions": 18554862.9,
+       "cycles": 7909232.733333333,
+       "cache-misses": 13976.933333333332,
+       "branch-misses": 23588.866666666665,
+       "mem_load_retired.l3_miss": 571.0333333333333,
+       "baclears.any": 10186.466666666667
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.050019499999999995,
+      "execMs": 1.7455545,
+      "per_req": {
+       "instructions": 18543844.966666665,
+       "cycles": 7873156.833333333,
+       "idq.dsb_uops": 17385360.1,
+       "idq.mite_uops": 655987.7,
+       "frontend_retired.any_dsb_miss": 65628.7,
+       "dsb2mite_switches.penalty_cycles": 58225.23333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.05051799999999999,
+      "execMs": 1.7471229999999998,
+      "per_req": {
+       "instructions": 18543737.1,
+       "cycles": 7879455.566666666,
+       "icache_data.stalls": 250463.96666666667,
+       "icache_tag.stalls": 140161.86666666667,
+       "L1-icache-load-misses": 46173.2,
+       "iTLB-load-misses": 781.9666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "50f03a1c7c99",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.04753399999999999,
+      "execMs": 1.7429295,
+      "per_req": {
+       "instructions": 18554408.0,
+       "cycles": 7882365.7,
+       "cache-misses": 12616.5,
+       "branch-misses": 23569.666666666668,
+       "mem_load_retired.l3_miss": 541.0666666666667,
+       "baclears.any": 10165.0
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.048649,
+      "execMs": 1.7511899999999998,
+      "per_req": {
+       "instructions": 18543195.4,
+       "cycles": 7886000.5,
+       "idq.dsb_uops": 17360215.433333334,
+       "idq.mite_uops": 645101.4333333333,
+       "frontend_retired.any_dsb_miss": 64519.46666666667,
+       "dsb2mite_switches.penalty_cycles": 57868.63333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.049644499999999994,
+      "execMs": 1.746478,
+      "per_req": {
+       "instructions": 18543236.833333332,
+       "cycles": 7870216.866666666,
+       "icache_data.stalls": 248343.83333333334,
+       "icache_tag.stalls": 137917.33333333334,
+       "L1-icache-load-misses": 45988.5,
+       "iTLB-load-misses": 765.1
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "9c68f7bacd98",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0492975,
+      "execMs": 1.7477595,
+      "per_req": {
+       "instructions": 18554652.766666666,
+       "cycles": 7923388.266666667,
+       "cache-misses": 14421.733333333334,
+       "branch-misses": 23703.733333333334,
+       "mem_load_retired.l3_miss": 550.8,
+       "baclears.any": 10060.566666666668
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.051527500000000004,
+      "execMs": 1.7627670000000002,
+      "per_req": {
+       "instructions": 18543281.5,
+       "cycles": 8005684.9,
+       "idq.dsb_uops": 17360727.2,
+       "idq.mite_uops": 663214.2,
+       "frontend_retired.any_dsb_miss": 65363.63333333333,
+       "dsb2mite_switches.penalty_cycles": 60246.166666666664
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.048711500000000005,
+      "execMs": 1.752791,
+      "per_req": {
+       "instructions": 18544618.766666666,
+       "cycles": 7894665.433333334,
+       "icache_data.stalls": 233667.8,
+       "icache_tag.stalls": 140030.93333333332,
+       "L1-icache-load-misses": 45897.1,
+       "iTLB-load-misses": 744.3
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "0a7348c06e43",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.049201999999999996,
+      "execMs": 1.7426249999999999,
+      "per_req": {
+       "instructions": 18557306.9,
+       "cycles": 7900089.933333334,
+       "cache-misses": 12150.8,
+       "branch-misses": 23694.466666666667,
+       "mem_load_retired.l3_miss": 493.6666666666667,
+       "baclears.any": 10380.1
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.047666,
+      "execMs": 1.745315,
+      "per_req": {
+       "instructions": 18545927.4,
+       "cycles": 7853972.433333334,
+       "idq.dsb_uops": 17338630.033333335,
+       "idq.mite_uops": 655023.2666666667,
+       "frontend_retired.any_dsb_miss": 66101.93333333333,
+       "dsb2mite_switches.penalty_cycles": 56054.066666666666
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.051527,
+      "execMs": 1.7599255,
+      "per_req": {
+       "instructions": 18545953.3,
+       "cycles": 8009533.933333334,
+       "icache_data.stalls": 291274.3333333333,
+       "icache_tag.stalls": 166525.2,
+       "L1-icache-load-misses": 47486.933333333334,
+       "iTLB-load-misses": 810.8666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "3c66fbe9052f",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0490285,
+      "execMs": 1.7427129999999997,
+      "per_req": {
+       "instructions": 18557442.566666666,
+       "cycles": 7904451.5,
+       "cache-misses": 12990.966666666667,
+       "branch-misses": 23606.266666666666,
+       "mem_load_retired.l3_miss": 498.3333333333333,
+       "baclears.any": 10346.333333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0502225,
+      "execMs": 1.75109,
+      "per_req": {
+       "instructions": 18545939.2,
+       "cycles": 7906920.1,
+       "idq.dsb_uops": 17377295.733333334,
+       "idq.mite_uops": 657288.7,
+       "frontend_retired.any_dsb_miss": 64713.53333333333,
+       "dsb2mite_switches.penalty_cycles": 59310.566666666666
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.048813499999999996,
+      "execMs": 1.7486570000000001,
+      "per_req": {
+       "instructions": 18546056.166666668,
+       "cycles": 7883064.766666667,
+       "icache_data.stalls": 238486.4,
+       "icache_tag.stalls": 141253.53333333333,
+       "L1-icache-load-misses": 46534.066666666666,
+       "iTLB-load-misses": 798.9333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "078bdef23a44",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.047769000000000006,
+      "execMs": 1.7428270000000001,
+      "per_req": {
+       "instructions": 18552432.833333332,
+       "cycles": 7856787.466666667,
+       "cache-misses": 10391.2,
+       "branch-misses": 23365.366666666665,
+       "mem_load_retired.l3_miss": 390.8333333333333,
+       "baclears.any": 10003.1
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.048324000000000006,
+      "execMs": 1.7395465,
+      "per_req": {
+       "instructions": 18542741.566666666,
+       "cycles": 7830263.966666667,
+       "idq.dsb_uops": 17347396.866666667,
+       "idq.mite_uops": 639343.3,
+       "frontend_retired.any_dsb_miss": 64699.73333333333,
+       "dsb2mite_switches.penalty_cycles": 55295.066666666666
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.048322500000000004,
+      "execMs": 1.740344,
+      "per_req": {
+       "instructions": 18542920.5,
+       "cycles": 7835903.833333333,
+       "icache_data.stalls": 237075.66666666666,
+       "icache_tag.stalls": 134014.8,
+       "L1-icache-load-misses": 45846.36666666667,
+       "iTLB-load-misses": 746.5666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "713aad85474a",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.049807500000000005,
+      "execMs": 1.7422865,
+      "per_req": {
+       "instructions": 18552334.866666667,
+       "cycles": 7892367.633333334,
+       "cache-misses": 12479.0,
+       "branch-misses": 23323.066666666666,
+       "mem_load_retired.l3_miss": 446.26666666666665,
+       "baclears.any": 10033.066666666668
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.05092,
+      "execMs": 1.7469735000000002,
+      "per_req": {
+       "instructions": 18542577.233333334,
+       "cycles": 7889226.466666667,
+       "idq.dsb_uops": 17333018.5,
+       "idq.mite_uops": 648565.7333333333,
+       "frontend_retired.any_dsb_miss": 65170.96666666667,
+       "dsb2mite_switches.penalty_cycles": 72354.33333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.048205,
+      "execMs": 1.742408,
+      "per_req": {
+       "instructions": 18542650.266666666,
+       "cycles": 7814791.2,
+       "icache_data.stalls": 224119.66666666666,
+       "icache_tag.stalls": 140918.86666666667,
+       "L1-icache-load-misses": 44337.3,
+       "iTLB-load-misses": 894.1333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "da62283c10de",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0489175,
+      "execMs": 1.7471065000000001,
+      "per_req": {
+       "instructions": 18558007.566666666,
+       "cycles": 7882403.833333333,
+       "cache-misses": 11806.433333333332,
+       "branch-misses": 23754.466666666667,
+       "mem_load_retired.l3_miss": 500.23333333333335,
+       "baclears.any": 10214.166666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0473755,
+      "execMs": 1.7450195,
+      "per_req": {
+       "instructions": 18546506.1,
+       "cycles": 7839148.066666666,
+       "idq.dsb_uops": 17349690.3,
+       "idq.mite_uops": 659575.4,
+       "frontend_retired.any_dsb_miss": 65178.833333333336,
+       "dsb2mite_switches.penalty_cycles": 58963.1
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.051937000000000004,
+      "execMs": 1.7542665,
+      "per_req": {
+       "instructions": 18546518.3,
+       "cycles": 7993614.6,
+       "icache_data.stalls": 286344.0333333333,
+       "icache_tag.stalls": 162877.66666666666,
+       "L1-icache-load-misses": 46664.066666666666,
+       "iTLB-load-misses": 765.1666666666666
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "6f5cd812f5fa",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.049226,
+      "execMs": 1.743352,
+      "per_req": {
+       "instructions": 18557750.0,
+       "cycles": 7904572.333333333,
+       "cache-misses": 12861.533333333333,
+       "branch-misses": 23777.5,
+       "mem_load_retired.l3_miss": 607.5333333333333,
+       "baclears.any": 10278.433333333332
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0505245,
+      "execMs": 1.7516064999999998,
+      "per_req": {
+       "instructions": 18546177.3,
+       "cycles": 7903800.4,
+       "idq.dsb_uops": 17370611.166666668,
+       "idq.mite_uops": 646459.8,
+       "frontend_retired.any_dsb_miss": 63697.666666666664,
+       "dsb2mite_switches.penalty_cycles": 58100.53333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.048173999999999995,
+      "execMs": 1.7452964999999998,
+      "per_req": {
+       "instructions": 18546439.166666668,
+       "cycles": 7852495.833333333,
+       "icache_data.stalls": 223842.8,
+       "icache_tag.stalls": 134946.7,
+       "L1-icache-load-misses": 46512.53333333333,
+       "iTLB-load-misses": 770.0333333333333
+      },
+      "pct_min": 100.0
+     }
+    }
+   ],
+   "tip": [
+    {
+     "plan": "46b45a84840a",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0551565,
+      "execMs": 1.723967,
+      "per_req": {
+       "instructions": 18558903.933333334,
+       "cycles": 7883256.6,
+       "cache-misses": 16612.666666666668,
+       "branch-misses": 23969.266666666666,
+       "mem_load_retired.l3_miss": 707.8666666666667,
+       "baclears.any": 10382.533333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.055403999999999995,
+      "execMs": 1.730493,
+      "per_req": {
+       "instructions": 18547746.533333335,
+       "cycles": 7881254.766666667,
+       "idq.dsb_uops": 17383605.066666666,
+       "idq.mite_uops": 671051.1333333333,
+       "frontend_retired.any_dsb_miss": 65740.73333333334,
+       "dsb2mite_switches.penalty_cycles": 59043.4
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0553615,
+      "execMs": 1.7259335,
+      "per_req": {
+       "instructions": 18547684.266666666,
+       "cycles": 7855731.1,
+       "icache_data.stalls": 282183.0,
+       "icache_tag.stalls": 153752.63333333333,
+       "L1-icache-load-misses": 47495.13333333333,
+       "iTLB-load-misses": 852.3
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "1d5a1124564a",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0579325,
+      "execMs": 1.7272515,
+      "per_req": {
+       "instructions": 18558722.566666666,
+       "cycles": 7923651.9,
+       "cache-misses": 18558.133333333335,
+       "branch-misses": 24099.3,
+       "mem_load_retired.l3_miss": 825.8333333333334,
+       "baclears.any": 10495.2
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.048277,
+      "execMs": 1.7191475,
+      "per_req": {
+       "instructions": 18547110.366666667,
+       "cycles": 7746193.7,
+       "idq.dsb_uops": 17368506.833333332,
+       "idq.mite_uops": 667489.1666666666,
+       "frontend_retired.any_dsb_miss": 66083.43333333333,
+       "dsb2mite_switches.penalty_cycles": 58581.96666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.048874,
+      "execMs": 1.718452,
+      "per_req": {
+       "instructions": 18547741.133333333,
+       "cycles": 7739792.466666667,
+       "icache_data.stalls": 209708.6,
+       "icache_tag.stalls": 131029.83333333333,
+       "L1-icache-load-misses": 46774.46666666667,
+       "iTLB-load-misses": 773.1666666666666
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "fd53a71a3e70",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0519415,
+      "execMs": 1.7207995,
+      "per_req": {
+       "instructions": 18556290.8,
+       "cycles": 7797975.833333333,
+       "cache-misses": 12573.333333333334,
+       "branch-misses": 23616.933333333334,
+       "mem_load_retired.l3_miss": 454.6333333333333,
+       "baclears.any": 10171.633333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.051986000000000004,
+      "execMs": 1.7184905,
+      "per_req": {
+       "instructions": 18545327.7,
+       "cycles": 7769482.5,
+       "idq.dsb_uops": 17365198.1,
+       "idq.mite_uops": 670559.5,
+       "frontend_retired.any_dsb_miss": 66851.3,
+       "dsb2mite_switches.penalty_cycles": 57825.066666666666
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0521035,
+      "execMs": 1.7191475,
+      "per_req": {
+       "instructions": 18545195.066666666,
+       "cycles": 7773121.433333334,
+       "icache_data.stalls": 241863.16666666666,
+       "icache_tag.stalls": 139789.73333333334,
+       "L1-icache-load-misses": 46318.86666666667,
+       "iTLB-load-misses": 795.4666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "e63d46ba9dd2",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0537275,
+      "execMs": 1.7229835,
+      "per_req": {
+       "instructions": 18559070.433333334,
+       "cycles": 7851623.2,
+       "cache-misses": 14274.7,
+       "branch-misses": 24102.133333333335,
+       "mem_load_retired.l3_miss": 655.0,
+       "baclears.any": 10354.266666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0492535,
+      "execMs": 1.7204595,
+      "per_req": {
+       "instructions": 18548491.166666668,
+       "cycles": 7750826.2,
+       "idq.dsb_uops": 17404272.433333334,
+       "idq.mite_uops": 676914.7333333333,
+       "frontend_retired.any_dsb_miss": 69439.16666666667,
+       "dsb2mite_switches.penalty_cycles": 58689.666666666664
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0495665,
+      "execMs": 1.7193065,
+      "per_req": {
+       "instructions": 18548010.366666667,
+       "cycles": 7856854.8,
+       "icache_data.stalls": 272093.0,
+       "icache_tag.stalls": 161622.1,
+       "L1-icache-load-misses": 46836.9,
+       "iTLB-load-misses": 787.2666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "0102c57deb77",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.055377,
+      "execMs": 1.7251235,
+      "per_req": {
+       "instructions": 18556543.366666667,
+       "cycles": 7879465.166666667,
+       "cache-misses": 16549.866666666665,
+       "branch-misses": 23781.633333333335,
+       "mem_load_retired.l3_miss": 701.4,
+       "baclears.any": 10373.066666666668
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.056549,
+      "execMs": 1.7271605,
+      "per_req": {
+       "instructions": 18545714.733333334,
+       "cycles": 7856935.0,
+       "idq.dsb_uops": 17388851.3,
+       "idq.mite_uops": 673330.6,
+       "frontend_retired.any_dsb_miss": 65738.0,
+       "dsb2mite_switches.penalty_cycles": 60860.833333333336
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.055427000000000004,
+      "execMs": 1.7244614999999999,
+      "per_req": {
+       "instructions": 18545669.333333332,
+       "cycles": 7841048.1,
+       "icache_data.stalls": 275931.06666666665,
+       "icache_tag.stalls": 150645.9,
+       "L1-icache-load-misses": 46954.36666666667,
+       "iTLB-load-misses": 828.2333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "f36f917feb57",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.05765000000000001,
+      "execMs": 1.7224705,
+      "per_req": {
+       "instructions": 18555661.833333332,
+       "cycles": 7898124.366666666,
+       "cache-misses": 17419.833333333332,
+       "branch-misses": 23736.9,
+       "mem_load_retired.l3_miss": 908.7333333333333,
+       "baclears.any": 10318.166666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0499345,
+      "execMs": 1.7168085,
+      "per_req": {
+       "instructions": 18544741.4,
+       "cycles": 7734696.166666667,
+       "idq.dsb_uops": 17363560.2,
+       "idq.mite_uops": 660782.9333333333,
+       "frontend_retired.any_dsb_miss": 66489.93333333333,
+       "dsb2mite_switches.penalty_cycles": 57598.433333333334
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.04926,
+      "execMs": 1.7173675,
+      "per_req": {
+       "instructions": 18544633.8,
+       "cycles": 7729393.666666667,
+       "icache_data.stalls": 209616.4,
+       "icache_tag.stalls": 131437.63333333333,
+       "L1-icache-load-misses": 45823.8,
+       "iTLB-load-misses": 780.0333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "8340d6f01116",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0505995,
+      "execMs": 1.7176575,
+      "per_req": {
+       "instructions": 18559355.2,
+       "cycles": 7792542.766666667,
+       "cache-misses": 11195.166666666666,
+       "branch-misses": 23851.733333333334,
+       "mem_load_retired.l3_miss": 427.56666666666666,
+       "baclears.any": 10371.633333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.053477,
+      "execMs": 1.7219415,
+      "per_req": {
+       "instructions": 18547414.5,
+       "cycles": 7807123.633333334,
+       "idq.dsb_uops": 17448733.7,
+       "idq.mite_uops": 658697.9666666667,
+       "frontend_retired.any_dsb_miss": 66012.46666666666,
+       "dsb2mite_switches.penalty_cycles": 56196.23333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0522065,
+      "execMs": 1.72368,
+      "per_req": {
+       "instructions": 18547761.6,
+       "cycles": 7813463.433333334,
+       "icache_data.stalls": 262632.06666666665,
+       "icache_tag.stalls": 146105.43333333332,
+       "L1-icache-load-misses": 47236.9,
+       "iTLB-load-misses": 806.9666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "fccef2878280",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0492595,
+      "execMs": 1.716904,
+      "per_req": {
+       "instructions": 18555580.766666666,
+       "cycles": 7750012.566666666,
+       "cache-misses": 9842.333333333334,
+       "branch-misses": 23568.733333333334,
+       "mem_load_retired.l3_miss": 338.53333333333336,
+       "baclears.any": 10207.1
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.052997,
+      "execMs": 1.732641,
+      "per_req": {
+       "instructions": 18544854.266666666,
+       "cycles": 7897258.733333333,
+       "idq.dsb_uops": 17385995.766666666,
+       "idq.mite_uops": 678921.8,
+       "frontend_retired.any_dsb_miss": 66978.83333333333,
+       "dsb2mite_switches.penalty_cycles": 61940.96666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0497225,
+      "execMs": 1.7182605,
+      "per_req": {
+       "instructions": 18544983.433333334,
+       "cycles": 7725778.533333333,
+       "icache_data.stalls": 211712.36666666667,
+       "icache_tag.stalls": 127637.46666666666,
+       "L1-icache-load-misses": 46044.6,
+       "iTLB-load-misses": 753.5666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "079d607cd622",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.055349999999999996,
+      "execMs": 1.724752,
+      "per_req": {
+       "instructions": 18556511.6,
+       "cycles": 7878262.166666667,
+       "cache-misses": 16223.8,
+       "branch-misses": 24004.766666666666,
+       "mem_load_retired.l3_miss": 779.1666666666666,
+       "baclears.any": 10274.433333333332
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.054400500000000004,
+      "execMs": 1.7250905,
+      "per_req": {
+       "instructions": 18545576.266666666,
+       "cycles": 7841680.233333333,
+       "idq.dsb_uops": 17365898.6,
+       "idq.mite_uops": 663828.8666666667,
+       "frontend_retired.any_dsb_miss": 65412.96666666667,
+       "dsb2mite_switches.penalty_cycles": 61144.433333333334
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0551045,
+      "execMs": 1.724858,
+      "per_req": {
+       "instructions": 18545425.6,
+       "cycles": 7843538.066666666,
+       "icache_data.stalls": 278451.6666666667,
+       "icache_tag.stalls": 151665.66666666666,
+       "L1-icache-load-misses": 47102.73333333333,
+       "iTLB-load-misses": 840.2333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "fad7e1187654",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.049608,
+      "execMs": 1.7181405,
+      "per_req": {
+       "instructions": 18556507.066666666,
+       "cycles": 7792955.433333334,
+       "cache-misses": 10981.066666666668,
+       "branch-misses": 23593.766666666666,
+       "mem_load_retired.l3_miss": 421.03333333333336,
+       "baclears.any": 10163.233333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.049464999999999995,
+      "execMs": 1.7163965,
+      "per_req": {
+       "instructions": 18545342.166666668,
+       "cycles": 7723433.833333333,
+       "idq.dsb_uops": 17378238.4,
+       "idq.mite_uops": 675627.2333333333,
+       "frontend_retired.any_dsb_miss": 70689.86666666667,
+       "dsb2mite_switches.penalty_cycles": 55751.63333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0478455,
+      "execMs": 1.7150205,
+      "per_req": {
+       "instructions": 18545226.5,
+       "cycles": 7710314.333333333,
+       "icache_data.stalls": 207083.1,
+       "icache_tag.stalls": 129037.03333333334,
+       "L1-icache-load-misses": 46009.333333333336,
+       "iTLB-load-misses": 763.5333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "e5e1f2e4f39b",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0524225,
+      "execMs": 1.7187774999999998,
+      "per_req": {
+       "instructions": 18556598.3,
+       "cycles": 7794330.466666667,
+       "cache-misses": 11566.1,
+       "branch-misses": 23930.866666666665,
+       "mem_load_retired.l3_miss": 482.96666666666664,
+       "baclears.any": 10237.933333333332
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.054103,
+      "execMs": 1.7230755,
+      "per_req": {
+       "instructions": 18545561.833333332,
+       "cycles": 7810643.6,
+       "idq.dsb_uops": 17336933.4,
+       "idq.mite_uops": 672286.9333333333,
+       "frontend_retired.any_dsb_miss": 66459.3,
+       "dsb2mite_switches.penalty_cycles": 59774.933333333334
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0535915,
+      "execMs": 1.7214605,
+      "per_req": {
+       "instructions": 18545369.533333335,
+       "cycles": 7819802.0,
+       "icache_data.stalls": 259622.0,
+       "icache_tag.stalls": 146061.03333333333,
+       "L1-icache-load-misses": 46340.53333333333,
+       "iTLB-load-misses": 854.7333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "afaca3c8a947",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.049117499999999994,
+      "execMs": 1.7180305,
+      "per_req": {
+       "instructions": 18559283.933333334,
+       "cycles": 7773055.466666667,
+       "cache-misses": 10114.6,
+       "branch-misses": 23882.7,
+       "mem_load_retired.l3_miss": 349.7,
+       "baclears.any": 10288.566666666668
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0532695,
+      "execMs": 1.730932,
+      "per_req": {
+       "instructions": 18547337.6,
+       "cycles": 7896463.866666666,
+       "idq.dsb_uops": 17415985.8,
+       "idq.mite_uops": 665808.0666666667,
+       "frontend_retired.any_dsb_miss": 65894.33333333333,
+       "dsb2mite_switches.penalty_cycles": 59851.63333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.049033999999999994,
+      "execMs": 1.717839,
+      "per_req": {
+       "instructions": 18547493.766666666,
+       "cycles": 7744501.766666667,
+       "icache_data.stalls": 220350.2,
+       "icache_tag.stalls": 135472.63333333333,
+       "L1-icache-load-misses": 46659.3,
+       "iTLB-load-misses": 819.7
+      },
+      "pct_min": 100.0
+     }
+    }
+   ]
+  }
+ },
+ "plans": {
+  "births-by-decade": {
+   "base": {
+    "616cb80769f7": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?f4e7a7a112f38377f2d115ba3fe84de2\n      GroupBy est=7955 cost=73774 by ?decade aggs ?f4e7a7a112f38377f2d115ba3fe84de2=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "08f53a3640de": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?500a7af9348a2fac3745d6f1c078fe3b\n      GroupBy est=7955 cost=73774 by ?decade aggs ?500a7af9348a2fac3745d6f1c078fe3b=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "86159347bd8b": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?a7b3b37793912d2e2ed9bd4969bbbcb8\n      GroupBy est=7955 cost=73774 by ?decade aggs ?a7b3b37793912d2e2ed9bd4969bbbcb8=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "24f78aab34cb": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?4f7b41e00c5cfbbcc25d41f3e9c2c99a\n      GroupBy est=7955 cost=73774 by ?decade aggs ?4f7b41e00c5cfbbcc25d41f3e9c2c99a=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "ec4499676234": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?3cb13c789293a0aafb65b66073d76885\n      GroupBy est=7955 cost=73774 by ?decade aggs ?3cb13c789293a0aafb65b66073d76885=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "939e0ee58f6f": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?df50aebbf8fb147b7969389507914676\n      GroupBy est=7955 cost=73774 by ?decade aggs ?df50aebbf8fb147b7969389507914676=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "33f362fc4577": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?8917d612c8592e7eb259559162c077c4\n      GroupBy est=7955 cost=73774 by ?decade aggs ?8917d612c8592e7eb259559162c077c4=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "33d6da7769a8": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?2de61aec86cf8b38b6be826269c4ad35\n      GroupBy est=7955 cost=73774 by ?decade aggs ?2de61aec86cf8b38b6be826269c4ad35=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "b26961fbbd39": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?f92453df713e5102eddb2c50e28e5ba6\n      GroupBy est=7955 cost=73774 by ?decade aggs ?f92453df713e5102eddb2c50e28e5ba6=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "e6a4186553d3": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?c482d1830190df376dec93aa134a9161\n      GroupBy est=7955 cost=73774 by ?decade aggs ?c482d1830190df376dec93aa134a9161=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "f2846f3dffca": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?f6bcc3dffec5401c219906bca8ffa7cc\n      GroupBy est=7955 cost=73774 by ?decade aggs ?f6bcc3dffec5401c219906bca8ffa7cc=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "4826a913e000": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?3da2e41df18659064ce01ad9765aa01a\n      GroupBy est=7955 cost=73774 by ?decade aggs ?3da2e41df18659064ce01ad9765aa01a=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]"
+   },
+   "main": {
+    "849ed57dccaa": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?38f3d40d3032e94912d53ef11d798256\n      GroupBy est=7955 cost=73774 by ?decade aggs ?38f3d40d3032e94912d53ef11d798256=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "4dff9182966c": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?c91dd9e62414611f10478fd196237f3e\n      GroupBy est=7955 cost=73774 by ?decade aggs ?c91dd9e62414611f10478fd196237f3e=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "7f13f48a76a9": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?aa4a15dd88ebc515d450804524584b03\n      GroupBy est=7955 cost=73774 by ?decade aggs ?aa4a15dd88ebc515d450804524584b03=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "8d970e6e223b": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?11afc5b3b3fd818408ca7fdf3c774207\n      GroupBy est=7955 cost=73774 by ?decade aggs ?11afc5b3b3fd818408ca7fdf3c774207=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "50f03a1c7c99": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?764192de5f1397db0a17f12556e32950\n      GroupBy est=7955 cost=73774 by ?decade aggs ?764192de5f1397db0a17f12556e32950=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "9c68f7bacd98": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?947067864c71cfbfb98464ae10e4ac02\n      GroupBy est=7955 cost=73774 by ?decade aggs ?947067864c71cfbfb98464ae10e4ac02=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "0a7348c06e43": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?61780056cb9f46615dfc06d9565592c\n      GroupBy est=7955 cost=73774 by ?decade aggs ?61780056cb9f46615dfc06d9565592c=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "3c66fbe9052f": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?ec6baba3b4f7451573c391ba071a1df6\n      GroupBy est=7955 cost=73774 by ?decade aggs ?ec6baba3b4f7451573c391ba071a1df6=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "078bdef23a44": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?2143df937ef0b0199dc1daeecf1f1717\n      GroupBy est=7955 cost=73774 by ?decade aggs ?2143df937ef0b0199dc1daeecf1f1717=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "713aad85474a": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?6b4dad19c41f205306741d906dfd11\n      GroupBy est=7955 cost=73774 by ?decade aggs ?6b4dad19c41f205306741d906dfd11=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "da62283c10de": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?f8ab0c37e7e8a981fd523859b42853e3\n      GroupBy est=7955 cost=73774 by ?decade aggs ?f8ab0c37e7e8a981fd523859b42853e3=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "6f5cd812f5fa": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?22470bccae4b5286c9c3ef6bc6acaddd\n      GroupBy est=7955 cost=73774 by ?decade aggs ?22470bccae4b5286c9c3ef6bc6acaddd=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]"
+   },
+   "tip": {
+    "46b45a84840a": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?260d8126ed0e2c082968b8047c14abe4\n      GroupBy est=7955 cost=73774 by ?decade aggs ?260d8126ed0e2c082968b8047c14abe4=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "1d5a1124564a": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?b2cc31e2679f6c21e7ac17d07cb3d6c4\n      GroupBy est=7955 cost=73774 by ?decade aggs ?b2cc31e2679f6c21e7ac17d07cb3d6c4=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "fd53a71a3e70": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?f1e8cc9bfefc09d4932aa57a25993\n      GroupBy est=7955 cost=73774 by ?decade aggs ?f1e8cc9bfefc09d4932aa57a25993=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "e63d46ba9dd2": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?56eb5bac3948d7df614abf9f3df7a731\n      GroupBy est=7955 cost=73774 by ?decade aggs ?56eb5bac3948d7df614abf9f3df7a731=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "0102c57deb77": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?e7dc9bbcc3113648f1273da4a722877e\n      GroupBy est=7955 cost=73774 by ?decade aggs ?e7dc9bbcc3113648f1273da4a722877e=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "f36f917feb57": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?5b4f18ba11e4f2e469dd487712839611\n      GroupBy est=7955 cost=73774 by ?decade aggs ?5b4f18ba11e4f2e469dd487712839611=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "8340d6f01116": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?81835ffee56ab9a40dd8ed2ea5e59f43\n      GroupBy est=7955 cost=73774 by ?decade aggs ?81835ffee56ab9a40dd8ed2ea5e59f43=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "fccef2878280": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?a77f4ff75b7bcbcda8d3f7ada6db5785\n      GroupBy est=7955 cost=73774 by ?decade aggs ?a77f4ff75b7bcbcda8d3f7ada6db5785=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "079d607cd622": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?d0e4de52d9d850747b5f8bb5250e632a\n      GroupBy est=7955 cost=73774 by ?decade aggs ?d0e4de52d9d850747b5f8bb5250e632a=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "fad7e1187654": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?5eed1f8618225b8046d133e8e95cf015\n      GroupBy est=7955 cost=73774 by ?decade aggs ?5eed1f8618225b8046d133e8e95cf015=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "e5e1f2e4f39b": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?f564d099d6728226f6f94d156c087584\n      GroupBy est=7955 cost=73774 by ?decade aggs ?f564d099d6728226f6f94d156c087584=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]",
+    "afaca3c8a947": "Project est=7955 cost=141220 ?decade ?n\n  OrderBy est=7955 cost=141220 ASC(?decade)\n    Bind est=7955 cost=81728 ?n := ?ba60049e0766e55bbeb4319543fedbd7\n      GroupBy est=7955 cost=73774 by ?decade aggs ?ba60049e0766e55bbeb4319543fedbd7=Count [incremental]\n        Bind est=7955 cost=61841 ?decade := (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) [expr cache: (FLOOR((YEAR(?d) / \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>)) * \"10\"^^<http://www.w3.org/2001/XMLSchema#integer>) row by row: 7321 distinct of 8037 rows]\n          MergeJoin est=7955 cost=53887 on ?p\n            IndexScan est=14928 cost=14928 POS ?p rdf:type <http://dbpedia.org/ontology/Person> [decodes SG]\n            IndexScan est=8038 cost=8038 PSO ?p <http://dbpedia.org/ontology/birthDate> ?d [decodes SOG]"
+   }
+  }
+ }
+}
