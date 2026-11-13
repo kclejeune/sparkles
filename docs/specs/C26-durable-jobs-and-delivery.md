@@ -66,8 +66,8 @@ inert until an explicit publication creates a job or result on the target branch
 
 A transition that changes no quad is not a commit. It takes no commit number and appears
 in no history, change event, commit count or annotation, and it wakes no live query, kept
-view or change subscriber. A publication is one commit whose counts, changes and events
-are those of its business quads alone, and its commit metadata names no run, attempt or
+view or change subscriber. A publication with a net change to the quads is one commit
+whose counts, changes and events are those of its business quads alone, and its commit metadata names no run, attempt or
 operation. Progress reports are process-local and coalesced, and a worker renews its
 lease infrequently rather than persisting every row. A rebuildable ready-time index
 avoids repeatedly scanning the whole ledger. The cost of the control log and its
@@ -463,8 +463,8 @@ index that misses a record cannot permanently lose work because periodic reconci
 compares it with committed ledger state.
 
 Startup first recovers the store, which replays the control keyspace as §7.2 describes,
-and checks the formats. It then synchronizes a new boot epoch, pauses work restored from
-a capture as §7.3 requires, expires old leases, rebuilds indexes and rechecks definitions
+and checks the formats. It then pauses work restored from a capture as §7.3 requires,
+synchronizes a new boot epoch, expires old leases, rebuilds indexes and rechecks definitions
 and principals. Only then can it admit claims. A failure before this sequence completes
 leaves dispatch off. Server shutdown fences new claims and requests bounded cancellation.
 It does not wait indefinitely for an external worker.
@@ -503,14 +503,17 @@ dry run or preview that stages a control record is refused, since neither may wr
 The following properties hold, and the recovery of §7.2 relies on them.
 
 1. A frame is durable before the writer lock is released after it. The serial commit
-   path and the control log both synchronize before the lock is released. A guard is
-   armed before the first byte of a frame's transaction reaches either log and disarmed
-   only after the log's length is recorded and the snapshot and the control state are
-   published. A failed write or synchronization, any other error in between, or an
+   path and the control log both synchronize before the lock is released. In a store
+   whose keyspace is enabled, a guard is armed before the first byte of any serial
+   transaction reaches either log, whether or not it carries a frame, and disarmed only
+   after the head and the log's length are recorded and the snapshot and the control
+   state are published. The group commit keeps the fence it already has for an unwind
+   of its coordinator. A failed write or synchronization, any other error in between, or an
    unwind that drops the armed guard poisons the writer, which refuses every later write
    until the store is opened again. An orderly close after the guard poisoned the writer
-   does not trim a log past its published length, since the bytes there may hold a
-   durable frame. No
+   truncates neither log, since the bytes past the published length may hold a durable
+   frame or a commit that a frame follows. A control-only frame is written only when the
+   writer's head is the published snapshot's commit. No
    frame is therefore ever written after one whose durability or publication is
    unknown, and no sequence number is used twice.
 2. Durable frames therefore form a prefix of the sequence numbers. Frame n+1 is written
@@ -591,9 +594,14 @@ checkpoint before the switch leaves the old generation current.
 
 ### 7.2 Recovery at open
 
-The open reads `control.bin`, or starts from an empty state at sequence zero when the
-keyspace is enabled and the file does not exist yet. It replays the write-ahead log as
-before and collects the frames of the transactions it keeps. It reads `control.log` and
+A store has no control keyspace while neither `control.bin` nor `control.log` exists and
+no settings file or registry entry needs one. A `jobs.json`, a jobs entry in the
+registry or a `control.log` without a `control.bin` is an integrity error, so a lost
+checkpoint is never read as an empty ledger. A `control.bin` without a `control.log` is
+the state that enablement leaves after its checkpoint step, and the state of a restored
+backup, and a writable open creates the empty log durably before it admits a write. The
+open reads `control.bin` and never replaces it with an empty one. It replays the
+write-ahead log as before and collects the frames of the transactions it keeps. It reads `control.log` and
 collects its frames up to the first record that is incomplete or fails its checksum. It
 then merges the frames of both logs above the checkpoint's sequence number in sequence
 order and applies them. All of this happens before the open truncates either log.
@@ -638,26 +646,42 @@ checkpoint's sequence number. It never copies `control.log`. The capture is ther
 consistent cut of quads and ledger. Definition manifests and immutable artifact
 references must also be captured or the backup explicitly reports them missing.
 
-A restored dataset opens with that checkpoint and its origin entry. Before any claim or
-delivery, the first jobs recovery writes one small frame that removes the origin entry
-and records a `job:Recovery` record naming it. That record is a restore hold, and while
-it stands no run is claimed and no delivery is sent. The recovery then pauses every
-nonterminal run and every pending or leased delivery in bounded frames, instead of
-returning interrupted attempts to their retry policy. A crash before the first frame
-leaves the origin entry, and a crash during the pausing leaves the hold, so the next
-recovery continues where it stopped. This holds whether the restore
-kept the dataset's UUID or minted a new one, including a retry of an older same-UUID
-backup. Old lease tokens fail the epoch check of the new process. An operator must map
-principals and secret references, confirm source continuity and choose whether
-previously uncertain external effects may be retried before resuming paused work through
-the recovery route of §6, which lifts the hold. A paused run can be cancelled meanwhile.
+A restored dataset opens with that checkpoint and its origin entry. The origin entry
+fences dispatch by itself. The first jobs recovery runs before it installs the process's
+boot epoch or returns any interrupted attempt to its retry policy, and it writes one
+small frame that removes the origin entry and records a `job:Recovery` record in the
+`pausing` phase. The restored set is every run and delivery that the checkpoint holds.
+The recovery pauses the nonterminal runs and the pending or leased deliveries of that set
+in bounded frames, each of which records how far it got, and a last frame moves the
+record to the `awaiting-decision` phase. A crash before the first frame leaves the origin
+entry, and a crash during the pausing leaves the `pausing` record, so the next recovery
+continues where it stopped. While an origin entry or a `pausing` record exists, a
+submission, a claim, a renewal, a publication, a failure under a lease and every
+delivery claim or send are refused under the writer, and a cancellation and a lookup of
+a recorded receipt are answered. The epoch is installed only after the record reaches
+`awaiting-decision`, so no admission check passes before then.
 
-The backup manifest lists `control.bin` and `jobs.json` as root files, and a backup that
-holds either requires the feature `control/1`. A restore checks the control closure before
-it reidentifies or publishes the dataset, whether or not an integrity check was asked
-for. A `jobs.json` needs a `control.bin`, a `control.bin` needs its origin entry, and that
-entry must name the backup's source dataset and captured commit, which must also be the
-checkpoint's business head. A backup that holds `control.log` is refused. The persistent,
+Once the record is `awaiting-decision`, runs and deliveries outside the restored set are
+dispatched as usual, and the paused ones wait. This holds whether the restore kept the
+dataset's UUID or minted a new one, including a retry of an older same-UUID backup. Old
+lease tokens fail the epoch check of the new process. An operator must map principals
+and secret references, confirm source continuity and choose whether previously
+uncertain external effects may be retried before resuming selected paused work through
+the recovery route of §6. That route refuses while the record is `pausing`, and it checks
+under the writer that each run or delivery it resumes is paused and belongs to the
+restored set. A paused run can be cancelled meanwhile.
+
+The backup manifest lists `control.bin` and `jobs.json` as root files, and both are meta
+files that a later backup replaces whole and never extends as an appended prefix. A
+restore checks the control closure before it reidentifies or publishes the dataset,
+whether or not an integrity check was asked for. The feature `control/1`, a `jobs.json`,
+a jobs entry in the captured registry and a captured log of version 3 each require a
+`control.bin`, and a `control.bin` requires the feature. A dataset reader of 9 alone does
+not, since an interrupted enablement may leave it. The
+checkpoint must carry an origin entry that names the backup's source dataset and
+captured commit, which must also be the checkpoint's business head. A backup that holds
+`control.log` is refused, and so is one that breaks any of these rules, such as one that
+keeps the feature and leaves out the checkpoint. The persistent,
 in-memory and materialized captures all render the checkpoint, and the extra files a
 backup creation may add or replace never include `control.bin`. A restore that the
 current release refuses, such as a new-identity restore of a dataset with configuration
@@ -665,8 +689,8 @@ history, stays refused.
 
 A clone is a new dataset whose copied `jobs.json` raises its reader to 9, and it starts
 with an empty control keyspace, an empty `control.bin` and an empty `control.log`. A clone
-of an activated store stays refused as it is now. It holds no run, lease or delivery identity of its
-source, so nothing in it can resume old work or reuse a delivery's deduplication
+of an activated store stays refused as it is now. A clone holds no run, lease or delivery
+identity of its source, so nothing in it can resume old work or reuse a delivery's deduplication
 identity. A later recovery feature may copy selected records into a clone under new
 identities with `origin` references.
 
@@ -707,7 +731,9 @@ the current implementation.
 | A17. A crash interrupts enablement, a checkpoint or a generation switch. | The next open recovers the same control state, and an interrupted enablement can be resumed. Enablement with a live direct log shorter than one block leaves a header of version 3. |
 | A18. A process crash is followed by a reopen that writes, then a power loss. | Frames recovered from the page cache were synchronized before the reopen wrote, so the two logs still form one prefix. |
 | A19. A publication makes no net change to the quads. | It creates no commit, its record names the head it follows, and a retry returns the same receipt. |
-| A20. A reader loads the control state and a snapshot while a publication commits. | The snapshot holds every commit the control state names. |
+| A20. A reader loads the control state and a snapshot while a publication commits. | The snapshot holds every commit the control state names. An ordinary commit that unwinds before its snapshot publishes poisons the writer, so no control-only frame follows it. |
+| A21. A restore is interrupted, retried and recovered while workers and the operator act. | Nothing is claimed, sent or published before the restored set is paused, the recovery continues after a restart, and the recovery route refuses while pausing. |
+| A22. A backup keeps the control feature or settings without its checkpoint. | The restore refuses it before reidentification, also without an integrity check. |
 
 Fault injection covers before and after vocabulary append, WAL append, control log
 append, synchronization, snapshot and control state publication, each step of a
