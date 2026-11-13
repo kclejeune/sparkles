@@ -474,7 +474,7 @@ class Admission(unittest.TestCase):
         self.assertEqual(start[-2:],['[ "$executor" != boat ] || exec 7>&-','echo "$unit"'])
         self.assertLess(next(i for i,l in enumerate(start) if l.startswith('systemd-run --user --unit')),len(start)-2)
         inner=(ROOT/'scripts/gate/remote/gate-inner.sh').read_text().splitlines()
-        call=next(i for i,l in enumerate(inner) if 'disk_clean.py' in l)
+        call=next(i for i,l in enumerate(inner) if 'disk_clean.py' in l and '--if-above 90' in l)
         self.assertEqual(inner[call-1].strip(),'if [ "${SPARKLES_REMOTE_EXECUTOR:-ssh}" = boat ]; then')
         self.assertTrue(inner[call].rstrip().endswith('|| true'));self.assertEqual(inner[-1],'finish $fail')
         gate=(ROOT/'scripts/gate/gate.sh').read_text()
