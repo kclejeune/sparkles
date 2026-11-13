@@ -206,6 +206,27 @@ fn main() {
             ),
             auto_read: None,
         });
+        if std::env::var_os("AUTO_LATENCY_RAW").is_some() {
+            // the reasoner without the dataset's record, as the Phase 1 harness makes it
+            let raw = sparkles_reasoner::query::QueryReasoner::new(
+                profile.clone(),
+                &Default::default(),
+                Default::default(),
+            )
+            .unwrap()
+            .with_max_derived(usize::MAX)
+            .provider();
+            let mut o = view(&datasets[fresh], ReasoningMode::Off, true);
+            o.reasoning = Some(raw);
+            o.default_graph_extra.clear();
+            modes.push(Mode {
+                profile: name,
+                name: "demand-raw",
+                dataset: fresh,
+                options: o,
+                auto_read: None,
+            });
+        }
         modes.push(Mode {
             profile: name,
             name: "demand-cached",
@@ -299,6 +320,12 @@ fn main() {
                         println!("{}/{}/{q}: auto chose otherwise: {d}", m.profile, m.name);
                         ok[mi][qi] = false;
                     }
+                }
+                if std::env::var_os("AUTO_LATENCY_RAW").is_some() {
+                    println!(
+                        "{}/{}/{q}: {d}; warnings {:?}",
+                        m.profile, m.name, applied.report.warnings
+                    );
                 }
                 decisions[mi][qi] = d;
             }

@@ -2704,10 +2704,10 @@ mod schema_completeness_tests {
         let free = (Slot::Var(0), Slot::Const(30), Slot::Var(2));
         let all = estimate_cone(&rules, free, [false; 3], &FlatStats);
         // 1,000 facts of 10, as many of 20, and the join of 20 with 11: 1,000 × 1
-        assert!(all >= 3000.0 && all < 3100.0, "{all}");
+        assert!((3000.0..3100.0).contains(&all), "{all}");
         let bound = estimate_cone(&rules, free, [true, false, false], &FlatStats);
         // per subject: 10 facts of 9, so 10 of 10 and 20, and 10 × 1 of the join
-        assert!(bound >= 30.0 && bound < 31.0, "{bound}");
+        assert!((30.0..31.0).contains(&bound), "{bound}");
         assert!(bound < all);
         let none = estimate_cone(
             &rules,
